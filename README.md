@@ -12,25 +12,25 @@ Albedo is a full-stack compilation and execution engine built from the ground up
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│              Developer surface                       │
+│      Developer surface - Under Development          │
 │   albedo dev · albedo.config.ts · HMR · overlays    │
 ├──────────────────────┬──────────────────────────────┤
-│   CLI (dom-compiler) │   Node bridge (NAPI)          │
-│  analyze · bundle    │   win32-x64 ✓                 │
-│  showcase · serve    │   macOS · Linux (pending)     │
+│   CLI (dom-compiler) │   Node bridge (NAPI)         │
+│  analyze · bundle    │   win32-x64                  |
+│  showcase · serve    │   macOS · Linux (pending)    │
 ├──────────────────────┴──────────────────────────────┤
-│          HTTP server runtime (albedo-server)         │
-│    axum · radix router · middleware · auth ·         │
-│    layout · streaming                                │
+│          HTTP server runtime (albedo-server)        │
+│    axum · radix router · middleware · auth ·        │
+│    layout · streaming                               │
 ├─────────────────────────────────────────────────────┤
-│                   Runtime kernel                     │
+│                   Runtime kernel                    │
 │  Sentinel ring │ Scheduler │ π-arch │ WebTransport  │
 ├─────────────────────────────────────────────────────┤
-│              Compiler pipeline                       │
+│              Compiler pipeline                      │
 │  Graph · Analyzer · Bundler · QuickJS · Incr. cache │
 ├─────────────────────────────────────────────────────┤
-│         Canonical IR + effect lattice                │
-│    Pure · Hooks · Async · IO · SideEffects           │
+│         Canonical IR + effect lattice               │
+│    Pure · Hooks · Async · IO · SideEffects          │
 └─────────────────────────────────────────────────────┘
 ```
 
