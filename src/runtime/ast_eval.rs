@@ -24,7 +24,7 @@ enum ParamBinding {
 #[derive(Debug, Clone)]
 struct ComponentFunction {
     params: Vec<ParamBinding>,
-    body_expr: Expr,
+    body_stmts: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,8 +135,8 @@ impl ComponentProject {
 
         let mut env = HashMap::new();
         bind_params(&function.params, props, &mut env);
-        let value = self.eval_expr(module_spec, &function.body_expr, &env)?;
-        Ok(value_to_string(&value))
+        let stmts = function.body_stmts.clone();
+        self.eval_body_stmts(module_spec, &stmts, &mut env)
     }
 
     fn eval_expr(
@@ -163,10 +163,15 @@ impl ComponentProject {
                 .unwrap_or(Value::Null)),
             Expr::Member(member) => self.eval_member(module_spec, member, env),
             Expr::Paren(paren) => self.eval_expr(module_spec, &paren.expr, env),
-            _ => Err(anyhow!(
-                "unsupported expression in JSX evaluator: {:?}",
-                expr
-            )),
+            Expr::Tpl(tpl) => self.eval_tpl(module_spec, tpl, env),
+            Expr::Bin(bin) => self.eval_bin(module_spec, bin, env),
+            Expr::Cond(cond) => self.eval_cond(module_spec, cond, env),
+            Expr::Call(call) => self.eval_call_expr(module_spec, call, env),
+            Expr::Array(arr) => self.eval_array_expr(module_spec, arr, env),
+            Expr::Object(obj) => self.eval_object_expr(module_spec, obj, env),
+            Expr::Unary(unary) => self.eval_unary(module_spec, unary, env),
+            // Graceful fallback for unsupported expressions — yield Null rather than crash
+            _ => Ok(Value::Null),
         }
     }
 
@@ -190,6 +195,338 @@ impl ComponentProject {
             Ok(map.get(&prop_name).cloned().unwrap_or(Value::Null))
         } else {
             Ok(Value::Null)
+        }
+    }
+
+    fn eval_tpl(
+        &self,
+        module_spec: &str,
+        tpl: &Tpl,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        let mut result = String::new();
+        for (i, quasi) in tpl.quasis.iter().enumerate() {
+            let text = quasi
+                .cooked
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| quasi.raw.to_string());
+            result.push_str(&text);
+            if i < tpl.exprs.len() {
+                let val = self.eval_expr(module_spec, &tpl.exprs[i], env)?;
+                result.push_str(&value_to_string(&val));
+            }
+        }
+        Ok(Value::String(result))
+    }
+
+    fn eval_bin(
+        &self,
+        module_spec: &str,
+        bin: &BinExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        match bin.op {
+            // Short-circuit logical ops
+            BinaryOp::LogicalAnd => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                if !is_truthy(&left) {
+                    Ok(left)
+                } else {
+                    self.eval_expr(module_spec, &bin.right, env)
+                }
+            }
+            BinaryOp::LogicalOr => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                if is_truthy(&left) {
+                    Ok(left)
+                } else {
+                    self.eval_expr(module_spec, &bin.right, env)
+                }
+            }
+            BinaryOp::NullishCoalescing => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                if matches!(left, Value::Null) {
+                    self.eval_expr(module_spec, &bin.right, env)
+                } else {
+                    Ok(left)
+                }
+            }
+            // String / number addition
+            BinaryOp::Add => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                let right = self.eval_expr(module_spec, &bin.right, env)?;
+                match (&left, &right) {
+                    (Value::Number(l), Value::Number(r)) => {
+                        let sum = l.as_f64().unwrap_or(0.0) + r.as_f64().unwrap_or(0.0);
+                        Ok(serde_json::Number::from_f64(sum)
+                            .map(Value::Number)
+                            .unwrap_or(Value::Null))
+                    }
+                    _ => Ok(Value::String(format!(
+                        "{}{}",
+                        value_to_string(&left),
+                        value_to_string(&right)
+                    ))),
+                }
+            }
+            // Comparison operators — return Bool (used in ternary conditions)
+            BinaryOp::EqEq | BinaryOp::EqEqEq => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                let right = self.eval_expr(module_spec, &bin.right, env)?;
+                Ok(Value::Bool(value_to_string(&left) == value_to_string(&right)))
+            }
+            BinaryOp::NotEq | BinaryOp::NotEqEq => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                let right = self.eval_expr(module_spec, &bin.right, env)?;
+                Ok(Value::Bool(value_to_string(&left) != value_to_string(&right)))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn eval_cond(
+        &self,
+        module_spec: &str,
+        cond: &CondExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        let test = self.eval_expr(module_spec, &cond.test, env)?;
+        if is_truthy(&test) {
+            self.eval_expr(module_spec, &cond.cons, env)
+        } else {
+            self.eval_expr(module_spec, &cond.alt, env)
+        }
+    }
+
+    fn eval_unary(
+        &self,
+        module_spec: &str,
+        unary: &UnaryExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        let val = self.eval_expr(module_spec, &unary.arg, env)?;
+        match unary.op {
+            UnaryOp::Bang => Ok(Value::Bool(!is_truthy(&val))),
+            UnaryOp::Minus => {
+                if let Value::Number(n) = &val {
+                    Ok(serde_json::Number::from_f64(-n.as_f64().unwrap_or(0.0))
+                        .map(Value::Number)
+                        .unwrap_or(Value::Null))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn eval_array_expr(
+        &self,
+        module_spec: &str,
+        arr: &ArrayLit,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        let mut out = Vec::with_capacity(arr.elems.len());
+        for elem in &arr.elems {
+            if let Some(ExprOrSpread { expr, spread: None }) = elem {
+                out.push(self.eval_expr(module_spec, expr, env)?);
+            }
+        }
+        Ok(Value::Array(out))
+    }
+
+    fn eval_object_expr(
+        &self,
+        module_spec: &str,
+        obj: &ObjectLit,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        let mut map = serde_json::Map::new();
+        for prop in &obj.props {
+            if let PropOrSpread::Prop(prop_box) = prop {
+                match prop_box.as_ref() {
+                    Prop::KeyValue(kv) => {
+                        if let Some(key) = prop_name_to_string(&kv.key) {
+                            let val = self.eval_expr(module_spec, &kv.value, env)?;
+                            map.insert(key, val);
+                        }
+                    }
+                    Prop::Shorthand(ident) => {
+                        let name = ident.sym.to_string();
+                        let val = env.get(&name).cloned().unwrap_or(Value::Null);
+                        map.insert(name, val);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(Value::Object(map))
+    }
+
+    fn eval_call_expr(
+        &self,
+        module_spec: &str,
+        call: &CallExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        // --- Array.map() ---
+        if let Callee::Expr(callee_expr) = &call.callee {
+            if let Expr::Member(member) = callee_expr.as_ref() {
+                if let MemberProp::Ident(prop_ident) = &member.prop {
+                    let method = prop_ident.sym.as_ref();
+                    let obj_val = self.eval_expr(module_spec, &member.obj, env)?;
+
+                    // .map(fn) — render each item
+                    if method == "map" {
+                        if let Value::Array(items) = obj_val {
+                            if let Some(ExprOrSpread { expr: mapper, spread: None }) = call.args.first() {
+                                let parts = items
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, item)| {
+                                        self.eval_closure(module_spec, mapper, item, i, env)
+                                            .map(|v| value_to_string(&v))
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                return Ok(Value::String(parts.join("")));
+                            }
+                        }
+                        return Ok(Value::Null);
+                    }
+
+                    // String prototype methods
+                    if let Value::String(s) = &obj_val {
+                        let result = match method {
+                            "toUpperCase" => Some(s.to_uppercase()),
+                            "toLowerCase" => Some(s.to_lowercase()),
+                            "trim" => Some(s.trim().to_string()),
+                            "trimStart" | "trimLeft" => Some(s.trim_start().to_string()),
+                            "trimEnd" | "trimRight" => Some(s.trim_end().to_string()),
+                            _ => None,
+                        };
+                        if let Some(r) = result {
+                            return Ok(Value::String(r));
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- classnames / clsx ---
+        if let Callee::Expr(callee_expr) = &call.callee {
+            if let Expr::Ident(ident) = callee_expr.as_ref() {
+                let fn_name = ident.sym.to_string();
+                let module = self.modules.get(module_spec);
+                let is_classnames = module
+                    .and_then(|m| m.imports.get(&fn_name))
+                    .map(|b| is_classnames_source(&b.source))
+                    .unwrap_or(false);
+
+                if is_classnames {
+                    let mut classes = Vec::new();
+                    for arg in &call.args {
+                        if arg.spread.is_some() {
+                            continue;
+                        }
+                        let val = self.eval_expr(module_spec, &arg.expr, env)?;
+                        classnames_collect(&val, &mut classes);
+                    }
+                    return Ok(Value::String(classes.join(" ")));
+                }
+            }
+        }
+
+        // Unknown call — return Null gracefully
+        Ok(Value::Null)
+    }
+
+    fn eval_closure(
+        &self,
+        module_spec: &str,
+        expr: &Expr,
+        arg: &Value,
+        index: usize,
+        parent_env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        match expr {
+            Expr::Arrow(arrow) => {
+                let params: Vec<ParamBinding> = arrow.params.iter().map(param_from_pat).collect();
+                let mut env = parent_env.clone();
+                // Also expose the index as second argument if there's a second param
+                let index_val = serde_json::Number::from_f64(index as f64)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null);
+                let args = Value::Array(vec![arg.clone(), index_val]);
+                bind_params_positional(&params, &args, &mut env);
+                match &*arrow.body {
+                    BlockStmtOrExpr::BlockStmt(block) => {
+                        self.eval_body_stmts(module_spec, &block.stmts, &mut env)
+                            .map(Value::String)
+                    }
+                    BlockStmtOrExpr::Expr(body_expr) => {
+                        self.eval_expr(module_spec, body_expr, &env)
+                    }
+                }
+            }
+            Expr::Fn(fn_expr) => {
+                let params: Vec<ParamBinding> =
+                    fn_expr.function.params.iter().map(|p| param_from_pat(&p.pat)).collect();
+                let mut env = parent_env.clone();
+                let index_val = serde_json::Number::from_f64(index as f64)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null);
+                let args = Value::Array(vec![arg.clone(), index_val]);
+                bind_params_positional(&params, &args, &mut env);
+                if let Some(body) = &fn_expr.function.body {
+                    self.eval_body_stmts(module_spec, &body.stmts, &mut env)
+                        .map(Value::String)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn eval_body_stmts(
+        &self,
+        module_spec: &str,
+        stmts: &[Stmt],
+        env: &mut HashMap<String, Value>,
+    ) -> Result<String> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Return(ret) => {
+                    let value = if let Some(expr) = &ret.arg {
+                        self.eval_expr(module_spec, expr, env)?
+                    } else {
+                        Value::Null
+                    };
+                    return Ok(value_to_string(&value));
+                }
+                Stmt::Decl(Decl::Var(var)) => {
+                    self.eval_var_decl_into_env(module_spec, var, env);
+                }
+                _ => {}
+            }
+        }
+        Ok(String::new())
+    }
+
+    fn eval_var_decl_into_env(
+        &self,
+        module_spec: &str,
+        var: &VarDecl,
+        env: &mut HashMap<String, Value>,
+    ) {
+        for decl in &var.decls {
+            let value = if let Some(init) = &decl.init {
+                self.eval_expr(module_spec, init, env).unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            apply_var_pat_to_env(&decl.name, value, env);
         }
     }
 
@@ -235,7 +572,7 @@ impl ComponentProject {
 
         let attrs = self.read_attrs(module_spec, &element.opening.attrs, env)?;
         let attrs_html = render_attrs(&attrs);
-        let children_html = self.render_children(module_spec, &element.children, env, true)?;
+        let children_html = self.render_children(module_spec, &element.children, env, false)?;
         let void_tag = is_void_tag(&tag);
 
         if void_tag && children_html.is_empty() {
@@ -596,17 +933,22 @@ fn function_from_function(function: &Function) -> Result<ComponentFunction> {
         .body
         .as_ref()
         .ok_or_else(|| anyhow!("missing function body"))?;
-    let body_expr = extract_return(body)?;
-    Ok(ComponentFunction { params, body_expr })
+    Ok(ComponentFunction {
+        params,
+        body_stmts: body.stmts.clone(),
+    })
 }
 
 fn function_from_arrow(arrow: &ArrowExpr) -> Result<ComponentFunction> {
     let params = arrow.params.iter().map(param_from_pat).collect();
-    let body_expr = match &*arrow.body {
-        BlockStmtOrExpr::BlockStmt(block) => extract_return(block)?,
-        BlockStmtOrExpr::Expr(expr) => (**expr).clone(),
+    let body_stmts = match &*arrow.body {
+        BlockStmtOrExpr::BlockStmt(block) => block.stmts.clone(),
+        BlockStmtOrExpr::Expr(expr) => vec![Stmt::Return(ReturnStmt {
+            span: Default::default(),
+            arg: Some(Box::new((**expr).clone())),
+        })],
     };
-    Ok(ComponentFunction { params, body_expr })
+    Ok(ComponentFunction { params, body_stmts })
 }
 
 fn collect_var_functions(
@@ -632,15 +974,63 @@ fn collect_var_functions(
     Ok(())
 }
 
-fn extract_return(block: &BlockStmt) -> Result<Expr> {
-    for stmt in &block.stmts {
-        if let Stmt::Return(return_stmt) = stmt {
-            if let Some(expr) = &return_stmt.arg {
-                return Ok((**expr).clone());
+fn apply_var_pat_to_env(pat: &Pat, value: Value, env: &mut HashMap<String, Value>) {
+    match pat {
+        Pat::Ident(binding) => {
+            env.insert(binding.id.sym.to_string(), value);
+        }
+        Pat::Array(array_pat) => {
+            for (i, elem) in array_pat.elems.iter().enumerate() {
+                if let Some(elem_pat) = elem {
+                    let elem_val = match &value {
+                        Value::Array(arr) => arr.get(i).cloned().unwrap_or(Value::Null),
+                        _ => Value::Null,
+                    };
+                    apply_var_pat_to_env(elem_pat, elem_val, env);
+                }
             }
         }
+        Pat::Object(object_pat) => {
+            let map = value.as_object().cloned().unwrap_or_default();
+            for prop in &object_pat.props {
+                match prop {
+                    ObjectPatProp::Assign(assign) => {
+                        let key = assign.key.sym.to_string();
+                        let val = map.get(&key).cloned().unwrap_or(Value::Null);
+                        env.insert(key, val);
+                    }
+                    ObjectPatProp::KeyValue(kv) => {
+                        if let Some(key) = prop_name_to_string(&kv.key) {
+                            let val = map.get(&key).cloned().unwrap_or(Value::Null);
+                            apply_var_pat_to_env(&kv.value, val, env);
+                        }
+                    }
+                    ObjectPatProp::Rest(_) => {}
+                }
+            }
+        }
+        _ => {}
     }
-    Err(anyhow!("component function has no return expression"))
+}
+
+// Bind closure params positionally from a Value::Array of arguments
+fn bind_params_positional(params: &[ParamBinding], args: &Value, env: &mut HashMap<String, Value>) {
+    let arr = args.as_array().cloned().unwrap_or_default();
+    for (i, param) in params.iter().enumerate() {
+        let val = arr.get(i).cloned().unwrap_or(Value::Null);
+        match param {
+            ParamBinding::Ident(name) => {
+                env.insert(name.clone(), val);
+            }
+            ParamBinding::Object(fields) => {
+                let map = val.as_object().cloned().unwrap_or_default();
+                for (key, local) in fields {
+                    env.insert(local.clone(), map.get(key).cloned().unwrap_or(Value::Null));
+                }
+            }
+            ParamBinding::Ignore => {}
+        }
+    }
 }
 
 fn param_from_pat(pat: &Pat) -> ParamBinding {
@@ -839,6 +1229,44 @@ fn is_void_tag(tag: &str) -> bool {
     )
 }
 
+fn is_truthy(val: &Value) -> bool {
+    match val {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+fn classnames_collect(val: &Value, out: &mut Vec<String>) {
+    match val {
+        Value::String(s) if !s.is_empty() => {
+            // A single string may itself be space-separated classes
+            out.push(s.clone());
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                classnames_collect(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for (key, flag) in map {
+                if is_truthy(flag) {
+                    out.push(key.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_classnames_source(source: &str) -> bool {
+    matches!(source, "classnames" | "clsx")
+        || source.ends_with("/classnames")
+        || source.ends_with("/clsx")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,5 +1287,145 @@ mod tests {
         assert!(html.contains("<button>Home</button>"));
         assert!(html.contains("<h3>Fast</h3>"));
         assert!(html.contains("<p>© 2026 My App</p>"));
+    }
+
+    #[test]
+    fn test_ternary_classname() {
+        let project = ComponentProject::load_from_dir(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("test-app").join("src").join("components")
+        ).unwrap();
+        let source = r#"
+            export default function Badge({ active }) {
+                return <span className={active ? "badge--active" : "badge--inactive"}>{active ? "On" : "Off"}</span>;
+            }
+        "#;
+        let mut modules = project.modules.clone();
+        let path = std::path::PathBuf::from("Badge.tsx");
+        let parsed = super::parse_module(source, &path).unwrap();
+        modules.insert("Badge.tsx".to_string(), parsed);
+        let p = ComponentProject { root: project.root.clone(), modules };
+        let props = serde_json::json!({ "active": true });
+        let html = p.render_entry("Badge.tsx", &props).unwrap();
+        assert!(html.contains("badge--active"));
+        assert!(html.contains("On"));
+    }
+
+    #[test]
+    fn test_template_literal_classname() {
+        let source = r#"
+            export default function Card({ variant }) {
+                return <div className={`card card--${variant}`}>hello</div>;
+            }
+        "#;
+        let path = std::path::PathBuf::from("Card.tsx");
+        let module = super::parse_module(source, &path).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-app").join("src").join("components");
+        let mut base = ComponentProject::load_from_dir(&root).unwrap();
+        base.modules.insert("Card.tsx".to_string(), module);
+        let props = serde_json::json!({ "variant": "primary" });
+        let html = base.render_entry("Card.tsx", &props).unwrap();
+        assert!(html.contains("card card--primary"));
+    }
+
+    #[test]
+    fn test_logical_and_short_circuit() {
+        let source = r#"
+            export default function Alert({ show, message }) {
+                return <div>{show && <span>{message}</span>}</div>;
+            }
+        "#;
+        let path = std::path::PathBuf::from("Alert.tsx");
+        let module = super::parse_module(source, &path).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-app").join("src").join("components");
+        let mut base = ComponentProject::load_from_dir(&root).unwrap();
+        base.modules.insert("Alert.tsx".to_string(), module);
+
+        let html_shown = base.render_entry("Alert.tsx", &serde_json::json!({ "show": true, "message": "hello" })).unwrap();
+        assert!(html_shown.contains("<span>hello</span>"));
+
+        let html_hidden = base.render_entry("Alert.tsx", &serde_json::json!({ "show": false, "message": "hello" })).unwrap();
+        assert!(!html_hidden.contains("<span>"));
+    }
+
+    #[test]
+    fn test_const_binding_in_function_body() {
+        let source = r#"
+            export default function Label({ kind }) {
+                const cls = kind === "primary" ? "label-primary" : "label-default";
+                return <span className={cls}>{kind}</span>;
+            }
+        "#;
+        let path = std::path::PathBuf::from("Label.tsx");
+        let module = super::parse_module(source, &path).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-app").join("src").join("components");
+        let mut base = ComponentProject::load_from_dir(&root).unwrap();
+        base.modules.insert("Label.tsx".to_string(), module);
+        let props = serde_json::json!({ "kind": "primary" });
+        let html = base.render_entry("Label.tsx", &props).unwrap();
+        assert!(html.contains("label-primary"));
+    }
+
+    #[test]
+    fn test_array_map_renders_list() {
+        let source = r#"
+            export default function List({ items }) {
+                return <ul>{items.map(item => <li>{item}</li>)}</ul>;
+            }
+        "#;
+        let path = std::path::PathBuf::from("List.tsx");
+        let module = super::parse_module(source, &path).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-app").join("src").join("components");
+        let mut base = ComponentProject::load_from_dir(&root).unwrap();
+        base.modules.insert("List.tsx".to_string(), module);
+        let props = serde_json::json!({ "items": ["alpha", "beta", "gamma"] });
+        let html = base.render_entry("List.tsx", &props).unwrap();
+        assert!(html.contains("<li>alpha</li>"));
+        assert!(html.contains("<li>beta</li>"));
+        assert!(html.contains("<li>gamma</li>"));
+    }
+
+    #[test]
+    fn test_hooks_in_body_do_not_crash() {
+        // useState and useEffect calls should be silently ignored (evaluate to Null)
+        let source = r#"
+            export default function Counter() {
+                const [count, setCount] = useState(0);
+                return <div className="counter">{count}</div>;
+            }
+        "#;
+        let path = std::path::PathBuf::from("Counter.tsx");
+        let module = super::parse_module(source, &path).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-app").join("src").join("components");
+        let mut base = ComponentProject::load_from_dir(&root).unwrap();
+        base.modules.insert("Counter.tsx".to_string(), module);
+        let html = base.render_entry("Counter.tsx", &serde_json::json!({})).unwrap();
+        assert!(html.contains("class=\"counter\""));
+    }
+
+    #[test]
+    fn test_classnames_call() {
+        let source = r#"
+            import cx from 'classnames';
+            export default function Button({ primary, disabled }) {
+                return <button className={cx("btn", { "btn--primary": primary, "btn--disabled": disabled })}>click</button>;
+            }
+        "#;
+        let path = std::path::PathBuf::from("Button.tsx");
+        let module = super::parse_module(source, &path).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-app").join("src").join("components");
+        let mut base = ComponentProject::load_from_dir(&root).unwrap();
+        base.modules.insert("Button.tsx".to_string(), module);
+        let props = serde_json::json!({ "primary": true, "disabled": false });
+        let html = base.render_entry("Button.tsx", &props).unwrap();
+        assert!(html.contains("btn"));
+        assert!(html.contains("btn--primary"));
+        assert!(!html.contains("btn--disabled"));
     }
 }

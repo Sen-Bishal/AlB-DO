@@ -1,7 +1,7 @@
 use crate::runtime::hot_set::HOT_SET_MAX;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use swc_common::{sync::Lrc, FileName, SourceMap};
@@ -16,7 +16,6 @@ pub const DEV_CONFIG_TS: &str = "albedo.config.ts";
 pub const DEV_CONTRACT_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct DevConfig {
     #[serde(default = "default_contract_version")]
     pub contract_version: u16,
@@ -34,6 +33,11 @@ pub struct DevConfig {
     pub hot_set: Vec<HotSetRegistration>,
     #[serde(default)]
     pub static_slice: StaticSliceConfig,
+    /// Map of URL path → entry component filename.
+    /// e.g. { "/analytics": "Analytics.tsx", "/settings": "Settings.tsx" }
+    /// The root entry ("/") is always served from `entry`.
+    #[serde(default)]
+    pub routes: HashMap<String, String>,
 }
 
 impl Default for DevConfig {
@@ -47,6 +51,7 @@ impl Default for DevConfig {
             hmr: DevHmrConfig::default(),
             hot_set: Vec::new(),
             static_slice: StaticSliceConfig::default(),
+            routes: HashMap::new(),
         }
     }
 }
@@ -297,6 +302,7 @@ pub struct ResolvedDevContract {
     pub strict: bool,
     pub verbose: bool,
     pub open: bool,
+    pub routes: HashMap<String, String>,
 }
 
 pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> {
@@ -462,6 +468,7 @@ pub fn resolve_dev_contract(
         strict: cli.strict,
         verbose: cli.verbose,
         open: cli.open,
+        routes: config.routes,
     })
 }
 

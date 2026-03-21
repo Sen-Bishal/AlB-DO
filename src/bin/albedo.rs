@@ -3,7 +3,7 @@ use dom_render_compiler::dev_contract::{
     parse_dev_cli_args, resolve_dev_contract, ResolvedDevContract, DEV_CONFIG_JSON, DEV_CONFIG_TS,
 };
 use dom_render_compiler::parser::ParsedComponent;
-use dom_render_compiler::runtime::ast_eval::render_from_components_dir;
+use dom_render_compiler::runtime::ast_eval::ComponentProject;
 use dom_render_compiler::scanner::{ProjectScanner, ScanFailure, ScanMode};
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -21,16 +21,18 @@ use walkdir::WalkDir;
 const RULE_WIDTH: usize = 92;
 const PORT_AUTO_INCREMENT_LIMIT: u16 = 10;
 
-#[derive(Debug, Clone)]
-struct DevRenderedArtifact {
-    html_document: String,
+#[derive(Clone)]
+struct DevAllRoutesArtifact {
+    /// URL path → full HTML document
+    route_documents: std::collections::HashMap<String, String>,
     render_ms: f64,
     total_ms: f64,
 }
 
 #[derive(Debug, Clone)]
 struct SharedDevState {
-    html_document: String,
+    /// route path (e.g. "/", "/analytics") → rendered HTML document
+    routes: std::collections::HashMap<String, String>,
     render_ms: f64,
     total_ms: f64,
     last_error: Option<String>,
@@ -265,7 +267,7 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         None
     };
 
-    let initial = build_dev_artifact(&contract).map_err(|err| {
+    let initial = build_all_routes(&contract).map_err(|err| {
         format!(
             "failed to render initial dev document (entry='{}'): {err}",
             contract.entry
@@ -275,7 +277,7 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     let (listener, addr, auto_incremented) =
         bind_dev_listener(contract.server.host.as_str(), contract.server.port)?;
     let shared_state = Arc::new(Mutex::new(SharedDevState {
-        html_document: initial.html_document,
+        routes: initial.route_documents,
         render_ms: initial.render_ms,
         total_ms: initial.total_ms,
         last_error: None,
@@ -326,6 +328,11 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     );
     if let Some(components) = scanned_components.as_ref() {
         print_kv("Components", components.len());
+    }
+    let route_count = 1 + contract.routes.len();
+    print_kv("Routes", route_count);
+    for (url, entry) in &contract.routes {
+        println!("    {} -> {}", style(url, "2"), entry);
     }
     print_kv("Stop", "Ctrl+C");
 
@@ -520,7 +527,8 @@ fn watch_and_rebuild_loop(
                     contract.hmr.enabled,
                 );
                 if let Ok(mut state) = shared_state.lock() {
-                    state.html_document = overlay;
+                    let overlay_map = std::collections::HashMap::from([("/".to_string(), overlay)]);
+                    state.routes = overlay_map;
                     state.last_error = Some(err.clone());
                 }
                 let next_revision = revision.fetch_add(1, Ordering::SeqCst) + 1;
@@ -532,10 +540,10 @@ fn watch_and_rebuild_loop(
             }
         }
 
-        match build_dev_artifact(&contract) {
+        match build_all_routes(&contract) {
             Ok(artifact) => {
                 if let Ok(mut state) = shared_state.lock() {
-                    state.html_document = artifact.html_document;
+                    state.routes = artifact.route_documents;
                     state.render_ms = artifact.render_ms;
                     state.total_ms = artifact.total_ms;
                     state.last_error = None;
@@ -560,7 +568,8 @@ fn watch_and_rebuild_loop(
                     contract.hmr.enabled,
                 );
                 if let Ok(mut state) = shared_state.lock() {
-                    state.html_document = overlay;
+                    let overlay_map = std::collections::HashMap::from([("/".to_string(), overlay)]);
+                    state.routes = overlay_map;
                     state.last_error = Some(err.clone());
                 }
                 let next_revision = revision.fetch_add(1, Ordering::SeqCst) + 1;
@@ -690,12 +699,13 @@ fn handle_dev_connection(
     } else if path == "/" || path == "/index.html" || is_route_like_path(path.as_str()) {
         let snapshot = {
             let state = shared_state.lock().expect("shared state lock poisoned");
-            (
-                state.html_document.clone(),
-                state.render_ms,
-                state.total_ms,
-                state.last_error.clone(),
-            )
+            // Normalize: /index.html → /
+            let lookup = if path == "/index.html" { "/".to_string() } else { path.clone() };
+            let doc = state.routes.get(&lookup)
+                .or_else(|| state.routes.get("/"))
+                .cloned()
+                .unwrap_or_default();
+            (doc, state.render_ms, state.total_ms, state.last_error.clone())
         };
         let mut headers = vec![
             ("x-albedo-render-ms", format!("{:.2}", snapshot.1)),
@@ -765,41 +775,62 @@ fn broadcast_reload_event(clients: &Arc<Mutex<Vec<TcpStream>>>, revision: u64) {
     *active = retained;
 }
 
-fn build_dev_artifact(contract: &ResolvedDevContract) -> Result<DevRenderedArtifact, String> {
+fn build_all_routes(contract: &ResolvedDevContract) -> Result<DevAllRoutesArtifact, String> {
     let total_start = Instant::now();
+
+    // Load the component project ONCE — single directory scan + parse for all routes
+    let project = ComponentProject::load_from_dir(&contract.root)
+        .map_err(|err| format!("failed to load components: {err}"))?;
+
+    // Collect CSS ONCE — shared across all route documents
+    let project_css = collect_css_bundle(&contract.root);
+    let base_css = dev_shell_base_css();
+
+    let mut route_documents = std::collections::HashMap::new();
+    let mut total_render_ms = 0.0_f64;
     let props = serde_json::json!({});
 
-    let render_start = Instant::now();
-    let rendered_html = render_from_components_dir(&contract.root, contract.entry.as_str(), &props)
-        .map_err(|err| err.to_string())?;
-    let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+    // Helper closure: render one entry → full HTML document
+    let render_entry = |entry: &str| -> Result<(String, f64), String> {
+        let render_start = Instant::now();
+        let rendered_html = project
+            .render_entry(entry, &props)
+            .map_err(|err| err.to_string())?;
+        let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+        let document = format!(
+            "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Dev</title>\n  <style>\n{base_css}\n{project_css}\n  </style>\n</head>\n<body>\n{rendered_html}\n</body>\n</html>\n"
+        );
+        let html = inject_hmr_client_script(&document, contract.hmr.enabled);
+        Ok((html, render_ms))
+    };
 
-    let project_css = collect_css_bundle(contract.root.as_path());
-    let document = format!(
-        "<!doctype html>\n\
-<html lang=\"en\">\n\
-<head>\n\
-  <meta charset=\"utf-8\" />\n\
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n\
-  <title>ALBEDO Dev</title>\n\
-  <style>\n\
-{base_css}\n\
-{project_css}\n\
-  </style>\n\
-</head>\n\
-<body>\n\
-{rendered_html}\n\
-</body>\n\
-</html>\n",
-        base_css = dev_shell_base_css(),
-        project_css = project_css,
-        rendered_html = rendered_html
-    );
+    // Root entry
+    match render_entry(contract.entry.as_str()) {
+        Ok((html, ms)) => { total_render_ms += ms; route_documents.insert("/".to_string(), html); }
+        Err(err) => {
+            let overlay = build_dev_error_overlay(&format!("Route '/' failed:\n{err}"), contract.hmr.enabled);
+            route_documents.insert("/".to_string(), overlay);
+        }
+    }
 
-    let html_document = inject_hmr_client_script(document.as_str(), contract.hmr.enabled);
-    Ok(DevRenderedArtifact {
-        html_document,
-        render_ms,
+    // Additional routes — same loaded project, just different entry points
+    for (url_path, entry) in &contract.routes {
+        let url = if url_path.starts_with('/') { url_path.clone() } else { format!("/{url_path}") };
+        match render_entry(entry.as_str()) {
+            Ok((html, ms)) => { total_render_ms += ms; route_documents.insert(url, html); }
+            Err(err) => {
+                let overlay = build_dev_error_overlay(
+                    &format!("Route '{url}' failed (entry='{entry}'):\n{err}"),
+                    contract.hmr.enabled,
+                );
+                route_documents.insert(url, overlay);
+            }
+        }
+    }
+
+    Ok(DevAllRoutesArtifact {
+        route_documents,
+        render_ms: total_render_ms,
         total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
     })
 }
