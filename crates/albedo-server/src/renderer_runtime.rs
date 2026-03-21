@@ -34,7 +34,9 @@ impl RendererRuntime {
 
         // The standalone runtime expects these artifacts to exist even if route handlers
         // do not consume them directly yet. This keeps build/runtime contracts explicit.
-        assert_optional_artifact_present(&artifacts_dir.join(BUNDLE_ROUTE_PREFETCH_MANIFEST_FILENAME));
+        assert_optional_artifact_present(
+            &artifacts_dir.join(BUNDLE_ROUTE_PREFETCH_MANIFEST_FILENAME),
+        );
         assert_optional_artifact_present(&artifacts_dir.join(BUNDLE_STATIC_SLICES_FILENAME));
 
         let module_sources = load_module_sources(&artifacts_dir, &manifest)?;

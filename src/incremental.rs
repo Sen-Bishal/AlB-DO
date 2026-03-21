@@ -143,13 +143,8 @@ impl IncrementalCache {
         Ok(())
     }
     fn hash_file(path: impl AsRef<Path>) -> io::Result<FileHash> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
         let content = fs::read(path)?;
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        Ok(hasher.finish())
+        Ok(fnv1a_hash_bytes(&content))
     }
 
     pub fn compute_file_hash(path: impl AsRef<Path>) -> io::Result<u64> {
@@ -343,6 +338,19 @@ pub struct CacheStats {
     pub invalidated: usize,
     pub files_tracked: usize,
     pub cache_hit_rate: f64,
+}
+
+/// FNV-1a 64-bit hash — stable across Rust versions, process runs, and platforms.
+/// Unlike `DefaultHasher`, this is deterministic: same bytes always → same hash.
+fn fnv1a_hash_bytes(data: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 #[cfg(test)]

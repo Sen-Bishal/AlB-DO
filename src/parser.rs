@@ -1,7 +1,5 @@
 use crate::effects::EffectProfile;
 use crate::types::*;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::rc::Rc;
 use swc_common::SourceMap;
@@ -263,9 +261,17 @@ impl Visit for EffectCollector {
 }
 
 fn hash_source(source: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    source.hash(&mut hasher);
-    hasher.finish()
+    // FNV-1a 64-bit — matches stable_source_hash in engine.rs.
+    // DefaultHasher must NOT be used here: it is not stable across Rust
+    // versions or process restarts, which would corrupt the incremental cache.
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in source.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 fn callee_name(callee: &Callee) -> Option<String> {

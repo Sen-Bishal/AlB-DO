@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use swc_common::{FileName, SourceMap};
@@ -38,12 +38,21 @@ struct ParsedModule {
 pub struct ComponentProject {
     root: PathBuf,
     modules: HashMap<String, ParsedModule>,
+    source_hashes: HashMap<String, u64>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PatchReport {
+    pub reparsed: usize,
+    pub skipped_unchanged: usize,
+    pub deleted: usize,
 }
 
 impl ComponentProject {
     pub fn load_from_dir(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let mut modules = HashMap::new();
+        let mut source_hashes = HashMap::new();
 
         for entry in WalkDir::new(&root)
             .follow_links(true)
@@ -55,8 +64,7 @@ impl ComponentProject {
                 continue;
             }
 
-            let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-            if !matches!(ext, "jsx" | "tsx" | "js" | "ts") {
+            if !is_component_module(path) {
                 continue;
             }
 
@@ -66,14 +74,87 @@ impl ComponentProject {
             let specifier = normalize_specifier(relative);
             let source = std::fs::read_to_string(path)
                 .map_err(|err| anyhow!("failed to read '{}': {err}", path.display()))?;
-            modules.insert(specifier, parse_module(&source, path)?);
+            let parsed = parse_module(&source, path)?;
+            source_hashes.insert(specifier.clone(), fnv1a_hash(source.as_bytes()));
+            modules.insert(specifier, parsed);
         }
 
         if modules.is_empty() {
             return Err(anyhow!("no components found under '{}'", root.display()));
         }
 
-        Ok(Self { root, modules })
+        Ok(Self {
+            root,
+            modules,
+            source_hashes,
+        })
+    }
+
+    pub fn patch(
+        &mut self,
+        changed_paths: &[PathBuf],
+        deleted_paths: &[PathBuf],
+    ) -> Result<PatchReport> {
+        let mut report = PatchReport::default();
+        let mut parsed_updates = Vec::new();
+        let mut staged_deletions = HashSet::new();
+        let mut seen_changed = HashSet::new();
+
+        for changed_path in changed_paths {
+            let Some((specifier, absolute_path)) = self.module_specifier_for_path(changed_path)
+            else {
+                continue;
+            };
+
+            if !seen_changed.insert(specifier.clone()) {
+                continue;
+            }
+
+            match std::fs::read_to_string(&absolute_path) {
+                Ok(source) => {
+                    let next_hash = fnv1a_hash(source.as_bytes());
+                    if self.source_hashes.get(&specifier).copied() == Some(next_hash) {
+                        report.skipped_unchanged += 1;
+                        continue;
+                    }
+
+                    let parsed = parse_module(&source, &absolute_path)?;
+                    parsed_updates.push((specifier, parsed, next_hash));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    staged_deletions.insert(specifier);
+                }
+                Err(err) => {
+                    return Err(anyhow!(
+                        "failed to read '{}' while patching: {err}",
+                        absolute_path.display()
+                    ));
+                }
+            }
+        }
+
+        for deleted_path in deleted_paths {
+            let Some((specifier, _)) = self.module_specifier_for_path(deleted_path) else {
+                continue;
+            };
+            staged_deletions.insert(specifier);
+        }
+
+        for (specifier, parsed, source_hash) in parsed_updates {
+            self.modules.insert(specifier.clone(), parsed);
+            self.source_hashes.insert(specifier, source_hash);
+            report.reparsed += 1;
+        }
+
+        for specifier in staged_deletions {
+            let removed_module = self.modules.remove(&specifier).is_some();
+            let removed_hash = self.source_hashes.remove(&specifier).is_some();
+            if removed_module || removed_hash {
+                report.deleted += 1;
+            }
+        }
+
+        Ok(report)
     }
 
     pub fn render_entry(&self, entry: &str, props: &Value) -> Result<String> {
@@ -97,6 +178,19 @@ impl ComponentProject {
             }
         }
         None
+    }
+
+    fn module_specifier_for_path(&self, path: &Path) -> Option<(String, PathBuf)> {
+        let absolute_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        let relative_path = absolute_path.strip_prefix(&self.root).ok()?;
+        if !is_component_module(relative_path) {
+            return None;
+        }
+        Some((normalize_specifier(relative_path), absolute_path))
     }
 
     fn render_export(&self, module_spec: &str, export_name: &str, props: &Value) -> Result<String> {
@@ -274,12 +368,16 @@ impl ComponentProject {
             BinaryOp::EqEq | BinaryOp::EqEqEq => {
                 let left = self.eval_expr(module_spec, &bin.left, env)?;
                 let right = self.eval_expr(module_spec, &bin.right, env)?;
-                Ok(Value::Bool(value_to_string(&left) == value_to_string(&right)))
+                Ok(Value::Bool(
+                    value_to_string(&left) == value_to_string(&right),
+                ))
             }
             BinaryOp::NotEq | BinaryOp::NotEqEq => {
                 let left = self.eval_expr(module_spec, &bin.left, env)?;
                 let right = self.eval_expr(module_spec, &bin.right, env)?;
-                Ok(Value::Bool(value_to_string(&left) != value_to_string(&right)))
+                Ok(Value::Bool(
+                    value_to_string(&left) != value_to_string(&right),
+                ))
             }
             _ => Ok(Value::Null),
         }
@@ -380,7 +478,11 @@ impl ComponentProject {
                     // .map(fn) — render each item
                     if method == "map" {
                         if let Value::Array(items) = obj_val {
-                            if let Some(ExprOrSpread { expr: mapper, spread: None }) = call.args.first() {
+                            if let Some(ExprOrSpread {
+                                expr: mapper,
+                                spread: None,
+                            }) = call.args.first()
+                            {
                                 let parts = items
                                     .iter()
                                     .enumerate()
@@ -460,18 +562,21 @@ impl ComponentProject {
                 let args = Value::Array(vec![arg.clone(), index_val]);
                 bind_params_positional(&params, &args, &mut env);
                 match &*arrow.body {
-                    BlockStmtOrExpr::BlockStmt(block) => {
-                        self.eval_body_stmts(module_spec, &block.stmts, &mut env)
-                            .map(Value::String)
-                    }
+                    BlockStmtOrExpr::BlockStmt(block) => self
+                        .eval_body_stmts(module_spec, &block.stmts, &mut env)
+                        .map(Value::String),
                     BlockStmtOrExpr::Expr(body_expr) => {
                         self.eval_expr(module_spec, body_expr, &env)
                     }
                 }
             }
             Expr::Fn(fn_expr) => {
-                let params: Vec<ParamBinding> =
-                    fn_expr.function.params.iter().map(|p| param_from_pat(&p.pat)).collect();
+                let params: Vec<ParamBinding> = fn_expr
+                    .function
+                    .params
+                    .iter()
+                    .map(|p| param_from_pat(&p.pat))
+                    .collect();
                 let mut env = parent_env.clone();
                 let index_val = serde_json::Number::from_f64(index as f64)
                     .map(Value::Number)
@@ -522,7 +627,8 @@ impl ComponentProject {
     ) {
         for decl in &var.decls {
             let value = if let Some(init) = &decl.init {
-                self.eval_expr(module_spec, init, env).unwrap_or(Value::Null)
+                self.eval_expr(module_spec, init, env)
+                    .unwrap_or(Value::Null)
             } else {
                 Value::Null
             };
@@ -1126,6 +1232,25 @@ fn value_to_string(value: &Value) -> String {
     }
 }
 
+fn is_component_module(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("jsx" | "tsx" | "js" | "ts")
+    )
+}
+
+fn fnv1a_hash(data: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in data {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 fn normalize_specifier(path: impl AsRef<Path>) -> String {
     let mut parts = Vec::new();
     for component in path.as_ref().components() {
@@ -1297,18 +1422,27 @@ mod tests {
     fn test_ternary_classname() {
         let project = ComponentProject::load_from_dir(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("test-app").join("src").join("components")
-        ).unwrap();
+                .join("test-app")
+                .join("src")
+                .join("components"),
+        )
+        .unwrap();
         let source = r#"
             export default function Badge({ active }) {
                 return <span className={active ? "badge--active" : "badge--inactive"}>{active ? "On" : "Off"}</span>;
             }
         "#;
         let mut modules = project.modules.clone();
+        let mut source_hashes = project.source_hashes.clone();
         let path = std::path::PathBuf::from("Badge.tsx");
         let parsed = super::parse_module(source, &path).unwrap();
         modules.insert("Badge.tsx".to_string(), parsed);
-        let p = ComponentProject { root: project.root.clone(), modules };
+        source_hashes.insert("Badge.tsx".to_string(), fnv1a_hash(source.as_bytes()));
+        let p = ComponentProject {
+            root: project.root.clone(),
+            modules,
+            source_hashes,
+        };
         let props = serde_json::json!({ "active": true });
         let html = p.render_entry("Badge.tsx", &props).unwrap();
         assert!(html.contains("badge--active"));
@@ -1325,7 +1459,9 @@ mod tests {
         let path = std::path::PathBuf::from("Card.tsx");
         let module = super::parse_module(source, &path).unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-app").join("src").join("components");
+            .join("test-app")
+            .join("src")
+            .join("components");
         let mut base = ComponentProject::load_from_dir(&root).unwrap();
         base.modules.insert("Card.tsx".to_string(), module);
         let props = serde_json::json!({ "variant": "primary" });
@@ -1343,14 +1479,26 @@ mod tests {
         let path = std::path::PathBuf::from("Alert.tsx");
         let module = super::parse_module(source, &path).unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-app").join("src").join("components");
+            .join("test-app")
+            .join("src")
+            .join("components");
         let mut base = ComponentProject::load_from_dir(&root).unwrap();
         base.modules.insert("Alert.tsx".to_string(), module);
 
-        let html_shown = base.render_entry("Alert.tsx", &serde_json::json!({ "show": true, "message": "hello" })).unwrap();
+        let html_shown = base
+            .render_entry(
+                "Alert.tsx",
+                &serde_json::json!({ "show": true, "message": "hello" }),
+            )
+            .unwrap();
         assert!(html_shown.contains("<span>hello</span>"));
 
-        let html_hidden = base.render_entry("Alert.tsx", &serde_json::json!({ "show": false, "message": "hello" })).unwrap();
+        let html_hidden = base
+            .render_entry(
+                "Alert.tsx",
+                &serde_json::json!({ "show": false, "message": "hello" }),
+            )
+            .unwrap();
         assert!(!html_hidden.contains("<span>"));
     }
 
@@ -1365,7 +1513,9 @@ mod tests {
         let path = std::path::PathBuf::from("Label.tsx");
         let module = super::parse_module(source, &path).unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-app").join("src").join("components");
+            .join("test-app")
+            .join("src")
+            .join("components");
         let mut base = ComponentProject::load_from_dir(&root).unwrap();
         base.modules.insert("Label.tsx".to_string(), module);
         let props = serde_json::json!({ "kind": "primary" });
@@ -1383,7 +1533,9 @@ mod tests {
         let path = std::path::PathBuf::from("List.tsx");
         let module = super::parse_module(source, &path).unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-app").join("src").join("components");
+            .join("test-app")
+            .join("src")
+            .join("components");
         let mut base = ComponentProject::load_from_dir(&root).unwrap();
         base.modules.insert("List.tsx".to_string(), module);
         let props = serde_json::json!({ "items": ["alpha", "beta", "gamma"] });
@@ -1405,10 +1557,14 @@ mod tests {
         let path = std::path::PathBuf::from("Counter.tsx");
         let module = super::parse_module(source, &path).unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-app").join("src").join("components");
+            .join("test-app")
+            .join("src")
+            .join("components");
         let mut base = ComponentProject::load_from_dir(&root).unwrap();
         base.modules.insert("Counter.tsx".to_string(), module);
-        let html = base.render_entry("Counter.tsx", &serde_json::json!({})).unwrap();
+        let html = base
+            .render_entry("Counter.tsx", &serde_json::json!({}))
+            .unwrap();
         assert!(html.contains("class=\"counter\""));
     }
 
@@ -1423,7 +1579,9 @@ mod tests {
         let path = std::path::PathBuf::from("Button.tsx");
         let module = super::parse_module(source, &path).unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-app").join("src").join("components");
+            .join("test-app")
+            .join("src")
+            .join("components");
         let mut base = ComponentProject::load_from_dir(&root).unwrap();
         base.modules.insert("Button.tsx".to_string(), module);
         let props = serde_json::json!({ "primary": true, "disabled": false });

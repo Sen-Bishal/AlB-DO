@@ -3,7 +3,7 @@ use dom_render_compiler::dev_contract::{
     parse_dev_cli_args, resolve_dev_contract, ResolvedDevContract, DEV_CONFIG_JSON, DEV_CONFIG_TS,
 };
 use dom_render_compiler::parser::ParsedComponent;
-use dom_render_compiler::runtime::ast_eval::ComponentProject;
+use dom_render_compiler::runtime::ast_eval::{ComponentProject, PatchReport};
 use dom_render_compiler::scanner::{ProjectScanner, ScanFailure, ScanMode};
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -32,10 +32,53 @@ struct DevAllRoutesArtifact {
 #[derive(Debug, Clone)]
 struct SharedDevState {
     /// route path (e.g. "/", "/analytics") → rendered HTML document
+    project: ComponentProject,
+    project_css: String,
     routes: std::collections::HashMap<String, String>,
     render_ms: f64,
     total_ms: f64,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PendingRebuild {
+    changed: Vec<PathBuf>,
+    deleted: Vec<PathBuf>,
+    force_rebuild: bool,
+    css_touched: bool,
+}
+
+impl PendingRebuild {
+    fn merge(&mut self, mut other: PendingRebuild) {
+        self.force_rebuild |= other.force_rebuild;
+        self.css_touched |= other.css_touched;
+        for path in other.changed.drain(..) {
+            self.add_changed(path);
+        }
+        for path in other.deleted.drain(..) {
+            self.add_deleted(path);
+        }
+    }
+
+    fn add_changed(&mut self, path: PathBuf) {
+        if self.changed.contains(&path) {
+            return;
+        }
+        self.deleted.retain(|existing| existing != &path);
+        self.changed.push(path);
+    }
+
+    fn add_deleted(&mut self, path: PathBuf) {
+        if self.deleted.contains(&path) {
+            return;
+        }
+        self.changed.retain(|existing| existing != &path);
+        self.deleted.push(path);
+    }
+
+    fn should_rebuild(&self) -> bool {
+        self.force_rebuild || !self.changed.is_empty() || !self.deleted.is_empty()
+    }
 }
 
 fn main() {
@@ -267,7 +310,10 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         None
     };
 
-    let initial = build_all_routes(&contract).map_err(|err| {
+    let project = ComponentProject::load_from_dir(&contract.root)
+        .map_err(|err| format!("failed to load components: {err}"))?;
+    let project_css = collect_css_bundle(&contract.root);
+    let initial = render_all_routes(&project, &contract, &project_css).map_err(|err| {
         format!(
             "failed to render initial dev document (entry='{}'): {err}",
             contract.entry
@@ -277,6 +323,8 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     let (listener, addr, auto_incremented) =
         bind_dev_listener(contract.server.host.as_str(), contract.server.port)?;
     let shared_state = Arc::new(Mutex::new(SharedDevState {
+        project,
+        project_css,
         routes: initial.route_documents,
         render_ms: initial.render_ms,
         total_ms: initial.total_ms,
@@ -500,20 +548,18 @@ fn watch_and_rebuild_loop(
             Err(_) => break,
         };
 
-        let mut needs_rebuild = event_needs_rebuild(&first, &contract.watch.ignore);
+        let mut pending = accumulate_rebuild_paths(&first, &contract.watch.ignore);
         loop {
             match event_rx.recv_timeout(debounce) {
                 Ok(next) => {
-                    if event_needs_rebuild(&next, &contract.watch.ignore) {
-                        needs_rebuild = true;
-                    }
+                    pending.merge(accumulate_rebuild_paths(&next, &contract.watch.ignore));
                 }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
 
-        if !needs_rebuild {
+        if !pending.should_rebuild() {
             continue;
         }
 
@@ -540,31 +586,33 @@ fn watch_and_rebuild_loop(
             }
         }
 
-        match build_all_routes(&contract) {
-            Ok(artifact) => {
-                if let Ok(mut state) = shared_state.lock() {
-                    state.routes = artifact.route_documents;
-                    state.render_ms = artifact.render_ms;
-                    state.total_ms = artifact.total_ms;
-                    state.last_error = None;
+        match rebuild_with_pending(&contract, &shared_state, &pending) {
+            Ok((patch_report, rendered)) => {
+                if rendered {
+                    let next_revision = revision.fetch_add(1, Ordering::SeqCst) + 1;
+                    if contract.hmr.enabled {
+                        broadcast_reload_event(&sse_clients, next_revision);
+                    }
+                    println!(
+                        "  {} rebuild complete in {:.2}ms (reparsed={}, skipped={}, deleted={})",
+                        style("[dev]", "1;32"),
+                        rebuild_start.elapsed().as_secs_f64() * 1000.0,
+                        patch_report.reparsed,
+                        patch_report.skipped_unchanged,
+                        patch_report.deleted
+                    );
+                } else {
+                    println!(
+                        "  {} no-op change in {:.2}ms (skipped={})",
+                        style("[dev]", "1;34"),
+                        rebuild_start.elapsed().as_secs_f64() * 1000.0,
+                        patch_report.skipped_unchanged
+                    );
                 }
-                let next_revision = revision.fetch_add(1, Ordering::SeqCst) + 1;
-                if contract.hmr.enabled {
-                    broadcast_reload_event(&sse_clients, next_revision);
-                }
-                println!(
-                    "  {} rebuild complete in {:.2}ms",
-                    style("[dev]", "1;32"),
-                    rebuild_start.elapsed().as_secs_f64() * 1000.0
-                );
             }
             Err(err) => {
                 let overlay = build_dev_error_overlay(
-                    format!(
-                        "Build failed while rendering '{}':\n{}",
-                        contract.entry, err
-                    )
-                    .as_str(),
+                    format!("Build failed during incremental rebuild:\n{}", err).as_str(),
                     contract.hmr.enabled,
                 );
                 if let Ok(mut state) = shared_state.lock() {
@@ -582,20 +630,27 @@ fn watch_and_rebuild_loop(
     }
 }
 
-fn event_needs_rebuild(event: &notify::Result<Event>, ignore_patterns: &[String]) -> bool {
+fn accumulate_rebuild_paths(
+    event: &notify::Result<Event>,
+    ignore_patterns: &[String],
+) -> PendingRebuild {
+    let mut pending = PendingRebuild::default();
+
     let Ok(event) = event else {
-        return false;
+        return pending;
     };
     let relevant_kind = matches!(
         event.kind,
         EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) | EventKind::Any
     );
     if !relevant_kind {
-        return false;
+        return pending;
     }
+    let is_remove = matches!(event.kind, EventKind::Remove(_));
 
     if event.paths.is_empty() {
-        return true;
+        pending.force_rebuild = true;
+        return pending;
     }
 
     for path in &event.paths {
@@ -609,28 +664,87 @@ fn event_needs_rebuild(event: &notify::Result<Event>, ignore_patterns: &[String]
             .map(|name| name == DEV_CONFIG_JSON || name == DEV_CONFIG_TS)
             .unwrap_or(false)
         {
-            return true;
+            pending.force_rebuild = true;
+            continue;
         }
 
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_ascii_lowercase());
-        if matches!(
-            extension.as_deref(),
-            Some("tsx")
-                | Some("ts")
-                | Some("jsx")
-                | Some("js")
-                | Some("css")
-                | Some("json")
-                | Some("html")
-        ) {
-            return true;
+        match extension.as_deref() {
+            Some("tsx") | Some("ts") | Some("jsx") | Some("js") => {
+                if is_remove {
+                    pending.add_deleted(path.clone());
+                } else {
+                    pending.add_changed(path.clone());
+                }
+            }
+            Some("css") => {
+                pending.css_touched = true;
+                pending.force_rebuild = true;
+            }
+            Some("json") | Some("html") => {
+                pending.force_rebuild = true;
+            }
+            _ => {}
         }
     }
 
-    false
+    pending
+}
+
+fn rebuild_with_pending(
+    contract: &ResolvedDevContract,
+    shared_state: &Arc<Mutex<SharedDevState>>,
+    pending: &PendingRebuild,
+) -> Result<(PatchReport, bool), String> {
+    let (patch_report, project_snapshot, css_snapshot_before_refresh) = {
+        let mut state = shared_state
+            .lock()
+            .map_err(|_| "shared state lock poisoned".to_string())?;
+
+        let patch_report = state
+            .project
+            .patch(&pending.changed, &pending.deleted)
+            .map_err(|err| format!("failed to patch components: {err}"))?;
+
+        if !pending.force_rebuild
+            && !pending.css_touched
+            && patch_report.reparsed == 0
+            && patch_report.deleted == 0
+        {
+            state.last_error = None;
+            return Ok((patch_report, false));
+        }
+
+        (
+            patch_report,
+            state.project.clone(),
+            state.project_css.clone(),
+        )
+    };
+
+    let css_snapshot = if pending.css_touched {
+        collect_css_bundle(&contract.root)
+    } else {
+        css_snapshot_before_refresh
+    };
+
+    let artifact = render_all_routes(&project_snapshot, contract, &css_snapshot)?;
+
+    let mut state = shared_state
+        .lock()
+        .map_err(|_| "shared state lock poisoned".to_string())?;
+    if pending.css_touched {
+        state.project_css = css_snapshot;
+    }
+    state.routes = artifact.route_documents;
+    state.render_ms = artifact.render_ms;
+    state.total_ms = artifact.total_ms;
+    state.last_error = None;
+
+    Ok((patch_report, true))
 }
 
 fn should_ignore_path(path: &Path, ignore_patterns: &[String]) -> bool {
@@ -700,12 +814,23 @@ fn handle_dev_connection(
         let snapshot = {
             let state = shared_state.lock().expect("shared state lock poisoned");
             // Normalize: /index.html → /
-            let lookup = if path == "/index.html" { "/".to_string() } else { path.clone() };
-            let doc = state.routes.get(&lookup)
+            let lookup = if path == "/index.html" {
+                "/".to_string()
+            } else {
+                path.clone()
+            };
+            let doc = state
+                .routes
+                .get(&lookup)
                 .or_else(|| state.routes.get("/"))
                 .cloned()
                 .unwrap_or_default();
-            (doc, state.render_ms, state.total_ms, state.last_error.clone())
+            (
+                doc,
+                state.render_ms,
+                state.total_ms,
+                state.last_error.clone(),
+            )
         };
         let mut headers = vec![
             ("x-albedo-render-ms", format!("{:.2}", snapshot.1)),
@@ -775,22 +900,18 @@ fn broadcast_reload_event(clients: &Arc<Mutex<Vec<TcpStream>>>, revision: u64) {
     *active = retained;
 }
 
-fn build_all_routes(contract: &ResolvedDevContract) -> Result<DevAllRoutesArtifact, String> {
+fn render_all_routes(
+    project: &ComponentProject,
+    contract: &ResolvedDevContract,
+    project_css: &str,
+) -> Result<DevAllRoutesArtifact, String> {
     let total_start = Instant::now();
-
-    // Load the component project ONCE — single directory scan + parse for all routes
-    let project = ComponentProject::load_from_dir(&contract.root)
-        .map_err(|err| format!("failed to load components: {err}"))?;
-
-    // Collect CSS ONCE — shared across all route documents
-    let project_css = collect_css_bundle(&contract.root);
     let base_css = dev_shell_base_css();
 
     let mut route_documents = std::collections::HashMap::new();
     let mut total_render_ms = 0.0_f64;
     let props = serde_json::json!({});
 
-    // Helper closure: render one entry → full HTML document
     let render_entry = |entry: &str| -> Result<(String, f64), String> {
         let render_start = Instant::now();
         let rendered_html = project
@@ -804,20 +925,29 @@ fn build_all_routes(contract: &ResolvedDevContract) -> Result<DevAllRoutesArtifa
         Ok((html, render_ms))
     };
 
-    // Root entry
     match render_entry(contract.entry.as_str()) {
-        Ok((html, ms)) => { total_render_ms += ms; route_documents.insert("/".to_string(), html); }
+        Ok((html, ms)) => {
+            total_render_ms += ms;
+            route_documents.insert("/".to_string(), html);
+        }
         Err(err) => {
-            let overlay = build_dev_error_overlay(&format!("Route '/' failed:\n{err}"), contract.hmr.enabled);
+            let overlay =
+                build_dev_error_overlay(&format!("Route '/' failed:\n{err}"), contract.hmr.enabled);
             route_documents.insert("/".to_string(), overlay);
         }
     }
 
-    // Additional routes — same loaded project, just different entry points
     for (url_path, entry) in &contract.routes {
-        let url = if url_path.starts_with('/') { url_path.clone() } else { format!("/{url_path}") };
+        let url = if url_path.starts_with('/') {
+            url_path.clone()
+        } else {
+            format!("/{url_path}")
+        };
         match render_entry(entry.as_str()) {
-            Ok((html, ms)) => { total_render_ms += ms; route_documents.insert(url, html); }
+            Ok((html, ms)) => {
+                total_render_ms += ms;
+                route_documents.insert(url, html);
+            }
             Err(err) => {
                 let overlay = build_dev_error_overlay(
                     &format!("Route '{url}' failed (entry='{entry}'):\n{err}"),

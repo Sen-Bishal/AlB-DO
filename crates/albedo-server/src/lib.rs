@@ -13,6 +13,8 @@ pub use contract::{
 };
 pub use error::RuntimeError;
 pub use lifecycle::{RequestContext, ResponseBody, ResponsePayload};
-pub use renderer_runtime::{RendererRuntime, RENDER_MANIFEST_FILENAME, RUNTIME_MODULE_SOURCES_FILENAME};
+pub use renderer_runtime::{
+    RendererRuntime, RENDER_MANIFEST_FILENAME, RUNTIME_MODULE_SOURCES_FILENAME,
+};
 pub use routing::{AuthPolicy, CompiledRouter, HttpMethod, MatchedRoute, RouteMatch, RouteTarget};
 pub use server::{AlbedoServer, AlbedoServerBuilder};

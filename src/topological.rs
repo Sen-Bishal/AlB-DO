@@ -11,10 +11,10 @@ impl<'a> TopologicalSorter<'a> {
     }
     pub fn sort(&self) -> Result<Vec<Vec<ComponentId>>> {
         self.graph.validate()?;
-        let mut in_degree = self.graph.calculate_in_degrees();
+        let mut out_degree = self.graph.calculate_out_degrees();
         let mut processed = HashSet::new();
         let mut levels = Vec::new();
-        let mut current_level: Vec<ComponentId> = in_degree
+        let mut current_level: Vec<ComponentId> = out_degree
             .iter()
             .filter(|(_, &degree)| degree == 0)
             .map(|(id, _)| *id)
@@ -40,7 +40,7 @@ impl<'a> TopologicalSorter<'a> {
                         continue;
                     }
 
-                    if let Some(degree) = in_degree.get_mut(&dependent) {
+                    if let Some(degree) = out_degree.get_mut(&dependent) {
                         if *degree > 0 {
                             *degree -= 1;
                         }
@@ -115,8 +115,8 @@ pub fn find_critical_path(
 ) -> Vec<ComponentId> {
     let mut max_path = Vec::new();
     let mut max_time = 0.0;
-    let in_degrees = graph.calculate_in_degrees();
-    let roots: Vec<ComponentId> = in_degrees
+    let out_degrees = graph.calculate_out_degrees();
+    let roots: Vec<ComponentId> = out_degrees
         .iter()
         .filter(|(_, &degree)| degree == 0)
         .map(|(id, _)| *id)

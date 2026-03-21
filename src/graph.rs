@@ -136,18 +136,24 @@ impl ComponentGraph {
         rec_stack.remove(&node);
         None
     }
-    pub fn calculate_in_degrees(&self) -> HashMap<ComponentId, usize> {
-        let mut in_degrees = HashMap::new();
+    /// Returns the number of outgoing dependency edges for each component
+    /// (i.e. how many other components each node directly depends on).
+    ///
+    /// Despite the historical name "in_degrees", this counts out-edges, not in-edges.
+    /// The topological sorters use this to find leaf nodes (count == 0) and process
+    /// the graph bottom-up: leaves first, root last — the correct SSR render order.
+    pub fn calculate_out_degrees(&self) -> HashMap<ComponentId, usize> {
+        let mut out_degrees = HashMap::new();
         for id in self.component_ids() {
             let dep_count = self
                 .dependencies
                 .get(&id)
                 .map(|deps| deps.len())
                 .unwrap_or(0);
-            in_degrees.insert(id, dep_count);
+            out_degrees.insert(id, dep_count);
         }
 
-        in_degrees
+        out_degrees
     }
 
     /// Get a component by ID (needed for caching)

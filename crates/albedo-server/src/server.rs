@@ -94,7 +94,8 @@ impl AlbedoServerBuilder {
         loader_id: impl Into<String>,
         loader: impl PropsLoader + 'static,
     ) -> Self {
-        self.props_loaders.insert(loader_id.into(), Arc::new(loader));
+        self.props_loaders
+            .insert(loader_id.into(), Arc::new(loader));
         self
     }
 

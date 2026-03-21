@@ -18,11 +18,11 @@ impl<'a> ParallelTopologicalSorter<'a> {
     pub fn sort(&self) -> Result<Vec<Vec<ComponentId>>> {
         self.graph.validate()?;
 
-        let mut in_degree = self.graph.calculate_in_degrees();
+        let mut out_degree = self.graph.calculate_out_degrees();
         let mut processed = HashSet::new();
         let mut levels = Vec::new();
 
-        let mut current_level: Vec<ComponentId> = in_degree
+        let mut current_level: Vec<ComponentId> = out_degree
             .iter()
             .filter(|(_, &d)| d == 0)
             .map(|(id, _)| *id)
@@ -40,9 +40,9 @@ impl<'a> ParallelTopologicalSorter<'a> {
                 processed.insert(node);
             }
             current_level = if current_level.len() > PARALLEL_THRESHOLD {
-                self.parallel_next_level(&current_level, &mut in_degree, &processed)
+                self.parallel_next_level(&current_level, &mut out_degree, &processed)
             } else {
-                self.serial_next_level(&current_level, &mut in_degree, &processed)
+                self.serial_next_level(&current_level, &mut out_degree, &processed)
             };
         }
 
@@ -60,7 +60,7 @@ impl<'a> ParallelTopologicalSorter<'a> {
     fn parallel_next_level(
         &self,
         current: &[ComponentId],
-        in_degree: &mut HashMap<ComponentId, usize>,
+        out_degree: &mut HashMap<ComponentId, usize>,
         processed: &HashSet<ComponentId>,
     ) -> Vec<ComponentId> {
         let core_ids = core_affinity::get_core_ids().unwrap_or_default();
@@ -91,7 +91,7 @@ impl<'a> ParallelTopologicalSorter<'a> {
         decrement_counts
             .into_iter()
             .filter_map(|(id, count)| {
-                in_degree.get_mut(&id).and_then(|deg| {
+                out_degree.get_mut(&id).and_then(|deg| {
                     *deg = deg.saturating_sub(count);
                     (*deg == 0).then_some(id)
                 })
@@ -102,7 +102,7 @@ impl<'a> ParallelTopologicalSorter<'a> {
     fn serial_next_level(
         &self,
         current: &[ComponentId],
-        in_degree: &mut HashMap<ComponentId, usize>,
+        out_degree: &mut HashMap<ComponentId, usize>,
         processed: &HashSet<ComponentId>,
     ) -> Vec<ComponentId> {
         let mut next = Vec::new();
@@ -111,7 +111,7 @@ impl<'a> ParallelTopologicalSorter<'a> {
                 if processed.contains(&dep) {
                     continue;
                 }
-                if let Some(deg) = in_degree.get_mut(&dep) {
+                if let Some(deg) = out_degree.get_mut(&dep) {
                     if *deg > 0 {
                         *deg -= 1;
                     }
@@ -227,8 +227,8 @@ pub fn find_critical_path_parallel(
     graph: &ComponentGraph,
     analyses: &HashMap<ComponentId, ComponentAnalysis>,
 ) -> Vec<ComponentId> {
-    let in_degrees = graph.calculate_in_degrees();
-    let roots: Vec<ComponentId> = in_degrees
+    let out_degrees = graph.calculate_out_degrees();
+    let roots: Vec<ComponentId> = out_degrees
         .iter()
         .filter(|(_, &d)| d == 0)
         .map(|(id, _)| *id)

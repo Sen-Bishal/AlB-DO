@@ -1,7 +1,16 @@
+[workspace]
+members = [
+    ".",
+    "crates/albedo-node",
+    "crates/albedo-server",
+]
+resolver = "2"
+
 [package]
 name = "dom-render-compiler"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [[bin]]
 name = "dom-compiler"
