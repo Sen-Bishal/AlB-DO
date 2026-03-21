@@ -668,7 +668,7 @@ impl ComponentProject {
                 JSXElementChild::JSXExprContainer(container) => match &container.expr {
                     JSXExpr::Expr(expr) => {
                         let value = self.eval_expr(module_spec, expr, env)?;
-                        if !value.is_null() {
+                        if !matches!(value, Value::Null | Value::Bool(false)) {
                             out.push(value);
                         }
                     }
@@ -712,6 +712,10 @@ impl ComponentProject {
                 JSXElementChild::JSXExprContainer(container) => match &container.expr {
                     JSXExpr::Expr(expr) => {
                         let value = self.eval_expr(module_spec, expr, env)?;
+                        // Null and Bool(false) render as nothing — same as React
+                        if matches!(value, Value::Null | Value::Bool(false)) {
+                            continue;
+                        }
                         let text = value_to_string(&value);
                         if escape_expr_children {
                             html.push_str(&escape_html(&text));
