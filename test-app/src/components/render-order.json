@@ -1,0 +1,53 @@
+{
+  "version": "1.0",
+  "generated_at": "2026-02-20T19:03:54.2946811Z",
+  "critical_path": [
+    2,
+    3,
+    0
+  ],
+  "parallel_batches": [
+    {
+      "level": 0,
+      "components": [
+        6,
+        1,
+        4,
+        2
+      ],
+      "estimated_time_ms": 10333.333333333334,
+      "can_defer": false
+    },
+    {
+      "level": 1,
+      "components": [
+        7,
+        3
+      ],
+      "estimated_time_ms": 10000.0,
+      "can_defer": true
+    },
+    {
+      "level": 2,
+      "components": [
+        5
+      ],
+      "estimated_time_ms": 1120.0,
+      "can_defer": true
+    },
+    {
+      "level": 3,
+      "components": [
+        0
+      ],
+      "estimated_time_ms": 9666.666666666666,
+      "can_defer": true
+    }
+  ],
+  "metrics": {
+    "total_components": 8,
+    "total_weight_kb": 11.181640625,
+    "optimization_time_ms": 0,
+    "estimated_improvement_ms": 11383.61111111111
+  }
+}

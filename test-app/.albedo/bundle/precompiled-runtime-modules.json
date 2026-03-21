@@ -1,0 +1,57 @@
+{
+  "version": "1.0",
+  "engine": "quickjs",
+  "manifest_schema_version": "2.0",
+  "manifest_generated_at": "2026-03-15T06:35:03.7304309Z",
+  "modules": [
+    {
+      "component_id": 0,
+      "module_path": "test-app/src/components\\App.jsx",
+      "source_hash": 17686425453288522029,
+      "compiled_script": "(function() {\n  const __albedo_exports = Object.create(null);\n  Object.defineProperty(__albedo_exports, \"__albedo_is_module_record\", { value: true, enumerable: false });\n  const __albedo_import_1_27 = __albedo_require(\"react\");\n  const React = __albedo_import_1_27;\n  const __albedo_import_28_69 = __albedo_require(\"./components/Header\");\n  const Header = __albedo_import_28_69;\n  const __albedo_import_70_117 = __albedo_require(\"./components/HeroImage\");\n  const HeroImage = __albedo_import_70_117;\n  const __albedo_import_118_163 = __albedo_require(\"./components/Features\");\n  const Features = __albedo_import_118_163;\n  const __albedo_import_164_205 = __albedo_require(\"./components/Footer\");\n  const Footer = __albedo_import_164_205;\n  function App() {\n    return h(\"div\", {\n        className: \"App\"\n    }, h(Header, null), h(HeroImage, null), h(Features, null), h(Footer, null));\n}\n  const __albedo_default_export__ = (App);\n  __albedo_exports.default = __albedo_default_export__;\n  globalThis.__ALBEDO_MODULES[\"test-app/src/components\\\\App.jsx\"] = __albedo_exports;\n})();"
+    },
+    {
+      "component_id": 1,
+      "module_path": "test-app/src/components\\Button.jsx",
+      "source_hash": 6390254648863716026,
+      "compiled_script": "(function() {\n  const __albedo_exports = Object.create(null);\n  Object.defineProperty(__albedo_exports, \"__albedo_is_module_record\", { value: true, enumerable: false });\n  const __albedo_import_1_27 = __albedo_require(\"react\");\n  const React = __albedo_import_1_27;\n  const __albedo_default_export__ = function Button({ children, onClick }) {\n    return h(\"button\", {\n        onClick: onClick\n    }, children);\n};\n  __albedo_exports.default = __albedo_default_export__;\n  globalThis.__ALBEDO_MODULES[\"test-app/src/components\\\\Button.jsx\"] = __albedo_exports;\n})();"
+    },
+    {
+      "component_id": 2,
+      "module_path": "test-app/src/components\\FeatureCard.jsx",
+      "source_hash": 1902942347191247233,
+      "compiled_script": "(function() {\n  const __albedo_exports = Object.create(null);\n  Object.defineProperty(__albedo_exports, \"__albedo_is_module_record\", { value: true, enumerable: false });\n  const __albedo_import_1_27 = __albedo_require(\"react\");\n  const React = __albedo_import_1_27;\n  const __albedo_default_export__ = function FeatureCard({ title }) {\n    return h(\"div\", {\n        className: \"card\"\n    }, h(\"h3\", null, title));\n};\n  __albedo_exports.default = __albedo_default_export__;\n  globalThis.__ALBEDO_MODULES[\"test-app/src/components\\\\FeatureCard.jsx\"] = __albedo_exports;\n})();"
+    },
+    {
+      "component_id": 3,
+      "module_path": "test-app/src/components\\Features.jsx",
+      "source_hash": 10980141744876352631,
+      "compiled_script": "(function() {\n  const __albedo_exports = Object.create(null);\n  Object.defineProperty(__albedo_exports, \"__albedo_is_module_record\", { value: true, enumerable: false });\n  const __albedo_import_1_27 = __albedo_require(\"react\");\n  const React = __albedo_import_1_27;\n  const __albedo_import_28_68 = __albedo_require(\"./FeatureCard\");\n  const FeatureCard = __albedo_import_28_68;\n  const __albedo_default_export__ = function Features() {\n    return h(\"section\", {\n        className: \"features\"\n    }, h(FeatureCard, {\n        title: \"Fast\"\n    }), h(FeatureCard, {\n        title: \"Reliable\"\n    }), h(FeatureCard, {\n        title: \"Scalable\"\n    }));\n};\n  __albedo_exports.default = __albedo_default_export__;\n  globalThis.__ALBEDO_MODULES[\"test-app/src/components\\\\Features.jsx\"] = __albedo_exports;\n})();"
+    },
+    {
+      "component_id": 4,
+      "module_path": "test-app/src/components\\Footer.jsx",
+      "source_hash": 3453313493226241020,
+      "compiled_script": "(function() {\n  const __albedo_exports = Object.create(null);\n  Object.defineProperty(__albedo_exports, \"__albedo_is_module_record\", { value: true, enumerable: false });\n  const __albedo_import_1_27 = __albedo_require(\"react\");\n  const React = __albedo_import_1_27;\n  const __albedo_default_export__ = function Footer() {\n    return h(\"footer\", null, h(\"p\", null, \"© 2026 My App\"));\n};\n  __albedo_exports.default = __albedo_default_export__;\n  globalThis.__ALBEDO_MODULES[\"test-app/src/components\\\\Footer.jsx\"] = __albedo_exports;\n})();"
+    },
+    {
+      "component_id": 5,
+      "module_path": "test-app/src/components\\Header.jsx",
+      "source_hash": 1280838684531643496,
+      "compiled_script": "(function() {\n  const __albedo_exports = Object.create(null);\n  Object.defineProperty(__albedo_exports, \"__albedo_is_module_record\", { value: true, enumerable: false });\n  const __albedo_import_1_27 = __albedo_require(\"react\");\n  const React = __albedo_import_1_27;\n  const __albedo_import_28_66 = __albedo_require(\"./Navigation\");\n  const Navigation = __albedo_import_28_66;\n  const __albedo_default_export__ = function Header() {\n    return h(\"header\", {\n        className: \"header\"\n    }, h(\"h1\", null, \"My App\"), h(Navigation, null));\n};\n  __albedo_exports.default = __albedo_default_export__;\n  globalThis.__ALBEDO_MODULES[\"test-app/src/components\\\\Header.jsx\"] = __albedo_exports;\n})();"
+    },
+    {
+      "component_id": 6,
+      "module_path": "test-app/src/components\\HeroImage.jsx",
+      "source_hash": 9843054492067840638,
+      "compiled_script": "(function() {\n  const __albedo_exports = Object.create(null);\n  Object.defineProperty(__albedo_exports, \"__albedo_is_module_record\", { value: true, enumerable: false });\n  const __albedo_import_1_27 = __albedo_require(\"react\");\n  const React = __albedo_import_1_27;\n  const __albedo_default_export__ = function HeroImage({ src, alt }) {\n    return h(\"div\", {\n        className: \"hero\"\n    }, h(\"img\", {\n        src: src,\n        alt: alt\n    }), h(\"h1\", null, \"Welcome\"));\n};\n  __albedo_exports.default = __albedo_default_export__;\n  globalThis.__ALBEDO_MODULES[\"test-app/src/components\\\\HeroImage.jsx\"] = __albedo_exports;\n})();"
+    },
+    {
+      "component_id": 7,
+      "module_path": "test-app/src/components\\Navigation.jsx",
+      "source_hash": 9413886077589463558,
+      "compiled_script": "(function() {\n  const __albedo_exports = Object.create(null);\n  Object.defineProperty(__albedo_exports, \"__albedo_is_module_record\", { value: true, enumerable: false });\n  const __albedo_import_1_27 = __albedo_require(\"react\");\n  const React = __albedo_import_1_27;\n  const __albedo_import_28_58 = __albedo_require(\"./Button\");\n  const Button = __albedo_import_28_58;\n  function Navigation() {\n    return h(\"nav\", null, h(Button, null, \"Home\"), h(Button, null, \"About\"), h(Button, null, \"Contact\"));\n}\n  const __albedo_default_export__ = (Navigation);\n  __albedo_exports[\"Navigation\"] = Navigation;\n  __albedo_exports.default = __albedo_default_export__;\n  globalThis.__ALBEDO_MODULES[\"test-app/src/components\\\\Navigation.jsx\"] = __albedo_exports;\n})();"
+    }
+  ],
+  "skipped": []
+}

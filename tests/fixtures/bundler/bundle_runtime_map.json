@@ -1,0 +1,46 @@
+{
+  "version": "1.0",
+  "plan_version": "1.0",
+  "entry_component_id": 3,
+  "modules": [
+    {
+      "component_id": 1,
+      "module_path": "src/components/header.tsx",
+      "class": "critical",
+      "dependency_ids": [],
+      "wrapper_module": "__albedo__/wrappers/<HASH>_src_components_header_tsx.mjs",
+      "vendor_chunks": []
+    },
+    {
+      "component_id": 2,
+      "module_path": "src/components/hero.tsx",
+      "class": "critical",
+      "dependency_ids": [
+        1
+      ],
+      "wrapper_module": "__albedo__/wrappers/<HASH>_src_components_hero_tsx.mjs",
+      "vendor_chunks": []
+    },
+    {
+      "component_id": 3,
+      "module_path": "src/routes/home.tsx",
+      "class": "entry",
+      "dependency_ids": [
+        1,
+        2
+      ],
+      "wrapper_module": "__albedo__/wrappers/<HASH>_src_routes_home_tsx.mjs",
+      "vendor_chunks": []
+    },
+    {
+      "component_id": 9,
+      "module_path": "/repo/node_modules/react/index.js",
+      "class": "deferred",
+      "dependency_ids": [],
+      "wrapper_module": "__albedo__/wrappers/<HASH>__repo_node_modules_react_index_js.mjs",
+      "vendor_chunks": [
+        "__albedo__/vendor/<HASH>_vendor_core.mjs"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,237 @@
+{
+  "components": [
+    {
+      "effects": {
+        "asynchronous": false,
+        "hooks": false,
+        "io": false,
+        "side_effects": false
+      },
+      "estimated_size_bytes": 350,
+      "export_kind": "default",
+      "id": 1,
+      "legacy_phase": null,
+      "legacy_priority": null,
+      "line_number": 0,
+      "module_path": "test-app/src/components/App.jsx",
+      "source_hash": 10926280922691246672,
+      "symbol": "App"
+    },
+    {
+      "effects": {
+        "asynchronous": false,
+        "hooks": false,
+        "io": false,
+        "side_effects": false
+      },
+      "estimated_size_bytes": 600,
+      "export_kind": "default",
+      "id": 2,
+      "legacy_phase": null,
+      "legacy_priority": null,
+      "line_number": 0,
+      "module_path": "test-app/src/components/Button.jsx",
+      "source_hash": 4618339451425261901,
+      "symbol": "Button"
+    },
+    {
+      "effects": {
+        "asynchronous": false,
+        "hooks": false,
+        "io": false,
+        "side_effects": false
+      },
+      "estimated_size_bytes": 850,
+      "export_kind": "default",
+      "id": 3,
+      "legacy_phase": null,
+      "legacy_priority": null,
+      "line_number": 0,
+      "module_path": "test-app/src/components/FeatureCard.jsx",
+      "source_hash": 437260469712399779,
+      "symbol": "FeatureCard"
+    },
+    {
+      "effects": {
+        "asynchronous": false,
+        "hooks": false,
+        "io": false,
+        "side_effects": false
+      },
+      "estimated_size_bytes": 700,
+      "export_kind": "default",
+      "id": 4,
+      "legacy_phase": null,
+      "legacy_priority": null,
+      "line_number": 0,
+      "module_path": "test-app/src/components/Features.jsx",
+      "source_hash": 7620123433515467872,
+      "symbol": "Features"
+    },
+    {
+      "effects": {
+        "asynchronous": false,
+        "hooks": false,
+        "io": false,
+        "side_effects": false
+      },
+      "estimated_size_bytes": 600,
+      "export_kind": "default",
+      "id": 5,
+      "legacy_phase": null,
+      "legacy_priority": null,
+      "line_number": 0,
+      "module_path": "test-app/src/components/Footer.jsx",
+      "source_hash": 18110766713771312264,
+      "symbol": "Footer"
+    },
+    {
+      "effects": {
+        "asynchronous": false,
+        "hooks": false,
+        "io": false,
+        "side_effects": false
+      },
+      "estimated_size_bytes": 600,
+      "export_kind": "default",
+      "id": 6,
+      "legacy_phase": null,
+      "legacy_priority": null,
+      "line_number": 0,
+      "module_path": "test-app/src/components/Header.jsx",
+      "source_hash": 10879000395668873690,
+      "symbol": "Header"
+    },
+    {
+      "effects": {
+        "asynchronous": false,
+        "hooks": false,
+        "io": false,
+        "side_effects": false
+      },
+      "estimated_size_bytes": 750,
+      "export_kind": "default",
+      "id": 7,
+      "legacy_phase": null,
+      "legacy_priority": null,
+      "line_number": 0,
+      "module_path": "test-app/src/components/HeroImage.jsx",
+      "source_hash": 11853266634164932765,
+      "symbol": "HeroImage"
+    },
+    {
+      "effects": {
+        "asynchronous": false,
+        "hooks": false,
+        "io": false,
+        "side_effects": false
+      },
+      "estimated_size_bytes": 700,
+      "export_kind": "default",
+      "id": 8,
+      "legacy_phase": null,
+      "legacy_priority": null,
+      "line_number": 0,
+      "module_path": "test-app/src/components/Navigation.jsx",
+      "source_hash": 6714999307681324380,
+      "symbol": "Navigation"
+    }
+  ],
+  "edges": [
+    {
+      "from": 1,
+      "to": 4
+    },
+    {
+      "from": 1,
+      "to": 5
+    },
+    {
+      "from": 1,
+      "to": 6
+    },
+    {
+      "from": 1,
+      "to": 7
+    },
+    {
+      "from": 4,
+      "to": 3
+    },
+    {
+      "from": 6,
+      "to": 8
+    },
+    {
+      "from": 8,
+      "to": 2
+    }
+  ],
+  "generated_at": "<normalized>",
+  "modules": [
+    {
+      "imports": [
+        "Features",
+        "Footer",
+        "Header",
+        "HeroImage",
+        "React"
+      ],
+      "module_path": "test-app/src/components/App.jsx",
+      "source_hash": 10926280922691246672
+    },
+    {
+      "imports": [
+        "React"
+      ],
+      "module_path": "test-app/src/components/Button.jsx",
+      "source_hash": 4618339451425261901
+    },
+    {
+      "imports": [
+        "React"
+      ],
+      "module_path": "test-app/src/components/FeatureCard.jsx",
+      "source_hash": 437260469712399779
+    },
+    {
+      "imports": [
+        "FeatureCard",
+        "React"
+      ],
+      "module_path": "test-app/src/components/Features.jsx",
+      "source_hash": 7620123433515467872
+    },
+    {
+      "imports": [
+        "React"
+      ],
+      "module_path": "test-app/src/components/Footer.jsx",
+      "source_hash": 18110766713771312264
+    },
+    {
+      "imports": [
+        "Navigation",
+        "React"
+      ],
+      "module_path": "test-app/src/components/Header.jsx",
+      "source_hash": 10879000395668873690
+    },
+    {
+      "imports": [
+        "React"
+      ],
+      "module_path": "test-app/src/components/HeroImage.jsx",
+      "source_hash": 11853266634164932765
+    },
+    {
+      "imports": [
+        "Button",
+        "React"
+      ],
+      "module_path": "test-app/src/components/Navigation.jsx",
+      "source_hash": 6714999307681324380
+    }
+  ],
+  "schema_version": "1.0"
+}

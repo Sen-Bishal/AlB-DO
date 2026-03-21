@@ -1,0 +1,16 @@
+{
+  "version": "1.0",
+  "plan_version": "1.0",
+  "routes": [
+    {
+      "entry_component_id": 3,
+      "entry_module": "src/routes/home.tsx",
+      "prefetch_modules": [
+        "__albedo__/wrappers/<HASH>_src_components_header_tsx.mjs",
+        "__albedo__/wrappers/<HASH>_src_components_hero_tsx.mjs",
+        "__albedo__/wrappers/<HASH>_src_routes_home_tsx.mjs"
+      ],
+      "vendor_chunks": []
+    }
+  ]
+}

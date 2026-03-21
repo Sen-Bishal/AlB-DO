@@ -1,0 +1,126 @@
+{
+  "version": "1.0",
+  "manifest_schema_version": "2.0",
+  "manifest_generated_at": "2026-03-15T06:35:03.7304309Z",
+  "entry_component_id": 0,
+  "modules": [
+    {
+      "component_id": 0,
+      "module_path": "test-app/src/components\\App.jsx",
+      "class": "entry",
+      "dependency_ids": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "wrapper_module_path": "__albedo__/wrappers/df2fe3a91b6ce328_test_app_src_components_App_jsx.mjs"
+    },
+    {
+      "component_id": 1,
+      "module_path": "test-app/src/components\\Button.jsx",
+      "class": "deferred",
+      "dependency_ids": [],
+      "wrapper_module_path": "__albedo__/wrappers/b1f50f11badc9973_test_app_src_components_Button_jsx.mjs"
+    },
+    {
+      "component_id": 2,
+      "module_path": "test-app/src/components\\FeatureCard.jsx",
+      "class": "critical",
+      "dependency_ids": [],
+      "wrapper_module_path": "__albedo__/wrappers/96f4530f3729863b_test_app_src_components_FeatureCard_jsx.mjs"
+    },
+    {
+      "component_id": 3,
+      "module_path": "test-app/src/components\\Features.jsx",
+      "class": "critical",
+      "dependency_ids": [
+        2
+      ],
+      "wrapper_module_path": "__albedo__/wrappers/384b4624eb3986bc_test_app_src_components_Features_jsx.mjs"
+    },
+    {
+      "component_id": 4,
+      "module_path": "test-app/src/components\\Footer.jsx",
+      "class": "critical",
+      "dependency_ids": [],
+      "wrapper_module_path": "__albedo__/wrappers/7c9d0aa15052d800_test_app_src_components_Footer_jsx.mjs"
+    },
+    {
+      "component_id": 5,
+      "module_path": "test-app/src/components\\Header.jsx",
+      "class": "critical",
+      "dependency_ids": [
+        7
+      ],
+      "wrapper_module_path": "__albedo__/wrappers/adb7521fc445cfae_test_app_src_components_Header_jsx.mjs"
+    },
+    {
+      "component_id": 6,
+      "module_path": "test-app/src/components\\HeroImage.jsx",
+      "class": "critical",
+      "dependency_ids": [],
+      "wrapper_module_path": "__albedo__/wrappers/258346067dc7a6ce_test_app_src_components_HeroImage_jsx.mjs"
+    },
+    {
+      "component_id": 7,
+      "module_path": "test-app/src/components\\Navigation.jsx",
+      "class": "critical",
+      "dependency_ids": [
+        1
+      ],
+      "wrapper_module_path": "__albedo__/wrappers/b60d80c346531745_test_app_src_components_Navigation_jsx.mjs"
+    }
+  ],
+  "vendor_chunks": [],
+  "rewrite_actions": [
+    {
+      "action": "wrap_module",
+      "component_id": 0,
+      "source_module": "test-app/src/components\\App.jsx",
+      "wrapper_module": "__albedo__/wrappers/df2fe3a91b6ce328_test_app_src_components_App_jsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 1,
+      "source_module": "test-app/src/components\\Button.jsx",
+      "wrapper_module": "__albedo__/wrappers/b1f50f11badc9973_test_app_src_components_Button_jsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 2,
+      "source_module": "test-app/src/components\\FeatureCard.jsx",
+      "wrapper_module": "__albedo__/wrappers/96f4530f3729863b_test_app_src_components_FeatureCard_jsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 3,
+      "source_module": "test-app/src/components\\Features.jsx",
+      "wrapper_module": "__albedo__/wrappers/384b4624eb3986bc_test_app_src_components_Features_jsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 4,
+      "source_module": "test-app/src/components\\Footer.jsx",
+      "wrapper_module": "__albedo__/wrappers/7c9d0aa15052d800_test_app_src_components_Footer_jsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 5,
+      "source_module": "test-app/src/components\\Header.jsx",
+      "wrapper_module": "__albedo__/wrappers/adb7521fc445cfae_test_app_src_components_Header_jsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 6,
+      "source_module": "test-app/src/components\\HeroImage.jsx",
+      "wrapper_module": "__albedo__/wrappers/258346067dc7a6ce_test_app_src_components_HeroImage_jsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 7,
+      "source_module": "test-app/src/components\\Navigation.jsx",
+      "wrapper_module": "__albedo__/wrappers/b60d80c346531745_test_app_src_components_Navigation_jsx.mjs"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "name": "@albedo/node",
+  "version": "0.1.0",
+  "description": "Node-API bridge for ALBEDO compiler analysis and manifest optimization.",
+  "private": false,
+  "license": "UNLICENSED",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./typed": {
+      "types": "./typed.d.ts",
+      "default": "./typed.js"
+    }
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "sideEffects": false,
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "typed.js",
+    "typed.d.ts",
+    "README.md",
+    "*.node"
+  ],
+  "scripts": {
+    "clean:native": "node scripts/clean-native.cjs",
+    "build": "npm run clean:native && napi build --platform --release",
+    "build:debug": "npm run clean:native && napi build --platform",
+    "test:smoke": "node scripts/smoke-test.cjs",
+    "test:types": "tsc --noEmit -p tsconfig.json",
+    "verify": "npm run build && npm run test:smoke && npm run test:types",
+    "pack:local": "npm run verify && npm pack"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4",
+    "@types/node": "^22.14.1",
+    "typescript": "^5.8.2"
+  }
+}

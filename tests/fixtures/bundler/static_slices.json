@@ -1,0 +1,29 @@
+{
+  "version": "1.0",
+  "manifest_schema_version": "2.0",
+  "manifest_generated_at": "2026-02-22T00:00:00Z",
+  "entry_component_id": 3,
+  "slices": [
+    {
+      "component_id": 1,
+      "module_path": "src/components/tier-a-eligible.tsx",
+      "source_hash": <HASH64>,
+      "eligible": true,
+      "ineligibility_reason": null
+    },
+    {
+      "component_id": 2,
+      "module_path": "src/components/tier-a-hook.tsx",
+      "source_hash": <HASH64>,
+      "eligible": false,
+      "ineligibility_reason": "hooks_detected"
+    },
+    {
+      "component_id": 3,
+      "module_path": "src/components/tier-b.tsx",
+      "source_hash": <HASH64>,
+      "eligible": false,
+      "ineligibility_reason": "component_tier_is_not_a"
+    }
+  ]
+}

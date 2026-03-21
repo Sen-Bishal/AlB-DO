@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "engine": "quickjs",
+  "manifest_schema_version": "2.0",
+  "manifest_generated_at": "2026-02-22T00:00:00Z",
+  "modules": [
+    {
+      "component_id": 1,
+      "module_path": "src/components/tier-a-eligible.tsx",
+      "source_hash": <HASH64>,
+      "compiled_script": "<SCRIPT>"
+    },
+    {
+      "component_id": 2,
+      "module_path": "src/components/tier-a-hook.tsx",
+      "source_hash": <HASH64>,
+      "compiled_script": "<SCRIPT>"
+    },
+    {
+      "component_id": 3,
+      "module_path": "src/components/tier-b.tsx",
+      "source_hash": <HASH64>,
+      "compiled_script": "<SCRIPT>"
+    }
+  ],
+  "skipped": []
+}

@@ -1,0 +1,20 @@
+{
+  "version": "1.0",
+  "plan_version": "1.0",
+  "routes": [
+    {
+      "entry_component_id": 0,
+      "entry_module": "test-app/src/components\\App.jsx",
+      "prefetch_modules": [
+        "__albedo__/wrappers/df2fe3a91b6ce328_test_app_src_components_App_jsx.mjs",
+        "__albedo__/wrappers/96f4530f3729863b_test_app_src_components_FeatureCard_jsx.mjs",
+        "__albedo__/wrappers/384b4624eb3986bc_test_app_src_components_Features_jsx.mjs",
+        "__albedo__/wrappers/7c9d0aa15052d800_test_app_src_components_Footer_jsx.mjs",
+        "__albedo__/wrappers/adb7521fc445cfae_test_app_src_components_Header_jsx.mjs",
+        "__albedo__/wrappers/258346067dc7a6ce_test_app_src_components_HeroImage_jsx.mjs",
+        "__albedo__/wrappers/b60d80c346531745_test_app_src_components_Navigation_jsx.mjs"
+      ],
+      "vendor_chunks": []
+    }
+  ]
+}

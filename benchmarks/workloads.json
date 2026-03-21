@@ -1,0 +1,49 @@
+{
+  "version": "1.0",
+  "description": "Phase 0 benchmark workloads and gating envelopes for Albedo.",
+  "regression_policy": {
+    "max_regression_percent": 15.0
+  },
+  "baseline_competitors": [
+    {
+      "id": "nextjs-15-ssr",
+      "name": "Next.js 15 (SSR)",
+      "category": "framework",
+      "benchmark_notes": "Run against equivalent route/component workload in external benchmark repo."
+    },
+    {
+      "id": "astro-5-static",
+      "name": "Astro 5 (Static/Islands)",
+      "category": "framework",
+      "benchmark_notes": "Use identical page shape with island hydration triggers."
+    },
+    {
+      "id": "vite-6-ssr",
+      "name": "Vite 6 (SSR reference)",
+      "category": "tooling",
+      "benchmark_notes": "Measure dev startup and incremental edit loop with matching modules."
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "test_app_components",
+      "name": "Test App Components",
+      "path": "test-app/src/components",
+      "warmup_runs": 3,
+      "sample_runs": 12,
+      "max_p95_scan_ms": 300.0,
+      "max_p95_optimize_ms": 200.0,
+      "max_p95_total_ms": 450.0
+    },
+    {
+      "id": "test_app_full_src",
+      "name": "Test App Full Source",
+      "path": "test-app/src",
+      "warmup_runs": 3,
+      "sample_runs": 12,
+      "max_p95_scan_ms": 400.0,
+      "max_p95_optimize_ms": 260.0,
+      "max_p95_total_ms": 600.0
+    }
+  ]
+}

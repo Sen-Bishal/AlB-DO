@@ -1,0 +1,47 @@
+[package]
+name = "dom-render-compiler"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dom-compiler"
+path = "src/bin/dom-compiler.rs"
+
+[dependencies]
+crossbeam = "0.8"
+core_affinity = "0.8"
+dashmap = "5.5"
+once_cell = "1.19"
+lru = "0.12"
+serde = { version = "=1.0.210", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+sysinfo = "0.30"
+num_cpus = "1.16"
+walkdir = "2.4"
+notify = "6.1"
+rquickjs = "0.9"
+time = { version = "0.3", features = ["formatting"] }
+
+swc_common = "0.37"
+swc_ecma_ast = "0.118"
+swc_ecma_codegen = "0.155"
+swc_ecma_parser = "0.149"
+swc_ecma_transforms_base = "0.145"
+swc_ecma_transforms_react = "0.191"
+swc_ecma_transforms_typescript = "0.198"
+swc_ecma_visit = "0.104"
+
+[dev-dependencies]
+tempfile = "3.8"
+regex = "1.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

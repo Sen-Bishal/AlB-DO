@@ -1,0 +1,129 @@
+{
+  "schema_version": "2.0",
+  "generated_at": "2026-03-15T06:35:03.7304309Z",
+  "components": [
+    {
+      "id": 0,
+      "name": "App",
+      "module_path": "test-app/src/components\\App.jsx",
+      "tier": "A",
+      "weight_bytes": 1450,
+      "priority": 1095.0,
+      "dependencies": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "can_defer": true,
+      "hydration_mode": "None"
+    },
+    {
+      "id": 1,
+      "name": "Button",
+      "module_path": "test-app/src/components\\Button.jsx",
+      "tier": "B",
+      "weight_bytes": 1300,
+      "priority": 110.0,
+      "dependencies": [],
+      "can_defer": true,
+      "hydration_mode": "OnIdle"
+    },
+    {
+      "id": 2,
+      "name": "FeatureCard",
+      "module_path": "test-app/src/components\\FeatureCard.jsx",
+      "tier": "A",
+      "weight_bytes": 1550,
+      "priority": 1100.0,
+      "dependencies": [],
+      "can_defer": true,
+      "hydration_mode": "None"
+    },
+    {
+      "id": 3,
+      "name": "Features",
+      "module_path": "test-app/src/components\\Features.jsx",
+      "tier": "A",
+      "weight_bytes": 1500,
+      "priority": 1098.0,
+      "dependencies": [
+        2
+      ],
+      "can_defer": true,
+      "hydration_mode": "None"
+    },
+    {
+      "id": 4,
+      "name": "Footer",
+      "module_path": "test-app/src/components\\Footer.jsx",
+      "tier": "A",
+      "weight_bytes": 1300,
+      "priority": 100.0,
+      "dependencies": [],
+      "can_defer": true,
+      "hydration_mode": "None"
+    },
+    {
+      "id": 5,
+      "name": "Header",
+      "module_path": "test-app/src/components\\Header.jsx",
+      "tier": "A",
+      "weight_bytes": 1400,
+      "priority": 118.0,
+      "dependencies": [
+        7
+      ],
+      "can_defer": false,
+      "hydration_mode": "None"
+    },
+    {
+      "id": 6,
+      "name": "HeroImage",
+      "module_path": "test-app/src/components\\HeroImage.jsx",
+      "tier": "A",
+      "weight_bytes": 1450,
+      "priority": 120.0,
+      "dependencies": [],
+      "can_defer": false,
+      "hydration_mode": "None"
+    },
+    {
+      "id": 7,
+      "name": "Navigation",
+      "module_path": "test-app/src/components\\Navigation.jsx",
+      "tier": "A",
+      "weight_bytes": 1500,
+      "priority": 119.0,
+      "dependencies": [
+        1
+      ],
+      "can_defer": false,
+      "hydration_mode": "None"
+    }
+  ],
+  "parallel_batches": [
+    [
+      1,
+      2,
+      4,
+      6
+    ],
+    [
+      3,
+      7
+    ],
+    [
+      5
+    ],
+    [
+      0
+    ]
+  ],
+  "critical_path": [
+    2,
+    3,
+    0
+  ],
+  "vendor_chunks": []
+}

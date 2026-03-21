@@ -1,0 +1,83 @@
+{
+  "version": "1.0",
+  "manifest_schema_version": "2.0",
+  "manifest_generated_at": "2026-02-20T00:00:00Z",
+  "entry_component_id": 3,
+  "modules": [
+    {
+      "component_id": 1,
+      "module_path": "src/components/header.tsx",
+      "class": "critical",
+      "dependency_ids": [],
+      "wrapper_module_path": "__albedo__/wrappers/<HASH>_src_components_header_tsx.mjs"
+    },
+    {
+      "component_id": 2,
+      "module_path": "src/components/hero.tsx",
+      "class": "critical",
+      "dependency_ids": [
+        1
+      ],
+      "wrapper_module_path": "__albedo__/wrappers/<HASH>_src_components_hero_tsx.mjs"
+    },
+    {
+      "component_id": 3,
+      "module_path": "src/routes/home.tsx",
+      "class": "entry",
+      "dependency_ids": [
+        1,
+        2
+      ],
+      "wrapper_module_path": "__albedo__/wrappers/<HASH>_src_routes_home_tsx.mjs"
+    },
+    {
+      "component_id": 9,
+      "module_path": "/repo/node_modules/react/index.js",
+      "class": "deferred",
+      "dependency_ids": [],
+      "wrapper_module_path": "__albedo__/wrappers/<HASH>__repo_node_modules_react_index_js.mjs"
+    }
+  ],
+  "vendor_chunks": [
+    {
+      "chunk_name": "vendor.core",
+      "packages": [
+        "react"
+      ],
+      "component_ids": [
+        9
+      ]
+    }
+  ],
+  "rewrite_actions": [
+    {
+      "action": "wrap_module",
+      "component_id": 1,
+      "source_module": "src/components/header.tsx",
+      "wrapper_module": "__albedo__/wrappers/<HASH>_src_components_header_tsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 2,
+      "source_module": "src/components/hero.tsx",
+      "wrapper_module": "__albedo__/wrappers/<HASH>_src_components_hero_tsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 3,
+      "source_module": "src/routes/home.tsx",
+      "wrapper_module": "__albedo__/wrappers/<HASH>_src_routes_home_tsx.mjs"
+    },
+    {
+      "action": "wrap_module",
+      "component_id": 9,
+      "source_module": "/repo/node_modules/react/index.js",
+      "wrapper_module": "__albedo__/wrappers/<HASH>__repo_node_modules_react_index_js.mjs"
+    },
+    {
+      "action": "link_vendor_chunk",
+      "component_id": 9,
+      "chunk_name": "vendor.core"
+    }
+  ]
+}
