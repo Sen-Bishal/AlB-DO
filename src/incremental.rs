@@ -1,13 +1,24 @@
 use crate::types::*;
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::time::SystemTime;
 
 type FileHash = u64;
+
+struct LazyCacheData {
+    file_hashes: HashMap<PathBuf, FileHash>,
+    component_cache: HashMap<ComponentId, CachedAnalysis>,
+    file_to_components: HashMap<PathBuf, HashSet<ComponentId>>,
+    component_to_file: HashMap<ComponentId, PathBuf>,
+    dependency_graph: HashMap<ComponentId, HashSet<ComponentId>>,
+}
+
 pub struct IncrementalCache {
     file_hashes: DashMap<PathBuf, FileHash>,
     component_cache: DashMap<ComponentId, CachedAnalysis>,
@@ -16,6 +27,8 @@ pub struct IncrementalCache {
     pub dependency_graph: DashMap<ComponentId, HashSet<ComponentId>>,
     cache_file_path: PathBuf,
     invalidated: DashMap<ComponentId, InvalidationReason>,
+    lazy_data: Lazy<RwLock<Option<LazyCacheData>>>,
+    loaded: RwLock<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,10 +69,12 @@ impl IncrementalCache {
             dependency_graph: DashMap::new(),
             cache_file_path,
             invalidated: DashMap::new(),
+            lazy_data: Lazy::new(|| RwLock::new(None)),
+            loaded: RwLock::new(false),
         }
     }
 
-    pub fn load(&mut self) -> io::Result<()> {
+    pub fn load(&self) -> io::Result<()> {
         if !self.cache_file_path.exists() {
             return Ok(());
         }
@@ -70,26 +85,15 @@ impl IncrementalCache {
 
         match bincode::deserialize::<PersistentCache>(&buffer) {
             Ok(cache) => {
-                for (path, hash) in cache.file_hashes {
-                    self.file_hashes.insert(path, hash);
-                }
-
-                for (id, analysis) in cache.component_cache {
-                    self.component_cache.insert(id, analysis);
-                }
-
-                for (path, ids) in cache.file_to_components {
-                    self.file_to_components.insert(path, ids);
-                }
-
-                for (id, path) in cache.component_to_file {
-                    self.component_to_file.insert(id, path);
-                }
-
-                for (id, deps) in cache.dependency_graph {
-                    self.dependency_graph.insert(id, deps);
-                }
-
+                let lazy_data = LazyCacheData {
+                    file_hashes: cache.file_hashes,
+                    component_cache: cache.component_cache,
+                    file_to_components: cache.file_to_components,
+                    component_to_file: cache.component_to_file,
+                    dependency_graph: cache.dependency_graph,
+                };
+                *self.lazy_data.write().unwrap() = Some(lazy_data);
+                *self.loaded.write().unwrap() = true;
                 Ok(())
             }
             Err(e) => {
@@ -97,9 +101,64 @@ impl IncrementalCache {
                     "Warning: Failed to deserialize cache, starting fresh: {}",
                     e
                 );
+                *self.loaded.write().unwrap() = true;
                 Ok(())
             }
         }
+    }
+
+    fn ensure_loaded(&self) {
+        if !*self.loaded.read().unwrap() {
+            let _ = self.load();
+        }
+    }
+
+    fn get_or_load_component(&self, id: ComponentId) -> Option<CachedAnalysis> {
+        self.ensure_loaded();
+
+        if let Some(ref data) = *self.lazy_data.read().unwrap() {
+            if let Some(cached) = data.component_cache.get(&id) {
+                return Some(cached.clone());
+            }
+        }
+
+        if let Some(entry) = self.component_cache.get(&id) {
+            return Some(entry.clone());
+        }
+
+        None
+    }
+
+    fn get_or_load_file_hash(&self, path: &PathBuf) -> Option<FileHash> {
+        self.ensure_loaded();
+
+        if let Some(ref data) = *self.lazy_data.read().unwrap() {
+            if let Some(&hash) = data.file_hashes.get(path) {
+                return Some(hash);
+            }
+        }
+
+        if let Some(entry) = self.file_hashes.get(path) {
+            return Some(*entry.value());
+        }
+
+        None
+    }
+
+    fn get_or_load_file_components(&self, path: &PathBuf) -> Option<HashSet<ComponentId>> {
+        self.ensure_loaded();
+
+        if let Some(ref data) = *self.lazy_data.read().unwrap() {
+            if let Some(ids) = data.file_to_components.get(path) {
+                return Some(ids.clone());
+            }
+        }
+
+        if let Some(entry) = self.file_to_components.get(path) {
+            return Some(entry.clone());
+        }
+
+        None
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -159,14 +218,16 @@ impl IncrementalCache {
     }
 
     pub fn detect_changes(&self, current_files: &[PathBuf]) -> ChangeSet {
+        self.ensure_loaded();
+
         let mut changed_files = Vec::new();
         let mut new_files = Vec::new();
         let mut deleted_files = Vec::new();
         for path in current_files {
             match Self::hash_file(path) {
                 Ok(current_hash) => {
-                    if let Some(cached_hash) = self.file_hashes.get(path) {
-                        if *cached_hash != current_hash {
+                    if let Some(cached_hash) = self.get_or_load_file_hash(path) {
+                        if cached_hash != current_hash {
                             changed_files.push(path.clone());
                         }
                     } else {
@@ -179,9 +240,25 @@ impl IncrementalCache {
             }
         }
         let current_set: HashSet<_> = current_files.iter().collect();
-        for entry in self.file_hashes.iter() {
-            if !current_set.contains(entry.key()) {
-                deleted_files.push(entry.key().clone());
+
+        let tracked_files: Vec<PathBuf> = {
+            let mut files = Vec::new();
+            for entry in self.file_hashes.iter() {
+                files.push(entry.key().clone());
+            }
+            if let Some(ref data) = *self.lazy_data.read().unwrap() {
+                for path in data.file_hashes.keys() {
+                    if !self.file_hashes.contains_key(path) {
+                        files.push(path.clone());
+                    }
+                }
+            }
+            files
+        };
+
+        for path in tracked_files {
+            if !current_set.contains(&path) {
+                deleted_files.push(path);
             }
         }
 
@@ -219,8 +296,10 @@ impl IncrementalCache {
     }
 
     pub fn invalidate_changed_files(&self, changes: &ChangeSet) {
+        self.ensure_loaded();
+
         for path in &changes.changed_files {
-            if let Some(component_ids) = self.file_to_components.get(path) {
+            if let Some(component_ids) = self.get_or_load_file_components(path) {
                 for id in component_ids.iter() {
                     self.invalidate_component(*id, InvalidationReason::FileChanged);
                 }
@@ -228,7 +307,7 @@ impl IncrementalCache {
         }
 
         for path in &changes.deleted_files {
-            if let Some(component_ids) = self.file_to_components.get(path) {
+            if let Some(component_ids) = self.get_or_load_file_components(path) {
                 for id in component_ids.iter() {
                     self.invalidate_component(*id, InvalidationReason::Deleted);
                 }
@@ -239,15 +318,14 @@ impl IncrementalCache {
     }
 
     pub fn is_cached(&self, id: ComponentId) -> bool {
-        !self.invalidated.contains_key(&id) && self.component_cache.contains_key(&id)
+        !self.invalidated.contains_key(&id) && self.get_or_load_component(id).is_some()
     }
 
     pub fn get_cached_analysis(&self, id: ComponentId) -> Option<CachedAnalysis> {
-        if self.is_cached(id) {
-            self.component_cache.get(&id).map(|entry| entry.clone())
-        } else {
-            None
+        if self.invalidated.contains_key(&id) {
+            return None;
         }
+        self.get_or_load_component(id)
     }
 
     pub fn cache_analysis(

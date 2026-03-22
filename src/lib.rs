@@ -43,7 +43,7 @@ impl RenderCompiler {
     }
 
     pub fn with_cache(cache_dir: PathBuf) -> Self {
-        let mut cache = IncrementalCache::new(cache_dir);
+        let cache = IncrementalCache::new(cache_dir);
 
         if let Err(e) = cache.load() {
             eprintln!("Warning: Failed to load cache: {}", e);

@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn test_quickjs_server_renderer_fixture_component() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1013,7 +1013,7 @@ mod tests {
 
     #[test]
     fn test_render_route_module_hash_cache_hits_and_hot_reload_misses() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_prime_runtime_cache_warms_modules_before_first_live_request() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1079,7 +1079,7 @@ mod tests {
 
     #[test]
     fn test_tier_a_static_slice_cache_hit_bypasses_engine_render() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[test]
     fn test_static_slice_cache_invalidates_on_manifest_source_change() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1210,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_revalidate_path_invalidates_route_static_slice_cache() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1261,7 +1261,7 @@ mod tests {
 
     #[test]
     fn test_revalidate_tag_invalidates_tagged_route_static_slice_cache() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1313,7 +1313,7 @@ mod tests {
 
     #[test]
     fn test_register_manifest_modules_with_precompiled_prefers_compiled_script() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1374,7 +1374,7 @@ mod tests {
 
     #[test]
     fn test_renderer_new_reports_init_error_for_invalid_bootstrap() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload {
             dom_shim_js: "(".to_string(),
             runtime_helpers_js: String::new(),
@@ -1419,7 +1419,7 @@ mod tests {
 
     #[test]
     fn test_render_route_reports_missing_dependency() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1450,7 +1450,7 @@ mod tests {
 
     #[test]
     fn test_render_route_reports_cyclic_module_graph() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1486,7 +1486,7 @@ mod tests {
 
     #[test]
     fn test_render_route_reports_invalid_props_json() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1506,7 +1506,7 @@ mod tests {
 
     #[test]
     fn test_render_route_reports_invalid_entry_export() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1535,7 +1535,7 @@ mod tests {
 
     #[test]
     fn test_quickjs_loader_supports_common_export_shapes() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1563,7 +1563,7 @@ mod tests {
 
     #[test]
     fn test_render_route_with_dependency_graph() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn test_render_route_stream_emits_shell_and_hydration_chunks() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1651,7 +1651,7 @@ mod tests {
 
     #[test]
     fn test_render_route_stream_with_manifest_hydration_adds_head_tag_chunks() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1721,7 +1721,7 @@ mod tests {
 
     #[test]
     fn test_register_manifest_modules_and_render() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1785,7 +1785,7 @@ mod tests {
 
     #[test]
     fn test_render_route_from_test_app_component_directory() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1819,7 +1819,7 @@ mod tests {
         )
         .unwrap();
 
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 
@@ -1838,7 +1838,7 @@ mod tests {
 
     #[test]
     fn test_quickjs_cold_vs_warm_render_smoke() {
-        let engine = QuickJsEngine::new().unwrap();
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).unwrap();
 

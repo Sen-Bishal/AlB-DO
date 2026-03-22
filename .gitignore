@@ -208,3 +208,6 @@ docker-compose.override.yml
 /benchmark/runtime-results/
 /research/data/
 /experiments/
+
+# Prevent Windows reserved device name conflicts
+nul

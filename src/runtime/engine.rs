@@ -121,4 +121,10 @@ pub trait RuntimeEngine {
         })
     }
     fn warm(&mut self) -> RuntimeResult<()>;
+    fn prewarm(&mut self) {
+        let _ = self.init(&BootstrapPayload::default());
+    }
+    fn is_initialized(&self) -> bool {
+        false
+    }
 }

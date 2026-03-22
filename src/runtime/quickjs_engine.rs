@@ -36,72 +36,104 @@ struct RenderEnvelope {
 }
 
 pub struct QuickJsEngine {
-    _runtime: Runtime,
-    context: Context,
+    runtime: Option<Runtime>,
+    context: Option<Context>,
     loaded_module_hashes: HashMap<String, u64>,
+    bootstrap: Option<BootstrapPayload>,
     initialized: bool,
 }
 
 impl QuickJsEngine {
-    pub fn new() -> RuntimeResult<Self> {
-        let runtime = Runtime::new().map_err(|err| {
-            RuntimeError::init(format!("failed to create QuickJS runtime: {err}"))
-        })?;
-        let context = Context::full(&runtime).map_err(|err| {
-            RuntimeError::init(format!("failed to create QuickJS context: {err}"))
-        })?;
-
-        Ok(Self {
-            _runtime: runtime,
-            context,
+    pub fn new() -> Self {
+        Self {
+            runtime: None,
+            context: None,
             loaded_module_hashes: HashMap::new(),
+            bootstrap: None,
             initialized: false,
-        })
+        }
     }
-}
 
-impl RuntimeEngine for QuickJsEngine {
-    fn init(&mut self, bootstrap: &BootstrapPayload) -> RuntimeResult<()> {
-        self.context.with(|ctx| -> RuntimeResult<()> {
-            ctx.eval::<(), _>(build_builtin_runtime_helpers_script())
-                .map_err(|err| {
-                    RuntimeError::init(format!("failed to install built-in runtime helpers: {err}"))
+    pub fn prewarm(&mut self) {
+        if self.initialized {
+            return;
+        }
+        let _ = self.ensure_initialized();
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    fn ensure_initialized(&mut self) -> RuntimeResult<()> {
+        if self.initialized {
+            return Ok(());
+        }
+
+        let runtime = self
+            .runtime
+            .get_or_insert_with(|| Runtime::new().expect("QuickJS runtime creation failed"));
+
+        if self.context.is_none() {
+            self.context = Some(Context::full(runtime).expect("QuickJS context creation failed"));
+        }
+
+        let bootstrap = self.bootstrap.take().unwrap_or_default();
+
+        self.context
+            .as_ref()
+            .unwrap()
+            .with(|ctx| -> RuntimeResult<()> {
+                ctx.eval::<(), _>(build_builtin_runtime_helpers_script())
+                    .map_err(|err| {
+                        RuntimeError::init(format!(
+                            "failed to install built-in runtime helpers: {err}"
+                        ))
+                    })?;
+
+                if !bootstrap.dom_shim_js.trim().is_empty() {
+                    ctx.eval::<(), _>(bootstrap.dom_shim_js.as_str())
+                        .map_err(|err| {
+                            RuntimeError::init(format!("failed to evaluate DOM shim: {err}"))
+                        })?;
+                }
+
+                if !bootstrap.runtime_helpers_js.trim().is_empty() {
+                    ctx.eval::<(), _>(bootstrap.runtime_helpers_js.as_str())
+                        .map_err(|err| {
+                            RuntimeError::init(format!("failed to evaluate runtime helpers: {err}"))
+                        })?;
+                }
+
+                ctx.eval::<(), _>("globalThis.__ALBEDO_MODULES = Object.create(null);")
+                    .map_err(|err| {
+                        RuntimeError::init(format!("failed to initialize module table: {err}"))
+                    })?;
+
+                let render_script = build_render_function_script();
+                ctx.eval::<(), _>(render_script.as_str()).map_err(|err| {
+                    RuntimeError::init(format!("failed to install reusable render function: {err}"))
                 })?;
 
-            if !bootstrap.dom_shim_js.trim().is_empty() {
-                ctx.eval::<(), _>(bootstrap.dom_shim_js.as_str())
-                    .map_err(|err| {
-                        RuntimeError::init(format!("failed to evaluate DOM shim: {err}"))
-                    })?;
-            }
-
-            if !bootstrap.runtime_helpers_js.trim().is_empty() {
-                ctx.eval::<(), _>(bootstrap.runtime_helpers_js.as_str())
-                    .map_err(|err| {
-                        RuntimeError::init(format!("failed to evaluate runtime helpers: {err}"))
-                    })?;
-            }
-
-            ctx.eval::<(), _>("globalThis.__ALBEDO_MODULES = Object.create(null);")
-                .map_err(|err| {
-                    RuntimeError::init(format!("failed to initialize module table: {err}"))
-                })?;
-
-            let render_script = build_render_function_script();
-            ctx.eval::<(), _>(render_script.as_str()).map_err(|err| {
-                RuntimeError::init(format!("failed to install reusable render function: {err}"))
+                Ok(())
             })?;
 
-            Ok(())
-        })?;
-
-        self.loaded_module_hashes.clear();
         for preload in &bootstrap.preloaded_libraries {
             self.load_module(&preload.specifier, &preload.code)?;
         }
 
         self.initialized = true;
         Ok(())
+    }
+}
+
+impl RuntimeEngine for QuickJsEngine {
+    fn init(&mut self, bootstrap: &BootstrapPayload) -> RuntimeResult<()> {
+        if self.initialized {
+            return Ok(());
+        }
+        self.bootstrap = Some(bootstrap.clone());
+        self.ensure_initialized()
     }
 
     fn load_module(&mut self, specifier: &str, code: &str) -> RuntimeResult<()> {
@@ -120,9 +152,10 @@ impl RuntimeEngine for QuickJsEngine {
             return Ok(());
         }
 
+        self.ensure_initialized()?;
         let script = compile_module_script_for_quickjs(specifier, code)?;
 
-        self.context.with(|ctx| {
+        self.context.as_ref().unwrap().with(|ctx| {
             ctx.eval::<(), _>(script.as_str()).map_err(|err| {
                 RuntimeError::load(
                     LoadErrorKind::EngineFailure,
@@ -146,7 +179,9 @@ impl RuntimeEngine for QuickJsEngine {
             return Ok(());
         }
 
-        self.context.with(|ctx| {
+        self.ensure_initialized()?;
+
+        self.context.as_ref().unwrap().with(|ctx| {
             ctx.eval::<(), _>(compiled_script).map_err(|err| {
                 RuntimeError::load(
                     LoadErrorKind::EngineFailure,
@@ -161,12 +196,10 @@ impl RuntimeEngine for QuickJsEngine {
     }
 
     fn render_component(&mut self, entry: &str, props_json: &str) -> RuntimeResult<RenderOutput> {
-        if !self.initialized {
-            return Err(RuntimeError::init("runtime not initialized"));
-        }
+        self.ensure_initialized()?;
 
         let eval_start = Instant::now();
-        let envelope_json = self.context.with(|ctx| {
+        let envelope_json = self.context.as_ref().unwrap().with(|ctx| {
             let globals = ctx.globals();
             let render_fn: Function = globals.get("__ALBEDO_RENDER_COMPONENT").map_err(|err| {
                 RuntimeError::render(format!(
@@ -206,7 +239,8 @@ impl RuntimeEngine for QuickJsEngine {
     }
 
     fn warm(&mut self) -> RuntimeResult<()> {
-        self.context.with(|ctx| {
+        self.ensure_initialized()?;
+        self.context.as_ref().unwrap().with(|ctx| {
             ctx.eval::<i32, _>("40 + 2")
                 .map(|_| ())
                 .map_err(|err| RuntimeError::init(format!("runtime warm-up failed: {err}")))
@@ -940,5 +974,31 @@ mod tests {
         assert!(!compiled.contains("<main>"));
         assert!(!compiled.contains(": string"));
         assert!(!compiled.contains(" as string"));
+    }
+
+    #[test]
+    fn test_prewarm_initializes_engine() {
+        use super::QuickJsEngine;
+
+        let engine = QuickJsEngine::new();
+        assert!(!engine.is_initialized());
+
+        let mut engine = engine;
+        engine.prewarm();
+        assert!(engine.is_initialized());
+    }
+
+    #[test]
+    fn test_prewarm_is_idempotent() {
+        use super::QuickJsEngine;
+
+        let engine = QuickJsEngine::new();
+        let mut engine = engine;
+
+        engine.prewarm();
+        assert!(engine.is_initialized());
+
+        engine.prewarm();
+        assert!(engine.is_initialized());
     }
 }

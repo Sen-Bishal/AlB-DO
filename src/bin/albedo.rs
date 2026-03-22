@@ -313,6 +313,7 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     let project = ComponentProject::load_from_dir(&contract.root)
         .map_err(|err| format!("failed to load components: {err}"))?;
     let project_css = collect_css_bundle(&contract.root);
+
     let initial = render_all_routes(&project, &contract, &project_css).map_err(|err| {
         format!(
             "failed to render initial dev document (entry='{}'): {err}",
@@ -322,6 +323,13 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
 
     let (listener, addr, auto_incremented) =
         bind_dev_listener(contract.server.host.as_str(), contract.server.port)?;
+
+    println!(
+        "  {} prewarming renderer ({} routes, {:.2}ms render time)",
+        style("[dev]", "1;34"),
+        initial.route_documents.len(),
+        initial.render_ms
+    );
     let shared_state = Arc::new(Mutex::new(SharedDevState {
         project,
         project_css,
@@ -773,7 +781,6 @@ fn handle_dev_connection(
     sse_clients: Arc<Mutex<Vec<TcpStream>>>,
     hmr_enabled: bool,
 ) -> std::io::Result<()> {
-    let request_start = Instant::now();
     let mut first_line = String::new();
     {
         let mut reader = BufReader::new(stream.try_clone()?);
@@ -784,7 +791,7 @@ fn handle_dev_connection(
     let raw_target = first_line.split_whitespace().nth(1).unwrap_or("/");
     let path = normalize_request_path(raw_target);
 
-    let status = if method != "GET" {
+    let (status, render_ms) = if method != "GET" {
         write_http_response(
             &mut stream,
             405,
@@ -793,7 +800,7 @@ fn handle_dev_connection(
             b"Method not allowed\n",
             &[],
         )?;
-        405
+        (405, 0.0)
     } else if path == "/_albedo/health" {
         write_http_response(
             &mut stream,
@@ -801,9 +808,9 @@ fn handle_dev_connection(
             "OK",
             "text/plain; charset=utf-8",
             b"ok\n",
-            &[("cache-control", "no-store".to_string())],
+            &[],
         )?;
-        200
+        (200, 0.0)
     } else if path == "/_albedo/hmr" && hmr_enabled {
         write_sse_handshake(&mut stream)?;
         if let Ok(mut clients) = sse_clients.lock() {
@@ -811,9 +818,8 @@ fn handle_dev_connection(
         }
         return Ok(());
     } else if path == "/" || path == "/index.html" || is_route_like_path(path.as_str()) {
-        let snapshot = {
+        let (doc, render_ms, total_ms, error) = {
             let state = shared_state.lock().expect("shared state lock poisoned");
-            // Normalize: /index.html → /
             let lookup = if path == "/index.html" {
                 "/".to_string()
             } else {
@@ -833,11 +839,11 @@ fn handle_dev_connection(
             )
         };
         let mut headers = vec![
-            ("x-albedo-render-ms", format!("{:.2}", snapshot.1)),
-            ("x-albedo-total-ms", format!("{:.2}", snapshot.2)),
+            ("x-albedo-render-ms", format!("{:.2}", render_ms)),
+            ("x-albedo-total-ms", format!("{:.2}", total_ms)),
             ("cache-control", "no-store".to_string()),
         ];
-        if snapshot.3.is_some() {
+        if error.is_some() {
             headers.push(("x-albedo-dev-state", "error".to_string()));
         } else {
             headers.push(("x-albedo-dev-state", "ok".to_string()));
@@ -847,10 +853,10 @@ fn handle_dev_connection(
             200,
             "OK",
             "text/html; charset=utf-8",
-            snapshot.0.as_bytes(),
+            doc.as_bytes(),
             headers.as_slice(),
         )?;
-        200
+        (200, render_ms)
     } else {
         write_http_response(
             &mut stream,
@@ -860,16 +866,15 @@ fn handle_dev_connection(
             b"Not found\n",
             &[],
         )?;
-        404
+        (404, 0.0)
     };
 
-    let duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
     println!(
-        "  [dev] {method} {path} -> {status} ({duration_ms:.2}ms)",
+        "  [dev] {method} {path} -> {status} ({render_ms:.2}ms)",
         method = method,
         path = path,
         status = status,
-        duration_ms = duration_ms
+        render_ms = render_ms
     );
     Ok(())
 }

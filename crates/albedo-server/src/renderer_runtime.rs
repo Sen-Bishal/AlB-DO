@@ -42,9 +42,7 @@ impl RendererRuntime {
         let module_sources = load_module_sources(&artifacts_dir, &manifest)?;
         let precompiled_modules = load_precompiled_modules(&artifacts_dir)?;
 
-        let engine = QuickJsEngine::new().map_err(|err| {
-            RuntimeError::RendererFailure(format!("failed to initialize QuickJS engine: {err}"))
-        })?;
+        let engine = QuickJsEngine::new();
         let bootstrap = BootstrapPayload::default();
         let mut renderer = ServerRenderer::new(engine, &bootstrap).map_err(|err| {
             RuntimeError::RendererFailure(format!("failed to initialize server renderer: {err}"))
