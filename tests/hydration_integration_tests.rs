@@ -13,7 +13,7 @@ use rquickjs::{Context, Runtime};
 use std::collections::HashMap;
 
 fn create_renderer() -> ServerRenderer<QuickJsEngine> {
-    let engine = QuickJsEngine::new().expect("engine should initialize");
+    let engine = QuickJsEngine::new();
     let bootstrap = BootstrapPayload::default();
     ServerRenderer::new(engine, &bootstrap).expect("renderer should initialize")
 }
@@ -75,6 +75,7 @@ fn test_hydration_no_js_for_tier_a_only_route() {
         parallel_batches: vec![vec![1, 2]],
         critical_path: vec![2],
         vendor_chunks: Vec::new(),
+        ..RenderManifestV2::legacy_defaults()
     };
 
     let mut sources = HashMap::new();
@@ -151,6 +152,7 @@ fn test_hydration_tier_c_uses_trigger_gated_islands() {
         parallel_batches: vec![vec![10, 11, 12], vec![20]],
         critical_path: vec![20],
         vendor_chunks: Vec::new(),
+        ..RenderManifestV2::legacy_defaults()
     };
 
     let mut sources = HashMap::new();
@@ -247,6 +249,7 @@ fn test_hydration_island_failure_does_not_break_other_islands() {
         parallel_batches: vec![vec![32], vec![31]],
         critical_path: vec![31],
         vendor_chunks: Vec::new(),
+        ..RenderManifestV2::legacy_defaults()
     };
 
     let mut sources = HashMap::new();

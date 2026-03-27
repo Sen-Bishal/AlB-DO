@@ -159,6 +159,7 @@ mod tests {
             parallel_batches: vec![vec![1, 2], vec![3, 4]],
             critical_path: vec![4],
             vendor_chunks: Vec::new(),
+            ..RenderManifestV2::legacy_defaults()
         }
     }
 

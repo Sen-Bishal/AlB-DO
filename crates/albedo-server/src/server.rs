@@ -23,7 +23,9 @@ use crate::contract::{
     RuntimeMiddleware,
 };
 use crate::error::RuntimeError;
+use crate::handlers::{streaming_handler, StreamingAppState};
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
+use crate::render::tier_b::SharedRenderServices;
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
 use axum::body::{to_bytes, Body};
@@ -50,11 +52,11 @@ type SharedPropsLoader = Arc<dyn PropsLoader>;
 struct RuntimeState {
     router: Arc<CompiledRouter>,
     handlers: Arc<HashMap<String, SharedHandler>>,
-    props_loaders: Arc<HashMap<String, SharedPropsLoader>>,
     layouts: Arc<HashMap<String, SharedLayoutHandler>>,
     middleware: Arc<HashMap<String, SharedMiddleware>>,
     auth_provider: SharedAuthProvider,
     request_timeout: Duration,
+    streaming_runtime: Option<Arc<StreamingAppState>>,
 }
 
 pub struct AlbedoServerBuilder {
@@ -144,6 +146,13 @@ impl AlbedoServerBuilder {
             }
         }
 
+        let streaming_runtime = renderer.as_ref().map(|runtime| {
+            Arc::new(StreamingAppState::new(
+                Arc::new(runtime.manifest().clone()),
+                SharedRenderServices::default(),
+            ))
+        });
+
         let has_entry_routes = self
             .config
             .routes
@@ -151,7 +160,25 @@ impl AlbedoServerBuilder {
             .any(|route| route.entry_module.is_some());
 
         for route in &self.config.routes {
-            if route.entry_module.is_none() && !self.handlers.contains_key(route.handler.as_str()) {
+            let has_layout_handlers = match router.match_route(route.method, route.path.as_str()) {
+                RouteMatch::Matched(matched) => !matched.target.layout_handlers.is_empty(),
+                RouteMatch::MethodNotAllowed { .. } | RouteMatch::NotFound => true,
+            };
+
+            let route_uses_manifest_streaming =
+                matches!(route.method, HttpMethod::Get | HttpMethod::Head)
+                    && route.entry_module.is_some()
+                    && route.props_loader.is_none()
+                    && route.auth.is_none()
+                    && route.middleware.is_empty()
+                    && !has_layout_handlers
+                    && streaming_runtime
+                        .as_ref()
+                        .map(|runtime| runtime.manifest.routes.contains_key(route.path.as_str()))
+                        .unwrap_or(false);
+
+            if !route_uses_manifest_streaming && !self.handlers.contains_key(route.handler.as_str())
+            {
                 return Err(RuntimeError::HandlerNotFound {
                     handler_id: route.handler.clone(),
                 });
@@ -185,11 +212,11 @@ impl AlbedoServerBuilder {
         let state = RuntimeState {
             router: Arc::new(router),
             handlers: Arc::new(self.handlers),
-            props_loaders: Arc::new(self.props_loaders),
             layouts: Arc::new(self.layouts),
             middleware: Arc::new(self.middleware),
             auth_provider: self.auth_provider,
             request_timeout: Duration::from_millis(self.config.server.request_timeout_ms),
+            streaming_runtime,
         };
 
         Ok(AlbedoServer {
@@ -235,13 +262,6 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
 
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(str::to_string);
-    let (parts, body) = request.into_parts();
-    let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(err) => {
-            return RuntimeError::RequestBodyRead(err.to_string()).into_response();
-        }
-    };
 
     let route_match = state.router.match_route(method, path.as_str());
     let response = match route_match {
@@ -264,6 +284,22 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
         )
         .into_response(),
         RouteMatch::Matched(matched) => {
+            if should_use_manifest_streaming(&state, &matched.target, method, path.as_str()) {
+                if let Some(streaming_runtime) = &state.streaming_runtime {
+                    return streaming_handler(State(streaming_runtime.clone()), request)
+                        .await
+                        .into_response();
+                }
+            }
+
+            let (parts, body) = request.into_parts();
+            let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(err) => {
+                    return RuntimeError::RequestBodyRead(err.to_string()).into_response();
+                }
+            };
+
             let mut request_context = RequestContext::new(
                 method,
                 path.clone(),
@@ -344,6 +380,34 @@ async fn execute_route(
     }
 
     Ok(response)
+}
+fn should_use_manifest_streaming(
+    state: &RuntimeState,
+    target: &RouteTarget,
+    method: HttpMethod,
+    path: &str,
+) -> bool {
+    if !matches!(method, HttpMethod::Get | HttpMethod::Head) {
+        return false;
+    }
+
+    if target.entry_module.is_none() {
+        return false;
+    }
+
+    if target.props_loader.is_some() || target.auth.is_some() {
+        return false;
+    }
+
+    if !target.middleware.is_empty() || !target.layout_handlers.is_empty() {
+        return false;
+    }
+
+    state
+        .streaming_runtime
+        .as_ref()
+        .map(|runtime| runtime.manifest.routes.contains_key(path))
+        .unwrap_or(false)
 }
 
 async fn apply_layout_handlers(

@@ -1,7 +1,9 @@
 pub mod config;
 pub mod contract;
 pub mod error;
+pub mod handlers;
 pub mod lifecycle;
+pub mod render;
 pub mod renderer_runtime;
 pub mod routing;
 pub mod server;
@@ -12,7 +14,11 @@ pub use contract::{
     RuntimeMiddleware,
 };
 pub use error::RuntimeError;
+pub use handlers::{streaming_handler, StreamingAppState};
 pub use lifecycle::{RequestContext, ResponseBody, ResponsePayload};
+pub use render::{
+    InjectionChunk, RenderError as TierBRenderError, TierBDataFetcher, TierBRenderRegistry,
+};
 pub use renderer_runtime::{
     RendererRuntime, RENDER_MANIFEST_FILENAME, RUNTIME_MODULE_SOURCES_FILENAME,
 };

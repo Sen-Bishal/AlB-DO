@@ -68,6 +68,7 @@ mod tests {
             parallel_batches: vec![vec![1]],
             critical_path: vec![1],
             vendor_chunks: Vec::new(),
+            ..RenderManifestV2::legacy_defaults()
         };
 
         let artifacts = build_hydration_artifacts(&manifest, "routes/entry").unwrap();

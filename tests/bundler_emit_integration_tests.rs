@@ -79,6 +79,7 @@ fn fixture_manifest() -> RenderManifestV2 {
             chunk_name: "vendor.core".to_string(),
             packages: vec!["react".to_string()],
         }],
+        ..RenderManifestV2::legacy_defaults()
     }
 }
 
@@ -124,6 +125,7 @@ fn fixture_static_slice_manifest() -> RenderManifestV2 {
         parallel_batches: vec![vec![1, 2], vec![3]],
         critical_path: vec![3],
         vendor_chunks: Vec::new(),
+        ..RenderManifestV2::legacy_defaults()
     }
 }
 

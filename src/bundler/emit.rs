@@ -3,7 +3,7 @@ use super::plan::BundlePlan;
 use super::precompiled::build_precompiled_runtime_modules_artifact;
 use super::rewrite::{build_wrapper_module_source, RewriteAction};
 use super::static_slice::build_bundle_static_slice_manifest;
-use crate::manifest::schema::{PrecompiledRuntimeModulesArtifact, RenderManifestV2};
+use crate::manifest::schema::{DomPosition, PrecompiledRuntimeModulesArtifact, RenderManifestV2};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -46,6 +46,8 @@ pub struct BundleRuntimeModule {
     pub dependency_ids: Vec<u64>,
     pub wrapper_module: String,
     pub vendor_chunks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dom_position: Option<DomPosition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,6 +171,7 @@ pub fn build_bundle_runtime_map(plan: &BundlePlan) -> BundleRuntimeMap {
                 .get(&module.component_id)
                 .map(|paths| paths.iter().cloned().collect())
                 .unwrap_or_default(),
+            dom_position: module.dom_position.clone(),
         })
         .collect();
 
@@ -503,6 +506,7 @@ mod tests {
                 class: BundleClass::Entry,
                 dependency_ids: Vec::new(),
                 wrapper_module_path: "__albedo__/wrappers/abc_src_routes_home_tsx.mjs".to_string(),
+                dom_position: None,
             }],
             vendor_chunks: vec![VendorChunkPlan {
                 chunk_name: "vendor.core".to_string(),

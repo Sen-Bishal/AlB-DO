@@ -1,10 +1,13 @@
+pub mod builder;
 pub mod schema;
 
 use crate::effects::{decide_tier_and_hydration, TieringInputs};
 use crate::graph::ComponentGraph;
-use crate::types::{Component, OptimizationResult};
+use crate::types::{Component, ComponentId, OptimizationResult};
+use builder::{ComponentTierMetadata, ManifestBuilder};
 use schema::{ComponentManifestEntry, HydrationMode, RenderManifestV2};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct ManifestOptions {
@@ -12,6 +15,7 @@ pub struct ManifestOptions {
     pub tier_c_split_min_bytes: u64,
     pub tier_b_mode: HydrationMode,
     pub tier_c_mode: HydrationMode,
+    pub tier_b_timeout_ms: u64,
 }
 
 impl Default for ManifestOptions {
@@ -21,6 +25,7 @@ impl Default for ManifestOptions {
             tier_c_split_min_bytes: 40 * 1024,
             tier_b_mode: HydrationMode::OnIdle,
             tier_c_mode: HydrationMode::OnVisible,
+            tier_b_timeout_ms: 2000,
         }
     }
 }
@@ -36,6 +41,7 @@ pub fn build_render_manifest_v2(
     let mut components: Vec<Component> = graph.components();
     components.sort_by_key(|component| component.id.as_u64());
 
+    let mut tier_metadata: HashMap<ComponentId, ComponentTierMetadata> = HashMap::new();
     let mut component_entries: Vec<ComponentManifestEntry> = components
         .iter()
         .map(|component| {
@@ -46,6 +52,14 @@ pub fn build_render_manifest_v2(
                 component.is_above_fold,
                 weight_bytes,
                 tiering_inputs_from_options(options),
+            );
+            tier_metadata.insert(
+                component.id,
+                ComponentTierMetadata {
+                    tier: decision.tier,
+                    hydration_mode: decision.hydration_mode,
+                    effect_profile: component.effect_profile,
+                },
             );
 
             let mut dependencies: Vec<u64> = graph
@@ -87,7 +101,29 @@ pub fn build_render_manifest_v2(
         .map(|id| id.as_u64())
         .collect::<Vec<u64>>();
 
+    let manifest_builder = ManifestBuilder::new(graph, tier_metadata, options.tier_b_timeout_ms);
+    let assets = manifest_builder.build_assets_manifest();
+    let build_id = manifest_builder.build_build_id();
+    let mut routes = HashMap::new();
+
+    for (route_path, root_component) in entry_components_for_routes(graph, result) {
+        let route =
+            manifest_builder.build_route_manifest(route_path.as_str(), root_component, &assets);
+        routes.insert(route.route.clone(), route);
+    }
+
+    if routes.is_empty() {
+        if let Some(root_component) = entry_component_for_route(graph, result) {
+            let route = manifest_builder.build_route_manifest("/", root_component, &assets);
+            routes.insert(route.route.clone(), route);
+        }
+    }
+
     RenderManifestV2 {
+        version: RenderManifestV2::VERSION,
+        build_id,
+        routes,
+        assets,
         schema_version: RenderManifestV2::SCHEMA_VERSION.to_string(),
         generated_at: result.generated_at.clone(),
         components: component_entries,
@@ -123,6 +159,77 @@ fn tiering_inputs_from_options(options: &ManifestOptions) -> TieringInputs {
         tier_b_mode: options.tier_b_mode,
         tier_c_mode: options.tier_c_mode,
     }
+}
+
+fn entry_component_for_route(
+    graph: &ComponentGraph,
+    result: &OptimizationResult,
+) -> Option<ComponentId> {
+    result.critical_path.last().copied().or_else(|| {
+        let mut ids = graph.component_ids();
+        ids.sort_unstable_by_key(|id| id.as_u64());
+        ids.first().copied()
+    })
+}
+
+fn entry_components_for_routes(
+    graph: &ComponentGraph,
+    result: &OptimizationResult,
+) -> Vec<(String, ComponentId)> {
+    let mut route_map: BTreeMap<String, ComponentId> = BTreeMap::new();
+
+    let mut component_ids = graph.component_ids();
+    component_ids.sort_unstable_by_key(|id| id.as_u64());
+
+    for id in component_ids {
+        if !graph.get_dependents(&id).is_empty() {
+            continue;
+        }
+
+        let Some(component) = graph.get(&id) else {
+            continue;
+        };
+        let Some(route_path) = route_path_from_component(component.file_path.as_str()) else {
+            continue;
+        };
+
+        route_map.entry(route_path).or_insert(id);
+    }
+
+    if route_map.is_empty() {
+        if let Some(entry) = entry_component_for_route(graph, result) {
+            route_map.insert("/".to_string(), entry);
+        }
+    }
+
+    route_map.into_iter().collect()
+}
+
+fn route_path_from_component(file_path: &str) -> Option<String> {
+    let normalized = file_path.replace('\\', "/");
+    let route_hint = normalized
+        .split_once("/routes/")
+        .map(|(_, tail)| tail.to_string())
+        .or_else(|| normalized.strip_prefix("routes/").map(str::to_string))?;
+
+    let mut route = Path::new(route_hint.as_str())
+        .with_extension("")
+        .to_string_lossy()
+        .replace('\\', "/");
+    route = route.trim_matches('/').to_string();
+
+    if route.ends_with("/index") {
+        route = route
+            .trim_end_matches("/index")
+            .trim_matches('/')
+            .to_string();
+    }
+
+    if route.is_empty() || route == "index" || route == "home" || route == "app" {
+        return Some("/".to_string());
+    }
+
+    Some(format!("/{}", route))
 }
 
 fn compute_priority(
@@ -214,5 +321,30 @@ mod tests {
 
         assert_eq!(entry.tier, Tier::B);
         assert_eq!(entry.hydration_mode, HydrationMode::OnIdle);
+    }
+
+    #[test]
+    fn test_build_render_manifest_v2_registers_multiple_routes() {
+        let mut compiler = RenderCompiler::new();
+
+        let mut home = Component::new(ComponentId::new(0), "Home".to_string());
+        home.file_path = "src/routes/home.tsx".to_string();
+        home.is_above_fold = true;
+        home.weight = 1024.0;
+
+        let mut about = Component::new(ComponentId::new(0), "About".to_string());
+        about.file_path = "src/routes/about.tsx".to_string();
+        about.is_above_fold = true;
+        about.weight = 1024.0;
+
+        compiler.add_component(home);
+        compiler.add_component(about);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        assert!(manifest.routes.contains_key("/"));
+        assert!(manifest.routes.contains_key("/about"));
     }
 }

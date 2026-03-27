@@ -1,7 +1,7 @@
 use super::classify::{classify_component, BundleClass};
 use super::rewrite::{stable_wrapper_module_path, RewriteAction};
 use super::vendor::{infer_package_name, plan_vendor_chunks, VendorChunkPlan, VendorPlanOptions};
-use crate::manifest::schema::RenderManifestV2;
+use crate::manifest::schema::{DomPosition, RenderManifestV2};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,6 +27,8 @@ pub struct BundleModulePlan {
     pub class: BundleClass,
     pub dependency_ids: Vec<u64>,
     pub wrapper_module_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dom_position: Option<DomPosition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +51,7 @@ pub fn build_bundle_plan(manifest: &RenderManifestV2, options: &BundlePlanOption
         .collect::<BTreeSet<_>>();
     let vendor_chunks = plan_vendor_chunks(manifest, &options.vendor);
     let chunk_index = build_vendor_chunk_index(&vendor_chunks);
+    let dom_position_index = build_dom_position_index(manifest);
 
     let mut components = manifest.components.clone();
     components.sort_by(|left, right| {
@@ -72,6 +75,7 @@ pub fn build_bundle_plan(manifest: &RenderManifestV2, options: &BundlePlanOption
             class,
             dependency_ids,
             wrapper_module_path: wrapper_module_path.clone(),
+            dom_position: dom_position_index.get(&component.name).cloned(),
         });
 
         rewrite_actions.push(RewriteAction::WrapModule {
@@ -104,6 +108,35 @@ pub fn build_bundle_plan(manifest: &RenderManifestV2, options: &BundlePlanOption
         vendor_chunks,
         rewrite_actions,
     }
+}
+
+fn build_dom_position_index(manifest: &RenderManifestV2) -> BTreeMap<String, DomPosition> {
+    let mut index = BTreeMap::new();
+
+    for route in manifest.routes.values() {
+        for node in &route.tier_a_root {
+            index
+                .entry(node.component_id.clone())
+                .or_insert_with(|| node.position.clone());
+        }
+        for node in &route.tier_b {
+            index
+                .entry(node.component_id.clone())
+                .or_insert_with(|| node.position.clone());
+            for child in &node.tier_a_children {
+                index
+                    .entry(child.component_id.clone())
+                    .or_insert_with(|| child.position.clone());
+            }
+        }
+        for node in &route.tier_c {
+            index
+                .entry(node.component_id.clone())
+                .or_insert_with(|| node.position.clone());
+        }
+    }
+
+    index
 }
 
 fn build_vendor_chunk_index(chunks: &[VendorChunkPlan]) -> BTreeMap<String, Vec<String>> {
@@ -182,6 +215,7 @@ mod tests {
                 chunk_name: "vendor.core".to_string(),
                 packages: vec!["react".to_string()],
             }],
+            ..RenderManifestV2::legacy_defaults()
         }
     }
 

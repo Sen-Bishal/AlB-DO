@@ -1,4 +1,7 @@
+use crate::manifest::schema::RenderManifestV2;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadErrorKind {
@@ -126,5 +129,63 @@ pub trait RuntimeEngine {
     }
     fn is_initialized(&self) -> bool {
         false
+    }
+}
+
+#[derive(Debug)]
+pub struct ManifestSentinelRing {
+    current_manifest: Arc<RwLock<Arc<RenderManifestV2>>>,
+    slots: Vec<RwLock<Option<Arc<RenderManifestV2>>>>,
+    head: AtomicUsize,
+}
+
+impl ManifestSentinelRing {
+    pub fn new(initial_manifest: Arc<RenderManifestV2>, ring_size: usize) -> Self {
+        let normalized_size = ring_size.max(1);
+        let slots = (0..normalized_size)
+            .map(|_| RwLock::new(None))
+            .collect::<Vec<_>>();
+
+        Self {
+            current_manifest: Arc::new(RwLock::new(initial_manifest)),
+            slots,
+            head: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn acquire(&self) -> Arc<RenderManifestV2> {
+        let manifest = self
+            .current_manifest
+            .read()
+            .expect("manifest lock poisoned")
+            .clone();
+        let slot = self.next_slot();
+        if let Ok(mut guard) = self.slots[slot].write() {
+            *guard = Some(manifest.clone());
+        }
+        manifest
+    }
+
+    pub fn publish(&self, new_manifest: Arc<RenderManifestV2>) {
+        if let Ok(mut guard) = self.current_manifest.write() {
+            *guard = new_manifest;
+        }
+    }
+
+    pub fn clear_slot(&self, slot: usize) {
+        if let Some(slot_ref) = self.slots.get(slot) {
+            if let Ok(mut guard) = slot_ref.write() {
+                *guard = None;
+            }
+        }
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn next_slot(&self) -> usize {
+        let next = self.head.fetch_add(1, Ordering::AcqRel);
+        next % self.slots.len()
     }
 }

@@ -209,6 +209,7 @@ mod tests {
             parallel_batches: vec![vec![1, 2, 3]],
             critical_path: vec![1],
             vendor_chunks: Vec::new(),
+            ..RenderManifestV2::legacy_defaults()
         };
 
         let mut sources = HashMap::new();

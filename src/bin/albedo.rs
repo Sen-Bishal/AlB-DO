@@ -20,6 +20,14 @@ use walkdir::WalkDir;
 
 const RULE_WIDTH: usize = 92;
 const PORT_AUTO_INCREMENT_LIMIT: u16 = 10;
+static DEV_PULSE_TICK: AtomicU64 = AtomicU64::new(0);
+
+const BANNER_PALETTE: [u8; 5] = [45, 81, 117, 153, 189];
+const RULE_PALETTE: [u8; 4] = [39, 45, 81, 117];
+const LOADING_FRAMES: [&str; 4] = [".", "o", "O", "o"];
+const RENDER_FRAMES: [&str; 4] = ["-", "=", "~", "="];
+const LOADING_COLORS: [u8; 4] = [45, 81, 117, 81];
+const RENDER_COLORS: [u8; 4] = [39, 45, 81, 117];
 
 #[derive(Clone)]
 struct DevAllRoutesArtifact {
@@ -325,10 +333,11 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         bind_dev_listener(contract.server.host.as_str(), contract.server.port)?;
 
     println!(
-        "  {} prewarming renderer ({} routes, {:.2}ms render time)",
+        "  {} {} prewarming renderer ({} routes, {} render time)",
         style("[dev]", "1;34"),
+        next_loading_icon(),
         initial.route_documents.len(),
-        initial.render_ms
+        colorize_timing_ms(initial.render_ms)
     );
     let shared_state = Arc::new(Mutex::new(SharedDevState {
         project,
@@ -382,6 +391,7 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
             contract.watch.debounce_ms
         ),
     );
+    print_timing_legend();
     if let Some(components) = scanned_components.as_ref() {
         print_kv("Components", components.len());
     }
@@ -601,19 +611,23 @@ fn watch_and_rebuild_loop(
                     if contract.hmr.enabled {
                         broadcast_reload_event(&sse_clients, next_revision);
                     }
+                    let rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
                     println!(
-                        "  {} rebuild complete in {:.2}ms (reparsed={}, skipped={}, deleted={})",
+                        "  {} {} rebuild complete in {} (reparsed={}, skipped={}, deleted={})",
                         style("[dev]", "1;32"),
-                        rebuild_start.elapsed().as_secs_f64() * 1000.0,
+                        next_render_icon(),
+                        colorize_timing_ms(rebuild_ms),
                         patch_report.reparsed,
                         patch_report.skipped_unchanged,
                         patch_report.deleted
                     );
                 } else {
+                    let noop_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
                     println!(
-                        "  {} no-op change in {:.2}ms (skipped={})",
+                        "  {} {} no-op change in {} (skipped={})",
                         style("[dev]", "1;34"),
-                        rebuild_start.elapsed().as_secs_f64() * 1000.0,
+                        next_loading_icon(),
+                        colorize_timing_ms(noop_ms),
                         patch_report.skipped_unchanged
                     );
                 }
@@ -781,17 +795,20 @@ fn handle_dev_connection(
     sse_clients: Arc<Mutex<Vec<TcpStream>>>,
     hmr_enabled: bool,
 ) -> std::io::Result<()> {
+    let socket_start = Instant::now();
     let mut first_line = String::new();
     {
         let mut reader = BufReader::new(stream.try_clone()?);
         reader.read_line(&mut first_line)?;
     }
+    let socket_wait_ms = socket_start.elapsed().as_secs_f64() * 1000.0;
+    let request_start = Instant::now();
 
     let method = first_line.split_whitespace().next().unwrap_or("GET");
     let raw_target = first_line.split_whitespace().nth(1).unwrap_or("/");
     let path = normalize_request_path(raw_target);
 
-    let (status, render_ms) = if method != "GET" {
+    let (status, build_render_ms, build_total_ms, route_like) = if method != "GET" {
         write_http_response(
             &mut stream,
             405,
@@ -800,7 +817,7 @@ fn handle_dev_connection(
             b"Method not allowed\n",
             &[],
         )?;
-        (405, 0.0)
+        (405, 0.0, 0.0, false)
     } else if path == "/_albedo/health" {
         write_http_response(
             &mut stream,
@@ -810,7 +827,7 @@ fn handle_dev_connection(
             b"ok\n",
             &[],
         )?;
-        (200, 0.0)
+        (200, 0.0, 0.0, false)
     } else if path == "/_albedo/hmr" && hmr_enabled {
         write_sse_handshake(&mut stream)?;
         if let Ok(mut clients) = sse_clients.lock() {
@@ -838,7 +855,12 @@ fn handle_dev_connection(
                 state.last_error.clone(),
             )
         };
+        let header_request_ms = request_start.elapsed().as_secs_f64() * 1000.0;
         let mut headers = vec![
+            ("x-albedo-socket-wait-ms", format!("{:.2}", socket_wait_ms)),
+            ("x-albedo-request-ms", format!("{:.2}", header_request_ms)),
+            ("x-albedo-build-render-ms", format!("{:.2}", render_ms)),
+            ("x-albedo-build-total-ms", format!("{:.2}", total_ms)),
             ("x-albedo-render-ms", format!("{:.2}", render_ms)),
             ("x-albedo-total-ms", format!("{:.2}", total_ms)),
             ("cache-control", "no-store".to_string()),
@@ -856,7 +878,7 @@ fn handle_dev_connection(
             doc.as_bytes(),
             headers.as_slice(),
         )?;
-        (200, render_ms)
+        (200, render_ms, total_ms, true)
     } else {
         write_http_response(
             &mut stream,
@@ -866,16 +888,42 @@ fn handle_dev_connection(
             b"Not found\n",
             &[],
         )?;
-        (404, 0.0)
+        (404, 0.0, 0.0, false)
     };
+    let request_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+    let icon = if route_like {
+        next_render_icon()
+    } else {
+        next_loading_icon()
+    };
+    let request_ms_colored = colorize_timing_ms(request_ms);
+    let socket_wait_ms_colored = colorize_timing_ms(socket_wait_ms);
+    let build_render_ms_colored = colorize_timing_ms(build_render_ms);
+    let build_total_ms_colored = colorize_timing_ms(build_total_ms);
 
-    println!(
-        "  [dev] {method} {path} -> {status} ({render_ms:.2}ms)",
-        method = method,
-        path = path,
-        status = status,
-        render_ms = render_ms
-    );
+    if route_like {
+        println!(
+            "  [dev] {icon} {method} {path} -> {status} (request={request_ms_colored}, socket_wait={socket_wait_ms_colored}, build_render={build_render_ms_colored}, build_total={build_total_ms_colored})",
+            icon = icon,
+            method = method,
+            path = path,
+            status = status,
+            request_ms_colored = request_ms_colored,
+            socket_wait_ms_colored = socket_wait_ms_colored,
+            build_render_ms_colored = build_render_ms_colored,
+            build_total_ms_colored = build_total_ms_colored
+        );
+    } else {
+        println!(
+            "  [dev] {icon} {method} {path} -> {status} (request={request_ms_colored}, socket_wait={socket_wait_ms_colored})",
+            icon = icon,
+            method = method,
+            path = path,
+            status = status,
+            request_ms_colored = request_ms_colored,
+            socket_wait_ms_colored = socket_wait_ms_colored
+        );
+    }
     Ok(())
 }
 
@@ -1251,11 +1299,35 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
             manifest_path.display()
         )
     })?;
+    let runtime_asset_path = out_dir.join("_albedo").join("runtime.js");
+    if let Some(parent) = runtime_asset_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create runtime asset directory '{}': {err}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(&runtime_asset_path, albedo_runtime_shim_template()).map_err(|err| {
+        format!(
+            "failed to write runtime shim '{}': {err}",
+            runtime_asset_path.display()
+        )
+    })?;
+    let hydration_asset_path = out_dir.join("_albedo").join("hydration.js");
+    std::fs::write(&hydration_asset_path, albedo_hydration_runtime_template()).map_err(|err| {
+        format!(
+            "failed to write hydration runtime '{}': {err}",
+            hydration_asset_path.display()
+        )
+    })?;
 
     print_ok("Optimized production build complete");
     print_kv("Output", out_dir.display());
-    print_kv("Artifacts", report.artifacts.len() + 1);
+    print_kv("Artifacts", report.artifacts.len() + 3);
     print_kv("Manifest", manifest_path.display());
+    print_kv("Shim Runtime", runtime_asset_path.display());
+    print_kv("Hydration Runtime", hydration_asset_path.display());
     print_kv(
         "Compile Time",
         format!("{:.2}ms", compile_start.elapsed().as_secs_f64() * 1000.0),
@@ -1367,6 +1439,18 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
             PathBuf::from("src/components/theme.css"),
             theme_css_template(),
         ),
+        (
+            PathBuf::from("src/components/albedo-shell.html"),
+            shell_template(),
+        ),
+        (
+            PathBuf::from("public/_albedo/runtime.js"),
+            albedo_runtime_shim_template(),
+        ),
+        (
+            PathBuf::from("public/_albedo/hydration.js"),
+            albedo_hydration_runtime_template(),
+        ),
         (PathBuf::from("public/.gitkeep"), String::new()),
     ];
 
@@ -1461,6 +1545,19 @@ fn theme_css_template() -> String {
         .to_string()
 }
 
+fn shell_template() -> String {
+    "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Shell</title>\n</head>\n<body>\n  <script type=\"module\" src=\"/_albedo/runtime.js\"></script>\n  <!--__SLOT___a_root-->\n</body>\n</html>\n"
+        .to_string()
+}
+
+fn albedo_runtime_shim_template() -> String {
+    include_str!("../../assets/albedo-runtime.js").to_string()
+}
+
+fn albedo_hydration_runtime_template() -> String {
+    include_str!("../../assets/albedo-hydration.js").to_string()
+}
+
 fn tsconfig_template() -> String {
     "{\n  \"compilerOptions\": {\n    \"target\": \"ES2022\",\n    \"module\": \"ESNext\",\n    \"moduleResolution\": \"Bundler\",\n    \"strict\": true,\n    \"jsx\": \"preserve\",\n    \"noEmit\": true,\n    \"skipLibCheck\": true,\n    \"types\": []\n  },\n  \"include\": [\n    \"src/**/*\",\n    \"albedo-env.d.ts\"\n  ]\n}\n"
         .to_string()
@@ -1537,18 +1634,41 @@ fn print_option(option: &str, description: &str) {
 fn print_banner() {
     let rule = "=".repeat(RULE_WIDTH);
     println!();
-    println!("{}", accent(&rule));
+    println!("{}", gradient_text(&rule, &RULE_PALETTE, false));
     println!(
         "{} {}",
-        style("ALBEDO CLI", "1;36"),
+        gradient_text("ALBEDO CLI", &BANNER_PALETTE, true),
         style("Modern Build Surface for Rust + JSX Projects", "2")
     );
-    println!("{}", accent(&rule));
+    println!("{}", gradient_text(&rule, &RULE_PALETTE, false));
 }
 
 fn print_section(title: &str) {
     println!();
     println!("{}", style(&format!("[{title}]"), "1;34"));
+}
+
+fn print_timing_legend() {
+    print_kv(
+        "Timing Index",
+        format!(
+            "{} <=1ms  {} <=25ms  {} <=250ms  {} >250ms",
+            style("GREEN", "1;32"),
+            style("CYAN", "1;36"),
+            style("YELLOW", "1;33"),
+            style("RED", "1;31")
+        ),
+    );
+    print_kv(
+        "Metrics",
+        format!(
+            "request={} socket_wait={} build_render={} build_total={}",
+            style("client->server", "2"),
+            style("socket idle", "2"),
+            style("route pre-render", "2"),
+            style("full prewarm", "2")
+        ),
+    );
 }
 
 fn print_kv(label: &str, value: impl std::fmt::Display) {
@@ -1567,8 +1687,64 @@ fn print_error(message: impl std::fmt::Display) {
     eprintln!("{} {}", style("[ERROR]", "1;31"), message);
 }
 
-fn accent(value: &str) -> String {
-    style(value, "36")
+fn colorize_timing_ms(value_ms: f64) -> String {
+    let code = if value_ms <= 1.0 {
+        "1;32"
+    } else if value_ms <= 25.0 {
+        "1;36"
+    } else if value_ms <= 250.0 {
+        "1;33"
+    } else {
+        "1;31"
+    };
+    style(&format!("{value_ms:.2}ms"), code)
+}
+
+fn next_loading_icon() -> String {
+    next_pulse_icon(&LOADING_FRAMES, &LOADING_COLORS, true)
+}
+
+fn next_render_icon() -> String {
+    next_pulse_icon(&RENDER_FRAMES, &RENDER_COLORS, true)
+}
+
+fn next_pulse_icon(frames: &[&str], colors: &[u8], bold: bool) -> String {
+    if frames.is_empty() {
+        return String::new();
+    }
+    let tick = DEV_PULSE_TICK.fetch_add(1, Ordering::Relaxed) as usize;
+    let frame = frames[tick % frames.len()];
+    let color = if colors.is_empty() {
+        81
+    } else {
+        colors[tick % colors.len()]
+    };
+    style_256(frame, color, bold)
+}
+
+fn gradient_text(value: &str, palette: &[u8], bold: bool) -> String {
+    if !supports_color() || value.is_empty() || palette.is_empty() {
+        return value.to_string();
+    }
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut out = String::new();
+    let max_idx = chars.len().saturating_sub(1).max(1);
+    for (idx, ch) in chars.iter().enumerate() {
+        let palette_idx = (idx * (palette.len() - 1)) / max_idx;
+        out.push_str(&style_256(ch.to_string().as_str(), palette[palette_idx], bold));
+    }
+    out
+}
+
+fn style_256(value: &str, color: u8, bold: bool) -> String {
+    if !supports_color() {
+        return value.to_string();
+    }
+    if bold {
+        format!("\u{1b}[1;38;5;{color}m{value}\u{1b}[0m")
+    } else {
+        format!("\u{1b}[38;5;{color}m{value}\u{1b}[0m")
+    }
 }
 
 fn style(value: &str, code: &str) -> String {

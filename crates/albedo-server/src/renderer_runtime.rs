@@ -82,6 +82,10 @@ impl RendererRuntime {
     pub fn revalidate_tag(&mut self, tag: &str) {
         self.renderer.revalidate_tag(tag);
     }
+
+    pub fn manifest(&self) -> &RenderManifestV2 {
+        &self.manifest
+    }
 }
 
 fn load_precompiled_modules(

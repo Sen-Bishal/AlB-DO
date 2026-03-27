@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Tier {
@@ -8,12 +10,172 @@ pub enum Tier {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
 pub enum HydrationMode {
+    Immediate,
+    LazyViewport,
+    LazyInteraction,
+    LazyIdle,
     None,
     OnVisible,
     OnIdle,
     OnInteraction,
-    Immediate,
+}
+
+impl HydrationMode {
+    pub fn into_streaming(self) -> Self {
+        match self {
+            Self::Immediate => Self::Immediate,
+            Self::LazyViewport | Self::OnVisible => Self::LazyViewport,
+            Self::LazyInteraction | Self::OnInteraction => Self::LazyInteraction,
+            Self::LazyIdle | Self::OnIdle => Self::LazyIdle,
+            Self::None => Self::None,
+        }
+    }
+}
+
+/// The full manifest written to disk at build time and loaded at server startup.
+///
+/// `schema_version` + legacy component fields are retained for backward compatibility
+/// with existing tooling while the new route schedule is rolled out.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenderManifestV2 {
+    pub version: u32,
+    pub build_id: String,
+    pub routes: HashMap<String, RouteManifest>,
+    pub assets: AssetManifest,
+    #[serde(default)]
+    pub schema_version: String,
+    #[serde(default)]
+    pub generated_at: String,
+    #[serde(default)]
+    pub components: Vec<ComponentManifestEntry>,
+    #[serde(default)]
+    pub parallel_batches: Vec<Vec<u64>>,
+    #[serde(default)]
+    pub critical_path: Vec<u64>,
+    #[serde(default)]
+    pub vendor_chunks: Vec<VendorChunk>,
+}
+
+impl RenderManifestV2 {
+    pub const SCHEMA_VERSION: &'static str = "2.0";
+    pub const VERSION: u32 = 2;
+
+    pub fn legacy_defaults() -> Self {
+        Self {
+            version: Self::VERSION,
+            build_id: String::new(),
+            routes: HashMap::new(),
+            assets: AssetManifest::default(),
+            schema_version: Self::SCHEMA_VERSION.to_string(),
+            generated_at: String::new(),
+            components: Vec::new(),
+            parallel_batches: Vec::new(),
+            critical_path: Vec::new(),
+            vendor_chunks: Vec::new(),
+        }
+    }
+}
+
+/// Per-route streaming schedule produced at compile time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouteManifest {
+    pub route: String,
+    pub shell: HtmlShell,
+    pub tier_a_root: Vec<RenderedNode>,
+    pub tier_b: Vec<TierBNode>,
+    pub tier_c: Vec<TierCNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenderedNode {
+    pub component_id: String,
+    pub placeholder_id: String,
+    pub html: String,
+    pub position: DomPosition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TierBNode {
+    pub component_id: String,
+    pub placeholder_id: String,
+    pub render_fn: String,
+    pub static_props: Value,
+    pub dynamic_prop_keys: Vec<String>,
+    pub data_deps: Vec<DataDep>,
+    pub tier_a_children: Vec<RenderedNode>,
+    pub position: DomPosition,
+    pub timeout_ms: u64,
+    pub fallback_html: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TierCNode {
+    pub component_id: String,
+    pub placeholder_id: String,
+    pub bundle_path: String,
+    pub initial_props: Value,
+    pub hydration_mode: HydrationMode,
+    pub position: DomPosition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomPosition {
+    pub parent_placeholder: Option<String>,
+    pub slot: String,
+    pub order: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DataDep {
+    pub key: String,
+    pub source: DataSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DataSource {
+    DbQuery {
+        query: String,
+        param_keys: Vec<String>,
+    },
+    HttpFetch {
+        url_template: String,
+        method: String,
+    },
+    Cache {
+        cache_key_template: String,
+        ttl_s: u64,
+    },
+    RequestContext {
+        key: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HtmlShell {
+    pub doctype_and_head: String,
+    pub body_open: String,
+    pub body_close: String,
+    pub shim_script: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssetManifest {
+    pub chunks: HashMap<String, String>,
+    pub css: Vec<String>,
+    pub runtime: String,
+}
+
+impl Default for AssetManifest {
+    fn default() -> Self {
+        Self {
+            chunks: HashMap::new(),
+            css: Vec::new(),
+            runtime: "/_albedo/runtime.js".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -33,20 +195,6 @@ pub struct ComponentManifestEntry {
 pub struct VendorChunk {
     pub chunk_name: String,
     pub packages: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RenderManifestV2 {
-    pub schema_version: String,
-    pub generated_at: String,
-    pub components: Vec<ComponentManifestEntry>,
-    pub parallel_batches: Vec<Vec<u64>>,
-    pub critical_path: Vec<u64>,
-    pub vendor_chunks: Vec<VendorChunk>,
-}
-
-impl RenderManifestV2 {
-    pub const SCHEMA_VERSION: &'static str = "2.0";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,4 +248,14 @@ pub struct PrecompiledRuntimeModulesArtifact {
 impl PrecompiledRuntimeModulesArtifact {
     pub const VERSION: &'static str = "1.0";
     pub const ENGINE_QUICKJS: &'static str = "quickjs";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HydrationMode;
+
+    #[test]
+    fn test_hydration_mode_none_stays_none_for_streaming() {
+        assert_eq!(HydrationMode::None.into_streaming(), HydrationMode::None);
+    }
 }

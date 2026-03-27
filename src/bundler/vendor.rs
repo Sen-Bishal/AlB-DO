@@ -179,6 +179,7 @@ mod tests {
             parallel_batches: Vec::new(),
             critical_path: Vec::new(),
             vendor_chunks: Vec::new(),
+            ..RenderManifestV2::legacy_defaults()
         };
 
         let chunks = plan_vendor_chunks(&manifest, &VendorPlanOptions::default());

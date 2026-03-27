@@ -6,6 +6,7 @@ license = "MIT"
 
 [dependencies]
 async-trait = "0.1"
+async-stream = "0.3"
 axum = "0.8"
 bytes = "1.7"
 dom-render-compiler = { path = "../.." }

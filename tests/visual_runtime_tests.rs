@@ -33,7 +33,7 @@ fn assert_matches_fixture(actual: &str, fixture_name: &str) {
 }
 
 fn create_renderer() -> ServerRenderer<QuickJsEngine> {
-    let engine = QuickJsEngine::new().expect("engine should initialize");
+    let engine = QuickJsEngine::new();
     let bootstrap = BootstrapPayload::default();
     ServerRenderer::new(engine, &bootstrap).expect("renderer should initialize")
 }
@@ -162,6 +162,7 @@ fn test_visual_snapshot_manifest_driven_case_study_route() {
         parallel_batches: vec![vec![11, 12], vec![13]],
         critical_path: vec![11, 13],
         vendor_chunks: Vec::new(),
+        ..RenderManifestV2::legacy_defaults()
     };
 
     let mut sources = HashMap::new();

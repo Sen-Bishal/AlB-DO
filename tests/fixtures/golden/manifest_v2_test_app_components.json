@@ -1,4 +1,10 @@
 {
+  "assets": {
+    "chunks": {},
+    "css": [],
+    "runtime": "/_albedo/runtime.js"
+  },
+  "build_id": "27a72ab37668d78a",
   "components": [
     {
       "can_defer": true,
@@ -8,7 +14,7 @@
         5,
         6
       ],
-      "hydration_mode": "None",
+      "hydration_mode": "none",
       "id": 0,
       "module_path": "test-app/src/components/App.jsx",
       "name": "App",
@@ -19,7 +25,7 @@
     {
       "can_defer": true,
       "dependencies": [],
-      "hydration_mode": "OnIdle",
+      "hydration_mode": "on_idle",
       "id": 1,
       "module_path": "test-app/src/components/Button.jsx",
       "name": "Button",
@@ -30,7 +36,7 @@
     {
       "can_defer": true,
       "dependencies": [],
-      "hydration_mode": "None",
+      "hydration_mode": "none",
       "id": 2,
       "module_path": "test-app/src/components/FeatureCard.jsx",
       "name": "FeatureCard",
@@ -43,7 +49,7 @@
       "dependencies": [
         2
       ],
-      "hydration_mode": "None",
+      "hydration_mode": "none",
       "id": 3,
       "module_path": "test-app/src/components/Features.jsx",
       "name": "Features",
@@ -54,7 +60,7 @@
     {
       "can_defer": true,
       "dependencies": [],
-      "hydration_mode": "None",
+      "hydration_mode": "none",
       "id": 4,
       "module_path": "test-app/src/components/Footer.jsx",
       "name": "Footer",
@@ -67,7 +73,7 @@
       "dependencies": [
         7
       ],
-      "hydration_mode": "None",
+      "hydration_mode": "none",
       "id": 5,
       "module_path": "test-app/src/components/Header.jsx",
       "name": "Header",
@@ -78,7 +84,7 @@
     {
       "can_defer": false,
       "dependencies": [],
-      "hydration_mode": "None",
+      "hydration_mode": "none",
       "id": 6,
       "module_path": "test-app/src/components/HeroImage.jsx",
       "name": "HeroImage",
@@ -91,7 +97,7 @@
       "dependencies": [
         1
       ],
-      "hydration_mode": "None",
+      "hydration_mode": "none",
       "id": 7,
       "module_path": "test-app/src/components/Navigation.jsx",
       "name": "Navigation",
@@ -124,6 +130,112 @@
       0
     ]
   ],
+  "routes": {
+    "/": {
+      "route": "/",
+      "shell": {
+        "body_close": "</body></html>",
+        "body_open": "<body><!--__SLOT___a_app_0--><!--__SLOT___a_features_3--><!--__SLOT___a_featurecard_2--><!--__SLOT___a_footer_4--><!--__SLOT___a_header_5--><!--__SLOT___a_navigation_7--><!--__SLOT___a_heroimage_6-->",
+        "doctype_and_head": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ALBEDO /</title></head>",
+        "shim_script": "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>"
+      },
+      "tier_a_root": [
+        {
+          "component_id": "App",
+          "html": "<section data-albedo-static=\"App\" data-component-id=\"0\"></section>",
+          "placeholder_id": "__a_app_0",
+          "position": {
+            "order": 0,
+            "parent_placeholder": null,
+            "slot": "default"
+          }
+        },
+        {
+          "component_id": "Features",
+          "html": "<section data-albedo-static=\"Features\" data-component-id=\"3\"></section>",
+          "placeholder_id": "__a_features_3",
+          "position": {
+            "order": 1,
+            "parent_placeholder": null,
+            "slot": "default"
+          }
+        },
+        {
+          "component_id": "FeatureCard",
+          "html": "<section data-albedo-static=\"FeatureCard\" data-component-id=\"2\"></section>",
+          "placeholder_id": "__a_featurecard_2",
+          "position": {
+            "order": 2,
+            "parent_placeholder": null,
+            "slot": "default"
+          }
+        },
+        {
+          "component_id": "Footer",
+          "html": "<section data-albedo-static=\"Footer\" data-component-id=\"4\"></section>",
+          "placeholder_id": "__a_footer_4",
+          "position": {
+            "order": 3,
+            "parent_placeholder": null,
+            "slot": "default"
+          }
+        },
+        {
+          "component_id": "Header",
+          "html": "<section data-albedo-static=\"Header\" data-component-id=\"5\"></section>",
+          "placeholder_id": "__a_header_5",
+          "position": {
+            "order": 4,
+            "parent_placeholder": null,
+            "slot": "default"
+          }
+        },
+        {
+          "component_id": "Navigation",
+          "html": "<section data-albedo-static=\"Navigation\" data-component-id=\"7\"></section>",
+          "placeholder_id": "__a_navigation_7",
+          "position": {
+            "order": 5,
+            "parent_placeholder": null,
+            "slot": "default"
+          }
+        },
+        {
+          "component_id": "HeroImage",
+          "html": "<section data-albedo-static=\"HeroImage\" data-component-id=\"6\"></section>",
+          "placeholder_id": "__a_heroimage_6",
+          "position": {
+            "order": 7,
+            "parent_placeholder": null,
+            "slot": "default"
+          }
+        }
+      ],
+      "tier_b": [
+        {
+          "component_id": "Button",
+          "data_deps": [],
+          "dynamic_prop_keys": [],
+          "fallback_html": "<div data-albedo-fallback=\"Button\"></div>",
+          "placeholder_id": "__b_button_1",
+          "position": {
+            "order": 6,
+            "parent_placeholder": null,
+            "slot": "default"
+          },
+          "render_fn": "render::Button",
+          "static_props": {
+            "component_id": 1,
+            "component_name": "Button"
+          },
+          "tier_a_children": [],
+          "timeout_ms": 2000
+        }
+      ],
+      "tier_c": []
+    }
+  },
   "schema_version": "2.0",
-  "vendor_chunks": []
+  "vendor_chunks": [],
+  "version": 2
 }
