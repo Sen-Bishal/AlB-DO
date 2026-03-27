@@ -5,6 +5,17 @@
 Albedo is a full-stack compilation and execution engine built from the ground up in Rust. It statically analyses your component graph, produces deterministic bundle artifacts, and serves them through a high-throughput axum-based HTTP runtime — all without a Node.js process in the hot path.
 
 > **Status: Pre-release.** The full compiler pipeline, runtime kernel, developer surface, and HTTP server are implemented and tested. Two items remain before public release — see the [Roadmap](#roadmap) below.
+>
+> 1. CLI frontend
+> 2. Company frontend
+> 3. license
+> 4. hide architecture
+> 5. security measures
+> 6. product rename
+
+Features -
+1. unit testing
+2. more cli commands -> rebase, migration, build tools
 
 ---
 
