@@ -30,8 +30,8 @@
   ],
   "scripts": {
     "clean:native": "node scripts/clean-native.cjs",
-    "build": "npm run clean:native && napi build --platform --release",
-    "build:debug": "npm run clean:native && napi build --platform",
+    "build": "npm run clean:native && node scripts/build-native.cjs --release",
+    "build:debug": "npm run clean:native && node scripts/build-native.cjs",
     "test:smoke": "node scripts/smoke-test.cjs",
     "test:types": "tsc --noEmit -p tsconfig.json",
     "verify": "npm run build && npm run test:smoke && npm run test:types",

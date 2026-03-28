@@ -55,6 +55,26 @@ fn normalize_module_paths(value: &mut Value) {
     }
 }
 
+fn normalize_source_hashes(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                if key == "source_hash" {
+                    *child = Value::String("<normalized>".to_string());
+                } else {
+                    normalize_source_hashes(child);
+                }
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                normalize_source_hashes(child);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
 fn normalize_path_string(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     let marker = "test-app/src/components/";
@@ -67,6 +87,7 @@ fn normalize_path_string(path: &str) -> String {
 fn assert_json_fixture(path: &Path, mut actual: Value) {
     normalize_generated_at(&mut actual);
     normalize_module_paths(&mut actual);
+    normalize_source_hashes(&mut actual);
 
     let update = std::env::var("ALBEDO_UPDATE_GOLDENS").ok().as_deref() == Some("1");
     if update {

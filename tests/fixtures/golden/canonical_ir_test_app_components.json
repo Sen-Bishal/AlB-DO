@@ -14,7 +14,7 @@
       "legacy_priority": null,
       "line_number": 0,
       "module_path": "test-app/src/components/App.jsx",
-      "source_hash": 10926280922691246672,
+      "source_hash": "<normalized>",
       "symbol": "App"
     },
     {
@@ -31,7 +31,7 @@
       "legacy_priority": null,
       "line_number": 0,
       "module_path": "test-app/src/components/Button.jsx",
-      "source_hash": 4618339451425261901,
+      "source_hash": "<normalized>",
       "symbol": "Button"
     },
     {
@@ -48,7 +48,7 @@
       "legacy_priority": null,
       "line_number": 0,
       "module_path": "test-app/src/components/FeatureCard.jsx",
-      "source_hash": 437260469712399779,
+      "source_hash": "<normalized>",
       "symbol": "FeatureCard"
     },
     {
@@ -65,7 +65,7 @@
       "legacy_priority": null,
       "line_number": 0,
       "module_path": "test-app/src/components/Features.jsx",
-      "source_hash": 7620123433515467872,
+      "source_hash": "<normalized>",
       "symbol": "Features"
     },
     {
@@ -82,7 +82,7 @@
       "legacy_priority": null,
       "line_number": 0,
       "module_path": "test-app/src/components/Footer.jsx",
-      "source_hash": 18110766713771312264,
+      "source_hash": "<normalized>",
       "symbol": "Footer"
     },
     {
@@ -99,7 +99,7 @@
       "legacy_priority": null,
       "line_number": 0,
       "module_path": "test-app/src/components/Header.jsx",
-      "source_hash": 10879000395668873690,
+      "source_hash": "<normalized>",
       "symbol": "Header"
     },
     {
@@ -116,7 +116,7 @@
       "legacy_priority": null,
       "line_number": 0,
       "module_path": "test-app/src/components/HeroImage.jsx",
-      "source_hash": 11853266634164932765,
+      "source_hash": "<normalized>",
       "symbol": "HeroImage"
     },
     {
@@ -133,7 +133,7 @@
       "legacy_priority": null,
       "line_number": 0,
       "module_path": "test-app/src/components/Navigation.jsx",
-      "source_hash": 6714999307681324380,
+      "source_hash": "<normalized>",
       "symbol": "Navigation"
     }
   ],
@@ -178,21 +178,21 @@
         "React"
       ],
       "module_path": "test-app/src/components/App.jsx",
-      "source_hash": 10926280922691246672
+      "source_hash": "<normalized>"
     },
     {
       "imports": [
         "React"
       ],
       "module_path": "test-app/src/components/Button.jsx",
-      "source_hash": 4618339451425261901
+      "source_hash": "<normalized>"
     },
     {
       "imports": [
         "React"
       ],
       "module_path": "test-app/src/components/FeatureCard.jsx",
-      "source_hash": 437260469712399779
+      "source_hash": "<normalized>"
     },
     {
       "imports": [
@@ -200,14 +200,14 @@
         "React"
       ],
       "module_path": "test-app/src/components/Features.jsx",
-      "source_hash": 7620123433515467872
+      "source_hash": "<normalized>"
     },
     {
       "imports": [
         "React"
       ],
       "module_path": "test-app/src/components/Footer.jsx",
-      "source_hash": 18110766713771312264
+      "source_hash": "<normalized>"
     },
     {
       "imports": [
@@ -215,14 +215,14 @@
         "React"
       ],
       "module_path": "test-app/src/components/Header.jsx",
-      "source_hash": 10879000395668873690
+      "source_hash": "<normalized>"
     },
     {
       "imports": [
         "React"
       ],
       "module_path": "test-app/src/components/HeroImage.jsx",
-      "source_hash": 11853266634164932765
+      "source_hash": "<normalized>"
     },
     {
       "imports": [
@@ -230,7 +230,7 @@
         "React"
       ],
       "module_path": "test-app/src/components/Navigation.jsx",
-      "source_hash": 6714999307681324380
+      "source_hash": "<normalized>"
     }
   ],
   "schema_version": "1.0"

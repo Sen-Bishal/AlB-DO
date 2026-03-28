@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Contributing to Albedo
 
 This repository is maintained with a release-first approach. Contributions are welcome when they are production-safe, tested, and aligned with the product direction.
@@ -57,4 +56,3 @@ npm run verify --prefix crates/albedo-node
 - Report security issues privately to maintainers through your internal/private channel.
 =======
 
->>>>>>> 3ec39c5073328e49484324660a05bf56b4f049b7

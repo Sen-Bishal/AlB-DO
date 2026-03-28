@@ -135,14 +135,14 @@
       "route": "/",
       "shell": {
         "body_close": "</body></html>",
-        "body_open": "<body><!--__SLOT___a_app_0--><!--__SLOT___a_features_3--><!--__SLOT___a_featurecard_2--><!--__SLOT___a_footer_4--><!--__SLOT___a_header_5--><!--__SLOT___a_navigation_7--><!--__SLOT___a_heroimage_6-->",
+        "body_open": "<body><!--__SLOT___a_app_0--><!--__SLOT___a_features_3--><!--__SLOT___a_featurecard_2--><!--__SLOT___a_footer_4--><!--__SLOT___a_header_5--><!--__SLOT___a_navigation_7--><div id=\"__b_button_1\" data-albedo-tier=\"b\"></div><!--__SLOT___a_heroimage_6-->",
         "doctype_and_head": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ALBEDO /</title></head>",
         "shim_script": "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>"
       },
       "tier_a_root": [
         {
           "component_id": "App",
-          "html": "<section data-albedo-static=\"App\" data-component-id=\"0\"></section>",
+          "html": "<div class=\"App\"><header class=\"header\"><h1>My App</h1><nav><button>Home</button><button>About</button><button>Contact</button></nav></header><div class=\"hero\"><img /><h1>Welcome</h1></div><section class=\"features\"><div class=\"card\"><h3>Fast</h3></div><div class=\"card\"><h3>Reliable</h3></div><div class=\"card\"><h3>Scalable</h3></div></section><footer><p>© 2026 My App</p></footer></div>",
           "placeholder_id": "__a_app_0",
           "position": {
             "order": 0,
@@ -152,7 +152,7 @@
         },
         {
           "component_id": "Features",
-          "html": "<section data-albedo-static=\"Features\" data-component-id=\"3\"></section>",
+          "html": "<section class=\"features\"><div class=\"card\"><h3>Fast</h3></div><div class=\"card\"><h3>Reliable</h3></div><div class=\"card\"><h3>Scalable</h3></div></section>",
           "placeholder_id": "__a_features_3",
           "position": {
             "order": 1,
@@ -162,7 +162,7 @@
         },
         {
           "component_id": "FeatureCard",
-          "html": "<section data-albedo-static=\"FeatureCard\" data-component-id=\"2\"></section>",
+          "html": "<div class=\"card\"><h3></h3></div>",
           "placeholder_id": "__a_featurecard_2",
           "position": {
             "order": 2,
@@ -172,7 +172,7 @@
         },
         {
           "component_id": "Footer",
-          "html": "<section data-albedo-static=\"Footer\" data-component-id=\"4\"></section>",
+          "html": "<footer><p>© 2026 My App</p></footer>",
           "placeholder_id": "__a_footer_4",
           "position": {
             "order": 3,
@@ -182,7 +182,7 @@
         },
         {
           "component_id": "Header",
-          "html": "<section data-albedo-static=\"Header\" data-component-id=\"5\"></section>",
+          "html": "<header class=\"header\"><h1>My App</h1><nav><button>Home</button><button>About</button><button>Contact</button></nav></header>",
           "placeholder_id": "__a_header_5",
           "position": {
             "order": 4,
@@ -192,7 +192,7 @@
         },
         {
           "component_id": "Navigation",
-          "html": "<section data-albedo-static=\"Navigation\" data-component-id=\"7\"></section>",
+          "html": "<nav><button>Home</button><button>About</button><button>Contact</button></nav>",
           "placeholder_id": "__a_navigation_7",
           "position": {
             "order": 5,
@@ -202,7 +202,7 @@
         },
         {
           "component_id": "HeroImage",
-          "html": "<section data-albedo-static=\"HeroImage\" data-component-id=\"6\"></section>",
+          "html": "<div class=\"hero\"><img /><h1>Welcome</h1></div>",
           "placeholder_id": "__a_heroimage_6",
           "position": {
             "order": 7,

@@ -420,6 +420,14 @@ mod tests {
     #[test]
     fn test_optimize_manifest_normalizes_ordering() {
         let manifest = json!({
+            "version": 2,
+            "build_id": "test-build-id",
+            "routes": {},
+            "assets": {
+                "chunks": {},
+                "css": [],
+                "runtime": "/_albedo/runtime.js"
+            },
             "schema_version": "2.0",
             "generated_at": "2026-02-20T00:00:00Z",
             "components": [
@@ -432,7 +440,7 @@ mod tests {
                     "priority": 1.0,
                     "dependencies": [1],
                     "can_defer": true,
-                    "hydration_mode": "OnVisible"
+                    "hydration_mode": "on_visible"
                 },
                 {
                     "id": 1,
@@ -443,7 +451,7 @@ mod tests {
                     "priority": 1.0,
                     "dependencies": [],
                     "can_defer": true,
-                    "hydration_mode": "OnVisible"
+                    "hydration_mode": "on_visible"
                 },
                 {
                     "id": 3,
@@ -454,7 +462,7 @@ mod tests {
                     "priority": 1.0,
                     "dependencies": [],
                     "can_defer": true,
-                    "hydration_mode": "OnVisible"
+                    "hydration_mode": "on_visible"
                 },
                 {
                     "id": 4,
@@ -465,7 +473,7 @@ mod tests {
                     "priority": 1.0,
                     "dependencies": [],
                     "can_defer": true,
-                    "hydration_mode": "OnVisible"
+                    "hydration_mode": "on_visible"
                 }
             ],
             "parallel_batches": [[2, 1]],
