@@ -1,3 +1,5 @@
+//CiCD reviewer rules
+
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, RenderedNode,
     RouteManifest, Tier, TierBNode, TierCNode,
