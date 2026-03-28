@@ -6,6 +6,9 @@ on:
     tags:
       - "albedo-node-v*"
 
+permissions:
+  contents: read
+
 jobs:
   build-and-pack:
     name: Build and Pack (${{ matrix.os }})

@@ -217,6 +217,7 @@ nul
 **/*.md
 !README.md
 !LICENSE.md
+!CONTRIBUTING.md
 
 # Local/installer scripting artifacts
 /*.ps1

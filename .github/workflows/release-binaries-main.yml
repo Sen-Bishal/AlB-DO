@@ -1,0 +1,103 @@
+name: Release Binaries (Main)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-binaries-main
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --bins
+
+      - name: Package binaries (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="albedo-binaries-${{ runner.os }}-${{ runner.arch }}.tar.gz"
+          tar -czf "$archive" \
+            target/release/albedo \
+            target/release/dom-compiler \
+            target/release/albedo-bench
+
+      - name: Package binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "albedo-binaries-${{ runner.os }}-${{ runner.arch }}.zip"
+          Compress-Archive -Path `
+            target/release/albedo.exe, `
+            target/release/dom-compiler.exe, `
+            target/release/albedo-bench.exe `
+            -DestinationPath $archive -Force
+
+      - name: Upload packaged binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: |
+            albedo-binaries-*.tar.gz
+            albedo-binaries-*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish Rolling Main Release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs:
+      - build
+
+    steps:
+      - name: Download all packaged binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish/update rolling release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: main-latest
+          name: Main Branch Binaries
+          targetCommitish: main
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: true
+          makeLatest: false
+          prerelease: true
+          artifactErrorsFailBuild: true
+          artifacts: dist/*
+          body: |
+            Automated rolling binary release from the `main` branch.
+            Commit: ${{ github.sha }}
