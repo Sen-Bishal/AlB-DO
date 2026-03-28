@@ -31,17 +31,10 @@ cargo test
 cargo check --release --bins
 ```
 
-If your change touches Node bridge code, also run:
-
-```bash
-npm ci --prefix crates/albedo-node
-npm run verify --prefix crates/albedo-node
-```
-
 ## CI and Release Expectations
 
-- `CI` workflow must pass on pull requests and on `main`.
 - Binaries are auto-published by the `Release Binaries (Main)` workflow from `main`.
+- The release workflow publishes three platform archives: Linux, Windows, and macOS.
 - Do not manually edit release assets on GitHub; update source/workflows and let automation publish.
 
 ## Documentation Policy
@@ -54,5 +47,4 @@ npm run verify --prefix crates/albedo-node
 
 - Do not open public issues for security vulnerabilities.
 - Report security issues privately to maintainers through your internal/private channel.
-=======
 

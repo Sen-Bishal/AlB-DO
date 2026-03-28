@@ -49,6 +49,7 @@ jobs:
             target/release/albedo \
             target/release/dom-compiler \
             target/release/albedo-bench
+          echo "RELEASE_ASSET=$archive" >> "$GITHUB_ENV"
 
       - name: Package binaries (Windows)
         if: runner.os == 'Windows'
@@ -60,44 +61,31 @@ jobs:
             target/release/dom-compiler.exe, `
             target/release/albedo-bench.exe `
             -DestinationPath $archive -Force
+          "RELEASE_ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Upload packaged binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.os }}
-          path: |
-            albedo-binaries-*.tar.gz
-            albedo-binaries-*.zip
-          if-no-files-found: error
+      - name: Publish packaged binary to rolling release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "main-latest"
+          $repo = "${{ github.repository }}"
+          $title = "Main Branch Binaries"
+          $notes = "Automated rolling binary release from the main branch.`nCommit: ${{ github.sha }}"
 
-  release:
-    name: Publish Rolling Main Release
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    needs:
-      - build
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo $repo --title $title --notes $notes --prerelease --target "${{ github.sha }}"
+            if ($LASTEXITCODE -ne 0) {
+              # Another matrix job may have created the release first.
+              gh release view $tag --repo $repo *> $null
+              if ($LASTEXITCODE -ne 0) {
+                throw "Failed to create or locate release '$tag'."
+              }
+            }
+          } else {
+            gh release edit $tag --repo $repo --title $title --notes $notes --prerelease --target "${{ github.sha }}"
+          }
 
-    steps:
-      - name: Download all packaged binaries
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          merge-multiple: true
-          path: dist
-
-      - name: Publish/update rolling release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: main-latest
-          name: Main Branch Binaries
-          targetCommitish: main
-          allowUpdates: true
-          replacesArtifacts: true
-          removeArtifacts: true
-          makeLatest: false
-          prerelease: true
-          artifactErrorsFailBuild: true
-          artifacts: dist/*
-          body: |
-            Automated rolling binary release from the `main` branch.
-            Commit: ${{ github.sha }}
+          gh release upload $tag "$env:RELEASE_ASSET" --repo $repo --clobber
