@@ -11,6 +11,7 @@ crates/albedo-server/Cargo.lock
 # Generated documentation
 /doc/
 /target/doc/
+.github/CODEOWNERS
 
 # Benchmark results
 /target/criterion/
