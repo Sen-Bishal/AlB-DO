@@ -211,3 +211,15 @@ docker-compose.override.yml
 
 # Prevent Windows reserved device name conflicts
 nul
+
+# Public release hygiene
+# Keep only top-level product docs public-facing.
+**/*.md
+!README.md
+!LICENSE.md
+
+# Local/installer scripting artifacts
+/*.ps1
+/installer.nsi
+/EnvVarUpdate.nsh
+/Albedo-Setup.exe
