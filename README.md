@@ -97,10 +97,6 @@ albedo build
 
 ---
 
-## ◫ Architecture
-
-
-
 ### Runtime kernel
 
 | Component | Role |
