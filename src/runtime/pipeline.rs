@@ -5,11 +5,14 @@ use super::pi_arch::{
 };
 use super::scheduler::{OvertakeZoneScheduler, SchedulerConfig, SchedulerFrameStats};
 use super::webtransport::{
-    LaneRenderedChunk, WebTransportError, WebTransportFrame, WebTransportMuxer,
+    LaneRenderedChunk, WTRenderMode, WTStreamRouter, WebTransportError, WebTransportFrame,
+    WebTransportMuxer,
 };
 use crate::graph::ComponentGraph;
+use crate::manifest::schema::Tier;
 use crate::types::{CompilerError, ComponentAnalysis, ComponentId};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimePipelineError {
@@ -26,13 +29,14 @@ pub struct FourLaneRuntimePipeline {
     analyses: HashMap<ComponentId, ComponentAnalysis>,
     scheduler: OvertakeZoneScheduler,
     inter_lane: PiArchLayer,
-    muxer: WebTransportMuxer,
+    stream_router: WTStreamRouter,
 }
 
 impl FourLaneRuntimePipeline {
     pub fn new(
         graph: &ComponentGraph,
         analyses: HashMap<ComponentId, ComponentAnalysis>,
+        component_tiers: HashMap<ComponentId, Tier>,
         hot_set_entries: &[(ComponentId, RenderPriority)],
         scheduler_config: SchedulerConfig,
         lane_queue_capacity: usize,
@@ -40,13 +44,17 @@ impl FourLaneRuntimePipeline {
         let highway = HighwayPlan::build(graph, &analyses)?;
         let scheduler = OvertakeZoneScheduler::with_hot_set(scheduler_config, hot_set_entries)?;
         let inter_lane = PiArchLayer::new(lane_queue_capacity.max(1), PiArchKernel::default());
+        let stream_router = WTStreamRouter::with_component_tiers(
+            Arc::new(Mutex::new(WebTransportMuxer::new())),
+            component_tiers,
+        );
 
         Ok(Self {
             highway,
             analyses,
             scheduler,
             inter_lane,
-            muxer: WebTransportMuxer::new(),
+            stream_router,
         })
     }
 
@@ -109,12 +117,12 @@ impl FourLaneRuntimePipeline {
     pub fn drain_render_queue_to_lane_chunks(&self) -> Vec<LaneRenderedChunk> {
         let mut chunks = Vec::new();
         while let Some(component_id) = self.scheduler.pop_render_ready() {
-            let lane = self.highway.lane_of(component_id).unwrap_or(0);
-            chunks.push(LaneRenderedChunk {
-                lane,
-                component_id: Some(component_id),
-                payload: format!("component:{}", component_id.as_u64()),
-            });
+            let chunk = self.stream_router.route_component_chunk(
+                component_id,
+                WTRenderMode::Patch,
+                format!("component:{}", component_id.as_u64()),
+            );
+            chunks.push(chunk);
         }
         chunks
     }
@@ -123,7 +131,7 @@ impl FourLaneRuntimePipeline {
         &mut self,
         chunks: &[LaneRenderedChunk],
     ) -> Result<Vec<WebTransportFrame>, RuntimePipelineError> {
-        Ok(self.muxer.mux_lane_chunks(chunks)?)
+        Ok(self.stream_router.mux_lane_chunks(chunks)?)
     }
 }
 
@@ -154,10 +162,12 @@ mod tests {
         let mut analyses = HashMap::new();
         analyses.insert(id_a, analysis(id_a, PI + 0.2, 1.0));
         analyses.insert(id_b, analysis(id_b, 0.1, 2.0));
+        let component_tiers = HashMap::from([(id_a, Tier::C), (id_b, Tier::B)]);
 
         let mut pipeline = FourLaneRuntimePipeline::new(
             &graph,
             analyses,
+            component_tiers,
             &[(id_b, RenderPriority::Critical)],
             SchedulerConfig {
                 overtake_budget: Duration::from_secs(1),
@@ -176,6 +186,12 @@ mod tests {
 
         let chunks = pipeline.drain_render_queue_to_lane_chunks();
         assert_eq!(chunks.len(), 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.lane
+                    == super::super::webtransport::WT_STREAM_SLOT_PATCHES as usize)
+        );
         let frames = pipeline.mux_lane_chunks(&chunks).unwrap();
         assert_eq!(frames.len(), 2);
     }
@@ -190,10 +206,17 @@ mod tests {
         let mut analyses = HashMap::new();
         analyses.insert(id_a, analysis(id_a, PI + 0.2, 1.0));
         analyses.insert(id_b, analysis(id_b, 0.1, 2.0));
+        let component_tiers = HashMap::from([(id_a, Tier::B), (id_b, Tier::C)]);
 
-        let pipeline =
-            FourLaneRuntimePipeline::new(&graph, analyses, &[], SchedulerConfig::default(), 32)
-                .unwrap();
+        let pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            component_tiers,
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .unwrap();
 
         let routed = pipeline.dispatch_cross_lane_dependency_signals();
         assert!(routed >= 1);
