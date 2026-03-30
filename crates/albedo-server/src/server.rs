@@ -28,6 +28,7 @@ use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 use crate::render::tier_b::SharedRenderServices;
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
+use crate::webtransport::WebTransportRuntime;
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -38,6 +39,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::{error, info};
 
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -245,12 +247,49 @@ impl AlbedoServer {
             .await
             .map_err(|err| RuntimeError::ServerStartup(err.to_string()))?;
         info!("ALBEDO server listening on {}", addr);
+        let router = self.router();
 
         let shutdown_timeout = Duration::from_millis(self.config.server.shutdown_timeout_ms);
-        axum::serve(listener, self.router())
-            .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let webtransport_task = if self.config.server.webtransport.enabled {
+            let runtime = WebTransportRuntime::bind(addr, &self.config.server.webtransport)?;
+            info!("ALBEDO WebTransport QUIC listener active on {}", addr);
+            let wt_shutdown = shutdown_rx.clone();
+            Some(tokio::spawn(async move { runtime.run(wt_shutdown).await }))
+        } else {
+            info!("ALBEDO WebTransport disabled; SSE/HTTP streaming fallback remains active");
+            None
+        };
+
+        let graceful_shutdown = {
+            let shutdown_tx = shutdown_tx.clone();
+            async move {
+                shutdown_signal(shutdown_timeout).await;
+                let _ = shutdown_tx.send(true);
+            }
+        };
+
+        let http_result = axum::serve(listener, router)
+            .with_graceful_shutdown(graceful_shutdown)
             .await
-            .map_err(|err| RuntimeError::ServerRuntime(err.to_string()))
+            .map_err(|err| RuntimeError::ServerRuntime(err.to_string()));
+
+        let _ = shutdown_tx.send(true);
+
+        if let Some(task) = webtransport_task {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(err) => {
+                    return Err(RuntimeError::ServerRuntime(format!(
+                        "webtransport task join failed: {err}"
+                    )));
+                }
+            }
+        }
+
+        http_result
     }
 }
 
@@ -749,3 +788,30 @@ mod tests {
         assert_eq!(body, "<main>ALBEDO</main>");
     }
 }
+
+/*
+Phase 3 is the client bootstrap phase.
+
+It adds a tiny browser runtime (target ~2–3 KB) that:
+
+Opens WebTransport session
+Connects to server WT endpoint when available.
+Falls back to existing path if WT isn’t usable (from earlier negotiation logic).
+Consumes the 4 stream slots
+0 control: handshake/keepalive/session events.
+1 shell: initial Tier B/C shell HTML.
+2 patches: incremental IR/component diffs.
+3 prefetch: route/module prefetch hints.
+Applies streamed updates to DOM
+Reads Stream 1 for first shell flush replacement.
+Applies Stream 2 diffs incrementally and in sequence.
+Handles resync requests when sequence gaps are detected.
+Handles prefetch signals
+Uses Stream 3 messages to inject preload/prefetch tags for next-route assets.
+Integrates with bundler/manifest
+Bootstrap is emitted only on pages containing Tier B/C components.
+Tier A-only pages ship no extra WT client code.
+Preserves non-blocking render
+Bootstrap loads async/deferred, never blocks first paint.
+Hydration logic remains component-owned; bootstrap only manages transport + patching.
+*/
