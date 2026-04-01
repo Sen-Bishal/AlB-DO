@@ -1,10 +1,15 @@
 use dom_render_compiler::bundler::BundlePlanOptions;
 use dom_render_compiler::dev_contract::{
-    parse_dev_cli_args, resolve_dev_contract, ResolvedDevContract, DEV_CONFIG_JSON, DEV_CONFIG_TS,
+    parse_dev_cli_args, resolve_dev_contract, HotSetPriority, HotSetRegistration,
+    ResolvedDevContract, DEV_CONFIG_JSON, DEV_CONFIG_TS,
 };
 use dom_render_compiler::parser::ParsedComponent;
 use dom_render_compiler::runtime::ast_eval::{ComponentProject, PatchReport};
+use dom_render_compiler::runtime::hot_set::{
+    HotSetRegistry, RenderPriority, SentinelRing, HOT_SET_MAX,
+};
 use dom_render_compiler::scanner::{ProjectScanner, ScanFailure, ScanMode};
+use dom_render_compiler::types::ComponentId;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
@@ -87,6 +92,45 @@ impl PendingRebuild {
     fn should_rebuild(&self) -> bool {
         self.force_rebuild || !self.changed.is_empty() || !self.deleted.is_empty()
     }
+}
+
+fn map_hot_priority(p: HotSetPriority) -> RenderPriority {
+    match p {
+        HotSetPriority::Low => RenderPriority::Low,
+        HotSetPriority::Normal => RenderPriority::Normal,
+        HotSetPriority::High => RenderPriority::High,
+        HotSetPriority::Critical => RenderPriority::Critical,
+    }
+}
+
+fn build_hot_set(
+    project: &ComponentProject,
+    registrations: &[HotSetRegistration],
+) -> (HotSetRegistry, SentinelRing) {
+    let registry = HotSetRegistry::new();
+    resolve_hot_set_registrations(project, registrations, &registry);
+    let ring = SentinelRing::from_registry(&registry)
+        .unwrap_or_else(|_| SentinelRing::new(&[]).expect("empty ring always succeeds"));
+    (registry, ring)
+}
+
+fn resolve_hot_set_registrations(
+    project: &ComponentProject,
+    registrations: &[HotSetRegistration],
+    registry: &HotSetRegistry,
+) -> usize {
+    let mut inserted = 0usize;
+    for reg in registrations {
+        if let Some(id) = project.component_id_by_name(&reg.component) {
+            let newly_inserted = registry
+                .register(id, map_hot_priority(reg.priority))
+                .unwrap_or(false);
+            if newly_inserted {
+                inserted += 1;
+            }
+        }
+    }
+    inserted
 }
 
 fn main() {
@@ -332,6 +376,10 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     let (listener, addr, auto_incremented) =
         bind_dev_listener(contract.server.host.as_str(), contract.server.port)?;
 
+    let (hot_registry, hot_ring) = build_hot_set(&project, &contract.hot_set);
+    let hot_registry = Arc::new(hot_registry);
+    let sentinel_ring = Arc::new(Mutex::new(hot_ring));
+
     println!(
         "  {} {} prewarming renderer ({} routes, {} render time)",
         style("[dev]", "1;34"),
@@ -355,12 +403,16 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         let watcher_state = Arc::clone(&shared_state);
         let watcher_clients = Arc::clone(&sse_clients);
         let watcher_revision = Arc::clone(&revision);
+        let watcher_registry = Arc::clone(&hot_registry);
+        let watcher_ring = Arc::clone(&sentinel_ring);
         std::thread::spawn(move || {
             watch_and_rebuild_loop(
                 watcher_contract,
                 watcher_state,
                 watcher_clients,
                 watcher_revision,
+                watcher_registry,
+                watcher_ring,
             );
         });
     }
@@ -395,6 +447,7 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     if let Some(components) = scanned_components.as_ref() {
         print_kv("Components", components.len());
     }
+    print_kv("Hot Set", format!("{}/{}", hot_registry.len(), HOT_SET_MAX));
     let route_count = 1 + contract.routes.len();
     print_kv("Routes", route_count);
     for (url, entry) in &contract.routes {
@@ -535,6 +588,8 @@ fn watch_and_rebuild_loop(
     shared_state: Arc<Mutex<SharedDevState>>,
     sse_clients: Arc<Mutex<Vec<TcpStream>>>,
     revision: Arc<AtomicU64>,
+    hot_registry: Arc<HotSetRegistry>,
+    sentinel_ring: Arc<Mutex<SentinelRing>>,
 ) {
     let (event_tx, event_rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = match RecommendedWatcher::new(
@@ -609,7 +664,86 @@ fn watch_and_rebuild_loop(
                 if rendered {
                     let next_revision = revision.fetch_add(1, Ordering::SeqCst) + 1;
                     if contract.hmr.enabled {
-                        broadcast_reload_event(&sse_clients, next_revision);
+                        let mut fallback_full_reload = pending.force_rebuild || pending.css_touched;
+                        let mut invalidated_components = Vec::<ComponentId>::new();
+
+                        if !fallback_full_reload {
+                            match shared_state.lock() {
+                                Ok(state) => {
+                                    let inserted = resolve_hot_set_registrations(
+                                        &state.project,
+                                        &contract.hot_set,
+                                        hot_registry.as_ref(),
+                                    );
+                                    if inserted > 0 {
+                                        match sentinel_ring.lock() {
+                                            Ok(mut ring) => {
+                                                if let Err(err) = ring
+                                                    .rebuild_from_registry(hot_registry.as_ref())
+                                                {
+                                                    fallback_full_reload = true;
+                                                    eprintln!(
+                                                        "  {} hot ring rebuild failed: {}",
+                                                        style("[dev]", "1;33"),
+                                                        err
+                                                    );
+                                                }
+                                            }
+                                            Err(_) => {
+                                                fallback_full_reload = true;
+                                                eprintln!(
+                                                    "  {} hot ring lock poisoned during rebuild",
+                                                    style("[dev]", "1;33"),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    fallback_full_reload = true;
+                                    eprintln!(
+                                        "  {} shared state lock poisoned while resolving hot set",
+                                        style("[dev]", "1;33"),
+                                    );
+                                }
+                            }
+                        }
+
+                        if !fallback_full_reload {
+                            match collect_hot_set_invalidations(
+                                &patch_report,
+                                hot_registry.as_ref(),
+                                &sentinel_ring,
+                            ) {
+                                Ok((drained_ids, has_non_hot_component_changes)) => {
+                                    if has_non_hot_component_changes {
+                                        fallback_full_reload = true;
+                                    } else {
+                                        invalidated_components = drained_ids;
+                                    }
+                                }
+                                Err(err) => {
+                                    fallback_full_reload = true;
+                                    eprintln!(
+                                        "  {} hot invalidation pass failed: {}",
+                                        style("[dev]", "1;33"),
+                                        err
+                                    );
+                                }
+                            }
+                        }
+
+                        if fallback_full_reload || invalidated_components.is_empty() {
+                            broadcast_reload_event(&sse_clients, next_revision);
+                        } else {
+                            for component_id in invalidated_components {
+                                broadcast_component_invalidation_event(
+                                    &sse_clients,
+                                    next_revision,
+                                    component_id,
+                                );
+                            }
+                        }
                     }
                     let rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
                     println!(
@@ -650,6 +784,34 @@ fn watch_and_rebuild_loop(
             }
         }
     }
+}
+
+fn collect_hot_set_invalidations(
+    patch_report: &PatchReport,
+    hot_registry: &HotSetRegistry,
+    sentinel_ring: &Arc<Mutex<SentinelRing>>,
+) -> Result<(Vec<ComponentId>, bool), String> {
+    let mut changed_component_ids = patch_report.reparsed_ids.clone();
+    changed_component_ids.extend(patch_report.deleted_ids.iter().copied());
+
+    if changed_component_ids
+        .iter()
+        .any(|component_id| !hot_registry.contains(*component_id))
+    {
+        return Ok((Vec::new(), true));
+    }
+
+    let ring = sentinel_ring
+        .lock()
+        .map_err(|_| "sentinel ring lock poisoned".to_string())?;
+
+    for component_id in &changed_component_ids {
+        ring.mark_dirty(*component_id);
+    }
+
+    let mut invalidated_components = Vec::new();
+    ring.drain(|component_id| invalidated_components.push(component_id));
+    Ok((invalidated_components, false))
 }
 
 fn accumulate_rebuild_paths(
@@ -980,8 +1142,7 @@ fn read_http_request_head(
     Ok((first_line, headers))
 }
 
-fn broadcast_reload_event(clients: &Arc<Mutex<Vec<TcpStream>>>, revision: u64) {
-    let payload = format!("data: reload:{revision}\n\n");
+fn broadcast_sse_payload(clients: &Arc<Mutex<Vec<TcpStream>>>, payload: &str) {
     let mut active = match clients.lock() {
         Ok(guard) => guard,
         Err(_) => return,
@@ -997,6 +1158,20 @@ fn broadcast_reload_event(clients: &Arc<Mutex<Vec<TcpStream>>>, revision: u64) {
         }
     }
     *active = retained;
+}
+
+fn broadcast_reload_event(clients: &Arc<Mutex<Vec<TcpStream>>>, revision: u64) {
+    let payload = format!("data: reload:{revision}\n\n");
+    broadcast_sse_payload(clients, payload.as_str());
+}
+
+fn broadcast_component_invalidation_event(
+    clients: &Arc<Mutex<Vec<TcpStream>>>,
+    revision: u64,
+    component_id: ComponentId,
+) {
+    let payload = format!("data: invalidate:{revision}:{}\n\n", component_id.as_u64());
+    broadcast_sse_payload(clients, payload.as_str());
 }
 
 fn render_all_routes(
@@ -1137,8 +1312,20 @@ fn inject_hmr_client_script(html_document: &str, hmr_enabled: bool) -> String {
     try {
       var es = new EventSource('/_albedo/hmr');
       es.onmessage = function (event) {
-        if (typeof event.data === 'string' && event.data.indexOf('reload') === 0) {
+        if (typeof event.data !== 'string') {
+          return;
+        }
+        if (event.data.indexOf('reload') === 0) {
           window.location.reload();
+          return;
+        }
+        if (event.data.indexOf('invalidate:') === 0) {
+          var parts = event.data.slice('invalidate:'.length).split(':');
+          try {
+            window.dispatchEvent(new CustomEvent('albedo:component-invalidated', {
+              detail: { revision: parts[0] || '', component_id: parts[1] || '' }
+            }));
+          } catch (_eventErr) {}
         }
       };
       es.onerror = function () {
@@ -1163,7 +1350,7 @@ fn inject_hmr_client_script(html_document: &str, hmr_enabled: bool) -> String {
 fn build_dev_error_overlay(message: &str, hmr_enabled: bool) -> String {
     let escaped = escape_html(message);
     let reconnect = if hmr_enabled {
-        "<script>(function(){var c=function(){try{var es=new EventSource('/_albedo/hmr');es.onmessage=function(e){if(typeof e.data==='string'&&e.data.indexOf('reload')===0){window.location.reload();}};es.onerror=function(){try{es.close();}catch(_e){}setTimeout(c,800);};}catch(_e){setTimeout(c,1000);}};c();})();</script>"
+        "<script>(function(){var c=function(){try{var es=new EventSource('/_albedo/hmr');es.onmessage=function(e){if(typeof e.data!=='string'){return;}if(e.data.indexOf('reload')===0){window.location.reload();return;}if(e.data.indexOf('invalidate:')===0){var p=e.data.slice('invalidate:'.length).split(':');try{window.dispatchEvent(new CustomEvent('albedo:component-invalidated',{detail:{revision:p[0]||'',component_id:p[1]||''}}));}catch(_eventErr){}}};es.onerror=function(){try{es.close();}catch(_e){}setTimeout(c,800);};}catch(_e){setTimeout(c,1000);}};c();})();</script>"
     } else {
         ""
     };

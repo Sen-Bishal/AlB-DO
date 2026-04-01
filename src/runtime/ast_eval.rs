@@ -1,3 +1,4 @@
+use crate::types::ComponentId;
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -39,13 +40,24 @@ pub struct ComponentProject {
     root: PathBuf,
     modules: HashMap<String, ParsedModule>,
     source_hashes: HashMap<String, u64>,
+    /// Stable identity: specifier → ComponentId assigned at first load.
+    specifier_to_id: HashMap<String, ComponentId>,
+    next_id: u64,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PatchReport {
     pub reparsed: usize,
     pub skipped_unchanged: usize,
     pub deleted: usize,
+    /// ComponentIds of modules that were actually re-parsed (content changed).
+    pub reparsed_ids: Vec<ComponentId>,
+    /// Specifiers of modules that were actually re-parsed (content changed).
+    pub reparsed_specifiers: Vec<String>,
+    /// ComponentIds of modules that were removed.
+    pub deleted_ids: Vec<ComponentId>,
+    /// Specifiers of modules that were removed.
+    pub deleted_specifiers: Vec<String>,
 }
 
 impl ComponentProject {
@@ -53,6 +65,8 @@ impl ComponentProject {
         let root = root.as_ref().to_path_buf();
         let mut modules = HashMap::new();
         let mut source_hashes = HashMap::new();
+        let mut specifier_to_id: HashMap<String, ComponentId> = HashMap::new();
+        let mut next_id: u64 = 0;
 
         for entry in WalkDir::new(&root)
             .follow_links(true)
@@ -76,6 +90,8 @@ impl ComponentProject {
                 .map_err(|err| anyhow!("failed to read '{}': {err}", path.display()))?;
             let parsed = parse_module(&source, path)?;
             source_hashes.insert(specifier.clone(), fnv1a_hash(source.as_bytes()));
+            specifier_to_id.insert(specifier.clone(), ComponentId::new(next_id));
+            next_id += 1;
             modules.insert(specifier, parsed);
         }
 
@@ -87,6 +103,8 @@ impl ComponentProject {
             root,
             modules,
             source_hashes,
+            specifier_to_id,
+            next_id,
         })
     }
 
@@ -142,19 +160,62 @@ impl ComponentProject {
 
         for (specifier, parsed, source_hash) in parsed_updates {
             self.modules.insert(specifier.clone(), parsed);
-            self.source_hashes.insert(specifier, source_hash);
+            self.source_hashes.insert(specifier.clone(), source_hash);
+            // Assign an ID if this is a newly-seen specifier.
+            let component_id = *self
+                .specifier_to_id
+                .entry(specifier.clone())
+                .or_insert_with(|| {
+                    let id = ComponentId::new(self.next_id);
+                    self.next_id += 1;
+                    id
+                });
+            report.reparsed_ids.push(component_id);
+            report.reparsed_specifiers.push(specifier);
             report.reparsed += 1;
         }
 
         for specifier in staged_deletions {
+            let component_id = self.specifier_to_id.get(&specifier).copied();
             let removed_module = self.modules.remove(&specifier).is_some();
             let removed_hash = self.source_hashes.remove(&specifier).is_some();
+            // Keep the ID in specifier_to_id so the ring entry stays stable; just note deletion.
             if removed_module || removed_hash {
+                if let Some(component_id) = component_id {
+                    report.deleted_ids.push(component_id);
+                }
+                report.deleted_specifiers.push(specifier);
                 report.deleted += 1;
             }
         }
 
         Ok(report)
+    }
+
+    /// Resolve a module specifier to its stable ComponentId.
+    pub fn component_id_for_specifier(&self, specifier: &str) -> Option<ComponentId> {
+        let spec = normalize_slashes(specifier);
+        self.specifier_to_id.get(&spec).copied()
+    }
+
+    /// Find a ComponentId by matching the component's file stem against `name`
+    /// (case-insensitive). E.g. `"Button"` matches `"Button.tsx"` or `"button.jsx"`.
+    pub fn component_id_for_name(&self, name: &str) -> Option<ComponentId> {
+        self.specifier_to_id
+            .iter()
+            .find(|(spec, _)| {
+                Path::new(spec)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|stem| stem.eq_ignore_ascii_case(name))
+                    .unwrap_or(false)
+            })
+            .map(|(_, &id)| id)
+    }
+
+    /// Alias used by live-dev runtime wiring.
+    pub fn component_id_by_name(&self, name: &str) -> Option<ComponentId> {
+        self.component_id_for_name(name)
     }
 
     pub fn render_entry(&self, entry: &str, props: &Value) -> Result<String> {
@@ -1442,6 +1503,8 @@ mod tests {
             root: project.root.clone(),
             modules,
             source_hashes,
+            specifier_to_id: project.specifier_to_id.clone(),
+            next_id: project.next_id,
         };
         let props = serde_json::json!({ "active": true });
         let html = p.render_entry("Badge.tsx", &props).unwrap();
