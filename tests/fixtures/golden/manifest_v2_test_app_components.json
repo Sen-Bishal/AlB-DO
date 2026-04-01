@@ -237,5 +237,21 @@
   },
   "schema_version": "2.0",
   "vendor_chunks": [],
-  "version": 2
+  "version": 2,
+  "wt_streams": [
+    {
+      "component_ids": [
+        1
+      ],
+      "label": "shell",
+      "slot": 1
+    },
+    {
+      "component_ids": [
+        1
+      ],
+      "label": "patch",
+      "slot": 2
+    }
+  ]
 }

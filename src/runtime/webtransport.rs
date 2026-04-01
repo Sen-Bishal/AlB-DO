@@ -4,6 +4,7 @@ use crate::types::ComponentId;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tracing::trace;
 
 pub const WEBTRANSPORT_STREAM_COUNT: usize = 4;
 pub const WT_STREAM_SLOT_CONTROL: u8 = 0;
@@ -32,6 +33,17 @@ pub enum WTRenderMode {
     Shell,
     Patch,
     Prefetch,
+}
+
+impl WTRenderMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Shell => "shell",
+            Self::Patch => "patch",
+            Self::Prefetch => "prefetch",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -148,6 +160,17 @@ impl WTStreamRouter {
         let tier = self.tier_for_component(component_id).unwrap_or(Tier::B);
         let slot = Self::stream_slot_for(tier, render_mode);
         self.upsert_component_stream(component_id, slot, render_mode);
+        let patch_sequence = self.patch_sequence_for(component_id).unwrap_or(0);
+
+        trace!(
+            target: "albedo.webtransport",
+            component_id = component_id.as_u64(),
+            tier = ?tier,
+            render_mode = render_mode.as_str(),
+            stream_slot = slot,
+            patch_sequence = patch_sequence,
+            "webtransport stream assignment"
+        );
 
         LaneRenderedChunk {
             lane: slot as usize,
@@ -162,6 +185,12 @@ impl WTStreamRouter {
         payload: impl Into<String>,
     ) -> LaneRenderedChunk {
         let slot = Self::stream_slot_for(Tier::B, render_mode);
+        trace!(
+            target: "albedo.webtransport",
+            render_mode = render_mode.as_str(),
+            stream_slot = slot,
+            "webtransport global stream assignment"
+        );
         LaneRenderedChunk {
             lane: slot as usize,
             component_id: None,

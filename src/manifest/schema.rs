@@ -34,6 +34,21 @@ impl HydrationMode {
     }
 }
 
+/// Describes which components are assigned to a given WebTransport stream slot.
+///
+/// Emitted into [`RenderManifestV2::wt_streams`] at build time so the dev CLI,
+/// `albedo trace`, and the WT client bootstrap can all agree on the slot-to-component
+/// mapping without re-running tier analysis at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WTStreamSlot {
+    /// Stream slot index (0 = control, 1 = shell, 2 = patches, 3 = prefetch).
+    pub slot: u8,
+    /// Human-readable label matching `WTRenderMode::as_str()`.
+    pub label: String,
+    /// Component IDs that stream on this slot.
+    pub component_ids: Vec<u64>,
+}
+
 /// The full manifest written to disk at build time and loaded at server startup.
 ///
 /// `schema_version` + legacy component fields are retained for backward compatibility
@@ -56,6 +71,13 @@ pub struct RenderManifestV2 {
     pub critical_path: Vec<u64>,
     #[serde(default)]
     pub vendor_chunks: Vec<VendorChunk>,
+    /// WebTransport stream slot assignments, populated at build time.
+    ///
+    /// Slot indices follow the `WT_STREAM_SLOT_*` constants in `runtime/webtransport.rs`:
+    /// slot 0 = control, 1 = shell, 2 = patches, 3 = prefetch.
+    /// Empty when the build predates WT support or when no Tier B/C components exist.
+    #[serde(default)]
+    pub wt_streams: Vec<WTStreamSlot>,
 }
 
 impl RenderManifestV2 {
@@ -74,6 +96,7 @@ impl RenderManifestV2 {
             parallel_batches: Vec::new(),
             critical_path: Vec::new(),
             vendor_chunks: Vec::new(),
+            wt_streams: Vec::new(),
         }
     }
 }

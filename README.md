@@ -164,7 +164,15 @@ Deploy artifact        1 binary  (scp it anywhere)
 ### ⟳ WebTransport-native streaming
 Bidirectional component streaming over HTTP/3 via the `WebTransportMuxer` 4-stream kernel. True full-duplex server push — no polling, no WebSocket fallback.
 
-**Status:** `in progress`
+**Status:** `pre-release hardening complete`
+
+Ship checklist:
+- `WTStreamRouter` stream-slot assignment + per-component patch sequencing
+- HTTP transport negotiation with silent SSE fallback
+- WT bootstrap emission only for Tier B/C routes
+- WT capability endpoint at `/_albedo/wt`
+- Session bridge: route renders can be pushed onto WT stream slots 0/1/2/3
+- Dev observability: per-client transport logs + stream assignment traces
 
 ---
 

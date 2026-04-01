@@ -104,6 +104,7 @@ pub fn build_render_manifest_v2(
     let manifest_builder = ManifestBuilder::new(graph, tier_metadata, options.tier_b_timeout_ms);
     let assets = manifest_builder.build_assets_manifest();
     let build_id = manifest_builder.build_build_id();
+    let wt_streams = manifest_builder.build_wt_stream_slots();
     let mut routes = HashMap::new();
 
     for (route_path, root_component) in entry_components_for_routes(graph, result) {
@@ -130,6 +131,7 @@ pub fn build_render_manifest_v2(
         parallel_batches,
         critical_path,
         vendor_chunks: Vec::new(),
+        wt_streams,
     }
 }
 
@@ -296,6 +298,11 @@ mod tests {
             .components
             .iter()
             .any(|entry| entry.tier == Tier::C));
+        assert_eq!(manifest.wt_streams.len(), 2);
+        assert!(manifest
+            .wt_streams
+            .iter()
+            .all(|slot| slot.slot == 1 || slot.slot == 2));
     }
 
     #[test]
@@ -321,6 +328,20 @@ mod tests {
 
         assert_eq!(entry.tier, Tier::B);
         assert_eq!(entry.hydration_mode, HydrationMode::OnIdle);
+
+        let shell_slot = manifest
+            .wt_streams
+            .iter()
+            .find(|slot| slot.slot == 1)
+            .expect("shell slot should exist");
+        let patch_slot = manifest
+            .wt_streams
+            .iter()
+            .find(|slot| slot.slot == 2)
+            .expect("patch slot should exist");
+
+        assert_eq!(shell_slot.component_ids, vec![entry.id]);
+        assert_eq!(patch_slot.component_ids, vec![entry.id]);
     }
 
     #[test]

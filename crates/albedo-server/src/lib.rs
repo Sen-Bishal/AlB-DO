@@ -15,7 +15,7 @@ pub use contract::{
     RuntimeMiddleware,
 };
 pub use error::RuntimeError;
-pub use handlers::{streaming_handler, StreamingAppState};
+pub use handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
 pub use lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 pub use render::{
     InjectionChunk, RenderError as TierBRenderError, TierBDataFetcher, TierBRenderRegistry,

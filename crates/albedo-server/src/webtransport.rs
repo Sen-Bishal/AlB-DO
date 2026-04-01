@@ -49,6 +49,55 @@ impl WebTransportSessionRegistry {
             .map(|sessions| sessions.len())
             .unwrap_or(0)
     }
+
+    pub fn has(&self, session_id: &Uuid) -> bool {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.contains_key(session_id))
+            .unwrap_or(false)
+    }
+
+    pub async fn send_payload(
+        &self,
+        session_id: Uuid,
+        stream_slot: u8,
+        payload: Vec<u8>,
+    ) -> Result<(), RuntimeError> {
+        if stream_slot as usize >= WEBTRANSPORT_STREAM_COUNT {
+            return Err(RuntimeError::ServerRuntime(format!(
+                "invalid WT stream slot {stream_slot}"
+            )));
+        }
+
+        let sender = {
+            let sessions = self.sessions.lock().map_err(|_| {
+                RuntimeError::ServerRuntime("WT session registry lock poisoned".to_string())
+            })?;
+            let handle = sessions.get(&session_id).ok_or_else(|| {
+                RuntimeError::ServerRuntime(format!("WT session '{}' not found", session_id))
+            })?;
+            handle.stream_senders[stream_slot as usize].clone()
+        };
+
+        sender.send(payload).await.map_err(|_| {
+            RuntimeError::ServerRuntime(format!(
+                "WT stream slot {} channel closed for session '{}'",
+                stream_slot, session_id
+            ))
+        })
+    }
+
+    pub async fn send_json<T: Serialize + ?Sized>(
+        &self,
+        session_id: Uuid,
+        stream_slot: u8,
+        payload: &T,
+    ) -> Result<(), RuntimeError> {
+        let payload = serde_json::to_vec(payload).map_err(|err| {
+            RuntimeError::ServerRuntime(format!("failed to serialize WT payload: {err}"))
+        })?;
+        self.send_payload(session_id, stream_slot, payload).await
+    }
 }
 
 pub struct WebTransportRuntime {
@@ -60,6 +109,14 @@ pub struct WebTransportRuntime {
 
 impl WebTransportRuntime {
     pub fn bind(addr: SocketAddr, config: &WebTransportConfig) -> Result<Self, RuntimeError> {
+        Self::bind_with_registry(addr, config, WebTransportSessionRegistry::default())
+    }
+
+    pub fn bind_with_registry(
+        addr: SocketAddr,
+        config: &WebTransportConfig,
+        sessions: WebTransportSessionRegistry,
+    ) -> Result<Self, RuntimeError> {
         let cert_path = config.cert_path.as_deref().ok_or_else(|| {
             RuntimeError::InvalidConfig("missing webtransport.cert_path".to_string())
         })?;
@@ -87,7 +144,7 @@ impl WebTransportRuntime {
 
         Ok(Self {
             endpoint,
-            sessions: WebTransportSessionRegistry::default(),
+            sessions,
             keepalive_interval: Duration::from_millis(config.keepalive_interval_ms.max(1)),
             stream_buffer_capacity: config.stream_buffer_capacity.max(1),
         })
@@ -138,6 +195,10 @@ impl WebTransportRuntime {
 
     pub fn session_count(&self) -> usize {
         self.sessions.count()
+    }
+
+    pub fn session_registry(&self) -> WebTransportSessionRegistry {
+        self.sessions.clone()
     }
 }
 
@@ -238,6 +299,7 @@ fn spawn_stream_writer(connection: Connection, stream_slot: u8, mut rx: mpsc::Re
             warn!(stream_slot, error = %err, "failed to write WT stream open frame");
             return;
         }
+        info!(stream_slot, "webtransport stream opened");
 
         while let Some(payload) = rx.recv().await {
             if let Err(err) = write_framed_payload(&mut stream, payload.as_slice()).await {
