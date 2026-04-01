@@ -174,7 +174,7 @@ impl<'a> ManifestBuilder<'a> {
             doctype_and_head,
             body_open,
             body_close: "</body></html>".to_string(),
-            shim_script: default_shim_script(),
+            shim_script: default_shim_script(!tier_b.is_empty() || !tier_c.is_empty()),
         }
     }
 
@@ -610,8 +610,14 @@ fn common_ancestor(mut left: PathBuf, right: &Path) -> Option<PathBuf> {
     Some(left)
 }
 
-fn default_shim_script() -> String {
-    "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>".to_string()
+fn default_shim_script(enable_wt_bootstrap: bool) -> String {
+    let mut script = "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>".to_string();
+    if enable_wt_bootstrap {
+        script.push_str(
+            "<script type=\"module\" async src=\"/_albedo/wt-bootstrap.js\" data-albedo-wt-bootstrap=\"1\"></script>",
+        );
+    }
+    script
 }
 
 fn next_order(counter: &mut u32) -> u32 {
@@ -655,4 +661,24 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_shim_script;
+
+    #[test]
+    fn test_default_shim_script_includes_wt_bootstrap_for_streaming_routes() {
+        let script = default_shim_script(true);
+        assert!(script.contains("/_albedo/runtime.js"));
+        assert!(script.contains("/_albedo/wt-bootstrap.js"));
+        assert!(script.contains("data-albedo-wt-bootstrap"));
+    }
+
+    #[test]
+    fn test_default_shim_script_omits_wt_bootstrap_for_tier_a_only_routes() {
+        let script = default_shim_script(false);
+        assert!(script.contains("/_albedo/runtime.js"));
+        assert!(!script.contains("/_albedo/wt-bootstrap.js"));
+    }
 }

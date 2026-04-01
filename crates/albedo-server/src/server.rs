@@ -788,30 +788,3 @@ mod tests {
         assert_eq!(body, "<main>ALBEDO</main>");
     }
 }
-
-/*
-Phase 3 is the client bootstrap phase.
-
-It adds a tiny browser runtime (target ~2–3 KB) that:
-
-Opens WebTransport session
-Connects to server WT endpoint when available.
-Falls back to existing path if WT isn’t usable (from earlier negotiation logic).
-Consumes the 4 stream slots
-0 control: handshake/keepalive/session events.
-1 shell: initial Tier B/C shell HTML.
-2 patches: incremental IR/component diffs.
-3 prefetch: route/module prefetch hints.
-Applies streamed updates to DOM
-Reads Stream 1 for first shell flush replacement.
-Applies Stream 2 diffs incrementally and in sequence.
-Handles resync requests when sequence gaps are detected.
-Handles prefetch signals
-Uses Stream 3 messages to inject preload/prefetch tags for next-route assets.
-Integrates with bundler/manifest
-Bootstrap is emitted only on pages containing Tier B/C components.
-Tier A-only pages ship no extra WT client code.
-Preserves non-blocking render
-Bootstrap loads async/deferred, never blocks first paint.
-Hydration logic remains component-owned; bootstrap only manages transport + patching.
-*/

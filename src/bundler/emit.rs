@@ -15,6 +15,7 @@ pub const BUNDLE_RUNTIME_MAP_FILENAME: &str = "bundle-runtime-map.json";
 pub const BUNDLE_ROUTE_PREFETCH_MANIFEST_FILENAME: &str = "route-prefetch-manifest.json";
 pub const BUNDLE_STATIC_SLICES_FILENAME: &str = "static-slices.json";
 pub const BUNDLE_PRECOMPILED_MODULES_FILENAME: &str = "precompiled-runtime-modules.json";
+pub const BUNDLE_WT_BOOTSTRAP_FILENAME: &str = "_albedo/wt-bootstrap.js";
 pub const BUNDLE_RUNTIME_MAP_VERSION: &str = "1.0";
 pub const BUNDLE_ROUTE_PREFETCH_MANIFEST_VERSION: &str = "1.0";
 
@@ -295,6 +296,15 @@ fn emit_bundle_artifacts_to_dir_internal(
 
     let mut artifacts = Vec::new();
 
+    let wt_bootstrap_source = emit_wt_bootstrap_source();
+    let wt_bootstrap_bytes = wt_bootstrap_source.into_bytes();
+    let wt_bootstrap_path = output_dir.join(relative_path_to_fs_path(BUNDLE_WT_BOOTSTRAP_FILENAME));
+    write_artifact(&wt_bootstrap_path, &wt_bootstrap_bytes)?;
+    artifacts.push(EmittedArtifact {
+        relative_path: BUNDLE_WT_BOOTSTRAP_FILENAME.to_string(),
+        bytes: wt_bootstrap_bytes.len(),
+    });
+
     let plan_json = emit_bundle_plan_json(plan).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -485,6 +495,10 @@ fn relative_path_to_fs_path(path: &str) -> PathBuf {
     out
 }
 
+fn emit_wt_bootstrap_source() -> String {
+    include_str!("../../assets/albedo-wt-bootstrap.js").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,7 +601,11 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let report = emit_bundle_artifacts_to_dir(&fixture_plan(), temp_dir.path()).unwrap();
 
-        assert_eq!(report.artifacts.len(), 5);
+        assert_eq!(report.artifacts.len(), 6);
+
+        let wt_bootstrap_path = temp_dir.path().join("_albedo").join("wt-bootstrap.js");
+        let wt_bootstrap_source = std::fs::read_to_string(wt_bootstrap_path).unwrap();
+        assert!(wt_bootstrap_source.contains("WebTransport"));
 
         let plan_path = temp_dir.path().join(BUNDLE_PLAN_FILENAME);
         let plan_json = std::fs::read_to_string(plan_path).unwrap();
