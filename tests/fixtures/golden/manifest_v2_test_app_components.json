@@ -137,7 +137,7 @@
         "body_close": "</body></html>",
         "body_open": "<body><!--__SLOT___a_app_0--><!--__SLOT___a_features_3--><!--__SLOT___a_featurecard_2--><!--__SLOT___a_footer_4--><!--__SLOT___a_header_5--><!--__SLOT___a_navigation_7--><div id=\"__b_button_1\" data-albedo-tier=\"b\"></div><!--__SLOT___a_heroimage_6-->",
         "doctype_and_head": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ALBEDO /</title></head>",
-        "shim_script": "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>"
+        "shim_script": "<script type=\"module\" src=\"/_albedo/runtime.js\"></script><script type=\"module\" async src=\"/_albedo/wt-bootstrap.js\" data-albedo-wt-bootstrap=\"1\"></script>"
       },
       "tier_a_root": [
         {
@@ -237,5 +237,21 @@
   },
   "schema_version": "2.0",
   "vendor_chunks": [],
-  "version": 2
+  "version": 2,
+  "wt_streams": [
+    {
+      "component_ids": [
+        1
+      ],
+      "label": "shell",
+      "slot": 1
+    },
+    {
+      "component_ids": [
+        1
+      ],
+      "label": "patch",
+      "slot": 2
+    }
+  ]
 }

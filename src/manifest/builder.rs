@@ -2,14 +2,18 @@
 
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, RenderedNode,
-    RouteManifest, Tier, TierBNode, TierCNode,
+    RouteManifest, Tier, TierBNode, TierCNode, WTStreamSlot,
 };
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;
 use crate::runtime::ast_eval::ComponentProject;
+use crate::runtime::webtransport::{
+    WTRenderMode, WTStreamRouter, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
+    WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
+};
 use crate::types::{Component, ComponentId};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 struct StaticRenderProject {
@@ -143,6 +147,37 @@ impl<'a> ManifestBuilder<'a> {
         format!("{:016x}", fnv1a_64(basis.as_bytes()))
     }
 
+    pub fn build_wt_stream_slots(&self) -> Vec<WTStreamSlot> {
+        let mut by_slot: BTreeMap<u8, BTreeSet<u64>> = BTreeMap::new();
+
+        for (component_id, metadata) in &self.metadata {
+            if !matches!(metadata.tier, Tier::B | Tier::C) {
+                continue;
+            }
+
+            let shell_slot = WTStreamRouter::stream_slot_for(metadata.tier, WTRenderMode::Shell);
+            by_slot
+                .entry(shell_slot)
+                .or_default()
+                .insert(component_id.as_u64());
+
+            let patch_slot = WTStreamRouter::stream_slot_for(metadata.tier, WTRenderMode::Patch);
+            by_slot
+                .entry(patch_slot)
+                .or_default()
+                .insert(component_id.as_u64());
+        }
+
+        by_slot
+            .into_iter()
+            .map(|(slot, component_ids)| WTStreamSlot {
+                slot,
+                label: stream_slot_label(slot).to_string(),
+                component_ids: component_ids.into_iter().collect(),
+            })
+            .collect()
+    }
+
     fn build_shell(
         &self,
         route: &str,
@@ -174,7 +209,7 @@ impl<'a> ManifestBuilder<'a> {
             doctype_and_head,
             body_open,
             body_close: "</body></html>".to_string(),
-            shim_script: default_shim_script(),
+            shim_script: default_shim_script(!tier_b.is_empty() || !tier_c.is_empty()),
         }
     }
 
@@ -610,8 +645,24 @@ fn common_ancestor(mut left: PathBuf, right: &Path) -> Option<PathBuf> {
     Some(left)
 }
 
-fn default_shim_script() -> String {
-    "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>".to_string()
+fn default_shim_script(enable_wt_bootstrap: bool) -> String {
+    let mut script = "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>".to_string();
+    if enable_wt_bootstrap {
+        script.push_str(
+            "<script type=\"module\" async src=\"/_albedo/wt-bootstrap.js\" data-albedo-wt-bootstrap=\"1\"></script>",
+        );
+    }
+    script
+}
+
+fn stream_slot_label(slot: u8) -> &'static str {
+    match slot {
+        WT_STREAM_SLOT_CONTROL => WTRenderMode::Control.as_str(),
+        WT_STREAM_SLOT_SHELL => WTRenderMode::Shell.as_str(),
+        WT_STREAM_SLOT_PATCHES => WTRenderMode::Patch.as_str(),
+        WT_STREAM_SLOT_PREFETCH => WTRenderMode::Prefetch.as_str(),
+        _ => "unknown",
+    }
 }
 
 fn next_order(counter: &mut u32) -> u32 {
@@ -655,4 +706,36 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_shim_script, stream_slot_label};
+    use crate::runtime::webtransport::{
+        WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES, WT_STREAM_SLOT_PREFETCH,
+        WT_STREAM_SLOT_SHELL,
+    };
+
+    #[test]
+    fn test_default_shim_script_includes_wt_bootstrap_for_streaming_routes() {
+        let script = default_shim_script(true);
+        assert!(script.contains("/_albedo/runtime.js"));
+        assert!(script.contains("/_albedo/wt-bootstrap.js"));
+        assert!(script.contains("data-albedo-wt-bootstrap"));
+    }
+
+    #[test]
+    fn test_default_shim_script_omits_wt_bootstrap_for_tier_a_only_routes() {
+        let script = default_shim_script(false);
+        assert!(script.contains("/_albedo/runtime.js"));
+        assert!(!script.contains("/_albedo/wt-bootstrap.js"));
+    }
+
+    #[test]
+    fn test_stream_slot_label_maps_expected_slots() {
+        assert_eq!(stream_slot_label(WT_STREAM_SLOT_CONTROL), "control");
+        assert_eq!(stream_slot_label(WT_STREAM_SLOT_SHELL), "shell");
+        assert_eq!(stream_slot_label(WT_STREAM_SLOT_PATCHES), "patch");
+        assert_eq!(stream_slot_label(WT_STREAM_SLOT_PREFETCH), "prefetch");
+    }
 }

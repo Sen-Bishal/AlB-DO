@@ -1,33 +1,15 @@
-//The following changes are gonna take place in this dir
-//HotSetRegistry — the DashMap<ComponentId, RenderPriority> with register/deregister methods and a bounded size cap.
-//RingNode — a struct with a ComponentId, an AtomicU8 dirty bit, and a raw pointer to the next node. The sentinel is a RingNode with a sentinel flag instead of a component ID.
-//SentinelRing — owns the nodes, owns the AtomicU32 dirty counter, exposes two methods: mark_dirty(ComponentId) called by data sources, and drain(callback) called by the scheduler each frame which walks from sentinel, calls the callback on each dirty node, clears the bit, and stops at sentinel.
-
-//Why raw pointers for the ring?
-//The circular structure creates a reference cycle that Rust's borrow checker will reject if you use Box or Arc naively. Raw pointers with a clear ownership model — SentinelRing owns all nodes, no one else does — is the correct and idiomatic approach here. unsafe is contained entirely inside SentinelRing and the public API is fully safe.
-
-//The only decision to make before writing code is which Ordering to use on the dirty bit. The safe default is AcqRel on the flip and Acquire on the read — guarantees the scheduler sees all writes that happened before the bit was set. We can tighten this to Relaxed later if benchmarks show the acquire fence is costing anything, but start correct then optimize.
-
-// std::sync::atomic — AtomicU8 for the dirty bit on each node, AtomicU32 for the global dirty counter, AtomicUsize for the ring size. Ordering::Acquire and Ordering::Release for the memory ordering on dirty bit flips so the scheduler thread always sees a consistent write from the data source thread.
-//std::ptr::NonNull — for the next pointer on each ring node. Safer than a raw *mut because it encodes non-nullability in the type, so you get a compile-time guarantee that your ring never has a broken link.
-//std::ptr — read, write, for node traversal inside the unsafe block in drain.
-//std::collections::HashSet — for the bounded size check on HotSetRegistry before allowing a new registration.
-
-//From existing dependencies — already in Cargo.toml
-//dashmap — already present. DashMap<ComponentId, RenderPriority> for the hot set registry. Lock-free concurrent reads from the scheduler, concurrent writes from data sources registering components.
-//crossbeam::queue::ArrayQueue — already pulling in crossbeam. This is the bounded lock-free queue that sits between the ring drain and the render queue. The scheduler drains the ring into this, the renderer reads from it. Fixed capacity, no allocation on push.
-
 use crate::config::AppConfig;
 use crate::contract::{
     AllowAllAuthProvider, AuthDecision, AuthProvider, LayoutHandler, PropsLoader, RouteHandler,
     RuntimeMiddleware,
 };
 use crate::error::RuntimeError;
-use crate::handlers::{streaming_handler, StreamingAppState};
+use crate::handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 use crate::render::tier_b::SharedRenderServices;
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
+use crate::webtransport::{WebTransportRuntime, WebTransportSessionRegistry};
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -38,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::{error, info};
 
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -146,10 +129,22 @@ impl AlbedoServerBuilder {
             }
         }
 
+        let shared_wt_sessions = self
+            .config
+            .server
+            .webtransport
+            .enabled
+            .then(WebTransportSessionRegistry::default);
+
         let streaming_runtime = renderer.as_ref().map(|runtime| {
             Arc::new(StreamingAppState::new(
                 Arc::new(runtime.manifest().clone()),
                 SharedRenderServices::default(),
+                StreamingTransportConfig::new(
+                    self.config.server.webtransport.enabled,
+                    self.config.server.port,
+                ),
+                shared_wt_sessions.clone(),
             ))
         });
 
@@ -245,12 +240,59 @@ impl AlbedoServer {
             .await
             .map_err(|err| RuntimeError::ServerStartup(err.to_string()))?;
         info!("ALBEDO server listening on {}", addr);
+        let router = self.router();
 
         let shutdown_timeout = Duration::from_millis(self.config.server.shutdown_timeout_ms);
-        axum::serve(listener, self.router())
-            .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let webtransport_task = if self.config.server.webtransport.enabled {
+            let shared_sessions = self
+                .state
+                .streaming_runtime
+                .as_ref()
+                .and_then(|streaming| streaming.webtransport_sessions.clone())
+                .unwrap_or_default();
+            let runtime = WebTransportRuntime::bind_with_registry(
+                addr,
+                &self.config.server.webtransport,
+                shared_sessions,
+            )?;
+            info!("ALBEDO WebTransport QUIC listener active on {}", addr);
+            let wt_shutdown = shutdown_rx.clone();
+            Some(tokio::spawn(async move { runtime.run(wt_shutdown).await }))
+        } else {
+            info!("ALBEDO WebTransport disabled; SSE/HTTP streaming fallback remains active");
+            None
+        };
+
+        let graceful_shutdown = {
+            let shutdown_tx = shutdown_tx.clone();
+            async move {
+                shutdown_signal(shutdown_timeout).await;
+                let _ = shutdown_tx.send(true);
+            }
+        };
+
+        let http_result = axum::serve(listener, router)
+            .with_graceful_shutdown(graceful_shutdown)
             .await
-            .map_err(|err| RuntimeError::ServerRuntime(err.to_string()))
+            .map_err(|err| RuntimeError::ServerRuntime(err.to_string()));
+
+        let _ = shutdown_tx.send(true);
+
+        if let Some(task) = webtransport_task {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(err) => {
+                    return Err(RuntimeError::ServerRuntime(format!(
+                        "webtransport task join failed: {err}"
+                    )));
+                }
+            }
+        }
+
+        http_result
     }
 }
 
@@ -262,6 +304,14 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
 
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(str::to_string);
+
+    if path == "/_albedo/wt" {
+        if let Some(streaming_runtime) = &state.streaming_runtime {
+            return streaming_handler(State(streaming_runtime.clone()), request)
+                .await
+                .into_response();
+        }
+    }
 
     let route_match = state.router.match_route(method, path.as_str());
     let response = match route_match {

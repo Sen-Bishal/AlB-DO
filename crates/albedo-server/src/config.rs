@@ -77,6 +77,41 @@ impl AppConfig {
             })?;
         }
 
+        if let Ok(enabled) = std::env::var(format!("{prefix}WEBTRANSPORT_ENABLED")) {
+            self.server.webtransport.enabled = parse_bool_env(
+                format!("{prefix}WEBTRANSPORT_ENABLED").as_str(),
+                enabled.as_str(),
+            )?;
+        }
+
+        if let Ok(cert_path) = std::env::var(format!("{prefix}WEBTRANSPORT_CERT_PATH")) {
+            self.server.webtransport.cert_path = Some(cert_path);
+        }
+
+        if let Ok(key_path) = std::env::var(format!("{prefix}WEBTRANSPORT_KEY_PATH")) {
+            self.server.webtransport.key_path = Some(key_path);
+        }
+
+        if let Ok(keepalive_ms) = std::env::var(format!("{prefix}WEBTRANSPORT_KEEPALIVE_MS")) {
+            self.server.webtransport.keepalive_interval_ms =
+                keepalive_ms.parse::<u64>().map_err(|err| {
+                    RuntimeError::InvalidConfig(format!(
+                        "failed to parse {prefix}WEBTRANSPORT_KEEPALIVE_MS value '{keepalive_ms}': {err}"
+                    ))
+                })?;
+        }
+
+        if let Ok(buffer_capacity) =
+            std::env::var(format!("{prefix}WEBTRANSPORT_STREAM_BUFFER_CAPACITY"))
+        {
+            self.server.webtransport.stream_buffer_capacity =
+                buffer_capacity.parse::<usize>().map_err(|err| {
+                    RuntimeError::InvalidConfig(format!(
+                        "failed to parse {prefix}WEBTRANSPORT_STREAM_BUFFER_CAPACITY value '{buffer_capacity}': {err}"
+                    ))
+                })?;
+        }
+
         Ok(())
     }
 
@@ -122,6 +157,8 @@ pub struct ServerConfig {
     pub request_timeout_ms: u64,
     #[serde(default = "default_shutdown_timeout_ms")]
     pub shutdown_timeout_ms: u64,
+    #[serde(default)]
+    pub webtransport: WebTransportConfig,
 }
 
 impl Default for ServerConfig {
@@ -131,6 +168,7 @@ impl Default for ServerConfig {
             port: default_port(),
             request_timeout_ms: default_request_timeout_ms(),
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
+            webtransport: WebTransportConfig::default(),
         }
     }
 }
@@ -154,7 +192,71 @@ impl ServerConfig {
                 "shutdown_timeout_ms must be > 0".to_string(),
             ));
         }
+        self.webtransport.validate()?;
         self.socket_addr()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebTransportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+    #[serde(default = "default_webtransport_keepalive_ms")]
+    pub keepalive_interval_ms: u64,
+    #[serde(default = "default_webtransport_stream_buffer_capacity")]
+    pub stream_buffer_capacity: usize,
+}
+
+impl Default for WebTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: None,
+            key_path: None,
+            keepalive_interval_ms: default_webtransport_keepalive_ms(),
+            stream_buffer_capacity: default_webtransport_stream_buffer_capacity(),
+        }
+    }
+}
+
+impl WebTransportConfig {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.keepalive_interval_ms == 0 {
+            return Err(RuntimeError::InvalidConfig(
+                "webtransport.keepalive_interval_ms must be > 0".to_string(),
+            ));
+        }
+        if self.stream_buffer_capacity == 0 {
+            return Err(RuntimeError::InvalidConfig(
+                "webtransport.stream_buffer_capacity must be > 0".to_string(),
+            ));
+        }
+
+        if self.enabled {
+            let cert_path = self
+                .cert_path
+                .as_ref()
+                .map(|value| value.trim())
+                .unwrap_or_default();
+            let key_path = self
+                .key_path
+                .as_ref()
+                .map(|value| value.trim())
+                .unwrap_or_default();
+
+            if cert_path.is_empty() || key_path.is_empty() {
+                return Err(RuntimeError::InvalidConfig(
+                    "webtransport.enabled=true requires both webtransport.cert_path and webtransport.key_path"
+                        .to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -312,6 +414,14 @@ const fn default_shutdown_timeout_ms() -> u64 {
     5_000
 }
 
+const fn default_webtransport_keepalive_ms() -> u64 {
+    15_000
+}
+
+const fn default_webtransport_stream_buffer_capacity() -> usize {
+    128
+}
+
 const fn default_renderer_cache_ttl_ms() -> u64 {
     30_000
 }
@@ -324,6 +434,16 @@ const fn default_renderer_cache_max_entries() -> usize {
     512
 }
 
+fn parse_bool_env(name: &str, value: &str) -> Result<bool, RuntimeError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(RuntimeError::InvalidConfig(format!(
+            "failed to parse {name} value '{value}' as boolean"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +451,21 @@ mod tests {
     #[test]
     fn test_default_server_config_validates() {
         let cfg = ServerConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_webtransport_requires_cert_and_key_when_enabled() {
+        let mut cfg = ServerConfig::default();
+        cfg.webtransport.enabled = true;
+
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires both webtransport.cert_path and webtransport.key_path"));
+
+        cfg.webtransport.cert_path = Some("./cert.pem".to_string());
+        cfg.webtransport.key_path = Some("./key.pem".to_string());
         assert!(cfg.validate().is_ok());
     }
 

@@ -796,36 +796,41 @@ fn handle_dev_connection(
     hmr_enabled: bool,
 ) -> std::io::Result<()> {
     let socket_start = Instant::now();
-    let mut first_line = String::new();
-    {
-        let mut reader = BufReader::new(stream.try_clone()?);
-        reader.read_line(&mut first_line)?;
-    }
+    let (first_line, request_headers) = read_http_request_head(&stream)?;
     let socket_wait_ms = socket_start.elapsed().as_secs_f64() * 1000.0;
     let request_start = Instant::now();
+    let client = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
 
     let method = first_line.split_whitespace().next().unwrap_or("GET");
     let raw_target = first_line.split_whitespace().nth(1).unwrap_or("/");
     let path = normalize_request_path(raw_target);
+    let transport = determine_dev_transport(path.as_str(), &request_headers, hmr_enabled);
+    let transport_label = format_dev_transport_label(transport);
+    let transport_header_value = transport.active.to_string();
 
     let (status, build_render_ms, build_total_ms, route_like) = if method != "GET" {
+        let headers = [("x-albedo-transport", transport_header_value.clone())];
         write_http_response(
             &mut stream,
             405,
             "Method Not Allowed",
             "text/plain; charset=utf-8",
             b"Method not allowed\n",
-            &[],
+            &headers,
         )?;
         (405, 0.0, 0.0, false)
     } else if path == "/_albedo/health" {
+        let headers = [("x-albedo-transport", transport_header_value.clone())];
         write_http_response(
             &mut stream,
             200,
             "OK",
             "text/plain; charset=utf-8",
             b"ok\n",
-            &[],
+            &headers,
         )?;
         (200, 0.0, 0.0, false)
     } else if path == "/_albedo/hmr" && hmr_enabled {
@@ -833,6 +838,13 @@ fn handle_dev_connection(
         if let Ok(mut clients) = sse_clients.lock() {
             clients.push(stream);
         }
+        println!(
+            "  [dev][transport] client={client} method={method} path={path} transport={transport}",
+            client = client,
+            method = method,
+            path = path,
+            transport = transport_label
+        );
         return Ok(());
     } else if path == "/" || path == "/index.html" || is_route_like_path(path.as_str()) {
         let (doc, render_ms, total_ms, error) = {
@@ -864,6 +876,7 @@ fn handle_dev_connection(
             ("x-albedo-render-ms", format!("{:.2}", render_ms)),
             ("x-albedo-total-ms", format!("{:.2}", total_ms)),
             ("cache-control", "no-store".to_string()),
+            ("x-albedo-transport", transport_header_value.clone()),
         ];
         if error.is_some() {
             headers.push(("x-albedo-dev-state", "error".to_string()));
@@ -880,13 +893,14 @@ fn handle_dev_connection(
         )?;
         (200, render_ms, total_ms, true)
     } else {
+        let headers = [("x-albedo-transport", transport_header_value.clone())];
         write_http_response(
             &mut stream,
             404,
             "Not Found",
             "text/plain; charset=utf-8",
             b"Not found\n",
-            &[],
+            &headers,
         )?;
         (404, 0.0, 0.0, false)
     };
@@ -903,7 +917,7 @@ fn handle_dev_connection(
 
     if route_like {
         println!(
-            "  [dev] {icon} {method} {path} -> {status} (request={request_ms_colored}, socket_wait={socket_wait_ms_colored}, build_render={build_render_ms_colored}, build_total={build_total_ms_colored})",
+            "  [dev] {icon} {method} {path} -> {status} (request={request_ms_colored}, socket_wait={socket_wait_ms_colored}, build_render={build_render_ms_colored}, build_total={build_total_ms_colored}, transport={transport}, client={client})",
             icon = icon,
             method = method,
             path = path,
@@ -911,27 +925,59 @@ fn handle_dev_connection(
             request_ms_colored = request_ms_colored,
             socket_wait_ms_colored = socket_wait_ms_colored,
             build_render_ms_colored = build_render_ms_colored,
-            build_total_ms_colored = build_total_ms_colored
+            build_total_ms_colored = build_total_ms_colored,
+            transport = transport_label,
+            client = client
         );
     } else {
         println!(
-            "  [dev] {icon} {method} {path} -> {status} (request={request_ms_colored}, socket_wait={socket_wait_ms_colored})",
+            "  [dev] {icon} {method} {path} -> {status} (request={request_ms_colored}, socket_wait={socket_wait_ms_colored}, transport={transport}, client={client})",
             icon = icon,
             method = method,
             path = path,
             status = status,
             request_ms_colored = request_ms_colored,
-            socket_wait_ms_colored = socket_wait_ms_colored
+            socket_wait_ms_colored = socket_wait_ms_colored,
+            transport = transport_label,
+            client = client
         );
     }
     Ok(())
 }
 
 fn write_sse_handshake(stream: &mut TcpStream) -> std::io::Result<()> {
-    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nx-albedo-transport: sse\r\n\r\n";
     stream.write_all(headers.as_bytes())?;
     stream.write_all(b"data: connected\n\n")?;
     stream.flush()
+}
+
+fn read_http_request_head(
+    stream: &TcpStream,
+) -> std::io::Result<(String, HashMap<String, String>)> {
+    let mut first_line = String::new();
+    let mut headers = HashMap::new();
+    let mut reader = BufReader::new(stream.try_clone()?);
+    reader.read_line(&mut first_line)?;
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if let Some((name, value)) = trimmed.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    Ok((first_line, headers))
 }
 
 fn broadcast_reload_event(clients: &Arc<Mutex<Vec<TcpStream>>>, revision: u64) {
@@ -1201,6 +1247,61 @@ fn is_route_like_path(path: &str) -> bool {
     }
     let segment = path.rsplit('/').next().unwrap_or(path);
     !segment.contains('.')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DevTransportDecision {
+    active: &'static str,
+    fallback_reason: Option<&'static str>,
+}
+
+fn determine_dev_transport(
+    path: &str,
+    headers: &HashMap<String, String>,
+    hmr_enabled: bool,
+) -> DevTransportDecision {
+    if path == "/_albedo/hmr" && hmr_enabled {
+        return DevTransportDecision {
+            active: "sse",
+            fallback_reason: None,
+        };
+    }
+
+    if request_wants_webtransport(headers) {
+        return DevTransportDecision {
+            active: "sse",
+            fallback_reason: Some("dev_http1_sse_fallback"),
+        };
+    }
+
+    DevTransportDecision {
+        active: "sse",
+        fallback_reason: None,
+    }
+}
+
+fn request_wants_webtransport(headers: &HashMap<String, String>) -> bool {
+    header_has_token(headers, "upgrade", "webtransport")
+        || headers
+            .keys()
+            .any(|name| name.starts_with("sec-webtransport-http3-draft"))
+}
+
+fn header_has_token(headers: &HashMap<String, String>, name: &str, token: &str) -> bool {
+    let Some(value) = headers.get(name) else {
+        return false;
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|entry| entry.eq_ignore_ascii_case(token))
+}
+
+fn format_dev_transport_label(decision: DevTransportDecision) -> String {
+    match decision.fallback_reason {
+        Some(reason) => format!("{} (fallback={})", decision.active, reason),
+        None => decision.active.to_string(),
+    }
 }
 
 fn is_benign_network_error(err: &std::io::Error) -> bool {
@@ -1731,7 +1832,11 @@ fn gradient_text(value: &str, palette: &[u8], bold: bool) -> String {
     let max_idx = chars.len().saturating_sub(1).max(1);
     for (idx, ch) in chars.iter().enumerate() {
         let palette_idx = (idx * (palette.len() - 1)) / max_idx;
-        out.push_str(&style_256(ch.to_string().as_str(), palette[palette_idx], bold));
+        out.push_str(&style_256(
+            ch.to_string().as_str(),
+            palette[palette_idx],
+            bold,
+        ));
     }
     out
 }
@@ -1809,5 +1914,31 @@ mod tests {
         let root = PathBuf::from("C:/work/demo/src/components");
         let inferred = infer_project_dir_from_root(&root).unwrap();
         assert_eq!(inferred, PathBuf::from("C:/work/demo"));
+    }
+
+    #[test]
+    fn test_determine_dev_transport_defaults_to_sse() {
+        let headers = HashMap::new();
+        let decision = determine_dev_transport("/", &headers, true);
+        assert_eq!(decision.active, "sse");
+        assert_eq!(decision.fallback_reason, None);
+    }
+
+    #[test]
+    fn test_determine_dev_transport_records_webtransport_fallback_reason() {
+        let mut headers = HashMap::new();
+        headers.insert("upgrade".to_string(), "webtransport".to_string());
+        let decision = determine_dev_transport("/", &headers, true);
+        assert_eq!(decision.active, "sse");
+        assert_eq!(decision.fallback_reason, Some("dev_http1_sse_fallback"));
+    }
+
+    #[test]
+    fn test_determine_dev_transport_hmr_path_is_sse_without_fallback_reason() {
+        let mut headers = HashMap::new();
+        headers.insert("upgrade".to_string(), "webtransport".to_string());
+        let decision = determine_dev_transport("/_albedo/hmr", &headers, true);
+        assert_eq!(decision.active, "sse");
+        assert_eq!(decision.fallback_reason, None);
     }
 }

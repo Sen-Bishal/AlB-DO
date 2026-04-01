@@ -4,7 +4,7 @@ use dom_render_compiler::bundler::emit::{
     emit_route_prefetch_manifest_json, emit_static_slices_json, emit_vendor_chunk_modules,
     emit_wrapper_modules, BUNDLE_PLAN_FILENAME, BUNDLE_PRECOMPILED_MODULES_FILENAME,
     BUNDLE_ROUTE_PREFETCH_MANIFEST_FILENAME, BUNDLE_RUNTIME_MAP_FILENAME,
-    BUNDLE_STATIC_SLICES_FILENAME,
+    BUNDLE_STATIC_SLICES_FILENAME, BUNDLE_WT_BOOTSTRAP_FILENAME,
 };
 use dom_render_compiler::bundler::plan::{build_bundle_plan, BundlePlanOptions};
 use dom_render_compiler::manifest::schema::{
@@ -277,6 +277,7 @@ fn test_emit_bundle_artifacts_is_byte_identical_across_runs() {
     assert!(snapshot_a.contains_key(BUNDLE_PLAN_FILENAME));
     assert!(snapshot_a.contains_key(BUNDLE_RUNTIME_MAP_FILENAME));
     assert!(snapshot_a.contains_key(BUNDLE_ROUTE_PREFETCH_MANIFEST_FILENAME));
+    assert!(snapshot_a.contains_key(BUNDLE_WT_BOOTSTRAP_FILENAME));
     assert!(snapshot_a
         .keys()
         .any(|path| path.starts_with("__albedo__/wrappers/")));
