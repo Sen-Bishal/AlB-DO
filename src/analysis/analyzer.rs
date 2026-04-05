@@ -65,7 +65,7 @@ impl<'a> ComponentAnalyzer<'a> {
 
         for component in self.graph.components() {
             let mut phase = 0.0;
-            //This is a comment for the lua and nvim setup test
+            // This is a comment for the lua and nvim setup test
             let dependencies = self.graph.get_dependencies(&component.id);
             for dep_id in dependencies {
                 if let Some(dep_comp) = self.graph.get(&dep_id) {

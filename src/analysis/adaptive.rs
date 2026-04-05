@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use sysinfo::System;
-//Fix this
+// Fix this
 pub struct GranularityController {
     system: System,
     recent_cache_misses: AtomicUsize,

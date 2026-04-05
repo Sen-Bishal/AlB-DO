@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 type FileHash = u64;
 
+#[allow(dead_code)]
 struct LazyCacheData {
     file_hashes: HashMap<PathBuf, FileHash>,
     component_cache: HashMap<ComponentId, CachedAnalysis>,
@@ -38,7 +39,7 @@ pub enum InvalidationReason {
     NewComponent,
     Deleted,
 }
-//This is another test for my lua and nvim setup
+// This is another test for my lua and nvim setup
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedAnalysis {
     pub component: Component,

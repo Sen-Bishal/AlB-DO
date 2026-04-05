@@ -13,7 +13,7 @@
       "legacy_phase": null,
       "legacy_priority": null,
       "line_number": 0,
-      "module_path": "test-app/src/components/App.jsx",
+      "module_path": "tests/fixtures/components/App.jsx",
       "source_hash": "<normalized>",
       "symbol": "App"
     },
@@ -30,7 +30,7 @@
       "legacy_phase": null,
       "legacy_priority": null,
       "line_number": 0,
-      "module_path": "test-app/src/components/Button.jsx",
+      "module_path": "tests/fixtures/components/Button.jsx",
       "source_hash": "<normalized>",
       "symbol": "Button"
     },
@@ -47,7 +47,7 @@
       "legacy_phase": null,
       "legacy_priority": null,
       "line_number": 0,
-      "module_path": "test-app/src/components/FeatureCard.jsx",
+      "module_path": "tests/fixtures/components/FeatureCard.jsx",
       "source_hash": "<normalized>",
       "symbol": "FeatureCard"
     },
@@ -64,7 +64,7 @@
       "legacy_phase": null,
       "legacy_priority": null,
       "line_number": 0,
-      "module_path": "test-app/src/components/Features.jsx",
+      "module_path": "tests/fixtures/components/Features.jsx",
       "source_hash": "<normalized>",
       "symbol": "Features"
     },
@@ -81,7 +81,7 @@
       "legacy_phase": null,
       "legacy_priority": null,
       "line_number": 0,
-      "module_path": "test-app/src/components/Footer.jsx",
+      "module_path": "tests/fixtures/components/Footer.jsx",
       "source_hash": "<normalized>",
       "symbol": "Footer"
     },
@@ -98,7 +98,7 @@
       "legacy_phase": null,
       "legacy_priority": null,
       "line_number": 0,
-      "module_path": "test-app/src/components/Header.jsx",
+      "module_path": "tests/fixtures/components/Header.jsx",
       "source_hash": "<normalized>",
       "symbol": "Header"
     },
@@ -115,7 +115,7 @@
       "legacy_phase": null,
       "legacy_priority": null,
       "line_number": 0,
-      "module_path": "test-app/src/components/HeroImage.jsx",
+      "module_path": "tests/fixtures/components/HeroImage.jsx",
       "source_hash": "<normalized>",
       "symbol": "HeroImage"
     },
@@ -132,7 +132,7 @@
       "legacy_phase": null,
       "legacy_priority": null,
       "line_number": 0,
-      "module_path": "test-app/src/components/Navigation.jsx",
+      "module_path": "tests/fixtures/components/Navigation.jsx",
       "source_hash": "<normalized>",
       "symbol": "Navigation"
     }

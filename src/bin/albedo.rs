@@ -4,7 +4,7 @@ use dom_render_compiler::dev_contract::{
     ResolvedDevContract, DEV_CONFIG_JSON, DEV_CONFIG_TS,
 };
 use dom_render_compiler::parser::ParsedComponent;
-use dom_render_compiler::runtime::ast_eval::{ComponentProject, PatchReport};
+use dom_render_compiler::runtime::eval::{ComponentProject, PatchReport};
 use dom_render_compiler::runtime::hot_set::{
     HotSetRegistry, RenderPriority, SentinelRing, HOT_SET_MAX,
 };

@@ -30,14 +30,14 @@ Zero Node.js in the hot path. Zero compromise on speed.
 
 ---
 
-## ⚡ Why AlBDO
+## Why AlBDO
 
 AlBDO is not a meta-framework bolted on top of an existing runtime. It is a **compiler and HTTP runtime built ground-up in Rust** — the bundler, the scheduler, the server, and the CLI are a single unified binary. No Node.js ever touches a live request.
 
 | | AlBDO | Next.js | Remix |
 |---|---|---|---|
 | **Language** | Rust | JavaScript | JavaScript |
-| **Node.js in hot path** | ✗ None | ✓ Always | ✓ Always |
+| **Node.js in hot path** | None | Always | Always |
 | **Hydration strategy** | Compiler-inferred (A/B/C) | Manual hints | Manual hints |
 | **Cached response time** | ~0.07ms | ~2–8ms | ~3–10ms |
 | **Deploy artifact** | Single binary | Node process + assets | Node process + assets |
@@ -45,7 +45,7 @@ AlBDO is not a meta-framework bolted on top of an existing runtime. It is a **co
 
 ---
 
-## ◈ Effect Lattice — Hydration Tiers
+## Effect Lattice — Hydration Tiers
 
 AlBDO's compiler analyses every component's effect profile at build time and classifies it into one of three hydration tiers. No runtime detection. No configuration needed.
 
@@ -68,17 +68,17 @@ EffectProfile { hooks, async, io, side_effects }
 > **v0.1.1** will print tier decisions in the terminal during `albedo dev` and `albedo build`.
 
 ```
-✓ App          → Tier A  (zero JS)
-✓ Header       → Tier A  (zero JS)
-✓ HeroImage    → Tier A  (zero JS)
-✓ Button       → Tier B  (selective hydration)
-✓ Navigation   → Tier B  (selective hydration)
-✓ FeatureCard  → Tier C  (full hydration)
+  App          → Tier A  (zero JS)
+  Header       → Tier A  (zero JS)
+  HeroImage    → Tier A  (zero JS)
+  Button       → Tier B  (selective hydration)
+  Navigation   → Tier B  (selective hydration)
+  FeatureCard  → Tier C  (full hydration)
 ```
 
 ---
 
-## ▶ Quick Start
+## Quick Start
 
 ```sh
 # Install — npm shell package, platform binary auto-selected
@@ -96,8 +96,6 @@ albedo build
 ```
 
 ---
-
-
 
 ### Runtime kernel
 
@@ -133,7 +131,7 @@ dom-render-compiler/
 
 ---
 
-## ◎ Performance
+## Performance
 
 > Benchmarked on a single machine. Cold starts vary by route — investigation ongoing.
 
@@ -145,7 +143,7 @@ Deploy artifact        1 binary  (scp it anywhere)
 
 ---
 
-## ✦ Features
+## Features
 
 - **SWC-powered JSX/TSX parser** with full effect inference — template literals, ternary/binary/unary, `const` bindings, `Array.map()`, `classnames`/`clsx` (native, no npm), object/array literals, and string prototype methods
 - **AST patch cache** — `source_hashes` + `patch()` + `PatchReport` for incremental re-parse on HMR
@@ -157,11 +155,12 @@ Deploy artifact        1 binary  (scp it anywhere)
 
 ---
 
-## ◉ Roadmap — v0.1.1
+## Roadmap — v0.1.1
 
 > Edge-native release. Focus: HTTP/3 streaming, single-binary distribution, and zero-config asset pipeline.
 
-### ⟳ WebTransport-native streaming
+### WebTransport-native streaming
+
 Bidirectional component streaming over HTTP/3 via the `WebTransportMuxer` 4-stream kernel. True full-duplex server push — no polling, no WebSocket fallback.
 
 **Status:** `pre-release hardening complete`
@@ -176,36 +175,40 @@ Ship checklist:
 
 ---
 
-### ⬡ Single-binary edge compilation
+### Single-binary edge compilation
+
 Deploy your entire application as one `scp`-able binary. Full cross-platform NAPI build matrix via GitHub Actions:
 
 | Target | Status |
 |---|---|
-| `win32-x64-msvc` | ✅ available |
-| `darwin-x64` | 🔧 in progress |
-| `darwin-arm64` | 🔧 in progress |
-| `linux-x64-gnu` | 📋 planned |
-| `linux-arm64-gnu` | 📋 planned |
+| `win32-x64-msvc` | Available |
+| `darwin-x64` | In progress |
+| `darwin-arm64` | In progress |
+| `linux-x64-gnu` | Planned |
+| `linux-arm64-gnu` | Planned |
 
 **Status:** `in progress`
 
 ---
 
-### ◈ Zero-config image & font pipeline
+### Zero-config image & font pipeline
+
 Automatic asset optimization baked into the compiler pass — no config files, no plugins, no Webpack. Images emit optimal formats (AVIF/WebP) and fonts are subset at build time. Zero runtime overhead.
 
 **Status:** `planned`
 
 ---
 
-### ⟨⟩ Compile-time i18n
+### Compile-time i18n
+
 Translated pages resolved entirely at compile time. The compiler emits a separate static bundle per locale — zero runtime i18n library, zero locale-detection overhead in the hot path.
 
 **Status:** `planned`
 
 ---
 
-### ▣ Tier feedback in terminal
+### Tier feedback in terminal
+
 Effect lattice decisions (Tier A / B / C per component) are already computed at compile time. v0.1.1 surfaces them as structured output during `albedo dev` and `albedo build` so developers can see exactly what the compiler decided and why.
 
 **Status:** `planned`
@@ -237,6 +240,25 @@ AlBDO is pre-release and developed in the open. The codebase is structured for i
 - **`albedo-analyzer`** — bundle planning, manifest generation, rewrite passes
 
 GSoC submissions are planned for both crates as independent projects.
+
+| Resource | Link |
+|----------|------|
+| GSoC proposal — `albedo-analyzer` | *(link TBD)* |
+| GSoC proposal — `albedo-core` | *(link TBD)* |
+| Landing page | [albedo.dev](https://albedo.dev) |
+| Architecture deep-dive | [`docs/architecture.md`](docs/architecture.md) |
+
+---
+
+## Compatibility
+
+| OS | Node version | NAPI target | Status |
+|----|-------------|-------------|--------|
+| Windows x64 | 18 / 20 / 22 | `win32-x64-msvc` | Available |
+| macOS x64 | 18 / 20 / 22 | `darwin-x64` | In progress |
+| macOS ARM64 | 18 / 20 / 22 | `darwin-arm64` | In progress |
+| Linux x64 | 18 / 20 / 22 | `linux-x64-gnu` | Planned |
+| Linux ARM64 | 18 / 20 / 22 | `linux-arm64-gnu` | Planned |
 
 ---
 

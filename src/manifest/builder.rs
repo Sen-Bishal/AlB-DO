@@ -1,4 +1,4 @@
-//CiCD reviewer rules
+// CiCD reviewer rules
 
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, RenderedNode,
@@ -6,7 +6,7 @@ use super::schema::{
 };
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;
-use crate::runtime::ast_eval::ComponentProject;
+use crate::runtime::eval::ComponentProject;
 use crate::runtime::webtransport::{
     WTRenderMode, WTStreamRouter, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
     WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,

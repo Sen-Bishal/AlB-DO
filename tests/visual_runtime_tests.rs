@@ -346,8 +346,8 @@ fn test_visual_snapshot_client_demo_route_for_non_technical_audience() {
 fn test_visual_snapshot_test_app_components_directory_render() {
     let mut renderer = create_renderer();
     let components_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("test-app")
-        .join("src")
+        .join("tests")
+        .join("fixtures")
         .join("components");
 
     let result = renderer

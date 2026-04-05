@@ -23,13 +23,27 @@ This repository is maintained with a release-first approach. Contributions are w
 
 ## Local Validation Before PR
 
-Run the following from repository root:
+Run the following from repository root before opening a pull request:
 
 ```bash
 cargo fmt --all
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test
 cargo check --release --bins
 ```
+
+## Pre-commit Hook Setup (required for all contributors)
+
+Install the repo's pre-commit hook once after cloning:
+
+```bash
+git config core.hooksPath .hooks
+# On Unix/macOS:
+chmod +x .hooks/pre-commit
+```
+
+The hook runs `cargo fmt --check`, `cargo clippy -D warnings`, and a fast `cargo nextest` pass
+before every commit. No commit will go through if any of these fail.
 
 ## CI and Release Expectations
 
