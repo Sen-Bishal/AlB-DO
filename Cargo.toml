@@ -1,56 +1,171 @@
 [workspace]
+resolver = "2"
 members = [
     ".",
     "crates/albedo-node",
     "crates/albedo-server",
 ]
-resolver = "2"
+
+[workspace.package]
+version      = "0.1.0-alpha.1"
+edition      = "2021"
+rust-version = "1.77.0"
+authors      = ["Bishal Sen(bishalsenpersonal@gmail.com)", "Bishal Sen(bishalsenpersonal@gmail.com)", "AlBDO(support@albdo.dev)"]
+license      = "MIT"
+repository   = "https://github.com/AlBDO/AlBDO-v-0.1.0"
+homepage     = "https://albdo.dev"
+keywords     = ["jsx", "tsx", "compiler", "ssr", "runtime"]
+categories   = ["web-programming", "compilers", "development-tools"]
+
+[workspace.dependencies]
+# Internal
+dom-render-compiler = { path = "." }
+
+# Async runtime
+tokio         = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync", "io-util"] }
+tokio-stream  = { version = "0.1" }
+async-trait   = { version = "0.1" }
+async-stream  = { version = "0.3" }
+futures-util  = { version = "0.3" }
+
+# Web framework
+axum             = { version = "0.8" }
+bytes            = { version = "1.7" }
+http             = { version = "1.1" }
+matchit          = { version = "0.8" }
+url              = { version = "2.5" }
+uuid             = { version = "1", features = ["v4"] }
+
+# Serialization
+serde            = { version = "1", features = ["derive"] }
+serde_json       = { version = "1" }
+bincode          = { version = "1.3" }
+
+# Parsing (SWC)
+swc_common                     = { version = "0.37" }
+swc_ecma_ast                   = { version = "0.118" }
+swc_ecma_codegen               = { version = "0.155" }
+swc_ecma_parser                = { version = "0.149" }
+swc_ecma_transforms_base       = { version = "0.145" }
+swc_ecma_transforms_react      = { version = "0.191" }
+swc_ecma_transforms_typescript = { version = "0.198" }
+swc_ecma_visit                 = { version = "0.104" }
+
+# Concurrency
+crossbeam  = { version = "0.8" }
+dashmap    = { version = "5.5" }
+rayon      = { version = "1" }
+
+# Caching / collections
+once_cell  = { version = "1" }
+lru        = { version = "0.12" }
+
+# Error handling
+thiserror  = { version = "1" }
+anyhow     = { version = "1" }
+
+# Logging / tracing
+tracing            = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# System / utilities
+core_affinity = { version = "0.8" }
+num_cpus      = { version = "1" }
+sysinfo       = { version = "0.30" }
+rquickjs      = { version = "0.9" }
+time          = { version = "0.3", features = ["formatting"] }
+
+# File system / watching
+notify   = { version = "6" }
+walkdir  = { version = "2" }
+
+# QUIC / TLS
+quinn            = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls-pemfile   = { version = "2.2" }
+rustls-pki-types = { version = "1.9" }
+
+# NAPI (Node.js bridge)
+napi        = { version = "2.16", default-features = false, features = ["napi8", "serde-json"] }
+napi-derive = { version = "2.16" }
+
+# Testing / benchmarks
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile  = { version = "3" }
+regex     = { version = "1" }
+tower     = { version = "0.5", features = ["util"] }
+
+[workspace.lints.rust]
+unsafe_code      = "forbid"
+missing_docs     = "warn"
+unused_imports   = "deny"
+dead_code        = "warn"
+unused_variables = "warn"
+
+[workspace.lints.clippy]
+all      = "deny"
+pedantic = "warn"
+
+# ── Root crate (dom-render-compiler) ────────
 
 [package]
-name = "dom-render-compiler"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name              = "dom-render-compiler"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+homepage.workspace    = true
+keywords.workspace    = true
+categories.workspace  = true
 
 [[bin]]
 name = "dom-compiler"
 path = "src/bin/dom-compiler.rs"
 
-[dependencies]
-crossbeam = "0.8"
-core_affinity = "0.8"
-dashmap = "5.5"
-once_cell = "1.19"
-lru = "0.12"
-serde = { version = "=1.0.210", features = ["derive"] }
-serde_json = "1.0"
-bincode = "1.3"
-thiserror = "1.0"
-anyhow = "1.0"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-sysinfo = "0.30"
-num_cpus = "1.16"
-walkdir = "2.4"
-notify = "6.1"
-rquickjs = "0.9"
-time = { version = "0.3", features = ["formatting"] }
+[[bin]]
+name = "albedo"
+path = "src/bin/albedo.rs"
 
-swc_common = "0.37"
-swc_ecma_ast = "0.118"
-swc_ecma_codegen = "0.155"
-swc_ecma_parser = "0.149"
-swc_ecma_transforms_base = "0.145"
-swc_ecma_transforms_react = "0.191"
-swc_ecma_transforms_typescript = "0.198"
-swc_ecma_visit = "0.104"
+[[bin]]
+name = "albedo-bench"
+path = "src/bin/albedo-bench.rs"
+
+[dependencies]
+crossbeam.workspace          = true
+core_affinity.workspace      = true
+dashmap.workspace            = true
+once_cell.workspace          = true
+lru.workspace                = true
+serde.workspace              = true
+serde_json.workspace         = true
+bincode.workspace            = true
+thiserror.workspace          = true
+anyhow.workspace             = true
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+sysinfo.workspace            = true
+num_cpus.workspace           = true
+walkdir.workspace            = true
+notify.workspace             = true
+rquickjs.workspace           = true
+time.workspace               = true
+
+swc_common.workspace                     = true
+swc_ecma_ast.workspace                   = true
+swc_ecma_codegen.workspace               = true
+swc_ecma_parser.workspace                = true
+swc_ecma_transforms_base.workspace       = true
+swc_ecma_transforms_react.workspace      = true
+swc_ecma_transforms_typescript.workspace = true
+swc_ecma_visit.workspace                 = true
 
 [dev-dependencies]
-tempfile = "3.8"
-regex = "1.11"
+tempfile.workspace = true
+regex.workspace    = true
 
 [profile.release]
-opt-level = 3
-lto = true
+opt-level     = 3
+lto           = true
 codegen-units = 1
-strip = true
+strip         = true

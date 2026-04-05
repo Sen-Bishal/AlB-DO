@@ -1,3 +1,39 @@
+//! # albedo-node
+//!
+//! NAPI bindings exposing the `dom-render-compiler` pipeline to Node.js.
+//!
+//! This crate produces a platform-native `.node` addon consumed by the `albedo` npm
+//! shell package. All heavy work runs on a Rust thread pool via [`napi::Task`] — the
+//! Node.js event loop is never blocked.
+//!
+//! ## Exported API (JavaScript surface)
+//!
+//! | JS name | Rust | Description |
+//! |---------|------|-------------|
+//! | `analyzeProject(path, opts?)` | [`analyze_project`] | Scan a project directory and return a `RenderManifestV2` |
+//! | `optimizeManifest(manifest, opts?)` | [`optimize_manifest`] | Post-process and normalize an existing manifest |
+//! | `getCacheStats()` | [`get_cache_stats`] | Return metrics from the last `analyzeProject` call |
+//!
+//! ## Platform support
+//!
+//! | Target | Status |
+//! |--------|--------|
+//! | `win32-x64-msvc` | available |
+//! | `darwin-x64` | in progress |
+//! | `darwin-arm64` | in progress |
+//! | `linux-x64-gnu` | planned |
+//! | `linux-arm64-gnu` | planned |
+
+#![deny(clippy::all)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::nursery)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::must_use_candidate)]
+// NAPI bridge: unwrap/expect are contained within panic_safe()
+#![warn(clippy::unwrap_used)]
+#![warn(clippy::expect_used)]
+#![deny(clippy::todo)]
+
 use dom_render_compiler::bundler::BundlePlanOptions;
 use dom_render_compiler::estimator::WeightEstimator;
 use dom_render_compiler::incremental::CacheStats as CompilerCacheStats;
@@ -19,6 +55,7 @@ use std::sync::Mutex;
 static LAST_CACHE_METRICS: Lazy<Mutex<CacheMetrics>> =
     Lazy::new(|| Mutex::new(CacheMetrics::default()));
 
+/// Options for the [`analyze_project`] call.
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct AnalyzeProjectOptions {
@@ -26,6 +63,7 @@ pub struct AnalyzeProjectOptions {
     pub persist_cache: Option<bool>,
 }
 
+/// Options for the [`optimize_manifest`] call.
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct OptimizeManifestOptions {
@@ -33,6 +71,7 @@ pub struct OptimizeManifestOptions {
     pub shared_dependency_min_components: Option<u32>,
 }
 
+/// Cache performance snapshot returned by [`get_cache_stats`].
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct CacheMetrics {
@@ -86,6 +125,13 @@ impl Task for OptimizeManifestTask {
     }
 }
 
+/// Scans `project_path` for JSX/TSX components, runs the full AlBDO compilation
+/// pipeline, and returns a serialized `RenderManifestV2`.
+///
+/// The call is async — compilation runs on a Rust thread pool and resolves as a
+/// JavaScript Promise without blocking the Node.js event loop.
+///
+/// Pass `cache_dir` in `options` to enable incremental compilation across invocations.
 #[napi(js_name = "analyzeProject")]
 pub fn analyze_project(
     project_path: String,
@@ -97,6 +143,11 @@ pub fn analyze_project(
     })
 }
 
+/// Post-processes an existing `RenderManifestV2` value: normalizes component ordering,
+/// deduplicates dependencies and batch entries, and derives vendor chunk assignments.
+///
+/// Returns the normalized manifest as a JavaScript value (same shape as the input).
+/// The call is async and resolves as a JavaScript Promise.
 #[napi(js_name = "optimizeManifest")]
 pub fn optimize_manifest(
     manifest: Value,
@@ -108,6 +159,9 @@ pub fn optimize_manifest(
     })
 }
 
+/// Returns a [`CacheMetrics`] snapshot from the most recent [`analyze_project`] call.
+///
+/// Returns a zeroed-out default if no call has been made yet in this process.
 #[napi(js_name = "getCacheStats")]
 pub fn get_cache_stats() -> CacheMetrics {
     snapshot_cache_metrics()

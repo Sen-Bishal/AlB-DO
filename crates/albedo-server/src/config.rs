@@ -5,7 +5,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 // Runtime direction:
-// - Apply ALBEDO plans to actual rendering behavior (critical-first SSR, deferred module loading, selective hydration).
+// - Apply ALBEDO plans to actual rendering behavior (critical-first SSR, deferred module loading,
+//   selective hydration).
 // - Keep standalone benchmark gates (TTFB, hydration, server CPU) as release blockers.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

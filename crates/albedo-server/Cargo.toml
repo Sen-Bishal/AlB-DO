@@ -1,29 +1,33 @@
 [package]
-name = "albedo-server"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+name              = "albedo-server"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+homepage.workspace    = true
 
 [dependencies]
-async-trait = "0.1"
-async-stream = "0.3"
-axum = "0.8"
-bytes = "1.7"
-dom-render-compiler = { path = "../.." }
-futures-util = "0.3"
-http = "1.1"
-matchit = "0.8"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync", "io-util"] }
-tokio-stream = "0.1"
-tracing = "0.1"
-url = "2.5"
-uuid = { version = "1.10", features = ["v4"] }
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls-pemfile = "2.2"
-rustls-pki-types = "1.9"
+async-trait.workspace          = true
+async-stream.workspace         = true
+axum.workspace                 = true
+bytes.workspace                = true
+dom-render-compiler.workspace  = true
+futures-util.workspace         = true
+http.workspace                 = true
+matchit.workspace              = true
+serde.workspace                = true
+serde_json.workspace           = true
+thiserror.workspace            = true
+tokio.workspace                = true
+tokio-stream.workspace         = true
+tracing.workspace              = true
+url.workspace                  = true
+uuid.workspace                 = true
+quinn.workspace                = true
+rustls-pemfile.workspace       = true
+rustls-pki-types.workspace     = true
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+tower.workspace = true

@@ -1,5 +1,5 @@
 use crate::parser::ParsedComponent;
-use crate::runtime::ast_eval::render_from_components_dir;
+use crate::runtime::eval::render_from_components_dir;
 use crate::scanner::ProjectScanner;
 use serde::Serialize;
 use serde_json::Value;

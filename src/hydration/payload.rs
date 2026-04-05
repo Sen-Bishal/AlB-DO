@@ -11,8 +11,8 @@ pub struct HydrationIslandPayload {
     pub trigger: HydrationTrigger,
     pub dependencies: Vec<u64>,
 }
-//This is a nvim setup test!
-//I think it works.
+// This is a nvim setup test!
+// I think it works.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HydrationPayload {
     pub version: String,

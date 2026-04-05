@@ -1,8 +1,59 @@
-pub mod adaptive;
-pub mod analyzer;
-pub mod benchmark;
+//! # dom-render-compiler
+//!
+//! The core compiler crate for [AlBDO](https://albedo.dev) — a Rust-native DOM render compiler
+//! and HTTP runtime for JSX/TSX applications.
+//!
+//! This crate is responsible for the full compilation pipeline:
+//!
+//! 1. **Parsing** — SWC-powered JSX/TSX ingestion with effect inference
+//! 2. **Graph construction** — [`ComponentGraph`] built from scanned source files
+//! 3. **Analysis** — [`ParallelAnalyzer`] assigns effect profiles and weight estimates
+//! 4. **Scheduling** — topological sort + critical-path scoring for parallel render batching
+//! 5. **Manifest emission** — [`RenderManifestV2`] consumed by `albedo-server`
+//! 6. **Bundling** — classify → plan → rewrite → emit pipeline in [`bundler`]
+//!
+//! ## Effect Lattice — Hydration Tiers
+//!
+//! Every component is classified into one of three tiers at compile time:
+//!
+//! | Tier | Profile | Client JS |
+//! |------|---------|----------|
+//! | A | No hooks, no async, no side effects | Zero bytes |
+//! | B | Light interactivity / event handlers | Island only |
+//! | C | Full hook surface, async I/O | Full hydration |
+//!
+//! ## Quick start
+//!
+//! ```rust,no_run
+//! use dom_render_compiler::RenderCompiler;
+//!
+//! let compiler = RenderCompiler::new();
+//! let manifest = compiler.optimize_manifest_v2().unwrap();
+//! println!("{} components compiled", manifest.components.len());
+//! ```
+
+#![deny(clippy::all)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::nursery)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::must_use_candidate)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    clippy::shadow_unrelated,
+    clippy::todo
+)]
+#![warn(clippy::expect_used)]
+#![warn(clippy::integer_arithmetic)]
+#![warn(rustdoc::broken_intra_doc_links)]
+#![warn(rustdoc::missing_crate_level_docs)]
+#![warn(rustdoc::invalid_codeblock_attributes)]
+
+pub mod analysis;
 pub mod bundler;
-pub mod dev_contract;
+pub mod dev;
 pub mod effects;
 pub mod estimator;
 pub mod graph;
@@ -10,14 +61,19 @@ pub mod hydration;
 pub mod incremental;
 pub mod ir;
 pub mod manifest;
-pub mod parallel;
-pub mod parallel_topo;
 pub mod parser;
 pub mod runtime;
 pub mod scanner;
-pub mod showcase;
-pub mod topological;
 pub mod types;
+
+pub use analysis::adaptive;
+pub use analysis::analyzer;
+pub use analysis::parallel;
+pub use analysis::parallel_topo;
+pub use analysis::topological;
+pub use dev::benchmark;
+pub use dev::contract as dev_contract;
+pub use dev::showcase;
 
 use crate::graph::ComponentGraph;
 use crate::incremental::IncrementalCache;
@@ -29,12 +85,26 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+/// The primary facade for the AlBDO compilation pipeline.
+///
+/// Owns a [`ComponentGraph`] and an optional [`IncrementalCache`]. Drives analysis,
+/// scheduling, manifest generation, and bundle emission in a single API surface.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use dom_render_compiler::RenderCompiler;
+///
+/// let compiler = RenderCompiler::new();
+/// let json = compiler.export_manifest_v2_json().unwrap();
+/// ```
 pub struct RenderCompiler {
     graph: ComponentGraph,
     cache: Option<IncrementalCache>,
 }
 
 impl RenderCompiler {
+    /// Creates a new [`RenderCompiler`] with an empty graph and no cache.
     pub fn new() -> Self {
         Self {
             graph: ComponentGraph::new(),
@@ -42,6 +112,10 @@ impl RenderCompiler {
         }
     }
 
+    /// Creates a [`RenderCompiler`] backed by a persistent [`IncrementalCache`] at `cache_dir`.
+    ///
+    /// The cache is loaded eagerly. A load failure is logged as a warning and the compiler
+    /// continues without cached state rather than returning an error.
     pub fn with_cache(cache_dir: PathBuf) -> Self {
         let cache = IncrementalCache::new(cache_dir);
 
@@ -55,18 +129,28 @@ impl RenderCompiler {
         }
     }
 
+    /// Inserts a [`Component`] into the graph and returns its assigned [`ComponentId`].
     pub fn add_component(&mut self, component: Component) -> ComponentId {
         self.graph.add_component(component)
     }
 
+    /// Records a render dependency edge `from` → `to` in the graph.
+    ///
+    /// Returns an error if adding the edge would introduce a cycle.
     pub fn add_dependency(&mut self, from: ComponentId, to: ComponentId) -> Result<()> {
         self.graph.add_dependency(from, to)
     }
 
+    /// Returns a shared reference to the underlying [`ComponentGraph`].
     pub fn graph(&self) -> &ComponentGraph {
         &self.graph
     }
 
+    /// Runs the full analysis and scheduling pipeline.
+    ///
+    /// Validates the graph for cycles, runs [`ParallelAnalyzer`], computes a topological
+    /// sort with priority scoring, and returns an [`OptimizationResult`] containing the
+    /// critical path and parallel render batches.
     pub fn optimize(&self) -> Result<OptimizationResult> {
         let start = Instant::now();
 
@@ -105,12 +189,17 @@ impl RenderCompiler {
         })
     }
 
+    /// Runs [`Self::optimize`] and serializes the result to a pretty-printed JSON string.
     pub fn export_json(&self) -> Result<String> {
         let result = self.optimize()?;
         serde_json::to_string_pretty(&result)
             .map_err(|e| CompilerError::AnalysisFailed(e.to_string()))
     }
 
+    /// Produces a [`ir::CanonicalIrDocument`] from the current graph state.
+    ///
+    /// The canonical IR is a stable, version-tagged representation of the component graph
+    /// and effect analyses, suitable for offline inspection and tooling interop.
     pub fn optimize_canonical_ir(&self) -> Result<ir::CanonicalIrDocument> {
         self.graph.validate()?;
         let analyzer = ParallelAnalyzer::new(&self.graph);
@@ -118,11 +207,16 @@ impl RenderCompiler {
         Ok(ir::build_canonical_ir_from_graph(&self.graph, &analyses))
     }
 
+    /// Runs [`Self::optimize_canonical_ir`] and serializes to a pretty-printed JSON string.
     pub fn export_canonical_ir_json(&self) -> Result<String> {
         let ir = self.optimize_canonical_ir()?;
         serde_json::to_string_pretty(&ir).map_err(|e| CompilerError::AnalysisFailed(e.to_string()))
     }
 
+    /// Builds a [`manifest::schema::RenderManifestV2`] from an existing [`OptimizationResult`].
+    ///
+    /// Use this when you already hold an `OptimizationResult` and want to avoid re-running
+    /// analysis. For the common one-shot case, prefer [`Self::optimize_manifest_v2`].
     pub fn manifest_v2_from_result(
         &self,
         result: &OptimizationResult,
@@ -134,17 +228,24 @@ impl RenderCompiler {
         )
     }
 
+    /// Runs the full pipeline and returns a [`manifest::schema::RenderManifestV2`].
+    ///
+    /// This is the primary output consumed by `albedo-server` to configure the HTTP runtime.
     pub fn optimize_manifest_v2(&self) -> Result<manifest::schema::RenderManifestV2> {
         let result = self.optimize()?;
         Ok(self.manifest_v2_from_result(&result))
     }
 
+    /// Runs [`Self::optimize_manifest_v2`] and serializes to a pretty-printed JSON string.
     pub fn export_manifest_v2_json(&self) -> Result<String> {
         let manifest = self.optimize_manifest_v2()?;
         serde_json::to_string_pretty(&manifest)
             .map_err(|e| CompilerError::AnalysisFailed(e.to_string()))
     }
 
+    /// Derives a [`bundler::BundlePlan`] from an existing manifest and bundle options.
+    ///
+    /// Prefer [`Self::optimize_bundle_plan`] for the common one-shot case.
     pub fn bundle_plan_from_manifest_v2(
         &self,
         manifest: &manifest::schema::RenderManifestV2,
@@ -153,17 +254,22 @@ impl RenderCompiler {
         bundler::build_bundle_plan(manifest, options)
     }
 
+    /// Runs the full pipeline and returns a [`bundler::BundlePlan`].
     pub fn optimize_bundle_plan(&self) -> Result<bundler::BundlePlan> {
         let manifest = self.optimize_manifest_v2()?;
         Ok(self.bundle_plan_from_manifest_v2(&manifest, &bundler::BundlePlanOptions::default()))
     }
 
+    /// Runs [`Self::optimize_bundle_plan`] and serializes to a pretty-printed JSON string.
     pub fn export_bundle_plan_json(&self) -> Result<String> {
         let plan = self.optimize_bundle_plan()?;
         bundler::emit::emit_bundle_plan_json(&plan)
             .map_err(|e| CompilerError::AnalysisFailed(e.to_string()))
     }
 
+    /// Emits bundle artifacts to `output_dir` from an existing manifest and options.
+    ///
+    /// Returns a [`bundler::emit::BundleEmitReport`] describing every file written.
     pub fn emit_bundle_artifacts_from_manifest_v2(
         &self,
         manifest: &manifest::schema::RenderManifestV2,
@@ -180,6 +286,10 @@ impl RenderCompiler {
         })
     }
 
+    /// Emits bundle artifacts with pre-resolved module sources to `output_dir`.
+    ///
+    /// `module_sources` maps module paths to their source strings, allowing the bundler
+    /// to inline real source content rather than emitting placeholder stubs.
     pub fn emit_bundle_artifacts_from_manifest_v2_with_sources(
         &self,
         manifest: &manifest::schema::RenderManifestV2,
@@ -203,6 +313,9 @@ impl RenderCompiler {
         })
     }
 
+    /// Runs the full pipeline and writes all bundle artifacts to `output_dir`.
+    ///
+    /// This is the one-shot emit path used by the `albedo build` CLI command.
     pub fn emit_bundle_artifacts_to_dir(
         &self,
         output_dir: impl AsRef<Path>,
@@ -217,6 +330,13 @@ impl RenderCompiler {
         })
     }
 
+    /// Runs an incremental compilation pass, reusing cached analyses for unchanged files.
+    ///
+    /// `file_paths` is the full list of source files in the project. The compiler diffs
+    /// this list against the cache to determine which components need re-analysis.
+    ///
+    /// Requires the compiler to have been constructed via [`Self::with_cache`]; if no cache
+    /// is present, falls back to a full non-incremental [`Self::optimize`] pass.
     pub fn optimize_incremental(&mut self, file_paths: &[PathBuf]) -> Result<OptimizationResult> {
         let start = Instant::now();
 
@@ -371,6 +491,9 @@ impl RenderCompiler {
         })
     }
 
+    /// Flushes the incremental cache to disk.
+    ///
+    /// No-op if the compiler was not constructed with [`Self::with_cache`].
     pub fn save_cache(&self) -> std::io::Result<()> {
         if let Some(cache) = &self.cache {
             cache.save()?;
@@ -379,6 +502,7 @@ impl RenderCompiler {
         Ok(())
     }
 
+    /// Returns a snapshot of cache performance metrics, or `None` if caching is disabled.
     pub fn cache_stats(&self) -> Option<incremental::CacheStats> {
         self.cache.as_ref().map(|c| c.get_stats())
     }

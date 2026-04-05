@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempfile::TempDir;
 
-const PRODUCTION_COMPONENTS_DIR: &str = "test-app/src/components";
+const PRODUCTION_COMPONENTS_DIR: &str = "tests/fixtures/components";
 
 fn verify_production_components_exist() {
     let path = Path::new(PRODUCTION_COMPONENTS_DIR);

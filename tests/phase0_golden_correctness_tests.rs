@@ -13,8 +13,8 @@ fn load_test_app_components() -> (
 ) {
     let scanner = ProjectScanner::new();
     let components_root = project_root()
-        .join("test-app")
-        .join("src")
+        .join("tests")
+        .join("fixtures")
         .join("components");
     let components = scanner
         .scan_directory(&components_root)
@@ -77,7 +77,7 @@ fn normalize_source_hashes(value: &mut Value) {
 
 fn normalize_path_string(path: &str) -> String {
     let normalized = path.replace('\\', "/");
-    let marker = "test-app/src/components/";
+    let marker = "tests/fixtures/components/";
     if let Some(index) = normalized.find(marker) {
         return normalized[index..].to_string();
     }
