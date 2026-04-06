@@ -93,8 +93,8 @@ impl IncrementalCache {
                     component_to_file: cache.component_to_file,
                     dependency_graph: cache.dependency_graph,
                 };
-                *self.lazy_data.write().unwrap() = Some(lazy_data);
-                *self.loaded.write().unwrap() = true;
+                *self.lazy_data.write().unwrap_or_else(|e| e.into_inner()) = Some(lazy_data);
+                *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = true;
                 Ok(())
             }
             Err(e) => {
@@ -102,14 +102,14 @@ impl IncrementalCache {
                     "Warning: Failed to deserialize cache, starting fresh: {}",
                     e
                 );
-                *self.loaded.write().unwrap() = true;
+                *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = true;
                 Ok(())
             }
         }
     }
 
     fn ensure_loaded(&self) {
-        if !*self.loaded.read().unwrap() {
+        if !*self.loaded.read().unwrap_or_else(|e| e.into_inner()) {
             let _ = self.load();
         }
     }
@@ -117,7 +117,7 @@ impl IncrementalCache {
     fn get_or_load_component(&self, id: ComponentId) -> Option<CachedAnalysis> {
         self.ensure_loaded();
 
-        if let Some(ref data) = *self.lazy_data.read().unwrap() {
+        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(|e| e.into_inner()) {
             if let Some(cached) = data.component_cache.get(&id) {
                 return Some(cached.clone());
             }
@@ -133,7 +133,7 @@ impl IncrementalCache {
     fn get_or_load_file_hash(&self, path: &PathBuf) -> Option<FileHash> {
         self.ensure_loaded();
 
-        if let Some(ref data) = *self.lazy_data.read().unwrap() {
+        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(|e| e.into_inner()) {
             if let Some(&hash) = data.file_hashes.get(path) {
                 return Some(hash);
             }
@@ -149,7 +149,7 @@ impl IncrementalCache {
     fn get_or_load_file_components(&self, path: &PathBuf) -> Option<HashSet<ComponentId>> {
         self.ensure_loaded();
 
-        if let Some(ref data) = *self.lazy_data.read().unwrap() {
+        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(|e| e.into_inner()) {
             if let Some(ids) = data.file_to_components.get(path) {
                 return Some(ids.clone());
             }
@@ -247,7 +247,7 @@ impl IncrementalCache {
             for entry in self.file_hashes.iter() {
                 files.push(entry.key().clone());
             }
-            if let Some(ref data) = *self.lazy_data.read().unwrap() {
+            if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(|e| e.into_inner()) {
                 for path in data.file_hashes.keys() {
                     if !self.file_hashes.contains_key(path) {
                         files.push(path.clone());

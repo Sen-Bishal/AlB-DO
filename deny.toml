@@ -1,0 +1,65 @@
+# cargo-deny configuration for AlBDO workspace — requires cargo-deny >= 0.14
+# Run: cargo deny check
+# Schema reference: https://embarkstudios.github.io/cargo-deny/checks/
+
+# ── Advisories ────────────────────────────────────────────────────────────────
+# cargo-deny 0.14+ (PR #611): top-level lint fields moved into [advisories.vulnerability]
+# etc. The correct v0.14+ schema puts checks under sub-tables.
+[advisories]
+# Scope of unmaintained-crate detection: all | workspace | transitive | none
+unmaintained = "all"
+# Scope of yanked-crate detection: deny | warn | allow (lint level)
+yanked = "deny"
+
+[[advisories.ignore]]
+id = "RUSTSEC-2025-0141"
+reason = "No safe upgrade available; bincode is used for persistent cache serialization"
+
+
+
+# ── Licenses ──────────────────────────────────────────────────────────────────
+[licenses]
+# Confidence threshold for license text similarity detection (0.0–1.0).
+confidence-threshold = 0.8
+
+# Every crate must have a license in this allow-list.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "CC0-1.0",
+    "OpenSSL",
+    "MPL-2.0",
+]
+
+# ── Bans ──────────────────────────────────────────────────────────────────────
+[bans]
+# SWC ships intentional internal version splits; hard-deny would give false positives.
+multiple-versions = "warn"
+# Never allow wildcard version specs.
+wildcards         = "deny"
+
+# Crates that must never appear anywhere in the dependency tree.
+[[bans.deny]]
+name = "failure"
+
+[[bans.deny]]
+name = "error-chain"
+
+[[bans.deny]]
+name = "openssl-sys"
+
+[[bans.deny]]
+name = "openssl"
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-git        = []
