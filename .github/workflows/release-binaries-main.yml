@@ -37,7 +37,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --release --bins
+        run: cargo build --release --bins --locked
 
       - name: Package binaries (Unix)
         if: runner.os != 'Windows'
