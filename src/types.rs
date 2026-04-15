@@ -1,4 +1,5 @@
 use crate::effects::EffectProfile;
+use crate::manifest::schema::Tier;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -116,6 +117,24 @@ pub struct OptimizationMetrics {
     pub total_weight_kb: f64,
     pub optimization_time_ms: u128,
     pub estimated_improvement_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TierReport {
+    pub components: Vec<ComponentTierSummary>,
+    pub tier_a_count: usize,
+    pub tier_b_count: usize,
+    pub tier_c_count: usize,
+    pub tier_b_hydration_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComponentTierSummary {
+    pub name: String,
+    pub file: String,
+    pub tier: Tier,
+    pub reason: String,
+    pub weight_bytes: u64,
 }
 
 pub struct IdGenerator {
