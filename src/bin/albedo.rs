@@ -16,12 +16,15 @@ use notify::{
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
+
+#[path = "albedo/printer.rs"]
+mod printer;
 
 const RULE_WIDTH: usize = 92;
 const PORT_AUTO_INCREMENT_LIMIT: u16 = 10;
@@ -33,6 +36,14 @@ const LOADING_FRAMES: [&str; 4] = [".", "o", "O", "o"];
 const RENDER_FRAMES: [&str; 4] = ["-", "=", "~", "="];
 const LOADING_COLORS: [u8; 4] = [45, 81, 117, 81];
 const RENDER_COLORS: [u8; 4] = [39, 45, 81, 117];
+
+const SCAFFOLD_APP: &str = include_str!("../../scaffold/App.tsx");
+const SCAFFOLD_HERO: &str = include_str!("../../scaffold/Hero.tsx");
+const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/Counter.tsx");
+const SCAFFOLD_LIVE_FEED: &str = include_str!("../../scaffold/LiveFeed.tsx");
+const SCAFFOLD_CONFIG: &str = include_str!("../../scaffold/albedo.config.ts");
+const SCAFFOLD_PACKAGE_JSON: &str = include_str!("../../scaffold/package.json");
+const SCAFFOLD_INDEX_HTML: &str = include_str!("../../scaffold/index.html");
 
 #[derive(Clone)]
 struct DevAllRoutesArtifact {
@@ -154,6 +165,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             forwarded.push("--prod".to_string());
             run_dev_mode(&forwarded)
         }
+        "ship" => run_ship_command(&args[2..]),
+        "serve" => run_serve_command(&args[2..]),
         "run" => run_command(&args[2..]),
         "help" | "--help" | "-h" => {
             print_help();
@@ -169,17 +182,6 @@ fn run(args: Vec<String>) -> Result<(), String> {
 struct InitOptions {
     target_dir: PathBuf,
     force: bool,
-    javascript: bool,
-}
-
-impl Default for InitOptions {
-    fn default() -> Self {
-        Self {
-            target_dir: PathBuf::from("."),
-            force: false,
-            javascript: false,
-        }
-    }
 }
 
 fn run_init_command(raw_args: &[String]) -> Result<(), String> {
@@ -199,41 +201,14 @@ fn run_init_command(raw_args: &[String]) -> Result<(), String> {
 
     scaffold_project(&target, &options)?;
 
-    let entry_file = if options.javascript {
-        "App.jsx"
-    } else {
-        "App.tsx"
-    };
-    let relative_target = if target == cwd {
-        ".".to_string()
-    } else {
-        target.display().to_string()
-    };
-
-    print_banner();
-    print_section("Project Initialized");
-    print_kv("Location", target.display());
-    print_kv("Entry", format!("src/components/{entry_file}"));
-    print_kv("Config", DEV_CONFIG_JSON);
-    print_kv(
-        "Template",
-        if options.javascript {
-            "JavaScript"
-        } else {
-            "TypeScript"
-        },
-    );
-    print_ok("Boilerplate web dev setup created");
-
-    print_section("Next Steps");
-    println!("  {}", style(&format!("cd {relative_target}"), "2"));
-    println!("  {}", style("cargo run --bin albedo -- dev", "2"));
-    println!("  {}", style("cargo run --bin albedo -- build", "2"));
+    let relative_target = options.target_dir.display().to_string();
+    print_init_success(relative_target.as_str());
     Ok(())
 }
 
 fn parse_init_args(raw_args: &[String]) -> Result<InitOptions, String> {
-    let mut options = InitOptions::default();
+    let mut target_dir: Option<PathBuf> = None;
+    let mut force = false;
     let mut target_set = false;
     let mut idx = 0usize;
 
@@ -241,19 +216,13 @@ fn parse_init_args(raw_args: &[String]) -> Result<InitOptions, String> {
         let arg = &raw_args[idx];
         match arg.as_str() {
             "--force" => {
-                options.force = true;
-            }
-            "--js" => {
-                options.javascript = true;
-            }
-            "--ts" => {
-                options.javascript = false;
+                force = true;
             }
             _ if !arg.starts_with('-') => {
                 if target_set {
                     return Err("init accepts at most one target directory".to_string());
                 }
-                options.target_dir = PathBuf::from(arg);
+                target_dir = Some(PathBuf::from(arg));
                 target_set = true;
             }
             unknown => {
@@ -263,7 +232,378 @@ fn parse_init_args(raw_args: &[String]) -> Result<InitOptions, String> {
         idx += 1;
     }
 
-    Ok(options)
+    let target_dir = target_dir.ok_or_else(|| {
+        "missing project name. Usage: albedo init <project-name> [--force]".to_string()
+    })?;
+
+    Ok(InitOptions { target_dir, force })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShipTarget {
+    Vercel,
+    Docker,
+    Fly,
+    Static,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShipOptions {
+    target: Option<ShipTarget>,
+    forwarded: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServeOptions {
+    dir: PathBuf,
+    host: String,
+    port: u16,
+}
+
+fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_ship_help();
+        return Ok(());
+    }
+
+    let options = parse_ship_args(raw_args)?;
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let contract = resolve_dev_contract(&options.forwarded, &cwd)?;
+    run_prod_build(&contract)?;
+
+    let target = if let Some(target) = options.target {
+        target
+    } else {
+        prompt_ship_target()?
+    };
+
+    match target {
+        ShipTarget::Vercel => configure_ship_vercel(&contract),
+        ShipTarget::Docker => configure_ship_docker(&contract),
+        ShipTarget::Fly => configure_ship_fly(&contract),
+        ShipTarget::Static => {
+            print_ok("Static export is ready");
+            print_kv(
+                "Dist",
+                contract.project_dir.join(".albedo").join("dist").display(),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn parse_ship_args(raw_args: &[String]) -> Result<ShipOptions, String> {
+    let mut target = None;
+    let mut forwarded = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < raw_args.len() {
+        match raw_args[idx].as_str() {
+            "--target" => {
+                idx += 1;
+                let value = raw_args
+                    .get(idx)
+                    .ok_or_else(|| "missing value after --target".to_string())?;
+                target = Some(parse_ship_target(value)?);
+            }
+            other => forwarded.push(other.to_string()),
+        }
+        idx += 1;
+    }
+
+    Ok(ShipOptions { target, forwarded })
+}
+
+fn parse_ship_target(raw: &str) -> Result<ShipTarget, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "vercel" => Ok(ShipTarget::Vercel),
+        "2" | "docker" => Ok(ShipTarget::Docker),
+        "3" | "fly" | "flyio" | "fly.io" => Ok(ShipTarget::Fly),
+        "4" | "static" => Ok(ShipTarget::Static),
+        other => Err(format!(
+            "unknown ship target '{other}'. Supported targets: vercel, docker, fly, static."
+        )),
+    }
+}
+
+fn prompt_ship_target() -> Result<ShipTarget, String> {
+    println!();
+    println!("  How do you want to deploy?");
+    println!();
+    println!("  [1] Vercel       - static export + vercel.json");
+    println!("  [2] Docker       - single binary image");
+    println!("  [3] Fly.io       - fly.toml + Dockerfile");
+    println!("  [4] Static       - export dist/ for any CDN");
+    println!();
+    print!("  > ");
+    std::io::stdout()
+        .flush()
+        .map_err(|err| format!("failed to flush prompt: {err}"))?;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| format!("failed to read target selection: {err}"))?;
+    parse_ship_target(input.trim())
+}
+
+fn configure_ship_vercel(contract: &ResolvedDevContract) -> Result<(), String> {
+    let vercel_json = "{\n  \"version\": 2,\n  \"cleanUrls\": true,\n  \"trailingSlash\": false,\n  \"outputDirectory\": \".albedo/dist\"\n}\n";
+    let path = contract.project_dir.join("vercel.json");
+    std::fs::write(&path, vercel_json)
+        .map_err(|err| format!("failed to write '{}': {err}", path.display()))?;
+    print_ok("Vercel target files generated");
+    print_kv("File", path.display());
+    print_kv("Deploy", "vercel --prod");
+    Ok(())
+}
+
+fn configure_ship_docker(contract: &ResolvedDevContract) -> Result<(), String> {
+    let dockerfile = "FROM debian:bookworm-slim\nCOPY ./target/release/albedo /usr/local/bin/albedo\nCOPY ./.albedo/dist /app/dist\nWORKDIR /app\nEXPOSE 3000\nCMD [\"albedo\", \"serve\", \"--dir\", \"dist\", \"--host\", \"0.0.0.0\", \"--port\", \"3000\"]\n";
+    let dockerignore = ".git\nnode_modules\ntarget/debug\n";
+    let dockerfile_path = contract.project_dir.join("Dockerfile");
+    let dockerignore_path = contract.project_dir.join(".dockerignore");
+    std::fs::write(&dockerfile_path, dockerfile)
+        .map_err(|err| format!("failed to write '{}': {err}", dockerfile_path.display()))?;
+    std::fs::write(&dockerignore_path, dockerignore)
+        .map_err(|err| format!("failed to write '{}': {err}", dockerignore_path.display()))?;
+    print_ok("Docker target files generated");
+    print_kv("Dockerfile", dockerfile_path.display());
+    print_kv("Docker Ignore", dockerignore_path.display());
+    print_kv("Build", "docker build -t albedo-app .");
+    print_kv("Run", "docker run -p 3000:3000 albedo-app");
+    Ok(())
+}
+
+fn configure_ship_fly(contract: &ResolvedDevContract) -> Result<(), String> {
+    configure_ship_docker(contract)?;
+    let app_name = infer_package_name(&contract.project_dir);
+    let fly_toml = format!(
+        "app = \"{app_name}\"\nprimary_region = \"iad\"\n\n[build]\n  dockerfile = \"Dockerfile\"\n\n[http_service]\n  internal_port = 3000\n  force_https = true\n  auto_stop_machines = \"stop\"\n  auto_start_machines = true\n  min_machines_running = 0\n"
+    );
+    let fly_toml_path = contract.project_dir.join("fly.toml");
+    std::fs::write(&fly_toml_path, fly_toml)
+        .map_err(|err| format!("failed to write '{}': {err}", fly_toml_path.display()))?;
+    print_ok("Fly.io target files generated");
+    print_kv("File", fly_toml_path.display());
+    print_kv("Deploy", "fly launch --copy-config && fly deploy");
+    Ok(())
+}
+
+fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_serve_help();
+        return Ok(());
+    }
+
+    let options = parse_serve_args(raw_args)?;
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let root = if options.dir.is_absolute() {
+        options.dir.clone()
+    } else {
+        cwd.join(options.dir)
+    };
+
+    if !root.is_dir() {
+        return Err(format!(
+            "serve directory '{}' does not exist or is not a directory",
+            root.display()
+        ));
+    }
+
+    let (listener, addr, auto_incremented) =
+        bind_dev_listener(options.host.as_str(), options.port)?;
+    print_banner();
+    print_section("Static Serve");
+    if auto_incremented {
+        print_warn(format!(
+            "Port {} is busy; auto-switched to {}.",
+            options.port,
+            addr.port()
+        ));
+    }
+    print_ok("Static file server is running");
+    print_kv("Directory", root.display());
+    print_kv("URL", format!("http://{}", addr));
+    print_kv("Stop", "Ctrl+C");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    if let Err(err) = handle_static_connection(stream, root.as_path()) {
+                        if !is_benign_network_error(&err) {
+                            eprintln!("[serve] request failed: {err}");
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                if !is_benign_network_error(&err) {
+                    eprintln!("[serve] accept failed: {err}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_serve_args(raw_args: &[String]) -> Result<ServeOptions, String> {
+    let mut dir = PathBuf::from(".albedo/dist");
+    let mut host = "127.0.0.1".to_string();
+    let mut port = 3000u16;
+    let mut idx = 0usize;
+    let mut dir_set = false;
+
+    while idx < raw_args.len() {
+        let arg = &raw_args[idx];
+        match arg.as_str() {
+            "--dir" => {
+                idx += 1;
+                let value = raw_args
+                    .get(idx)
+                    .ok_or_else(|| "missing value after --dir".to_string())?;
+                dir = PathBuf::from(value);
+                dir_set = true;
+            }
+            "--host" => {
+                idx += 1;
+                let value = raw_args
+                    .get(idx)
+                    .ok_or_else(|| "missing value after --host".to_string())?;
+                if value.trim().is_empty() {
+                    return Err("--host must not be empty".to_string());
+                }
+                host = value.to_string();
+            }
+            "--port" => {
+                idx += 1;
+                let value = raw_args
+                    .get(idx)
+                    .ok_or_else(|| "missing value after --port".to_string())?;
+                port = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid port '{value}'"))?;
+                if port == 0 {
+                    return Err("--port must be > 0".to_string());
+                }
+            }
+            _ if !arg.starts_with('-') && !dir_set => {
+                dir = PathBuf::from(arg);
+                dir_set = true;
+            }
+            unknown => {
+                return Err(format!("unknown serve option '{unknown}'"));
+            }
+        }
+        idx += 1;
+    }
+
+    Ok(ServeOptions { dir, host, port })
+}
+
+fn handle_static_connection(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
+    let (first_line, _headers) = read_http_request_head(&stream)?;
+    if first_line.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET");
+    let raw_target = parts.next().unwrap_or("/");
+    let path = normalize_request_path(raw_target);
+
+    if method != "GET" && method != "HEAD" {
+        return write_http_response(
+            &mut stream,
+            405,
+            "Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"Method Not Allowed",
+            &[("allow", "GET, HEAD".to_string())],
+        );
+    }
+
+    let selected = resolve_static_asset_path(root, path.as_str());
+    match selected {
+        Some(file_path) => {
+            let body = std::fs::read(&file_path).unwrap_or_else(|_| Vec::new());
+            let content_type = content_type_for_path(&file_path);
+            let payload = if method == "HEAD" { Vec::new() } else { body };
+            write_http_response(
+                &mut stream,
+                200,
+                "OK",
+                content_type,
+                payload.as_slice(),
+                &[("cache-control", "no-cache".to_string())],
+            )
+        }
+        None => write_http_response(
+            &mut stream,
+            404,
+            "Not Found",
+            "text/plain; charset=utf-8",
+            b"Not Found",
+            &[("cache-control", "no-cache".to_string())],
+        ),
+    }
+}
+
+fn resolve_static_asset_path(root: &Path, request_path: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if request_path == "/" {
+        candidates.push(root.join("index.html"));
+    } else {
+        let relative = request_path.trim_start_matches('/');
+        if let Some(safe_rel) = sanitize_static_relative_path(relative) {
+            let candidate = root.join(safe_rel);
+            if candidate.is_dir() {
+                candidates.push(candidate.join("index.html"));
+            } else {
+                candidates.push(candidate);
+            }
+        }
+        if is_route_like_path(request_path) {
+            candidates.push(root.join("index.html"));
+        }
+    }
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn sanitize_static_relative_path(raw: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in Path::new(raw).components() {
+        match component {
+            Component::Normal(segment) => out.push(segment),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) | Component::ParentDir => return None,
+        }
+    }
+    Some(out)
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("mjs") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 fn run_command(raw_args: &[String]) -> Result<(), String> {
@@ -361,6 +701,9 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     } else {
         None
     };
+    let tier_report = compile_tier_report(&contract, scanned_components.as_deref())?;
+    let root_label = contract.root.display().to_string();
+    printer::print_tier_report(&tier_report, root_label.as_str());
 
     let project = ComponentProject::load_from_dir(&contract.root)
         .map_err(|err| format!("failed to load components: {err}"))?;
@@ -581,6 +924,24 @@ fn print_scan_failure_details(failures: &[ScanFailure], verbose: bool) {
         ));
         print_warn("run with --verbose to print all parse failures");
     }
+}
+
+fn compile_tier_report(
+    contract: &ResolvedDevContract,
+    scanned_components: Option<&[ParsedComponent]>,
+) -> Result<dom_render_compiler::types::TierReport, String> {
+    let components = if let Some(components) = scanned_components {
+        components.to_vec()
+    } else {
+        scan_components_with_contract_policy(contract, "analyzing component tiers")?
+    };
+
+    let scanner = ProjectScanner::new();
+    let compiler = scanner.build_compiler(components);
+    let (_, tier_report) = compiler
+        .optimize_manifest_v2_with_tier_report()
+        .map_err(|err| format!("failed to compute tier report: {err}"))?;
+    Ok(tier_report)
 }
 
 fn watch_and_rebuild_loop(
@@ -1609,13 +1970,21 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
             hydration_asset_path.display()
         )
     })?;
+    let index_html_path = out_dir.join("index.html");
+    std::fs::write(&index_html_path, SCAFFOLD_INDEX_HTML).map_err(|err| {
+        format!(
+            "failed to write index html '{}': {err}",
+            index_html_path.display()
+        )
+    })?;
 
     print_ok("Optimized production build complete");
     print_kv("Output", out_dir.display());
-    print_kv("Artifacts", report.artifacts.len() + 3);
+    print_kv("Artifacts", report.artifacts.len() + 4);
     print_kv("Manifest", manifest_path.display());
     print_kv("Shim Runtime", runtime_asset_path.display());
     print_kv("Hydration Runtime", hydration_asset_path.display());
+    print_kv("Index HTML", index_html_path.display());
     print_kv(
         "Compile Time",
         format!("{:.2}ms", compile_start.elapsed().as_secs_f64() * 1000.0),
@@ -1691,86 +2060,81 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         )
     })?;
 
-    let entry_file = if options.javascript {
-        "App.jsx"
-    } else {
-        "App.tsx"
-    };
+    std::fs::create_dir_all(target.join("src").join("components")).map_err(|err| {
+        format!(
+            "failed to create scaffold directory '{}': {err}",
+            target.join("src/components").display()
+        )
+    })?;
+    std::fs::create_dir_all(target.join("public")).map_err(|err| {
+        format!(
+            "failed to create scaffold directory '{}': {err}",
+            target.join("public").display()
+        )
+    })?;
+
     let package_name = infer_package_name(target);
+    let package_json = SCAFFOLD_PACKAGE_JSON.replace("__ALBEDO_APP_NAME__", package_name.as_str());
 
-    let config = serde_json::json!({
-        "contract_version": 1,
-        "root": "src/components",
-        "entry": entry_file,
-        "server": { "host": "127.0.0.1", "port": 3000 },
-        "watch": { "debounce_ms": 75, "ignore": ["**/.git/**", "**/node_modules/**"] },
-        "hmr": { "enabled": true, "transport": "sse" },
-        "hot_set": [],
-        "static_slice": { "enabled": true, "opt_out": [] }
-    });
-    let config_text = serde_json::to_string_pretty(&config)
-        .map_err(|err| format!("failed to generate config: {err}"))?;
-
-    let mut files = vec![
-        (PathBuf::from(DEV_CONFIG_JSON), format!("{config_text}\n")),
-        (
-            PathBuf::from("package.json"),
-            package_json_template(&package_name),
-        ),
-        (PathBuf::from("README.md"), readme_template(&package_name)),
-        (PathBuf::from(".gitignore"), gitignore_template()),
-        (
-            PathBuf::from("src/components").join(entry_file),
-            app_component_template(options.javascript),
-        ),
-        (
-            PathBuf::from("src/components/theme.css"),
-            theme_css_template(),
-        ),
-        (
-            PathBuf::from("src/components/albedo-shell.html"),
-            shell_template(),
-        ),
-        (
-            PathBuf::from("public/_albedo/runtime.js"),
-            albedo_runtime_shim_template(),
-        ),
-        (
-            PathBuf::from("public/_albedo/hydration.js"),
-            albedo_hydration_runtime_template(),
-        ),
-        (PathBuf::from("public/.gitkeep"), String::new()),
-    ];
-
-    if !options.javascript {
-        files.push((PathBuf::from("tsconfig.json"), tsconfig_template()));
-        files.push((PathBuf::from("albedo-env.d.ts"), albedo_env_template()));
-    }
-
-    if !options.force {
-        for (relative, _) in &files {
-            let file_path = target.join(relative);
-            if file_path.exists() {
-                return Err(format!(
-                    "file '{}' already exists (use --force to overwrite)",
-                    file_path.display()
-                ));
-            }
-        }
-    }
-
-    for (relative, content) in files {
-        let file_path = target.join(relative);
-        if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                format!("failed to create directory '{}': {err}", parent.display())
-            })?;
-        }
-        std::fs::write(&file_path, content)
-            .map_err(|err| format!("failed to write '{}': {err}", file_path.display()))?;
-    }
+    write_scaffold_file(
+        &target.join("src").join("App.tsx"),
+        SCAFFOLD_APP,
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join("src").join("components").join("Hero.tsx"),
+        SCAFFOLD_HERO,
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join("src").join("components").join("Counter.tsx"),
+        SCAFFOLD_COUNTER,
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join("src").join("components").join("LiveFeed.tsx"),
+        SCAFFOLD_LIVE_FEED,
+        options.force,
+    )?;
+    write_scaffold_file(&target.join(DEV_CONFIG_TS), SCAFFOLD_CONFIG, options.force)?;
+    write_scaffold_file(
+        &target.join("package.json"),
+        package_json.as_str(),
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join("public").join("index.html"),
+        SCAFFOLD_INDEX_HTML,
+        options.force,
+    )?;
 
     Ok(())
+}
+
+fn write_scaffold_file(path: &Path, content: &str, force: bool) -> Result<(), String> {
+    if path.exists() && !force {
+        return Err(format!(
+            "file '{}' already exists (use --force to overwrite)",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create directory '{}': {err}", parent.display()))?;
+    }
+    std::fs::write(path, content)
+        .map_err(|err| format!("failed to write scaffold file '{}': {err}", path.display()))
+}
+
+fn print_init_success(project_name: &str) {
+    println!("{} Created {}/", style("✓", "1;32"), project_name);
+    println!();
+    println!("  Next steps:");
+    println!("    cd {}", project_name);
+    println!("    albedo dev");
+    println!();
+    println!("  The starter app has three components - one at each effect tier.");
+    println!("  Run albedo dev to see how AlBDO classifies them.");
 }
 
 fn infer_package_name(target: &Path) -> String {
@@ -1802,42 +2166,6 @@ fn sanitize_package_name(value: &str) -> Option<String> {
     }
 }
 
-fn package_json_template(name: &str) -> String {
-    format!(
-        "{{\n  \"name\": \"{name}\",\n  \"private\": true,\n  \"version\": \"0.1.0\",\n  \"scripts\": {{\n    \"dev\": \"cargo run --bin albedo -- dev\",\n    \"build\": \"cargo run --bin albedo -- build\"\n  }}\n}}\n"
-    )
-}
-
-fn readme_template(name: &str) -> String {
-    format!(
-        "# {name}\n\nBuilt with ALBEDO starter.\n\n## Commands\n\n- `cargo run --bin albedo -- dev`\n- `cargo run --bin albedo -- build`\n\n## Config\n\n- `{DEV_CONFIG_JSON}` (primary)\n- `{DEV_CONFIG_TS}` (supported)\n"
-    )
-}
-
-fn gitignore_template() -> String {
-    "node_modules/\ndist/\n.albedo/\ntarget/\n.DS_Store\n".to_string()
-}
-
-fn app_component_template(javascript: bool) -> String {
-    if javascript {
-        return "import \"./theme.css\";\n\nexport default function App() {\n  return (\n    <main className=\"landing\">\n      <section className=\"hero\">\n        <p className=\"badge\">ALBEDO</p>\n        <h1>ALBEDO - Making the internet faster</h1>\n        <p className=\"subcopy\">Get started by editing <code>src/components/App.tsx</code></p>\n        <div className=\"actions\">\n          <a href=\"https://github.com\" target=\"_blank\" rel=\"noreferrer\">Docs</a>\n          <a href=\"https://github.com\" target=\"_blank\" rel=\"noreferrer\">Examples</a>\n        </div>\n      </section>\n    </main>\n  );\n}\n"
-            .to_string();
-    }
-
-    "import \"./theme.css\";\n\nexport default function App() {\n  return (\n    <main className=\"landing\">\n      <section className=\"hero\">\n        <p className=\"badge\">ALBEDO</p>\n        <h1>ALBEDO - Making the internet faster</h1>\n        <p className=\"subcopy\">Get started by editing <code>src/components/App.tsx</code></p>\n        <div className=\"actions\">\n          <a href=\"https://github.com\" target=\"_blank\" rel=\"noreferrer\">Docs</a>\n          <a href=\"https://github.com\" target=\"_blank\" rel=\"noreferrer\">Examples</a>\n        </div>\n      </section>\n    </main>\n  );\n}\n"
-        .to_string()
-}
-
-fn theme_css_template() -> String {
-    ":root {\n  --ink: #f5f7ff;\n  --muted: #b8bfd3;\n  --line: rgba(245, 247, 255, 0.28);\n  --glass: rgba(8, 12, 24, 0.62);\n  --chip: rgba(12, 18, 34, 0.82);\n  --accent: #8be9ff;\n}\n\n* {\n  box-sizing: border-box;\n}\n\nbody {\n  margin: 0;\n  min-height: 100vh;\n  font-family: \"Segoe UI\", \"Aptos\", sans-serif;\n}\n\n.landing {\n  min-height: 100vh;\n  display: grid;\n  place-items: center;\n  padding: 1.2rem;\n}\n\n.hero {\n  width: min(760px, 100%);\n  border: 1px solid var(--line);\n  border-radius: 20px;\n  background: var(--glass);\n  backdrop-filter: blur(8px);\n  padding: clamp(1.3rem, 4vw, 2.6rem);\n  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.4);\n}\n\n.badge {\n  margin: 0;\n  font-size: 0.72rem;\n  letter-spacing: 0.22em;\n  text-transform: uppercase;\n  color: var(--accent);\n  font-weight: 700;\n}\n\nh1 {\n  margin: 0.75rem 0 0;\n  font-size: clamp(2rem, 7vw, 3.9rem);\n  line-height: 1.03;\n  letter-spacing: -0.02em;\n  max-width: 17ch;\n}\n\n.subcopy {\n  margin: 1rem 0 0;\n  color: var(--muted);\n  font-size: clamp(0.98rem, 2vw, 1.12rem);\n}\n\n.subcopy code {\n  color: var(--ink);\n  background: var(--chip);\n  border: 1px solid var(--line);\n  border-radius: 8px;\n  padding: 0.2rem 0.45rem;\n  font-family: \"Cascadia Code\", \"Consolas\", monospace;\n  font-size: 0.92em;\n}\n\n.actions {\n  margin-top: 1.2rem;\n  display: flex;\n  gap: 0.7rem;\n  flex-wrap: wrap;\n}\n\n.actions a {\n  text-decoration: none;\n  color: var(--ink);\n  border: 1px solid var(--line);\n  background: var(--chip);\n  border-radius: 999px;\n  padding: 0.55rem 0.95rem;\n  font-weight: 600;\n}\n\n.actions a:hover {\n  border-color: var(--accent);\n}\n"
-        .to_string()
-}
-
-fn shell_template() -> String {
-    "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Shell</title>\n</head>\n<body>\n  <script type=\"module\" src=\"/_albedo/runtime.js\"></script>\n  <!--__SLOT___a_root-->\n</body>\n</html>\n"
-        .to_string()
-}
-
 fn albedo_runtime_shim_template() -> String {
     include_str!("../../assets/albedo-runtime.js").to_string()
 }
@@ -1846,29 +2174,18 @@ fn albedo_hydration_runtime_template() -> String {
     include_str!("../../assets/albedo-hydration.js").to_string()
 }
 
-fn tsconfig_template() -> String {
-    "{\n  \"compilerOptions\": {\n    \"target\": \"ES2022\",\n    \"module\": \"ESNext\",\n    \"moduleResolution\": \"Bundler\",\n    \"strict\": true,\n    \"jsx\": \"preserve\",\n    \"noEmit\": true,\n    \"skipLibCheck\": true,\n    \"types\": []\n  },\n  \"include\": [\n    \"src/**/*\",\n    \"albedo-env.d.ts\"\n  ]\n}\n"
-        .to_string()
-}
-
-fn albedo_env_template() -> String {
-    "declare namespace JSX {\n  interface IntrinsicElements {\n    [elementName: string]: any;\n  }\n}\n"
-        .to_string()
-}
-
 fn print_help() {
     print_banner();
     print_section("Usage");
     println!("  {}", style("albedo <COMMAND> [OPTIONS]", "1"));
 
     print_section("Commands");
-    print_command(
-        "init [DIR]",
-        "Create a new ALBEDO project with starter boilerplate",
-    );
+    print_command("init <PROJECT>", "Create a tiered starter app scaffold");
     print_command("help", "Show command list and examples");
-    print_command("dev [DIR]", "Alias for `albedo run dev`");
+    print_command("dev [DIR]", "Compile, show tier report, start dev server");
     print_command("build [DIR]", "Alias for `albedo run dev --prod`");
+    print_command("ship [DIR]", "Build and configure deployment target files");
+    print_command("serve [DIR]", "Serve static files from a directory");
     print_command("run dev [DIR]", "Validate and run the development workflow");
     print_command(
         "run dev --prod [DIR]",
@@ -1888,27 +2205,45 @@ fn print_help() {
     print_option("--prod", "Production build mode for `run dev`");
 
     print_section("Examples");
-    println!("  {}", style("albedo init my-next-run", "2"));
-    println!(
-        "  {}",
-        style("albedo dev my-next-run/src/components --entry App.tsx", "2")
-    );
+    println!("  {}", style("albedo init my-app", "2"));
+    println!("  {}", style("cd my-app && albedo dev", "2"));
+    println!("  {}", style("albedo ship --target docker", "2"));
     println!(
         "  {}",
         style("albedo build --config ./albedo.config.json", "2")
     );
+    println!("  {}", style("albedo serve ./.albedo/dist", "2"));
 }
 
 fn print_init_help() {
     print_banner();
     print_section("Init Usage");
+    println!("  {}", style("albedo init <project-name> [--force]", "1"));
+    print_option("--force", "Overwrite existing scaffold files");
+}
+
+fn print_ship_help() {
+    print_banner();
+    print_section("Ship Usage");
+    println!("  {}", style("albedo ship [DIR] [--target <name>]", "1"));
+    print_option(
+        "--target <name>",
+        "Deployment target: vercel, docker, fly, static",
+    );
+    print_option("--config <FILE>", "Use explicit albedo config file");
+    print_option("--entry <FILE>", "Override entry module relative to root");
+}
+
+fn print_serve_help() {
+    print_banner();
+    print_section("Serve Usage");
     println!(
         "  {}",
-        style("albedo init [DIR] [--js|--ts] [--force]", "1")
+        style("albedo serve [DIR] [--host <IP>] [--port <PORT>]", "1")
     );
-    print_option("--js", "Create JavaScript starter (App.jsx)");
-    print_option("--ts", "Create TypeScript starter (App.tsx, default)");
-    print_option("--force", "Overwrite existing scaffold files");
+    print_option("--dir <DIR>", "Directory to serve (default: .albedo/dist)");
+    print_option("--host <IP>", "Bind host (default: 127.0.0.1)");
+    print_option("--port <PORT>", "Bind port (default: 3000)");
 }
 
 fn print_command(command: &str, description: &str) {
@@ -2055,21 +2390,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_init_args_defaults() {
-        let options = parse_init_args(&[]).unwrap();
-        assert_eq!(options, InitOptions::default());
+    fn test_parse_init_args_requires_target() {
+        let err = parse_init_args(&[]).unwrap_err();
+        assert!(err.contains("missing project name"));
     }
 
     #[test]
-    fn test_parse_init_args_with_js_and_force() {
-        let args = vec![
-            "my-app".to_string(),
-            "--js".to_string(),
-            "--force".to_string(),
-        ];
+    fn test_parse_init_args_with_force() {
+        let args = vec!["my-app".to_string(), "--force".to_string()];
         let options = parse_init_args(&args).unwrap();
         assert_eq!(options.target_dir, PathBuf::from("my-app"));
-        assert!(options.javascript);
         assert!(options.force);
     }
 
@@ -2086,14 +2416,33 @@ mod tests {
     fn test_scaffold_project_writes_contract_config() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("starter");
-        let options = InitOptions::default();
+        let options = InitOptions {
+            target_dir: PathBuf::from("starter"),
+            force: false,
+        };
         scaffold_project(&target, &options).unwrap();
 
-        assert!(target.join(DEV_CONFIG_JSON).is_file());
-        assert!(target.join("src/components/App.tsx").is_file());
-        assert!(target.join("src/components/theme.css").is_file());
-        assert!(target.join("tsconfig.json").is_file());
-        assert!(target.join("albedo-env.d.ts").is_file());
+        assert!(target.join(DEV_CONFIG_TS).is_file());
+        assert!(target.join("src/App.tsx").is_file());
+        assert!(target.join("src/components/Hero.tsx").is_file());
+        assert!(target.join("src/components/Counter.tsx").is_file());
+        assert!(target.join("src/components/LiveFeed.tsx").is_file());
+        assert!(target.join("public/index.html").is_file());
+        assert!(target.join("package.json").is_file());
+    }
+
+    #[test]
+    fn test_parse_ship_target_supports_named_targets() {
+        assert_eq!(parse_ship_target("docker").unwrap(), ShipTarget::Docker);
+        assert_eq!(parse_ship_target("vercel").unwrap(), ShipTarget::Vercel);
+        assert_eq!(parse_ship_target("fly").unwrap(), ShipTarget::Fly);
+        assert_eq!(parse_ship_target("static").unwrap(), ShipTarget::Static);
+    }
+
+    #[test]
+    fn test_sanitize_static_relative_path_rejects_parent_segments() {
+        assert!(sanitize_static_relative_path("../secret.txt").is_none());
+        assert!(sanitize_static_relative_path("safe/file.txt").is_some());
     }
 
     #[test]

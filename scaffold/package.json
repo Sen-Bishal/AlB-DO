@@ -1,0 +1,13 @@
+{
+  "name": "__ALBEDO_APP_NAME__",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "albedo dev",
+    "build": "albedo build",
+    "ship": "albedo ship"
+  },
+  "dependencies": {
+    "albedo": "0.1.0-alpha.1"
+  }
+}

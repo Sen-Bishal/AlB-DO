@@ -80,6 +80,10 @@ use crate::incremental::IncrementalCache;
 use crate::parallel::ParallelAnalyzer;
 use crate::parallel_topo::{find_critical_path_parallel, ParallelTopologicalSorter};
 use crate::types::*;
+use crate::{
+    effects::{decide_tier_and_hydration, TieringInputs, TieringReason},
+    manifest::schema::Tier,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -232,8 +236,22 @@ impl RenderCompiler {
     ///
     /// This is the primary output consumed by `albedo-server` to configure the HTTP runtime.
     pub fn optimize_manifest_v2(&self) -> Result<manifest::schema::RenderManifestV2> {
+        let (manifest, _) = self.optimize_manifest_v2_with_tier_report()?;
+        Ok(manifest)
+    }
+
+    /// Runs the full pipeline and returns the manifest plus a per-component tier report.
+    ///
+    /// This is intended for CLI surfaces (for example `albedo dev`) that need to display
+    /// tiering decisions without coupling compiler internals to terminal rendering code.
+    pub fn optimize_manifest_v2_with_tier_report(
+        &self,
+    ) -> Result<(manifest::schema::RenderManifestV2, TierReport)> {
         let result = self.optimize()?;
-        Ok(self.manifest_v2_from_result(&result))
+        let options = manifest::ManifestOptions::default();
+        let manifest = manifest::build_render_manifest_v2(&self.graph, &result, &options);
+        let tier_report = self.build_tier_report(&options);
+        Ok((manifest, tier_report))
     }
 
     /// Runs [`Self::optimize_manifest_v2`] and serializes to a pretty-printed JSON string.
@@ -506,6 +524,86 @@ impl RenderCompiler {
     pub fn cache_stats(&self) -> Option<incremental::CacheStats> {
         self.cache.as_ref().map(|c| c.get_stats())
     }
+
+    fn build_tier_report(&self, options: &manifest::ManifestOptions) -> TierReport {
+        let mut report = TierReport::default();
+        let tiering_inputs = TieringInputs {
+            tier_a_inline_max_bytes: options.tier_a_inline_max_bytes,
+            tier_c_split_min_bytes: options.tier_c_split_min_bytes,
+            tier_b_mode: options.tier_b_mode,
+            tier_c_mode: options.tier_c_mode,
+        };
+
+        let mut components = self.graph.components();
+        components.sort_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        for component in components {
+            let weight_bytes = component.weight.max(0.0).round() as u64;
+            let decision = decide_tier_and_hydration(
+                component.effect_profile,
+                component.is_interactive,
+                component.is_above_fold,
+                weight_bytes,
+                tiering_inputs,
+            );
+
+            let reason = tier_reason_to_message(decision.reason, decision.tier);
+            report.components.push(ComponentTierSummary {
+                name: component.name,
+                file: component.file_path,
+                tier: decision.tier,
+                reason,
+                weight_bytes,
+            });
+
+            match decision.tier {
+                Tier::A => report.tier_a_count += 1,
+                Tier::B => {
+                    report.tier_b_count += 1;
+                    report.tier_b_hydration_bytes =
+                        report.tier_b_hydration_bytes.saturating_add(weight_bytes);
+                }
+                Tier::C => report.tier_c_count += 1,
+            }
+        }
+
+        report
+    }
+}
+
+fn tier_reason_to_message(reason: TieringReason, tier: Tier) -> String {
+    match reason {
+        TieringReason::PureStaticEligible => "no hooks, no IO, no side effects".to_string(),
+        TieringReason::HookDrivenHydration => {
+            if tier == Tier::C {
+                "hooks + interaction boundary - streamed".to_string()
+            } else {
+                "hooks detected - client hydration required".to_string()
+            }
+        }
+        TieringReason::AsyncBoundary => {
+            if tier == Tier::C {
+                "async boundary - streamed from server".to_string()
+            } else {
+                "async boundary - hydrated island".to_string()
+            }
+        }
+        TieringReason::IoBoundary => "async fetch/IO boundary - streamed from server".to_string(),
+        TieringReason::SideEffectBoundary => {
+            "side effects boundary - streamed from server".to_string()
+        }
+        TieringReason::WeightBasedPromotion => {
+            if tier == Tier::C {
+                "size/interaction threshold promoted to streamed tier".to_string()
+            } else {
+                "size threshold promoted to hydration island".to_string()
+            }
+        }
+    }
 }
 
 impl Default for RenderCompiler {
@@ -604,6 +702,18 @@ mod tests {
         assert!(json.contains("\"2.0\""));
         assert!(json.contains("parallel_batches"));
         assert!(json.contains("critical_path"));
+    }
+
+    #[test]
+    fn test_manifest_v2_with_tier_report_keeps_component_count_in_sync() {
+        let compiler = create_example_app();
+        let (manifest, report) = compiler.optimize_manifest_v2_with_tier_report().unwrap();
+
+        assert_eq!(manifest.components.len(), report.components.len());
+        assert_eq!(
+            report.tier_a_count + report.tier_b_count + report.tier_c_count,
+            report.components.len()
+        );
     }
 
     #[test]
