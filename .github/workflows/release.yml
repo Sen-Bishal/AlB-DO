@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build · ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target:   x86_64-pc-windows-msvc
+            os:       windows-latest
+            artifact: albdo-windows-x64
+            cross:    false
+          - target:   x86_64-apple-darwin
+            os:       macos-13
+            artifact: albdo-macos-x64
+            cross:    false
+          - target:   aarch64-apple-darwin
+            os:       macos-latest
+            artifact: albdo-macos-arm64
+            cross:    false
+          - target:   x86_64-unknown-linux-gnu
+            os:       ubuntu-22.04
+            artifact: albdo-linux-x64
+            cross:    false
+          - target:   aarch64-unknown-linux-gnu
+            os:       ubuntu-22.04
+            artifact: albdo-linux-arm64
+            cross:    true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (ARM Linux only)
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target "${{ matrix.target }}" --bin albdo
+          else
+            cargo build --release --target "${{ matrix.target }}" --bin albdo
+          fi
+
+      - name: Resolve binary path
+        id: bin
+        shell: bash
+        run: |
+          EXT=""
+          [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
+          echo "path=target/${{ matrix.target }}/release/albdo${EXT}" >> "$GITHUB_OUTPUT"
+
+      # ── Generate shell completions from the real binary ──────────────────────
+      - name: Generate completions
+        shell: bash
+        run: |
+          BIN="${{ steps.bin.outputs.path }}"
+          mkdir -p installer/completions
+          "$BIN" completions bash        > installer/completions/albdo.bash
+          "$BIN" completions zsh         > installer/completions/_albdo
+          "$BIN" completions fish        > installer/completions/albdo.fish
+          "$BIN" completions powershell  > installer/completions/_albdo.ps1
+
+      # ══════════════════════ WINDOWS ═══════════════════════════════════════════
+      - name: Install WiX Toolset
+        if: runner.os == 'Windows'
+        run: dotnet tool install --global wix
+
+      - name: Stage Windows artifacts
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cp "${{ steps.bin.outputs.path }}" installer/windows/albdo.exe
+          cp installer/completions/_albdo.ps1 installer/windows/_albdo.ps1
+
+      - name: Build Windows installer (.msi)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          cd installer/windows
+          wix build AlBDO.wxs -o "AlBDO-${VERSION}-x64.msi"
+
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: installer/windows/AlBDO-*.msi
+
+      # ══════════════════════ MACOS ═════════════════════════════════════════════
+      - name: Stage macOS binary and completions
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p installer/macos/root/usr/local/bin
+          mkdir -p installer/macos/root/usr/local/share/albdo/completions
+          cp "${{ steps.bin.outputs.path }}" installer/macos/root/usr/local/bin/albdo
+          chmod 755 installer/macos/root/usr/local/bin/albdo
+          cp installer/completions/albdo.bash installer/macos/root/usr/local/share/albdo/completions/
+          cp installer/completions/_albdo     installer/macos/root/usr/local/share/albdo/completions/
+          cp installer/completions/albdo.fish installer/macos/root/usr/local/share/albdo/completions/
+
+      - name: Build macOS .pkg + .dmg
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x installer/macos/build-pkg.sh
+          bash installer/macos/build-pkg.sh "${{ github.ref_name }}" "${{ matrix.artifact }}"
+
+      - name: Upload macOS .dmg
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: installer/macos/*.dmg
+
+      # ══════════════════════ LINUX ═════════════════════════════════════════════
+      - name: Resolve Debian arch
+        if: runner.os == 'Linux'
+        id: deb_arch
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64*)  echo "arch=amd64" >> "$GITHUB_OUTPUT" ;;
+            aarch64*) echo "arch=arm64" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Stage Linux artifacts
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p installer/linux/deb/usr/bin
+          mkdir -p installer/linux/deb/usr/share/albdo/completions
+          cp "${{ steps.bin.outputs.path }}" installer/linux/deb/usr/bin/albdo
+          chmod 755 installer/linux/deb/usr/bin/albdo
+          cp installer/completions/albdo.bash installer/linux/deb/usr/share/albdo/completions/
+          cp installer/completions/_albdo     installer/linux/deb/usr/share/albdo/completions/
+          cp installer/completions/albdo.fish installer/linux/deb/usr/share/albdo/completions/
+
+      - name: Build .deb
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x installer/linux/build-deb.sh
+          bash installer/linux/build-deb.sh "${{ github.ref_name }}" "${{ steps.deb_arch.outputs.arch }}"
+
+      - name: Upload .deb
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: installer/linux/*.deb
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Create GitHub Release (draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          draft: true
+          generate_release_notes: true
+          name: AlBDO ${{ github.ref_name }}
+          body: |
+            ## Installation
+
+            | Platform            | Download |
+            |---------------------|----------|
+            | Windows x64         | `AlBDO-<version>-x64.msi` |
+            | macOS Intel         | `AlBDO-<version>-macos-x64.dmg` |
+            | macOS Apple Silicon | `AlBDO-<version>-macos-arm64.dmg` |
+            | Linux x64           | `albdo_<version>_amd64.deb` |
+            | Linux arm64         | `albdo_<version>_arm64.deb` |
+
+            Run `albdo --version` after installation to verify.
