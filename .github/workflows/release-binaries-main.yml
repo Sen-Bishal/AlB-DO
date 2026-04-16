@@ -250,13 +250,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
-        run: gh release upload "main-latest" artifacts/albedo-binaries-windows-x64.zip --repo "${{ github.repository }}" --clobber
+        run: |
+          gh release upload "main-latest" artifacts/albedo-binaries-windows-x64.zip --repo "${{ github.repository }}" --clobber || {
+            gh release delete-asset "main-latest" -o "${{ github.repository }}" -n "albedo-binaries-windows-x64.zip" --yes
+            gh release upload "main-latest" artifacts/albedo-binaries-windows-x64.zip --repo "${{ github.repository }}"
+          }
 
       - name: Upload MSI
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
-        run: gh release upload "main-latest" msi/AlBDO-Experimental-x64.msi --repo "${{ github.repository }}" --clobber
+        run: |
+          gh release upload "main-latest" msi/AlBDO-Experimental-x64.msi --repo "${{ github.repository }}" --clobber || {
+            gh release delete-asset "main-latest" -o "${{ github.repository }}" -n "AlBDO-Experimental-x64.msi" --yes
+            gh release upload "main-latest" msi/AlBDO-Experimental-x64.msi --repo "${{ github.repository }}"
+          }
 
       - name: Verify Release
         env:
