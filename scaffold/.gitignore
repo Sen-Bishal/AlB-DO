@@ -5,3 +5,6 @@ dist/
 .env.local
 *.log
 .DS_Store
+
+# Un-ignore index.html (needed for scaffold)
+!index.html
