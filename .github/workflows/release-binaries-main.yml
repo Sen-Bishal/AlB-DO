@@ -18,8 +18,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-all:
-    name: Build All Platforms
+  build-linux:
+    name: Build Linux
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,39 +31,61 @@ jobs:
       - name: Cache Cargo Artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Linux binaries
+      - name: Build binaries
         run: cargo build --release --bins --locked --manifest-path Cargo.toml
-        env:
-          CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
 
-      - name: Build macOS binaries
-        run: cargo build --release --bins --locked --manifest-path Cargo.toml
-        env:
-          CARGO_BUILD_TARGET: x86_64-apple-darwin
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/albedo-binaries-ubuntu-x64.tar.gz \
+            target/release/albedo \
+            target/release/dom-compiler \
+            target/release/albedo-bench
 
-      - name: Build Windows binaries
-        run: cargo build --release --bins --locked --manifest-path Cargo.toml
-        env:
-          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-
-      - name: Upload all binaries
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: albedo-binaries-all
-          path: |
-            target/x86_64-unknown-linux-gnu/release/albedo
-            target/x86_64-unknown-linux-gnu/release/dom-compiler
-            target/x86_64-unknown-linux-gnu/release/albedo-bench
-            target/x86_64-apple-darwin/release/albedo
-            target/x86_64-apple-darwin/release/dom-compiler
-            target/x86_64-apple-darwin/release/albedo-bench
-            target/x86_64-pc-windows-msvc/release/albedo.exe
-            target/x86_64-pc-windows-msvc/release/dom-compiler.exe
-            target/x86_64-pc-windows-msvc/release/albedo-bench.exe
+          name: albedo-linux
+          path: artifacts/albedo-binaries-ubuntu-x64.tar.gz
           retention-days: 1
 
-  build-msi:
-    name: Build MSI Installer
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cargo build --release --bins --locked --manifest-path Cargo.toml
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/albedo-binaries-macos-x64.tar.gz \
+            target/release/albedo \
+            target/release/dom-compiler \
+            target/release/albedo-bench
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: albedo-macos
+          path: artifacts/albedo-binaries-macos-x64.tar.gz
+          retention-days: 1
+
+  build-windows:
+    name: Build Windows
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -75,7 +97,38 @@ jobs:
       - name: Cache Cargo Artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Windows binary
+      - name: Build binaries
+        run: cargo build --release --bins --locked --manifest-path Cargo.toml
+        env:
+          CARGO_INCREMENTAL: "0"
+
+      - name: Package binaries
+        shell: pwsh
+        run: |
+          mkdir -Force artifacts | Out-Null
+          Compress-Archive -Path target/release/albedo.exe, target/release/dom-compiler.exe, target/release/albedo-bench.exe -DestinationPath artifacts/albedo-binaries-windows-x64.zip -Force
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: albedo-windows
+          path: artifacts/albedo-binaries-windows-x64.zip
+          retention-days: 1
+
+  build-msi:
+    name: Build MSI
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binary
         run: cargo build --release --bin albedo --locked --manifest-path Cargo.toml
         env:
           CARGO_INCREMENTAL: "0"
@@ -84,6 +137,7 @@ jobs:
         run: dotnet tool install --global wix --version 5.0.0
 
       - name: Copy installer source
+        shell: pwsh
         run: |
           $targetDir = "target\release\installer"
           New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
@@ -106,14 +160,26 @@ jobs:
 
   release:
     name: Create Rolling Release
-    needs: [build-all, build-msi]
+    needs: [build-linux, build-macos, build-windows, build-msi]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all binaries
+      - name: Download Linux artifacts
         uses: actions/download-artifact@v4
         with:
-          name: albedo-binaries-all
-          path: binaries
+          name: albedo-linux
+          path: artifacts
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: albedo-macos
+          path: artifacts
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: albedo-windows
+          path: artifacts
 
       - name: Download MSI
         uses: actions/download-artifact@v4
@@ -121,31 +187,8 @@ jobs:
           name: albedo-msi
           path: msi
 
-      - name: Package Linux binaries
-        shell: bash
-        run: |
-          cd binaries
-          tar -czf ../artifacts/albedo-binaries-ubuntu-x64.tar.gz \
-            x86_64-unknown-linux-gnu/release/albedo \
-            x86_64-unknown-linux-gnu/release/dom-compiler \
-            x86_64-unknown-linux-gnu/release/albedo-bench
-
-      - name: Package macOS binaries
-        shell: bash
-        run: |
-          cd binaries
-          tar -czf ../artifacts/albedo-binaries-macos-x64.tar.gz \
-            x86_64-apple-darwin/release/albedo \
-            x86_64-apple-darwin/release/dom-compiler \
-            x86_64-apple-darwin/release/albedo-bench
-
-      - name: Package Windows binaries
-        shell: pwsh
-        run: |
-          Compress-Archive -Path "binaries\x86_64-pc-windows-msvc\release\*.exe" -DestinationPath "artifacts\albedo-binaries-windows-x64.zip" -Force
-
       - name: List artifacts
-        run: ls -la artifacts/
+        run: ls -la artifacts/ msi/
 
       - name: Create Release
         env:
@@ -195,26 +238,24 @@ jobs:
       - name: Upload Linux artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          cd artifacts
-          gh release upload "main-latest" albedo-binaries-ubuntu-x64.tar.gz --repo "${{ github.repository }}" --clobber
+        run: gh release upload "main-latest" artifacts/albedo-binaries-ubuntu-x64.tar.gz --repo "${{ github.repository }}" --clobber
 
       - name: Upload macOS artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          cd artifacts
-          gh release upload "main-latest" albedo-binaries-macos-x64.tar.gz --repo "${{ github.repository }}" --clobber
+        run: gh release upload "main-latest" artifacts/albedo-binaries-macos-x64.tar.gz --repo "${{ github.repository }}" --clobber
 
       - name: Upload Windows artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
-        run: |
-          gh release upload "main-latest" artifacts/albedo-binaries-windows-x64.zip --repo "${{ github.repository }}" --clobber
-          gh release upload "main-latest" msi/AlBDO-Experimental-x64.msi --repo "${{ github.repository }}" --clobber
+        run: gh release upload "main-latest" artifacts/albedo-binaries-windows-x64.zip --repo "${{ github.repository }}" --clobber
+
+      - name: Upload MSI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release upload "main-latest" msi/AlBDO-Experimental-x64.msi --repo "${{ github.repository }}" --clobber
 
       - name: Verify Release
         env:
