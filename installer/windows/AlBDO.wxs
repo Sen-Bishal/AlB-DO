@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
     <Package
-        Name="AlBDO (Experimental)"
+        Name="AlBDO"
         Version="0.1.0"
         Manufacturer="AlBDO"
         UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
@@ -12,6 +12,8 @@
             Schedule="afterInstallInitialize"
             AllowDowngrades="yes" />
 
+        <MediaTemplate EmbedCab="yes" />
+
         <StandardDirectory Id="LocalAppDataFolder">
             <Directory Id="AlBDO.Root" Name="AlBDO">
                 <Directory Id="INSTALLDIR" Name="bin">
@@ -20,7 +22,7 @@
                             Id="AlbedoExe"
                             Source="..\albedo.exe"
                             KeyPath="yes"
-                            Checksum="yes" />
+                            Compressed="yes" />
                         <Environment
                             Id="PATH"
                             Name="PATH"
@@ -54,16 +56,14 @@
                     <RegistryValue
                         Root="HKCU"
                         Key="Software\AlBDO"
-                        Name="StartMenuShortcut"
+                        Name="installed"
                         Type="string"
-                        Value="installed"
+                        Value="1"
                         KeyPath="yes" />
                 </Component>
             </Directory>
         </StandardDirectory>
 
-        <Icon Id="AlBDOIcon" SourceFile="..\albedo.exe" />
-        <Property Id="ARPPRODUCTICON" Value="AlBDOIcon" />
         <Property Id="ARPHELPLINK" Value="https://albdo.dev" />
 
         <Feature Id="ProductFeature" Title="AlBDO CLI" Level="1">

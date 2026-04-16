@@ -148,7 +148,7 @@ jobs:
         run: |
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
           Push-Location target\release\installer
-          wix build AlBDO.wxs -o "..\AlBDO-Experimental-x64.msi"
+          wix build AlBDO.wxs -o "..\AlBDO-Experimental-x64.msi" -bindvariable "SourceDir=."
           Pop-Location
 
       - name: Upload MSI
