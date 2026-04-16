@@ -26,6 +26,9 @@ use walkdir::WalkDir;
 #[path = "albedo/printer.rs"]
 mod printer;
 
+#[path = "albedo/first_run.rs"]
+mod first_run;
+
 const RULE_WIDTH: usize = 92;
 const PORT_AUTO_INCREMENT_LIMIT: u16 = 10;
 static DEV_PULSE_TICK: AtomicU64 = AtomicU64::new(0);
@@ -152,6 +155,10 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
+    // First-run detection — on a fresh install this re-launches as `albdo init`
+    // and exits. On subsequent runs this is a no-op (single Path::exists check).
+    first_run::check_and_run_init();
+
     if args.len() <= 1 {
         print_help();
         return Ok(());
@@ -168,12 +175,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "ship" => run_ship_command(&args[2..]),
         "serve" => run_serve_command(&args[2..]),
         "run" => run_command(&args[2..]),
+        "completions" => run_completions_command(&args[2..]),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
         }
         unknown => Err(format!(
-            "unknown command '{unknown}'. Run `albedo help` to see available commands."
+            "unknown command '{unknown}'. Run `albdo help` to see available commands."
         )),
     }
 }
@@ -2174,6 +2182,241 @@ fn albedo_hydration_runtime_template() -> String {
     include_str!("../../assets/albedo-hydration.js").to_string()
 }
 
+fn run_completions_command(raw_args: &[String]) -> Result<(), String> {
+    let shell = raw_args.first().map(|s| s.as_str()).unwrap_or("");
+    let script = match shell {
+        "bash" => COMPLETIONS_BASH,
+        "zsh" => COMPLETIONS_ZSH,
+        "fish" => COMPLETIONS_FISH,
+        "powershell" | "pwsh" => COMPLETIONS_POWERSHELL,
+        _ => {
+            return Err(
+                "usage: albdo completions <bash|zsh|fish|powershell>\n\
+                 Examples:\n  \
+                   albdo completions bash        >> ~/.bashrc\n  \
+                   albdo completions zsh         >> ~/.zshrc\n  \
+                   albdo completions fish        > ~/.config/fish/completions/albdo.fish\n  \
+                   albdo completions powershell  >> $PROFILE"
+                    .to_string(),
+            );
+        }
+    };
+    print!("{script}");
+    Ok(())
+}
+
+// ─── Static completion scripts ────────────────────────────────────────────────
+// Generated once here; the CI pipes `albdo completions <shell>` to produce the
+// files that get bundled into each platform installer.
+
+const COMPLETIONS_BASH: &str = r#"# albdo bash completions
+_albdo_completions() {
+    local cur prev words
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    local commands="init dev build ship serve run completions help"
+
+    case "$prev" in
+        albdo)
+            COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+            return 0
+            ;;
+        completions)
+            COMPREPLY=( $(compgen -W "bash zsh fish powershell" -- "$cur") )
+            return 0
+            ;;
+        ship)
+            COMPREPLY=( $(compgen -W "--target --config --entry" -- "$cur") )
+            return 0
+            ;;
+        --target)
+            COMPREPLY=( $(compgen -W "vercel docker fly static" -- "$cur") )
+            return 0
+            ;;
+        dev|build|run)
+            COMPREPLY=( $(compgen -W "--config --entry --host --port --no-hmr --strict --verbose --open --prod" -- "$cur") )
+            return 0
+            ;;
+        init)
+            COMPREPLY=( $(compgen -W "--force" -- "$cur") )
+            return 0
+            ;;
+        serve)
+            COMPREPLY=( $(compgen -W "--dir --host --port" -- "$cur") )
+            return 0
+            ;;
+    esac
+
+    COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+}
+complete -F _albdo_completions albdo
+"#;
+
+const COMPLETIONS_ZSH: &str = r#"#compdef albdo
+_albdo() {
+    local -a commands
+    commands=(
+        'init:Create a tiered starter app scaffold'
+        'dev:Start the live dev server with HMR'
+        'build:Compile an optimised production build'
+        'ship:Build and configure deployment target files'
+        'serve:Serve static files from a directory'
+        'run:Run a sub-mode (e.g. run dev)'
+        'completions:Emit shell completion script to stdout'
+        'help:Show command list and examples'
+    )
+
+    local -a dev_flags
+    dev_flags=(
+        '--config[Use explicit albedo.config.json/ts]:file:_files'
+        '--entry[Override entry module]:file:_files'
+        '--host[Override server host]:host'
+        '--port[Override server port]:port'
+        '--no-hmr[Disable HMR]'
+        '--strict[Enable strict startup behaviour]'
+        '--verbose[Verbose diagnostics]'
+        '--open[Open browser on startup]'
+        '--prod[Production build mode]'
+    )
+
+    case $state in
+        (cmd)
+            _describe 'albdo commands' commands && return 0
+            ;;
+    esac
+
+    _arguments -C \
+        '1: :->cmd' \
+        '*: :->args'
+
+    case $state in
+        (cmd)
+            _describe 'albdo commands' commands
+            ;;
+        (args)
+            case $words[2] in
+                (completions)
+                    _values 'shell' bash zsh fish powershell
+                    ;;
+                (dev|build)
+                    _arguments $dev_flags
+                    ;;
+                (ship)
+                    _arguments \
+                        '--target[Deployment target]:target:(vercel docker fly static)' \
+                        $dev_flags
+                    ;;
+                (serve)
+                    _arguments \
+                        '--dir[Directory to serve]:directory:_files -/' \
+                        '--host[Bind host]:host' \
+                        '--port[Bind port]:port'
+                    ;;
+                (init)
+                    _arguments '--force[Overwrite existing files]'
+                    ;;
+            esac
+            ;;
+    esac
+}
+_albdo "$@"
+"#;
+
+const COMPLETIONS_FISH: &str = r#"# albdo fish completions
+set -l albdo_commands init dev build ship serve run completions help
+
+# Disable file completions for the main command
+complete -c albdo -f
+
+# Top-level commands
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a init        -d 'Create a tiered starter app scaffold'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a dev         -d 'Start the live dev server with HMR'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a build       -d 'Compile an optimised production build'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a ship        -d 'Build and configure deployment target files'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a serve       -d 'Serve static files from a directory'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a run         -d 'Run a sub-mode'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a completions -d 'Emit shell completion script to stdout'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a help        -d 'Show command list and examples'
+
+# completions <shell>
+complete -c albdo -n "__fish_seen_subcommand_from completions" -a "bash zsh fish powershell"
+
+# dev / build flags
+for sub in dev build run
+    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l config  -d 'Use explicit albedo config file'     -r
+    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l entry   -d 'Override entry module'               -r
+    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l host    -d 'Override server host'                -r
+    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l port    -d 'Override server port'                -r
+    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l no-hmr  -d 'Disable HMR'
+    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l strict  -d 'Enable strict startup behaviour'
+    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l verbose -d 'Verbose diagnostics'
+    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l open    -d 'Open browser on startup'
+end
+complete -c albdo -n "__fish_seen_subcommand_from dev build" -l prod -d 'Production build mode'
+
+# ship flags
+complete -c albdo -n "__fish_seen_subcommand_from ship" -l target -d 'Deployment target' -r -a "vercel docker fly static"
+complete -c albdo -n "__fish_seen_subcommand_from ship" -l config -d 'Use explicit albedo config file' -r
+
+# serve flags
+complete -c albdo -n "__fish_seen_subcommand_from serve" -l dir  -d 'Directory to serve' -r
+complete -c albdo -n "__fish_seen_subcommand_from serve" -l host -d 'Bind host'          -r
+complete -c albdo -n "__fish_seen_subcommand_from serve" -l port -d 'Bind port'          -r
+
+# init flags
+complete -c albdo -n "__fish_seen_subcommand_from init" -l force -d 'Overwrite existing files'
+"#;
+
+const COMPLETIONS_POWERSHELL: &str = r#"# albdo PowerShell tab-completion
+Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    $tokens = $commandAst.CommandElements
+    $nTokens = $tokens.Count
+
+    $commands = @('init','dev','build','ship','serve','run','completions','help')
+    $devFlags = @('--config','--entry','--host','--port','--no-hmr','--strict','--verbose','--open','--prod')
+
+    if ($nTokens -le 2) {
+        $commands | Where-Object { $_ -like "$wordToComplete*" } |
+            ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+        return
+    }
+
+    $subcommand = $tokens[1].ToString()
+
+    switch ($subcommand) {
+        'completions' {
+            @('bash','zsh','fish','powershell') | Where-Object { $_ -like "$wordToComplete*" } |
+                ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+        }
+        { $_ -in 'dev','build','run' } {
+            $devFlags | Where-Object { $_ -like "$wordToComplete*" } |
+                ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
+        }
+        'ship' {
+            if ($wordToComplete -eq '--target' -or ($nTokens -ge 3 -and $tokens[$nTokens-2] -eq '--target')) {
+                @('vercel','docker','fly','static') | Where-Object { $_ -like "$wordToComplete*" } |
+                    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+            } else {
+                @('--target','--config','--entry') | Where-Object { $_ -like "$wordToComplete*" } |
+                    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
+            }
+        }
+        'serve' {
+            @('--dir','--host','--port') | Where-Object { $_ -like "$wordToComplete*" } |
+                ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
+        }
+        'init' {
+            @('--force') | Where-Object { $_ -like "$wordToComplete*" } |
+                ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
+        }
+    }
+}
+"#;
+
 fn print_help() {
     print_banner();
     print_section("Usage");
@@ -2190,6 +2433,10 @@ fn print_help() {
     print_command(
         "run dev --prod [DIR]",
         "Compile an optimized production build into .albedo/dist",
+    );
+    print_command(
+        "completions <SHELL>",
+        "Emit shell completion script (bash, zsh, fish, powershell)",
     );
 
     print_section("Dev Flags");
