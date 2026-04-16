@@ -10,8 +10,7 @@
 
         <MajorUpgrade
             Schedule="afterInstallInitialize"
-            Disallow="yes"
-            AllowSameVersionUpgrades="yes" />
+            AllowDowngrades="yes" />
 
         <StandardDirectory Id="LocalAppDataFolder">
             <Directory Id="AlBDO.Root" Name="AlBDO">
@@ -22,6 +21,21 @@
                             Source="target\release\albedo.exe"
                             KeyPath="yes"
                             Checksum="yes" />
+                        <Environment
+                            Id="PATH"
+                            Name="PATH"
+                            Value="[INSTALLDIR]"
+                            Permanent="no"
+                            Part="last"
+                            Action="set"
+                            System="no" />
+                        <Environment
+                            Id="ALBEDO_HOME"
+                            Name="ALBEDO_HOME"
+                            Value="[AlBDO.Root]"
+                            Permanent="no"
+                            Action="set"
+                            System="no" />
                     </Component>
                 </Directory>
             </Directory>
@@ -47,23 +61,6 @@
                 </Component>
             </Directory>
         </StandardDirectory>
-
-        <Environment
-            Id="PATH"
-            Name="PATH"
-            Value="[INSTALLDIR]"
-            Permanent="no"
-            Part="last"
-            Action="set"
-            System="no" />
-
-        <Environment
-            Id="ALBEDO_HOME"
-            Name="ALBEDO_HOME"
-            Value="[AlBDO.Root]"
-            Permanent="no"
-            Action="set"
-            System="no" />
 
         <Icon Id="AlBDOIcon" SourceFile="target\release\albedo.exe" />
         <Property Id="ARPPRODUCTICON" Value="AlBDOIcon" />
