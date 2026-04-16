@@ -224,7 +224,7 @@ jobs:
 
           #### Linux / macOS
           1. Extract the tarball
-          2. Add the binaries to your PATH: `export PATH=$PATH:$(pwd)`
+          2. Add the binaries to your PATH
           3. Run `./albedo init my-app`
           "@
 
