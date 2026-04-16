@@ -37,10 +37,10 @@ const RENDER_FRAMES: [&str; 4] = ["-", "=", "~", "="];
 const LOADING_COLORS: [u8; 4] = [45, 81, 117, 81];
 const RENDER_COLORS: [u8; 4] = [39, 45, 81, 117];
 
-const SCAFFOLD_APP: &str = include_str!("../../scaffold/App.tsx");
-const SCAFFOLD_HERO: &str = include_str!("../../scaffold/Hero.tsx");
-const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/Counter.tsx");
-const SCAFFOLD_LIVE_FEED: &str = include_str!("../../scaffold/LiveFeed.tsx");
+const SCAFFOLD_APP: &str = include_str!("../../scaffold/src/App.tsx");
+const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/Hero.tsx");
+const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/src/Counter.tsx");
+const SCAFFOLD_LIVE_FEED: &str = include_str!("../../scaffold/src/LiveFeed.tsx");
 const SCAFFOLD_CONFIG: &str = include_str!("../../scaffold/albedo.config.ts");
 const SCAFFOLD_PACKAGE_JSON: &str = include_str!("../../scaffold/package.json");
 const SCAFFOLD_INDEX_HTML: &str = include_str!("../../scaffold/index.html");
