@@ -193,47 +193,48 @@ jobs:
       - name: Create Release
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
         run: |
-          $tag = "main-latest"
-          $repo = "${{ github.repository }}"
-          $title = "Main Branch Binaries"
-          $notes = @"
+          set -euo pipefail
+          
+          commit_sha="${{ github.sha }}"
+          date=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          repo="${{ github.repository }}"
+          
+          notes=$(cat <<NOTES
           ## AlBDO Experimental Release
 
-          **Commit:** `${{ github.sha }}`
-          **Date:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC")
+          **Commit:** \`$commit_sha\`
+          **Date:** $date
 
           ### Included Artifacts
-          - `albedo-binaries-ubuntu-x64.tar.gz` - Linux x64 binaries
-          - `albedo-binaries-macos-x64.tar.gz` - macOS x64 binaries
-          - `albedo-binaries-windows-x64.zip` - Windows x64 binaries
-          - `AlBDO-Experimental-x64.msi` - Windows MSI Installer (recommended)
+          - \`albedo-binaries-ubuntu-x64.tar.gz\` - Linux x64 binaries
+          - \`albedo-binaries-macos-x64.tar.gz\` - macOS x64 binaries
+          - \`albedo-binaries-windows-x64.zip\` - Windows x64 binaries
+          - \`AlBDO-Experimental-x64.msi\` - Windows MSI Installer (recommended)
 
           ### Installation
 
           #### Windows (MSI Installer - Recommended)
-          1. Download `AlBDO-Experimental-x64.msi`
+          1. Download \`AlBDO-Experimental-x64.msi\`
           2. Double-click to install (no admin required)
-          3. Open terminal and run `albedo init my-app`
+          3. Open terminal and run \`albedo init my-app\`
 
           #### Windows (Portable)
-          1. Extract `albedo-binaries-windows-x64.zip`
+          1. Extract \`albedo-binaries-windows-x64.zip\`
           2. Add the extracted folder to your PATH
-          3. Run `albedo init my-app`
+          3. Run \`albedo init my-app\`
 
           #### Linux / macOS
           1. Extract the tarball
           2. Add the binaries to your PATH
-          3. Run `./albedo init my-app`
-          "@
-
-          gh release view $tag --repo $repo *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --repo $repo --title $title --notes "$notes" --prerelease --target "${{ github.sha }}"
-          } else {
-            gh release edit $tag --repo $repo --title $title --notes "$notes" --prerelease --target "${{ github.sha }}"
-          }
+          3. Run \`./albedo init my-app\`
+          NOTES
+          )
+          
+          gh release view main-latest --repo "$repo" > /dev/null 2>&1 || \
+            gh release create main-latest --repo "$repo" --title "Main Branch Binaries" --notes "$notes" --prerelease --target "$commit_sha"
+          
+          gh release edit main-latest --repo "$repo" --title "Main Branch Binaries" --notes "$notes" --prerelease --target "$commit_sha" 2>/dev/null || true
 
       - name: Upload Linux artifacts
         env:
