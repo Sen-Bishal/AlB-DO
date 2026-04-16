@@ -231,38 +231,20 @@ jobs:
           NOTES
           )
           
-          gh release view main-latest --repo "$repo" > /dev/null 2>&1 || \
-            gh release create main-latest --repo "$repo" --title "Main Branch Binaries" --notes "$notes" --prerelease --target "$commit_sha"
-          
-          gh release edit main-latest --repo "$repo" --title "Main Branch Binaries" --notes "$notes" --prerelease --target "$commit_sha" 2>/dev/null || true
+          # Delete existing release if exists, then create fresh
+          gh release delete main-latest --repo "$repo" --yes 2>/dev/null || true
+          gh release create main-latest --repo "$repo" --title "Main Branch Binaries" --notes "$notes" --prerelease --target "$commit_sha"
 
-      - name: Upload Linux artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "main-latest" artifacts/albedo-binaries-ubuntu-x64.tar.gz --repo "${{ github.repository }}" --clobber
-
-      - name: Upload macOS artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "main-latest" artifacts/albedo-binaries-macos-x64.tar.gz --repo "${{ github.repository }}" --clobber
-
-      - name: Upload Windows artifacts
+      - name: Upload all artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "main-latest" artifacts/albedo-binaries-windows-x64.zip --repo "${{ github.repository }}" || \
-          gh release delete-asset "main-latest" --repo "${{ github.repository }}" --pattern "albedo-binaries-windows-x64.zip" --yes && \
+          gh release upload "main-latest" artifacts/albedo-binaries-ubuntu-x64.tar.gz --repo "${{ github.repository }}"
+          gh release upload "main-latest" artifacts/albedo-binaries-macos-x64.tar.gz --repo "${{ github.repository }}"
           gh release upload "main-latest" artifacts/albedo-binaries-windows-x64.zip --repo "${{ github.repository }}"
-
-      - name: Upload MSI
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "main-latest" msi/AlBDO-Experimental-x64.msi --repo "${{ github.repository }}" || \
-          gh release delete-asset "main-latest" --repo "${{ github.repository }}" --pattern "AlBDO-Experimental-x64.msi" --yes && \
           gh release upload "main-latest" msi/AlBDO-Experimental-x64.msi --repo "${{ github.repository }}"
 
       - name: Verify Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release view main-latest --repo "${{ github.repository }}" --json assets --output json | jq '.assets[].name'
+        run: gh release view main-latest --repo "${{ github.repository }}" --json assets --output json | jq -r '.[] | .name'
