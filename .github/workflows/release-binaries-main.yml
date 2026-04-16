@@ -77,6 +77,8 @@ jobs:
 
       - name: Build Windows binary
         run: cargo build --release --bin albedo --locked --manifest-path Cargo.toml
+        env:
+          CARGO_INCREMENTAL: "0"
 
       - name: Install WiX Toolset
         run: dotnet tool install --global wix --version 5.0.0
