@@ -62,7 +62,7 @@
             </Directory>
         </StandardDirectory>
 
-        <Icon Id="AlBDOIcon" Source="..\albedo.exe" />
+        <Icon Id="AlBDOIcon" SourceFile="..\albedo.exe" />
         <Property Id="ARPPRODUCTICON" Value="AlBDOIcon" />
         <Property Id="ARPHELPLINK" Value="https://albdo.dev" />
 
