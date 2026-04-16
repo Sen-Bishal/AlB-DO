@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+    <Package
+        Name="AlBDO (Experimental)"
+        Version="0.1.0"
+        Manufacturer="AlBDO"
+        UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+        Scope="perUser"
+        InstallerVersion="500">
+
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            Disallow="yes"
+            AllowSameVersionUpgrades="yes" />
+
+        <StandardDirectory Id="LocalAppDataFolder">
+            <Directory Id="AlBDO.Root" Name="AlBDO">
+                <Directory Id="INSTALLDIR" Name="bin">
+                    <Component Id="AlbedoBinary" Guid="B1C2D3E4-F5A6-8901-2345-67890ABCDEF0">
+                        <File
+                            Id="AlbedoExe"
+                            Source="target\release\albedo.exe"
+                            KeyPath="yes"
+                            Checksum="yes" />
+                    </Component>
+                </Directory>
+            </Directory>
+        </StandardDirectory>
+
+        <StandardDirectory Id="ProgramMenuFolder">
+            <Directory Id="ApplicationProgramsFolder" Name="AlBDO">
+                <Component Id="StartMenuShortcut" Guid="C2D3E4F5-A6B7-8901-3456-7890ABCDEF12">
+                    <Shortcut
+                        Id="StartMenuShortcut"
+                        Name="AlBDO CLI"
+                        Description="AlBDO - Rust-native JSX/TSX Compiler"
+                        Target="[INSTALLDIR]albedo.exe"
+                        WorkingDirectory="INSTALLDIR" />
+                    <RemoveFolder Id="CleanUpShortcuts" On="uninstall" />
+                    <RegistryValue
+                        Root="HKCU"
+                        Key="Software\AlBDO"
+                        Name="StartMenuShortcut"
+                        Type="string"
+                        Value="installed"
+                        KeyPath="yes" />
+                </Component>
+            </Directory>
+        </StandardDirectory>
+
+        <Environment
+            Id="PATH"
+            Name="PATH"
+            Value="[INSTALLDIR]"
+            Permanent="no"
+            Part="last"
+            Action="set"
+            System="no" />
+
+        <Environment
+            Id="ALBEDO_HOME"
+            Name="ALBEDO_HOME"
+            Value="[AlBDO.Root]"
+            Permanent="no"
+            Action="set"
+            System="no" />
+
+        <Icon Id="AlBDOIcon" SourceFile="target\release\albedo.exe" />
+        <Property Id="ARPPRODUCTICON" Value="AlBDOIcon" />
+        <Property Id="ARPHELPLINK" Value="https://albdo.dev" />
+
+        <Feature Id="ProductFeature" Title="AlBDO CLI" Level="1">
+            <ComponentRef Id="AlbedoBinary" />
+            <ComponentRef Id="StartMenuShortcut" />
+        </Feature>
+
+    </Package>
+</Wix>
