@@ -1,13 +1,16 @@
 {
   "name": "__ALBEDO_APP_NAME__",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.0",
+  "type": "module",
   "scripts": {
     "dev": "albedo dev",
     "build": "albedo build",
     "ship": "albedo ship"
   },
-  "dependencies": {
-    "albedo": "0.1.0-alpha.1"
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "clsx": "^2.0.0"
   }
 }

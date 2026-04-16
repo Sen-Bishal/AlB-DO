@@ -13,19 +13,14 @@ concurrency:
   group: release-binaries-main
   cancel-in-progress: true
 
-jobs:
-  build:
-    name: Build (${{ matrix.os }})
-    if: github.ref == 'refs/heads/main'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
 
+jobs:
+  build-all:
+    name: Build All Platforms
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,56 +31,190 @@ jobs:
       - name: Cache Cargo Artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binaries
-        run: cargo build --release --bins --locked
+      - name: Build Linux binaries
+        run: cargo build --release --bins --locked --manifest-path Cargo.toml
+        env:
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
 
-      - name: Package binaries (Unix)
-        if: runner.os != 'Windows'
+      - name: Build macOS binaries
+        run: cargo build --release --bins --locked --manifest-path Cargo.toml
+        env:
+          CARGO_BUILD_TARGET: x86_64-apple-darwin
+
+      - name: Build Windows binaries
+        run: cargo build --release --bins --locked --manifest-path Cargo.toml
+        env:
+          CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+
+      - name: Upload all binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: albedo-binaries-all
+          path: |
+            target/x86_64-unknown-linux-gnu/release/albedo
+            target/x86_64-unknown-linux-gnu/release/dom-compiler
+            target/x86_64-unknown-linux-gnu/release/albedo-bench
+            target/x86_64-apple-darwin/release/albedo
+            target/x86_64-apple-darwin/release/dom-compiler
+            target/x86_64-apple-darwin/release/albedo-bench
+            target/x86_64-pc-windows-msvc/release/albedo.exe
+            target/x86_64-pc-windows-msvc/release/dom-compiler.exe
+            target/x86_64-pc-windows-msvc/release/albedo-bench.exe
+          retention-days: 1
+
+  build-msi:
+    name: Build MSI Installer
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Windows binary
+        run: cargo build --release --bin albedo --locked --manifest-path Cargo.toml
+
+      - name: Install WiX Toolset
+        run: dotnet tool install --global wix --version 5.0.0
+
+      - name: Copy installer source
+        run: |
+          $targetDir = "target\release\installer"
+          New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+          Copy-Item -Path "installer\windows\AlBDO.wxs" -Destination "$targetDir\AlBDO.wxs" -Force
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          Push-Location target\release\installer
+          wix build AlBDO.wxs -o "..\AlBDO-Experimental-x64.msi"
+          Pop-Location
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: albedo-msi
+          path: target/release/AlBDO-Experimental-x64.msi
+          retention-days: 1
+
+  release:
+    name: Create Rolling Release
+    needs: [build-all, build-msi]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: albedo-binaries-all
+          path: binaries
+
+      - name: Download MSI
+        uses: actions/download-artifact@v4
+        with:
+          name: albedo-msi
+          path: msi
+
+      - name: Package Linux binaries
         shell: bash
         run: |
-          set -euo pipefail
-          archive="albedo-binaries-${{ runner.os }}-${{ runner.arch }}.tar.gz"
-          tar -czf "$archive" \
-            target/release/albedo \
-            target/release/dom-compiler \
-            target/release/albedo-bench
-          echo "RELEASE_ASSET=$archive" >> "$GITHUB_ENV"
+          cd binaries
+          tar -czf ../artifacts/albedo-binaries-ubuntu-x64.tar.gz \
+            x86_64-unknown-linux-gnu/release/albedo \
+            x86_64-unknown-linux-gnu/release/dom-compiler \
+            x86_64-unknown-linux-gnu/release/albedo-bench
 
-      - name: Package binaries (Windows)
-        if: runner.os == 'Windows'
+      - name: Package macOS binaries
+        shell: bash
+        run: |
+          cd binaries
+          tar -czf ../artifacts/albedo-binaries-macos-x64.tar.gz \
+            x86_64-apple-darwin/release/albedo \
+            x86_64-apple-darwin/release/dom-compiler \
+            x86_64-apple-darwin/release/albedo-bench
+
+      - name: Package Windows binaries
         shell: pwsh
         run: |
-          $archive = "albedo-binaries-${{ runner.os }}-${{ runner.arch }}.zip"
-          Compress-Archive -Path `
-            target/release/albedo.exe, `
-            target/release/dom-compiler.exe, `
-            target/release/albedo-bench.exe `
-            -DestinationPath $archive -Force
-          "RELEASE_ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Compress-Archive -Path "binaries\x86_64-pc-windows-msvc\release\*.exe" -DestinationPath "artifacts\albedo-binaries-windows-x64.zip" -Force
 
-      - name: Publish packaged binary to rolling release
-        shell: pwsh
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create Release
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
           $tag = "main-latest"
           $repo = "${{ github.repository }}"
           $title = "Main Branch Binaries"
-          $notes = "Automated rolling binary release from the main branch.`nCommit: ${{ github.sha }}"
+          $notes = @"
+          ## AlBDO Experimental Release
+
+          **Commit:** `${{ github.sha }}`
+          **Date:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC")
+
+          ### Included Artifacts
+          - `albedo-binaries-ubuntu-x64.tar.gz` - Linux x64 binaries
+          - `albedo-binaries-macos-x64.tar.gz` - macOS x64 binaries
+          - `albedo-binaries-windows-x64.zip` - Windows x64 binaries
+          - `AlBDO-Experimental-x64.msi` - Windows MSI Installer (recommended)
+
+          ### Installation
+
+          #### Windows (MSI Installer - Recommended)
+          1. Download `AlBDO-Experimental-x64.msi`
+          2. Double-click to install (no admin required)
+          3. Open terminal and run `albedo init my-app`
+
+          #### Windows (Portable)
+          1. Extract `albedo-binaries-windows-x64.zip`
+          2. Add the extracted folder to your PATH
+          3. Run `albedo init my-app`
+
+          #### Linux / macOS
+          1. Extract the tarball
+          2. Add the binaries to your PATH: `export PATH=$PATH:$(pwd)`
+          3. Run `./albedo init my-app`
+          "@
 
           gh release view $tag --repo $repo *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --repo $repo --title $title --notes $notes --prerelease --target "${{ github.sha }}"
-            if ($LASTEXITCODE -ne 0) {
-              # Another matrix job may have created the release first.
-              gh release view $tag --repo $repo *> $null
-              if ($LASTEXITCODE -ne 0) {
-                throw "Failed to create or locate release '$tag'."
-              }
-            }
+            gh release create $tag --repo $repo --title $title --notes "$notes" --prerelease --target "${{ github.sha }}"
           } else {
-            gh release edit $tag --repo $repo --title $title --notes $notes --prerelease --target "${{ github.sha }}"
+            gh release edit $tag --repo $repo --title $title --notes "$notes" --prerelease --target "${{ github.sha }}"
           }
 
-          gh release upload $tag "$env:RELEASE_ASSET" --repo $repo --clobber
+      - name: Upload Linux artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cd artifacts
+          gh release upload "main-latest" albedo-binaries-ubuntu-x64.tar.gz --repo "${{ github.repository }}" --clobber
+
+      - name: Upload macOS artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cd artifacts
+          gh release upload "main-latest" albedo-binaries-macos-x64.tar.gz --repo "${{ github.repository }}" --clobber
+
+      - name: Upload Windows artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release upload "main-latest" artifacts/albedo-binaries-windows-x64.zip --repo "${{ github.repository }}" --clobber
+          gh release upload "main-latest" msi/AlBDO-Experimental-x64.msi --repo "${{ github.repository }}" --clobber
+
+      - name: Verify Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view main-latest --repo "${{ github.repository }}" --json assets --output json | jq '.assets[].name'
