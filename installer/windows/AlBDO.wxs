@@ -18,7 +18,7 @@
                     <Component Id="AlbedoBinary" Guid="B1C2D3E4-F5A6-8901-2345-67890ABCDEF0">
                         <File
                             Id="AlbedoExe"
-                            Source="target\release\albedo.exe"
+                            Source="..\albedo.exe"
                             KeyPath="yes"
                             Checksum="yes" />
                         <Environment
@@ -62,7 +62,7 @@
             </Directory>
         </StandardDirectory>
 
-        <Icon Id="AlBDOIcon" SourceFile="target\release\albedo.exe" />
+        <Icon Id="AlBDOIcon" Source="..\albedo.exe" />
         <Property Id="ARPPRODUCTICON" Value="AlBDOIcon" />
         <Property Id="ARPHELPLINK" Value="https://albdo.dev" />
 
