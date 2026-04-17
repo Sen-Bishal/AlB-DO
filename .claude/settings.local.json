@@ -15,7 +15,12 @@
       "Bash(curl -s -o /dev/null http://127.0.0.1:4789/)",
       "Bash(curl -s -o /dev/null http://127.0.0.1:4789/nope)",
       "mcp__Desktop_Commander__list_directory",
-      "mcp__Desktop_Commander__start_search"
+      "mcp__Desktop_Commander__start_search",
+      "Bash(cargo clean *)",
+      "Bash(cargo install *)",
+      "Bash(where albedo *)",
+      "Bash(albedo --version)",
+      "Bash(albedo --help)"
     ]
   }
 }
