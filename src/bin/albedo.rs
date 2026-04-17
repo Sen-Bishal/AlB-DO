@@ -44,9 +44,13 @@ const SCAFFOLD_APP: &str = include_str!("../../scaffold/src/App.tsx");
 const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/Hero.tsx");
 const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/src/Counter.tsx");
 const SCAFFOLD_LIVE_FEED: &str = include_str!("../../scaffold/src/LiveFeed.tsx");
+const SCAFFOLD_STYLES: &str = include_str!("../../scaffold/src/styles.css");
 const SCAFFOLD_CONFIG: &str = include_str!("../../scaffold/albedo.config.ts");
 const SCAFFOLD_PACKAGE_JSON: &str = include_str!("../../scaffold/package.json");
 const SCAFFOLD_INDEX_HTML: &str = include_str!("../../scaffold/index.html");
+const SCAFFOLD_TSCONFIG: &str = include_str!("../../scaffold/tsconfig.json");
+const SCAFFOLD_README: &str = include_str!("../../scaffold/README.md");
+const SCAFFOLD_GITIGNORE: &str = include_str!("../../scaffold/.gitignore");
 
 #[derive(Clone)]
 struct DevAllRoutesArtifact {
@@ -2104,6 +2108,11 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         SCAFFOLD_LIVE_FEED,
         options.force,
     )?;
+    write_scaffold_file(
+        &target.join("src").join("styles.css"),
+        SCAFFOLD_STYLES,
+        options.force,
+    )?;
     write_scaffold_file(&target.join(DEV_CONFIG_TS), SCAFFOLD_CONFIG, options.force)?;
     write_scaffold_file(
         &target.join("package.json"),
@@ -2113,6 +2122,21 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
     write_scaffold_file(
         &target.join("public").join("index.html"),
         SCAFFOLD_INDEX_HTML,
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join("tsconfig.json"),
+        SCAFFOLD_TSCONFIG,
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join("README.md"),
+        SCAFFOLD_README,
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join(".gitignore"),
+        SCAFFOLD_GITIGNORE,
         options.force,
     )?;
 
@@ -2674,8 +2698,12 @@ mod tests {
         assert!(target.join("src/components/Hero.tsx").is_file());
         assert!(target.join("src/components/Counter.tsx").is_file());
         assert!(target.join("src/components/LiveFeed.tsx").is_file());
+        assert!(target.join("src/styles.css").is_file());
         assert!(target.join("public/index.html").is_file());
         assert!(target.join("package.json").is_file());
+        assert!(target.join("tsconfig.json").is_file());
+        assert!(target.join("README.md").is_file());
+        assert!(target.join(".gitignore").is_file());
     }
 
     #[test]

@@ -1,19 +1,35 @@
 import { useState } from "react";
 
 export default function Counter() {
-  // Tier B: useState hook introduces local interactivity, so hydration is required.
+  // Tier B: useState introduces interactivity — AlBDO emits a small
+  // hydration island so only this card boots on the client.
   const [count, setCount] = useState(0);
 
   return (
-    <section>
-      <h2>Tier B - Hydrated Counter</h2>
-      <p>
-        Hooks move this component out of Tier A. AlBDO sends only the hydration
-        payload needed for this island.
+    <>
+      <div className="card-head">
+        <span className="tier-badge">
+          <span>tier b</span>
+        </span>
+        <span className="card-meta">
+          <span>island</span>
+        </span>
+      </div>
+      <h3 className="card-title">Interactive island</h3>
+      <p className="card-body">
+        Hooks move this component into Tier B. AlBDO isolates it, ships the
+        minimum JS to hydrate just this card, and keeps the rest static.
       </p>
-      <button type="button" onClick={() => setCount((value) => value + 1)}>
-        Count: {count}
-      </button>
-    </section>
+      <div className="counter-action">
+        <button
+          type="button"
+          className="counter-btn"
+          onClick={() => setCount((value) => value + 1)}
+        >
+          + increment
+        </button>
+        <span className="counter-value">{count}</span>
+      </div>
+    </>
   );
 }
