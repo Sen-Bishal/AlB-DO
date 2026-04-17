@@ -29,16 +29,16 @@ mod printer;
 #[path = "albedo/first_run.rs"]
 mod first_run;
 
-const RULE_WIDTH: usize = 92;
 const PORT_AUTO_INCREMENT_LIMIT: u16 = 10;
-static DEV_PULSE_TICK: AtomicU64 = AtomicU64::new(0);
 
-const BANNER_PALETTE: [u8; 5] = [45, 81, 117, 153, 189];
-const RULE_PALETTE: [u8; 4] = [39, 45, 81, 117];
-const LOADING_FRAMES: [&str; 4] = [".", "o", "O", "o"];
-const RENDER_FRAMES: [&str; 4] = ["-", "=", "~", "="];
-const LOADING_COLORS: [u8; 4] = [45, 81, 117, 81];
-const RENDER_COLORS: [u8; 4] = [39, 45, 81, 117];
+const ACCENT: u8 = 81;
+const ACCENT_SOFT: u8 = 117;
+const ACCENT_DEEP: u8 = 45;
+const MUTED: u8 = 244;
+
+const BRAND_PALETTE: [u8; 5] = [45, 51, 87, 123, 159];
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAMES_ASCII: [&str; 4] = ["|", "/", "-", "\\"];
 
 const SCAFFOLD_APP: &str = include_str!("../../scaffold/src/App.tsx");
 const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/Hero.tsx");
@@ -211,7 +211,7 @@ fn run_init_command(raw_args: &[String]) -> Result<(), String> {
         cwd.join(&options.target_dir)
     };
 
-    scaffold_project(&target, &options)?;
+    with_spinner("scaffolding project…", || scaffold_project(&target, &options))?;
 
     let relative_target = options.target_dir.display().to_string();
     print_init_success(relative_target.as_str());
@@ -295,9 +295,10 @@ fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
         ShipTarget::Docker => configure_ship_docker(&contract),
         ShipTarget::Fly => configure_ship_fly(&contract),
         ShipTarget::Static => {
-            print_ok("Static export is ready");
+            print_section("static");
+            print_ok("static export ready");
             print_kv(
-                "Dist",
+                "dist",
                 contract.project_dir.join(".albedo").join("dist").display(),
             );
             Ok(())
@@ -340,15 +341,29 @@ fn parse_ship_target(raw: &str) -> Result<ShipTarget, String> {
 }
 
 fn prompt_ship_target() -> Result<ShipTarget, String> {
+    print_section("pick a target");
+    println!(
+        "    {} vercel     {}",
+        style_256("1", ACCENT_SOFT, true),
+        style("static export + vercel.json", "2")
+    );
+    println!(
+        "    {} docker     {}",
+        style_256("2", ACCENT_SOFT, true),
+        style("single binary image", "2")
+    );
+    println!(
+        "    {} fly        {}",
+        style_256("3", ACCENT_SOFT, true),
+        style("fly.toml + Dockerfile", "2")
+    );
+    println!(
+        "    {} static     {}",
+        style_256("4", ACCENT_SOFT, true),
+        style("export dist/ for any CDN", "2")
+    );
     println!();
-    println!("  How do you want to deploy?");
-    println!();
-    println!("  [1] Vercel       - static export + vercel.json");
-    println!("  [2] Docker       - single binary image");
-    println!("  [3] Fly.io       - fly.toml + Dockerfile");
-    println!("  [4] Static       - export dist/ for any CDN");
-    println!();
-    print!("  > ");
+    print!("  {} ", style_256("›", ACCENT, true));
     std::io::stdout()
         .flush()
         .map_err(|err| format!("failed to flush prompt: {err}"))?;
@@ -365,9 +380,10 @@ fn configure_ship_vercel(contract: &ResolvedDevContract) -> Result<(), String> {
     let path = contract.project_dir.join("vercel.json");
     std::fs::write(&path, vercel_json)
         .map_err(|err| format!("failed to write '{}': {err}", path.display()))?;
-    print_ok("Vercel target files generated");
-    print_kv("File", path.display());
-    print_kv("Deploy", "vercel --prod");
+    print_section("vercel");
+    print_ok("vercel.json written");
+    print_kv("file", path.display());
+    print_kv("deploy", style_256("vercel --prod", ACCENT_SOFT, true));
     Ok(())
 }
 
@@ -380,11 +396,12 @@ fn configure_ship_docker(contract: &ResolvedDevContract) -> Result<(), String> {
         .map_err(|err| format!("failed to write '{}': {err}", dockerfile_path.display()))?;
     std::fs::write(&dockerignore_path, dockerignore)
         .map_err(|err| format!("failed to write '{}': {err}", dockerignore_path.display()))?;
-    print_ok("Docker target files generated");
-    print_kv("Dockerfile", dockerfile_path.display());
-    print_kv("Docker Ignore", dockerignore_path.display());
-    print_kv("Build", "docker build -t albedo-app .");
-    print_kv("Run", "docker run -p 3000:3000 albedo-app");
+    print_section("docker");
+    print_ok("Dockerfile + .dockerignore written");
+    print_kv("dockerfile", dockerfile_path.display());
+    print_kv("ignore", dockerignore_path.display());
+    print_kv("build", style_256("docker build -t albedo-app .", ACCENT_SOFT, true));
+    print_kv("run", style_256("docker run -p 3000:3000 albedo-app", ACCENT_SOFT, true));
     Ok(())
 }
 
@@ -397,9 +414,13 @@ fn configure_ship_fly(contract: &ResolvedDevContract) -> Result<(), String> {
     let fly_toml_path = contract.project_dir.join("fly.toml");
     std::fs::write(&fly_toml_path, fly_toml)
         .map_err(|err| format!("failed to write '{}': {err}", fly_toml_path.display()))?;
-    print_ok("Fly.io target files generated");
-    print_kv("File", fly_toml_path.display());
-    print_kv("Deploy", "fly launch --copy-config && fly deploy");
+    print_section("fly.io");
+    print_ok("fly.toml written");
+    print_kv("file", fly_toml_path.display());
+    print_kv(
+        "deploy",
+        style_256("fly launch --copy-config && fly deploy", ACCENT_SOFT, true),
+    );
     Ok(())
 }
 
@@ -428,18 +449,30 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     let (listener, addr, auto_incremented) =
         bind_dev_listener(options.host.as_str(), options.port)?;
     print_banner();
-    print_section("Static Serve");
+    print_section("serve");
     if auto_incremented {
         print_warn(format!(
-            "Port {} is busy; auto-switched to {}.",
+            "port {} busy — using {}",
             options.port,
             addr.port()
         ));
     }
-    print_ok("Static file server is running");
-    print_kv("Directory", root.display());
-    print_kv("URL", format!("http://{}", addr));
-    print_kv("Stop", "Ctrl+C");
+    println!();
+    print_ok(format!(
+        "serving · {}",
+        style_256(&format!("http://{}", addr), ACCENT_SOFT, true)
+    ));
+    println!(
+        "    {} {}",
+        style_256("·", MUTED, false),
+        style(&format!("{}", root.display()), "2")
+    );
+    println!();
+    println!(
+        "    {}  stop the server",
+        style_256("ctrl+c", MUTED, true)
+    );
+    println!();
 
     for stream in listener.incoming() {
         match stream {
@@ -448,14 +481,14 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
                 std::thread::spawn(move || {
                     if let Err(err) = handle_static_connection(stream, root.as_path()) {
                         if !is_benign_network_error(&err) {
-                            eprintln!("[serve] request failed: {err}");
+                            eprintln!("  {} request failed: {err}", style("✗", "1;31"));
                         }
                     }
                 });
             }
             Err(err) => {
                 if !is_benign_network_error(&err) {
-                    eprintln!("[serve] accept failed: {err}");
+                    eprintln!("  {} accept failed: {err}", style("✗", "1;31"));
                 }
             }
         }
@@ -657,40 +690,40 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     let contract = resolve_dev_contract(&forwarded, &cwd)?;
 
     print_banner();
-    print_section(if prod_mode {
-        "Run Dev (Production Build)"
-    } else {
-        "Run Dev"
-    });
-    print_kv("Project", contract.project_dir.display());
-    print_kv("Root", contract.root.display());
-    print_kv("Entry", contract.entry.as_str());
+    print_section(if prod_mode { "build" } else { "dev" });
+    print_kv("project", contract.project_dir.display());
     print_kv(
-        "Server",
-        format!("{}:{}", contract.server.host, contract.server.port),
+        "server",
+        format!(
+            "http://{}:{}",
+            contract.server.host, contract.server.port
+        ),
     );
-    print_kv(
-        "HMR",
-        if contract.hmr.enabled {
-            format!("{:?}", contract.hmr.transport)
-        } else {
-            "disabled".to_string()
-        },
-    );
-    print_kv("Hot Set", format!("{}/32", contract.hot_set.len()));
-    print_kv(
-        "Config",
-        contract
-            .config_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "(defaults)".to_string()),
-    );
-    print_kv("Strict", contract.strict);
-    print_kv("Verbose", contract.verbose);
+    if contract.verbose {
+        print_kv("root", contract.root.display());
+        print_kv("entry", contract.entry.as_str());
+        print_kv(
+            "hmr",
+            if contract.hmr.enabled {
+                format!("{:?}", contract.hmr.transport)
+            } else {
+                "disabled".to_string()
+            },
+        );
+        print_kv("hot set", format!("{}/32", contract.hot_set.len()));
+        print_kv(
+            "config",
+            contract
+                .config_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "(defaults)".to_string()),
+        );
+        print_kv("strict", contract.strict);
+    }
 
     if cli_options.print_contract {
-        print_section("Resolved Contract");
+        print_section("resolved contract");
         let contract_json = serde_json::to_string_pretty(&contract)
             .map_err(|err| format!("failed to serialize contract: {err}"))?;
         println!("{contract_json}");
@@ -713,20 +746,23 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     } else {
         None
     };
-    let tier_report = compile_tier_report(&contract, scanned_components.as_deref())?;
+
+    let (tier_report, project, project_css, initial) = with_spinner("compiling components…", || {
+        let tier_report = compile_tier_report(&contract, scanned_components.as_deref())?;
+        let project = ComponentProject::load_from_dir(&contract.root)
+            .map_err(|err| format!("failed to load components: {err}"))?;
+        let project_css = collect_css_bundle(&contract.root);
+        let initial = render_all_routes(&project, &contract, &project_css).map_err(|err| {
+            format!(
+                "failed to render initial dev document (entry='{}'): {err}",
+                contract.entry
+            )
+        })?;
+        Ok::<_, String>((tier_report, project, project_css, initial))
+    })?;
+
     let root_label = contract.root.display().to_string();
     printer::print_tier_report(&tier_report, root_label.as_str());
-
-    let project = ComponentProject::load_from_dir(&contract.root)
-        .map_err(|err| format!("failed to load components: {err}"))?;
-    let project_css = collect_css_bundle(&contract.root);
-
-    let initial = render_all_routes(&project, &contract, &project_css).map_err(|err| {
-        format!(
-            "failed to render initial dev document (entry='{}'): {err}",
-            contract.entry
-        )
-    })?;
 
     let (listener, addr, auto_incremented) =
         bind_dev_listener(contract.server.host.as_str(), contract.server.port)?;
@@ -735,13 +771,12 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     let hot_registry = Arc::new(hot_registry);
     let sentinel_ring = Arc::new(Mutex::new(hot_ring));
 
-    println!(
-        "  {} {} prewarming renderer ({} routes, {} render time)",
-        style("[dev]", "1;34"),
-        next_loading_icon(),
+    print_ok(format!(
+        "compiled {} route{} in {}",
         initial.route_documents.len(),
+        if initial.route_documents.len() == 1 { "" } else { "s" },
         colorize_timing_ms(initial.render_ms)
-    );
+    ));
     let shared_state = Arc::new(Mutex::new(SharedDevState {
         project,
         project_css,
@@ -772,43 +807,58 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         });
     }
 
-    print_section("Dev Runtime");
     if auto_incremented {
         print_warn(format!(
-            "Port {} is busy; auto-switched to {}.",
+            "port {} busy — using {}",
             contract.server.port,
             addr.port()
         ));
     }
-    print_ok("Live dev server is running");
-    print_kv("URL", format!("http://{}", addr));
-    print_kv(
-        "HMR Channel",
-        if contract.hmr.enabled {
-            format!("SSE -> http://{}/_albedo/hmr", addr)
-        } else {
-            "disabled".to_string()
-        },
-    );
-    print_kv(
-        "File Watcher",
-        format!(
-            "watching '{}' (debounce={}ms)",
-            contract.root.display(),
-            contract.watch.debounce_ms
-        ),
-    );
-    print_timing_legend();
-    if let Some(components) = scanned_components.as_ref() {
-        print_kv("Components", components.len());
-    }
-    print_kv("Hot Set", format!("{}/{}", hot_registry.len(), HOT_SET_MAX));
+    println!();
+    print_ok(format!(
+        "ready · {}",
+        style_256(&format!("http://{}", addr), ACCENT_SOFT, true)
+    ));
     let route_count = 1 + contract.routes.len();
-    print_kv("Routes", route_count);
-    for (url, entry) in &contract.routes {
-        println!("    {} -> {}", style(url, "2"), entry);
+    println!(
+        "    {} {} route{}{}",
+        style_256("·", MUTED, false),
+        route_count,
+        if route_count == 1 { "" } else { "s" },
+        if contract.hmr.enabled {
+            style("  · hmr on", "2").to_string()
+        } else {
+            style("  · hmr off", "2").to_string()
+        }
+    );
+    if contract.verbose {
+        if let Some(components) = scanned_components.as_ref() {
+            print_kv("components", components.len());
+        }
+        print_kv("hot set", format!("{}/{}", hot_registry.len(), HOT_SET_MAX));
+        print_kv(
+            "watcher",
+            format!(
+                "'{}' (debounce={}ms)",
+                contract.root.display(),
+                contract.watch.debounce_ms
+            ),
+        );
+        for (url, entry) in &contract.routes {
+            println!(
+                "    {} {} {}",
+                style_256("·", MUTED, false),
+                style(url, "2"),
+                style(&format!("→ {}", entry), "2")
+            );
+        }
     }
-    print_kv("Stop", "Ctrl+C");
+    println!();
+    println!(
+        "    {}  stop the server",
+        style_256("ctrl+c", MUTED, true)
+    );
+    println!();
 
     if contract.open {
         let target = format!("http://{}", addr);
@@ -826,14 +876,14 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
                 std::thread::spawn(move || {
                     if let Err(err) = handle_dev_connection(stream, state, clients, hmr_enabled) {
                         if !is_benign_network_error(&err) {
-                            eprintln!("[dev] request failed: {err}");
+                            eprintln!("  {} request failed: {err}", style("✗", "1;31"));
                         }
                     }
                 });
             }
             Err(err) => {
                 if !is_benign_network_error(&err) {
-                    eprintln!("[dev] accept failed: {err}");
+                    eprintln!("  {} accept failed: {err}", style("✗", "1;31"));
                 }
             }
         }
@@ -891,11 +941,13 @@ fn scan_components_with_contract_policy(
 
     if contract.verbose {
         println!(
-            "  {} during {} -> {} component(s), {} parse failure(s)",
-            style("[scan]", "1;34"),
-            context,
+            "  {}  scanned {} component{} during {} ({} failure{})",
+            style_256("·", ACCENT, false),
             report.components.len(),
-            report.failures.len()
+            if report.components.len() == 1 { "" } else { "s" },
+            context,
+            report.failures.len(),
+            if report.failures.len() == 1 { "" } else { "s" }
         );
     }
 
@@ -919,8 +971,8 @@ fn print_scan_failure_details(failures: &[ScanFailure], verbose: bool) {
     if verbose {
         for failure in failures {
             eprintln!(
-                "  {} {} -> {}",
-                style("[scan]", "1;33"),
+                "  {}  {} → {}",
+                style("!", "1;33"),
                 failure.path.display(),
                 failure.message
             );
@@ -973,14 +1025,15 @@ fn watch_and_rebuild_loop(
     ) {
         Ok(watcher) => watcher,
         Err(err) => {
-            eprintln!("[dev] watcher init failed: {err}");
+            eprintln!("  {} watcher init failed: {err}", style("✗", "1;31"));
             return;
         }
     };
 
     if let Err(err) = watcher.watch(contract.root.as_path(), RecursiveMode::Recursive) {
         eprintln!(
-            "[dev] watcher failed to watch '{}': {}",
+            "  {} watcher failed to watch '{}': {}",
+            style("✗", "1;31"),
             contract.root.display(),
             err
         );
@@ -1027,7 +1080,7 @@ fn watch_and_rebuild_loop(
                 if contract.hmr.enabled {
                     broadcast_reload_event(&sse_clients, next_revision);
                 }
-                eprintln!("  {} rebuild failed: {}", style("[dev]", "1;31"), err);
+                eprintln!("  {} rebuild failed: {}", style("✗", "1;31"), err);
                 continue;
             }
         }
@@ -1057,7 +1110,7 @@ fn watch_and_rebuild_loop(
                                                     fallback_full_reload = true;
                                                     eprintln!(
                                                         "  {} hot ring rebuild failed: {}",
-                                                        style("[dev]", "1;33"),
+                                                        style("!", "1;33"),
                                                         err
                                                     );
                                                 }
@@ -1066,7 +1119,7 @@ fn watch_and_rebuild_loop(
                                                 fallback_full_reload = true;
                                                 eprintln!(
                                                     "  {} hot ring lock poisoned during rebuild",
-                                                    style("[dev]", "1;33"),
+                                                    style("!", "1;33"),
                                                 );
                                             }
                                         }
@@ -1076,7 +1129,7 @@ fn watch_and_rebuild_loop(
                                     fallback_full_reload = true;
                                     eprintln!(
                                         "  {} shared state lock poisoned while resolving hot set",
-                                        style("[dev]", "1;33"),
+                                        style("!", "1;33"),
                                     );
                                 }
                             }
@@ -1099,7 +1152,7 @@ fn watch_and_rebuild_loop(
                                     fallback_full_reload = true;
                                     eprintln!(
                                         "  {} hot invalidation pass failed: {}",
-                                        style("[dev]", "1;33"),
+                                        style("!", "1;33"),
                                         err
                                     );
                                 }
@@ -1119,23 +1172,21 @@ fn watch_and_rebuild_loop(
                         }
                     }
                     let rebuild_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
+                    let _ = patch_report.skipped_unchanged;
+                    let _ = patch_report.deleted;
                     println!(
-                        "  {} {} rebuild complete in {} (reparsed={}, skipped={}, deleted={})",
-                        style("[dev]", "1;32"),
-                        next_render_icon(),
-                        colorize_timing_ms(rebuild_ms),
+                        "  {}  rebuilt {} component{} in {}",
+                        style("✓", "1;32"),
                         patch_report.reparsed,
-                        patch_report.skipped_unchanged,
-                        patch_report.deleted
+                        if patch_report.reparsed == 1 { "" } else { "s" },
+                        colorize_timing_ms(rebuild_ms),
                     );
-                } else {
+                } else if contract.verbose {
                     let noop_ms = rebuild_start.elapsed().as_secs_f64() * 1000.0;
                     println!(
-                        "  {} {} no-op change in {} (skipped={})",
-                        style("[dev]", "1;34"),
-                        next_loading_icon(),
+                        "  {}  no-op in {}",
+                        style_256("·", MUTED, false),
                         colorize_timing_ms(noop_ms),
-                        patch_report.skipped_unchanged
                     );
                 }
             }
@@ -1153,7 +1204,7 @@ fn watch_and_rebuild_loop(
                 if contract.hmr.enabled {
                     broadcast_reload_event(&sse_clients, next_revision);
                 }
-                eprintln!("  {} rebuild failed: {}", style("[dev]", "1;31"), err);
+                eprintln!("  {} rebuild failed: {}", style("✗", "1;31"), err);
             }
         }
     }
@@ -1373,13 +1424,6 @@ fn handle_dev_connection(
         if let Ok(mut clients) = sse_clients.lock() {
             clients.push(stream);
         }
-        println!(
-            "  [dev][transport] client={client} method={method} path={path} transport={transport}",
-            client = client,
-            method = method,
-            path = path,
-            transport = transport_label
-        );
         return Ok(());
     } else if path == "/" || path == "/index.html" || is_route_like_path(path.as_str()) {
         let (doc, render_ms, total_ms, error) = {
@@ -1440,41 +1484,21 @@ fn handle_dev_connection(
         (404, 0.0, 0.0, false)
     };
     let request_ms = request_start.elapsed().as_secs_f64() * 1000.0;
-    let icon = if route_like {
-        next_render_icon()
-    } else {
-        next_loading_icon()
-    };
-    let request_ms_colored = colorize_timing_ms(request_ms);
-    let socket_wait_ms_colored = colorize_timing_ms(socket_wait_ms);
-    let build_render_ms_colored = colorize_timing_ms(build_render_ms);
-    let build_total_ms_colored = colorize_timing_ms(build_total_ms);
+    let _ = (socket_wait_ms, build_render_ms, build_total_ms, transport_label, client);
 
     if route_like {
+        let status_styled = if status < 400 {
+            style_256(&status.to_string(), ACCENT_SOFT, true)
+        } else {
+            style(&status.to_string(), "1;31")
+        };
         println!(
-            "  [dev] {icon} {method} {path} -> {status} (request={request_ms_colored}, socket_wait={socket_wait_ms_colored}, build_render={build_render_ms_colored}, build_total={build_total_ms_colored}, transport={transport}, client={client})",
-            icon = icon,
-            method = method,
-            path = path,
-            status = status,
-            request_ms_colored = request_ms_colored,
-            socket_wait_ms_colored = socket_wait_ms_colored,
-            build_render_ms_colored = build_render_ms_colored,
-            build_total_ms_colored = build_total_ms_colored,
-            transport = transport_label,
-            client = client
-        );
-    } else {
-        println!(
-            "  [dev] {icon} {method} {path} -> {status} (request={request_ms_colored}, socket_wait={socket_wait_ms_colored}, transport={transport}, client={client})",
-            icon = icon,
-            method = method,
-            path = path,
-            status = status,
-            request_ms_colored = request_ms_colored,
-            socket_wait_ms_colored = socket_wait_ms_colored,
-            transport = transport_label,
-            client = client
+            "  {}  {}  {}  {}  {}",
+            style_256("→", ACCENT, true),
+            style(method, "1"),
+            path,
+            status_styled,
+            colorize_timing_ms(request_ms)
         );
     }
     Ok(())
@@ -1903,45 +1927,49 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
         ));
     }
 
-    print_section("Production Pipeline");
-    print_kv("Components", components.len());
+    print_section("build");
+    print_kv("components", components.len());
     print_kv(
-        "Scan Time",
-        format!("{:.2}ms", scan_start.elapsed().as_secs_f64() * 1000.0),
+        "scan",
+        colorize_timing_ms(scan_start.elapsed().as_secs_f64() * 1000.0),
     );
 
     let compile_start = Instant::now();
-    let scanner = ProjectScanner::new();
-    let compiler = scanner.build_compiler(components);
-    let manifest = compiler
-        .optimize_manifest_v2()
-        .map_err(|err| format!("failed to optimize manifest: {err}"))?;
+    let out_dir_for_closure = out_dir.clone();
+    let (manifest, report, missing_sources) = with_spinner("compiling production bundle…", move || {
+        let scanner = ProjectScanner::new();
+        let compiler = scanner.build_compiler(components);
+        let manifest = compiler
+            .optimize_manifest_v2()
+            .map_err(|err| format!("failed to optimize manifest: {err}"))?;
 
-    let mut module_sources = HashMap::new();
-    let mut missing_sources = 0usize;
-    for component in &manifest.components {
-        if module_sources.contains_key(&component.module_path) {
-            continue;
+        let mut module_sources = HashMap::new();
+        let mut missing_sources = 0usize;
+        for component in &manifest.components {
+            if module_sources.contains_key(&component.module_path) {
+                continue;
+            }
+
+            match read_manifest_module_source(contract, &component.module_path) {
+                Ok(source) => {
+                    module_sources.insert(component.module_path.clone(), source);
+                }
+                Err(_) => {
+                    missing_sources += 1;
+                }
+            }
         }
 
-        match read_manifest_module_source(contract, &component.module_path) {
-            Ok(source) => {
-                module_sources.insert(component.module_path.clone(), source);
-            }
-            Err(_) => {
-                missing_sources += 1;
-            }
-        }
-    }
-
-    let report = compiler
-        .emit_bundle_artifacts_from_manifest_v2_with_sources(
-            &manifest,
-            &module_sources,
-            &BundlePlanOptions::default(),
-            &out_dir,
-        )
-        .map_err(|err| format!("failed to emit production artifacts: {err}"))?;
+        let report = compiler
+            .emit_bundle_artifacts_from_manifest_v2_with_sources(
+                &manifest,
+                &module_sources,
+                &BundlePlanOptions::default(),
+                &out_dir_for_closure,
+            )
+            .map_err(|err| format!("failed to emit production artifacts: {err}"))?;
+        Ok::<_, String>((manifest, report, missing_sources))
+    })?;
 
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|err| format!("failed to serialize manifest: {err}"))?;
@@ -1990,28 +2018,37 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
         )
     })?;
 
-    print_ok("Optimized production build complete");
-    print_kv("Output", out_dir.display());
-    print_kv("Artifacts", report.artifacts.len() + 4);
-    print_kv("Manifest", manifest_path.display());
-    print_kv("Shim Runtime", runtime_asset_path.display());
-    print_kv("Hydration Runtime", hydration_asset_path.display());
-    print_kv("Index HTML", index_html_path.display());
-    print_kv(
-        "Compile Time",
-        format!("{:.2}ms", compile_start.elapsed().as_secs_f64() * 1000.0),
-    );
+    print_ok(format!(
+        "built in {}",
+        colorize_timing_ms(compile_start.elapsed().as_secs_f64() * 1000.0)
+    ));
+    print_kv("output", out_dir.display());
+    print_kv("artifacts", report.artifacts.len() + 4);
     if missing_sources > 0 {
         print_warn(format!(
-            "{missing_sources} manifest modules had unreadable sources and were skipped for static slice precompile."
+            "{missing_sources} module{} had unreadable sources — skipped from static precompile",
+            if missing_sources == 1 { "" } else { "s" }
         ));
     }
 
-    for artifact in report.artifacts.iter().take(8) {
-        println!("  - {} ({} bytes)", artifact.relative_path, artifact.bytes);
+    let _ = (&manifest_path, &runtime_asset_path, &hydration_asset_path, &index_html_path);
+    for artifact in report.artifacts.iter().take(6) {
+        println!(
+            "    {} {} {}",
+            style_256("·", MUTED, false),
+            artifact.relative_path,
+            style(&format!("({} B)", artifact.bytes), "2")
+        );
     }
-    if report.artifacts.len() > 8 {
-        println!("  ... and {} more artifacts", report.artifacts.len() - 8);
+    if report.artifacts.len() > 6 {
+        println!(
+            "    {} {}",
+            style_256("·", MUTED, false),
+            style(
+                &format!("+{} more", report.artifacts.len() - 6),
+                "2"
+            )
+        );
     }
 
     Ok(())
@@ -2159,14 +2196,35 @@ fn write_scaffold_file(path: &Path, content: &str, force: bool) -> Result<(), St
 }
 
 fn print_init_success(project_name: &str) {
-    println!("{} Created {}/", style("✓", "1;32"), project_name);
+    print_banner();
+    print_ok(format!(
+        "created {}{}",
+        style_256(project_name, ACCENT_SOFT, true),
+        style("/", "2")
+    ));
+    print_section("next steps");
+    println!(
+        "    {}  cd {}",
+        style_256("1", ACCENT, true),
+        style(project_name, "1")
+    );
+    println!(
+        "    {}  albedo dev",
+        style_256("2", ACCENT, true)
+    );
     println!();
-    println!("  Next steps:");
-    println!("    cd {}", project_name);
-    println!("    albedo dev");
+    println!(
+        "  {}",
+        style(
+            "the starter has three components — one at each effect tier.",
+            "2"
+        )
+    );
+    println!(
+        "  {}",
+        style("run albedo dev to see how AlBDO classifies them.", "2")
+    );
     println!();
-    println!("  The starter app has three components - one at each effect tier.");
-    println!("  Run albedo dev to see how AlBDO classifies them.");
 }
 
 fn infer_package_name(target: &Path) -> String {
@@ -2443,142 +2501,189 @@ Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptB
 
 fn print_help() {
     print_banner();
-    print_section("Usage");
-    println!("  {}", style("albedo <COMMAND> [OPTIONS]", "1"));
-
-    print_section("Commands");
-    print_command("init <PROJECT>", "Create a tiered starter app scaffold");
-    print_command("help", "Show command list and examples");
-    print_command("dev [DIR]", "Compile, show tier report, start dev server");
-    print_command("build [DIR]", "Alias for `albedo run dev --prod`");
-    print_command("ship [DIR]", "Build and configure deployment target files");
-    print_command("serve [DIR]", "Serve static files from a directory");
-    print_command("run dev [DIR]", "Validate and run the development workflow");
-    print_command(
-        "run dev --prod [DIR]",
-        "Compile an optimized production build into .albedo/dist",
-    );
-    print_command(
-        "completions <SHELL>",
-        "Emit shell completion script (bash, zsh, fish, powershell)",
-    );
-
-    print_section("Dev Flags");
-    print_option("--config <FILE>", "Use explicit albedo.config.json/ts");
-    print_option("--entry <FILE>", "Override entry module relative to root");
-    print_option("--host <IP>", "Override server host");
-    print_option("--port <PORT>", "Override server port");
-    print_option("--no-hmr", "Disable HMR in resolved config");
-    print_option("--strict", "Enable strict startup behavior");
-    print_option("--verbose, -v", "Verbose diagnostics");
-    print_option("--open", "Open browser on startup flag");
-    print_option("--print-contract", "Print resolved merged contract JSON");
-    print_option("--prod", "Production build mode for `run dev`");
-
-    print_section("Examples");
-    println!("  {}", style("albedo init my-app", "2"));
-    println!("  {}", style("cd my-app && albedo dev", "2"));
-    println!("  {}", style("albedo ship --target docker", "2"));
     println!(
-        "  {}",
-        style("albedo build --config ./albedo.config.json", "2")
+        "  {}  {}",
+        style("usage", "2"),
+        style("albedo <command> [options]", "1")
     );
-    println!("  {}", style("albedo serve ./.albedo/dist", "2"));
+
+    print_section("commands");
+    print_command("init", "<project>", "scaffold a new app");
+    print_command("dev", "[dir]", "start the dev server");
+    print_command("build", "[dir]", "compile an optimized bundle");
+    print_command("ship", "[dir]", "build + configure deploy target");
+    print_command("serve", "[dir]", "serve a static directory");
+    print_command("completions", "<shell>", "print shell completions");
+    print_command("help", "", "show this help");
+
+    print_section("dev flags");
+    print_option("--config <FILE>", "explicit albedo config");
+    print_option("--entry <FILE>", "override entry module");
+    print_option("--host <IP>", "server host");
+    print_option("--port <PORT>", "server port");
+    print_option("--no-hmr", "disable HMR");
+    print_option("--strict", "strict startup");
+    print_option("--verbose, -v", "verbose diagnostics");
+    print_option("--open", "open browser on start");
+    print_option("--prod", "production build mode");
+
+    print_section("examples");
+    print_example("albedo init my-app");
+    print_example("cd my-app && albedo dev");
+    print_example("albedo ship --target docker");
+    print_example("albedo serve ./.albedo/dist");
+    println!();
 }
 
 fn print_init_help() {
     print_banner();
-    print_section("Init Usage");
-    println!("  {}", style("albedo init <project-name> [--force]", "1"));
-    print_option("--force", "Overwrite existing scaffold files");
+    print_section("init");
+    println!(
+        "  {}  {}",
+        style("usage", "2"),
+        style("albedo init <project> [--force]", "1")
+    );
+    print_option("--force", "overwrite existing files");
+    println!();
 }
 
 fn print_ship_help() {
     print_banner();
-    print_section("Ship Usage");
-    println!("  {}", style("albedo ship [DIR] [--target <name>]", "1"));
-    print_option(
-        "--target <name>",
-        "Deployment target: vercel, docker, fly, static",
+    print_section("ship");
+    println!(
+        "  {}  {}",
+        style("usage", "2"),
+        style("albedo ship [dir] [--target <name>]", "1")
     );
-    print_option("--config <FILE>", "Use explicit albedo config file");
-    print_option("--entry <FILE>", "Override entry module relative to root");
+    print_option("--target <name>", "vercel | docker | fly | static");
+    print_option("--config <FILE>", "explicit albedo config");
+    print_option("--entry <FILE>", "override entry module");
+    println!();
 }
 
 fn print_serve_help() {
     print_banner();
-    print_section("Serve Usage");
+    print_section("serve");
     println!(
-        "  {}",
-        style("albedo serve [DIR] [--host <IP>] [--port <PORT>]", "1")
+        "  {}  {}",
+        style("usage", "2"),
+        style("albedo serve [dir] [--host <IP>] [--port <PORT>]", "1")
     );
-    print_option("--dir <DIR>", "Directory to serve (default: .albedo/dist)");
-    print_option("--host <IP>", "Bind host (default: 127.0.0.1)");
-    print_option("--port <PORT>", "Bind port (default: 3000)");
+    print_option("--dir <DIR>", "directory to serve (default: .albedo/dist)");
+    print_option("--host <IP>", "bind host (default: 127.0.0.1)");
+    print_option("--port <PORT>", "bind port (default: 3000)");
+    println!();
 }
 
-fn print_command(command: &str, description: &str) {
-    println!("  {:<32} {}", style(command, "1"), description);
+fn print_command(command: &str, args: &str, description: &str) {
+    println!(
+        "    {} {}  {}",
+        style_256(command, ACCENT_SOFT, true),
+        style(&format!("{:<14}", args), "2"),
+        description
+    );
 }
 
 fn print_option(option: &str, description: &str) {
-    println!("  {:<32} {}", style(option, "1"), description);
+    println!(
+        "    {:<22} {}",
+        style(option, "1"),
+        style(description, "2")
+    );
+}
+
+fn print_example(cmd: &str) {
+    println!(
+        "    {} {}",
+        style_256("$", ACCENT, true),
+        style(cmd, "2")
+    );
 }
 
 fn print_banner() {
-    let rule = "=".repeat(RULE_WIDTH);
     println!();
-    println!("{}", gradient_text(&rule, &RULE_PALETTE, false));
     println!(
-        "{} {}",
-        gradient_text("ALBEDO CLI", &BANNER_PALETTE, true),
-        style("Modern Build Surface for Rust + JSX Projects", "2")
+        "  {}  {}  {}  {}",
+        gradient_text("albedo", &BRAND_PALETTE, true),
+        style_256("·", ACCENT_DEEP, false),
+        style(env!("CARGO_PKG_VERSION"), "1"),
+        style("— fast JSX for Rust", "2")
     );
-    println!("{}", gradient_text(&rule, &RULE_PALETTE, false));
+    println!();
 }
 
 fn print_section(title: &str) {
     println!();
-    println!("{}", style(&format!("[{title}]"), "1;34"));
-}
-
-fn print_timing_legend() {
-    print_kv(
-        "Timing Index",
-        format!(
-            "{} <=1ms  {} <=25ms  {} <=250ms  {} >250ms",
-            style("GREEN", "1;32"),
-            style("CYAN", "1;36"),
-            style("YELLOW", "1;33"),
-            style("RED", "1;31")
-        ),
-    );
-    print_kv(
-        "Metrics",
-        format!(
-            "request={} socket_wait={} build_render={} build_total={}",
-            style("client->server", "2"),
-            style("socket idle", "2"),
-            style("route pre-render", "2"),
-            style("full prewarm", "2")
-        ),
+    println!(
+        "  {} {}",
+        style_256("▸", ACCENT, true),
+        style(title, "1")
     );
 }
 
 fn print_kv(label: &str, value: impl std::fmt::Display) {
-    println!("  {:<20} {}", style(label, "2"), value);
+    println!(
+        "    {:<14} {}",
+        style_256(label, MUTED, false),
+        value
+    );
 }
 
 fn print_ok(message: impl std::fmt::Display) {
-    println!("  {} {}", style("[OK]", "1;32"), message);
+    println!("  {} {}", style("✓", "1;32"), message);
 }
 
 fn print_warn(message: impl std::fmt::Display) {
-    println!("  {} {}", style("[WARN]", "1;33"), message);
+    println!("  {} {}", style("!", "1;33"), message);
 }
 
 fn print_error(message: impl std::fmt::Display) {
-    eprintln!("{} {}", style("[ERROR]", "1;31"), message);
+    eprintln!("  {} {}", style("✗", "1;31"), message);
+}
+
+/// Runs a synchronous closure while animating a braille spinner on stderr.
+/// Cache-friendly: if colour is disabled or the task is near-instant it still
+/// prints a clean single-line "label… done" result. Spinner frames are cleared
+/// before the final print.
+fn with_spinner<F, R>(label: &str, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if !supports_color() {
+        eprintln!("  · {}", label);
+        return f();
+    }
+
+    let label = label.to_string();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop);
+    let label_clone = label.clone();
+    let handle = std::thread::spawn(move || {
+        let mut i = 0usize;
+        while !stop_clone.load(Ordering::Relaxed) {
+            let frames = if cfg!(windows) && std::env::var_os("WT_SESSION").is_none() {
+                &SPINNER_FRAMES_ASCII[..]
+            } else {
+                &SPINNER_FRAMES[..]
+            };
+            let frame = frames[i % frames.len()];
+            eprint!(
+                "\r  {}  {}",
+                style_256(frame, ACCENT, true),
+                style(&label_clone, "2")
+            );
+            let _ = std::io::stderr().flush();
+            std::thread::sleep(Duration::from_millis(80));
+            i += 1;
+        }
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    });
+
+    let result = f();
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+    result
 }
 
 fn colorize_timing_ms(value_ms: f64) -> String {
@@ -2592,28 +2697,6 @@ fn colorize_timing_ms(value_ms: f64) -> String {
         "1;31"
     };
     style(&format!("{value_ms:.2}ms"), code)
-}
-
-fn next_loading_icon() -> String {
-    next_pulse_icon(&LOADING_FRAMES, &LOADING_COLORS, true)
-}
-
-fn next_render_icon() -> String {
-    next_pulse_icon(&RENDER_FRAMES, &RENDER_COLORS, true)
-}
-
-fn next_pulse_icon(frames: &[&str], colors: &[u8], bold: bool) -> String {
-    if frames.is_empty() {
-        return String::new();
-    }
-    let tick = DEV_PULSE_TICK.fetch_add(1, Ordering::Relaxed) as usize;
-    let frame = frames[tick % frames.len()];
-    let color = if colors.is_empty() {
-        81
-    } else {
-        colors[tick % colors.len()]
-    };
-    style_256(frame, color, bold)
 }
 
 fn gradient_text(value: &str, palette: &[u8], bold: bool) -> String {
