@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check *)",
+      "Bash(cargo test *)",
+      "Bash(cargo build *)",
+      "Bash(./target/debug/albedo.exe help *)",
+      "Bash(rm -rf /tmp/cli-test-app)",
+      "Bash(./target/debug/albedo.exe init *)",
+      "Bash(./target/debug/albedo.exe ship *)",
+      "Bash(./target/debug/albedo.exe serve *)",
+      "Read(//tmp/**)",
+      "Bash(B:/AlBDO-v-0.1.0/.claude/worktrees/musing-meitner-abd1d9/target/debug/albedo.exe dev *)",
+      "Bash(echo \"started pid=$!\")",
+      "Bash(curl -s -o /dev/null http://127.0.0.1:4789/)",
+      "Bash(curl -s -o /dev/null http://127.0.0.1:4789/nope)"
+    ]
+  }
+}
