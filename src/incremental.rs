@@ -86,14 +86,21 @@ impl IncrementalCache {
 
         match bincode::deserialize::<PersistentCache>(&buffer) {
             Ok(cache) => {
-                let lazy_data = LazyCacheData {
-                    file_hashes: cache.file_hashes,
-                    component_cache: cache.component_cache,
-                    file_to_components: cache.file_to_components,
-                    component_to_file: cache.component_to_file,
-                    dependency_graph: cache.dependency_graph,
-                };
-                *self.lazy_data.write().unwrap_or_else(|e| e.into_inner()) = Some(lazy_data);
+                for (path, hash) in cache.file_hashes {
+                    self.file_hashes.insert(path, hash);
+                }
+                for (id, analysis) in cache.component_cache {
+                    self.component_cache.insert(id, analysis);
+                }
+                for (path, ids) in cache.file_to_components {
+                    self.file_to_components.insert(path, ids);
+                }
+                for (id, path) in cache.component_to_file {
+                    self.component_to_file.insert(id, path);
+                }
+                for (id, deps) in cache.dependency_graph {
+                    self.dependency_graph.insert(id, deps);
+                }
                 *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = true;
                 Ok(())
             }
