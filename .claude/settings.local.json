@@ -20,7 +20,10 @@
       "Bash(cargo install *)",
       "Bash(where albedo *)",
       "Bash(albedo --version)",
-      "Bash(albedo --help)"
+      "Bash(albedo --help)",
+      "Bash(cargo fmt *)",
+      "Bash(rustfmt --check --edition 2021 src/ir/mod.rs src/ir/columns.rs)",
+      "Bash(rustfmt --edition 2021 src/ir/mod.rs src/ir/columns.rs)"
     ]
   }
 }
