@@ -204,7 +204,7 @@ impl IncrementalCache {
     }
     fn hash_file(path: impl AsRef<Path>) -> io::Result<FileHash> {
         let content = fs::read(path)?;
-        Ok(fnv1a_hash_bytes(&content))
+        Ok(hash_file_bytes(&content))
     }
 
     pub fn compute_file_hash(path: impl AsRef<Path>) -> io::Result<u64> {
@@ -419,17 +419,16 @@ pub struct CacheStats {
     pub cache_hit_rate: f64,
 }
 
-/// FNV-1a 64-bit hash — stable across Rust versions, process runs, and platforms.
-/// Unlike `DefaultHasher`, this is deterministic: same bytes always → same hash.
-fn fnv1a_hash_bytes(data: &[u8]) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for &byte in data {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+/// `xxh3_64` content hash — stable across Rust versions, process runs, and
+/// platforms. Unlike `DefaultHasher`, this is deterministic: same bytes →
+/// same hash. Cycle 2 of the SoA IR refactor swapped the previous FNV-1a
+/// byte loop for `xxh3_64`, which is SIMD-aware and ~3-5× faster on modern
+/// hardware while remaining a fixed-seed, allocation-free function. The
+/// hash space (64 bits) is unchanged so the on-wire `source_hash` field
+/// type is preserved; only its values rotate, which is announced via the
+/// `CANONICAL_IR_SCHEMA_VERSION` bump.
+fn hash_file_bytes(data: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(data)
 }
 
 #[cfg(test)]

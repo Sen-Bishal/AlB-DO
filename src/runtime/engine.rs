@@ -89,16 +89,16 @@ pub struct BootstrapLibrary {
     pub code: String,
 }
 
+/// Stable 64-bit content hash of a source string.
+///
+/// Cycle 2 (SoA IR refactor) — uses `xxh3_64` for SIMD-accelerated throughput
+/// (~3-5× FNV-1a on modern CPUs) while preserving determinism across
+/// processes, Rust versions, and platforms. The implementation intentionally
+/// matches `parser::hash_source` and `incremental::hash_file_bytes` so that
+/// the same byte sequence yields the same `source_hash` everywhere it is
+/// observed in the IR.
 pub fn stable_source_hash(source: &str) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in source.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    xxhash_rust::xxh3::xxh3_64(source.as_bytes())
 }
 
 pub trait RuntimeEngine {
