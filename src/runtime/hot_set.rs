@@ -1,14 +1,11 @@
+use crate::runtime::dirty_bitmap::DirtyBitmap;
 use crate::types::ComponentId;
 use crossbeam::queue::ArrayQueue;
-use crossbeam::utils::CachePadded;
 use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 
 pub const HOT_SET_MAX: usize = 32;
-const DIRTY_FALSE: u8 = 0;
-const DIRTY_TRUE: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
@@ -108,31 +105,6 @@ impl HotSetRegistry {
     }
 }
 
-#[derive(Debug)]
-struct RingNode {
-    component_id: Option<ComponentId>,
-    dirty: AtomicU8,
-    next: NonNull<CachePadded<RingNode>>,
-}
-
-impl RingNode {
-    fn sentinel() -> Self {
-        Self {
-            component_id: None,
-            dirty: AtomicU8::new(DIRTY_FALSE),
-            next: NonNull::dangling(),
-        }
-    }
-
-    fn component(component_id: ComponentId) -> Self {
-        Self {
-            component_id: Some(component_id),
-            dirty: AtomicU8::new(DIRTY_FALSE),
-            next: NonNull::dangling(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RingDrainStats {
     pub drained: usize,
@@ -150,19 +122,22 @@ impl RingDrainStats {
     }
 }
 
+/// Lock-free dirty tracker for the hot-set.
+///
+/// Cycle 2 of the SoA IR refactor replaced the prior `NonNull`-based
+/// `CachePadded<RingNode>` linked list with a flat
+/// [`DirtyBitmap`](crate::runtime::dirty_bitmap::DirtyBitmap) addressed by
+/// slot index. The struct keeps the historical `SentinelRing` name and
+/// public surface so the scheduler and CLI integrations need no changes:
+/// internally it is a bitmap, externally `mark_dirty` / `drain` /
+/// `drain_to_queue` behave exactly as before but eliminate the per-node
+/// pointer chase that dominated the prior drain cost.
 #[derive(Debug)]
 pub struct SentinelRing {
-    sentinel: NonNull<CachePadded<RingNode>>,
-    nodes: Vec<NonNull<CachePadded<RingNode>>>,
-    node_index: HashMap<ComponentId, usize>,
-    dirty_count: AtomicU32,
+    slot_for: FxHashMap<ComponentId, usize>,
+    id_for: Vec<ComponentId>,
+    bitmap: DirtyBitmap,
 }
-
-// Safety: ring topology is immutable after construction and shared access only mutates atomics.
-unsafe impl Send for SentinelRing {}
-
-// Safety: all concurrent state transitions are guarded by atomics; pointers are read-only links.
-unsafe impl Sync for SentinelRing {}
 
 impl SentinelRing {
     pub fn new(component_ids: &[ComponentId]) -> Result<Self, HotSetError> {
@@ -171,42 +146,17 @@ impl SentinelRing {
             return Err(HotSetError::CapacityExceeded { max: HOT_SET_MAX });
         }
 
-        let sentinel_ptr = leak_node(RingNode::sentinel());
-        let mut nodes = Vec::with_capacity(unique_ids.len() + 1);
-        nodes.push(sentinel_ptr);
-
-        let mut node_index = HashMap::with_capacity(unique_ids.len());
-        for component_id in unique_ids {
-            let node_ptr = leak_node(RingNode::component(component_id));
-            node_index.insert(component_id, nodes.len());
-            nodes.push(node_ptr);
-        }
-
-        // Build a circular singly linked list: sentinel -> n1 -> n2 -> ... -> sentinel.
-        unsafe {
-            if nodes.len() == 1 {
-                let sentinel = &mut *sentinel_ptr.as_ptr();
-                sentinel.next = sentinel_ptr;
-            } else {
-                let sentinel = &mut *sentinel_ptr.as_ptr();
-                sentinel.next = nodes[1];
-                for idx in 1..nodes.len() {
-                    let next = if idx + 1 < nodes.len() {
-                        nodes[idx + 1]
-                    } else {
-                        sentinel_ptr
-                    };
-                    let node = &mut *nodes[idx].as_ptr();
-                    node.next = next;
-                }
-            }
+        let bitmap = DirtyBitmap::with_capacity(unique_ids.len());
+        let mut slot_for =
+            FxHashMap::with_capacity_and_hasher(unique_ids.len(), Default::default());
+        for (slot, id) in unique_ids.iter().enumerate() {
+            slot_for.insert(*id, slot);
         }
 
         Ok(Self {
-            sentinel: sentinel_ptr,
-            nodes,
-            node_index,
-            dirty_count: AtomicU32::new(0),
+            slot_for,
+            id_for: unique_ids,
+            bitmap,
         })
     }
 
@@ -226,76 +176,54 @@ impl SentinelRing {
     }
 
     pub fn len(&self) -> usize {
-        self.nodes.len().saturating_sub(1)
+        self.id_for.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.id_for.is_empty()
     }
 
     pub fn contains(&self, component_id: ComponentId) -> bool {
-        self.node_index.contains_key(&component_id)
+        self.slot_for.contains_key(&component_id)
     }
 
+    /// Returns the live count of dirty bits.
+    ///
+    /// `O(word_count)` — the hot set is bounded by [`HOT_SET_MAX`], so this
+    /// is one bitmap word worth of work in practice.
     pub fn dirty_count(&self) -> u32 {
-        self.dirty_count.load(Ordering::Acquire)
+        self.bitmap.count_set() as u32
     }
 
+    /// Atomically marks `component_id` dirty. Returns `true` iff the slot
+    /// transitioned from clean to dirty (matching the prior `SentinelRing`
+    /// contract used by the scheduler).
     pub fn mark_dirty(&self, component_id: ComponentId) -> bool {
-        let Some(index) = self.node_index.get(&component_id).copied() else {
+        let Some(&slot) = self.slot_for.get(&component_id) else {
             return false;
         };
-
-        let node_ptr = self.nodes[index];
-        let node = unsafe { node_ptr.as_ref() };
-
-        let flipped = node
-            .dirty
-            .compare_exchange(DIRTY_FALSE, DIRTY_TRUE, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-
-        if flipped {
-            self.dirty_count.fetch_add(1, Ordering::AcqRel);
-        }
-
-        flipped
+        self.bitmap.mark(slot)
     }
 
+    /// Drains every dirty slot, calling `on_dirty(component_id)` once per
+    /// slot, and returns the total drained count.
+    ///
+    /// Order: ascending by internal slot index, which matches the order in
+    /// which ids were registered (the constructor preserves caller order;
+    /// [`Self::from_registry`] sorts ids by `as_u64()` first, so its drain
+    /// is sorted-ascending — relied on by existing scheduler tests).
     pub fn drain<F>(&self, mut on_dirty: F) -> usize
     where
         F: FnMut(ComponentId),
     {
-        if self.dirty_count.load(Ordering::Acquire) == 0 {
-            return 0;
-        }
-
-        let mut drained = 0;
-        unsafe {
-            let sentinel = self.sentinel;
-            let mut cursor = sentinel.as_ref().next;
-
-            while cursor != sentinel {
-                let node = cursor.as_ref();
-                let was_dirty = node.dirty.swap(DIRTY_FALSE, Ordering::Relaxed) == DIRTY_TRUE;
-                if was_dirty {
-                    self.dirty_count.fetch_sub(1, Ordering::AcqRel);
-                    if let Some(component_id) = node.component_id {
-                        on_dirty(component_id);
-                        drained += 1;
-                    }
-                }
-                cursor = node.next;
+        self.bitmap.drain(|slot| {
+            if let Some(component_id) = self.id_for.get(slot) {
+                on_dirty(*component_id);
             }
-        }
-
-        drained
+        })
     }
 
     pub fn drain_to_queue(&self, queue: &ArrayQueue<ComponentId>) -> RingDrainStats {
-        if self.dirty_count.load(Ordering::Acquire) == 0 {
-            return RingDrainStats::empty();
-        }
-
         let mut stats = RingDrainStats::empty();
         stats.drained = self.drain(|component_id| {
             if queue.push(component_id).is_ok() {
@@ -306,21 +234,6 @@ impl SentinelRing {
         });
         stats
     }
-}
-
-impl Drop for SentinelRing {
-    fn drop(&mut self) {
-        for ptr in self.nodes.drain(..) {
-            unsafe {
-                drop(Box::from_raw(ptr.as_ptr()));
-            }
-        }
-    }
-}
-
-fn leak_node(node: RingNode) -> NonNull<CachePadded<RingNode>> {
-    let leaked = Box::leak(Box::new(CachePadded::new(node)));
-    NonNull::from(leaked)
 }
 
 fn dedupe_ids(component_ids: &[ComponentId]) -> Vec<ComponentId> {

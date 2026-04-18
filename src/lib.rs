@@ -706,7 +706,7 @@ mod tests {
         let compiler = create_example_app();
         let json = compiler.export_canonical_ir_json().unwrap();
         assert!(json.contains("schema_version"));
-        assert!(json.contains("\"1.0\""));
+        assert!(json.contains("\"1.1\""));
         assert!(json.contains("components"));
         assert!(json.contains("edges"));
     }

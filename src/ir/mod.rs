@@ -26,7 +26,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-pub const CANONICAL_IR_SCHEMA_VERSION: &str = "1.0";
+/// Bumped from "1.0" → "1.1" in cycle 2 of the SoA IR refactor: the
+/// `source_hash` algorithm switched from FNV-1a to `xxh3_64`. The JSON
+/// shape of `CanonicalIrDocument` is unchanged; only the numeric value of
+/// `source_hash` fields rotates. Consumers that compare against persisted
+/// hashes from a prior schema must re-derive them after this bump.
+pub const CANONICAL_IR_SCHEMA_VERSION: &str = "1.1";
 
 /// Deterministic seeds for [`CanonicalIrDocument::canonical_hash`].
 ///

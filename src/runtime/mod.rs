@@ -1,3 +1,4 @@
+pub mod dirty_bitmap;
 pub mod engine;
 pub mod eval;
 pub mod highway;

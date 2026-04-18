@@ -177,21 +177,21 @@
         "HeroImage",
         "React"
       ],
-      "module_path": "test-app/src/components/App.jsx",
+      "module_path": "tests/fixtures/components/App.jsx",
       "source_hash": "<normalized>"
     },
     {
       "imports": [
         "React"
       ],
-      "module_path": "test-app/src/components/Button.jsx",
+      "module_path": "tests/fixtures/components/Button.jsx",
       "source_hash": "<normalized>"
     },
     {
       "imports": [
         "React"
       ],
-      "module_path": "test-app/src/components/FeatureCard.jsx",
+      "module_path": "tests/fixtures/components/FeatureCard.jsx",
       "source_hash": "<normalized>"
     },
     {
@@ -199,14 +199,14 @@
         "FeatureCard",
         "React"
       ],
-      "module_path": "test-app/src/components/Features.jsx",
+      "module_path": "tests/fixtures/components/Features.jsx",
       "source_hash": "<normalized>"
     },
     {
       "imports": [
         "React"
       ],
-      "module_path": "test-app/src/components/Footer.jsx",
+      "module_path": "tests/fixtures/components/Footer.jsx",
       "source_hash": "<normalized>"
     },
     {
@@ -214,14 +214,14 @@
         "Navigation",
         "React"
       ],
-      "module_path": "test-app/src/components/Header.jsx",
+      "module_path": "tests/fixtures/components/Header.jsx",
       "source_hash": "<normalized>"
     },
     {
       "imports": [
         "React"
       ],
-      "module_path": "test-app/src/components/HeroImage.jsx",
+      "module_path": "tests/fixtures/components/HeroImage.jsx",
       "source_hash": "<normalized>"
     },
     {
@@ -229,9 +229,9 @@
         "Button",
         "React"
       ],
-      "module_path": "test-app/src/components/Navigation.jsx",
+      "module_path": "tests/fixtures/components/Navigation.jsx",
       "source_hash": "<normalized>"
     }
   ],
-  "schema_version": "1.0"
+  "schema_version": "1.1"
 }

@@ -63,6 +63,10 @@ lru         = { version = "0.12" }
 ahash       = { version = "0.8" }
 rustc-hash  = { version = "2" }
 
+# Hashing / SIMD (Cycle 2 — SoA IR refactor)
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+wide        = { version = "0.7" }
+
 # Error handling
 thiserror  = { version = "1" }
 anyhow     = { version = "1" }
@@ -142,6 +146,8 @@ once_cell.workspace          = true
 lru.workspace                = true
 ahash.workspace              = true
 rustc-hash.workspace         = true
+xxhash-rust.workspace        = true
+wide.workspace               = true
 serde.workspace              = true
 serde_json.workspace         = true
 bincode.workspace            = true
