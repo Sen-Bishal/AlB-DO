@@ -471,6 +471,7 @@ dependencies = [
 name = "dom-render-compiler"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "ahash",
  "anyhow",
  "bincode",
  "core_affinity",
@@ -482,6 +483,7 @@ dependencies = [
  "once_cell",
  "regex",
  "rquickjs",
+ "rustc-hash 2.1.1",
  "serde",
  "serde_json",
  "swc_common",

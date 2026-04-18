@@ -200,21 +200,39 @@ impl RenderCompiler {
             .map_err(|e| CompilerError::AnalysisFailed(e.to_string()))
     }
 
-    /// Produces a [`ir::CanonicalIrDocument`] from the current graph state.
+    /// Produces a canonical IR column store ([`ir::IrColumns`]) from the current
+    /// graph state.
     ///
-    /// The canonical IR is a stable, version-tagged representation of the component graph
-    /// and effect analyses, suitable for offline inspection and tooling interop.
-    pub fn optimize_canonical_ir(&self) -> Result<ir::CanonicalIrDocument> {
+    /// The column store is the runtime-primary representation — hot-path
+    /// consumers read one column at a time. Callers that need the
+    /// JSON-shaped document can materialize it via
+    /// [`ir::IrColumns::to_canonical`].
+    pub fn optimize_canonical_ir_columns(&self) -> Result<ir::IrColumns> {
         self.graph.validate()?;
         let analyzer = ParallelAnalyzer::new(&self.graph);
         let analyses = analyzer.analyze()?;
-        Ok(ir::build_canonical_ir_from_graph(&self.graph, &analyses))
+        Ok(ir::IrColumns::from_graph(&self.graph, &analyses))
     }
 
-    /// Runs [`Self::optimize_canonical_ir`] and serializes to a pretty-printed JSON string.
+    /// Produces a [`ir::CanonicalIrDocument`] from the current graph state.
+    ///
+    /// Kept for the JSON export path and external tooling interop; runtime
+    /// consumers should prefer [`Self::optimize_canonical_ir_columns`] and
+    /// read column slices directly.
+    pub fn optimize_canonical_ir(&self) -> Result<ir::CanonicalIrDocument> {
+        Ok(self.optimize_canonical_ir_columns()?.to_canonical())
+    }
+
+    /// Runs [`Self::optimize_canonical_ir_columns`] and serializes to a
+    /// pretty-printed JSON string.
+    ///
+    /// The JSON export path is the only runtime call site that materializes
+    /// the AoS [`ir::CanonicalIrDocument`] shape.
     pub fn export_canonical_ir_json(&self) -> Result<String> {
-        let ir = self.optimize_canonical_ir()?;
-        serde_json::to_string_pretty(&ir).map_err(|e| CompilerError::AnalysisFailed(e.to_string()))
+        let columns = self.optimize_canonical_ir_columns()?;
+        let document = columns.to_canonical();
+        serde_json::to_string_pretty(&document)
+            .map_err(|e| CompilerError::AnalysisFailed(e.to_string()))
     }
 
     /// Builds a [`manifest::schema::RenderManifestV2`] from an existing [`OptimizationResult`].

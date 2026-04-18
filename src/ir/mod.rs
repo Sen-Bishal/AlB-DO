@@ -1,15 +1,43 @@
+//! Canonical IR — struct-of-arrays runtime representation.
+//!
+//! The runtime truth for the IR is [`columns::IrColumns`]. The classic
+//! array-of-structs types ([`CanonicalIrDocument`], [`CanonicalIrComponent`],
+//! [`CanonicalIrEdge`], [`CanonicalIrModule`]) are retained only as a
+//! serialization shell: they are materialized on demand via
+//! [`columns::IrColumns::to_canonical`] when JSON export is requested and
+//! reconstructed from JSON via [`columns::IrColumns::from_canonical`].
+//!
+//! Hot-path consumers — reconcile, dirty-scan, lane routing — read the
+//! column store directly.
+//! Dated - 18th April 2026 - BshL
+
+pub mod columns;
+
+pub use columns::{IrColumns, IrModuleColumn, StringId, StringInterner};
+
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;
 use crate::parser::ParsedComponent;
 use crate::types::{ComponentAnalysis, ComponentId};
+use ahash::AHasher;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{hash_map::DefaultHasher, HashSet};
-use std::collections::{BTreeMap, HashMap};
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{BuildHasher, Hash, Hasher};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const CANONICAL_IR_SCHEMA_VERSION: &str = "1.0";
+
+/// Deterministic seeds for [`CanonicalIrDocument::canonical_hash`].
+///
+/// Pinned so hashes are stable across processes and builds. Do not change
+/// without a documented schema-version bump.
+const CANONICAL_HASH_SEEDS: (u64, u64, u64, u64) = (
+    0x243f_6a88_85a3_08d3,
+    0x1319_8a2e_0370_7344,
+    0xa409_3822_299f_31d0,
+    0x082e_fa98_ec4e_6c89,
+);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -55,12 +83,22 @@ pub struct CanonicalIrDocument {
 }
 
 impl CanonicalIrDocument {
+    /// Stable 64-bit content hash of the normalized document.
+    ///
+    /// Ignores `generated_at`. Uses a fixed-seed [`AHasher`] so the value is
+    /// reproducible across runs and processes.
     pub fn canonical_hash(&self) -> u64 {
         let mut normalized = self.clone();
         normalized.normalize();
         normalized.generated_at = "<normalized>".to_string();
         let encoded = serde_json::to_vec(&normalized).unwrap_or_default();
-        let mut hasher = DefaultHasher::new();
+        let state = ahash::RandomState::with_seeds(
+            CANONICAL_HASH_SEEDS.0,
+            CANONICAL_HASH_SEEDS.1,
+            CANONICAL_HASH_SEEDS.2,
+            CANONICAL_HASH_SEEDS.3,
+        );
+        let mut hasher: AHasher = state.build_hasher();
         encoded.hash(&mut hasher);
         hasher.finish()
     }
@@ -85,7 +123,52 @@ impl CanonicalIrDocument {
     }
 }
 
+/// Builds the canonical IR (as columns) from a list of parsed components.
+///
+/// Columns are the runtime primary; callers that need the JSON-shaped
+/// [`CanonicalIrDocument`] should call [`IrColumns::to_canonical`] on the
+/// returned value.
+pub fn build_canonical_ir_columns_from_parsed(components: &[ParsedComponent]) -> IrColumns {
+    IrColumns::from_parsed(components)
+}
+
+/// Builds the canonical IR (as columns) from a resolved [`ComponentGraph`].
+pub fn build_canonical_ir_columns_from_graph(
+    graph: &ComponentGraph,
+    analyses: &HashMap<ComponentId, ComponentAnalysis>,
+) -> IrColumns {
+    IrColumns::from_graph(graph, analyses)
+}
+
+/// Convenience AoS builder — produces the serialization-shaped document
+/// directly. Prefer the column variants for runtime consumers; this wrapper
+/// exists for ergonomics in tests and the JSON export path.
 pub fn build_canonical_ir_from_parsed(components: &[ParsedComponent]) -> CanonicalIrDocument {
+    build_canonical_ir_columns_from_parsed(components).to_canonical()
+}
+
+/// Convenience AoS builder — see [`build_canonical_ir_from_parsed`].
+pub fn build_canonical_ir_from_graph(
+    graph: &ComponentGraph,
+    analyses: &HashMap<ComponentId, ComponentAnalysis>,
+) -> CanonicalIrDocument {
+    build_canonical_ir_columns_from_graph(graph, analyses).to_canonical()
+}
+
+// PHASE 2 GATEWAY: the column builders below are the only producers of the
+// canonical IR. Cycle 2 introduces a SIMD hash rescan pass that writes back
+// into `IrColumns::source_hashes` without re running these builders. The
+// xxh3 source hashing lives at the `ParsedComponent::source_hash` origin in
+// `src/parser.rs`. Cycle 2 also bumps `CANONICAL_IR_SCHEMA_VERSION` when the
+// source hash algorithm changes.
+
+pub(crate) fn build_canonical_components_and_edges_from_parsed(
+    components: &[ParsedComponent],
+) -> (
+    Vec<CanonicalIrModule>,
+    Vec<CanonicalIrComponent>,
+    Vec<CanonicalIrEdge>,
+) {
     let mut parsed_components = components.to_vec();
     parsed_components.sort_by(|left, right| {
         left.file_path
@@ -136,21 +219,17 @@ pub fn build_canonical_ir_from_parsed(components: &[ParsedComponent]) -> Canonic
         }
     }
 
-    let mut document = CanonicalIrDocument {
-        schema_version: CANONICAL_IR_SCHEMA_VERSION.to_string(),
-        generated_at: now_rfc3339(),
-        modules,
-        components: ir_components,
-        edges,
-    };
-    document.normalize();
-    document
+    (modules, ir_components, edges)
 }
 
-pub fn build_canonical_ir_from_graph(
+pub(crate) fn build_canonical_components_and_edges_from_graph(
     graph: &ComponentGraph,
     analyses: &HashMap<ComponentId, ComponentAnalysis>,
-) -> CanonicalIrDocument {
+) -> (
+    Vec<CanonicalIrModule>,
+    Vec<CanonicalIrComponent>,
+    Vec<CanonicalIrEdge>,
+) {
     let mut modules_by_path: BTreeMap<String, CanonicalIrModule> = BTreeMap::new();
     let mut components = Vec::new();
     let mut edges = Vec::new();
@@ -209,10 +288,18 @@ pub fn build_canonical_ir_from_graph(
         }
     }
 
+    (modules_by_path.into_values().collect(), components, edges)
+}
+
+pub(crate) fn new_canonical_document(
+    modules: Vec<CanonicalIrModule>,
+    components: Vec<CanonicalIrComponent>,
+    edges: Vec<CanonicalIrEdge>,
+) -> CanonicalIrDocument {
     let mut document = CanonicalIrDocument {
         schema_version: CANONICAL_IR_SCHEMA_VERSION.to_string(),
         generated_at: now_rfc3339(),
-        modules: modules_by_path.into_values().collect(),
+        modules,
         components,
         edges,
     };
@@ -326,7 +413,7 @@ fn build_modules(parsed_components: &[ParsedComponent]) -> Vec<CanonicalIrModule
     output
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
@@ -373,5 +460,22 @@ mod tests {
             .analyzer_to_ir
             .iter()
             .any(|entry| entry.legacy_source == "ComponentAnalysis.priority"));
+    }
+
+    #[test]
+    fn test_columns_round_trip_from_parsed() {
+        let input = vec![
+            fixture_component("Button", "src/Button.tsx", vec![]),
+            fixture_component("App", "src/App.tsx", vec!["Button"]),
+            fixture_component("Layout", "src/Layout.tsx", vec!["App"]),
+        ];
+
+        let direct = build_canonical_ir_from_parsed(&input);
+        let via_columns = IrColumns::from_parsed(&input).to_canonical();
+
+        // The two paths must produce byte-identical serialized output once
+        // `generated_at` is stamped out, which is what `canonical_hash`
+        // normalizes before hashing.
+        assert_eq!(direct.canonical_hash(), via_columns.canonical_hash());
     }
 }
