@@ -145,6 +145,25 @@ impl DirtyBitmap {
         }
         total
     }
+
+    /// Zero-allocation drain into a caller-owned `Vec<u32>`.
+    ///
+    /// Clears `scratch` then appends every set column index as a `u32` in
+    /// ascending order. Intended for the frame hot path, where `scratch`
+    /// lives in a [`FrameArena`](super::frame::FrameArena) and is reused
+    /// across ticks — no heap traffic inside the reconcile loop.
+    ///
+    /// Indices ≥ `u32::MAX` are silently dropped; the IR column store is
+    /// addressed by `u32` positions everywhere else in the pipeline, so this
+    /// matches the upstream contract without introducing a panic path.
+    pub fn drain_into(&self, scratch: &mut Vec<u32>) -> usize {
+        scratch.clear();
+        self.drain(|idx| {
+            if let Ok(as_u32) = u32::try_from(idx) {
+                scratch.push(as_u32);
+            }
+        })
+    }
 }
 
 /// Compares two equal-length hash columns lane-by-lane and folds the

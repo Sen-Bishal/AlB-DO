@@ -287,6 +287,27 @@ impl WebTransportMuxer {
         Ok(frames)
     }
 
+    /// Reserves the next sequence number for `stream_id` without building a
+    /// frame. Used by the frame hot path, which writes its patch payload
+    /// directly into a pooled buffer and only needs the monotone counter.
+    ///
+    /// Returns `None` for an out-of-range `stream_id`. A `Some` result is a
+    /// lock-free `fetch_add(1, Relaxed)` — the same contract as
+    /// [`Self::mux_lane_chunks`] but with no allocation.
+    pub fn allocate_sequence(&self, stream_id: usize) -> Option<u64> {
+        self.next_sequence
+            .get(stream_id)
+            .map(|slot| slot.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Current value of the per-stream sequence counter. Diagnostic only —
+    /// intentionally does not advance the counter.
+    pub fn peek_sequence(&self, stream_id: usize) -> Option<u64> {
+        self.next_sequence
+            .get(stream_id)
+            .map(|slot| slot.load(Ordering::Acquire))
+    }
+
     pub fn mux_route_chunks(&self, chunks: &[RouteStreamChunk]) -> Vec<WebTransportFrame> {
         let mut frames = Vec::with_capacity(chunks.len());
         for chunk in chunks {

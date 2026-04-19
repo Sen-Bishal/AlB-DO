@@ -173,8 +173,13 @@ swc_ecma_transforms_typescript.workspace = true
 swc_ecma_visit.workspace                 = true
 
 [dev-dependencies]
-tempfile.workspace = true
-regex.workspace    = true
+tempfile.workspace  = true
+regex.workspace     = true
+criterion.workspace = true
+
+[[bench]]
+name    = "frame_tick"
+harness = false
 
 [profile.release]
 opt-level     = 3

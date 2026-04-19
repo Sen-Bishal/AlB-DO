@@ -1,6 +1,7 @@
 pub mod dirty_bitmap;
 pub mod engine;
 pub mod eval;
+pub mod frame;
 pub mod highway;
 pub mod hot_set;
 pub mod pi_arch;
