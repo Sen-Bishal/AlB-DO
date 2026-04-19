@@ -487,6 +487,7 @@ dependencies = [
  "notify",
  "num_cpus",
  "once_cell",
+ "rayon",
  "regex",
  "rquickjs",
  "rustc-hash 2.1.1",

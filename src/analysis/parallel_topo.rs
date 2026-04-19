@@ -1,7 +1,7 @@
 use crate::graph::ComponentGraph;
 use crate::types::*;
-use crossbeam::channel;
 use dashmap::DashMap;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 const PARALLEL_THRESHOLD: usize = 20;
@@ -63,30 +63,15 @@ impl<'a> ParallelTopologicalSorter<'a> {
         out_degree: &mut HashMap<ComponentId, usize>,
         processed: &HashSet<ComponentId>,
     ) -> Vec<ComponentId> {
-        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-        let n_threads = num_cpus::get().min(current.len()).max(1);
-        let chunk_size = current.len().div_ceil(n_threads);
         let decrement_counts: DashMap<ComponentId, usize> = DashMap::new();
 
-        crossbeam::scope(|s| {
-            for (i, chunk) in current.chunks(chunk_size).enumerate() {
-                let decrement_counts = &decrement_counts;
-                let core_id = core_ids.get(i % core_ids.len().max(1)).copied();
-                s.spawn(move |_| {
-                    if let Some(id) = core_id {
-                        core_affinity::set_for_current(id);
-                    }
-                    for &node in chunk {
-                        for dep in self.graph.get_dependents(&node) {
-                            if !processed.contains(&dep) {
-                                *decrement_counts.entry(dep).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                });
+        current.par_iter().for_each(|&node| {
+            for dep in self.graph.get_dependents(&node) {
+                if !processed.contains(&dep) {
+                    *decrement_counts.entry(dep).or_insert(0) += 1;
+                }
             }
-        })
-        .unwrap();
+        });
 
         decrement_counts
             .into_iter()
@@ -130,28 +115,13 @@ impl<'a> ParallelTopologicalSorter<'a> {
     ) -> Result<Vec<Vec<ComponentId>>> {
         let mut levels = self.sort()?;
 
-        let n_threads = num_cpus::get().min(levels.len()).max(1);
-        let chunk_size = levels.len().div_ceil(n_threads);
-        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-
-        crossbeam::scope(|s| {
-            for (i, chunk) in levels.chunks_mut(chunk_size).enumerate() {
-                let core_id = core_ids.get(i % core_ids.len().max(1)).copied();
-                s.spawn(move |_| {
-                    if let Some(id) = core_id {
-                        core_affinity::set_for_current(id);
-                    }
-                    for level in chunk.iter_mut() {
-                        level.sort_unstable_by(|a, b| {
-                            let pa = analyses.get(a).map_or(0.0, |x| x.priority);
-                            let pb = analyses.get(b).map_or(0.0, |x| x.priority);
-                            pb.partial_cmp(&pa).unwrap()
-                        });
-                    }
-                });
-            }
-        })
-        .unwrap();
+        levels.par_iter_mut().for_each(|level| {
+            level.sort_unstable_by(|a, b| {
+                let pa = analyses.get(a).map_or(0.0, |x| x.priority);
+                let pb = analyses.get(b).map_or(0.0, |x| x.priority);
+                pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        });
 
         Ok(levels)
     }
@@ -169,37 +139,11 @@ impl<'a> ParallelTopologicalSorter<'a> {
                 .collect();
         }
 
-        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-        let n_threads = num_cpus::get().min(levels.len()).max(1);
-        let chunk_size = levels.len().div_ceil(n_threads);
-        let (tx, rx) = channel::unbounded::<Vec<RenderBatch>>();
-
-        crossbeam::scope(|s| {
-            for (thread_idx, chunk) in levels.chunks(chunk_size).enumerate() {
-                let tx = tx.clone();
-                let core_id = core_ids.get(thread_idx % core_ids.len().max(1)).copied();
-                let base_idx = thread_idx * chunk_size;
-                s.spawn(move |_| {
-                    if let Some(id) = core_id {
-                        core_affinity::set_for_current(id);
-                    }
-                    let batches = chunk
-                        .iter()
-                        .enumerate()
-                        .map(|(offset, components)| {
-                            self.make_batch(base_idx + offset, components, analyses)
-                        })
-                        .collect();
-                    tx.send(batches).unwrap();
-                });
-            }
-            drop(tx);
-        })
-        .unwrap();
-
-        let mut out: Vec<RenderBatch> = rx.iter().flatten().collect();
-        out.sort_unstable_by_key(|b| b.level);
-        out
+        levels
+            .into_par_iter()
+            .enumerate()
+            .map(|(idx, components)| self.make_batch(idx, &components, analyses))
+            .collect()
     }
 
     fn make_batch(
@@ -238,43 +182,21 @@ pub fn find_critical_path_parallel(
         return Vec::new();
     }
 
-    if roots.len() <= 4 {
-        return roots
+    let candidates: Vec<(Vec<ComponentId>, f64)> = if roots.len() <= 4 {
+        roots
             .iter()
             .map(|&root| find_longest_path(root, graph, analyses, &mut HashSet::new()))
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(path, _)| path)
-            .unwrap_or_default();
-    }
+            .collect()
+    } else {
+        roots
+            .par_iter()
+            .map(|&root| find_longest_path(root, graph, analyses, &mut HashSet::new()))
+            .collect()
+    };
 
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    let n_threads = num_cpus::get().min(roots.len()).max(1);
-    let chunk_size = roots.len().div_ceil(n_threads);
-    let (tx, rx) = channel::unbounded::<(Vec<ComponentId>, f64)>();
-
-    crossbeam::scope(|s| {
-        for (i, chunk) in roots.chunks(chunk_size).enumerate() {
-            let tx = tx.clone();
-            let core_id = core_ids.get(i % core_ids.len().max(1)).copied();
-            s.spawn(move |_| {
-                if let Some(id) = core_id {
-                    core_affinity::set_for_current(id);
-                }
-                if let Some(best) = chunk
-                    .iter()
-                    .map(|&root| find_longest_path(root, graph, analyses, &mut HashSet::new()))
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                {
-                    tx.send(best).unwrap();
-                }
-            });
-        }
-        drop(tx);
-    })
-    .unwrap();
-
-    rx.iter()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+    candidates
+        .into_iter()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(path, _)| path)
         .unwrap_or_default()
 }
@@ -301,7 +223,7 @@ fn find_longest_path(
     let (mut longest_path, longest_time) = dependents
         .iter()
         .map(|&dep| find_longest_path(dep, graph, analyses, visited))
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or_default();
 
     longest_path.insert(0, node);

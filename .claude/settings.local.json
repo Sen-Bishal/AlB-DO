@@ -24,7 +24,8 @@
       "Bash(cargo fmt *)",
       "Bash(rustfmt --check --edition 2021 src/ir/mod.rs src/ir/columns.rs)",
       "Bash(rustfmt --edition 2021 src/ir/mod.rs src/ir/columns.rs)",
-      "Bash(ALBEDO_UPDATE_GOLDENS=1 cargo test --test phase0_golden_correctness_tests)"
+      "Bash(ALBEDO_UPDATE_GOLDENS=1 cargo test --test phase0_golden_correctness_tests)",
+      "Bash(cargo clippy *)"
     ]
   }
 }

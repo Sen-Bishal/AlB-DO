@@ -142,6 +142,7 @@ path = "src/bin/albedo-bench.rs"
 crossbeam.workspace          = true
 core_affinity.workspace      = true
 dashmap.workspace            = true
+rayon.workspace              = true
 once_cell.workspace          = true
 lru.workspace                = true
 ahash.workspace              = true

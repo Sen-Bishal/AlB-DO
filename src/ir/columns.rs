@@ -173,6 +173,22 @@ mod presence_bits {
     pub const PHASE: u8 = 1 << 1;
 }
 
+/// Disjoint mutable borrow of the hot IR columns for a parallel pass.
+///
+/// Returned by [`IrColumns::column_pass_mut`]. Each field is a `&mut [_]`
+/// into a different backing `Vec` inside the owning [`IrColumns`], so the
+/// borrow checker proves that distributing these slices to different
+/// rayon workers is race-free without any runtime synchronization.
+#[derive(Debug)]
+pub struct ColumnPass<'a> {
+    pub effects: &'a mut [u8],
+    pub source_hashes: &'a mut [u64],
+    pub priorities: &'a mut [f32],
+    pub phases: &'a mut [f32],
+    pub edge_from: &'a mut [u32],
+    pub edge_to: &'a mut [u32],
+}
+
 /// Cold module column — one entry per module, indexed by module ordinal.
 #[derive(Debug, Clone, Default)]
 pub struct IrModuleColumn {
@@ -471,6 +487,67 @@ impl IrColumns {
         columns
     }
 
+    /// Disjoint mutable split-borrow of the hot columns for a
+    /// cycle-3 parallel pass.
+    ///
+    /// The returned [`ColumnPass`] bundles six non-overlapping `&mut [_]`
+    /// borrows, one group per logical reconcile lane. Because each field
+    /// is borrowed at most once, the compile-time borrow checker proves the
+    /// partition is race-free — a rayon `scope`/`join` can drive each group
+    /// on a separate worker with no synchronization primitive required.
+    pub fn column_pass_mut(&mut self) -> ColumnPass<'_> {
+        ColumnPass {
+            effects: &mut self.effects,
+            source_hashes: &mut self.source_hashes,
+            priorities: &mut self.priorities,
+            phases: &mut self.phases,
+            edge_from: &mut self.edge_from,
+            edge_to: &mut self.edge_to,
+        }
+    }
+
+    /// Fans four column mutators out across a rayon scope.
+    ///
+    /// Each closure receives a disjoint mutable slice of the column store
+    /// and runs on an independent rayon worker. The method blocks until
+    /// every worker has returned, which keeps the public surface
+    /// synchronous and single-owner — callers never observe a half-written
+    /// column from outside this call.
+    ///
+    /// Column grouping:
+    /// - `effects_pass`      → `&mut [u8]`  (tag recompute)
+    /// - `source_hashes_pass`→ `&mut [u64]` (rehash changed)
+    /// - `schedule_pass`     → `&mut [f32]` for priorities and phases
+    /// - `edges_pass`        → `&mut [u32]` for `edge_from` and `edge_to`
+    pub fn parallel_column_pass<EF, SH, SC, ED>(
+        &mut self,
+        effects_pass: EF,
+        source_hashes_pass: SH,
+        schedule_pass: SC,
+        edges_pass: ED,
+    ) where
+        EF: FnOnce(&mut [u8]) + Send,
+        SH: FnOnce(&mut [u64]) + Send,
+        SC: FnOnce(&mut [f32], &mut [f32]) + Send,
+        ED: FnOnce(&mut [u32], &mut [u32]) + Send,
+    {
+        let ColumnPass {
+            effects,
+            source_hashes,
+            priorities,
+            phases,
+            edge_from,
+            edge_to,
+        } = self.column_pass_mut();
+
+        rayon::scope(|scope| {
+            scope.spawn(move |_| effects_pass(effects));
+            scope.spawn(move |_| source_hashes_pass(source_hashes));
+            scope.spawn(move |_| schedule_pass(priorities, phases));
+            scope.spawn(move |_| edges_pass(edge_from, edge_to));
+        });
+    }
+
     /// Materializes the column store back into the serialization-shaped
     /// [`CanonicalIrDocument`].
     ///
@@ -589,6 +666,44 @@ mod tests {
         assert_eq!(original.components, regenerated.components);
         assert_eq!(original.edges, regenerated.edges);
         assert_eq!(original.modules, regenerated.modules);
+    }
+
+    #[test]
+    fn parallel_column_pass_splits_mutable_columns() {
+        let mut columns = IrColumns::from_parsed(&sample_parsed());
+
+        let effects_before = columns.effects().to_vec();
+        let hashes_before = columns.source_hashes().to_vec();
+
+        columns.parallel_column_pass(
+            |effects| {
+                for bits in effects.iter_mut() {
+                    *bits |= effect_bits::IO;
+                }
+            },
+            |hashes| {
+                for hash in hashes.iter_mut() {
+                    *hash ^= 0xFFFF_FFFF_FFFF_FFFF;
+                }
+            },
+            |priorities, phases| {
+                for value in priorities.iter_mut() {
+                    *value += 1.0;
+                }
+                for value in phases.iter_mut() {
+                    *value += 2.0;
+                }
+            },
+            |_edge_from, _edge_to| {},
+        );
+
+        for (before, after) in effects_before.iter().zip(columns.effects().iter()) {
+            assert_eq!(after & effect_bits::IO, effect_bits::IO);
+            assert_eq!(before | effect_bits::IO, *after);
+        }
+        for (before, after) in hashes_before.iter().zip(columns.source_hashes().iter()) {
+            assert_eq!(*after, before ^ 0xFFFF_FFFF_FFFF_FFFF);
+        }
     }
 
     #[test]
