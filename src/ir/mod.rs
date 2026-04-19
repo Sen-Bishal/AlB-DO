@@ -13,7 +13,10 @@
 
 pub mod columns;
 
-pub use columns::{ColumnPass, IrColumns, IrModuleColumn, StringId, StringInterner};
+pub use columns::{
+    field_mask, ColumnPass, IrColumns, IrModuleColumn, LaneColumnPass, LaneColumnPatch, StringId,
+    StringInterner, LANE_COUNT as IR_LANE_COUNT,
+};
 
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;

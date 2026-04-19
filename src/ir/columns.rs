@@ -35,6 +35,13 @@ use crate::types::{ComponentAnalysis, ComponentId};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ops::Range;
+
+/// Number of highway lanes the column store can partition into.
+///
+/// Mirrors [`crate::runtime::highway::LANE_COUNT`]; the runtime side carries
+/// a compile-time assertion that the two constants stay in lockstep.
+pub const LANE_COUNT: usize = 4;
 
 /// Interned string handle.
 ///
@@ -173,6 +180,62 @@ mod presence_bits {
     pub const PHASE: u8 = 1 << 1;
 }
 
+/// Field-selection bits carried by a [`LaneColumnPatch`].
+///
+/// A patch's `field_mask` marks which of the payload slots are authoritative;
+/// unset bits mean the corresponding payload field is ignored. The bit layout
+/// is stable and forms part of the wire contract for lane-scoped patches.
+pub mod field_mask {
+    pub const EFFECTS: u32 = 1 << 0;
+    pub const SOURCE_HASH: u32 = 1 << 1;
+    pub const PRIORITY: u32 = 1 << 2;
+    pub const PHASE: u32 = 1 << 3;
+    pub const ESTIMATED_SIZE: u32 = 1 << 4;
+    pub const EXPORT_KIND: u32 = 1 << 5;
+    pub const LINE_NUMBER: u32 = 1 << 6;
+    pub const SYMBOL: u32 = 1 << 7;
+    pub const MODULE_PATH: u32 = 1 << 8;
+}
+
+/// Lane-scoped column patch — the primary unit of reconcile output.
+///
+/// Replaces the JSON struct-diff of [`CanonicalIrComponent`]: a patch points
+/// at `(lane, column_idx)` directly, and `field_mask` selects which of the
+/// packed payload slots are meaningful. Unselected slots hold zero-initialized
+/// defaults and must be ignored by the receiver.
+#[derive(Debug, Clone, Default)]
+pub struct LaneColumnPatch {
+    pub lane: u8,
+    pub column_idx: u32,
+    pub field_mask: u32,
+    pub effects: u8,
+    pub export_kind: u8,
+    pub estimated_size: u32,
+    pub line_number: u32,
+    pub source_hash: u64,
+    pub priority: f32,
+    pub phase: f32,
+    pub symbol: StringId,
+    pub module_path: StringId,
+}
+
+/// Disjoint mutable borrow of a single lane's hot column slices.
+///
+/// Returned by [`IrColumns::lane_column_pass_mut`] and, in grouped form, by
+/// [`IrColumns::parallel_lane_column_pass`]. Because every field is a
+/// `&mut [_]` into a non-overlapping region of the owning [`IrColumns`], the
+/// borrow checker proves that shipping these passes to rayon workers is
+/// race-free without synchronization primitives.
+#[derive(Debug)]
+pub struct LaneColumnPass<'a> {
+    pub lane: u8,
+    pub column_start: u32,
+    pub effects: &'a mut [u8],
+    pub source_hashes: &'a mut [u64],
+    pub priorities: &'a mut [f32],
+    pub phases: &'a mut [f32],
+}
+
 /// Disjoint mutable borrow of the hot IR columns for a parallel pass.
 ///
 /// Returned by [`IrColumns::column_pass_mut`]. Each field is a `&mut [_]`
@@ -231,6 +294,14 @@ pub struct IrColumns {
     // PHASE 2 GATEWAY: cycle 2 addresses DirtyBitmap bits by column index;
     // random-access lookups by component id go through this map.
     id_to_index: FxHashMap<u64, u32>,
+
+    // ── Lane partition (cycle 4) ─────────────────────
+    // `lane_ids[i]` is the lane assignment of component slot `i`.
+    // `lane_offsets[lane]..lane_offsets[lane + 1]` is the half-open range
+    // occupied by `lane` after a [`Self::sort_by_lane`] call. Before any
+    // sort, every component lives in lane 0.
+    lane_ids: Vec<u8>,
+    lane_offsets: [u32; LANE_COUNT + 1],
 }
 
 impl IrColumns {
@@ -256,6 +327,8 @@ impl IrColumns {
             edge_to: Vec::new(),
             modules: Vec::new(),
             id_to_index: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            lane_ids: Vec::with_capacity(capacity),
+            lane_offsets: [0; LANE_COUNT + 1],
         }
     }
 
@@ -326,6 +399,70 @@ impl IrColumns {
 
     pub fn strings(&self) -> &StringInterner {
         &self.strings
+    }
+
+    /// Per-slot lane assignment. Before [`Self::sort_by_lane`] is called
+    /// every entry is `0`.
+    pub fn lane_ids(&self) -> &[u8] {
+        &self.lane_ids
+    }
+
+    /// Cumulative lane-start positions. `offsets[lane]..offsets[lane + 1]`
+    /// is the contiguous column range owned by `lane`.
+    pub fn lane_offsets(&self) -> [u32; LANE_COUNT + 1] {
+        self.lane_offsets
+    }
+
+    /// Half-open column range occupied by `lane`, or `None` if `lane` is out
+    /// of range or the stored offsets are inconsistent with column length.
+    pub fn lane_range(&self, lane: usize) -> Option<Range<usize>> {
+        if lane >= LANE_COUNT {
+            return None;
+        }
+        let start = usize::try_from(self.lane_offsets.get(lane).copied().unwrap_or(0)).ok()?;
+        let end =
+            usize::try_from(self.lane_offsets.get(lane.saturating_add(1)).copied().unwrap_or(0))
+                .ok()?;
+        if start > end || end > self.ids.len() {
+            return None;
+        }
+        Some(start..end)
+    }
+
+    pub fn lane_ids_slice(&self, lane: usize) -> &[u8] {
+        self.lane_range(lane)
+            .and_then(|range| self.lane_ids.get(range))
+            .unwrap_or(&[])
+    }
+
+    pub fn lane_source_hashes(&self, lane: usize) -> &[u64] {
+        self.lane_range(lane)
+            .and_then(|range| self.source_hashes.get(range))
+            .unwrap_or(&[])
+    }
+
+    pub fn lane_effects(&self, lane: usize) -> &[u8] {
+        self.lane_range(lane)
+            .and_then(|range| self.effects.get(range))
+            .unwrap_or(&[])
+    }
+
+    pub fn lane_priorities(&self, lane: usize) -> &[f32] {
+        self.lane_range(lane)
+            .and_then(|range| self.priorities.get(range))
+            .unwrap_or(&[])
+    }
+
+    pub fn lane_phases(&self, lane: usize) -> &[f32] {
+        self.lane_range(lane)
+            .and_then(|range| self.phases.get(range))
+            .unwrap_or(&[])
+    }
+
+    pub fn lane_ids_column(&self, lane: usize) -> &[u64] {
+        self.lane_range(lane)
+            .and_then(|range| self.ids.get(range))
+            .unwrap_or(&[])
     }
 
     pub fn symbol_at(&self, idx: u32) -> &str {
@@ -484,6 +621,19 @@ impl IrColumns {
             columns.edge_to.push(to_idx);
         }
 
+        // Unsorted columns live entirely in lane 0 until the caller invokes
+        // [`Self::sort_by_lane`]. This keeps the empty and pre-sort states
+        // observably consistent with a fully lane-partitioned store.
+        columns.lane_ids = vec![0_u8; columns.ids.len()];
+        let total = u32::try_from(columns.ids.len()).unwrap_or(u32::MAX);
+        let mut offsets = [0_u32; LANE_COUNT + 1];
+        for slot in 1..=LANE_COUNT {
+            if let Some(entry) = offsets.get_mut(slot) {
+                *entry = total;
+            }
+        }
+        columns.lane_offsets = offsets;
+
         columns
     }
 
@@ -548,6 +698,268 @@ impl IrColumns {
         });
     }
 
+    /// Borrows one lane's hot column slices for mutation.
+    ///
+    /// Returns `None` if `lane >= LANE_COUNT` or the internal lane offsets
+    /// are inconsistent. The returned [`LaneColumnPass`] exposes
+    /// non-overlapping `&mut [_]` views into each hot column — exactly the
+    /// contract [`Self::parallel_lane_column_pass`] fans out across rayon
+    /// workers.
+    pub fn lane_column_pass_mut(&mut self, lane: usize) -> Option<LaneColumnPass<'_>> {
+        let range = self.lane_range(lane)?;
+        let lane_u8 = u8::try_from(lane).ok()?;
+        let column_start = u32::try_from(range.start).unwrap_or(0);
+        Some(LaneColumnPass {
+            lane: lane_u8,
+            column_start,
+            effects: self.effects.get_mut(range.clone())?,
+            source_hashes: self.source_hashes.get_mut(range.clone())?,
+            priorities: self.priorities.get_mut(range.clone())?,
+            phases: self.phases.get_mut(range)?,
+        })
+    }
+
+    /// Fans per-lane mutation closures across a rayon scope.
+    ///
+    /// Each closure receives the [`LaneColumnPass`] for its lane. Because
+    /// the lane partitions are disjoint, all four passes can be dispatched
+    /// simultaneously with no locking. Runs synchronously — returns once
+    /// every worker has completed.
+    pub fn parallel_lane_column_pass<F0, F1, F2, F3>(
+        &mut self,
+        lane0: F0,
+        lane1: F1,
+        lane2: F2,
+        lane3: F3,
+    ) where
+        F0: FnOnce(LaneColumnPass<'_>) + Send,
+        F1: FnOnce(LaneColumnPass<'_>) + Send,
+        F2: FnOnce(LaneColumnPass<'_>) + Send,
+        F3: FnOnce(LaneColumnPass<'_>) + Send,
+    {
+        let offsets = self.lane_offsets;
+        let total = self.ids.len();
+
+        let effects = split_lane_slices_mut(&mut self.effects, offsets, total);
+        let source_hashes = split_lane_slices_mut(&mut self.source_hashes, offsets, total);
+        let priorities = split_lane_slices_mut(&mut self.priorities, offsets, total);
+        let phases = split_lane_slices_mut(&mut self.phases, offsets, total);
+
+        let [e0, e1, e2, e3] = effects;
+        let [h0, h1, h2, h3] = source_hashes;
+        let [p0, p1, p2, p3] = priorities;
+        let [ph0, ph1, ph2, ph3] = phases;
+        let [s0, s1, s2, s3, _] = offsets;
+
+        let pass0 = LaneColumnPass {
+            lane: 0,
+            column_start: s0,
+            effects: e0,
+            source_hashes: h0,
+            priorities: p0,
+            phases: ph0,
+        };
+        let pass1 = LaneColumnPass {
+            lane: 1,
+            column_start: s1,
+            effects: e1,
+            source_hashes: h1,
+            priorities: p1,
+            phases: ph1,
+        };
+        let pass2 = LaneColumnPass {
+            lane: 2,
+            column_start: s2,
+            effects: e2,
+            source_hashes: h2,
+            priorities: p2,
+            phases: ph2,
+        };
+        let pass3 = LaneColumnPass {
+            lane: 3,
+            column_start: s3,
+            effects: e3,
+            source_hashes: h3,
+            priorities: p3,
+            phases: ph3,
+        };
+
+        rayon::scope(|scope| {
+            scope.spawn(move |_| lane0(pass0));
+            scope.spawn(move |_| lane1(pass1));
+            scope.spawn(move |_| lane2(pass2));
+            scope.spawn(move |_| lane3(pass3));
+        });
+    }
+
+    /// Reorders every hot column so that all components assigned to the
+    /// same lane live in a contiguous slice.
+    ///
+    /// `lane_for` is invoked once per component id and must return a value
+    /// in `0..LANE_COUNT`; out-of-range values are clamped down to
+    /// `LANE_COUNT - 1` to keep the partition total. The lane order within
+    /// a slice preserves the caller-observed order of `lane_for` invocations
+    /// — i.e. the pre-sort column order — which makes the sort stable and
+    /// keeps deterministic behavior for golden-fixture tests that assume a
+    /// lane-only reordering.
+    ///
+    /// Side effects:
+    /// * `ids`, `source_hashes`, `estimated_sizes`, `line_numbers`,
+    ///   `effects`, `export_kinds`, `priorities`, `phases`, `presence`,
+    ///   `symbols`, `module_paths` are permuted in lockstep.
+    /// * `edge_from` / `edge_to` endpoints are remapped to the new column
+    ///   indices; edge order is preserved.
+    /// * `id_to_index` is rebuilt.
+    /// * `lane_ids` and `lane_offsets` are populated from the histogram.
+    pub fn sort_by_lane<F>(&mut self, lane_for: F)
+    where
+        F: Fn(u64) -> usize,
+    {
+        let len = self.ids.len();
+        if len == 0 {
+            self.lane_ids.clear();
+            self.lane_offsets = [0; LANE_COUNT + 1];
+            return;
+        }
+
+        let mut assignments = vec![0_u8; len];
+        for (slot, id) in self.ids.iter().enumerate() {
+            let lane = lane_for(*id).min(LANE_COUNT.saturating_sub(1));
+            if let Some(entry) = assignments.get_mut(slot) {
+                *entry = u8::try_from(lane).unwrap_or(0);
+            }
+        }
+
+        let mut counts = [0_u32; LANE_COUNT];
+        for &lane in &assignments {
+            if let Some(slot) = counts.get_mut(lane as usize) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+
+        let mut offsets = [0_u32; LANE_COUNT + 1];
+        let mut running: u32 = 0;
+        for lane in 0..LANE_COUNT {
+            if let Some(entry) = offsets.get_mut(lane) {
+                *entry = running;
+            }
+            running = running.saturating_add(counts.get(lane).copied().unwrap_or(0));
+        }
+        if let Some(last) = offsets.get_mut(LANE_COUNT) {
+            *last = u32::try_from(len).unwrap_or(u32::MAX);
+        }
+
+        let mut cursor = [0_u32; LANE_COUNT];
+        for lane in 0..LANE_COUNT {
+            if let Some(entry) = cursor.get_mut(lane) {
+                *entry = offsets.get(lane).copied().unwrap_or(0);
+            }
+        }
+
+        let mut new_idx_of_old = vec![0_u32; len];
+        for (old, &lane_byte) in assignments.iter().enumerate() {
+            let lane = lane_byte as usize;
+            if let Some(cur) = cursor.get_mut(lane) {
+                if let Some(entry) = new_idx_of_old.get_mut(old) {
+                    *entry = *cur;
+                }
+                *cur = cur.saturating_add(1);
+            }
+        }
+
+        let mut old_idx_at_new = vec![0_u32; len];
+        for (old, &new_idx) in new_idx_of_old.iter().enumerate() {
+            if let Some(entry) = old_idx_at_new.get_mut(new_idx as usize) {
+                *entry = u32::try_from(old).unwrap_or(u32::MAX);
+            }
+        }
+
+        self.ids = permute(&self.ids, &old_idx_at_new);
+        self.source_hashes = permute(&self.source_hashes, &old_idx_at_new);
+        self.estimated_sizes = permute(&self.estimated_sizes, &old_idx_at_new);
+        self.line_numbers = permute(&self.line_numbers, &old_idx_at_new);
+        self.effects = permute(&self.effects, &old_idx_at_new);
+        self.export_kinds = permute(&self.export_kinds, &old_idx_at_new);
+        self.priorities = permute(&self.priorities, &old_idx_at_new);
+        self.phases = permute(&self.phases, &old_idx_at_new);
+        self.presence = permute(&self.presence, &old_idx_at_new);
+        self.symbols = permute(&self.symbols, &old_idx_at_new);
+        self.module_paths = permute(&self.module_paths, &old_idx_at_new);
+        self.lane_ids = permute(&assignments, &old_idx_at_new);
+
+        for slot in self.edge_from.iter_mut() {
+            let old = *slot as usize;
+            if let Some(&new_idx) = new_idx_of_old.get(old) {
+                *slot = new_idx;
+            }
+        }
+        for slot in self.edge_to.iter_mut() {
+            let old = *slot as usize;
+            if let Some(&new_idx) = new_idx_of_old.get(old) {
+                *slot = new_idx;
+            }
+        }
+
+        self.id_to_index.clear();
+        self.id_to_index.reserve(len);
+        for (slot, &id) in self.ids.iter().enumerate() {
+            self.id_to_index
+                .insert(id, u32::try_from(slot).unwrap_or(u32::MAX));
+        }
+
+        self.lane_offsets = offsets;
+    }
+
+    /// Snapshots a component's column values into a [`LaneColumnPatch`].
+    ///
+    /// `field_mask` selects which slots are filled from the live columns;
+    /// bits cleared in the mask are left at default values. Returns `None`
+    /// if `column_idx` is out of range.
+    pub fn build_lane_patch(&self, column_idx: u32, field_mask: u32) -> Option<LaneColumnPatch> {
+        let slot = column_idx as usize;
+        if slot >= self.ids.len() {
+            return None;
+        }
+
+        let lane = self.lane_ids.get(slot).copied().unwrap_or(0);
+        let mut patch = LaneColumnPatch {
+            lane,
+            column_idx,
+            field_mask,
+            ..LaneColumnPatch::default()
+        };
+
+        if field_mask & field_mask::EFFECTS != 0 {
+            patch.effects = self.effects.get(slot).copied().unwrap_or(0);
+        }
+        if field_mask & field_mask::EXPORT_KIND != 0 {
+            patch.export_kind = self.export_kinds.get(slot).copied().unwrap_or(0);
+        }
+        if field_mask & field_mask::ESTIMATED_SIZE != 0 {
+            patch.estimated_size = self.estimated_sizes.get(slot).copied().unwrap_or(0);
+        }
+        if field_mask & field_mask::LINE_NUMBER != 0 {
+            patch.line_number = self.line_numbers.get(slot).copied().unwrap_or(0);
+        }
+        if field_mask & field_mask::SOURCE_HASH != 0 {
+            patch.source_hash = self.source_hashes.get(slot).copied().unwrap_or(0);
+        }
+        if field_mask & field_mask::PRIORITY != 0 {
+            patch.priority = self.priorities.get(slot).copied().unwrap_or(0.0);
+        }
+        if field_mask & field_mask::PHASE != 0 {
+            patch.phase = self.phases.get(slot).copied().unwrap_or(0.0);
+        }
+        if field_mask & field_mask::SYMBOL != 0 {
+            patch.symbol = self.symbols.get(slot).copied().unwrap_or_default();
+        }
+        if field_mask & field_mask::MODULE_PATH != 0 {
+            patch.module_path = self.module_paths.get(slot).copied().unwrap_or_default();
+        }
+
+        Some(patch)
+    }
+
     /// Materializes the column store back into the serialization-shaped
     /// [`CanonicalIrDocument`].
     ///
@@ -589,6 +1001,40 @@ impl IrColumns {
 
         new_canonical_document(modules, components, edges)
     }
+}
+
+fn permute<T>(src: &[T], old_idx_at_new: &[u32]) -> Vec<T>
+where
+    T: Copy + Default,
+{
+    let mut out = Vec::with_capacity(old_idx_at_new.len());
+    for &old_idx in old_idx_at_new {
+        out.push(src.get(old_idx as usize).copied().unwrap_or_default());
+    }
+    out
+}
+
+fn split_lane_slices_mut<T>(
+    slice: &mut [T],
+    offsets: [u32; LANE_COUNT + 1],
+    total: usize,
+) -> [&mut [T]; LANE_COUNT] {
+    let [r0, r1, r2, r3, r4] = offsets;
+    let clamp = |raw: u32| usize::try_from(raw).unwrap_or(0).min(total).min(slice.len());
+    let (b0, b1, b2, b3, b4) = (clamp(r0), clamp(r1), clamp(r2), clamp(r3), clamp(r4));
+
+    let size0 = b1.saturating_sub(b0);
+    let size1 = b2.saturating_sub(b1);
+    let size2 = b3.saturating_sub(b2);
+    let size3 = b4.saturating_sub(b3);
+
+    let (_prefix, rest) = slice.split_at_mut(b0);
+    let (lane0, rest) = rest.split_at_mut(size0);
+    let (lane1, rest) = rest.split_at_mut(size1);
+    let (lane2, rest) = rest.split_at_mut(size2);
+    let (lane3, _tail) = rest.split_at_mut(size3);
+
+    [lane0, lane1, lane2, lane3]
 }
 
 #[cfg(test)]
@@ -716,5 +1162,185 @@ mod tests {
             component.export_kind,
             IrExportKind::Default | IrExportKind::Named
         ));
+    }
+
+    fn four_component_parsed() -> Vec<ParsedComponent> {
+        (0..4)
+            .map(|idx| ParsedComponent {
+                name: format!("C{idx}"),
+                file_path: format!("src/C{idx}.tsx"),
+                line_number: idx as usize + 1,
+                imports: if idx == 0 {
+                    vec!["C3".to_string()]
+                } else {
+                    Vec::new()
+                },
+                estimated_size: 100 + idx as usize * 10,
+                is_default_export: false,
+                props: Vec::new(),
+                effect_profile: EffectProfile::default(),
+                source_hash: 0xDEAD_0000 | u64::from(idx as u32),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fresh_columns_park_everything_in_lane_zero() {
+        let columns = IrColumns::from_parsed(&four_component_parsed());
+        let len = u32::try_from(columns.len()).unwrap_or(0);
+        assert_eq!(columns.lane_offsets(), [0, len, len, len, len]);
+        assert!(columns.lane_ids().iter().all(|lane| *lane == 0));
+    }
+
+    #[test]
+    fn sort_by_lane_partitions_columns_into_contiguous_ranges() {
+        let mut columns = IrColumns::from_parsed(&four_component_parsed());
+
+        let ids_before = columns.ids().to_vec();
+        let hashes_before = columns.source_hashes().to_vec();
+
+        columns.sort_by_lane(|id| (id as usize) % LANE_COUNT);
+
+        let offsets = columns.lane_offsets();
+        assert_eq!(*offsets.first().expect("start"), 0);
+        assert_eq!(
+            *offsets.last().expect("total"),
+            u32::try_from(columns.len()).expect("len fits in u32")
+        );
+        for lane in 0..LANE_COUNT {
+            let start = *offsets.get(lane).expect("lane start");
+            let end = *offsets.get(lane + 1).expect("lane end");
+            assert!(start <= end, "lane offsets must be monotone");
+            for &assignment in columns.lane_ids_slice(lane) {
+                assert_eq!(usize::from(assignment), lane);
+            }
+        }
+
+        let mut id_hash = ids_before.iter().zip(&hashes_before).collect::<Vec<_>>();
+        id_hash.sort_by_key(|(id, _)| *id);
+        for (id, expected_hash) in id_hash {
+            let slot = columns.index_of(*id).expect("id preserved after sort");
+            let actual_hash = *columns
+                .source_hashes()
+                .get(slot as usize)
+                .expect("hash slot lives alongside id slot");
+            assert_eq!(actual_hash, *expected_hash);
+        }
+    }
+
+    #[test]
+    fn sort_by_lane_remaps_edge_endpoints() {
+        let parsed = four_component_parsed();
+        let mut columns = IrColumns::from_parsed(&parsed);
+
+        let edges_before = columns
+            .edge_from()
+            .iter()
+            .zip(columns.edge_to())
+            .map(|(from, to)| {
+                (
+                    columns.ids().get(*from as usize).copied().unwrap_or(0),
+                    columns.ids().get(*to as usize).copied().unwrap_or(0),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        columns.sort_by_lane(|id| (id as usize) % LANE_COUNT);
+
+        let edges_after = columns
+            .edge_from()
+            .iter()
+            .zip(columns.edge_to())
+            .map(|(from, to)| {
+                (
+                    columns.ids().get(*from as usize).copied().unwrap_or(0),
+                    columns.ids().get(*to as usize).copied().unwrap_or(0),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(edges_before, edges_after);
+    }
+
+    #[test]
+    fn parallel_lane_column_pass_mutates_every_lane_independently() {
+        let mut columns = IrColumns::from_parsed(&four_component_parsed());
+        columns.sort_by_lane(|id| (id as usize) % LANE_COUNT);
+
+        columns.parallel_lane_column_pass(
+            |pass| {
+                assert_eq!(pass.lane, 0);
+                for slot in pass.effects.iter_mut() {
+                    *slot |= effect_bits::HOOKS;
+                }
+            },
+            |pass| {
+                assert_eq!(pass.lane, 1);
+                for slot in pass.source_hashes.iter_mut() {
+                    *slot ^= 0xA5A5_A5A5_A5A5_A5A5;
+                }
+            },
+            |pass| {
+                assert_eq!(pass.lane, 2);
+                for slot in pass.priorities.iter_mut() {
+                    *slot += 1.0;
+                }
+            },
+            |pass| {
+                assert_eq!(pass.lane, 3);
+                for slot in pass.phases.iter_mut() {
+                    *slot += 1.0;
+                }
+            },
+        );
+
+        for lane in 0..LANE_COUNT {
+            for slot in columns.lane_range(lane).expect("lane range") {
+                match lane {
+                    0 => assert!(
+                        columns.effects().get(slot).copied().unwrap_or(0) & effect_bits::HOOKS != 0
+                    ),
+                    1 => assert_ne!(columns.source_hashes().get(slot).copied().unwrap_or(0), 0),
+                    2 => assert!(columns.priorities().get(slot).copied().unwrap_or(0.0) >= 1.0),
+                    3 => assert!(columns.phases().get(slot).copied().unwrap_or(0.0) >= 1.0),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_lane_patch_snapshots_only_selected_fields() {
+        let mut columns = IrColumns::from_parsed(&four_component_parsed());
+        columns.sort_by_lane(|id| (id as usize) % LANE_COUNT);
+
+        let slot = columns.index_of(1).expect("id 1 present");
+        let full_mask = field_mask::SOURCE_HASH | field_mask::PRIORITY | field_mask::PHASE;
+        let patch = columns
+            .build_lane_patch(slot, full_mask)
+            .expect("patch built");
+
+        assert_eq!(patch.column_idx, slot);
+        assert_eq!(patch.field_mask, full_mask);
+        assert_eq!(
+            patch.source_hash,
+            columns.source_hashes().get(slot as usize).copied().unwrap()
+        );
+        assert_eq!(patch.effects, 0, "unselected field must stay at default");
+    }
+
+    #[test]
+    fn sort_by_lane_clamps_out_of_range_lane_values() {
+        let mut columns = IrColumns::from_parsed(&four_component_parsed());
+        columns.sort_by_lane(|_| LANE_COUNT + 7);
+        let offsets = columns.lane_offsets();
+        let total = u32::try_from(columns.len()).unwrap_or(0);
+        assert_eq!(*offsets.get(LANE_COUNT).expect("terminal"), total);
+        assert_eq!(
+            *offsets
+                .get(LANE_COUNT.saturating_sub(1))
+                .expect("last start"),
+            0
+        );
     }
 }

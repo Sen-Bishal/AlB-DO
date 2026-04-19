@@ -25,7 +25,15 @@
       "Bash(rustfmt --check --edition 2021 src/ir/mod.rs src/ir/columns.rs)",
       "Bash(rustfmt --edition 2021 src/ir/mod.rs src/ir/columns.rs)",
       "Bash(ALBEDO_UPDATE_GOLDENS=1 cargo test --test phase0_golden_correctness_tests)",
-      "Bash(cargo clippy *)"
+      "Bash(cargo clippy *)",
+      "Bash(grep -E \"\\(columns\\\\.rs|dirty_bitmap\\\\.rs|highway\\\\.rs|ir\\\\\\\\\\\\\\\\mod\\\\.rs\\)\")",
+      "Bash(grep -B1 -E \"src\\\\\\\\\\\\\\\\\\(ir\\\\\\\\\\\\\\\\columns|runtime\\\\\\\\\\\\\\\\\\(highway|dirty_bitmap\\)\\)\\\\.rs\")",
+      "Bash(awk '/^\\(error|warning\\):/ {msg=$0; getline; if \\($0 ~ /src\\\\\\\\\\(ir\\\\\\\\columns|runtime\\\\\\\\\\(highway|dirty_bitmap\\)\\)\\\\.rs/\\) print msg}' /tmp/clippy_out.txt)",
+      "Bash(awk 'BEGIN{IGNORECASE=1} /^\\(error|warning\\):/ {msg=$0; getline; if \\(index\\($0, \"columns.rs\"\\) || index\\($0, \"highway.rs\"\\) || index\\($0, \"dirty_bitmap.rs\"\\)\\) print msg}' /tmp/clippy_out.txt)",
+      "Bash(python -c ' *)",
+      "Bash(rm clippy_full.log)",
+      "Bash(python filter_clippy.py)",
+      "Bash(rm clippy_full.log filter_clippy.py)"
     ]
   }
 }
