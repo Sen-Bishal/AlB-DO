@@ -3,7 +3,6 @@ use crate::manifest::schema::Tier;
 use crate::types::ComponentId;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use tracing::trace;
 
 pub const WEBTRANSPORT_STREAM_COUNT: usize = 4;
@@ -97,13 +96,13 @@ pub enum WebTransportError {
 }
 
 pub struct WTStreamRouter {
-    pub muxer: Arc<Mutex<WebTransportMuxer>>,
+    pub muxer: WebTransportMuxer,
     pub component_map: DashMap<ComponentId, WTComponentStream>,
     component_tiers: DashMap<ComponentId, Tier>,
 }
 
 impl WTStreamRouter {
-    pub fn new(muxer: Arc<Mutex<WebTransportMuxer>>) -> Self {
+    pub fn new(muxer: WebTransportMuxer) -> Self {
         Self {
             muxer,
             component_map: DashMap::new(),
@@ -112,7 +111,7 @@ impl WTStreamRouter {
     }
 
     pub fn with_component_tiers(
-        muxer: Arc<Mutex<WebTransportMuxer>>,
+        muxer: WebTransportMuxer,
         component_tiers: impl IntoIterator<Item = (ComponentId, Tier)>,
     ) -> Self {
         let router = Self::new(muxer);
@@ -202,8 +201,7 @@ impl WTStreamRouter {
         &self,
         chunks: &[LaneRenderedChunk],
     ) -> Result<Vec<WebTransportFrame>, WebTransportError> {
-        let mut muxer = self.muxer.lock().expect("webtransport muxer lock poisoned");
-        muxer.mux_lane_chunks(chunks)
+        self.muxer.mux_lane_chunks(chunks)
     }
 
     fn upsert_component_stream(
@@ -232,8 +230,32 @@ impl WTStreamRouter {
     }
 }
 
+/// Lock-free 4-stream sequence allocator.
+///
+/// Each WebTransport stream (`control`, `shell`, `patches`, `prefetch`) gets
+/// its own [`AtomicU64`] frame counter. `fetch_add(1, Relaxed)` replaces the
+/// previous `Mutex<WebTransportMuxer>` critical section — the render thread
+/// and any async producer can mint frame sequences concurrently without
+/// contention on the emit path.
+///
+/// `Relaxed` is sufficient because sequences are monotone per stream and
+/// frames are reassembled by sorting on `sequence` at the receiver
+/// ([`WebTransportMuxer::reassemble_stream`]); we do not depend on ordering
+/// with respect to any other memory operation.
 pub struct WebTransportMuxer {
-    next_sequence: [u64; WEBTRANSPORT_STREAM_COUNT],
+    next_sequence: [AtomicU64; WEBTRANSPORT_STREAM_COUNT],
+}
+
+impl std::fmt::Debug for WebTransportMuxer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let snapshot: [u64; WEBTRANSPORT_STREAM_COUNT] = std::array::from_fn(|idx| {
+            self.next_sequence[idx].load(Ordering::Acquire)
+        });
+        formatter
+            .debug_struct("WebTransportMuxer")
+            .field("next_sequence", &snapshot)
+            .finish()
+    }
 }
 
 impl Default for WebTransportMuxer {
@@ -245,12 +267,12 @@ impl Default for WebTransportMuxer {
 impl WebTransportMuxer {
     pub fn new() -> Self {
         Self {
-            next_sequence: [0_u64; WEBTRANSPORT_STREAM_COUNT],
+            next_sequence: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
     pub fn mux_lane_chunks(
-        &mut self,
+        &self,
         chunks: &[LaneRenderedChunk],
     ) -> Result<Vec<WebTransportFrame>, WebTransportError> {
         let mut frames = Vec::with_capacity(chunks.len());
@@ -265,7 +287,7 @@ impl WebTransportMuxer {
         Ok(frames)
     }
 
-    pub fn mux_route_chunks(&mut self, chunks: &[RouteStreamChunk]) -> Vec<WebTransportFrame> {
+    pub fn mux_route_chunks(&self, chunks: &[RouteStreamChunk]) -> Vec<WebTransportFrame> {
         let mut frames = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             let stream_id = self.stream_for_route_chunk(chunk.kind);
@@ -308,13 +330,12 @@ impl WebTransportMuxer {
     }
 
     fn make_frame(
-        &mut self,
+        &self,
         stream_id: usize,
         component_id: Option<ComponentId>,
         payload: String,
     ) -> WebTransportFrame {
-        let sequence = self.next_sequence[stream_id];
-        self.next_sequence[stream_id] = sequence + 1;
+        let sequence = self.next_sequence[stream_id].fetch_add(1, Ordering::Relaxed);
 
         WebTransportFrame {
             stream_id: stream_id as u8,
@@ -324,7 +345,7 @@ impl WebTransportMuxer {
         }
     }
 
-    fn stream_for_route_chunk(&mut self, kind: RouteStreamChunkKind) -> usize {
+    fn stream_for_route_chunk(&self, kind: RouteStreamChunkKind) -> usize {
         match kind {
             RouteStreamChunkKind::ShellHtml => WT_STREAM_SLOT_SHELL as usize,
             RouteStreamChunkKind::DeferredHtml | RouteStreamChunkKind::HydrationPayload => {
@@ -340,8 +361,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_mux_lane_chunks_is_lock_free_across_producers() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let muxer = Arc::new(WebTransportMuxer::new());
+        let producers = 4;
+        let per_producer = 64;
+        let mut handles = Vec::with_capacity(producers);
+
+        for producer_idx in 0..producers {
+            let muxer = Arc::clone(&muxer);
+            handles.push(thread::spawn(move || {
+                let mut sequences = Vec::with_capacity(per_producer);
+                for item in 0..per_producer {
+                    let frames = muxer
+                        .mux_lane_chunks(&[LaneRenderedChunk {
+                            lane: WT_STREAM_SLOT_PATCHES as usize,
+                            component_id: Some(ComponentId::new(producer_idx as u64)),
+                            payload: format!("p{producer_idx}-{item}"),
+                        }])
+                        .unwrap();
+                    sequences.push(frames[0].sequence);
+                }
+                sequences
+            }));
+        }
+
+        let mut all: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect();
+        all.sort_unstable();
+        let total = (producers * per_producer) as u64;
+        assert_eq!(all.len(), total as usize);
+        for (expected, actual) in (0..total).zip(all) {
+            assert_eq!(expected, actual, "atomic sequence must be contention-free");
+        }
+    }
+
+    #[test]
     fn test_mux_lane_chunks_assigns_monotonic_sequence_per_stream() {
-        let mut muxer = WebTransportMuxer::new();
+        let muxer = WebTransportMuxer::new();
         let frames = muxer
             .mux_lane_chunks(&[
                 LaneRenderedChunk {
@@ -372,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_mux_route_chunks_maps_shell_deferred_and_hydration_streams() {
-        let mut muxer = WebTransportMuxer::new();
+        let muxer = WebTransportMuxer::new();
         let frames = muxer.mux_route_chunks(&[
             RouteStreamChunk {
                 kind: RouteStreamChunkKind::ShellHtml,
@@ -443,7 +504,7 @@ mod tests {
     #[test]
     fn test_router_maps_component_tiers_to_stream_slots() {
         let router = WTStreamRouter::with_component_tiers(
-            Arc::new(Mutex::new(WebTransportMuxer::new())),
+            WebTransportMuxer::new(),
             [
                 (ComponentId::new(10), Tier::A),
                 (ComponentId::new(11), Tier::B),
@@ -462,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_router_tracks_per_component_patch_sequence() {
-        let router = WTStreamRouter::new(Arc::new(Mutex::new(WebTransportMuxer::new())));
+        let router = WTStreamRouter::new(WebTransportMuxer::new());
         router.register_component_tier(ComponentId::new(21), Tier::B);
         router.register_component_tier(ComponentId::new(22), Tier::C);
 
@@ -476,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_router_muxes_routed_chunks_with_muxer_sequences() {
-        let router = WTStreamRouter::new(Arc::new(Mutex::new(WebTransportMuxer::new())));
+        let router = WTStreamRouter::new(WebTransportMuxer::new());
         router.register_component_tier(ComponentId::new(31), Tier::B);
 
         let chunks = vec![

@@ -12,7 +12,6 @@ use crate::graph::ComponentGraph;
 use crate::manifest::schema::Tier;
 use crate::types::{CompilerError, ComponentAnalysis, ComponentId};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimePipelineError {
@@ -44,10 +43,8 @@ impl FourLaneRuntimePipeline {
         let highway = HighwayPlan::build(graph, &analyses)?;
         let scheduler = OvertakeZoneScheduler::with_hot_set(scheduler_config, hot_set_entries)?;
         let inter_lane = PiArchLayer::new(lane_queue_capacity.max(1), PiArchKernel::default());
-        let stream_router = WTStreamRouter::with_component_tiers(
-            Arc::new(Mutex::new(WebTransportMuxer::new())),
-            component_tiers,
-        );
+        let stream_router =
+            WTStreamRouter::with_component_tiers(WebTransportMuxer::new(), component_tiers);
 
         Ok(Self {
             highway,
@@ -128,7 +125,7 @@ impl FourLaneRuntimePipeline {
     }
 
     pub fn mux_lane_chunks(
-        &mut self,
+        &self,
         chunks: &[LaneRenderedChunk],
     ) -> Result<Vec<WebTransportFrame>, RuntimePipelineError> {
         Ok(self.stream_router.mux_lane_chunks(chunks)?)
@@ -164,7 +161,7 @@ mod tests {
         analyses.insert(id_b, analysis(id_b, 0.1, 2.0));
         let component_tiers = HashMap::from([(id_a, Tier::C), (id_b, Tier::B)]);
 
-        let mut pipeline = FourLaneRuntimePipeline::new(
+        let pipeline = FourLaneRuntimePipeline::new(
             &graph,
             analyses,
             component_tiers,

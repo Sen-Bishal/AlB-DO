@@ -13,7 +13,7 @@
 
 pub mod columns;
 
-pub use columns::{IrColumns, IrModuleColumn, StringId, StringInterner};
+pub use columns::{ColumnPass, IrColumns, IrModuleColumn, StringId, StringInterner};
 
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;

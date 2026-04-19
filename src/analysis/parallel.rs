@@ -1,6 +1,6 @@
 use crate::graph::ComponentGraph;
 use crate::types::*;
-use dashmap::DashMap;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
@@ -47,28 +47,10 @@ impl<'a> ParallelAnalyzer<'a> {
         components: &[Component],
         total_weight: f64,
     ) -> HashMap<ComponentId, ComponentAnalysis> {
-        let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-        let n_threads = num_cpus::get().min(components.len()).max(1);
-        let chunk_size = components.len().div_ceil(n_threads);
-        let results: DashMap<ComponentId, ComponentAnalysis> = DashMap::new();
-
-        crossbeam::scope(|s| {
-            for (i, chunk) in components.chunks(chunk_size).enumerate() {
-                let results = &results;
-                let core_id = core_ids.get(i % core_ids.len().max(1)).copied();
-                s.spawn(move |_| {
-                    if let Some(id) = core_id {
-                        core_affinity::set_for_current(id);
-                    }
-                    for comp in chunk {
-                        results.insert(comp.id, self.analyze_component(comp, total_weight));
-                    }
-                });
-            }
-        })
-        .unwrap();
-
-        results.into_iter().collect()
+        components
+            .par_iter()
+            .map(|comp| (comp.id, self.analyze_component(comp, total_weight)))
+            .collect()
     }
 
     fn serial_analyze(
@@ -110,28 +92,10 @@ impl<'a> ParallelAnalyzer<'a> {
         components: &[Component],
     ) -> HashMap<ComponentId, f64> {
         if components.len() > PARALLEL_THRESHOLD {
-            let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-            let n_threads = num_cpus::get().min(components.len()).max(1);
-            let chunk_size = components.len().div_ceil(n_threads);
-            let results: DashMap<ComponentId, f64> = DashMap::new();
-
-            crossbeam::scope(|s| {
-                for (i, chunk) in components.chunks(chunk_size).enumerate() {
-                    let results = &results;
-                    let core_id = core_ids.get(i % core_ids.len().max(1)).copied();
-                    s.spawn(move |_| {
-                        if let Some(id) = core_id {
-                            core_affinity::set_for_current(id);
-                        }
-                        for comp in chunk {
-                            results.insert(comp.id, self.component_phase(comp, total_weight));
-                        }
-                    });
-                }
-            })
-            .unwrap();
-
-            results.into_iter().collect()
+            components
+                .par_iter()
+                .map(|comp| (comp.id, self.component_phase(comp, total_weight)))
+                .collect()
         } else {
             components
                 .iter()
