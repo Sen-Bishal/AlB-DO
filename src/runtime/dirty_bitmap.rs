@@ -159,53 +159,85 @@ impl DirtyBitmap {
 /// the dirty set in a single linear scan, ~4 hashes per SIMD cycle, with
 /// 64 results emitted per cache-line write to the bitmap.
 pub fn hash_diff_into_bitmap(old: &[u64], new: &[u64], bitmap: &DirtyBitmap) -> usize {
+    hash_diff_into_bitmap_at(old, new, bitmap, 0)
+}
+
+/// Lane-scoped variant of [`hash_diff_into_bitmap`].
+///
+/// `start_idx` is the global column index of the first entry in both
+/// `old` and `new`. Mismatches at local position `i` are recorded at
+/// global bit `start_idx + i`, which lets a cycle-4 per-lane reconcile
+/// feed dirty results into the same whole-store bitmap the cycle-2 global
+/// reconcile uses — one kernel, two call sites. When `start_idx == 0`
+/// this is exactly the cycle-2 entry point.
+///
+/// The kernel handles sub-word offsets: it splits each global 64-bit word
+/// across up to two atomic OR-merges so the bitmap's bit alignment is
+/// preserved even when the lane slice straddles a word boundary.
+pub fn hash_diff_into_bitmap_at(
+    old: &[u64],
+    new: &[u64],
+    bitmap: &DirtyBitmap,
+    start_idx: usize,
+) -> usize {
     let len = old.len().min(new.len());
     if len == 0 {
         return 0;
     }
 
-    let mut total = 0;
-    let word_count = len.div_ceil(BITS_PER_WORD);
+    let mut total = 0usize;
+    let mut cur_word = start_idx / BITS_PER_WORD;
+    let mut cur_mask: u64 = 0;
 
-    for word_idx in 0..word_count {
-        let base = word_idx * BITS_PER_WORD;
-        let end = (base + BITS_PER_WORD).min(len);
-        let mut word_mask: u64 = 0;
-        let mut bit_pos: usize = 0;
-
-        // SIMD body: 4 lanes per iteration → 16 iterations cover one word.
-        let mut i = base;
-        while i + 4 <= end {
-            let old_v = u64x4::new([old[i], old[i + 1], old[i + 2], old[i + 3]]);
-            let new_v = u64x4::new([new[i], new[i + 1], new[i + 2], new[i + 3]]);
-            // `cmp_eq` returns u64::MAX where lanes are equal, 0 otherwise;
-            // we want the inverse (mismatch ⇒ dirty).
-            let eq = old_v.cmp_eq(new_v).to_array();
-            for lane in eq {
-                if lane == 0 {
-                    word_mask |= 1u64 << bit_pos;
-                    total += 1;
-                }
-                bit_pos += 1;
+    let mark = |global: usize, total: &mut usize, cur_word: &mut usize, cur_mask: &mut u64| {
+        let word_idx = global / BITS_PER_WORD;
+        let bit_pos = global % BITS_PER_WORD;
+        if word_idx != *cur_word {
+            if *cur_mask != 0 {
+                bitmap.or_word(*cur_word, *cur_mask);
             }
-            i += 4;
+            *cur_word = word_idx;
+            *cur_mask = 0;
         }
+        *cur_mask |= 1u64 << bit_pos;
+        *total = total.saturating_add(1);
+    };
 
-        // Scalar tail for the ragged end of the column.
-        while i < end {
-            if old[i] != new[i] {
-                word_mask |= 1u64 << bit_pos;
-                total += 1;
+    let mut i = 0usize;
+    while i + 4 <= len {
+        let old_v = u64x4::new([
+            old.get(i).copied().unwrap_or(0),
+            old.get(i + 1).copied().unwrap_or(0),
+            old.get(i + 2).copied().unwrap_or(0),
+            old.get(i + 3).copied().unwrap_or(0),
+        ]);
+        let new_v = u64x4::new([
+            new.get(i).copied().unwrap_or(0),
+            new.get(i + 1).copied().unwrap_or(0),
+            new.get(i + 2).copied().unwrap_or(0),
+            new.get(i + 3).copied().unwrap_or(0),
+        ]);
+        let eq = old_v.cmp_eq(new_v).to_array();
+        for (lane_offset, &lane_eq) in eq.iter().enumerate() {
+            if lane_eq == 0 {
+                let global = start_idx.saturating_add(i).saturating_add(lane_offset);
+                mark(global, &mut total, &mut cur_word, &mut cur_mask);
             }
-            i += 1;
-            bit_pos += 1;
         }
-
-        if word_mask != 0 {
-            bitmap.or_word(word_idx, word_mask);
-        }
+        i += 4;
     }
 
+    while i < len {
+        if old.get(i).copied().unwrap_or(0) != new.get(i).copied().unwrap_or(0) {
+            let global = start_idx.saturating_add(i);
+            mark(global, &mut total, &mut cur_word, &mut cur_mask);
+        }
+        i += 1;
+    }
+
+    if cur_mask != 0 {
+        bitmap.or_word(cur_word, cur_mask);
+    }
     total
 }
 
@@ -325,5 +357,40 @@ mod tests {
         let dirty = hash_diff_into_bitmap(&old, &new, &bitmap);
         assert_eq!(dirty, 1);
         assert!(bitmap.is_set(1));
+    }
+
+    #[test]
+    fn hash_diff_at_offset_marks_global_indices() {
+        // Lane slice starts at global index 70 (spans word 1 and word 2).
+        let bitmap = DirtyBitmap::with_capacity(200);
+        let old = vec![0u64; 10];
+        let mut new = vec![0u64; 10];
+        let mutations = [0usize, 3, 9];
+        for &idx in &mutations {
+            if let Some(slot) = new.get_mut(idx) {
+                *slot = 0xC0DE;
+            }
+        }
+
+        let dirty = hash_diff_into_bitmap_at(&old, &new, &bitmap, 70);
+        assert_eq!(dirty, mutations.len());
+        for &local in &mutations {
+            assert!(bitmap.is_set(70 + local), "global bit {} dirty", 70 + local);
+        }
+        assert!(!bitmap.is_set(70 + 1));
+        assert!(!bitmap.is_set(70 + 4));
+    }
+
+    #[test]
+    fn hash_diff_at_offset_preserves_sub_word_alignment() {
+        // Straddle a word boundary: local 0 lands at global bit 63, local 1 at bit 64.
+        let bitmap = DirtyBitmap::with_capacity(200);
+        let old = [0u64; 2];
+        let new = [1u64, 2u64];
+
+        let dirty = hash_diff_into_bitmap_at(&old, &new, &bitmap, 63);
+        assert_eq!(dirty, 2);
+        assert!(bitmap.is_set(63));
+        assert!(bitmap.is_set(64));
     }
 }
