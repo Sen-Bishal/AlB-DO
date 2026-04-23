@@ -5,10 +5,10 @@
 //! `Box<[AtomicU64]>` indexed by column position. Each bit is one component
 //! slot in [`IrColumns`](crate::ir::columns::IrColumns):
 //!
-//! * **Mark**: `bits[idx / 64].fetch_or(1 << (idx % 64), AcqRel)` — wait-free,
-//!   no allocation, branch-predictable on the producer side.
-//! * **Drain**: per word `swap(0, AcqRel)` then a `trailing_zeros` pop loop —
-//!   64 dirty flags per cache-line load, branch-predictable inner loop.
+//! * **Mark**: `bits[idx / 64].fetch_or(1 << (idx % 64), AcqRel)` — wait-free, no allocation,
+//!   branch-predictable on the producer side.
+//! * **Drain**: per word `swap(0, AcqRel)` then a `trailing_zeros` pop loop — 64 dirty flags per
+//!   cache-line load, branch-predictable inner loop.
 //!
 //! Compared to the linked-list ring this eliminates the per-node pointer
 //! chase (one cache miss per dirty entry) and replaces it with a sequential
@@ -160,7 +160,10 @@ impl DirtyBitmap {
         scratch.clear();
         self.drain(|idx| {
             if let Ok(as_u32) = u32::try_from(idx) {
-                scratch.push(as_u32);
+                scratch.push(as_u32); // For pinaki -> We need to figure out what the push-params
+                                      // are sending each pass. we can make the channels send a req
+                                      // and count them per microsecond interval, or if there's any
+                                      // better way find it.
             }
         })
     }
@@ -224,6 +227,7 @@ pub fn hash_diff_into_bitmap_at(
 
     let mut i = 0usize;
     while i + 4 <= len {
+        // Pinaki -> responsive? need to test it out after bakabox/sussybox impl.
         let old_v = u64x4::new([
             old.get(i).copied().unwrap_or(0),
             old.get(i + 1).copied().unwrap_or(0),

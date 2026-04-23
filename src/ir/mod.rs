@@ -254,6 +254,7 @@ pub(crate) fn build_canonical_components_and_edges_from_graph(
                 imports: Vec::new(),
             });
 
+        // Pinaki -> Better error handling
         if let Some(module) = modules_by_path.get_mut(&component.file_path) {
             let mut dependency_names = graph
                 .get_dependencies(&component.id)
