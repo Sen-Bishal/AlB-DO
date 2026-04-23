@@ -1,3 +1,4 @@
+// impl Ir in GoLAng
 //! Struct-of-Arrays column store for the canonical IR.
 //!
 //! `IrColumns` is the runtime truth for the IR graph. Hot-path consumers —
@@ -420,9 +421,13 @@ impl IrColumns {
             return None;
         }
         let start = usize::try_from(self.lane_offsets.get(lane).copied().unwrap_or(0)).ok()?;
-        let end =
-            usize::try_from(self.lane_offsets.get(lane.saturating_add(1)).copied().unwrap_or(0))
-                .ok()?;
+        let end = usize::try_from(
+            self.lane_offsets
+                .get(lane.saturating_add(1))
+                .copied()
+                .unwrap_or(0),
+        )
+        .ok()?;
         if start > end || end > self.ids.len() {
             return None;
         }
@@ -804,11 +809,10 @@ impl IrColumns {
     /// lane-only reordering.
     ///
     /// Side effects:
-    /// * `ids`, `source_hashes`, `estimated_sizes`, `line_numbers`,
-    ///   `effects`, `export_kinds`, `priorities`, `phases`, `presence`,
-    ///   `symbols`, `module_paths` are permuted in lockstep.
-    /// * `edge_from` / `edge_to` endpoints are remapped to the new column
-    ///   indices; edge order is preserved.
+    /// * `ids`, `source_hashes`, `estimated_sizes`, `line_numbers`, `effects`, `export_kinds`,
+    ///   `priorities`, `phases`, `presence`, `symbols`, `module_paths` are permuted in lockstep.
+    /// * `edge_from` / `edge_to` endpoints are remapped to the new column indices; edge order is
+    ///   preserved.
     /// * `id_to_index` is rebuilt.
     /// * `lane_ids` and `lane_offsets` are populated from the histogram.
     pub fn sort_by_lane<F>(&mut self, lane_for: F)
@@ -1020,7 +1024,12 @@ fn split_lane_slices_mut<T>(
     total: usize,
 ) -> [&mut [T]; LANE_COUNT] {
     let [r0, r1, r2, r3, r4] = offsets;
-    let clamp = |raw: u32| usize::try_from(raw).unwrap_or(0).min(total).min(slice.len());
+    let clamp = |raw: u32| {
+        usize::try_from(raw)
+            .unwrap_or(0)
+            .min(total)
+            .min(slice.len())
+    };
     let (b0, b1, b2, b3, b4) = (clamp(r0), clamp(r1), clamp(r2), clamp(r3), clamp(r4));
 
     let size0 = b1.saturating_sub(b0);
