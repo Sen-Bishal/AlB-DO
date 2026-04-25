@@ -75,6 +75,8 @@ pub use dev::benchmark;
 pub use dev::contract as dev_contract;
 pub use dev::showcase;
 
+use crate::analysis::adaptive::GranularityController;
+use crate::analysis::analyzer::ComponentAnalyzer;
 use crate::graph::ComponentGraph;
 use crate::incremental::IncrementalCache;
 use crate::parallel::ParallelAnalyzer;
@@ -138,6 +140,25 @@ impl RenderCompiler {
         self.graph.add_component(component)
     }
 
+    /// Picks between the rayon-parallel and serial analyzer based on a
+    /// [`GranularityController`] estimate. Small graphs amortize poorly
+    /// against thread spawn cost, so the serial path wins below threshold.
+    /// `controller` is borrowed (not constructed here) because
+    /// [`GranularityController::new`] does I/O via `System::new_all`.
+    fn run_analysis_with(
+        &self,
+        controller: &GranularityController,
+    ) -> Result<HashMap<ComponentId, ComponentAnalysis>> {
+        if controller.should_parallelize(
+            self.graph.len(),
+            std::mem::size_of::<ComponentAnalysis>(),
+        ) {
+            ParallelAnalyzer::new(&self.graph).analyze()
+        } else {
+            ComponentAnalyzer::new(&self.graph).analyze()
+        }
+    }
+
     /// Records a render dependency edge `from` → `to` in the graph.
     ///
     /// Returns an error if adding the edge would introduce a cycle.
@@ -160,8 +181,9 @@ impl RenderCompiler {
 
         self.graph.validate()?;
 
-        let analyzer = ParallelAnalyzer::new(&self.graph);
-        let analyses = analyzer.analyze()?;
+        // One controller per `optimize()` — `new()` does sysinfo I/O.
+        let controller = GranularityController::new();
+        let analyses = self.run_analysis_with(&controller)?;
 
         let sorter = ParallelTopologicalSorter::new(&self.graph);
         let levels = sorter.sort_with_priority(&analyses)?;
@@ -209,8 +231,8 @@ impl RenderCompiler {
     /// [`ir::IrColumns::to_canonical`].
     pub fn optimize_canonical_ir_columns(&self) -> Result<ir::IrColumns> {
         self.graph.validate()?;
-        let analyzer = ParallelAnalyzer::new(&self.graph);
-        let analyses = analyzer.analyze()?;
+        let controller = GranularityController::new();
+        let analyses = self.run_analysis_with(&controller)?;
         Ok(ir::IrColumns::from_graph(&self.graph, &analyses))
     }
 
@@ -378,6 +400,9 @@ impl RenderCompiler {
 
         self.graph.validate()?;
 
+        // Constructed once per call — its `new()` does sysinfo I/O.
+        let controller = GranularityController::new();
+
         let (analyses, cache_stats) = if let Some(cache) = &self.cache {
             let changes = cache.detect_changes(file_paths);
 
@@ -432,8 +457,7 @@ impl RenderCompiler {
                 let reanalyze_count = invalidated.len() + changes.new_files.len();
                 println!(" Reanalyzing {} components...", reanalyze_count);
 
-                let analyzer = ParallelAnalyzer::new(&self.graph);
-                let new_analyses = analyzer.analyze()?;
+                let new_analyses = self.run_analysis_with(&controller)?;
 
                 for id in invalidated.iter() {
                     if let Some(analysis) = new_analyses.get(id) {
@@ -486,8 +510,7 @@ impl RenderCompiler {
             stats.invalidated = invalidated_count;
             (analyses, Some(stats))
         } else {
-            let analyzer = ParallelAnalyzer::new(&self.graph);
-            (analyzer.analyze()?, None)
+            (self.run_analysis_with(&controller)?, None)
         };
 
         let sorter = ParallelTopologicalSorter::new(&self.graph);

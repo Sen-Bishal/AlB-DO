@@ -55,6 +55,26 @@ impl RendererRuntime {
             )
             .map_err(|err| RuntimeError::RendererFailure(err.to_string()))?;
 
+        // Pre-warm static slice + normalized props caches by pre-rendering every
+        // manifest route. Soft-fails: a priming error degrades to a cold cache,
+        // which is the same behavior as before this call existed.
+        let warm_requests: Vec<RouteRenderRequest> = manifest
+            .routes
+            .keys()
+            .map(|entry| RouteRenderRequest {
+                entry: entry.clone(),
+                props_json: "{}".to_string(),
+                module_order: Vec::new(),
+                hydration_payload: None,
+            })
+            .collect();
+
+        if !warm_requests.is_empty() {
+            if let Err(err) = renderer.prime_runtime_cache(&warm_requests) {
+                tracing::warn!(target: "albedo.renderer", error = %err, "cache priming failed");
+            }
+        }
+
         Ok(Self { manifest, renderer })
     }
 

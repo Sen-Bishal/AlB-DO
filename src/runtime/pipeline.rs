@@ -1,3 +1,4 @@
+use super::affinity::build_pinned_rayon_pool;
 use super::dirty_bitmap::{hash_diff_into_bitmap, hash_diff_into_bitmap_at, DirtyBitmap};
 use super::frame::{frame_tick, FrameArena, FrameMetrics, FrameReport};
 use super::highway::{phase_to_lane, HighwayPlan, LANE_COUNT};
@@ -10,12 +11,14 @@ use super::webtransport::{
     LaneRenderedChunk, WTRenderMode, WTStreamRouter, WebTransportError, WebTransportFrame,
     WebTransportMuxer,
 };
+use crate::analysis::adaptive::GranularityController;
 use crate::graph::ComponentGraph;
-use crate::ir::columns::IrColumns;
+use crate::ir::columns::{IrColumns, LaneColumnPass};
 use crate::manifest::schema::Tier;
 use crate::types::{CompilerError, ComponentAnalysis, ComponentId};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimePipelineError {
@@ -39,6 +42,12 @@ pub struct FourLaneRuntimePipeline {
     // Snapshot of the previous tick's source hashes; diffed against the live
     // column on each reconcile to drive the SIMD bulk dirty-mark kernel.
     prev_source_hashes: Vec<u64>,
+    // Constructed once at pipeline build time — `new()` does sysinfo I/O.
+    granularity: GranularityController,
+    // Optional core-pinned rayon pool; when present, `tick_frame` runs
+    // inside `pool.install` so every lane worker stays on a fixed core.
+    // `None` falls back to the global rayon pool with no behavior change.
+    pinned_pool: Option<rayon::ThreadPool>,
     frame_metrics: FrameMetrics,
 }
 
@@ -70,6 +79,11 @@ impl FourLaneRuntimePipeline {
         let prev_source_hashes = columns.source_hashes().to_vec();
         let frame_metrics = FrameMetrics::default();
 
+        // One pool per pipeline. `LANE_COUNT` workers, one per lane; the
+        // helper returns `None` if the platform refuses pinning, in which
+        // case `tick_frame` falls back to rayon's global pool.
+        let pinned_pool = build_pinned_rayon_pool(LANE_COUNT);
+
         Ok(Self {
             highway,
             analyses,
@@ -80,12 +94,42 @@ impl FourLaneRuntimePipeline {
             columns,
             dirty_bitmap,
             prev_source_hashes,
+            granularity: GranularityController::new(),
+            pinned_pool,
             frame_metrics,
         })
     }
 
     pub fn submit_analyzer_result(&self, component_id: ComponentId) -> bool {
         self.scheduler.submit_analyzer_result(component_id)
+    }
+
+    /// Replaces the scheduler's hot-set registry with `entries` and rebuilds
+    /// the sentinel ring. Use after pipeline construction to flush in a
+    /// freshly-derived hot set (e.g. from `component_tiers`).
+    pub fn reconfigure_hot_set(
+        &mut self,
+        entries: &[(ComponentId, RenderPriority)],
+    ) -> Result<(), RuntimePipelineError> {
+        Ok(self.scheduler.configure_hot_set(entries)?)
+    }
+
+    /// Adds a single component to the hot set without disturbing the rest of
+    /// the registry. Sentinel ring is rebuilt to keep the dirty-mark path
+    /// O(1).
+    pub fn register_hot_component(
+        &mut self,
+        component_id: ComponentId,
+        priority: RenderPriority,
+    ) -> Result<(), RuntimePipelineError> {
+        Ok(self
+            .scheduler
+            .register_hot_component(component_id, priority)?)
+    }
+
+    /// Removes a component from the hot set. No-op if it wasn't registered.
+    pub fn deregister_hot_component(&mut self, component_id: ComponentId) {
+        self.scheduler.deregister_hot_component(component_id);
     }
 
     pub fn mark_hot_dirty(&self, component_id: ComponentId) -> bool {
@@ -128,6 +172,53 @@ impl FourLaneRuntimePipeline {
         }
 
         routed
+    }
+
+    /// Targeted variant of [`Self::dispatch_cross_lane_dependency_signals`].
+    ///
+    /// Uses the `O(log N + k)` binary-search lookup on
+    /// `cross_lane_dependencies` (sorted by `dependent`) instead of scanning
+    /// the full edge list. Suitable for the per-component update path where
+    /// only one dependent is known to have changed.
+    pub fn dispatch_cross_lane_signals_for(&self, dependent: ComponentId) -> usize {
+        let mut routed = 0usize;
+        for edge in self.highway.cross_lane_deps_for_dependent(dependent) {
+            let Some(source_analysis) = self.analyses.get(&edge.dependency) else {
+                continue;
+            };
+            let Some(target_analysis) = self.analyses.get(&edge.dependent) else {
+                continue;
+            };
+
+            let message = LaneMessage {
+                from_lane: edge.from_lane,
+                component_id: edge.dependency,
+                phase_result: PhaseResult {
+                    phase: source_analysis.phase,
+                    priority: source_analysis.priority,
+                },
+            };
+            let target = LaneTarget {
+                lane: edge.to_lane,
+                phase: target_analysis.phase,
+                priority: target_analysis.priority,
+            };
+
+            if let DispatchOutcome::Routed { .. } = self.inter_lane.dispatch(message, &[target]) {
+                routed += 1;
+            }
+        }
+        routed
+    }
+
+    /// Diagnostic-only — returns the flattened component order owned by
+    /// `lane`. Not for the hot path; intended for introspection and tests.
+    pub fn lane_component_ids(&self, lane: usize) -> Vec<ComponentId> {
+        self.highway
+            .lanes
+            .get(lane)
+            .map(|plan| plan.flattened_components())
+            .unwrap_or_default()
     }
 
     pub fn drain_inter_lane_messages(&self, lane: usize) -> Vec<LaneMessage> {
@@ -225,6 +316,34 @@ impl FourLaneRuntimePipeline {
         mismatches
     }
 
+    /// Recomputes per-slot `source_hashes` for every lane by folding the
+    /// hot scheduling columns (`effects`, `priorities`, `phases`) into a
+    /// stable FxHash digest. Picks the rayon fan-out path when the
+    /// granularity controller expects parallelism to amortize, otherwise
+    /// drives each lane serially via `lane_column_pass_mut`.
+    ///
+    /// Pair with [`Self::reconcile_source_hashes`] to surface mutations:
+    /// this pass writes the new digests, the reconcile diffs them.
+    pub fn run_column_analysis_pass(&mut self) {
+        if self
+            .granularity
+            .should_parallelize(self.columns.len(), std::mem::size_of::<u64>())
+        {
+            self.columns.parallel_lane_column_pass(
+                |pass| recompute_lane_source_hashes(pass),
+                |pass| recompute_lane_source_hashes(pass),
+                |pass| recompute_lane_source_hashes(pass),
+                |pass| recompute_lane_source_hashes(pass),
+            );
+        } else {
+            for lane in 0..LANE_COUNT {
+                if let Some(pass) = self.columns.lane_column_pass_mut(lane) {
+                    recompute_lane_source_hashes(pass);
+                }
+            }
+        }
+    }
+
     /// Cycle-5 RAF entry point.
     ///
     /// Drives a single reconciliation tick: drain the owned bitmap, partition
@@ -237,12 +356,26 @@ impl FourLaneRuntimePipeline {
     /// returned [`FrameReport`] is also folded into [`FrameMetrics`] for
     /// downstream percentile observability.
     pub fn tick_frame(&mut self) -> FrameReport {
-        let report = frame_tick(
-            &self.columns,
-            &self.dirty_bitmap,
-            &self.stream_router.muxer,
-            &mut self.frame_arena,
-        );
+        // Run on the core-pinned pool when one is available so each lane
+        // worker stays warm on a single core; otherwise fall through to
+        // rayon's global pool.
+        let report = if let Some(pool) = self.pinned_pool.as_ref() {
+            pool.install(|| {
+                frame_tick(
+                    &self.columns,
+                    &self.dirty_bitmap,
+                    &self.stream_router.muxer,
+                    &mut self.frame_arena,
+                )
+            })
+        } else {
+            frame_tick(
+                &self.columns,
+                &self.dirty_bitmap,
+                &self.stream_router.muxer,
+                &mut self.frame_arena,
+            )
+        };
         self.frame_metrics.record(&report);
         report
     }
@@ -269,6 +402,37 @@ impl FourLaneRuntimePipeline {
     /// from [`Self::tick_frame`] so the emit cadence is the caller's choice.
     pub fn emit_frame_metrics_summary(&self) {
         self.frame_metrics.emit_summary();
+    }
+}
+
+/// Per-lane source-hash recompute. Folds `effects`, `priorities`, and
+/// `phases` (bit-cast to u32) into FxHash so any mutation in those columns
+/// flips the slot's `source_hash` and the next reconcile pass picks it up.
+fn recompute_lane_source_hashes(pass: LaneColumnPass<'_>) {
+    let LaneColumnPass {
+        effects,
+        source_hashes,
+        priorities,
+        phases,
+        ..
+    } = pass;
+    let len = source_hashes.len();
+    for i in 0..len {
+        let mut hasher = FxHasher::default();
+        effects.get(i).copied().unwrap_or(0).hash(&mut hasher);
+        priorities
+            .get(i)
+            .copied()
+            .unwrap_or(0.0)
+            .to_bits()
+            .hash(&mut hasher);
+        phases
+            .get(i)
+            .copied()
+            .unwrap_or(0.0)
+            .to_bits()
+            .hash(&mut hasher);
+        source_hashes[i] = hasher.finish();
     }
 }
 
