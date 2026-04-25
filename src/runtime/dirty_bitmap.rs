@@ -34,8 +34,7 @@ pub struct DirtyBitmap {
 
 impl DirtyBitmap {
     /// Allocates a bitmap that tracks `capacity` slots.
-    ///
-    /// At least one word is always allocated so `mark`/`drain` need no
+    //  / At least one word is always allocated so `mark`/`drain` need no
     /// special-case for empty stores.
     pub fn with_capacity(capacity: usize) -> Self {
         let words = capacity.div_ceil(BITS_PER_WORD).max(1);
