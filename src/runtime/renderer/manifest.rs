@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::time::Instant;
+
+use lru::LruCache;
 
 use crate::hydration;
 use crate::manifest::schema::{PrecompiledRuntimeModulesArtifact, RenderManifestV2};
@@ -19,7 +22,9 @@ pub struct ServerRenderer<E: RuntimeEngine> {
     engine: E,
     module_registry: ModuleRegistry,
     loaded_module_hashes: HashMap<String, u64>,
-    normalized_props_cache: HashMap<String, String>,
+    // True LRU eviction. The previous HashMap-based path popped an
+    // arbitrary key once full, which silently invalidated hot entries.
+    normalized_props_cache: LruCache<String, String>,
     static_slice_modules: HashMap<String, u64>,
     static_slice_html_cache: HashMap<StaticSliceCacheKey, String>,
     route_invalidation_versions: HashMap<String, u64>,
@@ -35,7 +40,9 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
             engine,
             module_registry: ModuleRegistry::default(),
             loaded_module_hashes: HashMap::new(),
-            normalized_props_cache: HashMap::new(),
+            normalized_props_cache: LruCache::new(
+                NonZeroUsize::new(PROPS_CACHE_MAX_ENTRIES).unwrap_or(NonZeroUsize::MIN),
+            ),
             static_slice_modules: HashMap::new(),
             static_slice_html_cache: HashMap::new(),
             route_invalidation_versions: HashMap::new(),
@@ -468,6 +475,7 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
     }
 
     fn normalize_props_json(&mut self, entry: &str, props_json: &str) -> RuntimeResult<String> {
+        // `LruCache::get` promotes the entry to most-recently-used.
         if let Some(normalized) = self.normalized_props_cache.get(props_json) {
             return Ok(normalized.clone());
         }
@@ -483,14 +491,10 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
             ))
         })?;
 
-        if self.normalized_props_cache.len() >= PROPS_CACHE_MAX_ENTRIES {
-            if let Some(evicted_key) = self.normalized_props_cache.keys().next().cloned() {
-                self.normalized_props_cache.remove(&evicted_key);
-            }
-        }
-
+        // `put` auto-evicts the least-recently-used entry when capacity is
+        // reached — no manual eviction loop needed.
         self.normalized_props_cache
-            .insert(props_json.to_string(), normalized_props.clone());
+            .put(props_json.to_string(), normalized_props.clone());
         Ok(normalized_props)
     }
 
