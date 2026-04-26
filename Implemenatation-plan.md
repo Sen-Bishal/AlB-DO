@@ -9,3 +9,15 @@ Server-driven UI instruction set and wire encoding for AlBDO. All DOM mutations 
 2. **`value_ref` / `text_ref` semantics** — `SET_ATTR` and `SET_TEXT` carry **inline `Vec<u8>`** payloads. No value interning in v1. This keeps the encoder single-pass and the decoder stateless for attribute/text values.
 
 3. **`instruction_range` in `PATCH`** — **`Range<u32>`** byte offsets into the current frame's instruction buffer. Cross-frame references are out of scope for v1.
+
+### Proposed Changes
+
+IR Module — Opcode Definitions
+
+opcode.rs
+Core instruction enum and supporting ID types. All IDs are u16-interned values that reference tables shipped via InitInternTable on the control stream at session init.
+
+IR Module — Wire Encoding
+
+wire.rs
+Bincode 2 encode/decode entry points. Keeps the serialization layer behind a clean function boundary so swapping to FlatBuffers later requires changes only in this file.
