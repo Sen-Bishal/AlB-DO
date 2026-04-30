@@ -28,6 +28,7 @@ uuid.workspace                 = true
 quinn.workspace                = true
 rustls-pemfile.workspace       = true
 rustls-pki-types.workspace     = true
+xxhash-rust.workspace          = true
 
 [dev-dependencies]
 tower.workspace = true

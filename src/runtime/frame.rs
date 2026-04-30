@@ -30,6 +30,7 @@
 //! Cycle 6 can fold in `effects`/`priority` without a wire-format break.
 
 use super::dirty_bitmap::DirtyBitmap;
+use super::render_observer::{publish_lane_frame, LaneFrameReport};
 use super::webtransport::{WebTransportMuxer, WEBTRANSPORT_STREAM_COUNT, WT_STREAM_SLOT_PATCHES};
 use crate::ir::columns::{field_mask, IrColumns, LANE_COUNT};
 use std::collections::VecDeque;
@@ -349,7 +350,35 @@ pub fn frame_tick(
         "frame_tick complete"
     );
 
+    // Forward to the LaneObserver, if one is installed. The publish path is a
+    // single OnceLock::get() check when no observer is registered.
+    publish_lane_frame(LaneFrameReport {
+        lane_bytes: lane_report_u64s(&report.lane_bytes),
+        lane_patches: lane_report_u32s(&report.lane_patches),
+        dirty_count: u64::try_from(report.dirty_count).unwrap_or(u64::MAX),
+        total_ns: u64::try_from(report.total_ns).unwrap_or(u64::MAX),
+    });
+
     report
+}
+
+/// Widen `[usize; LANE_COUNT]` to `[u64; 4]` for the observer surface. The
+/// LaneObserver wire shape is fixed at 4 lanes so the inspector never has to
+/// handle a size-mismatched array.
+fn lane_report_u64s(input: &[usize; LANE_COUNT]) -> [u64; 4] {
+    let mut out = [0_u64; 4];
+    for (slot, value) in out.iter_mut().zip(input.iter()) {
+        *slot = u64::try_from(*value).unwrap_or(u64::MAX);
+    }
+    out
+}
+
+fn lane_report_u32s(input: &[usize; LANE_COUNT]) -> [u32; 4] {
+    let mut out = [0_u32; 4];
+    for (slot, value) in out.iter_mut().zip(input.iter()) {
+        *slot = u32::try_from(*value).unwrap_or(u32::MAX);
+    }
+    out
 }
 
 /// All four lane buffers carry [`WT_STREAM_SLOT_PATCHES`] as their transport

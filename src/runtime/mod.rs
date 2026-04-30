@@ -8,6 +8,7 @@ pub mod hot_set;
 pub mod pi_arch;
 pub mod pipeline;
 pub mod quickjs_engine;
+pub mod render_observer;
 pub mod renderer;
 pub mod scheduler;
 pub mod static_slice;

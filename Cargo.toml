@@ -23,7 +23,7 @@ dom-render-compiler = { path = "." }
 
 # Async runtime
 tokio         = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync", "io-util"] }
-tokio-stream  = { version = "0.1" }
+tokio-stream  = { version = "0.1", features = ["sync"] }
 async-trait   = { version = "0.1" }
 async-stream  = { version = "0.3" }
 futures-util  = { version = "0.3" }

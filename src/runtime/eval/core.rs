@@ -246,6 +246,13 @@ impl ComponentProject {
         function_name: &str,
         props: &Value,
     ) -> Result<String> {
+        // Observer frame: opens a cascade-tracking scope for this component's
+        // render. The guard publishes a `RenderInfo` on drop iff a process-wide
+        // `RenderObserver` is installed — when none is, the whole scope
+        // collapses to a single `OnceLock::get()` check.
+        let _frame =
+            crate::runtime::render_observer::enter_frame_guard(function_name, module_spec);
+
         let module = self
             .modules
             .get(module_spec)
