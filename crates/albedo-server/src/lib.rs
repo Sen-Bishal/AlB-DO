@@ -47,6 +47,7 @@ pub mod config;
 pub mod contract;
 pub mod error;
 pub mod handlers;
+pub mod inspector;
 pub mod lifecycle;
 pub mod render;
 pub mod renderer_runtime;
@@ -61,6 +62,10 @@ pub use contract::{
 };
 pub use error::RuntimeError;
 pub use handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
+pub use inspector::{
+    EventTier as InspectorEventTier, GraphSnapshot as InspectorGraphSnapshot, InspectorState,
+    MetricsSnapshot as InspectorMetricsSnapshot, RenderEvent as InspectorRenderEvent,
+};
 pub use lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 pub use render::{
     InjectionChunk, RenderError as TierBRenderError, TierBDataFetcher, TierBRenderRegistry,
