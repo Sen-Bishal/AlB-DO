@@ -29,6 +29,9 @@ mod printer;
 #[path = "albedo/first_run.rs"]
 mod first_run;
 
+#[path = "albedo/inspector.rs"]
+mod inspector;
+
 const PORT_AUTO_INCREMENT_LIMIT: u16 = 10;
 
 const ACCENT: u8 = 81;
@@ -748,19 +751,40 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         None
     };
 
-    let (tier_report, project, project_css, initial) = with_spinner("compiling components…", || {
-        let tier_report = compile_tier_report(&contract, scanned_components.as_deref())?;
-        let project = ComponentProject::load_from_dir(&contract.root)
-            .map_err(|err| format!("failed to load components: {err}"))?;
-        let project_css = collect_css_bundle(&contract.root);
-        let initial = render_all_routes(&project, &contract, &project_css).map_err(|err| {
-            format!(
-                "failed to render initial dev document (entry='{}'): {err}",
-                contract.entry
-            )
+    let (manifest, tier_report, project, project_css, initial) =
+        with_spinner("compiling components…", || {
+            let (manifest, tier_report) =
+                compile_manifest_and_tier_report(&contract, scanned_components.as_deref())?;
+            let project = ComponentProject::load_from_dir(&contract.root)
+                .map_err(|err| format!("failed to load components: {err}"))?;
+            let project_css = collect_css_bundle(&contract.root);
+            let initial = render_all_routes(&project, &contract, &project_css).map_err(|err| {
+                format!(
+                    "failed to render initial dev document (entry='{}'): {err}",
+                    contract.entry
+                )
+            })?;
+            Ok::<_, String>((manifest, tier_report, project, project_css, initial))
         })?;
-        Ok::<_, String>((tier_report, project, project_css, initial))
-    })?;
+
+    // Build the dev inspector state from the manifest, then install both
+    // observer hooks so every `render_local` and every runtime `frame_tick`
+    // emits live data to `/__albedo`. Failure to install (only happens if
+    // someone else won the OnceLock race in this process) is non-fatal.
+    let inspector_state = Arc::new(inspector::InspectorState::default());
+    inspector_state.set_graph(inspector::GraphSnapshot::from_manifest(&manifest));
+    inspector_state.set_tier_map(inspector::tier_map_from_manifest(&manifest));
+    let publisher = Arc::new(inspector::InspectorPublisher::new(Arc::clone(&inspector_state)));
+    if let Err(_existing) = dom_render_compiler::runtime::render_observer::install_render_observer(
+        publisher.clone(),
+    ) {
+        // Another observer beat us to it; not an error in dev — keep going.
+    }
+    if let Err(_existing) =
+        dom_render_compiler::runtime::render_observer::install_lane_observer(publisher.clone())
+    {
+        // Same as above — second installer is a no-op.
+    }
 
     let root_label = contract.root.display().to_string();
     printer::print_tier_report(&tier_report, root_label.as_str());
@@ -832,6 +856,11 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
             style("  · hmr off", "2").to_string()
         }
     );
+    println!(
+        "    {} inspector · {}",
+        style_256("·", MUTED, false),
+        style_256(&format!("http://{}/__albedo", addr), ACCENT_SOFT, true)
+    );
     if contract.verbose {
         if let Some(components) = scanned_components.as_ref() {
             print_kv("components", components.len());
@@ -873,9 +902,12 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
             Ok(stream) => {
                 let state = Arc::clone(&shared_state);
                 let clients = Arc::clone(&sse_clients);
+                let inspector = Arc::clone(&inspector_state);
                 let hmr_enabled = contract.hmr.enabled;
                 std::thread::spawn(move || {
-                    if let Err(err) = handle_dev_connection(stream, state, clients, hmr_enabled) {
+                    if let Err(err) =
+                        handle_dev_connection(stream, state, clients, inspector, hmr_enabled)
+                    {
                         if !is_benign_network_error(&err) {
                             eprintln!("  {} request failed: {err}", style("✗", "1;31"));
                         }
@@ -991,10 +1023,19 @@ fn print_scan_failure_details(failures: &[ScanFailure], verbose: bool) {
     }
 }
 
-fn compile_tier_report(
+/// Computes the v2 manifest *and* tier report in one pass. Used by the dev
+/// runtime to seed the inspector graph and tier map without redoing the
+/// component scan.
+fn compile_manifest_and_tier_report(
     contract: &ResolvedDevContract,
     scanned_components: Option<&[ParsedComponent]>,
-) -> Result<dom_render_compiler::types::TierReport, String> {
+) -> Result<
+    (
+        dom_render_compiler::manifest::schema::RenderManifestV2,
+        dom_render_compiler::types::TierReport,
+    ),
+    String,
+> {
     let components = if let Some(components) = scanned_components {
         components.to_vec()
     } else {
@@ -1003,10 +1044,9 @@ fn compile_tier_report(
 
     let scanner = ProjectScanner::new();
     let compiler = scanner.build_compiler(components);
-    let (_, tier_report) = compiler
+    compiler
         .optimize_manifest_v2_with_tier_report()
-        .map_err(|err| format!("failed to compute tier report: {err}"))?;
-    Ok(tier_report)
+        .map_err(|err| format!("failed to compute tier report: {err}"))
 }
 
 fn watch_and_rebuild_loop(
@@ -1380,6 +1420,7 @@ fn handle_dev_connection(
     mut stream: TcpStream,
     shared_state: Arc<Mutex<SharedDevState>>,
     sse_clients: Arc<Mutex<Vec<TcpStream>>>,
+    inspector_state: Arc<inspector::InspectorState>,
     hmr_enabled: bool,
 ) -> std::io::Result<()> {
     let socket_start = Instant::now();
@@ -1397,6 +1438,15 @@ fn handle_dev_connection(
     let transport = determine_dev_transport(path.as_str(), &request_headers, hmr_enabled);
     let transport_label = format_dev_transport_label(transport);
     let transport_header_value = transport.active.to_string();
+
+    // Inspector dispatch — sits ahead of the route ladder so /__albedo never
+    // falls through to the route renderer. Only GET reaches here; the
+    // method-not-allowed case below still applies for other verbs.
+    if method == "GET" && inspector::matches_path(path.as_str()) {
+        return match inspector::dispatch(&inspector_state, path.as_str(), &mut stream)? {
+            inspector::Dispatch::Handled | inspector::Dispatch::StreamOwned => Ok(()),
+        };
+    }
 
     let (status, build_render_ms, build_total_ms, route_like) = if method != "GET" {
         let headers = [("x-albedo-transport", transport_header_value.clone())];

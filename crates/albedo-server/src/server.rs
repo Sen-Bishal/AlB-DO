@@ -5,6 +5,9 @@ use crate::contract::{
 };
 use crate::error::RuntimeError;
 use crate::handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
+use crate::inspector::{
+    self as inspector_routes, GraphSnapshot as InspectorGraphSnapshot, InspectorState,
+};
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 use crate::render::tier_b::SharedRenderServices;
 use crate::renderer_runtime::RendererRuntime;
@@ -40,6 +43,7 @@ struct RuntimeState {
     auth_provider: SharedAuthProvider,
     request_timeout: Duration,
     streaming_runtime: Option<Arc<StreamingAppState>>,
+    inspector: Option<Arc<InspectorState>>,
 }
 
 pub struct AlbedoServerBuilder {
@@ -50,6 +54,9 @@ pub struct AlbedoServerBuilder {
     middleware: HashMap<String, SharedMiddleware>,
     auth_provider: SharedAuthProvider,
     renderer: Option<RendererRuntime>,
+    /// `Some(true)` / `Some(false)` overrides the default. `None` defaults to
+    /// `cfg!(debug_assertions)` — on in debug builds, off in release.
+    inspector_enabled: Option<bool>,
 }
 
 impl AlbedoServerBuilder {
@@ -62,7 +69,17 @@ impl AlbedoServerBuilder {
             middleware: HashMap::new(),
             auth_provider: Arc::new(AllowAllAuthProvider),
             renderer: None,
+            inspector_enabled: None,
         }
+    }
+
+    /// Forces the dev inspector on or off. By default the inspector is mounted
+    /// when the binary is built with debug assertions and skipped otherwise —
+    /// call this to override that policy (for example, to expose the inspector
+    /// in a release-mode preview build).
+    pub fn with_inspector(mut self, enabled: bool) -> Self {
+        self.inspector_enabled = Some(enabled);
+        self
     }
 
     pub fn register_handler(
@@ -204,6 +221,21 @@ impl AlbedoServerBuilder {
             }
         }
 
+        let inspector_enabled = self
+            .inspector_enabled
+            .unwrap_or(cfg!(debug_assertions));
+        let inspector = if inspector_enabled {
+            let inspector_state = Arc::new(InspectorState::new());
+            if let Some(streaming) = streaming_runtime.as_ref() {
+                inspector_state.set_graph(InspectorGraphSnapshot::from_manifest(
+                    streaming.manifest.as_ref(),
+                ));
+            }
+            Some(inspector_state)
+        } else {
+            None
+        };
+
         let state = RuntimeState {
             router: Arc::new(router),
             handlers: Arc::new(self.handlers),
@@ -212,6 +244,7 @@ impl AlbedoServerBuilder {
             auth_provider: self.auth_provider,
             request_timeout: Duration::from_millis(self.config.server.request_timeout_ms),
             streaming_runtime,
+            inspector,
         };
 
         Ok(AlbedoServer {
@@ -234,6 +267,14 @@ impl AlbedoServer {
             .with_state(self.state.clone())
     }
 
+    /// Handle on the dev inspector's shared state, when one is mounted.
+    /// Subsystems that want to publish render events into the inspector hold
+    /// onto this `Arc` and call `publish_event` directly — there is no
+    /// additional indirection from this method.
+    pub fn inspector(&self) -> Option<Arc<InspectorState>> {
+        self.state.inspector.clone()
+    }
+
     pub async fn run(self) -> Result<(), RuntimeError> {
         let addr = self.config.server.socket_addr()?;
         let listener = TcpListener::bind(addr)
@@ -244,6 +285,11 @@ impl AlbedoServer {
 
         let shutdown_timeout = Duration::from_millis(self.config.server.shutdown_timeout_ms);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        if let Some(inspector_state) = self.state.inspector.clone() {
+            info!("ALBEDO dev inspector mounted at /__albedo");
+            crate::inspector::heartbeat::spawn(inspector_state, shutdown_rx.clone());
+        }
 
         let webtransport_task = if self.config.server.webtransport.enabled {
             let shared_sessions = self
@@ -310,6 +356,12 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
             return streaming_handler(State(streaming_runtime.clone()), request)
                 .await
                 .into_response();
+        }
+    }
+
+    if inspector_routes::matches_inspector_path(path.as_str()) {
+        if let Some(inspector) = &state.inspector {
+            return inspector_routes::dispatch(inspector, path.as_str()).into_response();
         }
     }
 
