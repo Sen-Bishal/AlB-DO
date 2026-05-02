@@ -12,11 +12,18 @@
 //! Dated - 18th April 2026 - BshL
 
 pub mod columns;
+pub mod opcode;
+pub mod wire;
 
 pub use columns::{
     field_mask, ColumnPass, IrColumns, IrModuleColumn, LaneColumnPass, LaneColumnPatch, StringId,
     StringInterner, LANE_COUNT as IR_LANE_COUNT,
 };
+pub use opcode::{
+    AttrId, EventId, Instruction, InstructionRange, InternEntry, InternTable, InternTableKind,
+    OpcodeFrame, ProxyId, SlotId, StableId, SuspenseId, TagId,
+};
+pub use wire::{decode_frame, decode_intern_table, encode_frame, encode_intern_table, WireError};
 
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;
