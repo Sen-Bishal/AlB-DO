@@ -84,8 +84,8 @@ impl IncrementalCache {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
-        match bincode::deserialize::<PersistentCache>(&buffer) {
-            Ok(cache) => {
+        match bincode::serde::decode_from_slice::<PersistentCache, _>(&buffer, bincode::config::standard()) {
+            Ok((cache, _bytes_read)) => {
                 for (path, hash) in cache.file_hashes {
                     self.file_hashes.insert(path, hash);
                 }
@@ -199,7 +199,7 @@ impl IncrementalCache {
                 .collect(),
         };
 
-        let encoded = bincode::serialize(&persistent).map_err(io::Error::other)?;
+        let encoded = bincode::serde::encode_to_vec(&persistent, bincode::config::standard()).map_err(io::Error::other)?;
         let temp_path = self.cache_file_path.with_extension("tmp");
         let mut file = fs::File::create(&temp_path)?;
         file.write_all(&encoded)?;
