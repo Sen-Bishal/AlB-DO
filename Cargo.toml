@@ -40,7 +40,7 @@ uuid             = { version = "1", features = ["v4"] }
 # SWC 0.37.x still relies on serde::__private, which changed in newer serde releases.
 serde            = { version = "=1.0.217", features = ["derive"] }
 serde_json       = { version = "1" }
-bincode          = { version = "1.3" }
+bincode          = { version = "2", features = ["serde"] }
 
 # Parsing (SWC)
 swc_common                     = { version = "0.37" }
@@ -179,6 +179,10 @@ criterion.workspace = true
 
 [[bench]]
 name    = "frame_tick"
+harness = false
+
+[[bench]]
+name    = "opcode_wire"
 harness = false
 
 [profile.release]
