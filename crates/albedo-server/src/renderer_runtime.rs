@@ -55,6 +55,31 @@ impl RendererRuntime {
             )
             .map_err(|err| RuntimeError::RendererFailure(err.to_string()))?;
 
+        // Pinaki — re-adding the startup priming pass. It's soft-fail by
+        // design: if a route can't be pre-rendered we degrade to cold cache,
+        // which is what we already had without this block. The win is that
+        // the *successful* routes hit warm `static_slice_html_cache` and
+        // `normalized_props_cache` on the very first request after deploy,
+        // instead of paying engine warmup + encoder warmup on the first hit
+        // for every entry. No new failure mode, free latency floor.
+        // -Bishal@May2026-fixtures-in-phase-A
+        let warm_requests: Vec<RouteRenderRequest> = manifest
+            .routes
+            .keys()
+            .map(|entry| RouteRenderRequest {
+                entry: entry.clone(),
+                props_json: "{}".to_string(),
+                module_order: Vec::new(),
+                hydration_payload: None,
+            })
+            .collect();
+
+        if !warm_requests.is_empty() {
+            if let Err(err) = renderer.prime_runtime_cache(&warm_requests) {
+                tracing::warn!(target: "albedo.renderer", error = %err, "cache priming failed");
+            }
+        }
+
         Ok(Self { manifest, renderer })
     }
 

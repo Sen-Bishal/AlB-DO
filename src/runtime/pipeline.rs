@@ -1,4 +1,4 @@
-use super::dirty_bitmap::DirtyBitmap;
+use super::dirty_bitmap::{hash_diff_into_bitmap, hash_diff_into_bitmap_at, DirtyBitmap};
 use super::frame::{frame_tick, FrameArena, FrameMetrics, FrameReport};
 use super::highway::{phase_to_lane, HighwayPlan, LANE_COUNT};
 use super::hot_set::{HotSetError, RenderPriority};
@@ -36,6 +36,15 @@ pub struct FourLaneRuntimePipeline {
     frame_arena: FrameArena,
     columns: IrColumns,
     dirty_bitmap: DirtyBitmap,
+    // Pinaki — putting the snapshot back. The SIMD `hash_diff_into_bitmap`
+    // kernel in `dirty_bitmap.rs` is correct only when diffed against a
+    // baseline taken at a stable column-pass boundary; this `Vec<u64>` IS
+    // that baseline. Without it, the kernel was 80 lines of dead code and
+    // the next person to add a caller would have had to re-derive the
+    // snapshot contract from the kernel doc-comment alone. Co-designed,
+    // ship together.
+    // -Bishal@May2026-fixtures-in-phase-A
+    prev_source_hashes: Vec<u64>,
     frame_metrics: FrameMetrics,
 }
 
@@ -67,6 +76,10 @@ impl FourLaneRuntimePipeline {
                 .map_or(0, phase_to_lane)
         });
         let dirty_bitmap = DirtyBitmap::with_capacity(columns.len());
+        // Seed the reconcile baseline with the columns' initial hashes so
+        // the first `reconcile_source_hashes()` only flags real mutations
+        // and not the bootstrap delta against an all-zero `Vec`.
+        let prev_source_hashes = columns.source_hashes().to_vec();
         let frame_metrics = FrameMetrics::default();
 
         Ok(Self {
@@ -78,6 +91,7 @@ impl FourLaneRuntimePipeline {
             frame_arena,
             columns,
             dirty_bitmap,
+            prev_source_hashes,
             frame_metrics,
         })
     }
@@ -175,6 +189,60 @@ impl FourLaneRuntimePipeline {
     /// tests that drive the bitmap without going through `ComponentId`.
     pub fn mark_column_dirty(&self, column_idx: usize) -> bool {
         self.dirty_bitmap.mark(column_idx)
+    }
+
+    /// Whole-store reconcile. Diffs the live `source_hashes` column against
+    /// the snapshot taken on the previous tick using the SIMD hash-diff
+    /// kernel, OR-folds mismatches into the dirty bitmap, and refreshes the
+    /// snapshot in place. Returns the number of mismatched slots.
+    ///
+    // Pinaki — re-adding the caller for `hash_diff_into_bitmap`. Without
+    // this, the SIMD kernel and `prev_source_hashes` baseline are
+    // unreachable from the live pipeline. Call this once per render loop
+    // iteration before `tick_frame()` so the bitmap reflects mutations the
+    // analyzer wrote into the column store since the last tick. Pair it
+    // with `reconcile_lane_source_hashes` for the cycle-4 per-lane form
+    // when only one lane mutated.
+    // -Bishal@May2026-fixtures-in-phase-A
+    pub fn reconcile_source_hashes(&mut self) -> usize {
+        let new_hashes = self.columns.source_hashes();
+        // Length drift means the column set changed — resize the snapshot
+        // so `copy_from_slice` below stays valid; the diff is bounded by
+        // `len.min(len)` so the extra slots simply re-baseline.
+        if self.prev_source_hashes.len() != new_hashes.len() {
+            self.prev_source_hashes.resize(new_hashes.len(), 0);
+        }
+        let mismatches =
+            hash_diff_into_bitmap(&self.prev_source_hashes, new_hashes, &self.dirty_bitmap);
+        self.prev_source_hashes.copy_from_slice(new_hashes);
+        mismatches
+    }
+
+    /// Per-lane reconcile. Diffs only the slice owned by `lane` and feeds
+    /// mismatches into the global bitmap at the lane's start offset, so the
+    /// cycle-2 and cycle-4 reconcile paths share one bitmap.
+    pub fn reconcile_lane_source_hashes(&mut self, lane: usize) -> usize {
+        if lane >= LANE_COUNT {
+            return 0;
+        }
+        let offsets = self.columns.lane_offsets();
+        let start = offsets.get(lane).copied().unwrap_or(0) as usize;
+        let end = offsets.get(lane.saturating_add(1)).copied().unwrap_or(0) as usize;
+        let new_hashes = self.columns.source_hashes();
+        if start > end || end > new_hashes.len() {
+            return 0;
+        }
+        // Keep the snapshot length in lockstep with the column store so the
+        // lane slice is always in-bounds on both sides of the diff.
+        if self.prev_source_hashes.len() != new_hashes.len() {
+            self.prev_source_hashes.resize(new_hashes.len(), 0);
+        }
+        let old_lane_slice = &self.prev_source_hashes[start..end];
+        let new_lane_slice = &new_hashes[start..end];
+        let mismatches =
+            hash_diff_into_bitmap_at(old_lane_slice, new_lane_slice, &self.dirty_bitmap, start);
+        self.prev_source_hashes[start..end].copy_from_slice(new_lane_slice);
+        mismatches
     }
 
     /// Cycle-5 RAF entry point.
@@ -379,6 +447,50 @@ mod tests {
 
         assert!(!pipeline.mark_component_dirty(ComponentId::new(u64::MAX)));
         assert!(pipeline.mark_component_dirty(id_a));
+    }
+
+    #[test]
+    fn test_reconcile_source_hashes_marks_only_mutated_slots() {
+        let graph = ComponentGraph::new();
+        let ids: Vec<ComponentId> = (0..4)
+            .map(|i| {
+                graph.add_component(Component::new(ComponentId::new(0), format!("C{i}")))
+            })
+            .collect();
+        let phases = [0.1_f64, 1.7, 3.4, 5.0];
+        let mut analyses = HashMap::new();
+        for (id, phase) in ids.iter().zip(phases.iter()) {
+            analyses.insert(*id, analysis(*id, *phase, 1.0));
+        }
+        let component_tiers = ids
+            .iter()
+            .map(|id| (*id, Tier::B))
+            .collect::<HashMap<_, _>>();
+
+        let mut pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            component_tiers,
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .unwrap();
+
+        // Baseline: snapshot already mirrors columns, so reconcile is a no-op.
+        assert_eq!(pipeline.reconcile_source_hashes(), 0);
+        assert_eq!(pipeline.dirty_bitmap().count_set(), 0);
+
+        // Mutate one column's source hash and confirm exactly one bit is marked.
+        pipeline.columns.column_pass_mut().source_hashes[0] = 0xDEAD_BEEF;
+        assert_eq!(pipeline.reconcile_source_hashes(), 1);
+        let mut drained = Vec::new();
+        pipeline.dirty_bitmap().drain(|idx| drained.push(idx));
+        assert_eq!(drained, vec![0]);
+
+        // Snapshot must have been refreshed — second reconcile sees no drift.
+        assert_eq!(pipeline.reconcile_source_hashes(), 0);
+        assert_eq!(pipeline.dirty_bitmap().count_set(), 0);
     }
 
     #[test]
