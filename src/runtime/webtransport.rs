@@ -133,6 +133,22 @@ pub enum WebTransportError {
         expected: u64,
         actual: u64,
     },
+    /// A reassemble pass found a frame whose payload kind contradicts the
+    /// stream's declared kind. Surfacing this as an error (instead of a
+    /// silent drop) so producers cannot accidentally route, e.g., a
+    /// binary opcode frame onto a text/HTML stream and have the byte
+    /// payload vanish on the receiver. Phase B will route binary opcode
+    /// frames to the patches stream — any text leak there is a producer
+    /// bug worth surfacing loudly.
+    #[error(
+        "payload kind mismatch in stream {stream_id} at sequence {sequence}: expected {expected}, found {found}"
+    )]
+    PayloadKindMismatch {
+        stream_id: u8,
+        sequence: u64,
+        expected: &'static str,
+        found: &'static str,
+    },
 }
 
 pub struct WTStreamRouter {
@@ -386,13 +402,26 @@ impl WebTransportMuxer {
             }
             match &frame.payload {
                 FramePayload::Text(text) => output.push_str(text.as_str()),
-                FramePayload::Binary(_) => {}
+                FramePayload::Binary(_) => {
+                    return Err(WebTransportError::PayloadKindMismatch {
+                        stream_id,
+                        sequence: frame.sequence,
+                        expected: "text",
+                        found: "binary",
+                    });
+                }
             }
             expected += 1;
         }
         Ok(output)
     }
 
+    // PHASE 2 (B-emitter) — Pinaki: this is `reassemble_binary_stream`'s
+    // first real caller. The Phase-B emitter should hand binary opcode
+    // frames to the patches stream (slot 2); the client decoder reads back
+    // through this fn after collecting all `WebTransportFrame`s sharing a
+    // `frame_id`. Concatenation order is by `sequence`, NOT receive order.
+    // — Bishal-albdo@may-2026
     pub fn reassemble_binary_stream(
         stream_id: u8,
         frames: &[WebTransportFrame],
@@ -422,7 +451,14 @@ impl WebTransportMuxer {
             }
             match &frame.payload {
                 FramePayload::Binary(bytes) => output.extend_from_slice(bytes),
-                FramePayload::Text(_) => {}
+                FramePayload::Text(_) => {
+                    return Err(WebTransportError::PayloadKindMismatch {
+                        stream_id,
+                        sequence: frame.sequence,
+                        expected: "binary",
+                        found: "text",
+                    });
+                }
             }
             expected += 1;
         }
@@ -633,6 +669,104 @@ mod tests {
 
         assert_eq!(router.patch_sequence_for(ComponentId::new(21)), Some(2));
         assert_eq!(router.patch_sequence_for(ComponentId::new(22)), Some(1));
+    }
+
+    #[test]
+    fn reassemble_route_chunks_errors_on_binary_payload() {
+        // A binary frame on a declared-text stream is a producer bug we
+        // want to surface, not silently drop.
+        let frames = vec![
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_SHELL,
+                sequence: 0,
+                component_id: None,
+                payload: FramePayload::Text("<main>".to_string()),
+            },
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_SHELL,
+                sequence: 1,
+                component_id: None,
+                payload: FramePayload::Binary(vec![0xCA, 0xFE]),
+            },
+        ];
+
+        let err = WebTransportMuxer::reassemble_stream(WT_STREAM_SLOT_SHELL, &frames).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WebTransportError::PayloadKindMismatch {
+                    expected: "text",
+                    found: "binary",
+                    sequence: 1,
+                    ..
+                }
+            ),
+            "expected PayloadKindMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reassemble_binary_stream_errors_on_text_payload() {
+        let frames = vec![
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_PATCHES,
+                sequence: 0,
+                component_id: None,
+                payload: FramePayload::Binary(vec![0x01, 0x02]),
+            },
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_PATCHES,
+                sequence: 1,
+                component_id: None,
+                payload: FramePayload::Text("oops".to_string()),
+            },
+        ];
+
+        let err =
+            WebTransportMuxer::reassemble_binary_stream(WT_STREAM_SLOT_PATCHES, &frames)
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WebTransportError::PayloadKindMismatch {
+                    expected: "binary",
+                    found: "text",
+                    sequence: 1,
+                    ..
+                }
+            ),
+            "expected PayloadKindMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reassemble_binary_stream_round_trips() {
+        // Concatenation contract: bytes from multiple sequenced frames are
+        // joined in `sequence` order. Phase-B / Phase-C will rely on this.
+        let frames = vec![
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_PATCHES,
+                sequence: 1,
+                component_id: None,
+                payload: FramePayload::Binary(vec![0x03, 0x04, 0x05]),
+            },
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_PATCHES,
+                sequence: 0,
+                component_id: None,
+                payload: FramePayload::Binary(vec![0x01, 0x02]),
+            },
+        ];
+
+        let bytes = WebTransportMuxer::reassemble_binary_stream(WT_STREAM_SLOT_PATCHES, &frames)
+            .expect("happy-path binary reassemble must succeed");
+        assert_eq!(bytes, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+    }
+
+    #[test]
+    fn reassemble_binary_stream_rejects_invalid_stream_id() {
+        let err = WebTransportMuxer::reassemble_binary_stream(99, &[]).unwrap_err();
+        assert!(matches!(err, WebTransportError::InvalidStreamId { .. }));
     }
 
     #[test]

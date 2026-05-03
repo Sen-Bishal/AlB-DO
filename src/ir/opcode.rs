@@ -21,10 +21,64 @@ pub struct SlotId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct SuspenseId(pub u32);
 
+/// Half-open `[start, end)` byte range.
+///
+/// Offsets resolve into the **concatenation** of all WebTransport STREAM
+/// messages that share an [`OpcodeFrame::frame_id`]. Reassembly via
+/// [`crate::runtime::webtransport::WebTransportMuxer::reassemble_binary_stream`]
+/// happens BEFORE [`crate::ir::wire::decode_frame`] is invoked. Cross-frame
+/// references are out of scope for v1.
+///
+/// Fields are private; construct via [`InstructionRange::try_new`] so the
+/// invariant `start <= end` holds at every wire boundary. Locking the
+/// constructor preserves wire-format flexibility — a future migration to
+/// `(start, len)` is an internal change, not an API break.
+//
+// PHASE 2 (B-emitter) — Pinaki: the SuspenseBoundary patcher in
+// `src/runtime/emitter.rs` will be the only producer of these ranges. Use
+// `try_new`, never reach for raw fields. Reason for the invariant: a
+// reversed range silently corrupts the client's slot-table apply step.
+// — Bishal-albdo@may-2026
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct InstructionRange {
-    pub start: u32,
-    pub end: u32,
+    start: u32,
+    end: u32,
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum RangeError {
+    #[error("instruction range invalid: start ({start}) > end ({end})")]
+    StartAfterEnd { start: u32, end: u32 },
+}
+
+impl InstructionRange {
+    /// Constructs a range, rejecting `start > end`.
+    pub fn try_new(start: u32, end: u32) -> Result<Self, RangeError> {
+        if start > end {
+            return Err(RangeError::StartAfterEnd { start, end });
+        }
+        Ok(Self { start, end })
+    }
+
+    #[inline]
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+
+    #[inline]
+    pub fn end(&self) -> u32 {
+        self.end
+    }
+
+    #[inline]
+    pub fn len(&self) -> u32 {
+        self.end - self.start
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
@@ -35,6 +89,12 @@ pub enum InternTableKind {
     Event = 2,
 }
 
+/// One entry in an [`InternTable`].
+///
+/// `value` is `String` (UTF-8) by deliberate choice: the intern table holds
+/// **identifiers** (tag/attr/event names), never arbitrary user payload.
+/// Inline value bytes for `SetAttr` / `SetText` are still `Vec<u8>` so they
+/// can carry non-UTF-8 binary attribute values.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct InternEntry {
     pub id: u16,
@@ -47,10 +107,56 @@ pub struct InternTable {
     pub entries: Vec<InternEntry>,
 }
 
+/// One mutation against an existing intern table.
+///
+/// Carried inside [`Instruction::PatchInternTable`]. `Set` upserts; `Remove`
+/// drops the entry by id. Bootstrap remains
+/// [`Instruction::InitInternTable`] (single-shot, ships the full table) so
+/// the warm path stays a single byte of discriminant.
+//
+// PHASE 2 (B-emitter) — Pinaki: the compiler's intern-table-diff pass
+// emits these ops on the control stream when the JSX corpus grows new
+// tags/attrs/events between hot reloads. `Remove` is for evicting an id
+// the client must drop from its mirror; do not reuse it for "rename".
+// — Bishal-albdo@may-2026
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub enum InternPatchOp {
+    Set { id: u16, value: String },
+    Remove { id: u16 },
+}
+
+/// The opcode set that drives the client's slot-table.
+///
+/// Wire-format note: variant order is the bincode discriminant. Adding new
+/// variants is allowed; **reordering existing ones is a wire break**. Any
+/// reorder requires a coordinated client/server upgrade.
+//
+// PHASE 2 (B-emitter) — Pinaki: `src/runtime/emitter.rs` is the only
+// producer. Walk `IrColumns` lane slices via the existing `LaneColumnPass`
+// (`src/ir/columns.rs`), emit one `OpcodeFrame` per lane, hand the encoded
+// bytes to `WTStreamRouter` as `FramePayload::Binary`. Do NOT mix `SetText`
+// with `SetTextRef` for the same `stable_id` in one frame — pick one
+// according to whether the value is reactive or static.
+// — Bishal-albdo@may-2026
+//
+// PHASE 3 (C-client) — every variant here needs a `case` in the client
+// `switch(op)` in `assets/albedo-runtime.js` (currently a 46-line
+// outerHTML patcher; will be rewritten to ~300 lines).
+// — Bishal-albdo@may-2026
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum Instruction {
+    /// Bootstrap an intern table on the control stream. Full table.
     InitInternTable {
         table: InternTable,
+    },
+
+    /// Incremental updates to an existing intern table.
+    ///
+    /// Sent on the control stream after the bootstrap `InitInternTable`.
+    /// The client applies `ops` in order against its mirror of `kind`.
+    PatchInternTable {
+        kind: InternTableKind,
+        ops: Vec<InternPatchOp>,
     },
 
     Create {
@@ -58,12 +164,14 @@ pub enum Instruction {
         stable_id: StableId,
     },
 
+    /// Static attribute write — value is inlined.
     SetAttr {
         stable_id: StableId,
         attr_id: AttrId,
         value: Vec<u8>,
     },
 
+    /// Static text write — value is inlined.
     SetText {
         stable_id: StableId,
         text: Vec<u8>,
@@ -98,8 +206,53 @@ pub enum Instruction {
         suspense_id: SuspenseId,
         range: InstructionRange,
     },
+
+    // ── Alt D — reactive slot refs ─────────────────────────────────
+    //
+    // PHASE 5 (E-hooks) — Pinaki: these are the wire-level binding for
+    // `useState` / `useEffect` server-side mirrors. Emitter produces a
+    // `SetTextRef` / `SetAttrRef` once at create-time; subsequent updates
+    // arrive as `SlotSet` carrying only the new value bytes against
+    // `slot_id`. The client keeps a `Map<SlotId, {kind, target}>` and
+    // re-applies on each `SlotSet`. Folded into the wire NOW (not in v2)
+    // because deferring would force every deployed client to upgrade
+    // when reactive bindings land. — Bishal-albdo@may-2026
+    /// Bind a text node's content to a server-side reactive slot.
+    SetTextRef {
+        stable_id: StableId,
+        slot_id: SlotId,
+    },
+
+    /// Bind an attribute to a server-side reactive slot.
+    SetAttrRef {
+        stable_id: StableId,
+        attr_id: AttrId,
+        slot_id: SlotId,
+    },
+
+    /// Push a new value into a slot. Client re-applies to every bound site.
+    SlotSet {
+        slot_id: SlotId,
+        value: Vec<u8>,
+    },
 }
 
+/// One wire frame.
+///
+/// **Concatenation contract:** an `OpcodeFrame` MAY span multiple
+/// WebTransport STREAM messages
+/// ([`crate::runtime::webtransport::WebTransportFrame`]s sharing the same
+/// `frame_id`). The decoder reassembles the concatenated byte buffer via
+/// [`crate::runtime::webtransport::WebTransportMuxer::reassemble_binary_stream`]
+/// BEFORE invoking [`crate::ir::wire::decode_frame`]. Per-message decoding
+/// is unsupported; do not assume frame == STREAM message.
+//
+// PHASE 2 (B-emitter) — Pinaki: `frame_id` MUST be allocated via the
+// per-stream sequence in `WebTransportMuxer::allocate_sequence` so a frame
+// split across STREAM messages stays attributable to the same logical
+// frame on reassembly. `component_id` is `None` for cross-component
+// patches (rare; only emitted on the control stream).
+// — Bishal-albdo@may-2026
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct OpcodeFrame {
     pub frame_id: u64,
@@ -236,10 +389,7 @@ mod tests {
     fn instruction_patch_round_trips() {
         let instruction = Instruction::Patch {
             suspense_id: SuspenseId(500),
-            range: InstructionRange {
-                start: 64,
-                end: 256,
-            },
+            range: InstructionRange::try_new(64, 256).expect("valid range"),
         };
         let bytes =
             bincode::encode_to_vec(&instruction, bincode::config::standard())
@@ -269,6 +419,126 @@ mod tests {
             bincode::decode_from_slice(&bytes, bincode::config::standard())
                 .expect("decode");
         assert_eq!(instruction, decoded);
+    }
+
+    #[test]
+    fn patch_intern_table_round_trips() {
+        let instruction = Instruction::PatchInternTable {
+            kind: InternTableKind::Event,
+            ops: vec![
+                InternPatchOp::Set { id: 1, value: "change".to_string() },
+                InternPatchOp::Remove { id: 0 },
+                InternPatchOp::Set { id: 2, value: "submit".to_string() },
+            ],
+        };
+        let bytes =
+            bincode::encode_to_vec(&instruction, bincode::config::standard())
+                .expect("encode");
+        let (decoded, _): (Instruction, _) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("decode");
+        assert_eq!(instruction, decoded);
+    }
+
+    #[test]
+    fn set_text_ref_round_trips() {
+        let instruction = Instruction::SetTextRef {
+            stable_id: StableId(7),
+            slot_id: SlotId(42),
+        };
+        let bytes =
+            bincode::encode_to_vec(&instruction, bincode::config::standard())
+                .expect("encode");
+        let (decoded, _): (Instruction, _) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("decode");
+        assert_eq!(instruction, decoded);
+    }
+
+    #[test]
+    fn set_attr_ref_round_trips() {
+        let instruction = Instruction::SetAttrRef {
+            stable_id: StableId(7),
+            attr_id: AttrId(3),
+            slot_id: SlotId(99),
+        };
+        let bytes =
+            bincode::encode_to_vec(&instruction, bincode::config::standard())
+                .expect("encode");
+        let (decoded, _): (Instruction, _) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("decode");
+        assert_eq!(instruction, decoded);
+    }
+
+    #[test]
+    fn slot_set_round_trips() {
+        let instruction = Instruction::SlotSet {
+            slot_id: SlotId(42),
+            value: b"new-text".to_vec(),
+        };
+        let bytes =
+            bincode::encode_to_vec(&instruction, bincode::config::standard())
+                .expect("encode");
+        let (decoded, _): (Instruction, _) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("decode");
+        assert_eq!(instruction, decoded);
+    }
+
+    #[test]
+    fn frame_with_alt_d_instructions_round_trips() {
+        let frame = OpcodeFrame {
+            frame_id: 17,
+            component_id: Some(3),
+            instructions: vec![
+                Instruction::SetTextRef {
+                    stable_id: StableId(1),
+                    slot_id: SlotId(10),
+                },
+                Instruction::SetAttrRef {
+                    stable_id: StableId(1),
+                    attr_id: AttrId(0),
+                    slot_id: SlotId(11),
+                },
+                Instruction::SlotSet {
+                    slot_id: SlotId(10),
+                    value: b"hello".to_vec(),
+                },
+            ],
+        };
+        let bytes =
+            bincode::encode_to_vec(&frame, bincode::config::standard())
+                .expect("encode");
+        let (decoded, _): (OpcodeFrame, _) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("decode");
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn instruction_range_try_new_rejects_start_after_end() {
+        let err = InstructionRange::try_new(100, 50).unwrap_err();
+        assert_eq!(
+            err,
+            RangeError::StartAfterEnd { start: 100, end: 50 }
+        );
+    }
+
+    #[test]
+    fn instruction_range_try_new_accepts_equal_start_end() {
+        let range = InstructionRange::try_new(64, 64).expect("equal endpoints are valid");
+        assert!(range.is_empty());
+        assert_eq!(range.len(), 0);
+    }
+
+    #[test]
+    fn instruction_range_accessors_match_constructor_inputs() {
+        let range = InstructionRange::try_new(10, 42).expect("valid");
+        assert_eq!(range.start(), 10);
+        assert_eq!(range.end(), 42);
+        assert_eq!(range.len(), 32);
+        assert!(!range.is_empty());
     }
 
     #[test]
@@ -320,7 +590,7 @@ mod tests {
                 },
                 Instruction::Patch {
                     suspense_id: SuspenseId(10),
-                    range: InstructionRange { start: 0, end: 64 },
+                    range: InstructionRange::try_new(0, 64).expect("valid range"),
                 },
             ],
         };
@@ -387,33 +657,5 @@ mod tests {
             "Create instruction should encode to ≤ 8 bytes, got {}",
             bytes.len()
         );
-    }
-
-    #[test]
-    fn intern_table_incremental_update_overwrites_entries() {
-        let initial = InternTable {
-            kind: InternTableKind::Event,
-            entries: vec![
-                InternEntry { id: 0, value: "click".to_string() },
-                InternEntry { id: 1, value: "input".to_string() },
-            ],
-        };
-        let update = InternTable {
-            kind: InternTableKind::Event,
-            entries: vec![
-                InternEntry { id: 1, value: "change".to_string() },
-            ],
-        };
-
-        let mut merged = std::collections::HashMap::new();
-        for entry in &initial.entries {
-            merged.insert(entry.id, entry.value.clone());
-        }
-        for entry in &update.entries {
-            merged.insert(entry.id, entry.value.clone());
-        }
-
-        assert_eq!(merged.get(&0).map(String::as_str), Some("click"));
-        assert_eq!(merged.get(&1).map(String::as_str), Some("change"));
     }
 }

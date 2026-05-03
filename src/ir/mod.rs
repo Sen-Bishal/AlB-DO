@@ -20,10 +20,13 @@ pub use columns::{
     StringInterner, LANE_COUNT as IR_LANE_COUNT,
 };
 pub use opcode::{
-    AttrId, EventId, Instruction, InstructionRange, InternEntry, InternTable, InternTableKind,
-    OpcodeFrame, ProxyId, SlotId, StableId, SuspenseId, TagId,
+    AttrId, EventId, Instruction, InstructionRange, InternEntry, InternPatchOp, InternTable,
+    InternTableKind, OpcodeFrame, ProxyId, RangeError, SlotId, StableId, SuspenseId, TagId,
 };
-pub use wire::{decode_frame, decode_intern_table, encode_frame, encode_intern_table, WireError};
+pub use wire::{
+    decode_frame, decode_intern_table, encode_frame, encode_intern_table, WireDecode, WireEncode,
+    WireError,
+};
 
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;

@@ -19,21 +19,62 @@ fn config() -> impl bincode::config::Config {
     bincode::config::standard()
 }
 
+// ── Codec traits ─────────────────────────────────────────────────────
+//
+// PHASE 2 (B-emitter) — Pinaki: emit through these traits
+// (`frame.wire_encode()`), not through the free functions. Reason: when we
+// swap bincode for FlatBuffers later, only this file changes. The free
+// functions below stay as ergonomic wrappers but they are not the contract
+// boundary. — Bishal-albdo@may-2026
+
+/// Encode any wire-shaped type to bytes.
+///
+/// Implemented for every `T: bincode::Encode` via a blanket impl, so any
+/// type derived with `#[derive(Encode, Decode)]` is automatically wirable.
+pub trait WireEncode {
+    fn wire_encode(&self) -> Result<Vec<u8>, WireError>;
+}
+
+/// Decode bytes into a wire-shaped type.
+pub trait WireDecode: Sized {
+    fn wire_decode(bytes: &[u8]) -> Result<Self, WireError>;
+}
+
+impl<T: bincode::Encode> WireEncode for T {
+    fn wire_encode(&self) -> Result<Vec<u8>, WireError> {
+        Ok(bincode::encode_to_vec(self, config())?)
+    }
+}
+
+impl<T: bincode::Decode<()>> WireDecode for T {
+    fn wire_decode(bytes: &[u8]) -> Result<Self, WireError> {
+        let (value, _) = bincode::decode_from_slice(bytes, config())?;
+        Ok(value)
+    }
+}
+
+// ── Free-function wrappers ───────────────────────────────────────────
+//
+// These remain the ergonomic call sites for callers that have a concrete
+// type at hand. They delegate straight to the trait — no parallel codec
+// path.
+
 /// Encodes an [`OpcodeFrame`] into a compact binary representation.
 ///
 /// The returned `Vec<u8>` is the payload that goes onto a WebTransport
 /// stream as [`FramePayload::Binary`](crate::runtime::webtransport::FramePayload::Binary).
 pub fn encode_frame(frame: &OpcodeFrame) -> Result<Vec<u8>, WireError> {
-    Ok(bincode::encode_to_vec(frame, config())?)
+    frame.wire_encode()
 }
 
 /// Decodes an [`OpcodeFrame`] from a binary slice.
 ///
-/// Returns the decoded frame. The caller owns the input slice and can
-/// discard it after this call returns.
+/// Caller MUST have already reassembled all WebTransport STREAM messages
+/// sharing the same `frame_id` via
+/// [`crate::runtime::webtransport::WebTransportMuxer::reassemble_binary_stream`]
+/// before calling this. See [`OpcodeFrame`] for the concatenation contract.
 pub fn decode_frame(bytes: &[u8]) -> Result<OpcodeFrame, WireError> {
-    let (frame, _bytes_read) = bincode::decode_from_slice(bytes, config())?;
-    Ok(frame)
+    OpcodeFrame::wire_decode(bytes)
 }
 
 // ── InternTable ──────────────────────────────────────────────────────
@@ -41,15 +82,14 @@ pub fn decode_frame(bytes: &[u8]) -> Result<OpcodeFrame, WireError> {
 /// Encodes an [`InternTable`] into a compact binary representation.
 ///
 /// Typically sent once on the control stream at session init, with
-/// incremental updates via subsequent calls.
+/// incremental updates via [`crate::ir::opcode::Instruction::PatchInternTable`].
 pub fn encode_intern_table(table: &InternTable) -> Result<Vec<u8>, WireError> {
-    Ok(bincode::encode_to_vec(table, config())?)
+    table.wire_encode()
 }
 
 /// Decodes an [`InternTable`] from a binary slice.
 pub fn decode_intern_table(bytes: &[u8]) -> Result<InternTable, WireError> {
-    let (table, _bytes_read) = bincode::decode_from_slice(bytes, config())?;
-    Ok(table)
+    InternTable::wire_decode(bytes)
 }
 
 #[cfg(test)]
@@ -82,6 +122,35 @@ mod tests {
         let bytes = encode_frame(&frame).expect("encode must succeed");
         let decoded = decode_frame(&bytes).expect("decode must succeed");
         assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn frame_round_trips_via_trait_calls() {
+        let frame = OpcodeFrame {
+            frame_id: 2,
+            component_id: None,
+            instructions: vec![Instruction::Create {
+                tag_id: TagId(1),
+                stable_id: StableId(7),
+            }],
+        };
+        let bytes = frame.wire_encode().expect("trait encode");
+        let decoded = OpcodeFrame::wire_decode(&bytes).expect("trait decode");
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn intern_table_round_trips_via_trait_calls() {
+        let table = InternTable {
+            kind: InternTableKind::Tag,
+            entries: vec![InternEntry {
+                id: 0,
+                value: "div".to_string(),
+            }],
+        };
+        let bytes = table.wire_encode().expect("trait encode");
+        let decoded = InternTable::wire_decode(&bytes).expect("trait decode");
+        assert_eq!(table, decoded);
     }
 
     #[test]
@@ -185,6 +254,13 @@ mod tests {
                         }],
                     },
                 },
+                Instruction::PatchInternTable {
+                    kind: InternTableKind::Attr,
+                    ops: vec![
+                        InternPatchOp::Set { id: 0, value: "class".to_string() },
+                        InternPatchOp::Remove { id: 1 },
+                    ],
+                },
                 Instruction::Create {
                     tag_id: TagId(0),
                     stable_id: StableId(1),
@@ -220,7 +296,20 @@ mod tests {
                 },
                 Instruction::Patch {
                     suspense_id: SuspenseId(10),
-                    range: InstructionRange { start: 0, end: 128 },
+                    range: InstructionRange::try_new(0, 128).expect("valid range"),
+                },
+                Instruction::SetTextRef {
+                    stable_id: StableId(1),
+                    slot_id: SlotId(9),
+                },
+                Instruction::SetAttrRef {
+                    stable_id: StableId(1),
+                    attr_id: AttrId(0),
+                    slot_id: SlotId(11),
+                },
+                Instruction::SlotSet {
+                    slot_id: SlotId(9),
+                    value: b"reactive".to_vec(),
                 },
             ],
         };

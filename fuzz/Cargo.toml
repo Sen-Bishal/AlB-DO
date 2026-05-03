@@ -1,0 +1,38 @@
+# Phase A — wire-format fuzz harness.
+#
+# PHASE 2 (B-emitter) — Pinaki: run `cargo fuzz run decode_frame -- -max_total_time=300`
+# (and the same for `decode_intern_table`) BEFORE the first emitter call site
+# lands. Reason: once Phase B has a caller, every decoder hardening becomes a
+# wire break. Standalone `[workspace]` marker keeps this crate out of the
+# parent workspace so the fuzz toolchain stays isolated.
+# — Bishal-albdo@may-2026
+
+[package]
+name = "albedo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dom-render-compiler = { path = ".." }
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_intern_table"
+path = "fuzz_targets/decode_intern_table.rs"
+test = false
+doc = false
+bench = false
+
+# Prevent cargo from walking up into the parent workspace.
+[workspace]
