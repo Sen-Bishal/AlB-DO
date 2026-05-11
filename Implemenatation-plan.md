@@ -39,3 +39,5 @@ Fuzz Targets
 
 `fuzz/fuzz_targets/decode_frame.rs` and `fuzz/fuzz_targets/decode_intern_table.rs`
 `cargo fuzz` harnesses over the wire decoders. Run for ≥ 5 minutes per target before declaring Phase A locked.
+
+Note: Make a python script to showcase our engine
