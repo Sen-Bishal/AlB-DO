@@ -1,4 +1,5 @@
 use super::dirty_bitmap::{hash_diff_into_bitmap, hash_diff_into_bitmap_at, DirtyBitmap};
+use super::emitter::{self, EmitResult, InternTableSnapshot};
 use super::frame::{frame_tick, FrameArena, FrameMetrics, FrameReport};
 use super::highway::{phase_to_lane, HighwayPlan, LANE_COUNT};
 use super::hot_set::{HotSetError, RenderPriority};
@@ -46,6 +47,8 @@ pub struct FourLaneRuntimePipeline {
     // -Bishal@May2026-fixtures-in-phase-A
     prev_source_hashes: Vec<u64>,
     frame_metrics: FrameMetrics,
+    // Phase B — intern table baseline for incremental diffing.
+    prev_intern_snapshot: InternTableSnapshot,
 }
 
 impl FourLaneRuntimePipeline {
@@ -81,6 +84,7 @@ impl FourLaneRuntimePipeline {
         // and not the bootstrap delta against an all-zero `Vec`.
         let prev_source_hashes = columns.source_hashes().to_vec();
         let frame_metrics = FrameMetrics::default();
+        let prev_intern_snapshot = InternTableSnapshot::default();
 
         Ok(Self {
             highway,
@@ -93,6 +97,7 @@ impl FourLaneRuntimePipeline {
             dirty_bitmap,
             prev_source_hashes,
             frame_metrics,
+            prev_intern_snapshot,
         })
     }
 
@@ -289,6 +294,36 @@ impl FourLaneRuntimePipeline {
     /// from [`Self::tick_frame`] so the emit cadence is the caller's choice.
     pub fn emit_frame_metrics_summary(&self) {
         self.frame_metrics.emit_summary();
+    }
+
+    /// Returns the opcode emission results from the most recent
+    /// [`Self::tick_frame`] call. These are the wire-encoded `OpcodeFrame`s
+    /// that can be forwarded to the WebTransport patches stream.
+    pub fn last_opcode_results(&self) -> &[EmitResult] {
+        self.frame_arena.opcode_results()
+    }
+
+    /// Diffs the intern table state against the previous snapshot and returns
+    /// `PatchInternTable` instructions for any changes. Updates the internal
+    /// baseline snapshot for the next call.
+    pub fn reconcile_intern_tables<F>(&mut self, classify: F) -> Vec<crate::ir::Instruction>
+    where
+        F: Fn(u16, &str) -> Option<crate::ir::opcode::InternTableKind>,
+    {
+        let current = InternTableSnapshot::capture(self.columns.strings(), classify);
+        let instructions = emitter::diff_intern_tables(&self.prev_intern_snapshot, &current);
+        self.prev_intern_snapshot = current;
+        instructions
+    }
+
+    /// Builds bootstrap `InitInternTable` instructions for session init.
+    /// Call once when a new WebTransport session connects.
+    pub fn get_bootstrap_intern_payload<F>(&self, classify: F) -> Vec<crate::ir::Instruction>
+    where
+        F: Fn(u16, &str) -> Option<crate::ir::opcode::InternTableKind>,
+    {
+        let snapshot = InternTableSnapshot::capture(self.columns.strings(), classify);
+        emitter::bootstrap_intern_tables(&snapshot)
     }
 }
 

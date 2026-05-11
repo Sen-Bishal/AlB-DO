@@ -30,6 +30,7 @@
 //! Cycle 6 can fold in `effects`/`priority` without a wire-format break.
 
 use super::dirty_bitmap::DirtyBitmap;
+use super::emitter::{self, EmitResult};
 use super::webtransport::{WebTransportMuxer, WEBTRANSPORT_STREAM_COUNT, WT_STREAM_SLOT_PATCHES};
 use crate::ir::columns::{field_mask, IrColumns, LANE_COUNT};
 use std::collections::VecDeque;
@@ -51,6 +52,7 @@ pub struct FrameArena {
     scratch_indices: Vec<u32>,
     lane_buckets: [Vec<u32>; LANE_COUNT],
     patch_bufs: [Vec<u8>; LANE_COUNT],
+    opcode_results: Vec<EmitResult>,
 }
 
 impl Default for FrameArena {
@@ -71,6 +73,7 @@ impl FrameArena {
             scratch_indices: Vec::with_capacity(capacity),
             lane_buckets: std::array::from_fn(|_| Vec::with_capacity(per_lane)),
             patch_bufs: std::array::from_fn(|_| Vec::with_capacity(patch_cap)),
+            opcode_results: Vec::with_capacity(LANE_COUNT),
         }
     }
 
@@ -86,6 +89,11 @@ impl FrameArena {
         self.lane_buckets.get(lane).map_or(&[], Vec::as_slice)
     }
 
+    /// Per-lane opcode emission results from the last [`frame_tick`].
+    pub fn opcode_results(&self) -> &[EmitResult] {
+        &self.opcode_results
+    }
+
     fn reset_for_tick(&mut self) {
         self.scratch_indices.clear();
         for bucket in &mut self.lane_buckets {
@@ -94,6 +102,7 @@ impl FrameArena {
         for buf in &mut self.patch_bufs {
             buf.clear();
         }
+        self.opcode_results.clear();
     }
 }
 
@@ -109,6 +118,10 @@ pub struct FrameReport {
     pub lane_patches: [usize; LANE_COUNT],
     pub lane_bytes: [usize; LANE_COUNT],
     pub lane_sequences: [Option<u64>; LANE_COUNT],
+    /// Number of opcode frames emitted by the Phase B emitter.
+    pub opcode_frames_emitted: usize,
+    /// Total wire bytes from opcode emission, per lane.
+    pub opcode_bytes: [usize; LANE_COUNT],
 }
 
 /// Ring-buffered `FrameReport` accumulator used by the pipeline to expose
@@ -325,6 +338,21 @@ pub fn frame_tick(
         frames_pushed = frames_pushed.saturating_add(1);
     }
 
+    // ── Phase B: opcode emission ─────────────────────────────────
+    let lane_bucket_refs = split_buckets(&arena.lane_buckets);
+    let mut opcode_frames_emitted = 0usize;
+    let mut opcode_bytes = [0usize; LANE_COUNT];
+    if let Ok(results) = emitter::emit_lane_frames(columns, &lane_bucket_refs, muxer) {
+        for result in &results {
+            let lane_idx = usize::from(result.lane);
+            if let Some(slot) = opcode_bytes.get_mut(lane_idx) {
+                *slot = result.wire_bytes.len();
+            }
+        }
+        opcode_frames_emitted = results.len();
+        arena.opcode_results = results;
+    }
+
     let total_ns = tick_start.elapsed().as_nanos();
     let report = FrameReport {
         dirty_count,
@@ -336,6 +364,8 @@ pub fn frame_tick(
         lane_patches,
         lane_bytes,
         lane_sequences,
+        opcode_frames_emitted,
+        opcode_bytes,
     };
 
     trace!(

@@ -1,4 +1,5 @@
 pub mod dirty_bitmap;
+pub mod emitter;
 pub mod engine;
 pub mod eval;
 pub mod frame;
