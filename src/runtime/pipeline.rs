@@ -29,6 +29,12 @@ pub enum RuntimePipelineError {
     WebTransport(#[from] WebTransportError),
     #[error(transparent)]
     Wire(#[from] WireError),
+    /// Phase-D operations (async island spawn, Future resolution) require a
+    /// tokio runtime handle. Surface this as a typed error rather than the
+    /// `Handle::current()` panic so the server can refuse the request with a
+    /// clean 5xx instead of crashing the tick loop.
+    #[error("pipeline missing tokio runtime handle; call `with_runtime_handle` before spawning async work")]
+    MissingRuntimeHandle,
 }
 
 pub struct FourLaneRuntimePipeline {
@@ -52,6 +58,12 @@ pub struct FourLaneRuntimePipeline {
     frame_metrics: FrameMetrics,
     // Phase B — intern table baseline for incremental diffing.
     prev_intern_snapshot: InternTableSnapshot,
+    // Phase B-finish — optional tokio runtime handle, threaded in by the
+    // server crate via `with_runtime_handle`. Stays `None` in unit tests
+    // that exercise sync paths only. Phase D's `Placeholder` emitter will
+    // require it via `require_runtime_handle` and fail with a typed error
+    // rather than panicking on `Handle::current()` outside a runtime ctx.
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 impl FourLaneRuntimePipeline {
@@ -101,7 +113,53 @@ impl FourLaneRuntimePipeline {
             prev_source_hashes,
             frame_metrics,
             prev_intern_snapshot,
+            runtime_handle: None,
         })
+    }
+
+    /// Binds a tokio runtime handle to the pipeline.
+    ///
+    /// The handle is stored, not consumed during construction. Phase D's
+    /// async-island spawner reads it via [`Self::require_runtime_handle`]
+    /// when emitting `Placeholder` opcodes; sync code paths (the
+    /// reconcile/tick fast path, fixture tests) never touch it.
+    ///
+    /// Returns `self` so server bootstrap can chain the call:
+    ///
+    /// ```ignore
+    /// let pipeline = FourLaneRuntimePipeline::new(...)?
+    ///     .with_runtime_handle(tokio::runtime::Handle::current());
+    /// ```
+    ///
+    /// Calling twice replaces the handle — there is no historical reason
+    /// to keep the prior one, and the server only ever binds the handle
+    /// once at startup.
+    #[must_use]
+    pub fn with_runtime_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.runtime_handle = Some(handle);
+        self
+    }
+
+    /// Returns the bound tokio runtime handle, if any.
+    ///
+    /// Prefer [`Self::require_runtime_handle`] at call sites that genuinely
+    /// need to spawn — the typed error path is part of the contract.
+    pub fn runtime_handle(&self) -> Option<&tokio::runtime::Handle> {
+        self.runtime_handle.as_ref()
+    }
+
+    /// Returns the bound tokio runtime handle or a typed error.
+    ///
+    /// This is the entry point Phase D's spawner uses. It exists so the
+    /// failure mode for "pipeline constructed without a runtime handle"
+    /// is a well-typed [`RuntimePipelineError::MissingRuntimeHandle`]
+    /// instead of a `Handle::current()` panic mid-tick.
+    pub fn require_runtime_handle(
+        &self,
+    ) -> Result<&tokio::runtime::Handle, RuntimePipelineError> {
+        self.runtime_handle
+            .as_ref()
+            .ok_or(RuntimePipelineError::MissingRuntimeHandle)
     }
 
     pub fn submit_analyzer_result(&self, component_id: ComponentId) -> bool {
@@ -330,15 +388,34 @@ impl FourLaneRuntimePipeline {
     }
 
     /// Converts the opcode emission results from the most recent
-    /// [`Self::tick_frame`] call into [`LaneRenderedChunk`]s.
+    /// [`Self::tick_frame`] call into [`LaneRenderedChunk`]s ready for
+    /// the WebTransport patches stream.
+    ///
+    /// The returned chunk's `lane` field is the **WT stream slot**
+    /// (always [`crate::runtime::webtransport::WT_STREAM_SLOT_PATCHES`]
+    /// for opcode emission), not the highway lane that produced it.
+    /// Routing through [`WTStreamRouter::route_component_chunk`] keeps
+    /// the patch_sequence counters in lockstep with the muxer so a later
+    /// `mux_lane_chunks` builds well-attributed `WebTransportFrame`s.
+    ///
+    /// The highway lane (0..3) is an internal scheduling detail. Once a
+    /// chunk crosses the runtime → transport boundary the only relevant
+    /// dimension is which WT stream it lands on.
     pub fn drain_opcode_chunks(&self) -> Vec<LaneRenderedChunk> {
         let mut chunks = Vec::new();
         for result in self.frame_arena.opcode_results() {
-            chunks.push(LaneRenderedChunk {
-                lane: result.lane as usize,
-                component_id: result.component_id.map(ComponentId::new),
-                payload: FramePayload::Binary(result.wire_bytes.clone()),
-            });
+            let payload = FramePayload::Binary(result.wire_bytes.clone());
+            let chunk = match result.component_id {
+                Some(id) => self.stream_router.route_component_chunk(
+                    ComponentId::new(id),
+                    WTRenderMode::Patch,
+                    payload,
+                ),
+                None => self
+                    .stream_router
+                    .route_global_chunk(WTRenderMode::Patch, payload),
+            };
+            chunks.push(chunk);
         }
         chunks
     }
@@ -353,6 +430,55 @@ impl FourLaneRuntimePipeline {
         F: Fn(u16, &str) -> Option<crate::ir::opcode::InternTableKind>,
     {
         let instructions = self.reconcile_intern_tables(classify);
+        self.frame_intern_instructions_for_control(instructions)
+    }
+
+    /// Builds the one-shot bootstrap intern-table chunk for a new bakabox
+    /// session.
+    ///
+    /// The returned [`LaneRenderedChunk`] is destined for
+    /// [`crate::runtime::webtransport::WT_STREAM_SLOT_CONTROL`] and carries
+    /// `Instruction::InitInternTable` entries for every kind that
+    /// `classify` maps a string into. `None` is returned when the column
+    /// store holds no classifiable strings — sending an empty bootstrap
+    /// would still be valid wire, but skipping the message keeps the
+    /// control stream quiet on cold-start sessions with no intern state.
+    ///
+    /// This is the symmetrical counterpart to [`Self::drain_intern_table_patches`]
+    /// for session init. Servers should call this exactly once per WT session
+    /// (right after `session_init` on the control stream) and rely on
+    /// `drain_intern_table_patches` for every subsequent reconcile tick.
+    ///
+    /// The internal baseline snapshot is also refreshed here, so a
+    /// subsequent `drain_intern_table_patches` against the same state will
+    /// see no drift and return `None`. Without this refresh, the first
+    /// patch-diff after bootstrap would resurface the bootstrap entries as
+    /// "new" — silently doubling the wire bytes on session warmup.
+    pub fn drain_bootstrap_intern_chunk<F>(
+        &mut self,
+        classify: F,
+    ) -> Result<Option<LaneRenderedChunk>, RuntimePipelineError>
+    where
+        F: Fn(u16, &str) -> Option<crate::ir::opcode::InternTableKind>,
+    {
+        let snapshot = InternTableSnapshot::capture(self.columns.strings(), &classify);
+        let instructions = emitter::bootstrap_intern_tables(&snapshot);
+        self.prev_intern_snapshot = snapshot;
+        self.frame_intern_instructions_for_control(instructions)
+    }
+
+    /// Shared helper: wraps a control-stream-bound instruction batch into
+    /// an [`OpcodeFrame`], encodes it, and routes the binary chunk through
+    /// the stream router. Returns `None` when there is nothing to ship.
+    ///
+    /// Centralising the frame_id allocation and wire encoding in one place
+    /// keeps the contract `(instructions) -> chunk` provable; the
+    /// bootstrap and patch paths are now byte-identical past the
+    /// instruction-vector boundary.
+    fn frame_intern_instructions_for_control(
+        &self,
+        instructions: Vec<crate::ir::opcode::Instruction>,
+    ) -> Result<Option<LaneRenderedChunk>, RuntimePipelineError> {
         if instructions.is_empty() {
             return Ok(None);
         }
@@ -605,5 +731,68 @@ mod tests {
         assert!(routed >= 1);
         let drained = pipeline.drain_inter_lane_messages(2);
         assert!(!drained.is_empty());
+    }
+
+    #[test]
+    fn pipeline_runtime_handle_is_none_by_default() {
+        let graph = ComponentGraph::new();
+        let id_a = graph.add_component(Component::new(ComponentId::new(0), "A".to_string()));
+        let mut analyses = HashMap::new();
+        analyses.insert(id_a, analysis(id_a, 0.1, 1.0));
+
+        let pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            HashMap::from([(id_a, Tier::B)]),
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .unwrap();
+
+        assert!(
+            pipeline.runtime_handle().is_none(),
+            "fresh pipeline must not carry a runtime handle"
+        );
+        assert!(
+            matches!(
+                pipeline.require_runtime_handle(),
+                Err(RuntimePipelineError::MissingRuntimeHandle)
+            ),
+            "require_runtime_handle must surface MissingRuntimeHandle when unbound"
+        );
+    }
+
+    #[test]
+    fn pipeline_with_runtime_handle_binds_and_exposes_it() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("must build tokio runtime for test");
+        let handle = runtime.handle().clone();
+
+        let graph = ComponentGraph::new();
+        let id_a = graph.add_component(Component::new(ComponentId::new(0), "A".to_string()));
+        let mut analyses = HashMap::new();
+        analyses.insert(id_a, analysis(id_a, 0.1, 1.0));
+
+        let pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            HashMap::from([(id_a, Tier::B)]),
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .unwrap()
+        .with_runtime_handle(handle);
+
+        assert!(
+            pipeline.runtime_handle().is_some(),
+            "with_runtime_handle must bind the handle"
+        );
+        assert!(
+            pipeline.require_runtime_handle().is_ok(),
+            "require_runtime_handle must return the bound handle"
+        );
     }
 }

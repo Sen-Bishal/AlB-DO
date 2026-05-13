@@ -154,6 +154,7 @@ serde_json.workspace         = true
 bincode.workspace            = true
 thiserror.workspace          = true
 anyhow.workspace             = true
+tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 sysinfo.workspace            = true

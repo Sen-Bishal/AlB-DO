@@ -1,3 +1,4 @@
+use crate::error::RuntimeError;
 use crate::render::tier_b::{
     render_tier_b, InjectionChunk, RequestContext as TierBRequestContext, SharedRenderServices,
 };
@@ -8,19 +9,32 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use dom_render_compiler::ir::opcode::InternTableKind;
 use dom_render_compiler::manifest::schema::{
     HydrationMode, RenderManifestV2, RouteManifest, TierBNode,
 };
+use dom_render_compiler::runtime::pipeline::{FourLaneRuntimePipeline, RuntimePipelineError};
 use dom_render_compiler::runtime::webtransport::{
-    WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES, WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
+    FramePayload, LaneRenderedChunk, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
+    WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
 };
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// Shared handle to the opcode pipeline that produces binary frames for
+/// the bakabox client.
+///
+/// `Mutex` rather than `RwLock`: the hot tick path mutates the pipeline
+/// (dirty bitmap drain, scratch buffers) and is the only writer; the
+/// uncontended fast path through `Mutex::lock` is single-instruction on
+/// modern targets. `Arc` wraps it because [`StreamingAppState`] is cloned
+/// into every request future.
+pub type SharedPipeline = Arc<Mutex<FourLaneRuntimePipeline>>;
 
 const WT_SESSION_HEADER: &str = "x-albedo-wt-session";
 const WT_PREFER_HEADER: &str = "x-albedo-wt-prefer";
@@ -31,6 +45,12 @@ pub struct StreamingAppState {
     pub services: SharedRenderServices,
     pub transport: StreamingTransportConfig,
     pub webtransport_sessions: Option<WebTransportSessionRegistry>,
+    /// Optional opcode pipeline. Populated by
+    /// [`Self::with_pipeline`] during server bootstrap or test setup.
+    /// `None` means the streaming path falls back to the legacy JSON
+    /// tier-B render — used by tests that don't exercise the binary wire
+    /// and by environments that haven't yet plumbed a renderer.
+    pipeline: Option<SharedPipeline>,
 }
 
 impl StreamingAppState {
@@ -45,8 +65,151 @@ impl StreamingAppState {
             services,
             transport,
             webtransport_sessions,
+            pipeline: None,
         }
     }
+
+    /// Binds an opcode pipeline to this streaming state.
+    ///
+    /// The pipeline is consumed and bound to `runtime_handle` (so Phase-D
+    /// async-island spawn paths can find a runtime context without
+    /// panicking on `Handle::current()`), wrapped in `Arc<Mutex<_>>`, and
+    /// stashed for the lifetime of the streaming app state.
+    ///
+    /// Returns `self` so this composes with [`Self::new`] in a single
+    /// builder expression.
+    #[must_use]
+    pub fn with_pipeline(
+        mut self,
+        pipeline: FourLaneRuntimePipeline,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
+        let pipeline = pipeline.with_runtime_handle(runtime_handle);
+        self.pipeline = Some(Arc::new(Mutex::new(pipeline)));
+        self
+    }
+
+    /// Returns the shared pipeline handle, or `None` when no pipeline is
+    /// bound.
+    pub fn pipeline(&self) -> Option<&SharedPipeline> {
+        self.pipeline.as_ref()
+    }
+
+    /// Returns `true` if an opcode pipeline has been bound. Used by the
+    /// streaming handler to choose between the binary opcode path and the
+    /// legacy JSON tier-B render.
+    pub fn has_pipeline(&self) -> bool {
+        self.pipeline.is_some()
+    }
+}
+
+// ── Pipeline tick + chunk helpers ────────────────────────────────────────
+//
+// Phase B-finish wire surface: the streaming handler talks to the pipeline
+// through these free functions, never through raw `Mutex::lock`. Each
+// function has one job; failures map to typed `RuntimeError` so the axum
+// handler can `into_response()` them uniformly.
+
+/// Drives one reconciliation tick on the bound pipeline and returns the
+/// binary opcode chunks that resulted.
+///
+/// Returns an empty `Vec` when no pipeline is bound. Synchronous — the
+/// underlying `Mutex` is held for the duration of the tick, which must
+/// not span an `.await`. Callers in an async context should wrap this in
+/// [`tokio::task::spawn_blocking`]; the tick itself is sub-millisecond on
+/// the hot path so the blocking-pool round-trip is the dominant cost.
+pub fn drive_pipeline_tick(state: &StreamingAppState) -> Vec<LaneRenderedChunk> {
+    let Some(pipeline) = state.pipeline.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(mut guard) = pipeline.lock() else {
+        // Mutex poisoning means an earlier tick panicked. The pipeline
+        // is in an indeterminate state; the safest move is to skip this
+        // tick and let the supervising layer rebuild. Returning empty
+        // is the correct wire-level answer — no frames, no harm.
+        warn!("opcode pipeline mutex poisoned; tick skipped");
+        return Vec::new();
+    };
+    guard.tick_frame();
+    guard.drain_opcode_chunks()
+}
+
+/// Produces the one-shot bootstrap intern table chunk for a fresh bakabox
+/// session.
+///
+/// Call exactly once per new WT session, immediately after
+/// `session_init`. Subsequent reconciliation rounds should use
+/// [`drain_pipeline_intern_patches`] instead — calling this twice would
+/// re-bootstrap, clobbering the client's intern mirror.
+///
+/// `classify` decides which interned strings ship as part of which kind
+/// (Tag / Attr / Event). The renderer owns this mapping; the streaming
+/// layer just threads it through.
+pub fn drain_pipeline_bootstrap<F>(
+    state: &StreamingAppState,
+    classify: F,
+) -> Result<Option<LaneRenderedChunk>, RuntimePipelineError>
+where
+    F: Fn(u16, &str) -> Option<InternTableKind>,
+{
+    let Some(pipeline) = state.pipeline.as_ref() else {
+        return Ok(None);
+    };
+    let mut guard = pipeline
+        .lock()
+        .map_err(|_| RuntimePipelineError::MissingRuntimeHandle)?;
+    guard.drain_bootstrap_intern_chunk(classify)
+}
+
+/// Produces the incremental intern table patch chunk, if any, since the
+/// previous reconciliation.
+///
+/// Returns `Ok(None)` when nothing in the intern table has changed —
+/// callers should skip the send in that case to keep the control stream
+/// quiet during steady-state ticks.
+pub fn drain_pipeline_intern_patches<F>(
+    state: &StreamingAppState,
+    classify: F,
+) -> Result<Option<LaneRenderedChunk>, RuntimePipelineError>
+where
+    F: Fn(u16, &str) -> Option<InternTableKind>,
+{
+    let Some(pipeline) = state.pipeline.as_ref() else {
+        return Ok(None);
+    };
+    let mut guard = pipeline
+        .lock()
+        .map_err(|_| RuntimePipelineError::MissingRuntimeHandle)?;
+    guard.drain_intern_table_patches(classify)
+}
+
+/// Forwards a batch of [`LaneRenderedChunk`]s to the bakabox client over
+/// the WebTransport session, one `send_payload` per chunk.
+///
+/// The chunk's `lane` field selects the WT stream slot. `FramePayload::Text`
+/// payloads are sent UTF-8 encoded as-is so existing JSON consumers (the
+/// shell, prefetch) keep working alongside binary opcode chunks.
+///
+/// Returns `Ok(())` when the session has no WT registry (server has
+/// WebTransport disabled) — the streaming handler will fall back to SSE.
+pub async fn ship_chunks_to_session(
+    state: &StreamingAppState,
+    session_id: Uuid,
+    chunks: Vec<LaneRenderedChunk>,
+) -> Result<(), RuntimeError> {
+    let Some(sessions) = state.webtransport_sessions.as_ref() else {
+        return Ok(());
+    };
+    for chunk in chunks {
+        let payload = match chunk.payload {
+            FramePayload::Binary(bytes) => bytes,
+            FramePayload::Text(text) => text.into_bytes(),
+        };
+        sessions
+            .send_payload(session_id, chunk.lane as u8, payload)
+            .await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

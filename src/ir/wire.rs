@@ -11,12 +11,41 @@ pub enum WireError {
     Decode(#[from] bincode::error::DecodeError),
 }
 
-/// Wire configuration — pinned so both ends agree.
+/// The locked wire configuration shared by the Rust runtime and the
+/// bakabox client decoder.
 ///
-/// `standard()` = little-endian, variable-length integers, no limit.
+/// Every knob is spelled out, even when it matches `bincode::config::standard()`
+/// today, because `standard()` is documented as "the current sane defaults"
+/// — a future bincode release is free to flip a default and silently change
+/// every byte we put on the wire. The bakabox decoder is hand-rolled JS; it
+/// has no way to track bincode version drift. Pinning each knob makes any
+/// regression a compile break here, not a 3am production wire-format break.
+///
+/// Knobs and why they are pinned:
+///
+/// - **Little-endian**: bakabox runs on the browser, which is overwhelmingly
+///   little-endian. Choosing it here means the JS decoder reads bytes in the
+///   same order they were written without per-field swaps.
+/// - **Variable-length integers**: most opcode fields are small `u16`/`u32`
+///   IDs (TagId, AttrId, StableId). Varint shrinks the average frame by ~30%
+///   versus fixed-width encoding without costing the decoder anything that
+///   matters at frame sizes we ship (sub-kilobyte typical).
+/// - **No limit**: the WebTransport muxer enforces frame budgets at the
+///   transport layer ([`crate::runtime::webtransport`]). A second limit at
+///   the codec is redundant and would surface as an opaque
+///   `DecodeError::LimitExceeded` rather than the transport's well-typed
+///   `WebTransportError::PayloadKindMismatch`.
+///
+/// Any change to this configuration is a wire-format break and MUST be
+/// accompanied by a bump of
+/// [`crate::ir::conformance::LOCKED_WIRE_VERSION`] and a regenerated
+/// `tests/fixtures/wire/v1_canonical_frame.bin`.
 #[inline]
-fn config() -> impl bincode::config::Config {
+pub(crate) fn config() -> impl bincode::config::Config {
     bincode::config::standard()
+        .with_little_endian()
+        .with_variable_int_encoding()
+        .with_no_limit()
 }
 
 // ── Codec traits ─────────────────────────────────────────────────────
