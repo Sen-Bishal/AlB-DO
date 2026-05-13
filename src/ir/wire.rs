@@ -35,9 +35,10 @@ pub trait WireEncode {
     fn wire_encode(&self) -> Result<Vec<u8>, WireError>;
 }
 
-/// Decode bytes into a wire-shaped type.
+/// Decode bytes into a wire-shaped type, returning the decoded value and
+/// the number of bytes consumed.
 pub trait WireDecode: Sized {
-    fn wire_decode(bytes: &[u8]) -> Result<Self, WireError>;
+    fn wire_decode(bytes: &[u8]) -> Result<(Self, usize), WireError>;
 }
 
 impl<T: bincode::Encode> WireEncode for T {
@@ -47,9 +48,9 @@ impl<T: bincode::Encode> WireEncode for T {
 }
 
 impl<T: bincode::Decode<()>> WireDecode for T {
-    fn wire_decode(bytes: &[u8]) -> Result<Self, WireError> {
-        let (value, _) = bincode::decode_from_slice(bytes, config())?;
-        Ok(value)
+    fn wire_decode(bytes: &[u8]) -> Result<(Self, usize), WireError> {
+        let (value, len) = bincode::decode_from_slice(bytes, config())?;
+        Ok((value, len))
     }
 }
 
@@ -67,13 +68,14 @@ pub fn encode_frame(frame: &OpcodeFrame) -> Result<Vec<u8>, WireError> {
     frame.wire_encode()
 }
 
-/// Decodes an [`OpcodeFrame`] from a binary slice.
+/// Decodes an [`OpcodeFrame`] from a binary slice. Returns the frame and
+/// the number of bytes consumed.
 ///
 /// Caller MUST have already reassembled all WebTransport STREAM messages
 /// sharing the same `frame_id` via
 /// [`crate::runtime::webtransport::WebTransportMuxer::reassemble_binary_stream`]
 /// before calling this. See [`OpcodeFrame`] for the concatenation contract.
-pub fn decode_frame(bytes: &[u8]) -> Result<OpcodeFrame, WireError> {
+pub fn decode_frame(bytes: &[u8]) -> Result<(OpcodeFrame, usize), WireError> {
     OpcodeFrame::wire_decode(bytes)
 }
 
@@ -88,7 +90,7 @@ pub fn encode_intern_table(table: &InternTable) -> Result<Vec<u8>, WireError> {
 }
 
 /// Decodes an [`InternTable`] from a binary slice.
-pub fn decode_intern_table(bytes: &[u8]) -> Result<InternTable, WireError> {
+pub fn decode_intern_table(bytes: &[u8]) -> Result<(InternTable, usize), WireError> {
     InternTable::wire_decode(bytes)
 }
 
@@ -120,7 +122,7 @@ mod tests {
         };
 
         let bytes = encode_frame(&frame).expect("encode must succeed");
-        let decoded = decode_frame(&bytes).expect("decode must succeed");
+        let (decoded, _) = decode_frame(&bytes).expect("decode must succeed");
         assert_eq!(frame, decoded);
     }
 
@@ -135,7 +137,7 @@ mod tests {
             }],
         };
         let bytes = frame.wire_encode().expect("trait encode");
-        let decoded = OpcodeFrame::wire_decode(&bytes).expect("trait decode");
+        let (decoded, _) = OpcodeFrame::wire_decode(&bytes).expect("trait decode");
         assert_eq!(frame, decoded);
     }
 
@@ -149,7 +151,7 @@ mod tests {
             }],
         };
         let bytes = table.wire_encode().expect("trait encode");
-        let decoded = InternTable::wire_decode(&bytes).expect("trait decode");
+        let (decoded, _) = InternTable::wire_decode(&bytes).expect("trait decode");
         assert_eq!(table, decoded);
     }
 
@@ -174,7 +176,7 @@ mod tests {
         };
 
         let bytes = encode_intern_table(&table).expect("encode must succeed");
-        let decoded = decode_intern_table(&bytes).expect("decode must succeed");
+        let (decoded, _) = decode_intern_table(&bytes).expect("decode must succeed");
         assert_eq!(table, decoded);
     }
 
@@ -196,7 +198,7 @@ mod tests {
             instructions: Vec::new(),
         };
         let bytes = encode_frame(&frame).expect("encode");
-        let decoded = decode_frame(&bytes).expect("decode");
+        let (decoded, _) = decode_frame(&bytes).expect("decode");
         assert_eq!(frame, decoded);
     }
 
@@ -235,7 +237,7 @@ mod tests {
             instructions,
         };
         let bytes = encode_frame(&frame).expect("encode");
-        let decoded = decode_frame(&bytes).expect("decode");
+        let (decoded, _) = decode_frame(&bytes).expect("decode");
         assert_eq!(frame, decoded);
     }
 
@@ -314,7 +316,7 @@ mod tests {
             ],
         };
         let bytes = encode_frame(&frame).expect("encode");
-        let decoded = decode_frame(&bytes).expect("decode");
+        let (decoded, _) = decode_frame(&bytes).expect("decode");
         assert_eq!(frame, decoded);
     }
 }

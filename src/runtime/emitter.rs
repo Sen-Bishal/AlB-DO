@@ -414,7 +414,7 @@ mod tests {
         let results = emit_lane_frames(&columns, &refs, &muxer).unwrap();
 
         for result in &results {
-            let decoded = wire::decode_frame(&result.wire_bytes)
+            let (decoded, _) = wire::decode_frame(&result.wire_bytes)
                 .expect("wire bytes must decode cleanly");
             assert_eq!(decoded.instructions.len(), result.instruction_count);
             assert_eq!(decoded.frame_id, result.frame_id);
@@ -441,7 +441,7 @@ mod tests {
         let results = emit_lane_frames(&columns, &refs, &muxer).unwrap();
 
         for result in &results {
-            let decoded = wire::decode_frame(&result.wire_bytes).unwrap();
+            let (decoded, _) = wire::decode_frame(&result.wire_bytes).unwrap();
             for instruction in &decoded.instructions {
                 if let Instruction::SlotSet { slot_id, value } = instruction {
                     let idx = slot_id.0 as usize;
@@ -634,11 +634,11 @@ mod tests {
 
         for result in &results {
             // Decode
-            let decoded = wire::decode_frame(&result.wire_bytes).unwrap();
+            let (decoded, _) = wire::decode_frame(&result.wire_bytes).unwrap();
             // Re-encode
             let re_encoded = decoded.wire_encode().unwrap();
             // Decode again
-            let re_decoded = wire::decode_frame(&re_encoded).unwrap();
+            let (re_decoded, _) = wire::decode_frame(&re_encoded).unwrap();
             assert_eq!(decoded, re_decoded, "double round-trip must be idempotent");
         }
     }
