@@ -8,9 +8,10 @@ use super::pi_arch::{
 };
 use super::scheduler::{OvertakeZoneScheduler, SchedulerConfig, SchedulerFrameStats};
 use super::webtransport::{
-    LaneRenderedChunk, WTRenderMode, WTStreamRouter, WebTransportError, WebTransportFrame,
-    WebTransportMuxer,
+    FramePayload, LaneRenderedChunk, WTRenderMode, WTStreamRouter, WebTransportError,
+    WebTransportFrame, WebTransportMuxer,
 };
+use crate::ir::wire::WireError;
 use crate::graph::ComponentGraph;
 use crate::ir::columns::IrColumns;
 use crate::manifest::schema::Tier;
@@ -26,6 +27,8 @@ pub enum RuntimePipelineError {
     HotSet(#[from] HotSetError),
     #[error(transparent)]
     WebTransport(#[from] WebTransportError),
+    #[error(transparent)]
+    Wire(#[from] WireError),
 }
 
 pub struct FourLaneRuntimePipeline {
@@ -324,6 +327,54 @@ impl FourLaneRuntimePipeline {
     {
         let snapshot = InternTableSnapshot::capture(self.columns.strings(), classify);
         emitter::bootstrap_intern_tables(&snapshot)
+    }
+
+    /// Converts the opcode emission results from the most recent
+    /// [`Self::tick_frame`] call into [`LaneRenderedChunk`]s.
+    pub fn drain_opcode_chunks(&self) -> Vec<LaneRenderedChunk> {
+        let mut chunks = Vec::new();
+        for result in self.frame_arena.opcode_results() {
+            chunks.push(LaneRenderedChunk {
+                lane: result.lane as usize,
+                component_id: result.component_id.map(ComponentId::new),
+                payload: FramePayload::Binary(result.wire_bytes.clone()),
+            });
+        }
+        chunks
+    }
+
+    /// Reconciles intern tables and returns a binary [`LaneRenderedChunk`]
+    /// for the control stream if any changes were detected.
+    pub fn drain_intern_table_patches<F>(
+        &mut self,
+        classify: F,
+    ) -> Result<Option<LaneRenderedChunk>, RuntimePipelineError>
+    where
+        F: Fn(u16, &str) -> Option<crate::ir::opcode::InternTableKind>,
+    {
+        let instructions = self.reconcile_intern_tables(classify);
+        if instructions.is_empty() {
+            return Ok(None);
+        }
+
+        let stream_id = crate::runtime::webtransport::WT_STREAM_SLOT_CONTROL as usize;
+        let frame_id = self
+            .stream_router
+            .muxer
+            .allocate_sequence(stream_id)
+            .unwrap_or(0);
+
+        let frame = crate::ir::opcode::OpcodeFrame {
+            frame_id,
+            component_id: None,
+            instructions,
+        };
+
+        let wire_bytes = crate::ir::wire::encode_frame(&frame)?;
+        Ok(Some(self.stream_router.route_global_chunk(
+            WTRenderMode::Control,
+            wire_bytes,
+        )))
     }
 }
 

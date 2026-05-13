@@ -112,7 +112,10 @@ fn bench_decode(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("decode");
     group.bench_function("bincode_opcode_frame", |b| {
-        b.iter(|| wire::decode_frame(black_box(&bincode_bytes)).unwrap())
+        b.iter(|| {
+            let (frame, _) = wire::decode_frame(black_box(&bincode_bytes)).unwrap();
+            frame
+        })
     });
     group.bench_function("json_opcode_payload", |b| {
         b.iter(|| serde_json::from_slice::<serde_json::Value>(black_box(&json_bytes)).unwrap())
@@ -128,7 +131,8 @@ fn bench_roundtrip(c: &mut Criterion) {
     group.bench_function("bincode_encode_decode", |b| {
         b.iter(|| {
             let bytes = wire::encode_frame(black_box(&frame)).unwrap();
-            let _ = wire::decode_frame(black_box(&bytes)).unwrap();
+            let (decoded, _) = wire::decode_frame(black_box(&bytes)).unwrap();
+            decoded
         })
     });
     group.bench_function("json_serialize_deserialize", |b| {
