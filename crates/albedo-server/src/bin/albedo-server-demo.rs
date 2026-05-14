@@ -1,8 +1,11 @@
 use albedo_server::{
-    AlbedoServerBuilder, AppConfig, AuthDecision, AuthPolicy, AuthProvider, HttpMethod, LayoutSpec,
-    RequestContext, ResponsePayload, RouteSpec, RuntimeError, RuntimeMiddleware, ServerConfig,
+    AlbedoServerBuilder, ApiResponse, AppConfig, AuthDecision, AuthPolicy, AuthProvider,
+    HttpMethod, LayoutSpec, RequestContext, ResponsePayload, RouteSpec, RuntimeError,
+    RuntimeMiddleware, ServerConfig,
 };
 use async_trait::async_trait;
+use dom_render_compiler::ir::action::{ActionEnvelope, ActionEventKind};
+use dom_render_compiler::ir::opcode::{Instruction, SlotId};
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -237,6 +240,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "stream_first_chunk_ms": 22.4
             }))
         })
+        // Phase-F surface — exercised via `register_api_handler` to ship
+        // ApiResponse directly. Pairs with `api.ping` in the route table.
+        .register_api_handler("api.ping", |ctx: RequestContext| async move {
+            ApiResponse::json(&json!({
+                "pong": true,
+                "request_id": ctx.request_id,
+                "path": ctx.path,
+                "phase": "F"
+            }))
+        })
+        // Phase-G surface — bakabox POSTs an ActionEnvelope to
+        // /_albedo/action; this handler echoes the input value back as
+        // an `Instruction::SlotSet` patch on slot 1. A real app would
+        // mutate server-side state and return the patches that reflect
+        // the new state — Phase H wires that loop end-to-end.
+        .register_action(1, |_ctx: RequestContext, env: ActionEnvelope| async move {
+            let kind = ActionEventKind::from_wire(env.event_kind);
+            let value = match kind {
+                ActionEventKind::Input => env.payload.clone(),
+                _ => format!("event:{kind:?}").into_bytes(),
+            };
+            Ok(vec![Instruction::SlotSet {
+                slot_id: SlotId(1),
+                value,
+            }])
+        })
         .build()?;
 
     print_startup_instructions(port, demo_token.as_str());
@@ -331,6 +360,10 @@ fn showcase_config() -> AppConfig {
                 "api.admin.metrics",
                 AuthPolicy::Required,
             ),
+            // Phase-F demo: routed to an ApiHandler (returns ApiResponse)
+            // rather than a RouteHandler. Same route surface, new dispatch
+            // path — the dispatcher picks the right registry by handler_id.
+            route("api.ping", HttpMethod::Get, "/api/ping", "api.ping"),
         ],
     }
 }
@@ -511,6 +544,9 @@ fn print_startup_instructions(port: u16, demo_token: &str) {
     println!("  /api/showcase");
     println!("  GET  /api/echo");
     println!("  POST /api/echo");
+    println!("  /api/ping             (Phase-F ApiHandler path)");
+    println!("Phase-G actions:");
+    println!("  POST /_albedo/action  (bincode ActionEnvelope; action_id=1 wired)");
     println!("Protected routes:");
     println!("  /admin (header: {}: {})", AUTH_TOKEN_HEADER, demo_token);
     println!(

@@ -1,9 +1,13 @@
+use crate::actions::ActionHandler;
+use crate::api::ApiHandler;
 use crate::config::AppConfig;
 use crate::contract::{
     AllowAllAuthProvider, AuthDecision, AuthProvider, LayoutHandler, PropsLoader, RouteHandler,
     RuntimeMiddleware,
 };
 use crate::error::RuntimeError;
+use crate::handlers::action::{run_action_request, ActionRegistry};
+use crate::handlers::api::dispatch_api_route;
 use crate::handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 use crate::render::tier_b::{SharedRenderServices, TierBOpcodeRegistry};
@@ -27,6 +31,8 @@ use tracing::{error, info};
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 type SharedHandler = Arc<dyn RouteHandler>;
+type SharedApiHandler = Arc<dyn ApiHandler>;
+type SharedActionHandler = Arc<dyn ActionHandler>;
 type SharedLayoutHandler = Arc<dyn LayoutHandler>;
 type SharedMiddleware = Arc<dyn RuntimeMiddleware>;
 type SharedAuthProvider = Arc<dyn AuthProvider>;
@@ -36,6 +42,14 @@ type SharedPropsLoader = Arc<dyn PropsLoader>;
 struct RuntimeState {
     router: Arc<CompiledRouter>,
     handlers: Arc<HashMap<String, SharedHandler>>,
+    /// Phase-F — API handlers keyed by the same `handler_id` namespace
+    /// as page handlers. Dispatch picks the right registry by looking
+    /// up `target.handler_id` here before falling through to `handlers`.
+    api_handlers: Arc<HashMap<String, SharedApiHandler>>,
+    /// Phase-G — action handlers keyed by `action_id` (the same u32
+    /// `BindEvent.proxy_id` carries on the wire). Served via
+    /// `POST /_albedo/action`.
+    action_handlers: Arc<ActionRegistry>,
     layouts: Arc<HashMap<String, SharedLayoutHandler>>,
     middleware: Arc<HashMap<String, SharedMiddleware>>,
     auth_provider: SharedAuthProvider,
@@ -46,6 +60,15 @@ struct RuntimeState {
 pub struct AlbedoServerBuilder {
     config: AppConfig,
     handlers: HashMap<String, SharedHandler>,
+    /// Phase-F — API handler registry. Distinct from `handlers` so
+    /// dispatch can pick the right call path; same handler_id namespace
+    /// so a route's `handler` field resolves to whichever registry the
+    /// user populated.
+    api_handlers: HashMap<String, SharedApiHandler>,
+    /// Phase-G — action handler registry keyed by u32 `action_id`.
+    /// Populated via [`Self::register_action`]; served by the
+    /// `POST /_albedo/action` axum route.
+    action_handlers: ActionRegistry,
     props_loaders: HashMap<String, SharedPropsLoader>,
     layouts: HashMap<String, SharedLayoutHandler>,
     middleware: HashMap<String, SharedMiddleware>,
@@ -66,6 +89,8 @@ impl AlbedoServerBuilder {
         Self {
             config,
             handlers: HashMap::new(),
+            api_handlers: HashMap::new(),
+            action_handlers: ActionRegistry::new(),
             props_loaders: HashMap::new(),
             layouts: HashMap::new(),
             middleware: HashMap::new(),
@@ -82,6 +107,36 @@ impl AlbedoServerBuilder {
         handler: impl RouteHandler + 'static,
     ) -> Self {
         self.handlers.insert(handler_id.into(), Arc::new(handler));
+        self
+    }
+
+    /// Registers an [`ApiHandler`] under `handler_id`. Routes whose
+    /// `handler` field resolves to this id are dispatched through the
+    /// API path ([`dispatch_api_route`]) instead of the page-route
+    /// pipeline. Auth still flows through the registered
+    /// `AuthProvider` against `RouteTarget.auth`.
+    pub fn register_api_handler(
+        mut self,
+        handler_id: impl Into<String>,
+        handler: impl ApiHandler + 'static,
+    ) -> Self {
+        self.api_handlers
+            .insert(handler_id.into(), Arc::new(handler));
+        self
+    }
+
+    /// Phase-G — registers an [`ActionHandler`] under the u32
+    /// `action_id`. Bakabox's `BindEvent` opcode carries `action_id`
+    /// as its `proxy_id`; when the corresponding DOM event fires, the
+    /// client POSTs an `ActionEnvelope` to `/_albedo/action`. The
+    /// handler returns opcode patches which the dispatcher wire-encodes
+    /// and returns to bakabox for in-place DOM mutation.
+    pub fn register_action(
+        mut self,
+        action_id: u32,
+        handler: impl ActionHandler + 'static,
+    ) -> Self {
+        self.action_handlers.insert(action_id, Arc::new(handler));
         self
     }
 
@@ -224,7 +279,12 @@ impl AlbedoServerBuilder {
                         .map(|runtime| runtime.manifest.routes.contains_key(route.path.as_str()))
                         .unwrap_or(false);
 
-            if !route_uses_manifest_streaming && !self.handlers.contains_key(route.handler.as_str())
+            // Phase-F: a route's `handler` may resolve to either a
+            // page `RouteHandler` or an API `ApiHandler`. Build fails
+            // only when neither registry knows the id.
+            if !route_uses_manifest_streaming
+                && !self.handlers.contains_key(route.handler.as_str())
+                && !self.api_handlers.contains_key(route.handler.as_str())
             {
                 return Err(RuntimeError::HandlerNotFound {
                     handler_id: route.handler.clone(),
@@ -259,6 +319,8 @@ impl AlbedoServerBuilder {
         let state = RuntimeState {
             router: Arc::new(router),
             handlers: Arc::new(self.handlers),
+            api_handlers: Arc::new(self.api_handlers),
+            action_handlers: Arc::new(self.action_handlers),
             layouts: Arc::new(self.layouts),
             middleware: Arc::new(self.middleware),
             auth_provider: self.auth_provider,
@@ -365,6 +427,13 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
         }
     }
 
+    // Phase-G — bakabox → server action invocations land here. Only
+    // POST is accepted; other methods fall through to the normal
+    // router (which will surface 405 or 404 as appropriate).
+    if path == "/_albedo/action" && method == HttpMethod::Post {
+        return run_action_route(&state, request).await;
+    }
+
     let route_match = state.router.match_route(method, path.as_str());
     let response = match route_match {
         RouteMatch::NotFound => RuntimeError::RouteNotFound {
@@ -402,7 +471,7 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
                 }
             };
 
-            let mut request_context = RequestContext::new(
+            let request_context = RequestContext::new(
                 method,
                 path.clone(),
                 query.as_deref(),
@@ -411,6 +480,15 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
                 body,
             );
 
+            // Phase-F: if `handler_id` resolves to an API handler,
+            // dispatch through the API path. Otherwise fall through to
+            // the page-route flow (middleware, auth, handler, layout).
+            if let Some(api_handler) = state.api_handlers.get(&matched.target.handler_id).cloned()
+            {
+                return run_api_request(&state, matched.target, request_context, api_handler).await;
+            }
+
+            let mut request_context = request_context;
             match execute_route(&state, matched.target, &mut request_context).await {
                 Ok(response) => response.into_response(),
                 Err(err) => {
@@ -422,6 +500,62 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
     };
 
     response
+}
+
+/// Phase-G — runs the action HTTP route. Reads the body, builds a
+/// `RequestContext` (so handlers see the same headers/query surface
+/// the rest of the runtime hands them), and dispatches to
+/// [`run_action_request`]. The body cap matches `MAX_REQUEST_BODY_BYTES`
+/// so an oversized envelope is rejected with the same shape as any
+/// other large request.
+async fn run_action_route(state: &RuntimeState, request: Request<Body>) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
+    };
+
+    let query = parts.uri.query().map(str::to_string);
+    let ctx = RequestContext::new(
+        HttpMethod::Post,
+        parts.uri.path().to_string(),
+        query.as_deref(),
+        Default::default(),
+        &parts.headers,
+        body.clone(),
+    );
+
+    run_action_request(state.action_handlers.as_ref(), ctx, body).await
+}
+
+/// Runs an API request: applies the route-level timeout, calls
+/// [`dispatch_api_route`], and converts the result into an axum
+/// response. Centralised so the dispatcher stays linear and so future
+/// per-request observability (tracing, metrics) attaches in one place.
+async fn run_api_request(
+    state: &RuntimeState,
+    target: RouteTarget,
+    ctx: RequestContext,
+    handler: SharedApiHandler,
+) -> Response {
+    let request_id = ctx.request_id.clone();
+    let dispatch = dispatch_api_route(&target, ctx, &state.auth_provider, &handler);
+    let result = tokio::time::timeout(state.request_timeout, dispatch).await;
+    match result {
+        Ok(Ok(api_response)) => api_response.into_response(),
+        Ok(Err(err)) => {
+            error!(request_id, error = %err, "api request failed");
+            err.into_response()
+        }
+        Err(_) => {
+            let err = RuntimeError::RequestHandling(format!(
+                "api request timed out after {} ms",
+                state.request_timeout.as_millis()
+            ));
+            error!(request_id, error = %err, "api request timed out");
+            err.into_response()
+        }
+    }
 }
 
 async fn execute_route(
@@ -576,6 +710,7 @@ async fn shutdown_signal(_timeout: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ApiResponse;
     use crate::config::{RouteSpec, ServerConfig};
     use crate::routing::{AuthPolicy, HttpMethod};
     use axum::body::to_bytes;
@@ -849,5 +984,414 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "<main>ALBEDO</main>");
+    }
+
+    // ── Phase F — API route tests ─────────────────────────────────────
+
+    fn api_route(method: HttpMethod, path: &str, handler: &str, auth: Option<AuthPolicy>) -> RouteSpec {
+        RouteSpec {
+            name: handler.to_string(),
+            method,
+            path: path.to_string(),
+            handler: handler.to_string(),
+            entry_module: None,
+            props_loader: None,
+            middleware: Vec::new(),
+            auth,
+        }
+    }
+
+    #[tokio::test]
+    async fn api_handler_echoes_request_body() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: vec![api_route(HttpMethod::Post, "/api/echo", "echo", None)],
+        };
+
+        let server = AlbedoServerBuilder::new(config)
+            .register_api_handler("echo", |ctx: RequestContext| async move {
+                Ok(ApiResponse::ok(ctx.body)
+                    .with_header("content-type", "application/octet-stream"))
+            })
+            .build()
+            .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/echo")
+                    .body(Body::from("hello-api"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let body = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(body, "hello-api");
+    }
+
+    #[tokio::test]
+    async fn api_handler_returns_json_with_correct_content_type() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: vec![api_route(HttpMethod::Get, "/api/status", "status", None)],
+        };
+
+        let server = AlbedoServerBuilder::new(config)
+            .register_api_handler("status", |_ctx: RequestContext| async move {
+                ApiResponse::json(&serde_json::json!({ "ok": true, "version": 1 }))
+            })
+            .build()
+            .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(body, r#"{"ok":true,"version":1}"#);
+    }
+
+    #[tokio::test]
+    async fn api_handler_with_required_auth_returns_401_when_denied() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: vec![api_route(
+                HttpMethod::Get,
+                "/api/private",
+                "private",
+                Some(AuthPolicy::Required),
+            )],
+        };
+
+        let server = AlbedoServerBuilder::new(config)
+            .register_api_handler("private", |_ctx: RequestContext| async move {
+                Ok(ApiResponse::ok(Bytes::from_static(b"secret")))
+            })
+            .with_auth_provider(DenyAllAuth)
+            .build()
+            .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/private")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "denied auth must surface as 401 on the API path"
+        );
+        let body = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        assert!(
+            !body.as_ref().eq(b"secret"),
+            "handler body must never reach the wire when auth denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_handler_with_role_auth_runs_when_provider_allows() {
+        // Mirrors the Phase-F risk-#9 mitigation test: an admin-only
+        // route must invoke the handler when the auth provider says yes.
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: vec![api_route(
+                HttpMethod::Get,
+                "/api/admin",
+                "admin",
+                Some(AuthPolicy::Role("admin".to_string())),
+            )],
+        };
+
+        let server = AlbedoServerBuilder::new(config)
+            .register_api_handler("admin", |_ctx: RequestContext| async move {
+                Ok(ApiResponse::ok(Bytes::from_static(b"admin-area")))
+            })
+            .build()
+            .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(body, "admin-area");
+    }
+
+    #[tokio::test]
+    async fn api_handler_method_mismatch_returns_405() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: vec![api_route(HttpMethod::Get, "/api/users", "users.list", None)],
+        };
+
+        let server = AlbedoServerBuilder::new(config)
+            .register_api_handler("users.list", |_ctx: RequestContext| async move {
+                Ok(ApiResponse::ok(Bytes::from_static(b"[]")))
+            })
+            .build()
+            .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let allow = response
+            .headers()
+            .get("allow")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(allow, Some("GET"));
+    }
+
+    // ── Phase G — action route tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn action_route_dispatches_and_returns_wire_encoded_opcode_frame() {
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+        use dom_render_compiler::ir::opcode::{Instruction, StableId, TagId};
+        use dom_render_compiler::ir::wire::decode_frame;
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+
+        let server = AlbedoServerBuilder::new(config)
+            .register_action(
+                42,
+                |_ctx: RequestContext,
+                 envelope: dom_render_compiler::ir::action::ActionEnvelope| async move {
+                    // Handler returns one Create that targets the action_id
+                    // as its stable_id so the test can verify the args
+                    // reached the handler unmodified.
+                    Ok(vec![Instruction::Create {
+                        tag_id: TagId(0),
+                        stable_id: StableId(envelope.action_id),
+                    }])
+                },
+            )
+            .build()
+            .unwrap();
+
+        let body = encode_action_envelope(&ActionEnvelope {
+            action_id: 42,
+            event_kind: 0,
+            payload: Vec::new(),
+        })
+        .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        let (frame, _) = decode_frame(&bytes).expect("response decodes as OpcodeFrame");
+        assert!(matches!(
+            frame.instructions[0],
+            Instruction::Create { stable_id: StableId(42), .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn action_route_returns_404_for_unregistered_action_id() {
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+        let server = AlbedoServerBuilder::new(config).build().unwrap();
+
+        let body = encode_action_envelope(&ActionEnvelope {
+            action_id: 99,
+            event_kind: 0,
+            payload: Vec::new(),
+        })
+        .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn action_route_carries_request_context_to_handler() {
+        // Verifies the handler sees the headers from the originating
+        // request — Phase H / I will lean on this for CSRF tokens and
+        // session-bearing cookies.
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+        let server = AlbedoServerBuilder::new(config)
+            .register_action(
+                7,
+                |ctx: RequestContext,
+                 _env: dom_render_compiler::ir::action::ActionEnvelope| async move {
+                    // Echo the token header back via SetText so the test
+                    // can read it from the decoded response.
+                    let token = ctx
+                        .headers
+                        .get("x-albedo-session")
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(vec![dom_render_compiler::ir::opcode::Instruction::SetText {
+                        stable_id: dom_render_compiler::ir::opcode::StableId(1),
+                        text: token.into_bytes(),
+                    }])
+                },
+            )
+            .build()
+            .unwrap();
+
+        let body = encode_action_envelope(&ActionEnvelope {
+            action_id: 7,
+            event_kind: 0,
+            payload: Vec::new(),
+        })
+        .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .header("x-albedo-session", "sess-abc")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        let (frame, _) = dom_render_compiler::ir::wire::decode_frame(&bytes).unwrap();
+        match &frame.instructions[0] {
+            dom_render_compiler::ir::opcode::Instruction::SetText { text, .. } => {
+                assert_eq!(text.as_slice(), b"sess-abc");
+            }
+            other => panic!("expected SetText, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_api_handler_id_fails_build() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: vec![api_route(HttpMethod::Get, "/api/missing", "missing", None)],
+        };
+
+        // No api_handler registered for "missing" — build must reject.
+        // `unwrap_err` would require AlbedoServer: Debug, so match by hand.
+        match AlbedoServerBuilder::new(config).build() {
+            Err(RuntimeError::HandlerNotFound { handler_id }) => {
+                assert_eq!(handler_id, "missing");
+            }
+            Err(other) => panic!("expected HandlerNotFound, got {other:?}"),
+            Ok(_) => panic!("build must reject a route with no registered handler"),
+        }
     }
 }
