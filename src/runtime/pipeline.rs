@@ -9,15 +9,21 @@ use super::pi_arch::{
 use super::scheduler::{OvertakeZoneScheduler, SchedulerConfig, SchedulerFrameStats};
 use super::webtransport::{
     FramePayload, LaneRenderedChunk, WTRenderMode, WTStreamRouter, WebTransportError,
-    WebTransportFrame, WebTransportMuxer,
+    WebTransportFrame, WebTransportMuxer, WT_STREAM_SLOT_PATCHES,
 };
-use crate::ir::wire::WireError;
+use crate::ir::opcode::{Instruction, InstructionRange, OpcodeFrame, StableId, SuspenseId};
+use crate::ir::wire::{self, WireError};
 use crate::graph::ComponentGraph;
 use crate::ir::columns::IrColumns;
 use crate::manifest::schema::Tier;
 use crate::types::{CompilerError, ComponentAnalysis, ComponentId};
+use dashmap::DashMap;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimePipelineError {
@@ -35,6 +41,32 @@ pub enum RuntimePipelineError {
     /// clean 5xx instead of crashing the tick loop.
     #[error("pipeline missing tokio runtime handle; call `with_runtime_handle` before spawning async work")]
     MissingRuntimeHandle,
+    /// Phase-D: an invariant on `InstructionRange` was violated. Surfaced
+    /// as a typed error so cancellation / wire-shape bugs don't panic
+    /// the tick loop.
+    #[error(transparent)]
+    Range(#[from] crate::ir::opcode::RangeError),
+}
+
+/// Phase-D — pending async island registry entry.
+///
+/// Records the placeholder `stable_id` so a later `Remove` can mark the
+/// island cancelled before its resolver Future lands. `cancelled` is
+/// atomic so a tick-thread mark and a resolver-thread read don't need a
+/// lock.
+#[derive(Debug)]
+struct AsyncIslandRecord {
+    stable_id: StableId,
+    cancelled: AtomicBool,
+}
+
+/// Phase-D — message sent from a resolved async-island Future back to
+/// the pipeline. Drained inside `tick_frame` and wrapped into a `Patch`
+/// frame on `WT_STREAM_SLOT_PATCHES`.
+#[derive(Debug)]
+struct AsyncResolution {
+    suspense_id: SuspenseId,
+    instructions: Vec<Instruction>,
 }
 
 pub struct FourLaneRuntimePipeline {
@@ -64,6 +96,23 @@ pub struct FourLaneRuntimePipeline {
     // require it via `require_runtime_handle` and fail with a typed error
     // rather than panicking on `Handle::current()` outside a runtime ctx.
     runtime_handle: Option<tokio::runtime::Handle>,
+
+    // Phase D — async island substrate.
+    //
+    // `suspense_allocator` mints monotonic SuspenseIds. `pending_placeholders`
+    // tracks every in-flight island so a `Remove` against the placeholder's
+    // stable_id can mark the eventual Patch as cancelled. The mpsc channel
+    // carries resolutions from spawned resolver tasks back to `tick_frame`,
+    // which wraps each into a `Patch` frame.
+    //
+    // `pending_placeholder_emissions` buffers `LaneRenderedChunk`s built by
+    // `enqueue_async_island` so the next `drain_opcode_chunks` ships the
+    // `Placeholder` opcode on the same tick the island was registered.
+    suspense_allocator: AtomicU32,
+    pending_placeholders: DashMap<SuspenseId, AsyncIslandRecord>,
+    async_tx: mpsc::UnboundedSender<AsyncResolution>,
+    async_rx: Mutex<mpsc::UnboundedReceiver<AsyncResolution>>,
+    pending_placeholder_emissions: Mutex<Vec<LaneRenderedChunk>>,
 }
 
 impl FourLaneRuntimePipeline {
@@ -101,6 +150,8 @@ impl FourLaneRuntimePipeline {
         let frame_metrics = FrameMetrics::default();
         let prev_intern_snapshot = InternTableSnapshot::default();
 
+        let (async_tx, async_rx) = mpsc::unbounded_channel();
+
         Ok(Self {
             highway,
             analyses,
@@ -114,6 +165,11 @@ impl FourLaneRuntimePipeline {
             frame_metrics,
             prev_intern_snapshot,
             runtime_handle: None,
+            suspense_allocator: AtomicU32::new(0),
+            pending_placeholders: DashMap::new(),
+            async_tx,
+            async_rx: Mutex::new(async_rx),
+            pending_placeholder_emissions: Mutex::new(Vec::new()),
         })
     }
 
@@ -387,6 +443,167 @@ impl FourLaneRuntimePipeline {
         emitter::bootstrap_intern_tables(&snapshot)
     }
 
+    // ── Phase D — async island surface ─────────────────────────────────
+
+    /// Registers an async island and ships the `Placeholder` on the next
+    /// `drain_opcode_chunks` call.
+    ///
+    /// Allocates a fresh `SuspenseId`, builds a `Placeholder { stable_id,
+    /// suspense_id }` chunk for the patches stream, and spawns `resolver`
+    /// on the bound tokio runtime. When the future completes, its
+    /// `Vec<Instruction>` is delivered to the pipeline via an internal
+    /// mpsc channel; the next `tick_frame` wraps that vector into a
+    /// `Patch` frame.
+    ///
+    /// Returns the allocated `SuspenseId` so callers that want to track
+    /// the island (e.g. for cancellation via [`Self::cancel_pending_async_for`])
+    /// can correlate.
+    ///
+    /// Requires a runtime handle bound via [`Self::with_runtime_handle`];
+    /// returns [`RuntimePipelineError::MissingRuntimeHandle`] otherwise.
+    pub fn enqueue_async_island<F>(
+        &self,
+        stable_id: StableId,
+        resolver: F,
+    ) -> Result<SuspenseId, RuntimePipelineError>
+    where
+        F: Future<Output = Vec<Instruction>> + Send + 'static,
+    {
+        let handle = self.require_runtime_handle()?.clone();
+        let suspense_id = SuspenseId(self.suspense_allocator.fetch_add(1, Ordering::Relaxed));
+
+        self.pending_placeholders.insert(
+            suspense_id,
+            AsyncIslandRecord {
+                stable_id,
+                cancelled: AtomicBool::new(false),
+            },
+        );
+
+        let placeholder_chunk = self.build_patches_chunk(vec![Instruction::Placeholder {
+            stable_id,
+            suspense_id,
+        }])?;
+
+        match self.pending_placeholder_emissions.lock() {
+            Ok(mut queue) => queue.push(placeholder_chunk),
+            Err(_) => {
+                // Lock poisoning would mean an earlier tick panicked while
+                // holding it. Drop the placeholder rather than panic again;
+                // the island's Future will still resolve and surface a
+                // (now-orphan) Patch which `drain_async_patch_chunks`
+                // tolerates by skipping unknown suspense ids.
+                self.pending_placeholders.remove(&suspense_id);
+                return Err(RuntimePipelineError::MissingRuntimeHandle);
+            }
+        }
+
+        let tx = self.async_tx.clone();
+        handle.spawn(async move {
+            let instructions = resolver.await;
+            let _ = tx.send(AsyncResolution {
+                suspense_id,
+                instructions,
+            });
+        });
+
+        Ok(suspense_id)
+    }
+
+    /// Marks every pending async island whose placeholder targets
+    /// `stable_id` as cancelled. When the island's Future eventually
+    /// lands, `drain_async_patch_chunks` drops it instead of shipping a
+    /// `Patch` that would target a removed DOM node.
+    ///
+    /// Returns the number of islands marked. Callers ship `Remove`
+    /// opcodes for the same `stable_id` independently; this call only
+    /// affects the *pending* async side of the bookkeeping.
+    pub fn cancel_pending_async_for(&self, stable_id: StableId) -> usize {
+        let mut marked = 0;
+        for entry in self.pending_placeholders.iter() {
+            if entry.value().stable_id == stable_id
+                && !entry.value().cancelled.swap(true, Ordering::Relaxed)
+            {
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    /// Number of async islands currently in-flight (placeholder shipped,
+    /// resolver Future not yet drained into a `Patch`). Exposed for
+    /// observability and tests; not on the hot path.
+    pub fn pending_async_count(&self) -> usize {
+        self.pending_placeholders.len()
+    }
+
+    /// Drains every resolved-but-not-yet-shipped async island and builds
+    /// one `Patch` frame per non-cancelled resolution. Cancelled islands
+    /// are removed silently.
+    ///
+    /// Returns chunks ready to enqueue on the patches stream. Caller is
+    /// `drain_opcode_chunks`; outside callers should not normally need
+    /// this directly.
+    fn drain_async_patch_chunks(&self) -> Result<Vec<LaneRenderedChunk>, RuntimePipelineError> {
+        let mut out = Vec::new();
+
+        let mut rx = match self.async_rx.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(out),
+        };
+
+        while let Ok(resolution) = rx.try_recv() {
+            let cancelled = self
+                .pending_placeholders
+                .remove(&resolution.suspense_id)
+                .map(|(_, record)| record.cancelled.load(Ordering::Relaxed))
+                .unwrap_or(true);
+
+            if cancelled {
+                continue;
+            }
+
+            // Per the Phase-D wire amendment in `src/ir/opcode.rs`, the
+            // `Patch` ships in its own frame and the resolved opcodes are
+            // the remaining instructions in the same frame. An empty
+            // `InstructionRange` signals that contract to the client.
+            let mut instructions = Vec::with_capacity(resolution.instructions.len() + 1);
+            instructions.push(Instruction::Patch {
+                suspense_id: resolution.suspense_id,
+                range: InstructionRange::try_new(0, 0)?,
+            });
+            instructions.extend(resolution.instructions);
+
+            out.push(self.build_patches_chunk(instructions)?);
+        }
+
+        Ok(out)
+    }
+
+    /// Builds an `OpcodeFrame` from `instructions`, allocates a fresh
+    /// `frame_id` against the patches stream, encodes, and routes
+    /// through the stream router. Shared by `enqueue_async_island` and
+    /// `drain_async_patch_chunks` so the wire shape stays in one place.
+    fn build_patches_chunk(
+        &self,
+        instructions: Vec<Instruction>,
+    ) -> Result<LaneRenderedChunk, RuntimePipelineError> {
+        let frame_id = self
+            .stream_router
+            .muxer
+            .allocate_sequence(WT_STREAM_SLOT_PATCHES as usize)
+            .unwrap_or(0);
+        let frame = OpcodeFrame {
+            frame_id,
+            component_id: None,
+            instructions,
+        };
+        let wire_bytes = wire::encode_frame(&frame)?;
+        Ok(self
+            .stream_router
+            .route_global_chunk(WTRenderMode::Patch, wire_bytes))
+    }
+
     /// Converts the opcode emission results from the most recent
     /// [`Self::tick_frame`] call into [`LaneRenderedChunk`]s ready for
     /// the WebTransport patches stream.
@@ -403,6 +620,16 @@ impl FourLaneRuntimePipeline {
     /// dimension is which WT stream it lands on.
     pub fn drain_opcode_chunks(&self) -> Vec<LaneRenderedChunk> {
         let mut chunks = Vec::new();
+
+        // Phase D: resolved async islands first. Cancelled or unknown
+        // resolutions are dropped silently; errors collapsing to an
+        // empty Vec keep the tick loop alive even if the patches stream
+        // hits a transient routing problem.
+        if let Ok(async_chunks) = self.drain_async_patch_chunks() {
+            chunks.extend(async_chunks);
+        }
+
+        // Per-tick patch frames from the synchronous emitter.
         for result in self.frame_arena.opcode_results() {
             let payload = FramePayload::Binary(result.wire_bytes.clone());
             let chunk = match result.component_id {
@@ -417,6 +644,15 @@ impl FourLaneRuntimePipeline {
             };
             chunks.push(chunk);
         }
+
+        // Phase D: Placeholders queued by `enqueue_async_island` this
+        // tick. Drained last so the client sees them after any
+        // resolutions from prior ticks have already replaced earlier
+        // placeholders.
+        if let Ok(mut queued) = self.pending_placeholder_emissions.lock() {
+            chunks.append(&mut queued);
+        }
+
         chunks
     }
 
@@ -803,5 +1039,200 @@ mod tests {
             pipeline.require_runtime_handle().is_ok(),
             "require_runtime_handle must return the bound handle"
         );
+    }
+
+    // ── Phase D — async island tests ───────────────────────────────────
+
+    use crate::ir::opcode::{Instruction, StableId, SuspenseId, TagId};
+    use crate::ir::wire::decode_frame;
+    use crate::runtime::webtransport::{FramePayload, WT_STREAM_SLOT_PATCHES};
+
+    /// Builds a minimal pipeline with a bound runtime handle suitable for
+    /// driving the async-island surface in tests. Returns both the
+    /// pipeline and the tokio runtime so the runtime can drive resolver
+    /// Futures via `block_on`.
+    fn build_async_pipeline() -> (FourLaneRuntimePipeline, tokio::runtime::Runtime) {
+        // Multi-thread runtime so spawned resolver Futures run on a worker;
+        // the test thread can then `block_on(sleep)` to give them time to
+        // land their resolutions on the pipeline's mpsc.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime must build");
+        let handle = runtime.handle().clone();
+
+        let graph = ComponentGraph::new();
+        let id = graph.add_component(Component::new(ComponentId::new(0), "Async".to_string()));
+        let mut analyses = HashMap::new();
+        analyses.insert(id, analysis(id, 0.1, 1.0));
+
+        let pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            HashMap::from([(id, Tier::B)]),
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .expect("pipeline must build")
+        .with_runtime_handle(handle);
+
+        (pipeline, runtime)
+    }
+
+    fn decoded_instructions(chunk: &LaneRenderedChunk) -> Vec<Instruction> {
+        let bytes = match &chunk.payload {
+            FramePayload::Binary(b) => b.clone(),
+            FramePayload::Text(_) => panic!("opcode chunks must be Binary"),
+        };
+        let (frame, _) = decode_frame(&bytes).expect("chunk must decode");
+        frame.instructions
+    }
+
+    #[test]
+    fn enqueue_async_island_emits_placeholder_chunk() {
+        let (pipeline, _runtime) = build_async_pipeline();
+
+        let suspense_id = pipeline
+            .enqueue_async_island(StableId(7), async { Vec::new() })
+            .expect("enqueue must succeed when runtime handle is bound");
+        assert_eq!(suspense_id, SuspenseId(0));
+        assert_eq!(pipeline.pending_async_count(), 1);
+
+        let chunks = pipeline.drain_opcode_chunks();
+        assert_eq!(chunks.len(), 1, "exactly one Placeholder chunk this tick");
+        assert_eq!(chunks[0].lane as u8, WT_STREAM_SLOT_PATCHES);
+
+        let instructions = decoded_instructions(&chunks[0]);
+        assert_eq!(
+            instructions,
+            vec![Instruction::Placeholder {
+                stable_id: StableId(7),
+                suspense_id: SuspenseId(0),
+            }]
+        );
+    }
+
+    #[test]
+    fn resolved_future_ships_patch_frame_with_resolution() {
+        let (pipeline, runtime) = build_async_pipeline();
+
+        let suspense_id = pipeline
+            .enqueue_async_island(StableId(11), async {
+                vec![Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(11),
+                }]
+            })
+            .expect("enqueue must succeed");
+
+        // Drain the placeholder so it doesn't show up in the next drain.
+        let _ = pipeline.drain_opcode_chunks();
+
+        // Drive the spawned resolver to completion. `block_on` returning
+        // a stable value of `Vec::new()` lets the runtime tick the
+        // spawned task; after the await point the task has already sent
+        // its resolution into the pipeline's mpsc.
+        // Give the worker thread a tick to await the resolver and send
+        // its resolution through the mpsc channel.
+        runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        });
+
+        let chunks = pipeline.drain_opcode_chunks();
+        assert_eq!(chunks.len(), 1, "patch frame must ship on the next drain");
+        let instructions = decoded_instructions(&chunks[0]);
+        assert_eq!(instructions.len(), 2, "Patch + one resolved Create");
+        match &instructions[0] {
+            Instruction::Patch { suspense_id: sid, .. } => assert_eq!(*sid, suspense_id),
+            other => panic!("first instruction must be Patch, got {:?}", other),
+        }
+        assert!(matches!(
+            instructions[1],
+            Instruction::Create { stable_id: StableId(11), .. }
+        ));
+        assert_eq!(
+            pipeline.pending_async_count(),
+            0,
+            "draining the patch must clear the pending entry"
+        );
+    }
+
+    #[test]
+    fn cancelled_async_island_drops_resolution_silently() {
+        let (pipeline, runtime) = build_async_pipeline();
+
+        pipeline
+            .enqueue_async_island(StableId(42), async {
+                vec![Instruction::SetText {
+                    stable_id: StableId(42),
+                    text: b"never shipped".to_vec(),
+                }]
+            })
+            .expect("enqueue must succeed");
+
+        // Caller decides the placeholder is no longer needed (e.g. the
+        // component was removed) BEFORE the resolver lands.
+        let cancelled = pipeline.cancel_pending_async_for(StableId(42));
+        assert_eq!(cancelled, 1, "exactly one pending island must be marked");
+
+        // Drain placeholder; this is the Placeholder chunk from enqueue.
+        let _ = pipeline.drain_opcode_chunks();
+
+        // Drive the resolver to completion.
+        // Give the worker thread a tick to await the resolver and send
+        // its resolution through the mpsc channel.
+        runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        });
+
+        let chunks = pipeline.drain_opcode_chunks();
+        assert!(
+            chunks.is_empty(),
+            "cancelled resolution must not ship a Patch; got {} chunks",
+            chunks.len()
+        );
+        assert_eq!(pipeline.pending_async_count(), 0);
+    }
+
+    #[test]
+    fn enqueue_without_runtime_handle_surfaces_typed_error() {
+        let graph = ComponentGraph::new();
+        let id = graph.add_component(Component::new(ComponentId::new(0), "X".to_string()));
+        let mut analyses = HashMap::new();
+        analyses.insert(id, analysis(id, 0.1, 1.0));
+
+        let pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            HashMap::from([(id, Tier::B)]),
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .unwrap();
+
+        let result = pipeline.enqueue_async_island(StableId(1), async { Vec::new() });
+        assert!(matches!(
+            result,
+            Err(RuntimePipelineError::MissingRuntimeHandle)
+        ));
+        assert_eq!(
+            pipeline.pending_async_count(),
+            0,
+            "no pending entry must be left behind when spawn fails"
+        );
+    }
+
+    #[test]
+    fn suspense_ids_are_monotonic_across_enqueues() {
+        let (pipeline, _runtime) = build_async_pipeline();
+        let a = pipeline.enqueue_async_island(StableId(1), async { Vec::new() }).unwrap();
+        let b = pipeline.enqueue_async_island(StableId(2), async { Vec::new() }).unwrap();
+        let c = pipeline.enqueue_async_island(StableId(3), async { Vec::new() }).unwrap();
+        assert_eq!(a, SuspenseId(0));
+        assert_eq!(b, SuspenseId(1));
+        assert_eq!(c, SuspenseId(2));
     }
 }

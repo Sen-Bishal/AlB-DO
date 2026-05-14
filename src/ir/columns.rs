@@ -447,6 +447,18 @@ impl IrColumns {
             .unwrap_or(&[])
     }
 
+    /// Per-lane slice of the async-effect bit. Each byte is `1` when the
+    /// component at that column index has `EffectProfile.asynchronous`
+    /// set and `0` otherwise. Used by Phase-D's async-island detection
+    /// to decide which dirty components ship as `Placeholder` + spawned
+    /// resolver instead of inline patches.
+    pub fn lane_asynchronous(&self, lane: usize) -> Vec<u8> {
+        self.lane_effects(lane)
+            .iter()
+            .map(|bits| u8::from((bits & effect_bits::ASYNC) != 0))
+            .collect()
+    }
+
     pub fn lane_priorities(&self, lane: usize) -> &[f32] {
         self.lane_range(lane)
             .and_then(|range| self.priorities.get(range))
@@ -1341,6 +1353,60 @@ mod tests {
                 .get(LANE_COUNT.saturating_sub(1))
                 .expect("last start"),
             0
+        );
+    }
+
+    #[test]
+    fn lane_asynchronous_extracts_only_the_async_bit() {
+        let parsed = vec![
+            ParsedComponent {
+                name: "AsyncIsland".to_string(),
+                file_path: "src/AsyncIsland.tsx".to_string(),
+                line_number: 1,
+                imports: Vec::new(),
+                estimated_size: 1,
+                is_default_export: false,
+                props: Vec::new(),
+                effect_profile: EffectProfile {
+                    asynchronous: true,
+                    ..EffectProfile::default()
+                },
+                source_hash: 1,
+            },
+            ParsedComponent {
+                name: "SyncCard".to_string(),
+                file_path: "src/SyncCard.tsx".to_string(),
+                line_number: 1,
+                imports: Vec::new(),
+                estimated_size: 1,
+                is_default_export: false,
+                props: Vec::new(),
+                effect_profile: EffectProfile {
+                    hooks: true,
+                    ..EffectProfile::default()
+                },
+                source_hash: 2,
+            },
+        ];
+        let columns = IrColumns::from_parsed(&parsed);
+
+        // Every lane the components landed in must report a 0/1 byte per
+        // index reflecting only the async bit. Other effect bits (hooks)
+        // must not leak through.
+        let mut total_async = 0usize;
+        let mut total_components = 0usize;
+        for lane in 0..LANE_COUNT {
+            let async_slice = columns.lane_asynchronous(lane);
+            total_components += async_slice.len();
+            total_async += async_slice.iter().filter(|&&b| b == 1).count();
+            for byte in async_slice {
+                assert!(byte == 0 || byte == 1, "lane_asynchronous bytes must be 0/1");
+            }
+        }
+        assert_eq!(total_components, 2);
+        assert_eq!(
+            total_async, 1,
+            "exactly one of the two components has the async bit set"
         );
     }
 }

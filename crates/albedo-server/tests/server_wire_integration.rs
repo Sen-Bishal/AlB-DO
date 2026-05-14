@@ -19,7 +19,7 @@ use albedo_server::handlers::streaming::{
 };
 use albedo_server::render::tier_b::SharedRenderServices;
 use dom_render_compiler::graph::ComponentGraph;
-use dom_render_compiler::ir::opcode::InternTableKind;
+use dom_render_compiler::ir::opcode::{Instruction, InternTableKind, StableId, TagId};
 use dom_render_compiler::ir::wire::decode_frame;
 use dom_render_compiler::manifest::schema::{RenderManifestV2, Tier};
 use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
@@ -237,4 +237,65 @@ async fn bootstrap_drains_baseline_so_subsequent_patch_diff_is_empty() {
         second.is_some(),
         "bootstrap is idempotent — repeated calls still emit InitInternTable"
     );
+}
+
+// ── Phase D — async-island integration ─────────────────────────────────
+//
+// Drives the async surface through `StreamingAppState::pipeline()` so the
+// wire path the server hands to Phase E's renderer is exercised, not just
+// the substrate inside the pipeline crate.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn async_island_enqueue_emits_placeholder_via_streaming_state() {
+    let (pipeline, _ids) = build_test_pipeline();
+    let state = streaming_state_with_pipeline(pipeline);
+
+    let suspense_id = {
+        let guard = state.pipeline().expect("pipeline bound").lock().unwrap();
+        guard
+            .enqueue_async_island(StableId(123), async {
+                vec![Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(123),
+                }]
+            })
+            .expect("enqueue must succeed when pipeline carries the runtime handle")
+    };
+
+    let chunks = drive_pipeline_tick(&state);
+    assert_eq!(chunks.len(), 1, "Placeholder chunk must ship on this tick");
+    assert_eq!(chunks[0].lane as u8, WT_STREAM_SLOT_PATCHES);
+
+    let bytes = match &chunks[0].payload {
+        FramePayload::Binary(b) => b.clone(),
+        FramePayload::Text(_) => panic!("Phase-D placeholder chunks must be Binary"),
+    };
+    let (frame, _) = decode_frame(&bytes).expect("placeholder bytes must decode");
+    assert_eq!(
+        frame.instructions,
+        vec![Instruction::Placeholder {
+            stable_id: StableId(123),
+            suspense_id,
+        }]
+    );
+
+    // Drive the spawned resolver — multi-thread runtime worker picks it
+    // up after a brief yield.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let patch_chunks = drive_pipeline_tick(&state);
+    assert_eq!(
+        patch_chunks.len(),
+        1,
+        "next tick must ship the resolved Patch frame"
+    );
+    let (patch_frame, _) = decode_frame(match &patch_chunks[0].payload {
+        FramePayload::Binary(b) => b,
+        FramePayload::Text(_) => panic!("patch chunks must be Binary"),
+    })
+    .expect("patch bytes must decode");
+    assert!(matches!(
+        patch_frame.instructions.first(),
+        Some(Instruction::Patch { .. })
+    ));
 }

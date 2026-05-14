@@ -6,7 +6,8 @@ use crate::contract::{
 use crate::error::RuntimeError;
 use crate::handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
-use crate::render::tier_b::SharedRenderServices;
+use crate::render::tier_b::{SharedRenderServices, TierBOpcodeRegistry};
+use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
 use crate::webtransport::{WebTransportRuntime, WebTransportSessionRegistry};
@@ -50,6 +51,14 @@ pub struct AlbedoServerBuilder {
     middleware: HashMap<String, SharedMiddleware>,
     auth_provider: SharedAuthProvider,
     renderer: Option<RendererRuntime>,
+    /// Phase-E opcode registry. When set, the WT streaming path runs
+    /// Tier-B render functions through this and ships opcodes; when
+    /// unset, the WT path falls back to SSE.
+    opcode_registry: Option<Arc<dyn TierBOpcodeRegistry>>,
+    /// Phase-D opcode pipeline + tokio runtime handle. The handle is
+    /// stashed alongside so the pipeline can spawn resolver Futures.
+    /// Userland binds both via `with_pipeline`.
+    pipeline: Option<(FourLaneRuntimePipeline, tokio::runtime::Handle)>,
 }
 
 impl AlbedoServerBuilder {
@@ -62,6 +71,8 @@ impl AlbedoServerBuilder {
             middleware: HashMap::new(),
             auth_provider: Arc::new(AllowAllAuthProvider),
             renderer: None,
+            opcode_registry: None,
+            pipeline: None,
         }
     }
 
@@ -114,6 +125,31 @@ impl AlbedoServerBuilder {
         self
     }
 
+    /// Registers the Phase-E opcode registry that resolves Tier-B
+    /// nodes for the WT streaming path. Without it the WT streaming
+    /// path errors out and the request falls back to SSE.
+    pub fn with_opcode_registry(
+        mut self,
+        registry: impl TierBOpcodeRegistry + 'static,
+    ) -> Self {
+        self.opcode_registry = Some(Arc::new(registry));
+        self
+    }
+
+    /// Binds an opcode pipeline + tokio runtime handle. The pair is
+    /// installed on `StreamingAppState` so Phase-D's async-island
+    /// machinery can spawn resolver Futures and Phase-E's WT path can
+    /// drain opcode chunks. Pair this with [`Self::with_opcode_registry`]
+    /// to enable the binary WT path end-to-end.
+    pub fn with_pipeline(
+        mut self,
+        pipeline: FourLaneRuntimePipeline,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
+        self.pipeline = Some((pipeline, runtime_handle));
+        self
+    }
+
     pub fn build(self) -> Result<AlbedoServer, RuntimeError> {
         self.config.validate()?;
 
@@ -136,16 +172,32 @@ impl AlbedoServerBuilder {
             .enabled
             .then(WebTransportSessionRegistry::default);
 
+        let services = SharedRenderServices {
+            opcode_registry: self.opcode_registry.clone(),
+            ..SharedRenderServices::default()
+        };
+
+        // Construct StreamingAppState, binding the optional pipeline +
+        // runtime handle when both are present. `with_pipeline` consumes
+        // the pair, so `take()` to move it out of the builder. The Arc
+        // wrap happens after pipeline binding so the bound pipeline is
+        // visible through `state.pipeline()`.
+        let mut pipeline_binding = self.pipeline;
         let streaming_runtime = renderer.as_ref().map(|runtime| {
-            Arc::new(StreamingAppState::new(
+            let state = StreamingAppState::new(
                 Arc::new(runtime.manifest().clone()),
-                SharedRenderServices::default(),
+                services.clone(),
                 StreamingTransportConfig::new(
                     self.config.server.webtransport.enabled,
                     self.config.server.port,
                 ),
                 shared_wt_sessions.clone(),
-            ))
+            );
+            let state = match pipeline_binding.take() {
+                Some((pipeline, handle)) => state.with_pipeline(pipeline, handle),
+                None => state,
+            };
+            Arc::new(state)
         });
 
         let has_entry_routes = self
