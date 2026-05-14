@@ -63,7 +63,8 @@ pub use error::RuntimeError;
 pub use handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
 pub use lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 pub use render::{
-    InjectionChunk, RenderError as TierBRenderError, TierBDataFetcher, TierBRenderRegistry,
+    InjectionChunk, RenderError as TierBRenderError, TierBDataFetcher, TierBOpcodeRegistry,
+    TierBRenderRegistry,
 };
 pub use renderer_runtime::{
     RendererRuntime, RENDER_MANIFEST_FILENAME, RUNTIME_MODULE_SOURCES_FILENAME,

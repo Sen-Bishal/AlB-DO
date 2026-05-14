@@ -23,22 +23,23 @@ pub struct SuspenseId(pub u32);
 
 /// Half-open `[start, end)` byte range.
 ///
-/// Offsets resolve into the **concatenation** of all WebTransport STREAM
-/// messages that share an [`OpcodeFrame::frame_id`]. Reassembly via
-/// [`crate::runtime::webtransport::WebTransportMuxer::reassemble_binary_stream`]
-/// happens BEFORE [`crate::ir::wire::decode_frame`] is invoked. Cross-frame
-/// references are out of scope for v1.
+/// **Phase D semantics (v1):** offsets resolve into the bytes of the
+/// **`OpcodeFrame` carrying this `Patch`** — *not* the placeholder's
+/// original frame. Async resolutions ship as standalone frames with a
+/// fresh `frame_id`; the range, when non-empty, identifies the slice of
+/// the same frame's reassembled bytes that holds the resolved opcode
+/// instructions. An empty range (`start == end`) means "the resolved
+/// opcodes are the remaining instructions in this frame after the
+/// `Patch` opcode" — which is what the v1 emitter currently produces.
 ///
-/// Fields are private; construct via [`InstructionRange::try_new`] so the
-/// invariant `start <= end` holds at every wire boundary. Locking the
-/// constructor preserves wire-format flexibility — a future migration to
-/// `(start, len)` is an internal change, not an API break.
-//
-// PHASE 2 (B-emitter) — Pinaki: the SuspenseBoundary patcher in
-// `src/runtime/emitter.rs` will be the only producer of these ranges. Use
-// `try_new`, never reach for raw fields. Reason for the invariant: a
-// reversed range silently corrupts the client's slot-table apply step.
-// — Bishal-albdo@may-2026
+/// Reassembly via
+/// [`crate::runtime::webtransport::WebTransportMuxer::reassemble_binary_stream`]
+/// still happens BEFORE [`crate::ir::wire::decode_frame`]; the only
+/// change from Phase A is that a `Patch` is now a self-contained
+/// frame, decoupled from the `Placeholder`'s original frame.
+///
+/// Fields are private; construct via [`InstructionRange::try_new`] so
+/// the invariant `start <= end` holds at every wire boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct InstructionRange {
     start: u32,
