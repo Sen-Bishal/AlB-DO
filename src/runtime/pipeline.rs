@@ -430,7 +430,7 @@ impl FourLaneRuntimePipeline {
         F: Fn(u16, &str) -> Option<crate::ir::opcode::InternTableKind>,
     {
         let instructions = self.reconcile_intern_tables(classify);
-        self.frame_intern_instructions_for_control(instructions)
+        self.frame_opcode_instructions_for_patches(instructions)
     }
 
     /// Builds the one-shot bootstrap intern-table chunk for a new bakabox
@@ -464,18 +464,27 @@ impl FourLaneRuntimePipeline {
         let snapshot = InternTableSnapshot::capture(self.columns.strings(), &classify);
         let instructions = emitter::bootstrap_intern_tables(&snapshot);
         self.prev_intern_snapshot = snapshot;
-        self.frame_intern_instructions_for_control(instructions)
+        self.frame_opcode_instructions_for_patches(instructions)
     }
 
-    /// Shared helper: wraps a control-stream-bound instruction batch into
-    /// an [`OpcodeFrame`], encodes it, and routes the binary chunk through
-    /// the stream router. Returns `None` when there is nothing to ship.
+    /// Shared helper: wraps an opcode instruction batch into an
+    /// [`OpcodeFrame`], encodes it, and routes the binary chunk onto
+    /// the WebTransport patches stream. Returns `None` when there is
+    /// nothing to ship.
     ///
-    /// Centralising the frame_id allocation and wire encoding in one place
-    /// keeps the contract `(instructions) -> chunk` provable; the
-    /// bootstrap and patch paths are now byte-identical past the
+    /// All binary opcode traffic — bootstrap intern tables, incremental
+    /// intern patches, the per-tick patch frames — rides
+    /// [`crate::runtime::webtransport::WT_STREAM_SLOT_PATCHES`]. The
+    /// control slot (slot 0) is reserved for JSON session envelopes
+    /// (`session_init`, `keep_alive`, `stream_open`) so the bakabox
+    /// client can treat slot 0 as pure-text and slot 2 as pure-binary,
+    /// avoiding a per-message kind discriminator.
+    ///
+    /// Centralising the frame_id allocation and wire encoding in one
+    /// place keeps the contract `(instructions) -> chunk` provable; the
+    /// bootstrap and patch paths are byte-identical past the
     /// instruction-vector boundary.
-    fn frame_intern_instructions_for_control(
+    fn frame_opcode_instructions_for_patches(
         &self,
         instructions: Vec<crate::ir::opcode::Instruction>,
     ) -> Result<Option<LaneRenderedChunk>, RuntimePipelineError> {
@@ -483,7 +492,7 @@ impl FourLaneRuntimePipeline {
             return Ok(None);
         }
 
-        let stream_id = crate::runtime::webtransport::WT_STREAM_SLOT_CONTROL as usize;
+        let stream_id = crate::runtime::webtransport::WT_STREAM_SLOT_PATCHES as usize;
         let frame_id = self
             .stream_router
             .muxer
@@ -498,7 +507,7 @@ impl FourLaneRuntimePipeline {
 
         let wire_bytes = crate::ir::wire::encode_frame(&frame)?;
         Ok(Some(self.stream_router.route_global_chunk(
-            WTRenderMode::Control,
+            WTRenderMode::Patch,
             wire_bytes,
         )))
     }

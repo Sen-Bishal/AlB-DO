@@ -24,9 +24,7 @@ use dom_render_compiler::ir::wire::decode_frame;
 use dom_render_compiler::manifest::schema::{RenderManifestV2, Tier};
 use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
 use dom_render_compiler::runtime::scheduler::SchedulerConfig;
-use dom_render_compiler::runtime::webtransport::{
-    FramePayload, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
-};
+use dom_render_compiler::runtime::webtransport::{FramePayload, WT_STREAM_SLOT_PATCHES};
 use dom_render_compiler::types::{Component, ComponentAnalysis, ComponentId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -188,8 +186,10 @@ async fn bootstrap_intern_chunk_round_trips_through_decoder() {
 
     assert_eq!(
         chunk.lane as u8,
-        WT_STREAM_SLOT_CONTROL,
-        "bootstrap intern chunks must route to slot {WT_STREAM_SLOT_CONTROL}"
+        WT_STREAM_SLOT_PATCHES,
+        "bootstrap intern chunks must ride the binary patches stream \
+         (slot {WT_STREAM_SLOT_PATCHES}) so slot 0 stays pure JSON for \
+         session envelopes"
     );
 
     let bytes = match chunk.payload {
