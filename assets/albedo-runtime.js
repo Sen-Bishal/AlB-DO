@@ -20,7 +20,12 @@
 // `installLegacyHtmlInjector` for as long as the Tier-B JSON path coexists
 // with opcodes (subsumed in Phase E).
 
-import { BakaboxWireError, decodeFrame } from './bincode.js';
+import {
+  ACTION_EVENT_KIND,
+  BakaboxWireError,
+  decodeFrame,
+  encodeActionEnvelope,
+} from './bincode.js';
 
 /**
  * Default attribute the shell renderer stamps on every element bakabox
@@ -35,18 +40,130 @@ export const DEFAULT_ANCHOR_ATTRIBUTE = 'data-albedo-id';
 /** Default attribute used to mark placeholder spans for async islands. */
 export const DEFAULT_SUSPENSE_ATTRIBUTE = 'data-albedo-suspense';
 
+/** Default HTTP endpoint the action dispatcher POSTs to. */
+export const DEFAULT_ACTION_ENDPOINT = '/_albedo/action';
+
 /**
- * No-op event dispatcher used until the hook system (Phase E) provides
- * a real one. Bound events fall through to this when an opcode-declared
- * proxy fires; logging keeps the no-op visible during development.
+ * Pre-installation no-op dispatcher. The `Bakabox` constructor uses
+ * this as a default so the VM is usable before
+ * [`createActionDispatcher`] has been wired (the bootstrap block at
+ * the bottom of this file replaces it once a `Bakabox` instance
+ * exists). Logging keeps the unwired state visible in dev.
  *
  * @param {number} proxyId
  * @param {Event} event
  */
-function defaultEventDispatcher(proxyId, event) {
+function noopEventDispatcher(proxyId, event) {
   if (typeof console !== 'undefined' && console.debug) {
-    console.debug('[bakabox] event proxy not yet wired', { proxyId, event });
+    console.debug('[bakabox] action dispatcher not yet installed', { proxyId, type: event?.type });
   }
+}
+
+/**
+ * Classifies a DOM event into the wire-level `event_kind` byte that
+ * `ActionEnvelope` carries. Mirrors the discriminants in
+ * `src/ir/action.rs::ActionEventKind`. Adding a kind here requires the
+ * matching variant on the Rust side.
+ *
+ * @param {Event} event
+ * @returns {{ kind: number, payload: Uint8Array }}
+ */
+function classifyEvent(event) {
+  const type = event?.type ?? 'other';
+  if (type === 'click' || type === 'dblclick' || type === 'mousedown' || type === 'mouseup') {
+    return { kind: ACTION_EVENT_KIND.Click, payload: new Uint8Array(0) };
+  }
+  if (type === 'input' || type === 'change') {
+    const value = event?.target?.value;
+    if (typeof value === 'string') {
+      return {
+        kind: ACTION_EVENT_KIND.Input,
+        payload: new TextEncoder().encode(value),
+      };
+    }
+    return { kind: ACTION_EVENT_KIND.Input, payload: new Uint8Array(0) };
+  }
+  if (type === 'submit') {
+    // Phase I defines the FormData encoding. For Phase G we ship the
+    // Submit kind with an empty payload so a handler can still see the
+    // event fired and respond.
+    return { kind: ACTION_EVENT_KIND.Submit, payload: new Uint8Array(0) };
+  }
+  return { kind: ACTION_EVENT_KIND.Other, payload: new Uint8Array(0) };
+}
+
+/**
+ * Builds an event dispatcher bound to a specific bakabox instance and
+ * endpoint. The returned function is what the VM hands to
+ * `addEventListener` for every `BindEvent`-wired element: on fire, it
+ * serializes an `ActionEnvelope`, POSTs to the server, and feeds the
+ * binary response back through `bakabox.applyFrameBytes` so the
+ * resulting patches mutate the DOM in place.
+ *
+ * Network failures are logged but never thrown — a stuck server must
+ * not deadlock the page. Non-200 responses are dropped after a single
+ * `console.warn` so the client stays observable.
+ *
+ * @param {object} options
+ * @param {Bakabox} options.bakabox
+ * @param {string} [options.endpoint]  Action POST URL. Defaults to `/_albedo/action`.
+ * @param {typeof fetch} [options.fetch]  Override for tests.
+ */
+export function createActionDispatcher({ bakabox, endpoint = DEFAULT_ACTION_ENDPOINT, fetch: fetchImpl } = {}) {
+  if (!bakabox) {
+    throw new TypeError('createActionDispatcher requires a bakabox instance');
+  }
+  const resolvedFetch =
+    fetchImpl ||
+    (typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function'
+      ? globalThis.fetch.bind(globalThis)
+      : null);
+
+  return async function dispatchEvent(proxyId, event) {
+    if (!resolvedFetch) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[bakabox] no fetch available; action dropped', { proxyId });
+      }
+      return;
+    }
+    const { kind, payload } = classifyEvent(event);
+    const bytes = encodeActionEnvelope({
+      actionId: proxyId,
+      eventKind: kind,
+      payload,
+    });
+
+    let response;
+    try {
+      response = await resolvedFetch(endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        credentials: 'same-origin',
+        cache: 'no-store',
+        body: bytes,
+      });
+    } catch (err) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[bakabox] action fetch failed', err);
+      }
+      return;
+    }
+    if (!response.ok) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[bakabox] action returned non-200', response.status);
+      }
+      return;
+    }
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength === 0) return;
+    try {
+      bakabox.applyFrameBytes(new Uint8Array(buffer));
+    } catch (err) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[bakabox] action response failed to apply', err);
+      }
+    }
+  };
 }
 
 /**
@@ -78,7 +195,7 @@ export class Bakabox {
     document,
     anchorAttribute = DEFAULT_ANCHOR_ATTRIBUTE,
     suspenseAttribute = DEFAULT_SUSPENSE_ATTRIBUTE,
-    eventDispatcher = defaultEventDispatcher,
+    eventDispatcher = noopEventDispatcher,
   }) {
     if (!document) {
       throw new TypeError('Bakabox requires a Document');
@@ -478,6 +595,18 @@ const globalScope =
 if (globalScope && globalScope.document) {
   const bakabox = createBakabox({ document: globalScope.document });
   bakabox.seedNodesFromDocument();
+
+  // Phase-G: install the real action dispatcher so `BindEvent`-wired
+  // listeners actually POST to the server when their DOM events fire.
+  // The endpoint can be overridden by setting
+  // `globalThis.__ALBEDO_ACTION_ENDPOINT__` before this module loads.
+  const endpoint =
+    typeof globalScope.__ALBEDO_ACTION_ENDPOINT__ === 'string' &&
+    globalScope.__ALBEDO_ACTION_ENDPOINT__
+      ? globalScope.__ALBEDO_ACTION_ENDPOINT__
+      : DEFAULT_ACTION_ENDPOINT;
+  bakabox.eventDispatcher = createActionDispatcher({ bakabox, endpoint });
+
   globalScope.__bakabox = bakabox;
   installLegacyHtmlInjector(globalScope, globalScope.document);
 }

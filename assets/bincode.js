@@ -534,3 +534,118 @@ export function decodeFrame(bytes) {
     consumed: reader.consumed(),
   };
 }
+
+// ── Phase-G writer surface ───────────────────────────────────────────
+//
+// Bakabox needs to send one bincode-encoded message to the server: the
+// `ActionEnvelope`. Rather than introduce a full general-purpose
+// writer, we expose a single tight function and one helper for the
+// underlying varint encoding. The locked codec config (little-endian,
+// variable_int_encoding, no_limit) matches the Rust side in
+// `src/ir/wire.rs::config`.
+
+/**
+ * Symbolic event-kind values matching `ActionEventKind` in
+ * `src/ir/action.rs`. The bakabox dispatcher emits these as the
+ * envelope's `event_kind` byte.
+ */
+export const ACTION_EVENT_KIND = Object.freeze({
+  Click: 0,
+  Input: 1,
+  Submit: 2,
+  Other: 3,
+});
+
+/**
+ * Encodes an `ActionEnvelope { action_id, event_kind, payload }` to a
+ * bincode-formatted `Uint8Array` ready to POST to `/_albedo/action`.
+ *
+ * @param {{ actionId: number, eventKind: number, payload: Uint8Array }} envelope
+ * @returns {Uint8Array}
+ */
+export function encodeActionEnvelope(envelope) {
+  if (!Number.isInteger(envelope.actionId) || envelope.actionId < 0) {
+    throw new TypeError(`actionId must be a non-negative integer, got ${envelope.actionId}`);
+  }
+  if (!Number.isInteger(envelope.eventKind) || envelope.eventKind < 0 || envelope.eventKind > 255) {
+    throw new TypeError(
+      `eventKind must be a u8 (0..=255), got ${envelope.eventKind}`,
+    );
+  }
+  const payload = envelope.payload || new Uint8Array(0);
+  if (!(payload instanceof Uint8Array)) {
+    throw new TypeError('payload must be a Uint8Array');
+  }
+
+  // Build the output buffer one segment at a time. Total size is small
+  // (envelope length is dominated by the payload), so a single
+  // allocation + concat is cleaner than a growable writer.
+  const actionIdBytes = encodeVarintU32(envelope.actionId);
+  const lengthBytes = encodeVarintU64(BigInt(payload.byteLength));
+
+  const out = new Uint8Array(
+    actionIdBytes.length + 1 + lengthBytes.length + payload.byteLength,
+  );
+  let offset = 0;
+  out.set(actionIdBytes, offset);
+  offset += actionIdBytes.length;
+  out[offset] = envelope.eventKind;
+  offset += 1;
+  out.set(lengthBytes, offset);
+  offset += lengthBytes.length;
+  out.set(payload, offset);
+  return out;
+}
+
+/**
+ * Encodes an unsigned u32 using bincode v2's variable-length
+ * convention. Exposed for tests; the only production caller is
+ * [`encodeActionEnvelope`].
+ *
+ * @param {number} value
+ * @returns {Uint8Array}
+ */
+export function encodeVarintU32(value) {
+  if (value < VARINT_U16_MARKER) {
+    return new Uint8Array([value]);
+  }
+  if (value <= 0xffff) {
+    const out = new Uint8Array(3);
+    out[0] = VARINT_U16_MARKER;
+    new DataView(out.buffer).setUint16(1, value, /* littleEndian */ true);
+    return out;
+  }
+  const out = new Uint8Array(5);
+  out[0] = VARINT_U32_MARKER;
+  new DataView(out.buffer).setUint32(1, value, true);
+  return out;
+}
+
+/**
+ * Encodes an unsigned u64 (as `BigInt`) using bincode v2's
+ * variable-length convention.
+ *
+ * @param {bigint} value
+ * @returns {Uint8Array}
+ */
+export function encodeVarintU64(value) {
+  if (value < BigInt(VARINT_U16_MARKER)) {
+    return new Uint8Array([Number(value)]);
+  }
+  if (value <= 0xffffn) {
+    const out = new Uint8Array(3);
+    out[0] = VARINT_U16_MARKER;
+    new DataView(out.buffer).setUint16(1, Number(value), true);
+    return out;
+  }
+  if (value <= 0xffffffffn) {
+    const out = new Uint8Array(5);
+    out[0] = VARINT_U32_MARKER;
+    new DataView(out.buffer).setUint32(1, Number(value), true);
+    return out;
+  }
+  const out = new Uint8Array(9);
+  out[0] = VARINT_U64_MARKER;
+  new DataView(out.buffer).setBigUint64(1, value, true);
+  return out;
+}

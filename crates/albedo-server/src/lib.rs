@@ -43,6 +43,8 @@
 #![warn(rustdoc::broken_intra_doc_links)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
+pub mod actions;
+pub mod api;
 pub mod config;
 pub mod contract;
 pub mod error;
@@ -54,6 +56,8 @@ pub mod routing;
 pub mod server;
 pub mod webtransport;
 
+pub use actions::ActionHandler;
+pub use api::{ApiHandler, ApiResponse};
 pub use config::{AppConfig, LayoutSpec, RendererConfig, RouteSpec, ServerConfig};
 pub use contract::{
     AllowAllAuthProvider, AuthDecision, AuthProvider, LayoutHandler, PropsLoader, RouteHandler,
