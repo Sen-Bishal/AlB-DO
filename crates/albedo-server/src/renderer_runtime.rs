@@ -55,9 +55,11 @@ impl RendererRuntime {
             )
             .map_err(|err| RuntimeError::RendererFailure(err.to_string()))?;
 
-        // Pre-warm static slice + normalized props caches by pre-rendering every
-        // manifest route. Soft-fails: a priming error degrades to a cold cache,
-        // which is the same behavior as before this call existed.
+        // Startup priming pass: pre-render every manifest route so the
+        // static-slice and normalized-props caches are warm on the very
+        // first request after deploy instead of paying engine + encoder
+        // warmup on every cold entry. Soft-fail by design — a priming
+        // error degrades to a cold cache, no new failure mode.
         let warm_requests: Vec<RouteRenderRequest> = manifest
             .routes
             .keys()

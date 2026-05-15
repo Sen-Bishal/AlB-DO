@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use dom_render_compiler::ir::opcode::{Instruction, StableId};
 use dom_render_compiler::manifest::schema::{DataDep, DataSource, TierBNode};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
@@ -61,6 +62,51 @@ pub trait TierBRenderRegistry: Send + Sync {
         props: &Value,
         data: &HashMap<String, Value>,
     ) -> Result<String, RenderError>;
+}
+
+/// Phase-E opcode-shaped Tier-B render registry.
+///
+/// Replaces [`TierBRenderRegistry`]'s `String` output with an opcode
+/// instruction vector destined for the bakabox VM via the patches stream.
+/// Userland renderers implement this when they want to ship Tier-B
+/// islands through the binary WT path instead of HTML chunks.
+///
+/// `placeholder_stable_id` is the bakabox-side anchor the
+/// `Placeholder` opcode created. Resolved opcodes that want to render
+/// inside the placeholder typically emit `Append { parent_id:
+/// placeholder_stable_id, child_id: <fresh> }`; resolvers that want
+/// to replace the placeholder altogether emit a `Remove` followed by
+/// fresh creates against a different parent.
+#[async_trait]
+pub trait TierBOpcodeRegistry: Send + Sync {
+    async fn call(
+        &self,
+        render_fn: &str,
+        placeholder_stable_id: StableId,
+        props: &Value,
+        data: &HashMap<String, Value>,
+    ) -> Result<Vec<Instruction>, RenderError>;
+}
+
+/// Deterministic FNV-1a 32-bit hash of a placeholder id string. Used
+/// to derive a stable bakabox `StableId` from the manifest's string
+/// `placeholder_id` so the server-side `Placeholder` opcode and any
+/// client-side anchor (shell-rendered `data-albedo-id` attributes once
+/// the renderer stamps them) align without a per-route id table.
+///
+/// FNV-1a-32 collides with negligible probability across realistic
+/// placeholder-id corpuses and is reproducible across rebuilds; we do
+/// not need the cryptographic guarantees of a wider hash here.
+#[must_use]
+pub fn stable_id_for_placeholder(placeholder_id: &str) -> StableId {
+    const FNV_OFFSET: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    let mut hash = FNV_OFFSET;
+    for byte in placeholder_id.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    StableId(hash)
 }
 
 #[async_trait]
@@ -163,6 +209,68 @@ pub async fn render_tier_b(
     Ok(full_html)
 }
 
+/// Phase-E: opcode-shaped counterpart to [`render_tier_b`].
+///
+/// Resolves dynamic props from the request context, fans out `data_deps`
+/// fetches in parallel via the existing [`TierBDataFetcher`] surface,
+/// and hands the merged `(props, data)` to the opcode registry. The
+/// returned `Vec<Instruction>` is the body of a Phase-D async-island
+/// `Patch`: the pipeline ships it after the `Patch` opcode in the same
+/// `OpcodeFrame`.
+///
+/// Errors surface as [`RenderError`]; callers that want to keep the
+/// async-island slot intact on failure should map the error into an
+/// empty Vec or a fallback opcode stream.
+pub async fn render_tier_b_opcodes(
+    node: &TierBNode,
+    ctx: &RequestContext,
+    opcode_registry: &(dyn TierBOpcodeRegistry + Send + Sync),
+    data_fetcher: &(dyn TierBDataFetcher + Send + Sync),
+) -> Result<Vec<Instruction>, RenderError> {
+    let mut props = node.static_props.clone();
+    let props_obj = props
+        .as_object_mut()
+        .ok_or_else(|| RenderError::StaticPropsNotObject {
+            key: "static_props".to_string(),
+        })?;
+
+    for key in &node.dynamic_prop_keys {
+        let value = ctx.resolve(key)?;
+        props_obj.insert(key.clone(), value);
+    }
+
+    let mut fetches = node
+        .data_deps
+        .iter()
+        .cloned()
+        .map(|dep| {
+            let ctx = ctx.clone();
+            async move { data_fetcher.fetch(&dep, &ctx).await }
+        })
+        .collect::<FuturesUnordered<_>>();
+
+    let mut data = HashMap::new();
+    while let Some(result) = fetches.next().await {
+        let (key, value) = result?;
+        data.insert(key, value);
+    }
+
+    let placeholder_stable_id = stable_id_for_placeholder(&node.placeholder_id);
+
+    opcode_registry
+        .call(
+            node.render_fn.as_str(),
+            placeholder_stable_id,
+            &props,
+            &data,
+        )
+        .await
+        .map_err(|err| RenderError::RegistryFailure {
+            render_fn: node.render_fn.clone(),
+            message: err.to_string(),
+        })
+}
+
 pub struct InjectionChunk {
     placeholder_id: String,
     kind: ChunkKind,
@@ -235,10 +343,34 @@ impl TierBRenderRegistry for StubTierBRenderRegistry {
     }
 }
 
+/// Phase-E stub opcode registry. Used by `SharedRenderServices::default()`
+/// and by tests; returns an empty instruction vector. Real renderers
+/// implement [`TierBOpcodeRegistry`] to emit opcodes that target the
+/// placeholder element via its server-assigned `StableId`.
+pub struct StubTierBOpcodeRegistry;
+
+#[async_trait]
+impl TierBOpcodeRegistry for StubTierBOpcodeRegistry {
+    async fn call(
+        &self,
+        _render_fn: &str,
+        _placeholder_stable_id: StableId,
+        _props: &Value,
+        _data: &HashMap<String, Value>,
+    ) -> Result<Vec<Instruction>, RenderError> {
+        Ok(Vec::new())
+    }
+}
+
 #[derive(Clone)]
 pub struct SharedRenderServices {
     pub registry: Arc<dyn TierBRenderRegistry>,
     pub data_fetcher: Arc<dyn TierBDataFetcher>,
+    /// Phase-E opcode registry. When `Some`, the WT streaming path
+    /// resolves Tier-B nodes through this and the pipeline's
+    /// async-island machinery. When `None`, the WT path falls back to
+    /// the legacy JSON+HTML envelope shipped through `__albedo_inject`.
+    pub opcode_registry: Option<Arc<dyn TierBOpcodeRegistry>>,
 }
 
 impl Default for SharedRenderServices {
@@ -246,6 +378,7 @@ impl Default for SharedRenderServices {
         Self {
             registry: Arc::new(StubTierBRenderRegistry),
             data_fetcher: Arc::new(DefaultTierBDataFetcher),
+            opcode_registry: None,
         }
     }
 }
@@ -334,5 +467,101 @@ mod tests {
         let script = InjectionChunk::fallback(&node()).into_script_tag();
         assert!(script.contains("__albedo_inject"));
         assert!(script.contains("fallback"));
+    }
+
+    // ── Phase E — opcode renderer tests ───────────────────────────────
+
+    use dom_render_compiler::ir::opcode::{Instruction, StableId, TagId};
+
+    /// Opcode-shaped registry stub. Captures the placeholder StableId
+    /// passed by `render_tier_b_opcodes` so the test can assert the
+    /// renderer wiring forwards it correctly. Returns a fixed two-op
+    /// instruction sequence anchored to the placeholder.
+    struct TestOpcodeRegistry {
+        seen_placeholder: std::sync::Mutex<Option<StableId>>,
+    }
+
+    impl TestOpcodeRegistry {
+        fn new() -> Self {
+            Self {
+                seen_placeholder: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TierBOpcodeRegistry for TestOpcodeRegistry {
+        async fn call(
+            &self,
+            _render_fn: &str,
+            placeholder_stable_id: StableId,
+            _props: &Value,
+            _data: &HashMap<String, Value>,
+        ) -> Result<Vec<Instruction>, RenderError> {
+            *self.seen_placeholder.lock().unwrap() = Some(placeholder_stable_id);
+            Ok(vec![
+                Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(9_999),
+                },
+                Instruction::Append {
+                    parent_id: placeholder_stable_id,
+                    child_id: StableId(9_999),
+                },
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn render_tier_b_opcodes_forwards_placeholder_stable_id() {
+        let node = node();
+        let ctx = RequestContext {
+            path: "/home".to_string(),
+            ..RequestContext::default()
+        };
+        let registry = TestOpcodeRegistry::new();
+
+        let opcodes = render_tier_b_opcodes(&node, &ctx, &registry, &TestFetcher)
+            .await
+            .expect("opcode render must succeed");
+
+        let expected_id = stable_id_for_placeholder(&node.placeholder_id);
+        assert_eq!(
+            *registry.seen_placeholder.lock().unwrap(),
+            Some(expected_id),
+            "registry must receive the FNV-hashed placeholder id"
+        );
+        assert_eq!(opcodes.len(), 2);
+        assert!(matches!(
+            opcodes[1],
+            Instruction::Append { parent_id, .. } if parent_id == expected_id
+        ));
+    }
+
+    #[test]
+    fn stable_id_for_placeholder_is_deterministic_and_collision_resistant() {
+        let a = stable_id_for_placeholder("__b_feature");
+        let b = stable_id_for_placeholder("__b_feature");
+        let c = stable_id_for_placeholder("__b_other");
+        assert_eq!(a, b, "same input must produce same id across calls");
+        assert_ne!(a, c, "different inputs should not collide on this corpus");
+    }
+
+    #[tokio::test]
+    async fn stub_opcode_registry_returns_empty_instruction_vector() {
+        let registry = StubTierBOpcodeRegistry;
+        let out = registry
+            .call(
+                "render::Whatever",
+                StableId(42),
+                &json!({}),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.is_empty(),
+            "stub registry must produce no opcodes; real renderers replace it"
+        );
     }
 }

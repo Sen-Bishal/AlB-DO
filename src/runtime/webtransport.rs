@@ -12,10 +12,50 @@ pub const WT_STREAM_SLOT_PATCHES: u8 = 2;
 pub const WT_STREAM_SLOT_PREFETCH: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FramePayload {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+impl FramePayload {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Text(s) => s.len(),
+            Self::Binary(b) => b.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(s) => s.is_empty(),
+            Self::Binary(b) => b.is_empty(),
+        }
+    }
+}
+
+impl From<String> for FramePayload {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for FramePayload {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+impl From<Vec<u8>> for FramePayload {
+    fn from(b: Vec<u8>) -> Self {
+        Self::Binary(b)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneRenderedChunk {
     pub lane: usize,
     pub component_id: Option<ComponentId>,
-    pub payload: String,
+    pub payload: FramePayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +63,7 @@ pub struct WebTransportFrame {
     pub stream_id: u8,
     pub sequence: u64,
     pub component_id: Option<ComponentId>,
-    pub payload: String,
+    pub payload: FramePayload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,6 +133,22 @@ pub enum WebTransportError {
         expected: u64,
         actual: u64,
     },
+    /// A reassemble pass found a frame whose payload kind contradicts the
+    /// stream's declared kind. Surfacing this as an error (instead of a
+    /// silent drop) so producers cannot accidentally route, e.g., a
+    /// binary opcode frame onto a text/HTML stream and have the byte
+    /// payload vanish on the receiver. Phase B will route binary opcode
+    /// frames to the patches stream — any text leak there is a producer
+    /// bug worth surfacing loudly.
+    #[error(
+        "payload kind mismatch in stream {stream_id} at sequence {sequence}: expected {expected}, found {found}"
+    )]
+    PayloadKindMismatch {
+        stream_id: u8,
+        sequence: u64,
+        expected: &'static str,
+        found: &'static str,
+    },
 }
 
 pub struct WTStreamRouter {
@@ -154,7 +210,7 @@ impl WTStreamRouter {
         &self,
         component_id: ComponentId,
         render_mode: WTRenderMode,
-        payload: impl Into<String>,
+        payload: impl Into<FramePayload>,
     ) -> LaneRenderedChunk {
         let tier = self.tier_for_component(component_id).unwrap_or(Tier::B);
         let slot = Self::stream_slot_for(tier, render_mode);
@@ -181,7 +237,7 @@ impl WTStreamRouter {
     pub fn route_global_chunk(
         &self,
         render_mode: WTRenderMode,
-        payload: impl Into<String>,
+        payload: impl Into<FramePayload>,
     ) -> LaneRenderedChunk {
         let slot = Self::stream_slot_for(Tier::B, render_mode);
         trace!(
@@ -312,7 +368,7 @@ impl WebTransportMuxer {
         let mut frames = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             let stream_id = self.stream_for_route_chunk(chunk.kind);
-            frames.push(self.make_frame(stream_id, None, chunk.content.clone()));
+            frames.push(self.make_frame(stream_id, None, FramePayload::Text(chunk.content.clone())));
         }
         frames
     }
@@ -344,7 +400,66 @@ impl WebTransportMuxer {
                     actual: frame.sequence,
                 });
             }
-            output.push_str(frame.payload.as_str());
+            match &frame.payload {
+                FramePayload::Text(text) => output.push_str(text.as_str()),
+                FramePayload::Binary(_) => {
+                    return Err(WebTransportError::PayloadKindMismatch {
+                        stream_id,
+                        sequence: frame.sequence,
+                        expected: "text",
+                        found: "binary",
+                    });
+                }
+            }
+            expected += 1;
+        }
+        Ok(output)
+    }
+
+    // PHASE 2 (B-emitter) — Pinaki: this is `reassemble_binary_stream`'s
+    // first real caller. The Phase-B emitter should hand binary opcode
+    // frames to the patches stream (slot 2); the client decoder reads back
+    // through this fn after collecting all `WebTransportFrame`s sharing a
+    // `frame_id`. Concatenation order is by `sequence`, NOT receive order.
+    // — Bishal-albdo@may-2026
+    pub fn reassemble_binary_stream(
+        stream_id: u8,
+        frames: &[WebTransportFrame],
+    ) -> Result<Vec<u8>, WebTransportError> {
+        if stream_id as usize >= WEBTRANSPORT_STREAM_COUNT {
+            return Err(WebTransportError::InvalidStreamId {
+                stream_id: stream_id as usize,
+            });
+        }
+
+        let mut selected = frames
+            .iter()
+            .filter(|frame| frame.stream_id == stream_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        selected.sort_unstable_by_key(|frame| frame.sequence);
+
+        let mut expected = 0_u64;
+        let mut output = Vec::new();
+        for frame in selected {
+            if frame.sequence != expected {
+                return Err(WebTransportError::SequenceGap {
+                    stream_id,
+                    expected,
+                    actual: frame.sequence,
+                });
+            }
+            match &frame.payload {
+                FramePayload::Binary(bytes) => output.extend_from_slice(bytes),
+                FramePayload::Text(_) => {
+                    return Err(WebTransportError::PayloadKindMismatch {
+                        stream_id,
+                        sequence: frame.sequence,
+                        expected: "binary",
+                        found: "text",
+                    });
+                }
+            }
             expected += 1;
         }
         Ok(output)
@@ -354,7 +469,7 @@ impl WebTransportMuxer {
         &self,
         stream_id: usize,
         component_id: Option<ComponentId>,
-        payload: String,
+        payload: FramePayload,
     ) -> WebTransportFrame {
         let sequence = self.next_sequence[stream_id].fetch_add(1, Ordering::Relaxed);
 
@@ -400,7 +515,7 @@ mod tests {
                         .mux_lane_chunks(&[LaneRenderedChunk {
                             lane: WT_STREAM_SLOT_PATCHES as usize,
                             component_id: Some(ComponentId::new(producer_idx as u64)),
-                            payload: format!("p{producer_idx}-{item}"),
+                            payload: FramePayload::Text(format!("p{producer_idx}-{item}")),
                         }])
                         .unwrap();
                     sequences.push(frames[0].sequence);
@@ -429,17 +544,17 @@ mod tests {
                 LaneRenderedChunk {
                     lane: 0,
                     component_id: Some(ComponentId::new(1)),
-                    payload: "a".to_string(),
+                    payload: FramePayload::Text("a".to_string()),
                 },
                 LaneRenderedChunk {
                     lane: 2,
                     component_id: Some(ComponentId::new(2)),
-                    payload: "b".to_string(),
+                    payload: FramePayload::Text("b".to_string()),
                 },
                 LaneRenderedChunk {
                     lane: 0,
                     component_id: Some(ComponentId::new(3)),
-                    payload: "c".to_string(),
+                    payload: FramePayload::Text("c".to_string()),
                 },
             ])
             .unwrap();
@@ -487,13 +602,13 @@ mod tests {
                 stream_id: 1,
                 sequence: 0,
                 component_id: None,
-                payload: "A".to_string(),
+                payload: FramePayload::Text("A".to_string()),
             },
             WebTransportFrame {
                 stream_id: 1,
                 sequence: 2,
                 component_id: None,
-                payload: "B".to_string(),
+                payload: FramePayload::Text("B".to_string()),
             },
         ];
 
@@ -508,13 +623,13 @@ mod tests {
                 stream_id: 0,
                 sequence: 0,
                 component_id: None,
-                payload: "shell".to_string(),
+                payload: FramePayload::Text("shell".to_string()),
             },
             WebTransportFrame {
                 stream_id: 1,
                 sequence: 1,
                 component_id: None,
-                payload: "gap".to_string(),
+                payload: FramePayload::Text("gap".to_string()),
             },
         ];
 
@@ -554,6 +669,104 @@ mod tests {
 
         assert_eq!(router.patch_sequence_for(ComponentId::new(21)), Some(2));
         assert_eq!(router.patch_sequence_for(ComponentId::new(22)), Some(1));
+    }
+
+    #[test]
+    fn reassemble_route_chunks_errors_on_binary_payload() {
+        // A binary frame on a declared-text stream is a producer bug we
+        // want to surface, not silently drop.
+        let frames = vec![
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_SHELL,
+                sequence: 0,
+                component_id: None,
+                payload: FramePayload::Text("<main>".to_string()),
+            },
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_SHELL,
+                sequence: 1,
+                component_id: None,
+                payload: FramePayload::Binary(vec![0xCA, 0xFE]),
+            },
+        ];
+
+        let err = WebTransportMuxer::reassemble_stream(WT_STREAM_SLOT_SHELL, &frames).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WebTransportError::PayloadKindMismatch {
+                    expected: "text",
+                    found: "binary",
+                    sequence: 1,
+                    ..
+                }
+            ),
+            "expected PayloadKindMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reassemble_binary_stream_errors_on_text_payload() {
+        let frames = vec![
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_PATCHES,
+                sequence: 0,
+                component_id: None,
+                payload: FramePayload::Binary(vec![0x01, 0x02]),
+            },
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_PATCHES,
+                sequence: 1,
+                component_id: None,
+                payload: FramePayload::Text("oops".to_string()),
+            },
+        ];
+
+        let err =
+            WebTransportMuxer::reassemble_binary_stream(WT_STREAM_SLOT_PATCHES, &frames)
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WebTransportError::PayloadKindMismatch {
+                    expected: "binary",
+                    found: "text",
+                    sequence: 1,
+                    ..
+                }
+            ),
+            "expected PayloadKindMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reassemble_binary_stream_round_trips() {
+        // Concatenation contract: bytes from multiple sequenced frames are
+        // joined in `sequence` order. Phase-B / Phase-C will rely on this.
+        let frames = vec![
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_PATCHES,
+                sequence: 1,
+                component_id: None,
+                payload: FramePayload::Binary(vec![0x03, 0x04, 0x05]),
+            },
+            WebTransportFrame {
+                stream_id: WT_STREAM_SLOT_PATCHES,
+                sequence: 0,
+                component_id: None,
+                payload: FramePayload::Binary(vec![0x01, 0x02]),
+            },
+        ];
+
+        let bytes = WebTransportMuxer::reassemble_binary_stream(WT_STREAM_SLOT_PATCHES, &frames)
+            .expect("happy-path binary reassemble must succeed");
+        assert_eq!(bytes, vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+    }
+
+    #[test]
+    fn reassemble_binary_stream_rejects_invalid_stream_id() {
+        let err = WebTransportMuxer::reassemble_binary_stream(99, &[]).unwrap_err();
+        assert!(matches!(err, WebTransportError::InvalidStreamId { .. }));
     }
 
     #[test]

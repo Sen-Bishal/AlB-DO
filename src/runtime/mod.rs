@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod dirty_bitmap;
+pub mod emitter;
 pub mod engine;
 pub mod eval;
 pub mod frame;
@@ -11,7 +12,11 @@ pub mod quickjs_engine;
 pub mod render_observer;
 pub mod renderer;
 pub mod scheduler;
+pub mod session;
+pub mod slot_store;
 pub mod static_slice;
 pub mod webtransport;
 
 pub use eval::{render_from_components_dir, ComponentProject, PatchReport};
+pub use session::SessionId;
+pub use slot_store::SlotStore;

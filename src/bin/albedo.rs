@@ -2054,6 +2054,24 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
             runtime_asset_path.display()
         )
     })?;
+    // Bakabox decoder. The runtime imports it as `./bincode.js`; both
+    // files live in `_albedo/` so the relative import resolves.
+    let bincode_asset_path = out_dir.join("_albedo").join("bincode.js");
+    std::fs::write(&bincode_asset_path, albedo_bincode_template()).map_err(|err| {
+        format!(
+            "failed to write bakabox decoder '{}': {err}",
+            bincode_asset_path.display()
+        )
+    })?;
+    // Bakabox WT bootstrap. Imports `./bincode.js`, so it must be in the
+    // same directory as the decoder above.
+    let wt_bootstrap_asset_path = out_dir.join("_albedo").join("wt-bootstrap.js");
+    std::fs::write(&wt_bootstrap_asset_path, albedo_wt_bootstrap_template()).map_err(|err| {
+        format!(
+            "failed to write WT bootstrap '{}': {err}",
+            wt_bootstrap_asset_path.display()
+        )
+    })?;
     let hydration_asset_path = out_dir.join("_albedo").join("hydration.js");
     std::fs::write(&hydration_asset_path, albedo_hydration_runtime_template()).map_err(|err| {
         format!(
@@ -2318,6 +2336,21 @@ fn albedo_runtime_shim_template() -> String {
 
 fn albedo_hydration_runtime_template() -> String {
     include_str!("../../assets/albedo-hydration.js").to_string()
+}
+
+/// Bakabox bincode decoder, deployed to `_albedo/bincode.js` so the
+/// runtime's `import './bincode.js'` resolves at the same `_albedo/`
+/// origin. Pairs with [`albedo_runtime_shim_template`]; the two ship
+/// together or the import will 404 at boot.
+fn albedo_bincode_template() -> String {
+    include_str!("../../assets/bincode.js").to_string()
+}
+
+/// Bakabox WT bootstrap, deployed to `_albedo/wt-bootstrap.js`. Imports
+/// `./bincode.js` at runtime, so it must ship alongside both the
+/// runtime and the decoder.
+fn albedo_wt_bootstrap_template() -> String {
+    include_str!("../../assets/albedo-wt-bootstrap.js").to_string()
 }
 
 fn run_completions_command(raw_args: &[String]) -> Result<(), String> {
