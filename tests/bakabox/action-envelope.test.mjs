@@ -14,6 +14,7 @@ import { test } from 'node:test';
 import {
   ACTION_EVENT_KIND,
   encodeActionEnvelope,
+  encodeFormDataPayload,
   encodeVarintU32,
   encodeVarintU64,
 } from '../../assets/bincode.js';
@@ -77,5 +78,71 @@ test('encodeActionEnvelope rejects bad inputs with a useful TypeError', () => {
   assert.throws(
     () => encodeActionEnvelope({ actionId: 0, eventKind: 0, payload: 'not bytes' }),
     /payload must be a Uint8Array/,
+  );
+});
+
+// ── Phase I — FormData payload encoder ──────────────────────────────
+
+/**
+ * Tiny FormData-like for tests — lets us avoid a DOM dependency while
+ * still exercising `encodeFormDataPayload` against the documented
+ * `entries()` contract.
+ */
+class FormDataLike {
+  constructor(pairs) {
+    this._pairs = pairs;
+  }
+  *entries() {
+    for (const [key, value] of this._pairs) {
+      yield [key, value];
+    }
+  }
+}
+
+test('encodeFormDataPayload produces a JSON object of name→value strings', () => {
+  const form = new FormDataLike([
+    ['username', 'alice'],
+    ['password', 'hunter2'],
+  ]);
+  const bytes = encodeFormDataPayload(form);
+  const text = new TextDecoder('utf-8').decode(bytes);
+  assert.deepStrictEqual(JSON.parse(text), { username: 'alice', password: 'hunter2' });
+});
+
+test('encodeFormDataPayload keeps the last value for repeated keys', () => {
+  // Matches the documented Phase-I contract for repeated `name=`
+  // inputs (last write wins). A future revision may opt-in to
+  // array-valued shapes once a typed `Vec<String>` field surfaces.
+  const form = new FormDataLike([
+    ['tag', 'rust'],
+    ['tag', 'web'],
+  ]);
+  const bytes = encodeFormDataPayload(form);
+  const decoded = JSON.parse(new TextDecoder('utf-8').decode(bytes));
+  assert.deepStrictEqual(decoded, { tag: 'web' });
+});
+
+test('encodeFormDataPayload skips non-string (File/Blob) values', () => {
+  const form = new FormDataLike([
+    ['title', 'photo'],
+    ['upload', { type: 'file', name: 'pic.jpg' }],
+  ]);
+  const bytes = encodeFormDataPayload(form);
+  const decoded = JSON.parse(new TextDecoder('utf-8').decode(bytes));
+  assert.deepStrictEqual(
+    decoded,
+    { title: 'photo' },
+    'Phase-I MVP is text-only; file uploads must not poison the JSON shape',
+  );
+});
+
+test('encodeFormDataPayload rejects non-FormData inputs', () => {
+  assert.throws(
+    () => encodeFormDataPayload(null),
+    /requires a FormData-like with entries\(\)/,
+  );
+  assert.throws(
+    () => encodeFormDataPayload({}),
+    /requires a FormData-like with entries\(\)/,
   );
 });

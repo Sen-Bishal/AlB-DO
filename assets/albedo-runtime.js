@@ -25,6 +25,7 @@ import {
   BakaboxWireError,
   decodeFrame,
   encodeActionEnvelope,
+  encodeFormDataPayload,
 } from './bincode.js';
 
 /**
@@ -84,9 +85,22 @@ function classifyEvent(event) {
     return { kind: ACTION_EVENT_KIND.Input, payload: new Uint8Array(0) };
   }
   if (type === 'submit') {
-    // Phase I defines the FormData encoding. For Phase G we ship the
-    // Submit kind with an empty payload so a handler can still see the
-    // event fired and respond.
+    // Phase-I: serialize the originating form's `FormData` as the
+    // payload. The submit handler is responsible for stopping the
+    // browser's default navigation; we extract entries from the form
+    // BEFORE that has had a chance to navigate away. File inputs are
+    // skipped by the encoder (Phase-I MVP is text-only).
+    const form = event?.target;
+    if (form && typeof FormData === 'function' && form instanceof HTMLFormElement) {
+      try {
+        return {
+          kind: ACTION_EVENT_KIND.Submit,
+          payload: encodeFormDataPayload(new FormData(form)),
+        };
+      } catch {
+        // Fall through to the empty-payload submit shape on encoding errors.
+      }
+    }
     return { kind: ACTION_EVENT_KIND.Submit, payload: new Uint8Array(0) };
   }
   return { kind: ACTION_EVENT_KIND.Other, payload: new Uint8Array(0) };
@@ -125,6 +139,13 @@ export function createActionDispatcher({ bakabox, endpoint = DEFAULT_ACTION_ENDP
         console.warn('[bakabox] no fetch available; action dropped', { proxyId });
       }
       return;
+    }
+    // Phase-I — when a form is server-action-bound, stop the browser
+    // from navigating to the form's `action` URL before we ship the
+    // envelope. The server-side Navigate opcode (if any) drives any
+    // redirect that follows submission.
+    if (event?.type === 'submit' && typeof event.preventDefault === 'function') {
+      event.preventDefault();
     }
     const { kind, payload } = classifyEvent(event);
     const bytes = encodeActionEnvelope({
@@ -311,6 +332,8 @@ export class Bakabox {
         return this._opSetAttrRef(op);
       case 'SlotSet':
         return this._opSlotSet(op);
+      case 'Navigate':
+        return this._opNavigate(op);
       default:
         throw new BakaboxWireError(
           `bakabox saw unknown opcode '${op.op}'`,
@@ -467,6 +490,27 @@ export class Bakabox {
         if (element && attrName) element.setAttribute(attrName, decoded);
       }
       // 'sentinel' sites from bare BindSlot are intentionally skipped.
+    }
+  }
+
+  /**
+   * Phase-I — applies a server-driven navigation. Drives the browser's
+   * top-level URL change via `location.assign`. The `navigator` field
+   * on the document's owning window is preferred over `globalThis`
+   * directly so SSR / test contexts that provide a stub window can
+   * intercept without monkey-patching the global scope.
+   *
+   * No-op in environments that don't expose a `location` object — the
+   * Node DOM shim used by tests injects one explicitly when it wants
+   * to assert against the navigation target.
+   */
+  _opNavigate({ url }) {
+    const ownerWindow =
+      this.document?.defaultView ||
+      (typeof globalThis !== 'undefined' ? globalThis : undefined);
+    const loc = ownerWindow?.location;
+    if (loc && typeof loc.assign === 'function') {
+      loc.assign(url);
     }
   }
 

@@ -39,7 +39,7 @@ pub enum WireError {
 /// Any change to this configuration is a wire-format break and MUST be
 /// accompanied by a bump of
 /// [`crate::ir::conformance::LOCKED_WIRE_VERSION`] and a regenerated
-/// `tests/fixtures/wire/v1_canonical_frame.bin`.
+/// `tests/fixtures/wire/v2_canonical_frame.bin`.
 #[inline]
 pub(crate) fn config() -> impl bincode::config::Config {
     bincode::config::standard()

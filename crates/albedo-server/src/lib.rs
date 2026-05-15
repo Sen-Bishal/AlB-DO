@@ -56,7 +56,7 @@ pub mod routing;
 pub mod server;
 pub mod webtransport;
 
-pub use actions::ActionHandler;
+pub use actions::{ActionHandler, SessionSlots};
 pub use api::{ApiHandler, ApiResponse};
 pub use config::{AppConfig, LayoutSpec, RendererConfig, RouteSpec, ServerConfig};
 pub use contract::{

@@ -6,7 +6,7 @@
 //! Response = bincode `OpcodeFrame` (the same shape bakabox already
 //! decodes for the WT patches stream).
 
-use crate::actions::ActionHandler;
+use crate::actions::{ActionHandler, SessionSlots};
 use crate::error::RuntimeError;
 use crate::lifecycle::RequestContext;
 use axum::body::Body;
@@ -40,6 +40,7 @@ pub async fn run_action_request(
     registry: &ActionRegistry,
     ctx: RequestContext,
     body: Bytes,
+    slots: SessionSlots,
 ) -> Response<Body> {
     let (envelope, _consumed) = match decode_action_envelope(body.as_ref()) {
         Ok(value) => value,
@@ -62,7 +63,7 @@ pub async fn run_action_request(
         }
     };
 
-    let instructions = match handler.handle(&ctx, &envelope).await {
+    let mut instructions = match handler.handle(&ctx, &envelope, slots.clone()).await {
         Ok(out) => out,
         Err(err) => {
             warn!(action_id = envelope.action_id, error = %err, "action handler failed");
@@ -72,6 +73,12 @@ pub async fn run_action_request(
             );
         }
     };
+
+    // Phase-H — append any `SlotSet` opcodes the handler triggered
+    // via `slots.write`. Drain is best-effort: a poisoned mutex
+    // returns an empty vec, so the handler's explicit response still
+    // ships even if the slot store is in a bad state.
+    instructions.extend(slots.drain_pending());
 
     // Action responses don't share frame_ids with the WT patches
     // stream — each is a self-contained `OpcodeFrame` per the Phase-D
@@ -131,11 +138,12 @@ pub(crate) fn status_for_error(err: &RuntimeError) -> StatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actions::ActionHandler;
+    use crate::actions::{ActionHandler, SessionSlots};
     use axum::body::to_bytes;
     use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
-    use dom_render_compiler::ir::opcode::{Instruction, StableId, TagId};
+    use dom_render_compiler::ir::opcode::{Instruction, SlotId, StableId, TagId};
     use dom_render_compiler::ir::wire::decode_frame;
+    use dom_render_compiler::runtime::{SessionId, SlotStore};
 
     fn ctx() -> RequestContext {
         RequestContext {
@@ -150,6 +158,10 @@ mod tests {
         }
     }
 
+    fn slots() -> SessionSlots {
+        SessionSlots::new(SessionId::random(), Arc::new(SlotStore::new()))
+    }
+
     async fn body_bytes(resp: Response<Body>) -> Bytes {
         to_bytes(resp.into_body(), 1024 * 1024).await.unwrap()
     }
@@ -158,7 +170,7 @@ mod tests {
     async fn dispatches_to_registered_handler_and_returns_wire_encoded_frame() {
         let mut registry: ActionRegistry = HashMap::new();
         let handler: Arc<dyn ActionHandler> = Arc::new(
-            |_ctx: RequestContext, env: ActionEnvelope| async move {
+            |_ctx: RequestContext, env: ActionEnvelope, _slots: SessionSlots| async move {
                 Ok(vec![Instruction::Create {
                     tag_id: TagId(0),
                     stable_id: StableId(env.action_id),
@@ -176,7 +188,7 @@ mod tests {
             .unwrap(),
         );
 
-        let response = run_action_request(&registry, ctx(), body).await;
+        let response = run_action_request(&registry, ctx(), body, slots()).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
@@ -202,6 +214,7 @@ mod tests {
             &registry,
             ctx(),
             Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]),
+            slots(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -218,7 +231,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = run_action_request(&registry, ctx(), body).await;
+        let response = run_action_request(&registry, ctx(), body, slots()).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -226,7 +239,7 @@ mod tests {
     async fn handler_error_returns_500() {
         let mut registry: ActionRegistry = HashMap::new();
         let handler: Arc<dyn ActionHandler> = Arc::new(
-            |_ctx: RequestContext, _env: ActionEnvelope| async move {
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
                 Err(RuntimeError::RequestHandling("boom".into()))
             },
         );
@@ -240,7 +253,52 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = run_action_request(&registry, ctx(), body).await;
+        let response = run_action_request(&registry, ctx(), body, slots()).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn slot_writes_inside_handler_surface_as_slot_set_in_response() {
+        // Phase-H closing the reactive loop: handler writes a slot →
+        // dispatcher drains the dirty set after handle() returns →
+        // SlotSet opcode is appended to the response wire frame.
+        let store = Arc::new(SlotStore::new());
+        let view = SessionSlots::new(SessionId::random(), store);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, slots: SessionSlots| async move {
+                slots.write(SlotId(7), b"42".to_vec());
+                Ok(Vec::new())
+            },
+        );
+        registry.insert(1, handler);
+
+        let body = Bytes::from(
+            encode_action_envelope(&ActionEnvelope {
+                action_id: 1,
+                event_kind: 0,
+                payload: Vec::new(),
+            })
+            .unwrap(),
+        );
+
+        let response = run_action_request(&registry, ctx(), body, view).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = body_bytes(response).await;
+        let (frame, _) = decode_frame(&bytes).expect("frame decodes");
+        assert_eq!(
+            frame.instructions.len(),
+            1,
+            "handler returned no explicit opcodes; only the SlotSet should ship",
+        );
+        match &frame.instructions[0] {
+            Instruction::SlotSet { slot_id, value } => {
+                assert_eq!(*slot_id, SlotId(7));
+                assert_eq!(value, b"42");
+            }
+            other => panic!("expected SlotSet, got {other:?}"),
+        }
     }
 }

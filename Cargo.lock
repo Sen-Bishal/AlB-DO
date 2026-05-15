@@ -632,6 +632,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "walkdir",
  "wide",
  "xxhash-rust",
