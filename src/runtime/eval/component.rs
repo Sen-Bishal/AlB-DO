@@ -20,6 +20,22 @@ pub fn fnv1a_hash(data: &[u8]) -> u64 {
     hash
 }
 
+/// FNV-1a-32: matches `stable_id_for_placeholder` in albedo-server's
+/// `render::tier_b`. The compiler crate can't depend on the server crate,
+/// so this is the source of truth for shell-stamped `data-albedo-id`s
+/// emitted by the static evaluator. Both functions must produce the same
+/// bytes for the same input — anchor IDs cross the WT boundary as u32s.
+pub fn fnv1a_32(data: &[u8]) -> u32 {
+    const FNV_OFFSET: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    let mut hash = FNV_OFFSET;
+    for byte in data {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 pub fn normalize_specifier(path: impl AsRef<Path>) -> String {
     let mut parts = Vec::new();
     for component in path.as_ref().components() {
@@ -59,12 +75,29 @@ pub fn import_candidates(base: &str) -> Vec<String> {
 }
 
 pub fn normalize_jsx_text(value: &str) -> Option<String> {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
+    // React JSX whitespace rules (paraphrased):
+    //   * Pure-whitespace text becomes nothing.
+    //   * If the text contains a newline, it represents source formatting:
+    //     adjacent whitespace fully collapses (`\n  x \n` → `x`).
+    //   * Without a newline, runs of whitespace collapse to a single space
+    //     and leading/trailing whitespace is preserved as one space — this
+    //     is what keeps `{n} items` from becoming `3items`.
+    let inner = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if inner.is_empty() {
+        return None;
     }
+    if value.contains('\n') {
+        return Some(inner);
+    }
+    let mut result = String::new();
+    if value.starts_with(|c: char| c.is_whitespace()) {
+        result.push(' ');
+    }
+    result.push_str(&inner);
+    if value.ends_with(|c: char| c.is_whitespace()) {
+        result.push(' ');
+    }
+    Some(result)
 }
 
 pub fn is_component_tag(tag: &str) -> bool {
@@ -180,11 +213,129 @@ pub fn value_to_string(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::Bool(boolean) => boolean.to_string(),
-        Value::Number(number) => number.to_string(),
+        Value::Number(number) => format_number_for_output(number),
         Value::String(string) => string.clone(),
         Value::Array(values) => values.iter().map(value_to_string).collect(),
-        Value::Object(object) => serde_json::to_string(object).unwrap_or_default(),
+        Value::Object(object) => {
+            // Date objects (encoded as { __albedo_date__: ms }) print as the
+            // ISO string, mirroring JS's `String(new Date())` shape closely
+            // enough for templates that interpolate them directly. Anything
+            // else falls through to JSON for visibility.
+            if let Some(ms) = object
+                .get("__albedo_date__")
+                .and_then(|v| v.as_f64())
+            {
+                return format_date_iso(ms);
+            }
+            serde_json::to_string(object).unwrap_or_default()
+        }
     }
+}
+
+/// Format a JSON number the way JS's `String(n)` does: integers without a
+/// trailing `.0`, floats with the standard ECMAScript-ish representation.
+/// `serde_json::Number::from_f64(42.0).to_string()` yields "42.0", which
+/// silently drifts from JS semantics — fix it once at the print site.
+pub fn format_number_for_output(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() {
+        return i.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return u.to_string();
+    }
+    if let Some(f) = n.as_f64() {
+        if f.is_finite() && f == f.trunc() && f.abs() < 1e16 {
+            return format!("{}", f as i64);
+        }
+        return n.to_string();
+    }
+    n.to_string()
+}
+
+/// Encode a Date instance as a tagged JSON object so it survives through
+/// the evaluator's `Value` substrate without needing a parallel type.
+pub fn make_date_value(ms: f64) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "__albedo_date__".to_string(),
+        serde_json::Number::from_f64(ms)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+    );
+    Value::Object(map)
+}
+
+pub fn date_value_ms(value: &Value) -> Option<f64> {
+    value
+        .as_object()
+        .and_then(|m| m.get("__albedo_date__"))
+        .and_then(|v| v.as_f64())
+}
+
+/// Coerce a runtime `Value` to an f64 the way JS's arithmetic operators
+/// would. NaN-on-failure is left as 0.0 because the static evaluator
+/// never surfaces NaN to HTML — Phase K's reactive path can take over.
+pub fn to_number(value: &Value) -> f64 {
+    match value {
+        Value::Null => 0.0,
+        Value::Bool(true) => 1.0,
+        Value::Bool(false) => 0.0,
+        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+        Value::Array(_) | Value::Object(_) => 0.0,
+    }
+}
+
+pub fn json_num(value: f64) -> Value {
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
+}
+
+pub fn json_int(value: i64) -> Value {
+    Value::Number(serde_json::Number::from(value))
+}
+
+pub fn arg_num(args: &[Value], index: usize) -> f64 {
+    args.get(index).map(to_number).unwrap_or(0.0)
+}
+
+fn format_date_iso(ms: f64) -> String {
+    let total_ms = ms as i64;
+    let mut secs = total_ms.div_euclid(1000);
+    let mut millis = total_ms.rem_euclid(1000) as u32;
+    if millis >= 1000 {
+        secs += 1;
+        millis -= 1000;
+    }
+    let (y, mo, d, h, mi, s) = epoch_seconds_to_ymd_hms(secs);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, mo, d, h, mi, s, millis
+    )
+}
+
+fn epoch_seconds_to_ymd_hms(mut secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let day_secs: i64 = 86_400;
+    let mut days = secs.div_euclid(day_secs);
+    secs = secs.rem_euclid(day_secs);
+    let hour = (secs / 3600) as u32;
+    let minute = ((secs % 3600) / 60) as u32;
+    let second = (secs % 60) as u32;
+
+    // Civil-from-days (Howard Hinnant), works for the full proleptic Gregorian
+    // range including pre-1970 negative inputs.
+    days += 719_468;
+    let era = if days >= 0 { days / 146_097 } else { (days - 146_096) / 146_097 };
+    let doe = (days - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, hour, minute, second)
 }
 
 pub fn prop_name_to_string(name: &swc_ecma_ast::PropName) -> Option<String> {

@@ -181,6 +181,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
             run_dev_mode(&forwarded)
         }
         "ship" => run_ship_command(&args[2..]),
+        // Phase J CLI clarity:
+        //   * `albedo files [dir]` — pure static file server; serves any
+        //     directory verbatim. This is what `albedo serve` did before.
+        //   * `albedo serve` — production server: builds the project via
+        //     the same stitcher as `dev` / `dev --prod` / `build`, then
+        //     serves the resulting `.albedo/dist`. One stitcher feeds
+        //     every command — dev/prod parity by construction.
+        //   * `albedo serve <dir>` — back-compat alias for `files <dir>`.
+        "files" => run_files_command(&args[2..]),
         "serve" => run_serve_command(&args[2..]),
         "run" => run_command(&args[2..]),
         "completions" => run_completions_command(&args[2..]),
@@ -428,7 +437,54 @@ fn configure_ship_fly(contract: &ResolvedDevContract) -> Result<(), String> {
     Ok(())
 }
 
+/// Phase J CLI: `albedo serve` runs the production build (same stitcher
+/// as `dev` / `dev --prod` / `build`) and then file-serves the resulting
+/// `.albedo/dist` directory. The build step is what guarantees one
+/// stitcher feeds dev and prod alike. If the user passes an explicit
+/// directory argument, we treat it as the back-compat shape for the old
+/// `albedo serve <dir>` (now spelt `albedo files <dir>`) and skip the
+/// build to preserve the long-standing CLI ergonomic.
 fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_serve_help();
+        return Ok(());
+    }
+
+    let user_passed_dir = raw_args
+        .iter()
+        .any(|arg| !arg.starts_with('-') || arg == "--dir");
+    if user_passed_dir {
+        // Back-compat: `albedo serve <dir>` and `--dir <dir>` keep their
+        // pre-Phase-J semantics — serve the directory directly. Equivalent
+        // to `albedo files <dir>`, kept so existing scripts don't break.
+        return run_files_command(raw_args);
+    }
+
+    // Build the project via the manifest+stitcher path, then serve.
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let contract = resolve_dev_contract(&[], &cwd)?;
+    print_banner();
+    print_section("serve");
+    print_kv("project", contract.project_dir.display());
+    print_kv("mode", "production (build + serve)");
+    println!();
+    run_prod_build(&contract)?;
+
+    let dist = contract.project_dir.join(".albedo").join("dist");
+    let mut forwarded: Vec<String> = vec![dist.display().to_string()];
+    let serve_options = parse_serve_args(raw_args)?;
+    forwarded.push("--host".to_string());
+    forwarded.push(serve_options.host);
+    forwarded.push("--port".to_string());
+    forwarded.push(serve_options.port.to_string());
+    run_files_command(&forwarded)
+}
+
+/// Static file server. Phase-J rename of the previous `albedo serve`
+/// command — the behavior is identical, just under a name that says what
+/// it does (no rendering, no stitcher; bytes off disk).
+fn run_files_command(raw_args: &[String]) -> Result<(), String> {
     if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_serve_help();
         return Ok(());
@@ -453,7 +509,7 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     let (listener, addr, auto_incremented) =
         bind_dev_listener(options.host.as_str(), options.port)?;
     print_banner();
-    print_section("serve");
+    print_section("files");
     if auto_incremented {
         print_warn(format!(
             "port {} busy — using {}",
@@ -2387,7 +2443,7 @@ _albdo_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local commands="init dev build ship serve run completions help"
+    local commands="init dev build ship serve files run completions help"
 
     case "$prev" in
         albdo)
@@ -2414,7 +2470,7 @@ _albdo_completions() {
             COMPREPLY=( $(compgen -W "--force" -- "$cur") )
             return 0
             ;;
-        serve)
+        serve|files)
             COMPREPLY=( $(compgen -W "--dir --host --port" -- "$cur") )
             return 0
             ;;
@@ -2433,7 +2489,8 @@ _albdo() {
         'dev:Start the live dev server with HMR'
         'build:Compile an optimised production build'
         'ship:Build and configure deployment target files'
-        'serve:Serve static files from a directory'
+        'serve:Production build + serve via the same stitcher as dev'
+        'files:Static file server (defaults to .albedo/dist)'
         'run:Run a sub-mode (e.g. run dev)'
         'completions:Emit shell completion script to stdout'
         'help:Show command list and examples'
@@ -2496,7 +2553,7 @@ _albdo "$@"
 "#;
 
 const COMPLETIONS_FISH: &str = r#"# albdo fish completions
-set -l albdo_commands init dev build ship serve run completions help
+set -l albdo_commands init dev build ship serve files run completions help
 
 # Disable file completions for the main command
 complete -c albdo -f
@@ -2547,7 +2604,7 @@ Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptB
     $tokens = $commandAst.CommandElements
     $nTokens = $tokens.Count
 
-    $commands = @('init','dev','build','ship','serve','run','completions','help')
+    $commands = @('init','dev','build','ship','serve','files','run','completions','help')
     $devFlags = @('--config','--entry','--host','--port','--no-hmr','--strict','--verbose','--open','--prod')
 
     if ($nTokens -le 2) {
@@ -2576,7 +2633,7 @@ Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptB
                     ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
             }
         }
-        'serve' {
+        { $_ -in 'serve','files' } {
             @('--dir','--host','--port') | Where-Object { $_ -like "$wordToComplete*" } |
                 ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
         }
@@ -2601,7 +2658,12 @@ fn print_help() {
     print_command("dev", "[dir]", "start the dev server");
     print_command("build", "[dir]", "compile an optimized bundle");
     print_command("ship", "[dir]", "build + configure deploy target");
-    print_command("serve", "[dir]", "serve a static directory");
+    print_command(
+        "serve",
+        "",
+        "production build + serve via the same stitcher as dev",
+    );
+    print_command("files", "[dir]", "static file server (defaults to .albedo/dist)");
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
 
@@ -2620,7 +2682,8 @@ fn print_help() {
     print_example("albedo init my-app");
     print_example("cd my-app && albedo dev");
     print_example("albedo ship --target docker");
-    print_example("albedo serve ./.albedo/dist");
+    print_example("albedo serve");
+    print_example("albedo files ./.albedo/dist");
     println!();
 }
 

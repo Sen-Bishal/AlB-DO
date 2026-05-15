@@ -81,6 +81,7 @@ impl<'a> ManifestBuilder<'a> {
         self.traverse(
             root_component,
             None,
+            false,
             &mut tier_a_root,
             &mut tier_b,
             &mut tier_c,
@@ -217,6 +218,12 @@ impl<'a> ManifestBuilder<'a> {
         &self,
         id: ComponentId,
         parent_placeholder: Option<String>,
+        // True iff a Tier-A ancestor has already inlined this subtree
+        // into its `render_static` HTML. When set, Tier-A nodes here
+        // skip pushing themselves to `tier_a_root` (the dedup contract
+        // for Phase J's static slicer). Independent of `parent_placeholder`,
+        // which controls body-anchor placement for Tier-B/C islands.
+        inlined_under_tier_a: bool,
         tier_a_root: &mut Vec<RenderedNode>,
         tier_b: &mut Vec<TierBNode>,
         tier_c: &mut Vec<TierCNode>,
@@ -229,7 +236,22 @@ impl<'a> ManifestBuilder<'a> {
 
         match metadata.tier {
             Tier::A => {
-                if parent_placeholder.is_none() {
+                // Static slicer dedup contract (Phase J):
+                //
+                // A Tier-A component's `render_static` already inlines every
+                // Tier-A descendant into one HTML string. Pushing those
+                // descendants to `tier_a_root` again — and emitting their
+                // own `__SLOT_` placeholders in `body_open` — produces
+                // duplicate work for the stitcher and a manifest that
+                // double-counts the same DOM bytes.
+                //
+                // The `inlined_under_tier_a` flag tracks whether a Tier-A
+                // ancestor has already absorbed our HTML; when set, we
+                // skip the push. `parent_placeholder` is left untouched
+                // so Tier-B/C descendants (which are NOT inlined into
+                // Tier-A's HTML — they remain separate async islands)
+                // keep their original body-anchor placement.
+                if !inlined_under_tier_a {
                     tier_a_root.push(self.render_static(
                         id,
                         parent_placeholder.clone(),
@@ -237,9 +259,12 @@ impl<'a> ManifestBuilder<'a> {
                     ));
                 }
                 for child in self.sorted_children(id) {
+                    let child_inlined =
+                        inlined_under_tier_a || self.tier_of(child) == Some(Tier::A);
                     self.traverse(
                         child,
                         parent_placeholder.clone(),
+                        child_inlined,
                         tier_a_root,
                         tier_b,
                         tier_c,
@@ -277,6 +302,7 @@ impl<'a> ManifestBuilder<'a> {
                     self.traverse(
                         child,
                         Some(placeholder_id.clone()),
+                        false,
                         tier_a_root,
                         tier_b,
                         tier_c,
