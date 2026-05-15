@@ -118,6 +118,7 @@ yarn.lock
 /benches/results/
 *.html
 !tests/fixtures/visual/*.html
+!tests/fixtures/jsx_matrix/**/expected.html
 
 # Test artifacts
 /tests/tmp/
