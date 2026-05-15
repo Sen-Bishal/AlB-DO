@@ -1,4 +1,4 @@
-use crate::actions::ActionHandler;
+use crate::actions::{ActionHandler, SessionSlots};
 use crate::api::ApiHandler;
 use crate::config::AppConfig;
 use crate::contract::{
@@ -12,6 +12,7 @@ use crate::handlers::{streaming_handler, StreamingAppState, StreamingTransportCo
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 use crate::render::tier_b::{SharedRenderServices, TierBOpcodeRegistry};
 use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
+use dom_render_compiler::runtime::{SessionId, SlotStore};
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
 use crate::webtransport::{WebTransportRuntime, WebTransportSessionRegistry};
@@ -50,6 +51,11 @@ struct RuntimeState {
     /// `BindEvent.proxy_id` carries on the wire). Served via
     /// `POST /_albedo/action`.
     action_handlers: Arc<ActionRegistry>,
+    /// Phase-H — shared reactive slot store. Action handlers read and
+    /// write through a `SessionSlots` view built per-request; the
+    /// pipeline (when bound) holds the same `Arc<SlotStore>` so writes
+    /// are visible to both sides without copying.
+    slot_store: Arc<SlotStore>,
     layouts: Arc<HashMap<String, SharedLayoutHandler>>,
     middleware: Arc<HashMap<String, SharedMiddleware>>,
     auth_provider: SharedAuthProvider,
@@ -137,6 +143,58 @@ impl AlbedoServerBuilder {
         handler: impl ActionHandler + 'static,
     ) -> Self {
         self.action_handlers.insert(action_id, Arc::new(handler));
+        self
+    }
+
+    /// Phase-I — registers a typed form-submit handler under
+    /// `action_id`. The dispatcher decodes the incoming
+    /// `ActionEnvelope.payload` as JSON into `T` before invoking
+    /// `handler`. On parse failure the action surfaces a
+    /// [`RuntimeError::RequestHandling`] which the HTTP path renders
+    /// as a 500 with the underlying serde message — production code
+    /// should validate inputs with a typed `T` (`serde` derive) so
+    /// "bad data" surfaces as a structured error early.
+    ///
+    /// The form payload shape is the JSON object bakabox's
+    /// `encodeFormDataPayload` emits for a browser `FormData`: keys
+    /// are input `name` attributes, values are the last submitted
+    /// string value for each name. Repeated `name`s collapse to the
+    /// last value (matches `<form>` POST semantics). Phase-J / future
+    /// work will extend the helper to optionally produce
+    /// `{key: string[]}` shapes for explicit multi-value fields.
+    pub fn register_form_action<T, F, Fut>(
+        mut self,
+        action_id: u32,
+        handler: F,
+    ) -> Self
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+        F: Fn(RequestContext, T, SessionSlots) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<
+                Output = Result<
+                    Vec<dom_render_compiler::ir::opcode::Instruction>,
+                    RuntimeError,
+                >,
+            > + Send
+            + 'static,
+    {
+        let handler = Arc::new(handler);
+        let wrapped = move |ctx: RequestContext,
+                            envelope: dom_render_compiler::ir::action::ActionEnvelope,
+                            slots: SessionSlots| {
+            let handler = handler.clone();
+            async move {
+                let parsed: T = serde_json::from_slice(&envelope.payload).map_err(|err| {
+                    RuntimeError::RequestHandling(format!(
+                        "form payload did not deserialize as {}: {err}",
+                        std::any::type_name::<T>()
+                    ))
+                })?;
+                (handler)(ctx, parsed, slots).await
+            }
+        };
+        self.action_handlers
+            .insert(action_id, Arc::new(wrapped));
         self
     }
 
@@ -232,6 +290,14 @@ impl AlbedoServerBuilder {
             ..SharedRenderServices::default()
         };
 
+        // Phase-H — one shared slot store for the lifetime of the
+        // server. Action handlers read/write through it via the
+        // dispatcher-built `SessionSlots`; the pipeline, when bound,
+        // holds the same `Arc` so future tick-side emissions see the
+        // same state. Without this sharing each side would run
+        // against an empty store and the reactive loop never closes.
+        let slot_store = Arc::new(SlotStore::new());
+
         // Construct StreamingAppState, binding the optional pipeline +
         // runtime handle when both are present. `with_pipeline` consumes
         // the pair, so `take()` to move it out of the builder. The Arc
@@ -249,7 +315,10 @@ impl AlbedoServerBuilder {
                 shared_wt_sessions.clone(),
             );
             let state = match pipeline_binding.take() {
-                Some((pipeline, handle)) => state.with_pipeline(pipeline, handle),
+                Some((pipeline, handle)) => {
+                    let pipeline = pipeline.with_slot_store(slot_store.clone());
+                    state.with_pipeline(pipeline, handle)
+                }
                 None => state,
             };
             Arc::new(state)
@@ -321,6 +390,7 @@ impl AlbedoServerBuilder {
             handlers: Arc::new(self.handlers),
             api_handlers: Arc::new(self.api_handlers),
             action_handlers: Arc::new(self.action_handlers),
+            slot_store,
             layouts: Arc::new(self.layouts),
             middleware: Arc::new(self.middleware),
             auth_provider: self.auth_provider,
@@ -502,18 +572,33 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
     response
 }
 
-/// Phase-G — runs the action HTTP route. Reads the body, builds a
-/// `RequestContext` (so handlers see the same headers/query surface
-/// the rest of the runtime hands them), and dispatches to
-/// [`run_action_request`]. The body cap matches `MAX_REQUEST_BODY_BYTES`
-/// so an oversized envelope is rejected with the same shape as any
-/// other large request.
+/// HTTP header bakabox sets to carry the session id alongside each
+/// action POST. Mirrors the WT-layer header used during session
+/// handshake. Production deployments should bind a signed cookie at
+/// session-open time and prefer that over the plain header.
+const ACTION_SESSION_HEADER: &str = "x-albedo-session";
+
+/// Phase-G/H — runs the action HTTP route. Reads the body, builds a
+/// `RequestContext`, extracts a session id from the
+/// `x-albedo-session` header (synthesising a random one when absent so
+/// handlers never see `None`), and dispatches to [`run_action_request`]
+/// with a [`SessionSlots`] view bound to the server's shared slot
+/// store. The body cap matches `MAX_REQUEST_BODY_BYTES` so an oversized
+/// envelope is rejected with the same shape as any other large request.
 async fn run_action_route(state: &RuntimeState, request: Request<Body>) -> Response {
     let (parts, body) = request.into_parts();
     let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(body) => body,
         Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
     };
+
+    let session_id = parts
+        .headers
+        .get(ACTION_SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        .map(SessionId::new)
+        .unwrap_or_else(SessionId::random);
 
     let query = parts.uri.query().map(str::to_string);
     let ctx = RequestContext::new(
@@ -525,7 +610,8 @@ async fn run_action_route(state: &RuntimeState, request: Request<Body>) -> Respo
         body.clone(),
     );
 
-    run_action_request(state.action_handlers.as_ref(), ctx, body).await
+    let slots = SessionSlots::new(session_id, state.slot_store.clone());
+    run_action_request(state.action_handlers.as_ref(), ctx, body, slots).await
 }
 
 /// Runs an API request: applies the route-level timeout, calls
@@ -1231,7 +1317,8 @@ mod tests {
             .register_action(
                 42,
                 |_ctx: RequestContext,
-                 envelope: dom_render_compiler::ir::action::ActionEnvelope| async move {
+                 envelope: dom_render_compiler::ir::action::ActionEnvelope,
+                 _slots: SessionSlots| async move {
                     // Handler returns one Create that targets the action_id
                     // as its stable_id so the test can verify the args
                     // reached the handler unmodified.
@@ -1325,7 +1412,8 @@ mod tests {
             .register_action(
                 7,
                 |ctx: RequestContext,
-                 _env: dom_render_compiler::ir::action::ActionEnvelope| async move {
+                 _env: dom_render_compiler::ir::action::ActionEnvelope,
+                 _slots: SessionSlots| async move {
                     // Echo the token header back via SetText so the test
                     // can read it from the decoded response.
                     let token = ctx
@@ -1373,6 +1461,400 @@ mod tests {
             }
             other => panic!("expected SetText, got {other:?}"),
         }
+    }
+
+    // ── Phase H — reactive slot store integration ─────────────────────
+
+    #[tokio::test]
+    async fn slot_state_persists_across_two_action_invocations_in_the_same_session() {
+        // The Phase-H closing loop: action A writes a slot, action B
+        // reads the same slot for the same session and gets the value
+        // back. Distinct sessions stay isolated.
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+        use dom_render_compiler::ir::opcode::SlotId;
+        use dom_render_compiler::ir::wire::decode_frame;
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+
+        // action_id 1 — writer: stores the payload bytes into slot 7.
+        // action_id 2 — reader: emits a `SetText` carrying whatever's
+        // currently in slot 7. Empty body when the slot is unset.
+        let server = AlbedoServerBuilder::new(config)
+            .register_action(
+                1,
+                |_ctx: RequestContext, env: ActionEnvelope, slots: SessionSlots| async move {
+                    slots.write(SlotId(7), env.payload.clone());
+                    Ok(Vec::new())
+                },
+            )
+            .register_action(
+                2,
+                |_ctx: RequestContext, _env: ActionEnvelope, slots: SessionSlots| async move {
+                    let current = slots.read(SlotId(7)).unwrap_or_default();
+                    Ok(vec![dom_render_compiler::ir::opcode::Instruction::SetText {
+                        stable_id: dom_render_compiler::ir::opcode::StableId(1),
+                        text: current,
+                    }])
+                },
+            )
+            .build()
+            .unwrap();
+
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let router = server.router();
+
+        // First POST — action 1 writes "hello-world" into slot 7.
+        let write_body = encode_action_envelope(&ActionEnvelope {
+            action_id: 1,
+            event_kind: 0,
+            payload: b"hello-world".to_vec(),
+        })
+        .unwrap();
+        let write_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .header("x-albedo-session", session_uuid.as_str())
+                    .body(Body::from(write_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(write_response.status(), StatusCode::OK);
+        // The write itself produced a SlotSet via the dirty drain.
+        let write_bytes = to_bytes(write_response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        let (write_frame, _) = decode_frame(&write_bytes).unwrap();
+        assert!(write_frame.instructions.iter().any(|instr| matches!(
+            instr,
+            dom_render_compiler::ir::opcode::Instruction::SlotSet { slot_id: SlotId(7), value }
+                if value == b"hello-world"
+        )));
+
+        // Second POST — action 2 reads slot 7 for the same session and
+        // emits the value back as the SetText payload.
+        let read_body = encode_action_envelope(&ActionEnvelope {
+            action_id: 2,
+            event_kind: 0,
+            payload: Vec::new(),
+        })
+        .unwrap();
+        let read_response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .header("x-albedo-session", session_uuid.as_str())
+                    .body(Body::from(read_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_response.status(), StatusCode::OK);
+        let read_bytes = to_bytes(read_response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        let (read_frame, _) = decode_frame(&read_bytes).unwrap();
+        match &read_frame.instructions[0] {
+            dom_render_compiler::ir::opcode::Instruction::SetText { text, .. } => {
+                assert_eq!(
+                    text.as_slice(),
+                    b"hello-world",
+                    "slot state must survive across action invocations within a session"
+                );
+            }
+            other => panic!("expected SetText, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn slot_state_is_isolated_across_distinct_sessions() {
+        // Same reader action, two different session ids → reads return
+        // independent (empty) state.
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+        use dom_render_compiler::ir::opcode::SlotId;
+        use dom_render_compiler::ir::wire::decode_frame;
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+        let server = AlbedoServerBuilder::new(config)
+            .register_action(
+                1,
+                |_ctx: RequestContext, env: ActionEnvelope, slots: SessionSlots| async move {
+                    slots.write(SlotId(7), env.payload.clone());
+                    Ok(Vec::new())
+                },
+            )
+            .register_action(
+                2,
+                |_ctx: RequestContext, _env: ActionEnvelope, slots: SessionSlots| async move {
+                    let current = slots.read(SlotId(7)).unwrap_or_default();
+                    Ok(vec![dom_render_compiler::ir::opcode::Instruction::SetText {
+                        stable_id: dom_render_compiler::ir::opcode::StableId(1),
+                        text: current,
+                    }])
+                },
+            )
+            .build()
+            .unwrap();
+
+        let router = server.router();
+        let session_a = uuid::Uuid::new_v4().to_string();
+        let session_b = uuid::Uuid::new_v4().to_string();
+
+        // Write under session A.
+        let write_body = encode_action_envelope(&ActionEnvelope {
+            action_id: 1,
+            event_kind: 0,
+            payload: b"a-only".to_vec(),
+        })
+        .unwrap();
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .header("x-albedo-session", session_a.as_str())
+                    .body(Body::from(write_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Read under session B — must NOT see session A's value.
+        let read_body = encode_action_envelope(&ActionEnvelope {
+            action_id: 2,
+            event_kind: 0,
+            payload: Vec::new(),
+        })
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .header("x-albedo-session", session_b.as_str())
+                    .body(Body::from(read_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match &frame.instructions[0] {
+            dom_render_compiler::ir::opcode::Instruction::SetText { text, .. } => {
+                assert!(
+                    text.is_empty(),
+                    "session B must not see session A's slot value; got {:?}",
+                    String::from_utf8_lossy(text)
+                );
+            }
+            other => panic!("expected SetText, got {other:?}"),
+        }
+    }
+
+    // ── Phase I — Navigate opcode + register_form_action ─────────────
+
+    #[tokio::test]
+    async fn action_handler_can_emit_navigate_opcode() {
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+        use dom_render_compiler::ir::opcode::Instruction;
+        use dom_render_compiler::ir::wire::decode_frame;
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+        let server = AlbedoServerBuilder::new(config)
+            .register_action(
+                1,
+                |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                    Ok(vec![Instruction::Navigate {
+                        url: "/dashboard".to_string(),
+                    }])
+                },
+            )
+            .build()
+            .unwrap();
+
+        let body = encode_action_envelope(&ActionEnvelope {
+            action_id: 1,
+            event_kind: 0,
+            payload: Vec::new(),
+        })
+        .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        assert!(
+            matches!(
+                &frame.instructions[0],
+                Instruction::Navigate { url } if url == "/dashboard"
+            ),
+            "Phase-I Navigate must round-trip through the action response wire path"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_form_action_deserialises_json_payload_into_typed_struct() {
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+        use dom_render_compiler::ir::opcode::{Instruction, StableId};
+        use dom_render_compiler::ir::wire::decode_frame;
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct LoginForm {
+            username: String,
+            password: String,
+        }
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+        let server = AlbedoServerBuilder::new(config)
+            .register_form_action::<LoginForm, _, _>(
+                1,
+                |_ctx: RequestContext, form: LoginForm, _slots: SessionSlots| async move {
+                    // Echo the username back so the test can verify the
+                    // typed payload made it through unchanged.
+                    Ok(vec![
+                        Instruction::SetText {
+                            stable_id: StableId(1),
+                            text: form.username.into_bytes(),
+                        },
+                        Instruction::Navigate {
+                            url: format!("/welcome?ack={}", form.password.len()),
+                        },
+                    ])
+                },
+            )
+            .build()
+            .unwrap();
+
+        let form_payload = serde_json::to_vec(&serde_json::json!({
+            "username": "alice",
+            "password": "hunter2",
+        }))
+        .unwrap();
+        let body = encode_action_envelope(&ActionEnvelope {
+            action_id: 1,
+            event_kind: 2, // Submit
+            payload: form_payload,
+        })
+        .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        let (frame, _) = decode_frame(&bytes).unwrap();
+        match &frame.instructions[0] {
+            Instruction::SetText { text, .. } => {
+                assert_eq!(text.as_slice(), b"alice");
+            }
+            other => panic!("expected SetText, got {other:?}"),
+        }
+        match &frame.instructions[1] {
+            Instruction::Navigate { url } => {
+                assert_eq!(url, "/welcome?ack=7");
+            }
+            other => panic!("expected Navigate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_form_action_rejects_malformed_json_with_500() {
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct Required {
+            #[allow(dead_code)]
+            field: String,
+        }
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+        let server = AlbedoServerBuilder::new(config)
+            .register_form_action::<Required, _, _>(
+                1,
+                |_ctx: RequestContext, _form: Required, _slots: SessionSlots| async move {
+                    panic!("handler must not run when payload fails to deserialize");
+                },
+            )
+            .build()
+            .unwrap();
+
+        let body = encode_action_envelope(&ActionEnvelope {
+            action_id: 1,
+            event_kind: 2,
+            payload: b"not json".to_vec(),
+        })
+        .unwrap();
+
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

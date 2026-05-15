@@ -35,7 +35,7 @@ const FIXTURE_PATH = resolve(
   '..',
   'fixtures',
   'wire',
-  'v1_canonical_frame.bin',
+  'v2_canonical_frame.bin',
 );
 
 // ── Minimal DOM shim ─────────────────────────────────────────────────
@@ -204,7 +204,8 @@ test('applyFrameBytes processes the canonical fixture end-to-end', () => {
 
   assert.equal(frame.frameId, 1n);
   assert.equal(frame.componentId, 42n);
-  assert.equal(frame.instructions.length, 14);
+  // 15 in wire v2 — Phase I added Navigate at index 14.
+  assert.equal(frame.instructions.length, 15);
 
   // Intern tables populated.
   assert.equal(bakabox.tags.get(0), 'div');
@@ -356,4 +357,30 @@ test('unknown opcode shape throws BakaboxWireError', () => {
     () => bakabox.applyInstruction({ op: 'NotAnOpcode' }),
     /unknown opcode 'NotAnOpcode'/,
   );
+});
+
+test('Navigate opcode drives the document window location', () => {
+  // Inject a fake window via `document.defaultView` — bakabox prefers
+  // it over `globalThis.location` so SSR / test harnesses can
+  // intercept without monkey-patching the global scope.
+  const navigated = [];
+  const doc = new FakeDocument();
+  doc.defaultView = {
+    location: {
+      assign(url) {
+        navigated.push(url);
+      },
+    },
+  };
+  const bakabox = createBakabox({ document: doc });
+  bakabox.applyInstruction({ op: 'Navigate', url: '/dashboard?ack=1' });
+  assert.deepStrictEqual(navigated, ['/dashboard?ack=1']);
+});
+
+test('Navigate opcode is a no-op when no window is reachable', () => {
+  const doc = new FakeDocument();
+  // No `defaultView` set; the FakeDocument has no `location` either.
+  const bakabox = createBakabox({ document: doc });
+  // Must not throw.
+  bakabox.applyInstruction({ op: 'Navigate', url: '/nope' });
 });

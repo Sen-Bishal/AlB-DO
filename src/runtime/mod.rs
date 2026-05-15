@@ -10,7 +10,11 @@ pub mod pipeline;
 pub mod quickjs_engine;
 pub mod renderer;
 pub mod scheduler;
+pub mod session;
+pub mod slot_store;
 pub mod static_slice;
 pub mod webtransport;
 
 pub use eval::{render_from_components_dir, ComponentProject, PatchReport};
+pub use session::SessionId;
+pub use slot_store::SlotStore;

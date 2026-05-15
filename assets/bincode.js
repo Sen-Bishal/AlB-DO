@@ -36,8 +36,14 @@
  * `LOCKED_WIRE_VERSION` in `src/ir/conformance.rs`. A bump on either
  * side without a matching update on the other is a coordinated-release
  * break — bakabox refuses to decode frames it can't structurally trust.
+ *
+ * v1 → v2: Phase I added `Instruction::Navigate { url }` at variant
+ * index 14. Adding a variant at the end is binary-compatible for
+ * decoders that don't see the new opcode, but a strict version check
+ * here prevents a stale client from quietly choking when a v2 server
+ * starts emitting Navigate.
  */
-export const LOCKED_WIRE_VERSION = 1;
+export const LOCKED_WIRE_VERSION = 2;
 
 /**
  * Symbolic names for each `InternTableKind`, indexed by the wire's
@@ -65,6 +71,7 @@ export const INSTRUCTION_NAMES = Object.freeze([
   'SetTextRef',         // 11
   'SetAttrRef',         // 12
   'SlotSet',            // 13
+  'Navigate',           // 14 (v2)
 ]);
 
 /**
@@ -480,6 +487,9 @@ const INSTRUCTION_READERS = Object.freeze([
     slotId: r.readVarintU32(),
     value: r.readByteSlice(),
   }),
+
+  // 14 (v2): Navigate { url: String }
+  (r) => ({ op: 'Navigate', url: r.readString() }),
 ]);
 
 /**
@@ -555,6 +565,34 @@ export const ACTION_EVENT_KIND = Object.freeze({
   Submit: 2,
   Other: 3,
 });
+
+/**
+ * Encodes a browser `FormData` instance as the `ActionEnvelope.payload`
+ * the server's `register_form_action::<T>` builder expects.
+ *
+ * Wire shape: UTF-8 bytes of a JSON object `{ field: lastValue }`
+ * where duplicate keys keep the LAST value (matches `<form>` POST
+ * semantics for repeated inputs of the same `name`). File inputs are
+ * skipped — Phase I is text-only; binary uploads are a follow-up.
+ *
+ * @param {FormData} formData
+ * @returns {Uint8Array}
+ */
+export function encodeFormDataPayload(formData) {
+  if (!formData || typeof formData.entries !== 'function') {
+    throw new TypeError(
+      'encodeFormDataPayload requires a FormData-like with entries()',
+    );
+  }
+  const fields = {};
+  for (const [key, value] of formData.entries()) {
+    if (typeof value === 'string') {
+      fields[key] = value;
+    }
+    // File / Blob values are skipped — Phase I MVP is text-only.
+  }
+  return new TextEncoder().encode(JSON.stringify(fields));
+}
 
 /**
  * Encodes an `ActionEnvelope { action_id, event_kind, payload }` to a

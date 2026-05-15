@@ -1,7 +1,7 @@
 use albedo_server::{
     AlbedoServerBuilder, ApiResponse, AppConfig, AuthDecision, AuthPolicy, AuthProvider,
     HttpMethod, LayoutSpec, RequestContext, ResponsePayload, RouteSpec, RuntimeError,
-    RuntimeMiddleware, ServerConfig,
+    RuntimeMiddleware, ServerConfig, SessionSlots,
 };
 use async_trait::async_trait;
 use dom_render_compiler::ir::action::{ActionEnvelope, ActionEventKind};
@@ -109,6 +109,16 @@ impl AuthProvider for DemoAuthProvider {
 #[derive(serde::Deserialize)]
 struct EchoRequest {
     message: String,
+}
+
+/// Phase-I demo form payload. Mirrors the JSON shape bakabox's
+/// `encodeFormDataPayload` emits for a `<form>` with `name="username"`
+/// and `name="password"` inputs.
+#[derive(serde::Deserialize)]
+struct LoginForm {
+    username: String,
+    #[allow(dead_code)] // the demo handler only uses the username
+    password: String,
 }
 
 #[tokio::main]
@@ -252,20 +262,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         // Phase-G surface — bakabox POSTs an ActionEnvelope to
         // /_albedo/action; this handler echoes the input value back as
-        // an `Instruction::SlotSet` patch on slot 1. A real app would
-        // mutate server-side state and return the patches that reflect
-        // the new state — Phase H wires that loop end-to-end.
-        .register_action(1, |_ctx: RequestContext, env: ActionEnvelope| async move {
-            let kind = ActionEventKind::from_wire(env.event_kind);
-            let value = match kind {
-                ActionEventKind::Input => env.payload.clone(),
-                _ => format!("event:{kind:?}").into_bytes(),
-            };
-            Ok(vec![Instruction::SlotSet {
-                slot_id: SlotId(1),
-                value,
-            }])
-        })
+        // an explicit `Instruction::SlotSet` patch on slot 1. The
+        // explicit path is useful when the renderer is the source of
+        // truth for the slot binding.
+        .register_action(
+            1,
+            |_ctx: RequestContext, env: ActionEnvelope, _slots: SessionSlots| async move {
+                let kind = ActionEventKind::from_wire(env.event_kind);
+                let value = match kind {
+                    ActionEventKind::Input => env.payload.clone(),
+                    _ => format!("event:{kind:?}").into_bytes(),
+                };
+                Ok(vec![Instruction::SlotSet {
+                    slot_id: SlotId(1),
+                    value,
+                }])
+            },
+        )
+        // Phase-H surface — server-side state survives across action
+        // invocations within a session. This handler reads the current
+        // counter from slot 2, increments it, and writes back. The
+        // dispatcher drains the dirty slot and ships the `SlotSet`
+        // automatically — handler returns no explicit opcodes.
+        .register_action(
+            2,
+            |_ctx: RequestContext, _env: ActionEnvelope, slots: SessionSlots| async move {
+                let current = slots
+                    .read(SlotId(2))
+                    .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(str::to_owned))
+                    .and_then(|text| text.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let next = current.saturating_add(1);
+                slots.write(SlotId(2), next.to_string().into_bytes());
+                Ok(Vec::new())
+            },
+        )
+        // Phase-I surface — typed form handler. The dispatcher
+        // deserializes the JSON payload bakabox emits for a submit
+        // event into `LoginForm` before invoking the closure; the
+        // closure responds with a `Navigate` to a different route.
+        .register_form_action::<LoginForm, _, _>(
+            3,
+            |_ctx: RequestContext, form: LoginForm, _slots: SessionSlots| async move {
+                Ok(vec![Instruction::Navigate {
+                    url: format!("/welcome?as={}", form.username),
+                }])
+            },
+        )
         .build()?;
 
     print_startup_instructions(port, demo_token.as_str());
@@ -546,7 +589,11 @@ fn print_startup_instructions(port: u16, demo_token: &str) {
     println!("  POST /api/echo");
     println!("  /api/ping             (Phase-F ApiHandler path)");
     println!("Phase-G actions:");
-    println!("  POST /_albedo/action  (bincode ActionEnvelope; action_id=1 wired)");
+    println!("  POST /_albedo/action  (action_id=1 echoes input → SlotSet on slot 1)");
+    println!("Phase-H reactive state:");
+    println!("  POST /_albedo/action  (action_id=2 increments per-session counter on slot 2)");
+    println!("Phase-I form actions:");
+    println!("  POST /_albedo/action  (action_id=3 typed LoginForm → Navigate /welcome?as=...)");
     println!("Protected routes:");
     println!("  /admin (header: {}: {})", AUTH_TOKEN_HEADER, demo_token);
     println!(

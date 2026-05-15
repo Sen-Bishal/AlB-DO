@@ -16,12 +16,14 @@ use crate::ir::wire::{self, WireError};
 use crate::graph::ComponentGraph;
 use crate::ir::columns::IrColumns;
 use crate::manifest::schema::Tier;
+use crate::runtime::slot_store::SlotStore;
 use crate::types::{CompilerError, ComponentAnalysis, ComponentId};
 use dashmap::DashMap;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 
@@ -113,6 +115,14 @@ pub struct FourLaneRuntimePipeline {
     async_tx: mpsc::UnboundedSender<AsyncResolution>,
     async_rx: Mutex<mpsc::UnboundedReceiver<AsyncResolution>>,
     pending_placeholder_emissions: Mutex<Vec<LaneRenderedChunk>>,
+
+    // Phase H — server-side reactive slot store. Shared via `Arc` with
+    // the server's action dispatcher so handlers can read/write slots
+    // and the changes are visible to subsequent drains without an
+    // intermediate copy. Defaults to a fresh empty store; userland
+    // binds the shared instance via `with_slot_store` when it wants
+    // the server-side state visible from the runtime side too.
+    slot_store: Arc<SlotStore>,
 }
 
 impl FourLaneRuntimePipeline {
@@ -170,6 +180,7 @@ impl FourLaneRuntimePipeline {
             async_tx,
             async_rx: Mutex::new(async_rx),
             pending_placeholder_emissions: Mutex::new(Vec::new()),
+            slot_store: Arc::new(SlotStore::new()),
         })
     }
 
@@ -216,6 +227,29 @@ impl FourLaneRuntimePipeline {
         self.runtime_handle
             .as_ref()
             .ok_or(RuntimePipelineError::MissingRuntimeHandle)
+    }
+
+    /// Phase-H — binds a shared [`SlotStore`] to this pipeline.
+    ///
+    /// Pass the same `Arc<SlotStore>` the server's action dispatcher
+    /// holds so writes the dispatcher performs are immediately visible
+    /// to the pipeline's reads (and vice versa). Without this call
+    /// each side runs against its own empty store and the reactive
+    /// loop never closes.
+    ///
+    /// Returns `self` so it chains with `with_runtime_handle` in
+    /// server bootstrap.
+    #[must_use]
+    pub fn with_slot_store(mut self, slot_store: Arc<SlotStore>) -> Self {
+        self.slot_store = slot_store;
+        self
+    }
+
+    /// Returns the shared slot store. Callers clone the `Arc` to keep
+    /// a stable view across requests.
+    #[must_use]
+    pub fn slot_store(&self) -> Arc<SlotStore> {
+        self.slot_store.clone()
     }
 
     pub fn submit_analyzer_result(&self, component_id: ComponentId) -> bool {

@@ -15,7 +15,7 @@
 //! the originating DOM event (see [`ActionEventKind`]); userland action
 //! handlers parse it according to the declared `event_kind`.
 
-use crate::ir::wire::{self, WireError};
+use crate::ir::wire::WireError;
 use bincode::{Decode, Encode};
 
 /// One client → server action invocation. Serialized as the HTTP POST

@@ -24,10 +24,17 @@ use super::opcode::{
 /// - The field order of any opcode payload struct.
 /// - The shape of [`OpcodeFrame`], [`InternTable`], or [`InternPatchOp`].
 ///
-/// The bakabox client decoder MUST refuse to decode any frame whose wire
-/// version it does not recognise. A version bump on the server requires a
-/// coordinated client upgrade.
-pub const LOCKED_WIRE_VERSION: u32 = 1;
+/// Adding a NEW variant at the end of [`Instruction`] is binary-compatible
+/// for decoders that only see pre-existing variants, but we still bump
+/// here so the version number reflects the *capability set* both sides
+/// must agree on. A v1 bakabox decoder that receives variant index 14
+/// (the first v2-only opcode) surfaces a typed wire error rather than
+/// silently mis-aligning.
+///
+/// Version history:
+/// - **v1** — Phase A locked the original 14 variants (0..=13).
+/// - **v2** — Phase I added `Instruction::Navigate` at index 14.
+pub const LOCKED_WIRE_VERSION: u32 = 2;
 
 /// Returns the deterministic conformance frame for [`LOCKED_WIRE_VERSION`].
 ///
@@ -39,7 +46,7 @@ pub const LOCKED_WIRE_VERSION: u32 = 1;
 /// Do not edit this function casually. Any change that alters the encoded
 /// bytes is a wire-format break and requires:
 ///   1. A [`LOCKED_WIRE_VERSION`] bump.
-///   2. Regenerating `tests/fixtures/wire/v1_canonical_frame.bin`.
+///   2. Regenerating `tests/fixtures/wire/v2_canonical_frame.bin`.
 ///   3. A matching update to the bakabox decoder test suite.
 ///
 /// # Panics
@@ -121,6 +128,9 @@ pub fn canonical_v1_frame() -> OpcodeFrame {
                 slot_id: SlotId(11),
                 value: b"reactive-value".to_vec(),
             },
+            Instruction::Navigate {
+                url: "/dashboard".to_string(),
+            },
         ],
     }
 }
@@ -141,11 +151,11 @@ mod tests {
     }
 
     #[test]
-    fn canonical_v1_frame_covers_every_instruction_variant() {
+    fn canonical_v2_frame_covers_every_instruction_variant() {
         // If a new variant is added to Instruction, this test fails fast
         // and reminds the author to extend the fixture. Count is hard-coded
         // so adding a variant without updating the fixture is a CI break.
-        const EXPECTED_VARIANT_COUNT: usize = 14;
+        const EXPECTED_VARIANT_COUNT: usize = 15;
         let frame = canonical_v1_frame();
         assert_eq!(
             frame.instructions.len(),

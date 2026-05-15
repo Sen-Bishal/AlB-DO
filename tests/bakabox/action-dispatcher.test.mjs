@@ -140,3 +140,58 @@ test('createActionDispatcher refuses construction without a bakabox', () => {
     /requires a bakabox instance/,
   );
 });
+
+// ── Phase I — Submit event handling ─────────────────────────────────
+
+test('submit events serialize FormData and stop the default navigation', async () => {
+  // Build a fake HTMLFormElement so the dispatcher's
+  // `instanceof HTMLFormElement` check passes. We don't pull in jsdom;
+  // we just assign a synthetic class to the global slot.
+  class HTMLFormElementShim {}
+  globalThis.HTMLFormElement = HTMLFormElementShim;
+  globalThis.FormData = class FormData {
+    constructor(form) {
+      this._pairs = form._pairs || [];
+    }
+    *entries() {
+      for (const pair of this._pairs) yield pair;
+    }
+  };
+
+  const form = new HTMLFormElementShim();
+  form._pairs = [
+    ['username', 'alice'],
+    ['password', 'hunter2'],
+  ];
+
+  let preventedDefault = false;
+  const event = {
+    type: 'submit',
+    target: form,
+    preventDefault() {
+      preventedDefault = true;
+    },
+  };
+
+  const { fetchImpl, calls } = fakeFetchReturning(new Uint8Array(0));
+  const bakabox = fakeBakabox();
+  const dispatch = createActionDispatcher({ bakabox, fetch: fetchImpl });
+
+  await dispatch(99, event);
+
+  assert.equal(preventedDefault, true, 'submit must preventDefault before fetch');
+  assert.equal(calls.length, 1);
+  // Decode the bincode envelope by hand: actionId varint(99) = 0x63,
+  // eventKind=Submit(2), payloadLen varint, then JSON bytes.
+  const body = calls[0].init.body;
+  assert.equal(body[0], 99, 'action id matches the bound proxy id');
+  assert.equal(body[1], 2, 'event_kind = Submit');
+  const payloadLen = body[2];
+  const payloadBytes = body.subarray(3, 3 + payloadLen);
+  const decoded = JSON.parse(new TextDecoder('utf-8').decode(payloadBytes));
+  assert.deepStrictEqual(decoded, { username: 'alice', password: 'hunter2' });
+
+  // Cleanup the globals we polluted so other tests don't see them.
+  delete globalThis.HTMLFormElement;
+  delete globalThis.FormData;
+});

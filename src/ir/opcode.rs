@@ -236,6 +236,20 @@ pub enum Instruction {
         slot_id: SlotId,
         value: Vec<u8>,
     },
+
+    /// Phase-I — instruct the bakabox client to navigate to `url`.
+    ///
+    /// Added as variant index 14 at the end of the enum so existing
+    /// wire decoders that haven't been recompiled still parse every
+    /// pre-existing variant correctly. A bakabox decoder that does
+    /// not know variant 14 surfaces a typed error (see the JS
+    /// decoder's `INSTRUCTION_NAMES` length check) rather than
+    /// silently mis-aligning subsequent reads.
+    ///
+    /// `LOCKED_WIRE_VERSION` bumps to 2 alongside this variant.
+    Navigate {
+        url: String,
+    },
 }
 
 /// One wire frame.
