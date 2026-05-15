@@ -182,6 +182,11 @@ vgcore.*
 *.bin
 *.dat
 
+# Bakabox wire-format conformance fixtures must ship in the repo so
+# the Rust + JS conformance tests have a stable byte-for-byte gate.
+# Tracked deliberately — see `src/ir/conformance.rs::LOCKED_WIRE_VERSION`.
+!tests/fixtures/wire/*.bin
+
 # Jupyter notebooks (if doing data analysis)
 .ipynb_checkpoints/
 *.ipynb
