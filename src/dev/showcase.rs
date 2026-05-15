@@ -404,8 +404,11 @@ mod tests {
         let artifact = build_showcase_artifact(&request).unwrap();
         let html = artifact.html_document;
 
-        assert!(html.contains("<h1>ALBEDO</h1>"));
-        assert!(html.contains("<button>Launch</button>"));
+        // Phase J shell-stamping inserts `data-albedo-id="<u32>"` on every
+        // host element, so substring checks now match the open tag and
+        // text+close tag separately rather than the bare element form.
+        assert!(html.contains("<h1 ") && html.contains(">ALBEDO</h1>"));
+        assert!(html.contains("<button ") && html.contains(">Launch</button>"));
         assert!(html.contains("TSX Showcase"));
         assert!(html.contains("Performance Stats"));
         assert!(html.contains("Dependency Hashes"));

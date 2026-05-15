@@ -1,16 +1,47 @@
 use crate::types::ComponentId;
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::runtime::eval::component::{
-    classnames_collect, escape_html, fnv1a_hash, import_candidates, is_classnames_source,
-    is_component_module, is_component_tag, is_truthy, is_void_tag, lit_to_value,
-    normalize_jsx_text, normalize_slashes, normalize_specifier, prop_name_to_string, render_attrs,
+    arg_num, classnames_collect, date_value_ms, escape_html, fnv1a_32, fnv1a_hash,
+    import_candidates, is_classnames_source, is_component_module, is_component_tag, is_truthy,
+    is_void_tag, json_int, json_num, lit_to_value, make_date_value, normalize_jsx_text,
+    normalize_slashes, normalize_specifier, prop_name_to_string, render_attrs, to_number,
     value_to_string,
 };
+
+thread_local! {
+    /// Per-render element counter. Reset by `render_entry` at the top of
+    /// every render call so element ids are deterministic per render and
+    /// independent across concurrent renders on different threads.
+    ///
+    /// Combined with `module_spec` it produces the FNV-1a-32 input that
+    /// becomes `data-albedo-id` on every shell element bakabox should be
+    /// able to address. Phase K's compiler can replace this with a
+    /// content-hash strategy when HMR stability matters.
+    static RENDER_ELEMENT_COUNTER: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Bakabox reads anchors from `data-albedo-id` (DEFAULT_ANCHOR_ATTRIBUTE
+/// in `assets/albedo-runtime.js`). Keep these in sync.
+pub const ALBEDO_ID_ATTR: &str = "data-albedo-id";
+
+fn next_element_stable_id(module_spec: &str) -> u32 {
+    RENDER_ELEMENT_COUNTER.with(|cell| {
+        let counter = cell.get();
+        cell.set(counter.wrapping_add(1));
+        let key = format!("{module_spec}#{counter}");
+        fnv1a_32(key.as_bytes())
+    })
+}
+
+fn reset_element_counter() {
+    RENDER_ELEMENT_COUNTER.with(|cell| cell.set(0));
+}
 use crate::runtime::eval::expr::{
     apply_var_pat_to_env, bind_params, bind_params_positional, param_from_pat,
     parse_module as parse_module_impl, ParamBinding, ParsedModule,
@@ -189,6 +220,10 @@ impl ComponentProject {
     }
 
     pub fn render_entry(&self, entry: &str, props: &Value) -> Result<String> {
+        // Each top-level render starts with a fresh element counter so the
+        // `data-albedo-id` attributes the renderer stamps are stable per
+        // render and don't leak across concurrent requests.
+        reset_element_counter();
         let entry = self
             .resolve_entry(entry)
             .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
@@ -290,21 +325,128 @@ impl ComponentProject {
                 env,
             )?)),
             Expr::Lit(lit) => Ok(lit_to_value(lit)),
-            Expr::Ident(ident) => Ok(env
-                .get(&ident.sym.to_string())
-                .cloned()
-                .unwrap_or(Value::Null)),
+            Expr::Ident(ident) => {
+                let name = ident.sym.to_string();
+                if let Some(value) = env.get(&name) {
+                    Ok(value.clone())
+                } else {
+                    // Static evaluator has no binding for this identifier.
+                    // Phase K wires reactive bindings; until then make the
+                    // miss findable in dev rather than letting it vanish.
+                    tracing::debug!(
+                        target: "albedo::eval",
+                        ident = %name,
+                        module = %module_spec,
+                        "unbound identifier in JSX expression — evaluating to null",
+                    );
+                    Ok(Value::Null)
+                }
+            }
             Expr::Member(member) => self.eval_member(module_spec, member, env),
             Expr::Paren(paren) => self.eval_expr(module_spec, &paren.expr, env),
             Expr::Tpl(tpl) => self.eval_tpl(module_spec, tpl, env),
             Expr::Bin(bin) => self.eval_bin(module_spec, bin, env),
             Expr::Cond(cond) => self.eval_cond(module_spec, cond, env),
             Expr::Call(call) => self.eval_call_expr(module_spec, call, env),
+            Expr::New(new_expr) => self.eval_new_expr(module_spec, new_expr, env),
             Expr::Array(arr) => self.eval_array_expr(module_spec, arr, env),
             Expr::Object(obj) => self.eval_object_expr(module_spec, obj, env),
             Expr::Unary(unary) => self.eval_unary(module_spec, unary, env),
-            _ => Ok(Value::Null),
+            Expr::OptChain(opt) => self.eval_opt_chain(module_spec, opt, env),
+            Expr::Seq(seq) => {
+                let mut last = Value::Null;
+                for expr in &seq.exprs {
+                    last = self.eval_expr(module_spec, expr, env)?;
+                }
+                Ok(last)
+            }
+            // TypeScript escape hatches are runtime no-ops: unwrap to the
+            // inner expression. SWC keeps these in the AST when JSX/TSX
+            // sources contain `as`, `!`, `<X>e`, `satisfies`, `as const`,
+            // or `f<T>` instantiation expressions.
+            Expr::TsAs(node) => self.eval_expr(module_spec, &node.expr, env),
+            Expr::TsNonNull(node) => self.eval_expr(module_spec, &node.expr, env),
+            Expr::TsConstAssertion(node) => self.eval_expr(module_spec, &node.expr, env),
+            Expr::TsTypeAssertion(node) => self.eval_expr(module_spec, &node.expr, env),
+            Expr::TsSatisfies(node) => self.eval_expr(module_spec, &node.expr, env),
+            Expr::TsInstantiation(node) => self.eval_expr(module_spec, &node.expr, env),
+            other => {
+                // Phase J keeps unhandled shapes returning Null for backwards
+                // compatibility, but never silently — every drop emits a
+                // tracing event that lets us extend the evaluator. Phase K's
+                // SWC pass will compile most of these away into slot-store
+                // opcodes, so this list should shrink, not grow.
+                tracing::debug!(
+                    target: "albedo::eval",
+                    module = %module_spec,
+                    expr_kind = std::any::type_name_of_val(other),
+                    "unhandled JSX expression shape — evaluating to null",
+                );
+                Ok(Value::Null)
+            }
         }
+    }
+
+    fn eval_opt_chain(
+        &self,
+        module_spec: &str,
+        opt: &swc_ecma_ast::OptChainExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        use swc_ecma_ast::*;
+        match &*opt.base {
+            OptChainBase::Member(member) => {
+                let obj = self.eval_expr(module_spec, &member.obj, env)?;
+                if matches!(obj, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                self.eval_member_on(module_spec, &obj, &member.prop, env)
+            }
+            OptChainBase::Call(call) => {
+                let callee = self.eval_expr(module_spec, &call.callee, env)?;
+                if matches!(callee, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                // Callable-value support is Phase K; until then, treat
+                // optional calls as null when reachable.
+                Ok(Value::Null)
+            }
+        }
+    }
+
+    fn eval_new_expr(
+        &self,
+        module_spec: &str,
+        new_expr: &swc_ecma_ast::NewExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        use swc_ecma_ast::*;
+        // Phase J only models `new Date(...)` because that's what ships in
+        // the matrix. Other constructors fall through to Null with a trace.
+        if let Expr::Ident(ident) = &*new_expr.callee {
+            if ident.sym.as_ref() == "Date" {
+                let args: Vec<Value> = match &new_expr.args {
+                    Some(args) => args
+                        .iter()
+                        .map(|a| self.eval_expr(module_spec, &a.expr, env))
+                        .collect::<Result<Vec<_>>>()?,
+                    None => Vec::new(),
+                };
+                let ms = match args.first() {
+                    None => 0.0, // Phase J: deterministic; no system clock.
+                    Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+                    Some(Value::String(s)) => s.parse::<f64>().unwrap_or(0.0),
+                    _ => 0.0,
+                };
+                return Ok(make_date_value(ms));
+            }
+        }
+        tracing::debug!(
+            target: "albedo::eval",
+            module = %module_spec,
+            "unhandled `new` constructor — evaluating to null",
+        );
+        Ok(Value::Null)
     }
 
     fn eval_member(
@@ -313,21 +455,65 @@ impl ComponentProject {
         member: &swc_ecma_ast::MemberExpr,
         env: &HashMap<String, Value>,
     ) -> Result<Value> {
-        use swc_ecma_ast::*;
         let object = self.eval_expr(module_spec, &member.obj, env)?;
-        let prop_name = match &member.prop {
-            MemberProp::Ident(ident) => ident.sym.to_string(),
-            MemberProp::Computed(computed) => {
-                let value = self.eval_expr(module_spec, &computed.expr, env)?;
-                value_to_string(&value)
-            }
-            _ => return Ok(Value::Null),
-        };
+        self.eval_member_on(module_spec, &object, &member.prop, env)
+    }
 
-        if let Value::Object(map) = object {
-            Ok(map.get(&prop_name).cloned().unwrap_or(Value::Null))
-        } else {
-            Ok(Value::Null)
+    /// Resolve a property access on an already-evaluated value. Factored
+    /// out so `Expr::OptChain` and `Expr::Member` share the dispatch.
+    fn eval_member_on(
+        &self,
+        module_spec: &str,
+        object: &Value,
+        prop: &swc_ecma_ast::MemberProp,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        use swc_ecma_ast::*;
+        // Computed access uses the runtime value verbatim — for arrays we
+        // want a numeric index without stringifying through `value_to_string`,
+        // which would render `1` as `"1"` and lose array-vs-object intent.
+        match prop {
+            MemberProp::Computed(computed) => {
+                let key = self.eval_expr(module_spec, &computed.expr, env)?;
+                if let (Value::Array(items), Some(idx)) = (object, key.as_f64()) {
+                    if idx.is_finite() && idx >= 0.0 && idx == idx.trunc() {
+                        return Ok(items.get(idx as usize).cloned().unwrap_or(Value::Null));
+                    }
+                }
+                let prop_name = value_to_string(&key);
+                self.lookup_named_prop(object, &prop_name)
+            }
+            MemberProp::Ident(ident) => {
+                let prop_name = ident.sym.to_string();
+                self.lookup_named_prop(object, &prop_name)
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn lookup_named_prop(&self, object: &Value, prop_name: &str) -> Result<Value> {
+        match object {
+            Value::Object(map) => {
+                // Date-tagged objects expose no JS-level properties; method
+                // calls on them are handled in `eval_call_expr` via the
+                // member callee path.
+                Ok(map.get(prop_name).cloned().unwrap_or(Value::Null))
+            }
+            Value::Array(items) => match prop_name {
+                "length" => Ok(json_int(items.len() as i64)),
+                _ => {
+                    // Numeric string indexing: `arr["0"]` matches JS semantics.
+                    if let Ok(idx) = prop_name.parse::<usize>() {
+                        return Ok(items.get(idx).cloned().unwrap_or(Value::Null));
+                    }
+                    Ok(Value::Null)
+                }
+            },
+            Value::String(s) => match prop_name {
+                "length" => Ok(json_int(s.chars().count() as i64)),
+                _ => Ok(Value::Null),
+            },
+            _ => Ok(Value::Null),
         }
     }
 
@@ -389,18 +575,44 @@ impl ComponentProject {
                 let left = self.eval_expr(module_spec, &bin.left, env)?;
                 let right = self.eval_expr(module_spec, &bin.right, env)?;
                 match (&left, &right) {
-                    (Value::Number(l), Value::Number(r)) => {
-                        let sum = l.as_f64().unwrap_or(0.0) + r.as_f64().unwrap_or(0.0);
-                        Ok(serde_json::Number::from_f64(sum)
-                            .map(Value::Number)
-                            .unwrap_or(Value::Null))
-                    }
+                    (Value::Number(l), Value::Number(r)) => Ok(json_num(
+                        l.as_f64().unwrap_or(0.0) + r.as_f64().unwrap_or(0.0),
+                    )),
                     _ => Ok(Value::String(format!(
                         "{}{}",
                         value_to_string(&left),
                         value_to_string(&right)
                     ))),
                 }
+            }
+            BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Exp => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                let right = self.eval_expr(module_spec, &bin.right, env)?;
+                let l = to_number(&left);
+                let r = to_number(&right);
+                let value = match bin.op {
+                    BinaryOp::Sub => l - r,
+                    BinaryOp::Mul => l * r,
+                    BinaryOp::Div => l / r,
+                    BinaryOp::Mod => l % r,
+                    BinaryOp::Exp => l.powf(r),
+                    _ => unreachable!(),
+                };
+                Ok(json_num(value))
+            }
+            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                let right = self.eval_expr(module_spec, &bin.right, env)?;
+                let l = to_number(&left);
+                let r = to_number(&right);
+                let result = match bin.op {
+                    BinaryOp::Lt => l < r,
+                    BinaryOp::Gt => l > r,
+                    BinaryOp::LtEq => l <= r,
+                    BinaryOp::GtEq => l >= r,
+                    _ => unreachable!(),
+                };
+                Ok(Value::Bool(result))
             }
             BinaryOp::EqEq | BinaryOp::EqEqEq => {
                 let left = self.eval_expr(module_spec, &bin.left, env)?;
@@ -509,59 +721,58 @@ impl ComponentProject {
         env: &HashMap<String, Value>,
     ) -> Result<Value> {
         use swc_ecma_ast::*;
+
+        // --- Member-callee dispatch: obj.method(...args) -----------------
         if let Callee::Expr(callee_expr) = &call.callee {
             if let Expr::Member(member) = callee_expr.as_ref() {
                 if let MemberProp::Ident(prop_ident) = &member.prop {
-                    let method = prop_ident.sym.as_ref();
-                    let obj_val = self.eval_expr(module_spec, &member.obj, env)?;
+                    let method = prop_ident.sym.to_string();
 
-                    if method == "map" {
-                        if let Value::Array(items) = obj_val {
-                            if let Some(ExprOrSpread {
-                                expr: mapper,
-                                spread: None,
-                            }) = call.args.first()
-                            {
-                                let parts = items
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, item)| {
-                                        self.eval_closure(module_spec, mapper, item, i, env)
-                                            .map(|v| value_to_string(&v))
-                                    })
-                                    .collect::<Result<Vec<_>>>()?;
-                                return Ok(Value::String(parts.join("")));
+                    // Static-namespace dispatch (Math.x, Date.x, JSON.x, ...)
+                    // is handled before evaluating `member.obj` because the
+                    // namespace itself isn't a value we model — `Math.floor`
+                    // would otherwise try to look up `Math` in env and miss.
+                    if let Expr::Ident(ns_ident) = &*member.obj {
+                        let ns_name = ns_ident.sym.to_string();
+                        if !env.contains_key(&ns_name) {
+                            if let Some(value) = self.eval_static_namespace_call(
+                                module_spec,
+                                &ns_name,
+                                &method,
+                                &call.args,
+                                env,
+                            )? {
+                                return Ok(value);
                             }
                         }
-                        return Ok(Value::Null);
                     }
 
-                    if let Value::String(s) = &obj_val {
-                        let result = match method {
-                            "toUpperCase" => Some(s.to_uppercase()),
-                            "toLowerCase" => Some(s.to_lowercase()),
-                            "trim" => Some(s.trim().to_string()),
-                            "trimStart" | "trimLeft" => Some(s.trim_start().to_string()),
-                            "trimEnd" | "trimRight" => Some(s.trim_end().to_string()),
-                            _ => None,
-                        };
-                        if let Some(r) = result {
-                            return Ok(Value::String(r));
-                        }
+                    // Instance-method dispatch.
+                    let obj_val = self.eval_expr(module_spec, &member.obj, env)?;
+                    if let Some(value) = self.eval_instance_method(
+                        module_spec,
+                        &obj_val,
+                        &method,
+                        &call.args,
+                        env,
+                    )? {
+                        return Ok(value);
                     }
                 }
             }
         }
 
+        // --- Bare-ident callee dispatch: f(...args) ----------------------
         if let Callee::Expr(callee_expr) = &call.callee {
             if let Expr::Ident(ident) = callee_expr.as_ref() {
                 let fn_name = ident.sym.to_string();
                 let module = self.modules.get(module_spec);
-                let is_classnames = module
-                    .and_then(|m| m.imports.get(&fn_name))
+                let import = module.and_then(|m| m.imports.get(&fn_name));
+
+                // classnames / clsx — flatten args into a class string.
+                let is_classnames = import
                     .map(|b| is_classnames_source(&b.source))
                     .unwrap_or(false);
-
                 if is_classnames {
                     let mut classes = Vec::new();
                     for arg in &call.args {
@@ -573,10 +784,231 @@ impl ComponentProject {
                     }
                     return Ok(Value::String(classes.join(" ")));
                 }
+
+                // useState shim (Phase J): recognize the React import and
+                // return `[initial, null]`. Phase K replaces this with real
+                // slot-store reads/writes; until then this lets `{count}`
+                // render its initial value instead of vanishing.
+                let is_react_use_state = fn_name == "useState"
+                    && import
+                        .map(|b| b.source == "react" && b.export_name == "useState")
+                        .unwrap_or(false);
+                if is_react_use_state {
+                    let initial = match call.args.first() {
+                        Some(arg) if arg.spread.is_none() => {
+                            self.eval_expr(module_spec, &arg.expr, env)?
+                        }
+                        _ => Value::Null,
+                    };
+                    return Ok(Value::Array(vec![initial, Value::Null]));
+                }
+
+                // JS-style coercions.
+                if fn_name == "String" || fn_name == "Number" || fn_name == "Boolean" {
+                    let arg = match call.args.first() {
+                        Some(a) if a.spread.is_none() => {
+                            self.eval_expr(module_spec, &a.expr, env)?
+                        }
+                        _ => Value::Null,
+                    };
+                    return Ok(match fn_name.as_str() {
+                        "String" => Value::String(value_to_string(&arg)),
+                        "Number" => json_num(to_number(&arg)),
+                        "Boolean" => Value::Bool(is_truthy(&arg)),
+                        _ => unreachable!(),
+                    });
+                }
             }
         }
 
         Ok(Value::Null)
+    }
+
+    fn eval_static_namespace_call(
+        &self,
+        module_spec: &str,
+        ns: &str,
+        method: &str,
+        args: &[swc_ecma_ast::ExprOrSpread],
+        env: &HashMap<String, Value>,
+    ) -> Result<Option<Value>> {
+        let evaluated: Vec<Value> = args
+            .iter()
+            .filter(|a| a.spread.is_none())
+            .map(|a| self.eval_expr(module_spec, &a.expr, env))
+            .collect::<Result<Vec<_>>>()?;
+
+        let result = match (ns, method) {
+            // Math.* — covers everything that shows up in display logic.
+            ("Math", "floor") => json_num(arg_num(&evaluated, 0).floor()),
+            ("Math", "ceil") => json_num(arg_num(&evaluated, 0).ceil()),
+            ("Math", "round") => json_num(arg_num(&evaluated, 0).round()),
+            ("Math", "trunc") => json_num(arg_num(&evaluated, 0).trunc()),
+            ("Math", "abs") => json_num(arg_num(&evaluated, 0).abs()),
+            ("Math", "sqrt") => json_num(arg_num(&evaluated, 0).sqrt()),
+            ("Math", "max") => json_num(
+                evaluated
+                    .iter()
+                    .map(to_number)
+                    .fold(f64::NEG_INFINITY, f64::max),
+            ),
+            ("Math", "min") => json_num(
+                evaluated
+                    .iter()
+                    .map(to_number)
+                    .fold(f64::INFINITY, f64::min),
+            ),
+            ("Math", "pow") => json_num(arg_num(&evaluated, 0).powf(arg_num(&evaluated, 1))),
+
+            // Date statics — no system clock in Phase J (deterministic SSR).
+            // `Date.now()` returns 0; user code that wants a real timestamp
+            // should accept it as a prop. Phase K will surface a clock slot.
+            ("Date", "now") => json_int(0),
+
+            // JSON.* — useful in display-time templates for debug surfaces.
+            ("JSON", "stringify") => match evaluated.first() {
+                Some(value) => Value::String(serde_json::to_string(value).unwrap_or_default()),
+                None => Value::Null,
+            },
+
+            // Object.keys / Object.values — used in admin/debug UIs.
+            ("Object", "keys") => match evaluated.first() {
+                Some(Value::Object(map)) => {
+                    Value::Array(map.keys().cloned().map(Value::String).collect())
+                }
+                _ => Value::Array(Vec::new()),
+            },
+            ("Object", "values") => match evaluated.first() {
+                Some(Value::Object(map)) => Value::Array(map.values().cloned().collect()),
+                _ => Value::Array(Vec::new()),
+            },
+
+            _ => return Ok(None),
+        };
+
+        Ok(Some(result))
+    }
+
+    fn eval_instance_method(
+        &self,
+        module_spec: &str,
+        receiver: &Value,
+        method: &str,
+        args: &[swc_ecma_ast::ExprOrSpread],
+        env: &HashMap<String, Value>,
+    ) -> Result<Option<Value>> {
+        // Date instance methods first — Date is encoded as a tagged object.
+        if let Some(ms) = date_value_ms(receiver) {
+            return Ok(Some(self.eval_date_method(method, ms)));
+        }
+
+        match receiver {
+            Value::String(s) => {
+                let result = match method {
+                    "toUpperCase" => Some(Value::String(s.to_uppercase())),
+                    "toLowerCase" => Some(Value::String(s.to_lowercase())),
+                    "trim" => Some(Value::String(s.trim().to_string())),
+                    "trimStart" | "trimLeft" => Some(Value::String(s.trim_start().to_string())),
+                    "trimEnd" | "trimRight" => Some(Value::String(s.trim_end().to_string())),
+                    "toString" => Some(Value::String(s.clone())),
+                    _ => None,
+                };
+                Ok(result)
+            }
+            Value::Number(n) => {
+                let f = n.as_f64().unwrap_or(0.0);
+                let evaluated: Vec<Value> = args
+                    .iter()
+                    .filter(|a| a.spread.is_none())
+                    .map(|a| self.eval_expr(module_spec, &a.expr, env))
+                    .collect::<Result<Vec<_>>>()?;
+                let result = match method {
+                    "toFixed" => {
+                        let digits = arg_num(&evaluated, 0).clamp(0.0, 100.0) as usize;
+                        Some(Value::String(format!("{:.*}", digits, f)))
+                    }
+                    "toString" => {
+                        let radix = if evaluated.is_empty() {
+                            10.0
+                        } else {
+                            arg_num(&evaluated, 0)
+                        };
+                        if radix == 10.0 {
+                            Some(Value::String(value_to_string(receiver)))
+                        } else if (radix - radix.trunc()).abs() < f64::EPSILON
+                            && (2.0..=36.0).contains(&radix)
+                            && f.is_finite()
+                            && f == f.trunc()
+                        {
+                            let int = f as i64;
+                            let radix = radix as u32;
+                            let mut digits = String::new();
+                            let (sign, mut value) = if int < 0 {
+                                ("-", (-(int as i128)) as u128)
+                            } else {
+                                ("", int as u128)
+                            };
+                            if value == 0 {
+                                digits.push('0');
+                            }
+                            while value > 0 {
+                                let d = (value % radix as u128) as u32;
+                                let ch = std::char::from_digit(d, radix).unwrap_or('0');
+                                digits.insert(0, ch);
+                                value /= radix as u128;
+                            }
+                            Some(Value::String(format!("{sign}{digits}")))
+                        } else {
+                            Some(Value::String(value_to_string(receiver)))
+                        }
+                    }
+                    _ => None,
+                };
+                Ok(result)
+            }
+            Value::Array(items) => match method {
+                "map" => {
+                    if let Some(swc_ecma_ast::ExprOrSpread {
+                        expr: mapper,
+                        spread: None,
+                    }) = args.first()
+                    {
+                        let parts = items
+                            .iter()
+                            .enumerate()
+                            .map(|(i, item)| {
+                                self.eval_closure(module_spec, mapper, item, i, env)
+                                    .map(|v| value_to_string(&v))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        return Ok(Some(Value::String(parts.join(""))));
+                    }
+                    Ok(Some(Value::Null))
+                }
+                "join" => {
+                    let sep = match args.first() {
+                        Some(a) if a.spread.is_none() => {
+                            value_to_string(&self.eval_expr(module_spec, &a.expr, env)?)
+                        }
+                        _ => ",".to_string(),
+                    };
+                    let parts: Vec<String> = items.iter().map(value_to_string).collect();
+                    Ok(Some(Value::String(parts.join(&sep))))
+                }
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn eval_date_method(&self, method: &str, ms: f64) -> Value {
+        match method {
+            "getTime" | "valueOf" => json_num(ms),
+            "toISOString" | "toJSON" | "toString" => {
+                Value::String(value_to_string(&make_date_value(ms)))
+            }
+            _ => Value::Null,
+        }
     }
 
     fn eval_closure(
@@ -717,7 +1149,28 @@ impl ComponentProject {
             return self.render_component_ref(module_spec, &tag, &Value::Object(props));
         }
 
-        let attrs = self.read_attrs(module_spec, &element.opening.attrs, env)?;
+        let mut attrs = self.read_attrs(module_spec, &element.opening.attrs, env)?;
+
+        // Shell-stamp every host (lowercase-tag) element with a stable
+        // `data-albedo-id`. Bakabox's `seedNodesFromDocument` looks for
+        // exactly this attribute (DEFAULT_ANCHOR_ATTRIBUTE) at boot, so
+        // this is the single contract that makes any future Tier-B/C
+        // patch addressable. The id is derived BEFORE children render so
+        // counter ordering is pre-order and matches client-side traversal.
+        //
+        // We don't override an explicit user-supplied `data-albedo-id`,
+        // which lets test harnesses or static fragments pin a known id.
+        if !attrs
+            .iter()
+            .any(|(name, _)| name == ALBEDO_ID_ATTR)
+        {
+            let stable_id = next_element_stable_id(module_spec);
+            attrs.push((
+                ALBEDO_ID_ATTR.to_string(),
+                Value::String(stable_id.to_string()),
+            ));
+        }
+
         let attrs_html = render_attrs(&attrs);
         let children_html = self.render_children(module_spec, &element.children, env, false)?;
         let void_tag = is_void_tag(&tag);
