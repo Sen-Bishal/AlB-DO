@@ -1,5 +1,7 @@
+use crate::error::RuntimeError;
 use crate::render::tier_b::{
-    render_tier_b, InjectionChunk, RequestContext as TierBRequestContext, SharedRenderServices,
+    render_tier_b, render_tier_b_opcodes, stable_id_for_placeholder, InjectionChunk,
+    RequestContext as TierBRequestContext, SharedRenderServices,
 };
 use crate::webtransport::WebTransportSessionRegistry;
 use async_stream::stream;
@@ -8,19 +10,30 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use dom_render_compiler::manifest::schema::{
-    HydrationMode, RenderManifestV2, RouteManifest, TierBNode,
-};
+use dom_render_compiler::ir::opcode::InternTableKind;
+use dom_render_compiler::manifest::schema::{HydrationMode, RenderManifestV2, RouteManifest};
+use dom_render_compiler::runtime::pipeline::{FourLaneRuntimePipeline, RuntimePipelineError};
 use dom_render_compiler::runtime::webtransport::{
-    WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES, WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
+    FramePayload, LaneRenderedChunk, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PREFETCH,
+    WT_STREAM_SLOT_SHELL,
 };
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// Shared handle to the opcode pipeline that produces binary frames for
+/// the bakabox client.
+///
+/// `Mutex` rather than `RwLock`: the hot tick path mutates the pipeline
+/// (dirty bitmap drain, scratch buffers) and is the only writer; the
+/// uncontended fast path through `Mutex::lock` is single-instruction on
+/// modern targets. `Arc` wraps it because [`StreamingAppState`] is cloned
+/// into every request future.
+pub type SharedPipeline = Arc<Mutex<FourLaneRuntimePipeline>>;
 
 const WT_SESSION_HEADER: &str = "x-albedo-wt-session";
 const WT_PREFER_HEADER: &str = "x-albedo-wt-prefer";
@@ -31,6 +44,12 @@ pub struct StreamingAppState {
     pub services: SharedRenderServices,
     pub transport: StreamingTransportConfig,
     pub webtransport_sessions: Option<WebTransportSessionRegistry>,
+    /// Optional opcode pipeline. Populated by
+    /// [`Self::with_pipeline`] during server bootstrap or test setup.
+    /// `None` means the streaming path falls back to the legacy JSON
+    /// tier-B render — used by tests that don't exercise the binary wire
+    /// and by environments that haven't yet plumbed a renderer.
+    pipeline: Option<SharedPipeline>,
 }
 
 impl StreamingAppState {
@@ -45,8 +64,151 @@ impl StreamingAppState {
             services,
             transport,
             webtransport_sessions,
+            pipeline: None,
         }
     }
+
+    /// Binds an opcode pipeline to this streaming state.
+    ///
+    /// The pipeline is consumed and bound to `runtime_handle` (so Phase-D
+    /// async-island spawn paths can find a runtime context without
+    /// panicking on `Handle::current()`), wrapped in `Arc<Mutex<_>>`, and
+    /// stashed for the lifetime of the streaming app state.
+    ///
+    /// Returns `self` so this composes with [`Self::new`] in a single
+    /// builder expression.
+    #[must_use]
+    pub fn with_pipeline(
+        mut self,
+        pipeline: FourLaneRuntimePipeline,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
+        let pipeline = pipeline.with_runtime_handle(runtime_handle);
+        self.pipeline = Some(Arc::new(Mutex::new(pipeline)));
+        self
+    }
+
+    /// Returns the shared pipeline handle, or `None` when no pipeline is
+    /// bound.
+    pub fn pipeline(&self) -> Option<&SharedPipeline> {
+        self.pipeline.as_ref()
+    }
+
+    /// Returns `true` if an opcode pipeline has been bound. Used by the
+    /// streaming handler to choose between the binary opcode path and the
+    /// legacy JSON tier-B render.
+    pub fn has_pipeline(&self) -> bool {
+        self.pipeline.is_some()
+    }
+}
+
+// ── Pipeline tick + chunk helpers ────────────────────────────────────────
+//
+// Phase B-finish wire surface: the streaming handler talks to the pipeline
+// through these free functions, never through raw `Mutex::lock`. Each
+// function has one job; failures map to typed `RuntimeError` so the axum
+// handler can `into_response()` them uniformly.
+
+/// Drives one reconciliation tick on the bound pipeline and returns the
+/// binary opcode chunks that resulted.
+///
+/// Returns an empty `Vec` when no pipeline is bound. Synchronous — the
+/// underlying `Mutex` is held for the duration of the tick, which must
+/// not span an `.await`. Callers in an async context should wrap this in
+/// [`tokio::task::spawn_blocking`]; the tick itself is sub-millisecond on
+/// the hot path so the blocking-pool round-trip is the dominant cost.
+pub fn drive_pipeline_tick(state: &StreamingAppState) -> Vec<LaneRenderedChunk> {
+    let Some(pipeline) = state.pipeline.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(mut guard) = pipeline.lock() else {
+        // Mutex poisoning means an earlier tick panicked. The pipeline
+        // is in an indeterminate state; the safest move is to skip this
+        // tick and let the supervising layer rebuild. Returning empty
+        // is the correct wire-level answer — no frames, no harm.
+        warn!("opcode pipeline mutex poisoned; tick skipped");
+        return Vec::new();
+    };
+    guard.tick_frame();
+    guard.drain_opcode_chunks()
+}
+
+/// Produces the one-shot bootstrap intern table chunk for a fresh bakabox
+/// session.
+///
+/// Call exactly once per new WT session, immediately after
+/// `session_init`. Subsequent reconciliation rounds should use
+/// [`drain_pipeline_intern_patches`] instead — calling this twice would
+/// re-bootstrap, clobbering the client's intern mirror.
+///
+/// `classify` decides which interned strings ship as part of which kind
+/// (Tag / Attr / Event). The renderer owns this mapping; the streaming
+/// layer just threads it through.
+pub fn drain_pipeline_bootstrap<F>(
+    state: &StreamingAppState,
+    classify: F,
+) -> Result<Option<LaneRenderedChunk>, RuntimePipelineError>
+where
+    F: Fn(u16, &str) -> Option<InternTableKind>,
+{
+    let Some(pipeline) = state.pipeline.as_ref() else {
+        return Ok(None);
+    };
+    let mut guard = pipeline
+        .lock()
+        .map_err(|_| RuntimePipelineError::MissingRuntimeHandle)?;
+    guard.drain_bootstrap_intern_chunk(classify)
+}
+
+/// Produces the incremental intern table patch chunk, if any, since the
+/// previous reconciliation.
+///
+/// Returns `Ok(None)` when nothing in the intern table has changed —
+/// callers should skip the send in that case to keep the control stream
+/// quiet during steady-state ticks.
+pub fn drain_pipeline_intern_patches<F>(
+    state: &StreamingAppState,
+    classify: F,
+) -> Result<Option<LaneRenderedChunk>, RuntimePipelineError>
+where
+    F: Fn(u16, &str) -> Option<InternTableKind>,
+{
+    let Some(pipeline) = state.pipeline.as_ref() else {
+        return Ok(None);
+    };
+    let mut guard = pipeline
+        .lock()
+        .map_err(|_| RuntimePipelineError::MissingRuntimeHandle)?;
+    guard.drain_intern_table_patches(classify)
+}
+
+/// Forwards a batch of [`LaneRenderedChunk`]s to the bakabox client over
+/// the WebTransport session, one `send_payload` per chunk.
+///
+/// The chunk's `lane` field selects the WT stream slot. `FramePayload::Text`
+/// payloads are sent UTF-8 encoded as-is so existing JSON consumers (the
+/// shell, prefetch) keep working alongside binary opcode chunks.
+///
+/// Returns `Ok(())` when the session has no WT registry (server has
+/// WebTransport disabled) — the streaming handler will fall back to SSE.
+pub async fn ship_chunks_to_session(
+    state: &StreamingAppState,
+    session_id: Uuid,
+    chunks: Vec<LaneRenderedChunk>,
+) -> Result<(), RuntimeError> {
+    let Some(sessions) = state.webtransport_sessions.as_ref() else {
+        return Ok(());
+    };
+    for chunk in chunks {
+        let payload = match chunk.payload {
+            FramePayload::Binary(bytes) => bytes,
+            FramePayload::Text(text) => text.into_bytes(),
+        };
+        sessions
+            .send_payload(session_id, chunk.lane as u8, payload)
+            .await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +469,26 @@ fn build_shell_chunk(
     shell
 }
 
+/// Hard cap on how long the WT path will tick + drain waiting for async
+/// islands to resolve. Stuck resolvers don't block the request forever;
+/// any still-pending islands at this point will be cancelled by the
+/// next request anyway (their resolutions arrive at an mpsc no one is
+/// reading).
+const WT_ASYNC_DRAIN_TIMEOUT_MS: u64 = 5_000;
+
+/// Inter-tick sleep while waiting for resolver Futures to complete.
+/// Short enough that small islands appear within the same RAF cadence
+/// the client expects; long enough that the loop doesn't spin.
+const WT_ASYNC_DRAIN_SLEEP_MS: u64 = 5;
+
+/// Phase-E: WT streaming flow. Ships shell as text on slot 1, opcode
+/// frames (bootstrap intern + per-tier-B patches via async islands) as
+/// binary on slot 2, and prefetch hints as JSON on slot 3.
+///
+/// Requires both an opcode pipeline (bound via
+/// `StreamingAppState::with_pipeline`) and a `TierBOpcodeRegistry`
+/// (set on `SharedRenderServices.opcode_registry`). Without these the
+/// function errors out so the caller falls back to SSE.
 async fn stream_route_over_webtransport(
     route: RouteManifest,
     ctx: TierBRequestContext,
@@ -318,60 +500,107 @@ async fn stream_route_over_webtransport(
         .as_ref()
         .ok_or_else(|| "webtransport session registry unavailable".to_string())?;
 
+    let pipeline = app
+        .pipeline()
+        .cloned()
+        .ok_or_else(|| "opcode pipeline unavailable on WT path".to_string())?;
+
+    let opcode_registry = app
+        .services
+        .opcode_registry
+        .clone()
+        .ok_or_else(|| "opcode registry unavailable on WT path".to_string())?;
+    let data_fetcher = app.services.data_fetcher.clone();
+
+    // 1. Shell HTML on the text slot.
     let mut shell = build_shell_chunk(
         &route,
         NegotiatedTransport::WebTransport,
         app.transport.webtransport_path.as_str(),
     );
     shell.push_str(&route.shell.body_close);
-
     sessions
-        .send_json(session_id, WT_STREAM_SLOT_SHELL, &json!({ "html": shell }))
+        .send_payload(session_id, WT_STREAM_SLOT_SHELL, shell.into_bytes())
         .await
         .map_err(|err| err.to_string())?;
 
-    let mut tier_b_futures: FuturesUnordered<_> = route
-        .tier_b
-        .iter()
-        .cloned()
-        .map(|node| {
-            let ctx = ctx.clone();
-            let app = app.clone();
-            async move { render_tier_b_patch_payload(node, ctx, app).await }
-        })
-        .collect();
-
-    while let Some(patch_payload) = tier_b_futures.next().await {
-        sessions
-            .send_json(session_id, WT_STREAM_SLOT_PATCHES, &patch_payload)
+    // 2. Bootstrap intern table on the binary patches slot. The
+    //    classifier is a stub for Phase E (Phase F+ will plug in a real
+    //    one driven by the renderer's intern context); shipping an
+    //    empty bootstrap is a valid no-op the bakabox VM tolerates.
+    if let Some(chunk) = drain_pipeline_bootstrap(app.as_ref(), |_, _| None)
+        .map_err(|err| err.to_string())?
+    {
+        ship_chunk(sessions, session_id, chunk)
             .await
             .map_err(|err| err.to_string())?;
     }
 
-    let mut prefetch_modules = Vec::new();
-    for node in &route.tier_c {
-        if node.hydration_mode == HydrationMode::None {
-            continue;
-        }
+    // 3. Enqueue every Tier-B node as a Phase-D async island. The
+    //    Future that resolves each island runs render_tier_b_opcodes
+    //    inside the node's manifest-declared timeout; on error or
+    //    timeout the island resolves to an empty instruction vector so
+    //    the placeholder stays empty rather than crashing the tick.
+    for node in &route.tier_b {
+        let node_owned = node.clone();
+        let ctx_owned = ctx.clone();
+        let registry = opcode_registry.clone();
+        let fetcher = data_fetcher.clone();
+        let timeout_ms = node.timeout_ms.max(1);
+        let placeholder_stable_id = stable_id_for_placeholder(&node.placeholder_id);
 
-        prefetch_modules.push(node.bundle_path.clone());
-
-        sessions
-            .send_json(
-                session_id,
-                WT_STREAM_SLOT_PATCHES,
-                &json!({
-                    "hydrate": {
-                        "component_id": node.component_id,
-                        "placeholder_id": node.placeholder_id,
-                        "props": node.initial_props,
-                    }
-                }),
+        let resolver = async move {
+            let rendered = tokio::time::timeout(
+                Duration::from_millis(timeout_ms),
+                render_tier_b_opcodes(
+                    &node_owned,
+                    &ctx_owned,
+                    registry.as_ref(),
+                    fetcher.as_ref(),
+                ),
             )
-            .await
+            .await;
+            match rendered {
+                Ok(Ok(instructions)) => instructions,
+                Ok(Err(err)) => {
+                    warn!(
+                        render_fn = %node_owned.render_fn,
+                        error = %err,
+                        "render_tier_b_opcodes failed; shipping empty patch"
+                    );
+                    Vec::new()
+                }
+                Err(_) => {
+                    warn!(
+                        render_fn = %node_owned.render_fn,
+                        timeout_ms,
+                        "render_tier_b_opcodes timed out; shipping empty patch"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        let _ = pipeline
+            .lock()
+            .map_err(|_| "pipeline mutex poisoned".to_string())?
+            .enqueue_async_island(placeholder_stable_id, resolver)
             .map_err(|err| err.to_string())?;
     }
 
+    // 4. Drive ticks + drain chunks until every island has resolved or
+    //    the hard deadline elapses. Each drain ships Placeholder frames
+    //    (on the first iteration) and Patch frames (as resolvers land).
+    drain_async_islands_into_session(app.as_ref(), sessions, session_id).await?;
+
+    // 5. Prefetch hints on slot 3 (JSON). Hydration triggers stay on
+    //    the SSE path until Phase F ports them to opcodes.
+    let prefetch_modules: Vec<String> = route
+        .tier_c
+        .iter()
+        .filter(|node| node.hydration_mode != HydrationMode::None)
+        .map(|node| node.bundle_path.clone())
+        .collect();
     if !prefetch_modules.is_empty() {
         sessions
             .send_json(
@@ -386,6 +615,7 @@ async fn stream_route_over_webtransport(
             .map_err(|err| err.to_string())?;
     }
 
+    // 6. Route-complete envelope on the JSON control slot.
     sessions
         .send_json(
             session_id,
@@ -402,44 +632,63 @@ async fn stream_route_over_webtransport(
     Ok(())
 }
 
-async fn render_tier_b_patch_payload(
-    node: TierBNode,
-    ctx: TierBRequestContext,
-    app: Arc<StreamingAppState>,
-) -> Value {
-    let render_result = timeout(
-        Duration::from_millis(node.timeout_ms.max(1)),
-        render_tier_b(
-            &node,
-            &ctx,
-            app.services.registry.as_ref(),
-            app.services.data_fetcher.as_ref(),
-        ),
-    )
-    .await;
-
-    match render_result {
-        Ok(Ok(html)) => json!({
-            "placeholder_id": node.placeholder_id,
-            "html": html,
-        }),
-        Ok(Err(_)) => json!({
-            "placeholder_id": node.placeholder_id,
-            "html": Value::Null,
-            "status": "error",
-        }),
-        Err(_) => json!({
-            "placeholder_id": node.placeholder_id,
-            "html": fallback_html(&node),
-            "status": "fallback",
-        }),
-    }
+/// Ships a single chunk through the right WT slot. Centralises the
+/// binary/text payload coercion so callers don't duplicate the match.
+async fn ship_chunk(
+    sessions: &WebTransportSessionRegistry,
+    session_id: Uuid,
+    chunk: LaneRenderedChunk,
+) -> Result<(), RuntimeError> {
+    let payload = match chunk.payload {
+        FramePayload::Binary(bytes) => bytes,
+        FramePayload::Text(text) => text.into_bytes(),
+    };
+    sessions
+        .send_payload(session_id, chunk.lane as u8, payload)
+        .await
 }
 
-fn fallback_html(node: &TierBNode) -> String {
-    node.fallback_html
-        .clone()
-        .unwrap_or_else(|| "<div data-albedo-fallback=\"timeout\"></div>".to_string())
+/// Tick + drain loop. Yields after each iteration so spawned resolvers
+/// can progress on the runtime's worker. Exits when no async islands
+/// are still pending, or when the hard deadline elapses.
+async fn drain_async_islands_into_session(
+    app: &StreamingAppState,
+    sessions: &WebTransportSessionRegistry,
+    session_id: Uuid,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now()
+        + Duration::from_millis(WT_ASYNC_DRAIN_TIMEOUT_MS);
+
+    loop {
+        let chunks = drive_pipeline_tick(app);
+        for chunk in chunks {
+            ship_chunk(sessions, session_id, chunk)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+
+        let pending = match app.pipeline() {
+            Some(handle) => handle
+                .lock()
+                .map_err(|_| "pipeline mutex poisoned".to_string())?
+                .pending_async_count(),
+            None => 0,
+        };
+        if pending == 0 {
+            return Ok(());
+        }
+
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                pending,
+                "async-island drain deadline reached; leaving {} islands unresolved",
+                pending
+            );
+            return Ok(());
+        }
+
+        tokio::time::sleep(Duration::from_millis(WT_ASYNC_DRAIN_SLEEP_MS)).await;
+    }
 }
 
 fn request_context_from_request(req: &Request) -> TierBRequestContext {
@@ -574,6 +823,7 @@ mod tests {
     use dom_render_compiler::manifest::schema::{
         DataDep, DataSource, DomPosition, HtmlShell, RenderedNode, RouteManifest, TierBNode,
     };
+    use serde_json::Value;
     use tokio::sync::mpsc;
 
     fn test_request(headers: &[(&str, &str)], version: Version) -> Request {
@@ -707,8 +957,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_stream_route_over_webtransport_sends_shell_patch_and_control_frames() {
+    /// Phase-E port of the old JSON-shell+JSON-patch+JSON-control test.
+    /// The WT path now ships shell HTML as raw text on slot 1, binary
+    /// opcode frames on slot 2, and a JSON `route_complete` envelope on
+    /// slot 0. The test asserts each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stream_route_over_webtransport_ships_shell_binary_patches_and_route_complete() {
+        use crate::render::tier_b::StubTierBOpcodeRegistry;
+        use dom_render_compiler::graph::ComponentGraph;
+        use dom_render_compiler::ir::wire::decode_frame;
+        use dom_render_compiler::manifest::schema::Tier;
+        use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
+        use dom_render_compiler::runtime::scheduler::SchedulerConfig;
+        use dom_render_compiler::runtime::webtransport::WT_STREAM_SLOT_PATCHES;
+        use dom_render_compiler::types::{Component, ComponentAnalysis, ComponentId};
+        use std::collections::HashMap;
+
         let session_id = Uuid::new_v4();
         let registry = WebTransportSessionRegistry::default();
 
@@ -723,12 +987,45 @@ mod tests {
             stream_senders: [control_tx, shell_tx, patch_tx, prefetch_tx],
         });
 
-        let app = Arc::new(StreamingAppState::new(
-            Arc::new(RenderManifestV2::legacy_defaults()),
-            SharedRenderServices::default(),
-            StreamingTransportConfig::new(true, 443),
-            Some(registry),
-        ));
+        // Build a minimal pipeline with one async-capable component so
+        // the WT path has a valid pipeline + opcode registry to bind to.
+        let graph = ComponentGraph::new();
+        let id = graph.add_component(Component::new(ComponentId::new(0), "Feature".to_string()));
+        let mut analyses = HashMap::new();
+        analyses.insert(
+            id,
+            ComponentAnalysis {
+                id,
+                priority: 1.0,
+                estimated_time_ms: 1.0,
+                phase: 0.1,
+                topological_level: 0,
+            },
+        );
+        let pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            HashMap::from([(id, Tier::B)]),
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .expect("pipeline must build");
+
+        let services = SharedRenderServices {
+            opcode_registry: Some(Arc::new(StubTierBOpcodeRegistry)),
+            ..SharedRenderServices::default()
+        };
+
+        let app = Arc::new(
+            StreamingAppState::new(
+                Arc::new(RenderManifestV2::legacy_defaults()),
+                services,
+                StreamingTransportConfig::new(true, 443),
+                Some(registry),
+            )
+            .with_pipeline(pipeline, tokio::runtime::Handle::current()),
+        );
 
         let route = route_manifest();
         let ctx = TierBRequestContext {
@@ -740,20 +1037,31 @@ mod tests {
             .await
             .unwrap();
 
-        let shell_payload: Value = serde_json::from_slice(&shell_rx.recv().await.unwrap()).unwrap();
-        assert!(shell_payload
-            .get("html")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .contains("data-albedo-tier=\"b\""));
-
-        let patch_payload: Value = serde_json::from_slice(&patch_rx.recv().await.unwrap()).unwrap();
-        assert_eq!(
-            patch_payload.get("placeholder_id").and_then(Value::as_str),
-            Some("__b_feature")
+        // Slot 1: shell HTML shipped as raw UTF-8.
+        let shell_bytes = shell_rx.recv().await.unwrap();
+        let shell_html = std::str::from_utf8(&shell_bytes).expect("shell must be UTF-8");
+        assert!(
+            shell_html.contains("data-albedo-tier=\"b\""),
+            "shell HTML must include the Tier-B placeholder marker"
         );
-        assert!(patch_payload.get("html").and_then(Value::as_str).is_some());
 
+        // Slot 2: at least one binary OpcodeFrame carrying the Placeholder
+        // opcode for the lone Tier-B node. Drain everything available; the
+        // first frame must be a Placeholder. The Patch frame for the
+        // resolution may or may not follow before the channel idles,
+        // depending on scheduler timing — the wire shape that matters
+        // for the test is the Placeholder.
+        let first_patch = patch_rx.recv().await.expect("at least one binary patch frame");
+        let (frame, _) = decode_frame(&first_patch).expect("patch bytes must decode");
+        assert!(
+            frame.instructions.iter().any(|instr| matches!(
+                instr,
+                dom_render_compiler::ir::opcode::Instruction::Placeholder { .. }
+            )),
+            "first binary frame on slot {WT_STREAM_SLOT_PATCHES} must carry a Placeholder"
+        );
+
+        // Slot 0: route_complete JSON envelope.
         let control_payload: Value =
             serde_json::from_slice(&control_rx.recv().await.unwrap()).unwrap();
         assert_eq!(

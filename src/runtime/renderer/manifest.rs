@@ -23,7 +23,9 @@ pub struct ServerRenderer<E: RuntimeEngine> {
     module_registry: ModuleRegistry,
     loaded_module_hashes: HashMap<String, u64>,
     // True LRU eviction. The previous HashMap-based path popped an
-    // arbitrary key once full, which silently invalidated hot entries.
+    // arbitrary key once full, which silently invalidated hot entries
+    // under sustained load — turning a 256-slot cache into a coin flip
+    // because `keys().next()` iterates in `RandomState` order, not LRU.
     normalized_props_cache: LruCache<String, String>,
     static_slice_modules: HashMap<String, u64>,
     static_slice_html_cache: HashMap<StaticSliceCacheKey, String>,
@@ -491,8 +493,8 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
             ))
         })?;
 
-        // `put` auto-evicts the least-recently-used entry when capacity is
-        // reached — no manual eviction loop needed.
+        // `put` auto-evicts the least-recently-used entry at capacity — no
+        // manual eviction loop, and crucially no arbitrary-key pop.
         self.normalized_props_cache
             .put(props_json.to_string(), normalized_props.clone());
         Ok(normalized_props)

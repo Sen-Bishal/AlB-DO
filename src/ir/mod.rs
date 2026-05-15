@@ -11,11 +11,27 @@
 //! column store directly.
 //! Dated - 18th April 2026 - BshL
 
+pub mod action;
 pub mod columns;
+pub mod conformance;
+pub mod opcode;
+pub mod wire;
 
+pub use action::{
+    decode_action_envelope, encode_action_envelope, ActionEnvelope, ActionEventKind,
+};
 pub use columns::{
     field_mask, ColumnPass, IrColumns, IrModuleColumn, LaneColumnPass, LaneColumnPatch, StringId,
     StringInterner, LANE_COUNT as IR_LANE_COUNT,
+};
+pub use conformance::{canonical_v1_frame, LOCKED_WIRE_VERSION};
+pub use opcode::{
+    AttrId, EventId, Instruction, InstructionRange, InternEntry, InternPatchOp, InternTable,
+    InternTableKind, OpcodeFrame, ProxyId, RangeError, SlotId, StableId, SuspenseId, TagId,
+};
+pub use wire::{
+    decode_frame, decode_intern_table, encode_frame, encode_intern_table, WireDecode, WireEncode,
+    WireError,
 };
 
 use crate::effects::EffectProfile;
