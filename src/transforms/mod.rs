@@ -22,5 +22,7 @@
 pub mod events;
 pub mod hooks;
 
-pub use events::{extract_handlers_in_function, HandlerExtract};
+pub use events::{
+    collect_free_idents_in_handler_body, extract_handlers_in_function, HandlerBody, HandlerExtract,
+};
 pub use hooks::{extract_use_state_hooks, HookBinding, HookExtractError};

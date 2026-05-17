@@ -356,6 +356,220 @@ fn string_state_setter_with_literal_writes_string_to_slot() {
     assert_eq!(decoded, "ready", "setLabel('ready') must store 'ready'");
 }
 
+// ── Stage 2 · closures over component props ──────────────────────────
+
+#[test]
+fn stage2_stepper_initial_render_emits_bindings_and_renders_initial_state() {
+    let project = compile("stepper");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store.clone());
+
+    let opts = RenderOptions { hook_compile: true };
+    let out = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &serde_json::json!({ "step": 5 }),
+        &slots,
+        &opts,
+    )
+    .expect("stepper renders with props");
+
+    assert!(
+        out.html.contains(">0</button>"),
+        "stepper initial HTML must show 0; got: {}",
+        out.html
+    );
+    assert_eq!(
+        out.opcodes
+            .iter()
+            .filter(|op| matches!(op, Instruction::BindEvent { .. }))
+            .count(),
+        1,
+        "stepper must emit one BindEvent"
+    );
+    assert_eq!(
+        out.opcodes
+            .iter()
+            .filter(|op| matches!(op, Instruction::SetTextRef { .. }))
+            .count(),
+        1,
+        "stepper must emit one SetTextRef"
+    );
+}
+
+#[test]
+fn stage2_handler_reads_captured_prop_and_writes_correct_increment() {
+    let project = compile("stepper");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store.clone());
+
+    let opts = RenderOptions { hook_compile: true };
+    let render = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &serde_json::json!({ "step": 5 }),
+        &slots,
+        &opts,
+    )
+    .expect("render");
+
+    let proxy_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
+            _ => None,
+        })
+        .expect("BindEvent");
+    let slot_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        })
+        .expect("SetTextRef");
+
+    let response = project
+        .invoke_action(
+            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &slots,
+        )
+        .expect("dispatch");
+
+    let raw = store.read(session, slot_id).expect("slot written");
+    let v: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        v.as_f64().map(|f| f as i64),
+        Some(5),
+        "handler with captured prop must write `n + step = 0 + 5 = 5`"
+    );
+    assert!(
+        response
+            .iter()
+            .any(|op| matches!(op, Instruction::SlotSet { slot_id: s, .. } if *s == slot_id)),
+        "response must include the SlotSet for the increment"
+    );
+}
+
+#[test]
+fn stage2_re_render_with_new_props_updates_captured_snapshot() {
+    let project = compile("stepper");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store.clone());
+
+    let opts = RenderOptions { hook_compile: true };
+
+    let render = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &serde_json::json!({ "step": 5 }),
+        &slots,
+        &opts,
+    )
+    .expect("first render");
+    let proxy_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
+            _ => None,
+        })
+        .expect("BindEvent");
+    let slot_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        })
+        .expect("SetTextRef");
+
+    // Re-render with new prop value — capture slot is rewritten.
+    let _ = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &serde_json::json!({ "step": 10 }),
+        &slots,
+        &opts,
+    )
+    .expect("second render");
+
+    project
+        .invoke_action(
+            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &slots,
+        )
+        .expect("dispatch");
+
+    let raw = store.read(session, slot_id).expect("slot written");
+    let v: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        v.as_f64().map(|f| f as i64),
+        Some(10),
+        "post-re-render dispatch must use the new prop value (step=10), not stale step=5"
+    );
+}
+
+#[test]
+fn stage2_greeter_captures_multiple_props_of_different_shapes() {
+    let project = compile("greeter");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store.clone());
+
+    let opts = RenderOptions { hook_compile: true };
+    let render = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &serde_json::json!({ "initial": "alice", "exclaim": "!!!" }),
+        &slots,
+        &opts,
+    )
+    .expect("render");
+
+    assert!(
+        render.html.contains(">alice</button>"),
+        "initial render must use prop value for useState initial; got: {}",
+        render.html
+    );
+
+    let proxy_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
+            _ => None,
+        })
+        .expect("BindEvent");
+    let slot_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        })
+        .expect("SetTextRef");
+
+    project
+        .invoke_action(
+            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &slots,
+        )
+        .expect("dispatch");
+
+    let raw = store.read(session, slot_id).expect("slot written");
+    let v: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        v.as_str(),
+        Some("alice!!!"),
+        "handler should concatenate `name + exclaim` using captured prop"
+    );
+}
+
 // ── Intern table contract ────────────────────────────────────────────
 
 /// Every render that emits any `BindEvent` must also prepend an

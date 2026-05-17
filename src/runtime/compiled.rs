@@ -13,13 +13,16 @@
 use crate::ir::action::ActionEnvelope;
 use crate::ir::opcode::{Instruction, SlotId};
 use crate::runtime::eval::component::fnv1a_32;
+use crate::runtime::eval::{ComponentFunction, ParamBinding};
 use crate::runtime::eval::{ComponentProject, PatchReport};
 use crate::runtime::slot_store::SessionSlotView;
-use crate::transforms::events::{HandlerBody, HandlerExtract};
+use crate::transforms::events::{
+    collect_free_idents_in_handler_body, HandlerBody, HandlerExtract,
+};
 use crate::transforms::hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_ecma_ast::Stmt;
 
@@ -69,6 +72,19 @@ pub struct CompiledComponent {
     /// Handler proxy ids in source order; index parallel to `handlers`.
     /// `fnv1a_32("{module}::{fn}::{event}#{handler_idx}")`.
     pub proxy_ids: Vec<u32>,
+    /// Stage 2 — component prop binding names extracted from the
+    /// function signature (destructured form only for now). A prop
+    /// named here is eligible for capture by any handler that
+    /// references it as a free variable.
+    pub param_names: Vec<String>,
+    /// Stage 2 — captured-prop slot ids keyed by prop name. Each
+    /// captured prop gets one render-scoped slot the renderer writes
+    /// at every render so the server-side handler dispatch can read
+    /// the most recent value back. Slot id is
+    /// `fnv1a_32("{module}::{fn}#prop:{name}")` — disjoint from the
+    /// hook-slot namespace (`#0`, `#1`, ...) so collisions are
+    /// impossible.
+    pub capture_slots: HashMap<String, SlotId>,
 }
 
 /// One handler the server can re-execute when bakabox POSTs an action
@@ -128,6 +144,34 @@ impl CompiledProject {
                     }
                 }
 
+                // Stage 2 · prop binding extraction + capture-slot allocation.
+                let param_names = extract_param_names(function);
+                let mut capture_slots: HashMap<String, SlotId> = HashMap::new();
+                if !param_names.is_empty() {
+                    // Union of free variables across every handler in
+                    // this component, intersected with param_names. A
+                    // prop only gets a capture slot when at least one
+                    // handler in this component actually references it
+                    // — components whose handlers don't read props
+                    // don't pay the snapshot-write cost.
+                    let mut captured: HashSet<String> = HashSet::new();
+                    for handler in &handler_extracts {
+                        let frees = collect_free_idents_in_handler_body(&handler.body);
+                        for name in frees {
+                            if param_names.contains(&name)
+                                && !value_slots.contains_key(&name)
+                                && !setter_slots.contains_key(&name)
+                            {
+                                captured.insert(name);
+                            }
+                        }
+                    }
+                    for name in captured {
+                        let slot_id = allocate_capture_slot_id(module_spec, function_name, &name);
+                        capture_slots.insert(name, slot_id);
+                    }
+                }
+
                 let mut proxy_ids = Vec::with_capacity(handler_extracts.len());
                 for handler in &handler_extracts {
                     let proxy_id = allocate_proxy_id(
@@ -159,6 +203,8 @@ impl CompiledProject {
                         value_slots,
                         setter_slots,
                         proxy_ids,
+                        param_names,
+                        capture_slots,
                     },
                 );
             }
@@ -309,6 +355,46 @@ pub fn allocate_proxy_id(
 ) -> u32 {
     let key = format!("{module_spec}::{function_name}::{event_name}#{handler_idx}");
     fnv1a_32(key.as_bytes())
+}
+
+/// Stage 2 · slot id for a captured component prop. Uses the same
+/// FNV-1a-32 family as hook slots but with a `#prop:` infix so the
+/// allocator namespace cannot collide with `allocate_slot_id`'s
+/// `#{hook_idx}` integers. A prop's slot is the same on every render
+/// of the same component — last write wins — which is correct for
+/// single-instance Stage 2; multi-instance is Stage 3+ work.
+#[must_use]
+pub fn allocate_capture_slot_id(
+    module_spec: &str,
+    function_name: &str,
+    prop_name: &str,
+) -> SlotId {
+    let key = format!("{module_spec}::{function_name}#prop:{prop_name}");
+    SlotId(fnv1a_32(key.as_bytes()))
+}
+
+/// Extract the prop names a component destructures from its single
+/// `props` parameter — the conventional shape:
+///
+/// ```ignore
+/// function Stepper({ step, label }: ...) { ... }
+/// ```
+///
+/// yields `["step", "label"]`. Single-binding form (`(props)`) returns
+/// an empty list because per-prop names aren't directly destructured;
+/// users who need handler-prop capture should destructure for Stage 2.
+fn extract_param_names(function: &ComponentFunction) -> Vec<String> {
+    let mut out = Vec::new();
+    for param in &function.params {
+        if let ParamBinding::Object(fields) = param {
+            for (_key, local) in fields {
+                if !out.contains(local) {
+                    out.push(local.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Helper used by the Phase J `extract` recursion to surface that a
