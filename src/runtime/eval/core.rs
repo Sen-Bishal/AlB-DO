@@ -102,6 +102,12 @@ struct ComponentScope {
     /// Map from value-binding name to its position in `initials`. Used
     /// during useState destructure to look up the initial.
     hook_index_for_value: HashMap<String, usize>,
+    /// Stage 2 — captured-prop slot ids per prop name. When set, the
+    /// renderer writes the current value of each captured prop to its
+    /// slot on every render of this component, and
+    /// `eval_handler_body` seeds the handler env from these slots so
+    /// the handler closure can reference the captured prop.
+    capture_slots: HashMap<String, SlotId>,
 }
 
 fn phase_k_enabled() -> bool {
@@ -315,6 +321,7 @@ fn current_phase_k_component(module_spec: &str, function_name: &str) -> Option<C
                 .iter()
                 .map(|h| (h.value_name.clone(), h.hook_idx))
                 .collect(),
+            capture_slots: meta.capture_slots.clone(),
         })
     })
 }
@@ -375,6 +382,31 @@ fn drain_initial_slot_writes() {
             let _ = state.slots.drain_pending();
         }
     });
+}
+
+/// Stage 2 — write the current value of every captured prop into its
+/// dedicated capture slot. Called at the top of `render_local` so a
+/// handler that fires before the next render still sees the value
+/// the prop had on the most recent render.
+///
+/// Writes are drained immediately because they're internal
+/// bookkeeping — surfacing them as `SlotSet` opcodes would push
+/// every captured prop down to bakabox on every render, even when
+/// the prop didn't change. Bakabox only needs `SlotSet` for slots
+/// it has subscribed via `SetTextRef` / `SetAttrRef`; capture slots
+/// are never subscribed.
+fn snapshot_captured_props_into_slots(scope: &ComponentScope, props: &Value) {
+    if scope.capture_slots.is_empty() {
+        return;
+    }
+    let Some(props_map) = props.as_object() else { return };
+    for (name, slot_id) in &scope.capture_slots {
+        let Some(value) = props_map.get(name) else { continue };
+        if let Ok(bytes) = serde_json::to_vec(value) {
+            phase_k_write_slot_value(*slot_id, bytes);
+        }
+    }
+    drain_initial_slot_writes();
 }
 
 /// Detect whether the expression in a JSX text-position child is a
@@ -678,6 +710,7 @@ impl ComponentProject {
                 .iter()
                 .map(|h| (h.value_name.clone(), h.hook_idx))
                 .collect(),
+            capture_slots: component.capture_slots.clone(),
         };
         phase_k_push_scope(scope);
 
@@ -700,6 +733,19 @@ impl ComponentProject {
             {
                 let value = self.eval_expr(module_spec, &initial_expr, &env).unwrap_or(Value::Null);
                 env.insert(name.clone(), value);
+            }
+        }
+
+        // Stage 2 — seed env with captured prop snapshots. The render
+        // path writes these on every render of the component; here we
+        // read them back so the handler body's references to props
+        // resolve correctly. Missing snapshots default to Null (the
+        // prop was undefined at last render).
+        for (name, slot_id) in &component.capture_slots {
+            if let Some(bytes) = slots.read(*slot_id) {
+                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                    env.insert(name.clone(), value);
+                }
             }
         }
 
@@ -802,6 +848,13 @@ impl ComponentProject {
         // leak scope into a parent component's render.
         let pushed_phase_k_scope = if phase_k_enabled() {
             if let Some(scope) = current_phase_k_component(module_spec, function_name) {
+                // Stage 2 · snapshot captured props to their dedicated
+                // slots BEFORE evaluating the body, so a handler that
+                // fires between renders reads the value the prop had
+                // on the most recent render. We drain immediately so
+                // the snapshot writes don't surface as user-driven
+                // SlotSet opcodes in the response frame.
+                snapshot_captured_props_into_slots(&scope, props);
                 phase_k_push_scope(scope);
                 true
             } else {

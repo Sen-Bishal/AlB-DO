@@ -28,9 +28,10 @@
 //! `setN(...)` calls; both are evaluated server-side via the existing
 //! Phase J interpreter.
 
+use std::collections::HashSet;
 use swc_ecma_ast::{
-    BlockStmtOrExpr, Expr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElement,
-    JSXElementChild, JSXExpr, Stmt,
+    BlockStmtOrExpr, Callee, Decl, Expr, ExprStmt, JSXAttrName, JSXAttrOrSpread, JSXAttrValue,
+    JSXElement, JSXElementChild, JSXExpr, MemberProp, Pat, Stmt,
 };
 
 /// One JSX `on*` handler extracted from a component body.
@@ -154,6 +155,236 @@ fn visit_child(child: &JSXElementChild, sink: &mut Vec<HandlerExtract>) {
         JSXElementChild::JSXExprContainer(container) => {
             if let JSXExpr::Expr(expr) = &container.expr {
                 visit_expr_for_jsx(expr, sink);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Stage 2 · free-variable collector for handler bodies
+//
+// `collect_free_idents_in_handler_body` walks a [`HandlerBody`] and
+// surfaces every identifier reference that is NOT introduced by a
+// binding inside the body itself. The result is the set the
+// CompiledProject filters against (slot reads, setter calls, captured
+// props, captured module constants) to decide how each name should
+// resolve at handler-invoke time.
+//
+// Stage 2 scope: only counts free identifiers that appear as direct
+// references — member access (`obj.prop`) contributes only `obj`, not
+// `prop`. Nested arrows/functions push local bindings onto a small
+// scope stack so their params don't leak into the parent's free set.
+// Var decls inside blocks also introduce locals.
+//
+// This is deliberately a small surface — for Stage 2 / 3 we only
+// need the **names** the handler refers to, not their types or
+// dataflow. The runtime resolves each at invoke time.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Collect every free identifier referenced by a handler body.
+pub fn collect_free_idents_in_handler_body(body: &HandlerBody) -> HashSet<String> {
+    let mut scope = ScopeStack::new();
+    let mut sink: HashSet<String> = HashSet::new();
+    match body {
+        HandlerBody::Expr(expr) => collect_in_expr(expr, &mut scope, &mut sink),
+        HandlerBody::Block(stmts) => {
+            for stmt in stmts {
+                collect_in_stmt(stmt, &mut scope, &mut sink);
+            }
+        }
+    }
+    sink
+}
+
+#[derive(Default)]
+struct ScopeStack {
+    frames: Vec<HashSet<String>>,
+}
+
+impl ScopeStack {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn push(&mut self) {
+        self.frames.push(HashSet::new());
+    }
+    fn pop(&mut self) {
+        self.frames.pop();
+    }
+    fn bind(&mut self, name: String) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.insert(name);
+        }
+    }
+    fn contains(&self, name: &str) -> bool {
+        self.frames.iter().any(|frame| frame.contains(name))
+    }
+}
+
+fn collect_in_stmt(stmt: &Stmt, scope: &mut ScopeStack, sink: &mut HashSet<String>) {
+    match stmt {
+        Stmt::Decl(Decl::Var(var)) => {
+            for decl in &var.decls {
+                if let Some(init) = &decl.init {
+                    collect_in_expr(init, scope, sink);
+                }
+                bind_pat(&decl.name, scope);
+            }
+        }
+        Stmt::Expr(ExprStmt { expr, .. }) => collect_in_expr(expr, scope, sink),
+        Stmt::Return(ret) => {
+            if let Some(arg) = &ret.arg {
+                collect_in_expr(arg, scope, sink);
+            }
+        }
+        Stmt::Block(block) => {
+            scope.push();
+            for s in &block.stmts {
+                collect_in_stmt(s, scope, sink);
+            }
+            scope.pop();
+        }
+        Stmt::If(node) => {
+            collect_in_expr(&node.test, scope, sink);
+            collect_in_stmt(&node.cons, scope, sink);
+            if let Some(alt) = &node.alt {
+                collect_in_stmt(alt, scope, sink);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_in_expr(expr: &Expr, scope: &mut ScopeStack, sink: &mut HashSet<String>) {
+    match expr {
+        Expr::Ident(ident) => {
+            let name = ident.sym.to_string();
+            if !scope.contains(&name) {
+                sink.insert(name);
+            }
+        }
+        Expr::Call(call) => {
+            if let Callee::Expr(callee) = &call.callee {
+                collect_in_expr(callee, scope, sink);
+            }
+            for arg in &call.args {
+                collect_in_expr(&arg.expr, scope, sink);
+            }
+        }
+        Expr::Member(member) => {
+            // Only the object side contributes a free name; the
+            // property side is a static identifier in JS object space.
+            collect_in_expr(&member.obj, scope, sink);
+            if let MemberProp::Computed(computed) = &member.prop {
+                collect_in_expr(&computed.expr, scope, sink);
+            }
+        }
+        Expr::Bin(bin) => {
+            collect_in_expr(&bin.left, scope, sink);
+            collect_in_expr(&bin.right, scope, sink);
+        }
+        Expr::Unary(unary) => collect_in_expr(&unary.arg, scope, sink),
+        Expr::Cond(cond) => {
+            collect_in_expr(&cond.test, scope, sink);
+            collect_in_expr(&cond.cons, scope, sink);
+            collect_in_expr(&cond.alt, scope, sink);
+        }
+        Expr::Paren(paren) => collect_in_expr(&paren.expr, scope, sink),
+        Expr::Tpl(tpl) => {
+            for e in &tpl.exprs {
+                collect_in_expr(e, scope, sink);
+            }
+        }
+        Expr::Array(array) => {
+            for elem in array.elems.iter().flatten() {
+                collect_in_expr(&elem.expr, scope, sink);
+            }
+        }
+        Expr::Object(object) => {
+            for prop in &object.props {
+                if let swc_ecma_ast::PropOrSpread::Prop(p) = prop {
+                    if let swc_ecma_ast::Prop::KeyValue(kv) = p.as_ref() {
+                        collect_in_expr(&kv.value, scope, sink);
+                    }
+                }
+            }
+        }
+        Expr::Arrow(arrow) => {
+            scope.push();
+            for param in &arrow.params {
+                bind_pat(param, scope);
+            }
+            match &*arrow.body {
+                BlockStmtOrExpr::Expr(e) => collect_in_expr(e, scope, sink),
+                BlockStmtOrExpr::BlockStmt(b) => {
+                    for s in &b.stmts {
+                        collect_in_stmt(s, scope, sink);
+                    }
+                }
+            }
+            scope.pop();
+        }
+        Expr::Fn(fn_expr) => {
+            scope.push();
+            for param in &fn_expr.function.params {
+                bind_pat(&param.pat, scope);
+            }
+            if let Some(body) = &fn_expr.function.body {
+                for s in &body.stmts {
+                    collect_in_stmt(s, scope, sink);
+                }
+            }
+            scope.pop();
+        }
+        Expr::New(new_expr) => {
+            collect_in_expr(&new_expr.callee, scope, sink);
+            if let Some(args) = &new_expr.args {
+                for arg in args {
+                    collect_in_expr(&arg.expr, scope, sink);
+                }
+            }
+        }
+        Expr::OptChain(opt) => match &*opt.base {
+            swc_ecma_ast::OptChainBase::Member(m) => {
+                collect_in_expr(&m.obj, scope, sink);
+            }
+            swc_ecma_ast::OptChainBase::Call(c) => {
+                collect_in_expr(&c.callee, scope, sink);
+                for arg in &c.args {
+                    collect_in_expr(&arg.expr, scope, sink);
+                }
+            }
+        },
+        Expr::TsAs(node) => collect_in_expr(&node.expr, scope, sink),
+        Expr::TsNonNull(node) => collect_in_expr(&node.expr, scope, sink),
+        Expr::TsConstAssertion(node) => collect_in_expr(&node.expr, scope, sink),
+        Expr::TsTypeAssertion(node) => collect_in_expr(&node.expr, scope, sink),
+        _ => {}
+    }
+}
+
+fn bind_pat(pat: &Pat, scope: &mut ScopeStack) {
+    match pat {
+        Pat::Ident(ident) => scope.bind(ident.id.sym.to_string()),
+        Pat::Array(array) => {
+            for elem in array.elems.iter().flatten() {
+                bind_pat(elem, scope);
+            }
+        }
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    swc_ecma_ast::ObjectPatProp::Assign(assign) => {
+                        scope.bind(assign.key.sym.to_string());
+                    }
+                    swc_ecma_ast::ObjectPatProp::KeyValue(kv) => {
+                        bind_pat(&kv.value, scope);
+                    }
+                    swc_ecma_ast::ObjectPatProp::Rest(rest) => {
+                        bind_pat(&rest.arg, scope);
+                    }
+                }
             }
         }
         _ => {}
