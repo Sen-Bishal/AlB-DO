@@ -570,6 +570,199 @@ fn stage2_greeter_captures_multiple_props_of_different_shapes() {
     );
 }
 
+// ── Stage 3 · closures over module-level constants ───────────────────
+
+#[test]
+fn stage3_module_constants_are_visible_in_jsx_render() {
+    let project = compile("capped");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store.clone());
+
+    let opts = RenderOptions { hook_compile: true };
+    let render = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &Value::Object(Default::default()),
+        &slots,
+        &opts,
+    )
+    .expect("capped renders");
+
+    // `{LABEL}: {n}` should resolve LABEL from the module const.
+    assert!(
+        render.html.contains(">n: 0</button>") || render.html.contains(">n: 0</button>"),
+        "render must resolve module constant `LABEL` in JSX text; got: {}",
+        render.html
+    );
+}
+
+#[test]
+fn stage3_handler_resolves_module_constant_in_setter_arg() {
+    let project = compile("capped");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store.clone());
+
+    let opts = RenderOptions { hook_compile: true };
+    let render = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &Value::Object(Default::default()),
+        &slots,
+        &opts,
+    )
+    .expect("render");
+
+    let proxy_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
+            _ => None,
+        })
+        .expect("BindEvent");
+    let slot_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        })
+        .expect("SetTextRef");
+
+    // Click — `Math.min(0 + 1, MAX=5)` = 1.
+    project
+        .invoke_action(
+            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &slots,
+        )
+        .expect("dispatch");
+    let raw = store.read(session, slot_id).expect("slot written");
+    let v: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        v.as_f64().map(|f| f as i64),
+        Some(1),
+        "handler must resolve module const MAX=5 in Math.min(n+1, MAX); got {v:?}"
+    );
+}
+
+#[test]
+fn stage3_handler_caps_at_module_constant_after_many_clicks() {
+    // Phase J's eval handles `Math.min(...)`. After MAX clicks the
+    // slot should stay at MAX. Validates that module consts remain
+    // resolvable across many sequential handler invocations and that
+    // the slot store survives the loop.
+    let project = compile("capped");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store.clone());
+
+    let opts = RenderOptions { hook_compile: true };
+    let render = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &Value::Object(Default::default()),
+        &slots,
+        &opts,
+    )
+    .expect("render");
+
+    let proxy_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
+            _ => None,
+        })
+        .expect("BindEvent");
+    let slot_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        })
+        .expect("SetTextRef");
+
+    for _ in 0..10 {
+        project
+            .invoke_action(
+                &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+                &slots,
+            )
+            .expect("dispatch");
+    }
+
+    let raw = store.read(session, slot_id).expect("slot written");
+    let v: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        v.as_f64().map(|f| f as i64),
+        Some(5),
+        "after 10 clicks, Math.min(n+1, MAX=5) must cap n at MAX=5"
+    );
+}
+
+#[test]
+fn stage3_chained_consts_resolve_in_source_order() {
+    // `DOUBLE = BASE + BASE` requires sequential eval against the
+    // accumulating env. The corpus pins this: useState's initial is
+    // BASE; the handler writes DOUBLE.
+    let project = compile("chained_consts");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store.clone());
+
+    let opts = RenderOptions { hook_compile: true };
+    let render = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &Value::Object(Default::default()),
+        &slots,
+        &opts,
+    )
+    .expect("render");
+
+    // useState(BASE) → n initial = 7.
+    assert!(
+        render.html.contains(">7</button>"),
+        "render must show useState(BASE) initial = 7; got: {}",
+        render.html
+    );
+
+    let proxy_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
+            _ => None,
+        })
+        .expect("BindEvent");
+    let slot_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        })
+        .expect("SetTextRef");
+
+    project
+        .invoke_action(
+            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &slots,
+        )
+        .expect("dispatch");
+
+    let raw = store.read(session, slot_id).expect("slot written");
+    let v: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        v.as_f64().map(|f| f as i64),
+        Some(14),
+        "handler must resolve DOUBLE = BASE + BASE = 14"
+    );
+}
+
 // ── Intern table contract ────────────────────────────────────────────
 
 /// Every render that emits any `BindEvent` must also prepend an

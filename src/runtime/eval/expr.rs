@@ -33,6 +33,12 @@ pub struct ParsedModule {
     pub imports: HashMap<String, ImportBinding>,
     pub functions: HashMap<String, ComponentFunction>,
     pub default_export: Option<String>,
+    /// Stage 3 — top-level `const/let/var X = expr` declarations whose
+    /// init isn't a function. Order preserved (Vec, not HashMap) so a
+    /// forward-referenced const sees prior ones during sequential eval.
+    /// Imported names live in `imports`; only declared-in-this-module
+    /// bindings show up here.
+    pub module_constants: Vec<(String, Expr)>,
 }
 
 pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
@@ -41,6 +47,7 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
         imports: HashMap::new(),
         functions: HashMap::new(),
         default_export: None,
+        module_constants: Vec::new(),
     };
     let mut synthetic_index = 0usize;
 
@@ -86,7 +93,10 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
                             .functions
                             .insert(name, function_from_fn_decl(&fn_decl)?);
                     }
-                    Decl::Var(var_decl) => collect_var_functions(&var_decl, &mut parsed.functions)?,
+                    Decl::Var(var_decl) => {
+                        collect_var_functions(&var_decl, &mut parsed.functions)?;
+                        collect_var_constants(&var_decl, &mut parsed.module_constants);
+                    }
                     _ => {}
                 },
                 ModuleDecl::ExportDefaultDecl(default_decl) => {
@@ -145,7 +155,8 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
                         .insert(name, function_from_fn_decl(&fn_decl)?);
                 }
                 Stmt::Decl(Decl::Var(var_decl)) => {
-                    collect_var_functions(&var_decl, &mut parsed.functions)?
+                    collect_var_functions(&var_decl, &mut parsed.functions)?;
+                    collect_var_constants(&var_decl, &mut parsed.module_constants);
                 }
                 _ => {}
             },
@@ -238,6 +249,26 @@ fn collect_var_functions(
         }
     }
     Ok(())
+}
+
+/// Stage 3 — collect module-level `const X = expr` declarations whose
+/// init isn't a function (those are already in `functions`). Pushed in
+/// source order so a forward-referenced const can see prior ones
+/// during sequential render-time eval.
+fn collect_var_constants(var_decl: &VarDecl, out: &mut Vec<(String, Expr)>) {
+    for decl in &var_decl.decls {
+        let name = match &decl.name {
+            Pat::Ident(binding_ident) => binding_ident.id.sym.to_string(),
+            _ => continue,
+        };
+        let Some(init) = &decl.init else { continue };
+        // Skip function-shaped inits — `collect_var_functions` already
+        // recorded those as renderable components.
+        match &**init {
+            Expr::Arrow(_) | Expr::Fn(_) => {}
+            _ => out.push((name, (**init).clone())),
+        }
+    }
 }
 
 pub fn apply_var_pat_to_env(pat: &Pat, value: Value, env: &mut HashMap<String, Value>) {
