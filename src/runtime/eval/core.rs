@@ -1,7 +1,13 @@
+use crate::ir::opcode::{Instruction, ProxyId, SlotId, StableId};
+use crate::runtime::compiled::{
+    allocate_proxy_id, CompiledComponent, CompiledProject,
+};
+use crate::runtime::slot_store::SessionSlotView;
+use crate::transforms::events::HandlerBody;
 use crate::types::ComponentId;
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -41,6 +47,377 @@ fn next_element_stable_id(module_spec: &str) -> u32 {
 
 fn reset_element_counter() {
     RENDER_ELEMENT_COUNTER.with(|cell| cell.set(0));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase K · hook-compile thread-local state
+//
+// `RENDER_K` is populated by `render_entry_compiled` and `eval_handler_body`
+// for the duration of one render or handler dispatch. It threads:
+//   * the session slot view (for slot reads and writes),
+//   * the accumulator for binding opcodes (`BindEvent`, `SetTextRef`),
+//   * a stack of containing element `data-albedo-id`s (so a slot read
+//     in JSX text-position knows which element to subscribe), and
+//   * a stack of per-component hook scopes (so identifier lookup
+//     resolves slot-bound names against the right metadata).
+// ─────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    static RENDER_K: RefCell<Option<RenderKState>> = const { RefCell::new(None) };
+}
+
+struct RenderKState {
+    slots: SessionSlotView,
+    opcodes: Vec<Instruction>,
+    element_stack: Vec<u32>,
+    scopes: Vec<ComponentScope>,
+    /// Render-scoped event intern table. Allocation order is "first
+    /// appearance" of each unique event name, starting at id 1 (0 is
+    /// reserved for an unset/sentinel id elsewhere in the substrate).
+    /// `drain_phase_k_opcodes` prepends a single
+    /// `InitInternTable { kind: Event, entries: ... }` opcode so
+    /// bakabox can resolve the event_id every `BindEvent` references.
+    event_intern: HashMap<String, u16>,
+    event_intern_order: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ComponentScope {
+    module_spec: String,
+    function_name: String,
+    /// Map from value-binding name (`n`) → slot id holding its value.
+    value_slots: HashMap<String, SlotId>,
+    /// Map from setter-binding name (`setN`) → slot id whose value is
+    /// overwritten when the setter is called.
+    setter_slots: HashMap<String, SlotId>,
+    /// Handler proxy_ids in source order. Indexed by `handlers_emitted`
+    /// as the renderer encounters JSX `on*` attributes.
+    proxy_ids: Vec<u32>,
+    /// Cursor into `proxy_ids` advanced as handlers are emitted.
+    handlers_emitted: usize,
+    /// Initial-value expressions for each hook in source order. Used
+    /// when a slot has not been written yet (first render) to derive
+    /// the initial value via the existing Phase-J interpreter.
+    initials: Vec<swc_ecma_ast::Expr>,
+    /// Map from value-binding name to its position in `initials`. Used
+    /// during useState destructure to look up the initial.
+    hook_index_for_value: HashMap<String, usize>,
+}
+
+fn phase_k_enabled() -> bool {
+    RENDER_K.with(|cell| cell.borrow().is_some())
+}
+
+fn phase_k_push_scope(scope: ComponentScope) {
+    RENDER_K.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.scopes.push(scope);
+        }
+    });
+}
+
+fn phase_k_pop_scope() {
+    RENDER_K.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.scopes.pop();
+        }
+    });
+}
+
+fn phase_k_push_element(stable_id: u32) {
+    RENDER_K.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.element_stack.push(stable_id);
+        }
+    });
+}
+
+fn phase_k_pop_element() {
+    RENDER_K.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.element_stack.pop();
+        }
+    });
+}
+
+fn phase_k_top_element() -> Option<u32> {
+    RENDER_K.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|state| state.element_stack.last().copied())
+    })
+}
+
+fn phase_k_emit(op: Instruction) {
+    RENDER_K.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.opcodes.push(op);
+        }
+    });
+}
+
+fn phase_k_slot_for_value(name: &str) -> Option<SlotId> {
+    RENDER_K.with(|cell| {
+        cell.borrow().as_ref().and_then(|state| {
+            state
+                .scopes
+                .last()
+                .and_then(|scope| scope.value_slots.get(name).copied())
+        })
+    })
+}
+
+fn phase_k_slot_for_setter(name: &str) -> Option<SlotId> {
+    RENDER_K.with(|cell| {
+        cell.borrow().as_ref().and_then(|state| {
+            state
+                .scopes
+                .last()
+                .and_then(|scope| scope.setter_slots.get(name).copied())
+        })
+    })
+}
+
+fn phase_k_next_proxy_id_for_event(event_name: &str) -> Option<u32> {
+    RENDER_K.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let state = borrow.as_mut()?;
+        let scope = state.scopes.last_mut()?;
+        // The compile pass laid down proxy_ids in source-traversal
+        // order; we advance one per emit and verify the recorded
+        // event_name matches what the render is asking for. A
+        // mismatch means the event order drifted between extraction
+        // and render — fail loud rather than silently misroute.
+        let idx = scope.handlers_emitted;
+        let proxy_id = *scope.proxy_ids.get(idx)?;
+        scope.handlers_emitted = idx + 1;
+        // Belt-and-suspenders: re-derive the proxy_id from the
+        // scope's identity + this event_name + idx, and assert it
+        // matches. Mismatch is a programming error in the extractor.
+        let derived = allocate_proxy_id(
+            &scope.module_spec,
+            &scope.function_name,
+            event_name,
+            idx,
+        );
+        debug_assert_eq!(
+            proxy_id, derived,
+            "phase K proxy_id drift: recorded {proxy_id} but derived {derived} for {}::{}::{event_name}#{idx}",
+            scope.module_spec, scope.function_name,
+        );
+        Some(proxy_id)
+    })
+}
+
+fn phase_k_read_slot_value(slot_id: SlotId) -> Option<Vec<u8>> {
+    RENDER_K.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|state| state.slots.read(slot_id))
+    })
+}
+
+fn phase_k_write_slot_value(slot_id: SlotId, bytes: Vec<u8>) {
+    RENDER_K.with(|cell| {
+        if let Some(state) = cell.borrow().as_ref() {
+            state.slots.write(slot_id, bytes);
+        }
+    });
+}
+
+fn phase_k_current_hook_initial(value_name: &str) -> Option<swc_ecma_ast::Expr> {
+    RENDER_K.with(|cell| {
+        cell.borrow().as_ref().and_then(|state| {
+            let scope = state.scopes.last()?;
+            let idx = scope.hook_index_for_value.get(value_name).copied()?;
+            scope.initials.get(idx).cloned()
+        })
+    })
+}
+
+/// RAII installer/restorer for the Phase-K thread-local state. Even
+/// on panic, the previous (typically `None`) state is reinstated so
+/// concurrent renderers on the same thread don't observe leaked state.
+struct PhaseKGuard {
+    previous: Option<RenderKState>,
+}
+
+impl PhaseKGuard {
+    fn install(slots: SessionSlotView) -> Self {
+        let previous = RENDER_K.with(|cell| {
+            cell.replace(Some(RenderKState {
+                slots,
+                opcodes: Vec::new(),
+                element_stack: Vec::new(),
+                scopes: Vec::new(),
+                event_intern: HashMap::new(),
+                event_intern_order: Vec::new(),
+            }))
+        });
+        Self { previous }
+    }
+}
+
+impl Drop for PhaseKGuard {
+    fn drop(&mut self) {
+        RENDER_K.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+// `render_local` resolves the current component's scope via
+// `current_phase_k_component`, which reads from a thread-local raw
+// pointer to the active `CompiledProject` (installed below). The
+// pointer is the right trade for keeping the Phase-J `render_*`
+// signatures untouched; thread-local-by-pointer is safe because the
+// borrow is single-threaded and the guard is dropped before the
+// reference goes out of scope on the calling stack frame.
+thread_local! {
+    static PHASE_K_PROJECT: Cell<Option<*const CompiledProject>> = const { Cell::new(None) };
+}
+
+fn install_phase_k_project(project: &CompiledProject) -> PhaseKProjectGuard {
+    let previous = PHASE_K_PROJECT.with(|cell| cell.replace(Some(project as *const _)));
+    PhaseKProjectGuard { previous }
+}
+
+struct PhaseKProjectGuard {
+    previous: Option<*const CompiledProject>,
+}
+
+impl Drop for PhaseKProjectGuard {
+    fn drop(&mut self) {
+        PHASE_K_PROJECT.with(|cell| cell.set(self.previous));
+    }
+}
+
+fn current_phase_k_component(module_spec: &str, function_name: &str) -> Option<ComponentScope> {
+    PHASE_K_PROJECT.with(|cell| {
+        let ptr = cell.get()?;
+        // Safety: the project reference is alive for the duration of
+        // the render — `render_entry_compiled` holds `&CompiledProject`
+        // on its stack frame while the eval runs, and the guard is
+        // dropped before that frame returns. No concurrent mutation
+        // is possible because access is thread-local.
+        let project = unsafe { &*ptr };
+        let meta = project.component_meta(module_spec, function_name)?;
+        Some(ComponentScope {
+            module_spec: meta.module_spec.clone(),
+            function_name: meta.function_name.clone(),
+            value_slots: meta.value_slots.clone(),
+            setter_slots: meta.setter_slots.clone(),
+            proxy_ids: meta.proxy_ids.clone(),
+            handlers_emitted: 0,
+            initials: meta.hooks.iter().map(|h| h.initial.clone()).collect(),
+            hook_index_for_value: meta
+                .hooks
+                .iter()
+                .map(|h| (h.value_name.clone(), h.hook_idx))
+                .collect(),
+        })
+    })
+}
+
+fn drain_phase_k_opcodes() -> Vec<Instruction> {
+    use crate::ir::opcode::{InternEntry, InternTable, InternTableKind};
+
+    RENDER_K.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(state) = borrow.as_mut() else {
+            return Vec::new();
+        };
+        let body = std::mem::take(&mut state.opcodes);
+
+        // Prepend the event intern table so bakabox can resolve every
+        // `event_id` carried by a `BindEvent` opcode below. The control
+        // stream conventionally ships intern tables ahead of the
+        // referencing opcodes; we honour the same ordering here.
+        let mut out: Vec<Instruction> = Vec::with_capacity(body.len() + 1);
+        if !state.event_intern_order.is_empty() {
+            let entries: Vec<InternEntry> = state
+                .event_intern_order
+                .iter()
+                .enumerate()
+                .map(|(idx, name)| InternEntry {
+                    id: (idx as u16).saturating_add(1),
+                    value: name.clone(),
+                })
+                .collect();
+            out.push(Instruction::InitInternTable {
+                table: InternTable {
+                    kind: InternTableKind::Event,
+                    entries,
+                },
+            });
+        }
+        out.extend(body);
+        out
+    })
+}
+
+/// `useState(...)` from `react` AND the current Phase-K scope knows
+/// about it. Used by `eval_var_decl_into_env` to decide whether to
+/// route through the slot store or fall through to the Phase-J shim.
+fn is_use_state_in_phase_k_scope(call: &swc_ecma_ast::CallExpr) -> bool {
+    use swc_ecma_ast::*;
+    let Callee::Expr(callee) = &call.callee else { return false };
+    let Expr::Ident(ident) = callee.as_ref() else { return false };
+    ident.sym.as_ref() == "useState" && phase_k_enabled()
+}
+
+/// Drain pending dirty entries WITHOUT producing opcodes. Used after
+/// a first-render initialisation write so the initial value doesn't
+/// show up as a user-driven mutation in the response frame.
+fn drain_initial_slot_writes() {
+    RENDER_K.with(|cell| {
+        if let Some(state) = cell.borrow().as_ref() {
+            let _ = state.slots.drain_pending();
+        }
+    });
+}
+
+/// Detect whether the expression in a JSX text-position child is a
+/// bare slot-bound identifier (e.g. `{n}` for `const [n, setN] =
+/// useState(0)`). Returns the SlotId when so, signalling that the
+/// renderer should emit a `SetTextRef` binding for the containing
+/// element. Phase K Stage 1 only recognises the simple shape; member
+/// access (`state.value`), arithmetic, and method calls are Phase J
+/// reads and don't subscribe to slot changes.
+fn phase_k_detect_slot_text_read(expr: &swc_ecma_ast::Expr) -> Option<SlotId> {
+    use swc_ecma_ast::*;
+    match expr {
+        Expr::Ident(ident) => phase_k_slot_for_value(&ident.sym.to_string()),
+        Expr::Paren(paren) => phase_k_detect_slot_text_read(&paren.expr),
+        Expr::TsAs(node) => phase_k_detect_slot_text_read(&node.expr),
+        Expr::TsNonNull(node) => phase_k_detect_slot_text_read(&node.expr),
+        Expr::TsTypeAssertion(node) => phase_k_detect_slot_text_read(&node.expr),
+        _ => None,
+    }
+}
+
+/// Render-scoped event interner. Allocates ids in first-appearance
+/// order starting at 1; id 0 is reserved as a sentinel. Bakabox
+/// resolves event_id → name through the `InitInternTable` opcode the
+/// drain step prepends, so the id only needs to be unique within one
+/// render frame.
+fn phase_k_event_id_for(event_name: &str) -> crate::ir::opcode::EventId {
+    use crate::ir::opcode::EventId;
+    RENDER_K.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let state = match borrow.as_mut() {
+            Some(state) => state,
+            None => return EventId(0),
+        };
+        if let Some(id) = state.event_intern.get(event_name) {
+            return EventId(*id);
+        }
+        // Next free id; +1 because 0 is reserved.
+        let id = (state.event_intern_order.len() as u16).saturating_add(1);
+        state.event_intern.insert(event_name.to_string(), id);
+        state.event_intern_order.push(event_name.to_string());
+        EventId(id)
+    })
 }
 use crate::runtime::eval::expr::{
     apply_var_pat_to_env, bind_params, bind_params_positional, param_from_pat,
@@ -230,6 +607,121 @@ impl ComponentProject {
         self.render_export(&entry, "default", props)
     }
 
+    /// Exposes the parsed-module table so [`CompiledProject`] can run
+    /// its Phase-K extractors over every function without re-parsing.
+    #[must_use]
+    pub fn modules(&self) -> &HashMap<String, ParsedModule> {
+        &self.modules
+    }
+
+    /// Phase-K render entry: produces HTML plus the binding opcodes
+    /// (`BindEvent`, `SetTextRef`) needed to hydrate the rendered
+    /// shell against the session slot store. The opcodes ride the
+    /// existing WT patches stream when the server ships them.
+    ///
+    /// Falls back to a Phase-J render when the compiled metadata for
+    /// the entry component is empty (no hooks, no handlers).
+    pub fn render_entry_compiled(
+        &self,
+        entry: &str,
+        props: &Value,
+        compiled: &CompiledProject,
+        slots: &SessionSlotView,
+    ) -> Result<(String, Vec<Instruction>)> {
+        reset_element_counter();
+        let entry = self
+            .resolve_entry(entry)
+            .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
+
+        // Set up the Phase-K thread-local state. RAII guard restores
+        // the previous (None) state even on panic so concurrent
+        // renderers on the same thread don't see stale scope. The
+        // project guard exposes the compiled metadata to `render_local`
+        // via a thread-local pointer — see `current_phase_k_component`.
+        let _slot_guard = PhaseKGuard::install(slots.clone());
+        let _project_guard = install_phase_k_project(compiled);
+
+        let html = self.render_export(&entry, "default", props)?;
+        let opcodes = drain_phase_k_opcodes();
+        Ok((html, opcodes))
+    }
+
+    /// Re-execute a handler body server-side. The body is whatever
+    /// `transforms::events::extract_handlers_in_function` surfaced —
+    /// either a single expression (arrow body) or a block of
+    /// statements. Setter calls inside the body translate to slot
+    /// writes; identifier reads of slot-bound names translate to slot
+    /// reads. Returns the explicit `Vec<Instruction>` from the body
+    /// (the body itself rarely emits anything explicit — the SlotSet
+    /// opcodes come from `SessionSlotView::drain_pending` afterwards).
+    pub fn eval_handler_body(
+        &self,
+        module_spec: &str,
+        body: &HandlerBody,
+        component: &CompiledComponent,
+        slots: &SessionSlotView,
+    ) -> Result<Vec<Instruction>> {
+        let _guard = PhaseKGuard::install(slots.clone());
+        // Push the component's scope. We don't need any of the
+        // pre-cache work because a handler only ever runs against one
+        // component scope at a time.
+        let scope = ComponentScope {
+            module_spec: component.module_spec.clone(),
+            function_name: component.function_name.clone(),
+            value_slots: component.value_slots.clone(),
+            setter_slots: component.setter_slots.clone(),
+            proxy_ids: component.proxy_ids.clone(),
+            handlers_emitted: 0,
+            initials: component.hooks.iter().map(|h| h.initial.clone()).collect(),
+            hook_index_for_value: component
+                .hooks
+                .iter()
+                .map(|h| (h.value_name.clone(), h.hook_idx))
+                .collect(),
+        };
+        phase_k_push_scope(scope);
+
+        // Seed env with the current slot values so identifier reads
+        // resolve to live state, not stale literals. The eval will
+        // also lazy-load via `phase_k_slot_for_value` when an ident
+        // isn't in env, so this is a fast path rather than a
+        // correctness gate.
+        let mut env: HashMap<String, Value> = HashMap::new();
+        for (name, slot_id) in &component.value_slots {
+            if let Some(bytes) = slots.read(*slot_id) {
+                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                    env.insert(name.clone(), value);
+                }
+            } else if let Some(initial_expr) = component
+                .hooks
+                .iter()
+                .find(|h| &h.value_name == name)
+                .map(|h| h.initial.clone())
+            {
+                let value = self.eval_expr(module_spec, &initial_expr, &env).unwrap_or(Value::Null);
+                env.insert(name.clone(), value);
+            }
+        }
+
+        let result: Result<Vec<Instruction>> = match body {
+            HandlerBody::Expr(expr) => {
+                let _ = self.eval_expr(module_spec, expr, &env)?;
+                Ok(Vec::new())
+            }
+            HandlerBody::Block(stmts) => {
+                // Evaluate each statement; we only care about side
+                // effects (slot writes via setter calls). Returns from
+                // a handler are ignored in Phase K Stage 1.
+                let mut local_env = env.clone();
+                self.eval_body_stmts(module_spec, stmts, &mut local_env)
+                    .map(|_| Vec::new())
+            }
+        };
+
+        phase_k_pop_scope();
+        result
+    }
+
     fn resolve_entry(&self, entry: &str) -> Option<String> {
         let entry = normalize_slashes(entry);
         if self.modules.contains_key(&entry) {
@@ -303,7 +795,28 @@ impl ComponentProject {
         let mut env = HashMap::new();
         bind_params(&function.params, props, &mut env);
         let stmts = function.body_stmts.clone();
-        self.eval_body_stmts(module_spec, &stmts, &mut env)
+
+        // Phase K: push this component's scope if hook-compile is
+        // enabled and the compiled project has metadata for it. Pop
+        // unconditionally on the way out so panics during eval don't
+        // leak scope into a parent component's render.
+        let pushed_phase_k_scope = if phase_k_enabled() {
+            if let Some(scope) = current_phase_k_component(module_spec, function_name) {
+                phase_k_push_scope(scope);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let result = self.eval_body_stmts(module_spec, &stmts, &mut env);
+
+        if pushed_phase_k_scope {
+            phase_k_pop_scope();
+        }
+        result
     }
 
     fn eval_expr(
@@ -766,6 +1279,26 @@ impl ComponentProject {
         if let Callee::Expr(callee_expr) = &call.callee {
             if let Expr::Ident(ident) = callee_expr.as_ref() {
                 let fn_name = ident.sym.to_string();
+
+                // Phase K · setter dispatch: when the current scope
+                // has registered `fn_name` as a useState setter, the
+                // call is a slot write — evaluate the arg, JSON-encode
+                // it, and store. Returns Null so the handler body's
+                // overall value (which is discarded) doesn't surface
+                // a confusing string-cast of the written value.
+                if let Some(slot_id) = phase_k_slot_for_setter(&fn_name) {
+                    let arg_value = match call.args.first() {
+                        Some(arg) if arg.spread.is_none() => {
+                            self.eval_expr(module_spec, &arg.expr, env)?
+                        }
+                        _ => Value::Null,
+                    };
+                    if let Ok(bytes) = serde_json::to_vec(&arg_value) {
+                        phase_k_write_slot_value(slot_id, bytes);
+                    }
+                    return Ok(Value::Null);
+                }
+
                 let module = self.modules.get(module_spec);
                 let import = module.and_then(|m| m.imports.get(&fn_name));
 
@@ -1096,7 +1629,80 @@ impl ComponentProject {
         var: &swc_ecma_ast::VarDecl,
         env: &mut HashMap<String, Value>,
     ) {
+        use swc_ecma_ast::*;
+
         for decl in &var.decls {
+            // Phase K hook-compile path: when `const [name, setter] =
+            // useState(initial)` is recognised AND the current scope
+            // has metadata for `name`, bind `name` to the current slot
+            // value (initialising the slot from `initial` on first
+            // access). The setter binding stays as Null in env — the
+            // call site is intercepted by `eval_call_expr`.
+            if let Pat::Array(array) = &decl.name {
+                if let Some(init) = &decl.init {
+                    if let Expr::Call(call) = init.as_ref() {
+                        if is_use_state_in_phase_k_scope(call) {
+                            let value_name = array
+                                .elems
+                                .first()
+                                .and_then(|opt| opt.as_ref())
+                                .and_then(|p| match p {
+                                    Pat::Ident(ident) => Some(ident.id.sym.to_string()),
+                                    _ => None,
+                                });
+                            let setter_name = array
+                                .elems
+                                .get(1)
+                                .and_then(|opt| opt.as_ref())
+                                .and_then(|p| match p {
+                                    Pat::Ident(ident) => Some(ident.id.sym.to_string()),
+                                    _ => None,
+                                });
+                            if let Some(name) = value_name {
+                                if let Some(slot_id) = phase_k_slot_for_value(&name) {
+                                    let value = match phase_k_read_slot_value(slot_id) {
+                                        Some(bytes) => serde_json::from_slice::<Value>(&bytes)
+                                            .unwrap_or(Value::Null),
+                                        None => {
+                                            // First read for this slot — seed it from
+                                            // the initial expression so the state
+                                            // persists across re-renders.
+                                            let initial_expr = phase_k_current_hook_initial(&name);
+                                            let initial_value = initial_expr
+                                                .as_ref()
+                                                .map(|expr| {
+                                                    self.eval_expr(module_spec, expr, env)
+                                                        .unwrap_or(Value::Null)
+                                                })
+                                                .unwrap_or(Value::Null);
+                                            if let Ok(bytes) =
+                                                serde_json::to_vec(&initial_value)
+                                            {
+                                                phase_k_write_slot_value(slot_id, bytes);
+                                                // Drain immediately — first-render
+                                                // initialisations are not user-visible
+                                                // mutations, they shouldn't show up
+                                                // in the response opcode frame as a
+                                                // SlotSet. Drop the pending entries
+                                                // by draining and ignoring.
+                                                drain_initial_slot_writes();
+                                            }
+                                            initial_value
+                                        }
+                                    };
+                                    env.insert(name.clone(), value);
+                                    if let Some(setter) = setter_name {
+                                        env.insert(setter, Value::Null);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Phase J fallback: existing behaviour.
             let value = if let Some(init) = &decl.init {
                 self.eval_expr(module_spec, init, env)
                     .unwrap_or(Value::Null)
@@ -1160,20 +1766,60 @@ impl ComponentProject {
         //
         // We don't override an explicit user-supplied `data-albedo-id`,
         // which lets test harnesses or static fragments pin a known id.
-        if !attrs
+        let stable_id = match attrs
             .iter()
-            .any(|(name, _)| name == ALBEDO_ID_ATTR)
+            .find(|(name, _)| name == ALBEDO_ID_ATTR)
+            .and_then(|(_, value)| value.as_str())
+            .and_then(|s| s.parse::<u32>().ok())
         {
-            let stable_id = next_element_stable_id(module_spec);
-            attrs.push((
-                ALBEDO_ID_ATTR.to_string(),
-                Value::String(stable_id.to_string()),
-            ));
+            Some(existing) => existing,
+            None => {
+                let id = next_element_stable_id(module_spec);
+                attrs.push((
+                    ALBEDO_ID_ATTR.to_string(),
+                    Value::String(id.to_string()),
+                ));
+                id
+            }
+        };
+
+        // Phase K · emit BindEvent for every JSX `on*` handler attached
+        // to this element. The proxy_ids were allocated at compile
+        // time in source order; the per-scope cursor (`handlers_emitted`)
+        // advances one per emit. event_id is the host-level event name
+        // — the wire opcode carries the same lowercase string bakabox
+        // already maps via `addEventListener`.
+        if phase_k_enabled() {
+            for attr in &element.opening.attrs {
+                if let JSXAttrOrSpread::JSXAttr(jsx_attr) = attr {
+                    if let JSXAttrName::Ident(name_ident) = &jsx_attr.name {
+                        let name = name_ident.sym.to_string();
+                        if name.starts_with("on") && name.len() > 2 {
+                            let event_name = name[2..].to_ascii_lowercase();
+                            if let Some(proxy_id) =
+                                phase_k_next_proxy_id_for_event(&event_name)
+                            {
+                                phase_k_emit(Instruction::BindEvent {
+                                    stable_id: StableId(stable_id),
+                                    event_id: phase_k_event_id_for(&event_name),
+                                    proxy_id: ProxyId(proxy_id),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        // Push the element onto the scope-stack so a slot read inside
+        // this element's children knows which `stable_id` to subscribe.
+        phase_k_push_element(stable_id);
 
         let attrs_html = render_attrs(&attrs);
         let children_html = self.render_children(module_spec, &element.children, env, false)?;
         let void_tag = is_void_tag(&tag);
+
+        phase_k_pop_element();
 
         if void_tag && children_html.is_empty() {
             if attrs_html.is_empty() {
@@ -1314,6 +1960,21 @@ impl ComponentProject {
                 }
                 JSXElementChild::JSXExprContainer(container) => match &container.expr {
                     JSXExpr::Expr(expr) => {
+                        // Phase K: when the child expression is a bare
+                        // slot-bound identifier, the rendered text node
+                        // becomes a reactive binding site. Emit
+                        // SetTextRef targeting the containing element
+                        // (top of element_stack) so bakabox subscribes
+                        // it to the slot store and re-applies on
+                        // future SlotSet opcodes.
+                        if let Some(slot_id) = phase_k_detect_slot_text_read(expr) {
+                            if let Some(stable_id) = phase_k_top_element() {
+                                phase_k_emit(Instruction::SetTextRef {
+                                    stable_id: StableId(stable_id),
+                                    slot_id,
+                                });
+                            }
+                        }
                         let value = self.eval_expr(module_spec, expr, env)?;
                         if matches!(value, Value::Null | Value::Bool(false)) {
                             continue;

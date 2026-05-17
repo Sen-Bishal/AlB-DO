@@ -18,7 +18,7 @@ use crate::ir::opcode::{Instruction, SlotId};
 use crate::runtime::session::SessionId;
 use dashmap::DashMap;
 use rustc_hash::FxHashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Concurrent server-side slot store. Constructed once per server and
 /// shared via `Arc<SlotStore>`.
@@ -108,6 +108,49 @@ impl SlotStore {
     /// `true` when no slots have been written. Convenience for tests.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+}
+
+/// Session-scoped slot view used by compile-time bindings (Phase K) and
+/// mirrored by `albedo_server::actions::SessionSlots` for the wire-side
+/// handler dispatcher. Identical structure on both sides so a server
+/// dispatcher and an in-process compile test share one substrate.
+///
+/// `Clone` is cheap — two `Arc` bumps — so threading the view through
+/// closures or spawned tasks is free.
+#[derive(Clone, Debug)]
+pub struct SessionSlotView {
+    session_id: SessionId,
+    store: Arc<SlotStore>,
+}
+
+impl SessionSlotView {
+    #[must_use]
+    pub fn new(session_id: SessionId, store: Arc<SlotStore>) -> Self {
+        Self { session_id, store }
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    #[must_use]
+    pub fn read(&self, slot_id: SlotId) -> Option<Vec<u8>> {
+        self.store.read(self.session_id, slot_id)
+    }
+
+    pub fn write(&self, slot_id: SlotId, value: Vec<u8>) {
+        self.store.write(self.session_id, slot_id, value);
+    }
+
+    pub fn drain_pending(&self) -> Vec<Instruction> {
+        self.store.drain_set_instructions(self.session_id)
+    }
+
+    #[must_use]
+    pub fn store(&self) -> &Arc<SlotStore> {
+        &self.store
     }
 }
 
