@@ -714,12 +714,13 @@ impl ComponentProject {
         };
         phase_k_push_scope(scope);
 
-        // Seed env with the current slot values so identifier reads
-        // resolve to live state, not stale literals. The eval will
-        // also lazy-load via `phase_k_slot_for_value` when an ident
-        // isn't in env, so this is a fast path rather than a
-        // correctness gate.
+        // Stage 3 · seed env with module-level constants first, so
+        // a handler body that references one resolves correctly.
+        // Slot values + captured props are seeded next, in that
+        // order — later seeds shadow earlier ones, which matches JS
+        // scoping (module const < component prop / state).
         let mut env: HashMap<String, Value> = HashMap::new();
+        self.seed_env_with_module_constants(module_spec, &mut env);
         for (name, slot_id) in &component.value_slots {
             if let Some(bytes) = slots.read(*slot_id) {
                 if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
@@ -797,6 +798,33 @@ impl ComponentProject {
         Some((normalize_specifier(relative_path), absolute_path))
     }
 
+    /// Stage 3 · evaluate module-level constants in source order and
+    /// seed them into `env`. Sequential evaluation against the
+    /// accumulating env so a later const can read earlier ones (forward
+    /// references in source order). Module constants whose init
+    /// references something the Phase J interpreter doesn't model
+    /// resolve to `Null` — a tracing warning surfaces the miss.
+    fn seed_env_with_module_constants(
+        &self,
+        module_spec: &str,
+        env: &mut HashMap<String, Value>,
+    ) {
+        let Some(module) = self.modules.get(module_spec) else { return };
+        if module.module_constants.is_empty() {
+            return;
+        }
+        // Clone the const list so we can `eval_expr(&self, ...)`
+        // without holding an immutable borrow of `self.modules`
+        // across the call.
+        let constants = module.module_constants.clone();
+        for (name, expr) in constants {
+            let value = self
+                .eval_expr(module_spec, &expr, env)
+                .unwrap_or(Value::Null);
+            env.insert(name, value);
+        }
+    }
+
     fn render_export(&self, module_spec: &str, export_name: &str, props: &Value) -> Result<String> {
         let module = self
             .modules
@@ -839,6 +867,13 @@ impl ComponentProject {
         })?;
 
         let mut env = HashMap::new();
+        // Stage 3 · seed env with module-level constants BEFORE
+        // binding props so a prop named the same as a const shadows
+        // (rare; matches JS scoping). Done in both Phase J and
+        // Phase K paths because module consts are universally useful
+        // and previously rendered as Null via the unbound-ident
+        // warning.
+        self.seed_env_with_module_constants(module_spec, &mut env);
         bind_params(&function.params, props, &mut env);
         let stmts = function.body_stmts.clone();
 
