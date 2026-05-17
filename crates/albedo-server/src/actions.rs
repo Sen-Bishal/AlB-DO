@@ -50,6 +50,15 @@ impl SessionSlots {
         self.session_id
     }
 
+    /// Returns a clone of the underlying shared store. Phase K's
+    /// `CompiledProjectActionAdapter` uses this to build a
+    /// `SessionSlotView` (the dom-render-compiler-side equivalent of
+    /// `SessionSlots`) that the compiled handler executes against.
+    #[must_use]
+    pub fn store(&self) -> &Arc<SlotStore> {
+        &self.store
+    }
+
     /// Reads the current value of `slot_id` for this session. Returns
     /// `None` when the slot has never been written.
     #[must_use]
