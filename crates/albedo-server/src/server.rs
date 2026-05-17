@@ -34,6 +34,49 @@ use tracing::{error, info};
 
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Bridge from a Phase-K `CompiledProject`'s handler registry to the
+/// server's `ActionHandler` trait. One adapter is registered per
+/// `(proxy_id, handler)` pair by `register_compiled_project`.
+///
+/// `handle` constructs a `SessionSlotView` from the dispatcher's
+/// `SessionSlots` (same `Arc<SlotStore>`, same `SessionId`) and calls
+/// the project's `invoke_action`. The drain happens inside
+/// `invoke_action` so the explicit return already carries the
+/// `SlotSet` opcodes; the dispatcher's follow-up drain is then a
+/// no-op, which is idempotent and safe.
+struct CompiledProjectActionAdapter {
+    project: Arc<dom_render_compiler::runtime::CompiledProject>,
+    action_id: u32,
+}
+
+#[async_trait::async_trait]
+impl ActionHandler for CompiledProjectActionAdapter {
+    async fn handle(
+        &self,
+        _ctx: &RequestContext,
+        envelope: &dom_render_compiler::ir::action::ActionEnvelope,
+        slots: SessionSlots,
+    ) -> Result<Vec<dom_render_compiler::ir::opcode::Instruction>, RuntimeError> {
+        debug_assert_eq!(
+            envelope.action_id, self.action_id,
+            "compiled adapter mis-dispatched: registered for {}, got envelope for {}",
+            self.action_id, envelope.action_id,
+        );
+        let view = dom_render_compiler::runtime::SessionSlotView::new(
+            slots.session_id(),
+            slots.store().clone(),
+        );
+        self.project
+            .invoke_action(envelope, &view)
+            .map_err(|err| {
+                RuntimeError::RequestHandling(format!(
+                    "compiled action handler {} failed: {err:#}",
+                    self.action_id
+                ))
+            })
+    }
+}
+
 type SharedHandler = Arc<dyn RouteHandler>;
 type SharedApiHandler = Arc<dyn ApiHandler>;
 type SharedLayoutHandler = Arc<dyn LayoutHandler>;
@@ -160,6 +203,36 @@ impl AlbedoServerBuilder {
         handler: impl ActionHandler + 'static,
     ) -> Self {
         self.action_handlers.insert(action_id, Arc::new(handler));
+        self
+    }
+
+    /// Phase K — register every handler in a [`CompiledProject`] into
+    /// the action registry. This is the bridge that turns a successful
+    /// compile + render into a live action dispatcher: bakabox POSTs
+    /// `/_albedo/action` with the `proxy_id` it learned from a
+    /// `BindEvent` opcode, the dispatcher routes by `action_id` (same
+    /// `u32`), and the compiled handler body executes server-side via
+    /// the shared Phase-J interpreter with setter calls translating to
+    /// slot writes.
+    ///
+    /// The same `CompiledProject` instance should drive both rendering
+    /// (`render_entry_with_bindings`) and dispatch (this builder
+    /// method) so the slot ids, proxy ids, and handler bodies all line
+    /// up. Multiple `CompiledProject`s can coexist by calling this
+    /// method repeatedly — proxy_id collisions are vanishingly
+    /// unlikely (FNV-1a-32 over `{module}::{fn}::{event}#{idx}`) but
+    /// later registrations win.
+    pub fn register_compiled_project(
+        mut self,
+        project: Arc<dom_render_compiler::runtime::CompiledProject>,
+    ) -> Self {
+        for proxy_id in project.handler_proxy_ids() {
+            let adapter = CompiledProjectActionAdapter {
+                project: project.clone(),
+                action_id: proxy_id,
+            };
+            self.action_handlers.insert(proxy_id, Arc::new(adapter));
+        }
         self
     }
 
