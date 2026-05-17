@@ -64,6 +64,7 @@ pub mod manifest;
 pub mod parser;
 pub mod runtime;
 pub mod scanner;
+pub mod transforms;
 pub mod types;
 
 pub use analysis::adaptive;
