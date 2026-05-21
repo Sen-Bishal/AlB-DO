@@ -4,6 +4,7 @@ use crate::runtime::compiled::{
 };
 use crate::runtime::slot_store::SessionSlotView;
 use crate::transforms::events::HandlerBody;
+use crate::transforms::form::{allocate_field_error_id, FORM_ACTION_PREFIX};
 use crate::types::ComponentId;
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
@@ -239,6 +240,49 @@ fn phase_k_current_hook_initial(value_name: &str) -> Option<swc_ecma_ast::Expr> 
             scope.initials.get(idx).cloned()
         })
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase L · form-action scope stack
+//
+// `FORM_ACTION_STACK` records the action name of every
+// `<form action="action:NAME">` the renderer is currently inside, in
+// nesting order. Descendant field elements (input / select /
+// textarea) consult the top of the stack to decide whether to
+// auto-emit a `data-albedo-error` span as their sibling — the span
+// is what server-side validation patches target via `SetText`
+// opcodes addressed by `allocate_field_error_id(action, field)`.
+//
+// Thread-local (single-threaded per render call) so concurrent
+// renders on other threads cannot observe each other's form scopes.
+// Modelled on the existing element / scope stacks above.
+// ─────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    static FORM_ACTION_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push a `<form action="action:NAME">` scope. The renderer calls
+/// this just before recursing into the form's children and pairs it
+/// with [`pop_form_action_scope`] after.
+fn push_form_action_scope(action_name: String) {
+    FORM_ACTION_STACK.with(|stack| stack.borrow_mut().push(action_name));
+}
+
+/// Pop the most recent form-action scope. Idempotent on an empty
+/// stack — defensive for early-return paths in eval_jsx_element that
+/// might skip the push (none today, but kept safe by construction).
+fn pop_form_action_scope() {
+    FORM_ACTION_STACK.with(|stack| {
+        let _ = stack.borrow_mut().pop();
+    });
+}
+
+/// Returns the action name of the innermost form-action scope, or
+/// `None` when the renderer is not inside one. Used by field
+/// elements to decide whether to emit a sibling error span.
+fn current_form_action_scope() -> Option<String> {
+    FORM_ACTION_STACK.with(|stack| stack.borrow().last().cloned())
 }
 
 /// RAII installer/restorer for the Phase-K thread-local state. Even
@@ -1818,9 +1862,24 @@ impl ComponentProject {
     ) -> Result<String> {
         use swc_ecma_ast::*;
 
-        let tag = match &element.opening.name {
+        let original_tag = match &element.opening.name {
             JSXElementName::Ident(ident) => ident.sym.to_string(),
             _ => return Err(anyhow!("unsupported JSX tag in module '{}'", module_spec)),
+        };
+
+        // Phase L · `<Link href="...">` desugars to an `<a href="..."
+        // data-albedo-link>` host element. Rewriting the tag here
+        // (rather than routing through `render_component_ref`) keeps
+        // the entire path — id stamping, BindEvent emission, children
+        // rendering — on the host-element track so `<Link>` enjoys
+        // the same wire contract as any other lowercase tag. The
+        // client-side runtime hooks `data-albedo-link` to intercept
+        // clicks and request the route over WebTransport instead of
+        // doing a full browser navigation.
+        let (tag, link_rewrite) = if original_tag == "Link" {
+            ("a".to_string(), true)
+        } else {
+            (original_tag.clone(), false)
         };
 
         if is_component_tag(&tag) {
@@ -1844,6 +1903,54 @@ impl ComponentProject {
         }
 
         let mut attrs = self.read_attrs(module_spec, &element.opening.attrs, env)?;
+
+        // Phase L · attach the `<Link>` marker attribute to the
+        // resulting `<a>` host element. `Value::Bool(true)` renders
+        // as a bare HTML attribute (`data-albedo-link`) via
+        // `render_attrs`, mirroring how the existing `required` etc.
+        // flag attributes ship.
+        if link_rewrite {
+            attrs.push((
+                "data-albedo-link".to_string(),
+                Value::Bool(true),
+            ));
+        }
+
+        // Phase L · `<form action="action:NAME">` rewrite. The
+        // renderer strips the sentinel `action="action:..."` and
+        // substitutes `data-albedo-action="NAME"` so the client-side
+        // runtime can intercept the submit. The action name is also
+        // pushed onto the form-scope stack so descendant fields
+        // (input / select / textarea) auto-emit a sibling
+        // `data-albedo-error` span — addressable from server-side
+        // validation patches via `allocate_field_error_id`.
+        let form_action_name: Option<String> = if tag == "form" {
+            let detected = attrs.iter().find_map(|(name, value)| {
+                if name != "action" {
+                    return None;
+                }
+                if let Value::String(raw) = value {
+                    raw.strip_prefix(FORM_ACTION_PREFIX).map(str::to_string)
+                } else {
+                    None
+                }
+            });
+            if let Some(action_name) = &detected {
+                // Drop the sentinel `action` attribute and replace it
+                // with `data-albedo-action` carrying the bare name.
+                // Slot count stays balanced (1 in, 1 out) so the
+                // rendered HTML still looks like a normal form
+                // element with one form-action hook attached.
+                attrs.retain(|(n, _)| n != "action");
+                attrs.push((
+                    "data-albedo-action".to_string(),
+                    Value::String(action_name.clone()),
+                ));
+            }
+            detected
+        } else {
+            None
+        };
 
         // Shell-stamp every host (lowercase-tag) element with a stable
         // `data-albedo-id`. Bakabox's `seedNodesFromDocument` looks for
@@ -1903,23 +2010,77 @@ impl ComponentProject {
         // this element's children knows which `stable_id` to subscribe.
         phase_k_push_element(stable_id);
 
+        // Phase L · enter the form-action scope before rendering
+        // children so nested fields can find it via
+        // `current_form_action_scope`. Paired with a pop after the
+        // recursive children render returns.
+        if let Some(action_name) = &form_action_name {
+            push_form_action_scope(action_name.clone());
+        }
+
         let attrs_html = render_attrs(&attrs);
         let children_html = self.render_children(module_spec, &element.children, env, false)?;
         let void_tag = is_void_tag(&tag);
 
+        if form_action_name.is_some() {
+            pop_form_action_scope();
+        }
+
         phase_k_pop_element();
 
-        if void_tag && children_html.is_empty() {
-            if attrs_html.is_empty() {
-                Ok(format!("<{tag} />"))
+        // Phase L · for form-action forms, inject a hidden CSRF input
+        // as the first child of the form body. The renderer emits a
+        // placeholder with `value=""` and a `data-albedo-csrf` marker;
+        // the server's CSRF middleware substitutes the `value`
+        // attribute with the per-session token before returning the
+        // response. Empty string for every non-form element so the
+        // format strings below stay branch-free.
+        let body_prefix: &'static str = if form_action_name.is_some() {
+            "<input type=\"hidden\" name=\"_csrf\" value=\"\" data-albedo-csrf />"
+        } else {
+            ""
+        };
+
+        // Phase L · sibling `data-albedo-error` span for every named
+        // field rendered inside a form-action form. The stable id is
+        // `allocate_field_error_id(action, field_name)` so server-side
+        // validation patches can target it via `SetText`. Field-tag
+        // matching is conservative (input / select / textarea) and
+        // the field must carry a `name` attribute — anything else is
+        // unsubmittable and shouldn't pretend to have an error sink.
+        let error_span_suffix: String = if let Some(action) = current_form_action_scope() {
+            if matches!(tag.as_str(), "input" | "select" | "textarea") {
+                attrs
+                    .iter()
+                    .find(|(n, _)| n == "name")
+                    .and_then(|(_, v)| v.as_str().map(str::to_string))
+                    .map(|field| {
+                        let id = allocate_field_error_id(&action, &field);
+                        format!(
+                            "<span data-albedo-id=\"{id}\" data-albedo-error=\"{field}\"></span>"
+                        )
+                    })
+                    .unwrap_or_default()
             } else {
-                Ok(format!("<{tag} {attrs_html} />"))
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let element_html = if void_tag && children_html.is_empty() {
+            if attrs_html.is_empty() {
+                format!("<{tag} />")
+            } else {
+                format!("<{tag} {attrs_html} />")
             }
         } else if attrs_html.is_empty() {
-            Ok(format!("<{tag}>{children_html}</{tag}>"))
+            format!("<{tag}>{body_prefix}{children_html}</{tag}>")
         } else {
-            Ok(format!("<{tag} {attrs_html}>{children_html}</{tag}>"))
-        }
+            format!("<{tag} {attrs_html}>{body_prefix}{children_html}</{tag}>")
+        };
+
+        Ok(format!("{element_html}{error_span_suffix}"))
     }
 
     fn render_component_ref(

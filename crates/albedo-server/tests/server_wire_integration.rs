@@ -250,10 +250,28 @@ async fn async_island_enqueue_emits_placeholder_via_streaming_state() {
     let (pipeline, _ids) = build_test_pipeline();
     let state = streaming_state_with_pipeline(pipeline);
 
+    // Phase D · gate the resolver behind a oneshot the test controls.
+    // The multi-thread tokio runtime polls spawned tasks on a worker
+    // thread as soon as one is free; without this gate, an `async {
+    // vec![...] }` block whose future is ready on first poll lands
+    // its resolution on `async_tx` BEFORE the first
+    // `drive_pipeline_tick` even runs, and the same-tick drain ships
+    // both the queued placeholder and the just-arrived patch
+    // together — defeating the placeholder-vs-patch sequencing the
+    // assertions below expect. Production resolvers do real I/O so
+    // this race doesn't show up there, but the test must simulate
+    // that latency to stay deterministic across runtime flavors.
+    let (release_resolver, resolver_gate) = tokio::sync::oneshot::channel::<()>();
+
     let suspense_id = {
         let guard = state.pipeline().expect("pipeline bound").lock().unwrap();
         guard
-            .enqueue_async_island(StableId(123), async {
+            .enqueue_async_island(StableId(123), async move {
+                // Park the future until the test side releases it.
+                // Errors on the gate (sender dropped before send) are
+                // treated as "release immediately" — the test would
+                // already be failing for an unrelated reason.
+                let _ = resolver_gate.await;
                 vec![Instruction::Create {
                     tag_id: TagId(0),
                     stable_id: StableId(123),
@@ -279,8 +297,12 @@ async fn async_island_enqueue_emits_placeholder_via_streaming_state() {
         }]
     );
 
-    // Drive the spawned resolver — multi-thread runtime worker picks it
-    // up after a brief yield.
+    // Release the gated resolver and yield long enough for the worker
+    // to wake, run the future to completion, and deliver the
+    // resolution back across the pipeline's mpsc channel.
+    release_resolver
+        .send(())
+        .expect("resolver gate must accept the release signal");
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let patch_chunks = drive_pipeline_tick(&state);
