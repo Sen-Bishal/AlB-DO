@@ -119,6 +119,11 @@ yarn.lock
 *.html
 !tests/fixtures/visual/*.html
 !tests/fixtures/jsx_matrix/**/expected.html
+# Dev inspector UI — loaded via `include_str!` in
+# `crates/albedo-server/src/inspector/api.rs` and the dev CLI's
+# `src/bin/albedo/inspector.rs`. Must ship in the repo or the binary
+# fails to compile. See also the `assets/` exception below.
+!crates/albedo-server/src/inspector/assets/*.html
 
 # Test artifacts
 /tests/tmp/

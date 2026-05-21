@@ -1,0 +1,961 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ALBEDO Inspector</title>
+  <style>
+    /*
+      Single-file inspector UI. No external dependencies on purpose: the dev
+      server includes the bytes via `include_str!`, so the asset has to be
+      self-contained or the binary breaks.
+
+      Layout: header strip, then a CSS grid with the component graph on the
+      left and a metrics column on the right. Below the fold sits the live
+      event log driven by the SSE stream at /__albedo/api/events.
+    */
+    :root {
+      --bg-0:        #0b0d12;
+      --bg-1:        #11141b;
+      --bg-2:        #181c25;
+      --bg-3:        #20242f;
+      --border:      #2a2f3c;
+      --text-0:      #e6e8ee;
+      --text-1:      #a8aebf;
+      --text-2:      #6e7385;
+      --accent:      #f6c66c;
+      --tier-a:      #7ed9a8;
+      --tier-b:      #f6c66c;
+      --tier-c:      #f08b6e;
+      --warn:        #e8543e;
+      --ok:          #7ed9a8;
+      --grid-line:   #1d2230;
+      --shadow:      0 1px 0 rgba(255,255,255,0.04) inset,
+                     0 8px 24px rgba(0,0,0,0.35);
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg-0);
+      color: var(--text-0);
+      font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI",
+            "Helvetica Neue", system-ui, sans-serif;
+      min-height: 100vh;
+    }
+    a { color: var(--accent); }
+
+    header.albedo-header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 20px;
+      background: var(--bg-1);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    header .brand {
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      font-size: 14px;
+    }
+    header .brand .accent { color: var(--accent); }
+    header .pill {
+      padding: 2px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: var(--text-1);
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+    }
+    header .conn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--text-1);
+    }
+    header .conn .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-2);
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.04);
+    }
+    header .conn.connected .dot { background: var(--ok); }
+    header .conn.lagging   .dot { background: var(--accent); }
+    header .conn.disconnected .dot { background: var(--warn); }
+
+    main.albedo-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 18px;
+      padding: 18px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    @media (max-width: 1024px) {
+      main.albedo-grid { grid-template-columns: 1fr; }
+    }
+
+    section.card {
+      background: var(--bg-1);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 14px 16px;
+    }
+    section.card h2 {
+      margin: 0 0 10px 0;
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      color: var(--text-2);
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+
+    /* ── Graph card ─────────────────────────────── */
+    #graph-card { padding: 0; overflow: hidden; }
+    #graph-card .graph-head {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #graph-card .graph-head h2 { margin: 0; }
+    #graph-card .graph-head .src {
+      font-size: 11px;
+      color: var(--text-2);
+      margin-left: auto;
+    }
+    svg.graph {
+      width: 100%;
+      height: 420px;
+      display: block;
+      background:
+        radial-gradient(circle at 50% 50%,
+          rgba(246, 198, 108, 0.04),
+          transparent 60%),
+        var(--bg-1);
+    }
+    svg.graph .grid line { stroke: var(--grid-line); stroke-width: 1; }
+    svg.graph .edge {
+      stroke: var(--border);
+      stroke-width: 1;
+      fill: none;
+      opacity: 0.7;
+    }
+    svg.graph .edge.cascade {
+      stroke: var(--accent);
+      stroke-width: 1.5;
+      opacity: 0.9;
+    }
+    svg.graph circle.node {
+      stroke: rgba(255,255,255,0.18);
+      stroke-width: 1.5;
+      cursor: pointer;
+      transition: stroke 80ms ease;
+    }
+    svg.graph circle.node:hover { stroke: var(--text-0); }
+    svg.graph circle.node.tier-a { fill: var(--tier-a); }
+    svg.graph circle.node.tier-b { fill: var(--tier-b); }
+    svg.graph circle.node.tier-c { fill: var(--tier-c); }
+    svg.graph text.label {
+      fill: var(--text-1);
+      font-size: 10px;
+      pointer-events: none;
+      text-anchor: middle;
+      dominant-baseline: hanging;
+    }
+
+    /* ── Metrics card ───────────────────────────── */
+    .metric-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
+    }
+    .metric-row:last-child { border-bottom: 0; }
+    .metric-row .k { color: var(--text-2); font-size: 11px; letter-spacing: 0.04em; }
+    .metric-row .v { color: var(--text-0); font-variant-numeric: tabular-nums; }
+    .metric-row .v.large { font-size: 28px; font-weight: 600; }
+    .metric-row .v.warn  { color: var(--warn); }
+    .metric-row .v.ok    { color: var(--ok); }
+    .metric-row .v.dim   { color: var(--text-1); }
+
+    .tier-bar {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .tier-bar .cell {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      text-align: center;
+    }
+    .tier-bar .cell .lbl {
+      font-size: 10px;
+      letter-spacing: 0.16em;
+      color: var(--text-2);
+    }
+    .tier-bar .cell .val {
+      margin-top: 2px;
+      font-size: 18px;
+      font-variant-numeric: tabular-nums;
+    }
+    .tier-bar .cell.a .lbl, .tier-bar .cell.a .val { color: var(--tier-a); }
+    .tier-bar .cell.b .lbl, .tier-bar .cell.b .val { color: var(--tier-b); }
+    .tier-bar .cell.c .lbl, .tier-bar .cell.c .val { color: var(--tier-c); }
+
+    ul.rank {
+      list-style: none;
+      padding: 0;
+      margin: 4px 0 0 0;
+    }
+    ul.rank li {
+      display: flex;
+      gap: 8px;
+      padding: 4px 0;
+      align-items: baseline;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
+    }
+    ul.rank li:last-child { border-bottom: 0; }
+    ul.rank .tag {
+      display: inline-block;
+      width: 14px;
+      text-align: center;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--bg-0);
+      background: var(--text-2);
+      border-radius: 4px;
+      padding: 1px 0;
+    }
+    ul.rank .tag.a { background: var(--tier-a); }
+    ul.rank .tag.b { background: var(--tier-b); }
+    ul.rank .tag.c { background: var(--tier-c); }
+    ul.rank .name { flex: 1; color: var(--text-0); }
+    ul.rank .val  { font-variant-numeric: tabular-nums; color: var(--text-1); font-size: 12px; }
+
+    .sparkline {
+      display: block;
+      width: 100%;
+      height: 36px;
+      margin-top: 6px;
+    }
+    .sparkline path { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+    .sparkline .baseline {
+      stroke: var(--grid-line);
+      stroke-width: 1;
+      stroke-dasharray: 2 3;
+    }
+
+    .lane-heatmap {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 6px 10px;
+      margin-top: 4px;
+      align-items: center;
+    }
+    .lane-heatmap .lane-name { color: var(--text-2); font-size: 11px; }
+    .lane-heatmap .bar-track {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      height: 10px;
+      overflow: hidden;
+    }
+    .lane-heatmap .bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--tier-a), var(--accent), var(--tier-c));
+      transition: width 200ms ease;
+    }
+    .lane-heatmap .pct { font-variant-numeric: tabular-nums; font-size: 11px; color: var(--text-1); }
+
+    /* ── Event log ──────────────────────────────── */
+    #events-card { grid-column: 1 / -1; padding: 0; }
+    #events-card .events-head {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    #events-card .events-head h2 { margin: 0; }
+    #events-card .events-head .count {
+      font-size: 11px;
+      color: var(--text-2);
+      margin-left: auto;
+    }
+    #events-card .events-head button {
+      background: var(--bg-2);
+      color: var(--text-1);
+      border: 1px solid var(--border);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    #events-card .events-head button:hover { color: var(--text-0); border-color: var(--text-2); }
+    ol.events {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      max-height: 320px;
+      overflow-y: auto;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    ol.events li {
+      display: grid;
+      grid-template-columns: 88px 24px 1fr auto auto;
+      gap: 10px;
+      padding: 6px 16px;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
+      align-items: baseline;
+    }
+    ol.events li:hover { background: var(--bg-2); }
+    ol.events .ts    { color: var(--text-2); }
+    ol.events .tier  {
+      display: inline-block;
+      text-align: center;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--bg-0);
+      border-radius: 4px;
+      padding: 1px 0;
+    }
+    ol.events .tier.a { background: var(--tier-a); }
+    ol.events .tier.b { background: var(--tier-b); }
+    ol.events .tier.c { background: var(--tier-c); }
+    ol.events .name  { color: var(--text-0); }
+    ol.events .cascade { color: var(--accent); font-variant-numeric: tabular-nums; }
+    ol.events .dur   { color: var(--text-1); font-variant-numeric: tabular-nums; }
+    ol.events .empty {
+      grid-column: 1 / -1;
+      text-align: center;
+      color: var(--text-2);
+      font-style: italic;
+      padding: 24px 0;
+    }
+  </style>
+</head>
+<body>
+  <header class="albedo-header">
+    <div class="brand"><span class="accent">ALBEDO</span> · inspector</div>
+    <span class="pill" id="graph-src-pill">no graph</span>
+    <span class="pill" id="render-count-pill">0 renders</span>
+    <span class="conn" id="conn-status"><span class="dot"></span><span class="label">connecting…</span></span>
+  </header>
+
+  <main class="albedo-grid">
+    <!-- Component graph (left, spans the full-height row above the event log). -->
+    <section class="card" id="graph-card">
+      <div class="graph-head">
+        <h2>Component graph</h2>
+        <span class="src" id="graph-src-label">—</span>
+      </div>
+      <svg class="graph" id="graph-svg" viewBox="0 0 800 420" preserveAspectRatio="xMidYMid meet">
+        <g class="grid">
+          <!-- Drawn by JS so the lines align with the viewBox at runtime. -->
+        </g>
+        <g class="edges"></g>
+        <g class="nodes"></g>
+        <g class="labels"></g>
+      </svg>
+    </section>
+
+    <!-- Metrics column (right). -->
+    <section class="card" id="metrics-card">
+      <h2>Collective albedo</h2>
+      <div class="metric-row">
+        <span class="k">α (assumed)</span>
+        <span class="v dim" id="assumed-alpha">—</span>
+      </div>
+      <div class="metric-row">
+        <span class="k">collective</span>
+        <span class="v large" id="collective-albedo">—</span>
+      </div>
+      <div class="metric-row">
+        <span class="k">cascade ratio</span>
+        <span class="v" id="cascade-ratio">—</span>
+      </div>
+      <div class="metric-row">
+        <span class="k">total renders</span>
+        <span class="v" id="total-renders">0</span>
+      </div>
+
+      <svg class="sparkline" id="trend-spark" viewBox="0 0 320 36" preserveAspectRatio="none">
+        <line class="baseline" x1="0" y1="18" x2="320" y2="18"></line>
+        <path d=""></path>
+      </svg>
+
+      <h2 style="margin-top:14px">Tier breakdown</h2>
+      <div class="tier-bar">
+        <div class="cell a"><div class="lbl">A</div><div class="val" id="tier-a-count">0</div></div>
+        <div class="cell b"><div class="lbl">B</div><div class="val" id="tier-b-count">0</div></div>
+        <div class="cell c"><div class="lbl">C</div><div class="val" id="tier-c-count">0</div></div>
+      </div>
+
+      <h2 style="margin-top:14px">Lane utilization</h2>
+      <div class="lane-heatmap" id="lane-heatmap">
+        <span class="lane-name">L0</span><div class="bar-track"><div class="bar-fill" style="width:0%"></div></div><span class="pct">0%</span>
+        <span class="lane-name">L1</span><div class="bar-track"><div class="bar-fill" style="width:0%"></div></div><span class="pct">0%</span>
+        <span class="lane-name">L2</span><div class="bar-track"><div class="bar-fill" style="width:0%"></div></div><span class="pct">0%</span>
+        <span class="lane-name">L3</span><div class="bar-track"><div class="bar-fill" style="width:0%"></div></div><span class="pct">0%</span>
+      </div>
+
+      <h2 style="margin-top:14px">Hottest</h2>
+      <ul class="rank" id="hottest-list"><li class="empty"><span class="name" style="text-align:center;width:100%;color:var(--text-2)">no data yet</span></li></ul>
+
+      <h2 style="margin-top:14px">Slowest (p95)</h2>
+      <ul class="rank" id="slowest-list"><li class="empty"><span class="name" style="text-align:center;width:100%;color:var(--text-2)">no data yet</span></li></ul>
+    </section>
+
+    <!-- Event log (full width below). -->
+    <section class="card" id="events-card">
+      <div class="events-head">
+        <h2>Render events</h2>
+        <span class="count" id="events-count">0 received</span>
+        <button id="events-clear" type="button">clear</button>
+        <button id="events-pause" type="button">pause</button>
+      </div>
+      <ol class="events" id="events-list">
+        <li class="empty">waiting for the SSE stream…</li>
+      </ol>
+    </section>
+  </main>
+
+<script>
+/*
+  Inspector front-end. Three responsibilities:
+
+    1. Poll /__albedo/api/graph every few seconds and re-layout the SVG.
+    2. Poll /__albedo/api/metrics on the same cadence and refresh the right
+       column.
+    3. Subscribe to /__albedo/api/events as an EventSource and prepend each
+       new RenderEvent to the live log. Mark the originating node + outgoing
+       edges in the graph for a moment so the cascade is visible.
+
+  No frameworks, no build step. The whole UI re-renders against fresh
+  snapshots; nodes are keyed by id so the SVG diff is cheap enough that
+  even a 200-node graph stays smooth at the 2 Hz poll rate.
+*/
+
+(function () {
+  'use strict';
+
+  // ── Endpoints ───────────────────────────────────────────────────
+  const GRAPH_URL   = '/__albedo/api/graph';
+  const METRICS_URL = '/__albedo/api/metrics';
+  const EVENTS_URL  = '/__albedo/api/events';
+
+  // ── DOM handles ─────────────────────────────────────────────────
+  const $ = (sel) => document.querySelector(sel);
+  const connStatus    = $('#conn-status');
+  const connLabel     = $('#conn-status .label');
+  const graphSvg      = $('#graph-svg');
+  const graphSrcPill  = $('#graph-src-pill');
+  const graphSrcLabel = $('#graph-src-label');
+  const renderCountPill = $('#render-count-pill');
+  const collective    = $('#collective-albedo');
+  const assumedAlpha  = $('#assumed-alpha');
+  const cascadeRatio  = $('#cascade-ratio');
+  const totalRenders  = $('#total-renders');
+  const tierA         = $('#tier-a-count');
+  const tierB         = $('#tier-b-count');
+  const tierC         = $('#tier-c-count');
+  const hottestList   = $('#hottest-list');
+  const slowestList   = $('#slowest-list');
+  const trendPath     = $('#trend-spark path');
+  const laneRoot      = $('#lane-heatmap');
+  const eventsList    = $('#events-list');
+  const eventsCount   = $('#events-count');
+  const eventsClear   = $('#events-clear');
+  const eventsPause   = $('#events-pause');
+
+  // ── State ───────────────────────────────────────────────────────
+  let lastGraph    = null;
+  let layoutCache  = new Map(); // id → { x, y } so re-renders are stable
+  let cascadeFlash = new Map(); // edge key → expiry ms; for transient cascade colouring
+  let eventsBuffer = [];
+  const MAX_EVENTS = 200;
+  let eventsPaused = false;
+  let eventsReceived = 0;
+
+  // ── Connection status ───────────────────────────────────────────
+  // Three-state indicator: connecting / connected / disconnected.
+  // The label string also flips to lagging when the SSE stream reports
+  // BroadcastStreamRecvError::Lagged (server-side filtered, but we
+  // surface re-opens here as a generic "lagging" signal).
+  function setConnState(state, label) {
+    connStatus.classList.remove('connected', 'disconnected', 'lagging');
+    if (state) connStatus.classList.add(state);
+    connLabel.textContent = label;
+  }
+
+  // ── Pretty formatters ───────────────────────────────────────────
+  function fmtFraction(n) {
+    if (typeof n !== 'number' || isNaN(n)) return '—';
+    return n.toFixed(3);
+  }
+  function fmtPercent(n) {
+    if (typeof n !== 'number' || isNaN(n)) return '—';
+    return (n * 100).toFixed(1) + '%';
+  }
+  function fmtCount(n) {
+    if (typeof n !== 'number' || isNaN(n)) return '0';
+    if (n < 1000) return String(n);
+    if (n < 1e6)  return (n / 1e3).toFixed(1) + 'k';
+    return (n / 1e6).toFixed(1) + 'M';
+  }
+  function fmtDuration(us) {
+    if (typeof us !== 'number' || us < 0) return '—';
+    if (us < 1000)   return us.toFixed(0) + 'µs';
+    if (us < 1e6)    return (us / 1000).toFixed(1) + 'ms';
+    return (us / 1e6).toFixed(2) + 's';
+  }
+  function fmtTimestamp(ms) {
+    if (!ms) return '--:--:--.---';
+    const d = new Date(ms);
+    const pad = (n, w) => String(n).padStart(w || 2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+  }
+
+  // ── Graph layout ────────────────────────────────────────────────
+  // Cheap iterative force layout: 80 iterations of repulsion + spring,
+  // bounded to the SVG viewBox. Stable across renders because we seed
+  // each node from `layoutCache` and let the simulation nudge from
+  // there. A new node spawns at the centre with a small jitter.
+  const VB_W = 800;
+  const VB_H = 420;
+
+  function layoutGraph(nodes, edges) {
+    const positions = new Map();
+    const n = nodes.length;
+    if (n === 0) return positions;
+
+    // Seed: previous position if known, else a circle around the centre.
+    nodes.forEach((node, i) => {
+      const prev = layoutCache.get(node.id);
+      if (prev) {
+        positions.set(node.id, { x: prev.x, y: prev.y });
+      } else {
+        const angle = (i / n) * Math.PI * 2;
+        positions.set(node.id, {
+          x: VB_W / 2 + Math.cos(angle) * 120 + (Math.random() - 0.5) * 20,
+          y: VB_H / 2 + Math.sin(angle) * 120 + (Math.random() - 0.5) * 20,
+        });
+      }
+    });
+
+    const REPEL = 1800;       // pairwise repulsion strength
+    const SPRING_K = 0.04;    // edge spring stiffness
+    const SPRING_LEN = 90;    // ideal edge length
+    const DAMP = 0.85;        // velocity damping per iteration
+    const ITER = 80;
+
+    const vel = new Map();
+    nodes.forEach((node) => vel.set(node.id, { vx: 0, vy: 0 }));
+
+    for (let step = 0; step < ITER; step++) {
+      // Pairwise repulsion. O(n^2) is fine for typical app graphs.
+      for (let i = 0; i < n; i++) {
+        const a = nodes[i];
+        const pa = positions.get(a.id);
+        for (let j = i + 1; j < n; j++) {
+          const b = nodes[j];
+          const pb = positions.get(b.id);
+          const dx = pa.x - pb.x;
+          const dy = pa.y - pb.y;
+          const distSq = Math.max(dx * dx + dy * dy, 25);
+          const force = REPEL / distSq;
+          const dist = Math.sqrt(distSq);
+          const fx = (dx / dist) * force;
+          const fy = (dy / dist) * force;
+          const va = vel.get(a.id);
+          const vb = vel.get(b.id);
+          va.vx += fx; va.vy += fy;
+          vb.vx -= fx; vb.vy -= fy;
+        }
+      }
+      // Edge springs.
+      for (const edge of edges) {
+        const pa = positions.get(edge.from);
+        const pb = positions.get(edge.to);
+        if (!pa || !pb) continue;
+        const dx = pb.x - pa.x;
+        const dy = pb.y - pa.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const stretch = dist - SPRING_LEN;
+        const fx = (dx / dist) * stretch * SPRING_K;
+        const fy = (dy / dist) * stretch * SPRING_K;
+        const va = vel.get(edge.from);
+        const vb = vel.get(edge.to);
+        va.vx += fx; va.vy += fy;
+        vb.vx -= fx; vb.vy -= fy;
+      }
+      // Integrate + clamp to viewBox padding.
+      for (const node of nodes) {
+        const p = positions.get(node.id);
+        const v = vel.get(node.id);
+        v.vx *= DAMP;
+        v.vy *= DAMP;
+        p.x = Math.max(40, Math.min(VB_W - 40, p.x + v.vx));
+        p.y = Math.max(30, Math.min(VB_H - 30, p.y + v.vy));
+      }
+    }
+
+    return positions;
+  }
+
+  // ── Graph render ────────────────────────────────────────────────
+  // Render strategy: rebuild the <g class="nodes"> + <g class="edges">
+  // subtrees from scratch on every snapshot. Cheap because the typical
+  // graph is < 100 nodes and the poll cadence is 2 Hz. Keeping the
+  // SVG stateless means we never end up with phantom nodes after the
+  // graph schema changes.
+  function renderGraph(snapshot) {
+    const nodesGroup = graphSvg.querySelector('.nodes');
+    const edgesGroup = graphSvg.querySelector('.edges');
+    const labelsGroup = graphSvg.querySelector('.labels');
+    const gridGroup = graphSvg.querySelector('.grid');
+
+    nodesGroup.innerHTML = '';
+    edgesGroup.innerHTML = '';
+    labelsGroup.innerHTML = '';
+    gridGroup.innerHTML = '';
+
+    // Light background grid for orientation.
+    for (let x = 0; x <= VB_W; x += 80) {
+      const ln = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      ln.setAttribute('x1', x); ln.setAttribute('x2', x);
+      ln.setAttribute('y1', 0); ln.setAttribute('y2', VB_H);
+      gridGroup.appendChild(ln);
+    }
+    for (let y = 0; y <= VB_H; y += 80) {
+      const ln = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      ln.setAttribute('x1', 0); ln.setAttribute('x2', VB_W);
+      ln.setAttribute('y1', y); ln.setAttribute('y2', y);
+      gridGroup.appendChild(ln);
+    }
+
+    if (!snapshot || !snapshot.nodes || snapshot.nodes.length === 0) {
+      graphSrcLabel.textContent = 'no graph data';
+      graphSrcPill.textContent  = 'no graph';
+      return;
+    }
+
+    const positions = layoutGraph(snapshot.nodes, snapshot.edges || []);
+    layoutCache = positions;
+
+    // Edges first so nodes render on top.
+    const now = performance.now();
+    for (const edge of (snapshot.edges || [])) {
+      const a = positions.get(edge.from);
+      const b = positions.get(edge.to);
+      if (!a || !b) continue;
+      const ln = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      ln.setAttribute('x1', a.x.toFixed(1));
+      ln.setAttribute('y1', a.y.toFixed(1));
+      ln.setAttribute('x2', b.x.toFixed(1));
+      ln.setAttribute('y2', b.y.toFixed(1));
+      ln.setAttribute('class', 'edge');
+      // Cascade flash: any edge from a recently-rendered component shows
+      // briefly highlighted so the operator can trace the wave visually.
+      const expiry = cascadeFlash.get(edge.from);
+      if (expiry && expiry > now) {
+        ln.classList.add('cascade');
+      }
+      edgesGroup.appendChild(ln);
+    }
+
+    // Node radii driven by weight_bytes (sqrt so a 100KB component isn't
+    // 100× the visual area of a 1KB one) clamped to [6, 18].
+    for (const node of snapshot.nodes) {
+      const p = positions.get(node.id);
+      if (!p) continue;
+      const weight = Number(node.weight_bytes) || 0;
+      const r = Math.max(6, Math.min(18, 6 + Math.sqrt(weight) * 0.06));
+
+      const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', p.x.toFixed(1));
+      c.setAttribute('cy', p.y.toFixed(1));
+      c.setAttribute('r', r.toFixed(1));
+      c.setAttribute('class', 'node tier-' + node.tier);
+      c.setAttribute('data-id', node.id);
+      // Hover title gives the operator the full path + tier + weight.
+      const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+      title.textContent = `${node.label} · tier ${node.tier.toUpperCase()} · ${fmtCount(weight)}B · ${node.module_path}`;
+      c.appendChild(title);
+      nodesGroup.appendChild(c);
+
+      const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      text.setAttribute('x', p.x.toFixed(1));
+      text.setAttribute('y', (p.y + r + 4).toFixed(1));
+      text.setAttribute('class', 'label');
+      text.textContent = node.label;
+      labelsGroup.appendChild(text);
+    }
+
+    graphSrcLabel.textContent =
+      `${snapshot.nodes.length} nodes · ${(snapshot.edges || []).length} edges · ${snapshot.source}`;
+    graphSrcPill.textContent =
+      snapshot.source === 'manifest' ? 'manifest graph' :
+      snapshot.source === 'demo'     ? 'demo graph' : 'no graph';
+  }
+
+  // ── Metrics render ─────────────────────────────────────────────
+  function renderMetrics(snapshot) {
+    if (!snapshot) return;
+
+    collective.textContent   = fmtFraction(snapshot.collective_albedo);
+    cascadeRatio.textContent = fmtFraction(snapshot.cascade_ratio);
+    cascadeRatio.classList.toggle('warn', !!snapshot.alpha_warning);
+    cascadeRatio.classList.toggle('ok', !snapshot.alpha_warning);
+    assumedAlpha.textContent = fmtFraction(snapshot.assumed_alpha);
+    totalRenders.textContent = fmtCount(snapshot.total_renders);
+    renderCountPill.textContent = `${fmtCount(snapshot.total_renders)} renders`;
+
+    tierA.textContent = fmtCount(snapshot.tier_breakdown.a);
+    tierB.textContent = fmtCount(snapshot.tier_breakdown.b);
+    tierC.textContent = fmtCount(snapshot.tier_breakdown.c);
+
+    renderRankList(hottestList, snapshot.hottest, (c) => fmtCount(c.render_count));
+    renderRankList(slowestList, snapshot.slowest, (c) => fmtDuration(c.p95_us));
+    renderTrend(snapshot.trend);
+    renderLanes(snapshot.lane_utilization);
+  }
+
+  function renderRankList(rootEl, items, valueFn) {
+    rootEl.innerHTML = '';
+    if (!items || items.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.innerHTML = '<span class="name" style="text-align:center;width:100%;color:var(--text-2)">no data yet</span>';
+      rootEl.appendChild(li);
+      return;
+    }
+    for (const item of items) {
+      const li = document.createElement('li');
+      const tag = document.createElement('span');
+      tag.className = 'tag ' + item.tier;
+      tag.textContent = item.tier.toUpperCase();
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = item.name;
+      const val = document.createElement('span');
+      val.className = 'val';
+      val.textContent = valueFn(item);
+      li.appendChild(tag);
+      li.appendChild(name);
+      li.appendChild(val);
+      rootEl.appendChild(li);
+    }
+  }
+
+  // Trend sparkline: map the ring buffer onto the 320×36 svg, scaling
+  // y by min/max so even a tight band reads clearly. Empty trend
+  // collapses to a single horizontal line at the baseline.
+  function renderTrend(trend) {
+    if (!trend || trend.length === 0) {
+      trendPath.setAttribute('d', '');
+      return;
+    }
+    const W = 320, H = 36, PAD_Y = 4;
+    const min = Math.min(...trend);
+    const max = Math.max(...trend);
+    const range = Math.max(max - min, 0.001);
+    const step = trend.length > 1 ? W / (trend.length - 1) : W;
+    let d = '';
+    trend.forEach((v, i) => {
+      const x = (i * step).toFixed(1);
+      const y = (H - PAD_Y - ((v - min) / range) * (H - PAD_Y * 2)).toFixed(1);
+      d += (i === 0 ? 'M' : 'L') + x + ' ' + y + ' ';
+    });
+    trendPath.setAttribute('d', d.trim());
+  }
+
+  function renderLanes(util) {
+    // The DOM has 4 fixed lane rows; we just update widths + pct text.
+    const lanes = laneRoot.querySelectorAll('.bar-fill');
+    const pcts  = laneRoot.querySelectorAll('.pct');
+    for (let i = 0; i < 4; i++) {
+      const v = (util && typeof util[i] === 'number') ? util[i] : 0;
+      const pct = Math.max(0, Math.min(1, v)) * 100;
+      lanes[i].style.width = pct.toFixed(0) + '%';
+      pcts[i].textContent = pct.toFixed(0) + '%';
+    }
+  }
+
+  // ── Event log ───────────────────────────────────────────────────
+  function pushEvent(evt) {
+    eventsReceived++;
+    eventsCount.textContent = eventsReceived + ' received';
+    if (eventsPaused) return;
+
+    // Mark the source node + its outgoing edges so the next graph
+    // render colours them. Flash window is 800ms.
+    if (typeof evt.component_id === 'number') {
+      cascadeFlash.set(evt.component_id, performance.now() + 800);
+    }
+
+    eventsBuffer.unshift(evt);
+    if (eventsBuffer.length > MAX_EVENTS) {
+      eventsBuffer.length = MAX_EVENTS;
+    }
+    renderEventList();
+  }
+
+  function renderEventList() {
+    eventsList.innerHTML = '';
+    if (eventsBuffer.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = 'no render events yet';
+      eventsList.appendChild(li);
+      return;
+    }
+    for (const evt of eventsBuffer) {
+      const li = document.createElement('li');
+      const ts = document.createElement('span');
+      ts.className = 'ts';
+      ts.textContent = fmtTimestamp(evt.timestamp_ms);
+      const tier = document.createElement('span');
+      tier.className = 'tier ' + evt.tier;
+      tier.textContent = (evt.tier || '?').toUpperCase();
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = evt.component_name || ('#' + evt.component_id);
+      const cascade = document.createElement('span');
+      cascade.className = 'cascade';
+      const cc = Array.isArray(evt.cascade_children) ? evt.cascade_children.length : 0;
+      cascade.textContent = cc > 0 ? ('↳ ' + cc) : '';
+      const dur = document.createElement('span');
+      dur.className = 'dur';
+      dur.textContent = fmtDuration(evt.duration_us);
+      li.appendChild(ts);
+      li.appendChild(tier);
+      li.appendChild(name);
+      li.appendChild(cascade);
+      li.appendChild(dur);
+      eventsList.appendChild(li);
+    }
+  }
+
+  eventsClear.addEventListener('click', function () {
+    eventsBuffer = [];
+    eventsReceived = 0;
+    eventsCount.textContent = '0 received';
+    renderEventList();
+  });
+  eventsPause.addEventListener('click', function () {
+    eventsPaused = !eventsPaused;
+    eventsPause.textContent = eventsPaused ? 'resume' : 'pause';
+  });
+
+  // ── HTTP polling ────────────────────────────────────────────────
+  // The graph and metrics endpoints are cheap JSON. Poll every 2 s so
+  // the inspector keeps moving even when no render events are firing.
+  async function pollGraph() {
+    try {
+      const res = await fetch(GRAPH_URL, { cache: 'no-store' });
+      if (!res.ok) throw new Error('graph http ' + res.status);
+      const snapshot = await res.json();
+      lastGraph = snapshot;
+      renderGraph(snapshot);
+    } catch (err) {
+      // Silent — the conn dot already conveys the stream's state.
+      if (console && console.warn) console.warn('[albedo] graph poll failed', err);
+    }
+  }
+  async function pollMetrics() {
+    try {
+      const res = await fetch(METRICS_URL, { cache: 'no-store' });
+      if (!res.ok) throw new Error('metrics http ' + res.status);
+      const snapshot = await res.json();
+      renderMetrics(snapshot);
+    } catch (err) {
+      if (console && console.warn) console.warn('[albedo] metrics poll failed', err);
+    }
+  }
+
+  // ── SSE subscription ────────────────────────────────────────────
+  // Reconnects with exponential backoff (capped at 8 s) so the
+  // inspector survives a server restart without manual intervention.
+  let sse = null;
+  let backoffMs = 500;
+
+  function openEventStream() {
+    if (sse) {
+      try { sse.close(); } catch (_e) {}
+      sse = null;
+    }
+    setConnState('lagging', 'connecting…');
+    sse = new EventSource(EVENTS_URL);
+
+    sse.addEventListener('open', function () {
+      backoffMs = 500;
+      setConnState('connected', 'live');
+    });
+
+    // Server publishes events under the `render` SSE event name.
+    sse.addEventListener('render', function (msgEvent) {
+      try {
+        const evt = JSON.parse(msgEvent.data);
+        pushEvent(evt);
+      } catch (err) {
+        if (console && console.warn) console.warn('[albedo] bad event', err);
+      }
+    });
+
+    sse.addEventListener('error', function () {
+      setConnState('disconnected', 'reconnecting in ' + Math.round(backoffMs / 1000) + 's');
+      try { sse.close(); } catch (_e) {}
+      sse = null;
+      setTimeout(openEventStream, backoffMs);
+      backoffMs = Math.min(backoffMs * 2, 8000);
+    });
+  }
+
+  // ── Bootstrap ───────────────────────────────────────────────────
+  function bootstrap() {
+    pollGraph();
+    pollMetrics();
+    openEventStream();
+    // Re-render the graph on a slower cadence than metrics so the
+    // layout stays put when only metrics changed. 4-second graph
+    // poll keeps the simulation churn low.
+    setInterval(pollGraph,   4000);
+    setInterval(pollMetrics, 2000);
+    // Cascade flashes need to be cleared periodically so old edges
+    // don't stay highlighted forever — the next graph render reads
+    // the live map.
+    setInterval(function gcCascadeFlash() {
+      const now = performance.now();
+      for (const [id, expiry] of cascadeFlash) {
+        if (expiry <= now) cascadeFlash.delete(id);
+      }
+    }, 500);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bootstrap);
+  } else {
+    bootstrap();
+  }
+})();
+</script>
+</body>
+</html>
