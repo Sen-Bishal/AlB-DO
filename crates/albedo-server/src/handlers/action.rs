@@ -9,6 +9,7 @@
 use crate::actions::{ActionHandler, SessionSlots};
 use crate::error::RuntimeError;
 use crate::lifecycle::RequestContext;
+use crate::render::csrf::CsrfRegistry;
 use axum::body::Body;
 use axum::http::{header, Response, StatusCode};
 use bytes::Bytes;
@@ -24,12 +25,14 @@ use tracing::warn;
 /// [`crate::AlbedoServerBuilder::register_action`].
 pub type ActionRegistry = HashMap<u32, Arc<dyn ActionHandler>>;
 
-/// Runs the action HTTP path. Decodes the envelope, looks up the
-/// handler by `action_id`, invokes it, and wire-encodes the returned
-/// instructions as an [`OpcodeFrame`] (no `component_id`).
+/// Runs the action HTTP path. Decodes the envelope, validates CSRF
+/// for form-shaped payloads, looks up the handler by `action_id`,
+/// invokes it, and wire-encodes the returned instructions as an
+/// [`OpcodeFrame`] (no `component_id`).
 ///
 /// Error mapping:
 /// - Malformed body → 400 with a short text reason
+/// - CSRF mismatch → 403 with `csrf` reason
 /// - Unknown `action_id` → 404
 /// - Handler error → 500 with the underlying message
 ///
@@ -38,6 +41,7 @@ pub type ActionRegistry = HashMap<u32, Arc<dyn ActionHandler>>;
 /// dispatcher feeds the bytes straight into `applyFrameBytes`.
 pub async fn run_action_request(
     registry: &ActionRegistry,
+    csrf: &CsrfRegistry,
     ctx: RequestContext,
     body: Bytes,
     slots: SessionSlots,
@@ -52,6 +56,28 @@ pub async fn run_action_request(
             );
         }
     };
+
+    // Phase L · CSRF gate. Form submissions carry a `_csrf` field in
+    // their JSON payload (the renderer injects the input via the
+    // `<form action="action:NAME">` rewrite path; the server's
+    // post-render middleware fills in the per-session token). Actions
+    // whose payload is not a JSON object — or that don't carry a
+    // `_csrf` field — skip the check. This keeps button-click
+    // actions and other non-form shapes on the wire unchanged.
+    if let Some(presented) = extract_csrf_field(&envelope.payload) {
+        if let Err(err) = csrf.validate(slots.session_id(), &presented) {
+            warn!(
+                action_id = envelope.action_id,
+                session = %slots.session_id(),
+                error = %err,
+                "CSRF validation failed",
+            );
+            return error_response(
+                StatusCode::FORBIDDEN,
+                format!("CSRF validation failed: {err}"),
+            );
+        }
+    }
 
     let handler = match registry.get(&envelope.action_id) {
         Some(handler) => handler.clone(),
@@ -135,6 +161,28 @@ pub(crate) fn status_for_error(err: &RuntimeError) -> StatusCode {
     }
 }
 
+/// Try to read a `_csrf` string field out of a JSON-encoded payload.
+///
+/// Returns:
+///   * `Some(token)` when the payload parses as a JSON object that
+///     carries a string-valued `_csrf` field.
+///   * `None` when the payload is not JSON, is JSON but not an
+///     object, or is an object that doesn't carry `_csrf`. The
+///     dispatcher treats `None` as "not a form action, skip the CSRF
+///     check" — button-click actions and other non-form shapes never
+///     have to opt in.
+///
+/// Deliberately lenient on the parse: a bincode payload (or any
+/// non-JSON bytes) returns `None` rather than an error, so non-form
+/// actions never trip on a JSON parser they were never expected to
+/// satisfy.
+fn extract_csrf_field(payload: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let object = value.as_object()?;
+    let field = object.get(crate::render::csrf::CSRF_FIELD_NAME)?;
+    field.as_str().map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +208,15 @@ mod tests {
 
     fn slots() -> SessionSlots {
         SessionSlots::new(SessionId::random(), Arc::new(SlotStore::new()))
+    }
+
+    /// Fresh empty CSRF registry — every existing dispatcher test
+    /// uses payloads that either aren't JSON or don't carry a
+    /// `_csrf` field, so the validate path is effectively a no-op
+    /// for them. The CSRF-specific tests below mint their own
+    /// registry to exercise the validate path explicitly.
+    fn csrf() -> CsrfRegistry {
+        CsrfRegistry::new()
     }
 
     async fn body_bytes(resp: Response<Body>) -> Bytes {
@@ -188,7 +245,7 @@ mod tests {
             .unwrap(),
         );
 
-        let response = run_action_request(&registry, ctx(), body, slots()).await;
+        let response = run_action_request(&registry, &csrf(), ctx(), body, slots()).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
@@ -212,6 +269,7 @@ mod tests {
         let registry: ActionRegistry = HashMap::new();
         let response = run_action_request(
             &registry,
+            &csrf(),
             ctx(),
             Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]),
             slots(),
@@ -231,7 +289,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = run_action_request(&registry, ctx(), body, slots()).await;
+        let response = run_action_request(&registry, &csrf(), ctx(), body, slots()).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -253,7 +311,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = run_action_request(&registry, ctx(), body, slots()).await;
+        let response = run_action_request(&registry, &csrf(), ctx(), body, slots()).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -283,7 +341,7 @@ mod tests {
             .unwrap(),
         );
 
-        let response = run_action_request(&registry, ctx(), body, view).await;
+        let response = run_action_request(&registry, &csrf(), ctx(), body, view).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let bytes = body_bytes(response).await;
@@ -300,5 +358,154 @@ mod tests {
             }
             other => panic!("expected SlotSet, got {other:?}"),
         }
+    }
+
+    /// Build a SessionSlots view bound to a known session id so the
+    /// CSRF tests below can mint a token against the same session.
+    fn slots_for(session: SessionId) -> SessionSlots {
+        SessionSlots::new(session, Arc::new(SlotStore::new()))
+    }
+
+    /// Wrap a JSON object containing a `_csrf` field (plus any extra
+    /// shape the caller wants) into the wire form bakabox emits for
+    /// a `<form>` submit.
+    fn json_payload_with_csrf(token: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "_csrf": token,
+            "user": "alice",
+        }))
+        .expect("payload encodes")
+    }
+
+    #[tokio::test]
+    async fn csrf_field_with_valid_token_dispatches_normally() {
+        // Mint a token bound to a known session, then submit a
+        // form-shaped payload carrying that exact token. The
+        // dispatcher must accept and run the handler.
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let token = csrf_registry.token_for(session);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                Ok(vec![Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(1),
+                }])
+            },
+        );
+        registry.insert(99, handler);
+
+        let body = Bytes::from(
+            encode_action_envelope(&ActionEnvelope {
+                action_id: 99,
+                event_kind: 2, // Submit
+                payload: json_payload_with_csrf(&token),
+            })
+            .unwrap(),
+        );
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            ctx(),
+            body,
+            slots_for(session),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn csrf_field_with_invalid_token_returns_403() {
+        // Mint a token, then submit with a different token. The
+        // dispatcher must return 403 and the registered handler
+        // must not run.
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let _real_token = csrf_registry.token_for(session);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                panic!("handler must not run on CSRF mismatch");
+            },
+        );
+        registry.insert(99, handler);
+
+        let body = Bytes::from(
+            encode_action_envelope(&ActionEnvelope {
+                action_id: 99,
+                event_kind: 2,
+                payload: json_payload_with_csrf("00000000000000000000000000000000"),
+            })
+            .unwrap(),
+        );
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            ctx(),
+            body,
+            slots_for(session),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn csrf_field_absent_skips_validation_and_dispatches() {
+        // JSON object payload WITHOUT a `_csrf` field — non-form
+        // action shape. Must dispatch normally, validate path
+        // skipped. Registry has a session token but the request
+        // doesn't present one, so the check must not run.
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let _token = csrf_registry.token_for(session);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                Ok(vec![Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(5),
+                }])
+            },
+        );
+        registry.insert(5, handler);
+
+        let payload = serde_json::to_vec(&serde_json::json!({ "user": "alice" })).unwrap();
+        let body = Bytes::from(
+            encode_action_envelope(&ActionEnvelope {
+                action_id: 5,
+                event_kind: 0, // Click — no form payload
+                payload,
+            })
+            .unwrap(),
+        );
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            ctx(),
+            body,
+            slots_for(session),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn csrf_extractor_returns_none_for_non_json_payload() {
+        // Non-JSON bytes (a bincode envelope is the typical case)
+        // must return None — the dispatcher then skips the check
+        // and routes the action normally. Direct unit test on the
+        // extractor so the parse-leniency contract stays explicit.
+        assert!(super::extract_csrf_field(&[0xff, 0x00, 0x12, 0x34]).is_none());
+        // JSON that isn't an object — array, string, number — also
+        // returns None.
+        assert!(super::extract_csrf_field(br#"[1,2,3]"#).is_none());
+        assert!(super::extract_csrf_field(br#""bare string""#).is_none());
     }
 }

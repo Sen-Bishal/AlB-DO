@@ -13,6 +13,7 @@ use crate::inspector::{
     self as inspector_routes, GraphSnapshot as InspectorGraphSnapshot, InspectorState,
 };
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
+use crate::render::csrf::CsrfRegistry;
 use crate::render::tier_b::{SharedRenderServices, TierBOpcodeRegistry};
 use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
 use dom_render_compiler::runtime::{SessionId, SlotStore};
@@ -101,6 +102,12 @@ struct RuntimeState {
     /// pipeline (when bound) holds the same `Arc<SlotStore>` so writes
     /// are visible to both sides without copying.
     slot_store: Arc<SlotStore>,
+    /// Phase L — per-session CSRF token registry. The action
+    /// dispatcher validates `_csrf` fields from JSON form payloads
+    /// against this map; the renderer side will eventually read it
+    /// to substitute the per-session token into hidden form inputs
+    /// stamped with `data-albedo-csrf`.
+    csrf: Arc<CsrfRegistry>,
     layouts: Arc<HashMap<String, SharedLayoutHandler>>,
     middleware: Arc<HashMap<String, SharedMiddleware>>,
     auth_provider: SharedAuthProvider,
@@ -236,25 +243,29 @@ impl AlbedoServerBuilder {
         self
     }
 
-    /// Phase-I — registers a typed form-submit handler under
-    /// `action_id`. The dispatcher decodes the incoming
-    /// `ActionEnvelope.payload` as JSON into `T` before invoking
-    /// `handler`. On parse failure the action surfaces a
-    /// [`RuntimeError::RequestHandling`] which the HTTP path renders
-    /// as a 500 with the underlying serde message — production code
-    /// should validate inputs with a typed `T` (`serde` derive) so
-    /// "bad data" surfaces as a structured error early.
+    /// Phase L — registers a typed form-submit handler under an
+    /// action **name** (the suffix the JSX form's
+    /// `action="action:NAME"` carries). The builder derives the
+    /// stable `action_id` via FNV-1a-32 (the same hash family the
+    /// renderer stamps into `data-albedo-action`), so userland never
+    /// has to compute the id by hand. The dispatcher decodes the
+    /// incoming `ActionEnvelope.payload` as JSON into `T` before
+    /// invoking `handler`; on parse failure the action surfaces a
+    /// [`RuntimeError::RequestHandling`] which the action HTTP path
+    /// renders as a 500 with the underlying serde message.
     ///
-    /// The form payload shape is the JSON object bakabox's
-    /// `encodeFormDataPayload` emits for a browser `FormData`: keys
-    /// are input `name` attributes, values are the last submitted
-    /// string value for each name. Repeated `name`s collapse to the
-    /// last value (matches `<form>` POST semantics). Phase-J / future
-    /// work will extend the helper to optionally produce
-    /// `{key: string[]}` shapes for explicit multi-value fields.
+    /// The form payload shape is the JSON object the client-side
+    /// runtime emits from a browser `FormData`: keys are input
+    /// `name` attributes, values are the last submitted string value
+    /// for each name. Repeated `name`s collapse to the last value
+    /// (matches `<form>` POST semantics). For per-field validation
+    /// patches (`SetText` opcodes targeting `data-albedo-error`
+    /// spans), implement [`crate::render::FromFormPayload`] on a
+    /// wrapping type and register through
+    /// [`Self::register_action`] with [`crate::render::form_action_handler`].
     pub fn register_form_action<T, F, Fut>(
         mut self,
-        action_id: u32,
+        action_name: impl Into<String>,
         handler: F,
     ) -> Self
     where
@@ -268,6 +279,15 @@ impl AlbedoServerBuilder {
             > + Send
             + 'static,
     {
+        // Derive the wire-level `action_id` from the user-supplied
+        // action name. Same FNV-1a-32 family the compile-time form
+        // extractor uses, so the JSX `action="action:NAME"` and the
+        // server-side `register_form_action("NAME", ...)` resolve to
+        // the same `action_id` on the wire without any per-route
+        // configuration.
+        let action_name = action_name.into();
+        let action_id = crate::render::form_action::form_action_id(&action_name);
+
         let handler = Arc::new(handler);
         let wrapped = move |ctx: RequestContext,
                             envelope: dom_render_compiler::ir::action::ActionEnvelope,
@@ -388,6 +408,13 @@ impl AlbedoServerBuilder {
         // against an empty store and the reactive loop never closes.
         let slot_store = Arc::new(SlotStore::new());
 
+        // Phase L · mint the CSRF registry once and share the same
+        // `Arc` between the streaming state (which mints tokens
+        // during page render) and `RuntimeState` (which validates
+        // them during action dispatch). The two paths MUST see the
+        // same token table or every form POST 403s.
+        let csrf_registry = Arc::new(CsrfRegistry::new());
+
         // Construct StreamingAppState, binding the optional pipeline +
         // runtime handle when both are present. `with_pipeline` consumes
         // the pair, so `take()` to move it out of the builder. The Arc
@@ -403,7 +430,8 @@ impl AlbedoServerBuilder {
                     self.config.server.port,
                 ),
                 shared_wt_sessions.clone(),
-            );
+            )
+            .with_csrf(csrf_registry.clone());
             let state = match pipeline_binding.take() {
                 Some((pipeline, handle)) => {
                     let pipeline = pipeline.with_slot_store(slot_store.clone());
@@ -496,6 +524,10 @@ impl AlbedoServerBuilder {
             api_handlers: Arc::new(self.api_handlers),
             action_handlers: Arc::new(self.action_handlers),
             slot_store,
+            // Phase L · same Arc the streaming state holds, so
+            // tokens minted during page render are the ones the
+            // action dispatcher validates against.
+            csrf: csrf_registry.clone(),
             layouts: Arc::new(self.layouts),
             middleware: Arc::new(self.middleware),
             auth_provider: self.auth_provider,
@@ -530,6 +562,16 @@ impl AlbedoServer {
     /// additional indirection from this method.
     pub fn inspector(&self) -> Option<Arc<InspectorState>> {
         self.state.inspector.clone()
+    }
+
+    /// Phase L · handle on the shared CSRF token registry. Used by
+    /// integration tests that need to mint or inspect tokens
+    /// outside the page-render path (for example, to construct a
+    /// known-valid form-submit payload without first hitting the
+    /// streaming handler). Production code does not need this — the
+    /// page-render path mints tokens on its own.
+    pub fn csrf_registry(&self) -> Arc<CsrfRegistry> {
+        self.state.csrf.clone()
     }
 
     pub async fn run(self) -> Result<(), RuntimeError> {
@@ -717,12 +759,22 @@ async fn run_action_route(state: &RuntimeState, request: Request<Body>) -> Respo
         Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
     };
 
-    let session_id = parts
-        .headers
-        .get(ACTION_SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
-        .map(SessionId::new)
+    // Phase L · prefer the `albedo-session` cookie (set by the
+    // streaming handler on first page render) over the explicit
+    // `x-albedo-session` header. Browser-driven form POSTs auto-send
+    // the cookie; programmatic clients can still override via the
+    // header. Without either, fall back to a fresh random session —
+    // which will trip CSRF validation on a subsequent submit, which
+    // is the correct failure mode.
+    let session_id = crate::render::csrf::read_session_cookie(&parts.headers)
+        .or_else(|| {
+            parts
+                .headers
+                .get(ACTION_SESSION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                .map(SessionId::new)
+        })
         .unwrap_or_else(SessionId::random);
 
     let query = parts.uri.query().map(str::to_string);
@@ -736,7 +788,14 @@ async fn run_action_route(state: &RuntimeState, request: Request<Body>) -> Respo
     );
 
     let slots = SessionSlots::new(session_id, state.slot_store.clone());
-    run_action_request(state.action_handlers.as_ref(), ctx, body, slots).await
+    run_action_request(
+        state.action_handlers.as_ref(),
+        state.csrf.as_ref(),
+        ctx,
+        body,
+        slots,
+    )
+    .await
 }
 
 /// Runs an API request: applies the route-level timeout, calls
@@ -1854,6 +1913,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_form_action_deserialises_json_payload_into_typed_struct() {
+        use crate::render::form_action::form_action_id;
         use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
         use dom_render_compiler::ir::opcode::{Instruction, StableId};
         use dom_render_compiler::ir::wire::decode_frame;
@@ -1865,6 +1925,12 @@ mod tests {
             password: String,
         }
 
+        // Phase L · `register_form_action` now takes the action
+        // name; the builder derives the wire-level `action_id` via
+        // FNV-1a-32. The envelope below uses the same hash so the
+        // dispatcher routes the request to the registered handler.
+        const ACTION_NAME: &str = "submit_login";
+
         let config = AppConfig {
             server: ServerConfig::default(),
             renderer: None,
@@ -1873,7 +1939,7 @@ mod tests {
         };
         let server = AlbedoServerBuilder::new(config)
             .register_form_action::<LoginForm, _, _>(
-                1,
+                ACTION_NAME,
                 |_ctx: RequestContext, form: LoginForm, _slots: SessionSlots| async move {
                     // Echo the username back so the test can verify the
                     // typed payload made it through unchanged.
@@ -1897,7 +1963,7 @@ mod tests {
         }))
         .unwrap();
         let body = encode_action_envelope(&ActionEnvelope {
-            action_id: 1,
+            action_id: form_action_id(ACTION_NAME),
             event_kind: 2, // Submit
             payload: form_payload,
         })
@@ -1936,6 +2002,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_form_action_rejects_malformed_json_with_500() {
+        use crate::render::form_action::form_action_id;
         use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
         use serde::Deserialize;
 
@@ -1945,6 +2012,12 @@ mod tests {
             field: String,
         }
 
+        // Phase L · action name resolves to a stable `action_id` on
+        // both ends; the envelope below uses the same hash so the
+        // dispatcher finds the handler even though the payload will
+        // fail to parse.
+        const ACTION_NAME: &str = "malformed_required";
+
         let config = AppConfig {
             server: ServerConfig::default(),
             renderer: None,
@@ -1953,7 +2026,7 @@ mod tests {
         };
         let server = AlbedoServerBuilder::new(config)
             .register_form_action::<Required, _, _>(
-                1,
+                ACTION_NAME,
                 |_ctx: RequestContext, _form: Required, _slots: SessionSlots| async move {
                     panic!("handler must not run when payload fails to deserialize");
                 },
@@ -1962,7 +2035,7 @@ mod tests {
             .unwrap();
 
         let body = encode_action_envelope(&ActionEnvelope {
-            action_id: 1,
+            action_id: form_action_id(ACTION_NAME),
             event_kind: 2,
             payload: b"not json".to_vec(),
         })

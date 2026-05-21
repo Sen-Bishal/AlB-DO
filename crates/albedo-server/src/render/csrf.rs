@@ -16,6 +16,7 @@
 //! Not a replacement for SameSite cookies or origin checks — this is
 //! defence in depth, not the only line.
 
+use axum::http::HeaderMap;
 use dashmap::DashMap;
 use dom_render_compiler::runtime::SessionId;
 use std::sync::Arc;
@@ -24,6 +25,14 @@ use std::sync::Arc;
 /// validates. Kept here so the renderer's form-render path and the
 /// dispatch-time validator agree without a string-typed contract.
 pub const CSRF_FIELD_NAME: &str = "_csrf";
+
+/// Cookie name that carries the per-session id between requests.
+/// The streaming handler mints one on first visit (Set-Cookie); the
+/// browser auto-attaches it to every subsequent request including
+/// form action POSTs. Both the page-render path and the action
+/// dispatch path read from this cookie so the CSRF token table
+/// stays addressable by the same `SessionId` on both sides.
+pub const ALBEDO_SESSION_COOKIE: &str = "albedo-session";
 
 /// Server-wide CSRF registry. Cloneable — internally an
 /// `Arc<DashMap>` — so the renderer and the dispatcher can both hold
@@ -118,6 +127,81 @@ impl CsrfRegistry {
 /// quoted shape for stability across DOM parsers.
 pub fn csrf_hidden_input_html(token: &str) -> String {
     format!("<input type=\"hidden\" name=\"{CSRF_FIELD_NAME}\" value=\"{token}\">")
+}
+
+/// Phase L · post-render CSRF substitution.
+///
+/// The renderer (in `dom_render_compiler::runtime::eval::core`) emits
+/// every form-action's hidden CSRF input as
+/// `<input type="hidden" name="_csrf" value="" data-albedo-csrf />`
+/// with an empty `value` and a `data-albedo-csrf` marker. The server
+/// then fills the value at request time with the per-session token
+/// minted via [`CsrfRegistry::token_for`] so the input is ready when
+/// bakabox serializes the form on submit.
+///
+/// The substitution is a deliberate byte-for-byte literal replace:
+/// the renderer's output is deterministic for this marker, so a
+/// full HTML parser would be overkill. The cost is one `str::replace`
+/// per response — sub-microsecond for any realistic page.
+///
+/// Returns the input unchanged when no marker is present (Tier-A
+/// pages without forms; cached responses; tests that don't render
+/// forms).
+pub fn substitute_csrf_token_in_html(html: &str, token: &str) -> String {
+    // Anchor: the renderer always emits the value attribute
+    // immediately before the marker attribute, in a single space-
+    // separated order. Pinning the exact sequence here is the contract
+    // both sides depend on; if the renderer's emission order changes,
+    // this constant must update in lockstep.
+    const EMPTY_PATTERN: &str = "value=\"\" data-albedo-csrf";
+    if !html.contains(EMPTY_PATTERN) {
+        return html.to_string();
+    }
+    let filled = format!("value=\"{token}\" data-albedo-csrf");
+    html.replace(EMPTY_PATTERN, &filled)
+}
+
+/// Reads the `albedo-session` cookie value from a request's header
+/// map and parses it into a [`SessionId`].
+///
+/// Returns `None` when the cookie is absent, malformed, or doesn't
+/// parse as a UUID. Callers that need a session id even on first
+/// visit should pair this with [`SessionId::random`] for a
+/// fresh-mint fallback (and remember to set the matching
+/// `Set-Cookie` on the response — see [`build_session_set_cookie`]).
+///
+/// Multiple cookies in a single header are supported (the
+/// `Cookie` header semicolon-separates them). The first matching
+/// `albedo-session=...` value wins; later duplicates are ignored.
+pub fn read_session_cookie(headers: &HeaderMap) -> Option<SessionId> {
+    let cookie_header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    for entry in cookie_header.split(';') {
+        let trimmed = entry.trim();
+        if let Some(value) = trimmed.strip_prefix(&format!("{ALBEDO_SESSION_COOKIE}=")) {
+            if let Ok(uuid) = uuid::Uuid::parse_str(value) {
+                return Some(SessionId::new(uuid));
+            }
+        }
+    }
+    None
+}
+
+/// Build a `Set-Cookie` header value that pins `albedo-session` to
+/// the supplied [`SessionId`]. Attributes:
+///   * `Path=/` — every route on the origin sees the cookie.
+///   * `HttpOnly` — JavaScript can't read it, so token leakage via
+///     XSS doesn't directly compromise the CSRF surface.
+///   * `SameSite=Lax` — sent on top-level same-site navigations but
+///     not on cross-site POSTs, which is exactly the threat CSRF
+///     tokens guard against.
+/// The cookie is session-scoped (no `Max-Age` / `Expires`) so it
+/// rolls when the browser closes — matches the lifetime semantics
+/// of the in-memory `CsrfRegistry`.
+pub fn build_session_set_cookie(session: SessionId) -> String {
+    format!(
+        "{ALBEDO_SESSION_COOKIE}={uuid}; Path=/; HttpOnly; SameSite=Lax",
+        uuid = session.as_uuid()
+    )
 }
 
 /// Mints a 128-bit random token rendered as 32 lowercase hex chars.
@@ -233,5 +317,90 @@ mod tests {
     #[test]
     fn constant_time_eq_accepts_equal_inputs() {
         assert!(constant_time_eq(b"deadbeef", b"deadbeef"));
+    }
+
+    #[test]
+    fn substitute_csrf_token_fills_empty_value_placeholder() {
+        let rendered = r#"<form><input type="hidden" name="_csrf" value="" data-albedo-csrf /></form>"#;
+        let out = substitute_csrf_token_in_html(rendered, "abc123");
+        assert!(out.contains("value=\"abc123\" data-albedo-csrf"));
+        assert!(!out.contains("value=\"\" data-albedo-csrf"));
+    }
+
+    #[test]
+    fn substitute_csrf_token_is_a_noop_when_no_marker_present() {
+        let plain = "<div>nothing to do here</div>";
+        assert_eq!(substitute_csrf_token_in_html(plain, "abc123"), plain);
+    }
+
+    #[test]
+    fn substitute_csrf_token_handles_multiple_forms_in_one_page() {
+        let rendered = concat!(
+            "<form><input value=\"\" data-albedo-csrf /></form>",
+            "<form><input value=\"\" data-albedo-csrf /></form>",
+        );
+        let out = substitute_csrf_token_in_html(rendered, "deadbeef");
+        assert_eq!(out.matches("value=\"deadbeef\"").count(), 2);
+        assert!(!out.contains("value=\"\" data-albedo-csrf"));
+    }
+
+    #[test]
+    fn read_session_cookie_finds_value_in_single_cookie_header() {
+        let mut headers = HeaderMap::new();
+        let session = SessionId::random();
+        let cookie = format!("{ALBEDO_SESSION_COOKIE}={}", session.as_uuid());
+        headers.insert(
+            axum::http::header::COOKIE,
+            cookie.parse().expect("cookie header value"),
+        );
+        let parsed = read_session_cookie(&headers).expect("cookie parses");
+        assert_eq!(parsed, session);
+    }
+
+    #[test]
+    fn read_session_cookie_finds_value_among_multiple_cookies() {
+        let mut headers = HeaderMap::new();
+        let session = SessionId::random();
+        let cookie = format!(
+            "theme=dark; {ALBEDO_SESSION_COOKIE}={}; preferences=compact",
+            session.as_uuid()
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            cookie.parse().expect("cookie header value"),
+        );
+        let parsed = read_session_cookie(&headers).expect("cookie parses");
+        assert_eq!(parsed, session);
+    }
+
+    #[test]
+    fn read_session_cookie_returns_none_when_absent() {
+        let headers = HeaderMap::new();
+        assert!(read_session_cookie(&headers).is_none());
+    }
+
+    #[test]
+    fn read_session_cookie_returns_none_for_malformed_uuid() {
+        let mut headers = HeaderMap::new();
+        let cookie = format!("{ALBEDO_SESSION_COOKIE}=not-a-uuid");
+        headers.insert(
+            axum::http::header::COOKIE,
+            cookie.parse().expect("cookie header value"),
+        );
+        assert!(read_session_cookie(&headers).is_none());
+    }
+
+    #[test]
+    fn build_session_set_cookie_carries_expected_attributes() {
+        let session = SessionId::random();
+        let header = build_session_set_cookie(session);
+        assert!(header.contains(&session.as_uuid().to_string()));
+        assert!(header.contains("Path=/"));
+        assert!(header.contains("HttpOnly"));
+        assert!(header.contains("SameSite=Lax"));
+        // No Max-Age / Expires — session cookie rolls when the
+        // browser closes, matching the in-memory registry's lifetime.
+        assert!(!header.contains("Max-Age"));
+        assert!(!header.contains("Expires"));
     }
 }

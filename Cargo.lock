@@ -44,6 +44,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "dashmap",
  "dom-render-compiler",
  "futures-util",
  "http",

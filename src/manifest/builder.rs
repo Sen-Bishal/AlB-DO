@@ -678,6 +678,15 @@ fn default_shim_script(enable_wt_bootstrap: bool) -> String {
             "<script type=\"module\" async src=\"/_albedo/wt-bootstrap.js\" data-albedo-wt-bootstrap=\"1\"></script>",
         );
     }
+    // Phase L · client-side Link / form-action / Navigate
+    // interception. Always shipped — even Tier-A-only routes may
+    // carry `<Link>` elements for SPA navigation. Module-script
+    // execution follows document order, so this loads after
+    // `runtime.js` and finds `__ALBEDO_RUNTIME` already wired by the
+    // time its IIFE runs.
+    script.push_str(
+        "<script type=\"module\" src=\"/_albedo/link-forms.js\"></script>",
+    );
     script
 }
 
@@ -755,6 +764,17 @@ mod tests {
         let script = default_shim_script(false);
         assert!(script.contains("/_albedo/runtime.js"));
         assert!(!script.contains("/_albedo/wt-bootstrap.js"));
+    }
+
+    #[test]
+    fn test_default_shim_script_always_includes_link_forms_asset() {
+        // Phase L · `link-forms.js` ships on every route, Tier-A
+        // included, because `<Link>` SPA navigation works without
+        // any WT bootstrap. Both shim variants must reference it.
+        let with_wt = default_shim_script(true);
+        let without_wt = default_shim_script(false);
+        assert!(with_wt.contains("/_albedo/link-forms.js"));
+        assert!(without_wt.contains("/_albedo/link-forms.js"));
     }
 
     #[test]

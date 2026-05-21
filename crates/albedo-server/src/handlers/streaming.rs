@@ -50,6 +50,13 @@ pub struct StreamingAppState {
     /// tier-B render — used by tests that don't exercise the binary wire
     /// and by environments that haven't yet plumbed a renderer.
     pipeline: Option<SharedPipeline>,
+    /// Phase L · per-session CSRF registry shared with the action
+    /// dispatcher's [`crate::server::RuntimeState`]. The page-render
+    /// path consults this to fill the empty `value=""` placeholders
+    /// the renderer stamps for form-action elements. Defaults to a
+    /// fresh empty registry so tests that don't exercise CSRF compile
+    /// and run unchanged; production wires it via [`Self::with_csrf`].
+    csrf: Arc<crate::render::csrf::CsrfRegistry>,
 }
 
 impl StreamingAppState {
@@ -65,7 +72,28 @@ impl StreamingAppState {
             transport,
             webtransport_sessions,
             pipeline: None,
+            csrf: Arc::new(crate::render::csrf::CsrfRegistry::new()),
         }
+    }
+
+    /// Binds a shared CSRF registry to this streaming state. Production
+    /// wires the **same** `Arc<CsrfRegistry>` here that the
+    /// `RuntimeState` action dispatcher holds, so the per-session
+    /// tokens minted during page render are the ones the action route
+    /// validates against. Without this call the streaming state runs
+    /// with a fresh empty registry — fine for tests, broken for
+    /// end-to-end CSRF.
+    #[must_use]
+    pub fn with_csrf(mut self, csrf: Arc<crate::render::csrf::CsrfRegistry>) -> Self {
+        self.csrf = csrf;
+        self
+    }
+
+    /// Returns the shared CSRF registry handle. Used by the
+    /// streaming handler to mint or look up tokens per request, and
+    /// exposed for tests that want to pre-populate tokens.
+    pub fn csrf(&self) -> &Arc<crate::render::csrf::CsrfRegistry> {
+        &self.csrf
     }
 
     /// Binds an opcode pipeline to this streaming state.
@@ -264,6 +292,20 @@ pub async fn streaming_handler(
     let route = route.clone();
     let ctx = request_context_from_request(&req);
 
+    // Phase L · resolve the per-session id used to address the CSRF
+    // token table. Read from the `albedo-session` cookie when the
+    // browser carries one; mint a fresh id otherwise. We track
+    // `is_fresh_session` so we know whether to emit a Set-Cookie on
+    // the response — repeat visits don't pay the header cost.
+    let (page_session, is_fresh_session) =
+        match crate::render::csrf::read_session_cookie(req.headers()) {
+            Some(existing) => (existing, false),
+            None => (
+                dom_render_compiler::runtime::SessionId::random(),
+                true,
+            ),
+        };
+
     if negotiated_transport == NegotiatedTransport::WebTransport {
         match maybe_webtransport_session_id(&req) {
             Some(session_id) => {
@@ -305,7 +347,7 @@ pub async fn streaming_handler(
         }
     }
 
-    let stream = build_stream(route, ctx, app, response_transport);
+    let stream = build_stream(route, ctx, app, response_transport, page_session);
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -314,6 +356,16 @@ pub async fn streaming_handler(
         .header("x-content-type-options", "nosniff")
         .header("cache-control", "no-store")
         .header("x-albedo-transport", response_transport.as_header_value());
+
+    // Phase L · pin the session id in a cookie the first time we
+    // see this browser so subsequent action POSTs route back to the
+    // same CsrfRegistry entry.
+    if is_fresh_session {
+        response = response.header(
+            header::SET_COOKIE,
+            crate::render::csrf::build_session_set_cookie(page_session),
+        );
+    }
 
     if let Some(alt_svc) = transport_config.alt_svc {
         response = response.header("alt-svc", alt_svc);
@@ -378,12 +430,15 @@ fn build_stream(
     ctx: TierBRequestContext,
     app: Arc<StreamingAppState>,
     negotiated_transport: NegotiatedTransport,
+    page_session: dom_render_compiler::runtime::SessionId,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
     stream! {
         let shell = build_shell_chunk(
             &route,
             negotiated_transport,
             app.transport.webtransport_path.as_str(),
+            app.csrf().as_ref(),
+            page_session,
         );
 
         yield Ok(Bytes::from(shell));
@@ -450,6 +505,8 @@ fn build_shell_chunk(
     route: &RouteManifest,
     negotiated_transport: NegotiatedTransport,
     webtransport_path: &str,
+    csrf: &crate::render::csrf::CsrfRegistry,
+    page_session: dom_render_compiler::runtime::SessionId,
 ) -> String {
     let mut shell = route.shell.doctype_and_head.clone();
     shell.push_str(&route.shell.body_open);
@@ -466,7 +523,13 @@ fn build_shell_chunk(
         );
     }
 
-    shell
+    // Phase L · fill any `value=""` CSRF placeholders the renderer
+    // stamped on form-action inputs. Mints the per-session token on
+    // first access; subsequent calls in the same session return the
+    // same value. No-op when the shell carries no `data-albedo-csrf`
+    // markers (Tier-A pages without forms).
+    let token = csrf.token_for(page_session);
+    crate::render::csrf::substitute_csrf_token_in_html(&shell, &token)
 }
 
 /// Hard cap on how long the WT path will tick + drain waiting for async
@@ -512,11 +575,21 @@ async fn stream_route_over_webtransport(
         .ok_or_else(|| "opcode registry unavailable on WT path".to_string())?;
     let data_fetcher = app.services.data_fetcher.clone();
 
+    // Phase L · the WT session id doubles as the CSRF session id on
+    // this path. The same uuid the client carries on the WT
+    // handshake is what the action route will see in the
+    // `albedo-session` cookie (or `x-albedo-wt-session` header) when
+    // it later POSTs a form, so the token table keys align without
+    // any cookie round-trip on the WT path.
+    let page_session = dom_render_compiler::runtime::SessionId::new(session_id);
+
     // 1. Shell HTML on the text slot.
     let mut shell = build_shell_chunk(
         &route,
         NegotiatedTransport::WebTransport,
         app.transport.webtransport_path.as_str(),
+        app.csrf().as_ref(),
+        page_session,
     );
     shell.push_str(&route.shell.body_close);
     sessions

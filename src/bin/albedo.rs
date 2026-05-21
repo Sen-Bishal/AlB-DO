@@ -2135,6 +2135,17 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
             hydration_asset_path.display()
         )
     })?;
+    // Phase L · ship the Link/form/Navigate client interception
+    // module next to the rest of the bakabox assets. Loaded by the
+    // shell shim after runtime.js so the IIFE finds
+    // `__ALBEDO_RUNTIME` already wired.
+    let link_forms_asset_path = out_dir.join("_albedo").join("link-forms.js");
+    std::fs::write(&link_forms_asset_path, albedo_link_forms_template()).map_err(|err| {
+        format!(
+            "failed to write link/forms client '{}': {err}",
+            link_forms_asset_path.display()
+        )
+    })?;
     let index_html_path = out_dir.join("index.html");
     std::fs::write(&index_html_path, SCAFFOLD_INDEX_HTML).map_err(|err| {
         format!(
@@ -2148,7 +2159,7 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
         colorize_timing_ms(compile_start.elapsed().as_secs_f64() * 1000.0)
     ));
     print_kv("output", out_dir.display());
-    print_kv("artifacts", report.artifacts.len() + 4);
+    print_kv("artifacts", report.artifacts.len() + 5);
     if missing_sources > 0 {
         print_warn(format!(
             "{missing_sources} module{} had unreadable sources — skipped from static precompile",
@@ -2156,7 +2167,13 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
         ));
     }
 
-    let _ = (&manifest_path, &runtime_asset_path, &hydration_asset_path, &index_html_path);
+    let _ = (
+        &manifest_path,
+        &runtime_asset_path,
+        &hydration_asset_path,
+        &link_forms_asset_path,
+        &index_html_path,
+    );
     for artifact in report.artifacts.iter().take(6) {
         println!(
             "    {} {} {}",
@@ -2407,6 +2424,15 @@ fn albedo_bincode_template() -> String {
 /// runtime and the decoder.
 fn albedo_wt_bootstrap_template() -> String {
     include_str!("../../assets/albedo-wt-bootstrap.js").to_string()
+}
+
+/// Phase L · client-side Link / form-action / Navigate interception.
+/// Deployed to `_albedo/link-forms.js`. The IIFE reads
+/// `globalThis.__ALBEDO_RUNTIME` set up by `runtime.js`, so this
+/// asset MUST load after the main runtime — the shell shim emits the
+/// `<script>` tag in document order to guarantee that.
+fn albedo_link_forms_template() -> String {
+    include_str!("../../assets/albedo-link-forms.js").to_string()
 }
 
 fn run_completions_command(raw_args: &[String]) -> Result<(), String> {

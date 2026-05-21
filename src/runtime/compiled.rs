@@ -19,7 +19,9 @@ use crate::runtime::slot_store::SessionSlotView;
 use crate::transforms::events::{
     collect_free_idents_in_handler_body, HandlerBody, HandlerExtract,
 };
+use crate::transforms::form::{extract_forms_in_function, FormExtract};
 use crate::transforms::hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
+use crate::transforms::link::{extract_links_in_function, LinkExtract};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -85,6 +87,19 @@ pub struct CompiledComponent {
     /// hook-slot namespace (`#0`, `#1`, ...) so collisions are
     /// impossible.
     pub capture_slots: HashMap<String, SlotId>,
+    /// Phase L · form-action metadata extracted from this component's
+    /// JSX. Each entry is one `<form action="action:NAME">` in
+    /// source-traversal order. The renderer consults this when it
+    /// stamps `data-albedo-action` and the hidden CSRF placeholder;
+    /// the server can warn at registration time when a form references
+    /// an action name no handler is bound to.
+    pub forms: Vec<FormExtract>,
+    /// Phase L · `<Link href>` metadata in source-traversal order.
+    /// The renderer rewrites each `<Link>` it sees as an `<a href
+    /// data-albedo-link>` host element; this list is the diagnostic
+    /// surface for tooling that wants to enumerate routes the JSX
+    /// references.
+    pub links: Vec<LinkExtract>,
 }
 
 /// One handler the server can re-execute when bakabox POSTs an action
@@ -133,6 +148,14 @@ impl CompiledProject {
                     })?;
                 let handler_extracts =
                     crate::transforms::events::extract_handlers_in_function(&function.body_stmts);
+
+                // Phase L · run the two new JSX walkers alongside the
+                // hook + handler extractors. The walkers are pure
+                // metadata passes; they don't mutate the AST and they
+                // share the same source-order indexing convention so
+                // the renderer can align by position later.
+                let form_extracts = extract_forms_in_function(&function.body_stmts);
+                let link_extracts = extract_links_in_function(&function.body_stmts);
 
                 let mut value_slots: HashMap<String, SlotId> = HashMap::new();
                 let mut setter_slots: HashMap<String, SlotId> = HashMap::new();
@@ -205,6 +228,8 @@ impl CompiledProject {
                         proxy_ids,
                         param_names,
                         capture_slots,
+                        forms: form_extracts,
+                        links: link_extracts,
                     },
                 );
             }
