@@ -33,7 +33,9 @@
       "Bash(python -c ' *)",
       "Bash(rm clippy_full.log)",
       "Bash(python filter_clippy.py)",
-      "Bash(rm clippy_full.log filter_clippy.py)"
+      "Bash(rm clippy_full.log filter_clippy.py)",
+      "Bash(ls \"A:\\\\AlBDO-v-0.1.0\\\\\")",
+      "PowerShell(Get-ChildItem -Path \"A:\\\\AlBDO-v-0.1.0\\\\crates\" -Recurse -File -Exclude \"target\" | Where-Object { $_.FullName -notmatch \"target\" } | Select-Object FullName, Length | Format-Table -AutoSize)"
     ]
   }
 }

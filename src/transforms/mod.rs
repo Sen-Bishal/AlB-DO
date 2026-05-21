@@ -1,10 +1,11 @@
-//! Phase K — compile-time JSX transforms.
+//! Phase K + Phase L — compile-time JSX transforms.
 //!
 //! The runtime is fully wired: Phase H ships [`SlotStore`], Phase G
 //! ships [`ActionHandler`], bakabox already handles `BindEvent`,
-//! `SetTextRef`, and `SlotSet`. What Phase K supplies is the
+//! `SetTextRef`, and `SlotSet`. What Phase K + L supply is the
 //! compile-time bridge from user-authored `useState` + JSX `on*`
-//! handlers to those wire primitives.
+//! handlers + `<form action="action:NAME">` + `<Link href>` to those
+//! wire primitives.
 //!
 //! Architectural choice: Phase J's evaluator is an AST walker. Rather
 //! than rewriting the AST source-to-source (a full SWC `VisitMut`
@@ -20,9 +21,16 @@
 //! [`ActionHandler`]: ../../../crates/albedo-server/src/actions.rs
 
 pub mod events;
+pub mod form;
 pub mod hooks;
+pub mod link;
 
 pub use events::{
     collect_free_idents_in_handler_body, extract_handlers_in_function, HandlerBody, HandlerExtract,
 };
+pub use form::{
+    allocate_field_error_id, allocate_form_action_id, extract_forms_in_function, FormExtract,
+    FormField, FormFieldKind, FormMethod, FORM_ACTION_PREFIX,
+};
 pub use hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
+pub use link::{extract_links_in_function, LinkExtract};
