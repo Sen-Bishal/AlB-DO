@@ -47,6 +47,7 @@ pub mod actions;
 pub mod api;
 pub mod config;
 pub mod contract;
+pub mod dev;
 pub mod error;
 pub mod handlers;
 pub mod inspector;

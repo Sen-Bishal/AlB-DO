@@ -1,7 +1,7 @@
 use super::classify::BundleClass;
 use super::plan::BundlePlan;
 use super::precompiled::build_precompiled_runtime_modules_artifact;
-use super::rewrite::{build_wrapper_module_source, RewriteAction};
+use super::rewrite::{build_wrapper_module_source, build_wrapper_source_map, RewriteAction};
 use super::static_slice::build_bundle_static_slice_manifest;
 use crate::manifest::schema::{DomPosition, PrecompiledRuntimeModulesArtifact, RenderManifestV2};
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,32 @@ pub fn emit_wrapper_modules(plan: &BundlePlan) -> BTreeMap<String, String> {
             emitted
                 .entry(wrapper_module.clone())
                 .or_insert_with(|| build_wrapper_module_source(source_module));
+        }
+    }
+
+    emitted
+}
+
+/// Phase M.4 · sibling source-map files for every wrapper module
+/// emitted by [`emit_wrapper_modules`]. Keyed by `{wrapper}.map`
+/// path so the relative `sourceMappingURL` in the wrapper resolves
+/// to a peer file in the bundle output tree. Stage 1 emits a v3
+/// stub map (no per-line mappings); Stage 2 will collect real
+/// mappings from the SWC transpile pass.
+pub fn emit_wrapper_source_maps(plan: &BundlePlan) -> BTreeMap<String, String> {
+    let mut emitted = BTreeMap::new();
+
+    for action in &plan.rewrite_actions {
+        if let RewriteAction::WrapModule {
+            source_module,
+            wrapper_module,
+            ..
+        } = action
+        {
+            let map_path = format!("{wrapper_module}.map");
+            emitted
+                .entry(map_path)
+                .or_insert_with(|| build_wrapper_source_map(source_module));
         }
     }
 
@@ -327,6 +353,20 @@ fn emit_bundle_artifacts_to_dir_internal(
         artifacts.push(EmittedArtifact {
             relative_path: normalized,
             bytes: source_bytes.len(),
+        });
+    }
+
+    // Phase M.4 · sibling .map files for every emitted wrapper. The
+    // wrapper JS carries a `//# sourceMappingURL=...` comment that
+    // resolves to this peer file in the same directory.
+    for (relative_map_path, map_source) in emit_wrapper_source_maps(plan) {
+        let normalized = normalize_relative_artifact_path(&relative_map_path);
+        let map_path = output_dir.join(relative_path_to_fs_path(&normalized));
+        let map_bytes = map_source.into_bytes();
+        write_artifact(&map_path, &map_bytes)?;
+        artifacts.push(EmittedArtifact {
+            relative_path: normalized,
+            bytes: map_bytes.len(),
         });
     }
 
@@ -601,7 +641,10 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let report = emit_bundle_artifacts_to_dir(&fixture_plan(), temp_dir.path()).unwrap();
 
-        assert_eq!(report.artifacts.len(), 6);
+        // Phase M.4 · the bundler now emits a `.map` file alongside
+        // every wrapper module; one wrapper in the fixture → one
+        // extra artifact compared to the pre-M.4 count of 6.
+        assert_eq!(report.artifacts.len(), 7);
 
         let wt_bootstrap_path = temp_dir.path().join("_albedo").join("wt-bootstrap.js");
         let wt_bootstrap_source = std::fs::read_to_string(wt_bootstrap_path).unwrap();

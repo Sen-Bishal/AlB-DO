@@ -114,6 +114,12 @@ struct RuntimeState {
     request_timeout: Duration,
     streaming_runtime: Option<Arc<StreamingAppState>>,
     inspector: Option<Arc<InspectorState>>,
+    /// Phase M.1 — error registry the floating overlay subscribes
+    /// to. `None` in production builds; `Some` when dev mode is on.
+    dev_error_registry: Option<crate::dev::SharedErrorRegistry>,
+    /// Phase M.2 — HMR registry the in-place DOM-swap client
+    /// subscribes to. Same on/off semantics as the error registry.
+    dev_hmr_registry: Option<crate::dev::SharedHmrRegistry>,
 }
 
 pub struct AlbedoServerBuilder {
@@ -145,6 +151,10 @@ pub struct AlbedoServerBuilder {
     /// stashed alongside so the pipeline can spawn resolver Futures.
     /// Userland binds both via `with_pipeline`.
     pipeline: Option<(FourLaneRuntimePipeline, tokio::runtime::Handle)>,
+    /// Phase M — dev-mode toggle. `Some(true)` / `Some(false)`
+    /// overrides; `None` defaults to `cfg!(debug_assertions)` so
+    /// debug builds get the overlay + HMR endpoints automatically.
+    dev_mode_enabled: Option<bool>,
 }
 
 impl AlbedoServerBuilder {
@@ -162,7 +172,17 @@ impl AlbedoServerBuilder {
             inspector_enabled: None,
             opcode_registry: None,
             pipeline: None,
+            dev_mode_enabled: None,
         }
+    }
+
+    /// Phase M — explicit toggle for the error overlay + HMR
+    /// surface mounted at `/_albedo/dev/*`. `None` (default) means
+    /// auto: enabled on `cfg!(debug_assertions)`, off otherwise.
+    #[must_use]
+    pub fn with_dev_mode(mut self, enabled: bool) -> Self {
+        self.dev_mode_enabled = Some(enabled);
+        self
     }
 
     /// Forces the dev inspector on or off. By default the inspector is mounted
@@ -518,6 +538,22 @@ impl AlbedoServerBuilder {
             None
         };
 
+        // Phase M · mint dev-mode registries when enabled. Defaults
+        // follow the inspector convention (on in debug builds, off
+        // in release) so a `cargo run --release` server doesn't leak
+        // dev routes.
+        let dev_mode_enabled = self
+            .dev_mode_enabled
+            .unwrap_or(cfg!(debug_assertions));
+        let (dev_error_registry, dev_hmr_registry) = if dev_mode_enabled {
+            (
+                Some(Arc::new(crate::dev::DevErrorRegistry::new())),
+                Some(Arc::new(crate::dev::HmrRegistry::new())),
+            )
+        } else {
+            (None, None)
+        };
+
         let state = RuntimeState {
             router: Arc::new(router),
             handlers: Arc::new(self.handlers),
@@ -534,6 +570,8 @@ impl AlbedoServerBuilder {
             request_timeout: Duration::from_millis(self.config.server.request_timeout_ms),
             streaming_runtime,
             inspector,
+            dev_error_registry,
+            dev_hmr_registry,
         };
 
         Ok(AlbedoServer {
@@ -572,6 +610,20 @@ impl AlbedoServer {
     /// page-render path mints tokens on its own.
     pub fn csrf_registry(&self) -> Arc<CsrfRegistry> {
         self.state.csrf.clone()
+    }
+
+    /// Phase M.1 · access the dev error overlay registry. `None`
+    /// when the server was built without dev mode enabled. Userland
+    /// integration code (a file watcher, an external linter, etc.)
+    /// uses this to push errors into the in-browser overlay.
+    pub fn dev_error_registry(&self) -> Option<crate::dev::SharedErrorRegistry> {
+        self.state.dev_error_registry.clone()
+    }
+
+    /// Phase M.2 · access the slot-preserving HMR registry. Same
+    /// availability rules as the error registry above.
+    pub fn dev_hmr_registry(&self) -> Option<crate::dev::SharedHmrRegistry> {
+        self.state.dev_hmr_registry.clone()
     }
 
     pub async fn run(self) -> Result<(), RuntimeError> {
@@ -661,6 +713,42 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
     if inspector_routes::matches_inspector_path(path.as_str()) {
         if let Some(inspector) = &state.inspector {
             return inspector_routes::dispatch(inspector, path.as_str()).into_response();
+        }
+    }
+
+    // Phase M · dev-mode error overlay + HMR endpoints. Only mounted
+    // when the corresponding registries exist on RuntimeState; in
+    // production builds both are None and these routes fall through
+    // to the regular router, which surfaces a clean 404.
+    if path.starts_with("/_albedo/dev/") {
+        match path.as_str() {
+            "/_albedo/dev/overlay.js" => {
+                if state.dev_error_registry.is_some() {
+                    return crate::handlers::dev::serve_overlay_script().into_response();
+                }
+            }
+            "/_albedo/dev/hmr-apply.js" => {
+                if state.dev_hmr_registry.is_some() {
+                    return crate::handlers::dev::serve_hmr_apply_script().into_response();
+                }
+            }
+            "/_albedo/dev/errors" => {
+                if let Some(registry) = &state.dev_error_registry {
+                    return crate::handlers::dev::serve_error_stream(registry.clone())
+                        .into_response();
+                }
+            }
+            "/_albedo/dev/hmr" => {
+                if let Some(registry) = &state.dev_hmr_registry {
+                    return crate::handlers::dev::serve_hmr_stream(registry.clone())
+                        .into_response();
+                }
+            }
+            _ => {
+                if state.dev_error_registry.is_some() || state.dev_hmr_registry.is_some() {
+                    return crate::handlers::dev::dev_not_found().into_response();
+                }
+            }
         }
     }
 

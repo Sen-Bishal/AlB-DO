@@ -1810,6 +1810,11 @@ fn inject_hmr_client_script(html_document: &str, hmr_enabled: bool) -> String {
         return html_document.to_string();
     }
 
+    // Phase M.2 · in-place HTML swap instead of full reload. Server-
+    // side slot store survives the swap (cookie unchanged), and a
+    // best-effort draft-input capture keeps the operator's typed
+    // text alive across the rebuild cycle. Falls back to a hard
+    // reload when the fetch or parse fails.
     let script = r#"<script>
 (function () {
   var connect = function () {
@@ -1820,7 +1825,7 @@ fn inject_hmr_client_script(html_document: &str, hmr_enabled: bool) -> String {
           return;
         }
         if (event.data.indexOf('reload') === 0) {
-          window.location.reload();
+          applyInPlaceSwap();
           return;
         }
         if (event.data.indexOf('invalidate:') === 0) {
@@ -1830,6 +1835,7 @@ fn inject_hmr_client_script(html_document: &str, hmr_enabled: bool) -> String {
               detail: { revision: parts[0] || '', component_id: parts[1] || '' }
             }));
           } catch (_eventErr) {}
+          applyInPlaceSwap();
         }
       };
       es.onerror = function () {
@@ -1840,6 +1846,86 @@ fn inject_hmr_client_script(html_document: &str, hmr_enabled: bool) -> String {
       setTimeout(connect, 1000);
     }
   };
+
+  // Refetch the current URL and swap document.body's innerHTML in
+  // place. Slot state lives on the server keyed by the
+  // albedo-session cookie, so the round-trip preserves it. Draft
+  // input values (text/textarea with a `name`) are best-effort
+  // restored across the swap.
+  var applyInPlaceSwap = function () {
+    var draft = captureDraft();
+    var scroll = { x: window.scrollX, y: window.scrollY };
+    fetch(window.location.href, { credentials: 'same-origin', cache: 'no-store' })
+      .then(function (response) {
+        if (!response.ok) {
+          window.location.reload();
+          return null;
+        }
+        return response.text();
+      })
+      .then(function (html) {
+        if (html == null) return;
+        var doc;
+        try {
+          doc = new DOMParser().parseFromString(html, 'text/html');
+        } catch (_err) {
+          window.location.reload();
+          return;
+        }
+        if (!doc || !doc.body) {
+          window.location.reload();
+          return;
+        }
+        document.body.innerHTML = doc.body.innerHTML;
+        restoreDraft(draft);
+        try { window.scrollTo(scroll.x, scroll.y); } catch (_e) {}
+        try {
+          window.dispatchEvent(new CustomEvent('albedo:hmr-applied', {
+            detail: { route: window.location.pathname }
+          }));
+        } catch (_e) {}
+      })
+      .catch(function () {
+        window.location.reload();
+      });
+  };
+
+  var captureDraft = function () {
+    var out = {};
+    var fields = document.querySelectorAll('input[name], textarea[name]');
+    for (var i = 0; i < fields.length; i++) {
+      var el = fields[i];
+      var name = el.getAttribute('name');
+      if (!name) continue;
+      var type = (el.type || '').toLowerCase();
+      if (type === 'password') continue;
+      if (type === 'checkbox' || type === 'radio') {
+        out[name + ':' + (el.value || '') + ':checked'] = !!el.checked;
+      } else {
+        out[name] = el.value;
+      }
+    }
+    return out;
+  };
+
+  var restoreDraft = function (draft) {
+    if (!draft) return;
+    var fields = document.querySelectorAll('input[name], textarea[name]');
+    for (var i = 0; i < fields.length; i++) {
+      var el = fields[i];
+      var name = el.getAttribute('name');
+      if (!name) continue;
+      var type = (el.type || '').toLowerCase();
+      if (type === 'password') continue;
+      if (type === 'checkbox' || type === 'radio') {
+        var key = name + ':' + (el.value || '') + ':checked';
+        if (key in draft) el.checked = !!draft[key];
+      } else if (name in draft) {
+        el.value = draft[name];
+      }
+    }
+  };
+
   connect();
 })();
 </script>"#;
