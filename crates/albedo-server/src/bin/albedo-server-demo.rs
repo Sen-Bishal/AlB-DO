@@ -302,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // event into `LoginForm` before invoking the closure; the
         // closure responds with a `Navigate` to a different route.
         .register_form_action::<LoginForm, _, _>(
-            3,
+            "submit_login",
             |_ctx: RequestContext, form: LoginForm, _slots: SessionSlots| async move {
                 Ok(vec![Instruction::Navigate {
                     url: format!("/welcome?as={}", form.username),

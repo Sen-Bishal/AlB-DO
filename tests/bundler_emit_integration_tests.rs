@@ -203,14 +203,40 @@ fn test_wrapper_sources_match_golden_fixtures() {
         .get(&header_wrapper_path)
         .expect("header wrapper source should exist");
 
-    assert_eq!(
-        normalize_newlines(home_source),
-        read_fixture("home_wrapper.mjs")
-    );
-    assert_eq!(
-        normalize_newlines(header_source),
-        read_fixture("header_wrapper.mjs")
-    );
+    // Phase M.4 · the wrapper now appends a `//# sourceMappingURL=`
+    // comment whose target name depends on the wrapper's stable
+    // hash. Compare the body (everything up to that comment)
+    // against the golden fixture, and assert the sourceMappingURL
+    // anchors the trailing `.mjs.map` file the bundler also emits.
+    let (home_body, home_map_line) = split_wrapper_at_sourcemap(home_source);
+    let (header_body, header_map_line) = split_wrapper_at_sourcemap(header_source);
+    assert_eq!(home_body, read_fixture("home_wrapper.mjs"));
+    assert_eq!(header_body, read_fixture("header_wrapper.mjs"));
+    assert!(home_map_line.ends_with(".mjs.map"));
+    assert!(header_map_line.ends_with(".mjs.map"));
+}
+
+/// Splits the wrapper source into (body, sourceMappingURL line). The
+/// body is everything before the comment, normalised for line
+/// endings; the sourceMappingURL line is the URL only, with the
+/// `//# sourceMappingURL=` prefix and any trailing newline
+/// stripped, so the caller can do a simple `.ends_with` check.
+fn split_wrapper_at_sourcemap(source: &str) -> (String, String) {
+    let normalised = normalize_newlines(source);
+    if let Some(idx) = normalised.find("//# sourceMappingURL=") {
+        let body = normalised[..idx].to_string();
+        let comment_line = normalised[idx..]
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim_end()
+            .to_string();
+        let url = comment_line
+            .trim_start_matches("//# sourceMappingURL=")
+            .to_string();
+        return (body, url);
+    }
+    (normalised, String::new())
 }
 
 #[test]
