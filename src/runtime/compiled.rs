@@ -22,6 +22,9 @@ use crate::transforms::events::{
 use crate::transforms::form::{extract_forms_in_function, FormExtract};
 use crate::transforms::hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 use crate::transforms::link::{extract_links_in_function, LinkExtract};
+use crate::transforms::shared_slots::{
+    extract_shared_slot_hooks, SharedSlotBinding, SharedSlotExtractError,
+};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -100,6 +103,12 @@ pub struct CompiledComponent {
     /// surface for tooling that wants to enumerate routes the JSX
     /// references.
     pub links: Vec<LinkExtract>,
+    /// Phase O.2 · `useSharedSlot("topic")` calls extracted from the
+    /// JSX in source-traversal order. The renderer (next session)
+    /// will read the topic's current value via the broadcast
+    /// registry; for now this exists as the compile-time contract
+    /// downstream wiring compiles against.
+    pub shared_slots: Vec<SharedSlotBinding>,
 }
 
 /// One handler the server can re-execute when bakabox POSTs an action
@@ -156,6 +165,20 @@ impl CompiledProject {
                 // the renderer can align by position later.
                 let form_extracts = extract_forms_in_function(&function.body_stmts);
                 let link_extracts = extract_links_in_function(&function.body_stmts);
+
+                // Phase O.2 · same pattern, surfaces `useSharedSlot`
+                // calls as a list of (binding_name, topic) records.
+                // Compile-time failure here propagates as an
+                // `anyhow!` so misuse blocks the build.
+                let shared_slot_bindings =
+                    extract_shared_slot_hooks(function, &module.imports).map_err(
+                        |err: SharedSlotExtractError| {
+                            anyhow!(
+                                "shared-slot extraction failed in \
+                                 {module_spec}::{function_name}: {err}"
+                            )
+                        },
+                    )?;
 
                 let mut value_slots: HashMap<String, SlotId> = HashMap::new();
                 let mut setter_slots: HashMap<String, SlotId> = HashMap::new();
@@ -230,6 +253,7 @@ impl CompiledProject {
                         capture_slots,
                         forms: form_extracts,
                         links: link_extracts,
+                        shared_slots: shared_slot_bindings,
                     },
                 );
             }
@@ -292,6 +316,38 @@ impl CompiledProject {
     /// adapters into the action dispatcher's `HashMap<u32, _>`.
     pub fn handler_proxy_ids(&self) -> impl Iterator<Item = u32> + '_ {
         self.handlers.keys().copied()
+    }
+
+    /// Phase O.2 · sorted, deduplicated topic keys referenced by any
+    /// `useSharedSlot` call across every component in this project.
+    /// Server-side wiring iterates this to pre-register topics with
+    /// the [`crate::runtime::BroadcastRegistry`] at startup.
+    ///
+    /// Sorted output is deterministic so a build-time snapshot of
+    /// "topics this project uses" is stable across builds of the
+    /// same source.
+    pub fn shared_slot_topics(&self) -> Vec<String> {
+        let mut topics: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for component in self.components.values() {
+            for binding in &component.shared_slots {
+                topics.insert(binding.topic.clone());
+            }
+        }
+        topics.into_iter().collect()
+    }
+
+    /// Phase O.2 · all `useSharedSlot` bindings for one component
+    /// (`{module_spec}::{function_name}`), in source order. Returns
+    /// an empty slice for components that don't use shared slots.
+    pub fn shared_slots_for_component(
+        &self,
+        module_spec: &str,
+        function_name: &str,
+    ) -> &[SharedSlotBinding] {
+        self.components
+            .get(&(module_spec.to_string(), function_name.to_string()))
+            .map(|c| c.shared_slots.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Dispatch an [`ActionEnvelope`] against the registered handler.
@@ -357,6 +413,62 @@ pub fn render_entry_with_bindings(
         .project
         .render_entry_compiled(entry, props, compiled, slots)?;
     Ok(RenderOutput { html, opcodes })
+}
+
+/// Phase O.2 · render with both the session slot store AND a shared
+/// broadcast registry available to `useSharedSlot` bindings. Auto-
+/// subscribes `session` to every topic the entry component (or any
+/// referenced component) declares via `useSharedSlot`, prepending
+/// the initial-value `SlotSet` opcodes onto the returned vector so
+/// the freshly-rendered shell paints with the current broadcast
+/// state and the client immediately starts receiving fan-outs over
+/// its WT patches lane.
+///
+/// `subscriber_sender` is the same `mpsc::Sender<Vec<u8>>` that
+/// feeds the session's `WT_STREAM_SLOT_PATCHES` writer — passing it
+/// here is what closes the loop between server-side broadcast writes
+/// and client-side patch application.
+pub fn render_entry_with_broadcast(
+    compiled: &CompiledProject,
+    entry: &str,
+    props: &Value,
+    slots: &SessionSlotView,
+    broadcast: &crate::runtime::broadcast::BroadcastRegistry,
+    subscriber_sender: crate::runtime::broadcast::BroadcastSender,
+    opts: &RenderOptions,
+) -> Result<RenderOutput> {
+    let topics = compiled.shared_slot_topics();
+    // Subscribe BEFORE the render so a write fan-out triggered
+    // mid-render (rare but possible if a render callback writes a
+    // topic it also reads) reaches this session. The initial
+    // SlotSet vector ships out as the head of the opcode response
+    // so the client paints with the current broadcast state.
+    let initial_opcodes =
+        broadcast.auto_subscribe(slots.session_id(), subscriber_sender, &topics);
+
+    if !opts.hook_compile {
+        // Phase-J shape: render without binding opcodes. We still
+        // ship the initial SlotSets so the client can render shared
+        // state immediately even without Phase-K hook compilation.
+        let html = compiled.project.render_entry(entry, props)?;
+        return Ok(RenderOutput {
+            html,
+            opcodes: initial_opcodes,
+        });
+    }
+
+    let (html, mut opcodes) = compiled.project.render_entry_compiled_with_broadcast(
+        entry, props, compiled, slots, broadcast,
+    )?;
+    // Initial SlotSets are prepended so bakabox seeds the shared-slot
+    // bindings before any `SetTextRef` referencing them lands.
+    let mut combined = Vec::with_capacity(initial_opcodes.len() + opcodes.len());
+    combined.extend(initial_opcodes);
+    combined.append(&mut opcodes);
+    Ok(RenderOutput {
+        html,
+        opcodes: combined,
+    })
 }
 
 /// FNV-1a-32 of `"{module_spec}::{function_name}#{hook_idx}"`. The

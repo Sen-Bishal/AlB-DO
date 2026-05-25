@@ -69,6 +69,13 @@ pub use error::RuntimeError;
 pub use handlers::{
     public_assets::PublicAssets, streaming_handler, StreamingAppState, StreamingTransportConfig,
 };
+// Phase O.2 · re-exports for the broadcast surface so userland
+// `use albedo_server::{BroadcastRegistry, ...}` resolves without
+// reaching into the compiler crate.
+pub use dom_render_compiler::runtime::{
+    broadcast_slot_id, BroadcastDelivery, BroadcastError, BroadcastRegistry, BroadcastSender,
+    BroadcastTopic,
+};
 pub use inspector::{
     EventTier as InspectorEventTier, GraphSnapshot as InspectorGraphSnapshot, InspectorState,
     MetricsSnapshot as InspectorMetricsSnapshot, RenderEvent as InspectorRenderEvent,

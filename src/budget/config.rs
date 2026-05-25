@@ -29,6 +29,14 @@ pub const DEFAULT_TIER_B_MAX_KB_PER_COMPONENT: u32 = 4;
 /// stream in parallel. Higher numbers can saturate the WT patches lane.
 pub const DEFAULT_TIER_C_MAX_CONCURRENT_FETCHES_PER_ROUTE: u32 = 10;
 
+/// Phase O.3 · built-in ceiling for the *emitted* per-component
+/// Tier-B wrapper bundle, in KB. This is the bytes the client's
+/// browser actually downloads to hydrate one island, distinct from
+/// the source-weight estimate in [`Self::tier_b_max_kb_per_component`].
+/// 1 KB is the sprint-plan default — "Counter" with no dependencies
+/// compiles well under it; importing `lodash` blows past instantly.
+pub const DEFAULT_TIER_B_BUNDLE_MAX_KB_PER_COMPONENT: u32 = 1;
+
 /// Fully-resolved budget shape after defaults + file overlay. Pass
 /// this to [`crate::budget::evaluate_budget`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +76,9 @@ impl TierBudget {
             tier_c_max_concurrent_fetches_per_route: override_block
                 .tier_c_max_concurrent_fetches_per_route
                 .unwrap_or(self.defaults.tier_c_max_concurrent_fetches_per_route),
+            tier_b_bundle_max_kb_per_component: override_block
+                .tier_b_bundle_max_kb_per_component
+                .unwrap_or(self.defaults.tier_b_bundle_max_kb_per_component),
         }
     }
 }
@@ -83,6 +94,14 @@ pub struct BudgetDefaults {
     pub tier_b_max_kb_per_component: u32,
     #[serde(default = "default_tier_c_max_concurrent_fetches_per_route")]
     pub tier_c_max_concurrent_fetches_per_route: u32,
+    /// Phase O.3 · ceiling for the *emitted* Tier-B wrapper bundle
+    /// per component, in KB. Distinct key from
+    /// `tier_b_max_kb_per_component` (source-weight estimate) so a
+    /// project can ship either or both gates. The bundle gate runs
+    /// post-emit and is the metric that matches what the user's
+    /// browser downloads.
+    #[serde(default = "default_tier_b_bundle_max_kb_per_component")]
+    pub tier_b_bundle_max_kb_per_component: u32,
 }
 
 impl Default for BudgetDefaults {
@@ -93,6 +112,7 @@ impl Default for BudgetDefaults {
             tier_b_max_kb_per_component: DEFAULT_TIER_B_MAX_KB_PER_COMPONENT,
             tier_c_max_concurrent_fetches_per_route:
                 DEFAULT_TIER_C_MAX_CONCURRENT_FETCHES_PER_ROUTE,
+            tier_b_bundle_max_kb_per_component: DEFAULT_TIER_B_BUNDLE_MAX_KB_PER_COMPONENT,
         }
     }
 }
@@ -109,6 +129,8 @@ pub struct RouteBudget {
     pub tier_b_max_kb_per_component: Option<u32>,
     #[serde(default)]
     pub tier_c_max_concurrent_fetches_per_route: Option<u32>,
+    #[serde(default)]
+    pub tier_b_bundle_max_kb_per_component: Option<u32>,
 }
 
 /// Error surface for [`load_budget_from_dir`]. Distinct from IO
@@ -177,6 +199,10 @@ const fn default_tier_c_max_concurrent_fetches_per_route() -> u32 {
     DEFAULT_TIER_C_MAX_CONCURRENT_FETCHES_PER_ROUTE
 }
 
+const fn default_tier_b_bundle_max_kb_per_component() -> u32 {
+    DEFAULT_TIER_B_BUNDLE_MAX_KB_PER_COMPONENT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +222,7 @@ mod tests {
         assert_eq!(defaults.tier_b_max_kb_per_route, 8);
         assert_eq!(defaults.tier_b_max_kb_per_component, 4);
         assert_eq!(defaults.tier_c_max_concurrent_fetches_per_route, 10);
+        assert_eq!(defaults.tier_b_bundle_max_kb_per_component, 1);
     }
 
     #[test]

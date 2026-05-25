@@ -3,6 +3,7 @@ use crate::error::RuntimeError;
 use dom_render_compiler::runtime::webtransport::{
     WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES, WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
 };
+use dom_render_compiler::runtime::{BroadcastRegistry, SessionId};
 use quinn::{Connection, Endpoint, SendStream};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -105,6 +106,11 @@ pub struct WebTransportRuntime {
     sessions: WebTransportSessionRegistry,
     keepalive_interval: Duration,
     stream_buffer_capacity: usize,
+    /// Phase O.2 · broadcast registry to clean up on session drop.
+    /// `None` means broadcast wasn't wired into this runtime; sessions
+    /// still close cleanly, the registry just keeps stale subscriber
+    /// entries that the next `write_topic` would prune anyway.
+    broadcast: Option<Arc<BroadcastRegistry>>,
 }
 
 impl WebTransportRuntime {
@@ -147,7 +153,21 @@ impl WebTransportRuntime {
             sessions,
             keepalive_interval: Duration::from_millis(config.keepalive_interval_ms.max(1)),
             stream_buffer_capacity: config.stream_buffer_capacity.max(1),
+            broadcast: None,
         })
+    }
+
+    /// Phase O.2 · attach a broadcast registry so the session-drop
+    /// path runs `cleanup_session(session_id)` automatically when a
+    /// QUIC connection closes. Without this wiring the registry's
+    /// reverse-index entry for a disconnected session lingers until
+    /// the next write to a topic it was subscribed to (which then
+    /// observes the closed channel and prunes lazily). Wiring it
+    /// makes cleanup eager and predictable.
+    #[must_use]
+    pub fn with_broadcast(mut self, broadcast: Arc<BroadcastRegistry>) -> Self {
+        self.broadcast = Some(broadcast);
+        self
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), RuntimeError> {
@@ -175,12 +195,14 @@ impl WebTransportRuntime {
                     let sessions = self.sessions.clone();
                     let keepalive_interval = self.keepalive_interval;
                     let stream_buffer_capacity = self.stream_buffer_capacity;
+                    let broadcast = self.broadcast.clone();
                     tokio::spawn(async move {
                         if let Err(err) = handle_connecting(
                             connecting,
                             sessions,
                             keepalive_interval,
                             stream_buffer_capacity,
+                            broadcast,
                         ).await {
                             warn!(error = %err, "webtransport session task failed");
                         }
@@ -207,6 +229,7 @@ async fn handle_connecting(
     sessions: WebTransportSessionRegistry,
     keepalive_interval: Duration,
     stream_buffer_capacity: usize,
+    broadcast: Option<Arc<BroadcastRegistry>>,
 ) -> Result<(), RuntimeError> {
     let connection = connecting.await.map_err(|err| {
         RuntimeError::ServerRuntime(format!("failed to accept WT session: {err}"))
@@ -255,6 +278,14 @@ async fn handle_connecting(
     connection.closed().await;
     keepalive_task.abort();
     sessions.remove(&session_id);
+    if let Some(broadcast) = broadcast.as_ref() {
+        // Eager broadcast cleanup keeps the subscriber map tight
+        // even when a session never wrote (so lazy pruning during
+        // `write_topic` would never have observed the closed
+        // channel). Cheap when the session was subscribed to
+        // nothing — a single DashMap remove.
+        broadcast.cleanup_session(SessionId::from(session_id));
+    }
 
     info!(
         session_id = %session_id,

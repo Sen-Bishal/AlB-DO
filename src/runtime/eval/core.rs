@@ -109,6 +109,13 @@ struct ComponentScope {
     /// `eval_handler_body` seeds the handler env from these slots so
     /// the handler closure can reference the captured prop.
     capture_slots: HashMap<String, SlotId>,
+    /// Phase O.2 — `useSharedSlot` bindings. Map from binding name to
+    /// (broadcast slot id, topic key). The renderer reads the current
+    /// value via the broadcast registry on first encounter, and
+    /// `phase_k_detect_slot_text_read` reports the broadcast slot id
+    /// so the emitted `SetTextRef` opcode lines up with future
+    /// broadcast fan-outs targeting the same id.
+    shared_slots: HashMap<String, (SlotId, String)>,
 }
 
 fn phase_k_enabled() -> bool {
@@ -352,6 +359,19 @@ fn current_phase_k_component(module_spec: &str, function_name: &str) -> Option<C
         // is possible because access is thread-local.
         let project = unsafe { &*ptr };
         let meta = project.component_meta(module_spec, function_name)?;
+        let shared_slots = meta
+            .shared_slots
+            .iter()
+            .map(|binding| {
+                (
+                    binding.binding_name.clone(),
+                    (
+                        crate::runtime::broadcast::broadcast_slot_id(&binding.topic),
+                        binding.topic.clone(),
+                    ),
+                )
+            })
+            .collect();
         Some(ComponentScope {
             module_spec: meta.module_spec.clone(),
             function_name: meta.function_name.clone(),
@@ -366,6 +386,68 @@ fn current_phase_k_component(module_spec: &str, function_name: &str) -> Option<C
                 .map(|h| (h.value_name.clone(), h.hook_idx))
                 .collect(),
             capture_slots: meta.capture_slots.clone(),
+            shared_slots,
+        })
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase O.2 · broadcast registry thread-local
+//
+// Mirrors `PHASE_K_PROJECT`: a raw pointer to the current
+// `BroadcastRegistry` installed by `render_entry_compiled_with_broadcast`
+// for the duration of one render. Required because `useSharedSlot`
+// resolves to the topic's current value via the registry at render
+// time, and the existing `render_entry_*` signatures predate the
+// registry. Lifetime is bound by the install guard — the caller
+// holds an `&BroadcastRegistry` while the guard exists.
+// ─────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    static PHASE_K_BROADCAST: Cell<Option<*const crate::runtime::broadcast::BroadcastRegistry>> =
+        const { Cell::new(None) };
+}
+
+fn install_phase_k_broadcast(
+    broadcast: &crate::runtime::broadcast::BroadcastRegistry,
+) -> PhaseKBroadcastGuard {
+    let previous = PHASE_K_BROADCAST.with(|cell| cell.replace(Some(broadcast as *const _)));
+    PhaseKBroadcastGuard { previous }
+}
+
+struct PhaseKBroadcastGuard {
+    previous: Option<*const crate::runtime::broadcast::BroadcastRegistry>,
+}
+
+impl Drop for PhaseKBroadcastGuard {
+    fn drop(&mut self) {
+        PHASE_K_BROADCAST.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Resolve the current broadcast registry, if any. Returned reference
+/// is bound to the caller's lifetime — the guard above keeps the
+/// pointer valid for the duration of the render call.
+fn current_phase_k_broadcast() -> Option<&'static crate::runtime::broadcast::BroadcastRegistry> {
+    PHASE_K_BROADCAST.with(|cell| {
+        let ptr = cell.get()?;
+        // Safety: see `current_phase_k_component`. Same lifetime
+        // contract — guard outlives every borrow because the
+        // installer is on the same stack frame as the render.
+        Some(unsafe { &*ptr })
+    })
+}
+
+/// `(slot_id, topic)` for a binding declared via `useSharedSlot` in
+/// the current component scope, or `None` when the name is not a
+/// shared-slot binding.
+fn phase_k_shared_slot_for_value(name: &str) -> Option<(SlotId, String)> {
+    RENDER_K.with(|cell| {
+        cell.borrow().as_ref().and_then(|state| {
+            state
+                .scopes
+                .last()
+                .and_then(|scope| scope.shared_slots.get(name).cloned())
         })
     })
 }
@@ -417,6 +499,17 @@ fn is_use_state_in_phase_k_scope(call: &swc_ecma_ast::CallExpr) -> bool {
     ident.sym.as_ref() == "useState" && phase_k_enabled()
 }
 
+/// Phase O.2 — `useSharedSlot(...)` from `albedo` AND Phase-K is
+/// active. Symmetric to `is_use_state_in_phase_k_scope`; the
+/// extractor already validates the topic-literal shape so the
+/// renderer doesn't re-check it.
+fn is_use_shared_slot_in_phase_k_scope(call: &swc_ecma_ast::CallExpr) -> bool {
+    use swc_ecma_ast::*;
+    let Callee::Expr(callee) = &call.callee else { return false };
+    let Expr::Ident(ident) = callee.as_ref() else { return false };
+    ident.sym.as_ref() == "useSharedSlot" && phase_k_enabled()
+}
+
 /// Drain pending dirty entries WITHOUT producing opcodes. Used after
 /// a first-render initialisation write so the initial value doesn't
 /// show up as a user-driven mutation in the response frame.
@@ -455,15 +548,31 @@ fn snapshot_captured_props_into_slots(scope: &ComponentScope, props: &Value) {
 
 /// Detect whether the expression in a JSX text-position child is a
 /// bare slot-bound identifier (e.g. `{n}` for `const [n, setN] =
-/// useState(0)`). Returns the SlotId when so, signalling that the
-/// renderer should emit a `SetTextRef` binding for the containing
-/// element. Phase K Stage 1 only recognises the simple shape; member
-/// access (`state.value`), arithmetic, and method calls are Phase J
-/// reads and don't subscribe to slot changes.
+/// useState(0)`, or `{messages}` for `const messages =
+/// useSharedSlot("topic")`). Returns the SlotId when so, signalling
+/// that the renderer should emit a `SetTextRef` binding for the
+/// containing element so bakabox re-applies the value when a future
+/// `SlotSet` for this id arrives — whether from per-session writes
+/// (Phase H) or broadcast fan-out (Phase O.2). Phase K Stage 1 only
+/// recognises the simple shape; member access (`state.value`),
+/// arithmetic, and method calls are Phase J reads and don't subscribe
+/// to slot changes.
 fn phase_k_detect_slot_text_read(expr: &swc_ecma_ast::Expr) -> Option<SlotId> {
     use swc_ecma_ast::*;
     match expr {
-        Expr::Ident(ident) => phase_k_slot_for_value(&ident.sym.to_string()),
+        Expr::Ident(ident) => {
+            let name = ident.sym.to_string();
+            // Per-session useState slot first; shared-slot is the
+            // fallback so a name collision between the two surfaces
+            // resolves to whichever the user declared LAST — which is
+            // the same conflict resolution JavaScript applies to
+            // shadowed bindings, and is what the developer most
+            // likely intended.
+            if let Some(slot_id) = phase_k_slot_for_value(&name) {
+                return Some(slot_id);
+            }
+            phase_k_shared_slot_for_value(&name).map(|(slot_id, _topic)| slot_id)
+        }
         Expr::Paren(paren) => phase_k_detect_slot_text_read(&paren.expr),
         Expr::TsAs(node) => phase_k_detect_slot_text_read(&node.expr),
         Expr::TsNonNull(node) => phase_k_detect_slot_text_read(&node.expr),
@@ -722,6 +831,37 @@ impl ComponentProject {
         Ok((html, opcodes))
     }
 
+    /// Phase O.2 · variant of [`Self::render_entry_compiled`] that
+    /// makes a [`BroadcastRegistry`] available to `useSharedSlot`
+    /// calls during render. Returns the same `(html, opcodes)` pair
+    /// — opcodes include any `SetTextRef` bindings the renderer
+    /// emitted for shared-slot text positions.
+    ///
+    /// The registry pointer is installed via a thread-local for the
+    /// duration of this call and torn down before return; callers
+    /// hand in a borrow and reclaim it untouched.
+    pub fn render_entry_compiled_with_broadcast(
+        &self,
+        entry: &str,
+        props: &Value,
+        compiled: &CompiledProject,
+        slots: &SessionSlotView,
+        broadcast: &crate::runtime::broadcast::BroadcastRegistry,
+    ) -> Result<(String, Vec<Instruction>)> {
+        reset_element_counter();
+        let entry = self
+            .resolve_entry(entry)
+            .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
+
+        let _slot_guard = PhaseKGuard::install(slots.clone());
+        let _project_guard = install_phase_k_project(compiled);
+        let _broadcast_guard = install_phase_k_broadcast(broadcast);
+
+        let html = self.render_export(&entry, "default", props)?;
+        let opcodes = drain_phase_k_opcodes();
+        Ok((html, opcodes))
+    }
+
     /// Re-execute a handler body server-side. The body is whatever
     /// `transforms::events::extract_handlers_in_function` surfaced —
     /// either a single expression (arrow body) or a block of
@@ -741,6 +881,19 @@ impl ComponentProject {
         // Push the component's scope. We don't need any of the
         // pre-cache work because a handler only ever runs against one
         // component scope at a time.
+        let shared_slots = component
+            .shared_slots
+            .iter()
+            .map(|binding| {
+                (
+                    binding.binding_name.clone(),
+                    (
+                        crate::runtime::broadcast::broadcast_slot_id(&binding.topic),
+                        binding.topic.clone(),
+                    ),
+                )
+            })
+            .collect();
         let scope = ComponentScope {
             module_spec: component.module_spec.clone(),
             function_name: component.function_name.clone(),
@@ -755,6 +908,7 @@ impl ComponentProject {
                 .map(|h| (h.value_name.clone(), h.hook_idx))
                 .collect(),
             capture_slots: component.capture_slots.clone(),
+            shared_slots,
         };
         phase_k_push_scope(scope);
 
@@ -1764,6 +1918,39 @@ impl ComponentProject {
         use swc_ecma_ast::*;
 
         for decl in &var.decls {
+            // Phase O.2 hook-compile path: `const name = useSharedSlot("topic")`
+            // binds `name` to the broadcast topic's current value at
+            // render time. The extractor already verified the binding
+            // shape and topic-literal contract; the renderer just
+            // looks up the value via the broadcast thread-local. When
+            // the registry isn't installed (a render outside the
+            // broadcast surface) the binding falls through to a
+            // `null` value — same shape as a slot that hasn't been
+            // written yet.
+            if let Pat::Ident(binding) = &decl.name {
+                if let Some(init) = &decl.init {
+                    if let Expr::Call(call) = init.as_ref() {
+                        if is_use_shared_slot_in_phase_k_scope(call) {
+                            let name = binding.id.sym.to_string();
+                            if let Some((_slot_id, topic)) =
+                                phase_k_shared_slot_for_value(&name)
+                            {
+                                let value = current_phase_k_broadcast()
+                                    .and_then(|reg| reg.get(&topic))
+                                    .map(|t| t.current_value())
+                                    .filter(|bytes| !bytes.is_empty())
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<Value>(&bytes).ok()
+                                    })
+                                    .unwrap_or(Value::Null);
+                                env.insert(name, value);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Phase K hook-compile path: when `const [name, setter] =
             // useState(initial)` is recognised AND the current scope
             // has metadata for `name`, bind `name` to the current slot

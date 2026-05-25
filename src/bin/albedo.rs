@@ -1,6 +1,8 @@
 use dom_render_compiler::budget::{
-    evaluate_budget, format_report_pretty, load_budget_from_dir, TierBudget,
+    compute_bundle_byte_report, evaluate_budget, evaluate_bundle_budget, format_report_pretty,
+    load_budget_from_dir, BudgetReport, TierBudget,
 };
+use dom_render_compiler::bundler::emit::BundleEmitReport;
 use dom_render_compiler::bundler::BundlePlanOptions;
 use dom_render_compiler::dev_contract::{
     parse_dev_cli_args, resolve_dev_contract, HotSetPriority, HotSetRegistration,
@@ -430,12 +432,22 @@ fn resolve_budget_for_contract(
     }
 }
 
-/// Phase O.1 · evaluate against the budget after a successful build.
-/// File-gated: only runs when `tier-budget.toml` exists. Build/ship
-/// callers pass `skip = true` to honour `--no-budget`.
+/// Phase O.1 + O.3 · evaluate against the budget after a successful
+/// build. File-gated: only runs when `tier-budget.toml` exists.
+/// Build/ship callers pass `skip = true` to honour `--no-budget`.
+///
+/// Two gates run in sequence:
+///   1. Source-weight (Phase O.1) — fast, uses only the manifest.
+///   2. Bundle-byte (Phase O.3) — measures emitted wrapper bytes.
+///      Only runs when `emit_report` is supplied; absent emit
+///      report falls back to source-weight only.
+///
+/// Both gates' violations land in the same printed diff so the user
+/// sees every reason the build is failing in one place.
 fn enforce_budget_after_build(
     contract: &ResolvedDevContract,
     manifest: &RenderManifestV2,
+    emit_report: Option<&BundleEmitReport>,
     skip: bool,
 ) -> Result<(), String> {
     if skip {
@@ -446,18 +458,57 @@ fn enforce_budget_after_build(
     let Some(budget) = loaded else {
         return Ok(());
     };
-    let report = evaluate_budget(manifest, &budget);
-    if report.is_ok() {
+
+    let source_report = evaluate_budget(manifest, &budget);
+    let bundle_report = emit_report
+        .map(|er| bundle_budget_report(er, manifest, &budget))
+        .transpose()?;
+
+    let combined = merge_budget_reports(&source_report, bundle_report.as_ref());
+    if combined.is_ok() {
         return Ok(());
     }
     print_section("budget");
     print_kv("source", "tier-budget.toml");
-    println!("{}", format_report_pretty(&report));
+    println!("{}", format_report_pretty(&combined));
     Err(format!(
         "tier budget exceeded ({} violation{})",
-        report.violations.len(),
-        if report.violations.len() == 1 { "" } else { "s" }
+        combined.violations.len(),
+        if combined.violations.len() == 1 { "" } else { "s" }
     ))
+}
+
+/// Build the bundle-byte report by re-deriving the plan from the
+/// manifest. The bundler is deterministic so a fresh plan matches
+/// the one the emit step produced; we don't need to thread the plan
+/// out of the build closure.
+fn bundle_budget_report(
+    emit_report: &BundleEmitReport,
+    manifest: &RenderManifestV2,
+    budget: &TierBudget,
+) -> Result<BudgetReport, String> {
+    let plan = dom_render_compiler::bundler::build_bundle_plan(
+        manifest,
+        &dom_render_compiler::bundler::BundlePlanOptions::default(),
+    );
+    let byte_report = compute_bundle_byte_report(emit_report, &plan, manifest);
+    Ok(evaluate_bundle_budget(&byte_report, budget))
+}
+
+/// Concatenate two budget reports for display purposes. The
+/// route-summary table comes from the source-weight pass (the
+/// bundle pass doesn't have route-level data today); violations
+/// from both are appended in order so a build that trips both gates
+/// shows every reason at once.
+fn merge_budget_reports(primary: &BudgetReport, secondary: Option<&BudgetReport>) -> BudgetReport {
+    let mut violations = primary.violations.clone();
+    if let Some(report) = secondary {
+        violations.extend(report.violations.iter().cloned());
+    }
+    BudgetReport {
+        violations,
+        route_summaries: primary.route_summaries.clone(),
+    }
 }
 
 fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
@@ -2574,11 +2625,13 @@ fn run_prod_build_with_budget(
         );
     }
 
-    // Phase O.1 · gate the build on the tier budget. File-gated: only
-    // runs when tier-budget.toml exists. Passing skip_budget=true
-    // (via --no-budget on ship/build) opts out even when the file is
-    // present.
-    enforce_budget_after_build(contract, &manifest, skip_budget)?;
+    // Phase O.1 + O.3 · gate the build on the tier budget. File-gated:
+    // only runs when tier-budget.toml exists. The emit report is
+    // passed in so the O.3 bundle-byte pass can run against measured
+    // wrapper sizes — without it, only the source-weight gate fires.
+    // Passing skip_budget=true (via --no-budget on ship/build) opts
+    // out of both passes even when the file is present.
+    enforce_budget_after_build(contract, &manifest, Some(&report), skip_budget)?;
 
     Ok(())
 }

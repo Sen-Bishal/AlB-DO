@@ -57,11 +57,28 @@ fn append_violation(out: &mut String, violation: &BudgetViolation) {
             ));
         }
     }
+    // Phase O.3 · the actionable hint the sprint plan calls out. The
+    // user sees the specific component and the exact knob they can
+    // turn to either fix or opt out.
+    if violation.kind == ViolationKind::TierBBundleKbPerComponent {
+        let component = violation
+            .top_contributors
+            .first()
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "<component>".to_string());
+        let suggested_kb = (violation.actual as f64 / 1024.0).ceil() as u32;
+        out.push_str(&format!(
+            "    hint    Move heavy imports in {component} to Tier-C, or raise \
+             `tier_b_bundle_max_kb_per_component = {suggested_kb}` in tier-budget.toml.\n",
+        ));
+    }
 }
 
 fn format_amounts(violation: &BudgetViolation) -> (String, String, String) {
     match violation.kind {
-        ViolationKind::TierBMaxKbPerRoute | ViolationKind::TierBMaxKbPerComponent => {
+        ViolationKind::TierBMaxKbPerRoute
+        | ViolationKind::TierBMaxKbPerComponent
+        | ViolationKind::TierBBundleKbPerComponent => {
             let limit_kb = violation.limit as f64 / 1024.0;
             let actual_kb = violation.actual as f64 / 1024.0;
             let delta_kb = actual_kb - limit_kb;
@@ -205,6 +222,29 @@ mod tests {
         assert!(out.contains("limit   50 count"));
         assert!(out.contains("actual  73 count"));
         assert!(out.contains("(+23 over)"));
+    }
+
+    #[test]
+    fn bundle_violation_renders_actionable_hint_with_component_name() {
+        let report = BudgetReport {
+            violations: vec![BudgetViolation {
+                route: String::new(),
+                kind: ViolationKind::TierBBundleKbPerComponent,
+                limit: 1024,
+                actual: 142 * 1024,
+                top_contributors: vec![ComponentContribution {
+                    name: "Counter".to_string(),
+                    weight_bytes: 142 * 1024,
+                }],
+            }],
+            route_summaries: vec![summary("/", 0, 0, 0)],
+        };
+        let out = format_report_pretty(&report);
+        assert!(out.contains("tier-b component bundle exceeded - <global>"));
+        assert!(out.contains("limit   1.0 KB"));
+        assert!(out.contains("actual  142.0 KB"));
+        assert!(out.contains("hint    Move heavy imports in Counter to Tier-C"));
+        assert!(out.contains("tier_b_bundle_max_kb_per_component = 142"));
     }
 
     #[test]

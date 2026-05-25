@@ -25,6 +25,7 @@ pub mod events;
 pub mod form;
 pub mod hooks;
 pub mod link;
+pub mod shared_slots;
 
 pub use css_modules::{is_css_module_path, scope_module_css, ScopedCssModule};
 pub use events::{
@@ -36,3 +37,6 @@ pub use form::{
 };
 pub use hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 pub use link::{extract_links_in_function, LinkExtract};
+pub use shared_slots::{
+    extract_shared_slot_hooks, SharedSlotBinding, SharedSlotExtractError,
+};
