@@ -15,15 +15,21 @@
 //! production. The budget makes the promotion visible at commit
 //! time.
 
+pub mod bundle;
 pub mod config;
 pub mod format;
 pub mod report;
 
+pub use bundle::{
+    compute_bundle_byte_report, BundleArtifactClass, BundleAttribution, BundleByteReport,
+    ComponentBundleSummary,
+};
 pub use config::{
     load_budget_from_dir, BudgetDefaults, BudgetLoadError, RouteBudget, TierBudget,
     TIER_BUDGET_FILENAME,
 };
 pub use format::format_report_pretty;
 pub use report::{
-    evaluate_budget, BudgetReport, BudgetViolation, ComponentContribution, ViolationKind,
+    evaluate_budget, evaluate_bundle_budget, BudgetReport, BudgetViolation, ComponentContribution,
+    ViolationKind,
 };

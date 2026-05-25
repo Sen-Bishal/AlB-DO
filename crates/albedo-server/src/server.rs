@@ -17,7 +17,7 @@ use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 use crate::render::csrf::CsrfRegistry;
 use crate::render::tier_b::{SharedRenderServices, TierBOpcodeRegistry};
 use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
-use dom_render_compiler::runtime::{SessionId, SlotStore};
+use dom_render_compiler::runtime::{BroadcastRegistry, SessionId, SlotStore};
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
 use crate::webtransport::{WebTransportRuntime, WebTransportSessionRegistry};
@@ -125,6 +125,12 @@ struct RuntimeState {
     /// `dispatch` checks for a matching file before falling through
     /// to the dynamic route matcher.
     public_assets: Option<Arc<PublicAssets>>,
+    /// Phase O.2 — broadcast slot registry. Topic-keyed shared
+    /// state; writes fan out as `SlotSet` opcodes over the WT
+    /// patches lane to every subscribed session. Always allocated
+    /// (cheap when unused); userland reaches it via
+    /// `AlbedoServer::broadcast()`.
+    broadcast: Arc<BroadcastRegistry>,
 }
 
 pub struct AlbedoServerBuilder {
@@ -469,6 +475,13 @@ impl AlbedoServerBuilder {
         // same token table or every form POST 403s.
         let csrf_registry = Arc::new(CsrfRegistry::new());
 
+        // Phase O.2 · single broadcast registry per server. Every
+        // route/action handler that wants to publish to a topic
+        // resolves it against this Arc; subscribe()/write_topic()
+        // are themselves concurrent so no further sharing layer is
+        // needed.
+        let broadcast = Arc::new(BroadcastRegistry::new());
+
         // Construct StreamingAppState, binding the optional pipeline +
         // runtime handle when both are present. `with_pipeline` consumes
         // the pair, so `take()` to move it out of the builder. The Arc
@@ -623,6 +636,7 @@ impl AlbedoServerBuilder {
             dev_error_registry,
             dev_hmr_registry,
             public_assets,
+            broadcast,
         };
 
         Ok(AlbedoServer {
@@ -684,6 +698,15 @@ impl AlbedoServer {
         self.state.public_assets.clone()
     }
 
+    /// Phase O.2 · handle on the per-server broadcast registry.
+    /// Route handlers, action handlers, and userland watchers all
+    /// resolve topics against this `Arc`. Always available — there
+    /// is no "broadcast disabled" mode; an unused registry is just
+    /// an empty `DashMap` and costs nothing at idle.
+    pub fn broadcast(&self) -> Arc<BroadcastRegistry> {
+        self.state.broadcast.clone()
+    }
+
     pub async fn run(self) -> Result<(), RuntimeError> {
         let addr = self.config.server.socket_addr()?;
         let listener = TcpListener::bind(addr)
@@ -711,7 +734,8 @@ impl AlbedoServer {
                 addr,
                 &self.config.server.webtransport,
                 shared_sessions,
-            )?;
+            )?
+            .with_broadcast(self.state.broadcast.clone());
             info!("ALBEDO WebTransport QUIC listener active on {}", addr);
             let wt_shutdown = shutdown_rx.clone();
             Some(tokio::spawn(async move { runtime.run(wt_shutdown).await }))

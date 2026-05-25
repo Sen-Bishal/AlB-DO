@@ -51,6 +51,7 @@ fn aggressive_tier_b_ceiling_trips_the_gate() {
             tier_b_max_kb_per_component: 0,
             tier_a_max_components_per_route: 9_999,
             tier_c_max_concurrent_fetches_per_route: 9_999,
+            tier_b_bundle_max_kb_per_component: 9_999,
         },
         routes: BTreeMap::new(),
     };
@@ -77,6 +78,7 @@ fn per_route_override_relaxes_otherwise_failing_gate() {
             tier_b_max_kb_per_component: Some(9999),
             tier_a_max_components_per_route: Some(9999),
             tier_c_max_concurrent_fetches_per_route: Some(9999),
+            tier_b_bundle_max_kb_per_component: Some(9999),
         },
     );
     let lenient_override = TierBudget {
@@ -85,6 +87,7 @@ fn per_route_override_relaxes_otherwise_failing_gate() {
             tier_b_max_kb_per_component: 0,
             tier_a_max_components_per_route: 0,
             tier_c_max_concurrent_fetches_per_route: 0,
+            tier_b_bundle_max_kb_per_component: 0,
         },
         routes,
     };

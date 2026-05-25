@@ -34,6 +34,11 @@ pub enum ViolationKind {
     TierBMaxKbPerRoute,
     TierBMaxKbPerComponent,
     TierCMaxConcurrentFetchesPerRoute,
+    /// Phase O.3 · per-component Tier-B emitted bundle weight
+    /// exceeded. Distinct from `TierBMaxKbPerComponent` (source
+    /// weight) so the diagnostic message can point at the bundle
+    /// path instead of the source file.
+    TierBBundleKbPerComponent,
 }
 
 impl ViolationKind {
@@ -45,6 +50,7 @@ impl ViolationKind {
             Self::TierBMaxKbPerRoute => "tier-b route weight",
             Self::TierBMaxKbPerComponent => "tier-b component weight",
             Self::TierCMaxConcurrentFetchesPerRoute => "tier-c concurrent fetches",
+            Self::TierBBundleKbPerComponent => "tier-b component bundle",
         }
     }
 
@@ -52,7 +58,9 @@ impl ViolationKind {
     pub fn unit(self) -> &'static str {
         match self {
             Self::TierAMaxComponentsPerRoute | Self::TierCMaxConcurrentFetchesPerRoute => "count",
-            Self::TierBMaxKbPerRoute | Self::TierBMaxKbPerComponent => "KB",
+            Self::TierBMaxKbPerRoute
+            | Self::TierBMaxKbPerComponent
+            | Self::TierBBundleKbPerComponent => "KB",
         }
     }
 }
@@ -224,6 +232,84 @@ fn top_n_contributors(contribs: &[ComponentContribution], n: usize) -> Vec<Compo
     sorted.sort_by(|a, b| b.weight_bytes.cmp(&a.weight_bytes).then_with(|| a.name.cmp(&b.name)));
     sorted.truncate(n);
     sorted
+}
+
+/// Phase O.3 · evaluate the measured-bundle-byte report against the
+/// budget. Independent of [`evaluate_budget`] so a caller can run
+/// either (or both) gates — the source-weight pass uses the manifest
+/// only and is cheap, the bundle pass requires a full emit and is
+/// the production-truthful metric.
+///
+/// Violations carry the offending component's `wrapper_bytes` as the
+/// `actual` value; the source-map weight is intentionally excluded
+/// (maps don't ship to production browsers as part of the
+/// hot-path payload).
+#[must_use]
+pub fn evaluate_bundle_budget(
+    bundle_report: &crate::budget::bundle::BundleByteReport,
+    budget: &crate::budget::config::TierBudget,
+) -> BudgetReport {
+    let mut violations: Vec<BudgetViolation> = Vec::new();
+    let mut route_summaries: Vec<RouteSummary> = Vec::new();
+
+    // The bundle pass doesn't have per-route attribution today —
+    // wrappers are component-keyed, not route-keyed — so route
+    // summaries are empty here. The CLI / formatter still surfaces
+    // the per-component figures through the violation breakdown.
+    let _ = &mut route_summaries;
+
+    // Per-component sweep. Bundle ceilings apply per-component only;
+    // route-aggregate bundle ceilings are a follow-up once route-level
+    // wrapper grouping is implemented in the emit step.
+    let mut components: Vec<&crate::budget::bundle::ComponentBundleSummary> =
+        bundle_report.per_component.values().collect();
+    components.sort_by(|left, right| {
+        left.component_id
+            .cmp(&right.component_id)
+            .then_with(|| left.component_name.cmp(&right.component_name))
+    });
+
+    for summary in components {
+        // Only Tier-B components are subject to the bundle ceiling.
+        // Tier-A ships zero JS (no wrapper bytes); Tier-C streams
+        // server-side and doesn't ride the hydration JS path.
+        if !matches!(summary.tier, crate::manifest::schema::Tier::B) {
+            continue;
+        }
+        let defaults = &budget.defaults;
+        let limit_bytes =
+            u64::from(defaults.tier_b_bundle_max_kb_per_component).saturating_mul(1024);
+        let actual = summary.budget_bytes();
+        if actual > limit_bytes {
+            violations.push(BudgetViolation {
+                route: String::new(),
+                kind: ViolationKind::TierBBundleKbPerComponent,
+                limit: limit_bytes,
+                actual,
+                top_contributors: vec![ComponentContribution {
+                    name: summary.component_name.clone(),
+                    weight_bytes: actual,
+                }],
+            });
+        }
+    }
+
+    violations.sort_by(|a, b| {
+        a.route
+            .cmp(&b.route)
+            .then_with(|| format!("{:?}", a.kind).cmp(&format!("{:?}", b.kind)))
+            .then_with(|| {
+                a.top_contributors
+                    .first()
+                    .map(|c| c.name.as_str())
+                    .cmp(&b.top_contributors.first().map(|c| c.name.as_str()))
+            })
+    });
+
+    BudgetReport {
+        violations,
+        route_summaries,
+    }
 }
 
 // Surface tier weights to userland JSON consumers; kept private to
@@ -454,6 +540,108 @@ mod tests {
         );
         let report = evaluate_budget(&m, &budget);
         assert!(report.is_ok(), "expected pass under overridden ceiling, got {:?}", report.violations);
+    }
+
+    #[test]
+    fn bundle_eval_passes_when_every_tier_b_component_is_under_ceiling() {
+        use crate::budget::bundle::{BundleByteReport, ComponentBundleSummary};
+        use std::collections::HashMap;
+
+        let mut per_component = HashMap::new();
+        per_component.insert(
+            1u64,
+            ComponentBundleSummary {
+                component_id: 1,
+                component_name: "Counter".to_string(),
+                tier: Tier::B,
+                wrapper_bytes: 800,
+                source_map_bytes: 4000,
+            },
+        );
+        let bundle = BundleByteReport {
+            attributions: Vec::new(),
+            per_component,
+            vendor_total_bytes: 0,
+            infrastructure_total_bytes: 0,
+        };
+        let report = crate::budget::evaluate_bundle_budget(&bundle, &TierBudget::default());
+        assert!(report.is_ok());
+    }
+
+    #[test]
+    fn bundle_eval_flags_oversized_tier_b_component_with_actionable_violation() {
+        use crate::budget::bundle::{BundleByteReport, ComponentBundleSummary};
+        use std::collections::HashMap;
+
+        let mut per_component = HashMap::new();
+        per_component.insert(
+            7u64,
+            ComponentBundleSummary {
+                component_id: 7,
+                component_name: "BloatedIsland".to_string(),
+                tier: Tier::B,
+                wrapper_bytes: 142 * 1024,
+                source_map_bytes: 0,
+            },
+        );
+        let bundle = BundleByteReport {
+            attributions: Vec::new(),
+            per_component,
+            vendor_total_bytes: 0,
+            infrastructure_total_bytes: 0,
+        };
+        let report = crate::budget::evaluate_bundle_budget(&bundle, &TierBudget::default());
+        assert!(!report.is_ok());
+        let v = report
+            .violations
+            .iter()
+            .find(|v| v.kind == ViolationKind::TierBBundleKbPerComponent)
+            .expect("expected bundle violation");
+        assert_eq!(v.limit, 1024);
+        assert_eq!(v.actual, 142 * 1024);
+        assert_eq!(
+            v.top_contributors.first().map(|c| c.name.as_str()),
+            Some("BloatedIsland"),
+        );
+    }
+
+    #[test]
+    fn bundle_eval_skips_tier_a_and_tier_c_components() {
+        use crate::budget::bundle::{BundleByteReport, ComponentBundleSummary};
+        use std::collections::HashMap;
+
+        // Both are over the 1 KB Tier-B ceiling, but neither is a
+        // Tier-B component so the bundle gate must not fire. Tier-A
+        // ships zero JS in practice; Tier-C streams server-side.
+        let mut per_component = HashMap::new();
+        per_component.insert(
+            1u64,
+            ComponentBundleSummary {
+                component_id: 1,
+                component_name: "BigStatic".to_string(),
+                tier: Tier::A,
+                wrapper_bytes: 50 * 1024,
+                source_map_bytes: 0,
+            },
+        );
+        per_component.insert(
+            2u64,
+            ComponentBundleSummary {
+                component_id: 2,
+                component_name: "BigStreamed".to_string(),
+                tier: Tier::C,
+                wrapper_bytes: 80 * 1024,
+                source_map_bytes: 0,
+            },
+        );
+        let bundle = BundleByteReport {
+            attributions: Vec::new(),
+            per_component,
+            vendor_total_bytes: 0,
+            infrastructure_total_bytes: 0,
+        };
+        let report = crate::budget::evaluate_bundle_budget(&bundle, &TierBudget::default());
+        assert!(report.is_ok());
     }
 
     #[test]
