@@ -9,13 +9,13 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use albedo_server::AlbedoServer;
+//! use albedo_server::{AlbedoServerBuilder, AppConfig};
 //!
 //! # async fn run() {
-//! AlbedoServer::builder()
-//!     .port(3000)
+//! AlbedoServerBuilder::new(AppConfig::default())
 //!     .build()
-//!     .serve()
+//!     .unwrap()
+//!     .run()
 //!     .await
 //!     .unwrap();
 //! # }
@@ -66,7 +66,9 @@ pub use contract::{
     RuntimeMiddleware,
 };
 pub use error::RuntimeError;
-pub use handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
+pub use handlers::{
+    public_assets::PublicAssets, streaming_handler, StreamingAppState, StreamingTransportConfig,
+};
 pub use inspector::{
     EventTier as InspectorEventTier, GraphSnapshot as InspectorGraphSnapshot, InspectorState,
     MetricsSnapshot as InspectorMetricsSnapshot, RenderEvent as InspectorRenderEvent,
