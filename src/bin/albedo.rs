@@ -1,8 +1,12 @@
+use dom_render_compiler::budget::{
+    evaluate_budget, format_report_pretty, load_budget_from_dir, TierBudget,
+};
 use dom_render_compiler::bundler::BundlePlanOptions;
 use dom_render_compiler::dev_contract::{
     parse_dev_cli_args, resolve_dev_contract, HotSetPriority, HotSetRegistration,
     ResolvedDevContract, DEV_CONFIG_JSON, DEV_CONFIG_TS,
 };
+use dom_render_compiler::manifest::schema::RenderManifestV2;
 use dom_render_compiler::parser::ParsedComponent;
 use dom_render_compiler::runtime::eval::{ComponentProject, PatchReport};
 use dom_render_compiler::runtime::hot_set::{
@@ -181,6 +185,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             run_dev_mode(&forwarded)
         }
         "ship" => run_ship_command(&args[2..]),
+        // Phase O.1 · standalone tier-budget evaluator. Loads
+        // tier-budget.toml when present (built-in defaults
+        // otherwise), runs the eval against the freshly-compiled
+        // manifest, and exits non-zero on violation.
+        "budget" => run_budget_command(&args[2..]),
         // Phase J CLI clarity:
         //   * `albedo files [dir]` — pure static file server; serves any
         //     directory verbatim. This is what `albedo serve` did before.
@@ -285,6 +294,172 @@ struct ServeOptions {
     port: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetFormat {
+    Pretty,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BudgetOptions {
+    strict: bool,
+    format: BudgetFormat,
+    forwarded: Vec<String>,
+}
+
+fn parse_budget_args(raw_args: &[String]) -> Result<BudgetOptions, String> {
+    let mut strict = false;
+    let mut format = BudgetFormat::Pretty;
+    let mut forwarded = Vec::new();
+    let mut idx = 0usize;
+    while idx < raw_args.len() {
+        match raw_args[idx].as_str() {
+            "--strict" => strict = true,
+            "--format" => {
+                idx += 1;
+                let value = raw_args
+                    .get(idx)
+                    .ok_or_else(|| "missing value after --format".to_string())?;
+                format = match value.as_str() {
+                    "pretty" => BudgetFormat::Pretty,
+                    "json" => BudgetFormat::Json,
+                    other => {
+                        return Err(format!(
+                            "unknown --format '{other}'. Supported: pretty, json."
+                        ))
+                    }
+                };
+            }
+            other => forwarded.push(other.to_string()),
+        }
+        idx += 1;
+    }
+    Ok(BudgetOptions {
+        strict,
+        format,
+        forwarded,
+    })
+}
+
+/// Phase O.1 · `albedo budget` — compiles the manifest in memory,
+/// loads `tier-budget.toml` (or built-in defaults), and prints the
+/// usage table. Exits non-zero when any ceiling is violated;
+/// `--strict` additionally requires the budget file to be present
+/// so CI fails loud rather than silently accepting defaults.
+fn run_budget_command(raw_args: &[String]) -> Result<(), String> {
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_budget_help();
+        return Ok(());
+    }
+    let options = parse_budget_args(raw_args)?;
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let contract = resolve_dev_contract(&options.forwarded, &cwd)?;
+
+    let manifest = build_manifest_for_budget(&contract)?;
+    let (budget, source) = resolve_budget_for_contract(&contract, options.strict)?;
+    let report = evaluate_budget(&manifest, &budget);
+
+    match options.format {
+        BudgetFormat::Pretty => {
+            print_section("budget");
+            print_kv("source", source);
+            println!("{}", format_report_pretty(&report));
+        }
+        BudgetFormat::Json => {
+            let json = serde_json::to_string_pretty(&report)
+                .map_err(|err| format!("failed to serialize budget report: {err}"))?;
+            println!("{json}");
+        }
+    }
+
+    if !report.is_ok() {
+        return Err(format!(
+            "tier budget exceeded ({} violation{})",
+            report.violations.len(),
+            if report.violations.len() == 1 { "" } else { "s" }
+        ));
+    }
+    Ok(())
+}
+
+/// Compile the project just far enough to produce a manifest without
+/// writing artefacts to disk. Used by `albedo budget` (which has no
+/// reason to emit a bundle) and by the build/ship gate (which emits
+/// artefacts first and then re-evaluates against the same manifest).
+fn build_manifest_for_budget(
+    contract: &ResolvedDevContract,
+) -> Result<RenderManifestV2, String> {
+    let components = scan_components_with_contract_policy(contract, "evaluating tier budget")?;
+    if components.is_empty() {
+        return Err(format!(
+            "no component files found under '{}' (.js/.jsx/.ts/.tsx expected)",
+            contract.root.display()
+        ));
+    }
+    let scanner = ProjectScanner::new();
+    let compiler = scanner.build_compiler(components);
+    compiler
+        .optimize_manifest_v2()
+        .map_err(|err| format!("failed to optimize manifest: {err}"))
+}
+
+/// Resolve the budget for a contract, returning the source label
+/// ("tier-budget.toml" or "built-in defaults") so the CLI can
+/// surface where the ceilings came from. `strict` rejects the
+/// built-in fallback so CI never accidentally passes against
+/// defaults.
+fn resolve_budget_for_contract(
+    contract: &ResolvedDevContract,
+    strict: bool,
+) -> Result<(TierBudget, String), String> {
+    let loaded = load_budget_from_dir(&contract.project_dir)
+        .map_err(|err| err.to_string())?;
+    match loaded {
+        Some(budget) => Ok((budget, "tier-budget.toml".to_string())),
+        None => {
+            if strict {
+                Err(format!(
+                    "tier-budget.toml not found in '{}' and --strict was set",
+                    contract.project_dir.display()
+                ))
+            } else {
+                Ok((TierBudget::default(), "built-in defaults".to_string()))
+            }
+        }
+    }
+}
+
+/// Phase O.1 · evaluate against the budget after a successful build.
+/// File-gated: only runs when `tier-budget.toml` exists. Build/ship
+/// callers pass `skip = true` to honour `--no-budget`.
+fn enforce_budget_after_build(
+    contract: &ResolvedDevContract,
+    manifest: &RenderManifestV2,
+    skip: bool,
+) -> Result<(), String> {
+    if skip {
+        return Ok(());
+    }
+    let loaded =
+        load_budget_from_dir(&contract.project_dir).map_err(|err| err.to_string())?;
+    let Some(budget) = loaded else {
+        return Ok(());
+    };
+    let report = evaluate_budget(manifest, &budget);
+    if report.is_ok() {
+        return Ok(());
+    }
+    print_section("budget");
+    print_kv("source", "tier-budget.toml");
+    println!("{}", format_report_pretty(&report));
+    Err(format!(
+        "tier budget exceeded ({} violation{})",
+        report.violations.len(),
+        if report.violations.len() == 1 { "" } else { "s" }
+    ))
+}
+
 fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
     if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_ship_help();
@@ -295,7 +470,8 @@ fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|err| format!("failed to resolve current directory: {err}"))?;
     let contract = resolve_dev_contract(&options.forwarded, &cwd)?;
-    run_prod_build(&contract)?;
+    let skip_budget = raw_args.iter().any(|arg| arg == "--no-budget");
+    run_prod_build_with_budget(&contract, skip_budget)?;
 
     let target = if let Some(target) = options.target {
         target
@@ -333,6 +509,10 @@ fn parse_ship_args(raw_args: &[String]) -> Result<ShipOptions, String> {
                     .ok_or_else(|| "missing value after --target".to_string())?;
                 target = Some(parse_ship_target(value)?);
             }
+            // Phase O.1 · `--no-budget` opts out of the tier
+            // budget gate; consumed here so it doesn't reach the
+            // dev-contract parser which would reject it as unknown.
+            "--no-budget" => {}
             other => forwarded.push(other.to_string()),
         }
         idx += 1;
@@ -343,12 +523,16 @@ fn parse_ship_args(raw_args: &[String]) -> Result<ShipOptions, String> {
 
 fn parse_ship_target(raw: &str) -> Result<ShipTarget, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
+        // Phase N · vercel is no longer a supported runtime target.
+        // The string still parses so the rejection message lands in
+        // `run_ship_command` rather than at flag parsing, giving the
+        // user the actual "why" instead of a generic "unknown target".
         "1" | "vercel" => Ok(ShipTarget::Vercel),
         "2" | "docker" => Ok(ShipTarget::Docker),
         "3" | "fly" | "flyio" | "fly.io" => Ok(ShipTarget::Fly),
         "4" | "static" => Ok(ShipTarget::Static),
         other => Err(format!(
-            "unknown ship target '{other}'. Supported targets: vercel, docker, fly, static."
+            "unknown ship target '{other}'. Supported targets: docker, fly, static."
         )),
     }
 }
@@ -356,14 +540,9 @@ fn parse_ship_target(raw: &str) -> Result<ShipTarget, String> {
 fn prompt_ship_target() -> Result<ShipTarget, String> {
     print_section("pick a target");
     println!(
-        "    {} vercel     {}",
-        style_256("1", ACCENT_SOFT, true),
-        style("static export + vercel.json", "2")
-    );
-    println!(
         "    {} docker     {}",
         style_256("2", ACCENT_SOFT, true),
-        style("single binary image", "2")
+        style("multi-stage binary image (recommended)", "2")
     );
     println!(
         "    {} fly        {}",
@@ -388,44 +567,53 @@ fn prompt_ship_target() -> Result<ShipTarget, String> {
     parse_ship_target(input.trim())
 }
 
-fn configure_ship_vercel(contract: &ResolvedDevContract) -> Result<(), String> {
-    let vercel_json = "{\n  \"version\": 2,\n  \"cleanUrls\": true,\n  \"trailingSlash\": false,\n  \"outputDirectory\": \".albedo/dist\"\n}\n";
-    let path = contract.project_dir.join("vercel.json");
-    std::fs::write(&path, vercel_json)
-        .map_err(|err| format!("failed to write '{}': {err}", path.display()))?;
-    print_section("vercel");
-    print_ok("vercel.json written");
-    print_kv("file", path.display());
-    print_kv("deploy", style_256("vercel --prod", ACCENT_SOFT, true));
-    Ok(())
+/// Phase N · Vercel is not a supported target — its serverless
+/// runtime does not execute the Rust binary that ALBEDO ships. The
+/// honest answer is "use `--target docker` (and optionally
+/// `--target fly`)" rather than emit a vercel.json that silently
+/// won't work in production.
+fn configure_ship_vercel(_contract: &ResolvedDevContract) -> Result<(), String> {
+    Err(
+        "vercel is not a supported ship target — Vercel's runtime does not execute Rust binaries. \
+         Use `albedo ship --target docker` (or `--target fly`) to deploy the binary + dist."
+            .to_string(),
+    )
 }
 
+/// Phase N · Multi-stage Dockerfile. Stage 1 compiles the userland
+/// app via `albedo build`; stage 2 ships the binary + `.albedo/dist`
+/// on a slim Debian runtime. Port is configurable via
+/// `ALBEDO_SERVER_PORT` at run time; defaults to 3000.
 fn configure_ship_docker(contract: &ResolvedDevContract) -> Result<(), String> {
-    let dockerfile = "FROM debian:bookworm-slim\nCOPY ./target/release/albedo /usr/local/bin/albedo\nCOPY ./.albedo/dist /app/dist\nWORKDIR /app\nEXPOSE 3000\nCMD [\"albedo\", \"serve\", \"--dir\", \"dist\", \"--host\", \"0.0.0.0\", \"--port\", \"3000\"]\n";
-    let dockerignore = ".git\nnode_modules\ntarget/debug\n";
+    let dockerfile = build_docker_template();
+    let dockerignore = build_dockerignore_template();
     let dockerfile_path = contract.project_dir.join("Dockerfile");
     let dockerignore_path = contract.project_dir.join(".dockerignore");
-    std::fs::write(&dockerfile_path, dockerfile)
+    std::fs::write(&dockerfile_path, dockerfile.as_str())
         .map_err(|err| format!("failed to write '{}': {err}", dockerfile_path.display()))?;
-    std::fs::write(&dockerignore_path, dockerignore)
+    std::fs::write(&dockerignore_path, dockerignore.as_str())
         .map_err(|err| format!("failed to write '{}': {err}", dockerignore_path.display()))?;
     print_section("docker");
     print_ok("Dockerfile + .dockerignore written");
     print_kv("dockerfile", dockerfile_path.display());
     print_kv("ignore", dockerignore_path.display());
-    print_kv("build", style_256("docker build -t albedo-app .", ACCENT_SOFT, true));
-    print_kv("run", style_256("docker run -p 3000:3000 albedo-app", ACCENT_SOFT, true));
+    print_kv(
+        "build",
+        style_256("docker build -t albedo-app .", ACCENT_SOFT, true),
+    );
+    print_kv(
+        "run",
+        style_256("docker run -p 3000:3000 albedo-app", ACCENT_SOFT, true),
+    );
     Ok(())
 }
 
 fn configure_ship_fly(contract: &ResolvedDevContract) -> Result<(), String> {
     configure_ship_docker(contract)?;
     let app_name = infer_package_name(&contract.project_dir);
-    let fly_toml = format!(
-        "app = \"{app_name}\"\nprimary_region = \"iad\"\n\n[build]\n  dockerfile = \"Dockerfile\"\n\n[http_service]\n  internal_port = 3000\n  force_https = true\n  auto_stop_machines = \"stop\"\n  auto_start_machines = true\n  min_machines_running = 0\n"
-    );
+    let fly_toml = build_fly_toml_template(&app_name);
     let fly_toml_path = contract.project_dir.join("fly.toml");
-    std::fs::write(&fly_toml_path, fly_toml)
+    std::fs::write(&fly_toml_path, fly_toml.as_str())
         .map_err(|err| format!("failed to write '{}': {err}", fly_toml_path.display()))?;
     print_section("fly.io");
     print_ok("fly.toml written");
@@ -435,6 +623,94 @@ fn configure_ship_fly(contract: &ResolvedDevContract) -> Result<(), String> {
         style_256("fly launch --copy-config && fly deploy", ACCENT_SOFT, true),
     );
     Ok(())
+}
+
+/// Multi-stage Dockerfile template emitted by `albedo ship --target
+/// docker` (and reused by `--target fly`). Kept as a function so the
+/// ship-target tests can assert key lines without depending on file
+/// I/O.
+fn build_docker_template() -> String {
+    r#"# Phase N · multi-stage build emitted by `albedo ship --target docker`.
+# Stage 1 compiles userland against the prebuilt `albedo` binary; stage
+# 2 ships the resulting `.albedo/dist` artefacts under a slim runtime.
+# Configurable at run time via ALBEDO_SERVER_PORT / ALBEDO_SERVER_HOST.
+
+FROM rust:1-bookworm AS builder
+WORKDIR /workspace
+COPY . .
+RUN if [ ! -f ./target/release/albedo ]; then \
+      cargo build --release --bin albedo; \
+    fi
+RUN ./target/release/albedo build .
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /workspace/target/release/albedo /usr/local/bin/albedo
+COPY --from=builder /workspace/.albedo/dist /app/dist
+COPY --from=builder /workspace/public /app/public
+
+ENV ALBEDO_SERVER_HOST=0.0.0.0
+ENV ALBEDO_SERVER_PORT=3000
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- "http://127.0.0.1:${ALBEDO_SERVER_PORT}/" >/dev/null 2>&1 || exit 1
+
+CMD ["sh", "-c", "albedo serve --dir dist --host ${ALBEDO_SERVER_HOST} --port ${ALBEDO_SERVER_PORT}"]
+"#
+    .to_string()
+}
+
+fn build_dockerignore_template() -> String {
+    r#".git
+.gitignore
+node_modules
+target/debug
+target/doc
+target/package
+target/tmp
+**/*.log
+**/.DS_Store
+**/Thumbs.db
+"#
+    .to_string()
+}
+
+fn build_fly_toml_template(app_name: &str) -> String {
+    format!(
+        r#"# Phase N · fly.toml emitted by `albedo ship --target fly`.
+# Pairs with the Dockerfile above; Fly builds the image remotely and
+# runs it under a tiny VM. Adjust `primary_region` to whichever Fly
+# region your users live closest to.
+
+app = "{app_name}"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ALBEDO_SERVER_HOST = "0.0.0.0"
+  ALBEDO_SERVER_PORT = "3000"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/"
+  timeout = "5s"
+"#
+    )
 }
 
 /// Phase J CLI: `albedo serve` runs the production build (same stitcher
@@ -727,9 +1003,16 @@ fn run_command(raw_args: &[String]) -> Result<(), String> {
 fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     let mut forwarded = Vec::new();
     let mut prod_mode = false;
+    let mut skip_budget = false;
     for arg in raw_args {
         if arg == "--prod" || arg == "--production" {
             prod_mode = true;
+        } else if arg == "--no-budget" {
+            // Phase O.1 · `albedo build --no-budget` opts out of
+            // the tier-budget gate even when tier-budget.toml is
+            // present. Dev mode never gates on budget; the flag is
+            // accepted there too so muscle memory is consistent.
+            skip_budget = true;
         } else {
             forwarded.push(arg.clone());
         }
@@ -790,10 +1073,12 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     }
 
     if prod_mode {
-        run_prod_build(&contract)?;
+        run_prod_build_with_budget(&contract, skip_budget)?;
         return Ok(());
     }
 
+    // Dev mode never gates on budget; the flag is silently accepted.
+    let _ = skip_budget;
     run_live_dev_runtime(contract)
 }
 
@@ -2106,7 +2391,17 @@ fn escape_html(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Phase O.1 · convenience wrapper preserving the old call sites'
+/// signature; the gate work happens in
+/// [`run_prod_build_with_budget`].
 fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
+    run_prod_build_with_budget(contract, false)
+}
+
+fn run_prod_build_with_budget(
+    contract: &ResolvedDevContract,
+    skip_budget: bool,
+) -> Result<(), String> {
     let out_dir = contract.project_dir.join(".albedo").join("dist");
 
     let scan_start = Instant::now();
@@ -2278,6 +2573,12 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
             )
         );
     }
+
+    // Phase O.1 · gate the build on the tier budget. File-gated: only
+    // runs when tier-budget.toml exists. Passing skip_budget=true
+    // (via --no-budget on ship/build) opts out even when the file is
+    // present.
+    enforce_budget_after_build(contract, &manifest, skip_budget)?;
 
     Ok(())
 }
@@ -2555,7 +2856,7 @@ _albdo_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local commands="init dev build ship serve files run completions help"
+    local commands="init dev build ship serve files budget run completions help"
 
     case "$prev" in
         albdo)
@@ -2567,15 +2868,23 @@ _albdo_completions() {
             return 0
             ;;
         ship)
-            COMPREPLY=( $(compgen -W "--target --config --entry" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--target --config --entry --no-budget" -- "$cur") )
             return 0
             ;;
         --target)
-            COMPREPLY=( $(compgen -W "vercel docker fly static" -- "$cur") )
+            COMPREPLY=( $(compgen -W "docker fly static" -- "$cur") )
             return 0
             ;;
         dev|build|run)
-            COMPREPLY=( $(compgen -W "--config --entry --host --port --no-hmr --strict --verbose --open --prod" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--config --entry --host --port --no-hmr --strict --verbose --open --prod --no-budget" -- "$cur") )
+            return 0
+            ;;
+        budget)
+            COMPREPLY=( $(compgen -W "--strict --format --config" -- "$cur") )
+            return 0
+            ;;
+        --format)
+            COMPREPLY=( $(compgen -W "pretty json" -- "$cur") )
             return 0
             ;;
         init)
@@ -2603,6 +2912,7 @@ _albdo() {
         'ship:Build and configure deployment target files'
         'serve:Production build + serve via the same stitcher as dev'
         'files:Static file server (defaults to .albedo/dist)'
+        'budget:Evaluate the tier budget against the current build'
         'run:Run a sub-mode (e.g. run dev)'
         'completions:Emit shell completion script to stdout'
         'help:Show command list and examples'
@@ -2645,8 +2955,15 @@ _albdo() {
                     ;;
                 (ship)
                     _arguments \
-                        '--target[Deployment target]:target:(vercel docker fly static)' \
+                        '--target[Deployment target]:target:(docker fly static)' \
+                        '--no-budget[Skip the tier-budget gate]' \
                         $dev_flags
+                    ;;
+                (budget)
+                    _arguments \
+                        '--strict[Require tier-budget.toml; fail if missing]' \
+                        '--format[Output format]:format:(pretty json)' \
+                        '--config[Use explicit albedo.config.json/ts]:file:_files'
                     ;;
                 (serve)
                     _arguments \
@@ -2665,7 +2982,7 @@ _albdo "$@"
 "#;
 
 const COMPLETIONS_FISH: &str = r#"# albdo fish completions
-set -l albdo_commands init dev build ship serve files run completions help
+set -l albdo_commands init dev build ship serve files budget run completions help
 
 # Disable file completions for the main command
 complete -c albdo -f
@@ -2676,6 +2993,7 @@ complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a dev         -d '
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a build       -d 'Compile an optimised production build'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a ship        -d 'Build and configure deployment target files'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a serve       -d 'Serve static files from a directory'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a budget      -d 'Evaluate the tier budget against the current build'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a run         -d 'Run a sub-mode'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a completions -d 'Emit shell completion script to stdout'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a help        -d 'Show command list and examples'
@@ -2697,8 +3015,14 @@ end
 complete -c albdo -n "__fish_seen_subcommand_from dev build" -l prod -d 'Production build mode'
 
 # ship flags
-complete -c albdo -n "__fish_seen_subcommand_from ship" -l target -d 'Deployment target' -r -a "vercel docker fly static"
+complete -c albdo -n "__fish_seen_subcommand_from ship" -l target -d 'Deployment target' -r -a "docker fly static"
 complete -c albdo -n "__fish_seen_subcommand_from ship" -l config -d 'Use explicit albedo config file' -r
+complete -c albdo -n "__fish_seen_subcommand_from ship" -l no-budget -d 'Skip the tier-budget gate'
+
+# budget flags
+complete -c albdo -n "__fish_seen_subcommand_from budget" -l strict -d 'Require tier-budget.toml; fail if missing'
+complete -c albdo -n "__fish_seen_subcommand_from budget" -l format -d 'Output format' -r -a "pretty json"
+complete -c albdo -n "__fish_seen_subcommand_from budget" -l config -d 'Use explicit albedo config file' -r
 
 # serve flags
 complete -c albdo -n "__fish_seen_subcommand_from serve" -l dir  -d 'Directory to serve' -r
@@ -2716,8 +3040,8 @@ Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptB
     $tokens = $commandAst.CommandElements
     $nTokens = $tokens.Count
 
-    $commands = @('init','dev','build','ship','serve','files','run','completions','help')
-    $devFlags = @('--config','--entry','--host','--port','--no-hmr','--strict','--verbose','--open','--prod')
+    $commands = @('init','dev','build','ship','serve','files','budget','run','completions','help')
+    $devFlags = @('--config','--entry','--host','--port','--no-hmr','--strict','--verbose','--open','--prod','--no-budget')
 
     if ($nTokens -le 2) {
         $commands | Where-Object { $_ -like "$wordToComplete*" } |
@@ -2738,10 +3062,19 @@ Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptB
         }
         'ship' {
             if ($wordToComplete -eq '--target' -or ($nTokens -ge 3 -and $tokens[$nTokens-2] -eq '--target')) {
-                @('vercel','docker','fly','static') | Where-Object { $_ -like "$wordToComplete*" } |
+                @('docker','fly','static') | Where-Object { $_ -like "$wordToComplete*" } |
                     ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
             } else {
-                @('--target','--config','--entry') | Where-Object { $_ -like "$wordToComplete*" } |
+                @('--target','--config','--entry','--no-budget') | Where-Object { $_ -like "$wordToComplete*" } |
+                    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
+            }
+        }
+        'budget' {
+            if ($wordToComplete -eq '--format' -or ($nTokens -ge 3 -and $tokens[$nTokens-2] -eq '--format')) {
+                @('pretty','json') | Where-Object { $_ -like "$wordToComplete*" } |
+                    ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+            } else {
+                @('--strict','--format','--config') | Where-Object { $_ -like "$wordToComplete*" } |
                     ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
             }
         }
@@ -2776,6 +3109,7 @@ fn print_help() {
         "production build + serve via the same stitcher as dev",
     );
     print_command("files", "[dir]", "static file server (defaults to .albedo/dist)");
+    print_command("budget", "[dir]", "evaluate the tier budget against the current build");
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
 
@@ -2817,11 +3151,29 @@ fn print_ship_help() {
     println!(
         "  {}  {}",
         style("usage", "2"),
-        style("albedo ship [dir] [--target <name>]", "1")
+        style("albedo ship [dir] [--target <name>] [--no-budget]", "1")
     );
-    print_option("--target <name>", "vercel | docker | fly | static");
+    print_option("--target <name>", "docker | fly | static");
     print_option("--config <FILE>", "explicit albedo config");
     print_option("--entry <FILE>", "override entry module");
+    print_option("--no-budget", "skip the tier-budget gate");
+    println!();
+}
+
+fn print_budget_help() {
+    print_banner();
+    print_section("budget");
+    println!(
+        "  {}  {}",
+        style("usage", "2"),
+        style("albedo budget [dir] [--strict] [--format pretty|json]", "1")
+    );
+    print_option(
+        "--strict",
+        "require tier-budget.toml; fail if missing",
+    );
+    print_option("--format <kind>", "pretty (default) | json");
+    print_option("--config <FILE>", "explicit albedo config");
     println!();
 }
 
@@ -3057,9 +3409,66 @@ mod tests {
     #[test]
     fn test_parse_ship_target_supports_named_targets() {
         assert_eq!(parse_ship_target("docker").unwrap(), ShipTarget::Docker);
+        // vercel still parses so the dispatcher can return a specific
+        // "Vercel doesn't run Rust binaries" message; see
+        // test_configure_ship_vercel_rejects_with_explanation.
         assert_eq!(parse_ship_target("vercel").unwrap(), ShipTarget::Vercel);
         assert_eq!(parse_ship_target("fly").unwrap(), ShipTarget::Fly);
         assert_eq!(parse_ship_target("static").unwrap(), ShipTarget::Static);
+    }
+
+    #[test]
+    fn test_docker_template_is_multi_stage_with_runtime_env() {
+        let dockerfile = build_docker_template();
+        assert!(dockerfile.contains("FROM rust:1-bookworm AS builder"));
+        assert!(dockerfile.contains("FROM debian:bookworm-slim AS runtime"));
+        assert!(dockerfile.contains("ALBEDO_SERVER_HOST=0.0.0.0"));
+        assert!(dockerfile.contains("ALBEDO_SERVER_PORT=3000"));
+        assert!(dockerfile.contains("HEALTHCHECK"));
+        assert!(dockerfile.contains("EXPOSE 3000"));
+        assert!(dockerfile.contains("COPY --from=builder /workspace/.albedo/dist"));
+    }
+
+    #[test]
+    fn test_dockerignore_template_excludes_common_build_noise() {
+        let ignore = build_dockerignore_template();
+        assert!(ignore.contains(".git"));
+        assert!(ignore.contains("node_modules"));
+        assert!(ignore.contains("target/debug"));
+    }
+
+    #[test]
+    fn test_fly_toml_template_uses_supplied_app_name() {
+        let toml = build_fly_toml_template("demo-app");
+        assert!(toml.contains("app = \"demo-app\""));
+        assert!(toml.contains("dockerfile = \"Dockerfile\""));
+        assert!(toml.contains("internal_port = 3000"));
+        assert!(toml.contains("[[http_service.checks]]"));
+    }
+
+    #[test]
+    fn test_configure_ship_vercel_rejects_with_explanation() {
+        let temp = tempfile::tempdir().unwrap();
+        let contract = ResolvedDevContract {
+            contract_version: 1,
+            project_dir: temp.path().to_path_buf(),
+            config_path: None,
+            root: temp.path().to_path_buf(),
+            entry: "App.tsx".to_string(),
+            server: dom_render_compiler::dev_contract::DevServerConfig::default(),
+            watch: dom_render_compiler::dev_contract::DevWatchConfig::default(),
+            hmr: dom_render_compiler::dev_contract::DevHmrConfig::default(),
+            hot_set: Vec::new(),
+            static_slice: dom_render_compiler::dev_contract::StaticSliceConfig::default(),
+            strict: false,
+            verbose: false,
+            open: false,
+            routes: HashMap::new(),
+        };
+        let err = configure_ship_vercel(&contract).unwrap_err();
+        assert!(err.contains("vercel is not a supported"));
+        assert!(err.contains("docker"));
+        assert!(!temp.path().join("vercel.json").exists());
     }
 
     #[test]

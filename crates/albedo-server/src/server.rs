@@ -8,6 +8,7 @@ use crate::contract::{
 use crate::error::RuntimeError;
 use crate::handlers::action::{run_action_request, ActionRegistry};
 use crate::handlers::api::dispatch_api_route;
+use crate::handlers::public_assets::PublicAssets;
 use crate::handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
 use crate::inspector::{
     self as inspector_routes, GraphSnapshot as InspectorGraphSnapshot, InspectorState,
@@ -120,6 +121,10 @@ struct RuntimeState {
     /// Phase M.2 — HMR registry the in-place DOM-swap client
     /// subscribes to. Same on/off semantics as the error registry.
     dev_hmr_registry: Option<crate::dev::SharedHmrRegistry>,
+    /// Phase N — public/ static asset mount(s). When present,
+    /// `dispatch` checks for a matching file before falling through
+    /// to the dynamic route matcher.
+    public_assets: Option<Arc<PublicAssets>>,
 }
 
 pub struct AlbedoServerBuilder {
@@ -155,6 +160,13 @@ pub struct AlbedoServerBuilder {
     /// overrides; `None` defaults to `cfg!(debug_assertions)` so
     /// debug builds get the overlay + HMR endpoints automatically.
     dev_mode_enabled: Option<bool>,
+    /// Phase N — directories served verbatim at the URL root. Each
+    /// `with_public_dir` call appends; the first matching root wins.
+    public_dirs: Vec<std::path::PathBuf>,
+    /// Phase N — `Cache-Control` value applied to every public asset
+    /// response. `None` means auto: `public, max-age=3600` when dev
+    /// mode is off, `no-store` when dev mode is on.
+    public_cache_control: Option<String>,
 }
 
 impl AlbedoServerBuilder {
@@ -173,7 +185,29 @@ impl AlbedoServerBuilder {
             opcode_registry: None,
             pipeline: None,
             dev_mode_enabled: None,
+            public_dirs: Vec::new(),
+            public_cache_control: None,
         }
+    }
+
+    /// Phase N — mount a directory whose files are served verbatim
+    /// at the URL root (`<dir>/logo.svg` → `GET /logo.svg`). Multiple
+    /// calls stack; the first matching root wins. Lookups go through
+    /// [`crate::handlers::public_assets::sanitize_public_path`] so
+    /// traversal attempts cannot escape the mount.
+    #[must_use]
+    pub fn with_public_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.public_dirs.push(dir.into());
+        self
+    }
+
+    /// Phase N — override the `Cache-Control` header used for public
+    /// asset responses. When unset the value tracks dev mode:
+    /// `no-store` in dev, `public, max-age=3600` in production.
+    #[must_use]
+    pub fn with_public_cache_control(mut self, value: impl Into<String>) -> Self {
+        self.public_cache_control = Some(value.into());
+        self
     }
 
     /// Phase M — explicit toggle for the error overlay + HMR
@@ -554,6 +588,22 @@ impl AlbedoServerBuilder {
             (None, None)
         };
 
+        let public_assets = if self.public_dirs.is_empty() {
+            None
+        } else {
+            let cache_control = self.public_cache_control.unwrap_or_else(|| {
+                if dev_mode_enabled {
+                    "no-store".to_string()
+                } else {
+                    "public, max-age=3600".to_string()
+                }
+            });
+            Some(Arc::new(PublicAssets::new(
+                self.public_dirs,
+                cache_control.as_str(),
+            )))
+        };
+
         let state = RuntimeState {
             router: Arc::new(router),
             handlers: Arc::new(self.handlers),
@@ -572,6 +622,7 @@ impl AlbedoServerBuilder {
             inspector,
             dev_error_registry,
             dev_hmr_registry,
+            public_assets,
         };
 
         Ok(AlbedoServer {
@@ -624,6 +675,13 @@ impl AlbedoServer {
     /// availability rules as the error registry above.
     pub fn dev_hmr_registry(&self) -> Option<crate::dev::SharedHmrRegistry> {
         self.state.dev_hmr_registry.clone()
+    }
+
+    /// Phase N · expose the public asset registry for tests and
+    /// userland code that wants to introspect the mounted roots.
+    /// `None` when no `with_public_dir(..)` calls were made.
+    pub fn public_assets(&self) -> Option<Arc<PublicAssets>> {
+        self.state.public_assets.clone()
     }
 
     pub async fn run(self) -> Result<(), RuntimeError> {
@@ -757,6 +815,22 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
     // router (which will surface 405 or 404 as appropriate).
     if path == "/_albedo/action" && method == HttpMethod::Post {
         return run_action_route(&state, request).await;
+    }
+
+    // Phase N — `public/` static assets resolve before dynamic
+    // routes so `public/logo.svg` reliably serves at `/logo.svg`
+    // even when the route map has a catch-all. GET/HEAD only; other
+    // methods fall through and surface 405 from the router.
+    if matches!(method, HttpMethod::Get | HttpMethod::Head) {
+        if let Some(assets) = &state.public_assets {
+            if let Some(file) = assets.resolve(path.as_str()) {
+                let mut response = assets.read_response(&file);
+                if method == HttpMethod::Head {
+                    *response.body_mut() = Body::empty();
+                }
+                return response;
+            }
+        }
     }
 
     let route_match = state.router.match_route(method, path.as_str());

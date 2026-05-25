@@ -52,6 +52,7 @@
 #![warn(rustdoc::invalid_codeblock_attributes)]
 
 pub mod analysis;
+pub mod budget;
 pub mod bundler;
 pub mod dev;
 pub mod effects;
@@ -62,6 +63,7 @@ pub mod incremental;
 pub mod ir;
 pub mod manifest;
 pub mod parser;
+pub mod routing;
 pub mod runtime;
 pub mod scanner;
 pub mod transforms;

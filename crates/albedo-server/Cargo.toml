@@ -32,4 +32,5 @@ rustls-pki-types.workspace     = true
 xxhash-rust.workspace          = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tower.workspace = true
