@@ -367,6 +367,8 @@ mod tests {
             position: position("root", 0),
             timeout_ms: 250,
             fallback_html: None,
+            initial_html: None,
+            initial_opcode_frame: Vec::new(),
         }
     }
 
@@ -398,6 +400,11 @@ mod tests {
             tier_a_root: tier_a,
             tier_b,
             tier_c,
+            shared_slot_topics: Vec::new(),
+            action_ids: Vec::new(),
+            layout_chain: Vec::new(),
+            error_component: None,
+            loading_component: None,
         }
     }
 

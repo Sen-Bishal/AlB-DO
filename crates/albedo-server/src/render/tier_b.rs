@@ -446,6 +446,8 @@ mod tests {
             },
             timeout_ms: 100,
             fallback_html: Some("<p>fallback</p>".to_string()),
+            initial_html: None,
+            initial_opcode_frame: Vec::new(),
         }
     }
 

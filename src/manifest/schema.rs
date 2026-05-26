@@ -109,6 +109,46 @@ pub struct RouteManifest {
     pub tier_a_root: Vec<RenderedNode>,
     pub tier_b: Vec<TierBNode>,
     pub tier_c: Vec<TierCNode>,
+    /// Phase P · broadcast topics referenced by any component on this
+    /// route. The streaming handler auto-subscribes each WT session
+    /// to these at render time so JSX-side `useSharedSlot("topic")`
+    /// resolves without explicit subscribe.
+    #[serde(default)]
+    pub shared_slot_topics: Vec<String>,
+    /// Phase P · TS-side action handler names + their wire
+    /// `action_id`s for this route. Populated once Stream C lands
+    /// the `action()` extractor; the field exists now so manifests
+    /// produced by intermediate builds round-trip cleanly.
+    #[serde(default)]
+    pub action_ids: Vec<RouteActionEntry>,
+    /// Phase P · ordered layout chain (outermost → leaf) for this
+    /// route. Each entry is a component name resolved through
+    /// `discover_routes::DiscoveredRoute.layout_chain`. Render-side
+    /// composition (Stream E.1) wraps the route's HTML in each
+    /// layout's HTML in order.
+    #[serde(default)]
+    pub layout_chain: Vec<String>,
+    /// Phase P · component name of the `error.tsx` boundary for this
+    /// route, if any. Streaming handler serves this when a Tier-C
+    /// resolution fails. Stream E.2 populates this; field added now
+    /// so the schema is stable.
+    #[serde(default)]
+    pub error_component: Option<String>,
+    /// Phase P · component name of the `loading.tsx` placeholder for
+    /// this route, if any. Streaming handler serves this while
+    /// Tier-C resolves. Stream E.2 populates this.
+    #[serde(default)]
+    pub loading_component: Option<String>,
+}
+
+/// Phase P · one TS-authored action handler discovered on a route.
+/// `action_id` is `FNV-1a-32(name)` — the same hash the form
+/// extractor's `allocate_form_action_id` produces, so the wire
+/// envelope's `action_id` looks the route up directly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteActionEntry {
+    pub name: String,
+    pub action_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -131,6 +171,23 @@ pub struct TierBNode {
     pub position: DomPosition,
     pub timeout_ms: u64,
     pub fallback_html: Option<String>,
+    /// Phase P · pre-rendered initial HTML for this Tier-B component,
+    /// produced at build time by `render_entry_with_broadcast` against
+    /// a fresh empty slot store. The streaming handler inlines this
+    /// into the shell instead of the placeholder fallback. `None`
+    /// when the build pipeline couldn't render (missing source,
+    /// transient error) — falls back to `fallback_html`.
+    #[serde(default)]
+    pub initial_html: Option<String>,
+    /// Phase P · bincode-encoded `OpcodeFrame` carrying the initial
+    /// hydration payload (`BindEvent` + `SetTextRef` + initial
+    /// `SlotSet`). The streaming handler ships these bytes verbatim
+    /// on the WT patches lane so bakabox wires up the island on
+    /// first paint. Empty when no Phase K hooks / events fired.
+    /// Encoding via `crate::ir::wire::encode_frame` matches the
+    /// runtime wire format — no schema drift possible.
+    #[serde(default)]
+    pub initial_opcode_frame: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

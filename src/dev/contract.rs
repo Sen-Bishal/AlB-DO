@@ -454,6 +454,54 @@ pub fn resolve_dev_contract(
         ));
     }
 
+    // Phase N · file-based routing. `<root>/routes/` is the convention;
+    // when it exists, every `*.tsx` / `*.jsx` / `*.ts` / `*.js` becomes
+    // a route automatically. Discovered routes overlay on top of any
+    // config-declared routes (file-based wins on URL conflict — the
+    // expected behaviour for convention-over-configuration).
+    let mut routes = config.routes;
+    let mut entry_override_from_routes: Option<String> = None;
+    let routes_dir = root.join(crate::routing::ROUTES_DIRNAME);
+    if routes_dir.is_dir() {
+        let discovery = crate::routing::discover_routes(&routes_dir).map_err(|err| {
+            format!(
+                "file-based routing failed under '{}': {err}",
+                routes_dir.display()
+            )
+        })?;
+        for route in discovery.routes {
+            // Entry paths are stored relative to `root` so the dev
+            // render loop (which calls `project.render_entry(entry)`)
+            // resolves them through the same code path as config-
+            // declared routes.
+            let entry_rel = format!(
+                "{}/{}",
+                crate::routing::ROUTES_DIRNAME,
+                route.source_rel_path.to_string_lossy().replace('\\', "/")
+            );
+            if route.url_path == "/" {
+                // An `index.tsx` under `routes/` overrides the dev
+                // contract's `entry`. This is what makes the user's
+                // file at `src/routes/index.tsx` actually render at
+                // `/` without them having to edit the config.
+                entry_override_from_routes = Some(entry_rel);
+            } else {
+                routes.insert(route.url_path, entry_rel);
+            }
+        }
+    }
+
+    let entry = entry_override_from_routes.unwrap_or(entry);
+    // Re-validate the (possibly overridden) entry exists under root.
+    let entry_path = root.join(&entry);
+    if !entry_path.is_file() {
+        return Err(format!(
+            "entry module '{}' does not exist under root '{}'",
+            entry,
+            root.display()
+        ));
+    }
+
     Ok(ResolvedDevContract {
         contract_version: config.contract_version,
         project_dir,
@@ -468,7 +516,7 @@ pub fn resolve_dev_contract(
         strict: cli.strict,
         verbose: cli.verbose,
         open: cli.open,
-        routes: config.routes,
+        routes,
     })
 }
 
@@ -1013,6 +1061,94 @@ export default defineConfig({
         assert_eq!(resolved.server.port, 4999);
         assert!(resolved.strict);
         assert!(resolved.open);
+    }
+
+    #[test]
+    fn file_based_routes_overlay_into_dev_contract_alongside_config_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("src");
+        std::fs::create_dir_all(root.join("routes").join("blog")).unwrap();
+        std::fs::write(
+            root.join("App.tsx"),
+            "export default function App(){return null;}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("routes").join("index.tsx"),
+            "export default function Home(){return null;}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("routes").join("about.tsx"),
+            "export default function About(){return null;}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("routes").join("blog").join("[slug].tsx"),
+            "export default function Post(){return null;}",
+        )
+        .unwrap();
+
+        // Config also declares a route — must coexist with the
+        // file-based discoveries.
+        std::fs::write(
+            temp.path().join(DEV_CONFIG_JSON),
+            r#"{
+  "contract_version": 1,
+  "root": "src",
+  "entry": "App.tsx",
+  "routes": { "/legacy": "App.tsx" }
+}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_dev_contract(&[], temp.path()).unwrap();
+
+        // `routes/index.tsx` overrides the configured entry so the
+        // file-based default actually paints at `/`.
+        assert_eq!(resolved.entry, "routes/index.tsx");
+
+        // Other discovered routes show up in the route map alongside
+        // the config-declared `/legacy`.
+        assert_eq!(
+            resolved.routes.get("/about").map(String::as_str),
+            Some("routes/about.tsx"),
+        );
+        assert_eq!(
+            resolved.routes.get("/blog/[slug]").map(String::as_str),
+            Some("routes/blog/[slug].tsx"),
+        );
+        assert_eq!(
+            resolved.routes.get("/legacy").map(String::as_str),
+            Some("App.tsx"),
+        );
+    }
+
+    #[test]
+    fn missing_routes_dir_falls_back_to_config_routes_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("App.tsx"),
+            "export default function App(){return null;}",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join(DEV_CONFIG_JSON),
+            r#"{
+  "contract_version": 1,
+  "root": "src",
+  "entry": "App.tsx",
+  "routes": { "/health": "App.tsx" }
+}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_dev_contract(&[], temp.path()).unwrap();
+        assert_eq!(resolved.entry, "App.tsx");
+        assert_eq!(resolved.routes.len(), 1);
+        assert!(resolved.routes.contains_key("/health"));
     }
 
     #[test]

@@ -35,7 +35,11 @@
       "Bash(python filter_clippy.py)",
       "Bash(rm clippy_full.log filter_clippy.py)",
       "Bash(ls \"A:\\\\AlBDO-v-0.1.0\\\\\")",
-      "PowerShell(Get-ChildItem -Path \"A:\\\\AlBDO-v-0.1.0\\\\crates\" -Recurse -File -Exclude \"target\" | Where-Object { $_.FullName -notmatch \"target\" } | Select-Object FullName, Length | Format-Table -AutoSize)"
+      "PowerShell(Get-ChildItem -Path \"A:\\\\AlBDO-v-0.1.0\\\\crates\" -Recurse -File -Exclude \"target\" | Where-Object { $_.FullName -notmatch \"target\" } | Select-Object FullName, Length | Format-Table -AutoSize)",
+      "Bash(python -c \"import json,sys; m=json.load\\(sys.stdin\\); r=m.get\\('routes',{}\\); k=[x for x in r.keys\\(\\) if 'interactive' in x.lower\\(\\) or x=='/']; print\\('routes with interactive or /:', k\\); print\\(\\); [print\\(rk,'->',list\\(r[rk].keys\\(\\)\\) if isinstance\\(r[rk],dict\\) else '?'\\) for rk in k]\")",
+      "Bash(python -c \"import json,sys; m=json.load\\(sys.stdin\\); r=m['routes']['/interactive']; print\\('tier_a_root len:',len\\(r.get\\('tier_a_root',[]\\)\\)\\); print\\('tier_b len:',len\\(r.get\\('tier_b',[]\\)\\)\\); print\\(\\); print\\('shell.body_open:'\\); print\\(r['shell'].get\\('body_open',''\\)[:2000]\\)\")",
+      "Bash(python -c \"import json,sys; m=json.load\\(sys.stdin\\); cs=m.get\\('components',[]\\); print\\('components:'\\); [print\\(' ', c['name'],'tier=',c['tier'],'weight=',c['weight_bytes']\\) for c in cs]\")",
+      "Bash(grep -v \"//\")"
     ]
   }
 }

@@ -132,7 +132,12 @@
   ],
   "routes": {
     "/": {
+      "action_ids": [],
+      "error_component": null,
+      "layout_chain": [],
+      "loading_component": null,
       "route": "/",
+      "shared_slot_topics": [],
       "shell": {
         "body_close": "</body></html>",
         "body_open": "<body><!--__SLOT___a_app_0--><div id=\"__b_button_1\" data-albedo-tier=\"b\"></div>",
@@ -157,6 +162,8 @@
           "data_deps": [],
           "dynamic_prop_keys": [],
           "fallback_html": "<div data-albedo-fallback=\"Button\"></div>",
+          "initial_html": "<button data-albedo-id=\"4151434149\"></button>",
+          "initial_opcode_frame": [],
           "placeholder_id": "__b_button_1",
           "position": {
             "order": 1,
