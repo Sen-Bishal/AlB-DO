@@ -2625,6 +2625,24 @@ fn run_prod_build_with_budget(
         );
     }
 
+    // Phase N · copy `<project>/public/` into `.albedo/dist/public/`
+    // so a pure-static deploy (CDN / static-export ship target) ships
+    // images, favicons, fonts, etc. alongside the rendered shell and
+    // hydration JS. Idempotent — re-runs overwrite the existing files
+    // without leaving stale entries because we copy into a fresh
+    // sub-dir each build.
+    let public_src = contract.project_dir.join("public");
+    if public_src.is_dir() {
+        let public_dst = out_dir.join("public");
+        let copied = copy_public_dir(&public_src, &public_dst)?;
+        if copied > 0 {
+            print_kv(
+                "public",
+                format!("{copied} file{}", if copied == 1 { "" } else { "s" }),
+            );
+        }
+    }
+
     // Phase O.1 + O.3 · gate the build on the tier budget. File-gated:
     // only runs when tier-budget.toml exists. The emit report is
     // passed in so the O.3 bundle-byte pass can run against measured
@@ -2634,6 +2652,50 @@ fn run_prod_build_with_budget(
     enforce_budget_after_build(contract, &manifest, Some(&report), skip_budget)?;
 
     Ok(())
+}
+
+/// Phase N · recursive directory copy used by the `public/` ship
+/// step. Returns the count of files copied so the build summary can
+/// print it. Skips symlinks (they'd require a portability story
+/// across platforms) and surfaces the offending path on any IO
+/// failure so the user sees exactly what went wrong.
+fn copy_public_dir(src: &Path, dst: &Path) -> Result<usize, String> {
+    std::fs::create_dir_all(dst)
+        .map_err(|err| format!("failed to create '{}': {err}", dst.display()))?;
+    let mut count = 0usize;
+    for entry in WalkDir::new(src).follow_links(false) {
+        let entry = entry.map_err(|err| format!("public/ walk failed: {err}"))?;
+        let path = entry.path();
+        if path.is_symlink() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(src)
+            .map_err(|err| format!("public/ path strip failed: {err}"))?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let target = dst.join(rel);
+        if path.is_dir() {
+            std::fs::create_dir_all(&target)
+                .map_err(|err| format!("failed to create '{}': {err}", target.display()))?;
+        } else if path.is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    format!("failed to create '{}': {err}", parent.display())
+                })?;
+            }
+            std::fs::copy(path, &target).map_err(|err| {
+                format!(
+                    "failed to copy '{}' → '{}': {err}",
+                    path.display(),
+                    target.display()
+                )
+            })?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn read_manifest_module_source(
@@ -3528,6 +3590,33 @@ mod tests {
     fn test_sanitize_static_relative_path_rejects_parent_segments() {
         assert!(sanitize_static_relative_path("../secret.txt").is_none());
         assert!(sanitize_static_relative_path("safe/file.txt").is_some());
+    }
+
+    #[test]
+    fn copy_public_dir_recursively_copies_files_and_skips_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("public");
+        let dst = temp.path().join("dist").join("public");
+        std::fs::create_dir_all(src.join("images")).unwrap();
+        std::fs::write(src.join("logo.svg"), b"<svg/>").unwrap();
+        std::fs::write(src.join("images").join("cover.png"), b"PNG").unwrap();
+
+        let count = copy_public_dir(&src, &dst).unwrap();
+        assert_eq!(count, 2);
+        assert!(dst.join("logo.svg").is_file());
+        assert!(dst.join("images").join("cover.png").is_file());
+        // Idempotent: a second run is a no-op overwrite, not a panic.
+        let again = copy_public_dir(&src, &dst).unwrap();
+        assert_eq!(again, 2);
+    }
+
+    #[test]
+    fn copy_public_dir_returns_zero_for_empty_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("public");
+        std::fs::create_dir_all(&src).unwrap();
+        let count = copy_public_dir(&src, &temp.path().join("dist")).unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

@@ -368,4 +368,237 @@ mod tests {
         assert!(manifest.routes.contains_key("/"));
         assert!(manifest.routes.contains_key("/about"));
     }
+
+    // ── Phase P · Stream B tests ────────────────────────────────────
+
+    /// Phase P · build a manifest from a real on-disk Tier-B component
+    /// (Counter with useState) and confirm the manifest carries real
+    /// HTML + opcodes, not a placeholder. This is the gate test for
+    /// Stream B.
+    #[test]
+    fn stream_b_tier_b_node_carries_real_html_and_opcode_frame() {
+        let mut compiler = RenderCompiler::new();
+        let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
+        // The hook-compile fixture under `tests/fixtures/hook_compile/counter/`
+        // ships a useState component the manifest builder can render
+        // through Phase K end-to-end.
+        counter.file_path =
+            "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+        counter.weight = 2048.0;
+        counter.effect_profile.hooks = true;
+        compiler.add_component(counter);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        // Counter compiles to Tier-B because of useState.
+        let counter_entry = manifest
+            .components
+            .iter()
+            .find(|c| c.name == "Counter")
+            .expect("Counter present");
+        assert_eq!(counter_entry.tier, Tier::B);
+
+        // The route's Tier-B list must carry the pre-rendered HTML
+        // and a non-empty opcode frame (BindEvent + SetTextRef).
+        let route = manifest
+            .routes
+            .values()
+            .next()
+            .expect("at least one route");
+        let tier_b = route
+            .tier_b
+            .iter()
+            .find(|n| n.component_id == "Counter")
+            .expect("Counter is in tier_b");
+        let html = tier_b
+            .initial_html
+            .as_deref()
+            .expect("Stream B fills initial_html for compilable Tier-B nodes");
+        assert!(
+            html.contains("<button"),
+            "expected rendered <button>; got: {html}"
+        );
+        assert!(
+            html.contains(">0</button>"),
+            "expected initial useState value '0' inline; got: {html}"
+        );
+        assert!(
+            !tier_b.initial_opcode_frame.is_empty(),
+            "expected non-empty opcode frame for hook-compiled Counter"
+        );
+    }
+
+    /// Phase P · the embedded opcode frame must round-trip through
+    /// `decode_frame` and contain the expected BindEvent + SetTextRef
+    /// opcodes Phase K emits for a useState counter.
+    #[test]
+    fn stream_b_tier_b_opcode_frame_round_trips_and_carries_phase_k_opcodes() {
+        use crate::ir::opcode::Instruction;
+        use crate::ir::wire::decode_frame;
+
+        let mut compiler = RenderCompiler::new();
+        let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
+        counter.file_path =
+            "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+        counter.weight = 2048.0;
+        counter.effect_profile.hooks = true;
+        compiler.add_component(counter);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        let tier_b = manifest
+            .routes
+            .values()
+            .next()
+            .unwrap()
+            .tier_b
+            .iter()
+            .find(|n| n.component_id == "Counter")
+            .unwrap();
+
+        let (frame, _) = decode_frame(&tier_b.initial_opcode_frame)
+            .expect("frame round-trips through decode_frame");
+        let has_bind_event = frame
+            .instructions
+            .iter()
+            .any(|op| matches!(op, Instruction::BindEvent { .. }));
+        let has_set_text_ref = frame
+            .instructions
+            .iter()
+            .any(|op| matches!(op, Instruction::SetTextRef { .. }));
+        assert!(
+            has_bind_event,
+            "expected BindEvent in counter opcode frame; got {:?}",
+            frame.instructions
+        );
+        assert!(
+            has_set_text_ref,
+            "expected SetTextRef in counter opcode frame; got {:?}",
+            frame.instructions
+        );
+    }
+
+    /// Phase P · Tier-A components remain unaffected. The new fields
+    /// default to None/empty for Tier-A routes (Tier-A renders to HTML
+    /// inline, no opcode payload needed).
+    #[test]
+    fn stream_b_tier_a_only_route_has_empty_initial_opcode_metadata() {
+        let mut compiler = RenderCompiler::new();
+        let mut static_hero = Component::new(ComponentId::new(0), "Hero".to_string());
+        static_hero.file_path = "src/Hero.tsx".to_string();
+        static_hero.is_above_fold = true;
+        static_hero.weight = 512.0;
+        compiler.add_component(static_hero);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        let route = manifest.routes.values().next().expect("route exists");
+        assert!(
+            route.tier_b.is_empty(),
+            "Tier-A only route should not produce Tier-B nodes"
+        );
+        // Schema defaults: empty per-route metadata for projects
+        // without file-based routes or TS actions.
+        assert!(route.shared_slot_topics.is_empty());
+        assert!(route.action_ids.is_empty());
+        assert!(route.layout_chain.is_empty());
+        assert!(route.error_component.is_none());
+        assert!(route.loading_component.is_none());
+    }
+
+    /// Phase P · falling back gracefully when the component file
+    /// doesn't exist on disk. The pre-render path returns None and
+    /// the manifest stays usable (fallback_html still populated).
+    #[test]
+    fn stream_b_falls_back_to_placeholder_when_source_is_missing() {
+        let mut compiler = RenderCompiler::new();
+        let mut ghost = Component::new(ComponentId::new(0), "Ghost".to_string());
+        ghost.file_path = "src/nonexistent/Ghost.tsx".to_string();
+        ghost.weight = 1024.0;
+        ghost.effect_profile.hooks = true;
+        compiler.add_component(ghost);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        let route = manifest.routes.values().next().unwrap();
+        let tier_b = route
+            .tier_b
+            .iter()
+            .find(|n| n.component_id == "Ghost")
+            .expect("Ghost still emitted as Tier-B placeholder");
+        // No disk source → no inline HTML, no opcodes. But the
+        // placeholder fallback still ships so the streaming handler
+        // has SOMETHING to render.
+        assert!(tier_b.initial_html.is_none());
+        assert!(tier_b.initial_opcode_frame.is_empty());
+        assert!(tier_b.fallback_html.is_some());
+    }
+
+    /// Phase P · two consecutive manifest builds against identical
+    /// inputs produce byte-identical opcode frames. Determinism is
+    /// load-bearing for the budget gate + cache invalidation.
+    #[test]
+    fn stream_b_manifest_build_is_deterministic_across_runs() {
+        let build = || {
+            let mut compiler = RenderCompiler::new();
+            let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
+            counter.file_path =
+                "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+            counter.weight = 2048.0;
+            counter.effect_profile.hooks = true;
+            compiler.add_component(counter);
+            let result = compiler.optimize().unwrap();
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default())
+        };
+
+        let first = build();
+        let second = build();
+
+        let first_tier_b = &first.routes.values().next().unwrap().tier_b[0];
+        let second_tier_b = &second.routes.values().next().unwrap().tier_b[0];
+        assert_eq!(first_tier_b.initial_html, second_tier_b.initial_html);
+        assert_eq!(
+            first_tier_b.initial_opcode_frame,
+            second_tier_b.initial_opcode_frame,
+            "opcode frame bytes must match across rebuilds"
+        );
+    }
+
+    /// Phase P · the shell's body_open should reference the Tier-B
+    /// placeholder by its stable id so the streaming handler can
+    /// slot the rendered HTML in. The pre-render machinery is
+    /// orthogonal to placeholder generation; this confirms we didn't
+    /// regress the existing wire shape.
+    #[test]
+    fn stream_b_shell_still_anchors_tier_b_placeholders() {
+        let mut compiler = RenderCompiler::new();
+        let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
+        counter.file_path =
+            "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+        counter.weight = 2048.0;
+        counter.effect_profile.hooks = true;
+        compiler.add_component(counter);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        let route = manifest.routes.values().next().unwrap();
+        let placeholder = &route.tier_b[0].placeholder_id;
+        assert!(
+            route.shell.body_open.contains(placeholder),
+            "shell.body_open should anchor the Tier-B placeholder id; \
+             got body_open='{}', placeholder='{}'",
+            route.shell.body_open,
+            placeholder
+        );
+    }
 }

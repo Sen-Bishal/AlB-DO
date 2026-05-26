@@ -940,6 +940,8 @@ mod tests {
             position: position(),
             timeout_ms: 100,
             fallback_html: Some("<p>fallback</p>".to_string()),
+            initial_html: None,
+            initial_opcode_frame: Vec::new(),
         }
     }
 
@@ -957,6 +959,11 @@ mod tests {
             tier_a_root: Vec::new(),
             tier_b: vec![tier_b_node()],
             tier_c: Vec::new(),
+            shared_slot_topics: Vec::new(),
+            action_ids: Vec::new(),
+            layout_chain: Vec::new(),
+            error_component: None,
+            loading_component: None,
         }
     }
 

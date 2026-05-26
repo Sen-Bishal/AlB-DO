@@ -2,11 +2,18 @@
 
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, RenderedNode,
-    RouteManifest, Tier, TierBNode, TierCNode, WTStreamSlot,
+    RouteActionEntry, RouteManifest, Tier, TierBNode, TierCNode, WTStreamSlot,
 };
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;
+use crate::ir::opcode::OpcodeFrame;
+use crate::ir::wire::encode_frame;
+use crate::routing::{discover_routes, DiscoveredRoute};
+use crate::runtime::broadcast::BroadcastRegistry;
+use crate::runtime::compiled::{render_entry_with_broadcast, CompiledProject, RenderOptions};
 use crate::runtime::eval::ComponentProject;
+use crate::runtime::session::SessionId;
+use crate::runtime::slot_store::{SessionSlotView, SlotStore};
 use crate::runtime::webtransport::{
     WTRenderMode, WTStreamRouter, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
     WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
@@ -15,10 +22,21 @@ use crate::types::{Component, ComponentId};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 struct StaticRenderProject {
     root: PathBuf,
     project: ComponentProject,
+}
+
+/// Phase P · CompiledProject wrapped around the same source tree the
+/// Phase J render project uses. Held alongside `static_render_project`
+/// so the builder can pre-render Tier-B components with full Phase K
+/// hook compile (BindEvent + SetTextRef + initial SlotSet) at build
+/// time, embedding the result into the manifest.
+struct CompiledRenderProject {
+    root: PathBuf,
+    project: CompiledProject,
 }
 
 struct ShellPlaceholder {
@@ -40,6 +58,16 @@ pub struct ManifestBuilder<'a> {
     tier_b_timeout_ms: u64,
     working_dir: Option<PathBuf>,
     static_render_project: Option<StaticRenderProject>,
+    /// Phase P · Phase K render path. Built from the same source tree
+    /// as `static_render_project` when possible. `None` when
+    /// CompiledProject construction fails (e.g. parse error in a
+    /// component); falls back to Phase J static render.
+    compiled_render_project: Option<CompiledRenderProject>,
+    /// Phase P · file-based-routing discovery, when `<root>/routes/`
+    /// exists. Used to populate `RouteManifest.layout_chain` (and
+    /// later `error_component` / `loading_component` once Stream E.2
+    /// extends the discovery struct).
+    discovered_routes: Vec<DiscoveredRoute>,
 }
 
 impl<'a> ManifestBuilder<'a> {
@@ -56,6 +84,8 @@ impl<'a> ManifestBuilder<'a> {
             .collect::<HashMap<_, _>>();
         let static_render_project =
             build_static_render_project(&components, working_dir.as_deref());
+        let compiled_render_project = build_compiled_render_project(&static_render_project);
+        let discovered_routes = discover_routes_from_components(&components, working_dir.as_deref());
 
         Self {
             graph,
@@ -64,6 +94,8 @@ impl<'a> ManifestBuilder<'a> {
             tier_b_timeout_ms,
             working_dir,
             static_render_project,
+            compiled_render_project,
+            discovered_routes,
         }
     }
 
@@ -89,13 +121,82 @@ impl<'a> ManifestBuilder<'a> {
             assets,
         );
 
+        // Phase P · per-route metadata. Topics are global today (every
+        // route knows every topic the project references) — the
+        // session over-subscribes a few extra mpsc::Sender clones,
+        // which is cheap. Per-route precision is a follow-up.
+        let shared_slot_topics = self
+            .compiled_render_project
+            .as_ref()
+            .map(|cp| cp.project.shared_slot_topics())
+            .unwrap_or_default();
+
+        // Action IDs come from CompiledComponent.action_handlers,
+        // which is empty until Stream C ships. The lookup path is
+        // future-proofed here so Stream C doesn't need a second
+        // schema bump.
+        let action_ids = self.collect_route_action_ids();
+
+        // Layout chain comes from discover_routes when `<root>/routes/`
+        // exists. Empty otherwise.
+        let layout_chain = self.layout_chain_for_route(route);
+
         RouteManifest {
             route: route.to_string(),
             shell: self.build_shell(route, assets, &tier_a_root, &tier_b, &tier_c),
             tier_a_root,
             tier_b,
             tier_c,
+            shared_slot_topics,
+            action_ids,
+            layout_chain,
+            error_component: None,
+            loading_component: None,
         }
+    }
+
+    /// Collect TS-action handler names + their wire IDs for this
+    /// route. Empty until Stream C lands the `action()` extractor
+    /// (which adds `action_handlers` to `CompiledComponent`). Kept as
+    /// a method so the call site in `build_route_manifest` reads
+    /// uniformly even before Stream C wires real data here.
+    fn collect_route_action_ids(&self) -> Vec<RouteActionEntry> {
+        Vec::new()
+    }
+
+    /// Resolve the layout chain for `route` by looking up the route's
+    /// discovery entry and translating each `layout_chain` path into
+    /// the matching component name. Skips entries that don't resolve
+    /// — graceful for projects without file-based routing.
+    fn layout_chain_for_route(&self, route: &str) -> Vec<String> {
+        let Some(discovered) = self
+            .discovered_routes
+            .iter()
+            .find(|r| r.url_path == route)
+        else {
+            return Vec::new();
+        };
+
+        discovered
+            .layout_chain
+            .iter()
+            .filter_map(|layout_rel| self.component_name_for_rel_path(layout_rel.as_path()))
+            .collect()
+    }
+
+    /// Map a `routes/...` relative path back to a component name by
+    /// matching tails against `Component.file_path`. Tolerant of
+    /// `/` vs `\` separator differences.
+    fn component_name_for_rel_path(&self, rel: &Path) -> Option<String> {
+        let needle = rel.to_string_lossy().replace('\\', "/");
+        let suffix = format!("/routes/{}", needle);
+        for component in self.components.values() {
+            let normalised = component.file_path.replace('\\', "/");
+            if normalised.ends_with(suffix.as_str()) || normalised.ends_with(needle.as_str()) {
+                return Some(component.name.clone());
+            }
+        }
+        None
     }
 
     pub fn build_assets_manifest(&self) -> AssetManifest {
@@ -349,6 +450,16 @@ impl<'a> ManifestBuilder<'a> {
         let component = self.component_or_panic(id);
         let metadata = self.metadata_or_panic(id);
 
+        // Phase P · pre-render through CompiledProject + Phase K so
+        // the manifest carries real HTML + the BindEvent / SetTextRef
+        // / initial-SlotSet payload instead of a fallback placeholder.
+        // Falls back to `None` + the existing fallback_html if the
+        // compile path isn't available or render errors transiently.
+        let (initial_html, initial_opcode_frame) = self
+            .render_tier_b_inline(component)
+            .map(|(html, bytes)| (Some(html), bytes))
+            .unwrap_or_else(|| (None, Vec::new()));
+
         TierBNode {
             component_id: component.name.clone(),
             placeholder_id,
@@ -370,7 +481,71 @@ impl<'a> ManifestBuilder<'a> {
                 "<div data-albedo-fallback=\"{}\"></div>",
                 escape_html(component.name.as_str())
             )),
+            initial_html,
+            initial_opcode_frame,
         }
+    }
+
+    /// Phase P · render `component` through `CompiledProject` + Phase
+    /// K hook compile and return `(html, bincode-encoded OpcodeFrame)`.
+    /// `None` when the compiled project isn't available or the render
+    /// errors (e.g. parse failure surfaced as runtime error). The
+    /// caller substitutes `fallback_html` in that case.
+    ///
+    /// Build-time render uses a fresh empty `SlotStore` + a fresh
+    /// `BroadcastRegistry`. Topics referenced by `useSharedSlot`
+    /// calls auto-register with empty seed values via
+    /// `auto_subscribe` — the streaming handler later overrides
+    /// those when real requests come in. The subscriber sender is a
+    /// dummy `mpsc::Sender` whose receiver is dropped; broadcast
+    /// fan-out uses `try_send` so this never blocks.
+    fn render_tier_b_inline(&self, component: &Component) -> Option<(String, Vec<u8>)> {
+        let compiled = self.compiled_render_project.as_ref()?;
+        let entry = self.component_entry_for_project(component, compiled.root.as_path())?;
+
+        let session = SessionId::random();
+        let slot_store = Arc::new(SlotStore::new());
+        let slots = SessionSlotView::new(session, slot_store);
+        let broadcast = BroadcastRegistry::new();
+        // Buffer = 16: deep enough to absorb the auto-subscribe
+        // initial-SlotSet burst for projects with many topics, while
+        // staying small enough that a runaway producer dies fast.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let opts = RenderOptions { hook_compile: true };
+
+        let output = render_entry_with_broadcast(
+            &compiled.project,
+            entry.as_str(),
+            &Value::Object(Default::default()),
+            &slots,
+            &broadcast,
+            tx,
+            &opts,
+        )
+        .ok()?;
+
+        if output.html.trim().is_empty() {
+            return None;
+        }
+
+        // Wrap the opcode vector in an `OpcodeFrame` and bincode-
+        // encode. The streaming handler later ships these bytes
+        // verbatim on the WT patches lane — same wire format the
+        // runtime emits for live patches, so the client decoder
+        // doesn't care whether the bytes came from build-time
+        // pre-render or runtime fan-out.
+        let frame_bytes = if output.opcodes.is_empty() {
+            Vec::new()
+        } else {
+            let frame = OpcodeFrame {
+                frame_id: 0,
+                component_id: Some(component.id.as_u64()),
+                instructions: output.opcodes,
+            };
+            encode_frame(&frame).ok()?
+        };
+
+        Some((output.html, frame_bytes))
     }
 
     fn build_tier_c_node(
@@ -622,6 +797,74 @@ impl<'a> ManifestBuilder<'a> {
             .get(&id)
             .unwrap_or_else(|| panic!("missing tier metadata for component '{:?}'", id))
     }
+}
+
+/// Phase P · build the Phase K render project from the same component
+/// source tree the Phase J static render uses. Returns `None` when
+/// `static_render_project` is absent (no resolvable source files) or
+/// when `CompiledProject::wrap` errors (parse failure surfaced as
+/// extraction error). The manifest builder degrades to placeholder
+/// fallback HTML in that case.
+fn build_compiled_render_project(
+    static_render_project: &Option<StaticRenderProject>,
+) -> Option<CompiledRenderProject> {
+    let static_project = static_render_project.as_ref()?;
+    // `ComponentProject` derives `Clone`; cloning here costs one
+    // pass over the parsed modules. The alternative — moving the
+    // project from `static_render_project` into the compiled one —
+    // would force `static_render_project` to disappear, breaking
+    // the Phase J fallback path that the existing builder relies
+    // on for Tier-A static renders.
+    let project_clone = static_project.project.clone();
+    let compiled = CompiledProject::wrap(project_clone).ok()?;
+    Some(CompiledRenderProject {
+        root: static_project.root.clone(),
+        project: compiled,
+    })
+}
+
+/// Phase P · resolve the project's `<root>/routes/` directory by
+/// looking for `/routes/` segments in any component file path, then
+/// run `discover_routes` against it. The CLI build path lands the
+/// resulting `DiscoveredRoute` list here so the manifest can carry
+/// layout chain (and later error/loading) metadata without the
+/// builder needing the dev contract.
+///
+/// Returns an empty vector when no `routes/` segment is found or
+/// when discovery errors — the manifest then ships without
+/// file-based routing metadata, which is correct for projects that
+/// use config-driven routing only.
+fn discover_routes_from_components(
+    components: &HashMap<ComponentId, Component>,
+    working_dir: Option<&Path>,
+) -> Vec<DiscoveredRoute> {
+    let Some(routes_dir) = infer_routes_dir(components, working_dir) else {
+        return Vec::new();
+    };
+    discover_routes(&routes_dir)
+        .map(|d| d.routes)
+        .unwrap_or_default()
+}
+
+/// Look for any component file under `<some>/routes/<*>` and return
+/// the canonical absolute `<some>/routes/` directory. Tolerant of
+/// `\` vs `/` separators on Windows.
+fn infer_routes_dir(
+    components: &HashMap<ComponentId, Component>,
+    working_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    for component in components.values() {
+        let normalised = component.file_path.replace('\\', "/");
+        let idx = normalised.find("/routes/")?;
+        // `/routes/` is 8 chars; we want the path including `routes/`
+        // (no trailing slash) as the discovery root.
+        let prefix = &normalised[..idx + "/routes".len()];
+        let absolute = resolve_component_path(prefix, working_dir)?;
+        if absolute.is_dir() {
+            return Some(absolute);
+        }
+    }
+    None
 }
 
 fn build_static_render_project(
