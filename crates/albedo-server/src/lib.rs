@@ -45,6 +45,7 @@
 
 pub mod actions;
 pub mod api;
+pub mod boot;
 pub mod config;
 pub mod contract;
 pub mod dev;
@@ -59,6 +60,7 @@ pub mod server;
 pub mod webtransport;
 
 pub use actions::{ActionHandler, SessionSlots};
+pub use boot::{boot_production_server, ProductionServerOptions};
 pub use api::{ApiHandler, ApiResponse};
 pub use config::{AppConfig, LayoutSpec, RendererConfig, RouteSpec, ServerConfig};
 pub use contract::{
