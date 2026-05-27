@@ -31,6 +31,24 @@ rustls-pemfile.workspace       = true
 rustls-pki-types.workspace     = true
 xxhash-rust.workspace          = true
 
+# Phase P · Stream A — the `albedo` CLI bin lives here (rather than in
+# the root `dom-render-compiler` crate) so its `serve` subcommand can
+# call `boot_production_server` without forming a workspace dep cycle.
+# The source file remains at `<workspace>/src/bin/albedo.rs` and is
+# reached via the relative `path` below; `include_str!` paths inside
+# that file resolve from its on-disk location, not the crate root, so
+# the existing `../../assets/...` / `../../scaffold/...` includes still
+# work. The bin's extra deps (`notify`, `walkdir`) come in as ordinary
+# dependencies above-level so they're available to the bin without
+# polluting the `albedo_server` library's surface — the library uses
+# none of them.
+notify  = { workspace = true }
+walkdir = { workspace = true }
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true
+
+[[bin]]
+name = "albedo"
+path = "../../src/bin/albedo.rs"

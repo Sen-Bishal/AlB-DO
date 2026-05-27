@@ -787,10 +787,14 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
         return run_files_command(raw_args);
     }
 
-    // Build the project via the manifest+stitcher path, then serve.
+    // Phase P · Stream A — build then boot a real `AlbedoServer`. The
+    // build emits the manifest with Stream B's pre-rendered Tier-B HTML
+    // and bincode-encoded opcode frames; `boot_production_server`
+    // loads them and registers every `CompiledProject` handler so
+    // bakabox click → `/_albedo/action` → slot update closes end-to-end.
     let cwd = std::env::current_dir()
         .map_err(|err| format!("failed to resolve current directory: {err}"))?;
-    let contract = resolve_dev_contract(&[], &cwd)?;
+    let mut contract = resolve_dev_contract(raw_args, &cwd)?;
     print_banner();
     print_section("serve");
     print_kv("project", contract.project_dir.display());
@@ -798,14 +802,58 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     println!();
     run_prod_build(&contract)?;
 
-    let dist = contract.project_dir.join(".albedo").join("dist");
-    let mut forwarded: Vec<String> = vec![dist.display().to_string()];
+    // `resolve_dev_contract` already absorbed `--host` / `--port` from
+    // `raw_args`. Pull the bind address back out for the banner.
     let serve_options = parse_serve_args(raw_args)?;
-    forwarded.push("--host".to_string());
-    forwarded.push(serve_options.host);
-    forwarded.push("--port".to_string());
-    forwarded.push(serve_options.port.to_string());
-    run_files_command(&forwarded)
+    contract.server.host = serve_options.host.clone();
+    contract.server.port = serve_options.port;
+
+    boot_and_run_production_server(&contract)
+}
+
+/// Phase P · Stream A — turn a built `ResolvedDevContract` into a
+/// running [`albedo_server::AlbedoServer`]. The Tokio runtime is
+/// spun up here (not at `main`) so the dev path stays sync and only
+/// pays the runtime cost on `albedo serve`.
+fn boot_and_run_production_server(contract: &ResolvedDevContract) -> Result<(), String> {
+    use albedo_server::{boot_production_server, ProductionServerOptions};
+
+    let opts = ProductionServerOptions::from_contract(contract);
+    let server = boot_production_server(&opts).map_err(|err| {
+        format!(
+            "failed to boot production server: {err}\n\
+             hint: did you run `albedo build` first?"
+        )
+    })?;
+
+    print_ok(format!(
+        "serving · {}",
+        style_256(
+            &format!("http://{}:{}", contract.server.host, contract.server.port),
+            ACCENT_SOFT,
+            true,
+        )
+    ));
+    println!(
+        "    {} {}",
+        style_256("·", MUTED, false),
+        style(&format!("{}", contract.project_dir.display()), "2")
+    );
+    println!();
+    println!(
+        "    {}  stop the server",
+        style_256("ctrl+c", MUTED, true)
+    );
+    println!();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to start tokio runtime: {err}"))?;
+
+    runtime
+        .block_on(server.run())
+        .map_err(|err| format!("server runtime error: {err}"))
 }
 
 /// Static file server. Phase-J rename of the previous `albedo serve`

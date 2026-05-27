@@ -126,14 +126,23 @@ repository.workspace  = true
 homepage.workspace    = true
 keywords.workspace    = true
 categories.workspace  = true
+# Phase P · Stream A — disable Cargo's `src/bin/*.rs` auto-discovery
+# so the `albedo.rs` bin (now owned by the `albedo-server` crate via a
+# cross-crate `path` entry) doesn't get compiled twice. Only the bins
+# explicitly listed below build under `dom-render-compiler`.
+autobins = false
 
 [[bin]]
 name = "dom-compiler"
 path = "src/bin/dom-compiler.rs"
 
-[[bin]]
-name = "albedo"
-path = "src/bin/albedo.rs"
+# Note: the `albedo` CLI moved to the `albedo-server` crate in Phase P
+# Stream A so it can call `boot_production_server` without re-introducing
+# the workspace dependency cycle (`albedo-server` depends on
+# `dom-render-compiler`). The source file still lives at
+# `src/bin/albedo.rs` — `crates/albedo-server/Cargo.toml` carries a
+# `[[bin]]` entry with `path = "../../src/bin/albedo.rs"` so the file
+# stays in place while compiling against the server's dep tree.
 
 [[bin]]
 name = "albedo-bench"
