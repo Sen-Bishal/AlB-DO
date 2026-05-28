@@ -2,6 +2,16 @@ use serde_json::Value;
 use std::path::Path;
 
 pub fn is_component_module(path: &Path) -> bool {
+    // Phase P · post-P wire-through — skip ambient TypeScript
+    // declaration files (`*.d.ts`, `*.d.tsx`). They carry
+    // `declare function` shapes with no body that the SWC parse
+    // path would reject as "missing function body", and they're
+    // declaration-only anyway — no runtime content for the
+    // renderer to walk.
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.ends_with(".d.ts") || name.ends_with(".d.tsx") {
+        return false;
+    }
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
         Some("jsx" | "tsx" | "js" | "ts")

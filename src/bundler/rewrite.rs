@@ -37,11 +37,26 @@ pub fn build_wrapper_module_source(source_module: &str) -> String {
 
 /// Phase M.4 — emit-time wrapper JS source map. Stage 1 produces a
 /// minimal but v3-spec-compliant map that points browser DevTools at
-/// the original `.tsx` file without claiming per-line mappings. Real
-/// mappings (Stage 2) require wiring SWC's mapping collector through
-/// the transpile path; until then, this stub lets DevTools surface
-/// the original source name in the call stack and "open in editor"
-/// flows, which is the practically useful 80%.
+/// the original `.tsx` file without claiming per-line mappings.
+///
+/// Phase P · Stream F.1 deferral note: the "Stage 2" the audit gap
+/// (#17) imagined — threading SWC's source-map collector through to
+/// per-line mappings — doesn't slot cleanly onto this architecture.
+/// The wrapper module is a 4-line trampoline (`import * as target`
+/// + re-export), NOT the SWC-transpiled output of the component
+/// TSX. SWC transpilation happens server-side for QuickJS execution
+/// in `runtime/quickjs_engine.rs`; the browser never sees that JS.
+/// Per-line mappings between trampoline lines and original TSX
+/// positions aren't meaningful.
+///
+/// The current `sources: ["..."]` entry IS the actionable piece —
+/// DevTools surfaces the original `.tsx` name in the call stack and
+/// "open in editor" flows, which is the practically useful 80%. Real
+/// per-line debugging would require shipping the transpiled TSX to
+/// the browser too (so the browser runs it client-side and maps
+/// against the original) — an architecture change bigger than F.1's
+/// scope. Revisit when client-side execution of authored TSX
+/// becomes a goal.
 pub fn build_wrapper_source_map(source_module: &str) -> String {
     let normalized = normalize_module_path(source_module);
     // Manual JSON write so we don't need to bring in `serde_json`

@@ -49,18 +49,36 @@ const BRAND_PALETTE: [u8; 5] = [45, 51, 87, 123, 159];
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAMES_ASCII: [&str; 4] = ["|", "/", "-", "\\"];
 
-const SCAFFOLD_APP: &str = include_str!("../../scaffold/src/App.tsx");
-const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/Hero.tsx");
-const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/src/Counter.tsx");
-const SCAFFOLD_LIVE_FEED: &str = include_str!("../../scaffold/src/LiveFeed.tsx");
+// Phase P · Stream F.2 — scaffold refresh.
+//
+// The scaffold lives in `scaffold/` and is mirrored verbatim into a
+// fresh project by `albedo init`. After F.2 it follows Phase N+
+// conventions: `src/routes/` for file-based routing, a root
+// `layout.tsx` wrapping every route, a `tier-budget.toml` at project
+// root, and TS-side `action()` + `useSharedSlot()` demonstrated in
+// the chat route. Old shape (`src/App.tsx` + Tier-C fetch demo)
+// retired — no upgrade path from pre-Phase-P scaffolds; users on
+// the old shape `albedo init --force` into a fresh dir.
+const SCAFFOLD_LAYOUT: &str = include_str!("../../scaffold/src/routes/layout.tsx");
+const SCAFFOLD_INDEX_ROUTE: &str = include_str!("../../scaffold/src/routes/index.tsx");
+const SCAFFOLD_CHAT_ROUTE: &str = include_str!("../../scaffold/src/routes/chat.tsx");
+const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/components/Hero.tsx");
+const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/src/components/Counter.tsx");
 const SCAFFOLD_ENV_DTS: &str = include_str!("../../scaffold/src/albedo-env.d.ts");
 const SCAFFOLD_STYLES: &str = include_str!("../../scaffold/src/styles.css");
 const SCAFFOLD_CONFIG: &str = include_str!("../../scaffold/albedo.config.ts");
 const SCAFFOLD_PACKAGE_JSON: &str = include_str!("../../scaffold/package.json");
-const SCAFFOLD_INDEX_HTML: &str = include_str!("../../scaffold/index.html");
+// Phase P · post-P wire-through — `public/index.html` removed from
+// the scaffold. The production server's streaming arm renders `/`
+// from the manifest's route entry; a static `index.html` at
+// `public/index.html` was getting served by the public-assets
+// dispatch BEFORE the manifest-streaming arm, shadowing the live
+// route. Static-export targets (Cloudflare Pages etc.) should
+// extract `routes["/"].shell` from the manifest at deploy time.
 const SCAFFOLD_TSCONFIG: &str = include_str!("../../scaffold/tsconfig.json");
 const SCAFFOLD_README: &str = include_str!("../../scaffold/README.md");
 const SCAFFOLD_GITIGNORE: &str = include_str!("../../scaffold/.gitignore");
+const SCAFFOLD_TIER_BUDGET: &str = include_str!("../../scaffold/tier-budget.toml");
 
 #[derive(Clone)]
 struct DevAllRoutesArtifact {
@@ -70,10 +88,33 @@ struct DevAllRoutesArtifact {
     total_ms: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SharedDevState {
     /// route path (e.g. "/", "/analytics") → rendered HTML document
     project: ComponentProject,
+    /// Phase P · Stream D.1 — Phase K facade around `project`,
+    /// rebuilt on every patch so the dev render path can hook-compile
+    /// `useState` + dispatch JSX `on*` handlers. Same `CompiledProject`
+    /// instance drives render (via [`render_entry_with_broadcast`])
+    /// AND action dispatch (via [`CompiledProject::invoke_action_with_broadcast`])
+    /// so slot ids + proxy ids align.
+    compiled: Arc<dom_render_compiler::runtime::CompiledProject>,
+    /// Phase P · Stream D.1 — single shared slot store for the dev
+    /// process. Surviving a re-render is what makes useState values
+    /// persist across HMR swaps: the slot store is the same `Arc`
+    /// before and after the rebuild, so the next render reads back
+    /// every value the previous action handlers wrote.
+    slot_store: Arc<dom_render_compiler::runtime::SlotStore>,
+    /// Phase P · Stream D.1 — broadcast registry shared between dev
+    /// render and dev action dispatch. Same role as the production
+    /// server's per-server registry; in dev there's only one process
+    /// so all `useSharedSlot` topics land here.
+    broadcast: Arc<dom_render_compiler::runtime::BroadcastRegistry>,
+    /// Phase P · Stream D.1 — fixed session id for the dev process.
+    /// One id per `albedo dev` invocation means every request +
+    /// every action dispatch hits the same slot-store partition, so
+    /// state continuity is automatic without cookie plumbing in dev.
+    session_id: dom_render_compiler::runtime::SessionId,
     project_css: String,
     routes: std::collections::HashMap<String, String>,
     render_ms: f64,
@@ -777,9 +818,35 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let user_passed_dir = raw_args
-        .iter()
-        .any(|arg| !arg.starts_with('-') || arg == "--dir");
+    // Phase P · post-P — only fall through to the static-file
+    // back-compat path when the user explicitly asks for a directory.
+    // Walk the args treating `--host`/`--port`/`--dir` values as
+    // bound to their flag so a port number like `3139` doesn't get
+    // mistaken for a positional dir arg.
+    let user_passed_dir = {
+        let mut explicit_dir = false;
+        let mut idx = 0;
+        while idx < raw_args.len() {
+            let arg = &raw_args[idx];
+            match arg.as_str() {
+                "--dir" => {
+                    explicit_dir = true;
+                    break;
+                }
+                "--host" | "--port" => {
+                    idx += 2; // skip the flag's value
+                    continue;
+                }
+                _ if !arg.starts_with('-') => {
+                    explicit_dir = true;
+                    break;
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+        explicit_dir
+    };
     if user_passed_dir {
         // Back-compat: `albedo serve <dir>` and `--dir <dir>` keep their
         // pre-Phase-J semantics — serve the directory directly. Equivalent
@@ -1191,20 +1258,61 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         None
     };
 
-    let (manifest, tier_report, project, project_css, initial) =
+    let (manifest, tier_report, project, compiled, slot_store, broadcast, session_id, project_css, initial) =
         with_spinner("compiling components…", || {
+            use dom_render_compiler::runtime::{
+                BroadcastRegistry, CompiledProject, SessionId, SlotStore,
+            };
             let (manifest, tier_report) =
                 compile_manifest_and_tier_report(&contract, scanned_components.as_deref())?;
             let project = ComponentProject::load_from_dir(&contract.root)
                 .map_err(|err| format!("failed to load components: {err}"))?;
+            // Phase P · Stream D.1 — Phase K facade + per-process
+            // slot store + broadcast registry. Shared across every
+            // render and every action dispatch in this dev process
+            // so the substrate behaves identically to production.
+            let compiled = Arc::new(
+                CompiledProject::wrap(project.clone())
+                    .map_err(|err| format!("failed to build Phase K project: {err}"))?,
+            );
+            let slot_store = Arc::new(SlotStore::new());
+            let broadcast = Arc::new(BroadcastRegistry::new());
+            // Pre-register every `useSharedSlot` topic the project
+            // references so a `broadcast(topic, ...)` write from an
+            // action dispatch finds a live `BroadcastTopic` to
+            // attach to. Same shape as
+            // `AlbedoServerBuilder::register_compiled_project` does
+            // in production (Stream C.3).
+            for topic in compiled.shared_slot_topics() {
+                broadcast.topic(topic, b"null".to_vec());
+            }
+            let session_id = SessionId::random();
             let project_css = collect_css_bundle(&contract.root);
-            let initial = render_all_routes(&project, &contract, &project_css).map_err(|err| {
+            let initial = render_all_routes(
+                compiled.as_ref(),
+                &slot_store,
+                &broadcast,
+                session_id,
+                &contract,
+                &project_css,
+            )
+            .map_err(|err| {
                 format!(
                     "failed to render initial dev document (entry='{}'): {err}",
                     contract.entry
                 )
             })?;
-            Ok::<_, String>((manifest, tier_report, project, project_css, initial))
+            Ok::<_, String>((
+                manifest,
+                tier_report,
+                project,
+                compiled,
+                slot_store,
+                broadcast,
+                session_id,
+                project_css,
+                initial,
+            ))
         })?;
 
     // Build the dev inspector state from the manifest, then install both
@@ -1244,6 +1352,10 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     ));
     let shared_state = Arc::new(Mutex::new(SharedDevState {
         project,
+        compiled,
+        slot_store,
+        broadcast,
+        session_id,
         project_css,
         routes: initial.route_documents,
         render_ms: initial.render_ms,
@@ -1788,7 +1900,9 @@ fn rebuild_with_pending(
     shared_state: &Arc<Mutex<SharedDevState>>,
     pending: &PendingRebuild,
 ) -> Result<(PatchReport, bool), String> {
-    let (patch_report, project_snapshot, css_snapshot_before_refresh) = {
+    use dom_render_compiler::runtime::CompiledProject;
+
+    let (patch_report, project_snapshot, css_snapshot_before_refresh, slot_store, broadcast, session_id) = {
         let mut state = shared_state
             .lock()
             .map_err(|_| "shared state lock poisoned".to_string())?;
@@ -1811,6 +1925,9 @@ fn rebuild_with_pending(
             patch_report,
             state.project.clone(),
             state.project_css.clone(),
+            state.slot_store.clone(),
+            state.broadcast.clone(),
+            state.session_id,
         )
     };
 
@@ -1820,11 +1937,36 @@ fn rebuild_with_pending(
         css_snapshot_before_refresh
     };
 
-    let artifact = render_all_routes(&project_snapshot, contract, &css_snapshot)?;
+    // Phase P · Stream D.1 — rebuild the Phase K facade against the
+    // freshly-patched project. The CompiledProject doesn't implement
+    // Clone (handler bodies hold SWC AST), so we re-wrap here rather
+    // than patching in place. CompiledProject::wrap is a metadata
+    // pass over already-parsed ParsedModules — cheap. The slot store
+    // + broadcast registry survive unchanged so useState values
+    // persist across the swap.
+    let compiled = Arc::new(
+        CompiledProject::wrap(project_snapshot)
+            .map_err(|err| format!("failed to rebuild Phase K project: {err}"))?,
+    );
+    // Re-register any new shared-slot topics the patched project
+    // declares. `topic()` is idempotent on the name key so existing
+    // topics (and their accumulated values) are preserved.
+    for topic in compiled.shared_slot_topics() {
+        broadcast.topic(topic, b"null".to_vec());
+    }
+    let artifact = render_all_routes(
+        compiled.as_ref(),
+        &slot_store,
+        &broadcast,
+        session_id,
+        contract,
+        &css_snapshot,
+    )?;
 
     let mut state = shared_state
         .lock()
         .map_err(|_| "shared state lock poisoned".to_string())?;
+    state.compiled = compiled;
     if pending.css_touched {
         state.project_css = css_snapshot;
     }
@@ -1888,7 +2030,29 @@ fn handle_dev_connection(
         };
     }
 
-    let (status, build_render_ms, build_total_ms, route_like) = if method != "GET" {
+    let (status, build_render_ms, build_total_ms, route_like) = if method == "POST"
+        && path == "/_albedo/action"
+    {
+        // Phase P · Stream D.3 — dev-side action dispatch. Mirrors
+        // `crates/albedo-server/src/handlers/action.rs` but inline
+        // because the dev path runs on std::net rather than axum.
+        // The same `CompiledProject` that rendered the page handles
+        // the dispatch, and writes hit the same `slot_store` so the
+        // next render (HMR or otherwise) sees the updated value.
+        let body = read_http_request_body(&mut stream, &request_headers)?;
+        let (status, payload, content_type) =
+            run_dev_action(body.as_slice(), &shared_state);
+        let headers = [("x-albedo-transport", transport_header_value.clone())];
+        write_http_response(
+            &mut stream,
+            status,
+            if status == 200 { "OK" } else { "Error" },
+            content_type,
+            payload.as_slice(),
+            &headers,
+        )?;
+        (status, 0.0, 0.0, false)
+    } else if method != "GET" {
         let headers = [("x-albedo-transport", transport_header_value.clone())];
         write_http_response(
             &mut stream,
@@ -1916,6 +2080,28 @@ fn handle_dev_connection(
             clients.push(stream);
         }
         return Ok(());
+    } else if let Some((body, content_type)) = dev_static_asset(path.as_str()) {
+        // Phase P · Stream D.4 — serve the bakabox client assets
+        // (runtime.js / bincode.js / link-forms.js / hydration.js /
+        // wt-bootstrap.js) from the in-binary `include_str!`
+        // templates. The dev server doesn't run `albedo build`, so
+        // the `.albedo/dist/_albedo/` mirror that production
+        // serves from doesn't exist here — we hand the bytes back
+        // directly. `cache-control: no-store` so a TSX edit picks
+        // up a fresh runtime if the build pipeline ever varies it.
+        let headers = [
+            ("x-albedo-transport", transport_header_value.clone()),
+            ("cache-control", "no-store".to_string()),
+        ];
+        write_http_response(
+            &mut stream,
+            200,
+            "OK",
+            content_type,
+            body.as_bytes(),
+            &headers,
+        )?;
+        (200, 0.0, 0.0, false)
     } else if path == "/" || path == "/index.html" || is_route_like_path(path.as_str()) {
         let (doc, render_ms, total_ms, error) = {
             let state = shared_state.lock().expect("shared state lock poisoned");
@@ -1995,6 +2181,122 @@ fn handle_dev_connection(
     Ok(())
 }
 
+/// Phase P · Stream D.3 — read the request body for a POST. The dev
+/// HTTP server reads the head line-by-line into `request_headers`;
+/// the body still sits in the TcpStream behind whatever buffering
+/// the OS did. We honour `content-length`, bail if it's missing or
+/// unparseable, and cap at 2 MiB (same ceiling
+/// `MAX_REQUEST_BODY_BYTES` enforces in the production action route).
+fn read_http_request_body(
+    stream: &mut TcpStream,
+    request_headers: &HashMap<String, String>,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    const MAX_BODY: usize = 2 * 1024 * 1024;
+    let length: usize = request_headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    if length > MAX_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "content-length exceeds 2 MiB cap",
+        ));
+    }
+    let mut buf = vec![0u8; length];
+    stream.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Phase P · Stream D.3 — dispatch a bincode `ActionEnvelope` against
+/// the dev process's shared `CompiledProject`. Returns
+/// `(status_code, body_bytes, content_type)` so the caller can write
+/// the HTTP response without further branching.
+///
+/// Wire-aligned with `crates/albedo-server/src/handlers/action.rs`:
+///   - Malformed envelope → 400 with a short text reason.
+///   - Unknown action_id → 404 with text reason.
+///   - Handler error → 500 with the underlying message.
+///   - Success → 200 with the bincode-encoded `OpcodeFrame`.
+///
+/// CSRF validation is skipped in dev mode — there's no cookie session
+/// in the dev server path. Production routes through the
+/// `CompiledProjectActionAdapter` for full CSRF enforcement.
+fn run_dev_action(
+    body: &[u8],
+    shared_state: &Arc<Mutex<SharedDevState>>,
+) -> (u16, Vec<u8>, &'static str) {
+    use dom_render_compiler::ir::action::decode_action_envelope;
+    use dom_render_compiler::ir::opcode::OpcodeFrame;
+    use dom_render_compiler::ir::wire::encode_frame;
+    use dom_render_compiler::runtime::SessionSlotView;
+
+    let envelope = match decode_action_envelope(body) {
+        Ok((envelope, _consumed)) => envelope,
+        Err(err) => {
+            return (
+                400,
+                format!("invalid action envelope: {err}").into_bytes(),
+                "text/plain; charset=utf-8",
+            );
+        }
+    };
+
+    let (compiled, slot_store, broadcast, session_id) = match shared_state.lock() {
+        Ok(state) => (
+            state.compiled.clone(),
+            state.slot_store.clone(),
+            state.broadcast.clone(),
+            state.session_id,
+        ),
+        Err(_) => {
+            return (
+                500,
+                b"dev shared state lock poisoned".to_vec(),
+                "text/plain; charset=utf-8",
+            );
+        }
+    };
+
+    if compiled.handler(envelope.action_id).is_none() {
+        return (
+            404,
+            format!("no handler registered for action_id {}", envelope.action_id).into_bytes(),
+            "text/plain; charset=utf-8",
+        );
+    }
+
+    let slots = SessionSlotView::new(session_id, slot_store);
+    let instructions =
+        match compiled.invoke_action_with_broadcast(&envelope, &slots, broadcast.as_ref()) {
+            Ok(instructions) => instructions,
+            Err(err) => {
+                return (
+                    500,
+                    format!("dev action handler failed: {err:#}").into_bytes(),
+                    "text/plain; charset=utf-8",
+                );
+            }
+        };
+
+    let frame = OpcodeFrame {
+        frame_id: 0,
+        component_id: None,
+        instructions,
+    };
+    match encode_frame(&frame) {
+        Ok(bytes) => (200, bytes, "application/octet-stream"),
+        Err(err) => (
+            500,
+            format!("failed to encode opcode frame: {err}").into_bytes(),
+            "text/plain; charset=utf-8",
+        ),
+    }
+}
+
 fn write_sse_handshake(stream: &mut TcpStream) -> std::io::Result<()> {
     let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\nx-albedo-transport: sse\r\n\r\n";
     stream.write_all(headers.as_bytes())?;
@@ -2063,10 +2365,17 @@ fn broadcast_component_invalidation_event(
 }
 
 fn render_all_routes(
-    project: &ComponentProject,
+    compiled: &dom_render_compiler::runtime::CompiledProject,
+    slot_store: &Arc<dom_render_compiler::runtime::SlotStore>,
+    broadcast: &Arc<dom_render_compiler::runtime::BroadcastRegistry>,
+    session_id: dom_render_compiler::runtime::SessionId,
     contract: &ResolvedDevContract,
     project_css: &str,
 ) -> Result<DevAllRoutesArtifact, String> {
+    use dom_render_compiler::runtime::{
+        render_entry_with_broadcast, RenderOptions, SessionSlotView,
+    };
+
     let total_start = Instant::now();
     let base_css = dev_shell_base_css();
 
@@ -2076,12 +2385,26 @@ fn render_all_routes(
 
     let render_entry = |entry: &str| -> Result<(String, f64), String> {
         let render_start = Instant::now();
-        let rendered_html = project
-            .render_entry(entry, &props)
-            .map_err(|err| err.to_string())?;
+        // Phase P · Stream D.1 — Phase K render path. Fresh
+        // SessionSlotView wrapping the SAME `slot_store` Arc that
+        // persists across re-renders, so useState values written by
+        // earlier action dispatches surface in this render. Dummy
+        // mpsc channel matches the build-time pattern Stream B uses
+        // — the receiver is dropped, broadcast `try_send` is
+        // non-blocking, so a topic write during render is a clean
+        // no-op rather than a hang.
+        let slots = SessionSlotView::new(session_id, slot_store.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let opts = RenderOptions { hook_compile: true };
+        let output = render_entry_with_broadcast(
+            compiled, entry, &props, &slots, broadcast, tx, &opts,
+        )
+        .map_err(|err| err.to_string())?;
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
         let document = format!(
-            "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Dev</title>\n  <style>\n{base_css}\n{project_css}\n  </style>\n</head>\n<body>\n{rendered_html}\n</body>\n</html>\n"
+            "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Dev</title>\n  <style>\n{base_css}\n{project_css}\n  </style>\n  {bakabox_scripts}\n</head>\n<body>\n{rendered_html}\n</body>\n</html>\n",
+            rendered_html = output.html,
+            bakabox_scripts = dev_bakabox_script_tags(),
         );
         let html = inject_hmr_client_script(&document, contract.hmr.enabled);
         Ok((html, render_ms))
@@ -2187,6 +2510,35 @@ body {
   color: var(--ink);
 }
 "#
+}
+
+/// Phase P · Stream D.2 — bakabox client script tags injected into
+/// the dev page head. Same shape as the production
+/// `default_shim_script` minus the WT bootstrap (the dev server
+/// doesn't carry a QUIC listener, so the WT path 404s; SSE/HMR
+/// suffices for dev). `runtime.js` is the entry; it imports
+/// `./bincode.js` and `./link-forms.js` is loaded explicitly so the
+/// Phase L `<Link>` / form-action interception fires.
+fn dev_bakabox_script_tags() -> &'static str {
+    "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>\
+     <script type=\"module\" src=\"/_albedo/link-forms.js\"></script>"
+}
+
+/// Phase P · Stream D.4 — resolve a URL path to one of the in-binary
+/// bakabox client assets. Mirrors what `albedo build` writes to
+/// `.albedo/dist/_albedo/` in production, but serves from the
+/// `include_str!`-baked templates so dev iteration doesn't require a
+/// rebuild. Returns `(body, content_type)` for the matching asset, or
+/// `None` for anything else.
+fn dev_static_asset(path: &str) -> Option<(String, &'static str)> {
+    match path {
+        "/_albedo/runtime.js" => Some((albedo_runtime_shim_template(), "text/javascript; charset=utf-8")),
+        "/_albedo/bincode.js" => Some((albedo_bincode_template(), "text/javascript; charset=utf-8")),
+        "/_albedo/link-forms.js" => Some((albedo_link_forms_template(), "text/javascript; charset=utf-8")),
+        "/_albedo/hydration.js" => Some((albedo_hydration_runtime_template(), "text/javascript; charset=utf-8")),
+        "/_albedo/wt-bootstrap.js" => Some((albedo_wt_bootstrap_template(), "text/javascript; charset=utf-8")),
+        _ => None,
+    }
 }
 
 fn inject_hmr_client_script(html_document: &str, hmr_enabled: bool) -> String {
@@ -2626,13 +2978,10 @@ fn run_prod_build_with_budget(
             link_forms_asset_path.display()
         )
     })?;
-    let index_html_path = out_dir.join("index.html");
-    std::fs::write(&index_html_path, SCAFFOLD_INDEX_HTML).map_err(|err| {
-        format!(
-            "failed to write index html '{}': {err}",
-            index_html_path.display()
-        )
-    })?;
+    // Phase P · post-P — no `<dist>/index.html` write. The
+    // production server's streaming arm renders `/` from the
+    // manifest's pre-baked route shell; a literal `index.html` in
+    // dist would shadow it via the public-assets dispatch.
 
     print_ok(format!(
         "built in {}",
@@ -2652,7 +3001,6 @@ fn run_prod_build_with_budget(
         &runtime_asset_path,
         &hydration_asset_path,
         &link_forms_asset_path,
-        &index_html_path,
     );
     for artifact in report.artifacts.iter().take(6) {
         println!(
@@ -2801,27 +3149,43 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         )
     })?;
 
-    std::fs::create_dir_all(target.join("src").join("components")).map_err(|err| {
-        format!(
-            "failed to create scaffold directory '{}': {err}",
-            target.join("src/components").display()
-        )
-    })?;
-    std::fs::create_dir_all(target.join("public")).map_err(|err| {
-        format!(
-            "failed to create scaffold directory '{}': {err}",
-            target.join("public").display()
-        )
-    })?;
+    // Phase P · Stream F.2 — file-based routing means `src/routes/`
+    // is the new entry-shape. Components co-locate under
+    // `src/components/`. `public/` ships static assets; the dev
+    // server + production AlbedoServer both serve them at root.
+    for dir in [
+        target.join("src").join("routes"),
+        target.join("src").join("components"),
+        target.join("public"),
+    ] {
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            format!(
+                "failed to create scaffold directory '{}': {err}",
+                dir.display()
+            )
+        })?;
+    }
 
     let package_name = infer_package_name(target);
     let package_json = SCAFFOLD_PACKAGE_JSON.replace("__ALBEDO_APP_NAME__", package_name.as_str());
 
+    // Routes (file-based; one file per URL).
     write_scaffold_file(
-        &target.join("src").join("App.tsx"),
-        SCAFFOLD_APP,
+        &target.join("src").join("routes").join("layout.tsx"),
+        SCAFFOLD_LAYOUT,
         options.force,
     )?;
+    write_scaffold_file(
+        &target.join("src").join("routes").join("index.tsx"),
+        SCAFFOLD_INDEX_ROUTE,
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join("src").join("routes").join("chat.tsx"),
+        SCAFFOLD_CHAT_ROUTE,
+        options.force,
+    )?;
+    // Shared components (imported by routes).
     write_scaffold_file(
         &target.join("src").join("components").join("Hero.tsx"),
         SCAFFOLD_HERO,
@@ -2830,11 +3194,6 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
     write_scaffold_file(
         &target.join("src").join("components").join("Counter.tsx"),
         SCAFFOLD_COUNTER,
-        options.force,
-    )?;
-    write_scaffold_file(
-        &target.join("src").join("components").join("LiveFeed.tsx"),
-        SCAFFOLD_LIVE_FEED,
         options.force,
     )?;
     write_scaffold_file(
@@ -2853,11 +3212,9 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         package_json.as_str(),
         options.force,
     )?;
-    write_scaffold_file(
-        &target.join("public").join("index.html"),
-        SCAFFOLD_INDEX_HTML,
-        options.force,
-    )?;
+    // Phase P · post-P — public/ is intentionally empty in the
+    // scaffold; users drop favicon / images / fonts here and they're
+    // served at `/`. The renderer + streaming handler own the HTML.
     write_scaffold_file(
         &target.join("tsconfig.json"),
         SCAFFOLD_TSCONFIG,
@@ -2871,6 +3228,13 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
     write_scaffold_file(
         &target.join(".gitignore"),
         SCAFFOLD_GITIGNORE,
+        options.force,
+    )?;
+    // Phase O.1 + O.3 budget gate. Drops in at project root; the
+    // build / ship paths auto-enforce when present.
+    write_scaffold_file(
+        &target.join("tier-budget.toml"),
+        SCAFFOLD_TIER_BUDGET,
         options.force,
     )?;
 
@@ -3263,16 +3627,16 @@ fn print_help() {
 
     print_section("commands");
     print_command("init", "<project>", "scaffold a new app");
-    print_command("dev", "[dir]", "start the dev server");
-    print_command("build", "[dir]", "compile an optimized bundle");
+    print_command("dev", "[dir]", "Phase K dev server with HMR + actions");
+    print_command("build", "[dir]", "compile manifest + bundle (tier-budget gated)");
     print_command("ship", "[dir]", "build + configure deploy target");
     print_command(
         "serve",
         "",
-        "production build + serve via the same stitcher as dev",
+        "build then boot a real AlbedoServer (actions, broadcast, WT)",
     );
     print_command("files", "[dir]", "static file server (defaults to .albedo/dist)");
-    print_command("budget", "[dir]", "evaluate the tier budget against the current build");
+    print_command("budget", "[dir]", "standalone tier-budget gate (CI-friendly)");
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
 
@@ -3346,11 +3710,40 @@ fn print_serve_help() {
     println!(
         "  {}  {}",
         style("usage", "2"),
-        style("albedo serve [dir] [--host <IP>] [--port <PORT>]", "1")
+        style("albedo serve [--host <IP>] [--port <PORT>]", "1")
     );
-    print_option("--dir <DIR>", "directory to serve (default: .albedo/dist)");
+    println!();
+    println!(
+        "    {} build the project then boot a real AlbedoServer:",
+        style("·", "2")
+    );
+    println!(
+        "        {} {}",
+        style("·", "2"),
+        "manifest-streaming for every route (Tier-A inline, Tier-B opcodes)"
+    );
+    println!(
+        "        {} {}",
+        style("·", "2"),
+        "POST /_albedo/action dispatch into the CompiledProject"
+    );
+    println!(
+        "        {} {}",
+        style("·", "2"),
+        "broadcast-topic fan-out over the WT patches lane"
+    );
+    println!(
+        "        {} {}",
+        style("·", "2"),
+        "GET /_albedo/runtime.js + /_albedo/link-forms.js served from <dist>/_albedo/"
+    );
+    println!();
     print_option("--host <IP>", "bind host (default: 127.0.0.1)");
     print_option("--port <PORT>", "bind port (default: 3000)");
+    print_option(
+        "<dir> | --dir <DIR>",
+        "BACK-COMPAT: falls through to `albedo files <dir>` (static-only)",
+    );
     println!();
 }
 
@@ -3555,18 +3948,32 @@ mod tests {
         };
         scaffold_project(&target, &options).unwrap();
 
+        // Phase P · Stream F.2 — scaffold now lays out file-based
+        // routes under src/routes/, components under src/components/,
+        // and includes tier-budget.toml at project root.
         assert!(target.join(DEV_CONFIG_TS).is_file());
-        assert!(target.join("src/App.tsx").is_file());
+        assert!(target.join("src/routes/layout.tsx").is_file());
+        assert!(target.join("src/routes/index.tsx").is_file());
+        assert!(target.join("src/routes/chat.tsx").is_file());
         assert!(target.join("src/components/Hero.tsx").is_file());
         assert!(target.join("src/components/Counter.tsx").is_file());
-        assert!(target.join("src/components/LiveFeed.tsx").is_file());
         assert!(target.join("src/styles.css").is_file());
         assert!(target.join("src/albedo-env.d.ts").is_file());
-        assert!(target.join("public/index.html").is_file());
+        // Phase P · post-P — public/ exists but is empty by default;
+        // the scaffold no longer ships a placeholder index.html.
+        assert!(target.join("public").is_dir());
+        assert!(!target.join("public/index.html").exists());
         assert!(target.join("package.json").is_file());
         assert!(target.join("tsconfig.json").is_file());
         assert!(target.join("README.md").is_file());
         assert!(target.join(".gitignore").is_file());
+        assert!(target.join("tier-budget.toml").is_file());
+
+        // Phase P · F.2 — old shape should NOT exist; pins the
+        // upgrade direction so a regression that re-adds src/App.tsx
+        // gets caught.
+        assert!(!target.join("src/App.tsx").exists());
+        assert!(!target.join("src/components/LiveFeed.tsx").exists());
     }
 
     #[test]
@@ -3698,5 +4105,166 @@ mod tests {
         let decision = determine_dev_transport("/_albedo/hmr", &headers, true);
         assert_eq!(decision.active, "sse");
         assert_eq!(decision.fallback_reason, None);
+    }
+
+    // ── Phase P · Stream D tests ────────────────────────────────────
+
+    /// Stream D.2 — the bakabox script tags injected into the dev
+    /// page head must reference the three client assets the dev
+    /// HTTP handler serves: runtime.js (the entry, which itself
+    /// imports bincode.js as a relative module), and link-forms.js
+    /// (Phase L Link/form/Navigate interception). Without these the
+    /// browser receives Phase K opcode-stamped HTML but no client
+    /// to apply patches against.
+    #[test]
+    fn dev_bakabox_script_tags_include_runtime_and_link_forms() {
+        let tags = dev_bakabox_script_tags();
+        assert!(
+            tags.contains("/_albedo/runtime.js"),
+            "expected runtime.js module reference; got: {tags}"
+        );
+        assert!(
+            tags.contains("/_albedo/link-forms.js"),
+            "expected link-forms.js module reference; got: {tags}"
+        );
+        assert!(
+            tags.contains("type=\"module\""),
+            "bakabox scripts must be ES modules so relative imports resolve"
+        );
+    }
+
+    /// Stream D.4 — the dev HTTP handler must resolve the bakabox
+    /// asset URLs to in-binary `include_str!` templates without
+    /// requiring `albedo build` to have run.
+    #[test]
+    fn dev_static_asset_serves_runtime_bincode_link_forms() {
+        let (runtime, runtime_ct) = dev_static_asset("/_albedo/runtime.js").unwrap();
+        assert!(!runtime.is_empty(), "runtime.js asset must have a body");
+        assert_eq!(runtime_ct, "text/javascript; charset=utf-8");
+
+        let (bincode, _ct) = dev_static_asset("/_albedo/bincode.js").unwrap();
+        assert!(!bincode.is_empty(), "bincode.js asset must have a body");
+
+        let (link_forms, _ct) = dev_static_asset("/_albedo/link-forms.js").unwrap();
+        assert!(
+            !link_forms.is_empty(),
+            "link-forms.js asset must have a body"
+        );
+
+        let (hydration, _ct) = dev_static_asset("/_albedo/hydration.js").unwrap();
+        assert!(!hydration.is_empty(), "hydration.js asset must have a body");
+    }
+
+    #[test]
+    fn dev_static_asset_returns_none_for_unrelated_paths() {
+        assert!(dev_static_asset("/").is_none());
+        assert!(dev_static_asset("/_albedo/action").is_none());
+        assert!(dev_static_asset("/_albedo/runtime.js.map").is_none());
+        assert!(dev_static_asset("/runtime.js").is_none());
+    }
+
+    /// Stream D.3 — a malformed bincode body must surface a 400 from
+    /// `run_dev_action` (not a 500 / panic). Proves the dispatcher
+    /// rejects garbage before reaching the handler lookup.
+    #[test]
+    fn run_dev_action_rejects_malformed_envelope_with_400() {
+        let state = build_dev_state_for_tests();
+        let (status, body, content_type) = run_dev_action(b"not a real bincode envelope", &state);
+        assert_eq!(status, 400);
+        assert_eq!(content_type, "text/plain; charset=utf-8");
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap_or_default()
+                .contains("invalid action envelope"),
+            "expected diagnostic about envelope decode; got: {body:?}"
+        );
+    }
+
+    /// Stream D.3 — a well-formed envelope whose `action_id` doesn't
+    /// resolve to a registered handler must return 404. Proves the
+    /// dispatcher's lookup-before-invoke fork.
+    #[test]
+    fn run_dev_action_returns_404_for_unknown_action_id() {
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+        let state = build_dev_state_for_tests();
+        let envelope = ActionEnvelope {
+            action_id: 0xdead_beef,
+            event_kind: 0,
+            payload: Vec::new(),
+        };
+        let bytes = encode_action_envelope(&envelope).expect("encode envelope");
+        let (status, _body, _ct) = run_dev_action(bytes.as_slice(), &state);
+        assert_eq!(
+            status, 404,
+            "unknown action_id must surface 404 from run_dev_action"
+        );
+    }
+
+    /// Helper: a SharedDevState wired to a tiny in-memory project so
+    /// `run_dev_action` can resolve `CompiledProject::handler`.
+    fn build_dev_state_for_tests() -> Arc<Mutex<SharedDevState>> {
+        use dom_render_compiler::runtime::eval::ComponentProject;
+        use dom_render_compiler::runtime::{
+            BroadcastRegistry, CompiledProject, SessionId, SlotStore,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("Counter.tsx"),
+            "import { useState } from \"react\";\n\
+             export default function Counter() {\n\
+               const [n, setN] = useState(0);\n\
+               return <button onClick={() => setN(n + 1)}>{n}</button>;\n\
+             }\n",
+        )
+        .expect("write fixture");
+
+        let project = ComponentProject::load_from_dir(temp.path()).expect("load project");
+        let compiled = Arc::new(
+            CompiledProject::wrap(project.clone()).expect("wrap compiled project"),
+        );
+        let state = SharedDevState {
+            project,
+            compiled,
+            slot_store: Arc::new(SlotStore::new()),
+            broadcast: Arc::new(BroadcastRegistry::new()),
+            session_id: SessionId::random(),
+            project_css: String::new(),
+            routes: std::collections::HashMap::new(),
+            render_ms: 0.0,
+            total_ms: 0.0,
+            last_error: None,
+        };
+        // Hold the tempdir alive for the test's lifetime by leaking
+        // it; the test process exits immediately after so the OS
+        // reclaims the directory. Avoids threading TempDir through.
+        std::mem::forget(temp);
+        Arc::new(Mutex::new(state))
+    }
+
+    /// Stream D.1 — slot store + broadcast registry survive a state
+    /// clone (the watch loop pattern). Pins the contract that HMR
+    /// preserves slot values: cloning SharedDevState doesn't drop
+    /// the shared Arcs, so a re-render reads back the same store.
+    #[test]
+    fn shared_dev_state_clone_preserves_slot_store_arc() {
+        let original = build_dev_state_for_tests();
+        let (slot_arc, broadcast_arc, session) = {
+            let s = original.lock().unwrap();
+            (s.slot_store.clone(), s.broadcast.clone(), s.session_id)
+        };
+        let cloned = {
+            let s = original.lock().unwrap();
+            s.clone()
+        };
+        assert!(
+            Arc::ptr_eq(&slot_arc, &cloned.slot_store),
+            "cloning SharedDevState must reuse the same SlotStore Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&broadcast_arc, &cloned.broadcast),
+            "cloning SharedDevState must reuse the same BroadcastRegistry Arc"
+        );
+        assert_eq!(session, cloned.session_id);
     }
 }

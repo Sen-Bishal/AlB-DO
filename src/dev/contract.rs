@@ -521,7 +521,21 @@ pub fn resolve_dev_contract(
 }
 
 fn detect_default_entry_module(root: &Path) -> Option<String> {
-    for candidate in ["App.tsx", "App.jsx", "App.ts", "App.js"] {
+    // Phase N+ file-based routing — `routes/index.tsx` is the
+    // canonical entry; fall back to the legacy `App.tsx` shape so
+    // pre-Phase-N projects still resolve. Forward slashes are
+    // normalised through PathBuf::is_file on both platforms.
+    let candidates = [
+        "routes/index.tsx",
+        "routes/index.jsx",
+        "routes/index.ts",
+        "routes/index.js",
+        "App.tsx",
+        "App.jsx",
+        "App.ts",
+        "App.js",
+    ];
+    for candidate in candidates {
         if root.join(candidate).is_file() {
             return Some(candidate.to_string());
         }
@@ -932,7 +946,11 @@ const fn default_true() -> bool {
 }
 
 fn default_root() -> &'static str {
-    "src/components"
+    // Phase N+ — file-based routes live under `src/routes/`, so the
+    // dev contract's source root is `src/` (not `src/components/`,
+    // which was the pre-Phase-N convention). Existing projects that
+    // hand-set `root` in `albedo.config.ts` keep their override.
+    "src"
 }
 
 #[cfg(test)]

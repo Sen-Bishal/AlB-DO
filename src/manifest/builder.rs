@@ -10,7 +10,9 @@ use crate::ir::opcode::OpcodeFrame;
 use crate::ir::wire::encode_frame;
 use crate::routing::{discover_routes, DiscoveredRoute};
 use crate::runtime::broadcast::BroadcastRegistry;
-use crate::runtime::compiled::{render_entry_with_broadcast, CompiledProject, RenderOptions};
+use crate::runtime::compiled::{
+    render_entry_with_bindings, render_entry_with_broadcast, CompiledProject, RenderOptions,
+};
 use crate::runtime::eval::ComponentProject;
 use crate::runtime::session::SessionId;
 use crate::runtime::slot_store::{SessionSlotView, SlotStore};
@@ -140,19 +142,54 @@ impl<'a> ManifestBuilder<'a> {
         // Layout chain comes from discover_routes when `<root>/routes/`
         // exists. Empty otherwise.
         let layout_chain = self.layout_chain_for_route(route);
+        // Phase P · Stream E.2 — pick the per-route error / loading
+        // boundary. `discover_routes` already chose the nearest one
+        // (longest matching URL prefix); we translate path → component
+        // name via the same matcher Stream E.1 tightened.
+        let error_component = self.error_component_for_route(route);
+        let loading_component = self.loading_component_for_route(route);
+
+        let shell = self.build_shell(
+            route,
+            assets,
+            &tier_a_root,
+            &tier_b,
+            &tier_c,
+            &layout_chain,
+        );
 
         RouteManifest {
             route: route.to_string(),
-            shell: self.build_shell(route, assets, &tier_a_root, &tier_b, &tier_c),
+            shell,
             tier_a_root,
             tier_b,
             tier_c,
             shared_slot_topics,
             action_ids,
             layout_chain,
-            error_component: None,
-            loading_component: None,
+            error_component,
+            loading_component,
         }
+    }
+
+    /// Phase P · Stream E.2 — resolve `routes/.../error.tsx` (if any)
+    /// for `route` to a component name the streaming handler can
+    /// render when a Tier-C node fails. `discover_routes_from_components`
+    /// returns the file path; component_name_for_rel_path translates
+    /// to the registered component's name. `None` when no error.tsx
+    /// covers this route.
+    fn error_component_for_route(&self, route: &str) -> Option<String> {
+        let discovered = self.discovered_routes.iter().find(|r| r.url_path == route)?;
+        let rel = discovered.error_boundary.as_ref()?;
+        self.component_name_for_rel_path(rel.as_path())
+    }
+
+    /// Phase P · Stream E.2 — same shape as `error_component_for_route`
+    /// for `loading.tsx`.
+    fn loading_component_for_route(&self, route: &str) -> Option<String> {
+        let discovered = self.discovered_routes.iter().find(|r| r.url_path == route)?;
+        let rel = discovered.loading.as_ref()?;
+        self.component_name_for_rel_path(rel.as_path())
     }
 
     /// Collect TS-action handler names + their wire IDs for this
@@ -185,14 +222,27 @@ impl<'a> ManifestBuilder<'a> {
     }
 
     /// Map a `routes/...` relative path back to a component name by
-    /// matching tails against `Component.file_path`. Tolerant of
+    /// tail-matching against `Component.file_path`. Tolerant of
     /// `/` vs `\` separator differences.
+    ///
+    /// Phase P · Stream E.1 — the match requires the path tail to
+    /// begin at `/routes/<rel>` so a needle of `layout.tsx` matches
+    /// only `<root>/routes/layout.tsx` and NOT `<root>/routes/nested/layout.tsx`.
+    /// A second pass accepts a bare-relative match (`routes/<rel>`
+    /// without a leading slash) for projects whose file_path
+    /// strings are stored relative to the workspace. Without these
+    /// constraints, HashMap iteration order would let any deeper
+    /// `layout.tsx` win against the root needle.
     fn component_name_for_rel_path(&self, rel: &Path) -> Option<String> {
         let needle = rel.to_string_lossy().replace('\\', "/");
-        let suffix = format!("/routes/{}", needle);
+        let absolute_suffix = format!("/routes/{}", needle);
+        let relative_suffix = format!("routes/{}", needle);
         for component in self.components.values() {
             let normalised = component.file_path.replace('\\', "/");
-            if normalised.ends_with(suffix.as_str()) || normalised.ends_with(needle.as_str()) {
+            if normalised.ends_with(absolute_suffix.as_str())
+                || normalised == relative_suffix
+                || normalised.ends_with(&format!("/{}", relative_suffix))
+            {
                 return Some(component.name.clone());
             }
         }
@@ -287,6 +337,7 @@ impl<'a> ManifestBuilder<'a> {
         tier_a_root: &[RenderedNode],
         tier_b: &[TierBNode],
         tier_c: &[TierCNode],
+        layout_chain: &[String],
     ) -> HtmlShell {
         let mut doctype_and_head = String::from(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
@@ -298,14 +349,39 @@ impl<'a> ManifestBuilder<'a> {
                 escape_html(css_path)
             ));
         }
+        // Phase P · Stream E.3 — inject scoped CSS for every
+        // `.module.css` file referenced by any component on this
+        // route. The scoped output is keyed by file (not by
+        // component) so a CSS file imported from multiple components
+        // ships exactly once per route. Concatenated into one
+        // `<style>` block to minimise extra requests and avoid a
+        // FOUC between Tier-A render and Tier-B hydration.
+        let scoped_css = self.collect_scoped_module_css_for_route(tier_a_root, tier_b, tier_c);
+        if !scoped_css.is_empty() {
+            doctype_and_head.push_str("<style data-albedo-css-modules>");
+            doctype_and_head.push_str(&scoped_css);
+            doctype_and_head.push_str("</style>");
+        }
         doctype_and_head.push_str("</head>");
 
-        let mut body_open = String::from("<body>");
+        // Build the route's inner body content first (everything that
+        // would land between <body> and </body> pre-E.1). This is the
+        // "leaf" content the layout chain wraps.
+        let mut inner = String::new();
         let mut placeholders = self.collect_shell_placeholders(tier_a_root, tier_b, tier_c);
         placeholders.sort_by_key(|entry| entry.order);
         for placeholder in placeholders {
-            body_open.push_str(&placeholder.html);
+            inner.push_str(&placeholder.html);
         }
+
+        // Phase P · Stream E.1 — apply the layout chain outermost-out.
+        // When `layout_chain` is empty, `wrap_in_layouts` is a no-op
+        // and the body_open shape stays identical to pre-E.1 — no
+        // observable change for routes without a `routes/layout.tsx`.
+        let wrapped = self.wrap_in_layouts(inner, layout_chain);
+
+        let mut body_open = String::from("<body>");
+        body_open.push_str(&wrapped);
 
         HtmlShell {
             doctype_and_head,
@@ -313,6 +389,139 @@ impl<'a> ManifestBuilder<'a> {
             body_close: "</body></html>".to_string(),
             shim_script: default_shim_script(!tier_b.is_empty() || !tier_c.is_empty()),
         }
+    }
+
+    /// Phase P · Stream E.3 — concatenate scoped CSS for every
+    /// `.module.css` file referenced by any component on this
+    /// route. Walks every TIer-A / Tier-B / Tier-C node on the
+    /// route, resolves each to its `module_spec`, and accumulates
+    /// the file-keyed scoped CSS from the project's registry. Dedup
+    /// happens at the file_key level inside `scoped_css_for_module`,
+    /// so a single file imported from multiple components emits
+    /// once. Empty string when no component on the route imports a
+    /// `.module.css` (the common case for back-compat routes).
+    fn collect_scoped_module_css_for_route(
+        &self,
+        tier_a_root: &[RenderedNode],
+        tier_b: &[TierBNode],
+        tier_c: &[TierCNode],
+    ) -> String {
+        let Some(compiled) = self.compiled_render_project.as_ref() else {
+            return String::new();
+        };
+        let registry = compiled.project.css_modules();
+        if registry.file_count() == 0 {
+            return String::new();
+        }
+
+        // Collect unique `module_spec`s referenced on this route.
+        // We resolve each component's name back to its file path,
+        // then to a project-relative spec via the same shape
+        // `CompiledProject::wrap` uses.
+        let mut module_specs: BTreeSet<String> = BTreeSet::new();
+        let mut record = |component_name: &str| {
+            if let Some(component) = self
+                .components
+                .values()
+                .find(|c| c.name == component_name)
+            {
+                if let Some(spec) =
+                    self.component_entry_for_project(component, compiled.root.as_path())
+                {
+                    module_specs.insert(spec);
+                }
+            }
+        };
+        for node in tier_a_root {
+            record(&node.component_id);
+        }
+        for node in tier_b {
+            record(&node.component_id);
+        }
+        for node in tier_c {
+            record(&node.component_id);
+        }
+
+        // For each module on the route, ask the registry for the
+        // de-duplicated scoped CSS. Top-level dedup across modules
+        // happens via the BTreeSet of file_keys we accumulate here.
+        let mut seen_keys: BTreeSet<&str> = BTreeSet::new();
+        let mut out = String::new();
+        for spec in &module_specs {
+            for body in registry.scoped_css_for_module(spec) {
+                if seen_keys.insert(body) {
+                    out.push_str(body);
+                }
+            }
+        }
+        out
+    }
+
+    /// Phase P · Stream E.1 — wrap a route's inner body content in
+    /// the rendered HTML of every layout in `layout_chain`, composing
+    /// outermost → leaf.
+    ///
+    /// `layout_chain` is the source-order chain `discover_routes`
+    /// produced (outermost first, leaf-parent last). The wrap walks
+    /// the chain in REVERSE so the innermost layout absorbs the
+    /// route content first, then the next layer absorbs THAT result,
+    /// and so on, until the outermost layout owns the whole tree.
+    ///
+    /// Each layout component is rendered statically with empty props
+    /// — layout files declare `<children />` to mark the inner
+    /// substitution point, which the renderer emits as
+    /// [`crate::runtime::eval::LAYOUT_CHILDREN_SENTINEL`]. The wrap
+    /// pass `str::replace`s that sentinel with the accumulated inner
+    /// HTML to compose the next layer.
+    ///
+    /// Layouts whose component name doesn't resolve to a known
+    /// component (missing file, unresolved import) are silently
+    /// skipped — matching the rest of the manifest builder's
+    /// graceful-degradation contract. A missing layout shouldn't
+    /// fail the whole build; it just leaves the chain shorter than
+    /// the discovered file suggested.
+    fn wrap_in_layouts(&self, leaf_html: String, layout_chain: &[String]) -> String {
+        use crate::runtime::eval::LAYOUT_CHILDREN_SENTINEL;
+
+        if layout_chain.is_empty() {
+            return leaf_html;
+        }
+
+        let mut accumulated = leaf_html;
+        for layout_name in layout_chain.iter().rev() {
+            let Some(layout_html) = self.render_layout_html(layout_name) else {
+                continue;
+            };
+            if !layout_html.contains(LAYOUT_CHILDREN_SENTINEL) {
+                // Layout source has no `<children />` — degrade to the
+                // pre-E.1 shape rather than dropping the route's
+                // content on the floor. The layout's rendered HTML
+                // wins; the inner content is appended so it's still
+                // observable in the shell. Surface a tracing warn so
+                // the build log flags the misconfiguration.
+                tracing::warn!(
+                    target: "albedo.manifest.layout",
+                    layout = %layout_name,
+                    "layout component has no <children /> intrinsic; \
+                     appending inner content rather than substituting"
+                );
+                accumulated = format!("{}{}", layout_html, accumulated);
+                continue;
+            }
+            accumulated = layout_html.replace(LAYOUT_CHILDREN_SENTINEL, &accumulated);
+        }
+        accumulated
+    }
+
+    /// Resolve a layout component name to its statically-rendered
+    /// HTML. Returns `None` when the component isn't registered or
+    /// rendering fails — caller's job to decide what to do with that.
+    fn render_layout_html(&self, layout_name: &str) -> Option<String> {
+        let component = self
+            .components
+            .values()
+            .find(|c| c.name == layout_name)?;
+        self.render_static_component_html(component)
     }
 
     fn traverse(
@@ -658,9 +867,36 @@ impl<'a> ManifestBuilder<'a> {
     }
 
     fn render_static_component_html(&self, component: &Component) -> Option<String> {
+        let empty_props = Value::Object(Default::default());
+
+        // Phase P · Stream E.3 — route the Tier-A static render
+        // through the CompiledProject path (with hook_compile off)
+        // so `styles.foo` resolves to the scoped class name via the
+        // CSS-module registry installed by `render_entry_with_bindings`.
+        // Falls back to the legacy static ComponentProject when no
+        // compiled project is available (test fixtures, etc.).
+        if let Some(compiled) = self.compiled_render_project.as_ref() {
+            let entry = self.component_entry_for_project(component, compiled.root.as_path())?;
+            let session = SessionId::random();
+            let slot_store = Arc::new(SlotStore::new());
+            let slots = SessionSlotView::new(session, slot_store);
+            let opts = RenderOptions { hook_compile: false };
+            if let Ok(output) = render_entry_with_bindings(
+                &compiled.project,
+                entry.as_str(),
+                &empty_props,
+                &slots,
+                &opts,
+            ) {
+                let html = output.html;
+                if !html.trim().is_empty() {
+                    return Some(html);
+                }
+            }
+        }
+
         let render_project = self.static_render_project.as_ref()?;
         let entry = self.component_entry_for_project(component, render_project.root.as_path())?;
-        let empty_props = Value::Object(Default::default());
         render_project
             .project
             .render_entry(entry.as_str(), &empty_props)

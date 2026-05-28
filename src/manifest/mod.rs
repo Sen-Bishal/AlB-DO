@@ -214,10 +214,23 @@ fn route_path_from_component(file_path: &str) -> Option<String> {
         .map(|(_, tail)| tail.to_string())
         .or_else(|| normalized.strip_prefix("routes/").map(str::to_string))?;
 
-    let mut route = Path::new(route_hint.as_str())
+    // Phase P · Stream E.1 — `layout.tsx` (and, ahead of Stream E.2,
+    // `error.tsx` / `loading.tsx`) are convention files, not routes.
+    // They live in `<routes>/` so the manifest builder's
+    // `render_layout_html` can resolve them by component name, but
+    // they MUST NOT become route entries — otherwise a phantom
+    // `/layout` URL appears alongside the real routes. Filter by
+    // the basename of the source file (with extension stripped).
+    let stripped = Path::new(route_hint.as_str())
         .with_extension("")
         .to_string_lossy()
         .replace('\\', "/");
+    let last_segment = stripped.rsplit('/').next().unwrap_or("");
+    if matches!(last_segment, "layout" | "error" | "loading") {
+        return None;
+    }
+
+    let mut route = stripped;
     route = route.trim_matches('/').to_string();
 
     if route.ends_with("/index") {

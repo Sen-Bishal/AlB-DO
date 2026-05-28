@@ -15,10 +15,10 @@ export default function Hero() {
       </p>
       <div className="hero-actions">
         <a className="btn btn-primary" href="#get-started">
-          Open src/App.tsx
+          Open src/routes/index.tsx
         </a>
-        <a className="btn btn-ghost" href="#tiers">
-          How tiers work
+        <a className="btn btn-ghost" href="/chat">
+          Try broadcast →
         </a>
       </div>
     </header>

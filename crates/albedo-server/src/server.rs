@@ -46,9 +46,18 @@ const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// `invoke_action` so the explicit return already carries the
 /// `SlotSet` opcodes; the dispatcher's follow-up drain is then a
 /// no-op, which is idempotent and safe.
+//
+// Phase P · Stream C.2 — adapter carries the per-server
+// `Arc<BroadcastRegistry>` so `handle()` can install it into the
+// interpreter's `PHASE_K_BROADCAST` thread-local for the duration of
+// the action dispatch. Without that install, a TS handler calling
+// `broadcast(topic, updater)` would surface a clean error from the
+// interpreter ("broadcast() unavailable") because the builtin only
+// resolves when the thread-local is set.
 struct CompiledProjectActionAdapter {
     project: Arc<dom_render_compiler::runtime::CompiledProject>,
     action_id: u32,
+    broadcast: Arc<BroadcastRegistry>,
 }
 
 #[async_trait::async_trait]
@@ -68,8 +77,14 @@ impl ActionHandler for CompiledProjectActionAdapter {
             slots.session_id(),
             slots.store().clone(),
         );
+        // Phase P · C.2 — `invoke_action_with_broadcast` installs the
+        // broadcast registry on the per-thread Phase K stack for the
+        // duration of `eval_handler_body`, so a TS action body's
+        // `broadcast(topic, updater)` call routes through this same
+        // `Arc<BroadcastRegistry>`. Fan-out lands on every subscribed
+        // session over the WT patches lane without further plumbing.
         self.project
-            .invoke_action(envelope, &view)
+            .invoke_action_with_broadcast(envelope, &view, self.broadcast.as_ref())
             .map_err(|err| {
                 RuntimeError::RequestHandling(format!(
                     "compiled action handler {} failed: {err:#}",
@@ -173,6 +188,13 @@ pub struct AlbedoServerBuilder {
     /// response. `None` means auto: `public, max-age=3600` when dev
     /// mode is off, `no-store` when dev mode is on.
     public_cache_control: Option<String>,
+    /// Phase P · Stream C.2 — the per-server broadcast registry, minted
+    /// at builder construction so [`Self::register_compiled_project`]
+    /// can clone the same `Arc` into every `CompiledProjectActionAdapter`.
+    /// `build()` reuses this exact `Arc` for `RuntimeState.broadcast`,
+    /// so action handlers, the WT runtime, and any userland write all
+    /// resolve topics against one registry.
+    broadcast: Arc<BroadcastRegistry>,
 }
 
 impl AlbedoServerBuilder {
@@ -193,7 +215,22 @@ impl AlbedoServerBuilder {
             dev_mode_enabled: None,
             public_dirs: Vec::new(),
             public_cache_control: None,
+            // Phase P · C.2 — mint here so `register_compiled_project`
+            // (which may run before `build()`) sees the same `Arc` the
+            // runtime state will hold. Idle cost is one empty
+            // DashMap; non-broadcast workloads don't pay anything.
+            broadcast: Arc::new(BroadcastRegistry::new()),
         }
+    }
+
+    /// Phase P · C.2 — access the broadcast registry this builder
+    /// will install on the eventual [`AlbedoServer`]. Useful when
+    /// userland code needs to seed a topic (with
+    /// [`BroadcastRegistry::topic`]) before any client connects.
+    /// Cloning the returned `Arc` is cheap; both halves resolve to
+    /// the same registry.
+    pub fn broadcast(&self) -> Arc<BroadcastRegistry> {
+        self.broadcast.clone()
     }
 
     /// Phase N — mount a directory whose files are served verbatim
@@ -297,9 +334,32 @@ impl AlbedoServerBuilder {
             let adapter = CompiledProjectActionAdapter {
                 project: project.clone(),
                 action_id: proxy_id,
+                // Phase P · C.2 — share the builder's broadcast `Arc`
+                // with the adapter so its `handle()` invocation routes
+                // `broadcast(topic, updater)` calls through the same
+                // registry the WT runtime + route handlers see.
+                broadcast: self.broadcast.clone(),
             };
             self.action_handlers.insert(proxy_id, Arc::new(adapter));
         }
+
+        // Phase P · Stream C.3 — auto-register every `useSharedSlot`
+        // topic this project references so the streaming handler's
+        // C.4 auto-subscribe pass (and any userland `broadcast()`
+        // write that happens before the first subscriber) finds a
+        // live `BroadcastTopic` to attach to. `BroadcastRegistry::topic`
+        // is idempotent — a second call with the same name returns
+        // the existing entry rather than clobbering its value, so
+        // calling this on multiple `CompiledProject`s that share
+        // topics is safe. Seed value is `b"null"` rather than `b"[]"`
+        // because we don't know the topic's element type at this
+        // layer; the `broadcast()` interpreter builtin already
+        // tolerates a `Null` current value by passing it to the
+        // updater closure.
+        for topic in project.shared_slot_topics() {
+            self.broadcast.topic(topic, b"null".to_vec());
+        }
+
         self
     }
 
@@ -475,12 +535,18 @@ impl AlbedoServerBuilder {
         // same token table or every form POST 403s.
         let csrf_registry = Arc::new(CsrfRegistry::new());
 
-        // Phase O.2 · single broadcast registry per server. Every
-        // route/action handler that wants to publish to a topic
-        // resolves it against this Arc; subscribe()/write_topic()
+        // Phase O.2 · single broadcast registry per server (minted in
+        // the builder so `register_compiled_project` adapters share
+        // the same `Arc`). Every route/action handler that publishes
+        // a topic
+        // ──────────────────────────────────────────────────────────
+        // Phase P · C.2 trailing note: the same `Arc` is now reused
+        // from `self.broadcast` rather than re-minted here, so
+        // adapters registered before `build()` see the same registry
+        // the runtime state ends up with. `subscribe()` / `write_topic()`
         // are themselves concurrent so no further sharing layer is
         // needed.
-        let broadcast = Arc::new(BroadcastRegistry::new());
+        let broadcast = self.broadcast;
 
         // Construct StreamingAppState, binding the optional pipeline +
         // runtime handle when both are present. `with_pipeline` consumes
@@ -498,7 +564,12 @@ impl AlbedoServerBuilder {
                 ),
                 shared_wt_sessions.clone(),
             )
-            .with_csrf(csrf_registry.clone());
+            .with_csrf(csrf_registry.clone())
+            // Phase P · C.4 — same broadcast `Arc` the action adapter
+            // and runtime state hold, so a WT session's auto-subscribe
+            // attaches the patches-lane sender to topics that
+            // subsequent action-handler `broadcast()` calls fan out to.
+            .with_broadcast(broadcast.clone());
             let state = match pipeline_binding.take() {
                 Some((pipeline, handle)) => {
                     let pipeline = pipeline.with_slot_store(slot_store.clone());
@@ -839,6 +910,25 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
     // router (which will surface 405 or 404 as appropriate).
     if path == "/_albedo/action" && method == HttpMethod::Post {
         return run_action_route(&state, request).await;
+    }
+
+    // Phase P · post-P wire-through — embedded bakabox client
+    // assets. Serves runtime.js / bincode.js / link-forms.js etc.
+    // from the binary directly, so production no longer needs to
+    // mount `<dist>` as a public_dir (which used to shadow `/` with
+    // the static fallback index.html). Fires BEFORE the
+    // public-assets dispatch so a user's `public/runtime.js`
+    // doesn't accidentally hijack the framework path.
+    if matches!(method, HttpMethod::Get | HttpMethod::Head) {
+        if let Some(response) =
+            crate::handlers::albedo_assets::dispatch_albedo_asset(path.as_str())
+        {
+            let mut response = response;
+            if method == HttpMethod::Head {
+                *response.body_mut() = Body::empty();
+            }
+            return response;
+        }
     }
 
     // Phase N — `public/` static assets resolve before dynamic

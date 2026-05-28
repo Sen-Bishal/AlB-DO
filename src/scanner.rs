@@ -143,6 +143,14 @@ impl ProjectScanner {
     }
 
     fn is_component_file(&self, path: &Path) -> bool {
+        // Phase P · post-P wire-through — skip ambient TS declaration
+        // files. Same exclusion is mirrored in
+        // `runtime::eval::component::is_component_module` so both
+        // the scanner and the renderer see the same set of files.
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(".d.ts") || name.ends_with(".d.tsx") {
+            return false;
+        }
         if let Some(ext) = path.extension() {
             let ext_str = ext.to_str().unwrap_or("");
             matches!(ext_str, "jsx" | "tsx" | "js" | "ts")

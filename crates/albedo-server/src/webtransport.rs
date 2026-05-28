@@ -58,6 +58,26 @@ impl WebTransportSessionRegistry {
             .unwrap_or(false)
     }
 
+    /// Phase P · Stream C.4 — clone the raw `mpsc::Sender` for one
+    /// stream slot of a session. Used by the streaming handler to
+    /// hand the patches-lane sender to [`crate::BroadcastRegistry::auto_subscribe`]
+    /// so future `write_topic` fan-outs land on the session directly
+    /// (the broadcast registry stores per-subscriber senders and
+    /// drains them with `try_send`). `None` when either the session
+    /// is unknown or `stream_slot` is out of range.
+    pub fn stream_sender(
+        &self,
+        session_id: Uuid,
+        stream_slot: u8,
+    ) -> Option<mpsc::Sender<Vec<u8>>> {
+        if (stream_slot as usize) >= WEBTRANSPORT_STREAM_COUNT {
+            return None;
+        }
+        let sessions = self.sessions.lock().ok()?;
+        let handle = sessions.get(&session_id)?;
+        Some(handle.stream_senders[stream_slot as usize].clone())
+    }
+
     pub async fn send_payload(
         &self,
         session_id: Uuid,

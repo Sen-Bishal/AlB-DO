@@ -329,12 +329,54 @@ declare namespace JSX {
     // Albedo built-in components
     Link: AlbedoLinkAttributes;
 
+    // Phase P · Stream E.1 — `<children />` intrinsic marks the
+    // substitution point inside a `routes/layout.tsx`. The
+    // renderer emits a sentinel comment that the manifest builder
+    // post-substitutes with the leaf route's HTML.
+    children: AlbedoBaseAttributes;
+
     // Catch-all for tags not enumerated. Keeps the surface
     // permissive while signalling "you're outside the supported
     // tag set" via the more-specific entries above.
     [tagName: string]: AlbedoBaseAttributes;
   }
 }
+
+// ── Phase P · `albedo` framework module surface ─────────────────
+//
+// The runtime recognises `useSharedSlot` + `action` only when they
+// resolve to imports from `"albedo"`. The declarations below
+// surface them to TypeScript so authors get autocomplete and the
+// renderer's extractor sees the canonical binding source.
+
+declare module "albedo" {
+  // Phase O.2 — read-only handle on a server-side broadcast topic.
+  // The value flows in over the WT patches lane on first paint and
+  // on every subsequent `broadcast()` write. `T` is whatever JSON
+  // shape the action handlers write — strings, numbers, arrays,
+  // structured objects all round-trip.
+  export function useSharedSlot<T = unknown>(topic: string): T;
+
+  // Phase P · Stream C.1 — declare an HTTP action handler. Body
+  // runs server-side when bakabox POSTs `/_albedo/action` for this
+  // declaration's `action_id` (FNV-1a-32 of the export name).
+  export function action<Args = unknown, R = void>(
+    handler: (args: Args) => R | Promise<R>,
+  ): (args: Args) => Promise<R>;
+}
+
+// Phase P · Stream C.2 — `broadcast(topic, updater)` is a free
+// ident the interpreter intercepts inside action handler bodies.
+// The TypeScript declaration mirrors what the interpreter expects.
+declare function broadcast<T>(
+  topic: string,
+  updater: (current: T) => T,
+): Promise<void>;
+
+// Phase P · Stream E.1 — the `<children />` JSX intrinsic in
+// `routes/layout.tsx` marks where the wrapped route renders.
+// Declared here so the type-checker stops flagging the unknown
+// tag; the renderer treats it as a sentinel-emitting host element.
 
 // Side-channel globals the client runtime publishes for advanced
 // userland integrations (e.g. instrumenting the WT debug slot).
