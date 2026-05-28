@@ -16,10 +16,14 @@ use crate::runtime::eval::component::fnv1a_32;
 use crate::runtime::eval::{ComponentFunction, ParamBinding};
 use crate::runtime::eval::{ComponentProject, PatchReport};
 use crate::runtime::slot_store::SessionSlotView;
+use crate::transforms::actions::ActionDeclaration;
+use crate::transforms::css_modules::{is_css_module_path, scope_module_css, ScopedCssModule};
 use crate::transforms::events::{
     collect_free_idents_in_handler_body, HandlerBody, HandlerExtract,
 };
-use crate::transforms::form::{extract_forms_in_function, FormExtract};
+use crate::transforms::form::{
+    allocate_form_action_id, extract_forms_in_function, FormExtract,
+};
 use crate::transforms::hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 use crate::transforms::link::{extract_links_in_function, LinkExtract};
 use crate::transforms::shared_slots::{
@@ -122,6 +126,81 @@ pub struct ResolvedHandler {
     pub body: HandlerBody,
 }
 
+/// Phase P · Stream E.3 — CSS-module class maps + scoped CSS bodies
+/// owned by the project. Populated once at [`CompiledProject::wrap`]
+/// time by reading every `.module.css` file the project's modules
+/// import. The renderer reads from this via a per-thread install
+/// (see `eval/core.rs::install_phase_k_css_modules`); the manifest
+/// builder reads from this via [`scoped_css_for_module`] to inject
+/// `<style>` blocks into each route's shell.
+#[derive(Debug, Clone, Default)]
+pub struct CssModuleRegistry {
+    /// Project-relative path of the `.module.css` file → its scoped
+    /// output (class map + rewritten CSS). The key is normalised
+    /// with `/` separators so dedup works across components that
+    /// share the same file from different import-source spellings.
+    files: HashMap<String, ScopedCssModule>,
+    /// `module_spec → (binding_name → file_key)`. `binding_name` is
+    /// the local name from `import styles from "./X.module.css"`;
+    /// `file_key` is the key into [`files`].
+    bindings: HashMap<String, HashMap<String, String>>,
+}
+
+impl CssModuleRegistry {
+    /// Phase P · E.3 — resolve `styles.foo` at render time. Returns
+    /// the scoped class name (without leading `.`) or `None` when
+    /// `binding` doesn't name a CSS-module import for `module_spec`,
+    /// or when `class_name` isn't a declared class in that file.
+    pub fn scoped_class_for(
+        &self,
+        module_spec: &str,
+        binding: &str,
+        class_name: &str,
+    ) -> Option<&str> {
+        let file_key = self.bindings.get(module_spec)?.get(binding)?;
+        let scoped = self.files.get(file_key)?;
+        scoped.class_map.get(class_name).map(|s| s.as_str())
+    }
+
+    /// Phase P · E.3 — every CSS-module file's scoped CSS body
+    /// referenced by `module_spec`, in stable order. The manifest
+    /// builder concatenates the results into one `<style>` block per
+    /// route. Empty when the module imports no `.module.css` files.
+    pub fn scoped_css_for_module(&self, module_spec: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        if let Some(map) = self.bindings.get(module_spec) {
+            // Stable, dedup-by-file order: sort by file_key first
+            // so multiple bindings to the same file collapse to one
+            // emission. (BTreeSet would dedupe; we use a manual
+            // pass so the order is alphabetic.)
+            let mut keys: Vec<&String> = map.values().collect();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                if let Some(scoped) = self.files.get(key) {
+                    out.push(scoped.scoped_css.as_str());
+                }
+            }
+        }
+        out
+    }
+
+    /// Phase P · E.3 — total number of distinct CSS-module files
+    /// loaded by the project. Useful for diagnostic surfaces and
+    /// tests that want to assert "this project loaded N modules".
+    #[must_use]
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Phase P · E.3 — iterate every loaded file's `(key, scoped)`
+    /// pair. The key is the project-relative path with `/`
+    /// separators; the value is the full scoping result.
+    pub fn iter_files(&self) -> impl Iterator<Item = (&str, &ScopedCssModule)> {
+        self.files.iter().map(|(k, v)| (k.as_str(), v))
+    }
+}
+
 /// Phase-K facade over [`ComponentProject`]. Owns the per-component
 /// hook metadata, the handler registry, and the slot/proxy id
 /// allocator. The Phase-J `ComponentProject` is exposed verbatim so
@@ -130,6 +209,17 @@ pub struct CompiledProject {
     project: ComponentProject,
     components: HashMap<(String, String), CompiledComponent>,
     handlers: HashMap<u32, ResolvedHandler>,
+    /// Phase P · Stream C.1 — every `export const NAME = action(...)`
+    /// declaration across the project, keyed by module spec for
+    /// per-module diagnostic queries. The wire registration lives in
+    /// `handlers` (keyed by `action_id = FNV-1a-32(name)`), parallel
+    /// to how Phase K's JSX `on*` handlers register by `proxy_id`.
+    action_declarations: HashMap<String, Vec<ActionDeclaration>>,
+    /// Phase P · Stream E.3 — CSS-module scoping done once at wrap
+    /// time. Render reads the class maps via thread-local install
+    /// in `runtime::eval::core`; the manifest builder reads scoped
+    /// CSS bodies for per-route `<style>` injection.
+    css_modules: CssModuleRegistry,
 }
 
 impl CompiledProject {
@@ -259,7 +349,76 @@ impl CompiledProject {
             }
         }
 
-        Ok(Self { project, components, handlers })
+        // Phase P · Stream E.3 — collect CSS-module imports across
+        // every module. Resolved once here (read + scope) so render
+        // and manifest paths can both reuse the cached results.
+        // Path resolution: import sources like "./Card.module.css"
+        // are joined relative to the module's parent directory and
+        // re-normalised to project-relative form, so two components
+        // in different dirs that import "./Card.module.css" get
+        // separate file_keys and disjoint scoped class names — as
+        // they should, because they reference different files.
+        let css_modules = build_css_module_registry(&project);
+
+        // Phase P · Stream C.1 — register every TS-side `action()`
+        // declaration alongside the Phase K onClick handlers. The
+        // `action_id` follows Phase L's FNV-1a-32 family so a JSX
+        // `<form action="action:NAME">` and a TS `export const NAME =
+        // action(...)` converge on the same wire id without
+        // per-project configuration. A synthetic empty
+        // `CompiledComponent` carries the dispatch context so
+        // `invoke_action`'s `component_meta` lookup resolves —
+        // TS actions don't own slot bindings, so all per-component
+        // maps are empty.
+        let mut action_declarations: HashMap<String, Vec<ActionDeclaration>> = HashMap::new();
+        for (module_spec, module) in project.modules() {
+            if module.action_declarations.is_empty() {
+                continue;
+            }
+            let mut per_module = Vec::with_capacity(module.action_declarations.len());
+            for declaration in &module.action_declarations {
+                let action_id = allocate_form_action_id(&declaration.name);
+                let synthetic_function = format!("__action__{}", declaration.name);
+                let synthetic_component = CompiledComponent {
+                    module_spec: module_spec.clone(),
+                    function_name: synthetic_function.clone(),
+                    hooks: Vec::new(),
+                    handlers: Vec::new(),
+                    value_slots: HashMap::new(),
+                    setter_slots: HashMap::new(),
+                    proxy_ids: Vec::new(),
+                    param_names: Vec::new(),
+                    capture_slots: HashMap::new(),
+                    forms: Vec::new(),
+                    links: Vec::new(),
+                    shared_slots: Vec::new(),
+                };
+                components.insert(
+                    (module_spec.clone(), synthetic_function.clone()),
+                    synthetic_component,
+                );
+                handlers.insert(
+                    action_id,
+                    ResolvedHandler {
+                        module_spec: module_spec.clone(),
+                        function_name: synthetic_function,
+                        handler_idx: 0,
+                        event_name: "action".to_string(),
+                        body: declaration.body.clone(),
+                    },
+                );
+                per_module.push(declaration.clone());
+            }
+            action_declarations.insert(module_spec.clone(), per_module);
+        }
+
+        Ok(Self {
+            project,
+            components,
+            handlers,
+            action_declarations,
+            css_modules,
+        })
     }
 
     /// Underlying Phase-J project; useful for callers that need access
@@ -283,7 +442,17 @@ impl CompiledProject {
         let rebuilt = Self::wrap(project_clone)?;
         self.components = rebuilt.components;
         self.handlers = rebuilt.handlers;
+        self.action_declarations = rebuilt.action_declarations;
+        self.css_modules = rebuilt.css_modules;
         Ok(report)
+    }
+
+    /// Phase P · Stream E.3 — handle on the project's CSS-module
+    /// registry. Render reads class maps via a thread-local install
+    /// of this `&CssModuleRegistry`; the manifest builder reads
+    /// scoped CSS bodies for per-route `<style>` injection.
+    pub fn css_modules(&self) -> &CssModuleRegistry {
+        &self.css_modules
     }
 
     /// Look up the metadata for one component. Returns `None` when the
@@ -350,6 +519,46 @@ impl CompiledProject {
             .unwrap_or(&[])
     }
 
+    /// Phase P · Stream C.1 — every `export const NAME = action(...)`
+    /// declaration in one module, in source order. Returns an empty
+    /// slice when the module declares no actions (or is unknown).
+    pub fn action_declarations_for_module(
+        &self,
+        module_spec: &str,
+    ) -> &[ActionDeclaration] {
+        self.action_declarations
+            .get(module_spec)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Phase P · Stream C.1 — iterate every TS-side action across
+    /// every module in the project, yielding `(module_spec, action)`
+    /// pairs. Order is module-iteration order (HashMap, not stable
+    /// across runs); within each module declarations are in source
+    /// order.
+    pub fn action_declarations_iter(
+        &self,
+    ) -> impl Iterator<Item = (&str, &ActionDeclaration)> {
+        self.action_declarations
+            .iter()
+            .flat_map(|(module_spec, decls)| {
+                decls.iter().map(move |d| (module_spec.as_str(), d))
+            })
+    }
+
+    /// Phase P · Stream C.1 — total count of TS-side action
+    /// declarations across the project. Useful for diagnostic
+    /// surfaces and tests that want to assert "this project
+    /// registered N actions" without iterating.
+    #[must_use]
+    pub fn action_declaration_count(&self) -> usize {
+        self.action_declarations
+            .values()
+            .map(|v| v.len())
+            .sum()
+    }
+
     /// Dispatch an [`ActionEnvelope`] against the registered handler.
     /// Returns the explicit `Vec<Instruction>` the handler emits PLUS
     /// the auto-drained `SlotSet` opcodes for any slot the handler
@@ -383,6 +592,29 @@ impl CompiledProject {
         explicit.extend(slots.drain_pending());
         Ok(explicit)
     }
+
+    /// Phase P · Stream C.2 — dispatch an action with the broadcast
+    /// registry installed for the duration of body evaluation. The
+    /// interpreter's `broadcast(topic, updater)` builtin reads from
+    /// this registry via a thread-local; when no registry is
+    /// installed (the plain [`invoke_action`] path), the builtin
+    /// returns a clean error rather than silently no-op-ing.
+    ///
+    /// The action adapter on the server side (`CompiledProjectActionAdapter`
+    /// in `crates/albedo-server/src/server.rs`) is the production
+    /// caller — it clones the per-server `Arc<BroadcastRegistry>`
+    /// minted by `AlbedoServerBuilder` and threads it through here
+    /// per request.
+    pub fn invoke_action_with_broadcast(
+        &self,
+        envelope: &ActionEnvelope,
+        slots: &SessionSlotView,
+        broadcast: &crate::runtime::broadcast::BroadcastRegistry,
+    ) -> Result<Vec<Instruction>> {
+        let _broadcast_guard =
+            crate::runtime::eval::core::install_phase_k_broadcast(broadcast);
+        self.invoke_action(envelope, slots)
+    }
 }
 
 /// Render an entry component with hook-compilation enabled.
@@ -405,6 +637,16 @@ pub fn render_entry_with_bindings(
     opts: &RenderOptions,
 ) -> Result<RenderOutput> {
     if !opts.hook_compile {
+        // Phase P · Stream E.3 — CSS-module class maps must resolve
+        // on the Phase J render path too, so Tier-A components that
+        // use `styles.foo` emit scoped class names even without hook
+        // compile. The guard's lifetime is bounded by the
+        // `render_entry` call below; we install + drop within this
+        // function so the thread-local doesn't leak.
+        let _css_modules_guard =
+            crate::runtime::eval::core::install_phase_k_css_modules(
+                compiled.css_modules(),
+            );
         let html = compiled.project.render_entry(entry, props)?;
         return Ok(RenderOutput { html, opcodes: Vec::new() });
     }
@@ -450,6 +692,13 @@ pub fn render_entry_with_broadcast(
         // Phase-J shape: render without binding opcodes. We still
         // ship the initial SlotSets so the client can render shared
         // state immediately even without Phase-K hook compilation.
+        // Phase P · E.3 — install the CSS-module class map even on
+        // the Phase J path so `styles.foo` resolves for Tier-A
+        // components in projects that opted out of hook compile.
+        let _css_modules_guard =
+            crate::runtime::eval::core::install_phase_k_css_modules(
+                compiled.css_modules(),
+            );
         let html = compiled.project.render_entry(entry, props)?;
         return Ok(RenderOutput {
             html,
@@ -540,4 +789,76 @@ fn extract_param_names(function: &ComponentFunction) -> Vec<String> {
 #[allow(dead_code)]
 pub(crate) fn is_compiled_stmt_root(_stmt: &Stmt) -> bool {
     true
+}
+
+/// Phase P · Stream E.3 — walk every module's imports, resolve
+/// `.module.css` sources to project-relative paths, read + scope
+/// each unique file once. Returns the populated registry.
+///
+/// Failures (file missing, IO error) skip the binding silently —
+/// CSS modules are a presentation concern and a broken CSS file
+/// shouldn't fail the build. The renderer falls through to a
+/// `Value::Null` member lookup in that case, surfacing as an empty
+/// class attribute in the output rather than a panic.
+fn build_css_module_registry(project: &ComponentProject) -> CssModuleRegistry {
+    let mut registry = CssModuleRegistry::default();
+    let root = project.root().to_path_buf();
+
+    for (module_spec, parsed) in project.modules() {
+        for (binding_name, import_binding) in &parsed.imports {
+            if !is_css_module_path(&import_binding.source) {
+                continue;
+            }
+            // Resolve the import source relative to the module's
+            // parent directory. `./Card.module.css` from
+            // `src/routes/about/page.tsx` lands at
+            // `src/routes/about/Card.module.css`.
+            let module_parent = Path::new(module_spec)
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            let raw_path = module_parent.join(&import_binding.source);
+            let file_key = normalize_path_key(&raw_path);
+            let abs_path = root.join(&raw_path);
+            if !registry.files.contains_key(&file_key) {
+                let css_source = match std::fs::read_to_string(&abs_path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let scoped = scope_module_css(file_key.as_str(), &css_source);
+                registry.files.insert(file_key.clone(), scoped);
+            }
+            registry
+                .bindings
+                .entry(module_spec.clone())
+                .or_default()
+                .insert(binding_name.clone(), file_key);
+        }
+    }
+
+    registry
+}
+
+/// Normalise a path to a stable forward-slash key. `..` segments
+/// are collapsed where possible so `./a/../b.css` and `b.css` map
+/// to the same entry. Mirrors `eval::component::normalize_specifier`
+/// but lives here to avoid a cross-module dependency.
+fn normalize_path_key(path: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !parts.is_empty() {
+                    parts.pop();
+                }
+            }
+            std::path::Component::Normal(seg) => {
+                parts.push(seg.to_string_lossy().to_string());
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                parts.push(component.as_os_str().to_string_lossy().to_string());
+            }
+        }
+    }
+    parts.join("/")
 }

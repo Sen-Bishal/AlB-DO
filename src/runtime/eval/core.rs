@@ -37,6 +37,17 @@ thread_local! {
 /// in `assets/albedo-runtime.js`). Keep these in sync.
 pub const ALBEDO_ID_ATTR: &str = "data-albedo-id";
 
+/// Phase P · Stream E.1 — sentinel emitted by the renderer when it
+/// encounters the `<children />` JSX intrinsic. The manifest
+/// builder's `wrap_in_layouts` pass post-render substitutes this
+/// comment with the accumulated inner HTML, so nested
+/// `routes/layout.tsx` files compose root → leaf without the
+/// renderer ever holding the inner content in scope. The string is
+/// chosen for vanishingly low collision risk with user-authored HTML
+/// (deliberately ugly + double-underscore prefix matches the rest of
+/// Albedo's internal markers).
+pub const LAYOUT_CHILDREN_SENTINEL: &str = "<!--__ALBEDO_LAYOUT_CHILDREN__-->";
+
 fn next_element_stable_id(module_spec: &str) -> u32 {
     RENDER_ELEMENT_COUNTER.with(|cell| {
         let counter = cell.get();
@@ -408,14 +419,90 @@ thread_local! {
         const { Cell::new(None) };
 }
 
-fn install_phase_k_broadcast(
+/// Phase P · Stream C.2 — peel `(expr)` and TS-only `as` / `satisfies`
+/// wrappers off an updater closure argument so `broadcast(topic, (x =>
+/// next))` and `broadcast(topic, (x => next) as any)` both reach the
+/// inner Arrow/Fn unchanged. Mirrors `transforms::actions::unwrap_parens`
+/// — the action authoring path lets the user wrap an updater in
+/// `(...)` or a TS cast for the same reasons.
+fn unwrap_updater_parens(expr: &swc_ecma_ast::Expr) -> &swc_ecma_ast::Expr {
+    use swc_ecma_ast::Expr;
+    match expr {
+        Expr::Paren(p) => unwrap_updater_parens(&p.expr),
+        Expr::TsAs(ts_as) => unwrap_updater_parens(&ts_as.expr),
+        Expr::TsSatisfies(ts_sat) => unwrap_updater_parens(&ts_sat.expr),
+        Expr::TsConstAssertion(ts_const) => unwrap_updater_parens(&ts_const.expr),
+        other => other,
+    }
+}
+
+// ── Phase P · Stream E.3 — CSS modules per-render thread-local ────
+//
+// CSS module class maps are owned by `CompiledProject` (see
+// `CssModuleRegistry`). The renderer installs a pointer to that
+// registry on the per-thread Phase K stack before walking a module,
+// and `eval_member` intercepts `Ident("styles").className` when the
+// ident resolves to a CSS-module import binding for the current
+// `module_spec`. Returns the scoped class name as `Value::String`.
+// Lifetime: the install guard outlives every borrow because the
+// installer and the render call run on the same stack frame, same
+// contract as `PHASE_K_BROADCAST`.
+// ───────────────────────────────────────────────────────────────────
+
+thread_local! {
+    static PHASE_K_CSS_MODULES: Cell<
+        Option<*const crate::runtime::compiled::CssModuleRegistry>,
+    > = const { Cell::new(None) };
+}
+
+pub(crate) fn install_phase_k_css_modules(
+    registry: &crate::runtime::compiled::CssModuleRegistry,
+) -> PhaseKCssModulesGuard {
+    let previous =
+        PHASE_K_CSS_MODULES.with(|cell| cell.replace(Some(registry as *const _)));
+    PhaseKCssModulesGuard { previous }
+}
+
+pub(crate) struct PhaseKCssModulesGuard {
+    previous: Option<*const crate::runtime::compiled::CssModuleRegistry>,
+}
+
+impl Drop for PhaseKCssModulesGuard {
+    fn drop(&mut self) {
+        PHASE_K_CSS_MODULES.with(|cell| cell.set(self.previous));
+    }
+}
+
+fn current_phase_k_css_modules(
+) -> Option<&'static crate::runtime::compiled::CssModuleRegistry> {
+    PHASE_K_CSS_MODULES.with(|cell| {
+        let ptr = cell.get()?;
+        // Safety: same contract as `current_phase_k_broadcast`. The
+        // installer is on the same stack frame as the render call;
+        // the guard restores the previous pointer on drop.
+        Some(unsafe { &*ptr })
+    })
+}
+
+/// Phase O.2 / Phase P · Stream C.2 — install a broadcast registry
+/// onto the per-thread Phase K stack. The returned guard restores the
+/// previous installation on drop (Phase K's other thread-locals follow
+/// the same RAII shape so nested renders / dispatches don't clobber
+/// each other).
+///
+/// Visible at `pub(crate)` so [`crate::runtime::compiled::CompiledProject`]
+/// can wrap action dispatch with this guard from outside the
+/// `eval::core` module. Keeping it crate-private (rather than `pub`)
+/// preserves the thread-local plumbing as an internal contract;
+/// userland goes through `invoke_action_with_broadcast` instead.
+pub(crate) fn install_phase_k_broadcast(
     broadcast: &crate::runtime::broadcast::BroadcastRegistry,
 ) -> PhaseKBroadcastGuard {
     let previous = PHASE_K_BROADCAST.with(|cell| cell.replace(Some(broadcast as *const _)));
     PhaseKBroadcastGuard { previous }
 }
 
-struct PhaseKBroadcastGuard {
+pub(crate) struct PhaseKBroadcastGuard {
     previous: Option<*const crate::runtime::broadcast::BroadcastRegistry>,
 }
 
@@ -795,6 +882,14 @@ impl ComponentProject {
     /// Exposes the parsed-module table so [`CompiledProject`] can run
     /// its Phase-K extractors over every function without re-parsing.
     #[must_use]
+    /// Project source root used to resolve relative module imports.
+    /// Exposed so [`crate::runtime::CompiledProject::wrap`] can read
+    /// `.module.css` files from disk relative to each module's
+    /// specifier (Phase P · Stream E.3).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn modules(&self) -> &HashMap<String, ParsedModule> {
         &self.modules
     }
@@ -825,6 +920,10 @@ impl ComponentProject {
         // via a thread-local pointer — see `current_phase_k_component`.
         let _slot_guard = PhaseKGuard::install(slots.clone());
         let _project_guard = install_phase_k_project(compiled);
+        // Phase P · Stream E.3 — install the CSS-module class map
+        // for the duration of the render so `eval_member` can
+        // resolve `styles.foo` to the scoped class name.
+        let _css_modules_guard = install_phase_k_css_modules(compiled.css_modules());
 
         let html = self.render_export(&entry, "default", props)?;
         let opcodes = drain_phase_k_opcodes();
@@ -856,6 +955,11 @@ impl ComponentProject {
         let _slot_guard = PhaseKGuard::install(slots.clone());
         let _project_guard = install_phase_k_project(compiled);
         let _broadcast_guard = install_phase_k_broadcast(broadcast);
+        // Phase P · Stream E.3 — same install as the non-broadcast
+        // render path. CSS module bindings are per-component and
+        // unrelated to broadcast scope, but render-time installs
+        // are stacked on the same Phase K thread-local lifecycle.
+        let _css_modules_guard = install_phase_k_css_modules(compiled.css_modules());
 
         let html = self.render_export(&entry, "default", props)?;
         let opcodes = drain_phase_k_opcodes();
@@ -1254,6 +1358,31 @@ impl ComponentProject {
         member: &swc_ecma_ast::MemberExpr,
         env: &HashMap<String, Value>,
     ) -> Result<Value> {
+        use swc_ecma_ast::*;
+
+        // Phase P · Stream E.3 — `styles.foo` where `styles` is a
+        // CSS-module import for the current module resolves to the
+        // scoped class name via the per-project class map. We check
+        // the obj BEFORE eval_expr so the lookup wins even though
+        // `styles` isn't bound in env (CSS-module imports don't
+        // surface as runtime values). Falls through to the regular
+        // member path on any mismatch.
+        if let (Expr::Ident(obj_ident), MemberProp::Ident(prop_ident)) =
+            (&*member.obj, &member.prop)
+        {
+            let binding = obj_ident.sym.to_string();
+            if !env.contains_key(&binding) {
+                if let Some(registry) = current_phase_k_css_modules() {
+                    let prop = prop_ident.sym.to_string();
+                    if let Some(scoped) =
+                        registry.scoped_class_for(module_spec, &binding, &prop)
+                    {
+                        return Ok(Value::String(scoped.to_string()));
+                    }
+                }
+            }
+        }
+
         let object = self.eval_expr(module_spec, &member.obj, env)?;
         self.eval_member_on(module_spec, &object, &member.prop, env)
     }
@@ -1566,6 +1695,39 @@ impl ComponentProject {
             if let Expr::Ident(ident) = callee_expr.as_ref() {
                 let fn_name = ident.sym.to_string();
 
+                // Phase P · Stream C.2 — `broadcast(topic, updater)`
+                // interpreter builtin. Lands above setter dispatch so
+                // a TS action body that happens to declare a setter
+                // named `broadcast` doesn't shadow the framework
+                // builtin. v1 scope guard: `broadcast()` only resolves
+                // when `PHASE_K_BROADCAST` is installed (i.e. inside
+                // an action handler via `CompiledProject::invoke_action_with_broadcast`).
+                // Render-time uses the thread-local read-only side via
+                // `phase_k_shared_slot_for_value`; writes from render
+                // callbacks aren't a supported surface today.
+                if fn_name == "broadcast" {
+                    if let Some(broadcast) = current_phase_k_broadcast() {
+                        return self.eval_broadcast_call(
+                            module_spec,
+                            call,
+                            env,
+                            broadcast,
+                        );
+                    }
+                    // v1 scope guard — surface a clean error rather
+                    // than silently falling through to the import /
+                    // user-function dispatch. A handler that reaches
+                    // here is either running outside an action
+                    // context (e.g. an onClick body that called
+                    // broadcast directly) or the server forgot to
+                    // route through `invoke_action_with_broadcast`.
+                    return Err(anyhow!(
+                        "broadcast() is only available inside action handlers \
+                         dispatched via CompiledProject::invoke_action_with_broadcast; \
+                         no broadcast registry is installed on the current call stack"
+                    ));
+                }
+
                 // Phase K · setter dispatch: when the current scope
                 // has registered `fn_name` as a useState setter, the
                 // call is a slot write — evaluate the arg, JSON-encode
@@ -1830,6 +1992,171 @@ impl ComponentProject {
         }
     }
 
+    /// Phase P · Stream C.2 — evaluate `broadcast(topic, updater)`.
+    ///
+    /// Atomic read-modify-write on a broadcast topic, mirroring the
+    /// React `setState(fn)` updater pattern:
+    ///
+    ///   1. Topic is registered if not yet present (idempotent —
+    ///      ad-hoc topics like `broadcast(\`chat:${room}\`, ...)`
+    ///      don't need pre-registration).
+    ///   2. Current value is read via `current_value()` and decoded as
+    ///      JSON. Empty / undecodable bytes surface as `Value::Null`
+    ///      so the updater can initialise on first call.
+    ///   3. The updater closure is evaluated with its single param
+    ///      bound to the current value. Expression-bodied arrows
+    ///      return their tail; block-bodied closures pick up the
+    ///      `return` statement. Block bodies without a `return` yield
+    ///      `Null`.
+    ///   4. The result is JSON-encoded and pushed through
+    ///      `broadcast.write_topic`, fanning out a `SlotSet` opcode
+    ///      to every subscribed session over the WT patches lane.
+    ///
+    /// Returns `Value::Null` so the action body's tail expression
+    /// (which is discarded by the action dispatcher) doesn't surface
+    /// a confusing string-cast of the written value.
+    fn eval_broadcast_call(
+        &self,
+        module_spec: &str,
+        call: &swc_ecma_ast::CallExpr,
+        env: &HashMap<String, Value>,
+        broadcast: &crate::runtime::broadcast::BroadcastRegistry,
+    ) -> Result<Value> {
+        let topic_arg = call.args.first().ok_or_else(|| {
+            anyhow!("broadcast() requires a topic argument as its first parameter")
+        })?;
+        if topic_arg.spread.is_some() {
+            return Err(anyhow!("broadcast() does not accept a spread topic argument"));
+        }
+        let topic_value = self.eval_expr(module_spec, &topic_arg.expr, env)?;
+        let topic = match topic_value {
+            Value::String(s) => s,
+            other => return Err(anyhow!(
+                "broadcast() topic must evaluate to a string; got {other:?}"
+            )),
+        };
+
+        // Ensure topic exists. Idempotent — `topic()` returns the
+        // existing entry on a second call. Default-seed with `null`
+        // so the updater's first invocation sees a sensible value
+        // rather than empty bytes.
+        let topic_arc = broadcast.get(&topic).unwrap_or_else(|| {
+            broadcast.topic(topic.clone(), b"null".to_vec())
+        });
+        let current_bytes = topic_arc.current_value();
+        let current_value: Value = if current_bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&current_bytes).unwrap_or(Value::Null)
+        };
+
+        let updater_arg = call.args.get(1).ok_or_else(|| {
+            anyhow!(
+                "broadcast('{}', updater) requires an updater closure as its second parameter",
+                topic
+            )
+        })?;
+        if updater_arg.spread.is_some() {
+            return Err(anyhow!(
+                "broadcast() does not accept a spread updater argument"
+            ));
+        }
+
+        let next_value =
+            self.invoke_updater(module_spec, &updater_arg.expr, &current_value, env)?;
+
+        let encoded = serde_json::to_vec(&next_value).map_err(|err| {
+            anyhow!("broadcast('{topic}') failed to encode updater result: {err}")
+        })?;
+        broadcast.write_topic(&topic, encoded).map_err(|err| {
+            anyhow!("broadcast('{topic}') write failed: {err}")
+        })?;
+
+        Ok(Value::Null)
+    }
+
+    /// Phase P · Stream C.2 — invoke an updater closure with one
+    /// positional arg. Supports arrow and function expressions, with
+    /// or without paren wrappers / TS casts. Block-bodied closures
+    /// follow the first `return` statement; expression-bodied arrows
+    /// return their tail expression. Anything else yields `Null` so
+    /// the broadcast pipeline still completes without a Rust panic.
+    fn invoke_updater(
+        &self,
+        module_spec: &str,
+        expr: &swc_ecma_ast::Expr,
+        arg: &Value,
+        parent_env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        use swc_ecma_ast::*;
+
+        let unwrapped = unwrap_updater_parens(expr);
+        match unwrapped {
+            Expr::Arrow(arrow) => {
+                let params: Vec<ParamBinding> =
+                    arrow.params.iter().map(param_from_pat).collect();
+                let mut env = parent_env.clone();
+                let args = Value::Array(vec![arg.clone()]);
+                bind_params_positional(&params, &args, &mut env);
+                match &*arrow.body {
+                    BlockStmtOrExpr::Expr(body_expr) => {
+                        self.eval_expr(module_spec, body_expr, &env)
+                    }
+                    BlockStmtOrExpr::BlockStmt(block) => {
+                        self.eval_updater_block(module_spec, &block.stmts, &mut env)
+                    }
+                }
+            }
+            Expr::Fn(fn_expr) => {
+                let params: Vec<ParamBinding> = fn_expr
+                    .function
+                    .params
+                    .iter()
+                    .map(|p| param_from_pat(&p.pat))
+                    .collect();
+                let mut env = parent_env.clone();
+                let args = Value::Array(vec![arg.clone()]);
+                bind_params_positional(&params, &args, &mut env);
+                match &fn_expr.function.body {
+                    Some(block) => self.eval_updater_block(module_spec, &block.stmts, &mut env),
+                    None => Ok(Value::Null),
+                }
+            }
+            _ => Err(anyhow!(
+                "broadcast() updater must be an arrow or function expression"
+            )),
+        }
+    }
+
+    /// Walk a block-bodied updater and return the first `return`'s
+    /// value (or `Value::Null` if no return is reached). Sibling to
+    /// `eval_body_stmts` but returns `Value` instead of coercing to
+    /// `String` — broadcast writes need the structured value back so
+    /// it can be JSON-encoded.
+    fn eval_updater_block(
+        &self,
+        module_spec: &str,
+        stmts: &[swc_ecma_ast::Stmt],
+        env: &mut HashMap<String, Value>,
+    ) -> Result<Value> {
+        use swc_ecma_ast::*;
+        for stmt in stmts {
+            match stmt {
+                Stmt::Return(ret) => {
+                    return match &ret.arg {
+                        Some(expr) => self.eval_expr(module_spec, expr, env),
+                        None => Ok(Value::Null),
+                    };
+                }
+                Stmt::Decl(Decl::Var(var)) => {
+                    self.eval_var_decl_into_env(module_spec, var, env);
+                }
+                _ => {}
+            }
+        }
+        Ok(Value::Null)
+    }
+
     fn eval_closure(
         &self,
         module_spec: &str,
@@ -2053,6 +2380,20 @@ impl ComponentProject {
             JSXElementName::Ident(ident) => ident.sym.to_string(),
             _ => return Err(anyhow!("unsupported JSX tag in module '{}'", module_spec)),
         };
+
+        // Phase P · Stream E.1 — `<children />` is the layout-wrap
+        // intrinsic. The renderer emits a fixed sentinel comment;
+        // the manifest builder's `wrap_in_layouts` substitutes the
+        // sentinel with the accumulated inner HTML after rendering
+        // each layout independently. Lowercase tag so JSX treats it
+        // as a host element (not a component reference) — we
+        // intercept before the host-element path runs so no
+        // `<children></children>` HTML ever lands in the output.
+        // Attrs and nested children on `<children />` are ignored;
+        // the intrinsic is a content sink, not a wrapper.
+        if original_tag == "children" {
+            return Ok(LAYOUT_CHILDREN_SENTINEL.to_string());
+        }
 
         // Phase L · `<Link href="...">` desugars to an `<a href="..."
         // data-albedo-link>` host element. Rewriting the tag here

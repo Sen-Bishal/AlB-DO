@@ -14,8 +14,8 @@ use dom_render_compiler::ir::opcode::InternTableKind;
 use dom_render_compiler::manifest::schema::{HydrationMode, RenderManifestV2, RouteManifest};
 use dom_render_compiler::runtime::pipeline::{FourLaneRuntimePipeline, RuntimePipelineError};
 use dom_render_compiler::runtime::webtransport::{
-    FramePayload, LaneRenderedChunk, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PREFETCH,
-    WT_STREAM_SLOT_SHELL,
+    FramePayload, LaneRenderedChunk, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
+    WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
 };
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::json;
@@ -57,6 +57,15 @@ pub struct StreamingAppState {
     /// fresh empty registry so tests that don't exercise CSRF compile
     /// and run unchanged; production wires it via [`Self::with_csrf`].
     csrf: Arc<crate::render::csrf::CsrfRegistry>,
+    /// Phase P · Stream C.4 — broadcast registry shared with the
+    /// action dispatcher's adapter and the per-server `RuntimeState`.
+    /// The streaming handler calls `auto_subscribe` on this when a
+    /// WT session establishes, so the session immediately receives
+    /// `SlotSet` opcodes for every topic the route's JSX referenced
+    /// via `useSharedSlot`. `None` for tests / configurations that
+    /// don't wire a registry — `auto_subscribe` is skipped in that
+    /// case rather than erroring.
+    broadcast: Option<Arc<dom_render_compiler::runtime::BroadcastRegistry>>,
 }
 
 impl StreamingAppState {
@@ -73,7 +82,34 @@ impl StreamingAppState {
             webtransport_sessions,
             pipeline: None,
             csrf: Arc::new(crate::render::csrf::CsrfRegistry::new()),
+            broadcast: None,
         }
+    }
+
+    /// Phase P · Stream C.4 — bind a broadcast registry to this
+    /// streaming state. Production wires the **same** `Arc` the
+    /// `RuntimeState` action dispatcher holds (and the
+    /// `CompiledProjectActionAdapter` clones into each registered
+    /// action handler). When set, the streaming handler calls
+    /// `auto_subscribe` per WT session connect against this
+    /// registry; when unset, the auto-subscribe pass is skipped.
+    #[must_use]
+    pub fn with_broadcast(
+        mut self,
+        broadcast: Arc<dom_render_compiler::runtime::BroadcastRegistry>,
+    ) -> Self {
+        self.broadcast = Some(broadcast);
+        self
+    }
+
+    /// Phase P · Stream C.4 — accessor for the bound broadcast
+    /// registry, used by the streaming handler's WT path and by
+    /// tests that want to seed topic values before the session
+    /// connects.
+    pub fn broadcast(
+        &self,
+    ) -> Option<&Arc<dom_render_compiler::runtime::BroadcastRegistry>> {
+        self.broadcast.as_ref()
     }
 
     /// Binds a shared CSRF registry to this streaming state. Production
@@ -596,6 +632,45 @@ async fn stream_route_over_webtransport(
         .send_payload(session_id, WT_STREAM_SLOT_SHELL, shell.into_bytes())
         .await
         .map_err(|err| err.to_string())?;
+
+    // Phase P · Stream C.4 — auto-subscribe this session to every
+    // broadcast topic the route's JSX references via
+    // `useSharedSlot`. The patches-lane sender becomes the
+    // per-subscriber sink the broadcast registry's `write_topic`
+    // drives later via `try_send`. The returned `Vec<Instruction>`
+    // is the initial-state SlotSet payload — wrap it in an
+    // `OpcodeFrame` and ship it before the bootstrap intern table
+    // so the client paints with current broadcast state before any
+    // `SetTextRef` (from the Tier-B opcode frame baked into the
+    // manifest by Stream B) references it.
+    if !route.shared_slot_topics.is_empty() {
+        if let Some(broadcast) = app.broadcast() {
+            if let Some(patches_sender) =
+                sessions.stream_sender(session_id, WT_STREAM_SLOT_PATCHES)
+            {
+                let initial = broadcast.auto_subscribe(
+                    page_session,
+                    patches_sender,
+                    &route.shared_slot_topics,
+                );
+                if !initial.is_empty() {
+                    let frame = dom_render_compiler::ir::opcode::OpcodeFrame {
+                        frame_id: 0,
+                        component_id: None,
+                        instructions: initial,
+                    };
+                    let encoded = dom_render_compiler::ir::wire::encode_frame(&frame)
+                        .map_err(|err| {
+                            format!("auto_subscribe initial-state encode failed: {err}")
+                        })?;
+                    sessions
+                        .send_payload(session_id, WT_STREAM_SLOT_PATCHES, encoded)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
+            }
+        }
+    }
 
     // 2. Bootstrap intern table on the binary patches slot. The
     //    classifier is a stub for Phase E (Phase F+ will plug in a real
@@ -1160,6 +1235,230 @@ mod tests {
             control_payload.get("event").and_then(Value::as_str),
             Some("route_complete")
         );
+    }
+
+    /// Phase P · Stream C.4 — when a route's manifest declares
+    /// `shared_slot_topics`, the streaming handler must call
+    /// `BroadcastRegistry::auto_subscribe` against the WT session's
+    /// patches-lane sender and ship a `SlotSet` opcode frame
+    /// carrying each topic's current value BEFORE the bootstrap
+    /// intern table. Without this pass, the client paints a blank
+    /// `useSharedSlot` binding until the first explicit `write_topic`
+    /// — Stream C.4 closes that race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stream_route_over_webtransport_auto_subscribes_to_shared_slot_topics() {
+        use crate::render::tier_b::StubTierBOpcodeRegistry;
+        use dom_render_compiler::graph::ComponentGraph;
+        use dom_render_compiler::ir::opcode::Instruction;
+        use dom_render_compiler::ir::wire::decode_frame;
+        use dom_render_compiler::manifest::schema::Tier;
+        use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
+        use dom_render_compiler::runtime::scheduler::SchedulerConfig;
+        use dom_render_compiler::runtime::{broadcast_slot_id, BroadcastRegistry};
+        use dom_render_compiler::types::{Component, ComponentAnalysis, ComponentId};
+        use std::collections::HashMap;
+
+        let session_id = Uuid::new_v4();
+        let registry = WebTransportSessionRegistry::default();
+
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        let (shell_tx, mut shell_rx) = mpsc::channel(8);
+        let (patch_tx, mut patch_rx) = mpsc::channel(8);
+        let (prefetch_tx, _prefetch_rx) = mpsc::channel(8);
+
+        registry.insert(WebTransportSessionHandle {
+            session_id,
+            remote_addr: "127.0.0.1:4433".parse().unwrap(),
+            stream_senders: [control_tx, shell_tx, patch_tx, prefetch_tx],
+        });
+
+        // Build a pipeline + opcode registry just so
+        // `stream_route_over_webtransport` clears its prerequisite
+        // checks; the test's assertion is about the C.4 auto-subscribe
+        // path, not the Tier-B / pipeline behaviour.
+        let graph = ComponentGraph::new();
+        let id = graph.add_component(Component::new(ComponentId::new(0), "Feature".to_string()));
+        let mut analyses = HashMap::new();
+        analyses.insert(
+            id,
+            ComponentAnalysis {
+                id,
+                priority: 1.0,
+                estimated_time_ms: 1.0,
+                phase: 0.1,
+                topological_level: 0,
+            },
+        );
+        let pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            HashMap::from([(id, Tier::B)]),
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .expect("pipeline must build");
+
+        let services = SharedRenderServices {
+            opcode_registry: Some(Arc::new(StubTierBOpcodeRegistry)),
+            ..SharedRenderServices::default()
+        };
+
+        // Pre-seed the topic so the auto-subscribe initial frame
+        // carries a meaningful current value (not the `b"null"`
+        // default).
+        let broadcast = Arc::new(BroadcastRegistry::new());
+        let seed_bytes = serde_json::to_vec(&serde_json::json!(["alpha", "beta"])).unwrap();
+        broadcast.topic("chat:lobby", seed_bytes.clone());
+
+        let app = Arc::new(
+            StreamingAppState::new(
+                Arc::new(RenderManifestV2::legacy_defaults()),
+                services,
+                StreamingTransportConfig::new(true, 443),
+                Some(registry),
+            )
+            .with_pipeline(pipeline, tokio::runtime::Handle::current())
+            .with_broadcast(broadcast.clone()),
+        );
+
+        // Route manifest that references one shared topic — Stream B
+        // populates this field at build time from
+        // `CompiledProject::shared_slot_topics()`.
+        let mut route = route_manifest();
+        route.shared_slot_topics = vec!["chat:lobby".to_string()];
+
+        let ctx = TierBRequestContext {
+            path: "/stream".to_string(),
+            ..TierBRequestContext::default()
+        };
+
+        stream_route_over_webtransport(route, ctx, app, session_id)
+            .await
+            .unwrap();
+
+        // Drain shell so the patches assertion isn't shadowed by the
+        // unrelated shell payload (different lane anyway, but
+        // belt-and-braces).
+        let _ = shell_rx.recv().await;
+
+        // FIRST patches-lane payload must be the auto-subscribe
+        // initial-state frame: one SlotSet whose slot_id ==
+        // broadcast_slot_id("chat:lobby"), value == the seeded JSON
+        // bytes. The bootstrap intern table (step 2) ships after.
+        let first_patch = patch_rx
+            .recv()
+            .await
+            .expect("auto-subscribe must ship a patches-lane frame");
+        let (frame, _) = decode_frame(&first_patch).expect("decode auto-subscribe frame");
+        assert_eq!(
+            frame.instructions.len(),
+            1,
+            "initial-state frame must carry exactly one SlotSet per topic"
+        );
+        match &frame.instructions[0] {
+            Instruction::SlotSet { slot_id, value } => {
+                assert_eq!(*slot_id, broadcast_slot_id("chat:lobby"));
+                assert_eq!(value, &seed_bytes);
+            }
+            other => panic!("expected SlotSet, got {other:?}"),
+        }
+    }
+
+    /// Phase P · C.4 negative — when the route declares no shared
+    /// topics, the auto-subscribe pass is skipped and the very first
+    /// patches-lane frame is the existing bootstrap (or whatever the
+    /// pipeline ships). Pins the contract so a future refactor
+    /// doesn't accidentally always-emit a SlotSet frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stream_route_over_webtransport_skips_auto_subscribe_when_no_topics() {
+        use crate::render::tier_b::StubTierBOpcodeRegistry;
+        use dom_render_compiler::graph::ComponentGraph;
+        use dom_render_compiler::ir::opcode::Instruction;
+        use dom_render_compiler::ir::wire::decode_frame;
+        use dom_render_compiler::manifest::schema::Tier;
+        use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
+        use dom_render_compiler::runtime::scheduler::SchedulerConfig;
+        use dom_render_compiler::runtime::BroadcastRegistry;
+        use dom_render_compiler::types::{Component, ComponentAnalysis, ComponentId};
+        use std::collections::HashMap;
+
+        let session_id = Uuid::new_v4();
+        let registry = WebTransportSessionRegistry::default();
+
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        let (shell_tx, _shell_rx) = mpsc::channel(8);
+        let (patch_tx, mut patch_rx) = mpsc::channel(8);
+        let (prefetch_tx, _prefetch_rx) = mpsc::channel(8);
+
+        registry.insert(WebTransportSessionHandle {
+            session_id,
+            remote_addr: "127.0.0.1:4433".parse().unwrap(),
+            stream_senders: [control_tx, shell_tx, patch_tx, prefetch_tx],
+        });
+
+        let graph = ComponentGraph::new();
+        let id = graph.add_component(Component::new(ComponentId::new(0), "Feature".to_string()));
+        let mut analyses = HashMap::new();
+        analyses.insert(
+            id,
+            ComponentAnalysis {
+                id,
+                priority: 1.0,
+                estimated_time_ms: 1.0,
+                phase: 0.1,
+                topological_level: 0,
+            },
+        );
+        let pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            HashMap::from([(id, Tier::B)]),
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .expect("pipeline must build");
+
+        let app = Arc::new(
+            StreamingAppState::new(
+                Arc::new(RenderManifestV2::legacy_defaults()),
+                SharedRenderServices {
+                    opcode_registry: Some(Arc::new(StubTierBOpcodeRegistry)),
+                    ..SharedRenderServices::default()
+                },
+                StreamingTransportConfig::new(true, 443),
+                Some(registry),
+            )
+            .with_pipeline(pipeline, tokio::runtime::Handle::current())
+            .with_broadcast(Arc::new(BroadcastRegistry::new())),
+        );
+
+        // No shared_slot_topics — auto-subscribe must skip entirely.
+        let route = route_manifest();
+        let ctx = TierBRequestContext {
+            path: "/stream".to_string(),
+            ..TierBRequestContext::default()
+        };
+
+        stream_route_over_webtransport(route, ctx, app, session_id)
+            .await
+            .unwrap();
+
+        // Whatever the first patches-lane frame is, it must NOT be a
+        // bare-SlotSet auto-subscribe frame (slot 0 is bootstrap,
+        // which always carries either an empty instruction vec or an
+        // intern table, never a top-level SlotSet).
+        if let Some(first_patch) = patch_rx.recv().await {
+            let (frame, _) = decode_frame(&first_patch).expect("decode patches frame");
+            let is_bare_slot_set = frame.instructions.len() == 1
+                && matches!(&frame.instructions[0], Instruction::SlotSet { .. });
+            assert!(
+                !is_bare_slot_set,
+                "with no shared topics, the first patches-lane frame must not be a \
+                 lone SlotSet (auto-subscribe should not have fired)"
+            );
+        }
     }
 
     #[tokio::test]

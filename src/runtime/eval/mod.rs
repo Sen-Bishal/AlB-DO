@@ -2,7 +2,9 @@ pub mod component;
 pub mod core;
 pub mod expr;
 
-pub use core::{render_from_components_dir, ComponentProject, PatchReport};
+pub use core::{
+    render_from_components_dir, ComponentProject, PatchReport, LAYOUT_CHILDREN_SENTINEL,
+};
 pub use expr::{ComponentFunction, ImportBinding, ParamBinding, ParsedModule};
 
 // Phase K re-exports — the corpus and any downstream consumer import

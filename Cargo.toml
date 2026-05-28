@@ -198,6 +198,28 @@ harness = false
 name    = "opcode_wire"
 harness = false
 
+# Phase P · Stream G — Speed-claim parity benches. Each is a
+# standalone Criterion bench that prints structured byte-count or
+# latency numbers to stderr alongside the timing measurement, so
+# the harvested values feed straight into the README's perf table.
+# See `benchmarks/parity/README.md` for the methodology + how to
+# refresh the published numbers.
+[[bench]]
+name    = "parity_fcp_bytes"
+harness = false
+
+[[bench]]
+name    = "parity_hydration_bytes"
+harness = false
+
+[[bench]]
+name    = "parity_action_roundtrip"
+harness = false
+
+[[bench]]
+name    = "parity_cold_start"
+harness = false
+
 [profile.release]
 opt-level     = 3
 lto           = true

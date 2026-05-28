@@ -20,6 +20,7 @@
 //! [`SlotStore`]: crate::runtime::slot_store::SlotStore
 //! [`ActionHandler`]: ../../../crates/albedo-server/src/actions.rs
 
+pub mod actions;
 pub mod css_modules;
 pub mod events;
 pub mod form;
@@ -27,6 +28,7 @@ pub mod hooks;
 pub mod link;
 pub mod shared_slots;
 
+pub use actions::{extract_action_declarations, ActionDeclaration, ActionExtractError};
 pub use css_modules::{is_css_module_path, scope_module_css, ScopedCssModule};
 pub use events::{
     collect_free_idents_in_handler_body, extract_handlers_in_function, HandlerBody, HandlerExtract,

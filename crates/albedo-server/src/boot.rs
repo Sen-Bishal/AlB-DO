@@ -160,11 +160,14 @@ pub fn boot_production_server(
     if dist_public.is_dir() {
         builder = builder.with_public_dir(dist_public);
     }
-    // Mount `<dist>` itself so the bakabox client assets emitted by
-    // the build under `<dist>/_albedo/{runtime,bincode,wt-bootstrap,
-    // hydration,link-forms}.js` resolve at the framework-reserved
-    // `/_albedo/*` URLs the manifest's shim script references.
-    builder = builder.with_public_dir(opts.dist_dir.clone());
+    // Phase P · post-P wire-through — `<dist>` is intentionally NOT
+    // mounted as a public_dir. The previous design served bakabox
+    // runtime assets from `<dist>/_albedo/*` via the public mount,
+    // but that also exposed `<dist>/index.html` at `/`, which
+    // shadowed the manifest-streaming arm for the root route. The
+    // runtime assets now route through `dispatch_albedo_asset` in
+    // `AlbedoServer::dispatch`, served from the binary's embedded
+    // templates — same source as the dev path's `dev_static_asset`.
 
     builder.build()
 }

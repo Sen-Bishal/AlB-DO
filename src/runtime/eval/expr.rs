@@ -39,6 +39,14 @@ pub struct ParsedModule {
     /// Imported names live in `imports`; only declared-in-this-module
     /// bindings show up here.
     pub module_constants: Vec<(String, Expr)>,
+    /// Phase P · Stream C.1 — `export const NAME = action(<arrow>)`
+    /// declarations extracted from `module_constants`. Populated at
+    /// parse time so [`crate::runtime::compiled::CompiledProject::wrap`]
+    /// doesn't re-walk the AST. Each entry's body runs through the
+    /// existing `eval_handler_body` interpreter at dispatch time
+    /// (C.2 ships the `broadcast()` builtin that makes that
+    /// interpretation useful end-to-end).
+    pub action_declarations: Vec<crate::transforms::actions::ActionDeclaration>,
 }
 
 pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
@@ -48,6 +56,7 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
         functions: HashMap::new(),
         default_export: None,
         module_constants: Vec::new(),
+        action_declarations: Vec::new(),
     };
     let mut synthetic_index = 0usize;
 
@@ -162,6 +171,20 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
             },
         }
     }
+
+    // Phase P · Stream C.1 — run the action extractor over the
+    // module's top-level constants now that `imports` + `module_constants`
+    // are both populated. Errors propagate as `anyhow!` so a malformed
+    // declaration (duplicate name, non-function handler, etc.) fails
+    // the build with a clean message instead of silently dropping the
+    // declaration.
+    parsed.action_declarations =
+        crate::transforms::actions::extract_action_declarations(&parsed).map_err(|err| {
+            anyhow!(
+                "action extraction failed in '{}': {err}",
+                file_path.display()
+            )
+        })?;
 
     Ok(parsed)
 }

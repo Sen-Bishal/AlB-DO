@@ -175,12 +175,13 @@ fn production_options_from_contract_absorbs_host_and_port_overrides() {
     use dom_render_compiler::dev_contract::resolve_dev_contract;
 
     let temp = tempdir().unwrap();
-    // `resolve_dev_contract` defaults the source root to
-    // `<project>/src/components`. Honour that so the contract resolves
-    // without falling into the strict "root does not exist" branch.
-    let components = temp.path().join("src").join("components");
-    fs::create_dir_all(&components).unwrap();
-    fs::write(components.join("App.tsx"), HELLO_TSX).unwrap();
+    // Phase N+ — `resolve_dev_contract` defaults the source root to
+    // `<project>/src/` and discovers `routes/index.tsx` as the entry.
+    // Honour that shape so the contract resolves without falling
+    // into the strict "root does not exist" branch.
+    let routes = temp.path().join("src").join("routes");
+    fs::create_dir_all(&routes).unwrap();
+    fs::write(routes.join("index.tsx"), HELLO_TSX).unwrap();
 
     // `albedo serve --host 0.0.0.0 --port 4444` flows through
     // `resolve_dev_contract`, so the contract carries the user's bind
@@ -254,20 +255,30 @@ async fn boot_production_server_serves_manifest_routes_via_streaming() {
 // ── 4 ── public asset fallback: bakabox runtime resolves ─────────
 
 #[tokio::test]
-async fn boot_production_server_serves_bakabox_runtime_from_dist() {
+async fn boot_production_server_serves_bakabox_runtime_from_embedded_assets() {
     let fixture = Fixture::with_counter();
     let server = boot_production_server(&fixture.options()).expect("boot");
 
+    // Phase P · post-P wire-through — runtime.js (and the rest of
+    // the bakabox client) ships from `dispatch_albedo_asset`'s
+    // `include_str!` templates baked into the binary, not from the
+    // dist mirror. The previous behaviour mounted `<dist>` as a
+    // public_dir, which shadowed `/` with `dist/index.html`.
     let response = server
         .router()
         .oneshot(get("/_albedo/runtime.js"))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(content_type, Some("text/javascript; charset=utf-8"));
     let body = to_bytes(response.into_body(), MAX_BODY).await.unwrap();
     assert!(
-        body.as_ref().starts_with(b"// albedo-runtime stub"),
-        "expected runtime.js content; got {} bytes",
+        !body.is_empty(),
+        "runtime.js body must be non-empty; got {} bytes",
         body.len()
     );
 }

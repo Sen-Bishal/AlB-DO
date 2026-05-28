@@ -1,21 +1,11 @@
-import Hero from "./components/Hero";
-import Counter from "./components/Counter";
-import LiveFeed from "./components/LiveFeed";
+import Hero from "../components/Hero";
+import Counter from "../components/Counter";
 
-export default function App() {
+// Landing route at `/`. The root layout wraps every page (nav +
+// footer); this leaf just contributes the body.
+export default function Home() {
   return (
-    <div className="app-shell">
-      <nav className="nav">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true" />
-          <span>AlBDO</span>
-        </div>
-        <span className="nav-pill">
-          <span className="dot" />
-          dev server · live
-        </span>
-      </nav>
-
+    <>
       <Hero />
 
       <div className="section-heading">
@@ -52,12 +42,27 @@ export default function App() {
           <Counter />
         </article>
 
-        <article className="card tier-c">
-          <LiveFeed />
+        <article className="card tier-b">
+          <div className="card-head">
+            <span className="tier-badge">
+              <span>tier b · broadcast</span>
+            </span>
+            <span className="card-meta">
+              <span>WT patches lane</span>
+            </span>
+          </div>
+          <h3 className="card-title">Server-pushed state</h3>
+          <p className="card-body">
+            <a href="/chat" className="btn btn-ghost">
+              Visit /chat
+            </a>{" "}
+            and open it in two tabs to see <code>broadcast()</code> fan
+            out over WebTransport.
+          </p>
         </article>
       </section>
 
-      <div className="section-heading">
+      <div id="get-started" className="section-heading">
         <h2>What makes it fast</h2>
         <span className="tag">design notes</span>
       </div>
@@ -85,15 +90,6 @@ export default function App() {
           </p>
         </article>
       </section>
-
-      <footer className="footer">
-        <span>AlBDO starter · edit src/App.tsx to begin</span>
-        <span>
-          <a href="https://github.com/anthropic-ai/albedo" rel="noreferrer">
-            docs →
-          </a>
-        </span>
-      </footer>
-    </div>
+    </>
   );
 }
