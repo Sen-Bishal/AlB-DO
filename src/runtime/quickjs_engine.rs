@@ -1,3 +1,4 @@
+use super::arena::{ArenaAllocator, ArenaControl, ArenaStats};
 use super::engine::{
     stable_source_hash, BootstrapPayload, LoadErrorKind, RenderOutput, RuntimeEngine, RuntimeError,
     RuntimeResult,
@@ -7,6 +8,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 use swc_common::{
     comments::SingleThreadedComments, sync::Lrc, FileName, Globals, Mark, SourceMap, Span, Spanned,
@@ -35,9 +37,16 @@ struct RenderEnvelope {
     error: Option<String>,
 }
 
+/// Number of leading renders that run in persistent (non-reset) mode so QuickJS can
+/// allocate its lazily-created, data-dependent runtime-global infrastructure (shape and
+/// atom tables) into the persistent region before request-scoped reset is enabled.
+const ARENA_WARMUP_RENDERS: u32 = 8;
+
 pub struct QuickJsEngine {
     runtime: Option<Runtime>,
     context: Option<Context>,
+    arena: Arc<ArenaControl>,
+    renders_done: u32,
     loaded_module_hashes: HashMap<String, u64>,
     bootstrap: Option<BootstrapPayload>,
     initialized: bool,
@@ -48,10 +57,17 @@ impl QuickJsEngine {
         Self {
             runtime: None,
             context: None,
+            arena: ArenaControl::with_default_caps(),
+            renders_done: 0,
             loaded_module_hashes: HashMap::new(),
             bootstrap: None,
             initialized: false,
         }
+    }
+
+    /// Snapshot of the request-scoped bump arena that backs the QuickJS runtime.
+    pub fn arena_stats(&self) -> ArenaStats {
+        self.arena.stats()
     }
 
     pub fn prewarm(&mut self) {
@@ -70,9 +86,11 @@ impl QuickJsEngine {
             return Ok(());
         }
 
-        let runtime = self
-            .runtime
-            .get_or_insert_with(|| Runtime::new().expect("QuickJS runtime creation failed"));
+        let arena = self.arena.clone();
+        let runtime = self.runtime.get_or_insert_with(|| {
+            Runtime::new_with_alloc(ArenaAllocator::new(arena))
+                .expect("QuickJS runtime creation failed")
+        });
 
         if self.context.is_none() {
             self.context = Some(Context::full(runtime).expect("QuickJS context creation failed"));
@@ -198,8 +216,19 @@ impl RuntimeEngine for QuickJsEngine {
     fn render_component(&mut self, entry: &str, props_json: &str) -> RuntimeResult<RenderOutput> {
         self.ensure_initialized()?;
 
+        // Movement III: after a short warmup (during which QuickJS finishes allocating its
+        // retained, data-dependent runtime-global tables into the persistent region),
+        // everything a render allocates is bump-allocated into the request region. The
+        // result string is copied out into Rust below, then a single cycle-collection pass
+        // drops any cyclic request garbage so the O(1) reset can reclaim the region with
+        // nothing left referencing it.
+        let scoped = self.renders_done >= ARENA_WARMUP_RENDERS;
+        self.renders_done = self.renders_done.saturating_add(1);
+        if scoped {
+            self.arena.begin_request();
+        }
         let eval_start = Instant::now();
-        let envelope_json = self.context.as_ref().unwrap().with(|ctx| {
+        let render_result = self.context.as_ref().unwrap().with(|ctx| {
             let globals = ctx.globals();
             let render_fn: Function = globals.get("__ALBEDO_RENDER_COMPONENT").map_err(|err| {
                 RuntimeError::render(format!(
@@ -214,9 +243,18 @@ impl RuntimeEngine for QuickJsEngine {
                         "failed to execute reusable render function for component '{entry}': {err}"
                     ))
                 })
-        })?;
+        });
         let eval_ms = eval_start.elapsed().as_millis();
 
+        if scoped {
+            self.runtime
+                .as_ref()
+                .expect("runtime initialized")
+                .run_gc();
+            self.arena.end_request();
+        }
+
+        let envelope_json = render_result?;
         let envelope: RenderEnvelope = serde_json::from_str(&envelope_json).map_err(|err| {
             RuntimeError::render(format!(
                 "failed to decode render result envelope for '{entry}': {err}"
@@ -1000,5 +1038,82 @@ mod tests {
 
         engine.prewarm();
         assert!(engine.is_initialized());
+    }
+
+    // A logic-heavy component: a loop, an array, an object with string keys, dynamic
+    // attribute values — enough to make QuickJS intern atoms and allocate shapes per
+    // render, which is exactly what the request reset has to survive.
+    const STRESS_COMPONENT: &str = r#"
+        export default function App(props) {
+            const rows = [];
+            for (let i = 0; i < props.n; i++) {
+                rows.push(h('li', { 'data-idx': i }, 'row ' + i));
+            }
+            const meta = { title: props.title, count: rows.length };
+            return h('ul', { id: meta.title, 'data-count': meta.count }, rows);
+        }
+    "#;
+
+    // Movement III guardrail (Workstream V): every render bump-allocates into the request
+    // region and the boundary reset returns it to empty, so steady-state renders add zero
+    // persistent heap traffic. Re-rendering the same input across many resets must also
+    // keep producing byte-identical, correct output — the corruption check for resetting
+    // a shared runtime's arena out from under its global atom/shape tables.
+    #[test]
+    fn request_arena_resets_each_render_without_persistent_growth_or_corruption() {
+        use super::{QuickJsEngine, ARENA_WARMUP_RENDERS};
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+        engine
+            .load_module("routes/stress", STRESS_COMPONENT)
+            .expect("module load");
+
+        let props = r#"{"n":6,"title":"grid"}"#;
+        let expected = "<ul id=\"grid\" data-count=\"6\">\
+<li data-idx=\"0\">row 0</li><li data-idx=\"1\">row 1</li>\
+<li data-idx=\"2\">row 2</li><li data-idx=\"3\">row 3</li>\
+<li data-idx=\"4\">row 4</li><li data-idx=\"5\">row 5</li></ul>";
+
+        // Warm past ARENA_WARMUP_RENDERS so every render in the steady loop below is
+        // request-scoped (begin_request + reset) and the persistent tables have settled.
+        const WARMUP: u32 = ARENA_WARMUP_RENDERS + 2;
+        const STEADY: usize = 200;
+
+        for _ in 0..WARMUP {
+            let out = engine
+                .render_component("routes/stress", props)
+                .expect("warmup render");
+            assert_eq!(out.html, expected);
+        }
+
+        let watermark = engine.arena_stats().persistent_used;
+        assert!(watermark > 0, "warmup should have populated the persistent region");
+
+        for i in 0..STEADY {
+            let out = engine
+                .render_component("routes/stress", props)
+                .expect("steady render");
+            // Correctness across resets: byte-identical output every time.
+            assert_eq!(out.html, expected, "render {i} diverged");
+
+            let stats = engine.arena_stats();
+            // The request region is reclaimed wholesale between renders.
+            assert_eq!(stats.request_used, 0, "request region not reset after render {i}");
+            // Zero per-tick persistent growth in steady state.
+            assert_eq!(
+                stats.persistent_used, watermark,
+                "persistent region grew on steady-state render {i}"
+            );
+        }
+
+        // The render region actually carried real per-render traffic (the bump path ran),
+        // and never spilled to the system fallback.
+        let final_stats = engine.arena_stats();
+        assert!(final_stats.request_peak > 0, "request region was never exercised");
+        assert_eq!(final_stats.fallback_allocs, 0, "region capacity was exceeded");
     }
 }
