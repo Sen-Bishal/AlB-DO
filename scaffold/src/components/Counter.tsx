@@ -24,7 +24,7 @@ export default function Counter() {
         <button
           type="button"
           className="counter-btn"
-          onClick={() => setCount((value) => value + 1)}
+          onClick={() => setCount(count + 1)}
         >
           + increment
         </button>

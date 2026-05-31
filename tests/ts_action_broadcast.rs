@@ -110,9 +110,11 @@ async fn broadcast_updater_receives_current_value_for_read_modify_write() {
     let value: serde_json::Value = serde_json::from_slice(&topic.current_value()).unwrap();
     assert_eq!(
         value,
-        serde_json::json!(42.0),
-        "updater n => n + 1 must see current value 41 and write 42 \
-         (numbers serialise as f64 through the interpreter)"
+        serde_json::json!(42),
+        "updater n => n + 1 must see current value 41 and write 42; \
+         json_num now prefers integer encoding when a value is exactly \
+         representable as i64 so a Tier-B count span paints '42' \
+         instead of '42.0'"
     );
 }
 

@@ -117,6 +117,15 @@ struct SharedDevState {
     session_id: dom_render_compiler::runtime::SessionId,
     project_css: String,
     routes: std::collections::HashMap<String, String>,
+    /// Phase P · post-P — resolved contract held alongside the cached
+    /// route docs so `handle_dev_connection` can re-render a single
+    /// route on demand. Without this, the cached `routes` snapshot is
+    /// the only doc shape the dev server ever serves; a broadcast
+    /// write in between renders never lands in the inline opcode
+    /// frame the next GET ships back. `Option<Arc<...>>` so the
+    /// in-process action dispatcher tests can build a state without
+    /// a full contract resolution.
+    contract: Option<Arc<ResolvedDevContract>>,
     render_ms: f64,
     total_ms: f64,
     last_error: Option<String>,
@@ -1054,7 +1063,7 @@ fn parse_serve_args(raw_args: &[String]) -> Result<ServeOptions, String> {
 }
 
 fn handle_static_connection(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
-    let (first_line, _headers) = read_http_request_head(&stream)?;
+    let (first_line, _headers, _body_prefetch) = read_http_request_head(&stream)?;
     if first_line.trim().is_empty() {
         return Ok(());
     }
@@ -1358,6 +1367,7 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         session_id,
         project_css,
         routes: initial.route_documents,
+        contract: Some(Arc::new(contract.clone())),
         render_ms: initial.render_ms,
         total_ms: initial.total_ms,
         last_error: None,
@@ -2006,7 +2016,7 @@ fn handle_dev_connection(
     hmr_enabled: bool,
 ) -> std::io::Result<()> {
     let socket_start = Instant::now();
-    let (first_line, request_headers) = read_http_request_head(&stream)?;
+    let (first_line, request_headers, body_prefetch) = read_http_request_head(&stream)?;
     let socket_wait_ms = socket_start.elapsed().as_secs_f64() * 1000.0;
     let request_start = Instant::now();
     let client = stream
@@ -2039,7 +2049,8 @@ fn handle_dev_connection(
         // The same `CompiledProject` that rendered the page handles
         // the dispatch, and writes hit the same `slot_store` so the
         // next render (HMR or otherwise) sees the updated value.
-        let body = read_http_request_body(&mut stream, &request_headers)?;
+        let body =
+            read_http_request_body(&mut stream, &request_headers, body_prefetch.as_slice())?;
         let (status, payload, content_type) =
             run_dev_action(body.as_slice(), &shared_state);
         let headers = [("x-albedo-transport", transport_header_value.clone())];
@@ -2103,6 +2114,15 @@ fn handle_dev_connection(
         )?;
         (200, 0.0, 0.0, false)
     } else if path == "/" || path == "/index.html" || is_route_like_path(path.as_str()) {
+        // Phase P · post-P — re-render this route on every GET. The
+        // dev server used to serve `state.routes` verbatim, but that
+        // cached snapshot was rendered once at startup; a
+        // `broadcast(topic, ...)` write between renders never landed
+        // in the inline opcode frame the next GET shipped back, so
+        // `/chat` always painted "null" no matter how many times the
+        // bump button had fired. Per-request render reads the topic
+        // store fresh, costs <1ms per route, and falls back to the
+        // cached doc when the on-demand render fails for any reason.
         let (doc, render_ms, total_ms, error) = {
             let state = shared_state.lock().expect("shared state lock poisoned");
             let lookup = if path == "/index.html" {
@@ -2110,12 +2130,14 @@ fn handle_dev_connection(
             } else {
                 path.clone()
             };
-            let doc = state
+            let fallback = state
                 .routes
                 .get(&lookup)
                 .or_else(|| state.routes.get("/"))
                 .cloned()
                 .unwrap_or_default();
+            let rendered = render_single_dev_route(&state, lookup.as_str()).ok();
+            let doc = rendered.map(|(html, _ms)| html).unwrap_or(fallback);
             (
                 doc,
                 state.render_ms,
@@ -2182,14 +2204,20 @@ fn handle_dev_connection(
 }
 
 /// Phase P · Stream D.3 — read the request body for a POST. The dev
-/// HTTP server reads the head line-by-line into `request_headers`;
-/// the body still sits in the TcpStream behind whatever buffering
-/// the OS did. We honour `content-length`, bail if it's missing or
-/// unparseable, and cap at 2 MiB (same ceiling
-/// `MAX_REQUEST_BODY_BYTES` enforces in the production action route).
+/// HTTP server reads the head via a `BufReader` whose internal buffer
+/// often slurps part (or all) of the body in the same syscall; that
+/// prefetch arrives here as `body_prefetch` and is consumed before we
+/// touch the raw socket. Without it `read_exact` blocks forever waiting
+/// for bytes the OS already delivered, and bakabox's POST /_albedo/action
+/// silently hangs — which is the user-visible "counter stuck at zero".
+///
+/// We honour `content-length`, bail if it's missing or unparseable, and
+/// cap at 2 MiB (same ceiling `MAX_REQUEST_BODY_BYTES` enforces in the
+/// production action route).
 fn read_http_request_body(
     stream: &mut TcpStream,
     request_headers: &HashMap<String, String>,
+    body_prefetch: &[u8],
 ) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     const MAX_BODY: usize = 2 * 1024 * 1024;
@@ -2206,8 +2234,18 @@ fn read_http_request_body(
             "content-length exceeds 2 MiB cap",
         ));
     }
-    let mut buf = vec![0u8; length];
-    stream.read_exact(&mut buf)?;
+    let mut buf = Vec::with_capacity(length);
+    // Drain whatever the head parser prefetched first. For tiny POSTs
+    // (bakabox envelopes are typically 7-32 bytes) this is the entire
+    // body; for larger requests the remainder lands via `read_exact`.
+    let take = body_prefetch.len().min(length);
+    buf.extend_from_slice(&body_prefetch[..take]);
+    if buf.len() < length {
+        let rest = length - buf.len();
+        let mut tail = vec![0u8; rest];
+        stream.read_exact(&mut tail)?;
+        buf.extend_from_slice(&tail);
+    }
     Ok(buf)
 }
 
@@ -2304,9 +2342,22 @@ fn write_sse_handshake(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.flush()
 }
 
+/// Reads the HTTP request line + headers from a stream.
+///
+/// Returns `(first_line, headers, pre_buffered_body)` where the third
+/// element is whatever bytes the underlying `BufReader` slurped past the
+/// final `\r\n` while parsing the head. POST handlers MUST prepend that
+/// slice to whatever they read off the socket — otherwise the body's
+/// first chunk goes to /dev/null and `read_exact(content_length)` blocks
+/// forever waiting for bytes the OS has already delivered.
+///
+/// Reusing the `BufReader` directly would be cleaner, but the caller
+/// continues to write directly into the `TcpStream` (response head),
+/// so we drain whatever the head reader prefetched and hand it back as
+/// a plain `Vec<u8>`. The `BufReader` is dropped here.
 fn read_http_request_head(
     stream: &TcpStream,
-) -> std::io::Result<(String, HashMap<String, String>)> {
+) -> std::io::Result<(String, HashMap<String, String>, Vec<u8>)> {
     let mut first_line = String::new();
     let mut headers = HashMap::new();
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -2329,7 +2380,12 @@ fn read_http_request_head(
         }
     }
 
-    Ok((first_line, headers))
+    // Capture bytes the BufReader prefetched past end-of-head so a
+    // following POST-body read doesn't deadlock on bytes that already
+    // arrived from the client. Most short envelopes (the bakabox action
+    // POST is ~7 bytes) fit entirely in this prefetch.
+    let leftover = reader.buffer().to_vec();
+    Ok((first_line, headers, leftover))
 }
 
 fn broadcast_sse_payload(clients: &Arc<Mutex<Vec<TcpStream>>>, payload: &str) {
@@ -2362,6 +2418,69 @@ fn broadcast_component_invalidation_event(
 ) {
     let payload = format!("data: invalidate:{revision}:{}\n\n", component_id.as_u64());
     broadcast_sse_payload(clients, payload.as_str());
+}
+
+/// Phase P · post-P — render one route on demand using the dev
+/// process's shared `CompiledProject`/`SlotStore`/`BroadcastRegistry`.
+/// Mirrors the inline `render_entry` closure in [`render_all_routes`]
+/// — same shell template, same `render_entry_with_broadcast` call,
+/// same `dev_bakabox_script_tags` injection — so a per-GET render
+/// produces bytes indistinguishable from the cached snapshot **except**
+/// that the inline opcode frame reflects the **current** broadcast
+/// topic value. Returns `Err` when the contract or matching route
+/// entry isn't known (caller falls back to the cached doc).
+fn render_single_dev_route(
+    state: &SharedDevState,
+    url_path: &str,
+) -> Result<(String, f64), String> {
+    use dom_render_compiler::runtime::{
+        render_entry_with_broadcast, RenderOptions, SessionSlotView,
+    };
+
+    let contract = state
+        .contract
+        .as_ref()
+        .ok_or_else(|| "dev contract not installed".to_string())?;
+
+    let entry = if url_path == "/" {
+        contract.entry.clone()
+    } else {
+        let trimmed = url_path.trim_start_matches('/');
+        contract
+            .routes
+            .iter()
+            .find(|(url, _)| url.trim_start_matches('/') == trimmed)
+            .map(|(_, entry)| entry.clone())
+            .ok_or_else(|| format!("no route entry for path '{url_path}'"))?
+    };
+
+    let render_start = Instant::now();
+    let props = serde_json::json!({});
+    let slots = SessionSlotView::new(state.session_id, state.slot_store.clone());
+    let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let opts = RenderOptions { hook_compile: true };
+    let output = render_entry_with_broadcast(
+        state.compiled.as_ref(),
+        entry.as_str(),
+        &props,
+        &slots,
+        state.broadcast.as_ref(),
+        tx,
+        &opts,
+    )
+    .map_err(|err| err.to_string())?;
+    let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+
+    let opcode_script = render_inline_opcode_script(&output.opcodes);
+    let base_css = dev_shell_base_css();
+    let project_css = state.project_css.as_str();
+    let document = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Dev</title>\n  <style>\n{base_css}\n{project_css}\n  </style>\n  {bakabox_scripts}\n</head>\n<body>\n{rendered_html}\n{opcode_script}\n</body>\n</html>\n",
+        rendered_html = output.html,
+        bakabox_scripts = dev_bakabox_script_tags(),
+    );
+    let html = inject_hmr_client_script(&document, contract.hmr.enabled);
+    Ok((html, render_ms))
 }
 
 fn render_all_routes(
@@ -2401,8 +2520,18 @@ fn render_all_routes(
         )
         .map_err(|err| err.to_string())?;
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase P · post-P wire-through — inline the Phase K opcode
+        // frame as a `<script type="application/x-albedo-frame">`
+        // so bakabox's bootstrap can apply BindEvent / SetTextRef /
+        // initial SlotSet instructions even without a WT patches
+        // lane (which dev mode doesn't have). Without this, clicks
+        // on `useState`-driven buttons silently no-op because no
+        // event listener gets attached.
+        let opcode_script = render_inline_opcode_script(&output.opcodes);
+
         let document = format!(
-            "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Dev</title>\n  <style>\n{base_css}\n{project_css}\n  </style>\n  {bakabox_scripts}\n</head>\n<body>\n{rendered_html}\n</body>\n</html>\n",
+            "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Dev</title>\n  <style>\n{base_css}\n{project_css}\n  </style>\n  {bakabox_scripts}\n</head>\n<body>\n{rendered_html}\n{opcode_script}\n</body>\n</html>\n",
             rendered_html = output.html,
             bakabox_scripts = dev_bakabox_script_tags(),
         );
@@ -2510,6 +2639,71 @@ body {
   color: var(--ink);
 }
 "#
+}
+
+/// Phase P · post-P wire-through — encode the Phase K opcode frame
+/// as a bootstrap `<script>` tag the bakabox runtime auto-applies.
+/// Empty string when the renderer emitted no opcodes (Tier-A-only
+/// route) so we don't ship a useless empty frame. Wraps the bincode
+/// bytes in a fresh `OpcodeFrame` envelope so the wire shape matches
+/// what bakabox's `applyFrameBytes` expects.
+fn render_inline_opcode_script(opcodes: &[dom_render_compiler::ir::opcode::Instruction]) -> String {
+    use dom_render_compiler::ir::opcode::OpcodeFrame;
+    use dom_render_compiler::ir::wire::encode_frame;
+    if opcodes.is_empty() {
+        return String::new();
+    }
+    let frame = OpcodeFrame {
+        frame_id: 0,
+        component_id: None,
+        instructions: opcodes.to_vec(),
+    };
+    let bytes = match encode_frame(&frame) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+    let b64 = base64_encode(&bytes);
+    format!(
+        "<script type=\"application/x-albedo-frame\" data-base64=\"{b64}\"></script>"
+    )
+}
+
+/// Phase P · post-P wire-through — tiny base64 encoder. Std lacks
+/// one and the dependency footprint isn't worth pulling in a crate
+/// for ~80 lines of cross-platform byte-shuffling. Standard alphabet
+/// + `=` padding per RFC 4648; no line wrapping (we embed in HTML
+/// attribute values).
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut chunks = input.chunks_exact(3);
+    for chunk in chunks.by_ref() {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = (rem[0] as u32) << 16;
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Phase P · Stream D.2 — bakabox client script tags injected into
@@ -4231,6 +4425,10 @@ mod tests {
             session_id: SessionId::random(),
             project_css: String::new(),
             routes: std::collections::HashMap::new(),
+            // Tests don't drive route re-rendering, so the contract
+            // is unset — the dispatch path under test only consults
+            // compiled/slot_store/broadcast/session_id.
+            contract: None,
             render_ms: 0.0,
             total_ms: 0.0,
             last_error: None,

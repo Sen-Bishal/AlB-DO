@@ -383,6 +383,23 @@ impl<'a> ManifestBuilder<'a> {
         let mut body_open = String::from("<body>");
         body_open.push_str(&wrapped);
 
+        // Phase P · post-P wire-through — inline every Tier-B node's
+        // pre-rendered opcode frame as a `<script type="application/x-albedo-frame">`
+        // so bakabox's bootstrap can apply BindEvent / SetTextRef /
+        // initial-SlotSet instructions on the first paint. Without
+        // this the production server only ships opcodes when the WT
+        // patches lane is active; static / HTTP-only deploys (and
+        // any pre-WT load) had no way to make clicks fire.
+        for node in tier_b {
+            if node.initial_opcode_frame.is_empty() {
+                continue;
+            }
+            body_open.push_str(&format!(
+                "<script type=\"application/x-albedo-frame\" data-base64=\"{}\"></script>",
+                base64_encode(&node.initial_opcode_frame)
+            ));
+        }
+
         HtmlShell {
             doctype_and_head,
             body_open,
@@ -1183,6 +1200,42 @@ fn next_order(counter: &mut u32) -> u32 {
     let current = *counter;
     *counter = counter.saturating_add(1);
     current
+}
+
+/// Phase P · post-P wire-through — tiny RFC 4648 base64 encoder.
+/// Mirrors `src/bin/albedo.rs::base64_encode` so the dev path and
+/// production manifest emit identical bootstrap script payloads.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut chunks = input.chunks_exact(3);
+    for chunk in chunks.by_ref() {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = (rem[0] as u32) << 16;
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
 }
 
 fn slugify(value: &str) -> String {

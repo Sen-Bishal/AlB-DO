@@ -242,6 +242,17 @@ export class Bakabox {
     this.slots = new Map();
     /** Map<SuspenseId, Element> — placeholder elements awaiting Patch (Phase D). */
     this.pending = new Map();
+    /**
+     * Map<SlotId, Uint8Array> — last `SlotSet.value` for slots that
+     * arrived BEFORE any `BindSlot` / `SetTextRef` / `SetAttrRef` for
+     * them. The renderer's `render_entry_with_broadcast` prepends
+     * auto-subscribe SlotSets so shared-slot state seeds first; bakabox
+     * sees that value before the binding instruction registers a target.
+     * We buffer the bytes here and replay them as soon as the binding
+     * lands so the initial broadcast paints without waiting for the WT
+     * patches lane (which dev mode doesn't have at all).
+     */
+    this.pendingSlotValues = new Map();
 
     /** UTF-8 decoder reused for every SetText/SetAttr payload. */
     this._textDecoder = new TextDecoder('utf-8');
@@ -434,6 +445,7 @@ export class Bakabox {
     // expressed by SetTextRef / SetAttrRef; this opcode is recorded only
     // so the server can audit that the client acknowledged the binding.
     this._ensureSlot(slotId).push({ kind: 'sentinel', stableId });
+    this._replayPendingSlotValue(slotId);
   }
 
   // ── Suspense handlers ──────────────────────────────────────────────
@@ -467,17 +479,26 @@ export class Bakabox {
   _opSetTextRef({ stableId, slotId }) {
     this._requireNode(stableId, 'SetTextRef');
     this._ensureSlot(slotId).push({ kind: 'text', stableId });
+    this._replayPendingSlotValue(slotId);
   }
 
   _opSetAttrRef({ stableId, attrId, slotId }) {
     this._requireNode(stableId, 'SetAttrRef');
     this._ensureSlot(slotId).push({ kind: 'attr', stableId, attrId });
+    this._replayPendingSlotValue(slotId);
   }
 
   _opSlotSet({ slotId, value }) {
     const sites = this.slots.get(slotId);
     if (!sites || sites.length === 0) {
-      return; // No bindings yet — server may emit SlotSet ahead of BindSlot during HMR.
+      // No bindings yet — common during initial paint where
+      // `render_entry_with_broadcast` prepends auto-subscribe SlotSets
+      // BEFORE the Phase K SetTextRef/SetAttrRef that target them.
+      // Cache the bytes so `_replayPendingSlotValue` can apply them as
+      // soon as the matching binding registers. Without this, the chat
+      // route's initial broadcast value never paints.
+      this.pendingSlotValues.set(slotId, value);
+      return;
     }
     const decoded = this._decodeBytes(value);
     for (const site of sites) {
@@ -523,6 +544,20 @@ export class Bakabox {
       this.slots.set(slotId, sites);
     }
     return sites;
+  }
+
+  /**
+   * If a SlotSet for this slot arrived before any binding was
+   * registered, replay it now via `_opSlotSet`. Called from
+   * `_opBindSlot` / `_opSetTextRef` / `_opSetAttrRef` so the cached
+   * value paints as soon as the binding target exists. No-op when
+   * nothing was buffered for the slot.
+   */
+  _replayPendingSlotValue(slotId) {
+    const pending = this.pendingSlotValues.get(slotId);
+    if (pending === undefined) return;
+    this.pendingSlotValues.delete(slotId);
+    this._opSlotSet({ slotId, value: pending });
   }
 
   _requireNode(stableId, opName) {
@@ -652,5 +687,84 @@ if (globalScope && globalScope.document) {
   bakabox.eventDispatcher = createActionDispatcher({ bakabox, endpoint });
 
   globalScope.__bakabox = bakabox;
+  // Phase P · post-P wire-through — publish `__ALBEDO_RUNTIME` as
+  // the public API surface that other client modules (Phase L's
+  // link-forms.js, future debug overlays, userland integrations)
+  // call into. The name + shape matches `Window.__ALBEDO_RUNTIME`
+  // declared in `scaffold/src/albedo-env.d.ts`. Without this,
+  // link-forms.js's submit interceptor silently skipped install and
+  // form submits fell through to native POST → 405.
+  globalScope.__ALBEDO_RUNTIME = {
+    applyFrameBytes: function applyFrameBytes(bytes) {
+      return bakabox.applyFrameBytes(bytes);
+    },
+    encodeActionEnvelope: function encodeActionEnvelopePublic(envelope) {
+      return encodeActionEnvelope(envelope);
+    },
+    hashActionName: function hashActionName(name) {
+      // FNV-1a-32, same family Phase L / Stream C use for action_id.
+      // Mirrors `dom_render_compiler::transforms::form::allocate_form_action_id`.
+      var hash = 0x811c9dc5 >>> 0;
+      for (var i = 0; i < name.length; i++) {
+        hash ^= name.charCodeAt(i) & 0xff;
+        hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+      }
+      return hash;
+    },
+    requestRouteRefresh: function requestRouteRefresh(path) {
+      // Fetch the route HTML + re-apply any inline opcode frame.
+      // Best-effort; the dev HMR client owns the in-place swap, this
+      // is the userland hook for after-action revalidation.
+      return fetch(path, { credentials: 'same-origin', cache: 'no-store' })
+        .then(function (response) { return response.text(); })
+        .then(function (html) {
+          var doc = new DOMParser().parseFromString(html, 'text/html');
+          if (doc && doc.body) {
+            globalScope.document.body.innerHTML = doc.body.innerHTML;
+            bakabox.seedNodesFromDocument();
+            applyInlineOpcodeFrames(globalScope.document, bakabox);
+          }
+        });
+    },
+    registerInstructionHandler: function registerInstructionHandler(name, fn) {
+      if (typeof name === 'string' && typeof fn === 'function') {
+        if (!bakabox._customHandlers) bakabox._customHandlers = {};
+        bakabox._customHandlers[name] = fn;
+      }
+    },
+  };
+
+  // Phase P · post-P wire-through — apply any inline opcode frames
+  // the renderer baked into the page. The dev `render_all_routes`
+  // and the production manifest builder emit
+  // `<script type="application/x-albedo-frame" data-base64="...">`
+  // tags carrying the bincode-encoded `OpcodeFrame` so BindEvent /
+  // SetTextRef bindings activate even without a WT patches lane
+  // (which dev mode doesn't have at all).
+  applyInlineOpcodeFrames(globalScope.document, bakabox);
+
   installLegacyHtmlInjector(globalScope, globalScope.document);
+}
+
+function applyInlineOpcodeFrames(document, bakabox) {
+  var scripts = document.querySelectorAll(
+    'script[type="application/x-albedo-frame"]',
+  );
+  for (var i = 0; i < scripts.length; i++) {
+    var script = scripts[i];
+    if (script.dataset && script.dataset.albedoApplied === '1') continue;
+    var b64 = script.getAttribute('data-base64');
+    if (!b64) continue;
+    try {
+      var binary = atob(b64);
+      var bytes = new Uint8Array(binary.length);
+      for (var j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
+      bakabox.applyFrameBytes(bytes);
+      if (script.dataset) script.dataset.albedoApplied = '1';
+    } catch (err) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('ALBEDO bootstrap: inline opcode frame decode failed', err);
+      }
+    }
+  }
 }
