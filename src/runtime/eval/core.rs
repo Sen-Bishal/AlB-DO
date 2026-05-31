@@ -1502,15 +1502,22 @@ impl ComponentProject {
             BinaryOp::Add => {
                 let left = self.eval_expr(module_spec, &bin.left, env)?;
                 let right = self.eval_expr(module_spec, &bin.right, env)?;
+                // JS `+` semantics: string concat when EITHER side is a
+                // string; numeric add (after `ToNumber` coercion)
+                // otherwise. The previous shape gated numeric add on
+                // BOTH sides being `Value::Number`, which made
+                // `null + 1` fall to string concat — silently breaking
+                // broadcast updaters like `(n) => n + 1` whose first
+                // call sees `n = null` and produces "1" instead of 1.
                 match (&left, &right) {
-                    (Value::Number(l), Value::Number(r)) => Ok(json_num(
-                        l.as_f64().unwrap_or(0.0) + r.as_f64().unwrap_or(0.0),
+                    (Value::String(_), _) | (_, Value::String(_)) => Ok(Value::String(
+                        format!(
+                            "{}{}",
+                            value_to_string(&left),
+                            value_to_string(&right)
+                        ),
                     )),
-                    _ => Ok(Value::String(format!(
-                        "{}{}",
-                        value_to_string(&left),
-                        value_to_string(&right)
-                    ))),
+                    _ => Ok(json_num(to_number(&left) + to_number(&right))),
                 }
             }
             BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Exp => {

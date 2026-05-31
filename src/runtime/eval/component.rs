@@ -297,6 +297,15 @@ pub fn to_number(value: &Value) -> f64 {
 }
 
 pub fn json_num(value: f64) -> Value {
+    // Prefer the integer form when the value is exactly representable
+    // as i64. `serde_json::Number::from_f64(1.0)` would encode as
+    // `"1.0"` over the wire — which lands on the client as the literal
+    // text "1.0" in a counter span, instead of the expected "1". This
+    // matches JS's `String(1)` → "1" semantics rather than the f64
+    // round-tripping a serde would otherwise impose.
+    if value.is_finite() && value == value.trunc() && value.abs() < 1e16 {
+        return Value::Number(serde_json::Number::from(value as i64));
+    }
     serde_json::Number::from_f64(value)
         .map(Value::Number)
         .unwrap_or(Value::Null)
