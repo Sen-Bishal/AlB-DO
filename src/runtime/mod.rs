@@ -1,4 +1,5 @@
 pub mod affinity;
+pub mod arena;
 pub mod broadcast;
 pub mod compiled;
 pub mod dirty_bitmap;
