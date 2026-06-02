@@ -191,6 +191,87 @@ async fn broadcast_updater_with_array_value_round_trips_structured_json() {
     );
 }
 
+// --- A1: block-bodied handlers + loud rejection of unsupported syntax ---
+
+#[tokio::test]
+async fn block_bodied_handler_executes_statement_side_effects() {
+    // Regression guard for the silent-drop bug: a block-bodied handler
+    // `() => { broadcast(...); }` reaches `eval_body_stmts` as a bare
+    // `Stmt::Expr`. Before A1 that hit the `_ => {}` catch-all and the
+    // broadcast was silently dropped — the handler ran but did nothing.
+    let project = compile();
+    let broadcast = Arc::new(BroadcastRegistry::new());
+    broadcast.topic("counter", serde_json::to_vec(&10).unwrap());
+
+    let (slots, _session, _store) = fresh_session();
+    let envelope = envelope_for("block_increment");
+    project
+        .invoke_action_with_broadcast(&envelope, &slots, broadcast.as_ref())
+        .expect("block-bodied handler dispatches");
+
+    let topic = broadcast.get("counter").expect("topic exists");
+    let value: serde_json::Value = serde_json::from_slice(&topic.current_value()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!(11),
+        "block-bodied `() => {{ broadcast(\"counter\", n => n + 1); }}` must \
+         actually fire its statement-position side effect"
+    );
+}
+
+#[tokio::test]
+async fn block_bodied_handler_evaluates_if_branch() {
+    // `if (true) { broadcast(..., 42) } else { ... }` — proves the guard is
+    // evaluated and the taken branch (a nested block) runs.
+    let project = compile();
+    let broadcast = Arc::new(BroadcastRegistry::new());
+    broadcast.topic("counter", serde_json::to_vec(&0).unwrap());
+
+    let (slots, _session, _store) = fresh_session();
+    let envelope = envelope_for("block_with_if");
+    project
+        .invoke_action_with_broadcast(&envelope, &slots, broadcast.as_ref())
+        .expect("if-bearing handler dispatches");
+
+    let topic = broadcast.get("counter").expect("topic exists");
+    let value: serde_json::Value = serde_json::from_slice(&topic.current_value()).unwrap();
+    // The broadcast-updater path encodes a bare numeric literal as f64
+    // (same as the sibling `set_counter_to_seven` → 7.0 test); what this
+    // test proves is that the `if (true)` guard ran and the taken branch
+    // fired at all.
+    assert_eq!(value, serde_json::json!(42.0));
+}
+
+#[tokio::test]
+async fn unsupported_loop_handler_errors_loudly() {
+    // Silent-wrong is the core enemy: a `for` loop is a Tier-B/C construct
+    // the pure-Rust evaluator does not model. Dispatching it must return a
+    // descriptive error instead of silently producing nothing.
+    let project = compile();
+    let broadcast = Arc::new(BroadcastRegistry::new());
+    broadcast.topic("counter", serde_json::to_vec(&0).unwrap());
+
+    let (slots, _session, _store) = fresh_session();
+    let envelope = envelope_for("unsupported_loop");
+    let result = project.invoke_action_with_broadcast(&envelope, &slots, broadcast.as_ref());
+
+    let err = result.expect_err("a `for` loop handler must error loudly, not no-op");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("unsupported statement") && message.contains("for"),
+        "error must name the unsupported construct, got: {message}"
+    );
+
+    // And it must not have partially mutated state before bailing.
+    let topic = broadcast.get("counter").expect("topic exists");
+    let value: serde_json::Value = serde_json::from_slice(&topic.current_value()).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!(0),
+        "the rejected handler must not leave a partial write behind"
+    );
+}
+
 #[tokio::test]
 async fn second_invoke_of_increment_continues_from_first_write() {
     let project = compile();

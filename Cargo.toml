@@ -101,6 +101,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile  = { version = "3" }
 regex     = { version = "1" }
 tower     = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["catch-panic"] }
 
 [workspace.lints.rust]
 unsafe_code      = "forbid"
