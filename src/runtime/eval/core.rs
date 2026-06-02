@@ -2237,7 +2237,65 @@ impl ComponentProject {
                 Stmt::Decl(Decl::Var(var)) => {
                     self.eval_var_decl_into_env(module_spec, var, env);
                 }
-                _ => {}
+                // A bare expression statement is evaluated for its side
+                // effects. This is the path block-bodied handlers take —
+                // `() => { setCount(count + 1); }` is an `ExprStmt` wrapping
+                // the setter call, and the slot write happens *inside*
+                // `eval_expr`. Before, this hit the catch-all and was silently
+                // dropped, so block-bodied handlers ran but did nothing. The
+                // return value is discarded (statement position).
+                Stmt::Expr(expr_stmt) => {
+                    let _ = self.eval_expr(module_spec, &expr_stmt.expr, env)?;
+                }
+                // `if (cond) { ... } else { ... }`: evaluate the guard, recurse
+                // into the taken branch with the same environment (function
+                // scope — handlers and Tier-A render bodies are small and don't
+                // rely on block-scoped shadowing). A `return` reached inside the
+                // branch surfaces as a non-empty string and short-circuits, the
+                // same convention the top-level loop uses.
+                Stmt::If(if_stmt) => {
+                    let test = self.eval_expr(module_spec, &if_stmt.test, env)?;
+                    if is_truthy(&test) {
+                        let returned = self.eval_body_stmts(
+                            module_spec,
+                            std::slice::from_ref(&if_stmt.cons),
+                            env,
+                        )?;
+                        if !returned.is_empty() {
+                            return Ok(returned);
+                        }
+                    } else if let Some(alt) = &if_stmt.alt {
+                        let returned =
+                            self.eval_body_stmts(module_spec, std::slice::from_ref(alt), env)?;
+                        if !returned.is_empty() {
+                            return Ok(returned);
+                        }
+                    }
+                }
+                // A nested block (`{ ... }`) is evaluated inline.
+                Stmt::Block(block) => {
+                    let returned = self.eval_body_stmts(module_spec, &block.stmts, env)?;
+                    if !returned.is_empty() {
+                        return Ok(returned);
+                    }
+                }
+                // An empty statement (`;`) is a no-op, not unsupported.
+                Stmt::Empty(_) => {}
+                // Everything else (`for` / `while` / `do` / `for-in` / `for-of`
+                // / `try` / `switch` / `throw` / labelled / `break` / `continue`
+                // / function & class declarations / async constructs) is *not*
+                // something this pure-Rust evaluator models. Silent-wrong is the
+                // core enemy: rather than drop it and emit partial output, fail
+                // loudly so the caller surfaces it. Components that need these
+                // constructs are Tier-B/C and belong on the QuickJS engine.
+                other => {
+                    return Err(anyhow!(
+                        "unsupported statement `{}` in pure-Rust evaluator for module '{}'; \
+                         this construct must run on the QuickJS engine (Tier B/C)",
+                        statement_kind(other),
+                        module_spec
+                    ));
+                }
             }
         }
         Ok(String::new())
@@ -2808,6 +2866,32 @@ impl ComponentProject {
             }
         }
         None
+    }
+}
+
+/// Human-readable label for a statement the pure-Rust evaluator does not model,
+/// used in the loud-error message so the dev knows exactly which construct hit
+/// the Tier-B/C boundary.
+fn statement_kind(stmt: &swc_ecma_ast::Stmt) -> &'static str {
+    use swc_ecma_ast::{Decl, Stmt};
+    match stmt {
+        Stmt::For(_) => "for",
+        Stmt::ForIn(_) => "for-in",
+        Stmt::ForOf(_) => "for-of",
+        Stmt::While(_) => "while",
+        Stmt::DoWhile(_) => "do-while",
+        Stmt::Try(_) => "try/catch",
+        Stmt::Switch(_) => "switch",
+        Stmt::Throw(_) => "throw",
+        Stmt::Break(_) => "break",
+        Stmt::Continue(_) => "continue",
+        Stmt::Labeled(_) => "labelled statement",
+        Stmt::With(_) => "with",
+        Stmt::Decl(Decl::Fn(_)) => "function declaration",
+        Stmt::Decl(Decl::Class(_)) => "class declaration",
+        Stmt::Decl(_) => "declaration",
+        Stmt::Debugger(_) => "debugger",
+        _ => "statement",
     }
 }
 

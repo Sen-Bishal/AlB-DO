@@ -990,11 +990,9 @@ fn run_files_command(raw_args: &[String]) -> Result<(), String> {
             Ok(stream) => {
                 let root = root.clone();
                 std::thread::spawn(move || {
-                    if let Err(err) = handle_static_connection(stream, root.as_path()) {
-                        if !is_benign_network_error(&err) {
-                            eprintln!("  {} request failed: {err}", style("✗", "1;31"));
-                        }
-                    }
+                    serve_connection_guarded(stream, |stream| {
+                        handle_static_connection(stream, root.as_path())
+                    });
                 });
             }
             Err(err) => {
@@ -1467,13 +1465,9 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
                 let inspector = Arc::clone(&inspector_state);
                 let hmr_enabled = contract.hmr.enabled;
                 std::thread::spawn(move || {
-                    if let Err(err) =
+                    serve_connection_guarded(stream, move |stream| {
                         handle_dev_connection(stream, state, clients, inspector, hmr_enabled)
-                    {
-                        if !is_benign_network_error(&err) {
-                            eprintln!("  {} request failed: {err}", style("✗", "1;31"));
-                        }
-                    }
+                    });
                 });
             }
             Err(err) => {
@@ -2910,6 +2904,55 @@ fn try_open_browser(url: &str) -> Result<(), String> {
 
     #[allow(unreachable_code)]
     Err("automatic browser open is not supported on this platform".to_string())
+}
+
+/// Run a connection handler with both I/O errors and panics turned into graceful
+/// outcomes. A panic mid-request becomes a `500` written back on the socket instead
+/// of a silently dropped connection and a dead worker thread. The stream is cloned
+/// up front so the fallback response can still be written after the handler (which
+/// owns the original) has unwound.
+fn serve_connection_guarded<F>(stream: TcpStream, handler: F)
+where
+    F: FnOnce(TcpStream) -> std::io::Result<()>,
+{
+    let fallback = stream.try_clone().ok();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || handler(stream)));
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            if !is_benign_network_error(&err) {
+                eprintln!("  {} request failed: {err}", style("✗", "1;31"));
+            }
+        }
+        Err(panic) => {
+            eprintln!(
+                "  {} request panicked: {}",
+                style("✗", "1;31"),
+                panic_detail(panic.as_ref())
+            );
+            if let Some(mut socket) = fallback {
+                let _ = write_http_response(
+                    &mut socket,
+                    500,
+                    "Internal Server Error",
+                    "application/json",
+                    br#"{"error":"internal server error"}"#,
+                    &[],
+                );
+            }
+        }
+    }
+}
+
+/// Best-effort human-readable message from a caught panic payload.
+fn panic_detail(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 fn write_http_response(
