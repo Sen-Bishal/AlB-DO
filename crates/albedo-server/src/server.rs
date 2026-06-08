@@ -58,6 +58,14 @@ struct CompiledProjectActionAdapter {
     project: Arc<dom_render_compiler::runtime::CompiledProject>,
     action_id: u32,
     broadcast: Arc<BroadcastRegistry>,
+    /// A1 · *scaffolding* — when `Some`, `handle()` routes the action through
+    /// the QuickJS executor (`invoke_action_quickjs_with_broadcast`) on a pooled
+    /// engine instead of the pure-Rust `invoke_action_with_broadcast`. Currently
+    /// wired but left `None` by `register_compiled_project` so the default path
+    /// is unchanged; flipping it on is remaining slice #1 of the A1 bridge (see
+    /// `engine_pool` module docs + `project_a1_bridge`). The QuickJS path unlocks
+    /// loops/`try`/array methods in action bodies that the pure-Rust path rejects.
+    engine_pool: Option<Arc<crate::engine_pool::QuickJsEnginePool>>,
 }
 
 #[async_trait::async_trait]
@@ -77,6 +85,40 @@ impl ActionHandler for CompiledProjectActionAdapter {
             slots.session_id(),
             slots.store().clone(),
         );
+
+        // A1 · QuickJS path (scaffolding, opt-in). When a pool is wired, ship
+        // the action to a pooled engine on its dedicated thread: the closure
+        // gets `&mut QuickJsEngine`, runs the same broadcast-aware executor, and
+        // its `Vec<Instruction>` result is returned across the thread boundary.
+        // Everything captured is `Send` (Arc clones + an owned envelope clone).
+        if let Some(pool) = &self.engine_pool {
+            let project = self.project.clone();
+            let broadcast = self.broadcast.clone();
+            let envelope = envelope.clone();
+            let action_id = self.action_id;
+            return pool
+                .with_engine(move |engine| {
+                    project
+                        .invoke_action_quickjs_with_broadcast(
+                            engine,
+                            &envelope,
+                            &view,
+                            broadcast.as_ref(),
+                        )
+                        .map_err(|err| {
+                            RuntimeError::RequestHandling(format!(
+                                "compiled action handler {action_id} (quickjs) failed: {err:#}"
+                            ))
+                        })
+                })
+                .await
+                .map_err(|err| {
+                    RuntimeError::RequestHandling(format!(
+                        "engine pool checkout for action {action_id} failed: {err}"
+                    ))
+                })?;
+        }
+
         // Phase P · C.2 — `invoke_action_with_broadcast` installs the
         // broadcast registry on the per-thread Phase K stack for the
         // duration of `eval_handler_body`, so a TS action body's
@@ -195,6 +237,14 @@ pub struct AlbedoServerBuilder {
     /// so action handlers, the WT runtime, and any userland write all
     /// resolve topics against one registry.
     broadcast: Arc<BroadcastRegistry>,
+    /// A1 · optional pool of warmed QuickJS engines. When set (via
+    /// [`Self::with_quickjs_action_engine_pool`]), every adapter built by a
+    /// *subsequent* [`Self::register_compiled_project`] runs its action bodies
+    /// through the QuickJS executor instead of the pure-Rust interpreter,
+    /// unlocking loops/`try`/array methods in handler bodies. `None` keeps the
+    /// pure-Rust path. Order matters: enable the pool before registering the
+    /// project, since the adapter captures the pool handle at registration.
+    action_engine_pool: Option<Arc<crate::engine_pool::QuickJsEnginePool>>,
 }
 
 impl AlbedoServerBuilder {
@@ -220,7 +270,29 @@ impl AlbedoServerBuilder {
             // runtime state will hold. Idle cost is one empty
             // DashMap; non-broadcast workloads don't pay anything.
             broadcast: Arc::new(BroadcastRegistry::new()),
+            // A1 · off by default — opt in via `with_quickjs_action_engine_pool`.
+            action_engine_pool: None,
         }
+    }
+
+    /// A1 · route compiled action bodies through a pool of warmed QuickJS
+    /// engines instead of the pure-Rust interpreter. Spawns `size` engine
+    /// threads (each warmed before this returns), so call it once, at boot.
+    ///
+    /// **Order matters:** enable the pool *before*
+    /// [`Self::register_compiled_project`] — the adapter captures the pool
+    /// handle at registration time, so projects registered earlier keep the
+    /// pure-Rust path. A `size` of 0 is treated as 1.
+    ///
+    /// The QuickJS path runs the same broadcast-aware executor and ships the
+    /// identical `SlotSet` wire shape as the pure-Rust path (proven at parity in
+    /// `compiled_project_dispatch.rs`), but additionally tolerates JS the
+    /// pure-Rust evaluator rejects (loops, `try`/`catch`, array methods).
+    #[must_use]
+    pub fn with_quickjs_action_engine_pool(mut self, size: usize) -> Self {
+        self.action_engine_pool =
+            Some(Arc::new(crate::engine_pool::QuickJsEnginePool::with_size(size)));
+        self
     }
 
     /// Phase P · C.2 — access the broadcast registry this builder
@@ -339,6 +411,10 @@ impl AlbedoServerBuilder {
                 // `broadcast(topic, updater)` calls through the same
                 // registry the WT runtime + route handlers see.
                 broadcast: self.broadcast.clone(),
+                // A1 · when a pool was enabled (before this call), route action
+                // bodies through QuickJS; otherwise the pure-Rust path. Cloning
+                // an `Arc` — every adapter for this project shares one pool.
+                engine_pool: self.action_engine_pool.clone(),
             };
             self.action_handlers.insert(proxy_id, Arc::new(adapter));
         }

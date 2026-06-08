@@ -200,6 +200,20 @@ impl BroadcastRegistry {
         self.topics.get(topic).map(|entry| entry.clone())
     }
 
+    /// Snapshot of every registered topic's current value, as
+    /// `(topic, value_bytes)`. Used by the QuickJS action path to seed an
+    /// updater-form `broadcast(topic, fn)` evaluator with the pre-write state so
+    /// the updater's first read matches what the pure-Rust path reads via
+    /// `current_value()`. A topic absent from the snapshot is treated as `null`
+    /// by the caller (first-call default), matching pure-Rust semantics for an
+    /// as-yet-unregistered topic.
+    pub fn snapshot_values(&self) -> Vec<(String, Vec<u8>)> {
+        self.topics
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().current_value()))
+            .collect()
+    }
+
     /// Subscribe `session` to `topic` with a sink (typically the
     /// session's WT patches-lane sender). Returns the topic's
     /// current value so the caller can ship an initial SlotSet to

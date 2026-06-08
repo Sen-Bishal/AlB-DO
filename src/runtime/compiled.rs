@@ -12,7 +12,10 @@
 
 use crate::ir::action::ActionEnvelope;
 use crate::ir::opcode::{Instruction, SlotId};
+use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
+use crate::runtime::broadcast::BroadcastRegistry;
 use crate::runtime::eval::component::fnv1a_32;
+use crate::runtime::quickjs_engine::QuickJsEngine;
 use crate::runtime::eval::{ComponentFunction, ParamBinding};
 use crate::runtime::eval::{ComponentProject, PatchReport};
 use crate::runtime::slot_store::SessionSlotView;
@@ -33,7 +36,9 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use swc_ecma_ast::Stmt;
+use swc_common::{sync::Lrc, SourceMap, DUMMY_SP};
+use swc_ecma_ast::{Expr, ExprStmt, Module, ModuleItem, Stmt};
+use swc_ecma_codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
 
 /// Per-render knobs the corpus and demo use to opt in to hook
 /// compilation. Phase K Stage 1 ships with `hook_compile: false` as
@@ -614,6 +619,269 @@ impl CompiledProject {
         let _broadcast_guard =
             crate::runtime::eval::core::install_phase_k_broadcast(broadcast);
         self.invoke_action(envelope, slots)
+    }
+
+    /// A1 · host-object bridge — dispatch an action by running its handler
+    /// body under **QuickJS** instead of the pure-Rust interpreter.
+    ///
+    /// Same lookup + slot contract as [`Self::invoke_action`], but the body
+    /// runs in a full JS engine: loops, `try`/`catch`, array methods, and
+    /// anything else the Phase-J interpreter rejects now execute. The
+    /// component's `useState` values and captured props seed the JS scope (read
+    /// from the slot store, falling back to each hook's codegen'd initial
+    /// expression when a slot has not been written yet); `setX` setters and
+    /// `broadcast` are installed as host bindings. The body's effects come back
+    /// in source order, each lowered to the same `Instruction::SlotSet` the
+    /// wire already carries. State writes are persisted to the slot store so the
+    /// next render sees them, leaving the dirty set clean (the returned vector
+    /// already carries every `SlotSet`, so a follow-up drain is a no-op).
+    ///
+    /// `engine` is borrowed mutably for the dispatch; the caller owns the
+    /// engine's lifecycle (per-worker pooling is the server-side concern).
+    ///
+    /// Module-level constants are seeded into the handler scope (source order,
+    /// before state/prop bindings, shadowed names skipped, failing inits → null)
+    /// for parity with the pure-Rust path's `seed_env_with_module_constants`.
+    pub fn invoke_action_quickjs(
+        &self,
+        engine: &mut QuickJsEngine,
+        envelope: &ActionEnvelope,
+        slots: &SessionSlotView,
+    ) -> Result<Vec<Instruction>> {
+        self.invoke_action_quickjs_inner(engine, envelope, slots, None)
+    }
+
+    /// [`Self::invoke_action_quickjs`] with a [`BroadcastRegistry`] so a
+    /// handler's `broadcast(topic, value)` call fans the value out to every
+    /// other subscribed session (the current session's own view is the local
+    /// `SlotSet` in the returned vector). Mirrors the relationship between
+    /// [`Self::invoke_action`] and [`Self::invoke_action_with_broadcast`].
+    pub fn invoke_action_quickjs_with_broadcast(
+        &self,
+        engine: &mut QuickJsEngine,
+        envelope: &ActionEnvelope,
+        slots: &SessionSlotView,
+        broadcast: &BroadcastRegistry,
+    ) -> Result<Vec<Instruction>> {
+        self.invoke_action_quickjs_inner(engine, envelope, slots, Some(broadcast))
+    }
+
+    fn invoke_action_quickjs_inner(
+        &self,
+        engine: &mut QuickJsEngine,
+        envelope: &ActionEnvelope,
+        slots: &SessionSlotView,
+        broadcast: Option<&BroadcastRegistry>,
+    ) -> Result<Vec<Instruction>> {
+        let handler = self
+            .handler(envelope.action_id)
+            .ok_or_else(|| anyhow!("no handler registered for action_id {}", envelope.action_id))?;
+        let component = self
+            .component_meta(&handler.module_spec, &handler.function_name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "handler {} references unknown component {}::{}",
+                    envelope.action_id,
+                    handler.module_spec,
+                    handler.function_name,
+                )
+            })?;
+
+        let (body_src, is_block) = handler_body_to_js(&handler.body)?;
+
+        // Seed the JS scope. State values and captured props that exist in the
+        // store come in as JSON; an unwritten useState value falls back to its
+        // initial expression, codegen'd to JS and seeded as engine-trusted
+        // source (so `count` resolves on the very first interaction).
+        let mut env = serde_json::Map::new();
+        let mut raw_bindings: Vec<(String, String)> = Vec::new();
+
+        // Seed module-level constants so a handler referencing one resolves
+        // instead of throwing a QuickJS `ReferenceError`. Parity with the
+        // pure-Rust `seed_env_with_module_constants`:
+        //   * seeded BEFORE state/prop bindings so a `useState(CONST)` initial
+        //     and a later const referencing an earlier one both resolve (source
+        //     order preserved);
+        //   * a const whose name is shadowed by a component-owned binding
+        //     (state value / captured prop / setter) is skipped — the pure-Rust
+        //     map would overwrite it, and here two `let`s of one name would be a
+        //     JS `SyntaxError`, so the component-owned `let` must be the sole one;
+        //   * each init is wrapped so a const that fails to evaluate (e.g. it
+        //     references an import the handler scope doesn't expose) degrades to
+        //     `null` instead of throwing — matching pure-Rust's `unwrap_or(Null)`,
+        //     so a failing const never breaks a handler that doesn't use it.
+        if let Some(module) = self.project.modules().get(&handler.module_spec) {
+            if !module.module_constants.is_empty() {
+                let owned: HashSet<&str> = component
+                    .value_slots
+                    .keys()
+                    .chain(component.capture_slots.keys())
+                    .chain(component.setter_slots.keys())
+                    .map(String::as_str)
+                    .collect();
+                for (name, expr) in &module.module_constants {
+                    if owned.contains(name.as_str()) {
+                        continue;
+                    }
+                    let init = expr_to_js(expr)?;
+                    raw_bindings.push((
+                        name.clone(),
+                        format!("(function(){{try{{return ({init});}}catch(__e){{return null;}}}})()"),
+                    ));
+                }
+            }
+        }
+
+        for (name, slot_id) in &component.value_slots {
+            if let Some(value) = slots
+                .read(*slot_id)
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            {
+                env.insert(name.clone(), value);
+            } else if let Some(hook) =
+                component.hooks.iter().find(|h| &h.value_name == name)
+            {
+                raw_bindings.push((name.clone(), expr_to_js(&hook.initial)?));
+            }
+        }
+        for (name, slot_id) in &component.capture_slots {
+            if let Some(value) = slots
+                .read(*slot_id)
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            {
+                env.insert(name.clone(), value);
+            }
+        }
+
+        let setters: Vec<(String, SlotId)> = component
+            .setter_slots
+            .iter()
+            .map(|(name, slot_id)| (name.clone(), *slot_id))
+            .collect();
+
+        // The action payload is exposed to the body as `event` when it is valid
+        // JSON (form submits, typed-input events); opaque bincode payloads and
+        // empty click envelopes pass `None` → the body sees `event === null`.
+        let event_string = String::from_utf8(envelope.payload.clone())
+            .ok()
+            .filter(|s| serde_json::from_str::<Value>(s).is_ok());
+
+        // Seed the pre-write broadcast snapshot so an updater-form
+        // `broadcast(topic, fn)` reads the current topic value (parity with the
+        // pure-Rust `eval_broadcast_call`, which reads `current_value()` before
+        // applying the updater). Only built when broadcast is wired AND the body
+        // references `broadcast` — non-broadcasting handlers pay nothing.
+        let mut broadcast_current = serde_json::Map::new();
+        if let Some(registry) = broadcast {
+            if body_src.contains("broadcast") {
+                for (topic, bytes) in registry.snapshot_values() {
+                    let value = if bytes.is_empty() {
+                        Value::Null
+                    } else {
+                        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+                    };
+                    broadcast_current.insert(topic, value);
+                }
+            }
+        }
+
+        let entry = format!("{}::{}", handler.module_spec, handler.function_name);
+        let invocation = HandlerInvocation {
+            body: &body_src,
+            is_block,
+            env: &env,
+            raw_bindings: &raw_bindings,
+            setters: &setters,
+            event_json: event_string.as_deref(),
+            broadcast_current: &broadcast_current,
+        };
+
+        let effects = engine.eval_handler(&entry, &invocation)?;
+
+        let mut instructions = Vec::with_capacity(effects.len());
+        for effect in effects {
+            match &effect {
+                HandlerEffect::SlotSet { slot_id, value } => {
+                    slots.write(*slot_id, value.clone());
+                }
+                HandlerEffect::Broadcast { topic, value, .. } => {
+                    if let Some(registry) = broadcast {
+                        // Register the topic if it's ad-hoc (idempotent — an
+                        // existing topic keeps its value), so `write_topic`
+                        // doesn't fail with `UnknownTopic`. Matches the pure-Rust
+                        // path, which `topic()`-seeds before writing.
+                        let _ = registry.topic(topic.clone(), b"null".to_vec());
+                        // Fan-out to other subscribers; delivery failures
+                        // (full/closed session channels) are surfaced by the
+                        // registry and are not this handler's concern.
+                        let _ = registry.write_topic(topic, value.clone());
+                    }
+                }
+            }
+            instructions.push(effect.into_instruction());
+        }
+
+        // State writes above marked the slot dirty; the returned vector already
+        // carries those SlotSets, so consume and discard the dirty set to keep
+        // the post-dispatch invariant (a follow-up drain is a no-op) identical
+        // to the pure-Rust `invoke_action` path.
+        let _ = slots.drain_pending();
+
+        Ok(instructions)
+    }
+}
+
+// ── A1 · host-object bridge — handler AST → JS source ─────────────────────
+//
+// The compiled representation keeps a handler body as swc AST
+// (`HandlerBody::Expr` / `Block`). Running it under QuickJS needs source text,
+// so these helpers codegen the AST back to JS via the same swc emitter the
+// engine uses for modules. The AST is the compiler's own (already TS/JSX
+// stripped at parse time for handler bodies), so the emitted source is trusted.
+
+/// Emit a sequence of module items as JS source.
+fn emit_module_js(items: Vec<ModuleItem>) -> Result<String> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let module = Module {
+        span: DUMMY_SP,
+        body: items,
+        shebang: None,
+    };
+    let mut buf = Vec::new();
+    {
+        let mut emitter = Emitter {
+            cfg: CodegenConfig::default(),
+            comments: None,
+            cm: cm.clone(),
+            wr: JsWriter::new(cm, "\n", &mut buf, None),
+        };
+        emitter
+            .emit_module(&module)
+            .map_err(|err| anyhow!("failed to codegen handler body: {err}"))?;
+    }
+    String::from_utf8(buf).map_err(|err| anyhow!("handler codegen produced invalid UTF-8: {err}"))
+}
+
+/// Codegen a single expression to JS source with no trailing terminator, so it
+/// can be spliced as a sub-expression (`(<expr>)`).
+fn expr_to_js(expr: &Expr) -> Result<String> {
+    let stmt = Stmt::Expr(ExprStmt {
+        span: DUMMY_SP,
+        expr: Box::new(expr.clone()),
+    });
+    let src = emit_module_js(vec![ModuleItem::Stmt(stmt)])?;
+    Ok(src.trim().trim_end_matches(';').trim().to_string())
+}
+
+/// Codegen a handler body to `(source, is_block)`. An expression body yields a
+/// bare expression; a block body yields its statements verbatim.
+fn handler_body_to_js(body: &HandlerBody) -> Result<(String, bool)> {
+    match body {
+        HandlerBody::Expr(expr) => Ok((expr_to_js(expr)?, false)),
+        HandlerBody::Block(stmts) => {
+            let items = stmts.iter().cloned().map(ModuleItem::Stmt).collect();
+            Ok((emit_module_js(items)?, true))
+        }
     }
 }
 

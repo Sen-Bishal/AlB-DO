@@ -294,3 +294,36 @@ async fn second_invoke_of_increment_continues_from_first_write() {
         );
     }
 }
+
+// ── A1 · updater-form broadcast through the QuickJS action path ───────────────
+//
+// Parity with `broadcast_updater_receives_current_value_for_read_modify_write`
+// above, but via `invoke_action_quickjs_with_broadcast`: the QuickJS path seeds
+// a pre-write snapshot of the topic value so `broadcast("counter", n => n + 1)`
+// reads 41 and writes 42, identical to the pure-Rust read-modify-write.
+#[tokio::test]
+async fn quickjs_broadcast_updater_reads_current_value() {
+    use dom_render_compiler::runtime::engine::{BootstrapPayload, RuntimeEngine};
+    use dom_render_compiler::runtime::quickjs_engine::QuickJsEngine;
+
+    let project = compile();
+    let broadcast = Arc::new(BroadcastRegistry::new());
+    broadcast.topic("counter", serde_json::to_vec(&41).unwrap());
+
+    let mut engine = QuickJsEngine::new();
+    engine.init(&BootstrapPayload::default()).expect("engine init");
+
+    let (slots, _session, _store) = fresh_session();
+    let envelope = envelope_for("increment_counter");
+    project
+        .invoke_action_quickjs_with_broadcast(&mut engine, &envelope, &slots, broadcast.as_ref())
+        .expect("quickjs updater-form broadcast dispatches");
+
+    let topic = broadcast.get("counter").expect("topic exists");
+    let value: serde_json::Value = serde_json::from_slice(&topic.current_value()).unwrap();
+    assert_eq!(
+        value.as_f64(),
+        Some(42.0),
+        "QuickJS updater n => n + 1 must read seeded current value 41 and write 42"
+    );
+}
