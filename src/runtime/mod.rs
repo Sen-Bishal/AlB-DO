@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod arena;
+pub mod bridge;
 pub mod broadcast;
 pub mod compiled;
 pub mod dirty_bitmap;
@@ -20,6 +21,7 @@ pub mod slot_store;
 pub mod static_slice;
 pub mod webtransport;
 
+pub use bridge::{HandlerEffect, HandlerInvocation};
 pub use broadcast::{
     broadcast_slot_id, BroadcastDelivery, BroadcastError, BroadcastRegistry, BroadcastSender,
     BroadcastTopic,

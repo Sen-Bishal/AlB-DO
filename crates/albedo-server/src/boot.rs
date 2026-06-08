@@ -144,12 +144,24 @@ pub fn boot_production_server(
         routes,
     };
 
+    // A1 · run compiled action bodies through the QuickJS executor in
+    // production. Sized to the host's parallelism so per-worker checkouts rarely
+    // queue; each engine is warmed at construction (see `engine_pool`). Must be
+    // enabled BEFORE `register_compiled_project`, which captures the pool into
+    // every action adapter. The QuickJS path is at full correctness parity with
+    // the pure-Rust interpreter (counter + broadcast tests) and additionally
+    // runs loops/`try`/array methods that the pure-Rust path rejects.
+    let action_engine_pool_size = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
     // Force dev mode off so a release `albedo serve` never leaks the
     // overlay/HMR endpoints. The inspector follows the same default
     // policy; tests can flip it back on via the builder.
     let mut builder = AlbedoServerBuilder::new(app_config)
         .with_renderer_runtime(renderer)
         .with_dev_mode(false)
+        .with_quickjs_action_engine_pool(action_engine_pool_size)
         .register_compiled_project(Arc::new(compiled));
 
     let user_public = opts.project_dir.join("public");

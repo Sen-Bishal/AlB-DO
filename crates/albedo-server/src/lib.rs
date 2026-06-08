@@ -49,6 +49,7 @@ pub mod boot;
 pub mod config;
 pub mod contract;
 pub mod dev;
+pub mod engine_pool;
 pub mod error;
 pub mod handlers;
 pub mod inspector;
@@ -67,6 +68,7 @@ pub use contract::{
     AllowAllAuthProvider, AuthDecision, AuthProvider, LayoutHandler, PropsLoader, RouteHandler,
     RuntimeMiddleware,
 };
+pub use engine_pool::{EnginePoolError, QuickJsEnginePool};
 pub use error::RuntimeError;
 pub use handlers::{
     public_assets::PublicAssets, streaming_handler, StreamingAppState, StreamingTransportConfig,

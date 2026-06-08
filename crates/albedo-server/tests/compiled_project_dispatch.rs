@@ -275,3 +275,113 @@ async fn compiled_counter_persists_across_two_action_invocations() {
         );
     }
 }
+
+/// A1 · the QuickJS action path, end-to-end through the HTTP route.
+///
+/// Same fixture, same POST, same wire assertions as
+/// `compiled_counter_dispatch_increments_slot_through_http_action_route` — but
+/// the server is built with `.with_quickjs_action_engine_pool(..)`, so the
+/// adapter runs the handler body on a pooled QuickJS engine instead of the
+/// pure-Rust interpreter. Identical `SlotSet` output proves parity on the wire;
+/// the only difference is the executor underneath. This is the proof gate for
+/// flipping the server adapter onto QuickJS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compiled_counter_dispatch_via_quickjs_pool_matches_pure_rust_wire() {
+    let project = Arc::new(
+        CompiledProject::load_from_dir(counter_fixture()).expect("counter fixture compiles"),
+    );
+
+    // Discover proxy_id + slot_id from a throwaway render (as bakabox would).
+    let render_view = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
+    let render = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &Value::Object(Default::default()),
+        &render_view,
+        &RenderOptions { hook_compile: true },
+    )
+    .expect("counter renders");
+    let proxy_id = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
+            _ => None,
+        })
+        .expect("BindEvent proxy_id");
+    let slot_id: SlotId = render
+        .opcodes
+        .iter()
+        .find_map(|op| match op {
+            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        })
+        .expect("SetTextRef slot_id");
+
+    let config = AppConfig {
+        server: Default::default(),
+        renderer: None,
+        layouts: Vec::new(),
+        routes: Vec::new(),
+    };
+    // The one line under test: enable the pool BEFORE registering the project
+    // so the adapter captures the pool and routes through QuickJS.
+    let server = AlbedoServerBuilder::new(config)
+        .with_quickjs_action_engine_pool(2)
+        .register_compiled_project(project.clone())
+        .build()
+        .expect("server builds with QuickJS action engine pool");
+
+    // Two increments over a pinned session: 0→1→2, reading persisted state —
+    // the same persistence guarantee the pure-Rust path gives.
+    let session_uuid = uuid::Uuid::new_v4().to_string();
+    let router = server.router();
+    for expected in [1, 2] {
+        let body = encode_action_envelope(&ActionEnvelope {
+            action_id: proxy_id,
+            event_kind: 0,
+            payload: Vec::new(),
+        })
+        .unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_albedo/action")
+                    .header("x-albedo-session", session_uuid.as_str())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("router handles the POST via the QuickJS pool");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "QuickJS-backed increment #{expected} must return 200"
+        );
+        let bytes = to_bytes(response.into_body(), MAX_BODY).await.unwrap();
+        let (frame, _) = decode_frame(&bytes).expect("decode frame");
+
+        let slot_sets: Vec<_> = frame
+            .instructions
+            .iter()
+            .filter_map(|op| match op {
+                Instruction::SlotSet { slot_id: s, value } if *s == slot_id => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            slot_sets.len(),
+            1,
+            "QuickJS dispatch must ship exactly one SlotSet, identical to pure-Rust; got: {:?}",
+            frame.instructions,
+        );
+        let n: Value = serde_json::from_slice(slot_sets[0]).expect("slot value decodes");
+        assert_eq!(
+            n.as_f64().expect("numeric") as i64,
+            expected,
+            "QuickJS increment #{expected} should yield n = {expected}, matching pure-Rust"
+        );
+    }
+}

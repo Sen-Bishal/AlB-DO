@@ -1,4 +1,7 @@
 use super::arena::{ArenaAllocator, ArenaControl, ArenaStats};
+use super::bridge::{
+    build_handler_script, decode_handler_envelope, HandlerEffect, HandlerInvocation,
+};
 use super::engine::{
     stable_source_hash, BootstrapPayload, LoadErrorKind, RenderOutput, RuntimeEngine, RuntimeError,
     RuntimeResult,
@@ -79,6 +82,56 @@ impl QuickJsEngine {
 
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// A1 · host-object bridge — run a TSX event handler / server `action()`
+    /// body under QuickJS and collect the slot-write and broadcast effects it
+    /// produced, in source order.
+    ///
+    /// Unlike [`RuntimeEngine::render_component`], which lowers a component to
+    /// HTML, this evaluates a handler body for its *effects*: `setX(v)` calls
+    /// become [`HandlerEffect::SlotSet`], `broadcast(topic, v)` calls become
+    /// [`HandlerEffect::Broadcast`]. Each lowers to the same
+    /// [`crate::ir::opcode::Instruction::SlotSet`] the action dispatcher already
+    /// ships, so the wire shape matches the pure-Rust handler path exactly —
+    /// the difference is that the body now runs in a full JS engine, so loops,
+    /// `try`/`catch`, array methods, and anything else the pure-Rust
+    /// interpreter rejected just work.
+    ///
+    /// A throw inside the body surfaces as a loud `RenderError` rather than a
+    /// silently dropped effect.
+    ///
+    /// Runs under the same request-scoped arena discipline as a render: after
+    /// warmup the body bump-allocates into the request region, the effect JSON
+    /// is copied out into Rust, then the boundary reset reclaims the region.
+    pub fn eval_handler(
+        &mut self,
+        entry: &str,
+        invocation: &HandlerInvocation,
+    ) -> RuntimeResult<Vec<HandlerEffect>> {
+        self.ensure_initialized()?;
+        let script = build_handler_script(invocation)?;
+
+        let scoped = self.renders_done >= ARENA_WARMUP_RENDERS;
+        self.renders_done = self.renders_done.saturating_add(1);
+        if scoped {
+            self.arena.begin_request();
+        }
+        let eval_result = self.context.as_ref().unwrap().with(|ctx| {
+            ctx.eval::<String, _>(script.as_str()).map_err(|err| {
+                RuntimeError::render(format!("failed to execute handler '{entry}': {err}"))
+            })
+        });
+        if scoped {
+            self.runtime
+                .as_ref()
+                .expect("runtime initialized")
+                .run_gc();
+            self.arena.end_request();
+        }
+
+        let envelope_json = eval_result?;
+        decode_handler_envelope(entry, &envelope_json)
     }
 
     fn ensure_initialized(&mut self) -> RuntimeResult<()> {
@@ -1115,5 +1168,182 @@ mod tests {
         let final_stats = engine.arena_stats();
         assert!(final_stats.request_peak > 0, "request region was never exercised");
         assert_eq!(final_stats.fallback_allocs, 0, "region capacity was exceeded");
+    }
+
+    // ── A1 · host-object bridge — handlers under QuickJS ──────────────────
+
+    // A handler body using a `for` loop and `try`/`catch` — exactly the
+    // constructs the pure-Rust evaluator rejects. Running it through QuickJS
+    // proves the promotion: the body computes a sum in a loop, swallows an
+    // error in a try, and lowers both a setter call and a broadcast to effects.
+    #[test]
+    fn eval_handler_runs_real_js_and_collects_effects_in_order() {
+        use super::QuickJsEngine;
+        use crate::ir::opcode::SlotId;
+        use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
+        use crate::runtime::broadcast::broadcast_slot_id;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use serde_json::{Map, Value};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let mut env: Map<String, Value> = Map::new();
+        env.insert("base".to_string(), Value::from(10));
+        let setters = vec![("setTotal".to_string(), SlotId(9))];
+
+        let body = r#"
+            let total = base;
+            for (let i = 1; i <= 3; i++) { total += i; }
+            try { JSON.parse("not json"); } catch (e) { total += 100; }
+            setTotal(total);
+            broadcast("chat:room", "hi");
+        "#;
+        let bc = Map::new();
+        let invocation = HandlerInvocation {
+            body,
+            is_block: true,
+            env: &env,
+            raw_bindings: &[],
+            setters: &setters,
+            event_json: None,
+            broadcast_current: &bc,
+        };
+
+        let effects = engine
+            .eval_handler("routes/counter", &invocation)
+            .expect("handler runs");
+
+        // 10 + (1+2+3) + 100 = 116
+        assert_eq!(
+            effects[0],
+            HandlerEffect::SlotSet {
+                slot_id: SlotId(9),
+                value: b"116".to_vec()
+            }
+        );
+        match &effects[1] {
+            HandlerEffect::Broadcast { topic, slot_id, value } => {
+                assert_eq!(topic, "chat:room");
+                assert_eq!(*slot_id, broadcast_slot_id("chat:room"));
+                assert_eq!(value, b"\"hi\"");
+            }
+            other => panic!("expected broadcast effect, got {other:?}"),
+        }
+        assert_eq!(effects.len(), 2);
+    }
+
+    // A throw inside the handler must surface loudly, not vanish.
+    #[test]
+    fn eval_handler_surfaces_thrown_errors() {
+        use super::QuickJsEngine;
+        use crate::runtime::bridge::HandlerInvocation;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use serde_json::Map;
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let env = Map::new();
+        let bc = Map::new();
+        let invocation = HandlerInvocation {
+            body: "throw new Error('handler exploded')",
+            is_block: true,
+            env: &env,
+            raw_bindings: &[],
+            setters: &[],
+            event_json: None,
+            broadcast_current: &bc,
+        };
+
+        let err = engine
+            .eval_handler("routes/boom", &invocation)
+            .expect_err("a throw must propagate");
+        assert!(
+            err.to_string().contains("handler exploded"),
+            "error should carry the thrown message, got: {err}"
+        );
+    }
+
+    // The event payload is exposed to the body as `event`.
+    #[test]
+    fn eval_handler_exposes_event_payload() {
+        use super::QuickJsEngine;
+        use crate::ir::opcode::SlotId;
+        use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use serde_json::Map;
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let env = Map::new();
+        let bc = Map::new();
+        let setters = vec![("setName".to_string(), SlotId(2))];
+        let invocation = HandlerInvocation {
+            body: "setName(event.value)",
+            is_block: true,
+            env: &env,
+            raw_bindings: &[],
+            setters: &setters,
+            event_json: Some(r#"{"value":"typed text"}"#),
+            broadcast_current: &bc,
+        };
+
+        let effects = engine
+            .eval_handler("routes/input", &invocation)
+            .expect("handler runs");
+        assert_eq!(
+            effects[0],
+            HandlerEffect::SlotSet {
+                slot_id: SlotId(2),
+                value: b"\"typed text\"".to_vec()
+            }
+        );
+    }
+
+    // Updater-form broadcast: `broadcast(topic, fn)` reads the seeded current
+    // value, applies the updater, and a second call in the same body chains off
+    // the first — matching the pure-Rust read-modify-write.
+    #[test]
+    fn eval_handler_resolves_updater_form_broadcast() {
+        use super::QuickJsEngine;
+        use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use serde_json::{Map, Value};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let env = Map::new();
+        let mut bc = Map::new();
+        bc.insert("count".to_string(), Value::from(5));
+        let invocation = HandlerInvocation {
+            body: "broadcast(\"count\", n => n + 1); broadcast(\"count\", n => n + 1);",
+            is_block: true,
+            env: &env,
+            raw_bindings: &[],
+            setters: &[],
+            event_json: None,
+            broadcast_current: &bc,
+        };
+
+        let effects = engine
+            .eval_handler("routes/counter", &invocation)
+            .expect("updater-form broadcast runs");
+
+        // Seeded at 5: first updater → 6, second chains off 6 → 7.
+        assert_eq!(effects.len(), 2);
+        match (&effects[0], &effects[1]) {
+            (
+                HandlerEffect::Broadcast { topic, value, .. },
+                HandlerEffect::Broadcast { value: value2, .. },
+            ) => {
+                assert_eq!(topic, "count");
+                assert_eq!(value, b"6");
+                assert_eq!(value2, b"7");
+            }
+            other => panic!("expected two broadcast effects, got {other:?}"),
+        }
     }
 }
