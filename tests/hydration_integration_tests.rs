@@ -98,6 +98,7 @@ fn test_hydration_no_js_for_tier_a_only_route() {
                 props_json: r#"{"message":"hello"}"#.to_string(),
                 module_order: Vec::new(),
                 hydration_payload: None,
+                host_json: None,
             },
             &manifest,
         )
@@ -183,6 +184,7 @@ fn test_hydration_tier_c_uses_trigger_gated_islands() {
                 props_json: r#"{"visible":"hero","cta":"click","note":"later"}"#.to_string(),
                 module_order: Vec::new(),
                 hydration_payload: None,
+                host_json: None,
             },
             &manifest,
         )
@@ -272,6 +274,7 @@ fn test_hydration_island_failure_does_not_break_other_islands() {
                 props_json: r#"{"value":"ok"}"#.to_string(),
                 module_order: Vec::new(),
                 hydration_payload: None,
+                host_json: None,
             },
             &manifest,
         )

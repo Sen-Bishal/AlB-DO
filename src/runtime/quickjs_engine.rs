@@ -134,6 +134,92 @@ impl QuickJsEngine {
         decode_handler_envelope(entry, &envelope_json)
     }
 
+    /// Shared body for [`RuntimeEngine::render_component`] and
+    /// [`RuntimeEngine::render_component_with_host`]. `host_json = None` renders
+    /// with no seed (every hook uses its initial) — byte-identical to the
+    /// pre-bridge behaviour, so the host-unaware path is untouched.
+    ///
+    /// When a `host` envelope is present it is installed as
+    /// `globalThis.__ALBEDO_HOST` for the duration of the render: `useState`
+    /// pairs its positional call with `host.state[idx]` (falling back to the
+    /// call's initial when the seed omits that index), and
+    /// `useSharedSlot("topic")` reads `host.shared[topic]`. This is what lets a
+    /// server render reflect the *current* slot-store / broadcast values rather
+    /// than always re-rendering from each hook's initial. A malformed seed
+    /// surfaces as a loud render error rather than silently rendering initials.
+    fn render_component_inner(
+        &mut self,
+        entry: &str,
+        props_json: &str,
+        host_json: Option<&str>,
+    ) -> RuntimeResult<RenderOutput> {
+        self.ensure_initialized()?;
+
+        // Movement III: after a short warmup (during which QuickJS finishes allocating its
+        // retained, data-dependent runtime-global tables into the persistent region),
+        // everything a render allocates is bump-allocated into the request region. The
+        // result string is copied out into Rust below, then a single cycle-collection pass
+        // drops any cyclic request garbage so the O(1) reset can reclaim the region with
+        // nothing left referencing it.
+        let scoped = self.renders_done >= ARENA_WARMUP_RENDERS;
+        self.renders_done = self.renders_done.saturating_add(1);
+        if scoped {
+            self.arena.begin_request();
+        }
+        let host_arg = host_json.unwrap_or("").to_string();
+        let eval_start = Instant::now();
+        let render_result = self.context.as_ref().unwrap().with(|ctx| {
+            let globals = ctx.globals();
+            let render_fn: Function = globals.get("__ALBEDO_RENDER_COMPONENT").map_err(|err| {
+                RuntimeError::render(format!(
+                    "reusable render function missing for component '{entry}': {err}"
+                ))
+            })?;
+
+            render_fn
+                .call::<(String, String, String), String>((
+                    entry.to_string(),
+                    props_json.to_string(),
+                    host_arg,
+                ))
+                .map_err(|err| {
+                    RuntimeError::render(format!(
+                        "failed to execute reusable render function for component '{entry}': {err}"
+                    ))
+                })
+        });
+        let eval_ms = eval_start.elapsed().as_millis();
+
+        if scoped {
+            self.runtime
+                .as_ref()
+                .expect("runtime initialized")
+                .run_gc();
+            self.arena.end_request();
+        }
+
+        let envelope_json = render_result?;
+        let envelope: RenderEnvelope = serde_json::from_str(&envelope_json).map_err(|err| {
+            RuntimeError::render(format!(
+                "failed to decode render result envelope for '{entry}': {err}"
+            ))
+        })?;
+
+        if envelope.ok {
+            let html = envelope.value.ok_or_else(|| {
+                RuntimeError::render(format!(
+                    "render script for '{entry}' returned success without value"
+                ))
+            })?;
+            Ok(RenderOutput { html, eval_ms })
+        } else {
+            let message = envelope
+                .error
+                .unwrap_or_else(|| "unknown runtime error".to_string());
+            Err(map_render_error(entry, &message))
+        }
+    }
+
     fn ensure_initialized(&mut self) -> RuntimeResult<()> {
         if self.initialized {
             return Ok(());
@@ -267,66 +353,16 @@ impl RuntimeEngine for QuickJsEngine {
     }
 
     fn render_component(&mut self, entry: &str, props_json: &str) -> RuntimeResult<RenderOutput> {
-        self.ensure_initialized()?;
+        self.render_component_inner(entry, props_json, None)
+    }
 
-        // Movement III: after a short warmup (during which QuickJS finishes allocating its
-        // retained, data-dependent runtime-global tables into the persistent region),
-        // everything a render allocates is bump-allocated into the request region. The
-        // result string is copied out into Rust below, then a single cycle-collection pass
-        // drops any cyclic request garbage so the O(1) reset can reclaim the region with
-        // nothing left referencing it.
-        let scoped = self.renders_done >= ARENA_WARMUP_RENDERS;
-        self.renders_done = self.renders_done.saturating_add(1);
-        if scoped {
-            self.arena.begin_request();
-        }
-        let eval_start = Instant::now();
-        let render_result = self.context.as_ref().unwrap().with(|ctx| {
-            let globals = ctx.globals();
-            let render_fn: Function = globals.get("__ALBEDO_RENDER_COMPONENT").map_err(|err| {
-                RuntimeError::render(format!(
-                    "reusable render function missing for component '{entry}': {err}"
-                ))
-            })?;
-
-            render_fn
-                .call::<(String, String), String>((entry.to_string(), props_json.to_string()))
-                .map_err(|err| {
-                    RuntimeError::render(format!(
-                        "failed to execute reusable render function for component '{entry}': {err}"
-                    ))
-                })
-        });
-        let eval_ms = eval_start.elapsed().as_millis();
-
-        if scoped {
-            self.runtime
-                .as_ref()
-                .expect("runtime initialized")
-                .run_gc();
-            self.arena.end_request();
-        }
-
-        let envelope_json = render_result?;
-        let envelope: RenderEnvelope = serde_json::from_str(&envelope_json).map_err(|err| {
-            RuntimeError::render(format!(
-                "failed to decode render result envelope for '{entry}': {err}"
-            ))
-        })?;
-
-        if envelope.ok {
-            let html = envelope.value.ok_or_else(|| {
-                RuntimeError::render(format!(
-                    "render script for '{entry}' returned success without value"
-                ))
-            })?;
-            Ok(RenderOutput { html, eval_ms })
-        } else {
-            let message = envelope
-                .error
-                .unwrap_or_else(|| "unknown runtime error".to_string());
-            Err(map_render_error(entry, &message))
-        }
+    fn render_component_with_host(
+        &mut self,
+        entry: &str,
+        props_json: &str,
+        host_json: &str,
+    ) -> RuntimeResult<RenderOutput> {
+        self.render_component_inner(entry, props_json, Some(host_json))
     }
 
     fn warm(&mut self) -> RuntimeResult<()> {
@@ -342,8 +378,14 @@ impl RuntimeEngine for QuickJsEngine {
 fn build_render_function_script() -> String {
     format!(
         r#"
-globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson) {{
+globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
   try {{
+    // A1 · install the per-render host seed (slot-backed useState values,
+    // broadcast-backed useSharedSlot values) and reset the positional hook
+    // counter so `useState` pairs with `host.state[idx]`. Empty/absent host
+    // means "no seed" — every hook falls back to its initial.
+    globalThis.__ALBEDO_HOST = (hostJson && hostJson.length > 0) ? JSON.parse(hostJson) : null;
+    globalThis.__ALBEDO_HOOK_INDEX = 0;
     const __albedo_record = globalThis.__ALBEDO_MODULES[entry];
     const __albedo_has_own = Object.prototype.hasOwnProperty;
     const __albedo_is_record = function(candidate) {{
@@ -392,6 +434,9 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson) {{
   }} catch (err) {{
     const message = (err && typeof err.message === 'string') ? err.message : String(err);
     return JSON.stringify({{ ok: false, error: message }});
+  }} finally {{
+    // Never let one render's host seed leak into the next render on this engine.
+    globalThis.__ALBEDO_HOST = null;
   }}
 }};
 "#
@@ -442,6 +487,13 @@ if (typeof globalThis.h !== 'function') {
       if (value === false || value === null || typeof value === 'undefined') {
         continue;
       }
+      // Event handlers (`onClick={fn}`) and any other function-valued prop are
+      // not HTML attributes — dropping them keeps server markup clean. The
+      // client-side binding for these is carried by the Phase K opcode stream,
+      // not by stringifying the closure into the tag.
+      if (typeof value === 'function') {
+        continue;
+      }
       if (value === true) {
         attrs += ' ' + key;
         continue;
@@ -463,6 +515,71 @@ if (typeof globalThis.h !== 'function') {
   };
 
   globalThis.h = h;
+}
+
+// A1 · host-object bridge (render side). The framework hooks resolve here
+// instead of through `__albedo_require("react"|"albedo")` so a real TSX hook
+// component LOADS and RENDERS under QuickJS. Their values come from a
+// per-render host seed (`globalThis.__ALBEDO_HOST`) the renderer installs
+// just before invoking the component:
+//
+//   { state: { "<hookIdx>": <currentValue>, ... },   // useState, slot-backed
+//     shared: { "<topic>": <currentValue>, ... } }    // useSharedSlot, broadcast-backed
+//
+// `useState` is positional like React: a per-render index counter
+// (`__ALBEDO_HOOK_INDEX`, reset by the render entry) pairs the Nth call with
+// `state["N"]`. An index the seed doesn't carry falls back to the call's own
+// initial argument, so an unwritten slot renders its initial — parity with the
+// pure-Rust `render_local` seeding. The setter is a no-op: a single SSR pass
+// has a fixed state snapshot; mutations travel client→server as actions.
+if (typeof globalThis.useState !== 'function') {
+  globalThis.__ALBEDO_HOST = null;
+  globalThis.__ALBEDO_HOOK_INDEX = 0;
+
+  const __albedo_has_own = Object.prototype.hasOwnProperty;
+
+  globalThis.useState = function(initial) {
+    const index = globalThis.__ALBEDO_HOOK_INDEX++;
+    const host = globalThis.__ALBEDO_HOST;
+    let value = initial;
+    if (host && host.state && __albedo_has_own.call(host.state, String(index))) {
+      value = host.state[String(index)];
+    }
+    const setState = function() { /* SSR render: state is fixed for this pass */ };
+    return [value, setState];
+  };
+
+  globalThis.useSharedSlot = function(topic) {
+    const host = globalThis.__ALBEDO_HOST;
+    const key = String(topic);
+    if (host && host.shared && __albedo_has_own.call(host.shared, key)) {
+      return host.shared[key];
+    }
+    return null;
+  };
+
+  // Server-side no-ops / pass-throughs so a component using the rest of the
+  // hook surface neither fails to load nor crashes mid-render. Effects never
+  // run during SSR; refs/memo/callback return shapes the render can read.
+  globalThis.useEffect = function() {};
+  globalThis.useLayoutEffect = function() {};
+  globalThis.useRef = function(initial) {
+    return { current: (initial === undefined ? null : initial) };
+  };
+  globalThis.useMemo = function(factory) {
+    return (typeof factory === 'function') ? factory() : undefined;
+  };
+  globalThis.useCallback = function(fn) { return fn; };
+
+  // `export const X = action(fn)` runs `action(fn)` at module load. Keep it a
+  // benign pass-through so loading the module never throws; the action body
+  // itself dispatches through the QuickJS action bridge, not this render path.
+  globalThis.action = function(fn) { return fn; };
+  // A `broadcast(...)` reached during render (rare) is a no-op here — render is
+  // read-only; writes happen in the action bridge.
+  if (typeof globalThis.broadcast !== 'function') {
+    globalThis.broadcast = function() {};
+  }
 }
 "#
 }
@@ -907,11 +1024,27 @@ fn strip_export_default_prefix(source: &str) -> Option<String> {
         .map(|rest| rest.trim().trim_end_matches(';').to_string())
 }
 
+/// The framework's own runtime modules. Their exports (`useState`,
+/// `useSharedSlot`, `action`, …) have no loadable module record — they resolve
+/// to the global shims installed by [`build_builtin_runtime_helpers_script`].
+/// A1 · host-object bridge: routing these imports through `__albedo_require`
+/// throws `MODULE_MISSING` at load, which is exactly why a real TSX hook
+/// component could not render under QuickJS before. Binding them to globals
+/// instead is what makes `import { useState } from "react"` load and run.
+fn is_framework_runtime_import(source: &str) -> bool {
+    matches!(source, "react" | "react-dom" | "albedo")
+}
+
 fn rewrite_import_declaration(
     import_decl: swc_ecma_ast::ImportDecl,
     specifier: &str,
 ) -> RuntimeResult<Vec<String>> {
     let import_source = import_decl.src.value.to_string();
+
+    if is_framework_runtime_import(import_source.as_str()) {
+        return rewrite_framework_runtime_import(import_decl, specifier);
+    }
+
     let import_source_literal = js_string_literal(import_source.as_str(), specifier)?;
     let require_call = format!("__albedo_require({import_source_literal})");
 
@@ -961,6 +1094,65 @@ fn rewrite_import_declaration(
             "const {{ {} }} = {import_binding};",
             named_bindings.join(", ")
         ));
+    }
+
+    Ok(statements)
+}
+
+/// Bind the names imported from a framework runtime module to the global
+/// shims rather than a `__albedo_require` lookup. Named imports map to
+/// `globalThis.<orig>`; a default/namespace import maps to a small object
+/// exposing the hook surface (so `React.useState` / `React.Fragment` still
+/// resolve). A string-literal named import (`import { "x" as y }`) has no
+/// global identifier to bind to and resolves to `undefined`.
+fn rewrite_framework_runtime_import(
+    import_decl: swc_ecma_ast::ImportDecl,
+    _specifier: &str,
+) -> RuntimeResult<Vec<String>> {
+    // The shape `React`/namespace imports get bound to. Mirrors the hook
+    // globals installed at engine init.
+    const FRAMEWORK_NAMESPACE_OBJECT: &str = "{ useState: globalThis.useState, \
+useSharedSlot: globalThis.useSharedSlot, useEffect: globalThis.useEffect, \
+useLayoutEffect: globalThis.useLayoutEffect, useRef: globalThis.useRef, \
+useMemo: globalThis.useMemo, useCallback: globalThis.useCallback, \
+action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";
+
+    if import_decl.specifiers.is_empty() {
+        // A bare side-effect import of a framework module is a no-op at load.
+        return Ok(Vec::new());
+    }
+
+    let mut statements = Vec::new();
+    for import_specifier in import_decl.specifiers {
+        match import_specifier {
+            ImportSpecifier::Default(default_specifier) => {
+                let local = default_specifier.local.sym.to_string();
+                statements.push(format!("const {local} = {FRAMEWORK_NAMESPACE_OBJECT};"));
+            }
+            ImportSpecifier::Namespace(namespace_specifier) => {
+                let local = namespace_specifier.local.sym.to_string();
+                statements.push(format!("const {local} = {FRAMEWORK_NAMESPACE_OBJECT};"));
+            }
+            ImportSpecifier::Named(named_specifier) => {
+                let local = named_specifier.local.sym.to_string();
+                let orig = match named_specifier.imported.as_ref() {
+                    None => Some(local.clone()),
+                    Some(ModuleExportName::Ident(imported_ident)) => {
+                        Some(imported_ident.sym.to_string())
+                    }
+                    // `import { "weird-name" as x }` — no global identifier.
+                    Some(ModuleExportName::Str(_)) => None,
+                };
+                match orig {
+                    Some(orig) => {
+                        statements.push(format!("const {local} = globalThis.{orig};"));
+                    }
+                    None => {
+                        statements.push(format!("const {local} = undefined;"));
+                    }
+                }
+            }
+        }
     }
 
     Ok(statements)
@@ -1345,5 +1537,159 @@ mod tests {
             }
             other => panic!("expected two broadcast effects, got {other:?}"),
         }
+    }
+
+    // ── A1 · host-object bridge — renders under QuickJS ───────────────────
+
+    // Before this slice a `import { useState } from "react"` component threw
+    // `MODULE_MISSING` at load (the import rewrote to `__albedo_require("react")`).
+    // Now `react`/`albedo` imports bind to the global hook shims, so a real hook
+    // component LOADS and RENDERS, falling back to each hook's initial when the
+    // host seed carries no value for it.
+    #[test]
+    fn react_use_state_component_renders_with_initial() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let src = r#"
+            import { useState } from "react";
+            export default function Counter(props) {
+                const [count, setCount] = useState(props.start);
+                return <span data-role="count">{count}</span>;
+            }
+        "#;
+        engine
+            .load_module("routes/counter.tsx", src)
+            .expect("hook component loads under quickjs");
+
+        let out = engine
+            .render_component("routes/counter.tsx", r#"{"start":7}"#)
+            .expect("hook component renders");
+        assert_eq!(out.html, "<span data-role=\"count\">7</span>");
+    }
+
+    // A host seed keyed by positional hook index overrides the initial, so the
+    // render reflects the current slot value (e.g. after an action wrote it).
+    #[test]
+    fn host_seed_overrides_use_state_initial() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let src = r#"
+            import { useState } from "react";
+            export default function Counter() {
+                const [count] = useState(0);
+                return <span>{count}</span>;
+            }
+        "#;
+        engine
+            .load_module("routes/counter.tsx", src)
+            .expect("module loads");
+
+        let out = engine
+            .render_component_with_host("routes/counter.tsx", "{}", r#"{"state":{"0":42}}"#)
+            .expect("seeded render");
+        assert_eq!(out.html, "<span>42</span>");
+
+        // The seed must not leak: a follow-up host-unaware render uses the initial.
+        let plain = engine
+            .render_component("routes/counter.tsx", "{}")
+            .expect("plain render");
+        assert_eq!(plain.html, "<span>0</span>");
+    }
+
+    // Two positional hooks line up with the seed by call order.
+    #[test]
+    fn host_seed_aligns_multiple_hooks_by_index() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let src = r#"
+            import { useState } from "react";
+            export default function Pair() {
+                const [a] = useState("a0");
+                const [b] = useState("b0");
+                return <span>{a}:{b}</span>;
+            }
+        "#;
+        engine.load_module("routes/pair.tsx", src).expect("loads");
+
+        // Seed only the second hook; the first falls back to its initial.
+        let out = engine
+            .render_component_with_host("routes/pair.tsx", "{}", r#"{"state":{"1":"B"}}"#)
+            .expect("seeded render");
+        assert_eq!(out.html, "<span>a0:B</span>");
+    }
+
+    // `useSharedSlot` (imported from `albedo`) reads the broadcast-backed seed.
+    #[test]
+    fn use_shared_slot_reads_host_seed() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let src = r#"
+            import { useSharedSlot } from "albedo";
+            export default function Room() {
+                const topic = useSharedSlot("chat:room");
+                return <span>{topic}</span>;
+            }
+        "#;
+        engine.load_module("routes/room.tsx", src).expect("loads");
+
+        let out = engine
+            .render_component_with_host(
+                "routes/room.tsx",
+                "{}",
+                r#"{"shared":{"chat:room":"hello"}}"#,
+            )
+            .expect("seeded render");
+        assert_eq!(out.html, "<span>hello</span>");
+
+        // No seed → null binding renders empty (matches the pure-Rust fallback).
+        let plain = engine
+            .render_component("routes/room.tsx", "{}")
+            .expect("plain render");
+        assert_eq!(plain.html, "<span></span>");
+    }
+
+    // The wider hook surface (useEffect/useRef/useMemo/useCallback) neither
+    // fails to load nor crashes a render — effects are no-ops on the server.
+    #[test]
+    fn full_hook_surface_renders_without_crashing() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let src = r#"
+            import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+            export default function Widget(props) {
+                const [n] = useState(props.n);
+                const ref = useRef(null);
+                const doubled = useMemo(function() { return n * 2; }, [n]);
+                const cb = useCallback(function() { return n; }, [n]);
+                useEffect(function() { ref.current = n; }, [n]);
+                return <span>{doubled}:{typeof cb}</span>;
+            }
+        "#;
+        engine.load_module("routes/widget.tsx", src).expect("loads");
+
+        let out = engine
+            .render_component("routes/widget.tsx", r#"{"n":5}"#)
+            .expect("renders");
+        assert_eq!(out.html, "<span>10:function</span>");
     }
 }

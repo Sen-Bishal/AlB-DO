@@ -701,6 +701,12 @@ pub struct ComponentProject {
     root: PathBuf,
     modules: HashMap<String, ParsedModule>,
     source_hashes: HashMap<String, u64>,
+    /// Raw module source, keyed by specifier. Retained (rather than dropped
+    /// after parse) so the A1 host-object bridge can feed a component's
+    /// original TSX through the QuickJS engine's own transpile + load pipeline
+    /// for a `render_entry_quickjs` render. Kept in lock-step with `modules`
+    /// across `load_from_dir` and `patch`.
+    sources: HashMap<String, String>,
     specifier_to_id: HashMap<String, ComponentId>,
     next_id: u64,
 }
@@ -721,6 +727,7 @@ impl ComponentProject {
         let root = root.as_ref().to_path_buf();
         let mut modules = HashMap::new();
         let mut source_hashes = HashMap::new();
+        let mut sources = HashMap::new();
         let mut specifier_to_id: HashMap<String, ComponentId> = HashMap::new();
         let mut next_id: u64 = 0;
 
@@ -748,6 +755,7 @@ impl ComponentProject {
             source_hashes.insert(specifier.clone(), fnv1a_hash(source.as_bytes()));
             specifier_to_id.insert(specifier.clone(), ComponentId::new(next_id));
             next_id += 1;
+            sources.insert(specifier.clone(), source);
             modules.insert(specifier, parsed);
         }
 
@@ -759,9 +767,28 @@ impl ComponentProject {
             root,
             modules,
             source_hashes,
+            sources,
             specifier_to_id,
             next_id,
         })
+    }
+
+    /// Raw TSX/JSX source for a module specifier, if known. Used by the A1
+    /// host-object render bridge to load a component into the QuickJS engine.
+    pub fn module_source(&self, specifier: &str) -> Option<&str> {
+        let spec = normalize_slashes(specifier);
+        self.sources.get(&spec).map(String::as_str)
+    }
+
+    /// Resolve a render `entry` to its `(module_spec, default_export_fn)`.
+    /// Mirrors the resolution [`Self::render_entry`] does internally, exposed
+    /// for the A1 host-object render bridge which needs the concrete module
+    /// specifier (to load the source into the engine) and the default-export
+    /// component name (to look up its compiled hook metadata).
+    pub fn resolve_entry_component(&self, entry: &str) -> Option<(String, String)> {
+        let module_spec = self.resolve_entry(entry)?;
+        let function_name = self.modules.get(&module_spec)?.default_export.clone()?;
+        Some((module_spec, function_name))
     }
 
     pub fn patch(
@@ -793,7 +820,7 @@ impl ComponentProject {
                     }
 
                     let parsed = parse_module_impl(&source, &absolute_path)?;
-                    parsed_updates.push((specifier, parsed, next_hash));
+                    parsed_updates.push((specifier, parsed, next_hash, source));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     staged_deletions.insert(specifier);
@@ -814,9 +841,10 @@ impl ComponentProject {
             staged_deletions.insert(specifier);
         }
 
-        for (specifier, parsed, source_hash) in parsed_updates {
+        for (specifier, parsed, source_hash, source) in parsed_updates {
             self.modules.insert(specifier.clone(), parsed);
             self.source_hashes.insert(specifier.clone(), source_hash);
+            self.sources.insert(specifier.clone(), source);
             let component_id = *self
                 .specifier_to_id
                 .entry(specifier.clone())
@@ -834,6 +862,7 @@ impl ComponentProject {
             let component_id = self.specifier_to_id.get(&specifier).copied();
             let removed_module = self.modules.remove(&specifier).is_some();
             let removed_hash = self.source_hashes.remove(&specifier).is_some();
+            self.sources.remove(&specifier);
             if removed_module || removed_hash {
                 if let Some(component_id) = component_id {
                     report.deleted_ids.push(component_id);

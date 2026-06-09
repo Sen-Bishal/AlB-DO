@@ -68,6 +68,7 @@ impl RendererRuntime {
                 props_json: "{}".to_string(),
                 module_order: Vec::new(),
                 hydration_payload: None,
+                host_json: None,
             })
             .collect();
 
@@ -90,6 +91,7 @@ impl RendererRuntime {
             props_json,
             module_order: Vec::new(),
             hydration_payload: None,
+            host_json: None,
         };
 
         self.renderer

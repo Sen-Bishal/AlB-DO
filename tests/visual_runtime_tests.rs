@@ -102,6 +102,7 @@ fn test_visual_snapshot_showcase_route() {
             props_json: props.to_string(),
             module_order: Vec::new(),
             hydration_payload: None,
+            host_json: None,
         })
         .expect("route render should succeed");
 
@@ -199,6 +200,7 @@ fn test_visual_snapshot_manifest_driven_case_study_route() {
             props_json: props.to_string(),
             module_order: Vec::new(),
             hydration_payload: Some("{\"route\":\"case-study\",\"islands\":0}".to_string()),
+            host_json: None,
         })
         .expect("manifest-driven route render should succeed");
 
@@ -325,6 +327,7 @@ fn test_visual_snapshot_client_demo_route_for_non_technical_audience() {
             hydration_payload: Some(
                 "{\"route\":\"client-demo\",\"mode\":\"showcase\"}".to_string(),
             ),
+            host_json: None,
         })
         .expect("client demo route render should succeed");
 
@@ -361,4 +364,53 @@ fn test_visual_snapshot_test_app_components_directory_render() {
 
     assert_matches_fixture(&result.html, "test_app_components_route.html");
     assert_eq!(result.hydration_payload, "{\"route\":\"test-app\"}");
+}
+
+// A1 · host-object bridge (render side) — end-to-end through ServerRenderer.
+// A real `import { useState } from "react"` route now loads under QuickJS, and a
+// per-request host seed on the RouteRenderRequest drives the SSR HTML: without a
+// seed the render uses the hook's initial; with one it reflects current state.
+#[test]
+fn host_seed_flows_through_server_renderer_to_use_state() {
+    let mut renderer = create_renderer();
+    renderer.register_module(
+        "routes/counter",
+        "import { useState } from \"react\";\n\
+         export default function Counter() {\n\
+           const [n] = useState(0);\n\
+           return <span>{n}</span>;\n\
+         }",
+    );
+
+    // No seed → the useState initial.
+    let plain = renderer
+        .render_route(&RouteRenderRequest {
+            entry: "routes/counter".to_string(),
+            props_json: "{}".to_string(),
+            module_order: Vec::new(),
+            hydration_payload: None,
+            host_json: None,
+        })
+        .expect("plain render should succeed");
+    assert!(
+        plain.html.contains("<span>0</span>"),
+        "host-unaware render must show the initial; got: {}",
+        plain.html
+    );
+
+    // Seed positional hook 0 → render reflects the seeded value, not the initial.
+    let seeded = renderer
+        .render_route(&RouteRenderRequest {
+            entry: "routes/counter".to_string(),
+            props_json: "{}".to_string(),
+            module_order: Vec::new(),
+            hydration_payload: None,
+            host_json: Some(r#"{"state":{"0":99}}"#.to_string()),
+        })
+        .expect("seeded render should succeed");
+    assert!(
+        seeded.html.contains("<span>99</span>"),
+        "host-seeded render must reflect the current value (99); got: {}",
+        seeded.html
+    );
 }
