@@ -123,6 +123,35 @@ pub trait RuntimeEngine {
             eval_ms: rendered.eval_ms,
         })
     }
+
+    /// A1 · host-object bridge (render side) — render `entry` with a JSON host
+    /// seed (`{ state: {..}, shared: {..} }`) exposed to its hooks. Engines that
+    /// don't model host objects ignore the seed and render from initials; the
+    /// default does exactly that, so this is additive for every engine.
+    fn render_component_with_host(
+        &mut self,
+        entry: &str,
+        props_json: &str,
+        _host_json: &str,
+    ) -> RuntimeResult<RenderOutput> {
+        self.render_component(entry, props_json)
+    }
+
+    /// Streaming counterpart to [`Self::render_component_with_host`]. Defaults to
+    /// the non-deferred shape, same as [`Self::render_component_stream`].
+    fn render_component_stream_with_host(
+        &mut self,
+        entry: &str,
+        props_json: &str,
+        host_json: &str,
+    ) -> RuntimeResult<RenderStreamOutput> {
+        let rendered = self.render_component_with_host(entry, props_json, host_json)?;
+        Ok(RenderStreamOutput {
+            shell_html: rendered.html,
+            deferred_chunks: Vec::new(),
+            eval_ms: rendered.eval_ms,
+        })
+    }
     fn warm(&mut self) -> RuntimeResult<()>;
     fn prewarm(&mut self) {
         let _ = self.init(&BootstrapPayload::default());

@@ -14,6 +14,7 @@ use crate::ir::action::ActionEnvelope;
 use crate::ir::opcode::{Instruction, SlotId};
 use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
 use crate::runtime::broadcast::BroadcastRegistry;
+use crate::runtime::engine::RuntimeEngine;
 use crate::runtime::eval::component::fnv1a_32;
 use crate::runtime::quickjs_engine::QuickJsEngine;
 use crate::runtime::eval::{ComponentFunction, ParamBinding};
@@ -828,6 +829,154 @@ impl CompiledProject {
         let _ = slots.drain_pending();
 
         Ok(instructions)
+    }
+
+    /// A1 · host-object bridge (render side) — render an entry component under
+    /// **QuickJS** with its host objects exposed.
+    ///
+    /// The symmetric counterpart to [`Self::invoke_action_quickjs`]: where that
+    /// runs a *handler* body in the real engine, this runs the component's
+    /// *render* there. The component's original TSX is loaded into `engine`
+    /// (cached by source hash) and rendered with a host seed installed:
+    ///
+    ///   * **props** flow as the component's argument (JSON), exactly as React;
+    ///   * **`useState`** values are seeded from the session slot store, keyed
+    ///     positionally by hook index — an unwritten slot falls back to the
+    ///     hook's initial, parity with the pure-Rust `render_local` seeding;
+    ///   * **`useSharedSlot`** values are seeded from the broadcast registry, so
+    ///     the render reflects the topic's *current* value, not a stale default.
+    ///
+    /// This is what lets a component whose render body uses arbitrary JS (loops,
+    /// `.map`, `try`, template literals — everything the pure-Rust evaluator
+    /// rejects) render correctly while still seeing live host state. It also
+    /// snapshots captured props into their slots so a follow-up
+    /// [`Self::invoke_action_quickjs`] reads the props this render observed.
+    ///
+    /// Returns HTML only — the client-hydration binding opcodes still come from
+    /// the Phase K pure-Rust emitter ([`render_entry_with_bindings`]); this path
+    /// is the SSR HTML payload, not a replacement for that opcode stream.
+    pub fn render_entry_quickjs(
+        &self,
+        engine: &mut QuickJsEngine,
+        entry: &str,
+        props: &Value,
+        slots: &SessionSlotView,
+    ) -> Result<RenderOutput> {
+        self.render_entry_quickjs_inner(engine, entry, props, slots, None)
+    }
+
+    /// [`Self::render_entry_quickjs`] with a [`BroadcastRegistry`] so the render
+    /// seeds `useSharedSlot` bindings from the current topic values. Mirrors the
+    /// relationship between [`Self::invoke_action_quickjs`] and
+    /// [`Self::invoke_action_quickjs_with_broadcast`].
+    pub fn render_entry_quickjs_with_broadcast(
+        &self,
+        engine: &mut QuickJsEngine,
+        entry: &str,
+        props: &Value,
+        slots: &SessionSlotView,
+        broadcast: &BroadcastRegistry,
+    ) -> Result<RenderOutput> {
+        self.render_entry_quickjs_inner(engine, entry, props, slots, Some(broadcast))
+    }
+
+    fn render_entry_quickjs_inner(
+        &self,
+        engine: &mut QuickJsEngine,
+        entry: &str,
+        props: &Value,
+        slots: &SessionSlotView,
+        broadcast: Option<&BroadcastRegistry>,
+    ) -> Result<RenderOutput> {
+        let (module_spec, function_name) = self
+            .project
+            .resolve_entry_component(entry)
+            .ok_or_else(|| anyhow!("could not resolve entry component '{entry}'"))?;
+
+        let source = self
+            .project
+            .module_source(&module_spec)
+            .ok_or_else(|| {
+                anyhow!("no retained source for module '{module_spec}' (quickjs render)")
+            })?
+            .to_string();
+
+        // Idempotent by source hash — re-loading an unchanged module is a no-op
+        // inside the engine, so calling this every render is cheap after warmup.
+        engine
+            .load_module(&module_spec, &source)
+            .map_err(|err| anyhow!("failed to load '{module_spec}' for quickjs render: {err}"))?;
+
+        // Build the per-render host seed from the component's compiled metadata.
+        let mut host = serde_json::Map::new();
+        if let Some(component) = self.component_meta(&module_spec, &function_name) {
+            // useState: state[hook_idx] = current slot value. Omitting an index
+            // tells the JS shim to use that hook's own initial argument.
+            let mut state = serde_json::Map::new();
+            for hook in &component.hooks {
+                if let Some(slot_id) = component.value_slots.get(&hook.value_name) {
+                    if let Some(value) = slots
+                        .read(*slot_id)
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    {
+                        state.insert(hook.hook_idx.to_string(), value);
+                    }
+                }
+            }
+            if !state.is_empty() {
+                host.insert("state".to_string(), Value::Object(state));
+            }
+
+            // useSharedSlot: shared[topic] = current broadcast value.
+            if let Some(registry) = broadcast {
+                let mut shared = serde_json::Map::new();
+                for binding in &component.shared_slots {
+                    if let Some(topic) = registry.get(&binding.topic) {
+                        let bytes = topic.current_value();
+                        let value = if bytes.is_empty() {
+                            Value::Null
+                        } else {
+                            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+                        };
+                        shared.insert(binding.topic.clone(), value);
+                    }
+                }
+                if !shared.is_empty() {
+                    host.insert("shared".to_string(), Value::Object(shared));
+                }
+            }
+
+            // Snapshot captured props into their slots so a handler firing
+            // before the next render reads the value the prop had here. Drained
+            // immediately — internal bookkeeping, never a user-driven SlotSet —
+            // exactly mirroring the pure-Rust `snapshot_captured_props_into_slots`.
+            if !component.capture_slots.is_empty() {
+                if let Some(props_map) = props.as_object() {
+                    for (name, slot_id) in &component.capture_slots {
+                        if let Some(value) = props_map.get(name) {
+                            if let Ok(bytes) = serde_json::to_vec(value) {
+                                slots.write(*slot_id, bytes);
+                            }
+                        }
+                    }
+                    let _ = slots.drain_pending();
+                }
+            }
+        }
+
+        let props_json = serde_json::to_string(props)
+            .map_err(|err| anyhow!("failed to encode props for quickjs render: {err}"))?;
+        let host_json = serde_json::to_string(&Value::Object(host))
+            .map_err(|err| anyhow!("failed to encode host seed for quickjs render: {err}"))?;
+
+        let rendered = engine
+            .render_component_with_host(&module_spec, &props_json, &host_json)
+            .map_err(|err| anyhow!("quickjs render of '{module_spec}' failed: {err}"))?;
+
+        Ok(RenderOutput {
+            html: rendered.html,
+            opcodes: Vec::new(),
+        })
     }
 }
 

@@ -293,8 +293,13 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
             }
         }
 
-        let static_slice_key =
-            self.build_static_slice_cache_key(&route.entry, &normalized_props, &module_order);
+        // A host-seeded render reflects per-session state, so it is never a
+        // cacheable static slice — bypass both the read and the write below.
+        let static_slice_key = if route.host_json.is_some() {
+            None
+        } else {
+            self.build_static_slice_cache_key(&route.entry, &normalized_props, &module_order)
+        };
         if let Some(cache_key) = static_slice_key.as_ref() {
             if let Some(static_html) = self.static_slice_html_cache.get(cache_key) {
                 return Ok(RouteRenderResult {
@@ -351,9 +356,20 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         let module_load_ms = load_start.elapsed().as_millis();
 
         let render_start = Instant::now();
-        let render_output = self
-            .engine
-            .render_component_stream(&route.entry, &normalized_props)?;
+        // A1 · host-object bridge — when the request carries a host seed (current
+        // slot-store / broadcast values for this session), render through the
+        // host-aware path so the SSR HTML reflects live state instead of each
+        // hook's initial. Absent a seed this is the original stateless render.
+        let render_output = match route.host_json.as_deref() {
+            Some(host_json) => self.engine.render_component_stream_with_host(
+                &route.entry,
+                &normalized_props,
+                host_json,
+            )?,
+            None => self
+                .engine
+                .render_component_stream(&route.entry, &normalized_props)?,
+        };
         let render_ms = render_start.elapsed().as_millis();
         let render_eval_ms = render_output.eval_ms;
         let shell_html = render_output.shell_html;

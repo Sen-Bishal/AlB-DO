@@ -265,12 +265,19 @@ pub fn entry_matches_path(entry: &str, path: &str) -> bool {
     entry.contains(stripped)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RouteRenderRequest {
     pub entry: String,
     pub props_json: String,
     pub module_order: Vec<String>,
     pub hydration_payload: Option<String>,
+    /// A1 · host-object bridge (render side) — optional JSON host seed
+    /// (`{ state: {..}, shared: {..} }`) exposed to the entry component's hooks
+    /// for this render. `None` renders from each hook's initial (the prior
+    /// behaviour); `Some` lets the SSR render reflect the session's current
+    /// slot-store / broadcast values. The engine ignores it unless it supports
+    /// host objects (QuickJS does).
+    pub host_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
