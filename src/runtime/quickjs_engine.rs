@@ -541,6 +541,12 @@ if (typeof globalThis.h !== 'function') {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#x27;');
   };
 
+  // Marker type for HTML strings produced by h() that are already safe to
+  // embed verbatim. Plain user values (strings, numbers) passed as JSX
+  // expression children are NOT this type and must be escaped before use.
+  function AlbedoHtml(str) { this.v = str; }
+  AlbedoHtml.prototype.toString = function() { return this.v; };
+
   const __albedo_push_children = function(value, out) {
     if (Array.isArray(value)) {
       for (const item of value) {
@@ -551,7 +557,13 @@ if (typeof globalThis.h !== 'function') {
     if (value === null || typeof value === 'undefined' || value === false) {
       return;
     }
-    out.push(String(value));
+    // Output of a prior h() call — already-safe markup, pass through verbatim.
+    if (value instanceof AlbedoHtml) {
+      out.push(value);
+      return;
+    }
+    // Plain user value (string, number, …) — escape before embedding in HTML.
+    out.push(new AlbedoHtml(__albedo_escape_html(String(value))));
   };
 
   const h = function(type, props, ...children) {
@@ -593,16 +605,16 @@ if (typeof globalThis.h !== 'function') {
     }
 
     const inner = flatChildren.join('');
-    return '<' + String(type) + attrs + '>' + inner + '</' + String(type) + '>';
+    return new AlbedoHtml('<' + String(type) + attrs + '>' + inner + '</' + String(type) + '>');
   };
 
   h.Fragment = function Fragment(fragmentProps) {
     if (!fragmentProps || typeof fragmentProps.children === 'undefined') {
-      return '';
+      return new AlbedoHtml('');
     }
     const out = [];
     __albedo_push_children(fragmentProps.children, out);
-    return out.join('');
+    return new AlbedoHtml(out.join(''));
   };
 
   globalThis.h = h;
