@@ -696,6 +696,13 @@ use crate::runtime::eval::expr::{
     parse_module as parse_module_impl, ParamBinding, ParsedModule,
 };
 
+/// `true` when any component of `path` is a `node_modules` directory. Those
+/// trees belong to the npm bundler (`bundler::npm`), not the component walk.
+fn path_is_in_node_modules(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == "node_modules")
+}
+
 #[derive(Debug, Clone)]
 pub struct ComponentProject {
     root: PathBuf,
@@ -738,6 +745,13 @@ impl ComponentProject {
         {
             let path = entry.path();
             if !path.is_file() {
+                continue;
+            }
+
+            // npm dependencies are bundled through `bundler::npm`, never
+            // ingested as project components (a node_modules tree under the
+            // project root would otherwise be walked wholesale).
+            if path_is_in_node_modules(path) {
                 continue;
             }
 
@@ -1123,6 +1137,9 @@ impl ComponentProject {
             self.root.join(path)
         };
         let relative_path = absolute_path.strip_prefix(&self.root).ok()?;
+        if path_is_in_node_modules(relative_path) {
+            return None;
+        }
         if !is_component_module(relative_path) {
             return None;
         }

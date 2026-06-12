@@ -45,6 +45,7 @@ pub async fn run_action_request(
     ctx: RequestContext,
     body: Bytes,
     slots: SessionSlots,
+    overlay: Option<&crate::dev::SharedErrorRegistry>,
 ) -> Response<Body> {
     let (envelope, _consumed) = match decode_action_envelope(body.as_ref()) {
         Ok(value) => value,
@@ -93,6 +94,9 @@ pub async fn run_action_request(
         Ok(out) => out,
         Err(err) => {
             warn!(action_id = envelope.action_id, error = %err, "action handler failed");
+            if let Some(reg) = overlay {
+                reg.report_action(format!("action {} failed: {err}", envelope.action_id));
+            }
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 err.to_string(),
@@ -245,7 +249,7 @@ mod tests {
             .unwrap(),
         );
 
-        let response = run_action_request(&registry, &csrf(), ctx(), body, slots()).await;
+        let response = run_action_request(&registry, &csrf(), ctx(), body, slots(), None).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
@@ -273,6 +277,7 @@ mod tests {
             ctx(),
             Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]),
             slots(),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -289,7 +294,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = run_action_request(&registry, &csrf(), ctx(), body, slots()).await;
+        let response = run_action_request(&registry, &csrf(), ctx(), body, slots(), None).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -311,7 +316,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = run_action_request(&registry, &csrf(), ctx(), body, slots()).await;
+        let response = run_action_request(&registry, &csrf(), ctx(), body, slots(), None).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -341,7 +346,7 @@ mod tests {
             .unwrap(),
         );
 
-        let response = run_action_request(&registry, &csrf(), ctx(), body, view).await;
+        let response = run_action_request(&registry, &csrf(), ctx(), body, view, None).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let bytes = body_bytes(response).await;
@@ -412,6 +417,7 @@ mod tests {
             ctx(),
             body,
             slots_for(session),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -449,6 +455,7 @@ mod tests {
             ctx(),
             body,
             slots_for(session),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -491,6 +498,7 @@ mod tests {
             ctx(),
             body,
             slots_for(session),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);

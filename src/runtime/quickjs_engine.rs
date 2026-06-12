@@ -267,6 +267,13 @@ impl QuickJsEngine {
                         RuntimeError::init(format!("failed to initialize module table: {err}"))
                     })?;
 
+                ctx.eval::<(), _>(build_npm_runtime_helpers_script().as_str())
+                    .map_err(|err| {
+                        RuntimeError::init(format!(
+                            "failed to install npm module runtime helpers: {err}"
+                        ))
+                    })?;
+
                 let render_script = build_render_function_script();
                 ctx.eval::<(), _>(render_script.as_str()).map_err(|err| {
                     RuntimeError::init(format!("failed to install reusable render function: {err}"))
@@ -407,28 +414,8 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
       throw new Error('{INVALID_ENTRY_EXPORT_MARKER}' + entry);
     }}
     const __albedo_props = JSON.parse(propsJson);
-    const __albedo_require = function(specifier) {{
-      const resolved = globalThis.__ALBEDO_MODULES[specifier];
-      if (typeof resolved === 'undefined') {{
-        throw new Error('{MODULE_MISSING_MARKER}' + specifier);
-      }}
-      if (__albedo_is_record(resolved)) {{
-        if (__albedo_has_own.call(resolved, 'default')) {{
-          const defaultExport = resolved.default;
-          if (typeof defaultExport === 'function') {{
-            return function(props) {{ return defaultExport(props, __albedo_require); }};
-          }}
-          return defaultExport;
-        }}
-        return resolved;
-      }}
-      if (typeof resolved === 'function') {{
-        return function(props) {{ return resolved(props, __albedo_require); }};
-      }}
-      return resolved;
-    }};
     const __albedo_value = (typeof __albedo_component === 'function')
-      ? __albedo_component(__albedo_props, __albedo_require)
+      ? __albedo_component(__albedo_props, globalThis.__albedo_require)
       : __albedo_component;
     return JSON.stringify({{ ok: true, value: String(__albedo_value) }});
   }} catch (err) {{
@@ -439,6 +426,110 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
     globalThis.__ALBEDO_HOST = null;
   }}
 }};
+"#
+    )
+}
+
+/// A2 · npm dependency runtime — the lazy module linker npm bundles load into.
+///
+/// Three pieces, installed once per context (right after the
+/// `__ALBEDO_MODULES` table):
+///
+/// 1. **Factory + alias tables.** An npm bundle registers one *factory* per
+///    file (`__ALBEDO_NPM_FACTORIES[key] = function(exports) {…}`) and an
+///    *alias* per bare specifier (`__ALBEDO_NPM_ALIASES["zod"] = key`).
+///    Registration is cheap; nothing runs until first use.
+/// 2. **`__albedo_require_record`** — the npm linker. Memoized through
+///    `__ALBEDO_MODULES`; the record is **published before the factory body
+///    runs**, so import cycles observe a partially-initialized record (Node's
+///    CommonJS discipline) instead of recursing forever.
+/// 3. **Import-binding helpers** (`__albedo_import_default` / `_namespace` /
+///    `_named`) — what compiled `import` statements call. For an npm specifier
+///    they apply real ESM semantics (`default` is the `default` property, a
+///    namespace/named import sees the record itself). For project modules they
+///    fall back to the legacy `__albedo_require`, whose component-aware
+///    default unwrapping is preserved byte-for-byte.
+///
+/// The legacy `__albedo_require` itself moves here as a **global**: compiled
+/// module records execute their import statements at *load* time, where the
+/// old render-function-local closure was out of scope — which is exactly why a
+/// project component importing another project module could not load before.
+fn build_npm_runtime_helpers_script() -> String {
+    format!(
+        r#"
+(function() {{
+  if (typeof globalThis.__albedo_require_record === 'function') {{ return; }}
+  globalThis.__ALBEDO_NPM_FACTORIES = Object.create(null);
+  globalThis.__ALBEDO_NPM_ALIASES = Object.create(null);
+  if (typeof globalThis.process === 'undefined') {{
+    globalThis.process = {{ env: {{ NODE_ENV: 'production' }} }};
+  }}
+  const __albedo_has_own = Object.prototype.hasOwnProperty;
+  const __albedo_is_record = function(candidate) {{
+    return candidate !== null
+      && typeof candidate === 'object'
+      && candidate.{MODULE_RECORD_FLAG} === true;
+  }};
+
+  globalThis.__albedo_is_npm_module = function(specifier) {{
+    const spec = String(specifier);
+    return __albedo_has_own.call(globalThis.__ALBEDO_NPM_ALIASES, spec)
+      || __albedo_has_own.call(globalThis.__ALBEDO_NPM_FACTORIES, spec);
+  }};
+
+  globalThis.__albedo_require_record = function(specifier) {{
+    const spec = String(specifier);
+    const key = __albedo_has_own.call(globalThis.__ALBEDO_NPM_ALIASES, spec)
+      ? globalThis.__ALBEDO_NPM_ALIASES[spec]
+      : spec;
+    const table = globalThis.__ALBEDO_MODULES;
+    if (__albedo_has_own.call(table, key)) {{ return table[key]; }}
+    const factory = globalThis.__ALBEDO_NPM_FACTORIES[key];
+    if (typeof factory !== 'function') {{
+      throw new Error('{MODULE_MISSING_MARKER}' + key);
+    }}
+    const record = Object.create(null);
+    Object.defineProperty(record, '{MODULE_RECORD_FLAG}', {{ value: true, enumerable: false }});
+    table[key] = record;
+    try {{ factory(record); }} catch (err) {{ delete table[key]; throw err; }}
+    return record;
+  }};
+
+  globalThis.__albedo_require = function(specifier) {{
+    const resolved = globalThis.__ALBEDO_MODULES[specifier];
+    if (typeof resolved === 'undefined') {{
+      throw new Error('{MODULE_MISSING_MARKER}' + specifier);
+    }}
+    if (__albedo_is_record(resolved)) {{
+      if (__albedo_has_own.call(resolved, 'default')) {{
+        const defaultExport = resolved.default;
+        if (typeof defaultExport === 'function') {{
+          return function(props) {{ return defaultExport(props, globalThis.__albedo_require); }};
+        }}
+        return defaultExport;
+      }}
+      return resolved;
+    }}
+    if (typeof resolved === 'function') {{
+      return function(props) {{ return resolved(props, globalThis.__albedo_require); }};
+    }}
+    return resolved;
+  }};
+
+  globalThis.__albedo_import_default = function(specifier) {{
+    if (globalThis.__albedo_is_npm_module(specifier)) {{
+      return globalThis.__albedo_require_record(specifier).default;
+    }}
+    return globalThis.__albedo_require(specifier);
+  }};
+  globalThis.__albedo_import_namespace = function(specifier) {{
+    if (globalThis.__albedo_is_npm_module(specifier)) {{
+      return globalThis.__albedo_require_record(specifier);
+    }}
+    return globalThis.__albedo_require(specifier);
+  }};
+  globalThis.__albedo_import_named = globalThis.__albedo_import_namespace;
+}})();
 "#
     )
 }
@@ -693,6 +784,30 @@ fn compile_exporting_module(specifier: &str, source: &str) -> RuntimeResult<Stri
                                 .push(format!("__albedo_exports[{export_key}] = {export_name};"));
                         }
                     }
+                    Decl::Class(class_decl) => {
+                        // Slice the full `export class X …` then drop the
+                        // `export` prefix so the class declaration stays a
+                        // hoistable statement inside the record.
+                        let decl_source =
+                            slice_source(source, export_decl.span, specifier)?;
+                        let stripped = decl_source
+                            .trim_start()
+                            .strip_prefix("export")
+                            .map(str::trim_start)
+                            .ok_or_else(|| {
+                                RuntimeError::load(
+                                    LoadErrorKind::UnsupportedSyntax,
+                                    format!(
+                                        "unsupported exported class declaration in module '{specifier}'"
+                                    ),
+                                )
+                            })?;
+                        statements.push(normalize_statement(stripped.to_string()));
+                        let export_name = class_decl.ident.sym.to_string();
+                        let export_key = js_string_literal(&export_name, specifier)?;
+                        export_assignments
+                            .push(format!("__albedo_exports[{export_key}] = {export_name};"));
+                    }
                     other => {
                         return Err(RuntimeError::load(
                             LoadErrorKind::UnsupportedSyntax,
@@ -768,6 +883,418 @@ fn compile_exporting_module(specifier: &str, source: &str) -> RuntimeResult<Stri
     }
 
     build_module_record_script(specifier, &statements, &export_assignments)
+}
+
+/// How an npm file lowers to a record factory (decided by the resolver from
+/// the file extension and the nearest `package.json` `"type"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NpmModuleFormat {
+    /// An ES module — imports/exports are rewritten onto the record linker.
+    Esm,
+    /// A CommonJS module — wrapped with `module`/`exports`/`require` shims;
+    /// the record gets `default = module.exports` plus copied named props
+    /// (Node's CJS→ESM interop shape).
+    Cjs,
+    /// A JSON module — the parsed value is the `default` export, object keys
+    /// are also exposed as named exports.
+    Json,
+}
+
+/// A2 · lower one npm file to a **lazy factory registration script**.
+///
+/// Unlike project modules (eager records via [`compile_module_script_for_quickjs`]),
+/// npm files register `__ALBEDO_NPM_FACTORIES[key] = function(__albedo_exports) {…}`
+/// and only execute on first import — which is what makes load order
+/// irrelevant and import cycles safe (see `build_npm_runtime_helpers_script`).
+///
+/// `resolve` maps every raw specifier appearing in `source` to its canonical
+/// record key; a specifier missing from the map is a resolver bug and fails
+/// loudly here rather than at run time.
+pub(crate) fn compile_npm_module_script(
+    key: &str,
+    source: &str,
+    format: NpmModuleFormat,
+    resolve: &HashMap<String, String>,
+) -> RuntimeResult<String> {
+    let source = source.trim_start_matches('\u{feff}');
+    match format {
+        NpmModuleFormat::Esm => compile_npm_esm_module(key, source, resolve),
+        NpmModuleFormat::Cjs => compile_npm_cjs_module(key, source, resolve),
+        NpmModuleFormat::Json => compile_npm_json_module(key, source),
+    }
+}
+
+fn npm_resolved_literal(
+    resolve: &HashMap<String, String>,
+    raw: &str,
+    key: &str,
+) -> RuntimeResult<String> {
+    let resolved = resolve.get(raw).ok_or_else(|| {
+        RuntimeError::load(
+            LoadErrorKind::ModuleMissing,
+            format!("npm module '{key}' references unresolved specifier '{raw}' (bundler bug)"),
+        )
+    })?;
+    js_string_literal(resolved, key)
+}
+
+fn compile_npm_esm_module(
+    key: &str,
+    source: &str,
+    resolve: &HashMap<String, String>,
+) -> RuntimeResult<String> {
+    let (module, _source_map) =
+        parse_module_with_syntax(key, source, Syntax::Es(EsSyntax::default()))?;
+
+    let mut statements = Vec::new();
+    let mut export_assignments = Vec::new();
+
+    for item in module.body {
+        match item {
+            ModuleItem::Stmt(stmt) => {
+                let snippet = normalize_statement(slice_source(source, stmt.span(), key)?);
+                if !snippet.is_empty() {
+                    statements.push(snippet);
+                }
+            }
+            ModuleItem::ModuleDecl(decl) => match decl {
+                ModuleDecl::Import(import_decl) => {
+                    let raw = import_decl.src.value.to_string();
+                    let resolved_literal = npm_resolved_literal(resolve, &raw, key)?;
+                    let record = format!("globalThis.__albedo_require_record({resolved_literal})");
+
+                    if import_decl.specifiers.is_empty() {
+                        statements.push(format!("{record};"));
+                        continue;
+                    }
+
+                    let mut named_bindings = Vec::new();
+                    for import_specifier in import_decl.specifiers {
+                        match import_specifier {
+                            ImportSpecifier::Default(default_specifier) => {
+                                let local = default_specifier.local.sym.to_string();
+                                statements.push(format!("const {local} = {record}.default;"));
+                            }
+                            ImportSpecifier::Namespace(namespace_specifier) => {
+                                let local = namespace_specifier.local.sym.to_string();
+                                statements.push(format!("const {local} = {record};"));
+                            }
+                            ImportSpecifier::Named(named_specifier) => {
+                                let local = named_specifier.local.sym.to_string();
+                                let binding = match named_specifier.imported.as_ref() {
+                                    None => local.clone(),
+                                    Some(ModuleExportName::Ident(imported_ident))
+                                        if imported_ident.sym == named_specifier.local.sym =>
+                                    {
+                                        local.clone()
+                                    }
+                                    Some(imported_name) => {
+                                        let property =
+                                            module_export_name_to_property(imported_name, key)?;
+                                        format!("{property}: {local}")
+                                    }
+                                };
+                                named_bindings.push(binding);
+                            }
+                        }
+                    }
+                    if !named_bindings.is_empty() {
+                        statements.push(format!(
+                            "const {{ {} }} = {record};",
+                            named_bindings.join(", ")
+                        ));
+                    }
+                }
+                ModuleDecl::ExportDefaultExpr(default_expr) => {
+                    let expr_source = slice_source(source, default_expr.expr.span(), key)?;
+                    statements.push(format!(
+                        "const __albedo_default_export__ = ({expr_source});"
+                    ));
+                    export_assignments
+                        .push("__albedo_exports.default = __albedo_default_export__;".to_string());
+                }
+                ModuleDecl::ExportDefaultDecl(default_decl) => {
+                    let decl_source = slice_source(source, default_decl.span(), key)?;
+                    let default_value =
+                        strip_export_default_prefix(&decl_source).ok_or_else(|| {
+                            RuntimeError::load(
+                                LoadErrorKind::UnsupportedSyntax,
+                                format!("unsupported default export declaration in npm module '{key}'"),
+                            )
+                        })?;
+                    statements.push(format!(
+                        "const __albedo_default_export__ = {default_value};"
+                    ));
+                    export_assignments
+                        .push("__albedo_exports.default = __albedo_default_export__;".to_string());
+                }
+                ModuleDecl::ExportDecl(export_decl) => {
+                    // Slice the full `export <decl>` and drop the prefix so
+                    // function/class declarations stay hoistable statements.
+                    let decl_source = slice_source(source, export_decl.span, key)?;
+                    let stripped = decl_source
+                        .trim_start()
+                        .strip_prefix("export")
+                        .map(str::trim_start)
+                        .ok_or_else(|| {
+                            RuntimeError::load(
+                                LoadErrorKind::UnsupportedSyntax,
+                                format!("unsupported export declaration in npm module '{key}'"),
+                            )
+                        })?;
+                    statements.push(normalize_statement(stripped.to_string()));
+
+                    let mut export_names = Vec::new();
+                    match export_decl.decl {
+                        Decl::Fn(fn_decl) => export_names.push(fn_decl.ident.sym.to_string()),
+                        Decl::Class(class_decl) => {
+                            export_names.push(class_decl.ident.sym.to_string());
+                        }
+                        Decl::Var(var_decl) => {
+                            for declarator in var_decl.decls {
+                                match declarator.name {
+                                    Pat::Ident(binding_ident) => {
+                                        export_names.push(binding_ident.id.sym.to_string());
+                                    }
+                                    _ => {
+                                        return Err(RuntimeError::load(
+                                            LoadErrorKind::UnsupportedSyntax,
+                                            format!(
+                                                "unsupported export pattern in npm module '{key}'; only identifier bindings are supported"
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(RuntimeError::load(
+                                LoadErrorKind::UnsupportedSyntax,
+                                format!(
+                                    "unsupported export declaration '{other:?}' in npm module '{key}'"
+                                ),
+                            ));
+                        }
+                    }
+                    for export_name in export_names {
+                        let export_key = js_string_literal(&export_name, key)?;
+                        export_assignments
+                            .push(format!("__albedo_exports[{export_key}] = {export_name};"));
+                    }
+                }
+                ModuleDecl::ExportNamed(named_export) => {
+                    if let Some(src) = named_export.src.as_ref() {
+                        // Re-export: `export { x as y } from "spec"` /
+                        // `export * as ns from "spec"`.
+                        let raw = src.value.to_string();
+                        let resolved_literal = npm_resolved_literal(resolve, &raw, key)?;
+                        let record =
+                            format!("globalThis.__albedo_require_record({resolved_literal})");
+                        for named_specifier in named_export.specifiers {
+                            match named_specifier {
+                                ExportSpecifier::Named(named) => {
+                                    let orig_property =
+                                        module_export_name_to_property(&named.orig, key)?;
+                                    let orig_key = if orig_property.starts_with('"') {
+                                        orig_property
+                                    } else {
+                                        js_string_literal(&orig_property, key)?
+                                    };
+                                    let exported = named
+                                        .exported
+                                        .as_ref()
+                                        .map(|name| module_export_name_to_property(name, key))
+                                        .transpose()?
+                                        .unwrap_or_else(|| {
+                                            orig_key.trim_matches('"').to_string()
+                                        });
+                                    let exported_key = if exported.starts_with('"') {
+                                        exported
+                                    } else {
+                                        js_string_literal(&exported, key)?
+                                    };
+                                    export_assignments.push(format!(
+                                        "__albedo_exports[{exported_key}] = {record}[{orig_key}];"
+                                    ));
+                                }
+                                ExportSpecifier::Namespace(namespace) => {
+                                    let exported =
+                                        module_export_name_to_property(&namespace.name, key)?;
+                                    let exported_key = if exported.starts_with('"') {
+                                        exported
+                                    } else {
+                                        js_string_literal(&exported, key)?
+                                    };
+                                    export_assignments.push(format!(
+                                        "__albedo_exports[{exported_key}] = {record};"
+                                    ));
+                                }
+                                ExportSpecifier::Default(_) => {
+                                    return Err(RuntimeError::load(
+                                        LoadErrorKind::UnsupportedSyntax,
+                                        format!(
+                                            "unsupported default re-export form in npm module '{key}'"
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        for named_specifier in named_export.specifiers {
+                            match named_specifier {
+                                ExportSpecifier::Named(named) => {
+                                    let local =
+                                        module_export_name_to_ident(&named.orig).ok_or_else(|| {
+                                            RuntimeError::load(
+                                                LoadErrorKind::UnsupportedSyntax,
+                                                format!(
+                                                    "unsupported named export source in npm module '{key}'"
+                                                ),
+                                            )
+                                        })?;
+                                    let exported = named
+                                        .exported
+                                        .as_ref()
+                                        .and_then(module_export_name_to_ident)
+                                        .unwrap_or_else(|| local.clone());
+                                    let export_key = js_string_literal(&exported, key)?;
+                                    export_assignments.push(format!(
+                                        "__albedo_exports[{export_key}] = {local};"
+                                    ));
+                                }
+                                ExportSpecifier::Default(default_export) => {
+                                    let local = default_export.exported.sym.to_string();
+                                    export_assignments
+                                        .push(format!("__albedo_exports.default = {local};"));
+                                }
+                                ExportSpecifier::Namespace(_) => {
+                                    return Err(RuntimeError::load(
+                                        LoadErrorKind::UnsupportedSyntax,
+                                        format!(
+                                            "namespace export without a source in npm module '{key}'"
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                ModuleDecl::ExportAll(export_all) => {
+                    // `export * from "spec"` — copy enumerable own props except
+                    // `default`. The `in` guard keeps the first star's binding
+                    // when two stars collide, while later non-star assignments
+                    // (locals always run unguarded) still win — ESM precedence.
+                    let raw = export_all.src.value.to_string();
+                    let resolved_literal = npm_resolved_literal(resolve, &raw, key)?;
+                    export_assignments.push(format!(
+                        "(function(__albedo_star) {{ for (const __albedo_k in __albedo_star) {{ if (__albedo_k !== 'default' && !(__albedo_k in __albedo_exports)) {{ __albedo_exports[__albedo_k] = __albedo_star[__albedo_k]; }} }} }})(globalThis.__albedo_require_record({resolved_literal}));"
+                    ));
+                }
+                unsupported => {
+                    return Err(RuntimeError::load(
+                        LoadErrorKind::UnsupportedSyntax,
+                        format!(
+                            "unsupported module declaration '{unsupported:?}' in npm module '{key}'"
+                        ),
+                    ));
+                }
+            },
+        }
+    }
+
+    build_npm_factory_script(key, &statements, &export_assignments)
+}
+
+fn compile_npm_cjs_module(
+    key: &str,
+    source: &str,
+    resolve: &HashMap<String, String>,
+) -> RuntimeResult<String> {
+    let key_literal = js_string_literal(key, key)?;
+    let dir = key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(key);
+    let dir_literal = js_string_literal(dir, key)?;
+    let map_literal = serde_json::to_string(resolve).map_err(|err| {
+        RuntimeError::load(
+            LoadErrorKind::EngineFailure,
+            format!("failed to serialize require map for npm module '{key}': {err}"),
+        )
+    })?;
+
+    let mut script = String::new();
+    script.push_str(&format!(
+        "globalThis.__ALBEDO_NPM_FACTORIES[{key_literal}] = function(__albedo_exports) {{\n"
+    ));
+    script.push_str("  const __albedo_module = { exports: {} };\n");
+    script.push_str(&format!("  const __albedo_require_map = {map_literal};\n"));
+    script.push_str(&format!(
+        "  const __albedo_cjs_require = function(specifier) {{\n    const spec = String(specifier);\n    if (!Object.prototype.hasOwnProperty.call(__albedo_require_map, spec)) {{\n      throw new Error('{MODULE_MISSING_MARKER}' + spec);\n    }}\n    const record = globalThis.__albedo_require_record(__albedo_require_map[spec]);\n    return (record && record.__albedo_cjs === true) ? record.default : record;\n  }};\n"
+    ));
+    script.push_str(&format!(
+        "  (function(module, exports, require, __filename, __dirname, global) {{\n{source}\n  }})(__albedo_module, __albedo_module.exports, __albedo_cjs_require, {key_literal}, {dir_literal}, globalThis);\n"
+    ));
+    script.push_str("  const __albedo_value = __albedo_module.exports;\n");
+    script.push_str(
+        "  Object.defineProperty(__albedo_exports, '__albedo_cjs', { value: true, enumerable: false });\n",
+    );
+    script.push_str("  __albedo_exports['default'] = __albedo_value;\n");
+    script.push_str(
+        "  if (__albedo_value && (typeof __albedo_value === 'object' || typeof __albedo_value === 'function')) {\n    for (const __albedo_k of Object.keys(__albedo_value)) {\n      if (__albedo_k !== 'default') { __albedo_exports[__albedo_k] = __albedo_value[__albedo_k]; }\n    }\n  }\n",
+    );
+    script.push_str("};");
+    Ok(script)
+}
+
+fn compile_npm_json_module(key: &str, source: &str) -> RuntimeResult<String> {
+    // Parse + re-serialize: validates the JSON and canonicalizes any
+    // formatting quirks (BOM already stripped) into a safe JS literal.
+    let value: serde_json::Value = serde_json::from_str(source).map_err(|err| {
+        RuntimeError::load(
+            LoadErrorKind::UnsupportedSyntax,
+            format!("invalid JSON in npm module '{key}': {err}"),
+        )
+    })?;
+    let value_literal = serde_json::to_string(&value).map_err(|err| {
+        RuntimeError::load(
+            LoadErrorKind::EngineFailure,
+            format!("failed to re-serialize JSON module '{key}': {err}"),
+        )
+    })?;
+    let key_literal = js_string_literal(key, key)?;
+
+    Ok(format!(
+        "globalThis.__ALBEDO_NPM_FACTORIES[{key_literal}] = function(__albedo_exports) {{\n  const __albedo_value = ({value_literal});\n  __albedo_exports['default'] = __albedo_value;\n  if (__albedo_value && typeof __albedo_value === 'object' && !Array.isArray(__albedo_value)) {{\n    for (const __albedo_k of Object.keys(__albedo_value)) {{\n      if (__albedo_k !== 'default') {{ __albedo_exports[__albedo_k] = __albedo_value[__albedo_k]; }}\n    }}\n  }}\n}};"
+    ))
+}
+
+fn build_npm_factory_script(
+    key: &str,
+    statements: &[String],
+    export_assignments: &[String],
+) -> RuntimeResult<String> {
+    let key_literal = js_string_literal(key, key)?;
+    let mut script = String::new();
+    script.push_str(&format!(
+        "globalThis.__ALBEDO_NPM_FACTORIES[{key_literal}] = function(__albedo_exports) {{\n"
+    ));
+    for statement in statements {
+        if statement.trim().is_empty() {
+            continue;
+        }
+        script.push_str("  ");
+        script.push_str(statement);
+        if !statement.ends_with('\n') {
+            script.push('\n');
+        }
+    }
+    for export in export_assignments {
+        script.push_str("  ");
+        script.push_str(export);
+        if !export.ends_with('\n') {
+            script.push('\n');
+        }
+    }
+    script.push_str("};");
+    Ok(script)
 }
 
 fn transpile_module_source_for_quickjs(specifier: &str, source: &str) -> RuntimeResult<String> {
@@ -1046,29 +1573,35 @@ fn rewrite_import_declaration(
     }
 
     let import_source_literal = js_string_literal(import_source.as_str(), specifier)?;
-    let require_call = format!("__albedo_require({import_source_literal})");
 
+    // Side-effect import: still trigger module initialization.
     if import_decl.specifiers.is_empty() {
-        return Ok(vec![format!("{require_call};")]);
+        return Ok(vec![format!(
+            "__albedo_import_namespace({import_source_literal});"
+        )]);
     }
 
+    // Each binding goes through a kind-specific helper so npm records get real
+    // ESM semantics (default = the `default` property; named imports
+    // destructure the record itself) while project modules keep the legacy
+    // `__albedo_require` unwrapping unchanged. The underlying record lookup is
+    // memoized, so repeated calls for one declaration are cheap.
     let mut statements = Vec::new();
     let mut named_bindings = Vec::new();
-    let import_binding = format!(
-        "__albedo_import_{}_{}",
-        import_decl.span.lo.0, import_decl.span.hi.0
-    );
-    statements.push(format!("const {import_binding} = {require_call};"));
 
     for import_specifier in import_decl.specifiers {
         match import_specifier {
             ImportSpecifier::Default(default_specifier) => {
                 let local = default_specifier.local.sym.to_string();
-                statements.push(format!("const {local} = {import_binding};"));
+                statements.push(format!(
+                    "const {local} = __albedo_import_default({import_source_literal});"
+                ));
             }
             ImportSpecifier::Namespace(namespace_specifier) => {
                 let local = namespace_specifier.local.sym.to_string();
-                statements.push(format!("const {local} = {import_binding};"));
+                statements.push(format!(
+                    "const {local} = __albedo_import_namespace({import_source_literal});"
+                ));
             }
             ImportSpecifier::Named(named_specifier) => {
                 let local = named_specifier.local.sym.to_string();
@@ -1091,7 +1624,7 @@ fn rewrite_import_declaration(
 
     if !named_bindings.is_empty() {
         statements.push(format!(
-            "const {{ {} }} = {import_binding};",
+            "const {{ {} }} = __albedo_import_named({import_source_literal});",
             named_bindings.join(", ")
         ));
     }
@@ -1234,13 +1767,10 @@ mod tests {
         "#;
 
         let compiled = compile_module_script_for_quickjs("components/App.jsx", source).unwrap();
-        assert!(compiled.contains(r#"__albedo_require("pkg/default")"#));
-        assert!(compiled.contains("const DefaultThing = __albedo_import_"));
-        assert!(compiled.contains(r#"__albedo_require("pkg/named")"#));
-        assert!(compiled.contains("const { a, b: c } = __albedo_import_"));
-        assert!(compiled.contains(r#"__albedo_require("pkg/ns")"#));
-        assert!(compiled.contains("const ns = __albedo_import_"));
-        assert!(compiled.contains(r#"__albedo_require("pkg/side-effect");"#));
+        assert!(compiled.contains(r#"const DefaultThing = __albedo_import_default("pkg/default");"#));
+        assert!(compiled.contains(r#"const { a, b: c } = __albedo_import_named("pkg/named");"#));
+        assert!(compiled.contains(r#"const ns = __albedo_import_namespace("pkg/ns");"#));
+        assert!(compiled.contains(r#"__albedo_import_namespace("pkg/side-effect");"#));
     }
 
     #[test]
