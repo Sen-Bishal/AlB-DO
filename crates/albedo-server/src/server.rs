@@ -922,7 +922,31 @@ impl AlbedoServer {
     }
 }
 
+/// Top-level axum entry point. Runs the real dispatch in a separate tokio
+/// task so a panicking handler surfaces as a 500 rather than a dropped
+/// connection.
 async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> Response {
+    match tokio::task::spawn(dispatch_inner(state, request)).await {
+        Ok(response) => response,
+        Err(join_err) => {
+            let msg = if join_err.is_panic() {
+                let payload = join_err.into_panic();
+                payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("(unknown panic payload)")
+                    .to_owned()
+            } else {
+                format!("task cancelled: {join_err}")
+            };
+            error!(cause = %msg, "request handler panicked — returning 500");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response {
     let method = match HttpMethod::try_from(request.method()) {
         Ok(method) => method,
         Err(err) => return err.into_response(),
@@ -1146,6 +1170,7 @@ async fn run_action_route(state: &RuntimeState, request: Request<Body>) -> Respo
         ctx,
         body,
         slots,
+        state.dev_error_registry.as_ref(),
     )
     .await
 }

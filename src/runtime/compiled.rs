@@ -10,6 +10,7 @@
 //! pre-extracted metadata**, not source-to-source codegen. Same wire
 //! opcodes; reuses the Phase-J evaluator end-to-end.
 
+use crate::bundler::npm::{bundle_npm_dependency, scan_bare_imports, NpmDependencyBundle};
 use crate::ir::action::ActionEnvelope;
 use crate::ir::opcode::{Instruction, SlotId};
 use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
@@ -226,6 +227,14 @@ pub struct CompiledProject {
     /// in `runtime::eval::core`; the manifest builder reads scoped
     /// CSS bodies for per-route `<style>` injection.
     css_modules: CssModuleRegistry,
+    /// A2 · npm dependencies discovered across the project's modules,
+    /// bundled once at wrap time. Each bundle is a set of lazy-factory
+    /// artifacts the QuickJS render/action paths preload (idempotent by
+    /// source hash) so `import { z } from "zod"` links at module-load
+    /// time. A bare import that fails to resolve is *not* an error here —
+    /// the engine throws a loud `MODULE_MISSING` naming the specifier the
+    /// first time something actually imports it.
+    npm_bundles: Vec<NpmDependencyBundle>,
 }
 
 impl CompiledProject {
@@ -418,12 +427,19 @@ impl CompiledProject {
             action_declarations.insert(module_spec.clone(), per_module);
         }
 
+        // A2 · discover + bundle npm dependencies once per wrap. Discovery
+        // scans the retained sources (catches namespace and side-effect
+        // imports the eval-side `ParsedModule.imports` map doesn't record);
+        // specifiers that name an existing project module are skipped.
+        let npm_bundles = bundle_project_npm_dependencies(&project);
+
         Ok(Self {
             project,
             components,
             handlers,
             action_declarations,
             css_modules,
+            npm_bundles,
         })
     }
 
@@ -432,6 +448,35 @@ impl CompiledProject {
     #[must_use]
     pub fn project(&self) -> &ComponentProject {
         &self.project
+    }
+
+    /// A2 · the npm dependency bundles discovered and built at wrap time.
+    /// One entry per bare specifier the project imports (`zod`,
+    /// `date-fns/addDays`, …).
+    #[must_use]
+    pub fn npm_bundles(&self) -> &[NpmDependencyBundle] {
+        &self.npm_bundles
+    }
+
+    /// A2 · load every npm artifact into `engine`. Idempotent and cheap
+    /// after the first call: artifacts are hash-memoized by the engine, and
+    /// the factories they register are lazy — nothing executes until a
+    /// module is actually imported.
+    fn preload_npm_bundles(&self, engine: &mut QuickJsEngine) -> Result<()> {
+        for bundle in &self.npm_bundles {
+            for artifact in &bundle.artifacts {
+                engine
+                    .load_precompiled_module(&artifact.key, &artifact.script, artifact.source_hash)
+                    .map_err(|err| {
+                        anyhow!(
+                            "failed to load npm artifact '{}' (from '{}'): {err}",
+                            artifact.key,
+                            bundle.specifier
+                        )
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     pub fn patch(
@@ -450,6 +495,7 @@ impl CompiledProject {
         self.handlers = rebuilt.handlers;
         self.action_declarations = rebuilt.action_declarations;
         self.css_modules = rebuilt.css_modules;
+        self.npm_bundles = rebuilt.npm_bundles;
         Ok(report)
     }
 
@@ -690,6 +736,12 @@ impl CompiledProject {
 
         let (body_src, is_block) = handler_body_to_js(&handler.body)?;
 
+        // A2 · make sure this engine has the project's npm bundles registered
+        // before the handler body (or a module const referencing an import)
+        // runs. Hash-memoized + lazy, so steady-state dispatches pay a map
+        // lookup per artifact.
+        self.preload_npm_bundles(engine)?;
+
         // Seed the JS scope. State values and captured props that exist in the
         // store come in as JSON; an unwritten useState value falls back to its
         // initial expression, codegen'd to JS and seeded as engine-trusted
@@ -697,39 +749,77 @@ impl CompiledProject {
         let mut env = serde_json::Map::new();
         let mut raw_bindings: Vec<(String, String)> = Vec::new();
 
-        // Seed module-level constants so a handler referencing one resolves
-        // instead of throwing a QuickJS `ReferenceError`. Parity with the
-        // pure-Rust `seed_env_with_module_constants`:
-        //   * seeded BEFORE state/prop bindings so a `useState(CONST)` initial
-        //     and a later const referencing an earlier one both resolve (source
-        //     order preserved);
-        //   * a const whose name is shadowed by a component-owned binding
-        //     (state value / captured prop / setter) is skipped — the pure-Rust
-        //     map would overwrite it, and here two `let`s of one name would be a
-        //     JS `SyntaxError`, so the component-owned `let` must be the sole one;
-        //   * each init is wrapped so a const that fails to evaluate (e.g. it
-        //     references an import the handler scope doesn't expose) degrades to
-        //     `null` instead of throwing — matching pure-Rust's `unwrap_or(Null)`,
-        //     so a failing const never breaks a handler that doesn't use it.
+        // Seed npm imports first, then module-level constants — a const like
+        // `const User = z.object(...)` references the import, so order
+        // matters. Both respect component-owned names (state values /
+        // captured props / setters): a component-owned `let` must be the sole
+        // binding of its name or the generated script is a JS `SyntaxError`.
+        // Each init is wrapped so a failing seed degrades to `null` instead
+        // of breaking a handler that never touches it — parity with the
+        // pure-Rust `seed_env_with_module_constants`' `unwrap_or(Null)`.
         if let Some(module) = self.project.modules().get(&handler.module_spec) {
-            if !module.module_constants.is_empty() {
-                let owned: HashSet<&str> = component
-                    .value_slots
-                    .keys()
-                    .chain(component.capture_slots.keys())
-                    .chain(component.setter_slots.keys())
-                    .map(String::as_str)
+            let owned: HashSet<&str> = component
+                .value_slots
+                .keys()
+                .chain(component.capture_slots.keys())
+                .chain(component.setter_slots.keys())
+                .map(String::as_str)
+                .collect();
+            let mut seeded: HashSet<&str> = HashSet::new();
+
+            // npm import bindings: `import { z } from "zod"` seeds
+            // `let z = __albedo_import_named("zod")["z"]` (default imports go
+            // through `__albedo_import_default`). Only specifiers that
+            // actually bundled are seeded; anything else keeps the loud
+            // `ReferenceError` the handler would produce today.
+            if !module.imports.is_empty() && !self.npm_bundles.is_empty() {
+                let bundled: HashSet<&str> = self
+                    .npm_bundles
+                    .iter()
+                    .map(|bundle| bundle.specifier.as_str())
                     .collect();
-                for (name, expr) in &module.module_constants {
-                    if owned.contains(name.as_str()) {
+                // Deterministic seeding order (imports are a HashMap).
+                let mut imports: Vec<(&String, &crate::runtime::eval::ImportBinding)> =
+                    module.imports.iter().collect();
+                imports.sort_by(|a, b| a.0.cmp(b.0));
+                for (local, binding) in imports {
+                    if owned.contains(local.as_str())
+                        || !bundled.contains(binding.source.as_str())
+                        || !seeded.insert(local.as_str())
+                    {
                         continue;
                     }
-                    let init = expr_to_js(expr)?;
+                    let source_literal = serde_json::to_string(&binding.source)
+                        .map_err(|err| anyhow!("failed to encode import source: {err}"))?;
+                    let accessor = if binding.export_name == "default" {
+                        format!("globalThis.__albedo_import_default({source_literal})")
+                    } else {
+                        let name_literal = serde_json::to_string(&binding.export_name)
+                            .map_err(|err| anyhow!("failed to encode import name: {err}"))?;
+                        format!(
+                            "globalThis.__albedo_import_named({source_literal})[{name_literal}]"
+                        )
+                    };
                     raw_bindings.push((
-                        name.clone(),
-                        format!("(function(){{try{{return ({init});}}catch(__e){{return null;}}}})()"),
+                        local.clone(),
+                        format!(
+                            "(function(){{try{{return {accessor};}}catch(__e){{return null;}}}})()"
+                        ),
                     ));
                 }
+            }
+
+            // Module-level constants, source order preserved so a later const
+            // can read an earlier one (and the npm imports above).
+            for (name, expr) in &module.module_constants {
+                if owned.contains(name.as_str()) || !seeded.insert(name.as_str()) {
+                    continue;
+                }
+                let init = expr_to_js(expr)?;
+                raw_bindings.push((
+                    name.clone(),
+                    format!("(function(){{try{{return ({init});}}catch(__e){{return null;}}}})()"),
+                ));
             }
         }
 
@@ -900,6 +990,11 @@ impl CompiledProject {
                 anyhow!("no retained source for module '{module_spec}' (quickjs render)")
             })?
             .to_string();
+
+        // A2 · npm bundles must be registered before the component module
+        // loads — its top-level import statements link against the factory
+        // table at load time. Hash-memoized, cheap after the first render.
+        self.preload_npm_bundles(engine)?;
 
         // Idempotent by source hash — re-loading an unchanged module is a no-op
         // inside the engine, so calling this every render is cheap after warmup.
@@ -1217,6 +1312,52 @@ pub(crate) fn is_compiled_stmt_root(_stmt: &Stmt) -> bool {
 /// shouldn't fail the build. The renderer falls through to a
 /// `Value::Null` member lookup in that case, surfacing as an empty
 /// class attribute in the output rather than a panic.
+/// A2 · discover every bare npm specifier the project's modules import and
+/// bundle each one through `bundler::npm`. Specifiers that name an existing
+/// project module are skipped (a bare-looking `import X from
+/// "components/Badge.tsx"` is project-internal, not npm). A specifier that
+/// fails to resolve or bundle logs a warning and is skipped — the engine
+/// throws a loud `MODULE_MISSING` naming it if a render/handler actually
+/// imports it, which is the established loud-error surface.
+fn bundle_project_npm_dependencies(project: &ComponentProject) -> Vec<NpmDependencyBundle> {
+    let mut specifiers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for module_spec in project.modules().keys() {
+        let Some(source) = project.module_source(module_spec) else {
+            continue;
+        };
+        for specifier in scan_bare_imports(source) {
+            if project.module_source(&specifier).is_some() {
+                continue;
+            }
+            specifiers.insert(specifier);
+        }
+    }
+
+    let mut bundles = Vec::new();
+    for specifier in specifiers {
+        match bundle_npm_dependency(project.root(), &specifier) {
+            Ok(bundle) => {
+                tracing::debug!(
+                    specifier = %bundle.specifier,
+                    package = %bundle.package_name,
+                    version = %bundle.package_version,
+                    artifacts = bundle.artifacts.len(),
+                    "bundled npm dependency"
+                );
+                bundles.push(bundle);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    specifier = %specifier,
+                    error = %err,
+                    "npm dependency did not bundle; imports of it will fail loudly at render"
+                );
+            }
+        }
+    }
+    bundles
+}
+
 fn build_css_module_registry(project: &ComponentProject) -> CssModuleRegistry {
     let mut registry = CssModuleRegistry::default();
     let root = project.root().to_path_buf();

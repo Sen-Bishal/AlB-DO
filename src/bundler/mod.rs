@@ -1,5 +1,6 @@
 pub mod classify;
 pub mod emit;
+pub mod npm;
 pub mod plan;
 pub mod precompiled;
 pub mod rewrite;
