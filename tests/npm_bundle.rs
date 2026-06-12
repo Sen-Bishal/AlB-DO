@@ -339,9 +339,7 @@ fn transitive_package_dependency_resolves() {
     let out = engine
         .render_component("routes/app.tsx", "{}")
         .expect("renders");
-    // Text children pass through `h` unescaped (existing engine semantics —
-    // only attribute values escape).
-    assert_eq!(out.html, "<s><<pith>></s>");
+    assert_eq!(out.html, "<s>&lt;&lt;pith&gt;&gt;</s>");
 }
 
 /// Slice 3 — the full production path: `CompiledProject::wrap` discovers the
