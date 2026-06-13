@@ -109,6 +109,79 @@ fn test_hydration_no_js_for_tier_a_only_route() {
     assert!(result.head_tags.is_empty());
 }
 
+// A3.2 — a Tier-C route now ships the client runtime plus a self-registering
+// component script in its head tags, and seeds the entry island's props into
+// the hydration payload.
+#[test]
+fn test_hydration_tier_c_route_injects_client_runtime_and_props() {
+    let mut renderer = create_renderer();
+
+    let manifest = RenderManifestV2 {
+        schema_version: "2.0".to_string(),
+        generated_at: "2026-02-17T00:00:00Z".to_string(),
+        components: vec![component(
+            50,
+            "Widget",
+            "components/widget",
+            Tier::C,
+            HydrationMode::OnInteraction,
+            Vec::new(),
+        )],
+        parallel_batches: vec![vec![50]],
+        critical_path: vec![50],
+        vendor_chunks: Vec::new(),
+        ..RenderManifestV2::legacy_defaults()
+    };
+
+    let mut sources = HashMap::new();
+    sources.insert(
+        "components/widget".to_string(),
+        "(props) => '<button>' + props.label + '</button>'".to_string(),
+    );
+    renderer
+        .register_manifest_modules(&manifest, &sources)
+        .expect("manifest registration should succeed");
+
+    let result = renderer
+        .render_route_with_manifest_hydration(
+            &RouteRenderRequest {
+                entry: "components/widget".to_string(),
+                props_json: r#"{"label":"go"}"#.to_string(),
+                module_order: Vec::new(),
+                hydration_payload: None,
+                host_json: None,
+            },
+            &manifest,
+        )
+        .expect("render should succeed");
+
+    // The shared client runtime is served, and the island self-registers.
+    assert!(
+        result
+            .head_tags
+            .iter()
+            .any(|tag| tag.contains("/_albedo/client.js")),
+        "Tier-C route must load the client runtime"
+    );
+    assert!(
+        result
+            .head_tags
+            .iter()
+            .any(|tag| tag.contains("registerComponent(\"50\"")),
+        "the island must self-register with the client runtime"
+    );
+
+    // The entry island's props are seeded into the payload for client render.
+    let payload: HydrationPayload =
+        serde_json::from_str(&result.hydration_payload).expect("payload should deserialize");
+    let entry = payload
+        .islands
+        .iter()
+        .find(|island| island.component_id == 50)
+        .expect("entry island should be present");
+    assert_eq!(entry.props["label"], "go");
+}
+
 #[test]
 fn test_hydration_tier_c_uses_trigger_gated_islands() {
     let mut renderer = create_renderer();

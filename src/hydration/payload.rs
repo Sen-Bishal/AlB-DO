@@ -4,16 +4,21 @@ use serde::{Deserialize, Serialize};
 
 pub const HYDRATION_PAYLOAD_VERSION: &str = "1.0";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HydrationIslandPayload {
     pub component_id: u64,
     pub module_path: String,
     pub trigger: HydrationTrigger,
     pub dependencies: Vec<u64>,
+    /// A3.2 · the initial props the client renders from, so its first render
+    /// matches the server markup it hydrates. Only the route-entry island is
+    /// seeded today (nested islands hydrate from their own defaults — the same
+    /// bound as A1's SSR hook seeding); absent in older payloads.
+    #[serde(default)]
+    pub props: serde_json::Value,
 }
-// This is a nvim setup test!
-// I think it works.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HydrationPayload {
     pub version: String,
     pub checksum: String,
@@ -26,7 +31,14 @@ pub struct HydrationPayload {
 pub fn build_hydration_payload(
     manifest: &RenderManifestV2,
     plan: &HydrationPlan,
+    props_json: &str,
 ) -> Result<HydrationPayload, serde_json::Error> {
+    let entry_props: serde_json::Value = if props_json.trim().is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        serde_json::from_str(props_json).unwrap_or(serde_json::Value::Object(Default::default()))
+    };
+
     let islands = plan
         .islands
         .iter()
@@ -35,6 +47,11 @@ pub fn build_hydration_payload(
             module_path: island.module_path.clone(),
             trigger: island.trigger,
             dependencies: island.dependencies.clone(),
+            props: if island.module_path == plan.entry {
+                entry_props.clone()
+            } else {
+                serde_json::Value::Object(Default::default())
+            },
         })
         .collect();
 
@@ -127,7 +144,7 @@ mod tests {
             }],
         };
 
-        let payload = build_hydration_payload(&manifest(), &plan).unwrap();
+        let payload = build_hydration_payload(&manifest(), &plan, "{}").unwrap();
         assert!(!payload.checksum.is_empty());
         assert!(payload_checksum_matches(&payload).unwrap());
     }
@@ -155,8 +172,8 @@ mod tests {
             }],
         };
 
-        let payload_a = build_hydration_payload(&manifest(), &plan_a).unwrap();
-        let payload_b = build_hydration_payload(&manifest(), &plan_b).unwrap();
+        let payload_a = build_hydration_payload(&manifest(), &plan_a, "{}").unwrap();
+        let payload_b = build_hydration_payload(&manifest(), &plan_b, "{}").unwrap();
         assert_ne!(payload_a.checksum, payload_b.checksum);
     }
 }

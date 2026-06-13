@@ -719,9 +719,33 @@ fn compile_legacy_expression_module(
 }
 
 fn compile_exporting_module(specifier: &str, source: &str) -> RuntimeResult<String> {
+    let lowered = lower_module_to_statements(specifier, source, rewrite_import_declaration)?;
+    build_module_record_script(specifier, &lowered.statements, &lowered.export_assignments)
+}
+
+/// One module body lowered to a flat list of classic-JS statements plus the
+/// export assignments that publish its bindings (and which local, if any, holds
+/// the default export). Shared by the server record wrapper
+/// ([`compile_exporting_module`]) and the Tier-C client island builder
+/// ([`compile_client_island_module`]) — the two differ only in the import
+/// policy they pass in and how they wrap the result.
+struct LoweredModule {
+    statements: Vec<String>,
+    export_assignments: Vec<String>,
+    default_export_local: Option<String>,
+}
+
+type ImportRewriter = fn(swc_ecma_ast::ImportDecl, &str) -> RuntimeResult<Vec<String>>;
+
+fn lower_module_to_statements(
+    specifier: &str,
+    source: &str,
+    rewrite_import: ImportRewriter,
+) -> RuntimeResult<LoweredModule> {
     let module = parse_module(specifier, source)?;
     let mut statements = Vec::new();
     let mut export_assignments = Vec::new();
+    let mut default_export_local: Option<String> = None;
 
     for item in module.body {
         match item {
@@ -739,6 +763,7 @@ fn compile_exporting_module(specifier: &str, source: &str) -> RuntimeResult<Stri
                     ));
                     export_assignments
                         .push("__albedo_exports.default = __albedo_default_export__;".to_string());
+                    default_export_local = Some("__albedo_default_export__".to_string());
                 }
                 ModuleDecl::ExportDefaultDecl(default_decl) => {
                     let decl_source = slice_source(source, default_decl.span(), specifier)?;
@@ -756,6 +781,7 @@ fn compile_exporting_module(specifier: &str, source: &str) -> RuntimeResult<Stri
                     ));
                     export_assignments
                         .push("__albedo_exports.default = __albedo_default_export__;".to_string());
+                    default_export_local = Some("__albedo_default_export__".to_string());
                 }
                 ModuleDecl::ExportDecl(export_decl) => match export_decl.decl {
                     Decl::Fn(fn_decl) => {
@@ -878,7 +904,7 @@ fn compile_exporting_module(specifier: &str, source: &str) -> RuntimeResult<Stri
                     }
                 }
                 ModuleDecl::Import(import_decl) => {
-                    let rewritten = rewrite_import_declaration(import_decl, specifier)?;
+                    let rewritten = rewrite_import(import_decl, specifier)?;
                     statements.extend(rewritten);
                 }
                 unsupported => {
@@ -894,7 +920,89 @@ fn compile_exporting_module(specifier: &str, source: &str) -> RuntimeResult<Stri
         }
     }
 
-    build_module_record_script(specifier, &statements, &export_assignments)
+    if default_export_local.is_none() {
+        // `export { X as default }` form — recover the local that the export
+        // assignment binds, so the client builder can register it.
+        for assignment in &export_assignments {
+            if let Some(rest) = assignment.strip_prefix("__albedo_exports.default = ") {
+                default_export_local = Some(rest.trim_end_matches(';').to_string());
+                break;
+            }
+        }
+    }
+
+    Ok(LoweredModule {
+        statements,
+        export_assignments,
+        default_export_local,
+    })
+}
+
+/// Tier-C client island import policy: framework runtime imports bind to the
+/// globals the client runtime installs (mirroring the server-side
+/// [`rewrite_framework_runtime_import`]); anything else is rejected loudly,
+/// because npm packages and child-component modules are not yet client-bundled
+/// (the A3.2 vendor-chunk follow-up).
+fn rewrite_import_for_client(
+    import_decl: swc_ecma_ast::ImportDecl,
+    specifier: &str,
+) -> RuntimeResult<Vec<String>> {
+    let import_source = import_decl.src.value.to_string();
+    if is_framework_runtime_import(import_source.as_str()) {
+        return rewrite_framework_runtime_import(import_decl, specifier);
+    }
+    Err(RuntimeError::load(
+        LoadErrorKind::UnsupportedSyntax,
+        format!(
+            "Tier-C client island '{specifier}' imports '{import_source}', which is not yet \
+             bundled for the browser; only framework runtime imports (react/react-dom/albedo) \
+             resolve client-side today (npm + child-module client chunks are the A3.2 follow-up)"
+        ),
+    ))
+}
+
+/// A3.2 — lower one Tier-C island component to a **browser** script.
+///
+/// The component is transpiled with the same JSX pragma as the server
+/// ([`transpile_module_source_for_quickjs`]), then lowered to classic-JS
+/// statements with framework imports bound to globals. The result is wrapped in
+/// an IIFE that self-registers the default export with the client runtime under
+/// `component_id`, so `__ALBEDO_HYDRATE_ISLAND` can resolve it. Bare `h`,
+/// `useState`, … resolve to the globals `assets/albedo-client.js` installs — the
+/// same mechanism that lets one transpiled module run on both sides.
+pub fn compile_client_island_module(
+    specifier: &str,
+    source: &str,
+    component_id: u64,
+) -> RuntimeResult<String> {
+    let normalized = source.trim_start_matches('\u{feff}');
+    let transpiled = transpile_module_source_for_quickjs(specifier, normalized)?;
+
+    let lowered = if !transpiled.contains("export") && !transpiled.contains("import") {
+        // A bare expression module (`(props) => …`) — the expression itself is
+        // the default export.
+        let expr = transpiled.trim().trim_end_matches(';');
+        LoweredModule {
+            statements: vec![format!("const __albedo_default_export__ = ({expr});")],
+            export_assignments: Vec::new(),
+            default_export_local: Some("__albedo_default_export__".to_string()),
+        }
+    } else {
+        lower_module_to_statements(specifier, transpiled.as_str(), rewrite_import_for_client)?
+    };
+
+    let default_local = lowered.default_export_local.ok_or_else(|| {
+        RuntimeError::load(
+            LoadErrorKind::UnsupportedSyntax,
+            format!("Tier-C client island '{specifier}' has no default export to hydrate"),
+        )
+    })?;
+
+    let id_literal = js_string_literal(&component_id.to_string(), specifier)?;
+    let body = lowered.statements.join("\n");
+    Ok(format!(
+        "(function(){{\n{body}\nif(globalThis.__albedoClient){{globalThis.__albedoClient.registerComponent({id_literal}, {default_local});}}\n}})();\n"
+    ))
 }
 
 /// How an npm file lowers to a record factory (decided by the resolver from

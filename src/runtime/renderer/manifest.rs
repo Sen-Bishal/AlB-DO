@@ -18,6 +18,14 @@ use super::core::{
 
 const PROPS_CACHE_MAX_ENTRIES: usize = 256;
 
+/// Make `js` safe to embed verbatim in an inline `<script>` element: the only
+/// sequence that can terminate the element early is `</`, so neutralise it with
+/// a backslash that is inert inside JS string/regex literals (where the only
+/// `</` in transpiled component code can appear).
+fn escape_inline_script(js: &str) -> String {
+    js.replace("</", "<\\/")
+}
+
 pub struct ServerRenderer<E: RuntimeEngine> {
     engine: E,
     module_registry: ModuleRegistry,
@@ -203,20 +211,20 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         route: &RouteRenderRequest,
         manifest: &RenderManifestV2,
     ) -> RuntimeResult<RouteRenderResult> {
-        let artifacts = hydration::build_hydration_artifacts(manifest, route.entry.as_str())
-            .map_err(|err| {
-                crate::runtime::engine::RuntimeError::render(format!(
-                    "failed to build hydration artifacts for route '{}': {err}",
-                    route.entry
-                ))
-            })?;
+        let artifacts =
+            hydration::build_hydration_artifacts(manifest, route.entry.as_str(), &route.props_json)
+                .map_err(|err| {
+                    crate::runtime::engine::RuntimeError::render(format!(
+                        "failed to build hydration artifacts for route '{}': {err}",
+                        route.entry
+                    ))
+                })?;
 
         if let Some(artifacts) = artifacts {
-            self.render_route_with_overrides(
-                route,
-                Some(artifacts.payload_json),
-                vec![artifacts.payload_script_tag, artifacts.bootstrap_script_tag],
-            )
+            let mut head_tags = self.build_client_island_head_tags(&artifacts.plan);
+            head_tags.push(artifacts.payload_script_tag);
+            head_tags.push(artifacts.bootstrap_script_tag);
+            self.render_route_with_overrides(route, Some(artifacts.payload_json), head_tags)
         } else {
             self.render_route_with_overrides(route, Some("{}".to_string()), Vec::new())
         }
@@ -227,23 +235,58 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         route: &RouteRenderRequest,
         manifest: &RenderManifestV2,
     ) -> RuntimeResult<RouteRenderStreamResult> {
-        let artifacts = hydration::build_hydration_artifacts(manifest, route.entry.as_str())
-            .map_err(|err| {
-                crate::runtime::engine::RuntimeError::render(format!(
-                    "failed to build hydration artifacts for route '{}': {err}",
-                    route.entry
-                ))
-            })?;
+        let artifacts =
+            hydration::build_hydration_artifacts(manifest, route.entry.as_str(), &route.props_json)
+                .map_err(|err| {
+                    crate::runtime::engine::RuntimeError::render(format!(
+                        "failed to build hydration artifacts for route '{}': {err}",
+                        route.entry
+                    ))
+                })?;
 
         if let Some(artifacts) = artifacts {
-            self.render_route_stream_with_overrides(
-                route,
-                Some(artifacts.payload_json),
-                vec![artifacts.payload_script_tag, artifacts.bootstrap_script_tag],
-            )
+            let mut head_tags = self.build_client_island_head_tags(&artifacts.plan);
+            head_tags.push(artifacts.payload_script_tag);
+            head_tags.push(artifacts.bootstrap_script_tag);
+            self.render_route_stream_with_overrides(route, Some(artifacts.payload_json), head_tags)
         } else {
             self.render_route_stream_with_overrides(route, Some("{}".to_string()), Vec::new())
         }
+    }
+
+    /// A3.2 · build the per-route Tier-C client `<script>` tags: the shared
+    /// client runtime followed by one self-registering module per hydratable
+    /// island. An island whose source cannot yet be client-bundled (npm /
+    /// child-module imports) is skipped — it degrades to static server HTML
+    /// rather than breaking the page. Inline scripts run in document order, so
+    /// the runtime and registrations are in place before the bootstrap (appended
+    /// after these) fires hydration.
+    fn build_client_island_head_tags(
+        &self,
+        plan: &crate::hydration::plan::HydrationPlan,
+    ) -> Vec<String> {
+        let mut island_scripts = Vec::new();
+        for island in &plan.islands {
+            let Some(module) = self.module_registry.module(&island.module_path) else {
+                continue;
+            };
+            if let Ok(js) = crate::runtime::quickjs_engine::compile_client_island_module(
+                &island.module_path,
+                &module.code,
+                island.component_id,
+            ) {
+                island_scripts.push(format!("<script>{}</script>", escape_inline_script(&js)));
+            }
+        }
+
+        if island_scripts.is_empty() {
+            return Vec::new();
+        }
+
+        let mut tags = Vec::with_capacity(island_scripts.len() + 1);
+        tags.push("<script src=\"/_albedo/client.js\"></script>".to_string());
+        tags.extend(island_scripts);
+        tags
     }
 
     fn render_route_stream_with_overrides(
@@ -414,19 +457,26 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         route: &FsRouteRenderRequest,
         manifest: &RenderManifestV2,
     ) -> RuntimeResult<RouteRenderResult> {
-        let artifacts = hydration::build_hydration_artifacts(manifest, route.entry_module.as_str())
-            .map_err(|err| {
-                crate::runtime::engine::RuntimeError::render(format!(
-                    "failed to build hydration artifacts for filesystem route '{}': {err}",
-                    route.entry_module
-                ))
-            })?;
+        let artifacts = hydration::build_hydration_artifacts(
+            manifest,
+            route.entry_module.as_str(),
+            &route.props_json,
+        )
+        .map_err(|err| {
+            crate::runtime::engine::RuntimeError::render(format!(
+                "failed to build hydration artifacts for filesystem route '{}': {err}",
+                route.entry_module
+            ))
+        })?;
 
         if let Some(artifacts) = artifacts {
+            let mut head_tags = self.build_client_island_head_tags(&artifacts.plan);
+            head_tags.push(artifacts.payload_script_tag);
+            head_tags.push(artifacts.bootstrap_script_tag);
             self.render_route_from_component_dir_with_overrides(
                 route,
                 Some(artifacts.payload_json),
-                vec![artifacts.payload_script_tag, artifacts.bootstrap_script_tag],
+                head_tags,
             )
         } else {
             self.render_route_from_component_dir_with_overrides(

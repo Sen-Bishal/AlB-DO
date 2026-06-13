@@ -21,6 +21,9 @@ const BINCODE_JS: &str = include_str!("../../../../assets/bincode.js");
 const LINK_FORMS_JS: &str = include_str!("../../../../assets/albedo-link-forms.js");
 const HYDRATION_JS: &str = include_str!("../../../../assets/albedo-hydration.js");
 const WT_BOOTSTRAP_JS: &str = include_str!("../../../../assets/albedo-wt-bootstrap.js");
+// A3 · the Tier-C client runtime (Preact-compatible VDOM + hooks). Installs the
+// `h`/`useState`/… globals and `__ALBEDO_HYDRATE_ISLAND` the bootstrap calls.
+const CLIENT_JS: &str = include_str!("../../../../assets/albedo-client.js");
 
 /// Resolve `path` to one of the in-binary bakabox client assets.
 /// Returns `Some(body)` for the known framework-reserved URLs;
@@ -32,6 +35,7 @@ fn resolve_albedo_asset(path: &str) -> Option<&'static str> {
         "/_albedo/bincode.js" => Some(BINCODE_JS),
         "/_albedo/link-forms.js" => Some(LINK_FORMS_JS),
         "/_albedo/hydration.js" => Some(HYDRATION_JS),
+        "/_albedo/client.js" => Some(CLIENT_JS),
         "/_albedo/wt-bootstrap.js" => Some(WT_BOOTSTRAP_JS),
         _ => None,
     }
@@ -69,6 +73,7 @@ mod tests {
             "/_albedo/bincode.js",
             "/_albedo/link-forms.js",
             "/_albedo/hydration.js",
+            "/_albedo/client.js",
             "/_albedo/wt-bootstrap.js",
         ] {
             let body = resolve_albedo_asset(path).unwrap_or_else(|| {
