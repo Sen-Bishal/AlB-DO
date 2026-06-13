@@ -19,13 +19,14 @@ pub struct HydrationArtifacts {
 pub fn build_hydration_artifacts(
     manifest: &RenderManifestV2,
     entry: &str,
+    props_json: &str,
 ) -> Result<Option<HydrationArtifacts>, serde_json::Error> {
     let plan = build_hydration_plan(manifest, entry);
     if plan.islands.is_empty() {
         return Ok(None);
     }
 
-    let payload = build_hydration_payload(manifest, &plan)?;
+    let payload = build_hydration_payload(manifest, &plan, props_json)?;
     let payload_json = serialize_hydration_payload(&payload)?;
     let payload_script_tag = build_payload_script_tag(
         &payload_json,
@@ -71,7 +72,7 @@ mod tests {
             ..RenderManifestV2::legacy_defaults()
         };
 
-        let artifacts = build_hydration_artifacts(&manifest, "routes/entry").unwrap();
+        let artifacts = build_hydration_artifacts(&manifest, "routes/entry", "{}").unwrap();
         assert!(artifacts.is_none());
     }
 }
