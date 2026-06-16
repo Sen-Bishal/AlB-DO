@@ -6,4 +6,4 @@ pub use core::{
     FsRouteRenderRequest, ModuleRegistry, RegisteredModule, RenderTimings, RouteRenderRequest,
     RouteRenderResult, RouteRenderStreamResult, RouteStreamChunk, RouteStreamChunkKind,
 };
-pub use manifest::ServerRenderer;
+pub use manifest::{inject_island_marker, ServerRenderer};

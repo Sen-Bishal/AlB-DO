@@ -6,6 +6,13 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "A:\\albedo-investor-demo", "run", "dev"],
       "port": 5173
+    },
+    {
+      "name": "albedo-verify",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "cd /d A:\\_albedo_verify && A:\\AlBDO-v-0.1.0\\target\\debug\\albedo.exe serve --port 3112"],
+      "port": 3112,
+      "autoPort": false
     }
   ]
 }

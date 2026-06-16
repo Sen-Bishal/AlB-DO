@@ -484,6 +484,44 @@ fn current_phase_k_css_modules(
     })
 }
 
+thread_local! {
+    static PHASE_K_ISLAND_SKIP: Cell<
+        Option<*const std::collections::HashSet<String>>,
+    > = const { Cell::new(None) };
+}
+
+/// Install the set of component names that are separate hydration islands
+/// (Tier-C) for the duration of a static render. A child component whose name
+/// is in this set is NOT inlined into its parent's HTML — the renderer emits
+/// nothing for it, so the island appears exactly once at its placeholder
+/// anchor. The manifest builder installs this around its Tier-A static pass;
+/// every other render path leaves it unset and inlines as before. RAII guard
+/// restores the previous installation on drop, mirroring the Phase K stack.
+pub(crate) fn install_island_skip_set(
+    set: &std::collections::HashSet<String>,
+) -> IslandSkipGuard {
+    let previous = PHASE_K_ISLAND_SKIP.with(|cell| cell.replace(Some(set as *const _)));
+    IslandSkipGuard { previous }
+}
+
+pub(crate) struct IslandSkipGuard {
+    previous: Option<*const std::collections::HashSet<String>>,
+}
+
+impl Drop for IslandSkipGuard {
+    fn drop(&mut self) {
+        PHASE_K_ISLAND_SKIP.with(|cell| cell.set(self.previous));
+    }
+}
+
+fn island_skip_contains(name: &str) -> bool {
+    PHASE_K_ISLAND_SKIP.with(|cell| match cell.get() {
+        // Safety: same stack-frame contract as the other Phase K thread-locals.
+        Some(ptr) => unsafe { &*ptr }.contains(name),
+        None => false,
+    })
+}
+
 /// Phase O.2 / Phase P · Stream C.2 — install a broadcast registry
 /// onto the per-thread Phase K stack. The returned guard restores the
 /// previous installation on drop (Phase K's other thread-locals follow
@@ -2522,6 +2560,14 @@ impl ComponentProject {
         };
 
         if is_component_tag(&tag) {
+            // Build-time tier split: a Tier-C child is a standalone hydration
+            // island, not part of its Tier-A parent's static HTML. When the
+            // manifest builder has installed the island set, emit nothing here
+            // so the component renders only once — at its placeholder anchor.
+            if island_skip_contains(&tag) {
+                return Ok(String::new());
+            }
+
             let mut props = Map::new();
             for (name, value) in self.read_attrs(module_spec, &element.opening.attrs, env)? {
                 if !name.starts_with("on") {

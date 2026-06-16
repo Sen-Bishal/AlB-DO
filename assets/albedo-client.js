@@ -447,6 +447,14 @@
       }
       return;
     }
+    // JSX prop → HTML attribute rename, matching the server renderer so
+    // hydration adopts the server's `class`/`for` rather than creating a stray
+    // `className`/`htmlFor` attribute.
+    if (key === 'className') {
+      key = 'class';
+    } else if (key === 'htmlFor') {
+      key = 'for';
+    }
     if (newValue === undefined || newValue === null || newValue === false) {
       dom.removeAttribute(key);
       return;

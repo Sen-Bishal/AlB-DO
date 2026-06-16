@@ -629,6 +629,17 @@ impl AlbedoServerBuilder {
         // the pair, so `take()` to move it out of the builder. The Arc
         // wrap happens after pipeline binding so the bound pipeline is
         // visible through `state.pipeline()`.
+        // A3 · precompute the per-route client-hydration blocks while the
+        // (`!Send`) renderer is still single-threaded on the boot thread. The
+        // resulting map is shared read-only into the streaming state so the
+        // concurrent request path never touches the QuickJS engine.
+        let route_hydration = Arc::new(
+            renderer
+                .as_mut()
+                .map(|runtime| runtime.build_hydration_blocks())
+                .unwrap_or_default(),
+        );
+
         let mut pipeline_binding = self.pipeline;
         let streaming_runtime = renderer.as_ref().map(|runtime| {
             let state = StreamingAppState::new(
@@ -645,7 +656,8 @@ impl AlbedoServerBuilder {
             // and runtime state hold, so a WT session's auto-subscribe
             // attaches the patches-lane sender to topics that
             // subsequent action-handler `broadcast()` calls fan out to.
-            .with_broadcast(broadcast.clone());
+            .with_broadcast(broadcast.clone())
+            .with_hydration(route_hydration.clone());
             let state = match pipeline_binding.take() {
                 Some((pipeline, handle)) => {
                     let pipeline = pipeline.with_slot_store(slot_store.clone());
