@@ -507,6 +507,14 @@ impl CompiledProject {
         &self.css_modules
     }
 
+    /// Gate 2 · B — look up a parsed module by its project-relative
+    /// spec (e.g. `routes/index.tsx`). The manifest builder uses this
+    /// to read a route's `export const metadata` object literal out of
+    /// the module's top-level constants.
+    pub fn module(&self, spec: &str) -> Option<&crate::runtime::eval::ParsedModule> {
+        self.project.modules().get(spec)
+    }
+
     /// Look up the metadata for one component. Returns `None` when the
     /// project doesn't contain a matching `(module_spec, function_name)`.
     #[must_use]

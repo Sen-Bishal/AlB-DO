@@ -139,6 +139,61 @@ pub struct RouteManifest {
     /// Tier-C resolves. Stream E.2 populates this.
     #[serde(default)]
     pub loading_component: Option<String>,
+    /// Gate 2 · B — resolved document metadata for this route's
+    /// `<head>`. Composed (last-writer-wins) from three layered
+    /// sources: the static `export const metadata` object, a dynamic
+    /// `generateMetadata()` evaluated per request, and JSX-hoisted
+    /// `<title>`/`<meta>` tags. `Default` (all empty) preserves the
+    /// historical shell `<head>` exactly — the `ALBEDO {route}` title
+    /// fallback still applies — so routes that author no metadata are
+    /// byte-identical to pre-B builds.
+    #[serde(default)]
+    pub metadata: RouteMetadata,
+}
+
+/// Gate 2 · B — the resolved per-route document metadata destined for
+/// the shell `<head>`. Authoring-surface agnostic: the builder lowers
+/// `export const metadata` / `generateMetadata()` / JSX head tags into
+/// this one shape, then the shell renders it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Resolved `<meta>` tags in author order (both `name=` and
+    /// `property=` flavours; `description` is NOT duplicated here — it
+    /// rides the `description` field and the shell emits its tag).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meta: Vec<MetaTag>,
+}
+
+impl RouteMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.description.is_none() && self.meta.is_empty()
+    }
+
+    /// Layer `other` on top of `self` (last-writer-wins): any scalar
+    /// `other` sets overrides; meta tags append. This is how the static
+    /// base composes with the dynamic and JSX-hoisted overrides.
+    pub fn merge(&mut self, other: RouteMetadata) {
+        if other.title.is_some() {
+            self.title = other.title;
+        }
+        if other.description.is_some() {
+            self.description = other.description;
+        }
+        self.meta.extend(other.meta);
+    }
+}
+
+/// One resolved `<meta>` tag. `attr` is the key-carrying attribute —
+/// `"name"` for standard + twitter tags, `"property"` for Open Graph.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetaTag {
+    pub attr: String,
+    pub key: String,
+    pub content: String,
 }
 
 /// Phase P · one TS-authored action handler discovered on a route.

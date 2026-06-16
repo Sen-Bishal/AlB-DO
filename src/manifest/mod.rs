@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod metadata;
 pub mod schema;
 
 use crate::effects::{decide_tier_and_hydration, TieringInputs};
@@ -613,5 +614,139 @@ mod tests {
             route.shell.body_open,
             placeholder
         );
+    }
+
+    /// Gate 2 · B (slice 1) — a route that exports `const metadata`
+    /// drives the shell `<head>`: the authored title replaces the
+    /// `ALBEDO {route}` fallback and description / OG / twitter tags are
+    /// emitted. The resolved metadata also rides the `RouteManifest`.
+    #[test]
+    fn shell_head_reflects_static_metadata_export() {
+        let mut compiler = RenderCompiler::new();
+        let mut page = Component::new(ComponentId::new(0), "Page".to_string());
+        page.file_path = "tests/fixtures/metadata/Page.tsx".to_string();
+        page.weight = 1024.0;
+        compiler.add_component(page);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        let route = manifest.routes.values().next().unwrap();
+        let head = &route.shell.doctype_and_head;
+
+        assert!(
+            head.contains("<title>Home — ALBEDO</title>"),
+            "author title must replace the fallback; head={head}"
+        );
+        assert!(
+            !head.contains("<title>ALBEDO "),
+            "the ALBEDO fallback title must not also appear; head={head}"
+        );
+        assert!(
+            head.contains("<meta name=\"description\" content=\"The fastest way to ship.\">"),
+            "head={head}"
+        );
+        assert!(
+            head.contains("property=\"og:title\" content=\"Home OG\""),
+            "head={head}"
+        );
+        assert!(
+            head.contains("name=\"twitter:card\" content=\"summary_large_image\""),
+            "head={head}"
+        );
+
+        // The structured metadata is also carried on the manifest for
+        // consumers other than the shell string.
+        assert_eq!(route.metadata.title.as_deref(), Some("Home — ALBEDO"));
+        assert_eq!(
+            route.metadata.description.as_deref(),
+            Some("The fastest way to ship.")
+        );
+    }
+
+    /// Gate 2 · B (slice 2) — JSX-rendered `<title>`/`<meta>` are
+    /// hoisted out of the body into the shell `<head>` (React-19 style)
+    /// and override the static `export const metadata` base (JSX wins).
+    #[test]
+    fn shell_head_hoists_jsx_title_and_meta_over_static() {
+        let mut compiler = RenderCompiler::new();
+        let mut page = Component::new(ComponentId::new(0), "Page".to_string());
+        page.file_path = "tests/fixtures/metadata/JsxHead.tsx".to_string();
+        page.weight = 1024.0;
+        compiler.add_component(page);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        let route = manifest.routes.values().next().unwrap();
+        let head = &route.shell.doctype_and_head;
+        // The rendered component HTML (where the JSX head tags lived) is
+        // carried on the tier-A node and injected into the body at serve
+        // time; the slice-2 hoist strips the head tags from it in place.
+        let node_html = route
+            .tier_a_root
+            .iter()
+            .map(|n| n.html.as_str())
+            .find(|html| html.contains("Body content"))
+            .expect("rendered page HTML should be on a tier-A node");
+
+        // JSX <title> overrode the static "Static Title".
+        assert!(
+            head.contains("<title>JSX Title Wins</title>"),
+            "JSX title must win; head={head}"
+        );
+        assert!(!head.contains("Static Title"), "static title must be overridden; head={head}");
+        // JSX <meta> hoisted into the head.
+        assert!(
+            head.contains("property=\"og:title\" content=\"JSX OG Title\""),
+            "head={head}"
+        );
+        // Static description (not overridden by JSX) survives.
+        assert!(
+            head.contains("<meta name=\"description\" content=\"static description\">"),
+            "head={head}"
+        );
+        // The hoisted tags are stripped from the rendered body HTML; real
+        // content stays.
+        assert!(!node_html.contains("<title"), "title stripped from body; node={node_html}");
+        assert!(
+            !node_html.contains("og:title"),
+            "meta stripped from body; node={node_html}"
+        );
+        assert!(
+            node_html.contains("Body content"),
+            "body retains real content; node={node_html}"
+        );
+
+        // The resolved metadata on the manifest reflects the merge.
+        assert_eq!(route.metadata.title.as_deref(), Some("JSX Title Wins"));
+    }
+
+    /// A route with no `metadata` export keeps the historical
+    /// `ALBEDO {route}` fallback title and emits no extra head tags —
+    /// proving the feature is opt-in and byte-compatible for untouched
+    /// routes.
+    #[test]
+    fn shell_head_keeps_fallback_without_metadata_export() {
+        let mut compiler = RenderCompiler::new();
+        let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
+        counter.file_path = "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+        counter.weight = 2048.0;
+        counter.effect_profile.hooks = true;
+        compiler.add_component(counter);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        let route = manifest.routes.values().next().unwrap();
+        assert!(
+            route.shell.doctype_and_head.contains("<title>ALBEDO "),
+            "no metadata export → ALBEDO fallback title; head={}",
+            route.shell.doctype_and_head
+        );
+        assert!(route.metadata.is_empty());
     }
 }

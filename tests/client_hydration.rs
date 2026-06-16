@@ -310,6 +310,127 @@ fn transpiled_tsx_island_ships_and_hydrates_with_seeded_props() {
     assert_eq!(value["network"], 0);
 }
 
+// B (Gate 2) — the rest of the React hook family runs client-side under the same
+// fiber/hook-slot discipline as `useState`/`useEffect`:
+//   • `useRef`   — a stable mutable cell that survives re-renders (proven by a
+//                  render counter that climbs instead of resetting to 1).
+//   • `useMemo`  — recomputes ONLY when its deps change (a factory-call counter
+//                  stays flat across an unrelated state update, ticks on a
+//                  relevant one).
+//   • `useCallback` — keeps a referentially-stable function while deps are equal,
+//                  returns a fresh one when they change.
+const HOOK_FAMILY_SCENARIO: &str = r#"
+globalThis.__memoCalls = 0;
+globalThis.__cbs = [];
+
+function Widget(props) {
+  var a = useState(0);
+  var n = a[0], setN = a[1];
+  var b = useState('x');
+  var label = b[0], setLabel = b[1];
+
+  // useRef: one cell, mutated every render. If useRef handed back a fresh
+  // {current: 0} each time, this would never exceed 1.
+  var renderCount = useRef(0);
+  renderCount.current = renderCount.current + 1;
+
+  // useMemo: depends only on n. The factory must not fire when only `label`
+  // changes.
+  var doubled = useMemo(function () {
+    globalThis.__memoCalls = globalThis.__memoCalls + 1;
+    return n * 2;
+  }, [n]);
+
+  // useCallback: depends only on n. Identity must hold across an n-independent
+  // re-render, break when n changes.
+  var cb = useCallback(function () { return n; }, [n]);
+  globalThis.__cbs.push(cb);
+
+  globalThis.__setN = setN;
+  globalThis.__setLabel = setLabel;
+  globalThis.__renderRef = renderCount;
+
+  return h('button', {}, 'n:' + n + ' x2:' + doubled + ' L:' + label);
+}
+
+var container = document.createElement('div');
+var button = document.createElement('button');
+button.appendChild(document.createTextNode('n:0 x2:0 L:x'));
+container.appendChild(button);
+
+__albedoClient.hydrate(h(Widget, {}), container);
+
+var afterHydrate = {
+  text: button.firstChild.nodeValue,
+  memoCalls: globalThis.__memoCalls,
+  renders: globalThis.__renderRef.current,
+  cbCount: globalThis.__cbs.length,
+};
+
+// Update an UNRELATED state (label). n is unchanged → useMemo must NOT recompute
+// and useCallback must keep the same function identity.
+globalThis.__setLabel('y');
+var afterLabel = {
+  text: button.firstChild.nodeValue,
+  memoCalls: globalThis.__memoCalls,
+  renders: globalThis.__renderRef.current,
+  cbStable: globalThis.__cbs[globalThis.__cbs.length - 1] === globalThis.__cbs[globalThis.__cbs.length - 2],
+};
+
+// Update n → useMemo recomputes, useCallback returns a fresh function.
+globalThis.__setN(5);
+var afterN = {
+  text: button.firstChild.nodeValue,
+  memoCalls: globalThis.__memoCalls,
+  renders: globalThis.__renderRef.current,
+  cbChanged: globalThis.__cbs[globalThis.__cbs.length - 1] !== globalThis.__cbs[globalThis.__cbs.length - 2],
+};
+
+JSON.stringify({
+  afterHydrate: afterHydrate,
+  afterLabel: afterLabel,
+  afterN: afterN,
+  network: globalThis.__net,
+});
+"#;
+
+#[test]
+fn client_runtime_runs_useref_usememo_usecallback() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(HOOK_FAMILY_SCENARIO).expect("scenario should evaluate")
+    });
+
+    let value: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+
+    // Mount: one render, memo computed once, one callback captured.
+    assert_eq!(value["afterHydrate"]["text"], "n:0 x2:0 L:x");
+    assert_eq!(value["afterHydrate"]["memoCalls"], 1);
+    assert_eq!(value["afterHydrate"]["renders"], 1);
+    assert_eq!(value["afterHydrate"]["cbCount"], 1);
+
+    // Unrelated update: ref cell persisted (renders climbs to 2), memo did NOT
+    // recompute (still 1), callback identity held.
+    assert_eq!(value["afterLabel"]["text"], "n:0 x2:0 L:y");
+    assert_eq!(value["afterLabel"]["memoCalls"], 1, "useMemo must not recompute when its deps are unchanged");
+    assert_eq!(value["afterLabel"]["renders"], 2, "useRef cell must survive re-render");
+    assert_eq!(value["afterLabel"]["cbStable"], true, "useCallback must keep identity when deps are equal");
+
+    // Relevant update: memo recomputed (2), callback identity broke, value patched.
+    assert_eq!(value["afterN"]["text"], "n:5 x2:10 L:y");
+    assert_eq!(value["afterN"]["memoCalls"], 2, "useMemo must recompute when deps change");
+    assert_eq!(value["afterN"]["renders"], 3);
+    assert_eq!(value["afterN"]["cbChanged"], true, "useCallback must return a fresh function when deps change");
+
+    // The whole sequence was local — no round-trip.
+    assert_eq!(value["network"], 0);
+}
+
 #[test]
 fn client_island_rejects_unbundled_imports_loudly() {
     // A non-framework import has no client binding yet — it must fail loudly

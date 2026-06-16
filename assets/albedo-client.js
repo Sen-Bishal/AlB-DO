@@ -137,6 +137,37 @@
     }
   }
 
+  function useRef(initial) {
+    var fiber = currentFiber;
+    var index = hookIndex++;
+    var hooks = fiber.hooks;
+    if (hooks.length <= index) {
+      hooks[index] = { current: initial };
+    }
+    return hooks[index];
+  }
+
+  function useMemo(factory, deps) {
+    var fiber = currentFiber;
+    var index = hookIndex++;
+    var hooks = fiber.hooks;
+    var prev = hooks[index];
+    // No deps array → recompute every render (React semantics). With deps,
+    // reuse the memoized value while they are referentially equal.
+    if (prev && deps && !depsChanged(prev.deps, deps)) {
+      return prev.value;
+    }
+    var value = factory();
+    hooks[index] = { value: value, deps: deps };
+    return value;
+  }
+
+  function useCallback(callback, deps) {
+    // useCallback(fn, deps) is exactly useMemo(() => fn, deps); it consumes the
+    // same single hook slot via the delegated useMemo call.
+    return useMemo(function () { return callback; }, deps);
+  }
+
   function depsChanged(a, b) {
     if (!a || !b || a.length !== b.length) {
       return true;
@@ -507,6 +538,9 @@
     Fragment: Fragment,
     useState: useState,
     useEffect: useEffect,
+    useRef: useRef,
+    useMemo: useMemo,
+    useCallback: useCallback,
     hydrate: hydrate,
     hydrateIsland: hydrateIsland,
     registerComponent: registerComponent,
@@ -517,5 +551,8 @@
   global.Fragment = Fragment;
   global.useState = useState;
   global.useEffect = useEffect;
+  global.useRef = useRef;
+  global.useMemo = useMemo;
+  global.useCallback = useCallback;
   global.__ALBEDO_HYDRATE_ISLAND = hydrateIslandDescriptor;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
