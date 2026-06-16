@@ -26,6 +26,58 @@ fn escape_inline_script(js: &str) -> String {
     js.replace("</", "<\\/")
 }
 
+/// A3.3 — inject `data-albedo-island="{component_id}"` into the root element
+/// of the SSR HTML string. The hydration bootstrap locates each island root via
+/// `document.querySelector('[data-albedo-island="ID"]')`, so the attribute must
+/// appear on the outermost element the server emitted.
+///
+/// The scan skips the tag name then walks attributes, respecting quoted values
+/// (which may legally contain `>`), and injects before the first unquoted `>`.
+/// If the HTML doesn't start with an element tag the string is returned as-is.
+fn inject_island_marker(html: &str, component_id: u64) -> String {
+    let marker = format!(" data-albedo-island=\"{}\"", component_id);
+    let bytes = html.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'<' {
+        return html.to_string();
+    }
+    let mut i = 1;
+    // skip tag name
+    while i < bytes.len() && bytes[i] != b'>' && bytes[i] != b' ' && bytes[i] != b'\n' && bytes[i] != b'/' {
+        i += 1;
+    }
+    // walk attributes, respecting quoted values
+    let mut in_quote = false;
+    let mut quote_char = b'"';
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_quote {
+            if c == quote_char {
+                in_quote = false;
+            }
+        } else if c == b'"' || c == b'\'' {
+            in_quote = true;
+            quote_char = c;
+        } else if c == b'>' {
+            let mut out = String::with_capacity(html.len() + marker.len());
+            out.push_str(&html[..i]);
+            out.push_str(&marker);
+            out.push_str(&html[i..]);
+            return out;
+        }
+        i += 1;
+    }
+    html.to_string()
+}
+
+/// Return the `component_id` of the entry island (the island whose
+/// `module_path` matches `plan.entry`), or `None` for Tier-A-only routes.
+fn entry_island_id(plan: &crate::hydration::plan::HydrationPlan) -> Option<u64> {
+    plan.islands
+        .iter()
+        .find(|island| island.module_path == plan.entry)
+        .map(|island| island.component_id)
+}
+
 pub struct ServerRenderer<E: RuntimeEngine> {
     engine: E,
     module_registry: ModuleRegistry,
@@ -221,10 +273,19 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
                 })?;
 
         if let Some(artifacts) = artifacts {
+            let entry_id = entry_island_id(&artifacts.plan);
             let mut head_tags = self.build_client_island_head_tags(&artifacts.plan);
             head_tags.push(artifacts.payload_script_tag);
             head_tags.push(artifacts.bootstrap_script_tag);
-            self.render_route_with_overrides(route, Some(artifacts.payload_json), head_tags)
+            let mut result =
+                self.render_route_with_overrides(route, Some(artifacts.payload_json), head_tags)?;
+            // A3.3 · stamp the island marker so the bootstrap can locate the
+            // root via querySelector('[data-albedo-island="ID"]').
+            if let Some(id) = entry_id {
+                result.html = inject_island_marker(&result.html, id);
+                result.shell_html = inject_island_marker(&result.shell_html, id);
+            }
+            Ok(result)
         } else {
             self.render_route_with_overrides(route, Some("{}".to_string()), Vec::new())
         }
@@ -245,10 +306,20 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
                 })?;
 
         if let Some(artifacts) = artifacts {
+            let entry_id = entry_island_id(&artifacts.plan);
             let mut head_tags = self.build_client_island_head_tags(&artifacts.plan);
             head_tags.push(artifacts.payload_script_tag);
             head_tags.push(artifacts.bootstrap_script_tag);
-            self.render_route_stream_with_overrides(route, Some(artifacts.payload_json), head_tags)
+            let mut result = self.render_route_with_overrides(
+                route,
+                Some(artifacts.payload_json),
+                head_tags,
+            )?;
+            if let Some(id) = entry_id {
+                result.html = inject_island_marker(&result.html, id);
+                result.shell_html = inject_island_marker(&result.shell_html, id);
+            }
+            Ok(route_render_result_to_stream(result))
         } else {
             self.render_route_stream_with_overrides(route, Some("{}".to_string()), Vec::new())
         }
@@ -470,14 +541,20 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         })?;
 
         if let Some(artifacts) = artifacts {
+            let entry_id = entry_island_id(&artifacts.plan);
             let mut head_tags = self.build_client_island_head_tags(&artifacts.plan);
             head_tags.push(artifacts.payload_script_tag);
             head_tags.push(artifacts.bootstrap_script_tag);
-            self.render_route_from_component_dir_with_overrides(
+            let mut result = self.render_route_from_component_dir_with_overrides(
                 route,
                 Some(artifacts.payload_json),
                 head_tags,
-            )
+            )?;
+            if let Some(id) = entry_id {
+                result.html = inject_island_marker(&result.html, id);
+                result.shell_html = inject_island_marker(&result.shell_html, id);
+            }
+            Ok(result)
         } else {
             self.render_route_from_component_dir_with_overrides(
                 route,
