@@ -1,8 +1,9 @@
 // CiCD reviewer rules
 
+use super::metadata::{hoist_head_tags_from_body, metadata_from_const_expr};
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, RenderedNode,
-    RouteActionEntry, RouteManifest, Tier, TierBNode, TierCNode, WTStreamSlot,
+    RouteActionEntry, RouteManifest, RouteMetadata, Tier, TierBNode, TierCNode, WTStreamSlot,
 };
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;
@@ -149,6 +150,16 @@ impl<'a> ManifestBuilder<'a> {
         let error_component = self.error_component_for_route(route);
         let loading_component = self.loading_component_for_route(route);
 
+        // Gate 2 · B — resolve the route's `<head>` metadata. Slice 1 is
+        // the static `export const metadata` base. Slice 2 then hoists
+        // JSX-rendered `<title>`/`<meta>` out of the rendered tier-node
+        // HTML (React-19 style), stripping them in place so the served
+        // body no longer carries them, and merges them over the static
+        // base (JSX wins — last-writer).
+        let mut metadata = self.extract_static_metadata(root_component);
+        let hoisted = hoist_head_from_nodes(&mut tier_a_root, &mut tier_b);
+        metadata.merge(hoisted);
+
         let shell = self.build_shell(
             route,
             assets,
@@ -156,6 +167,7 @@ impl<'a> ManifestBuilder<'a> {
             &tier_b,
             &tier_c,
             &layout_chain,
+            &metadata,
         );
 
         RouteManifest {
@@ -169,7 +181,36 @@ impl<'a> ManifestBuilder<'a> {
             layout_chain,
             error_component,
             loading_component,
+            metadata,
         }
+    }
+
+    /// Gate 2 · B (slice 1) — read the route leaf component's
+    /// `export const metadata = { ... }` object literal and lower it to
+    /// a [`RouteMetadata`]. Returns the default (empty) metadata when the
+    /// compiled project is unavailable, the module can't be resolved, or
+    /// no `metadata` const is exported — all of which leave the shell's
+    /// historical `<head>` unchanged.
+    fn extract_static_metadata(&self, root_component: ComponentId) -> RouteMetadata {
+        let Some(compiled) = self.compiled_render_project.as_ref() else {
+            return RouteMetadata::default();
+        };
+        let Some(component) = self.components.get(&root_component) else {
+            return RouteMetadata::default();
+        };
+        let Some(entry) = self.component_entry_for_project(component, compiled.root.as_path())
+        else {
+            return RouteMetadata::default();
+        };
+        let Some(module) = compiled.project.module(entry.as_str()) else {
+            return RouteMetadata::default();
+        };
+        module
+            .module_constants
+            .iter()
+            .find(|(name, _)| name == "metadata")
+            .map(|(_, expr)| metadata_from_const_expr(expr))
+            .unwrap_or_default()
     }
 
     /// Phase P · Stream E.2 — resolve `routes/.../error.tsx` (if any)
@@ -338,11 +379,55 @@ impl<'a> ManifestBuilder<'a> {
         tier_b: &[TierBNode],
         tier_c: &[TierCNode],
         layout_chain: &[String],
+        metadata: &RouteMetadata,
     ) -> HtmlShell {
+        // Build the route's inner body content first (everything that
+        // would land between <body> and </body> pre-E.1). This is the
+        // "leaf" content the layout chain wraps. The leaf HTML is a set
+        // of slot placeholders here; the rendered component HTML (where
+        // slice-2 JSX head tags were hoisted out of) lives on the tier
+        // nodes and is injected at serve time.
+        let mut inner = String::new();
+        let mut placeholders = self.collect_shell_placeholders(tier_a_root, tier_b, tier_c);
+        placeholders.sort_by_key(|entry| entry.order);
+        for placeholder in placeholders {
+            inner.push_str(&placeholder.html);
+        }
+
+        // Phase P · Stream E.1 — apply the layout chain outermost-out.
+        // When `layout_chain` is empty, `wrap_in_layouts` is a no-op
+        // and the body_open shape stays identical to pre-E.1 — no
+        // observable change for routes without a `routes/layout.tsx`.
+        let wrapped = self.wrap_in_layouts(inner, layout_chain);
+
         let mut doctype_and_head = String::from(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
         );
-        doctype_and_head.push_str(&format!("<title>ALBEDO {}</title>", escape_html(route)));
+        // Author-declared title wins; otherwise keep the historical
+        // `ALBEDO {route}` fallback so untouched routes are byte-identical
+        // to pre-B builds.
+        match &metadata.title {
+            Some(title) => {
+                doctype_and_head.push_str(&format!("<title>{}</title>", escape_html(title)))
+            }
+            None => {
+                doctype_and_head.push_str(&format!("<title>ALBEDO {}</title>", escape_html(route)))
+            }
+        }
+        if let Some(description) = &metadata.description {
+            doctype_and_head.push_str(&format!(
+                "<meta name=\"description\" content=\"{}\">",
+                escape_html(description)
+            ));
+        }
+        for tag in &metadata.meta {
+            doctype_and_head.push_str(&format!(
+                "<meta {}=\"{}\" content=\"{}\">",
+                escape_html(&tag.attr),
+                escape_html(&tag.key),
+                escape_html(&tag.content)
+            ));
+        }
         for css_path in &assets.css {
             doctype_and_head.push_str(&format!(
                 "<link rel=\"stylesheet\" href=\"{}\">",
@@ -363,22 +448,6 @@ impl<'a> ManifestBuilder<'a> {
             doctype_and_head.push_str("</style>");
         }
         doctype_and_head.push_str("</head>");
-
-        // Build the route's inner body content first (everything that
-        // would land between <body> and </body> pre-E.1). This is the
-        // "leaf" content the layout chain wraps.
-        let mut inner = String::new();
-        let mut placeholders = self.collect_shell_placeholders(tier_a_root, tier_b, tier_c);
-        placeholders.sort_by_key(|entry| entry.order);
-        for placeholder in placeholders {
-            inner.push_str(&placeholder.html);
-        }
-
-        // Phase P · Stream E.1 — apply the layout chain outermost-out.
-        // When `layout_chain` is empty, `wrap_in_layouts` is a no-op
-        // and the body_open shape stays identical to pre-E.1 — no
-        // observable change for routes without a `routes/layout.tsx`.
-        let wrapped = self.wrap_in_layouts(inner, layout_chain);
 
         let mut body_open = String::from("<body>");
         body_open.push_str(&wrapped);
@@ -1252,6 +1321,39 @@ fn slugify(value: &str) -> String {
     } else {
         out
     }
+}
+
+/// Gate 2 · B (slice 2) — hoist JSX-rendered `<title>`/`<meta>` out of
+/// every rendered tier node's HTML into one merged [`RouteMetadata`],
+/// stripping the tags from the node HTML in place. Covers Tier-A roots,
+/// Tier-B pre-rendered HTML, and the Tier-A children nested under Tier-B.
+/// The body that ships to the browser therefore no longer carries the
+/// hoisted tags — they re-emit in the document `<head>`.
+fn hoist_head_from_nodes(
+    tier_a_root: &mut [RenderedNode],
+    tier_b: &mut [TierBNode],
+) -> RouteMetadata {
+    fn hoist_into(html: &mut String, merged: &mut RouteMetadata) {
+        let (stripped, found) = hoist_head_tags_from_body(html);
+        if !found.is_empty() {
+            *html = stripped;
+            merged.merge(found);
+        }
+    }
+
+    let mut merged = RouteMetadata::default();
+    for node in tier_a_root.iter_mut() {
+        hoist_into(&mut node.html, &mut merged);
+    }
+    for node in tier_b.iter_mut() {
+        for child in node.tier_a_children.iter_mut() {
+            hoist_into(&mut child.html, &mut merged);
+        }
+        if let Some(html) = node.initial_html.as_mut() {
+            hoist_into(html, &mut merged);
+        }
+    }
+    merged
 }
 
 fn escape_html(value: &str) -> String {

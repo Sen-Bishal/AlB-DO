@@ -136,6 +136,7 @@
       "error_component": null,
       "layout_chain": [],
       "loading_component": null,
+      "metadata": {},
       "route": "/",
       "shared_slot_topics": [],
       "shell": {

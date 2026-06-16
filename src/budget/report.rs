@@ -405,6 +405,7 @@ mod tests {
             layout_chain: Vec::new(),
             error_component: None,
             loading_component: None,
+            metadata: Default::default(),
         }
     }
 
