@@ -34,7 +34,7 @@ fn escape_inline_script(js: &str) -> String {
 /// The scan skips the tag name then walks attributes, respecting quoted values
 /// (which may legally contain `>`), and injects before the first unquoted `>`.
 /// If the HTML doesn't start with an element tag the string is returned as-is.
-fn inject_island_marker(html: &str, component_id: u64) -> String {
+pub fn inject_island_marker(html: &str, component_id: u64) -> String {
     let marker = format!(" data-albedo-island=\"{}\"", component_id);
     let bytes = html.as_bytes();
     if bytes.is_empty() || bytes[0] != b'<' {

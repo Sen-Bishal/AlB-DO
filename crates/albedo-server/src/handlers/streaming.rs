@@ -66,6 +66,12 @@ pub struct StreamingAppState {
     /// don't wire a registry — `auto_subscribe` is skipped in that
     /// case rather than erroring.
     broadcast: Option<Arc<dom_render_compiler::runtime::BroadcastRegistry>>,
+    /// A3 · per-route client-hydration blocks precomputed at boot by
+    /// [`crate::renderer_runtime::RendererRuntime::build_hydration_blocks`].
+    /// `build_stream` fills each Tier-C placeholder with the island's marked
+    /// SSR HTML and emits the client runtime + island IIFEs + payload +
+    /// bootstrap before `</body>`. Empty for tests / Tier-A-only builds.
+    hydration: Arc<HashMap<String, crate::renderer_runtime::RouteHydration>>,
 }
 
 impl StreamingAppState {
@@ -83,7 +89,21 @@ impl StreamingAppState {
             pipeline: None,
             csrf: Arc::new(crate::render::csrf::CsrfRegistry::new()),
             broadcast: None,
+            hydration: Arc::new(HashMap::new()),
         }
+    }
+
+    /// A3 · bind the per-route hydration blocks built at boot. Production wires
+    /// the map [`RendererRuntime::build_hydration_blocks`] returns; tests and
+    /// Tier-A-only builds leave it empty (default), and `build_stream` simply
+    /// emits no client-hydration scripts.
+    #[must_use]
+    pub fn with_hydration(
+        mut self,
+        hydration: Arc<HashMap<String, crate::renderer_runtime::RouteHydration>>,
+    ) -> Self {
+        self.hydration = hydration;
+        self
     }
 
     /// Phase P · Stream C.4 — bind a broadcast registry to this
@@ -469,12 +489,14 @@ fn build_stream(
     page_session: dom_render_compiler::runtime::SessionId,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
     stream! {
+        let hydration = app.hydration.get(route.route.as_str());
         let shell = build_shell_chunk(
             &route,
             negotiated_transport,
             app.transport.webtransport_path.as_str(),
             app.csrf().as_ref(),
             page_session,
+            hydration,
         );
 
         yield Ok(Bytes::from(shell));
@@ -511,25 +533,13 @@ fn build_stream(
             yield Ok(Bytes::from(chunk.into_script_tag()));
         }
 
+        // A3 · emit the client runtime + per-island IIFEs + hydration payload +
+        // bootstrap precomputed at boot. Replaces the legacy `bundle_path`
+        // (`/_albedo/chunks/*.js`, never emitted → 404) + `__albedo_hydrate`
+        // path. Absent for Tier-A-only routes.
         let mut closing = String::new();
-        for node in &route.tier_c {
-            if node.hydration_mode == HydrationMode::None {
-                continue;
-            }
-            closing.push_str(&format!(
-                "<script type=\"module\" src=\"{}\"></script>",
-                node.bundle_path
-            ));
-            let component_id = serde_json::to_string(&node.component_id)
-                .unwrap_or_else(|_| "\"\"".to_string());
-            let placeholder_id = serde_json::to_string(&node.placeholder_id)
-                .unwrap_or_else(|_| "\"\"".to_string());
-            closing.push_str(&format!(
-                "<script>__albedo_hydrate({},{},{})</script>",
-                component_id,
-                placeholder_id,
-                node.initial_props
-            ));
+        if let Some(hydration) = hydration {
+            closing.push_str(&hydration.closing_scripts);
         }
 
         closing.push_str(&route.shell.body_close);
@@ -543,6 +553,7 @@ fn build_shell_chunk(
     webtransport_path: &str,
     csrf: &crate::render::csrf::CsrfRegistry,
     page_session: dom_render_compiler::runtime::SessionId,
+    hydration: Option<&crate::renderer_runtime::RouteHydration>,
 ) -> String {
     let mut shell = route.shell.doctype_and_head.clone();
     shell.push_str(&route.shell.body_open);
@@ -557,6 +568,16 @@ fn build_shell_chunk(
             &format!("<!--__SLOT_{}-->", node.placeholder_id),
             &node.html,
         );
+    }
+
+    // A3 · replace each empty Tier-C placeholder with the island's marked SSR
+    // HTML so the browser has real markup to adopt (and the user something to
+    // interact with). The marker rides on the island's own root element.
+    if let Some(hydration) = hydration {
+        for (placeholder_id, marked_html) in &hydration.placeholders {
+            let empty = format!("<div id=\"{placeholder_id}\" data-albedo-tier=\"c\"></div>");
+            shell = shell.replace(&empty, marked_html);
+        }
     }
 
     // Phase L · fill any `value=""` CSRF placeholders the renderer
@@ -619,13 +640,16 @@ async fn stream_route_over_webtransport(
     // any cookie round-trip on the WT path.
     let page_session = dom_render_compiler::runtime::SessionId::new(session_id);
 
-    // 1. Shell HTML on the text slot.
+    // 1. Shell HTML on the text slot. A3 client hydration rides the SSE/HTTP
+    //    path (`build_stream`); the WT path stays on its opcode-frame model, so
+    //    no per-route hydration block is threaded here.
     let mut shell = build_shell_chunk(
         &route,
         NegotiatedTransport::WebTransport,
         app.transport.webtransport_path.as_str(),
         app.csrf().as_ref(),
         page_session,
+        None,
     );
     shell.push_str(&route.shell.body_close);
     sessions

@@ -597,11 +597,15 @@ if (typeof globalThis.h !== 'function') {
       if (typeof value === 'function') {
         continue;
       }
+      // JSX prop → HTML attribute rename, mirroring the pure-Rust renderer
+      // (`render_attrs`) so QuickJS-rendered islands match build-time Tier-A
+      // markup and apply CSS classes in the browser.
+      const attrName = key === 'className' ? 'class' : key;
       if (value === true) {
-        attrs += ' ' + key;
+        attrs += ' ' + attrName;
         continue;
       }
-      attrs += ' ' + key + '="' + __albedo_escape_html(value) + '"';
+      attrs += ' ' + attrName + '="' + __albedo_escape_html(value) + '"';
     }
 
     const inner = flatChildren.join('');

@@ -113,6 +113,15 @@ impl<'a> ManifestBuilder<'a> {
         let mut tier_c = Vec::new();
         let mut order_counter = 0u32;
 
+        // Tier-C children are standalone hydration islands, anchored at their
+        // own placeholder — not inlined into a Tier-A parent's static HTML
+        // (which would render them twice: once inline, once at the island).
+        // Install the island-name set so the tier-blind static renderer emits
+        // a hole for them during `traverse`'s `render_static` calls.
+        let island_names = self.tier_c_component_names();
+        let _island_guard =
+            crate::runtime::eval::core::install_island_skip_set(&island_names);
+
         self.traverse(
             root_component,
             None,
@@ -1096,6 +1105,17 @@ impl<'a> ManifestBuilder<'a> {
 
     fn tier_of(&self, id: ComponentId) -> Option<Tier> {
         self.metadata.get(&id).map(|entry| entry.tier)
+    }
+
+    /// Names of every Tier-C component — the hydration islands a Tier-A parent
+    /// must NOT inline. Drives the `install_island_skip_set` guard around the
+    /// static render pass.
+    fn tier_c_component_names(&self) -> std::collections::HashSet<String> {
+        self.components
+            .iter()
+            .filter(|(id, _)| self.tier_of(**id) == Some(Tier::C))
+            .map(|(_, component)| component.name.clone())
+            .collect()
     }
 
     fn sorted_children(&self, id: ComponentId) -> Vec<ComponentId> {
