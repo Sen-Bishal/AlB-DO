@@ -20,6 +20,7 @@
 //! **not** the free-function wrappers — fulfilling the Phase A `wire.rs`
 //! contract that trait calls are the codec boundary.
 
+use super::webtransport::{WebTransportMuxer, WT_STREAM_SLOT_PATCHES};
 use crate::ir::columns::{IrColumns, StringInterner, LANE_COUNT};
 use crate::ir::opcode::{
     InstructionRange, InternEntry, InternPatchOp, InternTable, InternTableKind, OpcodeFrame,
@@ -27,7 +28,6 @@ use crate::ir::opcode::{
 };
 use crate::ir::wire::{WireEncode, WireError};
 use crate::ir::Instruction;
-use super::webtransport::{WebTransportMuxer, WT_STREAM_SLOT_PATCHES};
 
 /// Per-lane emission result — one encoded `OpcodeFrame` per non-empty lane.
 #[derive(Debug, Clone)]
@@ -109,16 +109,15 @@ impl InternTableSnapshot {
 /// # Arguments
 ///
 /// * `columns`       — the lane-sorted column store.
-/// * `dirty_indices` — flat array of dirty column indices (output of
-///                     [`DirtyBitmap::drain_into`]).
-/// * `lane_buckets`  — pre-partitioned per-lane dirty indices (the same
-///                     buckets [`frame_tick`](super::frame::frame_tick) builds).
+/// * `dirty_indices` — flat array of dirty column indices (output of [`DirtyBitmap::drain_into`]).
+/// * `lane_buckets`  — pre-partitioned per-lane dirty indices (the same buckets
+///   [`frame_tick`](super::frame::frame_tick) builds).
 /// * `muxer`         — sequence allocator for frame IDs.
 ///
 /// # Wire contract
 ///
-/// * `frame_id` is allocated via `muxer.allocate_sequence()` — fulfils the
-///   PHASE 2 comment on [`OpcodeFrame::frame_id`].
+/// * `frame_id` is allocated via `muxer.allocate_sequence()` — fulfils the PHASE 2 comment on
+///   [`OpcodeFrame::frame_id`].
 /// * Encoding goes through `frame.wire_encode()` (trait path).
 pub fn emit_lane_frames(
     columns: &IrColumns,
@@ -187,11 +186,7 @@ pub fn emit_lane_frames(
 /// | 0      | 8    | source_hash (LE)   |
 /// | 8      | 1    | effects bitmask    |
 #[inline]
-fn emit_lane_instructions(
-    indices: &[u32],
-    hashes: &[u64],
-    effects: &[u8],
-) -> Vec<Instruction> {
+fn emit_lane_instructions(indices: &[u32], hashes: &[u64], effects: &[u8]) -> Vec<Instruction> {
     let mut instructions = Vec::with_capacity(indices.len());
 
     for &column_idx in indices {
@@ -348,6 +343,8 @@ mod tests {
             is_default_export: false,
             props: Vec::new(),
             effect_profile: EffectProfile::default(),
+            is_interactive: false,
+            is_client_interactive: false,
             source_hash: 0xBEEF_0000 | u64::from(id),
         }
     }
@@ -414,8 +411,8 @@ mod tests {
         let results = emit_lane_frames(&columns, &refs, &muxer).unwrap();
 
         for result in &results {
-            let (decoded, _) = wire::decode_frame(&result.wire_bytes)
-                .expect("wire bytes must decode cleanly");
+            let (decoded, _) =
+                wire::decode_frame(&result.wire_bytes).expect("wire bytes must decode cleanly");
             assert_eq!(decoded.instructions.len(), result.instruction_count);
             assert_eq!(decoded.frame_id, result.frame_id);
 
@@ -503,12 +500,19 @@ mod tests {
     fn bootstrap_intern_tables_emits_init_for_each_non_empty_kind() {
         let snapshot = InternTableSnapshot {
             tags: vec![
-                InternEntry { id: 0, value: "div".to_string() },
-                InternEntry { id: 1, value: "span".to_string() },
+                InternEntry {
+                    id: 0,
+                    value: "div".to_string(),
+                },
+                InternEntry {
+                    id: 1,
+                    value: "span".to_string(),
+                },
             ],
-            attrs: vec![
-                InternEntry { id: 0, value: "class".to_string() },
-            ],
+            attrs: vec![InternEntry {
+                id: 0,
+                value: "class".to_string(),
+            }],
             events: Vec::new(),
         };
 
@@ -529,8 +533,14 @@ mod tests {
     fn diff_intern_tables_detects_additions_and_removals() {
         let prev = InternTableSnapshot {
             tags: vec![
-                InternEntry { id: 0, value: "div".to_string() },
-                InternEntry { id: 1, value: "span".to_string() },
+                InternEntry {
+                    id: 0,
+                    value: "div".to_string(),
+                },
+                InternEntry {
+                    id: 1,
+                    value: "span".to_string(),
+                },
             ],
             attrs: Vec::new(),
             events: Vec::new(),
@@ -538,9 +548,15 @@ mod tests {
 
         let current = InternTableSnapshot {
             tags: vec![
-                InternEntry { id: 0, value: "div".to_string() },
+                InternEntry {
+                    id: 0,
+                    value: "div".to_string(),
+                },
                 // id 1 removed
-                InternEntry { id: 2, value: "section".to_string() }, // added
+                InternEntry {
+                    id: 2,
+                    value: "section".to_string(),
+                }, // added
             ],
             attrs: Vec::new(),
             events: Vec::new(),
@@ -553,8 +569,12 @@ mod tests {
             Instruction::PatchInternTable { kind, ops } => {
                 assert_eq!(*kind, InternTableKind::Tag);
                 assert_eq!(ops.len(), 2); // 1 Set + 1 Remove
-                assert!(ops.iter().any(|op| matches!(op, InternPatchOp::Set { id: 2, .. })));
-                assert!(ops.iter().any(|op| matches!(op, InternPatchOp::Remove { id: 1 })));
+                assert!(ops
+                    .iter()
+                    .any(|op| matches!(op, InternPatchOp::Set { id: 2, .. })));
+                assert!(ops
+                    .iter()
+                    .any(|op| matches!(op, InternPatchOp::Remove { id: 1 })));
             }
             other => panic!("expected PatchInternTable, got {:?}", other),
         }
@@ -563,12 +583,18 @@ mod tests {
     #[test]
     fn diff_intern_tables_detects_value_changes() {
         let prev = InternTableSnapshot {
-            tags: vec![InternEntry { id: 0, value: "div".to_string() }],
+            tags: vec![InternEntry {
+                id: 0,
+                value: "div".to_string(),
+            }],
             attrs: Vec::new(),
             events: Vec::new(),
         };
         let current = InternTableSnapshot {
-            tags: vec![InternEntry { id: 0, value: "article".to_string() }],
+            tags: vec![InternEntry {
+                id: 0,
+                value: "article".to_string(),
+            }],
             attrs: Vec::new(),
             events: Vec::new(),
         };
@@ -578,7 +604,9 @@ mod tests {
         match &instructions[0] {
             Instruction::PatchInternTable { ops, .. } => {
                 assert_eq!(ops.len(), 1);
-                assert!(matches!(&ops[0], InternPatchOp::Set { id: 0, value } if value == "article"));
+                assert!(
+                    matches!(&ops[0], InternPatchOp::Set { id: 0, value } if value == "article")
+                );
             }
             other => panic!("expected PatchInternTable, got {:?}", other),
         }
@@ -587,9 +615,18 @@ mod tests {
     #[test]
     fn diff_identical_snapshots_produces_no_ops() {
         let snapshot = InternTableSnapshot {
-            tags: vec![InternEntry { id: 0, value: "div".to_string() }],
-            attrs: vec![InternEntry { id: 0, value: "class".to_string() }],
-            events: vec![InternEntry { id: 0, value: "click".to_string() }],
+            tags: vec![InternEntry {
+                id: 0,
+                value: "div".to_string(),
+            }],
+            attrs: vec![InternEntry {
+                id: 0,
+                value: "class".to_string(),
+            }],
+            events: vec![InternEntry {
+                id: 0,
+                value: "click".to_string(),
+            }],
         };
 
         let instructions = diff_intern_tables(&snapshot, &snapshot);

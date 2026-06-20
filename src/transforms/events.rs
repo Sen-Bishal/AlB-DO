@@ -9,13 +9,11 @@
 //! order with the AST of the function body intact, so the renderer
 //! can:
 //!
-//!   1. Compute a deterministic `proxy_id` from `(module, function,
-//!      handler_idx)` and emit a `BindEvent` opcode for the
-//!      containing element.
+//!   1. Compute a deterministic `proxy_id` from `(module, function, handler_idx)` and emit a
+//!      `BindEvent` opcode for the containing element.
 //!
-//!   2. Register a server-side dispatcher that re-executes the same
-//!      AST against the session slot store when bakabox POSTs to
-//!      `/_albedo/action/<proxy_id>`.
+//!   2. Register a server-side dispatcher that re-executes the same AST against the session slot
+//!      store when bakabox POSTs to `/_albedo/action/<proxy_id>`.
 //!
 //! Phase K Stage 1 supports the canonical inline-arrow pattern:
 //!
@@ -63,30 +61,86 @@ pub enum HandlerBody {
 /// returned vector is in source-traversal order; handler_idx is the
 /// vector index.
 pub fn extract_handlers_in_function(stmts: &[Stmt]) -> Vec<HandlerExtract> {
+    // Resolve bare-identifier handlers (`onClick={inc}`) against the component's
+    // local definitions: `const inc = () => …`, `const inc = function(){…}`, and
+    // `const inc = useCallback(() => …, deps)` all become handler bodies.
+    let locals = extract_local_handler_defs(stmts);
     let mut sink = Vec::new();
     for stmt in stmts {
-        visit_stmt_for_jsx(stmt, &mut sink);
+        visit_stmt_for_jsx(stmt, &locals, &mut sink);
     }
     sink
 }
 
-fn visit_stmt_for_jsx(stmt: &Stmt, sink: &mut Vec<HandlerExtract>) {
+/// A `const NAME = <closure>` definition in the component body, where `<closure>`
+/// is an arrow, a function expression, or `useCallback(<closure>, deps)`. Used to
+/// resolve bare-identifier JSX handlers to their bodies.
+fn extract_local_handler_defs(stmts: &[Stmt]) -> std::collections::HashMap<String, HandlerBody> {
+    let mut out = std::collections::HashMap::new();
+    for stmt in stmts {
+        let Stmt::Decl(Decl::Var(var)) = stmt else {
+            continue;
+        };
+        for decl in &var.decls {
+            let Some(name) = decl.name.as_ident().map(|i| i.sym.to_string()) else {
+                continue;
+            };
+            if let Some(init) = &decl.init {
+                if let Some(body) = handler_body_from_expr(init) {
+                    out.insert(name, body);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The handler body of a closure expression: an arrow, a function expression, or
+/// `useCallback(<closure>, deps)` (unwrapped to the inner closure). `None` for
+/// anything else (not a handler value).
+fn handler_body_from_expr(expr: &Expr) -> Option<HandlerBody> {
+    match expr {
+        Expr::Arrow(arrow) => Some(match &*arrow.body {
+            BlockStmtOrExpr::BlockStmt(block) => HandlerBody::Block(block.stmts.clone()),
+            BlockStmtOrExpr::Expr(inner) => HandlerBody::Expr((**inner).clone()),
+        }),
+        Expr::Fn(fn_expr) => fn_expr
+            .function
+            .body
+            .as_ref()
+            .map(|block| HandlerBody::Block(block.stmts.clone())),
+        Expr::Call(call)
+            if matches!(&call.callee, Callee::Expr(e)
+                if matches!(&**e, Expr::Ident(id) if id.sym.as_ref() == "useCallback")) =>
+        {
+            call.args
+                .first()
+                .and_then(|arg| handler_body_from_expr(&arg.expr))
+        }
+        Expr::Paren(paren) => handler_body_from_expr(&paren.expr),
+        _ => None,
+    }
+}
+
+type Locals = std::collections::HashMap<String, HandlerBody>;
+
+fn visit_stmt_for_jsx(stmt: &Stmt, locals: &Locals, sink: &mut Vec<HandlerExtract>) {
     match stmt {
         Stmt::Return(ret) => {
             if let Some(arg) = &ret.arg {
-                visit_expr_for_jsx(arg, sink);
+                visit_expr_for_jsx(arg, locals, sink);
             }
         }
-        Stmt::Expr(es) => visit_expr_for_jsx(&es.expr, sink),
+        Stmt::Expr(es) => visit_expr_for_jsx(&es.expr, locals, sink),
         Stmt::Block(block) => {
             for s in &block.stmts {
-                visit_stmt_for_jsx(s, sink);
+                visit_stmt_for_jsx(s, locals, sink);
             }
         }
         Stmt::Decl(swc_ecma_ast::Decl::Var(var)) => {
             for d in &var.decls {
                 if let Some(init) = &d.init {
-                    visit_expr_for_jsx(init, sink);
+                    visit_expr_for_jsx(init, locals, sink);
                 }
             }
         }
@@ -94,34 +148,42 @@ fn visit_stmt_for_jsx(stmt: &Stmt, sink: &mut Vec<HandlerExtract>) {
     }
 }
 
-fn visit_expr_for_jsx(expr: &Expr, sink: &mut Vec<HandlerExtract>) {
+fn visit_expr_for_jsx(expr: &Expr, locals: &Locals, sink: &mut Vec<HandlerExtract>) {
     match expr {
-        Expr::JSXElement(element) => visit_element(element, sink),
+        Expr::JSXElement(element) => visit_element(element, locals, sink),
         Expr::JSXFragment(fragment) => {
             for child in &fragment.children {
-                visit_child(child, sink);
+                visit_child(child, locals, sink);
             }
         }
-        Expr::Paren(paren) => visit_expr_for_jsx(&paren.expr, sink),
+        Expr::Paren(paren) => visit_expr_for_jsx(&paren.expr, locals, sink),
         Expr::Cond(c) => {
-            visit_expr_for_jsx(&c.cons, sink);
-            visit_expr_for_jsx(&c.alt, sink);
+            visit_expr_for_jsx(&c.cons, locals, sink);
+            visit_expr_for_jsx(&c.alt, locals, sink);
         }
         _ => {}
     }
 }
 
-fn visit_element(element: &JSXElement, sink: &mut Vec<HandlerExtract>) {
+fn visit_element(element: &JSXElement, locals: &Locals, sink: &mut Vec<HandlerExtract>) {
     for attr in &element.opening.attrs {
-        let JSXAttrOrSpread::JSXAttr(attr) = attr else { continue };
-        let JSXAttrName::Ident(name_ident) = &attr.name else { continue };
+        let JSXAttrOrSpread::JSXAttr(attr) = attr else {
+            continue;
+        };
+        let JSXAttrName::Ident(name_ident) = &attr.name else {
+            continue;
+        };
         let name = name_ident.sym.to_string();
         if !name.starts_with("on") || name.len() <= 2 {
             continue;
         }
         let event_name = name[2..].to_ascii_lowercase();
-        let Some(JSXAttrValue::JSXExprContainer(container)) = &attr.value else { continue };
-        let JSXExpr::Expr(handler_expr) = &container.expr else { continue };
+        let Some(JSXAttrValue::JSXExprContainer(container)) = &attr.value else {
+            continue;
+        };
+        let JSXExpr::Expr(handler_expr) = &container.expr else {
+            continue;
+        };
         let body = match handler_expr.as_ref() {
             Expr::Arrow(arrow) => match &*arrow.body {
                 BlockStmtOrExpr::BlockStmt(block) => HandlerBody::Block(block.stmts.clone()),
@@ -131,30 +193,38 @@ fn visit_element(element: &JSXElement, sink: &mut Vec<HandlerExtract>) {
                 Some(block) => HandlerBody::Block(block.stmts.clone()),
                 None => continue,
             },
-            // Bare identifiers (`onClick={handleClick}`) are deferred
-            // to Phase K Stage 2 — they need handler-resolution against
-            // the surrounding scope.
+            // Bare identifier (`onClick={inc}`): resolve against the component's
+            // local closure defs (arrow / function / useCallback). Unresolvable
+            // references are still skipped.
+            Expr::Ident(ident) => match locals.get(ident.sym.as_ref()) {
+                Some(body) => body.clone(),
+                None => continue,
+            },
             _ => continue,
         };
         let handler_idx = sink.len();
-        sink.push(HandlerExtract { handler_idx, event_name, body });
+        sink.push(HandlerExtract {
+            handler_idx,
+            event_name,
+            body,
+        });
     }
     for child in &element.children {
-        visit_child(child, sink);
+        visit_child(child, locals, sink);
     }
 }
 
-fn visit_child(child: &JSXElementChild, sink: &mut Vec<HandlerExtract>) {
+fn visit_child(child: &JSXElementChild, locals: &Locals, sink: &mut Vec<HandlerExtract>) {
     match child {
-        JSXElementChild::JSXElement(element) => visit_element(element, sink),
+        JSXElementChild::JSXElement(element) => visit_element(element, locals, sink),
         JSXElementChild::JSXFragment(fragment) => {
             for c in &fragment.children {
-                visit_child(c, sink);
+                visit_child(c, locals, sink);
             }
         }
         JSXElementChild::JSXExprContainer(container) => {
             if let JSXExpr::Expr(expr) = &container.expr {
-                visit_expr_for_jsx(expr, sink);
+                visit_expr_for_jsx(expr, locals, sink);
             }
         }
         _ => {}

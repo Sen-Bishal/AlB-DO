@@ -76,9 +76,19 @@ pub struct TieringInputs {
     pub tier_c_mode: HydrationMode,
 }
 
+/// Decide a component's render tier.
+///
+/// Two interactivity signals are distinguished (dataflow tier design, step 2):
+/// - `has_event_handler` — the component declares any `on*` handler. It can no longer be a static
+///   Tier-A node, and it hydrates on interaction.
+/// - `client_interactive` — at least one handler is provably client-satisfiable (its closure
+///   reaches no server boundary). This is the lever that promotes to Tier-C (client island, zero
+///   round-trip). A handler that must round-trip (e.g. `onClick` → `fetch`) leaves this false,
+///   keeping the component Tier-B.
 pub fn decide_tier_and_hydration(
     effects: EffectProfile,
-    is_interactive: bool,
+    has_event_handler: bool,
+    client_interactive: bool,
     is_above_fold: bool,
     weight_bytes: u64,
     inputs: TieringInputs,
@@ -98,7 +108,7 @@ pub fn decide_tier_and_hydration(
     if effects.io {
         return TieringDecision {
             tier: Tier::C,
-            hydration_mode: if is_interactive {
+            hydration_mode: if has_event_handler {
                 HydrationMode::OnInteraction
             } else {
                 inputs.tier_c_mode
@@ -108,11 +118,11 @@ pub fn decide_tier_and_hydration(
     }
 
     if effects.asynchronous {
-        let promote_to_tier_c = is_interactive || weight_bytes >= inputs.tier_c_split_min_bytes;
+        let promote_to_tier_c = client_interactive || weight_bytes >= inputs.tier_c_split_min_bytes;
         return if promote_to_tier_c {
             TieringDecision {
                 tier: Tier::C,
-                hydration_mode: if is_interactive {
+                hydration_mode: if has_event_handler {
                     HydrationMode::OnInteraction
                 } else {
                     inputs.tier_c_mode
@@ -129,7 +139,7 @@ pub fn decide_tier_and_hydration(
     }
 
     if effects.hooks {
-        return if is_interactive {
+        return if client_interactive {
             TieringDecision {
                 tier: Tier::C,
                 hydration_mode: HydrationMode::OnInteraction,
@@ -144,7 +154,8 @@ pub fn decide_tier_and_hydration(
         };
     }
 
-    if weight_bytes <= inputs.tier_a_inline_max_bytes && !is_interactive {
+    // A handler with no hooks/effects still must hydrate to run — never Tier-A.
+    if weight_bytes <= inputs.tier_a_inline_max_bytes && !has_event_handler {
         return TieringDecision {
             tier: Tier::A,
             hydration_mode: HydrationMode::None,
@@ -153,11 +164,11 @@ pub fn decide_tier_and_hydration(
     }
 
     if weight_bytes >= inputs.tier_c_split_min_bytes
-        || (is_interactive && weight_bytes > inputs.tier_a_inline_max_bytes)
+        || (client_interactive && weight_bytes > inputs.tier_a_inline_max_bytes)
     {
         return TieringDecision {
             tier: Tier::C,
-            hydration_mode: if is_interactive {
+            hydration_mode: if has_event_handler {
                 HydrationMode::OnInteraction
             } else {
                 inputs.tier_c_mode
@@ -189,10 +200,19 @@ mod tests {
     #[test]
     fn test_pure_small_component_is_tier_a() {
         let decision =
-            decide_tier_and_hydration(EffectProfile::pure(), false, false, 1024, inputs());
+            decide_tier_and_hydration(EffectProfile::pure(), false, false, false, 1024, inputs());
         assert_eq!(decision.tier, Tier::A);
         assert_eq!(decision.hydration_mode, HydrationMode::None);
         assert_eq!(decision.reason, TieringReason::PureStaticEligible);
+    }
+
+    #[test]
+    fn test_handler_without_hooks_is_not_tier_a() {
+        // A pure component that nonetheless declares an `on*` handler must
+        // hydrate to run the handler — it can never collapse to static Tier-A.
+        let decision =
+            decide_tier_and_hydration(EffectProfile::pure(), true, false, false, 1024, inputs());
+        assert_ne!(decision.tier, Tier::A);
     }
 
     #[test]
@@ -204,11 +224,77 @@ mod tests {
             },
             false,
             false,
+            false,
             1024,
             inputs(),
         );
         assert_eq!(decision.tier, Tier::B);
         assert_eq!(decision.reason, TieringReason::HookDrivenHydration);
+    }
+
+    fn tier_of(source: &str, file: &str) -> TieringDecision {
+        use crate::parser::ComponentParser;
+        let parsed = ComponentParser::new().parse_source(source, file).unwrap();
+        let c = &parsed[0];
+        decide_tier_and_hydration(
+            c.effect_profile,
+            c.is_interactive,
+            c.is_client_interactive,
+            false,
+            1024,
+            inputs(),
+        )
+    }
+
+    #[test]
+    fn handler_driven_counter_promotes_to_tier_c_without_name_heuristic() {
+        // A component NAMED "Counter" — which the old name heuristic would never
+        // flag — reaches Tier-C purely because its `onClick` is client-satisfiable.
+        let decision = tier_of(
+            r#"
+            export default function Counter() {
+                const [n, setN] = useState(0);
+                return <button onClick={() => setN(n + 1)}>{n}</button>;
+            }
+            "#,
+            "Counter.tsx",
+        );
+        assert_eq!(decision.tier, Tier::C);
+        assert_eq!(decision.reason, TieringReason::HookDrivenHydration);
+    }
+
+    #[test]
+    fn server_touching_handler_stays_tier_b() {
+        // Step 2 discriminator: same shape as Counter, but the handler awaits
+        // `fetch` — a server boundary — so it must NOT be a zero-round-trip
+        // Tier-C island; it stays Tier-B.
+        let decision = tier_of(
+            r#"
+            export default function LikeButton() {
+                const [liked, setLiked] = useState(false);
+                return <button onClick={async () => { await fetch('/api/like'); setLiked(true); }}>like</button>;
+            }
+            "#,
+            "LikeButton.tsx",
+        );
+        assert_eq!(decision.tier, Tier::B);
+    }
+
+    #[test]
+    fn extracted_local_handler_resolves_to_client_satisfiable() {
+        // The handler is a bare identifier resolving to a local pure closure —
+        // free-variable resolution must still land it on Tier-C.
+        let decision = tier_of(
+            r#"
+            export default function Stepper() {
+                const [n, setN] = useState(0);
+                const inc = () => setN(n + 1);
+                return <button onClick={inc}>{n}</button>;
+            }
+            "#,
+            "Stepper.tsx",
+        );
+        assert_eq!(decision.tier, Tier::C);
     }
 
     #[test]
@@ -218,6 +304,7 @@ mod tests {
                 io: true,
                 ..EffectProfile::default()
             },
+            false,
             false,
             false,
             1024,

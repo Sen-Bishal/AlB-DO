@@ -12,23 +12,19 @@
 
 use crate::bundler::npm::{bundle_npm_dependency, scan_bare_imports, NpmDependencyBundle};
 use crate::ir::action::ActionEnvelope;
-use crate::ir::opcode::{Instruction, SlotId};
+use crate::ir::opcode::{Instruction, InternTableKind, SlotId};
 use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
 use crate::runtime::broadcast::BroadcastRegistry;
 use crate::runtime::engine::RuntimeEngine;
 use crate::runtime::eval::component::fnv1a_32;
-use crate::runtime::quickjs_engine::QuickJsEngine;
 use crate::runtime::eval::{ComponentFunction, ParamBinding};
 use crate::runtime::eval::{ComponentProject, PatchReport};
+use crate::runtime::quickjs_engine::QuickJsEngine;
 use crate::runtime::slot_store::SessionSlotView;
 use crate::transforms::actions::ActionDeclaration;
 use crate::transforms::css_modules::{is_css_module_path, scope_module_css, ScopedCssModule};
-use crate::transforms::events::{
-    collect_free_idents_in_handler_body, HandlerBody, HandlerExtract,
-};
-use crate::transforms::form::{
-    allocate_form_action_id, extract_forms_in_function, FormExtract,
-};
+use crate::transforms::events::{collect_free_idents_in_handler_body, HandlerBody, HandlerExtract};
+use crate::transforms::form::{allocate_form_action_id, extract_forms_in_function, FormExtract};
 use crate::transforms::hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 use crate::transforms::link::{extract_links_in_function, LinkExtract};
 use crate::transforms::shared_slots::{
@@ -49,12 +45,10 @@ use swc_ecma_codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderOptions {
     /// When `true`, the renderer:
-    ///   * Reads `useState` value bindings from `SessionSlotView`
-    ///     (initialising the slot from the initial expression on
-    ///     first access).
+    ///   * Reads `useState` value bindings from `SessionSlotView` (initialising the slot from the
+    ///     initial expression on first access).
     ///   * Emits `BindEvent` opcodes for every JSX `on*` handler.
-    ///   * Emits `SetTextRef` opcodes for every slot read used in
-    ///     a JSX expression context.
+    ///   * Emits `SetTextRef` opcodes for every slot read used in a JSX expression context.
     ///
     /// When `false`, the renderer behaves exactly as Phase J shipped:
     /// the useState shim from `eval/core.rs` binds the initial
@@ -70,6 +64,76 @@ pub struct RenderOptions {
 pub struct RenderOutput {
     pub html: String,
     pub opcodes: Vec<Instruction>,
+}
+
+/// One `{slot}` read bound to a server-rendered text node — the client
+/// re-paints `stable_id`'s text whenever `slot_id` changes.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactiveTextBinding {
+    pub stable_id: u32,
+    pub slot_id: u32,
+}
+
+/// One `{slot}` read in an attribute position bound to a server-rendered
+/// element — the client re-applies `attr` (the HTML attribute name, e.g.
+/// `class`) on `stable_id` whenever `slot_id` changes.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactiveAttrBinding {
+    pub stable_id: u32,
+    pub attr: String,
+    pub slot_id: u32,
+}
+
+/// One derived `{slot-expr}` binding — a JSX expression that reads reactive
+/// slots but isn't a bare read (`{count * 2}`, `className={busy ? 'b' : ''}`).
+/// The client recomputes `thunk(state)` whenever any `dep_slots` slot changes
+/// and re-applies it to `stable_id` (as text when `attr` is null, else as that
+/// HTML attribute).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactiveDerivedBinding {
+    pub stable_id: u32,
+    pub attr: Option<String>,
+    pub dep_slots: Vec<u32>,
+    /// `(function(__s){ ... return (<expr>); })` over the live state object.
+    pub thunk: String,
+}
+
+/// One `on*` handler wired to a server-rendered element — a client-side
+/// click on `stable_id` runs the handler thunk registered for `proxy_id`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactiveEventBinding {
+    pub stable_id: u32,
+    pub event: String,
+    pub proxy_id: u32,
+}
+
+/// The fine-grained reactive payload for one route: everything the client
+/// needs to drive state transitions locally against the already-rendered
+/// static HTML, with no component hydration and no server round-trip.
+///
+/// This is the Tier-C "binding mode" lever — the same `SetTextRef`/`BindEvent`
+/// bindings the Tier-B opcode path already emits, plus the handler bodies
+/// lowered to JS thunks so the recompute runs in the browser. The driver
+/// (`assets/albedo-reactive.js`) feeds the resulting `SlotSet`s to the
+/// existing bakabox patcher.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReactivePayload {
+    /// SSR HTML (with `data-albedo-id` stamps) the bindings reference.
+    pub html: String,
+    /// `{slot}` → text-node bindings.
+    pub texts: Vec<ReactiveTextBinding>,
+    /// `{slot}` → attribute bindings.
+    pub attrs: Vec<ReactiveAttrBinding>,
+    /// derived `{slot-expr}` → text/attribute bindings (recomputed client-side).
+    pub derived: Vec<ReactiveDerivedBinding>,
+    /// `on*` → element bindings.
+    pub events: Vec<ReactiveEventBinding>,
+    /// `proxy_id` → handler thunk source `(function(__state,__emit){...})`.
+    pub handlers: Vec<(u32, String)>,
 }
 
 /// One compiled component's metadata, derived from its parsed AST.
@@ -120,6 +184,14 @@ pub struct CompiledComponent {
     /// registry; for now this exists as the compile-time contract
     /// downstream wiring compiles against.
     pub shared_slots: Vec<SharedSlotBinding>,
+    /// Step 3 (derived bindings) · local `const NAME = useMemo(() => EXPR, …)`
+    /// and plain derived `const NAME = EXPR` definitions in the component body,
+    /// keyed by binding name. When a JSX expression reads such a local, the
+    /// derived-binding analysis substitutes it with `EXPR` so a `{doubled}`
+    /// (where `doubled = useMemo(() => count * 2)`) recomputes from `count`'s
+    /// slot. Hook calls (`useState`/`useRef`/`useCallback`) and functions are
+    /// excluded.
+    pub derived_locals: HashMap<String, Expr>,
 }
 
 /// One handler the server can re-execute when bakabox POSTs an action
@@ -254,12 +326,11 @@ impl CompiledProject {
 
         for (module_spec, module) in project.modules() {
             for (function_name, function) in &module.functions {
-                let hook_bindings = extract_use_state_hooks(function, &module.imports)
-                    .map_err(|err: HookExtractError| {
-                        anyhow!(
-                            "hook extraction failed in {module_spec}::{function_name}: {err}"
-                        )
-                    })?;
+                let hook_bindings = extract_use_state_hooks(function, &module.imports).map_err(
+                    |err: HookExtractError| {
+                        anyhow!("hook extraction failed in {module_spec}::{function_name}: {err}")
+                    },
+                )?;
                 let handler_extracts =
                     crate::transforms::events::extract_handlers_in_function(&function.body_stmts);
 
@@ -275,15 +346,13 @@ impl CompiledProject {
                 // calls as a list of (binding_name, topic) records.
                 // Compile-time failure here propagates as an
                 // `anyhow!` so misuse blocks the build.
-                let shared_slot_bindings =
-                    extract_shared_slot_hooks(function, &module.imports).map_err(
-                        |err: SharedSlotExtractError| {
-                            anyhow!(
-                                "shared-slot extraction failed in \
+                let shared_slot_bindings = extract_shared_slot_hooks(function, &module.imports)
+                    .map_err(|err: SharedSlotExtractError| {
+                        anyhow!(
+                            "shared-slot extraction failed in \
                                  {module_spec}::{function_name}: {err}"
-                            )
-                        },
-                    )?;
+                        )
+                    })?;
 
                 let mut value_slots: HashMap<String, SlotId> = HashMap::new();
                 let mut setter_slots: HashMap<String, SlotId> = HashMap::new();
@@ -359,6 +428,7 @@ impl CompiledProject {
                         forms: form_extracts,
                         links: link_extracts,
                         shared_slots: shared_slot_bindings,
+                        derived_locals: extract_derived_locals(&function.body_stmts),
                     },
                 );
             }
@@ -407,6 +477,7 @@ impl CompiledProject {
                     forms: Vec::new(),
                     links: Vec::new(),
                     shared_slots: Vec::new(),
+                    derived_locals: HashMap::new(),
                 };
                 components.insert(
                     (module_spec.clone(), synthetic_function.clone()),
@@ -534,10 +605,217 @@ impl CompiledProject {
         self.handlers.get(&proxy_id)
     }
 
+    /// Step 3 — resolve a component's render-entry module spec from its function
+    /// name. The render manifest identifies a Tier-C node by component name
+    /// (and carries an absolute `module_path` that won't match the project's
+    /// relative module specs); this finds the spec `build_reactive_payload`
+    /// (and `resolve_entry`) actually keys on. First match wins.
+    #[must_use]
+    pub fn module_spec_for_component(&self, function_name: &str) -> Option<&str> {
+        self.components
+            .keys()
+            .find(|(_, name)| name == function_name)
+            .map(|(spec, _)| spec.as_str())
+    }
+
     /// Total count of registered handlers — for diagnostic surfaces.
     #[must_use]
     pub fn handler_count(&self) -> usize {
         self.handlers.len()
+    }
+
+    /// Step 3 (fine-grained reactivity) — build the client reactive payload
+    /// for an entry component: the `{slot}`/`on*` bindings the Phase K render
+    /// already emits, plus each handler body lowered to a JS thunk that runs
+    /// the state transition in the browser.
+    ///
+    /// Where Tier-B ships the click to the server and waits for a `SlotSet`,
+    /// binding mode runs the same handler locally and emits the `SlotSet`
+    /// itself — zero round-trip, no component hydration, only the bound text
+    /// nodes re-paint. This is the substrate behind the "stop hydrating
+    /// components" lane; the consumer is `assets/albedo-reactive.js`.
+    pub fn build_reactive_payload(
+        &self,
+        entry: &str,
+        props: &Value,
+        slots: &SessionSlotView,
+    ) -> Result<ReactivePayload> {
+        let opts = RenderOptions { hook_compile: true };
+        let out = render_entry_with_bindings(self, entry, props, slots, &opts)?;
+
+        // event_id → name and attr_id → name, from the prepended intern tables.
+        let mut event_names: HashMap<u16, String> = HashMap::new();
+        let mut attr_names: HashMap<u16, String> = HashMap::new();
+        for op in &out.opcodes {
+            if let Instruction::InitInternTable { table } = op {
+                match table.kind {
+                    InternTableKind::Event => {
+                        for intern in &table.entries {
+                            event_names.insert(intern.id, intern.value.clone());
+                        }
+                    }
+                    InternTableKind::Attr => {
+                        for intern in &table.entries {
+                            attr_names.insert(intern.id, intern.value.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut texts = Vec::new();
+        let mut attrs = Vec::new();
+        let mut events = Vec::new();
+        let mut proxy_ids = Vec::new();
+        for op in &out.opcodes {
+            match op {
+                Instruction::SetTextRef { stable_id, slot_id } => {
+                    texts.push(ReactiveTextBinding {
+                        stable_id: stable_id.0,
+                        slot_id: slot_id.0,
+                    });
+                }
+                Instruction::SetAttrRef {
+                    stable_id,
+                    attr_id,
+                    slot_id,
+                } => {
+                    attrs.push(ReactiveAttrBinding {
+                        stable_id: stable_id.0,
+                        attr: attr_names.get(&attr_id.0).cloned().unwrap_or_default(),
+                        slot_id: slot_id.0,
+                    });
+                }
+                Instruction::BindEvent {
+                    stable_id,
+                    event_id,
+                    proxy_id,
+                } => {
+                    events.push(ReactiveEventBinding {
+                        stable_id: stable_id.0,
+                        event: event_names.get(&event_id.0).cloned().unwrap_or_default(),
+                        proxy_id: proxy_id.0,
+                    });
+                    proxy_ids.push(proxy_id.0);
+                }
+                _ => {}
+            }
+        }
+
+        let mut handlers = Vec::with_capacity(proxy_ids.len());
+        for proxy_id in proxy_ids {
+            handlers.push((proxy_id, self.build_client_handler_thunk(proxy_id)?));
+        }
+
+        // Derived bindings: the render recorded each `{slot-expr}` (text or attr)
+        // that reads slots but isn't a bare read. Lower each to a recompute thunk
+        // over the live state object — every dependency name binds to its slot
+        // (falling back to that slot's initial value), then the expression is
+        // returned. The client re-runs this when any dependency changes.
+        let slot_initials = self.slot_initial_js_map()?;
+        let raw_derived = crate::runtime::eval::core::take_phase_k_derived_bindings();
+        let mut derived = Vec::with_capacity(raw_derived.len());
+        for binding in raw_derived {
+            let mut thunk = String::from("(function(__s){\n");
+            for (name, slot_id) in &binding.deps {
+                let slot = slot_id.0;
+                let initial = slot_initials
+                    .get(&slot)
+                    .cloned()
+                    .unwrap_or_else(|| "undefined".to_string());
+                thunk.push_str(&format!(
+                    "var {name}=(__s[{slot}]!==undefined?__s[{slot}]:({initial}));\n"
+                ));
+            }
+            thunk.push_str(&format!("return ({});\n}})", expr_to_js(&binding.expr)?));
+            derived.push(ReactiveDerivedBinding {
+                stable_id: binding.stable_id,
+                attr: binding.attr,
+                dep_slots: binding.deps.iter().map(|(_, slot)| slot.0).collect(),
+                thunk,
+            });
+        }
+
+        Ok(ReactivePayload {
+            html: out.html,
+            texts,
+            attrs,
+            derived,
+            events,
+            handlers,
+        })
+    }
+
+    /// Map every `useState` value slot id → its initial expression lowered to JS,
+    /// across all components. Used to seed derived-binding dependency fallbacks
+    /// so a recompute that reads a slot not yet written still gets the SSR value.
+    fn slot_initial_js_map(&self) -> Result<HashMap<u32, String>> {
+        let mut out = HashMap::new();
+        for component in self.components.values() {
+            for hook in &component.hooks {
+                if let Some(slot_id) = component.value_slots.get(&hook.value_name) {
+                    out.insert(slot_id.0, expr_to_js(&hook.initial)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Lower one handler to a client thunk `(function(__state,__emit){...})`.
+    ///
+    /// Mirror of the server's `build_handler_script`, but over a *live* JS
+    /// state object instead of the session slot store: each `useState` value
+    /// binds to `__state[slot]` (falling back to its initial expression on the
+    /// first interaction), each setter writes `__state[slot]` and emits the
+    /// change via `__emit(slot, value)`. The driver turns each `__emit` into a
+    /// `SlotSet` against bakabox. Sequential clicks accumulate because the
+    /// state object persists between dispatches (the server re-seeds per call).
+    fn build_client_handler_thunk(&self, proxy_id: u32) -> Result<String> {
+        let handler = self
+            .handler(proxy_id)
+            .ok_or_else(|| anyhow!("no handler registered for proxy_id {proxy_id}"))?;
+        let component = self
+            .component_meta(&handler.module_spec, &handler.function_name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "handler {proxy_id} references unknown component {}::{}",
+                    handler.module_spec,
+                    handler.function_name,
+                )
+            })?;
+        let (body_src, is_block) = handler_body_to_js(&handler.body)?;
+
+        let mut s = String::from("(function(__state,__emit){\n");
+        // useState value bindings — read live state, fall back to the initial.
+        for (name, slot_id) in &component.value_slots {
+            let initial = component
+                .hooks
+                .iter()
+                .find(|h| &h.value_name == name)
+                .map(|h| expr_to_js(&h.initial))
+                .transpose()?
+                .unwrap_or_else(|| "undefined".to_string());
+            let slot = slot_id.0;
+            s.push_str(&format!(
+                "var {name}=(__state[{slot}]!==undefined?__state[{slot}]:({initial}));\n"
+            ));
+        }
+        // Setters write live state and emit the change for the patcher.
+        for (name, slot_id) in &component.setter_slots {
+            let slot = slot_id.0;
+            s.push_str(&format!(
+                "var {name}=function(v){{var __v=(v===undefined?null:v);__state[{slot}]=__v;__emit({slot},__v);}};\n"
+            ));
+        }
+        if is_block {
+            s.push_str(&body_src);
+            s.push('\n');
+        } else {
+            s.push_str(&format!("({body_src});\n"));
+        }
+        s.push_str("})");
+        Ok(s)
     }
 
     /// Iterate every handler's `proxy_id`. Used by
@@ -582,10 +860,7 @@ impl CompiledProject {
     /// Phase P · Stream C.1 — every `export const NAME = action(...)`
     /// declaration in one module, in source order. Returns an empty
     /// slice when the module declares no actions (or is unknown).
-    pub fn action_declarations_for_module(
-        &self,
-        module_spec: &str,
-    ) -> &[ActionDeclaration] {
+    pub fn action_declarations_for_module(&self, module_spec: &str) -> &[ActionDeclaration] {
         self.action_declarations
             .get(module_spec)
             .map(|v| v.as_slice())
@@ -597,14 +872,10 @@ impl CompiledProject {
     /// pairs. Order is module-iteration order (HashMap, not stable
     /// across runs); within each module declarations are in source
     /// order.
-    pub fn action_declarations_iter(
-        &self,
-    ) -> impl Iterator<Item = (&str, &ActionDeclaration)> {
+    pub fn action_declarations_iter(&self) -> impl Iterator<Item = (&str, &ActionDeclaration)> {
         self.action_declarations
             .iter()
-            .flat_map(|(module_spec, decls)| {
-                decls.iter().map(move |d| (module_spec.as_str(), d))
-            })
+            .flat_map(|(module_spec, decls)| decls.iter().map(move |d| (module_spec.as_str(), d)))
     }
 
     /// Phase P · Stream C.1 — total count of TS-side action
@@ -613,10 +884,7 @@ impl CompiledProject {
     /// registered N actions" without iterating.
     #[must_use]
     pub fn action_declaration_count(&self) -> usize {
-        self.action_declarations
-            .values()
-            .map(|v| v.len())
-            .sum()
+        self.action_declarations.values().map(|v| v.len()).sum()
     }
 
     /// Dispatch an [`ActionEnvelope`] against the registered handler.
@@ -671,8 +939,7 @@ impl CompiledProject {
         slots: &SessionSlotView,
         broadcast: &crate::runtime::broadcast::BroadcastRegistry,
     ) -> Result<Vec<Instruction>> {
-        let _broadcast_guard =
-            crate::runtime::eval::core::install_phase_k_broadcast(broadcast);
+        let _broadcast_guard = crate::runtime::eval::core::install_phase_k_broadcast(broadcast);
         self.invoke_action(envelope, slots)
     }
 
@@ -837,9 +1104,7 @@ impl CompiledProject {
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             {
                 env.insert(name.clone(), value);
-            } else if let Some(hook) =
-                component.hooks.iter().find(|h| &h.value_name == name)
-            {
+            } else if let Some(hook) = component.hooks.iter().find(|h| &h.value_name == name) {
                 raw_bindings.push((name.clone(), expr_to_js(&hook.initial)?));
             }
         }
@@ -938,11 +1203,11 @@ impl CompiledProject {
     /// (cached by source hash) and rendered with a host seed installed:
     ///
     ///   * **props** flow as the component's argument (JSON), exactly as React;
-    ///   * **`useState`** values are seeded from the session slot store, keyed
-    ///     positionally by hook index — an unwritten slot falls back to the
-    ///     hook's initial, parity with the pure-Rust `render_local` seeding;
-    ///   * **`useSharedSlot`** values are seeded from the broadcast registry, so
-    ///     the render reflects the topic's *current* value, not a stale default.
+    ///   * **`useState`** values are seeded from the session slot store, keyed positionally by hook
+    ///     index — an unwritten slot falls back to the hook's initial, parity with the pure-Rust
+    ///     `render_local` seeding;
+    ///   * **`useSharedSlot`** values are seeded from the broadcast registry, so the render
+    ///     reflects the topic's *current* value, not a stale default.
     ///
     /// This is what lets a component whose render body uses arbitrary JS (loops,
     /// `.map`, `try`, template literals — everything the pure-Rust evaluator
@@ -1125,6 +1390,58 @@ fn expr_to_js(expr: &Expr) -> Result<String> {
     Ok(src.trim().trim_end_matches(';').trim().to_string())
 }
 
+/// Step 3 (derived bindings) — extract a component's resolvable local
+/// definitions: `const NAME = useMemo(() => EXPR, …)` (expression-body memos)
+/// and plain derived `const NAME = EXPR`. Hook calls (`useState`/`useRef`/
+/// `useCallback`) and function values are excluded; a JSX `{NAME}` that reads
+/// one of these is substituted with `EXPR` during derived-binding analysis.
+fn extract_derived_locals(stmts: &[Stmt]) -> HashMap<String, Expr> {
+    use swc_ecma_ast::{BlockStmtOrExpr, Callee, Decl, VarDeclKind};
+
+    fn callee_is(callee: &Callee, name: &str) -> bool {
+        matches!(callee, Callee::Expr(expr)
+            if matches!(&**expr, Expr::Ident(id) if id.sym.as_ref() == name))
+    }
+
+    let mut out = HashMap::new();
+    for stmt in stmts {
+        let Stmt::Decl(Decl::Var(var)) = stmt else {
+            continue;
+        };
+        if var.kind != VarDeclKind::Const {
+            continue;
+        }
+        for decl in &var.decls {
+            let Some(name) = decl.name.as_ident().map(|i| i.sym.to_string()) else {
+                continue;
+            };
+            let Some(init) = &decl.init else {
+                continue;
+            };
+            match &**init {
+                // `useMemo(() => EXPR, deps)` → EXPR (expression-body arrow only).
+                Expr::Call(call) if callee_is(&call.callee, "useMemo") => {
+                    if let Some(arg) = call.args.first() {
+                        if let Expr::Arrow(arrow) = &*arg.expr {
+                            if let BlockStmtOrExpr::Expr(body) = &*arrow.body {
+                                out.insert(name, (**body).clone());
+                            }
+                        }
+                    }
+                }
+                // Other calls (useState/useRef/useCallback/…) and function
+                // values aren't recomputable derived expressions.
+                Expr::Call(_) | Expr::Arrow(_) | Expr::Fn(_) => {}
+                // Plain derived const: `const doubled = count * 2;`.
+                other => {
+                    out.insert(name, other.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Codegen a handler body to `(source, is_block)`. An expression body yields a
 /// bare expression; a block body yields its statements verbatim.
 fn handler_body_to_js(body: &HandlerBody) -> Result<(String, bool)> {
@@ -1141,11 +1458,11 @@ fn handler_body_to_js(body: &HandlerBody) -> Result<(String, bool)> {
 ///
 /// When `opts.hook_compile == true`, the returned `RenderOutput`
 /// contains:
-///   * `html` — the same HTML the Phase-J renderer produces (with
-///     `data-albedo-id` stamps on every host element).
-///   * `opcodes` — `BindEvent { stable_id, event_id, proxy_id }` for
-///     every JSX `on*` handler, and `SetTextRef { stable_id, slot_id }`
-///     for every slot-bound expression in a text-child position.
+///   * `html` — the same HTML the Phase-J renderer produces (with `data-albedo-id` stamps on every
+///     host element).
+///   * `opcodes` — `BindEvent { stable_id, event_id, proxy_id }` for every JSX `on*` handler, and
+///     `SetTextRef { stable_id, slot_id }` for every slot-bound expression in a text-child
+///     position.
 ///
 /// When `hook_compile == false`, falls back to Phase J behaviour and
 /// returns an empty opcode vector.
@@ -1164,11 +1481,12 @@ pub fn render_entry_with_bindings(
         // `render_entry` call below; we install + drop within this
         // function so the thread-local doesn't leak.
         let _css_modules_guard =
-            crate::runtime::eval::core::install_phase_k_css_modules(
-                compiled.css_modules(),
-            );
+            crate::runtime::eval::core::install_phase_k_css_modules(compiled.css_modules());
         let html = compiled.project.render_entry(entry, props)?;
-        return Ok(RenderOutput { html, opcodes: Vec::new() });
+        return Ok(RenderOutput {
+            html,
+            opcodes: Vec::new(),
+        });
     }
 
     let (html, opcodes) = compiled
@@ -1205,8 +1523,7 @@ pub fn render_entry_with_broadcast(
     // topic it also reads) reaches this session. The initial
     // SlotSet vector ships out as the head of the opcode response
     // so the client paints with the current broadcast state.
-    let initial_opcodes =
-        broadcast.auto_subscribe(slots.session_id(), subscriber_sender, &topics);
+    let initial_opcodes = broadcast.auto_subscribe(slots.session_id(), subscriber_sender, &topics);
 
     if !opts.hook_compile {
         // Phase-J shape: render without binding opcodes. We still
@@ -1216,9 +1533,7 @@ pub fn render_entry_with_broadcast(
         // the Phase J path so `styles.foo` resolves for Tier-A
         // components in projects that opted out of hook compile.
         let _css_modules_guard =
-            crate::runtime::eval::core::install_phase_k_css_modules(
-                compiled.css_modules(),
-            );
+            crate::runtime::eval::core::install_phase_k_css_modules(compiled.css_modules());
         let html = compiled.project.render_entry(entry, props)?;
         return Ok(RenderOutput {
             html,
@@ -1226,9 +1541,9 @@ pub fn render_entry_with_broadcast(
         });
     }
 
-    let (html, mut opcodes) = compiled.project.render_entry_compiled_with_broadcast(
-        entry, props, compiled, slots, broadcast,
-    )?;
+    let (html, mut opcodes) = compiled
+        .project
+        .render_entry_compiled_with_broadcast(entry, props, compiled, slots, broadcast)?;
     // Initial SlotSets are prepended so bakabox seeds the shared-slot
     // bindings before any `SetTextRef` referencing them lands.
     let mut combined = Vec::with_capacity(initial_opcodes.len() + opcodes.len());
@@ -1270,11 +1585,7 @@ pub fn allocate_proxy_id(
 /// of the same component — last write wins — which is correct for
 /// single-instance Stage 2; multi-instance is Stage 3+ work.
 #[must_use]
-pub fn allocate_capture_slot_id(
-    module_spec: &str,
-    function_name: &str,
-    prop_name: &str,
-) -> SlotId {
+pub fn allocate_capture_slot_id(module_spec: &str, function_name: &str, prop_name: &str) -> SlotId {
     let key = format!("{module_spec}::{function_name}#prop:{prop_name}");
     SlotId(fnv1a_32(key.as_bytes()))
 }

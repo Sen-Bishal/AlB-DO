@@ -50,6 +50,7 @@ pub fn build_render_manifest_v2(
             let decision = decide_tier_and_hydration(
                 component.effect_profile,
                 component.is_interactive,
+                component.is_client_interactive,
                 component.is_above_fold,
                 weight_bytes,
                 tiering_inputs_from_options(options),
@@ -396,8 +397,7 @@ mod tests {
         // The hook-compile fixture under `tests/fixtures/hook_compile/counter/`
         // ships a useState component the manifest builder can render
         // through Phase K end-to-end.
-        counter.file_path =
-            "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+        counter.file_path = "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
         counter.weight = 2048.0;
         counter.effect_profile.hooks = true;
         compiler.add_component(counter);
@@ -416,11 +416,7 @@ mod tests {
 
         // The route's Tier-B list must carry the pre-rendered HTML
         // and a non-empty opcode frame (BindEvent + SetTextRef).
-        let route = manifest
-            .routes
-            .values()
-            .next()
-            .expect("at least one route");
+        let route = manifest.routes.values().next().expect("at least one route");
         let tier_b = route
             .tier_b
             .iter()
@@ -454,8 +450,7 @@ mod tests {
 
         let mut compiler = RenderCompiler::new();
         let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
-        counter.file_path =
-            "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+        counter.file_path = "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
         counter.weight = 2048.0;
         counter.effect_profile.hooks = true;
         compiler.add_component(counter);
@@ -564,8 +559,7 @@ mod tests {
         let build = || {
             let mut compiler = RenderCompiler::new();
             let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
-            counter.file_path =
-                "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+            counter.file_path = "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
             counter.weight = 2048.0;
             counter.effect_profile.hooks = true;
             compiler.add_component(counter);
@@ -580,8 +574,7 @@ mod tests {
         let second_tier_b = &second.routes.values().next().unwrap().tier_b[0];
         assert_eq!(first_tier_b.initial_html, second_tier_b.initial_html);
         assert_eq!(
-            first_tier_b.initial_opcode_frame,
-            second_tier_b.initial_opcode_frame,
+            first_tier_b.initial_opcode_frame, second_tier_b.initial_opcode_frame,
             "opcode frame bytes must match across rebuilds"
         );
     }
@@ -595,8 +588,7 @@ mod tests {
     fn stream_b_shell_still_anchors_tier_b_placeholders() {
         let mut compiler = RenderCompiler::new();
         let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
-        counter.file_path =
-            "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+        counter.file_path = "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
         counter.weight = 2048.0;
         counter.effect_profile.hooks = true;
         compiler.add_component(counter);
@@ -697,7 +689,10 @@ mod tests {
             head.contains("<title>JSX Title Wins</title>"),
             "JSX title must win; head={head}"
         );
-        assert!(!head.contains("Static Title"), "static title must be overridden; head={head}");
+        assert!(
+            !head.contains("Static Title"),
+            "static title must be overridden; head={head}"
+        );
         // JSX <meta> hoisted into the head.
         assert!(
             head.contains("property=\"og:title\" content=\"JSX OG Title\""),
@@ -710,7 +705,10 @@ mod tests {
         );
         // The hoisted tags are stripped from the rendered body HTML; real
         // content stays.
-        assert!(!node_html.contains("<title"), "title stripped from body; node={node_html}");
+        assert!(
+            !node_html.contains("<title"),
+            "title stripped from body; node={node_html}"
+        );
         assert!(
             !node_html.contains("og:title"),
             "meta stripped from body; node={node_html}"

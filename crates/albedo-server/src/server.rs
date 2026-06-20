@@ -16,8 +16,6 @@ use crate::inspector::{
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 use crate::render::csrf::CsrfRegistry;
 use crate::render::tier_b::{SharedRenderServices, TierBOpcodeRegistry};
-use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
-use dom_render_compiler::runtime::{BroadcastRegistry, SessionId, SlotStore};
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
 use crate::webtransport::{WebTransportRuntime, WebTransportSessionRegistry};
@@ -27,6 +25,8 @@ use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
+use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
+use dom_render_compiler::runtime::{BroadcastRegistry, SessionId, SlotStore};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +46,6 @@ const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// `invoke_action` so the explicit return already carries the
 /// `SlotSet` opcodes; the dispatcher's follow-up drain is then a
 /// no-op, which is idempotent and safe.
-//
 // Phase P · Stream C.2 — adapter carries the per-server
 // `Arc<BroadcastRegistry>` so `handle()` can install it into the
 // interpreter's `PHASE_K_BROADCAST` thread-local for the duration of
@@ -245,6 +244,12 @@ pub struct AlbedoServerBuilder {
     /// pure-Rust path. Order matters: enable the pool before registering the
     /// project, since the adapter captures the pool handle at registration.
     action_engine_pool: Option<Arc<crate::engine_pool::QuickJsEnginePool>>,
+    /// Step 3 (binding mode) — the last [`CompiledProject`] registered, retained
+    /// so [`Self::build`] can precompute fine-grained reactive blocks
+    /// (`RendererRuntime::build_reactive_blocks`) for routes whose Tier-C
+    /// components are driveable from text bindings alone. `None` keeps the A3
+    /// whole-component island path for every route.
+    reactive_project: Option<Arc<dom_render_compiler::runtime::CompiledProject>>,
 }
 
 impl AlbedoServerBuilder {
@@ -272,6 +277,8 @@ impl AlbedoServerBuilder {
             broadcast: Arc::new(BroadcastRegistry::new()),
             // A1 · off by default — opt in via `with_quickjs_action_engine_pool`.
             action_engine_pool: None,
+            // Step 3 · set by `register_compiled_project`.
+            reactive_project: None,
         }
     }
 
@@ -290,8 +297,9 @@ impl AlbedoServerBuilder {
     /// pure-Rust evaluator rejects (loops, `try`/`catch`, array methods).
     #[must_use]
     pub fn with_quickjs_action_engine_pool(mut self, size: usize) -> Self {
-        self.action_engine_pool =
-            Some(Arc::new(crate::engine_pool::QuickJsEnginePool::with_size(size)));
+        self.action_engine_pool = Some(Arc::new(crate::engine_pool::QuickJsEnginePool::with_size(
+            size,
+        )));
         self
     }
 
@@ -402,6 +410,10 @@ impl AlbedoServerBuilder {
         mut self,
         project: Arc<dom_render_compiler::runtime::CompiledProject>,
     ) -> Self {
+        // Step 3 · retain for binding-mode precompute in `build()` (cheap Arc
+        // clone; the same instance drives render bindings + action dispatch).
+        self.reactive_project = Some(project.clone());
+
         for proxy_id in project.handler_proxy_ids() {
             let adapter = CompiledProjectActionAdapter {
                 project: project.clone(),
@@ -468,10 +480,7 @@ impl AlbedoServerBuilder {
         T: serde::de::DeserializeOwned + Send + 'static,
         F: Fn(RequestContext, T, SessionSlots) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<
-                Output = Result<
-                    Vec<dom_render_compiler::ir::opcode::Instruction>,
-                    RuntimeError,
-                >,
+                Output = Result<Vec<dom_render_compiler::ir::opcode::Instruction>, RuntimeError>,
             > + Send
             + 'static,
     {
@@ -499,8 +508,7 @@ impl AlbedoServerBuilder {
                 (handler)(ctx, parsed, slots).await
             }
         };
-        self.action_handlers
-            .insert(action_id, Arc::new(wrapped));
+        self.action_handlers.insert(action_id, Arc::new(wrapped));
         self
     }
 
@@ -547,10 +555,7 @@ impl AlbedoServerBuilder {
     /// Registers the Phase-E opcode registry that resolves Tier-B
     /// nodes for the WT streaming path. Without it the WT streaming
     /// path errors out and the request falls back to SSE.
-    pub fn with_opcode_registry(
-        mut self,
-        registry: impl TierBOpcodeRegistry + 'static,
-    ) -> Self {
+    pub fn with_opcode_registry(mut self, registry: impl TierBOpcodeRegistry + 'static) -> Self {
         self.opcode_registry = Some(Arc::new(registry));
         self
     }
@@ -633,12 +638,25 @@ impl AlbedoServerBuilder {
         // (`!Send`) renderer is still single-threaded on the boot thread. The
         // resulting map is shared read-only into the streaming state so the
         // concurrent request path never touches the QuickJS engine.
-        let route_hydration = Arc::new(
-            renderer
+        let route_hydration = Arc::new({
+            let mut blocks = renderer
                 .as_mut()
                 .map(|runtime| runtime.build_hydration_blocks())
-                .unwrap_or_default(),
-        );
+                .unwrap_or_default();
+            // Step 3 (binding mode) · for routes whose Tier-C component is
+            // driveable from text bindings alone, supersede the A3 island block
+            // with the fine-grained reactive block (Phase K static HTML + the
+            // inline driver). Fallback-safe: routes with no eligible component
+            // keep their A3 block untouched.
+            if let (Some(runtime), Some(compiled)) =
+                (renderer.as_ref(), self.reactive_project.as_ref())
+            {
+                for (path, block) in runtime.build_reactive_blocks(compiled.as_ref()) {
+                    blocks.insert(path, block);
+                }
+            }
+            blocks
+        });
 
         let mut pipeline_binding = self.pipeline;
         let streaming_runtime = renderer.as_ref().map(|runtime| {
@@ -729,9 +747,7 @@ impl AlbedoServerBuilder {
             }
         }
 
-        let inspector_enabled = self
-            .inspector_enabled
-            .unwrap_or(cfg!(debug_assertions));
+        let inspector_enabled = self.inspector_enabled.unwrap_or(cfg!(debug_assertions));
         let inspector = if inspector_enabled {
             let inspector_state = Arc::new(InspectorState::new());
             if let Some(streaming) = streaming_runtime.as_ref() {
@@ -748,9 +764,7 @@ impl AlbedoServerBuilder {
         // follow the inspector convention (on in debug builds, off
         // in release) so a `cargo run --release` server doesn't leak
         // dev routes.
-        let dev_mode_enabled = self
-            .dev_mode_enabled
-            .unwrap_or(cfg!(debug_assertions));
+        let dev_mode_enabled = self.dev_mode_enabled.unwrap_or(cfg!(debug_assertions));
         let (dev_error_registry, dev_hmr_registry) = if dev_mode_enabled {
             (
                 Some(Arc::new(crate::dev::DevErrorRegistry::new())),
@@ -1032,8 +1046,7 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     // public-assets dispatch so a user's `public/runtime.js`
     // doesn't accidentally hijack the framework path.
     if matches!(method, HttpMethod::Get | HttpMethod::Head) {
-        if let Some(response) =
-            crate::handlers::albedo_assets::dispatch_albedo_asset(path.as_str())
+        if let Some(response) = crate::handlers::albedo_assets::dispatch_albedo_asset(path.as_str())
         {
             let mut response = response;
             if method == HttpMethod::Head {
@@ -1108,8 +1121,7 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
             // Phase-F: if `handler_id` resolves to an API handler,
             // dispatch through the API path. Otherwise fall through to
             // the page-route flow (middleware, auth, handler, layout).
-            if let Some(api_handler) = state.api_handlers.get(&matched.target.handler_id).cloned()
-            {
+            if let Some(api_handler) = state.api_handlers.get(&matched.target.handler_id).cloned() {
                 return run_api_request(&state, matched.target, request_context, api_handler).await;
             }
 
@@ -1647,7 +1659,12 @@ mod tests {
 
     // ── Phase F — API route tests ─────────────────────────────────────
 
-    fn api_route(method: HttpMethod, path: &str, handler: &str, auth: Option<AuthPolicy>) -> RouteSpec {
+    fn api_route(
+        method: HttpMethod,
+        path: &str,
+        handler: &str,
+        auth: Option<AuthPolicy>,
+    ) -> RouteSpec {
         RouteSpec {
             name: handler.to_string(),
             method,
@@ -1930,7 +1947,10 @@ mod tests {
         let (frame, _) = decode_frame(&bytes).expect("response decodes as OpcodeFrame");
         assert!(matches!(
             frame.instructions[0],
-            Instruction::Create { stable_id: StableId(42), .. }
+            Instruction::Create {
+                stable_id: StableId(42),
+                ..
+            }
         ));
     }
 
@@ -1994,10 +2014,12 @@ mod tests {
                         .get("x-albedo-session")
                         .cloned()
                         .unwrap_or_default();
-                    Ok(vec![dom_render_compiler::ir::opcode::Instruction::SetText {
-                        stable_id: dom_render_compiler::ir::opcode::StableId(1),
-                        text: token.into_bytes(),
-                    }])
+                    Ok(vec![
+                        dom_render_compiler::ir::opcode::Instruction::SetText {
+                            stable_id: dom_render_compiler::ir::opcode::StableId(1),
+                            text: token.into_bytes(),
+                        },
+                    ])
                 },
             )
             .build()
@@ -2069,10 +2091,12 @@ mod tests {
                 2,
                 |_ctx: RequestContext, _env: ActionEnvelope, slots: SessionSlots| async move {
                     let current = slots.read(SlotId(7)).unwrap_or_default();
-                    Ok(vec![dom_render_compiler::ir::opcode::Instruction::SetText {
-                        stable_id: dom_render_compiler::ir::opcode::StableId(1),
-                        text: current,
-                    }])
+                    Ok(vec![
+                        dom_render_compiler::ir::opcode::Instruction::SetText {
+                            stable_id: dom_render_compiler::ir::opcode::StableId(1),
+                            text: current,
+                        },
+                    ])
                 },
             )
             .build()
@@ -2174,10 +2198,12 @@ mod tests {
                 2,
                 |_ctx: RequestContext, _env: ActionEnvelope, slots: SessionSlots| async move {
                     let current = slots.read(SlotId(7)).unwrap_or_default();
-                    Ok(vec![dom_render_compiler::ir::opcode::Instruction::SetText {
-                        stable_id: dom_render_compiler::ir::opcode::StableId(1),
-                        text: current,
-                    }])
+                    Ok(vec![
+                        dom_render_compiler::ir::opcode::Instruction::SetText {
+                            stable_id: dom_render_compiler::ir::opcode::StableId(1),
+                            text: current,
+                        },
+                    ])
                 },
             )
             .build()

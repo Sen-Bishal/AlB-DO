@@ -3,13 +3,12 @@
 //! [`frame_tick`] is the end-of-pipeline hot path. It assumes Cycles 1-4
 //! have landed:
 //!
-//! * [`IrColumns`](crate::ir::columns::IrColumns) is lane-sorted and exposes
-//!   per-lane contiguous column slices.
+//! * [`IrColumns`](crate::ir::columns::IrColumns) is lane-sorted and exposes per-lane contiguous
+//!   column slices.
 //! * [`DirtyBitmap`] addresses component slots by column index; its
-//!   [`drain_into`](DirtyBitmap::drain_into) feeds the scratch Vec without
-//!   allocating.
-//! * [`WebTransportMuxer`] allocates per-stream sequence numbers via a
-//!   lock-free `fetch_add(1, Relaxed)`.
+//!   [`drain_into`](DirtyBitmap::drain_into) feeds the scratch Vec without allocating.
+//! * [`WebTransportMuxer`] allocates per-stream sequence numbers via a lock-free `fetch_add(1,
+//!   Relaxed)`.
 //!
 //! Every intermediate buffer lives in a [`FrameArena`] owned by the pipeline,
 //! so the inner loop performs *zero* heap traffic — the only allocations
@@ -261,12 +260,12 @@ impl FrameMetrics {
 /// The call order inside this function mirrors the plan, one line per stage:
 ///
 /// 1. **Drain** — `bitmap.drain_into(scratch)` yields column indices.
-/// 2. **Partition** — scan `scratch` once, look each index up against the
-///    lane-sorted `lane_offsets`, push into the matching bucket.
-/// 3. **Emit** — `rayon::join` over the four lanes; each worker writes its
-///    patch records into its own pre-sized `Vec<u8>` in the arena.
-/// 4. **Sequence** — one `fetch_add(1, Relaxed)` per non-empty lane against
-///    the shared [`WebTransportMuxer`] so the receiver can reassemble.
+/// 2. **Partition** — scan `scratch` once, look each index up against the lane-sorted
+///    `lane_offsets`, push into the matching bucket.
+/// 3. **Emit** — `rayon::join` over the four lanes; each worker writes its patch records into its
+///    own pre-sized `Vec<u8>` in the arena.
+/// 4. **Sequence** — one `fetch_add(1, Relaxed)` per non-empty lane against the shared
+///    [`WebTransportMuxer`] so the receiver can reassemble.
 ///
 /// The arena is the sole mutable state. `columns`, `bitmap`, and `muxer`
 /// are all `&` borrows — the function is safe to call from any context that
@@ -297,7 +296,11 @@ pub fn frame_tick(
 
     let partition_start = Instant::now();
     let lane_offsets = columns.lane_offsets();
-    partition_dirty_by_lane(&arena.scratch_indices, &lane_offsets, &mut arena.lane_buckets);
+    partition_dirty_by_lane(
+        &arena.scratch_indices,
+        &lane_offsets,
+        &mut arena.lane_buckets,
+    );
     let partition_ns = partition_start.elapsed().as_nanos();
 
     let emit_start = Instant::now();
@@ -438,9 +441,7 @@ fn partition_dirty_by_lane(
 fn lane_for_index(idx: u32, lane_offsets: &[u32; LANE_COUNT + 1]) -> usize {
     match lane_offsets.binary_search(&idx) {
         Ok(mut hit) => {
-            while hit + 1 < lane_offsets.len()
-                && lane_offsets.get(hit + 1).copied() == Some(idx)
-            {
+            while hit + 1 < lane_offsets.len() && lane_offsets.get(hit + 1).copied() == Some(idx) {
                 hit = hit.saturating_add(1);
             }
             hit.min(LANE_COUNT.saturating_sub(1))
@@ -464,9 +465,7 @@ fn build_lane_patch_buf(indices: &[u32], hashes: &[u64], buf: &mut Vec<u8>) -> u
     buf.len()
 }
 
-fn split_patch_bufs_mut(
-    bufs: &mut [Vec<u8>; LANE_COUNT],
-) -> [&mut Vec<u8>; LANE_COUNT] {
+fn split_patch_bufs_mut(bufs: &mut [Vec<u8>; LANE_COUNT]) -> [&mut Vec<u8>; LANE_COUNT] {
     let (head0, rest0) = bufs.split_at_mut(1);
     let (head1, rest1) = rest0.split_at_mut(1);
     let (head2, head3) = rest1.split_at_mut(1);
@@ -508,6 +507,8 @@ mod tests {
             is_default_export: false,
             props: Vec::new(),
             effect_profile: EffectProfile::default(),
+            is_interactive: false,
+            is_client_interactive: false,
             source_hash: 0xAAAA_0000 | u64::from(id),
         }
     }
@@ -602,7 +603,11 @@ mod tests {
             let _ = frame_tick(&columns, &bitmap, &muxer, &mut arena);
         }
 
-        assert_eq!(arena.scratch_capacity(), baseline, "zero growth under steady dirty load");
+        assert_eq!(
+            arena.scratch_capacity(),
+            baseline,
+            "zero growth under steady dirty load"
+        );
     }
 
     #[test]

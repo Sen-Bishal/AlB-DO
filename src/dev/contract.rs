@@ -303,6 +303,15 @@ pub struct ResolvedDevContract {
     pub verbose: bool,
     pub open: bool,
     pub routes: HashMap<String, String>,
+    /// A4 · per-URL layout chain (outermost → leaf), each entry a
+    /// `root`-relative module path (`routes/layout.tsx`,
+    /// `routes/blog/layout.tsx`, …). The dev render loop composes
+    /// these around the leaf route's HTML so `albedo dev` shows the
+    /// same nav/footer shell `albedo serve` composes at build time —
+    /// without this dev and prod render structurally different
+    /// documents. Empty for routes with no `layout.tsx` in their path.
+    #[serde(default)]
+    pub route_layouts: HashMap<String, Vec<String>>,
 }
 
 pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> {
@@ -460,6 +469,7 @@ pub fn resolve_dev_contract(
     // config-declared routes (file-based wins on URL conflict — the
     // expected behaviour for convention-over-configuration).
     let mut routes = config.routes;
+    let mut route_layouts: HashMap<String, Vec<String>> = HashMap::new();
     let mut entry_override_from_routes: Option<String> = None;
     let routes_dir = root.join(crate::routing::ROUTES_DIRNAME);
     if routes_dir.is_dir() {
@@ -479,6 +489,24 @@ pub fn resolve_dev_contract(
                 crate::routing::ROUTES_DIRNAME,
                 route.source_rel_path.to_string_lossy().replace('\\', "/")
             );
+            // A4 · capture the route's layout chain (outermost → leaf)
+            // as `root`-relative module paths so the dev server can
+            // compose the same layouts prod does. `discover_routes`
+            // already orders the chain root-down.
+            if !route.layout_chain.is_empty() {
+                let chain = route
+                    .layout_chain
+                    .iter()
+                    .map(|rel| {
+                        format!(
+                            "{}/{}",
+                            crate::routing::ROUTES_DIRNAME,
+                            rel.to_string_lossy().replace('\\', "/")
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                route_layouts.insert(route.url_path.clone(), chain);
+            }
             if route.url_path == "/" {
                 // An `index.tsx` under `routes/` overrides the dev
                 // contract's `entry`. This is what makes the user's
@@ -517,6 +545,7 @@ pub fn resolve_dev_contract(
         verbose: cli.verbose,
         open: cli.open,
         routes,
+        route_layouts,
     })
 }
 

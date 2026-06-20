@@ -2414,6 +2414,63 @@ fn broadcast_component_invalidation_event(
     broadcast_sse_payload(clients, payload.as_str());
 }
 
+/// A4 · compose a route's layout chain around its rendered HTML so
+/// `albedo dev` ships the same nav/footer shell `albedo serve` builds
+/// at compile time. `layout_entries` is outermost → leaf; each is
+/// rendered statically and its `<children />` sentinel is replaced
+/// with the accumulated inner HTML, innermost-first — the same
+/// contract the manifest builder's `wrap_in_layouts` uses. A layout
+/// that fails to render is skipped with a warning rather than failing
+/// the page, matching the build path's graceful degradation.
+fn compose_dev_layouts(
+    compiled: &dom_render_compiler::runtime::CompiledProject,
+    slot_store: &Arc<dom_render_compiler::runtime::SlotStore>,
+    broadcast: &Arc<dom_render_compiler::runtime::BroadcastRegistry>,
+    session_id: dom_render_compiler::runtime::SessionId,
+    layout_entries: &[String],
+    inner_html: String,
+) -> String {
+    use dom_render_compiler::runtime::eval::LAYOUT_CHILDREN_SENTINEL;
+    use dom_render_compiler::runtime::{
+        render_entry_with_broadcast, RenderOptions, SessionSlotView,
+    };
+
+    if layout_entries.is_empty() {
+        return inner_html;
+    }
+
+    let mut accumulated = inner_html;
+    let props = serde_json::json!({});
+    for entry in layout_entries.iter().rev() {
+        let slots = SessionSlotView::new(session_id, slot_store.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let opts = RenderOptions { hook_compile: true };
+        let layout_html = match render_entry_with_broadcast(
+            compiled,
+            entry.as_str(),
+            &props,
+            &slots,
+            broadcast.as_ref(),
+            tx,
+            &opts,
+        ) {
+            Ok(output) => output.html,
+            Err(err) => {
+                eprintln!("    · skipping layout '{entry}' (render failed): {err}");
+                continue;
+            }
+        };
+        if layout_html.contains(LAYOUT_CHILDREN_SENTINEL) {
+            accumulated = layout_html.replace(LAYOUT_CHILDREN_SENTINEL, &accumulated);
+        } else {
+            // No `<children />` — degrade by prepending rather than
+            // dropping the route content, same as the build path.
+            accumulated = format!("{layout_html}{accumulated}");
+        }
+    }
+    accumulated
+}
+
 /// Phase P · post-P — render one route on demand using the dev
 /// process's shared `CompiledProject`/`SlotStore`/`BroadcastRegistry`.
 /// Mirrors the inline `render_entry` closure in [`render_all_routes`]
@@ -2465,12 +2522,26 @@ fn render_single_dev_route(
     .map_err(|err| err.to_string())?;
     let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
 
+    // A4 · wrap in the route's layout chain so dev matches prod.
+    let layout_entries = contract
+        .route_layouts
+        .get(url_path)
+        .cloned()
+        .unwrap_or_default();
+    let rendered_html = compose_dev_layouts(
+        state.compiled.as_ref(),
+        &state.slot_store,
+        &state.broadcast,
+        state.session_id,
+        &layout_entries,
+        output.html,
+    );
+
     let opcode_script = render_inline_opcode_script(&output.opcodes);
     let base_css = dev_shell_base_css();
     let project_css = state.project_css.as_str();
     let document = format!(
         "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Dev</title>\n  <style>\n{base_css}\n{project_css}\n  </style>\n  {bakabox_scripts}\n</head>\n<body>\n{rendered_html}\n{opcode_script}\n</body>\n</html>\n",
-        rendered_html = output.html,
         bakabox_scripts = dev_bakabox_script_tags(),
     );
     let html = inject_hmr_client_script(&document, contract.hmr.enabled);
@@ -2496,7 +2567,7 @@ fn render_all_routes(
     let mut total_render_ms = 0.0_f64;
     let props = serde_json::json!({});
 
-    let render_entry = |entry: &str| -> Result<(String, f64), String> {
+    let render_entry = |url: &str, entry: &str| -> Result<(String, f64), String> {
         let render_start = Instant::now();
         // Phase P · Stream D.1 — Phase K render path. Fresh
         // SessionSlotView wrapping the SAME `slot_store` Arc that
@@ -2515,6 +2586,19 @@ fn render_all_routes(
         .map_err(|err| err.to_string())?;
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
 
+        // A4 · compose the route's layout chain so the cached dev doc
+        // matches what prod renders (and what the on-demand
+        // `render_single_dev_route` path produces).
+        let layout_entries = contract.route_layouts.get(url).cloned().unwrap_or_default();
+        let rendered_html = compose_dev_layouts(
+            compiled,
+            slot_store,
+            broadcast,
+            session_id,
+            &layout_entries,
+            output.html,
+        );
+
         // Phase P · post-P wire-through — inline the Phase K opcode
         // frame as a `<script type="application/x-albedo-frame">`
         // so bakabox's bootstrap can apply BindEvent / SetTextRef /
@@ -2526,14 +2610,13 @@ fn render_all_routes(
 
         let document = format!(
             "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n  <title>ALBEDO Dev</title>\n  <style>\n{base_css}\n{project_css}\n  </style>\n  {bakabox_scripts}\n</head>\n<body>\n{rendered_html}\n{opcode_script}\n</body>\n</html>\n",
-            rendered_html = output.html,
             bakabox_scripts = dev_bakabox_script_tags(),
         );
         let html = inject_hmr_client_script(&document, contract.hmr.enabled);
         Ok((html, render_ms))
     };
 
-    match render_entry(contract.entry.as_str()) {
+    match render_entry("/", contract.entry.as_str()) {
         Ok((html, ms)) => {
             total_render_ms += ms;
             route_documents.insert("/".to_string(), html);
@@ -2551,7 +2634,7 @@ fn render_all_routes(
         } else {
             format!("/{url_path}")
         };
-        match render_entry(entry.as_str()) {
+        match render_entry(&url, entry.as_str()) {
             Ok((html, ms)) => {
                 total_render_ms += ms;
                 route_documents.insert(url, html);
@@ -2574,6 +2657,24 @@ fn render_all_routes(
 }
 
 fn collect_css_bundle(root: &Path) -> String {
+    collect_css_bundle_filtered(root, |_| true)
+}
+
+/// Global (non-module) CSS only. `.module.css` files carry their own
+/// build-scoped class names and are injected per-route as scoped
+/// `<style>` blocks by the manifest builder, so concatenating them
+/// raw here would double-ship the rules with the wrong (unscoped)
+/// selectors. Everything else under the tree is plain global CSS.
+fn collect_global_css_bundle(root: &Path) -> String {
+    collect_css_bundle_filtered(root, |path| {
+        !path
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with(".module.css")
+    })
+}
+
+fn collect_css_bundle_filtered(root: &Path, keep: impl Fn(&Path) -> bool) -> String {
     let mut css_files = WalkDir::new(root)
         .follow_links(true)
         .into_iter()
@@ -2587,6 +2688,7 @@ fn collect_css_bundle(root: &Path) -> String {
                 .map(|ext| ext.eq_ignore_ascii_case("css"))
                 .unwrap_or(false)
         })
+        .filter(|entry| keep(entry.path()))
         .map(|entry| entry.path().to_path_buf())
         .collect::<Vec<_>>();
     css_files.sort();
@@ -2602,6 +2704,40 @@ fn collect_css_bundle(root: &Path) -> String {
         }
     }
     out
+}
+
+/// A4 · inline every global `.css` file under `root` into each route's
+/// shell `<head>` so a production `albedo serve` ships the same styles
+/// the dev server inlines. Global CSS is never scanned as a component
+/// (`ProjectScanner::is_component_file` rejects `.css`), so it has no
+/// other path into the prod shell — without this, `albedo build` emits
+/// zero global CSS and a real app needs a manual `public/styles.css` +
+/// `<link>` workaround. Mirrors the dev path's `collect_css_bundle`
+/// concatenation, minus `.module.css` (already injected scoped,
+/// per-route, by the manifest builder). Returns the routes touched.
+fn inject_global_css_into_shells(
+    manifest: &mut dom_render_compiler::manifest::schema::RenderManifestV2,
+    root: &Path,
+) -> usize {
+    let global_css = collect_global_css_bundle(root);
+    if global_css.trim().is_empty() {
+        return 0;
+    }
+    let style_block = format!("<style data-albedo-global-css>{global_css}</style>");
+    let mut touched = 0usize;
+    for route in manifest.routes.values_mut() {
+        let head = &mut route.shell.doctype_and_head;
+        // Idempotent — never double-inject if a shell already carries it.
+        if head.contains("data-albedo-global-css") {
+            continue;
+        }
+        match head.rfind("</head>") {
+            Some(pos) => head.insert_str(pos, &style_block),
+            None => head.push_str(&style_block),
+        }
+        touched += 1;
+    }
+    touched
 }
 
 fn dev_shell_base_css() -> &'static str {
@@ -3112,7 +3248,7 @@ fn run_prod_build_with_budget(
 
     let compile_start = Instant::now();
     let out_dir_for_closure = out_dir.clone();
-    let (manifest, report, missing_sources) = with_spinner("compiling production bundle…", move || {
+    let (mut manifest, report, missing_sources) = with_spinner("compiling production bundle…", move || {
         let scanner = ProjectScanner::new();
         let compiler = scanner.build_compiler(components);
         let manifest = compiler
@@ -3146,6 +3282,13 @@ fn run_prod_build_with_budget(
             .map_err(|err| format!("failed to emit production artifacts: {err}"))?;
         Ok::<_, String>((manifest, report, missing_sources))
     })?;
+
+    // A4 · inline global CSS into every route shell so prod ships the
+    // same styles dev inlines. Runs after the manifest is built but
+    // before it's serialized (the prod server reads shells straight
+    // from `render-manifest.v2.json`); the emit step above writes JS
+    // chunks only and never the shell, so this ordering is safe.
+    let css_routes = inject_global_css_into_shells(&mut manifest, &contract.root);
 
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|err| format!("failed to serialize manifest: {err}"))?;
@@ -3226,6 +3369,15 @@ fn run_prod_build_with_budget(
     ));
     print_kv("output", out_dir.display());
     print_kv("artifacts", report.artifacts.len() + 5);
+    if css_routes > 0 {
+        print_kv(
+            "global css",
+            format!(
+                "inlined into {css_routes} route{}",
+                if css_routes == 1 { "" } else { "s" }
+            ),
+        );
+    }
     if missing_sources > 0 {
         print_warn(format!(
             "{missing_sources} module{} had unreadable sources — skipped from static precompile",
@@ -4271,6 +4423,7 @@ mod tests {
             verbose: false,
             open: false,
             routes: HashMap::new(),
+            route_layouts: HashMap::new(),
         };
         let err = configure_ship_vercel(&contract).unwrap_err();
         assert!(err.contains("vercel is not a supported"));

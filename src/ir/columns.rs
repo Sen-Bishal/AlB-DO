@@ -1077,6 +1077,8 @@ mod tests {
                     hooks: true,
                     ..EffectProfile::default()
                 },
+                is_interactive: false,
+                is_client_interactive: false,
                 source_hash: 0xA1B2_C3D4_0000_0001,
             },
             ParsedComponent {
@@ -1088,6 +1090,8 @@ mod tests {
                 is_default_export: false,
                 props: Vec::new(),
                 effect_profile: EffectProfile::default(),
+                is_interactive: false,
+                is_client_interactive: false,
                 source_hash: 0xA1B2_C3D4_0000_0002,
             },
         ]
@@ -1200,6 +1204,8 @@ mod tests {
                 is_default_export: false,
                 props: Vec::new(),
                 effect_profile: EffectProfile::default(),
+                is_interactive: false,
+                is_client_interactive: false,
                 source_hash: 0xDEAD_0000 | u64::from(idx as u32),
             })
             .collect()
@@ -1380,6 +1386,8 @@ mod tests {
                     asynchronous: true,
                     ..EffectProfile::default()
                 },
+                is_interactive: false,
+                is_client_interactive: false,
                 source_hash: 1,
             },
             ParsedComponent {
@@ -1394,6 +1402,8 @@ mod tests {
                     hooks: true,
                     ..EffectProfile::default()
                 },
+                is_interactive: false,
+                is_client_interactive: false,
                 source_hash: 2,
             },
         ];
@@ -1409,7 +1419,10 @@ mod tests {
             total_components += async_slice.len();
             total_async += async_slice.iter().filter(|&&b| b == 1).count();
             for byte in async_slice {
-                assert!(byte == 0 || byte == 1, "lane_asynchronous bytes must be 0/1");
+                assert!(
+                    byte == 0 || byte == 1,
+                    "lane_asynchronous bytes must be 0/1"
+                );
             }
         }
         assert_eq!(total_components, 2);
