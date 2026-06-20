@@ -86,25 +86,41 @@ pub fn import_candidates(base: &str) -> Vec<String> {
 
 pub fn normalize_jsx_text(value: &str) -> Option<String> {
     // React JSX whitespace rules (paraphrased):
-    //   * Pure-whitespace text becomes nothing.
-    //   * If the text contains a newline, it represents source formatting:
-    //     adjacent whitespace fully collapses (`\n  x \n` → `x`).
-    //   * Without a newline, runs of whitespace collapse to a single space
-    //     and leading/trailing whitespace is preserved as one space — this
-    //     is what keeps `{n} items` from becoming `3items`.
+    //   * Interior runs of whitespace collapse to a single space.
+    //   * A leading/trailing whitespace run is REMOVED when it
+    //     contains a newline (source indentation adjacent to a tag)
+    //     but PRESERVED as a single space when it does not — so
+    //     `Built at the <span>speed</span>` keeps the space before
+    //     `<span>` even when the text node opens with a newline+indent,
+    //     while `\n  x \n` (indented on its own line) collapses to `x`.
+    //   * A pure-whitespace node collapses to nothing if it spans a
+    //     newline, but to a single significant space otherwise (the
+    //     space in `{a} {b}` on one line).
     let inner = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if inner.is_empty() {
-        return None;
+        if value.is_empty() || value.contains('\n') {
+            return None;
+        }
+        return Some(" ".to_string());
     }
-    if value.contains('\n') {
-        return Some(inner);
-    }
+    // Inspect only the boundary whitespace runs, not the whole string,
+    // so a newline buried in interior indentation can't strip a
+    // same-line space adjacent to an inline element.
+    let leading_has_newline = value
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .any(|c| c == '\n');
+    let trailing_has_newline = value
+        .chars()
+        .rev()
+        .take_while(|c| c.is_whitespace())
+        .any(|c| c == '\n');
     let mut result = String::new();
-    if value.starts_with(|c: char| c.is_whitespace()) {
+    if value.starts_with(|c: char| c.is_whitespace()) && !leading_has_newline {
         result.push(' ');
     }
     result.push_str(&inner);
-    if value.ends_with(|c: char| c.is_whitespace()) {
+    if value.ends_with(|c: char| c.is_whitespace()) && !trailing_has_newline {
         result.push(' ');
     }
     Some(result)

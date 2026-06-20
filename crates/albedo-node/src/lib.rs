@@ -345,7 +345,8 @@ fn build_compiler_with_cache(components: Vec<ParsedComponent>, cache_dir: &Path)
         let hints = estimator.estimate_priority_hints(parsed);
         component.is_above_fold = hints.is_above_fold;
         component.is_lcp_candidate = hints.is_lcp_candidate;
-        component.is_interactive = hints.is_interactive;
+        component.is_interactive = parsed.is_interactive;
+        component.is_client_interactive = parsed.is_client_interactive;
 
         let id = compiler.add_component(component);
         component_map.insert(parsed.name.clone(), id);

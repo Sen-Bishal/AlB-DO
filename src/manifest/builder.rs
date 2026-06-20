@@ -88,7 +88,8 @@ impl<'a> ManifestBuilder<'a> {
         let static_render_project =
             build_static_render_project(&components, working_dir.as_deref());
         let compiled_render_project = build_compiled_render_project(&static_render_project);
-        let discovered_routes = discover_routes_from_components(&components, working_dir.as_deref());
+        let discovered_routes =
+            discover_routes_from_components(&components, working_dir.as_deref());
 
         Self {
             graph,
@@ -119,8 +120,7 @@ impl<'a> ManifestBuilder<'a> {
         // Install the island-name set so the tier-blind static renderer emits
         // a hole for them during `traverse`'s `render_static` calls.
         let island_names = self.tier_c_component_names();
-        let _island_guard =
-            crate::runtime::eval::core::install_island_skip_set(&island_names);
+        let _island_guard = crate::runtime::eval::core::install_island_skip_set(&island_names);
 
         self.traverse(
             root_component,
@@ -229,7 +229,10 @@ impl<'a> ManifestBuilder<'a> {
     /// to the registered component's name. `None` when no error.tsx
     /// covers this route.
     fn error_component_for_route(&self, route: &str) -> Option<String> {
-        let discovered = self.discovered_routes.iter().find(|r| r.url_path == route)?;
+        let discovered = self
+            .discovered_routes
+            .iter()
+            .find(|r| r.url_path == route)?;
         let rel = discovered.error_boundary.as_ref()?;
         self.component_name_for_rel_path(rel.as_path())
     }
@@ -237,7 +240,10 @@ impl<'a> ManifestBuilder<'a> {
     /// Phase P · Stream E.2 — same shape as `error_component_for_route`
     /// for `loading.tsx`.
     fn loading_component_for_route(&self, route: &str) -> Option<String> {
-        let discovered = self.discovered_routes.iter().find(|r| r.url_path == route)?;
+        let discovered = self
+            .discovered_routes
+            .iter()
+            .find(|r| r.url_path == route)?;
         let rel = discovered.loading.as_ref()?;
         self.component_name_for_rel_path(rel.as_path())
     }
@@ -256,11 +262,7 @@ impl<'a> ManifestBuilder<'a> {
     /// the matching component name. Skips entries that don't resolve
     /// — graceful for projects without file-based routing.
     fn layout_chain_for_route(&self, route: &str) -> Vec<String> {
-        let Some(discovered) = self
-            .discovered_routes
-            .iter()
-            .find(|r| r.url_path == route)
-        else {
+        let Some(discovered) = self.discovered_routes.iter().find(|r| r.url_path == route) else {
             return Vec::new();
         };
 
@@ -304,6 +306,10 @@ impl<'a> ManifestBuilder<'a> {
         let mut css = Vec::new();
 
         for component in self.components.values() {
+            if component.file_path.ends_with(".css") {
+                css.push(component.file_path.replace('\\', "/"));
+            }
+
             let Some(metadata) = self.metadata.get(&component.id) else {
                 continue;
             };
@@ -317,10 +323,6 @@ impl<'a> ManifestBuilder<'a> {
                         format!("{:016x}", component.source_hash)
                     ),
                 );
-            }
-
-            if component.file_path.ends_with(".css") {
-                css.push(component.file_path.replace('\\', "/"));
             }
         }
 
@@ -515,11 +517,7 @@ impl<'a> ManifestBuilder<'a> {
         // `CompiledProject::wrap` uses.
         let mut module_specs: BTreeSet<String> = BTreeSet::new();
         let mut record = |component_name: &str| {
-            if let Some(component) = self
-                .components
-                .values()
-                .find(|c| c.name == component_name)
-            {
+            if let Some(component) = self.components.values().find(|c| c.name == component_name) {
                 if let Some(spec) =
                     self.component_entry_for_project(component, compiled.root.as_path())
                 {
@@ -585,6 +583,12 @@ impl<'a> ManifestBuilder<'a> {
         let mut accumulated = leaf_html;
         for layout_name in layout_chain.iter().rev() {
             let Some(layout_html) = self.render_layout_html(layout_name) else {
+                tracing::warn!(
+                    target: "albedo.manifest.layout",
+                    layout = %layout_name,
+                    "layout component not found or failed to render; \
+                     route shipped without this layout in the chain"
+                );
                 continue;
             };
             if !layout_html.contains(LAYOUT_CHILDREN_SENTINEL) {
@@ -612,10 +616,7 @@ impl<'a> ManifestBuilder<'a> {
     /// HTML. Returns `None` when the component isn't registered or
     /// rendering fails — caller's job to decide what to do with that.
     fn render_layout_html(&self, layout_name: &str) -> Option<String> {
-        let component = self
-            .components
-            .values()
-            .find(|c| c.name == layout_name)?;
+        let component = self.components.values().find(|c| c.name == layout_name)?;
         self.render_static_component_html(component)
     }
 
@@ -903,7 +904,14 @@ impl<'a> ManifestBuilder<'a> {
         );
         let html = self
             .render_static_component_html(component)
-            .unwrap_or_else(|| self.render_static_fallback_html(component));
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    target: "albedo.manifest.render",
+                    component = %component.name,
+                    "static render failed; falling back to text-stripped placeholder markup"
+                );
+                self.render_static_fallback_html(component)
+            });
 
         RenderedNode {
             component_id: component.name.clone(),
@@ -975,7 +983,9 @@ impl<'a> ManifestBuilder<'a> {
             let session = SessionId::random();
             let slot_store = Arc::new(SlotStore::new());
             let slots = SessionSlotView::new(session, slot_store);
-            let opts = RenderOptions { hook_compile: false };
+            let opts = RenderOptions {
+                hook_compile: false,
+            };
             if let Ok(output) = render_entry_with_bindings(
                 &compiled.project,
                 entry.as_str(),
@@ -1158,7 +1168,18 @@ fn build_compiled_render_project(
     // the Phase J fallback path that the existing builder relies
     // on for Tier-A static renders.
     let project_clone = static_project.project.clone();
-    let compiled = CompiledProject::wrap(project_clone).ok()?;
+    let compiled = match CompiledProject::wrap(project_clone) {
+        Ok(compiled) => compiled,
+        Err(err) => {
+            tracing::warn!(
+                target: "albedo.manifest.build",
+                error = %err,
+                "CompiledProject::wrap failed; static renders fall back to the legacy \
+                 ComponentProject path (CSS-module class names will not resolve)"
+            );
+            return None;
+        }
+    };
     Some(CompiledRenderProject {
         root: static_project.root.clone(),
         project: compiled,
@@ -1197,11 +1218,15 @@ fn infer_routes_dir(
 ) -> Option<PathBuf> {
     for component in components.values() {
         let normalised = component.file_path.replace('\\', "/");
-        let idx = normalised.find("/routes/")?;
+        let Some(idx) = normalised.find("/routes/") else {
+            continue;
+        };
         // `/routes/` is 8 chars; we want the path including `routes/`
         // (no trailing slash) as the discovery root.
         let prefix = &normalised[..idx + "/routes".len()];
-        let absolute = resolve_component_path(prefix, working_dir)?;
+        let Some(absolute) = resolve_component_path(prefix, working_dir) else {
+            continue;
+        };
         if absolute.is_dir() {
             return Some(absolute);
         }
@@ -1234,7 +1259,19 @@ fn build_static_render_project(
         root = common_ancestor(root, parent)?;
     }
 
-    let project = ComponentProject::load_from_dir(&root).ok()?;
+    let project = match ComponentProject::load_from_dir(&root) {
+        Ok(project) => project,
+        Err(err) => {
+            tracing::warn!(
+                target: "albedo.manifest.build",
+                root = %root.display(),
+                error = %err,
+                "ComponentProject::load_from_dir failed; static/Tier-A rendering \
+                 will be unavailable for this build"
+            );
+            return None;
+        }
+    };
     Some(StaticRenderProject { root, project })
 }
 
@@ -1269,9 +1306,7 @@ fn default_shim_script(enable_wt_bootstrap: bool) -> String {
     // execution follows document order, so this loads after
     // `runtime.js` and finds `__ALBEDO_RUNTIME` already wired by the
     // time its IIFE runs.
-    script.push_str(
-        "<script type=\"module\" src=\"/_albedo/link-forms.js\"></script>",
-    );
+    script.push_str("<script type=\"module\" src=\"/_albedo/link-forms.js\"></script>");
     script
 }
 
@@ -1295,8 +1330,7 @@ fn next_order(counter: &mut u32) -> u32 {
 /// Mirrors `src/bin/albedo.rs::base64_encode` so the dev path and
 /// production manifest emit identical bootstrap script payloads.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     let mut chunks = input.chunks_exact(3);
     for chunk in chunks.by_ref() {

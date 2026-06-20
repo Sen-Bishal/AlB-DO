@@ -64,6 +64,11 @@ impl WeightEstimator {
     }
 
     pub fn estimate_priority_hints(&self, component: &ParsedComponent) -> PriorityHints {
+        // NOTE: interactivity is NO LONGER inferred here. It is a dataflow
+        // property derived from actual JSX `on*` handlers during parsing
+        // (`ParsedComponent::is_interactive`), not a component-name guess.
+        // Only the LCP/above-fold priority hints remain name-based (they affect
+        // hydration priority, not the client-vs-server tier).
         let name_lower = component.name.to_lowercase();
 
         let is_above_fold = name_lower.contains("header")
@@ -76,15 +81,9 @@ impl WeightEstimator {
             || name_lower.contains("image")
             || name_lower.contains("featured");
 
-        let is_interactive = name_lower.contains("button")
-            || name_lower.contains("form")
-            || name_lower.contains("input")
-            || name_lower.contains("link");
-
         PriorityHints {
             is_above_fold,
             is_lcp_candidate,
-            is_interactive,
         }
     }
 }
@@ -99,7 +98,6 @@ impl Default for WeightEstimator {
 pub struct PriorityHints {
     pub is_above_fold: bool,
     pub is_lcp_candidate: bool,
-    pub is_interactive: bool,
 }
 
 #[cfg(test)]
@@ -117,6 +115,8 @@ mod tests {
             is_default_export: false,
             props: Vec::new(),
             effect_profile: EffectProfile::default(),
+            is_interactive: false,
+            is_client_interactive: false,
             source_hash: 1,
         }
     }
@@ -148,14 +148,5 @@ mod tests {
         let hints = estimator.estimate_priority_hints(&component);
         assert!(hints.is_above_fold);
         assert!(hints.is_lcp_candidate);
-    }
-
-    #[test]
-    fn test_priority_hints_button() {
-        let estimator = WeightEstimator::new();
-        let component = create_test_component("Button");
-
-        let hints = estimator.estimate_priority_hints(&component);
-        assert!(hints.is_interactive);
     }
 }

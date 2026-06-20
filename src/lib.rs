@@ -152,10 +152,8 @@ impl RenderCompiler {
         &self,
         controller: &GranularityController,
     ) -> Result<HashMap<ComponentId, ComponentAnalysis>> {
-        if controller.should_parallelize(
-            self.graph.len(),
-            std::mem::size_of::<ComponentAnalysis>(),
-        ) {
+        if controller.should_parallelize(self.graph.len(), std::mem::size_of::<ComponentAnalysis>())
+        {
             ParallelAnalyzer::new(&self.graph).analyze()
         } else {
             ComponentAnalyzer::new(&self.graph).analyze()
@@ -590,6 +588,7 @@ impl RenderCompiler {
             let decision = decide_tier_and_hydration(
                 component.effect_profile,
                 component.is_interactive,
+                component.is_client_interactive,
                 component.is_above_fold,
                 weight_bytes,
                 tiering_inputs,

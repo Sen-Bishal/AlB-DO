@@ -17,9 +17,7 @@ pub mod conformance;
 pub mod opcode;
 pub mod wire;
 
-pub use action::{
-    decode_action_envelope, encode_action_envelope, ActionEnvelope, ActionEventKind,
-};
+pub use action::{decode_action_envelope, encode_action_envelope, ActionEnvelope, ActionEventKind};
 pub use columns::{
     field_mask, ColumnPass, IrColumns, IrModuleColumn, LaneColumnPass, LaneColumnPatch, StringId,
     StringInterner, LANE_COUNT as IR_LANE_COUNT,
@@ -458,6 +456,8 @@ mod tests {
             is_default_export: false,
             props: Vec::new(),
             effect_profile: EffectProfile::default(),
+            is_interactive: false,
+            is_client_interactive: false,
             source_hash: 42,
         }
     }

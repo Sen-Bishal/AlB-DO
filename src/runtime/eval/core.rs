@@ -1,7 +1,5 @@
 use crate::ir::opcode::{Instruction, ProxyId, SlotId, StableId};
-use crate::runtime::compiled::{
-    allocate_proxy_id, CompiledComponent, CompiledProject,
-};
+use crate::runtime::compiled::{allocate_proxy_id, CompiledComponent, CompiledProject};
 use crate::runtime::slot_store::SessionSlotView;
 use crate::transforms::events::HandlerBody;
 use crate::transforms::form::{allocate_field_error_id, FORM_ACTION_PREFIX};
@@ -61,6 +59,129 @@ fn reset_element_counter() {
     RENDER_ELEMENT_COUNTER.with(|cell| cell.set(0));
 }
 
+/// A derived text/attribute binding collected during a Phase K render: a JSX
+/// expression that reads ≥1 reactive slot but isn't a bare slot read
+/// (`{count * 2}`, `{open ? 'on' : 'off'}`, `className={busy ? 'b' : ''}`). The
+/// client recomputes `expr` from state whenever any `deps` slot changes and
+/// re-applies it to `stable_id` — as text when `attr` is `None`, else as that
+/// HTML attribute. Lowered to a JS thunk by `build_reactive_payload`.
+#[derive(Debug, Clone)]
+pub struct DerivedBindingRaw {
+    pub stable_id: u32,
+    pub attr: Option<String>,
+    /// `(binding name, slot id)` for every reactive slot the expression reads.
+    pub deps: Vec<(String, SlotId)>,
+    pub expr: swc_ecma_ast::Expr,
+}
+
+thread_local! {
+    /// Derived bindings collected during the current render. Reset at the top of
+    /// every `render_entry_compiled*` call (like the element counter) and taken
+    /// by `build_reactive_payload` right after the render returns. Renders that
+    /// don't consume it just overwrite it next time — no leak, no wire impact.
+    static DERIVED_OUT: RefCell<Vec<DerivedBindingRaw>> = const { RefCell::new(Vec::new()) };
+}
+
+fn reset_derived_bindings() {
+    DERIVED_OUT.with(|cell| cell.borrow_mut().clear());
+}
+
+fn push_derived_binding(binding: DerivedBindingRaw) {
+    DERIVED_OUT.with(|cell| cell.borrow_mut().push(binding));
+}
+
+/// Take the derived bindings collected by the most recent render on this thread.
+pub fn take_phase_k_derived_bindings() -> Vec<DerivedBindingRaw> {
+    DERIVED_OUT.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+/// Analyse a JSX expression for a derived binding, substituting any resolvable
+/// local (`useMemo` body / derived const) with its defining expression. Returns
+/// `Some((resolved_expr, deps))` when, after substitution, the expression reads
+/// ≥1 reactive slot AND every other variable identifier is a recognised pure
+/// global — i.e. it is recomputable client-side from state alone. Returns `None`
+/// when it reads no slot (static — leave it) or touches an unknown variable
+/// (prop / unresolved local / ref / arbitrary call), conservatively skipping.
+fn phase_k_collect_slot_deps(
+    expr: &swc_ecma_ast::Expr,
+) -> Option<(swc_ecma_ast::Expr, Vec<(String, SlotId)>)> {
+    use swc_ecma_ast::Expr;
+    use swc_ecma_visit::{Fold, FoldWith};
+
+    const PURE_GLOBALS: &[&str] = &[
+        "Math",
+        "String",
+        "Number",
+        "Boolean",
+        "JSON",
+        "Array",
+        "Object",
+        "Date",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "isFinite",
+        "undefined",
+        "NaN",
+        "Infinity",
+    ];
+
+    struct Resolver {
+        deps: Vec<(String, SlotId)>,
+        seen: HashSet<String>,
+        unknown: bool,
+        /// Resolution stack — guards against a local that (transitively)
+        /// references itself.
+        stack: Vec<String>,
+    }
+
+    impl Fold for Resolver {
+        fn fold_expr(&mut self, expr: Expr) -> Expr {
+            if let Expr::Ident(ident) = &expr {
+                let name = ident.sym.to_string();
+                if let Some(slot) = phase_k_slot_for_value(&name)
+                    .or_else(|| phase_k_shared_slot_for_value(&name).map(|(slot, _)| slot))
+                {
+                    if self.seen.insert(name.clone()) {
+                        self.deps.push((name, slot));
+                    }
+                    return expr;
+                }
+                if PURE_GLOBALS.contains(&name.as_str()) {
+                    return expr;
+                }
+                if self.stack.iter().any(|n| n == &name) {
+                    self.unknown = true;
+                    return expr;
+                }
+                if let Some(def) = phase_k_resolve_local(&name) {
+                    // Substitute the local with its (recursively resolved) def.
+                    self.stack.push(name);
+                    let folded = def.fold_with(self);
+                    self.stack.pop();
+                    return folded;
+                }
+                self.unknown = true;
+                return expr;
+            }
+            expr.fold_children_with(self)
+        }
+    }
+
+    let mut resolver = Resolver {
+        deps: Vec::new(),
+        seen: HashSet::new(),
+        unknown: false,
+        stack: Vec::new(),
+    };
+    let resolved = expr.clone().fold_with(&mut resolver);
+    if resolver.unknown || resolver.deps.is_empty() {
+        None
+    } else {
+        Some((resolved, resolver.deps))
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Phase K · hook-compile thread-local state
 //
@@ -68,10 +189,10 @@ fn reset_element_counter() {
 // for the duration of one render or handler dispatch. It threads:
 //   * the session slot view (for slot reads and writes),
 //   * the accumulator for binding opcodes (`BindEvent`, `SetTextRef`),
-//   * a stack of containing element `data-albedo-id`s (so a slot read
-//     in JSX text-position knows which element to subscribe), and
-//   * a stack of per-component hook scopes (so identifier lookup
-//     resolves slot-bound names against the right metadata).
+//   * a stack of containing element `data-albedo-id`s (so a slot read in JSX text-position knows
+//     which element to subscribe), and
+//   * a stack of per-component hook scopes (so identifier lookup resolves slot-bound names against
+//     the right metadata).
 // ─────────────────────────────────────────────────────────────────────
 
 thread_local! {
@@ -91,6 +212,13 @@ struct RenderKState {
     /// bakabox can resolve the event_id every `BindEvent` references.
     event_intern: HashMap<String, u16>,
     event_intern_order: Vec<String>,
+    /// Render-scoped attribute intern table, symmetric to the event one.
+    /// Allocation order is first-appearance of each unique HTML attribute
+    /// name (e.g. `class`), starting at id 1. `drain_phase_k_opcodes`
+    /// prepends an `InitInternTable { kind: Attr, .. }` so bakabox can
+    /// resolve the `attr_id` every `SetAttrRef` references.
+    attr_intern: HashMap<String, u16>,
+    attr_intern_order: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -127,6 +255,10 @@ struct ComponentScope {
     /// so the emitted `SetTextRef` opcode lines up with future
     /// broadcast fan-outs targeting the same id.
     shared_slots: HashMap<String, (SlotId, String)>,
+    /// Step 3 (derived bindings) — resolvable local defs (`useMemo` bodies /
+    /// plain derived consts) keyed by name, so a JSX `{doubled}` can be
+    /// substituted with its defining expression during derived-binding analysis.
+    derived_locals: HashMap<String, swc_ecma_ast::Expr>,
 }
 
 fn phase_k_enabled() -> bool {
@@ -188,6 +320,20 @@ fn phase_k_slot_for_value(name: &str) -> Option<SlotId> {
                 .scopes
                 .last()
                 .and_then(|scope| scope.value_slots.get(name).copied())
+        })
+    })
+}
+
+/// Resolve a JSX-referenced local (`useMemo` body / plain derived const) to its
+/// defining expression in the current component scope. `None` when `name` isn't
+/// a recognised derived local. See `ComponentScope::derived_locals`.
+fn phase_k_resolve_local(name: &str) -> Option<swc_ecma_ast::Expr> {
+    RENDER_K.with(|cell| {
+        cell.borrow().as_ref().and_then(|state| {
+            state
+                .scopes
+                .last()
+                .and_then(|scope| scope.derived_locals.get(name).cloned())
         })
     })
 }
@@ -320,6 +466,8 @@ impl PhaseKGuard {
                 scopes: Vec::new(),
                 event_intern: HashMap::new(),
                 event_intern_order: Vec::new(),
+                attr_intern: HashMap::new(),
+                attr_intern_order: Vec::new(),
             }))
         });
         Self { previous }
@@ -398,6 +546,7 @@ fn current_phase_k_component(module_spec: &str, function_name: &str) -> Option<C
                 .collect(),
             capture_slots: meta.capture_slots.clone(),
             shared_slots,
+            derived_locals: meta.derived_locals.clone(),
         })
     })
 }
@@ -458,8 +607,7 @@ thread_local! {
 pub(crate) fn install_phase_k_css_modules(
     registry: &crate::runtime::compiled::CssModuleRegistry,
 ) -> PhaseKCssModulesGuard {
-    let previous =
-        PHASE_K_CSS_MODULES.with(|cell| cell.replace(Some(registry as *const _)));
+    let previous = PHASE_K_CSS_MODULES.with(|cell| cell.replace(Some(registry as *const _)));
     PhaseKCssModulesGuard { previous }
 }
 
@@ -473,8 +621,7 @@ impl Drop for PhaseKCssModulesGuard {
     }
 }
 
-fn current_phase_k_css_modules(
-) -> Option<&'static crate::runtime::compiled::CssModuleRegistry> {
+fn current_phase_k_css_modules() -> Option<&'static crate::runtime::compiled::CssModuleRegistry> {
     PHASE_K_CSS_MODULES.with(|cell| {
         let ptr = cell.get()?;
         // Safety: same contract as `current_phase_k_broadcast`. The
@@ -497,9 +644,7 @@ thread_local! {
 /// anchor. The manifest builder installs this around its Tier-A static pass;
 /// every other render path leaves it unset and inlines as before. RAII guard
 /// restores the previous installation on drop, mirroring the Phase K stack.
-pub(crate) fn install_island_skip_set(
-    set: &std::collections::HashSet<String>,
-) -> IslandSkipGuard {
+pub(crate) fn install_island_skip_set(set: &std::collections::HashSet<String>) -> IslandSkipGuard {
     let previous = PHASE_K_ISLAND_SKIP.with(|cell| cell.replace(Some(set as *const _)));
     IslandSkipGuard { previous }
 }
@@ -591,7 +736,7 @@ fn drain_phase_k_opcodes() -> Vec<Instruction> {
         // `event_id` carried by a `BindEvent` opcode below. The control
         // stream conventionally ships intern tables ahead of the
         // referencing opcodes; we honour the same ordering here.
-        let mut out: Vec<Instruction> = Vec::with_capacity(body.len() + 1);
+        let mut out: Vec<Instruction> = Vec::with_capacity(body.len() + 2);
         if !state.event_intern_order.is_empty() {
             let entries: Vec<InternEntry> = state
                 .event_intern_order
@@ -609,6 +754,25 @@ fn drain_phase_k_opcodes() -> Vec<Instruction> {
                 },
             });
         }
+        // Attr intern table — symmetric to the event one above, so bakabox can
+        // resolve the `attr_id` every `SetAttrRef` references.
+        if !state.attr_intern_order.is_empty() {
+            let entries: Vec<InternEntry> = state
+                .attr_intern_order
+                .iter()
+                .enumerate()
+                .map(|(idx, name)| InternEntry {
+                    id: (idx as u16).saturating_add(1),
+                    value: name.clone(),
+                })
+                .collect();
+            out.push(Instruction::InitInternTable {
+                table: InternTable {
+                    kind: InternTableKind::Attr,
+                    entries,
+                },
+            });
+        }
         out.extend(body);
         out
     })
@@ -619,8 +783,12 @@ fn drain_phase_k_opcodes() -> Vec<Instruction> {
 /// route through the slot store or fall through to the Phase-J shim.
 fn is_use_state_in_phase_k_scope(call: &swc_ecma_ast::CallExpr) -> bool {
     use swc_ecma_ast::*;
-    let Callee::Expr(callee) = &call.callee else { return false };
-    let Expr::Ident(ident) = callee.as_ref() else { return false };
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    let Expr::Ident(ident) = callee.as_ref() else {
+        return false;
+    };
     ident.sym.as_ref() == "useState" && phase_k_enabled()
 }
 
@@ -630,8 +798,12 @@ fn is_use_state_in_phase_k_scope(call: &swc_ecma_ast::CallExpr) -> bool {
 /// renderer doesn't re-check it.
 fn is_use_shared_slot_in_phase_k_scope(call: &swc_ecma_ast::CallExpr) -> bool {
     use swc_ecma_ast::*;
-    let Callee::Expr(callee) = &call.callee else { return false };
-    let Expr::Ident(ident) = callee.as_ref() else { return false };
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    let Expr::Ident(ident) = callee.as_ref() else {
+        return false;
+    };
     ident.sym.as_ref() == "useSharedSlot" && phase_k_enabled()
 }
 
@@ -661,9 +833,13 @@ fn snapshot_captured_props_into_slots(scope: &ComponentScope, props: &Value) {
     if scope.capture_slots.is_empty() {
         return;
     }
-    let Some(props_map) = props.as_object() else { return };
+    let Some(props_map) = props.as_object() else {
+        return;
+    };
     for (name, slot_id) in &scope.capture_slots {
-        let Some(value) = props_map.get(name) else { continue };
+        let Some(value) = props_map.get(name) else {
+            continue;
+        };
         if let Ok(bytes) = serde_json::to_vec(value) {
             phase_k_write_slot_value(*slot_id, bytes);
         }
@@ -727,6 +903,27 @@ fn phase_k_event_id_for(event_name: &str) -> crate::ir::opcode::EventId {
         state.event_intern.insert(event_name.to_string(), id);
         state.event_intern_order.push(event_name.to_string());
         EventId(id)
+    })
+}
+
+/// Intern an HTML attribute name to a render-scoped `AttrId`, recording it for
+/// the `InitInternTable { kind: Attr }` `drain_phase_k_opcodes` prepends.
+/// Symmetric to [`phase_k_event_id_for`].
+fn phase_k_attr_id_for(attr_name: &str) -> crate::ir::opcode::AttrId {
+    use crate::ir::opcode::AttrId;
+    RENDER_K.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let state = match borrow.as_mut() {
+            Some(state) => state,
+            None => return AttrId(0),
+        };
+        if let Some(id) = state.attr_intern.get(attr_name) {
+            return AttrId(*id);
+        }
+        let id = (state.attr_intern_order.len() as u16).saturating_add(1);
+        state.attr_intern.insert(attr_name.to_string(), id);
+        state.attr_intern_order.push(attr_name.to_string());
+        AttrId(id)
     })
 }
 use crate::runtime::eval::expr::{
@@ -990,6 +1187,7 @@ impl ComponentProject {
         slots: &SessionSlotView,
     ) -> Result<(String, Vec<Instruction>)> {
         reset_element_counter();
+        reset_derived_bindings();
         let entry = self
             .resolve_entry(entry)
             .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
@@ -1029,6 +1227,7 @@ impl ComponentProject {
         broadcast: &crate::runtime::broadcast::BroadcastRegistry,
     ) -> Result<(String, Vec<Instruction>)> {
         reset_element_counter();
+        reset_derived_bindings();
         let entry = self
             .resolve_entry(entry)
             .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
@@ -1094,6 +1293,7 @@ impl ComponentProject {
                 .collect(),
             capture_slots: component.capture_slots.clone(),
             shared_slots,
+            derived_locals: component.derived_locals.clone(),
         };
         phase_k_push_scope(scope);
 
@@ -1115,7 +1315,9 @@ impl ComponentProject {
                 .find(|h| &h.value_name == name)
                 .map(|h| h.initial.clone())
             {
-                let value = self.eval_expr(module_spec, &initial_expr, &env).unwrap_or(Value::Null);
+                let value = self
+                    .eval_expr(module_spec, &initial_expr, &env)
+                    .unwrap_or(Value::Null);
                 env.insert(name.clone(), value);
             }
         }
@@ -1190,12 +1392,10 @@ impl ComponentProject {
     /// references in source order). Module constants whose init
     /// references something the Phase J interpreter doesn't model
     /// resolve to `Null` — a tracing warning surfaces the miss.
-    fn seed_env_with_module_constants(
-        &self,
-        module_spec: &str,
-        env: &mut HashMap<String, Value>,
-    ) {
-        let Some(module) = self.modules.get(module_spec) else { return };
+    fn seed_env_with_module_constants(&self, module_spec: &str, env: &mut HashMap<String, Value>) {
+        let Some(module) = self.modules.get(module_spec) else {
+            return;
+        };
         if module.module_constants.is_empty() {
             return;
         }
@@ -1237,8 +1437,7 @@ impl ComponentProject {
         // render. The guard publishes a `RenderInfo` on drop iff a process-wide
         // `RenderObserver` is installed — when none is, the whole scope
         // collapses to a single `OnceLock::get()` check.
-        let _frame =
-            crate::runtime::render_observer::enter_frame_guard(function_name, module_spec);
+        let _frame = crate::runtime::render_observer::enter_frame_guard(function_name, module_spec);
 
         let module = self
             .modules
@@ -1458,9 +1657,7 @@ impl ComponentProject {
             if !env.contains_key(&binding) {
                 if let Some(registry) = current_phase_k_css_modules() {
                     let prop = prop_ident.sym.to_string();
-                    if let Some(scoped) =
-                        registry.scoped_class_for(module_spec, &binding, &prop)
-                    {
+                    if let Some(scoped) = registry.scoped_class_for(module_spec, &binding, &prop) {
                         return Ok(Value::String(scoped.to_string()));
                     }
                 }
@@ -1594,13 +1791,11 @@ impl ComponentProject {
                 // broadcast updaters like `(n) => n + 1` whose first
                 // call sees `n = null` and produces "1" instead of 1.
                 match (&left, &right) {
-                    (Value::String(_), _) | (_, Value::String(_)) => Ok(Value::String(
-                        format!(
-                            "{}{}",
-                            value_to_string(&left),
-                            value_to_string(&right)
-                        ),
-                    )),
+                    (Value::String(_), _) | (_, Value::String(_)) => Ok(Value::String(format!(
+                        "{}{}",
+                        value_to_string(&left),
+                        value_to_string(&right)
+                    ))),
                     _ => Ok(json_num(to_number(&left) + to_number(&right))),
                 }
             }
@@ -1768,13 +1963,9 @@ impl ComponentProject {
 
                     // Instance-method dispatch.
                     let obj_val = self.eval_expr(module_spec, &member.obj, env)?;
-                    if let Some(value) = self.eval_instance_method(
-                        module_spec,
-                        &obj_val,
-                        &method,
-                        &call.args,
-                        env,
-                    )? {
+                    if let Some(value) =
+                        self.eval_instance_method(module_spec, &obj_val, &method, &call.args, env)?
+                    {
                         return Ok(value);
                     }
                 }
@@ -1798,12 +1989,7 @@ impl ComponentProject {
                 // callbacks aren't a supported surface today.
                 if fn_name == "broadcast" {
                     if let Some(broadcast) = current_phase_k_broadcast() {
-                        return self.eval_broadcast_call(
-                            module_spec,
-                            call,
-                            env,
-                            broadcast,
-                        );
+                        return self.eval_broadcast_call(module_spec, call, env, broadcast);
                     }
                     // v1 scope guard — surface a clean error rather
                     // than silently falling through to the import /
@@ -2088,20 +2274,15 @@ impl ComponentProject {
     /// Atomic read-modify-write on a broadcast topic, mirroring the
     /// React `setState(fn)` updater pattern:
     ///
-    ///   1. Topic is registered if not yet present (idempotent —
-    ///      ad-hoc topics like `broadcast(\`chat:${room}\`, ...)`
-    ///      don't need pre-registration).
-    ///   2. Current value is read via `current_value()` and decoded as
-    ///      JSON. Empty / undecodable bytes surface as `Value::Null`
-    ///      so the updater can initialise on first call.
-    ///   3. The updater closure is evaluated with its single param
-    ///      bound to the current value. Expression-bodied arrows
-    ///      return their tail; block-bodied closures pick up the
-    ///      `return` statement. Block bodies without a `return` yield
-    ///      `Null`.
-    ///   4. The result is JSON-encoded and pushed through
-    ///      `broadcast.write_topic`, fanning out a `SlotSet` opcode
-    ///      to every subscribed session over the WT patches lane.
+    ///   1. Topic is registered if not yet present (idempotent — ad-hoc topics like
+    ///      `broadcast(\`chat:${room}\`, ...)` don't need pre-registration).
+    ///   2. Current value is read via `current_value()` and decoded as JSON. Empty / undecodable
+    ///      bytes surface as `Value::Null` so the updater can initialise on first call.
+    ///   3. The updater closure is evaluated with its single param bound to the current value.
+    ///      Expression-bodied arrows return their tail; block-bodied closures pick up the `return`
+    ///      statement. Block bodies without a `return` yield `Null`.
+    ///   4. The result is JSON-encoded and pushed through `broadcast.write_topic`, fanning out a
+    ///      `SlotSet` opcode to every subscribed session over the WT patches lane.
     ///
     /// Returns `Value::Null` so the action body's tail expression
     /// (which is discarded by the action dispatcher) doesn't surface
@@ -2117,23 +2298,27 @@ impl ComponentProject {
             anyhow!("broadcast() requires a topic argument as its first parameter")
         })?;
         if topic_arg.spread.is_some() {
-            return Err(anyhow!("broadcast() does not accept a spread topic argument"));
+            return Err(anyhow!(
+                "broadcast() does not accept a spread topic argument"
+            ));
         }
         let topic_value = self.eval_expr(module_spec, &topic_arg.expr, env)?;
         let topic = match topic_value {
             Value::String(s) => s,
-            other => return Err(anyhow!(
-                "broadcast() topic must evaluate to a string; got {other:?}"
-            )),
+            other => {
+                return Err(anyhow!(
+                    "broadcast() topic must evaluate to a string; got {other:?}"
+                ))
+            }
         };
 
         // Ensure topic exists. Idempotent — `topic()` returns the
         // existing entry on a second call. Default-seed with `null`
         // so the updater's first invocation sees a sensible value
         // rather than empty bytes.
-        let topic_arc = broadcast.get(&topic).unwrap_or_else(|| {
-            broadcast.topic(topic.clone(), b"null".to_vec())
-        });
+        let topic_arc = broadcast
+            .get(&topic)
+            .unwrap_or_else(|| broadcast.topic(topic.clone(), b"null".to_vec()));
         let current_bytes = topic_arc.current_value();
         let current_value: Value = if current_bytes.is_empty() {
             Value::Null
@@ -2159,9 +2344,9 @@ impl ComponentProject {
         let encoded = serde_json::to_vec(&next_value).map_err(|err| {
             anyhow!("broadcast('{topic}') failed to encode updater result: {err}")
         })?;
-        broadcast.write_topic(&topic, encoded).map_err(|err| {
-            anyhow!("broadcast('{topic}') write failed: {err}")
-        })?;
+        broadcast
+            .write_topic(&topic, encoded)
+            .map_err(|err| anyhow!("broadcast('{topic}') write failed: {err}"))?;
 
         Ok(Value::Null)
     }
@@ -2184,8 +2369,7 @@ impl ComponentProject {
         let unwrapped = unwrap_updater_parens(expr);
         match unwrapped {
             Expr::Arrow(arrow) => {
-                let params: Vec<ParamBinding> =
-                    arrow.params.iter().map(param_from_pat).collect();
+                let params: Vec<ParamBinding> = arrow.params.iter().map(param_from_pat).collect();
                 let mut env = parent_env.clone();
                 let args = Value::Array(vec![arg.clone()]);
                 bind_params_positional(&params, &args, &mut env);
@@ -2408,16 +2592,12 @@ impl ComponentProject {
                     if let Expr::Call(call) = init.as_ref() {
                         if is_use_shared_slot_in_phase_k_scope(call) {
                             let name = binding.id.sym.to_string();
-                            if let Some((_slot_id, topic)) =
-                                phase_k_shared_slot_for_value(&name)
-                            {
+                            if let Some((_slot_id, topic)) = phase_k_shared_slot_for_value(&name) {
                                 let value = current_phase_k_broadcast()
                                     .and_then(|reg| reg.get(&topic))
                                     .map(|t| t.current_value())
                                     .filter(|bytes| !bytes.is_empty())
-                                    .and_then(|bytes| {
-                                        serde_json::from_slice::<Value>(&bytes).ok()
-                                    })
+                                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                                     .unwrap_or(Value::Null);
                                 env.insert(name, value);
                                 continue;
@@ -2445,14 +2625,13 @@ impl ComponentProject {
                                     Pat::Ident(ident) => Some(ident.id.sym.to_string()),
                                     _ => None,
                                 });
-                            let setter_name = array
-                                .elems
-                                .get(1)
-                                .and_then(|opt| opt.as_ref())
-                                .and_then(|p| match p {
-                                    Pat::Ident(ident) => Some(ident.id.sym.to_string()),
-                                    _ => None,
-                                });
+                            let setter_name =
+                                array.elems.get(1).and_then(|opt| opt.as_ref()).and_then(
+                                    |p| match p {
+                                        Pat::Ident(ident) => Some(ident.id.sym.to_string()),
+                                        _ => None,
+                                    },
+                                );
                             if let Some(name) = value_name {
                                 if let Some(slot_id) = phase_k_slot_for_value(&name) {
                                     let value = match phase_k_read_slot_value(slot_id) {
@@ -2470,9 +2649,7 @@ impl ComponentProject {
                                                         .unwrap_or(Value::Null)
                                                 })
                                                 .unwrap_or(Value::Null);
-                                            if let Ok(bytes) =
-                                                serde_json::to_vec(&initial_value)
-                                            {
+                                            if let Ok(bytes) = serde_json::to_vec(&initial_value) {
                                                 phase_k_write_slot_value(slot_id, bytes);
                                                 // Drain immediately — first-render
                                                 // initialisations are not user-visible
@@ -2595,10 +2772,7 @@ impl ComponentProject {
         // `render_attrs`, mirroring how the existing `required` etc.
         // flag attributes ship.
         if link_rewrite {
-            attrs.push((
-                "data-albedo-link".to_string(),
-                Value::Bool(true),
-            ));
+            attrs.push(("data-albedo-link".to_string(), Value::Bool(true)));
         }
 
         // Phase L · `<form action="action:NAME">` rewrite. The
@@ -2655,10 +2829,7 @@ impl ComponentProject {
             Some(existing) => existing,
             None => {
                 let id = next_element_stable_id(module_spec);
-                attrs.push((
-                    ALBEDO_ID_ATTR.to_string(),
-                    Value::String(id.to_string()),
-                ));
+                attrs.push((ALBEDO_ID_ATTR.to_string(), Value::String(id.to_string())));
                 id
             }
         };
@@ -2676,14 +2847,46 @@ impl ComponentProject {
                         let name = name_ident.sym.to_string();
                         if name.starts_with("on") && name.len() > 2 {
                             let event_name = name[2..].to_ascii_lowercase();
-                            if let Some(proxy_id) =
-                                phase_k_next_proxy_id_for_event(&event_name)
-                            {
+                            if let Some(proxy_id) = phase_k_next_proxy_id_for_event(&event_name) {
                                 phase_k_emit(Instruction::BindEvent {
                                     stable_id: StableId(stable_id),
                                     event_id: phase_k_event_id_for(&event_name),
                                     proxy_id: ProxyId(proxy_id),
                                 });
+                            }
+                        } else if let Some(JSXAttrValue::JSXExprContainer(container)) =
+                            &jsx_attr.value
+                        {
+                            // Phase K · attribute binding: when an attr value is a
+                            // bare slot read (`className={cls}`, `value={text}`),
+                            // bind it so a future SlotSet re-applies the attribute.
+                            // Uses the HTML attribute name render_attrs emits
+                            // (`className`→`class`) so the client patches the same
+                            // attribute the server rendered. Derived expressions
+                            // (ternary, concat) are not bare reads — left unbound.
+                            if let JSXExpr::Expr(expr) = &container.expr {
+                                let html_name = if name == "className" {
+                                    "class"
+                                } else {
+                                    name.as_str()
+                                };
+                                if let Some(slot_id) = phase_k_detect_slot_text_read(expr) {
+                                    phase_k_emit(Instruction::SetAttrRef {
+                                        stable_id: StableId(stable_id),
+                                        attr_id: phase_k_attr_id_for(html_name),
+                                        slot_id,
+                                    });
+                                } else if let Some((resolved, deps)) =
+                                    phase_k_collect_slot_deps(expr)
+                                {
+                                    // Derived attribute: `className={busy ? 'b' : ''}`.
+                                    push_derived_binding(DerivedBindingRaw {
+                                        stable_id,
+                                        attr: Some(html_name.to_string()),
+                                        deps,
+                                        expr: resolved,
+                                    });
+                                }
                             }
                         }
                     }
@@ -2907,6 +3110,20 @@ impl ComponentProject {
                                     stable_id: StableId(stable_id),
                                     slot_id,
                                 });
+                            }
+                        } else if phase_k_enabled() {
+                            // Derived text: `{count * 2}`, `{open ? 'a' : 'b'}` —
+                            // reads slots but isn't a bare read. Record it so the
+                            // client recomputes the value from state on change.
+                            if let Some(stable_id) = phase_k_top_element() {
+                                if let Some((resolved, deps)) = phase_k_collect_slot_deps(expr) {
+                                    push_derived_binding(DerivedBindingRaw {
+                                        stable_id,
+                                        attr: None,
+                                        deps,
+                                        expr: resolved,
+                                    });
+                                }
                             }
                         }
                         let value = self.eval_expr(module_spec, expr, env)?;

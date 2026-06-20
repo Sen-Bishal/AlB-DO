@@ -1,5 +1,6 @@
 use crate::effects::EffectProfile;
 use crate::types::*;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use swc_common::SourceMap;
@@ -76,6 +77,17 @@ pub struct ParsedComponent {
     pub is_default_export: bool,
     pub props: Vec<String>,
     pub effect_profile: EffectProfile,
+    /// True when the component declares ANY `on*` JSX handler. Forces the
+    /// component off Tier-A (it must hydrate at least enough to round-trip)
+    /// and drives hydration timing. See `EffectCollector::visit_jsx_attr`.
+    pub is_interactive: bool,
+    /// True when at least one `on*` handler is provably client-satisfiable —
+    /// its closure (transitively through local definitions) touches no server
+    /// boundary (network io). This is the dataflow lever that promotes a
+    /// hooks component to Tier-C (client island, zero round-trip) vs Tier-B
+    /// (server round-trip). A `Counter` (onClick→setState) is client-satisfiable;
+    /// a `LikeButton` (onClick→`fetch`) is not. See step 2 in the tier design.
+    pub is_client_interactive: bool,
     pub source_hash: u64,
 }
 
@@ -105,34 +117,38 @@ impl ComponentVisitor {
         }
     }
 
-    fn effect_profile_from_function(&self, function: &Function) -> EffectProfile {
+    fn analyze_function(&self, function: &Function) -> ComponentAnalysis {
         let mut collector = EffectCollector::default();
         if function.is_async {
             collector.profile.asynchronous = true;
         }
         if let Some(body) = &function.body {
+            collector.prime_local_defs(&body.stmts);
             body.visit_with(&mut collector);
         }
-        collector.profile
+        collector.finish()
     }
 
-    fn effect_profile_from_arrow(&self, arrow: &ArrowExpr) -> EffectProfile {
+    fn analyze_arrow(&self, arrow: &ArrowExpr) -> ComponentAnalysis {
         let mut collector = EffectCollector::default();
         if arrow.is_async {
             collector.profile.asynchronous = true;
         }
         match &*arrow.body {
-            BlockStmtOrExpr::BlockStmt(block) => block.visit_with(&mut collector),
+            BlockStmtOrExpr::BlockStmt(block) => {
+                collector.prime_local_defs(&block.stmts);
+                block.visit_with(&mut collector);
+            }
             BlockStmtOrExpr::Expr(expr) => expr.visit_with(&mut collector),
         }
-        collector.profile
+        collector.finish()
     }
 
-    fn effect_profile_from_expr(&self, expr: &Expr) -> EffectProfile {
+    fn analyze_expr(&self, expr: &Expr) -> ComponentAnalysis {
         match expr {
-            Expr::Arrow(arrow) => self.effect_profile_from_arrow(arrow),
-            Expr::Fn(function) => self.effect_profile_from_function(&function.function),
-            _ => EffectProfile::default(),
+            Expr::Arrow(arrow) => self.analyze_arrow(arrow),
+            Expr::Fn(function) => self.analyze_function(&function.function),
+            _ => ComponentAnalysis::default(),
         }
     }
 
@@ -141,7 +157,7 @@ impl ComponentVisitor {
         name: String,
         estimated_size: usize,
         is_default_export: bool,
-        effect_profile: EffectProfile,
+        analysis: ComponentAnalysis,
     ) {
         self.components.push(ParsedComponent {
             name,
@@ -151,7 +167,9 @@ impl ComponentVisitor {
             estimated_size,
             is_default_export,
             props: Vec::new(),
-            effect_profile,
+            effect_profile: analysis.profile,
+            is_interactive: analysis.is_interactive,
+            is_client_interactive: analysis.is_client_interactive,
             source_hash: self.source_hash,
         });
     }
@@ -174,8 +192,8 @@ impl Visit for ComponentVisitor {
 
         if name.chars().next().is_some_and(|c| c.is_uppercase()) {
             let estimated_size = name.len() * 50 + 200;
-            let effect_profile = self.effect_profile_from_function(&func.function);
-            self.push_component(name, estimated_size, false, effect_profile);
+            let analysis = self.analyze_function(&func.function);
+            self.push_component(name, estimated_size, false, analysis);
         }
     }
 
@@ -187,8 +205,8 @@ impl Visit for ComponentVisitor {
                         let is_component = matches!(&**init, Expr::Arrow(_) | Expr::Fn(_));
                         if is_component {
                             let estimated_size = name.len() * 50 + 200;
-                            let effect_profile = self.effect_profile_from_expr(init);
-                            self.push_component(name, estimated_size, false, effect_profile);
+                            let analysis = self.analyze_expr(init);
+                            self.push_component(name, estimated_size, false, analysis);
                         }
                     }
                 }
@@ -201,8 +219,8 @@ impl Visit for ComponentVisitor {
             if let Some(ident) = &func.ident {
                 let name = ident.sym.to_string();
                 let estimated_size = name.len() * 50 + 300;
-                let effect_profile = self.effect_profile_from_function(&func.function);
-                self.push_component(name, estimated_size, true, effect_profile);
+                let analysis = self.analyze_function(&func.function);
+                self.push_component(name, estimated_size, true, analysis);
             }
         }
     }
@@ -210,24 +228,153 @@ impl Visit for ComponentVisitor {
     fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
         if let Some(name) = self.extract_component_name(&export.expr) {
             let estimated_size = name.len() * 50 + 200;
-            let effect_profile = self.effect_profile_from_expr(&export.expr);
+            let analysis = self.analyze_expr(&export.expr);
 
             if let Some(comp) = self.components.iter_mut().find(|c| c.name == name) {
                 comp.is_default_export = true;
-                comp.effect_profile = comp.effect_profile.join(effect_profile);
+                comp.effect_profile = comp.effect_profile.join(analysis.profile);
+                comp.is_interactive = comp.is_interactive || analysis.is_interactive;
+                comp.is_client_interactive =
+                    comp.is_client_interactive || analysis.is_client_interactive;
             } else {
-                self.push_component(name, estimated_size, true, effect_profile);
+                self.push_component(name, estimated_size, true, analysis);
             }
         }
     }
 }
 
+/// Outcome of analyzing one component's defining closure.
+#[derive(Default)]
+struct ComponentAnalysis {
+    profile: EffectProfile,
+    /// Any `on*` handler present (keeps the component off Tier-A).
+    is_interactive: bool,
+    /// At least one handler is provably client-satisfiable (no server boundary).
+    is_client_interactive: bool,
+}
+
 #[derive(Default)]
 struct EffectCollector {
     profile: EffectProfile,
+    /// Per-component map: local function/const name -> client-safe (its body
+    /// reaches no server boundary, transitively via other locals). Primed from
+    /// the component body before the main walk so handler references such as
+    /// `onClick={inc}` can be resolved against it.
+    local_safety: HashMap<String, bool>,
+    /// Saw at least one `on*` JSX handler prop.
+    has_handler: bool,
+    /// Saw at least one provably client-satisfiable `on*` handler.
+    has_client_handler: bool,
 }
 
 impl EffectCollector {
+    fn finish(self) -> ComponentAnalysis {
+        ComponentAnalysis {
+            profile: self.profile,
+            is_interactive: self.has_handler,
+            is_client_interactive: self.has_client_handler,
+        }
+    }
+
+    /// Collect local `const NAME = closure` / `function NAME` definitions from
+    /// the component body and classify each as client-safe (its body reaches no
+    /// network/server boundary, transitively through other locals). This lets a
+    /// handler reference like `onClick={inc}` resolve to `inc`'s analysis.
+    fn prime_local_defs(&mut self, stmts: &[Stmt]) {
+        // direct[name] = body directly contains a server-boundary io call.
+        // calls[name]  = function names this def invokes (for transitivity).
+        let mut direct: HashMap<String, bool> = HashMap::new();
+        let mut calls: HashMap<String, Vec<String>> = HashMap::new();
+
+        for stmt in stmts {
+            match stmt {
+                Stmt::Decl(Decl::Fn(f)) => {
+                    let mut scan = DefScan::default();
+                    if let Some(body) = &f.function.body {
+                        body.visit_with(&mut scan);
+                    }
+                    let name = f.ident.sym.to_string();
+                    direct.insert(name.clone(), scan.found_io);
+                    calls.insert(name, scan.called);
+                }
+                Stmt::Decl(Decl::Var(var)) => {
+                    for decl in &var.decls {
+                        if let Some(name) = decl.name.as_ident().map(|i| i.sym.to_string()) {
+                            if let Some(init) = &decl.init {
+                                if let Some((found_io, called)) = scan_closure(init) {
+                                    direct.insert(name.clone(), found_io);
+                                    calls.insert(name, called);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Fixpoint: a def is unsafe if it directly hits a boundary, or it calls
+        // a local def already known to be unsafe.
+        let mut unsafe_defs: HashSet<String> = direct
+            .iter()
+            .filter(|(_, io)| **io)
+            .map(|(name, _)| name.clone())
+            .collect();
+        loop {
+            let mut changed = false;
+            for (name, callees) in &calls {
+                if unsafe_defs.contains(name) {
+                    continue;
+                }
+                if callees.iter().any(|c| unsafe_defs.contains(c)) {
+                    unsafe_defs.insert(name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        self.local_safety = direct
+            .keys()
+            .map(|name| (name.clone(), !unsafe_defs.contains(name)))
+            .collect();
+    }
+
+    /// Is this `on*` handler value provably client-satisfiable?
+    fn handler_is_client_safe(&self, value: Option<&JSXAttrValue>) -> bool {
+        match value {
+            Some(JSXAttrValue::JSXExprContainer(container)) => match &container.expr {
+                JSXExpr::Expr(expr) => self.expr_handler_client_safe(expr),
+                JSXExpr::JSXEmptyExpr(_) => true,
+            },
+            // String-literal handler or boolean shorthand: no server boundary.
+            _ => true,
+        }
+    }
+
+    fn expr_handler_client_safe(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Arrow(arrow) => !arrow_hits_server_boundary(arrow, &self.local_safety),
+            Expr::Fn(func) => func.function.body.as_ref().map_or(true, |body| {
+                let mut scan = ServerBoundaryScan::new(&self.local_safety);
+                body.visit_with(&mut scan);
+                !scan.found
+            }),
+            Expr::Ident(id) => self
+                .local_safety
+                .get(id.sym.as_ref())
+                .copied()
+                .unwrap_or(true),
+            Expr::Paren(paren) => self.expr_handler_client_safe(&paren.expr),
+            // Member access, call result, etc.: not a *provable* server boundary.
+            // Round toward Tier-C (a wrong Tier-C still works for a client-side
+            // fetch; "use server" can override the unprovable long tail).
+            _ => true,
+        }
+    }
+
     fn mark_call(&mut self, call_name: &str) {
         let name = call_name.trim();
         if is_hook_call(name) {
@@ -258,6 +405,128 @@ impl Visit for EffectCollector {
         }
         call.visit_children_with(self);
     }
+
+    fn visit_jsx_attr(&mut self, attr: &JSXAttr) {
+        // Handler detection: any `on[A-Z]…` prop (onClick, onSubmit, onChange…)
+        // makes the component interactive. Server actions are authored as the
+        // distinct `action="action:NAME"` attribute (not an `on*` prop) and so
+        // are excluded by construction — they round-trip and stay Tier-B.
+        if let JSXAttrName::Ident(ident) = &attr.name {
+            if is_event_handler_prop(ident.sym.as_ref()) {
+                self.has_handler = true;
+                if self.handler_is_client_safe(attr.value.as_ref()) {
+                    self.has_client_handler = true;
+                }
+                // Do NOT descend into the handler closure: its effects run at
+                // interaction time, not render time, so they must not pollute
+                // the render-time effect profile (a `fetch` inside onClick is
+                // not a render-time io boundary — it is classified above).
+                return;
+            }
+        }
+        attr.visit_children_with(self);
+    }
+}
+
+fn is_event_handler_prop(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() > 2 && &bytes[..2] == b"on" && bytes[2].is_ascii_uppercase()
+}
+
+/// A network/server boundary reachable from a handler closure forces Tier-B.
+/// Subset of `is_io_call`: client-only storage (localStorage/sessionStorage)
+/// is deliberately excluded — it is satisfiable in a Tier-C client island.
+fn is_server_boundary_call(name: &str) -> bool {
+    const SERVER_IO: &[&str] = &[
+        "fetch",
+        "axios",
+        "axios.get",
+        "axios.post",
+        "fs.readFile",
+        "fs.readFileSync",
+        "fs.writeFile",
+        "fs.writeFileSync",
+        "http.get",
+        "http.request",
+        "https.get",
+        "https.request",
+    ];
+    SERVER_IO.iter().any(|candidate| *candidate == name)
+}
+
+/// Scans a local definition's body for a direct server boundary and records the
+/// function names it calls (so callers can propagate taint transitively).
+#[derive(Default)]
+struct DefScan {
+    found_io: bool,
+    called: Vec<String>,
+}
+
+impl Visit for DefScan {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Some(name) = callee_name(&call.callee) {
+            if is_server_boundary_call(&name) {
+                self.found_io = true;
+            }
+            self.called.push(name);
+        }
+        call.visit_children_with(self);
+    }
+}
+
+/// Returns `(direct_io, called_names)` for a closure expression, or `None` when
+/// the initializer is not a function (so it is not a callable local handler).
+fn scan_closure(expr: &Expr) -> Option<(bool, Vec<String>)> {
+    let mut scan = DefScan::default();
+    match expr {
+        Expr::Arrow(arrow) => match &*arrow.body {
+            BlockStmtOrExpr::BlockStmt(block) => block.visit_with(&mut scan),
+            BlockStmtOrExpr::Expr(inner) => inner.visit_with(&mut scan),
+        },
+        Expr::Fn(func) => {
+            if let Some(body) = &func.function.body {
+                body.visit_with(&mut scan);
+            }
+        }
+        _ => return None,
+    }
+    Some((scan.found_io, scan.called))
+}
+
+/// Walks a handler closure and flags whether it reaches a server boundary —
+/// either a direct network io call or a call to a local def known to be unsafe.
+struct ServerBoundaryScan<'a> {
+    local_safety: &'a HashMap<String, bool>,
+    found: bool,
+}
+
+impl<'a> ServerBoundaryScan<'a> {
+    fn new(local_safety: &'a HashMap<String, bool>) -> Self {
+        Self {
+            local_safety,
+            found: false,
+        }
+    }
+}
+
+impl Visit for ServerBoundaryScan<'_> {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Some(name) = callee_name(&call.callee) {
+            if is_server_boundary_call(&name) || self.local_safety.get(&name) == Some(&false) {
+                self.found = true;
+            }
+        }
+        call.visit_children_with(self);
+    }
+}
+
+fn arrow_hits_server_boundary(arrow: &ArrowExpr, local_safety: &HashMap<String, bool>) -> bool {
+    let mut scan = ServerBoundaryScan::new(local_safety);
+    match &*arrow.body {
+        BlockStmtOrExpr::BlockStmt(block) => block.visit_with(&mut scan),
+        BlockStmtOrExpr::Expr(inner) => inner.visit_with(&mut scan),
+    }
+    scan.found
 }
 
 fn hash_source(source: &str) -> u64 {
@@ -416,6 +685,49 @@ mod tests {
         assert!(component.effect_profile.asynchronous);
         assert!(component.effect_profile.io);
         assert!(component.effect_profile.side_effects);
+    }
+
+    #[test]
+    fn test_jsx_onclick_marks_interactive() {
+        let parser = ComponentParser::new();
+        // Named like a non-interactive component on purpose: detection must be
+        // driven by the onClick handler, not the component name.
+        let source = r#"
+            export default function Panel() {
+                const [count, setCount] = useState(0);
+                return <div onClick={() => setCount(count + 1)}>{count}</div>;
+            }
+        "#;
+        let components = parser.parse_source(source, "test.tsx").unwrap();
+        assert!(components[0].is_interactive);
+        assert!(components[0].effect_profile.hooks);
+    }
+
+    #[test]
+    fn test_no_handler_is_not_interactive() {
+        let parser = ComponentParser::new();
+        // Named "Button" — the old heuristic would have flagged it interactive.
+        let source = r#"
+            export default function Button() {
+                return <button class="btn">Static</button>;
+            }
+        "#;
+        let components = parser.parse_source(source, "test.tsx").unwrap();
+        assert!(!components[0].is_interactive);
+    }
+
+    #[test]
+    fn test_form_server_action_is_not_interactive() {
+        let parser = ComponentParser::new();
+        // `action="action:…"` is a server action (round-trips → Tier-B), not an
+        // `on*` handler, so it must NOT mark the component interactive.
+        let source = r#"
+            export default function ContactForm() {
+                return <form action="action:submit"><input name="email" /></form>;
+            }
+        "#;
+        let components = parser.parse_source(source, "test.tsx").unwrap();
+        assert!(!components[0].is_interactive);
     }
 
     #[test]

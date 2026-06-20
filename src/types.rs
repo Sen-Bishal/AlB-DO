@@ -26,6 +26,10 @@ pub struct Component {
     pub dependencies: HashSet<ComponentId>,
     pub is_above_fold: bool,
     pub is_interactive: bool,
+    /// At least one handler is provably client-satisfiable → Tier-C eligible.
+    /// Distinct from `is_interactive` (any handler). See the tier design step 2.
+    #[serde(default)]
+    pub is_client_interactive: bool,
     pub is_lcp_candidate: bool,
     pub effect_profile: EffectProfile,
     pub source_hash: u64,
@@ -43,6 +47,7 @@ impl Component {
             dependencies: HashSet::new(),
             is_above_fold: false,
             is_interactive: false,
+            is_client_interactive: false,
             is_lcp_candidate: false,
             effect_profile: EffectProfile::default(),
             source_hash: 0,

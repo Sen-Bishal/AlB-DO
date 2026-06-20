@@ -4,11 +4,15 @@ use dom_render_compiler::bundler::emit::{
     BUNDLE_PRECOMPILED_MODULES_FILENAME, BUNDLE_ROUTE_PREFETCH_MANIFEST_FILENAME,
     BUNDLE_STATIC_SLICES_FILENAME,
 };
-use dom_render_compiler::hydration::payload::{build_hydration_payload, serialize_hydration_payload};
+use dom_render_compiler::hydration::payload::{
+    build_hydration_payload, serialize_hydration_payload,
+};
 use dom_render_compiler::hydration::plan::{
     HydrationIslandPlan, HydrationPlan, HydrationTrigger, HYDRATION_PLAN_VERSION,
 };
-use dom_render_compiler::hydration::script::{build_bootstrap_script_tag, build_payload_script_tag};
+use dom_render_compiler::hydration::script::{
+    build_bootstrap_script_tag, build_payload_script_tag,
+};
 use dom_render_compiler::manifest::schema::{
     ComponentManifestEntry, HydrationMode, PrecompiledRuntimeModulesArtifact, RenderManifestV2,
 };
@@ -185,7 +189,10 @@ impl RendererRuntime {
                 let Some(component) = by_name.get(node.component_id.as_str()) else {
                     continue;
                 };
-                let Some(module) = self.renderer.module_registry().module(&component.module_path)
+                let Some(module) = self
+                    .renderer
+                    .module_registry()
+                    .module(&component.module_path)
                 else {
                     continue;
                 };
@@ -263,6 +270,99 @@ impl RendererRuntime {
                 },
             );
         }
+        blocks
+    }
+
+    /// Step 3 (binding mode) — precompute the fine-grained reactive block for
+    /// every route whose Tier-C component(s) the analysis proved client-driveable
+    /// from text bindings alone. Unlike A3 (which hydrates a whole component), a
+    /// binding-mode route ships the Phase K static HTML (carrying `data-albedo-id`
+    /// stamps) into the placeholder and a tiny inline driver that runs the handler
+    /// locally and patches the bound text nodes — no VDOM, no hydration, no
+    /// round-trip.
+    ///
+    /// Returns a `RouteHydration` per eligible route, keyed by route path, so it
+    /// drops straight into the same streaming plumbing A3 uses. Fallback-safe:
+    /// any component whose payload can't be built (entry won't resolve, no
+    /// text/event bindings, structural reactivity) is skipped, so the route falls
+    /// back to the A3 island path with no regression.
+    pub fn build_reactive_blocks(
+        &self,
+        compiled: &dom_render_compiler::runtime::CompiledProject,
+    ) -> HashMap<String, RouteHydration> {
+        use dom_render_compiler::runtime::eval::SessionSlotView;
+        use dom_render_compiler::runtime::slot_store::SlotStore;
+        use dom_render_compiler::runtime::SessionId;
+        use std::sync::Arc;
+
+        let driver = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/albedo-reactive.js"
+        ));
+
+        let empty_props = serde_json::Value::Object(Default::default());
+        let mut blocks = HashMap::new();
+
+        for (path, route) in &self.manifest.routes {
+            let mut placeholders = Vec::new();
+            let mut installs = String::new();
+
+            for node in &route.tier_c {
+                if node.hydration_mode == HydrationMode::None {
+                    continue;
+                }
+                // The manifest names the component; resolve it to the render-entry
+                // spec the compiled project keys on (its absolute `module_path`
+                // won't match the project-relative module specs).
+                let Some(entry) = compiled.module_spec_for_component(&node.component_id) else {
+                    continue;
+                };
+
+                let slots = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
+                let payload = match compiled.build_reactive_payload(entry, &empty_props, &slots) {
+                    // Binding mode requires at least one text/attr/derived binding
+                    // driven by at least one client handler. Anything else (no
+                    // handler, no slot read, structural-only) is not eligible —
+                    // fall through to the A3 island path.
+                    Ok(p)
+                        if (!p.texts.is_empty()
+                            || !p.attrs.is_empty()
+                            || !p.derived.is_empty())
+                            && !p.events.is_empty() =>
+                    {
+                        p
+                    }
+                    _ => continue,
+                };
+
+                // Fill the empty Tier-C placeholder with the Phase K HTML — the
+                // SAME render the binding frame was emitted from, so its
+                // `data-albedo-id` stamps line up with every BindEvent/SetTextRef.
+                placeholders.push((node.placeholder_id.clone(), payload.html.clone()));
+
+                if let Ok(json) = serde_json::to_string(&payload) {
+                    installs
+                        .push_str("<script>window.__albedoReactive&&window.__albedoReactive.boot(");
+                    installs.push_str(&escape_inline_script(&json));
+                    installs.push_str(");</script>");
+                }
+            }
+
+            if !placeholders.is_empty() {
+                let mut scripts = String::from("<script>");
+                scripts.push_str(&escape_inline_script(driver));
+                scripts.push_str("</script>");
+                scripts.push_str(&installs);
+                blocks.insert(
+                    path.clone(),
+                    RouteHydration {
+                        placeholders,
+                        closing_scripts: scripts,
+                    },
+                );
+            }
+        }
+
         blocks
     }
 
