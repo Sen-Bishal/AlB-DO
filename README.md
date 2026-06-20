@@ -143,5 +143,4 @@ crates/
 
 ---
 
-Built by [Sen-Bishal](https://github.com/Sen-Bishal) and
-[PixMusicaX](https://github.com/PixMusicaX). MIT License.
+Built by [Sen-Bishal](https://github.com/Sen-Bishal) 
