@@ -99,6 +99,11 @@ pub struct ReactiveDerivedBinding {
     pub dep_slots: Vec<u32>,
     /// `(function(__s){ ... return (<expr>); })` over the live state object.
     pub thunk: String,
+    /// When true the recomputed value is raw HTML applied via `innerHTML`
+    /// (the conditionals rung — `{cond && <X/>}` toggles a static subtree),
+    /// not escaped text/attribute content. Defaults false for value bindings.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub html: bool,
 }
 
 /// One `on*` handler wired to a server-rendered element — a client-side
@@ -643,6 +648,24 @@ impl CompiledProject {
         let opts = RenderOptions { hook_compile: true };
         let out = render_entry_with_bindings(self, entry, props, slots, &opts)?;
 
+        // Conditionals rung · deliberate fallback. If the render hit a
+        // structural construct binding mode can't represent fine-grained (a
+        // slot-reactive conditional with a non-static branch, a list, ...), the
+        // renderer flagged it. Bail with an error so the caller
+        // (`renderer_runtime::build_reactive_blocks`) skips this component and
+        // it keeps its correct A3 whole-component island — rather than shipping
+        // a binding payload whose conditional would silently go stale. Must run
+        // before the thread-local is overwritten by the next render.
+        if crate::runtime::eval::core::phase_k_structural_fallback_required() {
+            // Drain the side-channel so it can't leak into the next render.
+            let _ = crate::runtime::eval::core::take_phase_k_derived_bindings();
+            let _ = crate::runtime::eval::core::take_phase_k_conditional_bindings();
+            return Err(anyhow!(
+                "component uses structural reactivity not representable in binding mode; \
+                 falling back to the A3 island"
+            ));
+        }
+
         // event_id → name and attr_id → name, from the prepended intern tables.
         let mut event_names: HashMap<u16, String> = HashMap::new();
         let mut attr_names: HashMap<u16, String> = HashMap::new();
@@ -734,6 +757,39 @@ impl CompiledProject {
                 attr: binding.attr,
                 dep_slots: binding.deps.iter().map(|(_, slot)| slot.0).collect(),
                 thunk,
+                html: false,
+            });
+        }
+
+        // Conditionals rung: each `{cond && <static JSX>}` / `{cond ? <A/> :
+        // <B/>}` is lowered to a derived binding whose recompute returns the
+        // pre-rendered HTML of whichever branch the (client-recomputed) test
+        // selects. `html: true` tells the driver to apply it via `innerHTML`.
+        let raw_conditionals = crate::runtime::eval::core::take_phase_k_conditional_bindings();
+        for cond in raw_conditionals {
+            let mut thunk = String::from("(function(__s){\n");
+            for (name, slot_id) in &cond.deps {
+                let slot = slot_id.0;
+                let initial = slot_initials
+                    .get(&slot)
+                    .cloned()
+                    .unwrap_or_else(|| "undefined".to_string());
+                thunk.push_str(&format!(
+                    "var {name}=(__s[{slot}]!==undefined?__s[{slot}]:({initial}));\n"
+                ));
+            }
+            thunk.push_str(&format!(
+                "return (({}) ? {} : {});\n}})",
+                expr_to_js(&cond.cond)?,
+                json_string_literal(&cond.html_true),
+                json_string_literal(&cond.html_false),
+            ));
+            derived.push(ReactiveDerivedBinding {
+                stable_id: cond.stable_id,
+                attr: None,
+                dep_slots: cond.deps.iter().map(|(_, slot)| slot.0).collect(),
+                thunk,
+                html: true,
             });
         }
 
@@ -1355,6 +1411,14 @@ impl CompiledProject {
 // so these helpers codegen the AST back to JS via the same swc emitter the
 // engine uses for modules. The AST is the compiler's own (already TS/JSX
 // stripped at parse time for handler bodies), so the emitted source is trusted.
+
+/// Safely embed an arbitrary string (e.g. pre-rendered branch HTML) as a JS
+/// string literal inside generated thunk source. JSON string syntax is a strict
+/// subset of JS string syntax, so `serde_json` gives correct escaping for
+/// quotes, backslashes, newlines, and control characters in one shot.
+fn json_string_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
 
 /// Emit a sequence of module items as JS source.
 fn emit_module_js(items: Vec<ModuleItem>) -> Result<String> {
