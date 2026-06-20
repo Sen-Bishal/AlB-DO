@@ -119,6 +119,94 @@ ALBEDO's single-binary architecture avoids a Node.js boot + JIT
 warm-up; the entire serve path is one Rust process loading bincode
 + JSON manifests.
 
+## Serve-time latency, over the wire (Workstream C)
+
+The four Criterion benches above pin *in-process* costs. They cannot
+show the number an operator feels: end-to-end request latency against a
+running `albedo serve`. That's what the **serve-time harness** measures
+(`src/dev/serve_bench.rs`, driven by the `albedo-bench --serve` mode).
+
+It's a deliberately zero-dependency load generator — a raw HTTP/1.1
+client over `std::net::TcpStream`, no `reqwest`/`hyper`/oha/bombardier
+to install — so it reproduces with nothing but `cargo` and adds minimal
+scheduling noise of its own. It points at a server you already booted;
+spawning is the operator's job (so the binary stays `--release`).
+
+### Reproduce
+
+```bash
+# 1. Build + boot the target app in RELEASE (numbers off a debug
+#    binary are meaningless — it's 10-50x slow).
+cargo build --release -p albedo-server --bin albedo
+cd my-app && ../target/release/albedo serve --port 3000 &
+
+# 2. Build + run the harness (also release).
+cargo build --release -p dom-render-compiler --bin albedo-bench
+./target/release/albedo-bench \
+    --serve http://127.0.0.1:3000 \
+    --path / --path /chat \
+    --warmup 100 --samples 2000 --concurrency 32 \
+    --markdown --output target/benchmarks/serve.json
+```
+
+It reports, per endpoint: **cold** (first sequential hit after the
+caller booted), and **warm** TTFB + total-body p50/p90/p99 under the
+configured concurrency. `--markdown` prints a README-ready table; the
+JSON report carries the full distribution.
+
+### Methodology
+
+- **One TCP connection per request** (`Connection: close`). Folds
+  connect cost into every sample — consistent across any framework you
+  point a comparable tool at, and the conservative choice (keep-alive
+  would only make ALBEDO look faster).
+- **TTFB** = just-before-write → first response byte. **Total** = →
+  EOF. We read to close, so `Content-Length` and chunked
+  (`Transfer-Encoding: chunked`, which the streaming shell uses) bodies
+  are handled identically.
+- **Guard:** any endpoint returning <100% 2xx fails the run loudly —
+  a broken route's latency is not citable.
+- **Honest label on "cold":** it's the first *uncontended sequential*
+  hit, not a fresh-process boot. If the server was already serving, it
+  reflects single-shot latency, not JIT/cache cold-start. (True
+  cold-process TTFB — boot then immediately hit — is a queued
+  enhancement; `parity_cold_start` covers the in-process load time.)
+
+### First measured numbers (scaffold app, release, 16-core machine)
+
+Fresh `albedo init` app (5-component starter), `albedo serve
+--release`, `GET /` (a 28.8 KB SSR shell). The number depends entirely
+on **what you include around the render** — connection model and
+concurrency — so report the layer, not a single figure:
+
+| Layer | Mode | TTFB p50 | TTFB p99 |
+|---|---|--:|--:|
+| In-process kernel (no socket) | action dispatch, Criterion | **~13.6 µs** | — |
+| Wire, uncontended, conn reused | keep-alive, concurrency 1 | **0.07 ms** (70 µs) | 0.17 ms |
+| Wire, uncontended, new conn/req | close, concurrency 1 | 0.36 ms | 0.54 ms |
+| Wire, steady-state, conn reused | keep-alive, concurrency 8 | 0.13 ms | 0.30 ms |
+| Wire, saturated (16 cores), reused | keep-alive, concurrency 16 | 0.23 ms | 0.53 ms |
+| Wire, new conn/req + 2× oversubscribed | close, concurrency 32 | 2.02 ms | 2.64 ms |
+
+Reading this table:
+- The **render+serve cost** is ~**70 µs** over loopback (keep-alive,
+  uncontended) — the truest "what does ALBEDO add" number.
+- A fresh **TCP connect per request** adds ~0.3 ms (the 0.07 → 0.36
+  jump). That's OS/loopback cost, identical for any framework.
+- **Oversubscription** (32 client threads + server on 16 cores) is what
+  produces the headline 2 ms — it's the load generator competing with
+  the server for cores, not render time. Per-request latency stays
+  sub-millisecond right up to core saturation when connections are
+  reused.
+
+Compare against `next start` on the same hardware with your own run of
+an equivalent tool, **at the same connection model and concurrency**.
+
+**Not yet measured here:** POST `/_albedo/action` latency over the wire
+(the harness supports POST bodies, but the driver doesn't yet
+construct a valid bincode `ActionEnvelope` — that's the next slice;
+`parity_action_roundtrip` covers the in-process dispatch cost today).
+
 ## Refresh cadence for the README perf table
 
 The numbers in the main README's "Performance" section were
