@@ -1,288 +1,147 @@
-<div align="center">
+# AlB'DO
 
-<br />
+A JSX/TSX render compiler and HTTP server, written in Rust. You write
+React-shaped components; AlB'DO compiles and serves them as one binary,
+with no Node.js in the request path.
 
-```
- █████╗ ██╗██████╗ ██████╗  ██████╗
-██╔══██╗██║██╔══██╗██╔══██╗██╔═══██╗
-███████║██║██████╔╝██║  ██║██║   ██║
-██╔══██║██║██╔══██╗██║  ██║██║   ██║
-██║  ██║██║██████╔╝██████╔╝╚██████╔╝
-╚═╝  ╚═╝╚═╝╚═════╝ ╚═════╝  ╚═════╝
-```
-
-**A Rust-native DOM render compiler and HTTP runtime for JSX/TSX.**  
-Zero Node.js in the hot path. Zero compromise on speed.
-
-<br />
-
-![Version](https://img.shields.io/badge/version-0.1.0--pre-e8a020?style=flat-square&labelColor=1a1a1a)
-![Built with Rust](https://img.shields.io/badge/built_with-Rust-ce422b?style=flat-square&labelColor=1a1a1a&logo=rust&logoColor=white)
-![License](https://img.shields.io/badge/license-MIT-f5c842?style=flat-square&labelColor=1a1a1a)
-![Crate](https://img.shields.io/badge/crate-dom--render--compiler-3da35d?style=flat-square&labelColor=1a1a1a)
-![Runtime](https://img.shields.io/badge/runtime-axum_0.8_+_tokio-2677cc?style=flat-square&labelColor=1a1a1a)
-![Parser](https://img.shields.io/badge/JSX%2FTSX-SWC--powered-0d9488?style=flat-square&labelColor=1a1a1a)
-![Status](https://img.shields.io/badge/status-pre--release-6b7280?style=flat-square&labelColor=1a1a1a)
-
-<br />
-
-</div>
+It is a work in progress — a prototype I'm building in the open, not a
+finished framework. The pieces below work today; the APIs will still
+move.
 
 ---
 
-## Why AlBDO
+## What works right now
 
-AlBDO is not a meta-framework bolted on top of an existing runtime. It is a **compiler and HTTP runtime built ground-up in Rust** — the bundler, the scheduler, the server, and the CLI are a single unified binary. No Node.js ever touches a live request.
+- `.tsx`/`.jsx` components parsed with SWC and rendered to HTML.
+- File-based routing with nested `layout.tsx` composition.
+- `useState` / `useEffect` / `useRef` / `useMemo` islands that hydrate
+  in the browser.
+- Server `action()` handlers and SSR run under an embedded JS engine
+  (QuickJS), so real JS — loops, `try`, array methods — works, and a
+  broken construct fails loudly instead of rendering null.
+- npm dependencies bundled in-tree for SSR + actions (tested against
+  `zod` and `date-fns`).
+- Global CSS and CSS modules, `<title>`/meta, and a dev server with
+  hot reload over SSE.
+- A "binding mode" path: for many stateful components the compiler ships
+  a few hundred bytes of bindings instead of hydrating the whole
+  component, and a click updates the bound node locally with no network
+  round-trip.
 
-| | AlBDO | Next.js | Remix |
-|---|---|---|---|
-| **Language** | Rust | JavaScript | JavaScript |
-| **Node.js in hot path** | None | Always | Always |
-| **Hydration strategy** | Compiler-inferred (A/B/C) | Manual hints | Manual hints |
-| **Cached response time** | ~0.07ms | ~2–8ms | ~3–10ms |
-| **Deploy artifact** | Single binary | Node process + assets | Node process + assets |
-| **HMR** | SSE + AST patch cache | Webpack / Turbopack | Vite |
+## What isn't done
 
----
-
-## Effect Lattice — Hydration Tiers
-
-AlBDO's compiler analyses every component's effect profile at build time and classifies it into one of three hydration tiers. No runtime detection. No configuration needed.
-
-```
-EffectProfile { hooks, async, io, side_effects }
-        │
-        ▼
-┌─────────────────────────────────────────────────────────┐
-│  Tier A  │  No hooks · no async · no side effects       │
-│          │  → Ships pure HTML. Zero bytes of client JS. │
-├─────────────────────────────────────────────────────────┤
-│  Tier B  │  Light interactivity, event handlers         │
-│          │  → Only the island hydrates on the client.   │
-├─────────────────────────────────────────────────────────┤
-│  Tier C  │  Full hook surface, async I/O, side effects  │
-│          │  → Full client hydration, compiler-decided.  │
-└─────────────────────────────────────────────────────────┘
-```
-
-> **v0.1.1** will print tier decisions in the terminal during `albedo dev` and `albedo build`.
-
-```
-  App          → Tier A  (zero JS)
-  Header       → Tier A  (zero JS)
-  HeroImage    → Tier A  (zero JS)
-  Button       → Tier B  (selective hydration)
-  Navigation   → Tier B  (selective hydration)
-  FeatureCard  → Tier C  (full hydration)
-```
+- No production-ready guarantees. Expect rough edges and breaking
+  changes.
+- Only the Windows binary is built today; other platforms compile but
+  aren't packaged yet.
+- Parts of the reactivity coverage (conditionals, keyed lists),
+  `useContext`, dynamic metadata, and the columnar wire format are
+  still in progress.
+- No published head-to-head benchmark against other frameworks. The
+  numbers below are AlB'DO measured on one machine; reproduce them and
+  compare against your own setup.
 
 ---
 
-## Quick Start
+## Try it
 
 ```sh
-# Install — npm shell package, platform binary auto-selected
-npm install -g albedo
-
-# Scaffold a new project (generates _albedo_guide.tsx with Tier A/B/C examples)
 albedo init my-app
 cd my-app
-
-# Start dev server with HMR over SSE
-albedo dev
-
-# Production build → single deployable binary
-albedo build
+albedo dev        # dev server + hot reload
+albedo build      # production build
+albedo serve      # build, then serve it
 ```
 
 ---
 
-### Runtime kernel
+## How rendering is decided
 
-| Component | Role |
-|---|---|
-| `SentinelRing` | Request watchdog and backpressure gate |
-| `OvertakeZoneScheduler` | Preemptive task scheduler |
-| `PiArchKernel` | Lagrange-scored 4-lane render kernel |
-| `WebTransportMuxer` | 4-stream HTTP/3 mux (bidirectional) |
-
-### Key source files
+The compiler reads each component's effects at build time and picks how
+much, if any, client JavaScript it needs. There's nothing to configure.
 
 ```
-dom-render-compiler/
-├── src/
-│   ├── lib.rs               # RenderCompiler facade
-│   ├── types.rs             # Tier, HydrationMode, shared types
-│   ├── effects.rs           # EffectProfile + lattice inference
-│   ├── ir.rs                # CanonicalIrDocument
-│   ├── graph.rs             # ComponentGraph (DashMap)
-│   ├── parser.rs            # SWC JSX/TSX parser + effect pass
-│   ├── manifest/schema.rs   # RenderManifestV2
-│   ├── bundler/             # Classify → Plan → Rewrite → Emit
-│   └── runtime/             # engine, scheduler, pi_arch, webtransport
-├── crates/
-│   ├── albedo-node/         # NAPI bindings (cross-platform)
-│   └── albedo-server/       # axum 0.8 + tokio HTTP runtime
-└── bin/
-    ├── albedo.rs            # CLI: init / dev / build + HMR over SSE
-    ├── dom-compiler.rs
-    └── albedo-bench.rs
+Tier A   no hooks, no async, no side effects   →  plain HTML, zero JS
+Tier B   event handlers, light interactivity   →  only that island ships JS
+Tier C   full hooks / async / side effects     →  full client hydration
 ```
+
+On top of that, the "binding mode" path can take a stateful component
+and ship just the state bindings — the server-rendered DOM stays put,
+and the handler runs in the browser against those bindings. No VDOM, no
+re-render, no request.
 
 ---
 
-## Performance
+## Measured numbers
 
-Phase P · Stream G ships four reproducible Criterion benches under
-[`benches/parity_*.rs`](./benches/) measuring the framework cost of
-the framework's hot paths. Methodology + how to reproduce:
+One 16-core machine, release build. Reproduce with the commands in
 [`benchmarks/parity/README.md`](./benchmarks/parity/README.md).
 
-| Metric | ALBEDO | Reference (Next.js / React 18) | Ratio |
-|---|---|---|---|
-| **FCP shell bytes** (per route, mean across 10) | **~315 B** | 80–150 KB (first HTML + framework runtime) | ~250–475× smaller |
-| **Hydration bytes** (counter island: wrapper + opcodes) | **~283 B** | 42–48 KB gzipped (React island) | ~150× smaller |
-| **Action round-trip** (in-process, full wire) | **~8 µs** | 1–5 ms (Server Actions warm path) | ~125–625× faster |
-| **Cold start** (`CompiledProject::load_from_dir`, small project) | **~1.12 ms** | 1–3 s (`next start`, equivalent route set) | ~1000–3000× faster |
+**Request latency** — a `GET /` SSR shell (28.8 KB, the scaffold's
+starter page), served over the wire:
 
-> Numbers reproduced locally via `cargo bench --bench parity_*`.
-> Reference figures come from published Next.js / React baselines; we
-> measure ALBEDO and frame the comparison honestly, never asking the
-> reader to take a marketing claim on trust. Re-run the benches when
-> the relevant code paths change — see the methodology doc for the
-> refresh cadence.
+| Connection model | Concurrency | TTFB p50 | TTFB p99 |
+|---|---|--:|--:|
+| keep-alive, uncontended | 1 | 0.07 ms (70 µs) | 0.17 ms |
+| keep-alive, steady | 8 | 0.13 ms | 0.30 ms |
+| keep-alive, all cores | 16 | 0.23 ms | 0.53 ms |
+| new connection per request | 1 | 0.36 ms | 0.54 ms |
+
+Render and serve costs about **70 µs** over loopback when a connection
+is reused. A fresh TCP connect per request adds ~0.3 ms (that's OS
+cost, the same for anything). Per-request latency stays under a
+millisecond up to core saturation.
+
+**In-process cost** (no socket, Criterion):
+
+| What | Time / size |
+|---|--:|
+| Server action dispatch (decode → run → encode) | ~13.6 µs |
+| Static (Tier A) route — framework shell, no client JS | ~315 B |
+| One interactive island (handler wrapper + bindings) | ~250–400 B |
+
+(The 28.8 KB shell above is mostly the starter's own CSS; the framework
+itself adds the ~315 B.)
+
+These are loopback and micro-benchmarks, not a full load test. They say
+what AlB'DO's own overhead is — they don't simulate your network or
+your database.
+
+---
+
+## Where it's headed
+
+Roughly in order, while it's still under development:
+
+1. **Honest perf, finished** — over-the-wire action latency, cold
+   process start, and clean-vs-incremental build timing, alongside the
+   request numbers above.
+2. **Wider reactivity** — conditionals and keyed lists in binding mode,
+   `useContext`, dynamic metadata.
+3. **A real app, ported** — take an existing React/Next app across to
+   AlB'DO and write up the friction honestly.
+4. **Distribution** — cross-platform binaries so `albedo` installs and
+   runs anywhere, not just Windows.
+
+---
+
+## Layout
 
 ```
-Cached response time   ~0.07ms   (categorically faster than JS-based frameworks)
-Node.js processes      0         (none — ever)
-Deploy artifact        1 binary  (scp it anywhere)
+src/
+  effects.rs          effect analysis → tier decision
+  parser.rs           SWC JSX/TSX parser
+  manifest/           build manifest + shell composition
+  bundler/            classify → plan → rewrite → emit
+  runtime/            render kernel, scheduler, QuickJS engine
+  dev/serve_bench.rs  serve-time latency harness
+crates/
+  albedo-server/      axum + tokio HTTP runtime, the `albedo` binary
+  albedo-node/        cross-platform bindings
 ```
 
 ---
 
-## Features
-
-- **SWC-powered JSX/TSX parser** with full effect inference — template literals, ternary/binary/unary, `const` bindings, `Array.map()`, `classnames`/`clsx` (native, no npm), object/array literals, and string prototype methods
-- **AST patch cache** — `source_hashes` + `patch()` + `PatchReport` for incremental re-parse on HMR
-- **Deterministic cache invalidation** via FNV-1a hashing (not `DefaultHasher`)
-- **3-phase mutex pattern** to unblock concurrent HTTP requests during render
-- **Multi-route support** — `albedo.config.json` `routes` map, single `load_from_dir` scan, per-route `SharedDevState`
-- **Radix router** with middleware, layout, and streaming in `crates/albedo-server`
-- **`albedo init`** generates `_albedo_guide.tsx` — a self-documenting starter with inline Tier A/B/C examples
-
----
-
-## Roadmap — v0.1.1
-
-> Edge-native release. Focus: HTTP/3 streaming, single-binary distribution, and zero-config asset pipeline.
-
-### WebTransport-native streaming
-
-Bidirectional component streaming over HTTP/3 via the `WebTransportMuxer` 4-stream kernel. True full-duplex server push — no polling, no WebSocket fallback.
-
-**Status:** `pre-release hardening complete`
-
-Ship checklist:
-- `WTStreamRouter` stream-slot assignment + per-component patch sequencing
-- HTTP transport negotiation with silent SSE fallback
-- WT bootstrap emission only for Tier B/C routes
-- WT capability endpoint at `/_albedo/wt`
-- Session bridge: route renders can be pushed onto WT stream slots 0/1/2/3
-- Dev observability: per-client transport logs + stream assignment traces
-
----
-
-### Single-binary edge compilation
-
-Deploy your entire application as one `scp`-able binary. Full cross-platform NAPI build matrix via GitHub Actions:
-
-| Target | Status |
-|---|---|
-| `win32-x64-msvc` | Available |
-| `darwin-x64` | In progress |
-| `darwin-arm64` | In progress |
-| `linux-x64-gnu` | Planned |
-| `linux-arm64-gnu` | Planned |
-
-**Status:** `in progress`
-
----
-
-### Zero-config image & font pipeline
-
-Automatic asset optimization baked into the compiler pass — no config files, no plugins, no Webpack. Images emit optimal formats (AVIF/WebP) and fonts are subset at build time. Zero runtime overhead.
-
-**Status:** `planned`
-
----
-
-### Compile-time i18n
-
-Translated pages resolved entirely at compile time. The compiler emits a separate static bundle per locale — zero runtime i18n library, zero locale-detection overhead in the hot path.
-
-**Status:** `planned`
-
----
-
-### Tier feedback in terminal
-
-Effect lattice decisions (Tier A / B / C per component) are already computed at compile time. v0.1.1 surfaces them as structured output during `albedo dev` and `albedo build` so developers can see exactly what the compiler decided and why.
-
-**Status:** `planned`
-
----
-
-## Distribution
-
-AlBDO follows the **esbuild/Turbo npm distribution model**:
-
-```
-albedo               ← shell package (detects platform, delegates)
-├── albedo-win32-x64-msvc
-├── albedo-darwin-x64
-├── albedo-darwin-arm64
-├── albedo-linux-x64-gnu
-└── albedo-linux-arm64-gnu
-```
-
-Homebrew tap and a `curl | sh` installer backed by GitHub Releases are also planned for v0.1.1.
-
----
-
-## Contributing
-
-AlBDO is pre-release and developed in the open. The codebase is structured for independent contribution:
-
-- **`albedo-core`** — compiler IR, effect lattice, graph, parser
-- **`albedo-analyzer`** — bundle planning, manifest generation, rewrite passes
-
-GSoC submissions are planned for both crates as independent projects.
-
-| Resource | Link |
-|----------|------|
-| GSoC proposal — `albedo-analyzer` | *(link TBD)* |
-| GSoC proposal — `albedo-core` | *(link TBD)* |
-| Landing page | [albedo.dev](https://albedo.dev) |
-| Architecture deep-dive | [`docs/architecture.md`](docs/architecture.md) |
-
----
-
-## Compatibility
-
-| OS | Node version | NAPI target | Status |
-|----|-------------|-------------|--------|
-| Windows x64 | 18 / 20 / 22 | `win32-x64-msvc` | Available |
-| macOS x64 | 18 / 20 / 22 | `darwin-x64` | In progress |
-| macOS ARM64 | 18 / 20 / 22 | `darwin-arm64` | In progress |
-| Linux x64 | 18 / 20 / 22 | `linux-x64-gnu` | Planned |
-| Linux ARM64 | 18 / 20 / 22 | `linux-arm64-gnu` | Planned |
-
----
-
-<div align="center">
-
-Built by [Sen-Bishal](https://github.com/Sen-Bishal) and [PixMusicaX](https://github.com/PixMusicaX)
-
-[github.com/AlBDO](https://github.com/AlBDO) · MIT License
-
-</div>
+Built by [Sen-Bishal](https://github.com/Sen-Bishal) and
+[PixMusicaX](https://github.com/PixMusicaX). MIT License.
