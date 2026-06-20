@@ -132,6 +132,15 @@ to install — so it reproduces with nothing but `cargo` and adds minimal
 scheduling noise of its own. It points at a server you already booted;
 spawning is the operator's job (so the binary stays `--release`).
 
+The harness has four modes:
+
+| Mode | Flag | What it measures |
+|---|---|---|
+| Serve latency | `--serve <url>` | GET shell **and** POST `action()` TTFB/total p50/p90/p99 over the wire |
+| Cold process start | `--cold-start` | Spawn the server → boot-to-ready → **first** (truly cold) HTTP hit, over N boots |
+| Build time | `--build-bench` | `albedo build` clean (artifacts wiped) vs warm re-run wall clock |
+| Build-time workloads | *(default)* | The in-process scan/optimize benches (`benchmarks/workloads.json`) |
+
 ### Reproduce
 
 ```bash
@@ -142,11 +151,39 @@ cd my-app && ../target/release/albedo serve --port 3000 &
 
 # 2. Build + run the harness (also release).
 cargo build --release -p dom-render-compiler --bin albedo-bench
+
+# GET shells + a POST action() round-trip, in one run.
 ./target/release/albedo-bench \
     --serve http://127.0.0.1:3000 \
     --path / --path /chat \
-    --warmup 100 --samples 2000 --concurrency 32 \
+    --action bump_counter --event-kind submit \
+    --warmup 200 --samples 3000 --concurrency 1 --keep-alive \
     --markdown --output target/benchmarks/serve.json
+```
+
+`--action <NAME>` FNV-1a-32-hashes the name to the wire `action_id`
+(the same hash the compiler + server use), builds a valid bincode
+`ActionEnvelope`, and POSTs it to `/_albedo/action`. `--event-kind`
+(`click`/`input`/`submit`/`other`), `--action-payload`, and
+`--action-id` (raw id override) tune the envelope; the same per-endpoint
+percentile machinery and the <100%-2xx guard apply, so an unregistered
+action (404) fails the run loudly instead of reporting a bogus latency.
+
+**Cold process start** (true boot-to-first-hit, not just the first
+uncontended hit) and **build-time clean-vs-incremental**:
+
+```bash
+# Cold start: 10 full spawn → ready → first-hit → kill cycles.
+./target/release/albedo-bench --cold-start \
+    --url http://127.0.0.1:3000 \
+    --exec ./target/release/albedo --exec-arg serve --exec-arg --port --exec-arg 3000 \
+    --cwd my-app --path /chat --iterations 10 --settle-ms 600 --markdown
+
+# Build time: clean (wipe .albedo) vs warm re-run.
+./target/release/albedo-bench --build-bench \
+    --exec ./target/release/albedo --exec-arg build \
+    --cwd my-app --artifact my-app/.albedo \
+    --clean-samples 5 --incremental-samples 8 --markdown
 ```
 
 It reports, per endpoint: **cold** (first sequential hit after the
@@ -166,11 +203,14 @@ JSON report carries the full distribution.
   are handled identically.
 - **Guard:** any endpoint returning <100% 2xx fails the run loudly —
   a broken route's latency is not citable.
-- **Honest label on "cold":** it's the first *uncontended sequential*
-  hit, not a fresh-process boot. If the server was already serving, it
-  reflects single-shot latency, not JIT/cache cold-start. (True
-  cold-process TTFB — boot then immediately hit — is a queued
-  enhancement; `parity_cold_start` covers the in-process load time.)
+- **Two senses of "cold", both now measured.** In `--serve` mode "cold"
+  is the first *uncontended sequential* hit against an already-running
+  server — single-shot latency, not a fresh boot. For true fresh-process
+  cold start (spawn → bind → first-ever HTTP hit), use `--cold-start`:
+  it spawns the server, polls a bare **TCP connect** for readiness (so
+  the first *HTTP* request is genuinely the first render, not warmed by
+  the readiness probe), times that first hit, kills the process, and
+  repeats over N boots for a real distribution.
 
 ### First measured numbers (scaffold app, release, 16-core machine)
 
@@ -202,10 +242,71 @@ Reading this table:
 Compare against `next start` on the same hardware with your own run of
 an equivalent tool, **at the same connection model and concurrency**.
 
-**Not yet measured here:** POST `/_albedo/action` latency over the wire
-(the harness supports POST bodies, but the driver doesn't yet
-construct a valid bincode `ActionEnvelope` — that's the next slice;
-`parity_action_roundtrip` covers the in-process dispatch cost today).
+### Action round-trip, over the wire (measured)
+
+The same harness now POSTs a real bincode `ActionEnvelope` to
+`/_albedo/action` and measures the full server round-trip: envelope
+decode → handler dispatch → slot drain → `OpcodeFrame` encode → wire.
+Measured against the dogfood portfolio app's `bump_counter` action
+(a `broadcast()` over a shared slot), `albedo serve --release`,
+16-core machine, 3000 samples:
+
+| Layer | Mode | TTFB p50 | TTFB p99 |
+|---|---|--:|--:|
+| GET `/` (shell, same run, reference) | keep-alive, c1 | 0.11 ms | 0.21 ms |
+| **Action POST, uncontended, conn reused** | keep-alive, c1 | **0.24 ms** | 0.43 ms |
+| Action POST, new conn/req | close, c1 | 0.50 ms | 1.21 ms |
+| Action POST, saturated (16 cores) | keep-alive, c16 | 0.45 ms | 1.34 ms |
+
+Reading this:
+- A full `action()` round-trip costs ~**0.24 ms** (240 µs) over loopback,
+  uncontended — roughly **0.13 ms more than a GET shell** on the same
+  run. That delta *is* the dispatch + broadcast + opcode-encode cost on
+  the wire; the in-process slice of it is the ~13.6 µs
+  `parity_action_roundtrip` number (the rest is socket + HTTP framing).
+- Fresh TCP connect per request adds ~0.26 ms (0.24 → 0.50), the same
+  OS/loopback cost any framework pays.
+- Under core saturation latency stays sub-millisecond at p50.
+
+### Cold process start (measured)
+
+`--cold-start`, 10 boots of `albedo serve --release` on the portfolio
+app, first hit on `GET /chat`:
+
+| Metric | p50 | p90 | p99 | min | max |
+|---|--:|--:|--:|--:|--:|
+| boot → ready (spawn → listening) | 500.9 ms | 505.9 ms | 506.5 ms | 488.2 ms | 506.5 ms |
+| first-hit TTFB (truly cold render) | 0.67 ms | 0.74 ms | 0.75 ms | 0.55 ms | 0.75 ms |
+| first-hit total | 0.67 ms | 0.76 ms | 0.76 ms | 0.57 ms | 0.76 ms |
+
+- **boot → ready ~0.5 s** is the whole `albedo serve` startup: it
+  stitches the project and loads the runtime artifacts before binding
+  the port. (Readiness granularity is the poll interval, default 25 ms.)
+  A single Rust process, no Node boot + JIT warm-up — compare `next
+  start` (typically 1–3 s to ready for a comparable app).
+- **first-hit TTFB 0.67 ms** is the genuinely-cold first render: ~6× the
+  steady-state 0.11 ms, the cost of the first cache fill. It decays to
+  the warm number within a handful of requests.
+
+### Build time — clean vs incremental (measured)
+
+`--build-bench`, portfolio app, `albedo build --release`, 5 clean
+(`.albedo` wiped) + 8 warm re-runs:
+
+| Build | p50 | p90 | min | max |
+|---|--:|--:|--:|--:|
+| clean (cold) | 434.2 ms | 512.3 ms | 432.5 ms | 512.3 ms |
+| incremental (warm re-run) | 435.0 ms | 437.4 ms | 431.5 ms | 513.6 ms |
+
+**Honest finding: incremental is 1.0× — i.e. no faster.** The CLI
+`albedo build` is from-scratch on every invocation: the `IncrementalCache`
+in `src/incremental.rs` is wired into the dev-server's in-process watch
+rebuild (HMR), **not** the one-shot CLI build, and cross-process
+demand-driven incremental (Salsa-style) is explicitly deferred to
+Movement IV. So ~**434 ms** is today's clean-build baseline for a
+5-component app; this bench is the yardstick the IV work will be
+measured against, and the 1.0× is the number to beat — not a result to
+hide.
 
 ## Refresh cadence for the README perf table
 

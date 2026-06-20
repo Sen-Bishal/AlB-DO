@@ -1,5 +1,6 @@
 pub mod benchmark;
 pub mod contract;
+pub mod proc_bench;
 pub mod serve_bench;
 pub mod showcase;
 
@@ -10,8 +11,16 @@ pub use benchmark::{
     ScenarioGateReport, ScenarioMetrics,
 };
 pub use serve_bench::{
-    run as run_serve_bench, ColdSample, EndpointResult, LatencyStats, Method, RequestSpec,
-    ServeBenchConfig, ServeBenchError, ServeBenchReport,
+    measure_single, probe_tcp_ready, run as run_serve_bench, ColdSample, EndpointResult,
+    LatencyStats, Method, RequestSpec, ServeBenchConfig, ServeBenchError, ServeBenchReport,
+};
+pub use proc_bench::{
+    run_cold_starts, ColdStartConfig, ColdStartReport, ColdStartSample, ProcBenchError,
+    ProcessSpawner, ServerProcess, Spawner,
+};
+pub use proc_bench::build_bench::{
+    run_build_bench, BuildBenchConfig, BuildBenchError, BuildBenchReport, BuildWorkload,
+    CommandBuildWorkload,
 };
 pub use contract::{
     parse_dev_cli_args, resolve_dev_contract, DevCliOptions, DevConfig, DevHmrConfig,

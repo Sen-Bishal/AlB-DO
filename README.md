@@ -93,6 +93,30 @@ is reused. A fresh TCP connect per request adds ~0.3 ms (that's OS
 cost, the same for anything). Per-request latency stays under a
 millisecond up to core saturation.
 
+**Action round-trip** — a `POST /_albedo/action` (decode the bincode
+envelope → run the handler → encode the opcode-frame response), measured
+over the wire against a real `broadcast()` action:
+
+| Connection model | Concurrency | TTFB p50 | TTFB p99 |
+|---|---|--:|--:|
+| keep-alive, uncontended | 1 | 0.24 ms | 0.43 ms |
+| keep-alive, all cores | 16 | 0.45 ms | 1.34 ms |
+| new connection per request | 1 | 0.50 ms | 1.21 ms |
+
+A full server action costs ~**0.24 ms** uncontended — about 0.13 ms more
+than a GET shell on the same run, which is the dispatch + encode cost on
+the wire (the in-process slice is the ~13.6 µs below).
+
+**Cold process start** — spawn `albedo serve`, wait for the port, time
+the first-ever hit: **~0.5 s** to ready (project stitch + artifact load,
+one Rust process — no Node boot), then a **0.67 ms** first render that
+warms to 0.11 ms within a few requests.
+
+**Build time** — `albedo build` is ~**434 ms** clean for the 5-component
+starter. The CLI build is from-scratch every run today (the incremental
+cache is dev-watch only; cross-process incremental is still ahead), so
+clean and re-run measure 1.0× — the baseline that work will improve on.
+
 **In-process cost** (no socket, Criterion):
 
 | What | Time / size |
@@ -114,14 +138,11 @@ your database.
 
 Roughly in order, while it's still under development:
 
-1. **Honest perf, finished** — over-the-wire action latency, cold
-   process start, and clean-vs-incremental build timing, alongside the
-   request numbers above.
-2. **Wider reactivity** — conditionals and keyed lists in binding mode,
+1. **Wider reactivity** — conditionals and keyed lists in binding mode,
    `useContext`, dynamic metadata.
-3. **A real app, ported** — take an existing React/Next app across to
+2. **A real app, ported** — take an existing React/Next app across to
    AlB'DO and write up the friction honestly.
-4. **Distribution** — cross-platform binaries so `albedo` installs and
+3. **Distribution** — cross-platform binaries so `albedo` installs and
    runs anywhere, not just Windows.
 
 ---

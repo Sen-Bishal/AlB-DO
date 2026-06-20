@@ -49,7 +49,7 @@ pub enum Method {
 }
 
 impl Method {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Method::Get => "GET",
             Method::Post => "POST",
@@ -163,7 +163,7 @@ impl LatencyStats {
     /// Compute stats from raw millisecond samples. Empty input yields a
     /// zeroed summary (count 0) rather than panicking — a request that
     /// never succeeded shows up as count 0 in the report, not a crash.
-    fn from_millis(mut samples: Vec<f64>) -> Self {
+    pub fn from_millis(mut samples: Vec<f64>) -> Self {
         if samples.is_empty() {
             return Self {
                 count: 0,
@@ -543,10 +543,15 @@ fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
 }
 
 /// Pull the numeric status out of `HTTP/1.1 200 OK\r\n...`. Returns
-/// `None` until enough bytes have arrived to parse it.
+/// `None` until the full status line has arrived.
+///
+/// Decodes ONLY the bytes up to the first `\r\n`, not the whole buffer:
+/// a binary response body (e.g. the bincode `OpcodeFrame` an `action()`
+/// returns) is not valid UTF-8, so decoding the accumulated header+body
+/// as a string would fail and report status 0 for a perfectly good 200.
 fn parse_status_line(bytes: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let line = text.split("\r\n").next()?;
+    let line_end = bytes.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(&bytes[..line_end]).ok()?;
     let mut parts = line.split(' ');
     let _http = parts.next()?;
     let code = parts.next()?;
@@ -587,6 +592,66 @@ pub fn run(config: &ServeBenchConfig) -> std::result::Result<ServeBenchReport, S
         keep_alive: config.keep_alive,
         endpoints,
     })
+}
+
+/// Issue exactly one request over a fresh connection and return its
+/// cold-sample measurement. Used by the process-lifecycle harness
+/// ([`crate::dev::proc_bench`]) to time the very first hit after a
+/// boot — the truly-cold render, before any warmup touches caches.
+pub fn measure_single(
+    base_url: &str,
+    spec: &RequestSpec,
+    timeout: Duration,
+) -> std::result::Result<ColdSample, ServeBenchError> {
+    let (addr, host_header) = resolve(base_url)?;
+    let (status, ttfb, total, bytes) =
+        do_request(addr, &host_header, spec, timeout).map_err(|source| {
+            ServeBenchError::Unreachable {
+                url: base_url.to_string(),
+                source,
+            }
+        })?;
+    Ok(ColdSample {
+        status,
+        ttfb_ms: dur_ms(ttfb),
+        total_ms: dur_ms(total),
+        bytes,
+    })
+}
+
+/// Poll a TCP connect against `base_url` until it succeeds, returning
+/// the elapsed time from first attempt to first successful connect.
+///
+/// Readiness is deliberately a bare TCP accept, NOT an HTTP request:
+/// that way the first *HTTP* request the caller then issues is still
+/// genuinely cold (first render, first cache fill). A successful connect
+/// means the server's listener is bound and accepting — for `albedo
+/// serve` that's the readiness signal, since it binds only once the
+/// runtime is loaded.
+pub fn probe_tcp_ready(
+    base_url: &str,
+    ready_timeout: Duration,
+    poll_interval: Duration,
+) -> std::result::Result<Duration, ServeBenchError> {
+    let (addr, _host) = resolve(base_url)?;
+    let started = Instant::now();
+    // Per-attempt connect timeout is bounded so a hung SYN doesn't blow
+    // the whole readiness budget on one attempt.
+    let attempt_timeout = poll_interval.min(Duration::from_millis(250)).max(Duration::from_millis(20));
+    loop {
+        match TcpStream::connect_timeout(&addr, attempt_timeout) {
+            Ok(_) => return Ok(started.elapsed()),
+            Err(source) => {
+                if started.elapsed() >= ready_timeout {
+                    return Err(ServeBenchError::Unreachable {
+                        url: base_url.to_string(),
+                        source,
+                    });
+                }
+                std::thread::sleep(poll_interval);
+            }
+        }
+    }
 }
 
 fn bench_endpoint(
@@ -879,6 +944,95 @@ mod tests {
         assert!(report.to_markdown().contains("keep-alive"));
     }
 
+    /// Action stub: reads the full request (head + `Content-Length`
+    /// body), attempts to decode the body as an `ActionEnvelope`, and
+    /// replies 200 only when it decodes cleanly (400 otherwise). This
+    /// lets a test assert the harness actually delivered a valid
+    /// envelope over the wire, not just that it constructed one.
+    fn spawn_action_stub() -> u16 {
+        use crate::ir::action::decode_action_envelope;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind action stub");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut acc = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    // Read until we have headers + the declared body.
+                    let (head_end, content_length) = loop {
+                        if let Some(he) = acc
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4)
+                        {
+                            let (_s, cl, _ch) = parse_head(&acc[..he]);
+                            break (he, cl.unwrap_or(0));
+                        }
+                        let n = match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        acc.extend_from_slice(&chunk[..n]);
+                    };
+                    while acc.len() < head_end + content_length {
+                        let n = match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        acc.extend_from_slice(&chunk[..n]);
+                    }
+                    let body = &acc[head_end..(head_end + content_length).min(acc.len())];
+                    let status_line = match decode_action_envelope(body) {
+                        Ok(_) => "HTTP/1.1 200 OK",
+                        Err(_) => "HTTP/1.1 400 Bad Request",
+                    };
+                    let resp = format!(
+                        "{status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn post_action_body_arrives_as_decodable_envelope() {
+        use crate::ir::action::{encode_action_envelope, ActionEnvelope};
+        let port = spawn_action_stub();
+        let body = encode_action_envelope(&ActionEnvelope {
+            action_id: 0xABCD,
+            event_kind: 2,
+            payload: b"{\"_csrf\":\"x\"}".to_vec(),
+        })
+        .unwrap();
+
+        let config = ServeBenchConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            warmup: 2,
+            samples: 6,
+            concurrency: 2,
+            timeout: Duration::from_secs(2),
+            keep_alive: false,
+            requests: vec![RequestSpec::post(
+                "submit",
+                "/_albedo/action",
+                body,
+                "application/octet-stream",
+            )],
+        };
+
+        let report = run(&config).expect("action bench runs");
+        let ep = &report.endpoints[0];
+        // The stub only answers 200 when the body decoded as an
+        // envelope — a 100% ok ratio proves the wire delivery.
+        assert_eq!(ep.method, Method::Post);
+        assert_eq!(ep.cold.status, 200, "stub decoded the cold envelope");
+        assert_eq!(ep.ok_ratio, 1.0, "every warm POST delivered a valid envelope");
+    }
+
     #[test]
     fn chunked_body_end_finds_terminator() {
         // Two data chunks ("Wiki" + "pedia") then the 0-terminator.
@@ -907,6 +1061,19 @@ mod tests {
         assert_eq!(status, 503);
         assert_eq!(cl, None);
         assert!(chunked);
+    }
+
+    #[test]
+    fn parse_status_line_tolerates_binary_body() {
+        // A 200 status line followed by a non-UTF-8 body (an action's
+        // bincode OpcodeFrame). Decoding the whole buffer as a string
+        // would fail; we must still read the 200 from the status line.
+        let mut bytes = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+        bytes.extend_from_slice(&[0xff, 0x00, 0xfe, 0x80, 0x01]); // invalid UTF-8
+        assert_eq!(parse_status_line(&bytes), Some(200));
+
+        // No CRLF yet → not enough bytes, returns None (keep reading).
+        assert_eq!(parse_status_line(b"HTTP/1.1 200 O"), None);
     }
 
     #[test]
