@@ -116,7 +116,11 @@
     for (var d = 0; d < derived.length; d++) {
       var dv = derived[d];
       var synthId = 'd' + d;
-      if (dv.attr) {
+      if (dv.html) {
+        // Conditionals rung: the recomputed value is raw branch HTML applied as
+        // innerHTML to a `display:contents` wrapper (toggling a static subtree).
+        vm.applyInstruction({ op: 'SetHtmlRef', stableId: dv.stableId, slotId: synthId });
+      } else if (dv.attr) {
         vm.applyInstruction({ op: 'SetAttrRef', stableId: dv.stableId, attr: dv.attr, slotId: synthId });
       } else {
         vm.applyInstruction({ op: 'SetTextRef', stableId: dv.stableId, slotId: synthId });
@@ -244,6 +248,9 @@
         case 'SetAttrRef':
           (vm.slots[op.slotId] || (vm.slots[op.slotId] = [])).push({ kind: 'attr', stableId: op.stableId, attr: op.attr });
           return;
+        case 'SetHtmlRef':
+          (vm.slots[op.slotId] || (vm.slots[op.slotId] = [])).push({ kind: 'html', stableId: op.stableId });
+          return;
         case 'BindEvent':
           var bindEl = vm.nodes[op.stableId];
           var name = vm.events[op.eventId];
@@ -261,6 +268,11 @@
             if (!node) continue;
             if (sites[s].kind === 'attr') {
               if (node.setAttribute) node.setAttribute(sites[s].attr, text);
+            } else if (sites[s].kind === 'html') {
+              // Conditional subtree toggle: swap the wrapper's children for the
+              // pre-rendered branch HTML. `text` is trusted server-rendered
+              // markup (the branch HTML the compiler emitted), not user input.
+              node.innerHTML = text;
             } else if (node.firstChild && node.firstChild.nodeType === 3) {
               // In-place text patch — keep the same server-rendered node.
               node.firstChild.nodeValue = text;

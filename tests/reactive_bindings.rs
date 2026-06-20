@@ -476,3 +476,146 @@ fn usememo_local_resolves_to_a_derived_binding() {
     assert_eq!(value["after2"]["dbl"], "6");
     assert_eq!(value["network"], 0);
 }
+
+// Conditionals rung: `{open && <p className="panel">…}` gates a STATIC subtree
+// on a boolean slot. The compiler renders it as a `display:contents` wrapper
+// whose innerHTML the client toggles between the branch HTML and empty when the
+// button flips `open`. Exercises the real driver makeVm (the production
+// SetHtmlRef → innerHTML path), with zero network.
+const CONDITIONAL_SCENARIO: &str = r#"
+var payload = globalThis.__PAYLOAD;
+var btnId = payload.events[0].stableId;
+var cond = payload.derived[0];          // the html:true conditional binding
+var wrapId = cond.stableId;
+
+var body = document.createElement('div');
+var button = document.createElement('button');
+button.setAttribute('data-albedo-id', String(btnId));
+button.appendChild(document.createTextNode('toggle'));
+var wrapper = document.createElement('span');
+wrapper.setAttribute('data-albedo-id', String(wrapId));
+wrapper.innerHTML = '';                 // SSR: open=false → nothing inside
+body.appendChild(button);
+body.appendChild(wrapper);
+globalThis.__wrap = wrapper;
+
+var vm = globalThis.__albedoReactive.makeVm(document);
+globalThis.__albedoReactive.installReactiveRuntime({ vm: vm, payload: payload, root: body });
+
+var afterInstall = wrapper.innerHTML;   // "" — install paints the falsy branch
+button.__dispatch('click');             // open -> true
+var afterOpen = wrapper.innerHTML;      // the <p class="panel"> branch HTML
+button.__dispatch('click');             // open -> false
+var afterClose = wrapper.innerHTML;     // "" again
+
+JSON.stringify({
+  isHtml: cond.html === true,
+  afterInstall: afterInstall,
+  afterOpen: afterOpen,
+  afterClose: afterClose,
+  sameNode: body.childNodes[1] === globalThis.__wrap,
+  network: globalThis.__net,
+});
+"#;
+
+#[test]
+fn conditional_subtree_toggles_via_innerhtml_with_zero_network() {
+    let project = CompiledProject::load_from_dir(hook_fixture("conditional"))
+        .expect("conditional fixture compiles");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store);
+
+    let payload = project
+        .build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots)
+        .expect("reactive payload builds");
+
+    // The conditional lowers to exactly one derived binding marked `html`,
+    // depending on `open`'s slot, plus the toggle handler. No text/attr binding
+    // (the subtree is static), so this is purely the structural rung.
+    assert!(payload.texts.is_empty(), "no bare text reads in this component");
+    assert!(payload.attrs.is_empty(), "no attribute slot reads either");
+    assert_eq!(payload.derived.len(), 1, "one conditional binding");
+    assert!(
+        payload.derived[0].html,
+        "the conditional binding must be flagged html (innerHTML toggle)"
+    );
+    assert_eq!(payload.events.len(), 1, "one onClick toggle");
+    // The SSR HTML carries the display:contents wrapper so the client has a
+    // stable anchor to toggle.
+    assert!(
+        payload.html.contains("display:contents"),
+        "served HTML must wrap the conditional in a display:contents span; got: {}",
+        payload.html
+    );
+
+    let payload_json = serde_json::to_string(&payload).expect("payload serializes");
+
+    let runtime = Runtime::new().expect("quickjs runtime");
+    let context = Context::full(&runtime).expect("quickjs context");
+
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_AND_VM)
+            .expect("DOM + VM shim evaluates");
+        ctx.eval::<(), _>(REACTIVE_DRIVER)
+            .expect("reactive driver evaluates");
+        let bootstrap = format!("globalThis.__PAYLOAD = {payload_json};");
+        ctx.eval::<(), _>(bootstrap.as_str())
+            .expect("payload injects");
+        ctx.eval::<String, _>(CONDITIONAL_SCENARIO)
+            .expect("conditional scenario evaluates")
+    });
+
+    let value: Value = serde_json::from_str(&summary).expect("scenario summary is JSON");
+
+    assert_eq!(value["isHtml"], true, "binding marked as html");
+    assert_eq!(value["afterInstall"], "", "falsy branch shows nothing on install");
+    // Flipping `open` true recomputes the conditional and swaps in the branch.
+    let opened = value["afterOpen"].as_str().unwrap_or_default();
+    assert!(
+        opened.contains("Now you see me") && opened.contains("panel"),
+        "opening must inject the static branch HTML; got: {opened}"
+    );
+    // Flipping back hides it again — fine-grained, same wrapper node.
+    assert_eq!(value["afterClose"], "", "closing removes the subtree again");
+    assert_eq!(value["sameNode"], true, "toggle reuses the same wrapper element");
+    assert_eq!(value["network"], 0, "conditional toggle must not round-trip");
+}
+
+#[test]
+fn dynamic_conditional_branch_falls_back_to_island() {
+    // A slot-reactive conditional whose branch reads state (`{open && <p>{count}</p>}`)
+    // is NOT representable fine-grained — the appearing subtree carries its own
+    // bindings. The renderer flags a structural fallback and the payload build
+    // errors, so `build_reactive_blocks` skips it and the route keeps its
+    // correct A3 whole-component island. Proving the deliberate fallback is the
+    // safety guarantee: binding mode never ships a stale conditional.
+    let project = CompiledProject::load_from_dir(hook_fixture("conditional_dynamic"))
+        .expect("conditional_dynamic fixture compiles");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store);
+
+    let result = project.build_reactive_payload(
+        "Component.tsx",
+        &Value::Object(Default::default()),
+        &slots,
+    );
+    assert!(
+        result.is_err(),
+        "a state-reading conditional branch must force the A3 fallback, not ship a binding payload"
+    );
+
+    // The fallback flag must be cleared by the time the build returns, so the
+    // NEXT (eligible) component on the same thread isn't poisoned into a false
+    // fallback.
+    let next = CompiledProject::load_from_dir(hook_fixture("conditional"))
+        .expect("conditional fixture compiles");
+    let store2 = Arc::new(SlotStore::new());
+    let slots2 = SessionSlotView::new(SessionId::random(), store2);
+    assert!(
+        next.build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots2)
+            .is_ok(),
+        "the structural-fallback flag must not leak into the next render"
+    );
+}

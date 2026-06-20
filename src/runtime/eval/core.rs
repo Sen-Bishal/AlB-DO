@@ -95,6 +95,66 @@ pub fn take_phase_k_derived_bindings() -> Vec<DerivedBindingRaw> {
     DERIVED_OUT.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
+/// A conditional subtree toggle collected during a Phase K render: a
+/// `{cond && <static JSX>}` or `{cond ? <static A> : <static B>}` whose `cond`
+/// is client-computable from reactive slots and whose branches are STATIC (no
+/// inner slot reads, no `on*` handlers, no nested components). The client
+/// recomputes `cond` from state whenever a dep slot changes and swaps the
+/// wrapper element's `innerHTML` between the two pre-rendered branch HTMLs —
+/// fine-grained structural reactivity with no component hydration. Lowered to a
+/// derived binding (with `html: true`) by `build_reactive_payload`.
+#[derive(Debug, Clone)]
+pub struct ConditionalBindingRaw {
+    /// `data-albedo-id` of the `display:contents` wrapper the renderer emitted.
+    pub stable_id: u32,
+    /// `(binding name, slot id)` for every reactive slot the test reads.
+    pub deps: Vec<(String, SlotId)>,
+    /// The boolean test expression (the `&&` left operand / ternary `test`).
+    pub cond: swc_ecma_ast::Expr,
+    /// HTML rendered when `cond` is truthy.
+    pub html_true: String,
+    /// HTML rendered when `cond` is falsy (empty string for `&&`).
+    pub html_false: String,
+}
+
+thread_local! {
+    /// Conditional subtree toggles collected during the current render. Same
+    /// lifecycle as `DERIVED_OUT`: reset at the top of each `render_entry_*`
+    /// call, taken by `build_reactive_payload`.
+    static CONDITIONAL_OUT: RefCell<Vec<ConditionalBindingRaw>> =
+        const { RefCell::new(Vec::new()) };
+    /// Set when the render hit a structural construct (a JSX conditional/list)
+    /// that binding mode can't represent fine-grained — so the component must
+    /// fall back to the A3 whole-component island rather than ship a stale or
+    /// broken binding payload. Read by `build_reactive_payload`.
+    static STRUCTURAL_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn reset_conditional_bindings() {
+    CONDITIONAL_OUT.with(|cell| cell.borrow_mut().clear());
+    STRUCTURAL_FALLBACK.with(|cell| cell.set(false));
+}
+
+fn push_conditional_binding(binding: ConditionalBindingRaw) {
+    CONDITIONAL_OUT.with(|cell| cell.borrow_mut().push(binding));
+}
+
+/// Take the conditional bindings collected by the most recent render.
+pub fn take_phase_k_conditional_bindings() -> Vec<ConditionalBindingRaw> {
+    CONDITIONAL_OUT.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+fn mark_structural_fallback() {
+    STRUCTURAL_FALLBACK.with(|cell| cell.set(true));
+}
+
+/// Whether the most recent Phase K render saw a structural construct binding
+/// mode can't represent — the signal for `build_reactive_payload` to fall back
+/// to the A3 island path. Cleared at the start of each render.
+pub fn phase_k_structural_fallback_required() -> bool {
+    STRUCTURAL_FALLBACK.with(|cell| cell.get())
+}
+
 /// Analyse a JSX expression for a derived binding, substituting any resolvable
 /// local (`useMemo` body / derived const) with its defining expression. Returns
 /// `Some((resolved_expr, deps))` when, after substitution, the expression reads
@@ -180,6 +240,144 @@ fn phase_k_collect_slot_deps(
     } else {
         Some((resolved, resolver.deps))
     }
+}
+
+/// Strip enclosing parentheses so classifiers see the inner expression.
+fn unwrap_paren(expr: &swc_ecma_ast::Expr) -> &swc_ecma_ast::Expr {
+    let mut cur = expr;
+    while let swc_ecma_ast::Expr::Paren(p) = cur {
+        cur = &p.expr;
+    }
+    cur
+}
+
+/// True for a branch that renders to nothing (`null`, `undefined`, `false`) —
+/// the trailing arm of a `cond && <X/>` (modelled as a ternary alt) or an
+/// explicit `cond ? <X/> : null`.
+fn is_empty_branch(expr: &swc_ecma_ast::Expr) -> bool {
+    use swc_ecma_ast::{Expr, Lit};
+    match unwrap_paren(expr) {
+        Expr::Lit(Lit::Null(_)) => true,
+        Expr::Ident(id) => id.sym.as_ref() == "undefined",
+        Expr::Lit(Lit::Bool(b)) => !b.value,
+        _ => false,
+    }
+}
+
+/// One JSX-bearing conditional in child position the binding-mode renderer can
+/// reason about structurally.
+enum JsxConditional<'a> {
+    /// `cond && <JSX>` — show the branch when `cond` is truthy.
+    And {
+        cond: &'a swc_ecma_ast::Expr,
+        branch: &'a swc_ecma_ast::Expr,
+    },
+    /// `cond ? <JSX|null> : <JSX|null>` — at least one arm is JSX.
+    Ternary {
+        test: &'a swc_ecma_ast::Expr,
+        cons: &'a swc_ecma_ast::Expr,
+        alt: &'a swc_ecma_ast::Expr,
+    },
+}
+
+/// True when an expression is a JSX element or fragment (the thing a branch
+/// must be for this to be a *structural* conditional rather than a derived-text
+/// one like `{cond && "label"}`, which the derived rung already handles).
+fn is_jsx_expr(expr: &swc_ecma_ast::Expr) -> bool {
+    matches!(
+        unwrap_paren(expr),
+        swc_ecma_ast::Expr::JSXElement(_) | swc_ecma_ast::Expr::JSXFragment(_)
+    )
+}
+
+/// Recognise a child expression as a JSX-bearing conditional. Returns `None`
+/// for non-conditionals and for conditionals with no JSX branch (those stay on
+/// the derived-text path).
+fn classify_jsx_conditional(expr: &swc_ecma_ast::Expr) -> Option<JsxConditional<'_>> {
+    use swc_ecma_ast::{BinaryOp, Expr};
+    match unwrap_paren(expr) {
+        Expr::Bin(bin) if bin.op == BinaryOp::LogicalAnd && is_jsx_expr(&bin.right) => {
+            Some(JsxConditional::And {
+                cond: &bin.left,
+                branch: &bin.right,
+            })
+        }
+        Expr::Cond(cond) if is_jsx_expr(&cond.cons) || is_jsx_expr(&cond.alt) => {
+            Some(JsxConditional::Ternary {
+                test: &cond.test,
+                cons: &cond.cons,
+                alt: &cond.alt,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// True when a JSX branch is *static* — safe to pre-render once and toggle
+/// wholesale via `innerHTML`. Static means: host (lowercase) elements only (no
+/// component refs, no `<Link>`/intrinsics), no `on*` handlers, no spread attrs,
+/// attribute values that are string literals only, and children that are plain
+/// text or nested static elements. No `{expr}` containers — so the subtree
+/// reads no reactive slots and emits no bindings, which is exactly what makes a
+/// whole-subtree swap correct (nothing inside needs re-binding) and crash-free
+/// (it never dereferences possibly-null state, the `{user && <X name={user.x}/>}`
+/// hazard). Anything else returns `false` → the component falls back to A3.
+fn is_static_branch(expr: &swc_ecma_ast::Expr) -> bool {
+    use swc_ecma_ast::Expr;
+    match unwrap_paren(expr) {
+        Expr::JSXElement(el) => is_static_jsx_element(el),
+        Expr::JSXFragment(frag) => frag.children.iter().all(is_static_jsx_child),
+        // An empty arm (`null`) is trivially static.
+        e => is_empty_branch(e),
+    }
+}
+
+fn is_static_jsx_element(el: &swc_ecma_ast::JSXElement) -> bool {
+    use swc_ecma_ast::{JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElementName};
+    // Host element only — a component ref needs hydration, not a static swap.
+    let JSXElementName::Ident(tag) = &el.opening.name else {
+        return false;
+    };
+    let name = tag.sym.as_ref();
+    if !is_host_tag(name) {
+        return false;
+    }
+    for attr in &el.opening.attrs {
+        let JSXAttrOrSpread::JSXAttr(jsx_attr) = attr else {
+            return false; // spread → not static
+        };
+        let JSXAttrName::Ident(attr_name) = &jsx_attr.name else {
+            return false;
+        };
+        let an = attr_name.sym.as_ref();
+        if an.starts_with("on") && an.len() > 2 {
+            return false; // event handler → needs binding
+        }
+        match &jsx_attr.value {
+            None => {}                                  // bare boolean attr
+            Some(JSXAttrValue::Lit(_)) => {}            // string literal
+            _ => return false,                          // `{expr}` value → reads state
+        }
+    }
+    el.children.iter().all(is_static_jsx_child)
+}
+
+fn is_static_jsx_child(child: &swc_ecma_ast::JSXElementChild) -> bool {
+    use swc_ecma_ast::JSXElementChild;
+    match child {
+        JSXElementChild::JSXText(_) => true,
+        JSXElementChild::JSXElement(el) => is_static_jsx_element(el),
+        JSXElementChild::JSXFragment(frag) => frag.children.iter().all(is_static_jsx_child),
+        // `{expr}` children read state / emit bindings → not a static subtree.
+        _ => false,
+    }
+}
+
+/// True for a lowercase host tag that isn't a renderer intrinsic. `<Link>` and
+/// `<children/>` get special rewrites elsewhere, so exclude them from the
+/// static-swap path (they're not plain host markup).
+fn is_host_tag(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_lowercase()) && name != "children"
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1188,6 +1386,7 @@ impl ComponentProject {
     ) -> Result<(String, Vec<Instruction>)> {
         reset_element_counter();
         reset_derived_bindings();
+        reset_conditional_bindings();
         let entry = self
             .resolve_entry(entry)
             .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
@@ -1228,6 +1427,7 @@ impl ComponentProject {
     ) -> Result<(String, Vec<Instruction>)> {
         reset_element_counter();
         reset_derived_bindings();
+        reset_conditional_bindings();
         let entry = self
             .resolve_entry(entry)
             .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
@@ -3079,6 +3279,123 @@ impl ComponentProject {
         Ok(out)
     }
 
+    /// Render a JSX-bearing conditional (`{cond && <X/>}` / `{cond ? <A/> :
+    /// <B/>}`) in binding mode. Appends the SSR HTML for the branch active
+    /// under the initial state to `html`. When the conditional is eligible
+    /// (client-computable `cond` + static branches) it also wraps that HTML in
+    /// a `display:contents` element and records a [`ConditionalBindingRaw`] so
+    /// the client can toggle it locally. When it isn't, it marks the render for
+    /// the A3 island fallback and just renders the active branch (the payload
+    /// is then discarded, so correctness comes from the fallback).
+    fn render_jsx_conditional(
+        &self,
+        module_spec: &str,
+        kind: &JsxConditional<'_>,
+        env: &HashMap<String, Value>,
+        html: &mut String,
+    ) -> Result<()> {
+        // Normalise both shapes to (test, true-branch, optional false-branch).
+        // `And` has no false branch — it renders to nothing when falsy.
+        let (cond, true_branch, false_branch): (
+            &swc_ecma_ast::Expr,
+            &swc_ecma_ast::Expr,
+            Option<&swc_ecma_ast::Expr>,
+        ) = match kind {
+            JsxConditional::And { cond, branch } => (cond, branch, None),
+            JsxConditional::Ternary { test, cons, alt } => (test, cons, Some(alt)),
+        };
+
+        // Is the test computable from reactive slots alone? `None` means either
+        // a constant test (can't change client-side — a static render is then
+        // correct) or one touching props/refs (also can't change via local
+        // state). Either way, no binding is needed.
+        let deps = phase_k_collect_slot_deps(cond);
+
+        // Are both branches safe to pre-render and toggle wholesale?
+        let branches_static = is_static_branch(true_branch)
+            && false_branch.map(is_static_branch).unwrap_or(true);
+
+        let active_truthy = is_truthy(&self.eval_expr(module_spec, cond, env)?);
+
+        // Render the branch React would show for the initial state — used for
+        // the SSR first paint either way.
+        let active_branch = if active_truthy {
+            Some(true_branch)
+        } else {
+            false_branch
+        };
+
+        // Eligible only when the test is slot-reactive AND both branches are
+        // static. A slot-reactive test with a non-static branch is the case we
+        // must NOT ship statically (it would go stale) → fall back to A3.
+        if !(deps.is_some() && branches_static) {
+            if deps.is_some() {
+                // Slot-reactive but not representable fine-grained → A3 island.
+                mark_structural_fallback();
+            }
+            if let Some(active) = active_branch {
+                html.push_str(&self.render_branch_html(module_spec, active, env)?);
+            }
+            return Ok(());
+        }
+
+        // `phase_k_collect_slot_deps` returns the test with any resolvable
+        // locals (useMemo / derived const) substituted in, plus its slot deps —
+        // the same shape the derived rung lowers, so a `{ready && …}` where
+        // `ready` is a `useMemo` recomputes correctly client-side.
+        let (resolved_cond, deps) = deps.expect("eligible implies deps present");
+
+        // Pre-render both branches (both are static, so both are crash-free).
+        let html_true = self.render_branch_html(module_spec, true_branch, env)?;
+        let html_false = match false_branch {
+            Some(alt) => self.render_branch_html(module_spec, alt, env)?,
+            None => String::new(),
+        };
+
+        // A `display:contents` wrapper carries the stable id without adding a
+        // layout box, so toggling its innerHTML preserves the surrounding flow.
+        let wrapper_id = next_element_stable_id(module_spec);
+        let active_html = if active_truthy { &html_true } else { &html_false };
+        html.push_str(&format!(
+            "<span {ALBEDO_ID_ATTR}=\"{wrapper_id}\" style=\"display:contents\">{active_html}</span>"
+        ));
+
+        push_conditional_binding(ConditionalBindingRaw {
+            stable_id: wrapper_id,
+            deps,
+            cond: resolved_cond,
+            html_true,
+            html_false,
+        });
+        Ok(())
+    }
+
+    /// Render one conditional branch expression to HTML. JSX elements/fragments
+    /// render normally; an empty arm (`null`/`undefined`/`false`) renders to "".
+    fn render_branch_html(
+        &self,
+        module_spec: &str,
+        branch: &swc_ecma_ast::Expr,
+        env: &HashMap<String, Value>,
+    ) -> Result<String> {
+        use swc_ecma_ast::Expr;
+        match unwrap_paren(branch) {
+            Expr::JSXElement(el) => self.eval_jsx_element(module_spec, el, env),
+            Expr::JSXFragment(frag) => self.eval_jsx_fragment(module_spec, frag, env),
+            other if is_empty_branch(other) => Ok(String::new()),
+            // Any other expression (e.g. a string in one arm of a ternary whose
+            // other arm is JSX) renders as its evaluated text.
+            other => {
+                let value = self.eval_expr(module_spec, other, env)?;
+                if matches!(value, Value::Null | Value::Bool(false)) {
+                    Ok(String::new())
+                } else {
+                    Ok(escape_html(&value_to_string(&value)))
+                }
+            }
+        }
+    }
+
     fn render_children(
         &self,
         module_spec: &str,
@@ -3097,6 +3414,20 @@ impl ComponentProject {
                 }
                 JSXElementChild::JSXExprContainer(container) => match &container.expr {
                     JSXExpr::Expr(expr) => {
+                        // Binding mode · conditionals rung. A `{cond && <JSX>}`
+                        // or `{cond ? <A/> : <B/>}` is structural — state can
+                        // change WHICH nodes exist, not just their text/attrs.
+                        // When `cond` is client-computable and the branches are
+                        // static, render it as a `display:contents` wrapper the
+                        // client toggles via `innerHTML` (handled here); else
+                        // mark the component for the A3 island fallback. Either
+                        // way we skip the text/derived/eval path below.
+                        if phase_k_enabled() {
+                            if let Some(kind) = classify_jsx_conditional(expr) {
+                                self.render_jsx_conditional(module_spec, &kind, env, &mut html)?;
+                                continue;
+                            }
+                        }
                         // Phase K: when the child expression is a bare
                         // slot-bound identifier, the rendered text node
                         // becomes a reactive binding site. Emit
