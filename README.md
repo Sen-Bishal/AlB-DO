@@ -143,5 +143,4 @@ crates/
 
 ---
 
-Built by [Sen-Bishal](https://github.com/Sen-Bishal) and
-[Sen-Bishal](https://github.com/Sen-Bishal). MIT License.
+Built by [Sen-Bishal](https://github.com/Sen-Bishal) 
