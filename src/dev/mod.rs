@@ -1,5 +1,6 @@
 pub mod benchmark;
 pub mod contract;
+pub mod serve_bench;
 pub mod showcase;
 
 pub use benchmark::{
@@ -7,6 +8,10 @@ pub use benchmark::{
     BaselineScenarioEnvelope, BenchmarkError, BenchmarkReport, BenchmarkScenario,
     BenchmarkWorkloads, GateStatus, MetricSummary, RegressionPolicy, ScenarioBenchmarkResult,
     ScenarioGateReport, ScenarioMetrics,
+};
+pub use serve_bench::{
+    run as run_serve_bench, ColdSample, EndpointResult, LatencyStats, Method, RequestSpec,
+    ServeBenchConfig, ServeBenchError, ServeBenchReport,
 };
 pub use contract::{
     parse_dev_cli_args, resolve_dev_contract, DevCliOptions, DevConfig, DevHmrConfig,
