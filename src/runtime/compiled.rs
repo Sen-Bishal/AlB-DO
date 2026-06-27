@@ -660,6 +660,7 @@ impl CompiledProject {
             // Drain the side-channel so it can't leak into the next render.
             let _ = crate::runtime::eval::core::take_phase_k_derived_bindings();
             let _ = crate::runtime::eval::core::take_phase_k_conditional_bindings();
+            let _ = crate::runtime::eval::core::take_phase_k_list_bindings();
             return Err(anyhow!(
                 "component uses structural reactivity not representable in binding mode; \
                  falling back to the A3 island"
@@ -788,6 +789,50 @@ impl CompiledProject {
                 stable_id: cond.stable_id,
                 attr: None,
                 dep_slots: cond.deps.iter().map(|(_, slot)| slot.0).collect(),
+                thunk,
+                html: true,
+            });
+        }
+
+        // Keyed-lists rung: each `{arr.map(item => <static JSX>)}` lowers to a
+        // `html: true` derived binding whose recompute reads the array slot and
+        // joins a per-item HTML template over the live data. `__str`/`__esc` are
+        // the runtime stringify+escape helpers the per-item `{expr}` holes call.
+        let raw_lists = crate::runtime::eval::core::take_phase_k_list_bindings();
+        for list in raw_lists {
+            let mut thunk = String::from(
+                "(function(__s){\n\
+                 function __str(v){return (v===null||v===undefined||v===false)?'':(''+v);}\n\
+                 function __esc(v){return __str(v).replace(/&/g,'&amp;').replace(/</g,'&lt;')\
+                 .replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\n",
+            );
+            for (name, slot_id) in &list.deps {
+                let slot = slot_id.0;
+                let initial = slot_initials
+                    .get(&slot)
+                    .cloned()
+                    .unwrap_or_else(|| "undefined".to_string());
+                thunk.push_str(&format!(
+                    "var {name}=(__s[{slot}]!==undefined?__s[{slot}]:({initial}));\n"
+                ));
+            }
+            let index_param = list
+                .index_param
+                .clone()
+                .unwrap_or_else(|| "__i".to_string());
+            thunk.push_str(&format!(
+                "var __arr=({});\n\
+                 if(!Array.isArray(__arr))return '';\n\
+                 return __arr.map(function({item},{index}){{ return ({tmpl}); }}).join('');\n}})",
+                expr_to_js(&list.array)?,
+                item = list.item_param,
+                index = index_param,
+                tmpl = jsx_item_template_js(&list.item_body)?,
+            ));
+            derived.push(ReactiveDerivedBinding {
+                stable_id: list.stable_id,
+                attr: None,
+                dep_slots: list.deps.iter().map(|(_, slot)| slot.0).collect(),
                 thunk,
                 html: true,
             });
@@ -1515,6 +1560,183 @@ fn handler_body_to_js(body: &HandlerBody) -> Result<(String, bool)> {
             let items = stmts.iter().cloned().map(ModuleItem::Stmt).collect();
             Ok((emit_module_js(items)?, true))
         }
+    }
+}
+
+/// HTML void elements — emitted self-contained with no closing tag.
+const HTML_VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// Map a JSX attribute name to the HTML attribute name the server renders.
+fn jsx_attr_name_to_html(name: &str) -> &str {
+    match name {
+        "className" => "class",
+        "htmlFor" => "for",
+        other => other,
+    }
+}
+
+/// Escape a static string for an HTML attribute value (double-quoted).
+fn escape_html_attr(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// Escape a static string for HTML text content.
+fn escape_html_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Lower a per-item JSX subtree (the body of a `.map()` arrow) to a JS
+/// expression that evaluates to the item's HTML string, with the item and index
+/// params in scope. Dynamic `{expr}` holes are runtime-escaped via the `__esc`
+/// helper the list thunk defines; static text/attributes are baked as escaped
+/// literals. Mirrors what the SSR renderer (`render_branch_html`) produces for
+/// the same item, so first paint and client re-render agree.
+///
+/// The eligibility gate (`is_static_list_item`) guarantees host elements only,
+/// no handlers/components/spreads, and `{expr}` holes that reference only the
+/// item/index params and pure globals — so this generator never has to handle a
+/// nested component, an event binding, or an outer-state read.
+fn jsx_item_template_js(node: &Expr) -> Result<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    jsx_node_to_html_js(node, &mut parts, &mut buf)?;
+    if !buf.is_empty() {
+        parts.push(json_string_literal(&buf));
+    }
+    if parts.is_empty() {
+        Ok("\"\"".to_string())
+    } else {
+        Ok(parts.join(" + "))
+    }
+}
+
+/// Accumulate JS HTML-string fragments for one JSX node. Static markup grows
+/// `buf` (flushed as one JSON literal when a dynamic part interrupts); dynamic
+/// `{expr}` holes flush `buf` and push an escaped-runtime-value fragment.
+fn jsx_node_to_html_js(node: &Expr, parts: &mut Vec<String>, buf: &mut String) -> Result<()> {
+    use swc_ecma_ast::{
+        Expr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElement, JSXElementChild,
+        JSXElementName, JSXExpr, Lit,
+    };
+
+    fn flush(parts: &mut Vec<String>, buf: &mut String) {
+        if !buf.is_empty() {
+            parts.push(json_string_literal(buf));
+            buf.clear();
+        }
+    }
+
+    fn child_to_js(
+        child: &JSXElementChild,
+        parts: &mut Vec<String>,
+        buf: &mut String,
+    ) -> Result<()> {
+        match child {
+            JSXElementChild::JSXText(text) => {
+                // Mirror the renderer's text normalisation: collapse a run that
+                // contains a newline (source indentation) to nothing/one space.
+                if let Some(normalized) =
+                    crate::runtime::eval::component::normalize_jsx_text(text.value.as_ref())
+                {
+                    buf.push_str(&escape_html_text(&normalized));
+                }
+            }
+            JSXElementChild::JSXElement(el) => {
+                jsx_node_to_html_js(&Expr::JSXElement(el.clone()), parts, buf)?
+            }
+            JSXElementChild::JSXFragment(frag) => {
+                for c in &frag.children {
+                    child_to_js(c, parts, buf)?;
+                }
+            }
+            JSXElementChild::JSXExprContainer(c) => {
+                if let JSXExpr::Expr(e) = &c.expr {
+                    flush(parts, buf);
+                    parts.push(format!("__esc(__str({}))", expr_to_js(e)?));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn element_to_js(el: &JSXElement, parts: &mut Vec<String>, buf: &mut String) -> Result<()> {
+        let JSXElementName::Ident(tag_ident) = &el.opening.name else {
+            return Err(anyhow!("non-host element reached list templater"));
+        };
+        let tag = tag_ident.sym.to_string();
+        buf.push('<');
+        buf.push_str(&tag);
+        for attr in &el.opening.attrs {
+            let JSXAttrOrSpread::JSXAttr(jsx_attr) = attr else {
+                return Err(anyhow!("spread attr reached list templater"));
+            };
+            let JSXAttrName::Ident(attr_name) = &jsx_attr.name else {
+                return Err(anyhow!("namespaced attr reached list templater"));
+            };
+            let html_name = jsx_attr_name_to_html(attr_name.sym.as_ref());
+            match &jsx_attr.value {
+                None => {
+                    buf.push(' ');
+                    buf.push_str(html_name);
+                }
+                Some(JSXAttrValue::Lit(Lit::Str(s))) => {
+                    buf.push(' ');
+                    buf.push_str(html_name);
+                    buf.push_str("=\"");
+                    buf.push_str(&escape_html_attr(s.value.as_ref()));
+                    buf.push('"');
+                }
+                Some(JSXAttrValue::Lit(lit)) => {
+                    // Non-string literal (number/bool) — codegen its text.
+                    buf.push(' ');
+                    buf.push_str(html_name);
+                    buf.push_str("=\"");
+                    buf.push_str(&escape_html_attr(&expr_to_js(&Expr::Lit(lit.clone()))?));
+                    buf.push('"');
+                }
+                Some(JSXAttrValue::JSXExprContainer(c)) => {
+                    if let JSXExpr::Expr(e) = &c.expr {
+                        buf.push(' ');
+                        buf.push_str(html_name);
+                        buf.push_str("=\"");
+                        flush(parts, buf);
+                        parts.push(format!("__esc(__str({}))", expr_to_js(e)?));
+                        buf.push('"');
+                    }
+                }
+                _ => return Err(anyhow!("unsupported attr value reached list templater")),
+            }
+        }
+        if HTML_VOID_ELEMENTS.contains(&tag.as_str()) {
+            buf.push('>');
+            return Ok(());
+        }
+        buf.push('>');
+        for child in &el.children {
+            child_to_js(child, parts, buf)?;
+        }
+        buf.push_str("</");
+        buf.push_str(&tag);
+        buf.push('>');
+        Ok(())
+    }
+
+    match node {
+        Expr::Paren(p) => jsx_node_to_html_js(&p.expr, parts, buf),
+        Expr::JSXElement(el) => element_to_js(el, parts, buf),
+        Expr::JSXFragment(frag) => {
+            for child in &frag.children {
+                child_to_js(child, parts, buf)?;
+            }
+            Ok(())
+        }
+        other => Err(anyhow!("list item body is not JSX: {other:?}")),
     }
 }
 

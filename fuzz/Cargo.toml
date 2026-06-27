@@ -34,5 +34,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "decode_action_envelope"
+path = "fuzz_targets/decode_action_envelope.rs"
+test = false
+doc = false
+bench = false
+
 # Prevent cargo from walking up into the parent workspace.
 [workspace]

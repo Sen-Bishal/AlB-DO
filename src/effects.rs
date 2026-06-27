@@ -132,7 +132,18 @@ pub fn decide_tier_and_hydration(
         } else {
             TieringDecision {
                 tier: Tier::B,
-                hydration_mode: inputs.tier_b_mode,
+                // RSC: an async component with no client interaction entry point
+                // (no event handler) is a *server data* component — render+await
+                // on the server and ship static HTML. It must NOT hydrate: a
+                // client island would re-invoke the component in the browser,
+                // get a Promise, and clobber the server-injected markup with an
+                // empty render. Only async components that also carry a
+                // round-tripping handler keep a hydration trigger.
+                hydration_mode: if has_event_handler {
+                    inputs.tier_b_mode
+                } else {
+                    HydrationMode::None
+                },
                 reason: TieringReason::AsyncBoundary,
             }
         };

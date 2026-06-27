@@ -481,6 +481,38 @@ fn webtransport_ack_response(transport: &StreamingTransportConfig) -> Response {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+/// Render a route boundary component (`error.tsx` / `loading.tsx`) to HTML
+/// through the same warmed Tier-B registry that renders async server
+/// components. Returns `None` when the route declares no such boundary, or
+/// when rendering it fails (logged) — the caller then falls back to the
+/// generic stub. Boundary components are registered in the boot
+/// `TierBRenderPlan` keyed by their bare component name (see
+/// `RendererRuntime::build_tier_b_render_plan`).
+async fn render_route_boundary(
+    app: &StreamingAppState,
+    component: Option<&str>,
+    props: &serde_json::Value,
+) -> Option<String> {
+    let name = component?;
+    match app
+        .services
+        .registry
+        .call(name, props, &HashMap::new())
+        .await
+    {
+        Ok(html) => Some(html),
+        Err(err) => {
+            warn!(
+                target: "albedo.render",
+                component = %name,
+                error = %err,
+                "route boundary render failed; using generic fallback"
+            );
+            None
+        }
+    }
+}
+
 fn build_stream(
     route: RouteManifest,
     ctx: TierBRequestContext,
@@ -488,9 +520,12 @@ fn build_stream(
     negotiated_transport: NegotiatedTransport,
     page_session: dom_render_compiler::runtime::SessionId,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
+    use dom_render_compiler::manifest::metadata::{
+        lower_metadata_object, render_head_metadata, DYNAMIC_HEAD_MARKER,
+    };
     stream! {
         let hydration = app.hydration.get(route.route.as_str());
-        let shell = build_shell_chunk(
+        let mut shell = build_shell_chunk(
             &route,
             negotiated_transport,
             app.transport.webtransport_path.as_str(),
@@ -499,7 +534,38 @@ fn build_stream(
             hydration,
         );
 
+        // Slice 3 — a route exporting `generateMetadata` carries a head marker
+        // instead of a static `<title>`/`<meta>` block. Resolve the real
+        // metadata per request (static base merged with the dynamic result) and
+        // substitute it in. A failed or absent eval degrades to the static base,
+        // so the marker is always replaced — a stray comment never ships.
+        if let Some(key) = route.dynamic_metadata.as_deref() {
+            let props = json!({ "params": ctx.params.clone(), "path": ctx.path.clone() });
+            let mut resolved = route.metadata.clone();
+            match app.services.registry.call_metadata(key, &props).await {
+                Ok(Some(value)) => resolved.merge(lower_metadata_object(&value)),
+                Ok(None) => {}
+                Err(err) => warn!(
+                    target: "albedo.render",
+                    route = %route.route,
+                    error = %err,
+                    "generateMetadata failed; falling back to static head"
+                ),
+            }
+            shell = shell.replace(
+                DYNAMIC_HEAD_MARKER,
+                &render_head_metadata(route.route.as_str(), &resolved),
+            );
+        }
+
         yield Ok(Bytes::from(shell));
+
+        // Route boundary component names (`error.tsx` / `loading.tsx`), if any.
+        // Captured once and cloned into each island future so a throwing or
+        // slow Tier-B node can fall back to the route's declared boundary UI
+        // instead of a blank `data-albedo-error` stub.
+        let error_component = route.error_component.clone();
+        let loading_component = route.loading_component.clone();
 
         let mut tier_b_futures: FuturesUnordered<_> = route
             .tier_b
@@ -508,6 +574,8 @@ fn build_stream(
             .map(|node| {
                 let ctx = ctx.clone();
                 let app = app.clone();
+                let error_component = error_component.clone();
+                let loading_component = loading_component.clone();
                 async move {
                     let render_result = timeout(
                         Duration::from_millis(node.timeout_ms.max(1)),
@@ -522,8 +590,39 @@ fn build_stream(
 
                     match render_result {
                         Ok(Ok(html)) => InjectionChunk::success(&node, html),
-                        Ok(Err(err)) => InjectionChunk::error(&node, err),
-                        Err(_) => InjectionChunk::fallback(&node),
+                        Ok(Err(err)) => {
+                            // The component threw. Render the route's `error.tsx`
+                            // boundary and inject its HTML; only if there is no
+                            // boundary (or it too fails) do we fall back to the
+                            // blank error stub.
+                            let error_props = json!({
+                                "error": { "message": err.to_string() }
+                            });
+                            match render_route_boundary(
+                                app.as_ref(),
+                                error_component.as_deref(),
+                                &error_props,
+                            )
+                            .await
+                            {
+                                Some(html) => InjectionChunk::error_boundary(&node, html),
+                                None => InjectionChunk::error(&node, err),
+                            }
+                        }
+                        Err(_) => {
+                            // The component timed out. Prefer the route's
+                            // `loading.tsx` UI over the generic timeout div.
+                            match render_route_boundary(
+                                app.as_ref(),
+                                loading_component.as_deref(),
+                                &json!({}),
+                            )
+                            .await
+                            {
+                                Some(html) => InjectionChunk::fallback_with_html(&node, html),
+                                None => InjectionChunk::fallback(&node),
+                            }
+                        }
                     }
                 }
             })
@@ -1064,6 +1163,7 @@ mod tests {
             error_component: None,
             loading_component: None,
             metadata: Default::default(),
+            dynamic_metadata: None,
         }
     }
 

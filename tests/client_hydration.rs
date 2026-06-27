@@ -431,6 +431,102 @@ fn client_runtime_runs_useref_usememo_usecallback() {
     assert_eq!(value["network"], 0);
 }
 
+// B (Gate 2) — `useContext` resolves the nearest Provider's value on the client,
+// the last hook in the React family. Three invariants the slice must hold:
+//   1. a consumer reads the Provider `value`, NOT the createContext default
+//      (default "light" vs provider "dark");
+//   2. a consumer re-rendering on its OWN state still resolves context (proves
+//      the per-fiber context snapshot, not a transient render-time stack);
+//   3. changing the Provider value (held in an ancestor's state) propagates to
+//      every consumer below it.
+const CONTEXT_SCENARIO: &str = r#"
+var ThemeContext = createContext('light');
+
+function ThemeLabel(props) {
+  var theme = useContext(ThemeContext);
+  return h('span', {}, theme);
+}
+
+function Toggle(props) {
+  // A consumer with its OWN local state. Re-rendering on this state must keep
+  // resolving the context value through the fiber's snapshot.
+  var s = useState(0);
+  var n = s[0], set = s[1];
+  var theme = useContext(ThemeContext);
+  globalThis.__bump = function () { set(n + 1); };
+  return h('button', {}, theme + ':' + n);
+}
+
+function App(props) {
+  var s = useState('dark');
+  var theme = s[0], setTheme = s[1];
+  globalThis.__setTheme = setTheme;
+  return h(ThemeContext.Provider, { value: theme },
+    h('div', {}, h(ThemeLabel, {}), h(Toggle, {})));
+}
+
+var container = document.createElement('div');
+var outer = document.createElement('div');
+var span = document.createElement('span');
+span.appendChild(document.createTextNode('dark'));
+var button = document.createElement('button');
+button.appendChild(document.createTextNode('dark:0'));
+outer.appendChild(span);
+outer.appendChild(button);
+container.appendChild(outer);
+
+__albedoClient.hydrate(h(App, {}), container);
+
+var afterHydrate = { label: span.firstChild.nodeValue, button: button.firstChild.nodeValue };
+
+// (2) Consumer's own state advances — context value must be retained.
+globalThis.__bump();
+var afterBump = { label: span.firstChild.nodeValue, button: button.firstChild.nodeValue };
+
+// (3) Provider value changes via the ancestor's state — propagates to both
+// consumers; Toggle keeps its own n (now 1).
+globalThis.__setTheme('light');
+var afterTheme = { label: span.firstChild.nodeValue, button: button.firstChild.nodeValue };
+
+JSON.stringify({
+  afterHydrate: afterHydrate,
+  afterBump: afterBump,
+  afterTheme: afterTheme,
+  network: globalThis.__net,
+});
+"#;
+
+#[test]
+fn client_runtime_resolves_usecontext_through_provider() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(CONTEXT_SCENARIO).expect("scenario should evaluate")
+    });
+
+    let value: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+
+    // (1) Both consumers read the Provider value ("dark"), not the default.
+    assert_eq!(value["afterHydrate"]["label"], "dark");
+    assert_eq!(value["afterHydrate"]["button"], "dark:0");
+
+    // (2) Toggle's local state advanced; context value held across the partial
+    // re-render; the label (untouched) stayed put.
+    assert_eq!(value["afterBump"]["button"], "dark:1");
+    assert_eq!(value["afterBump"]["label"], "dark");
+
+    // (3) Provider value change propagated to both consumers; Toggle kept n=1.
+    assert_eq!(value["afterTheme"]["label"], "light");
+    assert_eq!(value["afterTheme"]["button"], "light:1");
+
+    // Pure client-side — no round-trip.
+    assert_eq!(value["network"], 0);
+}
+
 #[test]
 fn client_island_rejects_unbundled_imports_loudly() {
     // A non-framework import has no client binding yet — it must fail loudly

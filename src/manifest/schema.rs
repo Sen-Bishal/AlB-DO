@@ -149,6 +149,13 @@ pub struct RouteManifest {
     /// byte-identical to pre-B builds.
     #[serde(default)]
     pub metadata: RouteMetadata,
+    /// Gate 2 · B slice 3 — when the route's leaf component module exports a
+    /// `generateMetadata(props)` function, this carries the boot-plan key
+    /// (the leaf component name) the serve path invokes per request to resolve
+    /// dynamic `<head>` metadata. `None` (the common case) means the route's
+    /// head is fully static and the pre-baked shell stands unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_metadata: Option<String>,
 }
 
 /// Gate 2 · B — the resolved per-route document metadata destined for

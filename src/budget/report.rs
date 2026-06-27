@@ -406,6 +406,7 @@ mod tests {
             error_component: None,
             loading_component: None,
             metadata: Default::default(),
+            dynamic_metadata: None,
         }
     }
 

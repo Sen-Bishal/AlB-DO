@@ -209,6 +209,66 @@ fn unescape_html(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Slice 3 — marker placed in a route shell's `<head>` when the route exports
+/// `generateMetadata`. The serve path runs `generateMetadata` per request,
+/// merges the result over the static base, and replaces this marker with
+/// [`render_head_metadata`] of the resolved metadata. Routes without dynamic
+/// metadata never carry it (their static head is rendered at build time).
+pub const DYNAMIC_HEAD_MARKER: &str = "<!--__ALBEDO_HEAD_META__-->";
+
+/// Render a route's resolved `<head>` metadata block — `<title>`, the
+/// `description` meta, and every author `<meta>` tag — to HTML. Shared by the
+/// build-time shell (static metadata) and the serve-time dynamic injection so
+/// both escape identically and apply the same `ALBEDO {route}` title fallback.
+/// `lower_metadata_object` is the companion that turns a `generateMetadata`
+/// return value into the [`RouteMetadata`] this renders.
+#[must_use]
+pub fn render_head_metadata(route: &str, metadata: &RouteMetadata) -> String {
+    let mut out = String::new();
+    match &metadata.title {
+        Some(title) => out.push_str(&format!("<title>{}</title>", escape_html(title))),
+        None => out.push_str(&format!("<title>ALBEDO {}</title>", escape_html(route))),
+    }
+    if let Some(description) = &metadata.description {
+        out.push_str(&format!(
+            "<meta name=\"description\" content=\"{}\">",
+            escape_html(description)
+        ));
+    }
+    for tag in &metadata.meta {
+        out.push_str(&format!(
+            "<meta {}=\"{}\" content=\"{}\">",
+            escape_html(&tag.attr),
+            escape_html(&tag.key),
+            escape_html(&tag.content)
+        ));
+    }
+    out
+}
+
+/// Lower a `generateMetadata()` return value (the Next.js `Metadata` object,
+/// arrived as JSON) into a [`RouteMetadata`]. A non-object value yields the
+/// default (empty) metadata. The public entry for the dynamic (slice 3) layer;
+/// internally identical to the static const path's object lowering.
+#[must_use]
+pub fn lower_metadata_object(value: &Value) -> RouteMetadata {
+    match value {
+        Value::Object(map) => metadata_from_json(map),
+        _ => RouteMetadata::default(),
+    }
+}
+
+/// HTML-escape for the head block. Matches the builder's `escape_html` exactly
+/// so build-time and serve-time emission are byte-identical.
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 /// Lower a `export const metadata = { ... }` initializer into a
 /// [`RouteMetadata`]. A non-object (or empty) initializer yields the
 /// default (empty) metadata, which preserves the shell's historical
@@ -599,5 +659,45 @@ mod tests {
         let meta = extract(source);
         // `base` is an identifier, not a literal → title unresolved.
         assert_eq!(meta.title, None);
+    }
+
+    #[test]
+    fn lower_metadata_object_maps_a_dynamic_result() {
+        // The shape a `generateMetadata()` return value arrives as (JSON).
+        let value = serde_json::json!({
+            "title": "Dynamic",
+            "description": "per request",
+            "openGraph": { "title": "OG", "type": "website" }
+        });
+        let meta = lower_metadata_object(&value);
+        assert_eq!(meta.title.as_deref(), Some("Dynamic"));
+        assert_eq!(meta.description.as_deref(), Some("per request"));
+        assert_eq!(tag(&meta, "property", "og:title"), Some("OG"));
+        assert_eq!(tag(&meta, "property", "og:type"), Some("website"));
+
+        // A non-object result (a route that returns nothing useful) is empty,
+        // not a panic.
+        assert!(lower_metadata_object(&serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
+    fn render_head_metadata_emits_block_and_falls_back() {
+        // Dynamic title wins and escapes; description + author meta render.
+        let mut meta = RouteMetadata {
+            title: Some("A & B".to_string()),
+            description: Some("d".to_string()),
+            meta: Vec::new(),
+        };
+        meta.push_property("og:title", "OG".to_string());
+        let html = render_head_metadata("/post", &meta);
+        assert!(html.contains("<title>A &amp; B</title>"), "{html}");
+        assert!(html.contains("<meta name=\"description\" content=\"d\">"), "{html}");
+        assert!(html.contains("<meta property=\"og:title\" content=\"OG\">"), "{html}");
+
+        // Empty metadata falls back to the `ALBEDO {route}` title — identical to
+        // the build-time shell, so a dynamic route whose eval fails degrades
+        // cleanly.
+        let fallback = render_head_metadata("/post", &RouteMetadata::default());
+        assert_eq!(fallback, "<title>ALBEDO /post</title>");
     }
 }

@@ -62,6 +62,19 @@ pub trait TierBRenderRegistry: Send + Sync {
         props: &Value,
         data: &HashMap<String, Value>,
     ) -> Result<String, RenderError>;
+
+    /// Gate 2 · B slice 3 — evaluate a route's `generateMetadata(props)` export
+    /// to its raw metadata object (the Next.js `Metadata` shape). `key` is the
+    /// boot-plan key the route's metadata module was registered under. Returns
+    /// `Ok(None)` when the route declares no `generateMetadata` (the default for
+    /// registries without a real engine pool, so non-pooled paths are unchanged).
+    async fn call_metadata(
+        &self,
+        _key: &str,
+        _props: &Value,
+    ) -> Result<Option<Value>, RenderError> {
+        Ok(None)
+    }
 }
 
 /// Phase-E opcode-shaped Tier-B render registry.
@@ -279,6 +292,10 @@ pub struct InjectionChunk {
 enum ChunkKind {
     Success { html: String },
     Fallback { html: String },
+    /// A route `error.tsx` boundary rendered to real HTML — the placeholder
+    /// is replaced by the fallback UI and marked `'error'` so the client can
+    /// style it, instead of being left a blank `data-albedo-error` stub.
+    ErrorBoundary { html: String },
     Error,
 }
 
@@ -301,6 +318,24 @@ impl InjectionChunk {
         }
     }
 
+    /// Timeout fallback backed by a route `loading.tsx` boundary's rendered
+    /// HTML instead of the generic timeout placeholder div.
+    pub fn fallback_with_html(node: &TierBNode, html: String) -> Self {
+        Self {
+            placeholder_id: node.placeholder_id.clone(),
+            kind: ChunkKind::Fallback { html },
+        }
+    }
+
+    /// A throwing Tier-B/async component whose route declares an `error.tsx`:
+    /// inject the rendered boundary HTML rather than a blank error stub.
+    pub fn error_boundary(node: &TierBNode, html: String) -> Self {
+        Self {
+            placeholder_id: node.placeholder_id.clone(),
+            kind: ChunkKind::ErrorBoundary { html },
+        }
+    }
+
     pub fn error(node: &TierBNode, _error: RenderError) -> Self {
         Self {
             placeholder_id: node.placeholder_id.clone(),
@@ -319,8 +354,160 @@ impl InjectionChunk {
                 let html = serde_json::to_string(&html).unwrap_or_else(|_| "\"\"".to_string());
                 format!("<script>__albedo_inject({id},{html},'fallback')</script>")
             }
+            ChunkKind::ErrorBoundary { html } => {
+                let html = serde_json::to_string(&html).unwrap_or_else(|_| "\"\"".to_string());
+                format!("<script>__albedo_inject({id},{html},'error')</script>")
+            }
             ChunkKind::Error => format!("<script>__albedo_inject({id},null,'error')</script>"),
         }
+    }
+}
+
+/// Self-contained load+render plan for one Tier-B component, precomputed at
+/// boot while the (`!Send`) renderer is still single-threaded. Owns everything
+/// a pool engine needs to render the component on the request path: the entry
+/// module spec and the full topologically-ordered list of `(specifier, code)`
+/// to register first (component module bodies link their imports *eagerly* at
+/// load via `__albedo_require`, so dependencies must be loaded before the
+/// module that imports them).
+#[derive(Debug, Clone)]
+pub struct TierBEntryPlan {
+    /// Module spec passed to `__ALBEDO_RENDER_COMPONENT` (the component's
+    /// `module_path`; its default export is the render function).
+    pub entry: String,
+    /// `(specifier, code)` pairs in dependency-first load order. `load_module`
+    /// is idempotent by source hash, so re-loading on every checkout is a cheap
+    /// hash-compare after an engine has seen the module once.
+    pub modules: Vec<(String, String)>,
+}
+
+/// Map from a `TierBNode.render_fn` (e.g. `"render::Stats"`) to its boot-built
+/// [`TierBEntryPlan`]. Built once by the renderer and handed to
+/// [`PooledTierBRenderRegistry`].
+pub type TierBRenderPlan = HashMap<String, TierBEntryPlan>;
+
+/// Production Tier-B render registry: resolves async/server Tier-B components to
+/// real HTML by rendering them through the warmed QuickJS [`engine pool`], the
+/// same warmed/concurrent/arena engines that execute `action()` calls.
+///
+/// Replaces [`StubTierBRenderRegistry`] (which returned an empty `<section>`,
+/// so every Tier-B node — async server components AND legit interactive Tier-B —
+/// rendered nothing on `albedo serve`). Each `call` checks out an engine, loads
+/// the component's module graph (idempotent after the first checkout), and runs
+/// `render_component_with_host`, whose `MaybePromise::finish` drives the QuickJS
+/// job queue so an `async function Page()` is awaited on the server before its
+/// HTML is lowered.
+///
+/// [`engine pool`]: crate::engine_pool::QuickJsEnginePool
+pub struct PooledTierBRenderRegistry {
+    pool: Arc<crate::engine_pool::QuickJsEnginePool>,
+    plan: TierBRenderPlan,
+}
+
+impl PooledTierBRenderRegistry {
+    #[must_use]
+    pub fn new(pool: Arc<crate::engine_pool::QuickJsEnginePool>, plan: TierBRenderPlan) -> Self {
+        Self { pool, plan }
+    }
+}
+
+#[async_trait]
+impl TierBRenderRegistry for PooledTierBRenderRegistry {
+    async fn call(
+        &self,
+        render_fn: &str,
+        props: &Value,
+        _data: &HashMap<String, Value>,
+    ) -> Result<String, RenderError> {
+        // A component with no boot-built plan can't be rendered on the request
+        // path — surface it loudly instead of silently injecting nothing (the
+        // exact silent-empty failure this registry exists to kill).
+        let plan =
+            self.plan
+                .get(render_fn)
+                .cloned()
+                .ok_or_else(|| {
+                    RenderError::RegistryFailure {
+                render_fn: render_fn.to_string(),
+                message:
+                    "no Tier-B render plan registered at boot (component not in manifest routes?)"
+                        .to_string(),
+            }
+                })?;
+
+        let props_json = serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string());
+        let render_fn_owned = render_fn.to_string();
+
+        // The closure crosses to the engine's dedicated thread, so every capture
+        // and the return type must be `Send + 'static`. Return a plain
+        // `Result<String, String>` rather than the engine's `RuntimeError` to
+        // keep the boundary free of engine-internal types.
+        let rendered = self
+            .pool
+            .with_engine(move |engine| -> Result<String, String> {
+                use dom_render_compiler::runtime::engine::RuntimeEngine;
+                for (specifier, code) in &plan.modules {
+                    engine
+                        .load_module(specifier, code)
+                        .map_err(|err| err.to_string())?;
+                }
+                engine
+                    .render_component_with_host(&plan.entry, &props_json, "{}")
+                    .map(|output| output.html)
+                    .map_err(|err| err.to_string())
+            })
+            .await
+            .map_err(|err| RenderError::RegistryFailure {
+                render_fn: render_fn_owned.clone(),
+                message: err.to_string(),
+            })?;
+
+        rendered.map_err(|message| RenderError::RegistryFailure {
+            render_fn: render_fn_owned,
+            message,
+        })
+    }
+
+    async fn call_metadata(
+        &self,
+        key: &str,
+        props: &Value,
+    ) -> Result<Option<Value>, RenderError> {
+        // Same boot-plan + pooled-engine path as `call`, but the engine
+        // evaluates `generateMetadata` to a DATA object rather than rendering
+        // HTML. A route without a registered plan can't be dynamic — treat it as
+        // "no dynamic metadata" (the static `<head>` stands) rather than failing
+        // the whole request over a head detail.
+        let Some(plan) = self.plan.get(key).cloned() else {
+            return Ok(None);
+        };
+
+        let props_json = serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string());
+        let key_owned = key.to_string();
+
+        let resolved = self
+            .pool
+            .with_engine(move |engine| -> Result<Option<Value>, String> {
+                use dom_render_compiler::runtime::engine::RuntimeEngine;
+                for (specifier, code) in &plan.modules {
+                    engine
+                        .load_module(specifier, code)
+                        .map_err(|err| err.to_string())?;
+                }
+                engine
+                    .eval_route_metadata(&plan.entry, &props_json)
+                    .map_err(|err| err.to_string())
+            })
+            .await
+            .map_err(|err| RenderError::RegistryFailure {
+                render_fn: key_owned.clone(),
+                message: err.to_string(),
+            })?;
+
+        resolved.map_err(|message| RenderError::RegistryFailure {
+            render_fn: key_owned,
+            message,
+        })
     }
 }
 
@@ -471,6 +658,31 @@ mod tests {
         assert!(script.contains("fallback"));
     }
 
+    #[test]
+    fn error_boundary_chunk_injects_real_html_not_null() {
+        // The bug this closes: a throwing Tier-B node used to ship
+        // `__albedo_inject(id, null, 'error')` → a blank placeholder. With a
+        // route `error.tsx`, it must ship the rendered boundary HTML so the
+        // client replaces the placeholder with fallback UI.
+        let script = InjectionChunk::error_boundary(&node(), "<p>boom</p>".to_string())
+            .into_script_tag();
+        assert!(script.contains("__albedo_inject"));
+        assert!(script.contains("<p>boom</p>"), "must carry the boundary HTML");
+        assert!(script.contains("'error'"), "must keep the error status marker");
+        assert!(
+            !script.contains("null"),
+            "the regression: error boundary must not inject null"
+        );
+    }
+
+    #[test]
+    fn fallback_with_html_uses_loading_boundary_markup() {
+        let script = InjectionChunk::fallback_with_html(&node(), "<p>loading…</p>".to_string())
+            .into_script_tag();
+        assert!(script.contains("<p>loading…</p>"));
+        assert!(script.contains("'fallback'"));
+    }
+
     // ── Phase E — opcode renderer tests ───────────────────────────────
 
     use dom_render_compiler::ir::opcode::{Instruction, StableId, TagId};
@@ -547,6 +759,31 @@ mod tests {
         let c = stable_id_for_placeholder("__b_other");
         assert_eq!(a, b, "same input must produce same id across calls");
         assert_ne!(a, c, "different inputs should not collide on this corpus");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_registry_surfaces_unregistered_component_loudly() {
+        // The whole point of this registry is to kill silent-empty Tier-B
+        // renders: a component with no boot-built plan must produce a loud
+        // `RegistryFailure`, never an empty success.
+        let pool = Arc::new(crate::engine_pool::QuickJsEnginePool::with_size(1));
+        let registry = PooledTierBRenderRegistry::new(pool, TierBRenderPlan::new());
+
+        let err = registry
+            .call("render::Missing", &json!({}), &HashMap::new())
+            .await
+            .expect_err("an unregistered component must fail loudly, not render empty");
+
+        match err {
+            RenderError::RegistryFailure { render_fn, message } => {
+                assert_eq!(render_fn, "render::Missing");
+                assert!(
+                    message.contains("no Tier-B render plan"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected RegistryFailure, got {other:?}"),
+        }
     }
 
     #[tokio::test]

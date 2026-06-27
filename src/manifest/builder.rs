@@ -1,6 +1,8 @@
 // CiCD reviewer rules
 
-use super::metadata::{hoist_head_tags_from_body, metadata_from_const_expr};
+use super::metadata::{
+    hoist_head_tags_from_body, metadata_from_const_expr, render_head_metadata, DYNAMIC_HEAD_MARKER,
+};
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, RenderedNode,
     RouteActionEntry, RouteManifest, RouteMetadata, Tier, TierBNode, TierCNode, WTStreamSlot,
@@ -169,6 +171,11 @@ impl<'a> ManifestBuilder<'a> {
         let hoisted = hoist_head_from_nodes(&mut tier_a_root, &mut tier_b);
         metadata.merge(hoisted);
 
+        // Slice 3 — does the route's leaf module export `generateMetadata`? If
+        // so the shell carries a head marker (not the static title/meta) and the
+        // serve path resolves the real metadata per request.
+        let dynamic_metadata = self.detect_dynamic_metadata(root_component);
+
         let shell = self.build_shell(
             route,
             assets,
@@ -177,6 +184,7 @@ impl<'a> ManifestBuilder<'a> {
             &tier_c,
             &layout_chain,
             &metadata,
+            dynamic_metadata.is_some(),
         );
 
         RouteManifest {
@@ -191,7 +199,24 @@ impl<'a> ManifestBuilder<'a> {
             error_component,
             loading_component,
             metadata,
+            dynamic_metadata,
         }
+    }
+
+    /// Slice 3 — return the leaf component's name when its module exports a
+    /// `generateMetadata` function (the boot-plan key the serve path invokes),
+    /// or `None` when the route's head is fully static. A `generateMetadata`
+    /// that exists but isn't actually exported is a harmless false positive:
+    /// the per-request eval finds no export and the static head stands.
+    fn detect_dynamic_metadata(&self, root_component: ComponentId) -> Option<String> {
+        let compiled = self.compiled_render_project.as_ref()?;
+        let component = self.components.get(&root_component)?;
+        let entry = self.component_entry_for_project(component, compiled.root.as_path())?;
+        let module = compiled.project.module(entry.as_str())?;
+        module
+            .functions
+            .contains_key("generateMetadata")
+            .then(|| component.name.clone())
     }
 
     /// Gate 2 · B (slice 1) — read the route leaf component's
@@ -391,6 +416,7 @@ impl<'a> ManifestBuilder<'a> {
         tier_c: &[TierCNode],
         layout_chain: &[String],
         metadata: &RouteMetadata,
+        dynamic_metadata: bool,
     ) -> HtmlShell {
         // Build the route's inner body content first (everything that
         // would land between <body> and </body> pre-E.1). This is the
@@ -414,30 +440,15 @@ impl<'a> ManifestBuilder<'a> {
         let mut doctype_and_head = String::from(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
         );
-        // Author-declared title wins; otherwise keep the historical
-        // `ALBEDO {route}` fallback so untouched routes are byte-identical
-        // to pre-B builds.
-        match &metadata.title {
-            Some(title) => {
-                doctype_and_head.push_str(&format!("<title>{}</title>", escape_html(title)))
-            }
-            None => {
-                doctype_and_head.push_str(&format!("<title>ALBEDO {}</title>", escape_html(route)))
-            }
-        }
-        if let Some(description) = &metadata.description {
-            doctype_and_head.push_str(&format!(
-                "<meta name=\"description\" content=\"{}\">",
-                escape_html(description)
-            ));
-        }
-        for tag in &metadata.meta {
-            doctype_and_head.push_str(&format!(
-                "<meta {}=\"{}\" content=\"{}\">",
-                escape_html(&tag.attr),
-                escape_html(&tag.key),
-                escape_html(&tag.content)
-            ));
+        // The `<title>`/`<meta>` block. For a route with `generateMetadata`,
+        // emit a marker the serve path replaces per request with the resolved
+        // (static-merged-with-dynamic) head; otherwise bake the static block.
+        // Author-declared title wins; otherwise the historical `ALBEDO {route}`
+        // fallback keeps untouched routes byte-identical to pre-B builds.
+        if dynamic_metadata {
+            doctype_and_head.push_str(DYNAMIC_HEAD_MARKER);
+        } else {
+            doctype_and_head.push_str(&render_head_metadata(route, metadata));
         }
         for css_path in &assets.css {
             doctype_and_head.push_str(&format!(

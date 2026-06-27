@@ -17,8 +17,15 @@
     {
       "name": "albedo-portfolio",
       "runtimeExecutable": "cmd",
-      "runtimeArgs": ["/c", "cd /d A:\\albedo-portfolio && A:\\AlBDO-v-0.1.0\\target\\debug\\albedo.exe serve --port 3113"],
+      "runtimeArgs": ["/c", "cd /d A:\\albedo-portfolio && A:\\AlBDO-v-0.1.0\\target\\release\\albedo.exe serve --port 3113"],
       "port": 3113,
+      "autoPort": false
+    },
+    {
+      "name": "albedo-portfolio-dbg",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "cd /d A:\\albedo-portfolio && A:\\AlBDO-v-0.1.0\\target\\debug\\albedo.exe serve --port 3115"],
+      "port": 3115,
       "autoPort": false
     }
   ]
