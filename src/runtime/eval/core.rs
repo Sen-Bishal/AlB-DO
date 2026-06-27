@@ -117,12 +117,45 @@ pub struct ConditionalBindingRaw {
     pub html_false: String,
 }
 
+/// A keyed-list (`.map()`) subtree collected during a Phase K render: an
+/// `{ARRAY.map((item[, i]) => <static JSX>)}` whose `ARRAY` is client-computable
+/// from reactive slots and whose per-item subtree is STATIC relative to the item
+/// (host elements, no `on*` handlers, no nested components; `{expr}` holes that
+/// reference only the item/index params and pure globals). The client recomputes
+/// the whole list's HTML from state whenever a dep slot changes and swaps the
+/// wrapper element's `innerHTML` — structural reactivity over a data-driven node
+/// count with no component hydration. Lowered to a `html: true` derived binding
+/// (a `.map(...).join('')` thunk) by `build_reactive_payload`.
+///
+/// First slice = coarse re-render: any change rebuilds all list DOM (correct for
+/// static items, which carry no per-node state to lose). True keyed
+/// reconciliation (preserve/reorder DOM identity, focus) is a documented
+/// follow-up — the `key` prop is parsed past but not yet used.
+#[derive(Debug, Clone)]
+pub struct ListBindingRaw {
+    /// `data-albedo-id` of the `display:contents` wrapper the renderer emitted.
+    pub stable_id: u32,
+    /// `(binding name, slot id)` for every reactive slot the array reads.
+    pub deps: Vec<(String, SlotId)>,
+    /// The array expression (with resolvable locals substituted), e.g. `items`.
+    pub array: swc_ecma_ast::Expr,
+    /// The arrow's first param name — the per-item binding (`item`).
+    pub item_param: String,
+    /// The arrow's optional second param name — the index binding (`i`).
+    pub index_param: Option<String>,
+    /// The arrow body: the per-item JSX element/fragment to template.
+    pub item_body: swc_ecma_ast::Expr,
+}
+
 thread_local! {
     /// Conditional subtree toggles collected during the current render. Same
     /// lifecycle as `DERIVED_OUT`: reset at the top of each `render_entry_*`
     /// call, taken by `build_reactive_payload`.
     static CONDITIONAL_OUT: RefCell<Vec<ConditionalBindingRaw>> =
         const { RefCell::new(Vec::new()) };
+    /// Keyed-list subtrees collected during the current render. Same lifecycle
+    /// as `CONDITIONAL_OUT`.
+    static LIST_OUT: RefCell<Vec<ListBindingRaw>> = const { RefCell::new(Vec::new()) };
     /// Set when the render hit a structural construct (a JSX conditional/list)
     /// that binding mode can't represent fine-grained — so the component must
     /// fall back to the A3 whole-component island rather than ship a stale or
@@ -132,7 +165,17 @@ thread_local! {
 
 fn reset_conditional_bindings() {
     CONDITIONAL_OUT.with(|cell| cell.borrow_mut().clear());
+    LIST_OUT.with(|cell| cell.borrow_mut().clear());
     STRUCTURAL_FALLBACK.with(|cell| cell.set(false));
+}
+
+fn push_list_binding(binding: ListBindingRaw) {
+    LIST_OUT.with(|cell| cell.borrow_mut().push(binding));
+}
+
+/// Take the keyed-list bindings collected by the most recent render.
+pub fn take_phase_k_list_bindings() -> Vec<ListBindingRaw> {
+    LIST_OUT.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 fn push_conditional_binding(binding: ConditionalBindingRaw) {
@@ -354,9 +397,9 @@ fn is_static_jsx_element(el: &swc_ecma_ast::JSXElement) -> bool {
             return false; // event handler → needs binding
         }
         match &jsx_attr.value {
-            None => {}                                  // bare boolean attr
-            Some(JSXAttrValue::Lit(_)) => {}            // string literal
-            _ => return false,                          // `{expr}` value → reads state
+            None => {}                       // bare boolean attr
+            Some(JSXAttrValue::Lit(_)) => {} // string literal
+            _ => return false,               // `{expr}` value → reads state
         }
     }
     el.children.iter().all(is_static_jsx_child)
@@ -378,6 +421,228 @@ fn is_static_jsx_child(child: &swc_ecma_ast::JSXElementChild) -> bool {
 /// static-swap path (they're not plain host markup).
 fn is_host_tag(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_ascii_lowercase()) && name != "children"
+}
+
+/// One keyed-list (`.map()`) call in child position the binding-mode renderer can
+/// reason about. Borrows the array, the arrow's param names, and the per-item
+/// JSX body. Returns `None` for anything that isn't `ARRAY.map(arrow)` with a
+/// JSX-bearing expression-body arrow taking one or two identifier params.
+struct JsxList<'a> {
+    array: &'a swc_ecma_ast::Expr,
+    item_param: String,
+    index_param: Option<String>,
+    body: &'a swc_ecma_ast::Expr,
+}
+
+fn classify_jsx_list(expr: &swc_ecma_ast::Expr) -> Option<JsxList<'_>> {
+    use swc_ecma_ast::{BlockStmtOrExpr, Callee, Expr, MemberProp, Pat};
+    let Expr::Call(call) = unwrap_paren(expr) else {
+        return None;
+    };
+    // Callee must be a `.map` member access; the object is the array expression.
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Member(member) = unwrap_paren(callee) else {
+        return None;
+    };
+    let MemberProp::Ident(method) = &member.prop else {
+        return None;
+    };
+    if method.sym.as_ref() != "map" {
+        return None;
+    }
+    // Exactly one callback argument, an arrow with 1-2 identifier params.
+    if call.args.len() != 1 || call.args[0].spread.is_some() {
+        return None;
+    }
+    let Expr::Arrow(arrow) = unwrap_paren(&call.args[0].expr) else {
+        return None;
+    };
+    if arrow.params.is_empty() || arrow.params.len() > 2 {
+        return None;
+    }
+    let param_ident = |pat: &Pat| -> Option<String> {
+        match pat {
+            Pat::Ident(id) => Some(id.id.sym.to_string()),
+            _ => None, // destructured params aren't handled in this slice
+        }
+    };
+    let item_param = param_ident(&arrow.params[0])?;
+    let index_param = match arrow.params.get(1) {
+        Some(p) => Some(param_ident(p)?),
+        None => None,
+    };
+    // Expression-body arrow returning JSX (the common `item => <li>…</li>`).
+    let BlockStmtOrExpr::Expr(body) = &*arrow.body else {
+        return None;
+    };
+    if !is_jsx_expr(body) {
+        return None;
+    }
+    Some(JsxList {
+        array: &member.obj,
+        item_param,
+        index_param,
+        body,
+    })
+}
+
+/// True when a per-item JSX subtree is *static relative to the item*: host
+/// elements only (no components, no `<Link>`), no `on*` handlers, no spreads,
+/// and every `{expr}` hole (child or attribute value) references only the item
+/// param, the index param, or a recognised pure global. Such a subtree can be
+/// regenerated wholesale from live item data with a templated `innerHTML` swap;
+/// anything richer (handlers, components, reads of OTHER component state) →
+/// A3 fallback.
+fn is_static_list_item(
+    expr: &swc_ecma_ast::Expr,
+    item_param: &str,
+    index_param: Option<&str>,
+) -> bool {
+    use swc_ecma_ast::Expr;
+    match unwrap_paren(expr) {
+        Expr::JSXElement(el) => is_static_list_element(el, item_param, index_param),
+        Expr::JSXFragment(frag) => frag
+            .children
+            .iter()
+            .all(|c| is_static_list_child(c, item_param, index_param)),
+        _ => false,
+    }
+}
+
+fn is_static_list_element(
+    el: &swc_ecma_ast::JSXElement,
+    item_param: &str,
+    index_param: Option<&str>,
+) -> bool {
+    use swc_ecma_ast::{JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElementName, JSXExpr};
+    let JSXElementName::Ident(tag) = &el.opening.name else {
+        return false;
+    };
+    if !is_host_tag(tag.sym.as_ref()) {
+        return false;
+    }
+    for attr in &el.opening.attrs {
+        let JSXAttrOrSpread::JSXAttr(jsx_attr) = attr else {
+            return false; // spread → not representable
+        };
+        let JSXAttrName::Ident(attr_name) = &jsx_attr.name else {
+            return false;
+        };
+        let an = attr_name.sym.as_ref();
+        if an.starts_with("on") && an.len() > 2 {
+            return false; // event handler inside a list item → needs an island
+        }
+        match &jsx_attr.value {
+            None => {}                       // bare boolean attr
+            Some(JSXAttrValue::Lit(_)) => {} // string literal
+            Some(JSXAttrValue::JSXExprContainer(c)) => {
+                let JSXExpr::Expr(e) = &c.expr else {
+                    return false;
+                };
+                if !item_expr_only_refs(e, item_param, index_param) {
+                    return false;
+                }
+            }
+            _ => return false, // JSX-valued attr etc.
+        }
+    }
+    el.children
+        .iter()
+        .all(|c| is_static_list_child(c, item_param, index_param))
+}
+
+fn is_static_list_child(
+    child: &swc_ecma_ast::JSXElementChild,
+    item_param: &str,
+    index_param: Option<&str>,
+) -> bool {
+    use swc_ecma_ast::{JSXElementChild, JSXExpr};
+    match child {
+        JSXElementChild::JSXText(_) => true,
+        JSXElementChild::JSXElement(el) => is_static_list_element(el, item_param, index_param),
+        JSXElementChild::JSXFragment(frag) => frag
+            .children
+            .iter()
+            .all(|c| is_static_list_child(c, item_param, index_param)),
+        JSXElementChild::JSXExprContainer(c) => match &c.expr {
+            JSXExpr::Expr(e) => item_expr_only_refs(e, item_param, index_param),
+            JSXExpr::JSXEmptyExpr(_) => true,
+        },
+        _ => false,
+    }
+}
+
+/// True when every free identifier in `expr` (in value position) is the item
+/// param, the index param, or a recognised pure global. Member-property names
+/// (`item.name`) are not `Expr::Ident`s so they aren't visited — exactly what we
+/// want, so `item.price * 2` and `Math.round(item.x)` pass while a read of an
+/// outer slot/prop/ref fails. Nested JSX (a component or element with its own
+/// state) also fails (its tag/handlers surface as non-item idents or are
+/// rejected structurally upstream).
+fn item_expr_only_refs(
+    expr: &swc_ecma_ast::Expr,
+    item_param: &str,
+    index_param: Option<&str>,
+) -> bool {
+    use swc_ecma_visit::{Visit, VisitWith};
+
+    const PURE_GLOBALS: &[&str] = &[
+        "Math",
+        "String",
+        "Number",
+        "Boolean",
+        "JSON",
+        "Array",
+        "Object",
+        "Date",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "isFinite",
+        "undefined",
+        "NaN",
+        "Infinity",
+    ];
+
+    struct Check<'a> {
+        item_param: &'a str,
+        index_param: Option<&'a str>,
+        ok: bool,
+        has_jsx: bool,
+    }
+    impl Visit for Check<'_> {
+        fn visit_expr(&mut self, e: &swc_ecma_ast::Expr) {
+            use swc_ecma_ast::Expr;
+            match e {
+                // Value-position identifier — the only place a free variable can
+                // appear. Member-property names (`item.name`) are `IdentName`s
+                // inside `MemberProp`, never `Expr::Ident`, so they're skipped.
+                Expr::Ident(id) => {
+                    let name = id.sym.as_ref();
+                    if !(name == self.item_param
+                        || self.index_param == Some(name)
+                        || PURE_GLOBALS.contains(&name))
+                    {
+                        self.ok = false;
+                    }
+                }
+                // Nested JSX inside an item hole isn't templated in this slice.
+                Expr::JSXElement(_) | Expr::JSXFragment(_) => self.has_jsx = true,
+                other => other.visit_children_with(self),
+            }
+        }
+    }
+
+    let mut check = Check {
+        item_param,
+        index_param,
+        ok: true,
+        has_jsx: false,
+    };
+    expr.visit_with(&mut check);
+    check.ok && !check.has_jsx
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -3312,8 +3577,8 @@ impl ComponentProject {
         let deps = phase_k_collect_slot_deps(cond);
 
         // Are both branches safe to pre-render and toggle wholesale?
-        let branches_static = is_static_branch(true_branch)
-            && false_branch.map(is_static_branch).unwrap_or(true);
+        let branches_static =
+            is_static_branch(true_branch) && false_branch.map(is_static_branch).unwrap_or(true);
 
         let active_truthy = is_truthy(&self.eval_expr(module_spec, cond, env)?);
 
@@ -3355,7 +3620,11 @@ impl ComponentProject {
         // A `display:contents` wrapper carries the stable id without adding a
         // layout box, so toggling its innerHTML preserves the surrounding flow.
         let wrapper_id = next_element_stable_id(module_spec);
-        let active_html = if active_truthy { &html_true } else { &html_false };
+        let active_html = if active_truthy {
+            &html_true
+        } else {
+            &html_false
+        };
         html.push_str(&format!(
             "<span {ALBEDO_ID_ATTR}=\"{wrapper_id}\" style=\"display:contents\">{active_html}</span>"
         ));
@@ -3396,6 +3665,69 @@ impl ComponentProject {
         }
     }
 
+    /// Binding mode · keyed-lists rung. Render `{ARRAY.map((item[,i]) => <JSX>)}`.
+    /// When `ARRAY` is slot-reactive AND the item subtree is static-relative-to-
+    /// item, emit a `display:contents` wrapper and record a [`ListBindingRaw`] so
+    /// the client regenerates the list's `innerHTML` from live state. Otherwise
+    /// mark the render for the A3 island fallback and just render the current
+    /// list (the binding payload is then discarded; correctness comes from the
+    /// fallback).
+    fn render_jsx_list(
+        &self,
+        module_spec: &str,
+        list: &JsxList<'_>,
+        env: &HashMap<String, Value>,
+        html: &mut String,
+    ) -> Result<()> {
+        // Is the array computable from reactive slots alone? `None` → it's a
+        // prop/constant/unresolved (can't change via local state), so a static
+        // render is correct and no binding is needed.
+        let deps = phase_k_collect_slot_deps(list.array);
+        let item_static =
+            is_static_list_item(list.body, &list.item_param, list.index_param.as_deref());
+
+        // SSR first paint: evaluate the array and render each item with the item
+        // (and index) param bound. This is the markup shipped for no-JS / before
+        // the client boots; on boot the driver recomputes and replaces it.
+        let array_value = self.eval_expr(module_spec, list.array, env)?;
+        let mut inner = String::new();
+        if let Value::Array(items) = &array_value {
+            for (i, item) in items.iter().enumerate() {
+                let mut child_env = env.clone();
+                child_env.insert(list.item_param.clone(), item.clone());
+                if let Some(index_param) = &list.index_param {
+                    child_env.insert(index_param.clone(), Value::from(i as i64));
+                }
+                inner.push_str(&self.render_branch_html(module_spec, list.body, &child_env)?);
+            }
+        }
+
+        // Eligible only when the array is slot-reactive AND items are static.
+        if !(deps.is_some() && item_static) {
+            if deps.is_some() {
+                // Slot-reactive list we can't represent fine-grained → A3 island.
+                mark_structural_fallback();
+            }
+            html.push_str(&inner);
+            return Ok(());
+        }
+
+        let (resolved_array, deps) = deps.expect("eligible implies deps present");
+        let wrapper_id = next_element_stable_id(module_spec);
+        html.push_str(&format!(
+            "<span {ALBEDO_ID_ATTR}=\"{wrapper_id}\" style=\"display:contents\">{inner}</span>"
+        ));
+        push_list_binding(ListBindingRaw {
+            stable_id: wrapper_id,
+            deps,
+            array: resolved_array,
+            item_param: list.item_param.clone(),
+            index_param: list.index_param.clone(),
+            item_body: list.body.clone(),
+        });
+        Ok(())
+    }
+
     fn render_children(
         &self,
         module_spec: &str,
@@ -3425,6 +3757,15 @@ impl ComponentProject {
                         if phase_k_enabled() {
                             if let Some(kind) = classify_jsx_conditional(expr) {
                                 self.render_jsx_conditional(module_spec, &kind, env, &mut html)?;
+                                continue;
+                            }
+                            // Binding mode · keyed-lists rung. `{arr.map(item =>
+                            // <JSX>)}` is structural — state changes WHICH nodes
+                            // exist. When the array is slot-reactive and items are
+                            // static, render it as a `display:contents` wrapper the
+                            // client regenerates via `innerHTML`; else fall back.
+                            if let Some(list) = classify_jsx_list(expr) {
+                                self.render_jsx_list(module_spec, &list, env, &mut html)?;
                                 continue;
                             }
                         }

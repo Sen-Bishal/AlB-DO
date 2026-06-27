@@ -8,9 +8,8 @@
 //! runs into a structural mismatch that is the real design fork of this slice.
 //!
 //! * [`QuickJsEngine`] is **`!Send`** and every entry point needs **`&mut`**.
-//! * The action adapter is **`&self` + `async`** and runs on axum's
-//!   **multi-thread** tokio runtime (`rt-multi-thread`), so a future may be
-//!   parked on one worker thread and resumed on another.
+//! * The action adapter is **`&self` + `async`** and runs on axum's **multi-thread** tokio runtime
+//!   (`rt-multi-thread`), so a future may be parked on one worker thread and resumed on another.
 //!
 //! A literal "check the engine out, get `&mut`, hand it to the caller, return
 //! it on drop" pool is therefore **unsound** here: holding a `!Send` engine
@@ -60,6 +59,25 @@ use tokio::sync::{oneshot, Semaphore};
 /// QuickJS's lazily-allocated global tables; we run a small margin past that so
 /// the first real checkout is already in request-scoped mode.
 const POOL_WARMUP_RENDERS: u32 = 10;
+
+/// Number of warm-up renders per component in [`warm_render_targets`]. The first
+/// render interns the component's QuickJS shapes/atoms into the persistent region;
+/// the rest are cheap confirmation that the now-warm path is stable.
+const RENDER_WARMUP_REPS: u32 = 2;
+
+/// A component to warm every pool engine's *render* path with. Owns its full
+/// dependency-ordered module graph and an entry spec so a pool worker can load and
+/// render it off the boot thread. Built from the renderer's Tier-B plan.
+#[derive(Clone)]
+pub struct WarmupComponent {
+    /// `(specifier, code)` pairs in dependency-first load order.
+    pub modules: Vec<(String, String)>,
+    /// Module spec passed to the render entry (the component's `module_path`).
+    pub entry: String,
+    /// Props JSON to render with during warm-up (values are irrelevant; only the
+    /// component's interned structure matters).
+    pub props_json: String,
+}
 
 /// A unit of work shipped to an engine's dedicated thread. The closure runs
 /// with exclusive `&mut` access to that thread's engine and is responsible for
@@ -225,6 +243,54 @@ impl QuickJsEnginePool {
 
         result
     }
+
+    /// Warm the *render* path of **every** engine in the pool with `components`.
+    ///
+    /// Unlike [`Self::with_engine`] (which runs on a single arbitrary engine), this
+    /// reaches each engine exactly once. It is a **synchronous, blocking** boot-time
+    /// call: it pops every worker, ships the render warm-up job to all of them
+    /// concurrently (each on its own thread), and blocks until all finish before
+    /// returning the workers to the idle set. With an empty `components` slice it is
+    /// a no-op.
+    ///
+    /// Must be called at boot, after construction and before the pool serves any
+    /// request: it pops the idle set without acquiring permits, which is sound only
+    /// while nothing else is checking engines out. The semaphore's permit count is
+    /// untouched, so normal checkouts resume correctly afterwards.
+    pub fn warm_render_path(&self, components: &[WarmupComponent]) {
+        if components.is_empty() {
+            return;
+        }
+
+        let workers: Vec<Worker> = {
+            let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
+            std::mem::take(&mut *idle)
+        };
+
+        // Ship the warm-up job to every worker, then block on all of them so every
+        // engine is hot before we return. A blocking std channel is fine — boot.
+        let mut dones = Vec::with_capacity(workers.len());
+        for worker in &workers {
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+            let components = components.to_vec();
+            let job: Job = Box::new(move |engine: &mut QuickJsEngine| {
+                warm_render_targets(engine, &components);
+                let _ = done_tx.send(());
+            });
+            // If a worker is gone its result never arrives; skip it.
+            if worker.job_tx.send(job).is_ok() {
+                dones.push(done_rx);
+            }
+        }
+        for done_rx in dones {
+            let _ = done_rx.recv();
+        }
+
+        {
+            let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
+            *idle = workers;
+        }
+    }
 }
 
 impl Drop for QuickJsEnginePool {
@@ -270,19 +336,23 @@ fn engine_worker_loop(job_rx: mpsc::Receiver<Job>, ready_tx: Sender<()>) {
     }
 }
 
-/// Warm a freshly constructed engine so it is hot before its first checkout.
+/// Warm a freshly constructed engine's *handler* path so it is hot before its
+/// first checkout.
 ///
 /// Two layers of warmth:
-/// 1. `prewarm()` — installs the built-in runtime helpers and constructs the
-///    QuickJS runtime/context (makes `is_initialized()` true).
-/// 2. Drive [`POOL_WARMUP_RENDERS`] representative handler evals so the
-///    request-scoped arena promotes out of persistent mode and enables O(1)
-///    reset. The warmup body is deliberately broad — a loop, a `try`/`catch`, an
-///    array method, a setter call, and an updater-form `broadcast` — so the
-///    QuickJS shape/atom tables for the common handler-script machinery are
-///    allocated into the persistent region during these renders rather than on
-///    a real request. The evals are pure (no `SlotStore`/`BroadcastRegistry`);
-///    the collected effects are discarded.
+/// 1. `prewarm()` — installs the built-in runtime helpers and constructs the QuickJS
+///    runtime/context (makes `is_initialized()` true).
+/// 2. Drive [`POOL_WARMUP_RENDERS`] representative handler evals so the request-scoped arena
+///    promotes out of persistent mode and enables O(1) reset. The warmup body is deliberately broad
+///    — a loop, a `try`/`catch`, an array method, a setter call, and an updater-form `broadcast` —
+///    so the QuickJS shape/atom tables for the common handler-script machinery are allocated into
+///    the persistent region during these renders rather than on a real request. The evals are pure
+///    (no `SlotStore`/`BroadcastRegistry`); the collected effects are discarded.
+///
+/// The *render* path is warmed separately and on demand via
+/// [`QuickJsEnginePool::warm_render_path`], because it needs the actual component
+/// modules (known only once the manifest is loaded). An engine that is only ever
+/// used for actions never pays for render warm-up.
 fn warm_engine(engine: &mut QuickJsEngine) {
     engine.prewarm();
 
@@ -313,6 +383,33 @@ fn warm_engine(engine: &mut QuickJsEngine) {
         // serves correctly), it must never abort pool construction.
         let _ = engine.eval_handler("__albedo_pool_warmup", &invocation);
     }
+}
+
+/// Warm one engine's *render* path with a known component set, in persistent
+/// arena mode. Each component's module graph is loaded and the component rendered
+/// a few times inside an explicit [`QuickJsEngine::begin_warmup`] /
+/// [`QuickJsEngine::end_warmup`] bracket, so all of its lazily-interned QuickJS
+/// state (element/attribute atoms, hidden-class shapes, the render-entry closure)
+/// lands in the persistent region. Without this, the *first* scoped render of a
+/// given component interns that state into the request region, which the boundary
+/// reset then frees — a use-after-free that crashes the next render (the documented
+/// arena residual hazard). Mirrors the boot renderer's "prime every route" pass,
+/// but per pool engine. Soft-fails per step; a cold engine still serves correctly
+/// for components it did manage to warm.
+fn warm_render_targets(engine: &mut QuickJsEngine, components: &[WarmupComponent]) {
+    use dom_render_compiler::runtime::engine::RuntimeEngine;
+
+    engine.begin_warmup();
+    for component in components {
+        for (specifier, code) in &component.modules {
+            let _ = engine.load_module(specifier, code);
+        }
+        for _ in 0..RENDER_WARMUP_REPS {
+            let _ =
+                engine.render_component_with_host(&component.entry, &component.props_json, "{}");
+        }
+    }
+    engine.end_warmup();
 }
 
 #[cfg(test)]

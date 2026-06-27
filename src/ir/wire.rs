@@ -30,22 +30,51 @@ pub enum WireError {
 ///   IDs (TagId, AttrId, StableId). Varint shrinks the average frame by ~30%
 ///   versus fixed-width encoding without costing the decoder anything that
 ///   matters at frame sizes we ship (sub-kilobyte typical).
-/// - **No limit**: the WebTransport muxer enforces frame budgets at the
-///   transport layer ([`crate::runtime::webtransport`]). A second limit at
-///   the codec is redundant and would surface as an opaque
-///   `DecodeError::LimitExceeded` rather than the transport's well-typed
-///   `WebTransportError::PayloadKindMismatch`.
+/// - **No limit**: the encode side trusts its own output — frames we build are
+///   bounded by construction and the WebTransport muxer budgets them at the
+///   transport layer ([`crate::runtime::webtransport`]). The *decode* side is a
+///   different story: it consumes attacker-controlled bytes, so it does NOT
+///   inherit this no-limit config (see [`decode_config`]). Splitting the two
+///   keeps the on-wire bytes of every valid frame byte-identical — the limit is
+///   a decode-time acceptance bound, not a serialization knob — so the
+///   conformance contract below is unaffected.
 ///
-/// Any change to this configuration is a wire-format break and MUST be
-/// accompanied by a bump of
+/// Any change to **this** (encode) configuration is a wire-format break and
+/// MUST be accompanied by a bump of
 /// [`crate::ir::conformance::LOCKED_WIRE_VERSION`] and a regenerated
-/// `tests/fixtures/wire/v2_canonical_frame.bin`.
+/// `tests/fixtures/wire/v2_canonical_frame.bin`. Changing [`decode_config`]'s
+/// limit is not a format break (valid frames decode identically).
 #[inline]
 pub(crate) fn config() -> impl bincode::config::Config {
     bincode::config::standard()
         .with_little_endian()
         .with_variable_int_encoding()
         .with_no_limit()
+}
+
+/// Upper bound on the bytes any single wire decode may read or allocate.
+///
+/// A bincode decoder with no limit trusts the length prefix of a `Vec`/`String`
+/// and pre-allocates that capacity — so a handful of bytes claiming a petabyte
+/// length triggers an unbounded allocation that aborts the process (an
+/// uncatchable OOM, not a `panic!`). This is the classic *decode bomb*. The
+/// most exposed caller is [`crate::ir::action::decode_action_envelope`], fed
+/// straight from a `POST /_albedo/action` body; the HTTP layer caps that body
+/// at 2 MiB, so this ceiling sits comfortably above it while staying orders of
+/// magnitude below "exhaust the host". No legitimate opcode frame (sub-kilobyte
+/// typical) or action envelope approaches it.
+pub(crate) const MAX_WIRE_DECODE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Decode-side configuration: identical format knobs to [`config`] (so valid
+/// bytes decode the same), plus a hard byte limit so a forged length prefix is
+/// rejected as a typed [`WireError::Decode`] instead of triggering a runaway
+/// allocation. Used by every [`WireDecode`] impl; never by encode.
+#[inline]
+fn decode_config() -> impl bincode::config::Config {
+    bincode::config::standard()
+        .with_little_endian()
+        .with_variable_int_encoding()
+        .with_limit::<MAX_WIRE_DECODE_BYTES>()
 }
 
 // ── Codec traits ─────────────────────────────────────────────────────
@@ -78,7 +107,9 @@ impl<T: bincode::Encode> WireEncode for T {
 
 impl<T: bincode::Decode<()>> WireDecode for T {
     fn wire_decode(bytes: &[u8]) -> Result<(Self, usize), WireError> {
-        let (value, len) = bincode::decode_from_slice(bytes, config())?;
+        // Bounded decode config — see `decode_config`. A malformed length
+        // prefix errors out here rather than allocating from it.
+        let (value, len) = bincode::decode_from_slice(bytes, decode_config())?;
         Ok((value, len))
     }
 }

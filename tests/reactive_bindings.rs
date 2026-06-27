@@ -533,7 +533,10 @@ fn conditional_subtree_toggles_via_innerhtml_with_zero_network() {
     // The conditional lowers to exactly one derived binding marked `html`,
     // depending on `open`'s slot, plus the toggle handler. No text/attr binding
     // (the subtree is static), so this is purely the structural rung.
-    assert!(payload.texts.is_empty(), "no bare text reads in this component");
+    assert!(
+        payload.texts.is_empty(),
+        "no bare text reads in this component"
+    );
     assert!(payload.attrs.is_empty(), "no attribute slot reads either");
     assert_eq!(payload.derived.len(), 1, "one conditional binding");
     assert!(
@@ -569,7 +572,10 @@ fn conditional_subtree_toggles_via_innerhtml_with_zero_network() {
     let value: Value = serde_json::from_str(&summary).expect("scenario summary is JSON");
 
     assert_eq!(value["isHtml"], true, "binding marked as html");
-    assert_eq!(value["afterInstall"], "", "falsy branch shows nothing on install");
+    assert_eq!(
+        value["afterInstall"], "",
+        "falsy branch shows nothing on install"
+    );
     // Flipping `open` true recomputes the conditional and swaps in the branch.
     let opened = value["afterOpen"].as_str().unwrap_or_default();
     assert!(
@@ -578,8 +584,14 @@ fn conditional_subtree_toggles_via_innerhtml_with_zero_network() {
     );
     // Flipping back hides it again — fine-grained, same wrapper node.
     assert_eq!(value["afterClose"], "", "closing removes the subtree again");
-    assert_eq!(value["sameNode"], true, "toggle reuses the same wrapper element");
-    assert_eq!(value["network"], 0, "conditional toggle must not round-trip");
+    assert_eq!(
+        value["sameNode"], true,
+        "toggle reuses the same wrapper element"
+    );
+    assert_eq!(
+        value["network"], 0,
+        "conditional toggle must not round-trip"
+    );
 }
 
 #[test]
@@ -596,11 +608,8 @@ fn dynamic_conditional_branch_falls_back_to_island() {
     let session = SessionId::random();
     let slots = SessionSlotView::new(session, store);
 
-    let result = project.build_reactive_payload(
-        "Component.tsx",
-        &Value::Object(Default::default()),
-        &slots,
-    );
+    let result =
+        project.build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots);
     assert!(
         result.is_err(),
         "a state-reading conditional branch must force the A3 fallback, not ship a binding payload"
@@ -613,6 +622,161 @@ fn dynamic_conditional_branch_falls_back_to_island() {
         .expect("conditional fixture compiles");
     let store2 = Arc::new(SlotStore::new());
     let slots2 = SessionSlotView::new(SessionId::random(), store2);
+    assert!(
+        next.build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots2)
+            .is_ok(),
+        "the structural-fallback flag must not leak into the next render"
+    );
+}
+
+// Keyed-lists rung. `{items.map(item => <li>{item.label}</li>)}` over a
+// `useState` array lowers to one `html: true` derived binding whose recompute
+// reads the array slot and joins a per-item HTML template. Clicking "add"
+// appends an item locally; the client regenerates the list's innerHTML from
+// state, growing the DOM — data-driven structural reactivity, zero network.
+const LIST_SCENARIO: &str = r#"
+var payload = globalThis.__PAYLOAD;
+var btnId = payload.events[0].stableId;
+var list = payload.derived[0];          // the html:true list binding
+var wrapId = list.stableId;
+
+var body = document.createElement('div');
+var button = document.createElement('button');
+button.setAttribute('data-albedo-id', String(btnId));
+button.appendChild(document.createTextNode('add'));
+var ul = document.createElement('ul');
+var wrapper = document.createElement('span');
+wrapper.setAttribute('data-albedo-id', String(wrapId));
+wrapper.innerHTML = '';                 // install paints the SSR list
+ul.appendChild(wrapper);
+body.appendChild(button);
+body.appendChild(ul);
+globalThis.__wrap = wrapper;
+
+var vm = globalThis.__albedoReactive.makeVm(document);
+globalThis.__albedoReactive.installReactiveRuntime({ vm: vm, payload: payload, root: body });
+
+var afterInstall = wrapper.innerHTML;   // <li>a</li><li>b</li>
+button.__dispatch('click');             // setItems([...items, {label:'c'}])
+var afterAdd = wrapper.innerHTML;        // <li>a</li><li>b</li><li>c</li>
+
+JSON.stringify({
+  isHtml: list.html === true,
+  afterInstall: afterInstall,
+  afterAdd: afterAdd,
+  sameNode: body.childNodes[1].childNodes[0] === globalThis.__wrap,
+  network: globalThis.__net,
+});
+"#;
+
+#[test]
+fn keyed_list_rerenders_innerhtml_with_zero_network() {
+    let project =
+        CompiledProject::load_from_dir(hook_fixture("list")).expect("list fixture compiles");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store);
+
+    let payload = project
+        .build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots)
+        .expect("reactive payload builds");
+
+    // The list lowers to exactly one derived binding marked `html`, depending on
+    // the `items` slot, plus the append handler. The per-item `{item.label}` is
+    // inside the list template — NOT a component-level text/derived binding.
+    assert!(
+        payload.texts.is_empty(),
+        "no component-level bare text reads"
+    );
+    assert!(
+        payload.attrs.is_empty(),
+        "no component-level attribute reads"
+    );
+    assert_eq!(payload.derived.len(), 1, "one list binding");
+    assert!(
+        payload.derived[0].html,
+        "the list binding must be flagged html (innerHTML re-render)"
+    );
+    assert_eq!(payload.events.len(), 1, "one onClick append handler");
+    assert!(
+        payload.html.contains("display:contents"),
+        "served HTML must wrap the list in a display:contents span; got: {}",
+        payload.html
+    );
+    // SSR first paint already renders the two initial items. (The server-side
+    // `<li>`s carry `data-albedo-id` stamps from the normal render path; the
+    // client template below emits clean markup — the install-paint reconciles
+    // them. So match on the item text, not the exact tag.)
+    assert!(
+        payload.html.contains(">a</li>") && payload.html.contains(">b</li>"),
+        "SSR must render the initial list items; got: {}",
+        payload.html
+    );
+
+    let payload_json = serde_json::to_string(&payload).expect("payload serializes");
+
+    let runtime = Runtime::new().expect("quickjs runtime");
+    let context = Context::full(&runtime).expect("quickjs context");
+
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_AND_VM)
+            .expect("DOM + VM shim evaluates");
+        ctx.eval::<(), _>(REACTIVE_DRIVER)
+            .expect("reactive driver evaluates");
+        let bootstrap = format!("globalThis.__PAYLOAD = {payload_json};");
+        ctx.eval::<(), _>(bootstrap.as_str())
+            .expect("payload injects");
+        ctx.eval::<String, _>(LIST_SCENARIO)
+            .expect("list scenario evaluates")
+    });
+
+    let value: Value = serde_json::from_str(&summary).expect("scenario summary is JSON");
+
+    assert_eq!(value["isHtml"], true, "binding marked as html");
+    // Install paints the two SSR items locally (no network).
+    let installed = value["afterInstall"].as_str().unwrap_or_default();
+    assert!(
+        installed.contains("<li class=\"row\">a</li>")
+            && installed.contains("<li class=\"row\">b</li>"),
+        "install must paint the initial list; got: {installed}"
+    );
+    // Appending grows the list — the new item appears, regenerated from state.
+    let added = value["afterAdd"].as_str().unwrap_or_default();
+    assert!(
+        added.contains("<li class=\"row\">c</li>") && added.matches("<li").count() == 3,
+        "appending must re-render the list with the new item; got: {added}"
+    );
+    assert_eq!(
+        value["sameNode"], true,
+        "re-render reuses the same wrapper node"
+    );
+    assert_eq!(value["network"], 0, "list mutation must not round-trip");
+}
+
+#[test]
+fn dynamic_list_item_falls_back_to_island() {
+    // A list whose per-item subtree carries its own handler (`<li onClick=…>`)
+    // is NOT representable as inert innerHTML — regenerating it would drop the
+    // per-item listeners. The renderer flags a structural fallback and the
+    // payload build errors, so `build_reactive_blocks` skips it and the route
+    // keeps its correct A3 whole-component island. This is the safety guarantee:
+    // binding mode never ships a list it would silently break.
+    let project = CompiledProject::load_from_dir(hook_fixture("list_dynamic"))
+        .expect("list_dynamic fixture compiles");
+    let store = Arc::new(SlotStore::new());
+    let slots = SessionSlotView::new(SessionId::random(), store);
+
+    let result =
+        project.build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots);
+    assert!(
+        result.is_err(),
+        "a list item with its own handler must force the A3 fallback, not ship a binding payload"
+    );
+
+    // The fallback flag must be cleared by the time the build returns, so the
+    // next (eligible) component on the same thread isn't poisoned.
+    let next = CompiledProject::load_from_dir(hook_fixture("list")).expect("list fixture compiles");
+    let slots2 = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
     assert!(
         next.build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots2)
             .is_ok(),

@@ -6,7 +6,7 @@ use super::engine::{
     stable_source_hash, BootstrapPayload, LoadErrorKind, RenderOutput, RuntimeEngine, RuntimeError,
     RuntimeResult,
 };
-use rquickjs::{Context, Function, Runtime};
+use rquickjs::{promise::MaybePromise, Context, Function, Runtime};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -40,9 +40,29 @@ struct RenderEnvelope {
     error: Option<String>,
 }
 
+/// Result envelope for [`QuickJsEngine::eval_route_metadata`]. Unlike
+/// [`RenderEnvelope`], `value` carries the raw `generateMetadata` object (the
+/// Next.js `Metadata` shape) rather than a rendered HTML string.
+#[derive(Debug, Deserialize)]
+struct MetadataEnvelope {
+    ok: bool,
+    value: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
 /// Number of leading renders that run in persistent (non-reset) mode so QuickJS can
 /// allocate its lazily-created, data-dependent runtime-global infrastructure (shape and
 /// atom tables) into the persistent region before request-scoped reset is enabled.
+///
+/// This counter-based window is the *implicit* warm-up used by the single-threaded boot
+/// renderer (it renders every route during the window). Code paths that must warm
+/// engines with a known set of components up front — e.g. the multi-engine action/
+/// render pool — instead use the *explicit* [`QuickJsEngine::begin_warmup`] /
+/// [`QuickJsEngine::end_warmup`] bracket, which forces persistent mode irrespective of
+/// the counter so an arbitrary number of warm-up renders all intern into the persistent
+/// region. Both mechanisms exist for the same reason: any retained (interned) state a
+/// render or handler creates *after* warm-up lands in the request region, which the
+/// boundary reset then frees — a use-after-free that corrupts the runtime.
 const ARENA_WARMUP_RENDERS: u32 = 8;
 
 pub struct QuickJsEngine {
@@ -50,6 +70,11 @@ pub struct QuickJsEngine {
     context: Option<Context>,
     arena: Arc<ArenaControl>,
     renders_done: u32,
+    /// When set, renders/handlers run in persistent (non-reset) mode regardless of
+    /// `renders_done`. Toggled by [`Self::begin_warmup`] / [`Self::end_warmup`] so a
+    /// caller can warm an engine with a specific component set whose interned state
+    /// must survive in the persistent region. See [`ARENA_WARMUP_RENDERS`].
+    force_persistent: bool,
     loaded_module_hashes: HashMap<String, u64>,
     bootstrap: Option<BootstrapPayload>,
     initialized: bool,
@@ -62,6 +87,7 @@ impl QuickJsEngine {
             context: None,
             arena: ArenaControl::with_default_caps(),
             renders_done: 0,
+            force_persistent: false,
             loaded_module_hashes: HashMap::new(),
             bootstrap: None,
             initialized: false,
@@ -82,6 +108,25 @@ impl QuickJsEngine {
 
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// Enter explicit warm-up mode: until [`Self::end_warmup`], every render and
+    /// handler eval runs in persistent (non-reset) arena mode regardless of how
+    /// many operations have already run. Use this to warm an engine with a known
+    /// set of components whose interned QuickJS state (shapes/atoms) must live in
+    /// the persistent region before the engine starts serving request-scoped work.
+    /// See [`ARENA_WARMUP_RENDERS`] for the implicit, counter-based alternative.
+    pub fn begin_warmup(&mut self) {
+        self.force_persistent = true;
+    }
+
+    /// Leave explicit warm-up mode and arm request-scoped reset for all subsequent
+    /// work. Advances the warm-up counter past [`ARENA_WARMUP_RENDERS`] so the
+    /// implicit window can't reopen and re-admit a persistent render after the
+    /// engine has been declared hot.
+    pub fn end_warmup(&mut self) {
+        self.force_persistent = false;
+        self.renders_done = self.renders_done.max(ARENA_WARMUP_RENDERS);
     }
 
     /// A1 · host-object bridge — run a TSX event handler / server `action()`
@@ -112,7 +157,7 @@ impl QuickJsEngine {
         self.ensure_initialized()?;
         let script = build_handler_script(invocation)?;
 
-        let scoped = self.renders_done >= ARENA_WARMUP_RENDERS;
+        let scoped = !self.force_persistent && self.renders_done >= ARENA_WARMUP_RENDERS;
         self.renders_done = self.renders_done.saturating_add(1);
         if scoped {
             self.arena.begin_request();
@@ -123,10 +168,7 @@ impl QuickJsEngine {
             })
         });
         if scoped {
-            self.runtime
-                .as_ref()
-                .expect("runtime initialized")
-                .run_gc();
+            self.runtime.as_ref().expect("runtime initialized").run_gc();
             self.arena.end_request();
         }
 
@@ -161,7 +203,7 @@ impl QuickJsEngine {
         // result string is copied out into Rust below, then a single cycle-collection pass
         // drops any cyclic request garbage so the O(1) reset can reclaim the region with
         // nothing left referencing it.
-        let scoped = self.renders_done >= ARENA_WARMUP_RENDERS;
+        let scoped = !self.force_persistent && self.renders_done >= ARENA_WARMUP_RENDERS;
         self.renders_done = self.renders_done.saturating_add(1);
         if scoped {
             self.arena.begin_request();
@@ -176,8 +218,8 @@ impl QuickJsEngine {
                 ))
             })?;
 
-            render_fn
-                .call::<(String, String, String), String>((
+            let maybe = render_fn
+                .call::<(String, String, String), MaybePromise>((
                     entry.to_string(),
                     props_json.to_string(),
                     host_arg,
@@ -186,15 +228,23 @@ impl QuickJsEngine {
                     RuntimeError::render(format!(
                         "failed to execute reusable render function for component '{entry}': {err}"
                     ))
-                })
+                })?;
+            // An async server component (RSC) returns a Promise of its envelope;
+            // `finish` drives the QuickJS job queue to resolution here, on the
+            // server. A synchronous component is already settled, so this is the
+            // no-op fast path. If resolution can't progress — the awaited work
+            // needs host I/O the SSR sandbox can't provide — `finish` yields
+            // `WouldBlock`, surfaced as a loud render error rather than a blank.
+            maybe.finish::<String>().map_err(|err| {
+                RuntimeError::render(format!(
+                    "failed to resolve render result for component '{entry}': {err}"
+                ))
+            })
         });
         let eval_ms = eval_start.elapsed().as_millis();
 
         if scoped {
-            self.runtime
-                .as_ref()
-                .expect("runtime initialized")
-                .run_gc();
+            self.runtime.as_ref().expect("runtime initialized").run_gc();
             self.arena.end_request();
         }
 
@@ -216,6 +266,72 @@ impl QuickJsEngine {
             let message = envelope
                 .error
                 .unwrap_or_else(|| "unknown runtime error".to_string());
+            Err(map_render_error(entry, &message))
+        }
+    }
+
+    /// Gate 2 · B slice 3 — evaluate a route module's `generateMetadata(props)`
+    /// export to its raw metadata object. `Ok(None)` when the module declares no
+    /// such export (the common case — the static `<head>` stands); `Ok(Some)`
+    /// with the resolved object otherwise. An `async generateMetadata` is driven
+    /// to settlement here, the same way an async server component is awaited
+    /// during render. A throw inside `generateMetadata` surfaces as a loud
+    /// render error rather than a silent empty head.
+    pub fn eval_route_metadata(
+        &mut self,
+        entry: &str,
+        props_json: &str,
+    ) -> RuntimeResult<Option<serde_json::Value>> {
+        self.ensure_initialized()?;
+
+        // Same request-arena discipline as a render: after warmup, everything
+        // the eval allocates is bump-allocated into the request region and reset
+        // in O(1) once the result string is copied out.
+        let scoped = !self.force_persistent && self.renders_done >= ARENA_WARMUP_RENDERS;
+        self.renders_done = self.renders_done.saturating_add(1);
+        if scoped {
+            self.arena.begin_request();
+        }
+
+        let eval_result = self.context.as_ref().unwrap().with(|ctx| {
+            let globals = ctx.globals();
+            let eval_fn: Function = globals.get("__ALBEDO_EVAL_METADATA").map_err(|err| {
+                RuntimeError::render(format!(
+                    "metadata eval function missing for route '{entry}': {err}"
+                ))
+            })?;
+            let maybe = eval_fn
+                .call::<(String, String), MaybePromise>((entry.to_string(), props_json.to_string()))
+                .map_err(|err| {
+                    RuntimeError::render(format!(
+                        "failed to invoke generateMetadata for '{entry}': {err}"
+                    ))
+                })?;
+            maybe.finish::<String>().map_err(|err| {
+                RuntimeError::render(format!(
+                    "failed to resolve generateMetadata for '{entry}': {err}"
+                ))
+            })
+        });
+
+        if scoped {
+            self.runtime.as_ref().expect("runtime initialized").run_gc();
+            self.arena.end_request();
+        }
+
+        let envelope_json = eval_result?;
+        let envelope: MetadataEnvelope = serde_json::from_str(&envelope_json).map_err(|err| {
+            RuntimeError::render(format!(
+                "failed to decode generateMetadata envelope for '{entry}': {err}"
+            ))
+        })?;
+
+        if envelope.ok {
+            Ok(envelope.value.filter(|value| !value.is_null()))
+        } else {
+            let message = envelope
+                .error
+                .unwrap_or_else(|| "unknown generateMetadata error".to_string());
             Err(map_render_error(entry, &message))
         }
     }
@@ -417,6 +533,27 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
     const __albedo_value = (typeof __albedo_component === 'function')
       ? __albedo_component(__albedo_props, globalThis.__albedo_require)
       : __albedo_component;
+    // An async server component (or any thenable-returning render) is awaited on
+    // the server: hand the Promise back to the host, which drives the QuickJS job
+    // queue to resolution (see `render_component_inner`). The host-seed reset in
+    // `finally` stays correct — hooks run during the synchronous prefix, before
+    // the component's first `await`, so the seed is consumed before this returns.
+    // Synchronous components keep the fast path: a plain string envelope.
+    if (__albedo_value !== null
+        && (typeof __albedo_value === 'object' || typeof __albedo_value === 'function')
+        && typeof __albedo_value.then === 'function') {{
+      return __albedo_value.then(
+        function(__albedo_resolved) {{
+          return JSON.stringify({{ ok: true, value: String(__albedo_resolved) }});
+        }},
+        function(__albedo_err) {{
+          const __albedo_msg = (__albedo_err && typeof __albedo_err.message === 'string')
+            ? __albedo_err.message
+            : String(__albedo_err);
+          return JSON.stringify({{ ok: false, error: __albedo_msg }});
+        }}
+      );
+    }}
     return JSON.stringify({{ ok: true, value: String(__albedo_value) }});
   }} catch (err) {{
     const message = (err && typeof err.message === 'string') ? err.message : String(err);
@@ -424,6 +561,49 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
   }} finally {{
     // Never let one render's host seed leak into the next render on this engine.
     globalThis.__ALBEDO_HOST = null;
+  }}
+}};
+
+// Gate 2 · B slice 3 — evaluate a route module's `generateMetadata(props)`
+// export to a plain metadata object (the Next.js `Metadata` shape). Unlike the
+// render path this returns DATA, not HTML: the envelope's `value` is the object
+// itself (or `null`), JSON-stringified for the host to lower via
+// `metadata_from_json`. A route without the export resolves to `null` — benign,
+// the static `<head>` stands. Async `generateMetadata` returns a Promise that
+// the host drives to settlement, exactly like an async server component.
+globalThis.__ALBEDO_EVAL_METADATA = function(entry, propsJson) {{
+  try {{
+    const __albedo_record = globalThis.__ALBEDO_MODULES[entry];
+    if (typeof __albedo_record === 'undefined') {{
+      throw new Error('{MODULE_MISSING_MARKER}' + entry);
+    }}
+    const __albedo_fn = (__albedo_record !== null && typeof __albedo_record === 'object')
+      ? __albedo_record.generateMetadata
+      : undefined;
+    if (typeof __albedo_fn !== 'function') {{
+      return JSON.stringify({{ ok: true, value: null }});
+    }}
+    const __albedo_props = JSON.parse(propsJson);
+    const __albedo_value = __albedo_fn(__albedo_props);
+    if (__albedo_value !== null
+        && (typeof __albedo_value === 'object' || typeof __albedo_value === 'function')
+        && typeof __albedo_value.then === 'function') {{
+      return __albedo_value.then(
+        function(__albedo_resolved) {{
+          return JSON.stringify({{ ok: true, value: (__albedo_resolved === undefined ? null : __albedo_resolved) }});
+        }},
+        function(__albedo_err) {{
+          const __albedo_msg = (__albedo_err && typeof __albedo_err.message === 'string')
+            ? __albedo_err.message
+            : String(__albedo_err);
+          return JSON.stringify({{ ok: false, error: __albedo_msg }});
+        }}
+      );
+    }}
+    return JSON.stringify({{ ok: true, value: (__albedo_value === undefined ? null : __albedo_value) }});
+  }} catch (err) {{
+    const message = (err && typeof err.message === 'string') ? err.message : String(err);
+    return JSON.stringify({{ ok: false, error: message }});
   }}
 }};
 "#
@@ -435,19 +615,16 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
 /// Three pieces, installed once per context (right after the
 /// `__ALBEDO_MODULES` table):
 ///
-/// 1. **Factory + alias tables.** An npm bundle registers one *factory* per
-///    file (`__ALBEDO_NPM_FACTORIES[key] = function(exports) {…}`) and an
-///    *alias* per bare specifier (`__ALBEDO_NPM_ALIASES["zod"] = key`).
-///    Registration is cheap; nothing runs until first use.
-/// 2. **`__albedo_require_record`** — the npm linker. Memoized through
-///    `__ALBEDO_MODULES`; the record is **published before the factory body
-///    runs**, so import cycles observe a partially-initialized record (Node's
-///    CommonJS discipline) instead of recursing forever.
-/// 3. **Import-binding helpers** (`__albedo_import_default` / `_namespace` /
-///    `_named`) — what compiled `import` statements call. For an npm specifier
-///    they apply real ESM semantics (`default` is the `default` property, a
-///    namespace/named import sees the record itself). For project modules they
-///    fall back to the legacy `__albedo_require`, whose component-aware
+/// 1. **Factory + alias tables.** An npm bundle registers one *factory* per file
+///    (`__ALBEDO_NPM_FACTORIES[key] = function(exports) {…}`) and an *alias* per bare specifier
+///    (`__ALBEDO_NPM_ALIASES["zod"] = key`). Registration is cheap; nothing runs until first use.
+/// 2. **`__albedo_require_record`** — the npm linker. Memoized through `__ALBEDO_MODULES`; the
+///    record is **published before the factory body runs**, so import cycles observe a
+///    partially-initialized record (Node's CommonJS discipline) instead of recursing forever.
+/// 3. **Import-binding helpers** (`__albedo_import_default` / `_namespace` / `_named`) — what
+///    compiled `import` statements call. For an npm specifier they apply real ESM semantics
+///    (`default` is the `default` property, a namespace/named import sees the record itself). For
+///    project modules they fall back to the legacy `__albedo_require`, whose component-aware
 ///    default unwrapping is preserved byte-for-byte.
 ///
 /// The legacy `__albedo_require` itself moves here as a **global**: compiled
@@ -678,6 +855,30 @@ if (typeof globalThis.useState !== 'function') {
   };
   globalThis.useCallback = function(fn) { return fn; };
 
+  // Context. SSR `h` invokes components EAGERLY (children are already-rendered
+  // HTML before a Provider runs), so a Provider cannot thread its value down to
+  // nested consumers in this single pass — that propagation is applied by the
+  // client runtime on hydration. Here `useContext` returns a renderer-seeded
+  // value (`host.context[id]`) when present, else the context default, so a
+  // component using context LOADS and RENDERS without crashing. The Provider is
+  // a transparent pass-through that renders its children.
+  globalThis.__albedo_context_seq = 0;
+  globalThis.createContext = function(defaultValue) {
+    const id = ++globalThis.__albedo_context_seq;
+    const Provider = function(props) {
+      return (props && typeof props.children !== 'undefined') ? props.children : '';
+    };
+    Provider.__albedoContextId = id;
+    return { __albedoContext: true, _id: id, _defaultValue: defaultValue, Provider: Provider };
+  };
+  globalThis.useContext = function(context) {
+    const host = globalThis.__ALBEDO_HOST;
+    if (host && host.context && context && __albedo_has_own.call(host.context, String(context._id))) {
+      return host.context[String(context._id)];
+    }
+    return context ? context._defaultValue : undefined;
+  };
+
   // `export const X = action(fn)` runs `action(fn)` at module load. Keep it a
   // benign pass-through so loading the module never throws; the action body
   // itself dispatches through the QuickJS action bridge, not this render path.
@@ -830,8 +1031,7 @@ fn lower_module_to_statements(
                         // Slice the full `export class X …` then drop the
                         // `export` prefix so the class declaration stays a
                         // hoistable statement inside the record.
-                        let decl_source =
-                            slice_source(source, export_decl.span, specifier)?;
+                        let decl_source = slice_source(source, export_decl.span, specifier)?;
                         let stripped = decl_source
                             .trim_start()
                             .strip_prefix("export")
@@ -1143,7 +1343,9 @@ fn compile_npm_esm_module(
                         strip_export_default_prefix(&decl_source).ok_or_else(|| {
                             RuntimeError::load(
                                 LoadErrorKind::UnsupportedSyntax,
-                                format!("unsupported default export declaration in npm module '{key}'"),
+                                format!(
+                                    "unsupported default export declaration in npm module '{key}'"
+                                ),
                             )
                         })?;
                     statements.push(format!(
@@ -1229,9 +1431,7 @@ fn compile_npm_esm_module(
                                         .as_ref()
                                         .map(|name| module_export_name_to_property(name, key))
                                         .transpose()?
-                                        .unwrap_or_else(|| {
-                                            orig_key.trim_matches('"').to_string()
-                                        });
+                                        .unwrap_or_else(|| orig_key.trim_matches('"').to_string());
                                     let exported_key = if exported.starts_with('"') {
                                         exported
                                     } else {
@@ -1282,9 +1482,8 @@ fn compile_npm_esm_module(
                                         .and_then(module_export_name_to_ident)
                                         .unwrap_or_else(|| local.clone());
                                     let export_key = js_string_literal(&exported, key)?;
-                                    export_assignments.push(format!(
-                                        "__albedo_exports[{export_key}] = {local};"
-                                    ));
+                                    export_assignments
+                                        .push(format!("__albedo_exports[{export_key}] = {local};"));
                                 }
                                 ExportSpecifier::Default(default_export) => {
                                     let local = default_export.exported.sym.to_string();
@@ -1772,6 +1971,7 @@ fn rewrite_framework_runtime_import(
 useSharedSlot: globalThis.useSharedSlot, useEffect: globalThis.useEffect, \
 useLayoutEffect: globalThis.useLayoutEffect, useRef: globalThis.useRef, \
 useMemo: globalThis.useMemo, useCallback: globalThis.useCallback, \
+useContext: globalThis.useContext, createContext: globalThis.createContext, \
 action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";
 
     if import_decl.specifiers.is_empty() {
@@ -1891,7 +2091,9 @@ mod tests {
         "#;
 
         let compiled = compile_module_script_for_quickjs("components/App.jsx", source).unwrap();
-        assert!(compiled.contains(r#"const DefaultThing = __albedo_import_default("pkg/default");"#));
+        assert!(
+            compiled.contains(r#"const DefaultThing = __albedo_import_default("pkg/default");"#)
+        );
         assert!(compiled.contains(r#"const { a, b: c } = __albedo_import_named("pkg/named");"#));
         assert!(compiled.contains(r#"const ns = __albedo_import_namespace("pkg/ns");"#));
         assert!(compiled.contains(r#"__albedo_import_namespace("pkg/side-effect");"#));
@@ -1990,7 +2192,10 @@ mod tests {
         }
 
         let watermark = engine.arena_stats().persistent_used;
-        assert!(watermark > 0, "warmup should have populated the persistent region");
+        assert!(
+            watermark > 0,
+            "warmup should have populated the persistent region"
+        );
 
         for i in 0..STEADY {
             let out = engine
@@ -2001,7 +2206,10 @@ mod tests {
 
             let stats = engine.arena_stats();
             // The request region is reclaimed wholesale between renders.
-            assert_eq!(stats.request_used, 0, "request region not reset after render {i}");
+            assert_eq!(
+                stats.request_used, 0,
+                "request region not reset after render {i}"
+            );
             // Zero per-tick persistent growth in steady state.
             assert_eq!(
                 stats.persistent_used, watermark,
@@ -2012,8 +2220,14 @@ mod tests {
         // The render region actually carried real per-render traffic (the bump path ran),
         // and never spilled to the system fallback.
         let final_stats = engine.arena_stats();
-        assert!(final_stats.request_peak > 0, "request region was never exercised");
-        assert_eq!(final_stats.fallback_allocs, 0, "region capacity was exceeded");
+        assert!(
+            final_stats.request_peak > 0,
+            "request region was never exercised"
+        );
+        assert_eq!(
+            final_stats.fallback_allocs, 0,
+            "region capacity was exceeded"
+        );
     }
 
     // ── A1 · host-object bridge — handlers under QuickJS ──────────────────
@@ -2032,7 +2246,9 @@ mod tests {
         use serde_json::{Map, Value};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let mut env: Map<String, Value> = Map::new();
         env.insert("base".to_string(), Value::from(10));
@@ -2069,7 +2285,11 @@ mod tests {
             }
         );
         match &effects[1] {
-            HandlerEffect::Broadcast { topic, slot_id, value } => {
+            HandlerEffect::Broadcast {
+                topic,
+                slot_id,
+                value,
+            } => {
                 assert_eq!(topic, "chat:room");
                 assert_eq!(*slot_id, broadcast_slot_id("chat:room"));
                 assert_eq!(value, b"\"hi\"");
@@ -2088,7 +2308,9 @@ mod tests {
         use serde_json::Map;
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let env = Map::new();
         let bc = Map::new();
@@ -2121,7 +2343,9 @@ mod tests {
         use serde_json::Map;
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let env = Map::new();
         let bc = Map::new();
@@ -2159,7 +2383,9 @@ mod tests {
         use serde_json::{Map, Value};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let env = Map::new();
         let mut bc = Map::new();
@@ -2206,7 +2432,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let src = r#"
             import { useState } from "react";
@@ -2225,6 +2453,73 @@ mod tests {
         assert_eq!(out.html, "<span data-role=\"count\">7</span>");
     }
 
+    // Async server component (RSC) — the default export is `async` and `await`s a
+    // data function before returning JSX. The host drives the QuickJS job queue to
+    // resolution (`MaybePromise::finish`), so the render is the *awaited* HTML, not
+    // `String(Promise)` → "[object Promise]". This server-side await is what makes
+    // async server components renderable at all.
+    #[test]
+    fn async_server_component_is_awaited_on_render() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+
+        let src = r#"
+            async function getStats() {
+                return { commits: 1284, repos: 37 };
+            }
+            export default async function Stats() {
+                const s = await getStats();
+                return <p id="stats-line">{s.commits + " / " + s.repos}</p>;
+            }
+        "#;
+        engine
+            .load_module("routes/stats.tsx", src)
+            .expect("async component loads under quickjs");
+
+        let out = engine
+            .render_component("routes/stats.tsx", "{}")
+            .expect("async server component renders");
+        assert_eq!(out.html, "<p id=\"stats-line\">1284 / 37</p>");
+    }
+
+    // A rejected await inside an async server component must surface as a loud
+    // render error carrying the thrown message — never a silent blank (the
+    // failure mode that originally shipped: an empty Tier-B placeholder).
+    #[test]
+    fn async_server_component_rejection_surfaces_loudly() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+
+        let src = r#"
+            export default async function Boom() {
+                await Promise.reject(new Error("data fetch failed"));
+                return <p>unreachable</p>;
+            }
+        "#;
+        engine
+            .load_module("routes/boom.tsx", src)
+            .expect("module loads");
+
+        let err = engine
+            .render_component("routes/boom.tsx", "{}")
+            .expect_err("a rejected await must not render successfully");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("data fetch failed"),
+            "render error must carry the thrown message, got: {message}"
+        );
+    }
+
     // A host seed keyed by positional hook index overrides the initial, so the
     // render reflects the current slot value (e.g. after an action wrote it).
     #[test]
@@ -2233,7 +2528,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let src = r#"
             import { useState } from "react";
@@ -2265,7 +2562,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let src = r#"
             import { useState } from "react";
@@ -2291,7 +2590,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let src = r#"
             import { useSharedSlot } from "albedo";
@@ -2326,7 +2627,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let src = r#"
             import { useState, useEffect, useRef, useMemo, useCallback } from "react";
@@ -2345,5 +2648,99 @@ mod tests {
             .render_component("routes/widget.tsx", r#"{"n":5}"#)
             .expect("renders");
         assert_eq!(out.html, "<span>10:function</span>");
+    }
+
+    // `useContext` loads and renders on the server. Eager `h` invocation means a
+    // nested Provider can't thread its value down in a single SSR pass (the
+    // client applies that on hydration), so a consumer resolves the context
+    // DEFAULT here — but it must not crash, and `createContext`/`useContext`
+    // must resolve as `react` imports.
+    #[test]
+    fn use_context_renders_default_without_crashing() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+
+        let src = r#"
+            import { createContext, useContext } from "react";
+            const ThemeContext = createContext("light");
+            function Label() {
+                const theme = useContext(ThemeContext);
+                return <span>{theme}</span>;
+            }
+            export default function App(props) {
+                return <ThemeContext.Provider value="dark"><Label /></ThemeContext.Provider>;
+            }
+        "#;
+        engine.load_module("routes/app.tsx", src).expect("loads");
+
+        let out = engine
+            .render_component("routes/app.tsx", "{}")
+            .expect("renders");
+        // Consumer reads the createContext default ("light") server-side; the
+        // Provider value ("dark") is applied client-side on hydration.
+        assert_eq!(out.html, "<span>light</span>");
+    }
+
+    // Slice 3 — `generateMetadata(props)` evaluates under QuickJS to a plain
+    // object: synchronous and async forms, param-dependent, and a clean `None`
+    // for routes that declare no such export.
+    #[test]
+    fn eval_route_metadata_returns_sync_async_and_absent() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+
+        // Sync generateMetadata reading a route param.
+        let sync_src = r#"
+            export function generateMetadata(props) {
+                return { title: "Post " + props.params.slug, description: "the post" };
+            }
+            export default function Page() { return <main></main>; }
+        "#;
+        engine
+            .load_module("routes/blog/[slug].tsx", sync_src)
+            .expect("loads");
+        let meta = engine
+            .eval_route_metadata("routes/blog/[slug].tsx", r#"{"params":{"slug":"hello"}}"#)
+            .expect("eval ok")
+            .expect("has metadata");
+        assert_eq!(meta["title"], "Post hello");
+        assert_eq!(meta["description"], "the post");
+
+        // Async generateMetadata is awaited to settlement on the server.
+        let async_src = r#"
+            export async function generateMetadata(props) {
+                return { title: "Async " + props.params.id };
+            }
+            export default function Page() { return <main></main>; }
+        "#;
+        engine
+            .load_module("routes/item/[id].tsx", async_src)
+            .expect("loads");
+        let meta = engine
+            .eval_route_metadata("routes/item/[id].tsx", r#"{"params":{"id":"42"}}"#)
+            .expect("eval ok")
+            .expect("has metadata");
+        assert_eq!(meta["title"], "Async 42");
+
+        // A module without generateMetadata resolves to None — the static head
+        // stands, no error.
+        let plain_src = r#"export default function Page() { return <main></main>; }"#;
+        engine
+            .load_module("routes/plain.tsx", plain_src)
+            .expect("loads");
+        assert!(engine
+            .eval_route_metadata("routes/plain.tsx", "{}")
+            .expect("eval ok")
+            .is_none());
     }
 }

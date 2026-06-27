@@ -20,7 +20,7 @@ use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2349,13 +2349,46 @@ fn write_sse_handshake(stream: &mut TcpStream) -> std::io::Result<()> {
 /// continues to write directly into the `TcpStream` (response head),
 /// so we drain whatever the head reader prefetched and hand it back as
 /// a plain `Vec<u8>`. The `BufReader` is dropped here.
+/// Hard ceiling on the total bytes of an HTTP request head the dev server will
+/// read from one connection. Without it, a client that opens a socket and sends
+/// an endless header stream (no terminating blank line) drives `read_line` to
+/// grow a `String` until the process is out of memory — a single-connection DoS.
+/// 64 KiB is orders of magnitude above any legitimate head (a browser sends a
+/// few KiB) yet bounds the worst case to a harmless transient buffer.
+const MAX_REQUEST_HEAD_BYTES: u64 = 64 * 1024;
+
+/// Ceiling on a single request/header line. Caps the cost of a client that
+/// floods one line with no newline (bounded anyway by the total-head cap, but
+/// this rejects the abuse earlier and with a clearer error).
+const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024;
+
+/// Ceiling on the number of header lines. Bounds the `HashMap` a client can
+/// force us to allocate; real requests carry well under a few dozen headers.
+const MAX_REQUEST_HEADER_COUNT: usize = 128;
+
 fn read_http_request_head(
     stream: &TcpStream,
 ) -> std::io::Result<(String, HashMap<String, String>, Vec<u8>)> {
+    // `Take` hard-caps total bytes pulled from the connection for the head, so
+    // every `read_line` below is bounded even against a newline-less flood.
+    let mut reader = BufReader::new(stream.try_clone()?.take(MAX_REQUEST_HEAD_BYTES));
+    parse_http_request_head(&mut reader)
+}
+
+/// Parses an HTTP request head (request line + headers) from a buffered reader,
+/// enforcing the size/count bounds above. Split out from [`read_http_request_head`]
+/// so it can be unit-tested against adversarial byte streams without a socket.
+fn parse_http_request_head<R: std::io::Read>(
+    reader: &mut BufReader<R>,
+) -> std::io::Result<(String, HashMap<String, String>, Vec<u8>)> {
+    use std::io::Error;
+
     let mut first_line = String::new();
     let mut headers = HashMap::new();
-    let mut reader = BufReader::new(stream.try_clone()?);
     reader.read_line(&mut first_line)?;
+    if first_line.len() > MAX_REQUEST_LINE_BYTES {
+        return Err(Error::new(ErrorKind::InvalidData, "request line exceeds limit"));
+    }
 
     loop {
         let mut line = String::new();
@@ -2363,10 +2396,17 @@ fn read_http_request_head(
         if bytes == 0 {
             break;
         }
+        if line.len() > MAX_REQUEST_LINE_BYTES {
+            return Err(Error::new(ErrorKind::InvalidData, "header line exceeds limit"));
+        }
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
+        }
+
+        if headers.len() >= MAX_REQUEST_HEADER_COUNT {
+            return Err(Error::new(ErrorKind::InvalidData, "header count exceeds limit"));
         }
 
         if let Some((name, value)) = trimmed.split_once(':') {
@@ -4303,6 +4343,56 @@ fn supports_color() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wraps adversarial bytes the way `read_http_request_head` wraps a socket:
+    /// a `Take`-capped `BufReader`, so the test exercises the exact bound path.
+    fn parse_head(bytes: &[u8]) -> std::io::Result<(String, HashMap<String, String>, Vec<u8>)> {
+        let mut reader =
+            BufReader::new(std::io::Cursor::new(bytes.to_vec()).take(MAX_REQUEST_HEAD_BYTES));
+        parse_http_request_head(&mut reader)
+    }
+
+    #[test]
+    fn parse_http_head_reads_a_well_formed_request() {
+        let (line, headers, leftover) =
+            parse_head(b"GET /x HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n")
+                .expect("well-formed head parses");
+        assert!(line.starts_with("GET /x"));
+        assert_eq!(headers.get("host").map(String::as_str), Some("localhost"));
+        assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn parse_http_head_rejects_an_overlong_header_line() {
+        // A single header line far past the per-line cap (no newline) must be
+        // rejected, not buffered without bound.
+        let mut input = b"GET / HTTP/1.1\r\nX-Flood: ".to_vec();
+        input.extend(std::iter::repeat(b'A').take(MAX_REQUEST_LINE_BYTES + 1024));
+        let err = parse_head(&input).expect_err("overlong header line must error");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_http_head_rejects_too_many_headers() {
+        let mut input = b"GET / HTTP/1.1\r\n".to_vec();
+        for i in 0..(MAX_REQUEST_HEADER_COUNT + 10) {
+            input.extend(format!("X-H{i}: v\r\n").into_bytes());
+        }
+        input.extend_from_slice(b"\r\n");
+        let err = parse_head(&input).expect_err("header flood must error");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_http_head_is_bounded_against_a_newline_less_flood() {
+        // No CRLF anywhere and more bytes than the total-head cap: the `Take`
+        // bound must make this terminate (and the per-line cap reject it),
+        // never grow without limit.
+        let input = vec![b'A'; (MAX_REQUEST_HEAD_BYTES as usize) * 2];
+        let err = parse_head(&input).expect_err("newline-less flood must error");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
 
     #[test]
     fn test_parse_init_args_requires_target() {

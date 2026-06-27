@@ -366,6 +366,122 @@ impl RendererRuntime {
         blocks
     }
 
+    /// Build the per-component Tier-B render plan consumed by
+    /// [`crate::render::tier_b::PooledTierBRenderRegistry`]. For every Tier-B
+    /// node across all manifest routes, resolve its component to an entry module
+    /// and the topologically-ordered module graph it needs, capturing the source
+    /// of each module so a (`Send`) pool engine can load + render it off the boot
+    /// thread.
+    ///
+    /// Built here, on the boot thread, because module-order resolution and source
+    /// access go through the `!Send` renderer's module registry. The result owns
+    /// all its strings, so it ships freely into the concurrent request path.
+    /// Best-effort per node: a component whose order can't resolve or whose
+    /// source is missing is skipped (it falls back to the registry's loud
+    /// "no plan" error at request time rather than rendering wrong HTML).
+    #[must_use]
+    pub fn build_tier_b_render_plan(&self) -> crate::render::tier_b::TierBRenderPlan {
+        let by_name: HashMap<&str, &ComponentManifestEntry> = self
+            .manifest
+            .components
+            .iter()
+            .map(|c| (c.name.as_str(), c))
+            .collect();
+
+        let mut plan = crate::render::tier_b::TierBRenderPlan::new();
+        for route in self.manifest.routes.values() {
+            for node in &route.tier_b {
+                self.add_component_to_plan(&mut plan, &by_name, &node.render_fn, &node.component_id);
+            }
+
+            // Route boundaries (`error.tsx` / `loading.tsx`) are rendered on the
+            // request path through the same pooled registry when a Tier-B node
+            // throws or times out, so they need boot-built plans too. Keyed by
+            // the bare component name (the registry is called with that name);
+            // no collision with the `render::*`-shaped Tier-B keys.
+            if let Some(name) = route.error_component.as_deref() {
+                self.add_component_to_plan(&mut plan, &by_name, name, name);
+            }
+            if let Some(name) = route.loading_component.as_deref() {
+                self.add_component_to_plan(&mut plan, &by_name, name, name);
+            }
+
+            // Slice 3 — a route exporting `generateMetadata` needs its leaf
+            // module in the pool so the request path can evaluate the export.
+            // Registered under the bare component name, the same key the serve
+            // path calls `call_metadata` with.
+            if let Some(name) = route.dynamic_metadata.as_deref() {
+                self.add_component_to_plan(&mut plan, &by_name, name, name);
+            }
+        }
+        plan
+    }
+
+    /// Resolve one component's entry module + dependency-ordered source graph and
+    /// insert it into `plan` under `key`. Best-effort: a component that isn't in
+    /// the manifest, whose module order can't resolve, or whose sources are
+    /// missing is logged and skipped (it then surfaces as the registry's loud
+    /// "no plan" error at request time rather than rendering wrong HTML).
+    /// Idempotent per `key`.
+    fn add_component_to_plan(
+        &self,
+        plan: &mut crate::render::tier_b::TierBRenderPlan,
+        by_name: &HashMap<&str, &ComponentManifestEntry>,
+        key: &str,
+        component_name: &str,
+    ) {
+        if plan.contains_key(key) {
+            return;
+        }
+        let Some(component) = by_name.get(component_name) else {
+            tracing::warn!(
+                target: "albedo.renderer",
+                key = %key,
+                component = %component_name,
+                "tier-b component not found in manifest; render plan skipped"
+            );
+            return;
+        };
+        let entry = component.module_path.clone();
+
+        let order = match self
+            .renderer
+            .module_registry()
+            .resolve_module_order(&entry, &[])
+        {
+            Ok(order) => order,
+            Err(err) => {
+                tracing::warn!(
+                    target: "albedo.renderer",
+                    key = %key,
+                    entry = %entry,
+                    error = %err,
+                    "tier-b module order unresolved; render plan skipped"
+                );
+                return;
+            }
+        };
+
+        let mut modules = Vec::with_capacity(order.len());
+        for specifier in &order {
+            let Some(module) = self.renderer.module_registry().module(specifier) else {
+                tracing::warn!(
+                    target: "albedo.renderer",
+                    key = %key,
+                    specifier = %specifier,
+                    "tier-b dependency module missing; render plan skipped"
+                );
+                return;
+            };
+            modules.push((specifier.clone(), module.code.clone()));
+        }
+
+        plan.insert(
+            key.to_string(),
+            crate::render::tier_b::TierBEntryPlan { entry, modules },
+        );
+    }
+
     /// Render one island component to its SSR HTML from default props. Soft-fails
     /// to `None` so a single bad island can't sink the whole boot.
     fn render_island_html(&mut self, module_path: &str) -> Option<String> {

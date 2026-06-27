@@ -15,7 +15,7 @@ use crate::inspector::{
 };
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 use crate::render::csrf::CsrfRegistry;
-use crate::render::tier_b::{SharedRenderServices, TierBOpcodeRegistry};
+use crate::render::tier_b::{PooledTierBRenderRegistry, SharedRenderServices, TierBOpcodeRegistry};
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
 use crate::webtransport::{WebTransportRuntime, WebTransportSessionRegistry};
@@ -596,10 +596,44 @@ impl AlbedoServerBuilder {
             .enabled
             .then(WebTransportSessionRegistry::default);
 
-        let services = SharedRenderServices {
+        let mut services = SharedRenderServices {
             opcode_registry: self.opcode_registry.clone(),
             ..SharedRenderServices::default()
         };
+
+        // RSC · Tier-B server rendering. The default `registry` is a stub that
+        // returns empty markup, so async server components (and every legit
+        // Tier-B island) render nothing on `albedo serve`. When both a renderer
+        // and the warmed QuickJS action pool are present, swap in the pool-backed
+        // registry: it resolves each Tier-B component's module graph at boot and
+        // renders it through the same warmed/arena engines actions use, awaiting
+        // any returned Promise on the server before lowering to HTML.
+        if let (Some(runtime), Some(pool)) = (renderer.as_ref(), self.action_engine_pool.as_ref()) {
+            let plan = runtime.build_tier_b_render_plan();
+
+            // Warm every pool engine's render path with the real Tier-B components
+            // before the pool serves a request. The arena's O(1) reset is only safe
+            // once a component's interned QuickJS state lives in the persistent
+            // region; warming here (in persistent mode) puts it there, so the first
+            // request-scoped render can't free-then-reuse it. Skipping this is the
+            // crash, not a slow path.
+            let warmup: Vec<crate::engine_pool::WarmupComponent> = plan
+                .values()
+                .map(|entry_plan| crate::engine_pool::WarmupComponent {
+                    modules: entry_plan.modules.clone(),
+                    entry: entry_plan.entry.clone(),
+                    props_json: "{}".to_string(),
+                })
+                .collect();
+            pool.warm_render_path(&warmup);
+
+            tracing::info!(
+                target: "albedo.renderer",
+                tier_b_components = plan.len(),
+                "installed pool-backed Tier-B render registry"
+            );
+            services.registry = Arc::new(PooledTierBRenderRegistry::new(pool.clone(), plan));
+        }
 
         // Phase-H — one shared slot store for the lifetime of the
         // server. Action handlers read/write through it via the

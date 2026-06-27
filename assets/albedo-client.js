@@ -42,6 +42,15 @@
   var currentFiber = null;
   var hookIndex = 0;
 
+  // `currentContextMap` is the set of active context providers during a tree
+  // walk: contextId -> the provider instance carrying the live `value` prop.
+  // It is snapshotted onto each component instance at mount so a *partial*
+  // re-render (a deep consumer's own setState, entered straight through
+  // `reconcile`) still resolves the right value without re-walking from the
+  // provider. `contextIdSeq` hands out stable per-context ids.
+  var currentContextMap = null;
+  var contextIdSeq = 0;
+
   // Effects collected during a render commit, flushed after the DOM settles.
   var pendingEffects = [];
 
@@ -168,6 +177,59 @@
     return useMemo(function () { return callback; }, deps);
   }
 
+  // createContext returns a context object whose `.Provider` is a sentinel
+  // component the reconciler special-cases (like Fragment): instead of running
+  // a component body it publishes `props.value` to descendants and renders its
+  // child. `_id` keys the provider in the context map; `_defaultValue` is what
+  // `useContext` returns when no Provider is mounted above the consumer.
+  function createContext(defaultValue) {
+    var id = ++contextIdSeq;
+    function Provider(props) {
+      // Vestigial: the reconciler renders a Provider via its children on the
+      // vnode, never by calling this body. Kept so the type is a valid
+      // function component for `isComponent`/JSX and for any direct call.
+      return props ? props.children : null;
+    }
+    Provider.__albedoContextId = id;
+    return { __albedoContext: true, _id: id, _defaultValue: defaultValue, Provider: Provider };
+  }
+
+  // useContext does NOT consume a positional hook slot — it reads the provider
+  // map snapshotted onto the fiber, so its result is independent of hook call
+  // order and stays correct across conditional renders. The value is read live
+  // from the provider instance's current vnode, so a consumer re-rendering for
+  // any reason observes the provider's latest `value`.
+  function useContext(context) {
+    var fiber = currentFiber;
+    var map = (fiber && fiber.contextMap) || currentContextMap;
+    if (map && context) {
+      var provider = map[context._id];
+      if (provider && provider.vnode && provider.vnode.props && 'value' in provider.vnode.props) {
+        return provider.vnode.props.value;
+      }
+    }
+    return context ? context._defaultValue : undefined;
+  }
+
+  // The context id this vnode type provides, or null if it is not a Provider.
+  function providerContextId(type) {
+    return (typeof type === 'function' && type.__albedoContextId) || null;
+  }
+
+  // A child context map = the parent map plus this provider, keyed by id. A
+  // fresh object per provider keeps sibling subtrees isolated and lets each
+  // instance keep its own snapshot.
+  function childContextMap(parent, id, providerInst) {
+    var next = {};
+    if (parent) {
+      for (var k in parent) {
+        next[k] = parent[k];
+      }
+    }
+    next[id] = providerInst;
+    return next;
+  }
+
   function depsChanged(a, b) {
     if (!a || !b || a.length !== b.length) {
       return true;
@@ -240,8 +302,18 @@
       var childInst = instantiate(only, parentDom);
       return { vnode: vnode, dom: childInst.dom, fragmentChild: childInst };
     }
+    var ctxId = providerContextId(vnode.type);
+    if (ctxId != null) {
+      var pinst = { vnode: vnode, isProvider: true, parentDom: parentDom, contextMap: currentContextMap };
+      var prevMap = currentContextMap;
+      currentContextMap = childContextMap(prevMap, ctxId, pinst);
+      pinst.providerChild = instantiate(singleFragmentChild(vnode), parentDom);
+      currentContextMap = prevMap;
+      pinst.dom = pinst.providerChild.dom;
+      return pinst;
+    }
     if (isComponent(vnode.type)) {
-      var inst = { vnode: vnode, component: vnode.type, hooks: [], parentDom: parentDom };
+      var inst = { vnode: vnode, component: vnode.type, hooks: [], parentDom: parentDom, contextMap: currentContextMap };
       var rendered = renderComponent(inst);
       inst.renderedInstance = instantiate(rendered, parentDom);
       inst.dom = inst.renderedInstance.dom;
@@ -275,8 +347,18 @@
       var childInst = hydrateInstance(dom, only, parentDom);
       return { vnode: vnode, dom: childInst.dom, fragmentChild: childInst };
     }
+    var ctxId = providerContextId(vnode.type);
+    if (ctxId != null) {
+      var pinst = { vnode: vnode, isProvider: true, parentDom: parentDom, contextMap: currentContextMap };
+      var prevMap = currentContextMap;
+      currentContextMap = childContextMap(prevMap, ctxId, pinst);
+      pinst.providerChild = hydrateInstance(dom, singleFragmentChild(vnode), parentDom);
+      currentContextMap = prevMap;
+      pinst.dom = pinst.providerChild.dom;
+      return pinst;
+    }
     if (isComponent(vnode.type)) {
-      var inst = { vnode: vnode, component: vnode.type, hooks: [], parentDom: parentDom };
+      var inst = { vnode: vnode, component: vnode.type, hooks: [], parentDom: parentDom, contextMap: currentContextMap };
       var rendered = renderComponent(inst);
       inst.renderedInstance = hydrateInstance(dom, rendered, parentDom);
       inst.dom = inst.renderedInstance.dom;
@@ -341,11 +423,32 @@
       instance.vnode = vnode;
       return instance;
     }
+    var rctxId = providerContextId(vnode.type);
+    if (rctxId != null) {
+      // Refresh the provider vnode first so consumers read the new `value`,
+      // then reconcile the child subtree under the updated context map. Basing
+      // the map on the instance's own snapshot (not the global) keeps a partial
+      // re-render entered straight at this provider correct.
+      instance.vnode = vnode;
+      instance.parentDom = parentDom;
+      var pPrevMap = currentContextMap;
+      currentContextMap = childContextMap(instance.contextMap || pPrevMap, rctxId, instance);
+      instance.providerChild = reconcile(parentDom, instance.providerChild, singleFragmentChild(vnode));
+      currentContextMap = pPrevMap;
+      instance.dom = instance.providerChild.dom;
+      return instance;
+    }
     if (isComponent(vnode.type)) {
       instance.vnode = vnode;
       instance.parentDom = parentDom;
+      // Restore this component's context snapshot so any subtree mounted during
+      // the re-render inherits the providers that were active above it, even
+      // when we entered through a deep partial re-render with a stale global.
+      var cPrevMap = currentContextMap;
+      currentContextMap = instance.contextMap || cPrevMap;
       var rendered = renderComponent(instance);
       instance.renderedInstance = reconcile(parentDom, instance.renderedInstance, rendered);
+      currentContextMap = cPrevMap;
       instance.dom = instance.renderedInstance.dom;
       return instance;
     }
@@ -402,6 +505,9 @@
     }
     if (instance.fragmentChild) {
       unmount(instance.fragmentChild);
+    }
+    if (instance.providerChild) {
+      unmount(instance.providerChild);
     }
     if (instance.childInstances) {
       for (var j = 0; j < instance.childInstances.length; j++) {
@@ -549,6 +655,8 @@
     useRef: useRef,
     useMemo: useMemo,
     useCallback: useCallback,
+    useContext: useContext,
+    createContext: createContext,
     hydrate: hydrate,
     hydrateIsland: hydrateIsland,
     registerComponent: registerComponent,
@@ -562,5 +670,7 @@
   global.useRef = useRef;
   global.useMemo = useMemo;
   global.useCallback = useCallback;
+  global.useContext = useContext;
+  global.createContext = createContext;
   global.__ALBEDO_HYDRATE_ISLAND = hydrateIslandDescriptor;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
