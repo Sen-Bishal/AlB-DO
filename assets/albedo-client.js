@@ -673,4 +673,26 @@
   global.useContext = useContext;
   global.createContext = createContext;
   global.__ALBEDO_HYDRATE_ISLAND = hydrateIslandDescriptor;
+
+  // Drain any islands the ≤2KB bootstrap (`src/hydration/script.rs`) enqueued
+  // before this (async-loaded) runtime finished defining the entry above. The
+  // bootstrap schedules each island on its trigger (idle/visible/interaction);
+  // if its `run` fires before `__ALBEDO_HYDRATE_ISLAND` exists it pushes the
+  // descriptor onto `__ALBEDO_HYDRATE_QUEUE` instead of dropping it. We flush
+  // that backlog now, then replace the queue with a live shim so any later
+  // push hydrates immediately — closing the script-load ordering race that
+  // otherwise left effect-only islands (idle trigger) dead on the page.
+  var pending = global.__ALBEDO_HYDRATE_QUEUE;
+  if (pending && typeof pending.length === 'number') {
+    for (var qi = 0; qi < pending.length; qi++) {
+      try {
+        hydrateIslandDescriptor(pending[qi]);
+      } catch (_e) {}
+    }
+  }
+  global.__ALBEDO_HYDRATE_QUEUE = {
+    push: function (island) {
+      hydrateIslandDescriptor(island);
+    },
+  };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

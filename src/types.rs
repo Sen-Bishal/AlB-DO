@@ -35,6 +35,13 @@ pub struct Component {
     pub source_hash: u64,
     pub file_path: String,
     pub line_number: usize,
+    /// True for a pure data/util/lib module that declares no renderable
+    /// component. It exists as a graph + manifest node so importers can link
+    /// it on the server, but it is never a route root and is skipped by the
+    /// manifest builder's child-walk (no tiering/static render). Defaults to
+    /// `false` so existing manifests deserialize unchanged.
+    #[serde(default)]
+    pub is_module_only: bool,
 }
 
 impl Component {
@@ -53,6 +60,7 @@ impl Component {
             source_hash: 0,
             file_path: String::new(),
             line_number: 0,
+            is_module_only: false,
         }
     }
 

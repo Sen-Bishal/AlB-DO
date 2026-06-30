@@ -9,7 +9,9 @@ use crate::error::RuntimeError;
 use crate::handlers::action::{run_action_request, ActionRegistry};
 use crate::handlers::api::dispatch_api_route;
 use crate::handlers::public_assets::PublicAssets;
-use crate::handlers::{streaming_handler, StreamingAppState, StreamingTransportConfig};
+use crate::handlers::{
+    streaming_handler, streaming_handler_with_match, StreamingAppState, StreamingTransportConfig,
+};
 use crate::inspector::{
     self as inspector_routes, GraphSnapshot as InspectorGraphSnapshot, InspectorState,
 };
@@ -1129,9 +1131,28 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
         RouteMatch::Matched(matched) => {
             if should_use_manifest_streaming(&state, &matched.target, method, path.as_str()) {
                 if let Some(streaming_runtime) = &state.streaming_runtime {
-                    return streaming_handler(State(streaming_runtime.clone()), request)
-                        .await
-                        .into_response();
+                    // The manifest is keyed by route *pattern* (`/essays/[slug]`),
+                    // which `boot_production_server` mirrors into `entry_module`.
+                    // Pass that key plus the params `CompiledRouter` already
+                    // extracted so dynamic routes stream their async body + head.
+                    let route_pattern = matched
+                        .target
+                        .entry_module
+                        .clone()
+                        .unwrap_or_else(|| path.clone());
+                    let params: HashMap<String, String> = matched
+                        .params
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    return streaming_handler_with_match(
+                        streaming_runtime.clone(),
+                        request,
+                        route_pattern,
+                        params,
+                    )
+                    .await
+                    .into_response();
                 }
             }
 
@@ -1344,10 +1365,17 @@ fn should_use_manifest_streaming(
         return false;
     }
 
+    // The manifest is keyed by route pattern, not the concrete request path, so
+    // a dynamic route (`/essays/[slug]`) would never match on the literal
+    // `path` (`/essays/my-essay`). `entry_module` carries the manifest key (set
+    // by `boot_production_server`); fall back to `path` for static routes whose
+    // key and path coincide.
+    let manifest_key = target.entry_module.as_deref().unwrap_or(path);
+
     state
         .streaming_runtime
         .as_ref()
-        .map(|runtime| runtime.manifest.routes.contains_key(path))
+        .map(|runtime| runtime.manifest.routes.contains_key(manifest_key))
         .unwrap_or(false)
 }
 

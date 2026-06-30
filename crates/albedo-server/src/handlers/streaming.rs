@@ -333,20 +333,56 @@ pub async fn streaming_handler(
     req: Request,
 ) -> impl IntoResponse {
     let path = req.uri().path().to_string();
-    let negotiated_transport = negotiate_transport(&req, &app.transport);
 
+    // WebTransport capability probe — answered without a route or params.
     if path == app.transport.webtransport_path {
+        let negotiated_transport = negotiate_transport(&req, &app.transport);
         return webtransport_capability_response(app.as_ref(), negotiated_transport);
     }
 
-    let Some(route) = app.manifest.routes.get(path.as_str()) else {
+    // Standalone / non-dispatched entry: the manifest is keyed by route
+    // pattern, so an exact-path lookup only resolves static routes. Dynamic
+    // routes flow through `streaming_handler_with_match` instead, which
+    // carries the matched pattern + params resolved by `CompiledRouter`.
+    serve_manifest_route(app, req, path, HashMap::new()).await
+}
+
+/// Dispatch-path entry for the manifest-streaming arm. The caller has already
+/// matched the request through [`crate::routing::CompiledRouter`], so it passes
+/// the resolved manifest key (`route_pattern`, e.g. `/essays/[slug]`) and the
+/// extracted route `params` (e.g. `{ slug: "..." }`) directly — this is what
+/// makes dynamic `[slug]` routes render their async body + per-request
+/// `generateMetadata()` on serve.
+pub async fn streaming_handler_with_match(
+    app: Arc<StreamingAppState>,
+    req: Request,
+    route_pattern: String,
+    params: HashMap<String, String>,
+) -> Response {
+    serve_manifest_route(app, req, route_pattern, params).await
+}
+
+/// Shared body of the streaming handler. `route_pattern` is the manifest key to
+/// render; `params` are the parsed dynamic-segment values threaded into the
+/// Tier-B [`TierBRequestContext`] so `ctx.resolve("params")` / dynamic props /
+/// `generateMetadata()` see them.
+async fn serve_manifest_route(
+    app: Arc<StreamingAppState>,
+    req: Request,
+    route_pattern: String,
+    params: HashMap<String, String>,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let negotiated_transport = negotiate_transport(&req, &app.transport);
+
+    let Some(route) = app.manifest.routes.get(route_pattern.as_str()) else {
         return not_found_response();
     };
 
     let transport_config = app.transport.clone();
     let mut response_transport = negotiated_transport;
     let route = route.clone();
-    let ctx = request_context_from_request(&req);
+    let ctx = request_context_from_request(&req, params);
 
     // Phase L · resolve the per-session id used to address the CSRF
     // token table. Read from the `albedo-session` cookie when the
@@ -595,8 +631,12 @@ fn build_stream(
                             // boundary and inject its HTML; only if there is no
                             // boundary (or it too fails) do we fall back to the
                             // blank error stub.
+                            // Reader-facing copy: the raw thrown message only,
+                            // never the wrapped diagnostic chain or a filesystem
+                            // path. The full `err` still reaches logs/overlay
+                            // (Display) on the boundary-render failure path below.
                             let error_props = json!({
-                                "error": { "message": err.to_string() }
+                                "error": { "message": err.user_message() }
                             });
                             match render_route_boundary(
                                 app.as_ref(),
@@ -962,7 +1002,10 @@ async fn drain_async_islands_into_session(
     }
 }
 
-fn request_context_from_request(req: &Request) -> TierBRequestContext {
+fn request_context_from_request(
+    req: &Request,
+    params: HashMap<String, String>,
+) -> TierBRequestContext {
     let mut headers = HashMap::new();
     let mut cookies = HashMap::new();
 
@@ -978,7 +1021,7 @@ fn request_context_from_request(req: &Request) -> TierBRequestContext {
 
     TierBRequestContext {
         path: req.uri().path().to_string(),
-        params: HashMap::new(),
+        params,
         headers,
         cookies,
     }

@@ -94,12 +94,20 @@ pub fn decide_tier_and_hydration(
     inputs: TieringInputs,
 ) -> TieringDecision {
     if effects.side_effects {
+        // A `useEffect`/`useLayoutEffect` component must run its effect on mount
+        // — it wires listeners, subscriptions, or DOM mutations that the user
+        // never explicitly triggers (e.g. a scroll-progress bar). So it must
+        // hydrate *eagerly*, never `OnInteraction`: a passive effect island
+        // would otherwise sit dead because no interaction ever lands on it.
+        // Above-fold → `Immediate` (hydrate ASAP); below-fold → `OnIdle`
+        // (hydrate at the first idle window). Both resolve to the client's Idle
+        // trigger today; the distinction is kept for future trigger granularity.
         return TieringDecision {
             tier: Tier::C,
             hydration_mode: if is_above_fold {
                 HydrationMode::Immediate
             } else {
-                HydrationMode::OnInteraction
+                HydrationMode::OnIdle
             },
             reason: TieringReason::SideEffectBoundary,
         };
@@ -323,5 +331,41 @@ mod tests {
         );
         assert_eq!(decision.tier, Tier::C);
         assert_eq!(decision.reason, TieringReason::IoBoundary);
+    }
+
+    #[test]
+    fn side_effect_component_hydrates_eagerly_not_on_interaction() {
+        // A `useEffect`-bearing island (e.g. a scroll-progress bar) must run its
+        // effect on mount — it can never wait for an interaction that may never
+        // come. Below-fold → OnIdle, above-fold → Immediate; neither is
+        // OnInteraction.
+        let below = decide_tier_and_hydration(
+            EffectProfile {
+                side_effects: true,
+                ..EffectProfile::default()
+            },
+            false,
+            false,
+            false,
+            1024,
+            inputs(),
+        );
+        assert_eq!(below.tier, Tier::C);
+        assert_eq!(below.reason, TieringReason::SideEffectBoundary);
+        assert_eq!(below.hydration_mode, HydrationMode::OnIdle);
+        assert_ne!(below.hydration_mode, HydrationMode::OnInteraction);
+
+        let above = decide_tier_and_hydration(
+            EffectProfile {
+                side_effects: true,
+                ..EffectProfile::default()
+            },
+            false,
+            false,
+            true,
+            1024,
+            inputs(),
+        );
+        assert_eq!(above.hydration_mode, HydrationMode::Immediate);
     }
 }

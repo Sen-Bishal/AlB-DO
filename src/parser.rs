@@ -57,8 +57,43 @@ impl ComponentParser {
         let mut visitor = ComponentVisitor::new(filename.to_string(), source_hash);
         module.visit_with(&mut visitor);
 
+        // A file that declared no component but exports something is a pure
+        // data/util/lib module. Surface it as a module-only node so a component
+        // importing it (by a name that matches no component) still links it on
+        // the server. Files with zero exports (types-only, side-effect-only)
+        // produce nothing, exactly as before.
+        if visitor.components.is_empty() && visitor.has_export {
+            visitor.components.push(ParsedComponent {
+                name: module_only_node_name(filename),
+                file_path: filename.to_string(),
+                line_number: 0,
+                imports: visitor.current_imports.clone(),
+                import_sources: visitor.current_import_sources.clone(),
+                estimated_size: 0,
+                is_default_export: false,
+                props: Vec::new(),
+                effect_profile: EffectProfile::default(),
+                is_interactive: false,
+                is_client_interactive: false,
+                source_hash,
+                is_module_only: true,
+            });
+        }
+
         Ok(visitor.components)
     }
+}
+
+/// Stable, collision-tolerant name for a module-only node, derived from the
+/// file stem (`../content/essays.ts` → `essays`). Only used as a graph/manifest
+/// label — module linking keys on `module_path`, not this name.
+fn module_only_node_name(filename: &str) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("module");
+    format!("__module__{stem}")
 }
 
 impl Default for ComponentParser {
@@ -73,6 +108,13 @@ pub struct ParsedComponent {
     pub file_path: String,
     pub line_number: usize,
     pub imports: Vec<String>,
+    /// Module specifiers (the `from "..."` strings) of every `import` in the
+    /// file, in source order. Distinct from `imports` (the bound *names*):
+    /// dependency wiring resolves these by **path** so a component can depend
+    /// on a non-component data/util module it imports by a name that doesn't
+    /// match any component (`import { getIssue } from "../content/essays"`).
+    /// See `ProjectScanner::build_compiler`.
+    pub import_sources: Vec<String>,
     pub estimated_size: usize,
     pub is_default_export: bool,
     pub props: Vec<String>,
@@ -89,6 +131,13 @@ pub struct ParsedComponent {
     /// a `LikeButton` (onClick→`fetch`) is not. See step 2 in the tier design.
     pub is_client_interactive: bool,
     pub source_hash: u64,
+    /// True when this node represents a file that declared NO component but
+    /// DOES export something (a pure data/util/lib module). It is a graph +
+    /// manifest + module-registry node purely so importers can link it on
+    /// the server; it is never routed, tiered for render, or statically
+    /// rendered. See `ProjectScanner::build_compiler` and the manifest
+    /// builder's `sorted_children` skip.
+    pub is_module_only: bool,
 }
 
 struct ComponentVisitor {
@@ -96,6 +145,12 @@ struct ComponentVisitor {
     source_hash: u64,
     components: Vec<ParsedComponent>,
     current_imports: Vec<String>,
+    /// Parallel to `current_imports` but keyed by the module specifier
+    /// (`from "..."`) rather than the bound name — see `import_sources`.
+    current_import_sources: Vec<String>,
+    /// The file exported at least one binding (named, default, or `export {}`).
+    /// Gates synthesis of a module-only node for component-less files.
+    has_export: bool,
 }
 
 impl ComponentVisitor {
@@ -105,6 +160,8 @@ impl ComponentVisitor {
             source_hash,
             components: Vec::new(),
             current_imports: Vec::new(),
+            current_import_sources: Vec::new(),
+            has_export: false,
         }
     }
 
@@ -164,6 +221,7 @@ impl ComponentVisitor {
             file_path: self.file_path.clone(),
             line_number: 0,
             imports: self.current_imports.clone(),
+            import_sources: self.current_import_sources.clone(),
             estimated_size,
             is_default_export,
             props: Vec::new(),
@@ -171,20 +229,60 @@ impl ComponentVisitor {
             is_interactive: analysis.is_interactive,
             is_client_interactive: analysis.is_client_interactive,
             source_hash: self.source_hash,
+            is_module_only: false,
         });
     }
 }
 
 impl Visit for ComponentVisitor {
     fn visit_import_decl(&mut self, import: &ImportDecl) {
-        for spec in &import.specifiers {
-            let name = match spec {
-                ImportSpecifier::Named(n) => n.local.sym.to_string(),
-                ImportSpecifier::Default(d) => d.local.sym.to_string(),
-                ImportSpecifier::Namespace(n) => n.local.sym.to_string(),
-            };
-            self.current_imports.push(name);
+        // `import type { T } from "..."` is fully erased by the TS transform —
+        // it creates no runtime module dependency, so it must contribute no
+        // edge. A phantom edge from a type-only import can give an unrelated
+        // route component a dependent (e.g. a `Foo` interface import colliding
+        // with a component named `Foo`), which makes the route look non-root
+        // and silently drops it from the manifest.
+        if import.type_only {
+            return;
         }
+
+        // Collect only the runtime (non-type) binding names. Inline
+        // `import { value, type T }` specifiers are erased per-specifier.
+        let mut names = Vec::new();
+        for spec in &import.specifiers {
+            match spec {
+                ImportSpecifier::Named(n) if n.is_type_only => continue,
+                ImportSpecifier::Named(n) => names.push(n.local.sym.to_string()),
+                ImportSpecifier::Default(d) => names.push(d.local.sym.to_string()),
+                ImportSpecifier::Namespace(n) => names.push(n.local.sym.to_string()),
+            }
+        }
+
+        // Record the module specifier only for a real runtime import: one that
+        // binds runtime names, or a bare side-effect import (`import "./x"`,
+        // no specifiers). An import whose every specifier was type-only is
+        // erased and wires nothing.
+        if !names.is_empty() || import.specifiers.is_empty() {
+            self.current_import_sources
+                .push(import.src.value.to_string());
+        }
+        self.current_imports.extend(names);
+    }
+
+    fn visit_export_decl(&mut self, export: &ExportDecl) {
+        // `export const x` / `export function f` / `export class C` — mark the
+        // file as exporting, then recurse so the inner fn/var decl still reaches
+        // `visit_fn_decl` / `visit_var_decl` (an exported component is detected
+        // exactly as a non-exported one is).
+        self.has_export = true;
+        export.visit_children_with(self);
+    }
+
+    fn visit_named_export(&mut self, export: &NamedExport) {
+        // `export { a, b }` and re-exports `export { x } from "./y"` — declare no
+        // component but make the file an importable module.
+        self.has_export = true;
+        export.visit_children_with(self);
     }
 
     fn visit_fn_decl(&mut self, func: &FnDecl) {
@@ -215,6 +313,7 @@ impl Visit for ComponentVisitor {
     }
 
     fn visit_export_default_decl(&mut self, export: &ExportDefaultDecl) {
+        self.has_export = true;
         if let DefaultDecl::Fn(func) = &export.decl {
             if let Some(ident) = &func.ident {
                 let name = ident.sym.to_string();
@@ -226,6 +325,7 @@ impl Visit for ComponentVisitor {
     }
 
     fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
+        self.has_export = true;
         if let Some(name) = self.extract_component_name(&export.expr) {
             let estimated_size = name.len() * 50 + 200;
             let analysis = self.analyze_expr(&export.expr);
@@ -379,6 +479,11 @@ impl EffectCollector {
         let name = call_name.trim();
         if is_hook_call(name) {
             self.profile.hooks = true;
+        }
+        if is_effect_hook_call(name) {
+            // An effect hook requires client execution → fully hydrated Tier-C
+            // island, never serve-wired or server-only Tier-B.
+            self.profile.side_effects = true;
         }
         if is_io_call(name) {
             self.profile.io = true;
@@ -569,6 +674,22 @@ fn is_hook_call(name: &str) -> bool {
     name.chars().nth(3).is_some_and(|ch| ch.is_uppercase())
 }
 
+/// The effect hooks — `useEffect`/`useLayoutEffect`/`useInsertionEffect` — are a
+/// *client-lifecycle* requirement, not a passive hook: the effect body must run
+/// in the browser (event listeners, DOM measurement, subscriptions, document
+/// mutation). They cannot be expressed as declarative serve-wired bindings, so
+/// they mark the component as side-effecting, which promotes it to a fully
+/// hydrated Tier-C island (see `decide_tier_and_hydration`). Without this, an
+/// effect-only component (no `on*` handler) would be read as a passive-hook
+/// component and mis-tiered to Tier B (server-only), silently dropping the
+/// effect on the serve path.
+fn is_effect_hook_call(name: &str) -> bool {
+    matches!(
+        name.trim(),
+        "useEffect" | "useLayoutEffect" | "useInsertionEffect"
+    )
+}
+
 fn is_async_call(name: &str) -> bool {
     const ASYNC_CALLS: &[&str] = &[
         "fetch",
@@ -621,6 +742,56 @@ fn is_side_effect_call(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captures_import_source_paths_distinct_from_names() {
+        let parser = ComponentParser::new();
+        let source = r#"
+            import EssayCard from "../components/EssayCard";
+            import { getIssue, essays } from "../content/essays";
+            export default function Issue() {
+                return <main>{getIssue().title}</main>;
+            }
+        "#;
+
+        let components = parser.parse_source(source, "src/routes/index.tsx").unwrap();
+        let issue = components.iter().find(|c| c.name == "Issue").unwrap();
+        // Names keep the legacy behaviour…
+        assert!(issue.imports.contains(&"EssayCard".to_string()));
+        assert!(issue.imports.contains(&"getIssue".to_string()));
+        // …and the new field carries the *specifiers* for path resolution.
+        assert!(issue
+            .import_sources
+            .contains(&"../components/EssayCard".to_string()));
+        assert!(issue
+            .import_sources
+            .contains(&"../content/essays".to_string()));
+        assert!(!issue.is_module_only);
+    }
+
+    #[test]
+    fn data_module_with_no_component_becomes_module_only_node() {
+        let parser = ComponentParser::new();
+        let source = r#"
+            export interface Essay { slug: string; title: string; }
+            export const essays: Essay[] = [{ slug: "a", title: "A" }];
+            export function getIssue() { return essays[0]; }
+        "#;
+
+        let components = parser.parse_source(source, "src/content/essays.ts").unwrap();
+        assert_eq!(components.len(), 1, "one synthetic module-only node");
+        assert!(components[0].is_module_only);
+        assert_eq!(components[0].file_path, "src/content/essays.ts");
+    }
+
+    #[test]
+    fn file_with_no_exports_and_no_component_produces_nothing() {
+        let parser = ComponentParser::new();
+        // Types-only / side-effect-free with no export → not a node.
+        let source = "type Local = { x: number };\nconst unused: Local = { x: 1 };\n";
+        let components = parser.parse_source(source, "src/internal.ts").unwrap();
+        assert!(components.is_empty());
+    }
 
     #[test]
     fn test_parse_simple_component() {

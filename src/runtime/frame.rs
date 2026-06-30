@@ -510,6 +510,8 @@ mod tests {
             is_interactive: false,
             is_client_interactive: false,
             source_hash: 0xAAAA_0000 | u64::from(id),
+            import_sources: Vec::new(),
+            is_module_only: false,
         }
     }
 

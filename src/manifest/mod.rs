@@ -169,11 +169,19 @@ fn entry_component_for_route(
     graph: &ComponentGraph,
     result: &OptimizationResult,
 ) -> Option<ComponentId> {
-    result.critical_path.last().copied().or_else(|| {
-        let mut ids = graph.component_ids();
-        ids.sort_unstable_by_key(|id| id.as_u64());
-        ids.first().copied()
-    })
+    let is_renderable = |id: &ComponentId| graph.get(id).is_some_and(|c| !c.is_module_only);
+
+    result
+        .critical_path
+        .iter()
+        .rev()
+        .copied()
+        .find(is_renderable)
+        .or_else(|| {
+            let mut ids = graph.component_ids();
+            ids.sort_unstable_by_key(|id| id.as_u64());
+            ids.into_iter().find(is_renderable)
+        })
 }
 
 fn entry_components_for_routes(
@@ -193,6 +201,11 @@ fn entry_components_for_routes(
         let Some(component) = graph.get(&id) else {
             continue;
         };
+        // A pure data/util module is a graph node only so importers can link
+        // it — it is never a route.
+        if component.is_module_only {
+            continue;
+        }
         let Some(route_path) = route_path_from_component(component.file_path.as_str()) else {
             continue;
         };
@@ -576,6 +589,43 @@ mod tests {
         assert_eq!(
             first_tier_b.initial_opcode_frame, second_tier_b.initial_opcode_frame,
             "opcode frame bytes must match across rebuilds"
+        );
+    }
+
+    /// The Tier-B injection bootstrap stub must ride in the shell `<head>`
+    /// (a classic script, before `</head>`) so it is defined before the body's
+    /// streamed `__albedo_inject(...)` calls run. Regression guard for the
+    /// blank-Tier-B-body bug surfaced dogfooding Halation.
+    #[test]
+    fn shell_head_carries_tier_b_inject_bootstrap_before_module_runtime() {
+        let mut compiler = RenderCompiler::new();
+        let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
+        counter.file_path = "tests/fixtures/hook_compile/counter/Component.tsx".to_string();
+        counter.weight = 2048.0;
+        counter.effect_profile.hooks = true; // → Tier-B
+        compiler.add_component(counter);
+
+        let result = compiler.optimize().unwrap();
+        let manifest =
+            build_render_manifest_v2(compiler.graph(), &result, &ManifestOptions::default());
+
+        let route = manifest.routes.values().next().unwrap();
+        let head = &route.shell.doctype_and_head;
+        assert!(
+            head.contains("__ALBEDO_INJECT_QUEUE"),
+            "head must carry the inject bootstrap stub; head={head}"
+        );
+        // The stub is inside <head> (defined before parse reaches the body).
+        let stub_at = head.find("__ALBEDO_INJECT_QUEUE").unwrap();
+        let head_close = head.find("</head>").unwrap();
+        assert!(
+            stub_at < head_close,
+            "inject bootstrap must be inside <head>, before </head>"
+        );
+        // And it is a classic script, not the deferred module.
+        assert!(
+            !head.contains("type=\"module\""),
+            "the head stub must be classic (runs during parse), not a module"
         );
     }
 

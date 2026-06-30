@@ -659,6 +659,24 @@ export function installLegacyHtmlInjector(target, document) {
     });
   }
 
+  // Drain calls buffered by the head-level classic stub
+  // (`TIER_B_INJECT_BOOTSTRAP`) that ran before this deferred module installed
+  // the real handlers. Replay them through the now-real functions, in order.
+  const pendingInject = target.__ALBEDO_INJECT_QUEUE;
+  if (pendingInject) {
+    target.__ALBEDO_INJECT_QUEUE = null;
+    for (let i = 0; i < pendingInject.length; i++) {
+      target.__albedo_inject.apply(null, pendingInject[i]);
+    }
+  }
+  const pendingHydrate = target.__ALBEDO_HYDRATE_QUEUE;
+  if (pendingHydrate) {
+    target.__ALBEDO_HYDRATE_QUEUE = null;
+    for (let i = 0; i < pendingHydrate.length; i++) {
+      target.__albedo_hydrate.apply(null, pendingHydrate[i]);
+    }
+  }
+
   return queue;
 }
 
