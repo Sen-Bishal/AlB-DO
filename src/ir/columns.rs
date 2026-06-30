@@ -1080,6 +1080,8 @@ mod tests {
                 is_interactive: false,
                 is_client_interactive: false,
                 source_hash: 0xA1B2_C3D4_0000_0001,
+                import_sources: Vec::new(),
+                is_module_only: false,
             },
             ParsedComponent {
                 name: "Button".to_string(),
@@ -1093,6 +1095,8 @@ mod tests {
                 is_interactive: false,
                 is_client_interactive: false,
                 source_hash: 0xA1B2_C3D4_0000_0002,
+                import_sources: Vec::new(),
+                is_module_only: false,
             },
         ]
     }
@@ -1207,6 +1211,8 @@ mod tests {
                 is_interactive: false,
                 is_client_interactive: false,
                 source_hash: 0xDEAD_0000 | u64::from(idx as u32),
+                import_sources: Vec::new(),
+                is_module_only: false,
             })
             .collect()
     }
@@ -1389,6 +1395,8 @@ mod tests {
                 is_interactive: false,
                 is_client_interactive: false,
                 source_hash: 1,
+                import_sources: Vec::new(),
+                is_module_only: false,
             },
             ParsedComponent {
                 name: "SyncCard".to_string(),
@@ -1405,6 +1413,8 @@ mod tests {
                 is_interactive: false,
                 is_client_interactive: false,
                 source_hash: 2,
+                import_sources: Vec::new(),
+                is_module_only: false,
             },
         ];
         let columns = IrColumns::from_parsed(&parsed);

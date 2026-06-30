@@ -13,4 +13,6 @@ pub use dev::{
     serve_overlay_script,
 };
 pub use public_assets::{content_type_for_path, sanitize_public_path, PublicAssets};
-pub use streaming::{streaming_handler, StreamingAppState, StreamingTransportConfig};
+pub use streaming::{
+    streaming_handler, streaming_handler_with_match, StreamingAppState, StreamingTransportConfig,
+};

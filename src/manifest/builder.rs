@@ -440,6 +440,16 @@ impl<'a> ManifestBuilder<'a> {
         let mut doctype_and_head = String::from(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
         );
+        // Tier-B injection bootstrap. The streamed Tier-B `<script>__albedo_inject(...)</script>`
+        // calls are CLASSIC scripts (run during parse), but the real
+        // `__albedo_inject` is defined in `runtime.js`, a `type="module"`
+        // script (deferred — runs AFTER the document parses). Without an early
+        // stub the body's inject calls fire before the function exists and are
+        // lost, leaving every Tier-B placeholder blank. This classic, head-level
+        // stub buffers calls into a queue that `installLegacyHtmlInjector`
+        // drains once the module loads. Must precede any inject call → first
+        // thing in <head>.
+        doctype_and_head.push_str(TIER_B_INJECT_BOOTSTRAP);
         // The `<title>`/`<meta>` block. For a route with `generateMetadata`,
         // emit a marker the serve path replaces per request with the resolved
         // (static-merged-with-dynamic) head; otherwise bake the static block.
@@ -1119,7 +1129,12 @@ impl<'a> ManifestBuilder<'a> {
         let mut keys = Vec::new();
         let module_path = component.file_path.replace('\\', "/");
         if module_path.contains('[') && module_path.contains(']') {
-            keys.push("path".to_string());
+            // A `[slug]` route component receives the parsed route params as a
+            // single `params` object prop (`{ slug }`) — the Next-idiomatic
+            // shape `async function Page({ params })` expects. The serve path
+            // resolves this key via `RequestContext::resolve("params")`, which
+            // assembles the matched params map into a JSON object.
+            keys.push("params".to_string());
         }
         keys
     }
@@ -1144,6 +1159,15 @@ impl<'a> ManifestBuilder<'a> {
             .graph
             .get_dependencies(&id)
             .into_iter()
+            // Module-only dependencies (data/util) are linked on the server via
+            // the manifest's dependency edges but have no JSX to render — never
+            // walk them as renderable children (would static-render a data file).
+            .filter(|child| {
+                !self
+                    .components
+                    .get(child)
+                    .is_some_and(|component| component.is_module_only)
+            })
             .collect::<Vec<_>>();
         children.sort_unstable_by_key(|component_id| component_id.as_u64());
         children
@@ -1304,6 +1328,15 @@ fn common_ancestor(mut left: PathBuf, right: &Path) -> Option<PathBuf> {
     Some(left)
 }
 
+/// Classic, head-level stub that buffers `__albedo_inject` / `__albedo_hydrate`
+/// calls until the deferred `runtime.js` module installs the real handlers and
+/// drains the queue (see `installLegacyHtmlInjector` in `assets/albedo-runtime.js`).
+/// Runs synchronously during head parse, so it is defined before any streamed
+/// Tier-B injection script in the body executes.
+const TIER_B_INJECT_BOOTSTRAP: &str = "<script>(function(){var w=window;\
+w.__albedo_inject=function(){(w.__ALBEDO_INJECT_QUEUE=w.__ALBEDO_INJECT_QUEUE||[]).push(arguments);};\
+w.__albedo_hydrate=function(){(w.__ALBEDO_HYDRATE_QUEUE=w.__ALBEDO_HYDRATE_QUEUE||[]).push(arguments);};})();</script>";
+
 fn default_shim_script(enable_wt_bootstrap: bool) -> String {
     let mut script = "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>".to_string();
     if enable_wt_bootstrap {
@@ -1444,11 +1477,24 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_shim_script, stream_slot_label};
+    use super::{default_shim_script, stream_slot_label, TIER_B_INJECT_BOOTSTRAP};
     use crate::runtime::webtransport::{
         WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES, WT_STREAM_SLOT_PREFETCH,
         WT_STREAM_SLOT_SHELL,
     };
+
+    #[test]
+    fn tier_b_inject_bootstrap_is_a_classic_stub_defining_both_globals() {
+        // Must be a CLASSIC script (no type=module) so it runs during parse,
+        // before any streamed Tier-B inject call — and must define both the
+        // inject and hydrate buffering globals the runtime module drains.
+        assert!(TIER_B_INJECT_BOOTSTRAP.starts_with("<script>"));
+        assert!(!TIER_B_INJECT_BOOTSTRAP.contains("type=\"module\""));
+        assert!(TIER_B_INJECT_BOOTSTRAP.contains("__albedo_inject"));
+        assert!(TIER_B_INJECT_BOOTSTRAP.contains("__albedo_hydrate"));
+        assert!(TIER_B_INJECT_BOOTSTRAP.contains("__ALBEDO_INJECT_QUEUE"));
+        assert!(TIER_B_INJECT_BOOTSTRAP.contains("__ALBEDO_HYDRATE_QUEUE"));
+    }
 
     #[test]
     fn test_default_shim_script_includes_wt_bootstrap_for_streaming_routes() {

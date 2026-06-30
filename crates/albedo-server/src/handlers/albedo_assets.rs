@@ -42,9 +42,14 @@ fn resolve_albedo_asset(path: &str) -> Option<&'static str> {
 }
 
 /// Build a 200 response carrying one of the embedded bakabox
-/// assets, or `None` for unrecognised paths. `cache-control` is
-/// `public, max-age=3600` — the bytes are content-hashed via the
-/// binary's build id so a cache-bust requires a binary rev.
+/// assets, or `None` for unrecognised paths.
+///
+/// `cache-control` is `no-cache` (revalidate before reuse). These assets live
+/// at FIXED, non-content-hashed URLs (`/_albedo/runtime.js`), so a binary rev
+/// that changes the bytes keeps the same URL — a long `max-age` would leave
+/// browsers running a stale client runtime after a deploy (drifting from the
+/// server). Content-hashed chunks (`/_albedo/chunks/<name>.<hash>.js`) are the
+/// ones safe to cache immutably; these are not.
 pub fn dispatch_albedo_asset(path: &str) -> Option<Response<Body>> {
     let body = resolve_albedo_asset(path)?;
     let response = Response::builder()
@@ -53,10 +58,7 @@ pub fn dispatch_albedo_asset(path: &str) -> Option<Response<Body>> {
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/javascript; charset=utf-8"),
         )
-        .header(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=3600"),
-        )
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
         .body(Body::from(body))
         .expect("static asset response builds");
     Some(response)
@@ -103,5 +105,26 @@ mod tests {
             .get("content-type")
             .and_then(|v| v.to_str().ok());
         assert_eq!(content_type, Some("text/javascript; charset=utf-8"));
+    }
+
+    /// Framework assets sit at fixed (non-hashed) URLs, so they must revalidate
+    /// — a long max-age would strand browsers on a stale client runtime after a
+    /// deploy. Regression guard for the cache-staleness bug.
+    #[tokio::test]
+    async fn dispatch_marks_framework_assets_no_cache() {
+        let response = dispatch_albedo_asset("/_albedo/runtime.js").unwrap();
+        let cache = response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(cache, Some("no-cache"));
+    }
+
+    /// The embedded runtime carries the Tier-B inject-queue drain (paired with
+    /// the head bootstrap stub). Guards against shipping a runtime that can't
+    /// replay calls buffered before it loads.
+    #[test]
+    fn embedded_runtime_drains_inject_queue() {
+        assert!(RUNTIME_JS.contains("__ALBEDO_INJECT_QUEUE"));
     }
 }

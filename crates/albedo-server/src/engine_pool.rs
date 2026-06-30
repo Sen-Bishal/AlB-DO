@@ -388,14 +388,15 @@ fn warm_engine(engine: &mut QuickJsEngine) {
 /// Warm one engine's *render* path with a known component set, in persistent
 /// arena mode. Each component's module graph is loaded and the component rendered
 /// a few times inside an explicit [`QuickJsEngine::begin_warmup`] /
-/// [`QuickJsEngine::end_warmup`] bracket, so all of its lazily-interned QuickJS
+/// [`QuickJsEngine::end_warmup`] bracket, so its stable lazily-interned QuickJS
 /// state (element/attribute atoms, hidden-class shapes, the render-entry closure)
-/// lands in the persistent region. Without this, the *first* scoped render of a
-/// given component interns that state into the request region, which the boundary
-/// reset then frees — a use-after-free that crashes the next render (the documented
-/// arena residual hazard). Mirrors the boot renderer's "prime every route" pass,
-/// but per pool engine. Soft-fails per step; a cold engine still serves correctly
-/// for components it did manage to warm.
+/// lands in the persistent region instead of being re-interned through the system
+/// allocator on every request. This is now a *performance* optimization, not a
+/// correctness requirement: request-time memory is QuickJS-managed and freed
+/// per-block (see [`crate::runtime`]'s arena docs), so an un-warmed component still
+/// renders correctly — it just pays system-allocator churn for its shapes/atoms
+/// until they settle. Mirrors the boot renderer's "prime every route" pass, but
+/// per pool engine. Soft-fails per step.
 fn warm_render_targets(engine: &mut QuickJsEngine, components: &[WarmupComponent]) {
     use dom_render_compiler::runtime::engine::RuntimeEngine;
 
@@ -438,18 +439,18 @@ mod tests {
     }
 
     /// Warm-on-construction reaches the arena layer: after construction, a
-    /// checked-out engine runs renders in request-scoped (O(1) reset) mode, not
-    /// the cold persistent mode. We observe this via `arena_stats`: a
-    /// post-warmup render touches the request region (`request_peak > 0`) and
-    /// the region resets at the request boundary (`request_used == 0`). A
-    /// non-warmed engine would still be in persistent mode (`request_peak == 0`).
+    /// checked-out engine runs work in request mode, where request-time memory is
+    /// served from (and freed back to) the system allocator rather than bumping the
+    /// persistent region. We observe this via `arena_stats`: a post-warmup eval
+    /// records request-time system traffic (`system_peak_bytes > 0`). A non-warmed
+    /// engine would still be in cold persistent mode (`system_peak_bytes == 0`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pool_engines_are_warmed_into_request_scoped_mode() {
         use dom_render_compiler::runtime::HandlerInvocation;
         use serde_json::Map;
 
         let pool = QuickJsEnginePool::with_size(1);
-        let (peak, used) = pool
+        let peak = pool
             .with_engine(|engine| {
                 let env = Map::new();
                 let bc = Map::new();
@@ -463,19 +464,15 @@ mod tests {
                     broadcast_current: &bc,
                 };
                 let _ = engine.eval_handler("__warm_probe", &inv);
-                let s = engine.arena_stats();
-                (s.request_peak, s.request_used)
+                engine.arena_stats().system_peak_bytes
             })
             .await
             .expect("checkout");
 
         assert!(
             peak > 0,
-            "engine should be in request-scoped mode after construction warmup (request_peak > 0)"
-        );
-        assert_eq!(
-            used, 0,
-            "the request region must reset at the render boundary"
+            "engine should serve request memory from the system allocator after warmup \
+             (system_peak_bytes > 0)"
         );
     }
 

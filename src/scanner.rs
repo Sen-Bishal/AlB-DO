@@ -1,6 +1,7 @@
 use crate::estimator::WeightEstimator;
 use crate::ir::{build_canonical_ir_from_parsed, CanonicalIrDocument};
 use crate::parser::{ComponentParser, ParsedComponent};
+use crate::runtime::eval::component::{import_candidates, normalize_specifier};
 use crate::types::*;
 use crate::RenderCompiler;
 use std::collections::HashMap;
@@ -111,17 +112,44 @@ impl ProjectScanner {
             component.is_client_interactive = parsed.is_client_interactive;
             component.effect_profile = parsed.effect_profile;
             component.source_hash = parsed.source_hash;
+            component.is_module_only = parsed.is_module_only;
 
             let id = compiler.add_component(component);
             component_map.insert(parsed.name.clone(), id);
         }
 
+        // Path-keyed index of every node by its normalized module path. This is
+        // what lets a component depend on a *non-component* module (data/util)
+        // it imports by a name that matches no component name.
+        let mut path_map: HashMap<String, ComponentId> = HashMap::new();
         for parsed in &components {
-            if let Some(&from_id) = component_map.get(&parsed.name) {
-                for import in &parsed.imports {
-                    if let Some(&to_id) = component_map.get(import) {
+            if let Some(&id) = component_map.get(&parsed.name) {
+                path_map.insert(normalize_specifier(&parsed.file_path), id);
+            }
+        }
+
+        for parsed in &components {
+            let Some(&from_id) = component_map.get(&parsed.name) else {
+                continue;
+            };
+
+            // Primary: resolve each import specifier to a file PATH relative to
+            // the importer, then look it up in the path-keyed index. Catches
+            // data/util imports the name match below cannot.
+            for source in &parsed.import_sources {
+                if let Some(to_id) = resolve_import_to_id(&parsed.file_path, source, &path_map) {
+                    if to_id != from_id {
                         compiler.add_dependency(from_id, to_id).ok();
                     }
+                }
+            }
+
+            // Fallback: the legacy name match (import binding name == component
+            // name). Kept for bare/aliased specifiers that don't resolve to a
+            // project file path; union with the path edges is idempotent.
+            for import in &parsed.imports {
+                if let Some(&to_id) = component_map.get(import) {
+                    compiler.add_dependency(from_id, to_id).ok();
                 }
             }
         }
@@ -167,11 +195,80 @@ impl Default for ProjectScanner {
     }
 }
 
+/// Resolve one import specifier (`from "..."`) against the importer's file path
+/// to a node id, probing the same extension/`index` candidates the runtime
+/// module loader uses. Returns `None` for bare/npm specifiers (no leading `.`)
+/// and for paths that match no project node.
+fn resolve_import_to_id(
+    importer_file_path: &str,
+    source: &str,
+    path_map: &HashMap<String, ComponentId>,
+) -> Option<ComponentId> {
+    // Only project-relative specifiers resolve to a file path; bare specifiers
+    // (`zod`, `@/x`) are npm/alias and fall to the name-based fallback.
+    if !(source.starts_with("./") || source.starts_with("../")) {
+        return None;
+    }
+
+    let importer_dir = Path::new(importer_file_path).parent().unwrap_or(Path::new(""));
+    let base = normalize_specifier(importer_dir.join(source));
+
+    import_candidates(&base)
+        .into_iter()
+        .find_map(|candidate| path_map.get(&candidate).copied())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::ComponentParser;
     use std::fs;
     use std::io::Write;
+
+    /// A component importing a non-component data module by a name that matches
+    /// no component (`getIssue`) must still get a dependency edge — resolved by
+    /// PATH against the data module's module-only node. This is the exact
+    /// Halation P2 shape (route → `content/essays`).
+    #[test]
+    fn build_compiler_wires_data_module_dep_by_path() {
+        let parser = ComponentParser::new();
+
+        let route_src = r#"
+            import { getIssue } from "../content/essays";
+            export default function Issue() {
+                return <main>{getIssue().title}</main>;
+            }
+        "#;
+        let data_src = r#"
+            export const essays = [{ slug: "a", title: "A" }];
+            export function getIssue() { return essays[0]; }
+        "#;
+
+        let mut parsed = parser
+            .parse_source(route_src, "src/routes/index.tsx")
+            .unwrap();
+        parsed.extend(parser.parse_source(data_src, "src/content/essays.ts").unwrap());
+
+        let scanner = ProjectScanner::new();
+        let compiler = scanner.build_compiler(parsed);
+        let graph = compiler.graph();
+
+        let issue = graph
+            .components()
+            .into_iter()
+            .find(|c| c.name == "Issue")
+            .expect("Issue node present");
+        let essays = graph
+            .components()
+            .into_iter()
+            .find(|c| c.is_module_only)
+            .expect("essays module-only node present");
+
+        assert!(
+            graph.get_dependencies(&issue.id).contains(&essays.id),
+            "Issue must depend on the essays data module (path-resolved edge)"
+        );
+    }
 
     #[test]
     fn test_scan_directory() {

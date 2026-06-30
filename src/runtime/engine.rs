@@ -36,6 +36,15 @@ pub enum RuntimeError {
     },
     #[error("RenderError: {0}")]
     RenderError(String),
+    /// A component threw while rendering. `message` is the raw thrown text
+    /// (JS `Error.message`); `component` is the module that threw, kept for
+    /// developer diagnostics. `Display` carries both (logs / dev overlay);
+    /// the reader-facing thrown text alone is available via
+    /// [`RuntimeError::thrown_message`]. Display is byte-identical to the
+    /// previous `render(format!("failed to render component '{entry}': …"))`
+    /// string so log output is unchanged.
+    #[error("RenderError: failed to render component '{component}': {message}")]
+    RenderComponentError { component: String, message: String },
     #[error("PropsError: {0}")]
     PropsError(String),
 }
@@ -58,6 +67,21 @@ impl RuntimeError {
 
     pub fn props(message: impl Into<String>) -> Self {
         Self::PropsError(message.into())
+    }
+
+    /// The raw message a failing component threw, *without* diagnostic
+    /// wrapping (component path, registry fn). Reader-facing `error.tsx`
+    /// boundaries display this; developer logs use `Display`, which keeps the
+    /// full diagnostic chain. For non-render variants this is just the inner
+    /// message — there is no separate "thrown" text to peel.
+    pub fn thrown_message(&self) -> String {
+        match self {
+            Self::RenderComponentError { message, .. } => message.clone(),
+            Self::RenderError(message)
+            | Self::PropsError(message)
+            | Self::InitError(message) => message.clone(),
+            Self::LoadError { message, .. } => message.clone(),
+        }
     }
 }
 

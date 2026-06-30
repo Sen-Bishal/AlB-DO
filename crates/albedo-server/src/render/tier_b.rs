@@ -12,10 +12,46 @@ pub enum RenderError {
     MissingDynamicProp { key: String },
     #[error("failed to merge dynamic prop '{key}': static props must be a JSON object")]
     StaticPropsNotObject { key: String },
-    #[error("render registry failed for '{render_fn}': {message}")]
-    RegistryFailure { render_fn: String, message: String },
+    /// A registered render fn failed. `diagnostic` is the full developer
+    /// chain (component path, engine wrapping) shown in logs / the dev
+    /// overlay via `Display`; `thrown_message` is the raw text the component
+    /// threw, which is all a reader-facing `error.tsx` boundary should see
+    /// (never the path or the wrapping). Keep them distinct so the boundary
+    /// reads structured data instead of parsing the diagnostic string.
+    #[error("render registry failed for '{render_fn}': {diagnostic}")]
+    RegistryFailure {
+        render_fn: String,
+        thrown_message: String,
+        diagnostic: String,
+    },
     #[error("data fetch failed for '{key}': {message}")]
     DataFetchFailure { key: String, message: String },
+}
+
+impl RenderError {
+    /// The reader-facing message for an `error.tsx` boundary: the original
+    /// thrown text only — never the wrapped diagnostic chain or a filesystem
+    /// path. Logs and the dev overlay use `Display` (the full chain) instead.
+    pub fn user_message(&self) -> String {
+        match self {
+            RenderError::RegistryFailure { thrown_message, .. } => thrown_message.clone(),
+            RenderError::DataFetchFailure { message, .. } => message.clone(),
+            RenderError::MissingDynamicProp { .. } | RenderError::StaticPropsNotObject { .. } => {
+                self.to_string()
+            }
+        }
+    }
+}
+
+/// Plain `Send` carrier for a component render failure crossing the engine's
+/// dedicated thread. The closure handed to `with_engine` must be
+/// `Send + 'static`, so the engine's `RuntimeError` cannot cross — but a flat
+/// `String` would lose the thrown/diagnostic distinction. This struct keeps
+/// both as data: `thrown_message` (reader-facing) and `diagnostic` (logs).
+#[derive(Debug, Clone)]
+struct ComponentRenderFailure {
+    thrown_message: String,
+    diagnostic: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -28,6 +64,18 @@ pub struct RequestContext {
 
 impl RequestContext {
     pub fn resolve(&self, key: &str) -> Result<Value, RenderError> {
+        // Dynamic `[slug]` routes request the whole parsed route-params map as a
+        // single `params` object prop. Assemble it here so a component authored
+        // as `async function Page({ params })` receives `{ slug: "..." }`.
+        if key == "params" {
+            let map = self
+                .params
+                .iter()
+                .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+                .collect::<serde_json::Map<String, Value>>();
+            return Ok(Value::Object(map));
+        }
+
         if let Some(value) = self.params.get(key) {
             return Ok(Value::String(value.clone()));
         }
@@ -203,13 +251,14 @@ pub async fn render_tier_b(
         data.insert(key, value);
     }
 
+    // The registry already returns a typed `RenderError::RegistryFailure`
+    // carrying this `render_fn` and the thrown message — propagate it as-is
+    // rather than wrapping it in a *second* `RegistryFailure`, which is what
+    // produced the doubled "render registry failed for '…'" prefix readers
+    // used to see through the error boundary.
     let component_html = render_registry
         .call(node.render_fn.as_str(), &props, &data)
-        .await
-        .map_err(|err| RenderError::RegistryFailure {
-            render_fn: node.render_fn.clone(),
-            message: err.to_string(),
-        })?;
+        .await?;
 
     let mut full_html = component_html;
     for child in &node.tier_a_children {
@@ -278,9 +327,13 @@ pub async fn render_tier_b_opcodes(
             &data,
         )
         .await
-        .map_err(|err| RenderError::RegistryFailure {
-            render_fn: node.render_fn.clone(),
-            message: err.to_string(),
+        .map_err(|err| {
+            let diagnostic = err.to_string();
+            RenderError::RegistryFailure {
+                render_fn: node.render_fn.clone(),
+                thrown_message: diagnostic.clone(),
+                diagnostic,
+            }
         })
 }
 
@@ -427,44 +480,60 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
                 .get(render_fn)
                 .cloned()
                 .ok_or_else(|| {
+                    let reason =
+                        "no Tier-B render plan registered at boot (component not in manifest routes?)"
+                            .to_string();
                     RenderError::RegistryFailure {
-                render_fn: render_fn.to_string(),
-                message:
-                    "no Tier-B render plan registered at boot (component not in manifest routes?)"
-                        .to_string(),
-            }
+                        render_fn: render_fn.to_string(),
+                        thrown_message: reason.clone(),
+                        diagnostic: reason,
+                    }
                 })?;
 
         let props_json = serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string());
         let render_fn_owned = render_fn.to_string();
 
         // The closure crosses to the engine's dedicated thread, so every capture
-        // and the return type must be `Send + 'static`. Return a plain
-        // `Result<String, String>` rather than the engine's `RuntimeError` to
-        // keep the boundary free of engine-internal types.
+        // and the return type must be `Send + 'static`. The engine's
+        // `RuntimeError` cannot cross (it would leak engine-internal types onto
+        // the boundary), but a flat `String` would discard the thrown/diagnostic
+        // split — so we carry both as plain data via `ComponentRenderFailure`.
         let rendered = self
             .pool
-            .with_engine(move |engine| -> Result<String, String> {
+            .with_engine(move |engine| -> Result<String, ComponentRenderFailure> {
                 use dom_render_compiler::runtime::engine::RuntimeEngine;
                 for (specifier, code) in &plan.modules {
-                    engine
-                        .load_module(specifier, code)
-                        .map_err(|err| err.to_string())?;
+                    engine.load_module(specifier, code).map_err(|err| {
+                        ComponentRenderFailure {
+                            thrown_message: err.thrown_message(),
+                            diagnostic: err.to_string(),
+                        }
+                    })?;
                 }
                 engine
                     .render_component_with_host(&plan.entry, &props_json, "{}")
                     .map(|output| output.html)
-                    .map_err(|err| err.to_string())
+                    .map_err(|err| ComponentRenderFailure {
+                        thrown_message: err.thrown_message(),
+                        diagnostic: err.to_string(),
+                    })
             })
             .await
-            .map_err(|err| RenderError::RegistryFailure {
-                render_fn: render_fn_owned.clone(),
-                message: err.to_string(),
+            .map_err(|err| {
+                // Engine-pool / join failure — infrastructure, not a component
+                // throw; the diagnostic doubles as the (rare) reader text.
+                let diagnostic = err.to_string();
+                RenderError::RegistryFailure {
+                    render_fn: render_fn_owned.clone(),
+                    thrown_message: diagnostic.clone(),
+                    diagnostic,
+                }
             })?;
 
-        rendered.map_err(|message| RenderError::RegistryFailure {
+        rendered.map_err(|failure| RenderError::RegistryFailure {
             render_fn: render_fn_owned,
-            message,
+            thrown_message: failure.thrown_message,
+            diagnostic: failure.diagnostic,
         })
     }
 
@@ -499,14 +568,19 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
                     .map_err(|err| err.to_string())
             })
             .await
-            .map_err(|err| RenderError::RegistryFailure {
-                render_fn: key_owned.clone(),
-                message: err.to_string(),
+            .map_err(|err| {
+                let diagnostic = err.to_string();
+                RenderError::RegistryFailure {
+                    render_fn: key_owned.clone(),
+                    thrown_message: diagnostic.clone(),
+                    diagnostic,
+                }
             })?;
 
         resolved.map_err(|message| RenderError::RegistryFailure {
             render_fn: key_owned,
-            message,
+            thrown_message: message.clone(),
+            diagnostic: message,
         })
     }
 }
@@ -775,12 +849,19 @@ mod tests {
             .expect_err("an unregistered component must fail loudly, not render empty");
 
         match err {
-            RenderError::RegistryFailure { render_fn, message } => {
+            RenderError::RegistryFailure {
+                render_fn,
+                thrown_message,
+                diagnostic,
+            } => {
                 assert_eq!(render_fn, "render::Missing");
                 assert!(
-                    message.contains("no Tier-B render plan"),
-                    "unexpected message: {message}"
+                    diagnostic.contains("no Tier-B render plan"),
+                    "unexpected diagnostic: {diagnostic}"
                 );
+                // The unregistered-plan reason has no separate thrown text, so
+                // the reader-facing message mirrors the diagnostic here.
+                assert_eq!(thrown_message, diagnostic);
             }
             other => panic!("expected RegistryFailure, got {other:?}"),
         }

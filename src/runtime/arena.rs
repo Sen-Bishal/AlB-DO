@@ -1,23 +1,36 @@
-//! Request-scoped bump arena for the QuickJS runtime executor (Movement III).
+//! Persistent warmup arena + QuickJS-managed request memory (Movement III, redesigned).
 //!
-//! QuickJS allocates *everything* — every object, string, shape and atom — through
-//! a single `JSMallocFunctions` table. This module supplies that table as a bump
-//! allocator split into two regions so that the cost model becomes:
+//! QuickJS allocates *everything* — every object, string, shape and atom — through a
+//! single `JSMallocFunctions` table. This module supplies that table. It splits memory by
+//! LIFETIME, but defers request-time lifetime management to QuickJS itself:
 //!
-//! * **persistent region** — warmup state (builtins, loaded modules) and any table
-//!   the runtime grows in place across requests. Never rewound while the engine lives.
-//! * **request region** — everything a single render allocates. Allocation is a
-//!   pointer bump; `free` is a no-op; at the request boundary the whole region is
-//!   reclaimed in O(1) by resetting the bump cursor. No per-allocation GC churn.
+//! * **persistent region** — a bump arena for warmup/bootstrap state (builtins, loaded
+//!   modules, the runtime-global tables QuickJS grows once during warmup). Never freed
+//!   while the engine lives; reclaimed wholesale when the engine drops.
+//! * **request-time memory** — everything a render/handler allocates after warmup goes to
+//!   the *system allocator* and is freed per-block by QuickJS's own refcount + cycle
+//!   collector via [`ArenaControl::dealloc`].
 //!
-//! The invariant that makes the O(1) reset safe: by the time a render returns, QuickJS
-//! has refcounted away every acyclic request object (and removed its shapes/atoms from
-//! the runtime-global tables); the engine then runs the cycle collector once before the
-//! reset so cyclic garbage is gone too. What remains referenced from the global tables
-//! lives only in the persistent region. The single hazard — QuickJS *reallocating* a
-//! persistent table mid-render — is neutralised by dispatching `realloc`/`dealloc` on
-//! the pointer's region (a persistent pointer's realloc stays persistent), not on the
-//! current mode.
+//! ## Why not a resettable request region?
+//!
+//! An earlier design bump-allocated request memory into a second region and reclaimed it
+//! in O(1) by resetting a cursor at the request boundary. That is only sound if nothing
+//! the runtime still references lives in the region by request end — but QuickJS interns
+//! long-lived **shapes** (hidden classes) and **atoms** (property-name strings) through
+//! the same allocation path *during* the request, keyed off the per-request object shapes
+//! and property names it sees. Those interned structures stay reachable from the
+//! runtime-global tables (`shape_hash`, `atom_array`) across requests. A wholesale reset
+//! freed that still-live memory, so the next request that reused a dangling shape/atom hit
+//! a use-after-free (`js_free_shape0`'s `ref_count == 0` assert, or an access violation).
+//!
+//! It surfaced the instant a route received per-request props whose *shape* the warmup had
+//! not already interned — e.g. a dynamic `[slug]` route, whose `{ params: { slug } }` props
+//! object has a shape the empty-props (`{}`) warmup never created. There is no general way
+//! to pre-intern every shape/atom an arbitrary app will produce (data-dependent keys,
+//! conditional render paths), so warmup tricks can only ever be patchwork. The correct
+//! model is to let QuickJS — which tracks each block's true lifetime — own request memory.
+//! The persistent bump still pays off for the one-time warmup state that genuinely never
+//! frees.
 //!
 //! Single-threaded by construction: a QuickJS `Runtime` is not `Send`, and the engine
 //! drives allocation and the `begin_request`/`end_request` control points from that one
@@ -45,17 +58,10 @@ const ALLOC_ALIGN: usize = std::mem::align_of::<u64>();
 const HEADER_SIZE: usize = ALLOC_ALIGN;
 
 const DEFAULT_PERSISTENT_CAP: usize = 16 * 1024 * 1024;
-const DEFAULT_REQUEST_CAP: usize = 16 * 1024 * 1024;
 
 #[inline]
 fn round_up(size: usize) -> usize {
     (size + ALLOC_ALIGN - 1) & !(ALLOC_ALIGN - 1)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RegionKind {
-    Persistent,
-    Request,
 }
 
 /// A fixed-capacity slab we bump-allocate within. The backing memory is committed once
@@ -112,27 +118,38 @@ impl Drop for Region {
 
 /// Shared arena state. The engine holds one `Arc` to drive the request boundary and read
 /// stats; QuickJS's runtime holds another (inside the [`ArenaAllocator`] it owns) for the
-/// allocation callbacks. The regions outlive every allocation because they are only freed
-/// when the last `Arc` drops.
+/// allocation callbacks. The persistent region outlives every allocation because it is
+/// only freed when the last `Arc` drops.
 pub struct ArenaControl {
     persistent: Region,
-    request: Region,
+    /// When true, fresh allocations are request-time and routed to the system allocator
+    /// (QuickJS owns their lifetime, freeing each via `dealloc`). When false (warmup /
+    /// bootstrap), they bump the persistent region.
     in_request: AtomicBool,
 
     alloc_calls: AtomicUsize,
     realloc_calls: AtomicUsize,
     dealloc_calls: AtomicUsize,
+    /// Persistent-region overflow that spilled to the system allocator.
     fallback_allocs: AtomicUsize,
+    /// A persistent block QuickJS grew while serving a request (rare — warmup state is
+    /// normally stable). Kept persistent so it never moves into freeable memory.
     persistent_grew_in_request: AtomicUsize,
-    request_peak: AtomicUsize,
+    /// Outstanding request-time (system) bytes. Returns to its baseline after each render
+    /// once QuickJS frees the render's garbage — the steady-state health signal.
+    system_live_bytes: AtomicUsize,
+    /// High-water mark of `system_live_bytes`.
+    system_peak_bytes: AtomicUsize,
 }
 
-/// A point-in-time view of arena usage, used by the guardrail test and diagnostics.
+/// A point-in-time view of arena usage, used by the guardrail tests and diagnostics.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ArenaStats {
     pub persistent_used: usize,
-    pub request_used: usize,
-    pub request_peak: usize,
+    /// Outstanding request-time bytes the system allocator currently holds.
+    pub system_live_bytes: usize,
+    /// High-water mark of request-time bytes since construction.
+    pub system_peak_bytes: usize,
     pub alloc_calls: usize,
     pub realloc_calls: usize,
     pub dealloc_calls: usize,
@@ -141,43 +158,42 @@ pub struct ArenaStats {
 }
 
 impl ArenaControl {
-    pub fn new(persistent_cap: usize, request_cap: usize) -> Arc<Self> {
+    pub fn new(persistent_cap: usize) -> Arc<Self> {
         Arc::new(Self {
             persistent: Region::new(persistent_cap),
-            request: Region::new(request_cap),
             in_request: AtomicBool::new(false),
             alloc_calls: AtomicUsize::new(0),
             realloc_calls: AtomicUsize::new(0),
             dealloc_calls: AtomicUsize::new(0),
             fallback_allocs: AtomicUsize::new(0),
             persistent_grew_in_request: AtomicUsize::new(0),
-            request_peak: AtomicUsize::new(0),
+            system_live_bytes: AtomicUsize::new(0),
+            system_peak_bytes: AtomicUsize::new(0),
         })
     }
 
     pub fn with_default_caps() -> Arc<Self> {
-        Self::new(DEFAULT_PERSISTENT_CAP, DEFAULT_REQUEST_CAP)
+        Self::new(DEFAULT_PERSISTENT_CAP)
     }
 
-    /// Enter request mode: subsequent fresh allocations are request-scoped.
+    /// Enter request mode: fresh allocations become QuickJS-managed system blocks.
     pub fn begin_request(&self) {
         self.in_request.store(true, Relaxed);
     }
 
-    /// Leave request mode and reclaim the request region in O(1). The caller must have run
-    /// the cycle collector first so QuickJS holds no live reference above the watermark.
+    /// Leave request mode. No region is reset: request memory is owned by QuickJS and
+    /// freed per-block via [`Self::dealloc`] (refcount + the cycle collector the engine
+    /// runs before this call). Resetting a region here is exactly the unsound step the
+    /// old design took — see the module docs.
     pub fn end_request(&self) {
-        let used = self.request.top.load(Relaxed);
-        self.request_peak.fetch_max(used, Relaxed);
-        self.request.top.store(0, Relaxed);
         self.in_request.store(false, Relaxed);
     }
 
     pub fn stats(&self) -> ArenaStats {
         ArenaStats {
             persistent_used: self.persistent.top.load(Relaxed),
-            request_used: self.request.top.load(Relaxed),
-            request_peak: self.request_peak.load(Relaxed),
+            system_live_bytes: self.system_live_bytes.load(Relaxed),
+            system_peak_bytes: self.system_peak_bytes.load(Relaxed),
             alloc_calls: self.alloc_calls.load(Relaxed),
             realloc_calls: self.realloc_calls.load(Relaxed),
             dealloc_calls: self.dealloc_calls.load(Relaxed),
@@ -187,32 +203,15 @@ impl ArenaControl {
     }
 
     #[inline]
-    fn region(&self, kind: RegionKind) -> &Region {
-        match kind {
-            RegionKind::Persistent => &self.persistent,
-            RegionKind::Request => &self.request,
-        }
+    fn is_persistent(&self, user: *mut u8) -> bool {
+        self.persistent.contains(user as usize)
     }
 
-    /// Which region (if any) owns a user pointer. `None` means it came from the system
-    /// fallback path.
-    #[inline]
-    fn locate(&self, user: *mut u8) -> Option<RegionKind> {
-        let addr = user as usize;
-        if self.request.contains(addr) {
-            Some(RegionKind::Request)
-        } else if self.persistent.contains(addr) {
-            Some(RegionKind::Persistent)
-        } else {
-            None
-        }
-    }
-
-    /// Allocate `usable` bytes from a specific region, falling back to the system
-    /// allocator when the region is full. `zero` requests zero-initialised memory.
-    fn alloc_in(&self, kind: RegionKind, usable: usize, zero: bool) -> *mut u8 {
+    /// Bump `usable` bytes off the persistent region, spilling to the system allocator if
+    /// it is full. A spilled block is a normal system block (freed via `dealloc`).
+    fn alloc_persistent(&self, usable: usize, zero: bool) -> *mut u8 {
         let total = HEADER_SIZE + usable;
-        if let Some(base) = self.region(kind).bump(total) {
+        if let Some(base) = self.persistent.bump(total) {
             // SAFETY: `bump` guaranteed `total` bytes from `base`, aligned to ALLOC_ALIGN.
             unsafe {
                 (base as *mut usize).write(usable);
@@ -224,29 +223,46 @@ impl ArenaControl {
             }
         } else {
             self.fallback_allocs.fetch_add(1, Relaxed);
-            system_alloc(usable, zero)
+            self.alloc_system(usable, zero)
         }
+    }
+
+    /// System allocation, tracked in the request-time live-bytes gauge.
+    fn alloc_system(&self, usable: usize, zero: bool) -> *mut u8 {
+        let user = system_alloc(usable, zero);
+        if !user.is_null() {
+            let live = self.system_live_bytes.fetch_add(usable, Relaxed) + usable;
+            self.system_peak_bytes.fetch_max(live, Relaxed);
+        }
+        user
     }
 
     fn alloc(&self, size: usize, zero: bool) -> *mut u8 {
         self.alloc_calls.fetch_add(1, Relaxed);
-        let kind = if self.in_request.load(Relaxed) {
-            RegionKind::Request
+        let usable = round_up(size);
+        if self.in_request.load(Relaxed) {
+            // Request-time: hand QuickJS a system block it can free per-object. We must
+            // NOT bump this into a resettable region — QuickJS interns long-lived
+            // shapes/atoms through here mid-request, and a wholesale reset would free
+            // memory still reachable from the runtime-global tables. (See module docs.)
+            self.alloc_system(usable, zero)
         } else {
-            RegionKind::Persistent
-        };
-        self.alloc_in(kind, round_up(size), zero)
+            // Warmup / bootstrap: permanent state — bump the persistent region.
+            self.alloc_persistent(usable, zero)
+        }
     }
 
     /// SAFETY: `user` must be a live pointer previously returned by this arena.
     unsafe fn dealloc(&self, user: *mut u8) {
         self.dealloc_calls.fetch_add(1, Relaxed);
-        match self.locate(user) {
-            // In-region frees are no-ops; the region is reclaimed wholesale on reset
-            // (request) or when the engine drops (persistent).
-            Some(_) => {}
-            None => system_dealloc(user),
+        if self.is_persistent(user) {
+            // Persistent block: reclaimed wholesale when the engine drops.
+            return;
         }
+        // System block (request-time, or a persistent-region spill).
+        let usable = read_header(user);
+        self.system_live_bytes.fetch_sub(usable, Relaxed);
+        system_dealloc(user);
     }
 
     /// SAFETY: `user` (if non-null) must be a live pointer previously returned by this arena.
@@ -259,34 +275,42 @@ impl ArenaControl {
         let new_usable = round_up(new_size);
         let old_usable = read_header(user);
 
-        let Some(kind) = self.locate(user) else {
-            return system_realloc(user, old_usable, new_usable);
-        };
+        if !self.is_persistent(user) {
+            // System block: a real realloc, with the live-bytes gauge adjusted by the delta.
+            let fresh = system_realloc(user, old_usable, new_usable);
+            if !fresh.is_null() {
+                if new_usable >= old_usable {
+                    let delta = new_usable - old_usable;
+                    let live = self.system_live_bytes.fetch_add(delta, Relaxed) + delta;
+                    self.system_peak_bytes.fetch_max(live, Relaxed);
+                } else {
+                    self.system_live_bytes
+                        .fetch_sub(old_usable - new_usable, Relaxed);
+                }
+            }
+            return fresh;
+        }
 
-        let region = self.region(kind);
+        // Persistent block. Fast path: grow/shrink the most recent allocation in its
+        // region — just move the bump cursor and keep the same address.
         let block_base = user as usize - HEADER_SIZE;
+        let off = block_base - self.persistent.base;
         let old_total = HEADER_SIZE + old_usable;
         let new_total = HEADER_SIZE + new_usable;
-
-        // Fast path: growing/shrinking the most recent allocation in its region — just
-        // move the bump cursor and keep the same address. This is the common case for
-        // QuickJS's incremental string and array growth.
-        let off = block_base - region.base;
-        let is_region_top = off + old_total == region.top.load(Relaxed);
-        if is_region_top && off + new_total <= region.cap {
-            region.top.store(off + new_total, Relaxed);
+        if off + old_total == self.persistent.top.load(Relaxed) && off + new_total <= self.persistent.cap
+        {
+            self.persistent.top.store(off + new_total, Relaxed);
             (block_base as *mut usize).write(new_usable);
             return user;
         }
 
-        // Slow path: copy into a fresh block *in the same region* so a persistent pointer
-        // stays persistent (and survives the next request reset). The old block becomes
-        // dead space — reclaimed on reset for the request region, or accepted as taper for
-        // the persistent region.
-        if kind == RegionKind::Persistent && self.in_request.load(Relaxed) {
+        // Slow path: copy into a fresh persistent block so the pointer stays persistent
+        // (warmup state must never move into freeable memory). The old block is dead
+        // space, reclaimed when the engine drops.
+        if self.in_request.load(Relaxed) {
             self.persistent_grew_in_request.fetch_add(1, Relaxed);
         }
-        let fresh = self.alloc_in(kind, new_usable, false);
+        let fresh = self.alloc_persistent(new_usable, false);
         if fresh.is_null() {
             return ptr::null_mut();
         }
@@ -306,7 +330,7 @@ impl ArenaAllocator {
     }
 }
 
-// SAFETY: every block (region or fallback) carries a size header, payloads are
+// SAFETY: every block (persistent or system) carries a size header, payloads are
 // ALLOC_ALIGN-aligned, and `usable_size` recovers the header written at allocation time.
 unsafe impl Allocator for ArenaAllocator {
     fn alloc(&mut self, size: usize) -> *mut u8 {
@@ -341,8 +365,7 @@ unsafe fn read_header(user: *mut u8) -> usize {
     (user.sub(HEADER_SIZE) as *const usize).read()
 }
 
-/// Fallback path: a header-prefixed system allocation, used only when a region is full or
-/// a single block exceeds region capacity.
+/// A header-prefixed system allocation: request-time memory, or a persistent-region spill.
 fn system_alloc(usable: usize, zero: bool) -> *mut u8 {
     let total = HEADER_SIZE + usable;
     let layout = match Layout::from_size_align(total, ALLOC_ALIGN) {
@@ -366,7 +389,7 @@ fn system_alloc(usable: usize, zero: bool) -> *mut u8 {
     }
 }
 
-/// SAFETY: `user` must be a system-fallback pointer (not owned by either region).
+/// SAFETY: `user` must be a system block (not owned by the persistent region).
 unsafe fn system_dealloc(user: *mut u8) {
     let base = user.sub(HEADER_SIZE);
     let usable = (base as *const usize).read();
@@ -374,7 +397,7 @@ unsafe fn system_dealloc(user: *mut u8) {
     alloc::dealloc(base, layout);
 }
 
-/// SAFETY: `user` must be a system-fallback pointer with the given old usable size.
+/// SAFETY: `user` must be a system block with the given old usable size.
 unsafe fn system_realloc(user: *mut u8, old_usable: usize, new_usable: usize) -> *mut u8 {
     let base = user.sub(HEADER_SIZE);
     let old_layout = Layout::from_size_align_unchecked(HEADER_SIZE + old_usable, ALLOC_ALIGN);
@@ -398,7 +421,7 @@ mod tests {
 
     #[test]
     fn header_records_rounded_usable_size_for_static_lookup() {
-        let ctl = ArenaControl::new(64 * 1024, 64 * 1024);
+        let ctl = ArenaControl::new(64 * 1024);
         let p = alloc(&ctl, 13);
         // 13 rounds up to the next 8-byte multiple.
         assert_eq!(unsafe { ArenaAllocator::usable_size(p) }, 16);
@@ -406,58 +429,77 @@ mod tests {
     }
 
     #[test]
-    fn fresh_allocations_follow_request_mode() {
-        let ctl = ArenaControl::new(64 * 1024, 64 * 1024);
+    fn warmup_allocations_bump_persistent_request_allocations_go_to_system() {
+        let ctl = ArenaControl::new(64 * 1024);
 
+        // Outside a request (warmup/bootstrap): bump the persistent region.
         let persistent = alloc(&ctl, 32);
-        assert_eq!(ctl.locate(persistent), Some(RegionKind::Persistent));
+        assert!(ctl.is_persistent(persistent));
+        let watermark = ctl.stats().persistent_used;
+        assert!(watermark > 0);
 
+        // Inside a request: QuickJS-managed system memory, not the persistent region.
         ctl.begin_request();
-        let scoped = alloc(&ctl, 32);
-        assert_eq!(ctl.locate(scoped), Some(RegionKind::Request));
-        assert!(ctl.stats().request_used > 0);
+        let mut a = ArenaAllocator::new(ctl.clone());
+        let scoped = a.alloc(32);
+        assert!(!ctl.is_persistent(scoped), "request alloc must be a system block");
+        assert!(ctl.stats().system_live_bytes >= 32);
+        assert!(ctl.stats().system_peak_bytes >= 32);
 
+        // `end_request` does NOT reset anything — the block lives until QuickJS frees it.
         ctl.end_request();
-        // The request region is reclaimed wholesale; the persistent watermark is untouched.
-        assert_eq!(ctl.stats().request_used, 0);
-        let persistent_after = ctl.stats().persistent_used;
-        assert!(persistent_after > 0);
-        assert!(ctl.stats().request_peak >= 32);
+        assert!(ctl.stats().system_live_bytes >= 32);
+        assert_eq!(
+            ctl.stats().persistent_used,
+            watermark,
+            "request memory never touches the persistent watermark"
+        );
+
+        // QuickJS frees it per-block; the live gauge returns to baseline.
+        unsafe { a.dealloc(scoped) };
+        assert_eq!(ctl.stats().system_live_bytes, 0);
+        assert_eq!(ctl.stats().persistent_used, watermark);
     }
 
     #[test]
-    fn end_request_reclaims_without_disturbing_persistent_watermark() {
-        let ctl = ArenaControl::new(64 * 1024, 64 * 1024);
+    fn steady_state_request_churn_never_grows_persistent() {
+        let ctl = ArenaControl::new(64 * 1024);
         let _persistent = alloc(&ctl, 100);
         let watermark = ctl.stats().persistent_used;
 
         for _ in 0..50 {
             ctl.begin_request();
+            let mut a = ArenaAllocator::new(ctl.clone());
+            let mut blocks = Vec::new();
             for _ in 0..16 {
-                let _ = alloc(&ctl, 64);
+                blocks.push(a.alloc(64));
+            }
+            // QuickJS frees the request's blocks (refcount/GC) — modelled here explicitly.
+            for b in blocks {
+                unsafe { a.dealloc(b) };
             }
             ctl.end_request();
-            // Every cycle returns the request region to empty and never touches persistent.
-            assert_eq!(ctl.stats().request_used, 0);
+            // Every cycle returns request memory to zero and never touches persistent.
+            assert_eq!(ctl.stats().system_live_bytes, 0);
             assert_eq!(ctl.stats().persistent_used, watermark);
         }
     }
 
     #[test]
-    fn oversized_allocation_falls_back_to_system_and_frees_cleanly() {
-        let ctl = ArenaControl::new(1024, 1024);
+    fn persistent_overflow_falls_back_to_system_and_frees_cleanly() {
+        let ctl = ArenaControl::new(1024);
         let mut a = ArenaAllocator::new(ctl.clone());
-        let big = a.alloc(8192); // larger than either region
+        let big = a.alloc(8192); // larger than the persistent region
         assert!(!big.is_null());
-        assert_eq!(ctl.locate(big), None);
+        assert!(!ctl.is_persistent(big));
         assert_eq!(ctl.stats().fallback_allocs, 1);
         assert_eq!(unsafe { ArenaAllocator::usable_size(big) }, 8192);
         unsafe { a.dealloc(big) }; // must not corrupt / double-free
     }
 
     #[test]
-    fn realloc_of_top_block_grows_in_place() {
-        let ctl = ArenaControl::new(64 * 1024, 64 * 1024);
+    fn realloc_of_top_persistent_block_grows_in_place() {
+        let ctl = ArenaControl::new(64 * 1024);
         let mut a = ArenaAllocator::new(ctl.clone());
         let p = a.alloc(32);
         unsafe {
@@ -472,8 +514,8 @@ mod tests {
     }
 
     #[test]
-    fn realloc_of_buried_block_copies_and_preserves_bytes() {
-        let ctl = ArenaControl::new(64 * 1024, 64 * 1024);
+    fn realloc_of_buried_persistent_block_copies_and_preserves_bytes() {
+        let ctl = ArenaControl::new(64 * 1024);
         let mut a = ArenaAllocator::new(ctl.clone());
         let p = a.alloc(16);
         unsafe { ptr::write_bytes(p, 0xCD, 16) };
@@ -489,7 +531,7 @@ mod tests {
 
     #[test]
     fn persistent_pointer_realloc_during_request_stays_persistent() {
-        let ctl = ArenaControl::new(64 * 1024, 64 * 1024);
+        let ctl = ArenaControl::new(64 * 1024);
         let mut a = ArenaAllocator::new(ctl.clone());
 
         // A persistent block, then bury it so realloc must move.
@@ -498,11 +540,27 @@ mod tests {
 
         ctl.begin_request();
         let moved = unsafe { a.realloc(persistent, 64) };
-        // The grown block must remain in the persistent region so the request reset below
-        // does not free memory the runtime still references.
-        assert_eq!(ctl.locate(moved), Some(RegionKind::Persistent));
+        // The grown block must remain persistent even mid-request, so it is never a
+        // system block QuickJS could free out from under a runtime-global reference.
+        assert!(ctl.is_persistent(moved));
         assert_eq!(ctl.stats().persistent_grew_in_request, 1);
         ctl.end_request();
-        assert_eq!(ctl.locate(moved), Some(RegionKind::Persistent));
+        assert!(ctl.is_persistent(moved));
+    }
+
+    #[test]
+    fn system_block_realloc_tracks_live_bytes() {
+        let ctl = ArenaControl::new(64 * 1024);
+        let mut a = ArenaAllocator::new(ctl.clone());
+        ctl.begin_request();
+        let p = a.alloc(32);
+        assert_eq!(ctl.stats().system_live_bytes, 32);
+        let grown = unsafe { a.realloc(p, 96) };
+        assert_eq!(ctl.stats().system_live_bytes, 96);
+        let shrunk = unsafe { a.realloc(grown, 48) };
+        assert_eq!(ctl.stats().system_live_bytes, 48);
+        unsafe { a.dealloc(shrunk) };
+        assert_eq!(ctl.stats().system_live_bytes, 0);
+        ctl.end_request();
     }
 }

@@ -706,6 +706,39 @@ fn build_npm_runtime_helpers_script() -> String {
     return globalThis.__albedo_require(specifier);
   }};
   globalThis.__albedo_import_named = globalThis.__albedo_import_namespace;
+
+  // Project-relative import resolution. A compiled `import … from "../x"`
+  // can't look the dependency up by its as-written source: project modules
+  // register in `__ALBEDO_MODULES` under their absolute `module_path` key
+  // (`A:\proj\src\components\X.tsx`), not the relative specifier. The rewriter
+  // collapses the relative path against the importer to an extensionless base
+  // (forward-slashed) and hands it here; we recover the registered key by
+  // probing the same extension candidates the scanner uses, matching on a
+  // slash-normalized form so a `\`-keyed table still resolves. A miss returns
+  // the base unchanged so `__albedo_require` throws a loud MODULE_MISSING
+  // naming it. (Bare/npm specifiers never reach here — they aren't wrapped.)
+  globalThis.__albedo_resolve_project = function(base) {{
+    const table = globalThis.__ALBEDO_MODULES;
+    if (__albedo_has_own.call(table, base)) {{ return base; }}
+    const norm = function(s) {{ return String(s).replace(/\\/g, '/'); }};
+    const want = norm(base);
+    const exts = ['.tsx', '.jsx', '.js', '.ts'];
+    const candidates = [want];
+    for (let i = 0; i < exts.length; i++) {{ candidates.push(want + exts[i]); }}
+    for (let i = 0; i < exts.length; i++) {{ candidates.push(want + '/index' + exts[i]); }}
+    // Prefer an exact (normalized) key match; fall back to a path-suffix match
+    // so a relative-keyed importer still resolves against an absolute key.
+    let suffixHit = null;
+    for (const key in table) {{
+      const nk = norm(key);
+      for (let i = 0; i < candidates.length; i++) {{
+        const c = candidates[i];
+        if (nk === c) {{ return key; }}
+        if (suffixHit === null && nk.endsWith('/' + c)) {{ suffixHit = key; }}
+      }}
+    }}
+    return suffixHit !== null ? suffixHit : base;
+  }};
 }})();
 "#
     )
@@ -1895,12 +1928,25 @@ fn rewrite_import_declaration(
         return rewrite_framework_runtime_import(import_decl, specifier);
     }
 
-    let import_source_literal = js_string_literal(import_source.as_str(), specifier)?;
+    // A project-relative specifier (`./x`, `../x`) is registered under the
+    // importer-resolved absolute `module_path`, not its as-written form, so we
+    // collapse it against the importer here and let `__albedo_resolve_project`
+    // recover the registered key at link time. Bare specifiers (npm, already
+    // branched on above for framework) pass through verbatim.
+    let specifier_expr = if is_relative_specifier(import_source.as_str()) {
+        let base = resolve_project_specifier_base(specifier, import_source.as_str());
+        format!(
+            "__albedo_resolve_project({})",
+            js_string_literal(base.as_str(), specifier)?
+        )
+    } else {
+        js_string_literal(import_source.as_str(), specifier)?
+    };
 
     // Side-effect import: still trigger module initialization.
     if import_decl.specifiers.is_empty() {
         return Ok(vec![format!(
-            "__albedo_import_namespace({import_source_literal});"
+            "__albedo_import_namespace({specifier_expr});"
         )]);
     }
 
@@ -1917,13 +1963,13 @@ fn rewrite_import_declaration(
             ImportSpecifier::Default(default_specifier) => {
                 let local = default_specifier.local.sym.to_string();
                 statements.push(format!(
-                    "const {local} = __albedo_import_default({import_source_literal});"
+                    "const {local} = __albedo_import_default({specifier_expr});"
                 ));
             }
             ImportSpecifier::Namespace(namespace_specifier) => {
                 let local = namespace_specifier.local.sym.to_string();
                 statements.push(format!(
-                    "const {local} = __albedo_import_namespace({import_source_literal});"
+                    "const {local} = __albedo_import_namespace({specifier_expr});"
                 ));
             }
             ImportSpecifier::Named(named_specifier) => {
@@ -1947,12 +1993,52 @@ fn rewrite_import_declaration(
 
     if !named_bindings.is_empty() {
         statements.push(format!(
-            "const {{ {} }} = __albedo_import_named({import_source_literal});",
+            "const {{ {} }} = __albedo_import_named({specifier_expr});",
             named_bindings.join(", ")
         ));
     }
 
     Ok(statements)
+}
+
+/// A relative module specifier — `./x` or `../x`. These name project files and
+/// must be resolved against the importer to find their registered module key;
+/// every other shape (bare npm specifier, already-branched framework import) is
+/// looked up verbatim.
+fn is_relative_specifier(source: &str) -> bool {
+    source.starts_with("./") || source.starts_with("../")
+}
+
+/// Collapse a relative import against the importing module's path into a stable,
+/// extensionless, forward-slashed base key — the form `__albedo_resolve_project`
+/// probes for extensions against `__ALBEDO_MODULES`. The drive/prefix and root
+/// are preserved so the base matches the scanner's absolute `module_path`
+/// exactly (e.g. importer `A:\proj\src\routes\index.tsx` + `../content/essays`
+/// → `A:/proj/src/content/essays`). `.`/`..` segments collapse like
+/// [`super::eval::component::normalize_specifier`], but unlike it the prefix is
+/// kept so absolute keys round-trip.
+fn resolve_project_specifier_base(importer: &str, source: &str) -> String {
+    use std::path::{Component, Path};
+
+    let parent = Path::new(importer).parent().unwrap_or_else(|| Path::new(""));
+    let joined = parent.join(source);
+
+    let mut parts: Vec<String> = Vec::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::Normal(segment) => parts.push(segment.to_string_lossy().to_string()),
+            Component::Prefix(prefix) => {
+                parts.push(prefix.as_os_str().to_string_lossy().to_string());
+            }
+            // The root separator is implicit in the joined `/` output.
+            Component::RootDir => {}
+        }
+    }
+    parts.join("/")
 }
 
 /// Bind the names imported from a framework runtime module to the global
@@ -2050,7 +2136,14 @@ fn map_render_error(entry: &str, message: &str) -> RuntimeError {
         );
     }
 
-    RuntimeError::render(format!("failed to render component '{entry}': {message}"))
+    // Keep the thrown text and the component path as separate fields. The
+    // path belongs in developer diagnostics (logs / dev overlay, via Display)
+    // but must never leak into a reader-facing `error.tsx` boundary — that
+    // reads `thrown_message()`, which returns `message` alone.
+    RuntimeError::RenderComponentError {
+        component: entry.to_string(),
+        message: message.to_string(),
+    }
 }
 
 fn extract_marker_payload(message: &str, marker: &str) -> Option<String> {
@@ -2191,43 +2284,105 @@ mod tests {
             assert_eq!(out.html, expected);
         }
 
-        let watermark = engine.arena_stats().persistent_used;
+        // Settle one post-warmup render, then snapshot the steady-state baseline.
+        let _ = engine
+            .render_component("routes/stress", props)
+            .expect("settle render");
+        let base = engine.arena_stats();
         assert!(
-            watermark > 0,
+            base.persistent_used > 0,
             "warmup should have populated the persistent region"
+        );
+        assert!(
+            base.system_peak_bytes > 0,
+            "request memory should be served from the system allocator"
         );
 
         for i in 0..STEADY {
             let out = engine
                 .render_component("routes/stress", props)
                 .expect("steady render");
-            // Correctness across resets: byte-identical output every time.
+            // Correctness across requests: byte-identical output every time.
             assert_eq!(out.html, expected, "render {i} diverged");
 
             let stats = engine.arena_stats();
-            // The request region is reclaimed wholesale between renders.
+            // Zero per-tick persistent growth in steady state — warmup state is hot and
+            // frozen; nothing a render allocates lands in the persistent region.
             assert_eq!(
-                stats.request_used, 0,
-                "request region not reset after render {i}"
-            );
-            // Zero per-tick persistent growth in steady state.
-            assert_eq!(
-                stats.persistent_used, watermark,
+                stats.persistent_used, base.persistent_used,
                 "persistent region grew on steady-state render {i}"
+            );
+            // QuickJS frees each render's request memory (refcount + cycle collector), so
+            // outstanding request bytes never ratchet up — no leak, no reset needed.
+            assert_eq!(
+                stats.system_live_bytes, base.system_live_bytes,
+                "request memory leaked on steady-state render {i}"
             );
         }
 
-        // The render region actually carried real per-render traffic (the bump path ran),
-        // and never spilled to the system fallback.
-        let final_stats = engine.arena_stats();
-        assert!(
-            final_stats.request_peak > 0,
-            "request region was never exercised"
-        );
+        // Persistent capacity was never exceeded (no warmup-state spill to the system path).
         assert_eq!(
-            final_stats.fallback_allocs, 0,
-            "region capacity was exceeded"
+            engine.arena_stats().fallback_allocs,
+            0,
+            "persistent capacity was exceeded"
         );
+    }
+
+    // A dynamic `[slug]` route shape: a module-level dataset + a component that
+    // reaches into `props.params.slug`. With empty props (`{}`) the lookup
+    // dereferences `undefined` and THROWS — exactly what the boot warmup does for
+    // a dynamic route, so its render-path shapes never intern persistently.
+    const SLUG_COMPONENT: &str = r#"
+        const ALL = [
+            { slug: "alpha", title: "Alpha", body: ["one", "two"] },
+            { slug: "beta", title: "Beta", body: ["three"] }
+        ];
+        export default function Essay(props) {
+            const essay = ALL.find(function (e) { return e.slug === props.params.slug; });
+            if (!essay) { throw new Error("no piece: " + props.params.slug); }
+            return h('article', { 'data-slug': essay.slug }, [
+                h('h1', {}, essay.title),
+                h('div', { 'class': 'body' }, essay.body.map(function (p) { return h('p', {}, p); }))
+            ]);
+        }
+    "#;
+
+    // Repro for the dynamic-route arena residual hazard: when the warmup render
+    // throws (props `{}` → no `params`), the route's render-path shapes are
+    // created for the first time during a *scoped* request, interned into
+    // QuickJS's global shape hash, then freed by the request reset — so the next
+    // request reuses a dangling shape and aborts (`sh->header.ref_count == 0`).
+    // The fix must keep these renders correct across many resets.
+    #[test]
+    fn dynamic_route_render_survives_reset_after_throwing_warmup() {
+        use super::{QuickJsEngine, ARENA_WARMUP_RENDERS};
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+        engine
+            .load_module("routes/slug", SLUG_COMPONENT)
+            .expect("module load");
+
+        // Mirror the boot warmup verbatim: render with empty props (the dynamic
+        // route throws — its render-path shapes never intern persistently).
+        for _ in 0..(ARENA_WARMUP_RENDERS + 2) {
+            let _ = engine.render_component("routes/slug", "{}");
+        }
+
+        // Steady scoped renders with real params. Pre-fix, the 2nd aborts.
+        for i in 0..16 {
+            let out = engine
+                .render_component("routes/slug", r#"{"params":{"slug":"alpha"}}"#)
+                .expect("scoped render");
+            assert!(
+                out.html.contains("data-slug=\"alpha\"") && out.html.contains("<p>one</p>"),
+                "render {i} diverged: {}",
+                out.html
+            );
+        }
     }
 
     // ── A1 · host-object bridge — handlers under QuickJS ──────────────────
