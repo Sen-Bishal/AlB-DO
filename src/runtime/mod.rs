@@ -7,6 +7,7 @@ pub mod dirty_bitmap;
 pub mod emitter;
 pub mod engine;
 pub mod eval;
+pub mod form_result;
 pub mod frame;
 pub mod highway;
 pub mod hot_set;
@@ -21,7 +22,7 @@ pub mod slot_store;
 pub mod static_slice;
 pub mod webtransport;
 
-pub use bridge::{HandlerEffect, HandlerInvocation};
+pub use bridge::{HandlerEffect, HandlerInvocation, HandlerOutcome};
 pub use broadcast::{
     broadcast_slot_id, BroadcastDelivery, BroadcastError, BroadcastRegistry, BroadcastSender,
     BroadcastTopic,

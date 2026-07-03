@@ -439,6 +439,29 @@ pub struct TierBEntryPlan {
 /// [`PooledTierBRenderRegistry`].
 pub type TierBRenderPlan = HashMap<String, TierBEntryPlan>;
 
+/// Server-context module body for a Tier-C island reached as a dependency of a
+/// server-rendered (Tier-B/async) component — a *client reference* in the
+/// React-Server-Components sense.
+///
+/// The island's real code never runs in the pool engines (the server graph);
+/// its module is swapped for this stub, whose default export renders only the
+/// framework's canonical empty island placeholder (`__albedo_island_placeholder`
+/// in the QuickJS prelude). The serve-time island fill pass then replaces that
+/// placeholder with the island's standalone SSR markup + `data-albedo-island`
+/// marker — the identical treatment a Tier-A parent's island child receives, so
+/// both renderers converge on one island representation.
+///
+/// `placeholder_id` is the island node's manifest `placeholder_id`
+/// (`__c_<slug>_<id>`), which contains no markup-significant characters, so the
+/// `{:?}` JS-string encoding is exact.
+#[must_use]
+pub fn island_client_reference_stub(placeholder_id: &str) -> String {
+    format!(
+        "export default (function __albedoIslandRef(props) {{ \
+return globalThis.__albedo_island_placeholder({placeholder_id:?}); }});"
+    )
+}
+
 /// Production Tier-B render registry: resolves async/server Tier-B components to
 /// real HTML by rendering them through the warmed QuickJS [`engine pool`], the
 /// same warmed/concurrent/arena engines that execute `action()` calls.
@@ -723,6 +746,22 @@ mod tests {
             .await
             .expect("tier b should render");
         assert_eq!(html, "<article><p>leaf</p></article>");
+    }
+
+    #[test]
+    fn island_client_reference_stub_emits_placeholder_call() {
+        // The server-graph stub for a Tier-C island must call the prelude
+        // placeholder primitive with the island's exact manifest placeholder id
+        // and export it as default — no island code, no other output.
+        let stub = island_client_reference_stub("__c_progress_7");
+        assert!(
+            stub.contains("globalThis.__albedo_island_placeholder(\"__c_progress_7\")"),
+            "stub must call the placeholder primitive with the pid: {stub}"
+        );
+        assert!(
+            stub.trim_start().starts_with("export default"),
+            "stub must be the module's default export: {stub}"
+        );
     }
 
     #[test]

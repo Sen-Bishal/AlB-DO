@@ -23,7 +23,9 @@ use crate::runtime::quickjs_engine::QuickJsEngine;
 use crate::runtime::slot_store::SessionSlotView;
 use crate::transforms::actions::ActionDeclaration;
 use crate::transforms::css_modules::{is_css_module_path, scope_module_css, ScopedCssModule};
-use crate::transforms::events::{collect_free_idents_in_handler_body, HandlerBody, HandlerExtract};
+use crate::transforms::events::{
+    collect_free_idents_in_handler_body, HandlerBody, HandlerEventParam, HandlerExtract,
+};
 use crate::transforms::form::{allocate_form_action_id, extract_forms_in_function, FormExtract};
 use crate::transforms::hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 use crate::transforms::link::{extract_links_in_function, LinkExtract};
@@ -208,6 +210,9 @@ pub struct ResolvedHandler {
     pub handler_idx: usize,
     pub event_name: String,
     pub body: HandlerBody,
+    /// Event-param shape of the handler closure (`(e) => …`). Binding mode binds
+    /// no event, so an event-reading handler is declined and falls back to A3.
+    pub event_param: HandlerEventParam,
 }
 
 /// Phase P · Stream E.3 — CSS-module class maps + scoped CSS bodies
@@ -312,6 +317,14 @@ pub struct CompiledProject {
     /// the engine throws a loud `MODULE_MISSING` naming the specifier the
     /// first time something actually imports it.
     npm_bundles: Vec<NpmDependencyBundle>,
+    /// P6 · form-action field manifest: `action_id → (action_name, declared
+    /// field names)`. Built once at wrap time from every
+    /// `<form action="action:NAME">`'s compile-time field set. The QuickJS
+    /// action dispatcher consults it to project a handler's `{ error: {...} }`
+    /// return onto the form's pre-allocated `data-albedo-error` spans — the
+    /// form's field set is the schema, so the runtime never guesses which spans
+    /// exist. Empty for actions no form references.
+    action_form_fields: HashMap<u32, (String, Vec<String>)>,
 }
 
 impl CompiledProject {
@@ -414,6 +427,7 @@ impl CompiledProject {
                             handler_idx: handler.handler_idx,
                             event_name: handler.event_name.clone(),
                             body: handler.body.clone(),
+                            event_param: handler.event_param.clone(),
                         },
                     );
                 }
@@ -496,6 +510,10 @@ impl CompiledProject {
                         handler_idx: 0,
                         event_name: "action".to_string(),
                         body: declaration.body.clone(),
+                        // Server `action()` handlers run via the action dispatcher,
+                        // not the binding-mode client thunk, so the event-param
+                        // shape is irrelevant here.
+                        event_param: HandlerEventParam::None,
                     },
                 );
                 per_module.push(declaration.clone());
@@ -509,6 +527,23 @@ impl CompiledProject {
         // specifiers that name an existing project module are skipped.
         let npm_bundles = bundle_project_npm_dependencies(&project);
 
+        // P6 · index each `<form action="action:NAME">`'s declared field set by
+        // its wire `action_id`, so action dispatch can reconcile a handler's
+        // validation return against the exact spans the form reserved at compile
+        // time (see `runtime::form_result`). `action_id` here is the same
+        // FNV-1a-32(name) the handler registered under, so the join is by name.
+        let mut action_form_fields: HashMap<u32, (String, Vec<String>)> = HashMap::new();
+        for component in components.values() {
+            for form in &component.forms {
+                action_form_fields.entry(form.action_id).or_insert_with(|| {
+                    (
+                        form.action_name.clone(),
+                        form.fields.iter().map(|field| field.name.clone()).collect(),
+                    )
+                });
+            }
+        }
+
         Ok(Self {
             project,
             components,
@@ -516,6 +551,7 @@ impl CompiledProject {
             action_declarations,
             css_modules,
             npm_bundles,
+            action_form_fields,
         })
     }
 
@@ -885,6 +921,33 @@ impl CompiledProject {
                     handler.function_name,
                 )
             })?;
+        // Binding mode wires only `__state`, setters, and captured props into the
+        // client thunk — NOT the DOM event. A handler that reads its event
+        // argument (`onInput={(e) => setCount(e.target.value.length)}`) therefore
+        // can't be faithfully lowered here; decline so `build_reactive_payload`
+        // fails and `build_reactive_blocks` falls the component back to A3
+        // hydration, where the real closure runs with the native event. Same
+        // "binding mode declines what it can't represent" boundary as the
+        // structural fallback. (Supporting the event in binding mode is a future
+        // optimization; A3 handles it correctly today.)
+        match &handler.event_param {
+            HandlerEventParam::Unsupported => {
+                return Err(anyhow!(
+                    "handler destructures its event argument; not representable in \
+                     binding mode — falling back to the A3 island"
+                ));
+            }
+            HandlerEventParam::Ident(name) => {
+                if collect_free_idents_in_handler_body(&handler.body).contains(name) {
+                    return Err(anyhow!(
+                        "handler reads its event argument '{name}'; not representable in \
+                         binding mode — falling back to the A3 island"
+                    ));
+                }
+            }
+            HandlerEventParam::None => {}
+        }
+
         let (body_src, is_block) = handler_body_to_js(&handler.body)?;
 
         let mut s = String::from("(function(__state,__emit){\n");
@@ -1261,10 +1324,10 @@ impl CompiledProject {
             broadcast_current: &broadcast_current,
         };
 
-        let effects = engine.eval_handler(&entry, &invocation)?;
+        let outcome = engine.eval_handler(&entry, &invocation)?;
 
-        let mut instructions = Vec::with_capacity(effects.len());
-        for effect in effects {
+        let mut instructions = Vec::with_capacity(outcome.effects.len());
+        for effect in outcome.effects {
             match &effect {
                 HandlerEffect::SlotSet { slot_id, value } => {
                     slots.write(*slot_id, value.clone());
@@ -1284,6 +1347,22 @@ impl CompiledProject {
                 }
             }
             instructions.push(effect.into_instruction());
+        }
+
+        // P6 — when this action backs a `<form action="action:NAME">`, project
+        // its return value onto the form's compile-time error spans: the
+        // erroring fields are filled, every other declared field is cleared (so a
+        // re-submit wipes stale messages). Non-form actions have no field
+        // manifest and skip this entirely. zod (or any validator) ran in the
+        // body; ALBEDO only maps the returned `{ error }` shape onto slots it
+        // reserved at build time.
+        if let Some((action_name, fields)) = self.action_form_fields.get(&envelope.action_id) {
+            let result = outcome.result.unwrap_or(Value::Null);
+            instructions.extend(crate::runtime::form_result::project_form_result(
+                action_name,
+                &result,
+                fields,
+            ));
         }
 
         // State writes above marked the slot dirty; the returned vector already

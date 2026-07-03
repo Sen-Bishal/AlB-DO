@@ -46,6 +46,35 @@ pub struct HandlerExtract {
     /// shared Phase J interpreter, with setter identifiers bound to
     /// slot-write actions.
     pub body: HandlerBody,
+    /// Shape of the closure's first parameter — the DOM event (`(e) => …`).
+    /// Binding mode binds only `__state`/setters/captured props, NOT the event,
+    /// so an event-reading handler can't be serve-wired and must fall back to A3
+    /// hydration (where the real closure runs with the native event). This lets
+    /// [`crate::runtime::compiled`] decide precisely instead of over-declining.
+    pub event_param: HandlerEventParam,
+}
+
+/// Shape of a handler closure's first parameter (the DOM event argument).
+#[derive(Debug, Clone)]
+pub enum HandlerEventParam {
+    /// The closure declares no parameters — `() => setN(n + 1)`. Binding mode can
+    /// run it verbatim.
+    None,
+    /// The first parameter is a plain identifier — `(e) => …`. Binding mode must
+    /// decline only if the body actually references `e` (it binds no event).
+    Ident(String),
+    /// The first parameter is a non-identifier pattern — `({ target }) => …`.
+    /// Binding mode can't reason about it; always decline to A3.
+    Unsupported,
+}
+
+/// The event-param shape of a handler closure, from its first parameter.
+fn event_param_from_first_pat(first: Option<&Pat>) -> HandlerEventParam {
+    match first {
+        None => HandlerEventParam::None,
+        Some(Pat::Ident(binding)) => HandlerEventParam::Ident(binding.id.sym.to_string()),
+        Some(_) => HandlerEventParam::Unsupported,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,10 +101,19 @@ pub fn extract_handlers_in_function(stmts: &[Stmt]) -> Vec<HandlerExtract> {
     sink
 }
 
+/// A local handler closure resolved from `const NAME = <closure>` — its body plus
+/// the event-param shape, so bare-identifier JSX handlers (`onInput={onType}`)
+/// carry the same event-param information as inline arrows.
+#[derive(Debug, Clone)]
+struct LocalHandler {
+    body: HandlerBody,
+    event_param: HandlerEventParam,
+}
+
 /// A `const NAME = <closure>` definition in the component body, where `<closure>`
 /// is an arrow, a function expression, or `useCallback(<closure>, deps)`. Used to
 /// resolve bare-identifier JSX handlers to their bodies.
-fn extract_local_handler_defs(stmts: &[Stmt]) -> std::collections::HashMap<String, HandlerBody> {
+fn extract_local_handler_defs(stmts: &[Stmt]) -> std::collections::HashMap<String, LocalHandler> {
     let mut out = std::collections::HashMap::new();
     for stmt in stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
@@ -86,8 +124,8 @@ fn extract_local_handler_defs(stmts: &[Stmt]) -> std::collections::HashMap<Strin
                 continue;
             };
             if let Some(init) = &decl.init {
-                if let Some(body) = handler_body_from_expr(init) {
-                    out.insert(name, body);
+                if let Some(local) = handler_body_from_expr(init) {
+                    out.insert(name, local);
                 }
             }
         }
@@ -95,20 +133,24 @@ fn extract_local_handler_defs(stmts: &[Stmt]) -> std::collections::HashMap<Strin
     out
 }
 
-/// The handler body of a closure expression: an arrow, a function expression, or
-/// `useCallback(<closure>, deps)` (unwrapped to the inner closure). `None` for
-/// anything else (not a handler value).
-fn handler_body_from_expr(expr: &Expr) -> Option<HandlerBody> {
+/// The handler closure info (body + event-param shape) of a closure expression:
+/// an arrow, a function expression, or `useCallback(<closure>, deps)` (unwrapped
+/// to the inner closure). `None` for anything else (not a handler value).
+fn handler_body_from_expr(expr: &Expr) -> Option<LocalHandler> {
     match expr {
-        Expr::Arrow(arrow) => Some(match &*arrow.body {
-            BlockStmtOrExpr::BlockStmt(block) => HandlerBody::Block(block.stmts.clone()),
-            BlockStmtOrExpr::Expr(inner) => HandlerBody::Expr((**inner).clone()),
+        Expr::Arrow(arrow) => Some(LocalHandler {
+            body: match &*arrow.body {
+                BlockStmtOrExpr::BlockStmt(block) => HandlerBody::Block(block.stmts.clone()),
+                BlockStmtOrExpr::Expr(inner) => HandlerBody::Expr((**inner).clone()),
+            },
+            event_param: event_param_from_first_pat(arrow.params.first()),
         }),
-        Expr::Fn(fn_expr) => fn_expr
-            .function
-            .body
-            .as_ref()
-            .map(|block| HandlerBody::Block(block.stmts.clone())),
+        Expr::Fn(fn_expr) => fn_expr.function.body.as_ref().map(|block| LocalHandler {
+            body: HandlerBody::Block(block.stmts.clone()),
+            event_param: event_param_from_first_pat(
+                fn_expr.function.params.first().map(|p| &p.pat),
+            ),
+        }),
         Expr::Call(call)
             if matches!(&call.callee, Callee::Expr(e)
                 if matches!(&**e, Expr::Ident(id) if id.sym.as_ref() == "useCallback")) =>
@@ -122,7 +164,7 @@ fn handler_body_from_expr(expr: &Expr) -> Option<HandlerBody> {
     }
 }
 
-type Locals = std::collections::HashMap<String, HandlerBody>;
+type Locals = std::collections::HashMap<String, LocalHandler>;
 
 fn visit_stmt_for_jsx(stmt: &Stmt, locals: &Locals, sink: &mut Vec<HandlerExtract>) {
     match stmt {
@@ -184,20 +226,26 @@ fn visit_element(element: &JSXElement, locals: &Locals, sink: &mut Vec<HandlerEx
         let JSXExpr::Expr(handler_expr) = &container.expr else {
             continue;
         };
-        let body = match handler_expr.as_ref() {
-            Expr::Arrow(arrow) => match &*arrow.body {
-                BlockStmtOrExpr::BlockStmt(block) => HandlerBody::Block(block.stmts.clone()),
-                BlockStmtOrExpr::Expr(expr) => HandlerBody::Expr((**expr).clone()),
-            },
+        let (body, event_param) = match handler_expr.as_ref() {
+            Expr::Arrow(arrow) => (
+                match &*arrow.body {
+                    BlockStmtOrExpr::BlockStmt(block) => HandlerBody::Block(block.stmts.clone()),
+                    BlockStmtOrExpr::Expr(expr) => HandlerBody::Expr((**expr).clone()),
+                },
+                event_param_from_first_pat(arrow.params.first()),
+            ),
             Expr::Fn(fn_expr) => match fn_expr.function.body.as_ref() {
-                Some(block) => HandlerBody::Block(block.stmts.clone()),
+                Some(block) => (
+                    HandlerBody::Block(block.stmts.clone()),
+                    event_param_from_first_pat(fn_expr.function.params.first().map(|p| &p.pat)),
+                ),
                 None => continue,
             },
             // Bare identifier (`onClick={inc}`): resolve against the component's
             // local closure defs (arrow / function / useCallback). Unresolvable
             // references are still skipped.
             Expr::Ident(ident) => match locals.get(ident.sym.as_ref()) {
-                Some(body) => body.clone(),
+                Some(local) => (local.body.clone(), local.event_param.clone()),
                 None => continue,
             },
             _ => continue,
@@ -207,6 +255,7 @@ fn visit_element(element: &JSXElement, locals: &Locals, sink: &mut Vec<HandlerEx
             handler_idx,
             event_name,
             body,
+            event_param,
         });
     }
     for child in &element.children {

@@ -754,6 +754,40 @@ fn keyed_list_rerenders_innerhtml_with_zero_network() {
 }
 
 #[test]
+fn event_reading_handler_falls_back_to_island() {
+    // A handler that reads its DOM event argument (`onInput={(e) =>
+    // setCount(e.target.value.length)}`) is NOT representable in binding mode:
+    // the client thunk wires `__state`/setters/captured props but never the
+    // event. `build_reactive_payload` must decline so `build_reactive_blocks`
+    // skips it and the component keeps its correct A3 island (where the real
+    // closure runs with the native event). This is the safety guarantee that
+    // killed MarginNote's silent no-op: binding mode never serve-wires a handler
+    // it can't execute.
+    let project = CompiledProject::load_from_dir(hook_fixture("event_reading_handler"))
+        .expect("event_reading_handler fixture compiles");
+    let store = Arc::new(SlotStore::new());
+    let slots = SessionSlotView::new(SessionId::random(), store);
+
+    let result =
+        project.build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots);
+    assert!(
+        result.is_err(),
+        "an event-reading handler must force the A3 fallback, not ship a binding payload"
+    );
+
+    // A parameterless handler on the same thread must still serve-wire — the
+    // decline is specific to reading the event, not a blanket poison.
+    let next = CompiledProject::load_from_dir(hook_fixture("counter"))
+        .expect("counter fixture compiles");
+    let slots2 = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
+    assert!(
+        next.build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots2)
+            .is_ok(),
+        "a parameterless handler must still be serve-wireable after the decline"
+    );
+}
+
+#[test]
 fn dynamic_list_item_falls_back_to_island() {
     // A list whose per-item subtree carries its own handler (`<li onClick=…>`)
     // is NOT representable as inert innerHTML — regenerating it would drop the

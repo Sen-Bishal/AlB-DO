@@ -1,6 +1,6 @@
 use super::arena::{ArenaAllocator, ArenaControl, ArenaStats};
 use super::bridge::{
-    build_handler_script, decode_handler_envelope, HandlerEffect, HandlerInvocation,
+    build_handler_script, decode_handler_envelope, HandlerInvocation, HandlerOutcome,
 };
 use super::engine::{
     stable_source_hash, BootstrapPayload, LoadErrorKind, RenderOutput, RuntimeEngine, RuntimeError,
@@ -146,6 +146,10 @@ impl QuickJsEngine {
     /// A throw inside the body surfaces as a loud `RenderError` rather than a
     /// silently dropped effect.
     ///
+    /// Returns both the body's side-effects and its completion value (a form
+    /// action's validation return); see [`HandlerOutcome`]. The result rides the
+    /// same copied-out JSON string as the effects — no extra engine round-trip.
+    ///
     /// Runs under the same request-scoped arena discipline as a render: after
     /// warmup the body bump-allocates into the request region, the effect JSON
     /// is copied out into Rust, then the boundary reset reclaims the region.
@@ -153,7 +157,7 @@ impl QuickJsEngine {
         &mut self,
         entry: &str,
         invocation: &HandlerInvocation,
-    ) -> RuntimeResult<Vec<HandlerEffect>> {
+    ) -> RuntimeResult<HandlerOutcome> {
         self.ensure_initialized()?;
         let script = build_handler_script(invocation)?;
 
@@ -829,6 +833,18 @@ if (typeof globalThis.h !== 'function') {
     const out = [];
     __albedo_push_children(fragmentProps.children, out);
     return new AlbedoHtml(out.join(''));
+  };
+
+  // Island-boundary primitive (server render context). A Tier-C island reached
+  // from a server-rendered (Tier-B/async) parent is compiled to a *client
+  // reference* whose module body is a stub that returns THIS — the framework's
+  // canonical empty island placeholder — instead of executing island code. The
+  // string is byte-identical to what the pure-Rust renderer emits for a Tier-A
+  // parent's island child (`eval::core`), so a single serve-time fill pass
+  // replaces it with the island's SSR markup + `data-albedo-island` marker for
+  // every island uniformly, regardless of which renderer emitted the hole.
+  globalThis.__albedo_island_placeholder = function(placeholderId) {
+    return new AlbedoHtml('<div id="' + placeholderId + '" data-albedo-tier="c"></div>');
   };
 
   globalThis.h = h;
@@ -2429,7 +2445,8 @@ mod tests {
 
         let effects = engine
             .eval_handler("routes/counter", &invocation)
-            .expect("handler runs");
+            .expect("handler runs")
+            .effects;
 
         // 10 + (1+2+3) + 100 = 116
         assert_eq!(
@@ -2488,6 +2505,50 @@ mod tests {
         );
     }
 
+    // P6 — a block body's early `return` is CAPTURED as the result, not leaked
+    // out of the effect-collection wrapper: a validation-return form action must
+    // still report its side-effects AND surface `{ error: ... }`. Guards the
+    // fixed return-escape bug in `build_handler_script`.
+    #[test]
+    fn eval_handler_captures_block_return_alongside_effects() {
+        use super::QuickJsEngine;
+        use crate::ir::opcode::SlotId;
+        use crate::runtime::bridge::HandlerInvocation;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use serde_json::Map;
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+
+        let env = Map::new();
+        let bc = Map::new();
+        let setters = vec![("touch".to_string(), SlotId(4))];
+        // A setter fires, THEN the body returns early — pre-fix, the `return`
+        // escaped the wrapper and both the effect serialization and the result
+        // were lost.
+        let invocation = HandlerInvocation {
+            body: "touch(1); return { error: { note: 'too short' } };",
+            is_block: true,
+            env: &env,
+            raw_bindings: &[],
+            setters: &setters,
+            event_json: None,
+            broadcast_current: &bc,
+        };
+
+        let outcome = engine
+            .eval_handler("routes/margin", &invocation)
+            .expect("handler runs");
+
+        // The pre-return effect survives.
+        assert_eq!(outcome.effects.len(), 1);
+        // The returned value is captured, not swallowed by the wrapper.
+        let result = outcome.result.expect("result captured");
+        assert_eq!(result["error"]["note"], serde_json::json!("too short"));
+    }
+
     // The event payload is exposed to the body as `event`.
     #[test]
     fn eval_handler_exposes_event_payload() {
@@ -2517,7 +2578,8 @@ mod tests {
 
         let effects = engine
             .eval_handler("routes/input", &invocation)
-            .expect("handler runs");
+            .expect("handler runs")
+            .effects;
         assert_eq!(
             effects[0],
             HandlerEffect::SlotSet {
@@ -2557,7 +2619,8 @@ mod tests {
 
         let effects = engine
             .eval_handler("routes/counter", &invocation)
-            .expect("updater-form broadcast runs");
+            .expect("updater-form broadcast runs")
+            .effects;
 
         // Seeded at 5: first updater → 6, second chains off 6 → 7.
         assert_eq!(effects.len(), 2);
@@ -2839,6 +2902,63 @@ mod tests {
         // Consumer reads the createContext default ("light") server-side; the
         // Provider value ("dark") is applied client-side on hydration.
         assert_eq!(out.html, "<span>light</span>");
+    }
+
+    // Island client-reference boundary. A Tier-C island reached from a
+    // server-rendered (async) parent is compiled to a client reference: its
+    // server-graph module body is a stub that returns ONLY the framework's
+    // canonical empty island placeholder — island code never runs on the server.
+    // This proves the prelude primitive + project-import resolution converge on
+    // the exact string the serve-time island fill targets, so an island nested
+    // in an `async function Page()` hydrates identically to a Tier-A parent's
+    // island child.
+    #[test]
+    fn island_client_reference_stub_renders_empty_placeholder_in_async_page() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+
+        // The island's server-context module: the client-reference stub (byte
+        // shape mirrors `render::tier_b::island_client_reference_stub`).
+        engine
+            .load_module(
+                "components/Progress.tsx",
+                "export default (function __albedoIslandRef(props) { \
+return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
+            )
+            .expect("stub loads");
+
+        // An async server page that mounts the island as a child. The island
+        // must appear as its placeholder hole, not as executed island markup.
+        let page = r#"
+            import Progress from "../components/Progress";
+            export default async function Page() {
+                return <main><h1>Essay</h1><Progress /></main>;
+            }
+        "#;
+        engine
+            .load_module("routes/index.tsx", page)
+            .expect("page loads");
+
+        let out = engine
+            .render_component("routes/index.tsx", "{}")
+            .expect("renders");
+
+        assert!(
+            out.html
+                .contains(r#"<div id="__c_progress_7" data-albedo-tier="c"></div>"#),
+            "async page must emit the island's empty placeholder hole, got: {}",
+            out.html
+        );
+        assert!(
+            out.html.contains("<h1>Essay</h1>"),
+            "the page's own server content still renders: {}",
+            out.html
+        );
     }
 
     // Slice 3 — `generateMetadata(props)` evaluates under QuickJS to a plain

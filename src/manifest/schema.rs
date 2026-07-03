@@ -260,6 +260,15 @@ pub struct TierCNode {
     pub initial_props: Value,
     pub hydration_mode: HydrationMode,
     pub position: DomPosition,
+    /// True when this component carries an effect hook (`useEffect` /
+    /// `useLayoutEffect` / `useInsertionEffect`) or another mount-time side
+    /// effect. Sourced from the tiering analysis' `EffectProfile::side_effects`,
+    /// so the serve path never has to re-parse source to learn it. Consumed by
+    /// the reactive serve-wire builder: a side-effecting island is excluded from
+    /// fine-grained binding mode (whose descriptor has no notion of effects) and
+    /// falls back to full A3 hydration, where its effect actually runs.
+    #[serde(default)]
+    pub side_effects: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

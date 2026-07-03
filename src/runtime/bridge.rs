@@ -135,7 +135,23 @@ struct HandlerEnvelope {
     /// On success: a JSON-encoded `Vec<RawEffect>` (double-encoded so the outer
     /// render envelope stays a flat `{ok, value, error}` shape).
     value: Option<String>,
+    /// On success: the handler body's *completion value*, JSON-encoded (double-
+    /// encoded, same reason as `value`). `null` when the body returns nothing.
+    /// Server-side form dispatch projects a `{ error: { field: msg } }` result
+    /// onto the form's compile-time `data-albedo-error` slots; other callers
+    /// ignore it. Optional so pre-P6 envelopes (no `result` key) still decode.
+    result: Option<String>,
     error: Option<String>,
+}
+
+/// What a handler body produced: its side-effects (setter/broadcast calls) and,
+/// for form actions, its return value. Effects always drive slot writes; the
+/// result is the userland return the server projects onto pre-allocated DOM
+/// slots (see `crates/albedo-server/src/render/form_result.rs`).
+#[derive(Debug)]
+pub struct HandlerOutcome {
+    pub effects: Vec<HandlerEffect>,
+    pub result: Option<Value>,
 }
 
 /// `true` for a valid JS identifier (the binding/setter names we splice into
@@ -233,17 +249,28 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
         _ => script.push_str("const event=null;\n"),
     }
 
-    // Run the body. A block runs as-is; an expression is evaluated for its
-    // effects (its value is discarded, matching the pure-Rust handler path).
+    // Run the body inside a nested arrow so a userland `return` is CAPTURED as
+    // the action's result instead of escaping the effect-collection epilogue.
+    // (Splicing a block body directly into this `try` — as before — let an early
+    // `return { error: ... }` bail out of the whole wrapper, skipping the effect
+    // serialization below: a form action's validation return silently produced
+    // no wire output.) A block body runs as its statements; an expression body
+    // is the arrow's implicit return. Effects still accumulate via the setter /
+    // `broadcast` closures regardless of how the body returns.
     if inv.is_block {
+        script.push_str("const __albedo_result=(function(){");
         script.push_str(inv.body);
-        script.push('\n');
+        script.push_str("})();\n");
     } else {
-        script.push_str(&format!("({});\n", inv.body));
+        script.push_str(&format!("const __albedo_result=({});\n", inv.body));
     }
 
+    // Two lanes: `value` = the effect list (setter/broadcast writes), `result` =
+    // the body's return value. Both double-encoded so the outer envelope stays a
+    // flat `{ok, value, result, error}` string shape. `undefined` normalizes to
+    // `null` so the result lane is always valid JSON.
     script.push_str(
-        "return JSON.stringify({ok:true,value:JSON.stringify(__albedo_effects)});\n",
+        "return JSON.stringify({ok:true,value:JSON.stringify(__albedo_effects),result:JSON.stringify(__albedo_result===undefined?null:__albedo_result)});\n",
     );
     script.push_str(
         "}catch(err){const message=(err&&typeof err.message==='string')?err.message:String(err);return JSON.stringify({ok:false,error:message});}\n",
@@ -252,12 +279,13 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     Ok(script)
 }
 
-/// Decodes the engine's raw envelope string into effects, mapping a JS throw to
-/// a loud [`RuntimeError`]. `entry` is only used for the error message.
+/// Decodes the engine's raw envelope string into effects plus the body's return
+/// value, mapping a JS throw to a loud [`RuntimeError`]. `entry` is only used
+/// for the error message.
 pub(crate) fn decode_handler_envelope(
     entry: &str,
     envelope_json: &str,
-) -> RuntimeResult<Vec<HandlerEffect>> {
+) -> RuntimeResult<HandlerOutcome> {
     let envelope: HandlerEnvelope = serde_json::from_str(envelope_json).map_err(|err| {
         RuntimeError::render(format!(
             "failed to decode handler effect envelope for '{entry}': {err}"
@@ -273,6 +301,14 @@ pub(crate) fn decode_handler_envelope(
         )));
     }
 
+    // The result lane is best-effort: a missing key (pre-P6 envelope) or a
+    // decode hiccup degrades to `None` rather than failing an otherwise-good
+    // dispatch — the effects still ship.
+    let result = envelope
+        .result
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+
     let effects_json = envelope.value.ok_or_else(|| {
         RuntimeError::render(format!("handler '{entry}' returned success without effects"))
     })?;
@@ -282,9 +318,12 @@ pub(crate) fn decode_handler_envelope(
         ))
     })?;
 
-    raw.into_iter()
+    let effects = raw
+        .into_iter()
         .map(|effect| lower_effect(entry, effect))
-        .collect()
+        .collect::<RuntimeResult<Vec<HandlerEffect>>>()?;
+
+    Ok(HandlerOutcome { effects, result })
 }
 
 fn lower_effect(entry: &str, raw: RawEffect) -> RuntimeResult<HandlerEffect> {
@@ -421,7 +460,10 @@ mod tests {
         let envelope =
             serde_json::json!({ "ok": true, "value": effects_json }).to_string();
 
-        let effects = decode_handler_envelope("routes/x", &envelope).unwrap();
+        let outcome = decode_handler_envelope("routes/x", &envelope).unwrap();
+        // No `result` key (pre-P6 envelope shape) → degrades to `None`.
+        assert!(outcome.result.is_none());
+        let effects = outcome.effects;
         assert_eq!(effects.len(), 2);
         assert_eq!(
             effects[0],

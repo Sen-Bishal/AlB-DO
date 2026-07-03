@@ -30,8 +30,8 @@ use axum::Router;
 use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
 use dom_render_compiler::runtime::{BroadcastRegistry, SessionId, SlotStore};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -144,8 +144,18 @@ type SharedMiddleware = Arc<dyn RuntimeMiddleware>;
 type SharedAuthProvider = Arc<dyn AuthProvider>;
 type SharedPropsLoader = Arc<dyn PropsLoader>;
 
-#[derive(Clone)]
-struct RuntimeState {
+/// The self-contained render + dispatch state produced by one build. Held
+/// behind an `RwLock<Arc<_>>` in [`RuntimeState`] so `albedo dev` can boot a
+/// fresh world on a source change and swap it in atomically — the listening
+/// socket, the HMR / error-overlay SSE connections, and the inspector all stay
+/// live across the swap. `albedo serve` stores exactly one world and never
+/// swaps it: the read lock is uncontended (the only writer is a dev file-save),
+/// and loading is a single refcount bump on the render hot path.
+///
+/// Everything render-coupled lives here as one unit so a full-reload swap is
+/// trivially consistent — the action handlers, their slot store, the CSRF table,
+/// and the streaming state are always the ones built together.
+struct RenderWorld {
     router: Arc<CompiledRouter>,
     handlers: Arc<HashMap<String, SharedHandler>>,
     /// Phase-F — API handlers keyed by the same `handler_id` namespace
@@ -172,13 +182,6 @@ struct RuntimeState {
     auth_provider: SharedAuthProvider,
     request_timeout: Duration,
     streaming_runtime: Option<Arc<StreamingAppState>>,
-    inspector: Option<Arc<InspectorState>>,
-    /// Phase M.1 — error registry the floating overlay subscribes
-    /// to. `None` in production builds; `Some` when dev mode is on.
-    dev_error_registry: Option<crate::dev::SharedErrorRegistry>,
-    /// Phase M.2 — HMR registry the in-place DOM-swap client
-    /// subscribes to. Same on/off semantics as the error registry.
-    dev_hmr_registry: Option<crate::dev::SharedHmrRegistry>,
     /// Phase N — public/ static asset mount(s). When present,
     /// `dispatch` checks for a matching file before falling through
     /// to the dynamic route matcher.
@@ -189,6 +192,42 @@ struct RuntimeState {
     /// (cheap when unused); userland reaches it via
     /// `AlbedoServer::broadcast()`.
     broadcast: Arc<BroadcastRegistry>,
+}
+
+#[derive(Clone)]
+struct RuntimeState {
+    /// The live render world. Cloned once per request (a refcount bump); the
+    /// guard is released immediately so nothing is held across an `.await`.
+    /// Swapped wholesale by the dev reloader — `serve` never writes it.
+    world: Arc<RwLock<Arc<RenderWorld>>>,
+    /// Persists across a world swap so its `set_graph` heartbeat and any open
+    /// inspector UI survive a dev reload.
+    inspector: Option<Arc<InspectorState>>,
+    /// Phase M.1 — error registry the floating overlay subscribes
+    /// to. `None` in production builds; `Some` when dev mode is on.
+    /// Persists across a world swap so the overlay's SSE stream isn't dropped
+    /// and build errors from a failed reload can still reach it.
+    dev_error_registry: Option<crate::dev::SharedErrorRegistry>,
+    /// Phase M.2 — HMR registry the in-place DOM-swap client
+    /// subscribes to. Same on/off semantics as the error registry.
+    /// Persists across a world swap: the dev reloader pushes the reload event
+    /// through the SAME registry the client's live SSE stream subscribed to.
+    dev_hmr_registry: Option<crate::dev::SharedHmrRegistry>,
+    /// Print per-request server-compute timings (ns/µs) to the terminal.
+    /// A persistent server property (not part of the swappable `RenderWorld`),
+    /// so a dev hot-swap keeps it. `true` for CLI dev/serve, `false` otherwise.
+    request_timings: bool,
+}
+
+impl RuntimeState {
+    /// Load the current render world. One refcount bump; the read guard is
+    /// dropped before returning, so callers never hold it across an `.await`.
+    fn world(&self) -> Arc<RenderWorld> {
+        self.world
+            .read()
+            .expect("render world lock poisoned")
+            .clone()
+    }
 }
 
 pub struct AlbedoServerBuilder {
@@ -224,6 +263,11 @@ pub struct AlbedoServerBuilder {
     /// overrides; `None` defaults to `cfg!(debug_assertions)` so
     /// debug builds get the overlay + HMR endpoints automatically.
     dev_mode_enabled: Option<bool>,
+    /// Print each request's server-compute time (ns/µs) to the terminal.
+    /// Off by default so library embedders + the test harness stay silent;
+    /// `boot_production_server` flips it on for both `albedo dev` and
+    /// `albedo serve`. See [`crate::timing`].
+    request_timings_enabled: bool,
     /// Phase N — directories served verbatim at the URL root. Each
     /// `with_public_dir` call appends; the first matching root wins.
     public_dirs: Vec<std::path::PathBuf>,
@@ -270,6 +314,7 @@ impl AlbedoServerBuilder {
             opcode_registry: None,
             pipeline: None,
             dev_mode_enabled: None,
+            request_timings_enabled: false,
             public_dirs: Vec::new(),
             public_cache_control: None,
             // Phase P · C.2 — mint here so `register_compiled_project`
@@ -341,6 +386,18 @@ impl AlbedoServerBuilder {
     #[must_use]
     pub fn with_dev_mode(mut self, enabled: bool) -> Self {
         self.dev_mode_enabled = Some(enabled);
+        self
+    }
+
+    /// Print each handled request's server-compute time (ns/µs) to stdout.
+    /// The CLI (`albedo dev` / `albedo serve`) turns this on via
+    /// [`crate::boot_production_server`]; library embedders opt in explicitly.
+    /// Only page-render GETs and action POSTs are timed — static assets,
+    /// framework JS, dev SSE streams, and the WT transport are skipped so the
+    /// log is pure ALBEDO numbers. See [`crate::timing`].
+    #[must_use]
+    pub fn with_request_timings(mut self, enabled: bool) -> Self {
+        self.request_timings_enabled = enabled;
         self
     }
 
@@ -675,24 +732,43 @@ impl AlbedoServerBuilder {
         // resulting map is shared read-only into the streaming state so the
         // concurrent request path never touches the QuickJS engine.
         let route_hydration = Arc::new({
-            let mut blocks = renderer
-                .as_mut()
-                .map(|runtime| runtime.build_hydration_blocks())
-                .unwrap_or_default();
-            // Step 3 (binding mode) · for routes whose Tier-C component is
-            // driveable from text bindings alone, supersede the A3 island block
-            // with the fine-grained reactive block (Phase K static HTML + the
-            // inline driver). Fallback-safe: routes with no eligible component
-            // keep their A3 block untouched.
-            if let (Some(runtime), Some(compiled)) =
-                (renderer.as_ref(), self.reactive_project.as_ref())
-            {
-                for (path, block) in runtime.build_reactive_blocks(compiled.as_ref()) {
-                    blocks.insert(path, block);
+            // Step 3 (binding mode) · build the fine-grained reactive blocks
+            // FIRST (immutable borrow). For routes whose Tier-C component is
+            // driveable from text bindings alone, this ships the Phase K static
+            // HTML + inline driver. Each block records, via its placeholder ids,
+            // exactly which islands it serve-wired.
+            let reactive_blocks = match (renderer.as_ref(), self.reactive_project.as_ref()) {
+                (Some(runtime), Some(compiled)) => {
+                    runtime.build_reactive_blocks(compiled.as_ref())
                 }
-            }
-            blocks
+                _ => HashMap::new(),
+            };
+            // The placeholder ids each route already serve-wired — the A3 pass
+            // skips these so it doesn't also emit an island for them.
+            let claimed: HashMap<String, std::collections::HashSet<String>> = reactive_blocks
+                .iter()
+                .map(|(path, block)| {
+                    (
+                        path.clone(),
+                        block.placeholders.iter().map(|(id, _)| id.clone()).collect(),
+                    )
+                })
+                .collect();
+
+            // A3 · hydrate the islands the reactive pass did NOT claim.
+            let hydration_blocks = renderer
+                .as_mut()
+                .map(|runtime| runtime.build_hydration_blocks(&claimed))
+                .unwrap_or_default();
+
+            // Fix #3 · merge per-component, not per-route, so a single route can
+            // carry BOTH a binding-mode island and an A3-hydrated island.
+            crate::renderer_runtime::merge_island_blocks(hydration_blocks, reactive_blocks)
         });
+
+        // Resolved here (not at its original site below) because the streaming
+        // state needs it to decide whether to inject the dev overlay/HMR client.
+        let dev_mode_enabled = self.dev_mode_enabled.unwrap_or(cfg!(debug_assertions));
 
         let mut pipeline_binding = self.pipeline;
         let streaming_runtime = renderer.as_ref().map(|runtime| {
@@ -711,7 +787,8 @@ impl AlbedoServerBuilder {
             // attaches the patches-lane sender to topics that
             // subsequent action-handler `broadcast()` calls fan out to.
             .with_broadcast(broadcast.clone())
-            .with_hydration(route_hydration.clone());
+            .with_hydration(route_hydration.clone())
+            .with_dev_mode(dev_mode_enabled);
             let state = match pipeline_binding.take() {
                 Some((pipeline, handle)) => {
                     let pipeline = pipeline.with_slot_store(slot_store.clone());
@@ -796,11 +873,10 @@ impl AlbedoServerBuilder {
             None
         };
 
-        // Phase M · mint dev-mode registries when enabled. Defaults
-        // follow the inspector convention (on in debug builds, off
-        // in release) so a `cargo run --release` server doesn't leak
-        // dev routes.
-        let dev_mode_enabled = self.dev_mode_enabled.unwrap_or(cfg!(debug_assertions));
+        // Phase M · mint dev-mode registries when enabled. `dev_mode_enabled`
+        // was resolved earlier (the streaming state needs it); defaults follow
+        // the inspector convention (on in debug builds, off in release) so a
+        // `cargo run --release` server doesn't leak dev routes.
         let (dev_error_registry, dev_hmr_registry) = if dev_mode_enabled {
             (
                 Some(Arc::new(crate::dev::DevErrorRegistry::new())),
@@ -826,7 +902,7 @@ impl AlbedoServerBuilder {
             )))
         };
 
-        let state = RuntimeState {
+        let world = RenderWorld {
             router: Arc::new(router),
             handlers: Arc::new(self.handlers),
             api_handlers: Arc::new(self.api_handlers),
@@ -841,11 +917,16 @@ impl AlbedoServerBuilder {
             auth_provider: self.auth_provider,
             request_timeout: Duration::from_millis(self.config.server.request_timeout_ms),
             streaming_runtime,
+            public_assets,
+            broadcast,
+        };
+
+        let state = RuntimeState {
+            world: Arc::new(RwLock::new(Arc::new(world))),
             inspector,
             dev_error_registry,
             dev_hmr_registry,
-            public_assets,
-            broadcast,
+            request_timings: self.request_timings_enabled,
         };
 
         Ok(AlbedoServer {
@@ -883,7 +964,7 @@ impl AlbedoServer {
     /// streaming handler). Production code does not need this — the
     /// page-render path mints tokens on its own.
     pub fn csrf_registry(&self) -> Arc<CsrfRegistry> {
-        self.state.csrf.clone()
+        self.state.world().csrf.clone()
     }
 
     /// Phase M.1 · access the dev error overlay registry. `None`
@@ -904,7 +985,7 @@ impl AlbedoServer {
     /// userland code that wants to introspect the mounted roots.
     /// `None` when no `with_public_dir(..)` calls were made.
     pub fn public_assets(&self) -> Option<Arc<PublicAssets>> {
-        self.state.public_assets.clone()
+        self.state.world().public_assets.clone()
     }
 
     /// Phase O.2 · handle on the per-server broadcast registry.
@@ -913,7 +994,22 @@ impl AlbedoServer {
     /// is no "broadcast disabled" mode; an unused registry is just
     /// an empty `DashMap` and costs nothing at idle.
     pub fn broadcast(&self) -> Arc<BroadcastRegistry> {
-        self.state.broadcast.clone()
+        self.state.world().broadcast.clone()
+    }
+
+    /// Hand the `albedo dev` file-watcher a handle to hot-swap the render world.
+    /// `None` when dev mode is off (a hardened `albedo serve`), so the reload
+    /// machinery is impossible to reach against a production server.
+    pub fn dev_reload_handle(&self) -> Option<DevReloadHandle> {
+        // Gate on the HMR registry — its presence IS the "dev mode on" signal,
+        // and the handle needs it to notify clients.
+        self.state.dev_hmr_registry.as_ref()?;
+        Some(DevReloadHandle {
+            world: self.state.world.clone(),
+            hmr: self.state.dev_hmr_registry.clone(),
+            errors: self.state.dev_error_registry.clone(),
+            revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
     }
 
     pub async fn run(self) -> Result<(), RuntimeError> {
@@ -933,8 +1029,8 @@ impl AlbedoServer {
         }
 
         let webtransport_task = if self.config.server.webtransport.enabled {
-            let shared_sessions = self
-                .state
+            let world = self.state.world();
+            let shared_sessions = world
                 .streaming_runtime
                 .as_ref()
                 .and_then(|streaming| streaming.webtransport_sessions.clone())
@@ -944,7 +1040,7 @@ impl AlbedoServer {
                 &self.config.server.webtransport,
                 shared_sessions,
             )?
-            .with_broadcast(self.state.broadcast.clone());
+            .with_broadcast(world.broadcast.clone());
             info!("ALBEDO WebTransport QUIC listener active on {}", addr);
             let wt_shutdown = shutdown_rx.clone();
             Some(tokio::spawn(async move { runtime.run(wt_shutdown).await }))
@@ -984,6 +1080,67 @@ impl AlbedoServer {
     }
 }
 
+/// Cloneable handle the `albedo dev` file-watcher uses to hot-swap the render
+/// world after a rebuild, without knowing anything about [`RenderWorld`]'s
+/// internals. It closes over the SAME world slot the running server dispatches
+/// against, so a swap is visible to every subsequent request immediately — the
+/// socket, the HMR/overlay SSE connections, and the inspector all stay live.
+#[derive(Clone)]
+pub struct DevReloadHandle {
+    world: Arc<RwLock<Arc<RenderWorld>>>,
+    hmr: Option<crate::dev::SharedHmrRegistry>,
+    errors: Option<crate::dev::SharedErrorRegistry>,
+    revision: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DevReloadHandle {
+    /// Rebuild the render world from disk and swap it in atomically, then push a
+    /// hard-reload event to every connected HMR client.
+    ///
+    /// On build failure the LIVE world is left untouched and the error is
+    /// surfaced to the overlay + returned, so a broken save degrades to "last
+    /// good page, with the error shown" instead of a dead server. The fresh
+    /// world is self-contained (router, handlers, action registry, streaming
+    /// state, slot store — all built together), so grafting it on is trivially
+    /// consistent; the fresh server's own dev registries are dropped and the
+    /// persistent ones this handle holds carry the SSE streams across the swap.
+    pub fn reload(&self, opts: &crate::boot::ProductionServerOptions) -> Result<(), RuntimeError> {
+        let fresh = crate::boot::boot_production_server(opts).inspect_err(|err| {
+            self.report_build_error(err.to_string());
+        })?;
+        let new_world = fresh.state.world();
+        *self.world.write().expect("render world lock poisoned") = new_world;
+
+        let revision = self
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if let Some(errors) = &self.errors {
+            errors.clear();
+        }
+        if let Some(hmr) = &self.hmr {
+            hmr.reload(revision);
+        }
+        Ok(())
+    }
+
+    /// Surface a build failure to the in-browser overlay without swapping the
+    /// world (the last good render keeps serving). Used by the watcher when the
+    /// rebuild step itself fails before `boot_production_server` is even reached.
+    pub fn report_build_error(&self, message: impl Into<String>) {
+        if let Some(errors) = &self.errors {
+            errors.report(
+                crate::dev::ErrorKind::Compile,
+                message,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+    }
+}
+
 /// Top-level axum entry point. Runs the real dispatch in a separate tokio
 /// task so a panicking handler surfaces as a 500 rather than a dropped
 /// connection.
@@ -1009,6 +1166,12 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
 }
 
 async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response {
+    // Start the server-compute clock at the very top so the reported number
+    // includes routing (the perfect-hash matcher is ours to claim) — but not a
+    // byte of network. Only page-render GETs and action POSTs read it back out
+    // (`crate::timing`); every other branch below returns without timing.
+    let started = Instant::now();
+
     let method = match HttpMethod::try_from(request.method()) {
         Ok(method) => method,
         Err(err) => return err.into_response(),
@@ -1017,8 +1180,13 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(str::to_string);
 
+    // Load the live render world ONCE for this request so a concurrent dev
+    // hot-swap can't split a single request across two worlds. Persistent state
+    // (inspector, dev registries) is read straight off `state`.
+    let world = state.world();
+
     if path == "/_albedo/wt" {
-        if let Some(streaming_runtime) = &state.streaming_runtime {
+        if let Some(streaming_runtime) = &world.streaming_runtime {
             return streaming_handler(State(streaming_runtime.clone()), request)
                 .await
                 .into_response();
@@ -1071,7 +1239,11 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     // POST is accepted; other methods fall through to the normal
     // router (which will surface 405 or 404 as appropriate).
     if path == "/_albedo/action" && method == HttpMethod::Post {
-        return run_action_route(&state, request).await;
+        let response = run_action_route(&world, state.dev_error_registry.as_ref(), request).await;
+        if state.request_timings {
+            crate::timing::print_request(method.as_str(), &path, started.elapsed());
+        }
+        return response;
     }
 
     // Phase P · post-P wire-through — embedded bakabox client
@@ -1097,7 +1269,7 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     // even when the route map has a catch-all. GET/HEAD only; other
     // methods fall through and surface 405 from the router.
     if matches!(method, HttpMethod::Get | HttpMethod::Head) {
-        if let Some(assets) = &state.public_assets {
+        if let Some(assets) = &world.public_assets {
             if let Some(file) = assets.resolve(path.as_str()) {
                 let mut response = assets.read_response(&file);
                 if method == HttpMethod::Head {
@@ -1108,7 +1280,7 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
         }
     }
 
-    let route_match = state.router.match_route(method, path.as_str());
+    let route_match = world.router.match_route(method, path.as_str());
     let response = match route_match {
         RouteMatch::NotFound => RuntimeError::RouteNotFound {
             method: method.as_str().to_string(),
@@ -1129,8 +1301,8 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
         )
         .into_response(),
         RouteMatch::Matched(matched) => {
-            if should_use_manifest_streaming(&state, &matched.target, method, path.as_str()) {
-                if let Some(streaming_runtime) = &state.streaming_runtime {
+            if should_use_manifest_streaming(&world, &matched.target, method, path.as_str()) {
+                if let Some(streaming_runtime) = &world.streaming_runtime {
                     // The manifest is keyed by route *pattern* (`/essays/[slug]`),
                     // which `boot_production_server` mirrors into `entry_module`.
                     // Pass that key plus the params `CompiledRouter` already
@@ -1145,7 +1317,7 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
                         .iter()
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect();
-                    return streaming_handler_with_match(
+                    let response = streaming_handler_with_match(
                         streaming_runtime.clone(),
                         request,
                         route_pattern,
@@ -1153,6 +1325,10 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
                     )
                     .await
                     .into_response();
+                    if state.request_timings {
+                        crate::timing::print_request(method.as_str(), &path, started.elapsed());
+                    }
+                    return response;
                 }
             }
 
@@ -1176,18 +1352,22 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
             // Phase-F: if `handler_id` resolves to an API handler,
             // dispatch through the API path. Otherwise fall through to
             // the page-route flow (middleware, auth, handler, layout).
-            if let Some(api_handler) = state.api_handlers.get(&matched.target.handler_id).cloned() {
-                return run_api_request(&state, matched.target, request_context, api_handler).await;
+            if let Some(api_handler) = world.api_handlers.get(&matched.target.handler_id).cloned() {
+                return run_api_request(&world, matched.target, request_context, api_handler).await;
             }
 
             let mut request_context = request_context;
-            match execute_route(&state, matched.target, &mut request_context).await {
+            let rendered = match execute_route(&world, matched.target, &mut request_context).await {
                 Ok(response) => response.into_response(),
                 Err(err) => {
                     error!(request_id = request_context.request_id, error = %err, "request failed");
                     err.into_response()
                 }
+            };
+            if state.request_timings {
+                crate::timing::print_request(method.as_str(), &path, started.elapsed());
             }
+            rendered
         }
     };
 
@@ -1207,7 +1387,11 @@ const ACTION_SESSION_HEADER: &str = "x-albedo-session";
 /// with a [`SessionSlots`] view bound to the server's shared slot
 /// store. The body cap matches `MAX_REQUEST_BODY_BYTES` so an oversized
 /// envelope is rejected with the same shape as any other large request.
-async fn run_action_route(state: &RuntimeState, request: Request<Body>) -> Response {
+async fn run_action_route(
+    world: &RenderWorld,
+    dev_error_registry: Option<&crate::dev::SharedErrorRegistry>,
+    request: Request<Body>,
+) -> Response {
     let (parts, body) = request.into_parts();
     let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(body) => body,
@@ -1242,14 +1426,14 @@ async fn run_action_route(state: &RuntimeState, request: Request<Body>) -> Respo
         body.clone(),
     );
 
-    let slots = SessionSlots::new(session_id, state.slot_store.clone());
+    let slots = SessionSlots::new(session_id, world.slot_store.clone());
     run_action_request(
-        state.action_handlers.as_ref(),
-        state.csrf.as_ref(),
+        world.action_handlers.as_ref(),
+        world.csrf.as_ref(),
         ctx,
         body,
         slots,
-        state.dev_error_registry.as_ref(),
+        dev_error_registry,
     )
     .await
 }
@@ -1259,14 +1443,14 @@ async fn run_action_route(state: &RuntimeState, request: Request<Body>) -> Respo
 /// response. Centralised so the dispatcher stays linear and so future
 /// per-request observability (tracing, metrics) attaches in one place.
 async fn run_api_request(
-    state: &RuntimeState,
+    world: &RenderWorld,
     target: RouteTarget,
     ctx: RequestContext,
     handler: SharedApiHandler,
 ) -> Response {
     let request_id = ctx.request_id.clone();
-    let dispatch = dispatch_api_route(&target, ctx, &state.auth_provider, &handler);
-    let result = tokio::time::timeout(state.request_timeout, dispatch).await;
+    let dispatch = dispatch_api_route(&target, ctx, &world.auth_provider, &handler);
+    let result = tokio::time::timeout(world.request_timeout, dispatch).await;
     match result {
         Ok(Ok(api_response)) => api_response.into_response(),
         Ok(Err(err)) => {
@@ -1276,7 +1460,7 @@ async fn run_api_request(
         Err(_) => {
             let err = RuntimeError::RequestHandling(format!(
                 "api request timed out after {} ms",
-                state.request_timeout.as_millis()
+                world.request_timeout.as_millis()
             ));
             error!(request_id, error = %err, "api request timed out");
             err.into_response()
@@ -1285,12 +1469,12 @@ async fn run_api_request(
 }
 
 async fn execute_route(
-    state: &RuntimeState,
+    world: &RenderWorld,
     target: RouteTarget,
     ctx: &mut RequestContext,
 ) -> Result<ResponsePayload, RuntimeError> {
     for middleware_id in &target.middleware {
-        let middleware = state.middleware.get(middleware_id).ok_or_else(|| {
+        let middleware = world.middleware.get(middleware_id).ok_or_else(|| {
             RuntimeError::MiddlewareNotFound {
                 middleware_id: middleware_id.clone(),
             }
@@ -1299,7 +1483,7 @@ async fn execute_route(
     }
 
     if let Some(policy) = &target.auth {
-        match state.auth_provider.authorize(ctx, policy).await? {
+        match world.auth_provider.authorize(ctx, policy).await? {
             AuthDecision::Allow => {}
             AuthDecision::Deny { reason } => {
                 return Err(RuntimeError::Authentication(reason));
@@ -1307,7 +1491,7 @@ async fn execute_route(
         }
     }
 
-    let handler = state
+    let handler = world
         .handlers
         .get(target.handler_id.as_str())
         .ok_or_else(|| RuntimeError::HandlerNotFound {
@@ -1317,21 +1501,21 @@ async fn execute_route(
 
     let ctx_for_response_hooks = ctx.clone();
     let response_fut = handler.handle(ctx.clone());
-    let mut response = tokio::time::timeout(state.request_timeout, response_fut)
+    let mut response = tokio::time::timeout(world.request_timeout, response_fut)
         .await
         .map_err(|_| {
             RuntimeError::RequestHandling(format!(
                 "request timed out after {} ms",
-                state.request_timeout.as_millis()
+                world.request_timeout.as_millis()
             ))
         })??;
 
     if !target.layout_handlers.is_empty() {
-        apply_layout_handlers(state, target.layout_handlers.as_slice(), ctx, &mut response).await?;
+        apply_layout_handlers(world, target.layout_handlers.as_slice(), ctx, &mut response).await?;
     }
 
     for middleware_id in target.middleware.iter().rev() {
-        let middleware = state.middleware.get(middleware_id).ok_or_else(|| {
+        let middleware = world.middleware.get(middleware_id).ok_or_else(|| {
             RuntimeError::MiddlewareNotFound {
                 middleware_id: middleware_id.clone(),
             }
@@ -1344,7 +1528,7 @@ async fn execute_route(
     Ok(response)
 }
 fn should_use_manifest_streaming(
-    state: &RuntimeState,
+    world: &RenderWorld,
     target: &RouteTarget,
     method: HttpMethod,
     path: &str,
@@ -1372,7 +1556,7 @@ fn should_use_manifest_streaming(
     // key and path coincide.
     let manifest_key = target.entry_module.as_deref().unwrap_or(path);
 
-    state
+    world
         .streaming_runtime
         .as_ref()
         .map(|runtime| runtime.manifest.routes.contains_key(manifest_key))
@@ -1380,7 +1564,7 @@ fn should_use_manifest_streaming(
 }
 
 async fn apply_layout_handlers(
-    state: &RuntimeState,
+    world: &RenderWorld,
     layout_handlers: &[String],
     ctx: &RequestContext,
     response: &mut ResponsePayload,
@@ -1411,7 +1595,7 @@ async fn apply_layout_handlers(
     };
 
     for layout_id in layout_handlers.iter().rev() {
-        let layout = state
+        let layout = world
             .layouts
             .get(layout_id)
             .ok_or_else(|| RuntimeError::LayoutNotFound {

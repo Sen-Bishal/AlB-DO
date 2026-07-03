@@ -65,6 +65,35 @@ fn trigger_from_mode(mode: HydrationMode) -> HydrationTrigger {
     }
 }
 
+/// Fix #3 · fold the per-route reactive (binding-mode) blocks into the A3
+/// hydration blocks **per component**. A route may legitimately carry both: some
+/// islands serve-wired in binding mode, others fully hydrated. For a route the
+/// reactive pass touched, its placeholders are disjoint from the hydration block
+/// (the hydration pass skips the reactive-claimed placeholder ids) and the two
+/// script bundles are independent, so unioning the placeholder lists and
+/// concatenating the closing scripts preserves both. Routes that appear in only
+/// one map pass through unchanged. This replaces the old per-route `insert` that
+/// let any single serve-wireable node clobber the entire route's hydration block.
+pub(crate) fn merge_island_blocks(
+    mut hydration: HashMap<String, RouteHydration>,
+    reactive: HashMap<String, RouteHydration>,
+) -> HashMap<String, RouteHydration> {
+    use std::collections::hash_map::Entry;
+    for (path, block) in reactive {
+        match hydration.entry(path) {
+            Entry::Occupied(mut slot) => {
+                let merged = slot.get_mut();
+                merged.placeholders.extend(block.placeholders);
+                merged.closing_scripts.push_str(&block.closing_scripts);
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(block);
+            }
+        }
+    }
+    hydration
+}
+
 impl RendererRuntime {
     pub fn from_config(config: &RendererConfig) -> Result<Self, RuntimeError> {
         let artifacts_dir = PathBuf::from(config.artifacts_dir.as_str());
@@ -161,7 +190,17 @@ impl RendererRuntime {
     /// returned map is keyed by route path and consumed by the streaming handler.
     /// Best-effort throughout: an island whose source can't render or compile is
     /// skipped, degrading to a non-interactive server page rather than failing.
-    pub fn build_hydration_blocks(&mut self) -> HashMap<String, RouteHydration> {
+    ///
+    /// `claimed` carries, per route path, the placeholder ids the fine-grained
+    /// reactive builder ([`Self::build_reactive_blocks`]) already serve-wired.
+    /// Those nodes are skipped here so a route that mixes a serve-wireable island
+    /// and a must-hydrate island emits exactly one block per node — the two maps
+    /// are then unioned per-component by the caller, instead of one clobbering
+    /// the whole route's block.
+    pub fn build_hydration_blocks(
+        &mut self,
+        claimed: &HashMap<String, std::collections::HashSet<String>>,
+    ) -> HashMap<String, RouteHydration> {
         struct IslandMeta {
             placeholder_id: String,
             component_id: u64,
@@ -181,9 +220,15 @@ impl RendererRuntime {
 
         let mut routes: Vec<(String, Vec<IslandMeta>)> = Vec::new();
         for (path, route) in &self.manifest.routes {
+            let route_claimed = claimed.get(path);
             let mut islands = Vec::new();
             for node in &route.tier_c {
                 if node.hydration_mode == HydrationMode::None {
+                    continue;
+                }
+                // Already serve-wired in binding mode — skip so the reactive
+                // block keeps ownership of this node's placeholder + script.
+                if route_claimed.is_some_and(|c| c.contains(&node.placeholder_id)) {
                     continue;
                 }
                 let Some(component) = by_name.get(node.component_id.as_str()) else {
@@ -311,6 +356,15 @@ impl RendererRuntime {
                 if node.hydration_mode == HydrationMode::None {
                     continue;
                 }
+                // Fix #2 — an effect-bearing island (e.g. a theme toggle that
+                // also mutates `document` via `useEffect`) must NOT be
+                // serve-wired. The binding-mode reactive descriptor carries no
+                // notion of effects, so wiring it would render the bindings but
+                // silently drop the effect. Skip it here so it falls through to
+                // full A3 hydration, where `runEffects()` runs on mount.
+                if node.side_effects {
+                    continue;
+                }
                 // The manifest names the component; resolve it to the render-entry
                 // spec the compiled project keys on (its absolute `module_path`
                 // won't match the project-relative module specs).
@@ -388,10 +442,25 @@ impl RendererRuntime {
             .map(|c| (c.name.as_str(), c))
             .collect();
 
+        // Island client-reference boundary (RSC-style). Every Tier-C island,
+        // keyed by its module path, maps to the empty placeholder the server
+        // graph must emit in its place. When a server component's dependency
+        // graph includes one of these modules, its body is swapped for a client
+        // reference stub (see `add_component_to_plan`) so island code never runs
+        // in the pool engines — only the boundary is emitted, then filled by the
+        // serve-time island pass, exactly as a Tier-A parent's island child is.
+        let island_modules = self.island_client_reference_map(&by_name);
+
         let mut plan = crate::render::tier_b::TierBRenderPlan::new();
         for route in self.manifest.routes.values() {
             for node in &route.tier_b {
-                self.add_component_to_plan(&mut plan, &by_name, &node.render_fn, &node.component_id);
+                self.add_component_to_plan(
+                    &mut plan,
+                    &by_name,
+                    &island_modules,
+                    &node.render_fn,
+                    &node.component_id,
+                );
             }
 
             // Route boundaries (`error.tsx` / `loading.tsx`) are rendered on the
@@ -400,10 +469,10 @@ impl RendererRuntime {
             // the bare component name (the registry is called with that name);
             // no collision with the `render::*`-shaped Tier-B keys.
             if let Some(name) = route.error_component.as_deref() {
-                self.add_component_to_plan(&mut plan, &by_name, name, name);
+                self.add_component_to_plan(&mut plan, &by_name, &island_modules, name, name);
             }
             if let Some(name) = route.loading_component.as_deref() {
-                self.add_component_to_plan(&mut plan, &by_name, name, name);
+                self.add_component_to_plan(&mut plan, &by_name, &island_modules, name, name);
             }
 
             // Slice 3 — a route exporting `generateMetadata` needs its leaf
@@ -411,10 +480,31 @@ impl RendererRuntime {
             // Registered under the bare component name, the same key the serve
             // path calls `call_metadata` with.
             if let Some(name) = route.dynamic_metadata.as_deref() {
-                self.add_component_to_plan(&mut plan, &by_name, name, name);
+                self.add_component_to_plan(&mut plan, &by_name, &island_modules, name, name);
             }
         }
         plan
+    }
+
+    /// Build the island client-reference map: every Tier-C island's module path
+    /// → the empty placeholder id (`__c_<slug>_<id>`) the server graph emits in
+    /// its place. Sourced from `route.tier_c` across all routes (the single
+    /// tiering source of truth); an island mounted in several routes resolves to
+    /// the same deterministic placeholder id, so first-writer-wins is exact.
+    fn island_client_reference_map(
+        &self,
+        by_name: &HashMap<&str, &ComponentManifestEntry>,
+    ) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        for route in self.manifest.routes.values() {
+            for node in &route.tier_c {
+                if let Some(component) = by_name.get(node.component_id.as_str()) {
+                    map.entry(component.module_path.clone())
+                        .or_insert_with(|| node.placeholder_id.clone());
+                }
+            }
+        }
+        map
     }
 
     /// Resolve one component's entry module + dependency-ordered source graph and
@@ -427,6 +517,7 @@ impl RendererRuntime {
         &self,
         plan: &mut crate::render::tier_b::TierBRenderPlan,
         by_name: &HashMap<&str, &ComponentManifestEntry>,
+        island_modules: &HashMap<String, String>,
         key: &str,
         component_name: &str,
     ) {
@@ -464,6 +555,20 @@ impl RendererRuntime {
 
         let mut modules = Vec::with_capacity(order.len());
         for specifier in &order {
+            // A Tier-C island in a server component's dependency graph is a
+            // client reference: swap its body for the stub so island code never
+            // runs in the pool engines — only the empty placeholder is emitted,
+            // then filled by the serve-time island pass. The entry itself is a
+            // Tier-B page (never an island), so it is never substituted.
+            if specifier != &entry {
+                if let Some(placeholder_id) = island_modules.get(specifier) {
+                    modules.push((
+                        specifier.clone(),
+                        crate::render::tier_b::island_client_reference_stub(placeholder_id),
+                    ));
+                    continue;
+                }
+            }
             let Some(module) = self.renderer.module_registry().module(specifier) else {
                 tracing::warn!(
                     target: "albedo.renderer",
@@ -575,4 +680,63 @@ struct RuntimeModuleSourcesArtifact {
 struct RuntimeModuleSourceEntry {
     module_path: String,
     code: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_island_blocks, RouteHydration};
+    use std::collections::HashMap;
+
+    fn block(placeholders: &[(&str, &str)], scripts: &str) -> RouteHydration {
+        RouteHydration {
+            placeholders: placeholders
+                .iter()
+                .map(|(id, html)| (id.to_string(), html.to_string()))
+                .collect(),
+            closing_scripts: scripts.to_string(),
+        }
+    }
+
+    /// A route that mixes a serve-wired island and an A3-hydrated island keeps
+    /// BOTH — placeholders unioned, scripts concatenated — instead of the
+    /// reactive block clobbering the whole route's hydration block (fix #3).
+    #[test]
+    fn merge_unions_placeholders_and_scripts_for_a_shared_route() {
+        let mut hydration = HashMap::new();
+        hydration.insert(
+            "/page".to_string(),
+            block(&[("__c_island_1", "<a>hydrated</a>")], "<script>client</script>"),
+        );
+
+        let mut reactive = HashMap::new();
+        reactive.insert(
+            "/page".to_string(),
+            block(&[("__c_island_2", "<b>wired</b>")], "<script>driver</script>"),
+        );
+
+        let merged = merge_island_blocks(hydration, reactive);
+        let route = &merged["/page"];
+
+        let ids: Vec<&str> = route.placeholders.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"__c_island_1"), "A3 island survives the merge");
+        assert!(ids.contains(&"__c_island_2"), "serve-wired island survives the merge");
+        assert_eq!(route.placeholders.len(), 2, "no placeholder dropped");
+        assert!(route.closing_scripts.contains("client"), "A3 scripts kept");
+        assert!(route.closing_scripts.contains("driver"), "reactive scripts kept");
+    }
+
+    /// Routes present in only one map pass through untouched, in either direction.
+    #[test]
+    fn merge_passes_through_unshared_routes_from_both_maps() {
+        let mut hydration = HashMap::new();
+        hydration.insert("/only-a3".to_string(), block(&[("a", "<x/>")], "A3"));
+
+        let mut reactive = HashMap::new();
+        reactive.insert("/only-reactive".to_string(), block(&[("b", "<y/>")], "RX"));
+
+        let merged = merge_island_blocks(hydration, reactive);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged["/only-a3"].closing_scripts, "A3");
+        assert_eq!(merged["/only-reactive"].closing_scripts, "RX");
+    }
 }

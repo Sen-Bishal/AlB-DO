@@ -380,6 +380,7 @@ mod tests {
             initial_props: serde_json::Value::Null,
             hydration_mode: HydrationMode::Immediate,
             position: position("root", 0),
+            side_effects: false,
         }
     }
 

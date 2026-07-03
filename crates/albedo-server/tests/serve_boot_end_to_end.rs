@@ -101,6 +101,7 @@ impl Fixture {
             dist_dir: self.dist_dir.clone(),
             host: "127.0.0.1".to_string(),
             port: 0,
+            dev_mode: false,
         }
     }
 }
@@ -219,6 +220,7 @@ fn boot_production_server_fails_loud_when_dist_dir_missing() {
         dist_dir: temp.path().join(".albedo").join("dist"),
         host: "127.0.0.1".to_string(),
         port: 0,
+        dev_mode: false,
     };
 
     let err = match boot_production_server(&opts) {

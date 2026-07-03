@@ -47,6 +47,11 @@ pub struct ProductionServerOptions {
     pub host: String,
     /// Bind port. Same default as `albedo dev` (3000).
     pub port: u16,
+    /// Dev mode — enables the error overlay + slot-preserving HMR (the dev
+    /// `/_albedo/dev/*` endpoints and the shell script injection) on top of the
+    /// production streaming pipeline. `false` for `albedo serve`; `albedo dev`
+    /// boots this same pipeline with it `true`.
+    pub dev_mode: bool,
 }
 
 impl ProductionServerOptions {
@@ -61,6 +66,9 @@ impl ProductionServerOptions {
             dist_dir,
             host: contract.server.host.clone(),
             port: contract.server.port,
+            // `albedo serve` is production by default; `albedo dev` flips this on
+            // via `ProductionServerOptions { dev_mode: true, .. }`.
+            dev_mode: false,
         }
     }
 }
@@ -160,7 +168,11 @@ pub fn boot_production_server(
     // policy; tests can flip it back on via the builder.
     let mut builder = AlbedoServerBuilder::new(app_config)
         .with_renderer_runtime(renderer)
-        .with_dev_mode(false)
+        .with_dev_mode(opts.dev_mode)
+        // Surface ALBEDO's own per-request server-compute time (ns/µs) in the
+        // terminal for both `albedo dev` and `albedo serve` — the honest number,
+        // published live. See `crate::timing`.
+        .with_request_timings(true)
         .with_quickjs_action_engine_pool(action_engine_pool_size)
         .register_compiled_project(Arc::new(compiled));
 

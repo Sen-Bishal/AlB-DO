@@ -72,6 +72,12 @@ pub struct StreamingAppState {
     /// SSR HTML and emits the client runtime + island IIFEs + payload +
     /// bootstrap before `</body>`. Empty for tests / Tier-A-only builds.
     hydration: Arc<HashMap<String, crate::renderer_runtime::RouteHydration>>,
+    /// Dev mode — when set, `build_stream` injects the error-overlay + HMR
+    /// client `<script>` tags (served at `/_albedo/dev/*`) before `</body>`, so
+    /// `albedo dev` runs the SAME production streaming pipeline as `albedo serve`
+    /// and gets the overlay + slot-preserving hot reload on top. `false` for
+    /// `albedo serve` and tests.
+    dev_mode: bool,
 }
 
 impl StreamingAppState {
@@ -90,7 +96,17 @@ impl StreamingAppState {
             csrf: Arc::new(crate::render::csrf::CsrfRegistry::new()),
             broadcast: None,
             hydration: Arc::new(HashMap::new()),
+            dev_mode: false,
         }
+    }
+
+    /// Enable dev mode on this streaming state so `build_stream` injects the
+    /// error-overlay + HMR client scripts. Wired by the server builder from its
+    /// `dev_mode_enabled` flag; `albedo serve` leaves it off.
+    #[must_use]
+    pub fn with_dev_mode(mut self, dev_mode: bool) -> Self {
+        self.dev_mode = dev_mode;
+        self
     }
 
     /// A3 · bind the per-route hydration blocks built at boot. Production wires
@@ -603,6 +619,14 @@ fn build_stream(
         let error_component = route.error_component.clone();
         let loading_component = route.loading_component.clone();
 
+        // Island fill data for this route, shared across the Tier-B futures. An
+        // island nested in an `async function Page()` renders (via its client
+        // reference stub) to the empty placeholder inside the page's HTML; this
+        // is the same marked SSR markup the shell fill uses, applied to the
+        // resolved chunk so async-page islands are byte-identical to Tier-A ones.
+        let island_fills: std::sync::Arc<Vec<(String, String)>> =
+            std::sync::Arc::new(hydration.map(|h| h.placeholders.clone()).unwrap_or_default());
+
         let mut tier_b_futures: FuturesUnordered<_> = route
             .tier_b
             .iter()
@@ -612,6 +636,7 @@ fn build_stream(
                 let app = app.clone();
                 let error_component = error_component.clone();
                 let loading_component = loading_component.clone();
+                let island_fills = island_fills.clone();
                 async move {
                     let render_result = timeout(
                         Duration::from_millis(node.timeout_ms.max(1)),
@@ -625,7 +650,10 @@ fn build_stream(
                     .await;
 
                     match render_result {
-                        Ok(Ok(html)) => InjectionChunk::success(&node, html),
+                        Ok(Ok(html)) => InjectionChunk::success(
+                            &node,
+                            replace_island_placeholders(html, &island_fills),
+                        ),
                         Ok(Err(err)) => {
                             // The component threw. Render the route's `error.tsx`
                             // boundary and inject its HTML; only if there is no
@@ -681,6 +709,18 @@ fn build_stream(
             closing.push_str(&hydration.closing_scripts);
         }
 
+        // Dev mode — inject the error-overlay + slot-preserving HMR client. Both
+        // self-connect to their `/_albedo/dev/*` SSE streams on load, so a single
+        // `<script src>` each is enough. This is what makes `albedo dev` the SAME
+        // production pipeline plus the dev affordances, instead of a second
+        // renderer. `defer` so they don't block the island runtime.
+        if app.dev_mode {
+            closing.push_str(
+                "<script src=\"/_albedo/dev/overlay.js\" defer></script>\
+                 <script src=\"/_albedo/dev/hmr-apply.js\" defer></script>",
+            );
+        }
+
         closing.push_str(&route.shell.body_close);
         yield Ok(Bytes::from(closing));
     }
@@ -711,12 +751,12 @@ fn build_shell_chunk(
 
     // A3 · replace each empty Tier-C placeholder with the island's marked SSR
     // HTML so the browser has real markup to adopt (and the user something to
-    // interact with). The marker rides on the island's own root element.
+    // interact with). The marker rides on the island's own root element. This
+    // fills island holes that land in the *shell* (a Tier-A parent's island
+    // child); holes that land inside a Tier-B/async page's rendered HTML are
+    // filled by the same pass in `build_stream` when the chunk resolves.
     if let Some(hydration) = hydration {
-        for (placeholder_id, marked_html) in &hydration.placeholders {
-            let empty = format!("<div id=\"{placeholder_id}\" data-albedo-tier=\"c\"></div>");
-            shell = shell.replace(&empty, marked_html);
-        }
+        shell = replace_island_placeholders(shell, &hydration.placeholders);
     }
 
     // Phase L · fill any `value=""` CSRF placeholders the renderer
@@ -726,6 +766,20 @@ fn build_shell_chunk(
     // markers (Tier-A pages without forms).
     let token = csrf.token_for(page_session);
     crate::render::csrf::substitute_csrf_token_in_html(&shell, &token)
+}
+
+/// Replace each empty Tier-C island placeholder (`<div id="…"
+/// data-albedo-tier="c"></div>`) with the island's marked SSR HTML. The single
+/// island-fill pass, shared by the shell (a Tier-A parent's island child) and
+/// the Tier-B chunk path (an island inside an `async function Page()`), so every
+/// island — whichever renderer emitted its hole — converges on identical served
+/// markup carrying the `data-albedo-island` marker the client hydrates against.
+fn replace_island_placeholders(mut html: String, placeholders: &[(String, String)]) -> String {
+    for (placeholder_id, marked_html) in placeholders {
+        let empty = format!("<div id=\"{placeholder_id}\" data-albedo-tier=\"c\"></div>");
+        html = html.replace(&empty, marked_html);
+    }
+    html
 }
 
 /// Hard cap on how long the WT path will tick + drain waiting for async
@@ -1258,6 +1312,30 @@ mod tests {
         let script = transport_hint_script(NegotiatedTransport::Sse, "/_albedo/wt");
         assert!(script.contains("__ALBEDO_ACTIVE_TRANSPORT__=\"sse\""));
         assert!(script.contains("__ALBEDO_WT_ENDPOINT__=\"\""));
+    }
+
+    #[test]
+    fn replace_island_placeholders_fills_holes_in_tier_b_html() {
+        // The unified island fill runs over async-page (Tier-B) HTML the same way
+        // it runs over the shell: an empty placeholder is swapped for the island's
+        // marked SSR markup; unrelated holes and content are left untouched.
+        let html = "<main><h1>Essay</h1>\
+<div id=\"__c_progress_7\" data-albedo-tier=\"c\"></div></main>"
+            .to_string();
+        let fills = vec![(
+            "__c_progress_7".to_string(),
+            "<div class=\"bar\" data-albedo-island=\"7\"></div>".to_string(),
+        )];
+        let out = replace_island_placeholders(html, &fills);
+        assert!(
+            out.contains("<div class=\"bar\" data-albedo-island=\"7\"></div>"),
+            "island hole must be filled with marked SSR markup: {out}"
+        );
+        assert!(
+            !out.contains("data-albedo-tier=\"c\""),
+            "the empty placeholder must be gone: {out}"
+        );
+        assert!(out.contains("<h1>Essay</h1>"), "page content preserved: {out}");
     }
 
     #[test]
