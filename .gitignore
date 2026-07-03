@@ -237,3 +237,6 @@ nul
 *.Setup.exe
 *.exe
 !target/**/*.exe
+
+# Private brainstorming / planning docs — not tracked (see legend.md + README.md for public docs)
+/development-plan/
