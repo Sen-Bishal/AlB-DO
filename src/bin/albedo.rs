@@ -40,12 +40,24 @@ mod inspector;
 
 const PORT_AUTO_INCREMENT_LIMIT: u16 = 10;
 
-const ACCENT: u8 = 81;
-const ACCENT_SOFT: u8 = 117;
-const ACCENT_DEEP: u8 = 45;
-const MUTED: u8 = 244;
+// Palette — "Halation". ALBEDO is the fraction of light a surface reflects, and
+// the flagship (Halation, "the glow around bright things") lives in champagne
+// gold on ink. The CLI matches: warm gold accents, not the old cold cyan. Every
+// `print_*` helper flows through these, so the whole tool recolors from here.
+const ACCENT: u8 = 179; // champagne gold — primary accent (glyphs, headings)
+const ACCENT_SOFT: u8 = 223; // pale gold / cream — values, links, live state
+const ACCENT_DEEP: u8 = 137; // deep gold — dividers, secondary marks
+const MUTED: u8 = 245; // warm-neutral gray — labels, secondary copy
 
-const BRAND_PALETTE: [u8; 5] = [45, 51, 87, 123, 159];
+// Shared column width for help listings (commands + flags), so the description
+// column aligns across both. Longest label is "completions <shell>" (19).
+const COL_WIDTH: usize = 20;
+
+// Wordmark shimmer: a low→high luminance ascent, deep gold rising to cream — the
+// "glow" made literal, per-character (mirrors `gradient_text`). The "instrument
+// for light" tier bars (A+B blend) live in `printer.rs` where the tier data is.
+const BRAND_PALETTE: [u8; 6] = [137, 179, 221, 222, 223, 230];
+
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAMES_ASCII: [&str; 4] = ["|", "/", "-", "\\"];
 
@@ -572,7 +584,7 @@ fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
         .map_err(|err| format!("failed to resolve current directory: {err}"))?;
     let contract = resolve_dev_contract(&options.forwarded, &cwd)?;
     let skip_budget = raw_args.iter().any(|arg| arg == "--no-budget");
-    run_prod_build_with_budget(&contract, skip_budget)?;
+    run_prod_build_with_budget(&contract, skip_budget, true, false)?;
 
     let target = if let Some(target) = options.target {
         target
@@ -871,7 +883,7 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|err| format!("failed to resolve current directory: {err}"))?;
     let mut contract = resolve_dev_contract(raw_args, &cwd)?;
-    print_banner();
+    print_boot_banner();
     print_section("serve");
     print_kv("project", contract.project_dir.display());
     print_kv("mode", "production (build + serve)");
@@ -1205,7 +1217,7 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     }
     let contract = resolve_dev_contract(&forwarded, &cwd)?;
 
-    print_banner();
+    print_boot_banner();
     print_section(if prod_mode { "build" } else { "dev" });
     print_kv("project", contract.project_dir.display());
     print_kv(
@@ -1246,7 +1258,7 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     }
 
     if prod_mode {
-        run_prod_build_with_budget(&contract, skip_budget)?;
+        run_prod_build_with_budget(&contract, skip_budget, true, false)?;
         return Ok(());
     }
 
@@ -1255,7 +1267,138 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     run_live_dev_runtime(contract)
 }
 
+/// One renderer for dev and prod. `albedo dev` boots the SAME production
+/// streaming pipeline as `albedo serve` (Tier-A/B/C, island hydration, dynamic
+/// metadata, error/loading boundaries, `head.html` pre-paint) with dev mode on
+/// (error overlay + hot reload), plus a file watcher that rebuilds the dist and
+/// hot-swaps the render world into the running server in place — no socket
+/// churn, no second renderer. This is what closes the long-standing dev/serve
+/// parity gap: everything verified on `serve` now renders identically in `dev`.
 fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
+    use albedo_server::{boot_production_server, ProductionServerOptions};
+
+    // 1. Build the dist the production pipeline serves from.
+    run_prod_build(&contract)?;
+
+    // 2. Boot the production server with dev mode on (overlay + HMR endpoints +
+    //    the shell dev-script injection from `StreamingAppState::with_dev_mode`).
+    let mut opts = ProductionServerOptions::from_contract(&contract);
+    opts.dev_mode = true;
+    let server = boot_production_server(&opts)
+        .map_err(|err| format!("failed to boot dev server: {err}"))?;
+
+    // 3. Spawn the watch → rebuild → hot-swap loop. The reload handle shares the
+    //    running server's world slot, so a swap is live for the next request.
+    if let Some(reload) = server.dev_reload_handle() {
+        let watch_contract = contract.clone();
+        let watch_opts = opts.clone();
+        let debounce = Duration::from_millis(contract.watch.debounce_ms.max(1));
+        std::thread::spawn(move || {
+            dev_watch_and_reload(watch_contract, watch_opts, reload, debounce);
+        });
+    }
+
+    let addr = format!("{}:{}", contract.server.host, contract.server.port);
+    println!();
+    print_ok(format!(
+        "dev · {}",
+        style_256(&format!("http://{addr}"), ACCENT_SOFT, true)
+    ));
+    println!(
+        "    {} same pipeline as `albedo serve` · overlay + hot reload on",
+        style_256("·", MUTED, false)
+    );
+    println!(
+        "    {} inspector · {}",
+        style_256("·", MUTED, false),
+        style_256(&format!("http://{addr}/__albedo"), ACCENT_SOFT, true)
+    );
+    println!();
+    println!("    {}  stop the server", style_256("ctrl+c", MUTED, true));
+    println!();
+
+    if contract.open {
+        let target = format!("http://{addr}");
+        if let Err(err) = try_open_browser(target.as_str()) {
+            print_warn(format!("failed to open browser automatically: {err}"));
+        }
+    }
+
+    // 4. Run the production server on a fresh multi-thread runtime, same as
+    //    `albedo serve` (the dev path stays sync until this point).
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to start tokio runtime: {err}"))?;
+    runtime
+        .block_on(server.run())
+        .map_err(|err| format!("dev server runtime error: {err}"))
+}
+
+/// The dev file-watcher loop. Watches the source tree (NOT `.albedo/dist`, which
+/// the rebuild writes to — so a rebuild can't retrigger itself), debounces a
+/// save-burst, then rebuilds the dist and asks the reload handle to hot-swap the
+/// fresh world and ping connected clients. A failed build leaves the last good
+/// world serving and surfaces the error to the in-browser overlay.
+fn dev_watch_and_reload(
+    contract: ResolvedDevContract,
+    opts: albedo_server::ProductionServerOptions,
+    reload: albedo_server::DevReloadHandle,
+    debounce: Duration,
+) {
+    let (event_tx, event_rx) = mpsc::channel::<notify::Result<Event>>();
+    let mut watcher = match RecommendedWatcher::new(
+        move |res| {
+            let _ = event_tx.send(res);
+        },
+        NotifyConfig::default(),
+    ) {
+        Ok(watcher) => watcher,
+        Err(err) => {
+            eprintln!("  {} watcher init failed: {err}", style("✗", "1;31"));
+            return;
+        }
+    };
+    if let Err(err) = watcher.watch(contract.root.as_path(), RecursiveMode::Recursive) {
+        eprintln!(
+            "  {} watcher failed to watch '{}': {}",
+            style("✗", "1;31"),
+            contract.root.display(),
+            err
+        );
+        return;
+    }
+
+    loop {
+        // Block until the first change, then drain the rest of the burst so a
+        // multi-file save rebuilds once.
+        if event_rx.recv().is_err() {
+            return; // sender dropped — watcher gone
+        }
+        while event_rx.recv_timeout(debounce).is_ok() {}
+
+        let rebuild_start = Instant::now();
+        match run_prod_build_quiet(&contract) {
+            Ok(()) => match reload.reload(&opts) {
+                Ok(()) => print_ok(format!(
+                    "reloaded in {}",
+                    colorize_timing_ms(rebuild_start.elapsed().as_secs_f64() * 1000.0)
+                )),
+                Err(err) => {
+                    reload.report_build_error(err.to_string());
+                    eprintln!("  {} reload failed: {err}", style("✗", "1;31"));
+                }
+            },
+            Err(err) => {
+                reload.report_build_error(err.clone());
+                eprintln!("  {} rebuild failed: {err}", style("✗", "1;31"));
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn legacy_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     let scanned_components = if contract.strict || contract.verbose {
         Some(scan_components_with_contract_policy(
             &contract,
@@ -2780,6 +2923,55 @@ fn inject_global_css_into_shells(
     touched
 }
 
+/// Inline an optional app-authored `<head>` partial into every route shell,
+/// immediately after the charset meta — so it runs BEFORE the body is parsed or
+/// painted. The intended use is a tiny blocking preferences/theme bootstrap that
+/// reads `localStorage` and stamps `data-*` attributes onto `<html>` pre-paint,
+/// eliminating the flash-of-default-theme a hydration-time effect would
+/// otherwise cause (the islands hydrate on idle, well after first paint).
+///
+/// Looked up at `<root>/src/head.html` then `<root>/head.html`; absent → no-op.
+/// The file is raw head HTML — the app writes whatever it needs (a `<script>`,
+/// `<link rel=preconnect>`, …) and ALBEDO injects it verbatim. Idempotent via a
+/// sentinel marker. Returns the number of routes touched.
+fn inject_head_partial_into_shells(
+    manifest: &mut dom_render_compiler::manifest::schema::RenderManifestV2,
+    root: &Path,
+) -> usize {
+    let partial = ["src/head.html", "head.html"]
+        .into_iter()
+        .map(|rel| root.join(rel))
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    if partial.trim().is_empty() {
+        return 0;
+    }
+
+    const MARKER: &str = "<!--albedo:head-partial-->";
+    let block = format!("{MARKER}{partial}");
+    const CHARSET: &str = "<meta charset=\"utf-8\">";
+
+    let mut touched = 0usize;
+    for route in manifest.routes.values_mut() {
+        let head = &mut route.shell.doctype_and_head;
+        // Idempotent — never double-inject if a shell already carries it.
+        if head.contains(MARKER) {
+            continue;
+        }
+        // Place it right after the charset meta (keeps charset first, the
+        // partial still inside the first bytes of <head> and ahead of <body>).
+        if let Some(pos) = head.find(CHARSET) {
+            head.insert_str(pos + CHARSET.len(), &block);
+        } else if let Some(pos) = head.find("<head>") {
+            head.insert_str(pos + "<head>".len(), &block);
+        } else {
+            head.insert_str(0, &block);
+        }
+        touched += 1;
+    }
+    touched
+}
+
 fn dev_shell_base_css() -> &'static str {
     r#"
 :root {
@@ -3259,12 +3451,23 @@ fn escape_html(input: &str) -> String {
 /// signature; the gate work happens in
 /// [`run_prod_build_with_budget`].
 fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
-    run_prod_build_with_budget(contract, false)
+    // serve / dev startup call this — full build presentation, no tier report
+    // (that's reserved for the explicit `albedo build`).
+    run_prod_build_with_budget(contract, false, false, false)
+}
+
+/// Silent build for the dev hot-reload path — does the full build but prints
+/// nothing (the watcher prints a single "reloaded in Xms" line instead of the
+/// whole build log on every save). Warnings and errors still surface.
+fn run_prod_build_quiet(contract: &ResolvedDevContract) -> Result<(), String> {
+    run_prod_build_with_budget(contract, false, false, true)
 }
 
 fn run_prod_build_with_budget(
     contract: &ResolvedDevContract,
     skip_budget: bool,
+    show_tiers: bool,
+    quiet: bool,
 ) -> Result<(), String> {
     let out_dir = contract.project_dir.join(".albedo").join("dist");
 
@@ -3279,20 +3482,25 @@ fn run_prod_build_with_budget(
         ));
     }
 
-    print_section("build");
-    print_kv("components", components.len());
-    print_kv(
-        "scan",
-        colorize_timing_ms(scan_start.elapsed().as_secs_f64() * 1000.0),
-    );
+    // `quiet` (dev hot reload) does the whole build silently so a save prints a
+    // single "reloaded in Xms" line — the presentation below is suppressed, but
+    // warnings and errors still surface.
+    if !quiet {
+        print_section("build");
+        print_kv("components", components.len());
+        print_kv(
+            "scan",
+            colorize_timing_ms(scan_start.elapsed().as_secs_f64() * 1000.0),
+        );
+    }
 
     let compile_start = Instant::now();
     let out_dir_for_closure = out_dir.clone();
-    let (mut manifest, report, missing_sources) = with_spinner("compiling production bundle…", move || {
+    let build_work = move || {
         let scanner = ProjectScanner::new();
         let compiler = scanner.build_compiler(components);
-        let manifest = compiler
-            .optimize_manifest_v2()
+        let (manifest, tier_report) = compiler
+            .optimize_manifest_v2_with_tier_report()
             .map_err(|err| format!("failed to optimize manifest: {err}"))?;
 
         let mut module_sources = HashMap::new();
@@ -3320,8 +3528,20 @@ fn run_prod_build_with_budget(
                 &out_dir_for_closure,
             )
             .map_err(|err| format!("failed to emit production artifacts: {err}"))?;
-        Ok::<_, String>((manifest, report, missing_sources))
-    })?;
+        Ok::<_, String>((manifest, tier_report, report, missing_sources))
+    };
+    let (mut manifest, tier_report, report, missing_sources) = if quiet {
+        build_work()?
+    } else {
+        with_spinner("compiling production bundle…", build_work)?
+    };
+
+    // `albedo build` shows the tier breakdown — the "instrument for light" view
+    // of what the app compiled to (luminance bars per tier). Suppressed for
+    // serve / dev (re)builds so a hot reload stays a single line.
+    if show_tiers {
+        printer::print_tier_report(&tier_report, &contract.root.display().to_string());
+    }
 
     // A4 · inline global CSS into every route shell so prod ships the
     // same styles dev inlines. Runs after the manifest is built but
@@ -3329,6 +3549,13 @@ fn run_prod_build_with_budget(
     // from `render-manifest.v2.json`); the emit step above writes JS
     // chunks only and never the shell, so this ordering is safe.
     let css_routes = inject_global_css_into_shells(&mut manifest, &contract.root);
+
+    // Inline the optional `src/head.html` pre-paint partial (theme/preferences
+    // bootstrap) into every shell head, right after the charset meta.
+    let head_partial_routes = inject_head_partial_into_shells(&mut manifest, &contract.root);
+    if head_partial_routes > 0 && !quiet {
+        println!("    head partial inlined into {head_partial_routes} routes");
+    }
 
     let manifest_json = serde_json::to_string_pretty(&manifest)
         .map_err(|err| format!("failed to serialize manifest: {err}"))?;
@@ -3403,20 +3630,22 @@ fn run_prod_build_with_budget(
     // manifest's pre-baked route shell; a literal `index.html` in
     // dist would shadow it via the public-assets dispatch.
 
-    print_ok(format!(
-        "built in {}",
-        colorize_timing_ms(compile_start.elapsed().as_secs_f64() * 1000.0)
-    ));
-    print_kv("output", out_dir.display());
-    print_kv("artifacts", report.artifacts.len() + 5);
-    if css_routes > 0 {
-        print_kv(
-            "global css",
-            format!(
-                "inlined into {css_routes} route{}",
-                if css_routes == 1 { "" } else { "s" }
-            ),
-        );
+    if !quiet {
+        print_ok(format!(
+            "built in {}",
+            colorize_timing_ms(compile_start.elapsed().as_secs_f64() * 1000.0)
+        ));
+        print_kv("output", out_dir.display());
+        print_kv("artifacts", report.artifacts.len() + 5);
+        if css_routes > 0 {
+            print_kv(
+                "global css",
+                format!(
+                    "inlined into {css_routes} route{}",
+                    if css_routes == 1 { "" } else { "s" }
+                ),
+            );
+        }
     }
     if missing_sources > 0 {
         print_warn(format!(
@@ -3431,23 +3660,22 @@ fn run_prod_build_with_budget(
         &hydration_asset_path,
         &link_forms_asset_path,
     );
-    for artifact in report.artifacts.iter().take(6) {
-        println!(
-            "    {} {} {}",
-            style_256("·", MUTED, false),
-            artifact.relative_path,
-            style(&format!("({} B)", artifact.bytes), "2")
-        );
-    }
-    if report.artifacts.len() > 6 {
-        println!(
-            "    {} {}",
-            style_256("·", MUTED, false),
-            style(
-                &format!("+{} more", report.artifacts.len() - 6),
-                "2"
-            )
-        );
+    if !quiet {
+        for artifact in report.artifacts.iter().take(6) {
+            println!(
+                "    {} {} {}",
+                style_256("·", MUTED, false),
+                artifact.relative_path,
+                style(&format!("({} B)", artifact.bytes), "2")
+            );
+        }
+        if report.artifacts.len() > 6 {
+            println!(
+                "    {} {}",
+                style_256("·", MUTED, false),
+                style(&format!("+{} more", report.artifacts.len() - 6), "2")
+            );
+        }
     }
 
     // Phase N · copy `<project>/public/` into `.albedo/dist/public/`
@@ -3460,7 +3688,7 @@ fn run_prod_build_with_budget(
     if public_src.is_dir() {
         let public_dst = out_dir.join("public");
         let copied = copy_public_dir(&public_src, &public_dst)?;
-        if copied > 0 {
+        if copied > 0 && !quiet {
             print_kv(
                 "public",
                 format!("{copied} file{}", if copied == 1 { "" } else { "s" }),
@@ -3692,27 +3920,27 @@ fn print_init_success(project_name: &str) {
         style_256(project_name, ACCENT_SOFT, true),
         style("/", "2")
     ));
-    print_section("next steps");
+    println!();
+    println!(
+        "  {}",
+        style("a starter, lit — three components, one at each tier of light.", "2")
+    );
+    println!();
+    print_section("next");
     println!(
         "    {}  cd {}",
         style_256("1", ACCENT, true),
-        style(project_name, "1")
+        style_256(project_name, ACCENT_SOFT, true)
     );
     println!(
-        "    {}  albedo dev",
-        style_256("2", ACCENT, true)
+        "    {}  {}",
+        style_256("2", ACCENT, true),
+        style_256("albedo dev", ACCENT_SOFT, true)
     );
     println!();
     println!(
         "  {}",
-        style(
-            "the starter has three components — one at each effect tier.",
-            "2"
-        )
-    );
-    println!(
-        "  {}",
-        style("run albedo dev to see how AlBDO classifies them.", "2")
+        style("run it, and watch albedo sort them by how much they move.", "2")
     );
     println!();
 }
@@ -4055,17 +4283,13 @@ fn print_help() {
     );
 
     print_section("commands");
-    print_command("init", "<project>", "scaffold a new app");
-    print_command("dev", "[dir]", "Phase K dev server with HMR + actions");
-    print_command("build", "[dir]", "compile manifest + bundle (tier-budget gated)");
-    print_command("ship", "[dir]", "build + configure deploy target");
-    print_command(
-        "serve",
-        "",
-        "build then boot a real AlbedoServer (actions, broadcast, WT)",
-    );
-    print_command("files", "[dir]", "static file server (defaults to .albedo/dist)");
-    print_command("budget", "[dir]", "standalone tier-budget gate (CI-friendly)");
+    print_command("init", "<name>", "scaffold a new app");
+    print_command("dev", "[dir]", "start the dev server — live reload");
+    print_command("build", "[dir]", "compile for production");
+    print_command("serve", "", "build and run the production server");
+    print_command("ship", "[dir]", "build and configure a deploy target");
+    print_command("files", "[dir]", "serve static files from a folder");
+    print_command("budget", "[dir]", "check the tier budget");
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
 
@@ -4143,28 +4367,23 @@ fn print_serve_help() {
     );
     println!();
     println!(
-        "    {} build the project then boot a real AlbedoServer:",
+        "    {} builds your app, then runs the production server:",
         style("·", "2")
     );
     println!(
         "        {} {}",
-        style("·", "2"),
-        "manifest-streaming for every route (Tier-A inline, Tier-B opcodes)"
+        style_256("·", ACCENT_DEEP, false),
+        style("streams every route — static inline, dynamic on demand", "2")
     );
     println!(
         "        {} {}",
-        style("·", "2"),
-        "POST /_albedo/action dispatch into the CompiledProject"
+        style_256("·", ACCENT_DEEP, false),
+        style("runs your server actions and live shared state", "2")
     );
     println!(
         "        {} {}",
-        style("·", "2"),
-        "broadcast-topic fan-out over the WT patches lane"
-    );
-    println!(
-        "        {} {}",
-        style("·", "2"),
-        "GET /_albedo/runtime.js + /_albedo/link-forms.js served from <dist>/_albedo/"
+        style_256("·", ACCENT_DEEP, false),
+        style("hydrates interactive islands with zero round-trips", "2")
     );
     println!();
     print_option("--host <IP>", "bind host (default: 127.0.0.1)");
@@ -4177,19 +4396,27 @@ fn print_serve_help() {
 }
 
 fn print_command(command: &str, args: &str, description: &str) {
+    // Align the description column no matter how long the command/args are. ANSI
+    // escapes have zero display width, so pad on the PLAIN text, then colorize —
+    // padding a pre-styled string counts the escape bytes and skews the column.
+    let plain_len = command.chars().count() + 1 + args.chars().count();
+    let pad = COL_WIDTH.saturating_sub(plain_len);
     println!(
-        "    {} {}  {}",
+        "    {} {}{}  {}",
         style_256(command, ACCENT_SOFT, true),
-        style(&format!("{:<14}", args), "2"),
-        description
+        style(args, "2"),
+        " ".repeat(pad),
+        description,
     );
 }
 
 fn print_option(option: &str, description: &str) {
+    let pad = COL_WIDTH.saturating_sub(option.chars().count());
     println!(
-        "    {:<22} {}",
-        style(option, "1"),
-        style(description, "2")
+        "    {}{}  {}",
+        style_256(option, ACCENT_SOFT, true),
+        " ".repeat(pad),
+        style(description, "2"),
     );
 }
 
@@ -4210,6 +4437,59 @@ fn print_banner() {
         style(env!("CARGO_PKG_VERSION"), "1"),
         style("— fast JSX for Rust", "2")
     );
+    // Halation halo — a dim champagne hairline under the wordmark (the glow
+    // around a bright thing). Six glyphs to match "albedo".
+    println!("  {}", style_256("──────", ACCENT_DEEP, false));
+    println!();
+}
+
+/// The server-boot masthead — the first thing anyone sees when an ALBEDO
+/// server comes up, so it earns a full block wordmark rather than the compact
+/// `print_banner` line the help screens use. The letters glow top-down through
+/// the champagne ramp (light catching the crown, cooling to deep gold in the
+/// drop-shadow base — Halation made literal). `NO_COLOR` degrades gracefully:
+/// the block shape still reads in monochrome.
+fn print_boot_banner() {
+    // "ALBDO" in the FIGlet "ANSI Shadow" font (generated with pyfiglet, not
+    // hand-drawn). The apostrophe has no glyph in this font, so the mark reads
+    // ALBDO up top and the literal "ALB'DO" lives in the tagline below. Every
+    // row is 41 cells wide; regenerate rather than edit by hand if the text
+    // ever changes: `pyfiglet -f ansi_shadow ALBDO`.
+    const ART: [&str; 6] = [
+        " █████╗ ██╗     ██████╗ ██████╗  ██████╗ ",
+        "██╔══██╗██║     ██╔══██╗██╔══██╗██╔═══██╗",
+        "███████║██║     ██████╔╝██║  ██║██║   ██║",
+        "██╔══██║██║     ██╔══██╗██║  ██║██║   ██║",
+        "██║  ██║███████╗██████╔╝██████╔╝╚██████╔╝",
+        "╚═╝  ╚═╝╚══════╝╚═════╝ ╚═════╝  ╚═════╝ ",
+    ];
+    // Vertical glow: cream at the crown, cooling through gold to deep gold in
+    // the shadow row. Reads as light catching the top edge of the letters.
+    const ROW_LUMEN: [u8; 6] = [230, 223, 222, 221, 179, 137];
+
+    println!();
+    for (row, line) in ART.iter().enumerate() {
+        println!("  {}", style_256(line, ROW_LUMEN[row], true));
+    }
+    println!();
+    // The brand + the "version" label, then the solar tier ladder (STRATEGY's
+    // Sol → Equinox → Umbra → Persephone) as the signature line — muted so the
+    // hierarchy holds: mark brightest, Version Beta next, the tiers a quiet
+    // footer. Slashes dimmed to let the names carry.
+    let sep = style(" / ", "2");
+    let tiers = ["SOL", "EQUINOX", "UMBRA", "PERSEPHONE"]
+        .iter()
+        .map(|name| style_256(name, MUTED, false))
+        .collect::<Vec<_>>()
+        .join(&sep);
+    println!(
+        "  {}  {}   {}",
+        gradient_text("ALB'DO", &BRAND_PALETTE, true),
+        style_256("Version Beta", ACCENT_SOFT, true),
+        tiers,
+    );
+    // Full-width champagne hairline — the halo under the mark (41 to match art).
+    println!("  {}", style_256(&"─".repeat(41), ACCENT_DEEP, false));
     println!();
 }
 
@@ -4288,16 +4568,24 @@ where
 }
 
 fn colorize_timing_ms(value_ms: f64) -> String {
-    let code = if value_ms <= 1.0 {
-        "1;32"
-    } else if value_ms <= 25.0 {
-        "1;36"
-    } else if value_ms <= 250.0 {
-        "1;33"
+    // Glow intensity (A+B blend): a faster path burns brighter — sub-ms is cream
+    // (hottest), then it cools through gold as the work gets heavier, and only a
+    // genuinely slow path drops to a warm red. Speed reads as light.
+    // Thresholds span both sub-ms renders/dispatch AND multi-hundred-ms builds,
+    // so a normal build glows gold, not alarm-red — only a genuinely slow path
+    // (>2s) cools to warm red.
+    let color = if value_ms <= 1.0 {
+        230 // cream — hottest (a sub-ms render / action)
+    } else if value_ms <= 50.0 {
+        222 // bright gold
+    } else if value_ms <= 500.0 {
+        ACCENT // gold — a snappy build
+    } else if value_ms <= 2000.0 {
+        ACCENT_DEEP // deep gold — a heavier build
     } else {
-        "1;31"
+        167 // warm red — genuinely slow
     };
-    style(&format!("{value_ms:.2}ms"), code)
+    style_256(&format!("{value_ms:.2}ms"), color, true)
 }
 
 fn gradient_text(value: &str, palette: &[u8], bold: bool) -> String {

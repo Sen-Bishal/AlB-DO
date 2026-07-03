@@ -1,7 +1,7 @@
 {
   ".claude/launch.json": {
-    "mtime": 1782660181.586589,
-    "ast_hash": "deca566c48955dc59dce8f13b45af6e0",
+    "mtime": 1782942736.8059165,
+    "ast_hash": "2c9b0179cc5a437630d42d9db2f4eaea",
     "semantic_hash": ""
   },
   ".claude/settings.json": {
@@ -30,8 +30,8 @@
     "semantic_hash": "63b0cf22511ebe193fd6e4f68c32f65c"
   },
   "assets/albedo-client.js": {
-    "mtime": 1782543936.6307282,
-    "ast_hash": "b835ade1659e5fbb73c0321a942797d9",
+    "mtime": 1782805559.9962983,
+    "ast_hash": "39edb0dcf6c7edea8c18238dce6d2cee",
     "semantic_hash": ""
   },
   "assets/albedo-error-overlay.js": {
@@ -50,9 +50,9 @@
     "semantic_hash": "9ac6503b46285ebbeed92892eefe73e3"
   },
   "assets/albedo-link-forms.js": {
-    "mtime": 1780257235.4004138,
-    "ast_hash": "60461afd636d2d30c3e9855fb691dbda",
-    "semantic_hash": "60461afd636d2d30c3e9855fb691dbda"
+    "mtime": 1782980273.8704925,
+    "ast_hash": "f1118b3d25965548d19e2f70e7b4dd0e",
+    "semantic_hash": ""
   },
   "assets/albedo-reactive.js": {
     "mtime": 1781973606.608875,
@@ -180,9 +180,9 @@
     "semantic_hash": "35624d48ec845c6c69631de873a05d8a"
   },
   "crates/albedo-server/src/boot.rs": {
-    "mtime": 1781942546.3642702,
-    "ast_hash": "b1e87fd9d04de6447f3f8a882f4af4f5",
-    "semantic_hash": "b1e87fd9d04de6447f3f8a882f4af4f5"
+    "mtime": 1783003405.3384426,
+    "ast_hash": "49bcd89b566474bcc0241d195cf6c86f",
+    "semantic_hash": ""
   },
   "crates/albedo-server/src/config.rs": {
     "mtime": 1781942305.8652275,
@@ -250,8 +250,8 @@
     "semantic_hash": "1425dc2b2c5772031d44a6f7674adaaa"
   },
   "crates/albedo-server/src/handlers/streaming.rs": {
-    "mtime": 1782744633.7824593,
-    "ast_hash": "e03853c499b3345f0fa67958c894eba7",
+    "mtime": 1782928155.264649,
+    "ast_hash": "8db429aa0f841eca18148f9d49887404",
     "semantic_hash": ""
   },
   "crates/albedo-server/src/inspector/api.rs": {
@@ -295,9 +295,9 @@
     "semantic_hash": "eee518ecb776111c7e4db6b59d68da0e"
   },
   "crates/albedo-server/src/lib.rs": {
-    "mtime": 1781942546.371717,
-    "ast_hash": "ce812c5361cb222f6bd6fd92ff124948",
-    "semantic_hash": "ce812c5361cb222f6bd6fd92ff124948"
+    "mtime": 1783003361.1099288,
+    "ast_hash": "9eedc7adc01af6f9168d664ae60dddd6",
+    "semantic_hash": ""
   },
   "crates/albedo-server/src/lifecycle.rs": {
     "mtime": 1781942305.914225,
@@ -320,18 +320,18 @@
     "semantic_hash": "f6227e6b989c959f3d83890029424a43"
   },
   "crates/albedo-server/src/render/mod.rs": {
-    "mtime": 1781942546.3732748,
+    "mtime": 1782978984.4513779,
     "ast_hash": "9f840234d02fba7f46f73af260526b36",
     "semantic_hash": "9f840234d02fba7f46f73af260526b36"
   },
   "crates/albedo-server/src/render/tier_b.rs": {
-    "mtime": 1782744628.0241463,
-    "ast_hash": "151deca116f137d02f1cc9c5de66c25c",
+    "mtime": 1782919643.143717,
+    "ast_hash": "681ed3646cb56c9b3bed5da9b3d8113a",
     "semantic_hash": ""
   },
   "crates/albedo-server/src/renderer_runtime.rs": {
-    "mtime": 1782547072.659607,
-    "ast_hash": "0a1f8c999cc1731eac9f198d852d41f6",
+    "mtime": 1782919438.508284,
+    "ast_hash": "09c143e375d3fdf5f15974ecd7c56c86",
     "semantic_hash": ""
   },
   "crates/albedo-server/src/routing.rs": {
@@ -340,8 +340,8 @@
     "semantic_hash": "6299433de1e02bbba107e2d0e21d3866"
   },
   "crates/albedo-server/src/server.rs": {
-    "mtime": 1782680033.6734495,
-    "ast_hash": "64abe70fa8d0efa9c256418c47ed1172",
+    "mtime": 1783003464.953593,
+    "ast_hash": "dffdb96eecced6518801e6fc13c64b9c",
     "semantic_hash": ""
   },
   "crates/albedo-server/src/webtransport.rs": {
@@ -375,9 +375,9 @@
     "semantic_hash": "573f184812798d830c2da007db15e857"
   },
   "crates/albedo-server/tests/serve_boot_end_to_end.rs": {
-    "mtime": 1781942546.3773446,
-    "ast_hash": "dd94bca8337f02bd611e0749e55ba1fe",
-    "semantic_hash": "dd94bca8337f02bd611e0749e55ba1fe"
+    "mtime": 1782942349.9885838,
+    "ast_hash": "dc21307626fe9553f2f6802634f69c07",
+    "semantic_hash": ""
   },
   "crates/albedo-server/tests/server_wire_integration.rs": {
     "mtime": 1781942546.3773446,
@@ -500,8 +500,8 @@
     "semantic_hash": "b8fe5794940ac0b6545a6bcf4ad9b975"
   },
   "src/bin/albedo.rs": {
-    "mtime": 1782659939.7243564,
-    "ast_hash": "ce4da662965ba96c5032a7a042ec2c5f",
+    "mtime": 1783064446.3665047,
+    "ast_hash": "52a3557f1ffebce7156df31373c08bcc",
     "semantic_hash": ""
   },
   "src/bin/albedo/first_run.rs": {
@@ -515,9 +515,9 @@
     "semantic_hash": "d1a46fdf2d096d1e2848ee8d48f5ed09"
   },
   "src/bin/albedo/printer.rs": {
-    "mtime": 1781942546.379347,
-    "ast_hash": "9a7f85add3b10f021bbe93219254bb49",
-    "semantic_hash": "9a7f85add3b10f021bbe93219254bb49"
+    "mtime": 1782944427.714104,
+    "ast_hash": "253ff7aeb476c09633ccf3880653ad46",
+    "semantic_hash": ""
   },
   "src/bin/dom-compiler.rs": {
     "mtime": 1781942306.0928252,
@@ -545,8 +545,8 @@
     "semantic_hash": "12ae05ec6702e95985f6c944a4b994d2"
   },
   "src/budget/report.rs": {
-    "mtime": 1782547207.056066,
-    "ast_hash": "aff674c2eb29c08209acbde6d715f450",
+    "mtime": 1782853139.148006,
+    "ast_hash": "8f8c6acf0f7aab1c7e121ec67be78025",
     "semantic_hash": ""
   },
   "src/bundler/classify.rs": {
@@ -630,9 +630,9 @@
     "semantic_hash": "b635d17d838628d7075f8b5a63918853"
   },
   "src/effects.rs": {
-    "mtime": 1782027584.2896447,
-    "ast_hash": "39a7cdd8b884e56b3538dc278e550fe9",
-    "semantic_hash": "39a7cdd8b884e56b3538dc278e550fe9"
+    "mtime": 1782805310.0201821,
+    "ast_hash": "c7fab078d9c38ed71415ae52dcc1cfa3",
+    "semantic_hash": ""
   },
   "src/estimator.rs": {
     "mtime": 1782658465.2139711,
@@ -660,9 +660,9 @@
     "semantic_hash": "49af57e29e640735bd576afb4997f9c6"
   },
   "src/hydration/script.rs": {
-    "mtime": 1781942306.281903,
-    "ast_hash": "58f636a9bd92ce6a30205dbb184061a7",
-    "semantic_hash": "58f636a9bd92ce6a30205dbb184061a7"
+    "mtime": 1782805543.7197032,
+    "ast_hash": "8d58734dd00fdbed8d7a7d5a88eabdb1",
+    "semantic_hash": ""
   },
   "src/incremental.rs": {
     "mtime": 1782462926.1269052,
@@ -705,8 +705,8 @@
     "semantic_hash": "8bc8485b91be3347035d85996946577d"
   },
   "src/manifest/builder.rs": {
-    "mtime": 1782679946.5810122,
-    "ast_hash": "3efcd09a567f7f5126681b764f846356",
+    "mtime": 1782855438.8011773,
+    "ast_hash": "9e4e5d9b99e03d69b1df4fed993d6784",
     "semantic_hash": ""
   },
   "src/manifest/metadata.rs": {
@@ -720,13 +720,13 @@
     "semantic_hash": ""
   },
   "src/manifest/schema.rs": {
-    "mtime": 1782546909.2361774,
-    "ast_hash": "c0afa486f6d5fa724dd88d306ba42a13",
+    "mtime": 1782853117.2590292,
+    "ast_hash": "4b5efef7cf5307cfe78924c4271f55f3",
     "semantic_hash": ""
   },
   "src/parser.rs": {
-    "mtime": 1782681222.8748922,
-    "ast_hash": "e6d2021ab66eefbbcd762a021473060c",
+    "mtime": 1782747142.5074933,
+    "ast_hash": "983c874bab314001e765561bf1c28328",
     "semantic_hash": ""
   },
   "src/routing/file_based.rs": {
@@ -750,9 +750,9 @@
     "semantic_hash": ""
   },
   "src/runtime/bridge.rs": {
-    "mtime": 1781942546.390342,
-    "ast_hash": "d17a7944fad588fbfbd7e8a475e3ce27",
-    "semantic_hash": "d17a7944fad588fbfbd7e8a475e3ce27"
+    "mtime": 1782979235.1772492,
+    "ast_hash": "57a27f77072a3c119996636bae94e3b4",
+    "semantic_hash": ""
   },
   "src/runtime/broadcast.rs": {
     "mtime": 1781942546.3913414,
@@ -760,8 +760,8 @@
     "semantic_hash": "964624f3e9cb7c910b5a982102b76e52"
   },
   "src/runtime/compiled.rs": {
-    "mtime": 1782486579.626371,
-    "ast_hash": "6b1059718ce4365c0393f38a6200373e",
+    "mtime": 1782979105.1545618,
+    "ast_hash": "496da3e056f3da0cb909ebff2fb711fa",
     "semantic_hash": ""
   },
   "src/runtime/dirty_bitmap.rs": {
@@ -785,8 +785,8 @@
     "semantic_hash": "da1079b1cb411cb6f03aab13af957b37"
   },
   "src/runtime/eval/core.rs": {
-    "mtime": 1782486579.6013694,
-    "ast_hash": "01c893b3141e89c8ffe40e250dc9f47b",
+    "mtime": 1782854889.5645566,
+    "ast_hash": "bb3d845144f39c06d5243119638095a7",
     "semantic_hash": ""
   },
   "src/runtime/eval/expr.rs": {
@@ -815,9 +815,9 @@
     "semantic_hash": "e0de3388868bc3ea5dc52ba7ff0363e5"
   },
   "src/runtime/mod.rs": {
-    "mtime": 1781942306.495653,
-    "ast_hash": "92be0d0a09fca3ae65efd60848977a91",
-    "semantic_hash": "92be0d0a09fca3ae65efd60848977a91"
+    "mtime": 1782979239.5500057,
+    "ast_hash": "061ecf402a1d074eb6386cf144ab28a6",
+    "semantic_hash": ""
   },
   "src/runtime/pi_arch.rs": {
     "mtime": 1781942306.4976623,
@@ -830,8 +830,8 @@
     "semantic_hash": "fbd2a393bb2e12b83b5f5c68b433fb98"
   },
   "src/runtime/quickjs_engine.rs": {
-    "mtime": 1782744514.4302216,
-    "ast_hash": "0d5f595a3b2acb50e0e1bbda53c92a65",
+    "mtime": 1782979128.4234188,
+    "ast_hash": "2d95d6859fe36f05d98a7e34a5edd86d",
     "semantic_hash": ""
   },
   "src/runtime/render_observer.rs": {
@@ -895,9 +895,9 @@
     "semantic_hash": "a7b35854a6c5507a13ff89d020172d3d"
   },
   "src/transforms/events.rs": {
-    "mtime": 1781942306.5951948,
-    "ast_hash": "708368e218d173e78775c65e49dfc294",
-    "semantic_hash": "708368e218d173e78775c65e49dfc294"
+    "mtime": 1782921412.2804613,
+    "ast_hash": "f7511f9bb5a689cf17c0ea45574db400",
+    "semantic_hash": ""
   },
   "src/transforms/form.rs": {
     "mtime": 1781942546.4013429,
@@ -1375,8 +1375,8 @@
     "semantic_hash": "46e77f1aeed3b1cb839e3a91038cce7d"
   },
   "tests/reactive_bindings.rs": {
-    "mtime": 1782486579.6363688,
-    "ast_hash": "a9fcfed68b081dff7711a1bae7ba486e",
+    "mtime": 1782921818.2085361,
+    "ast_hash": "d777a7de62ded80dd440190936c56646",
     "semantic_hash": ""
   },
   "tests/shared_slot_golden.rs": {
@@ -1490,9 +1490,9 @@
     "semantic_hash": "17e5f50d2f95cddd96f15ad8e3846ecb"
   },
   "ENDGAME.md": {
-    "mtime": 1780257235.3674126,
-    "ast_hash": "83748789b577b038dfdb65efdd6eb40d",
-    "semantic_hash": "83748789b577b038dfdb65efdd6eb40d"
+    "mtime": 1782999907.711971,
+    "ast_hash": "aff6f353052c2c22a2082d1811bdbf97",
+    "semantic_hash": ""
   },
   "ENDGAME2.md": {
     "mtime": 1782543754.0202045,
@@ -1520,8 +1520,8 @@
     "semantic_hash": "3634b1ffff5f5ab021b7db549fef6968"
   },
   "TODO.md": {
-    "mtime": 1782660513.2496953,
-    "ast_hash": "d76e0bdd192f10565a2795e634707726",
+    "mtime": 1782981514.4323423,
+    "ast_hash": "532368c0cf1175caaf345a25bfbc113f",
     "semantic_hash": ""
   },
   "USING-ALBEDO.md": {
@@ -1757,6 +1757,31 @@
   "tests/adversarial_input.rs": {
     "mtime": 1782545383.0880444,
     "ast_hash": "4af88bad3b5db932db063b45ada28de6",
+    "semantic_hash": ""
+  },
+  "tests/fixtures/hook_compile/event_reading_handler/Component.tsx": {
+    "mtime": 1782921803.2000031,
+    "ast_hash": "df9638e44e2349bc250fa508d89be108",
+    "semantic_hash": ""
+  },
+  "src/runtime/form_result.rs": {
+    "mtime": 1782979009.8225558,
+    "ast_hash": "18e9de553892815b7a4e392419466989",
+    "semantic_hash": ""
+  },
+  "crates/albedo-server/src/timing.rs": {
+    "mtime": 1783003349.8513713,
+    "ast_hash": "2986779359501362205e72195e939af3",
+    "semantic_hash": ""
+  },
+  "PORT_DIFF.md": {
+    "mtime": 1782981495.8791847,
+    "ast_hash": "084ee5a84f24a8b3e32b4c28178f29e1",
+    "semantic_hash": ""
+  },
+  "STRATEGY.md": {
+    "mtime": 1783002213.7443275,
+    "ast_hash": "3da4acaa2f918b5be343186563d38186",
     "semantic_hash": ""
   }
 }

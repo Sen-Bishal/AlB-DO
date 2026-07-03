@@ -1130,6 +1130,50 @@ fn island_skip_contains(name: &str) -> bool {
     })
 }
 
+thread_local! {
+    static LAYOUT_ISLAND_PLACEHOLDERS: Cell<
+        Option<*const std::collections::HashMap<String, String>>,
+    > = const { Cell::new(None) };
+}
+
+/// Install the `component-name → placeholder-id` map of Tier-C islands mounted
+/// in a layout, for the duration of that layout's static render. A route's own
+/// islands emit nothing here (their placeholder is collected separately into the
+/// `<children />` slot); but a layout island has no children slot to fall back
+/// to, so while this map is installed the skipped island emits its real
+/// `<div id="…" data-albedo-tier="c"></div>` placeholder INLINE at its authored
+/// position (masthead, footer, …). The serve path then replaces that exact div
+/// with the hydrated island, anchoring it where the layout put it. RAII guard
+/// restores the previous installation on drop.
+pub(crate) fn install_layout_island_placeholders(
+    map: &std::collections::HashMap<String, String>,
+) -> LayoutIslandPlaceholderGuard {
+    let previous = LAYOUT_ISLAND_PLACEHOLDERS.with(|cell| cell.replace(Some(map as *const _)));
+    LayoutIslandPlaceholderGuard { previous }
+}
+
+pub(crate) struct LayoutIslandPlaceholderGuard {
+    previous: Option<*const std::collections::HashMap<String, String>>,
+}
+
+impl Drop for LayoutIslandPlaceholderGuard {
+    fn drop(&mut self) {
+        LAYOUT_ISLAND_PLACEHOLDERS.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Return the placeholder id for a layout-mounted Tier-C island by name, when a
+/// layout-island map is installed and contains it. `None` everywhere else — so
+/// outside a layout render (or for an island not collected as a layout island)
+/// the skip branch keeps its historical emit-nothing behavior.
+fn layout_island_placeholder_for(name: &str) -> Option<String> {
+    LAYOUT_ISLAND_PLACEHOLDERS.with(|cell| match cell.get() {
+        // Safety: same stack-frame contract as the other Phase K thread-locals.
+        Some(ptr) => unsafe { &*ptr }.get(name).cloned(),
+        None => None,
+    })
+}
+
 /// Phase O.2 / Phase P · Stream C.2 — install a broadcast registry
 /// onto the per-thread Phase K stack. The returned guard restores the
 /// previous installation on drop (Phase K's other thread-locals follow
@@ -3206,7 +3250,20 @@ impl ComponentProject {
             // island, not part of its Tier-A parent's static HTML. When the
             // manifest builder has installed the island set, emit nothing here
             // so the component renders only once — at its placeholder anchor.
+            // EXCEPTION: while a layout-island map is installed (layout render),
+            // emit the island's real placeholder div INLINE so it anchors at its
+            // authored position in the layout — a layout has no `<children />`
+            // slot for the separate placeholder collection to target.
             if island_skip_contains(&tag) {
+                if let Some(placeholder_id) = layout_island_placeholder_for(&tag) {
+                    // Emit RAW (no escaping): the serve path string-replaces this
+                    // exact div, and placeholder ids are always `__c_<slug>_<id>`
+                    // (no markup-significant chars), so escaping would only risk
+                    // a mismatch.
+                    return Ok(format!(
+                        "<div id=\"{placeholder_id}\" data-albedo-tier=\"c\"></div>"
+                    ));
+                }
                 return Ok(String::new());
             }
 

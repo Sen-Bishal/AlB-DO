@@ -58,6 +58,7 @@ pub mod render;
 pub mod renderer_runtime;
 pub mod routing;
 pub mod server;
+pub mod timing;
 pub mod webtransport;
 
 pub use actions::{ActionHandler, SessionSlots};
@@ -93,7 +94,7 @@ pub use renderer_runtime::{
     RendererRuntime, RENDER_MANIFEST_FILENAME, RUNTIME_MODULE_SOURCES_FILENAME,
 };
 pub use routing::{AuthPolicy, CompiledRouter, HttpMethod, MatchedRoute, RouteMatch, RouteTarget};
-pub use server::{AlbedoServer, AlbedoServerBuilder};
+pub use server::{AlbedoServer, AlbedoServerBuilder, DevReloadHandle};
 pub use webtransport::{
     WebTransportRuntime, WebTransportSessionHandle, WebTransportSessionRegistry,
 };

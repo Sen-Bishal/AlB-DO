@@ -51,7 +51,26 @@
   // pair of strings on each side.
   const LINK_ATTR = 'data-albedo-link';
   const FORM_ATTR = 'data-albedo-action';
+  // The authored sentinel, mirrors `transforms::form::FORM_ACTION_PREFIX`. A
+  // client-rendered island keeps `action="action:NAME"` verbatim (no SSR
+  // transform), so the interceptor reads the name from either source.
+  const FORM_ACTION_PREFIX = 'action:';
   const ACTION_ENDPOINT = '/_albedo/action';
+
+  // The albedo action name for a form, or `''` if it isn't an action form.
+  // Prefers the SSR-stamped `data-albedo-action`; falls back to the raw
+  // `action="action:NAME"` sentinel a client-rendered island emits.
+  function resolveFormActionName(form) {
+    const stamped = form.getAttribute(FORM_ATTR);
+    if (stamped) {
+      return stamped;
+    }
+    const raw = form.getAttribute('action');
+    if (raw && raw.slice(0, FORM_ACTION_PREFIX.length) === FORM_ACTION_PREFIX) {
+      return raw.slice(FORM_ACTION_PREFIX.length);
+    }
+    return '';
+  }
 
   // bakabox ActionEventKind discriminants — mirrors
   // `dom_render_compiler::ir::action::ActionEventKind`.
@@ -155,10 +174,16 @@
         return;
       }
       const form = event.target;
-      if (!(form instanceof HTMLFormElement) || !form.hasAttribute(FORM_ATTR)) {
+      if (!(form instanceof HTMLFormElement)) {
         return;
       }
-      const actionName = form.getAttribute(FORM_ATTR);
+      // The action name comes from `data-albedo-action` when the SSR renderer
+      // rewrote the form, OR straight from the authored `action="action:NAME"`
+      // sentinel when the form was rendered CLIENT-SIDE (a Tier-C island's own
+      // render doesn't run the server-side attribute transform). Recognizing the
+      // sentinel here makes an authored form action work identically whether it
+      // was server- or client-rendered — the FNV-1a-32 id is the same either way.
+      const actionName = resolveFormActionName(form);
       if (!actionName) {
         return;
       }
@@ -176,9 +201,15 @@
     const payload = serializeFormToJson(form);
     const actionId = resolveActionId(actionName);
 
+    // `encodeActionEnvelope` (bincode.js) reads camelCase `actionId` /
+    // `eventKind` — the same shape runtime.js's own event dispatcher uses. The
+    // snake_case keys this once passed made the encoder throw
+    // ("actionId … got undefined") synchronously inside the submit listener, so
+    // no form action ever reached the wire. `payload` is already UTF-8 JSON
+    // bytes from `serializeFormToJson`.
     const envelopeBytes = ALBEDO.encodeActionEnvelope({
-      action_id: actionId >>> 0,
-      event_kind: EVENT_KIND_SUBMIT,
+      actionId: actionId >>> 0,
+      eventKind: EVENT_KIND_SUBMIT,
       payload: payload,
     });
 

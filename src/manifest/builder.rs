@@ -49,6 +49,12 @@ struct ShellPlaceholder {
     html: String,
 }
 
+/// Sentinel `parent_placeholder` for a Tier-C island mounted in a layout. It
+/// marks the node so `collect_shell_placeholders` does NOT emit it into the
+/// `<children />` slot — the island's anchor is the inline placeholder the
+/// layout render emits at its authored position instead.
+const LAYOUT_ISLAND_PARENT: &str = "__albedo_layout_island__";
+
 #[derive(Debug, Clone)]
 pub struct ComponentTierMetadata {
     pub tier: Tier,
@@ -154,6 +160,15 @@ impl<'a> ManifestBuilder<'a> {
         // Layout chain comes from discover_routes when `<root>/routes/`
         // exists. Empty otherwise.
         let layout_chain = self.layout_chain_for_route(route);
+
+        // Layout-island reachability — a Tier-C island mounted in a layout isn't
+        // reached by the route-entry `traverse` above, so collect those islands
+        // here and fold them into the route's `tier_c`. They carry a sentinel
+        // parent so `collect_shell_placeholders` skips them; their anchor is the
+        // inline placeholder the layout render emits (via `layout_island_map`).
+        let (layout_islands, layout_island_map) =
+            self.collect_layout_islands(&layout_chain, &mut order_counter, assets);
+        tier_c.extend(layout_islands);
         // Phase P · Stream E.2 — pick the per-route error / loading
         // boundary. `discover_routes` already chose the nearest one
         // (longest matching URL prefix); we translate path → component
@@ -183,6 +198,7 @@ impl<'a> ManifestBuilder<'a> {
             &tier_b,
             &tier_c,
             &layout_chain,
+            &layout_island_map,
             &metadata,
             dynamic_metadata.is_some(),
         );
@@ -415,6 +431,7 @@ impl<'a> ManifestBuilder<'a> {
         tier_b: &[TierBNode],
         tier_c: &[TierCNode],
         layout_chain: &[String],
+        layout_island_map: &std::collections::HashMap<String, String>,
         metadata: &RouteMetadata,
         dynamic_metadata: bool,
     ) -> HtmlShell {
@@ -435,7 +452,7 @@ impl<'a> ManifestBuilder<'a> {
         // When `layout_chain` is empty, `wrap_in_layouts` is a no-op
         // and the body_open shape stays identical to pre-E.1 — no
         // observable change for routes without a `routes/layout.tsx`.
-        let wrapped = self.wrap_in_layouts(inner, layout_chain);
+        let wrapped = self.wrap_in_layouts(inner, layout_chain, layout_island_map);
 
         let mut doctype_and_head = String::from(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
@@ -594,12 +611,23 @@ impl<'a> ManifestBuilder<'a> {
     /// graceful-degradation contract. A missing layout shouldn't
     /// fail the whole build; it just leaves the chain shorter than
     /// the discovered file suggested.
-    fn wrap_in_layouts(&self, leaf_html: String, layout_chain: &[String]) -> String {
+    fn wrap_in_layouts(
+        &self,
+        leaf_html: String,
+        layout_chain: &[String],
+        layout_island_map: &std::collections::HashMap<String, String>,
+    ) -> String {
         use crate::runtime::eval::LAYOUT_CHILDREN_SENTINEL;
 
         if layout_chain.is_empty() {
             return leaf_html;
         }
+
+        // Install the layout-island placeholder map for the duration of every
+        // `render_layout_html` below, so a Tier-C island in the layout emits its
+        // real placeholder div inline (instead of nothing) at its authored spot.
+        let _island_anchor_guard =
+            crate::runtime::eval::core::install_layout_island_placeholders(layout_island_map);
 
         let mut accumulated = leaf_html;
         for layout_name in layout_chain.iter().rev() {
@@ -639,6 +667,79 @@ impl<'a> ManifestBuilder<'a> {
     fn render_layout_html(&self, layout_name: &str) -> Option<String> {
         let component = self.components.values().find(|c| c.name == layout_name)?;
         self.render_static_component_html(component)
+    }
+
+    /// Layout-island reachability — collect every Tier-C island reachable from a
+    /// layout in `layout_chain` and lower it to a `TierCNode`. These islands are
+    /// NOT walked by the route-entry `traverse` (a layout is rendered standalone
+    /// with the `<children />` sentinel, off the route's component subtree), so
+    /// without this pass an island mounted in `layout.tsx` ships no hydration
+    /// block on serve.
+    ///
+    /// Returns the nodes plus the `name → placeholder_id` map the renderer
+    /// consults (via `install_layout_island_placeholders`) to emit each island's
+    /// inline placeholder while the layout is rendered. Each node carries the
+    /// [`LAYOUT_ISLAND_PARENT`] sentinel so `collect_shell_placeholders` leaves
+    /// it out of the `<children />` slot — its anchor is the inline div instead.
+    fn collect_layout_islands(
+        &self,
+        layout_chain: &[String],
+        order_counter: &mut u32,
+        assets: &AssetManifest,
+    ) -> (Vec<TierCNode>, std::collections::HashMap<String, String>) {
+        use std::collections::HashSet;
+
+        let mut nodes = Vec::new();
+        let mut map = std::collections::HashMap::new();
+        let mut emitted: HashSet<ComponentId> = HashSet::new();
+        let mut visited: HashSet<ComponentId> = HashSet::new();
+
+        for layout_name in layout_chain {
+            let Some(layout_id) = self
+                .components
+                .iter()
+                .find(|(_, c)| &c.name == layout_name)
+                .map(|(id, _)| *id)
+            else {
+                continue;
+            };
+
+            // Depth-first walk of the layout's render subtree. Recurse through
+            // Tier-A/Tier-B so an island nested inside the layout's static markup
+            // is still found; a Tier-C node is the island boundary — its own
+            // subtree belongs to the island and isn't walked here. `visited`
+            // guards against dependency cycles; `emitted` dedups an island shared
+            // across multiple layouts in the chain.
+            let mut stack = self.sorted_children(layout_id);
+            while let Some(id) = stack.pop() {
+                if !visited.insert(id) {
+                    continue;
+                }
+                match self.tier_of(id) {
+                    Some(Tier::C) => {
+                        if !emitted.insert(id) {
+                            continue;
+                        }
+                        let node = self.build_tier_c_node(
+                            id,
+                            Some(LAYOUT_ISLAND_PARENT.to_string()),
+                            order_counter,
+                            assets,
+                        );
+                        map.insert(node.component_id.clone(), node.placeholder_id.clone());
+                        nodes.push(node);
+                    }
+                    Some(Tier::A) | Some(Tier::B) => {
+                        for child in self.sorted_children(id) {
+                            stack.push(child);
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        (nodes, map)
     }
 
     fn traverse(
@@ -908,6 +1009,7 @@ impl<'a> ManifestBuilder<'a> {
                 slot: "default".to_string(),
                 order: next_order(order_counter),
             },
+            side_effects: metadata.effect_profile.side_effects,
         }
     }
 
@@ -1528,5 +1630,90 @@ mod tests {
         assert_eq!(stream_slot_label(WT_STREAM_SLOT_SHELL), "shell");
         assert_eq!(stream_slot_label(WT_STREAM_SLOT_PATCHES), "patch");
         assert_eq!(stream_slot_label(WT_STREAM_SLOT_PREFETCH), "prefetch");
+    }
+
+    /// Layout-island reachability — a Tier-C island mounted in a layout (not on
+    /// the route) is lifted into the route's islands so it ships a hydration
+    /// block, anchored inline in the layout (sentinel parent → kept out of the
+    /// `<children />` slot) with its name → placeholder-id recorded for the
+    /// renderer. Guards the "discovered → built → dropped at serve" regression.
+    #[test]
+    fn collect_layout_islands_lifts_a_tier_c_island_from_a_layout() {
+        use super::{ComponentTierMetadata, ManifestBuilder, LAYOUT_ISLAND_PARENT};
+        use crate::effects::EffectProfile;
+        use crate::manifest::schema::{AssetManifest, HydrationMode, Tier};
+        use crate::types::{Component, ComponentId};
+        use crate::RenderCompiler;
+        use std::collections::HashMap;
+
+        let mut compiler = RenderCompiler::new();
+
+        let mut layout = Component::new(ComponentId::new(0), "RootLayout".to_string());
+        layout.file_path = "src/routes/layout.tsx".to_string();
+
+        // An effect-bearing Tier-C island, mounted by the layout's masthead.
+        let mut panel = Component::new(ComponentId::new(0), "Panel".to_string());
+        panel.file_path = "src/components/Panel.tsx".to_string();
+        panel.effect_profile.side_effects = true;
+
+        let layout_id = compiler.add_component(layout);
+        let panel_id = compiler.add_component(panel);
+        compiler.add_dependency(layout_id, panel_id).unwrap();
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            layout_id,
+            ComponentTierMetadata {
+                tier: Tier::A,
+                hydration_mode: HydrationMode::None,
+                effect_profile: EffectProfile::default(),
+            },
+        );
+        metadata.insert(
+            panel_id,
+            ComponentTierMetadata {
+                tier: Tier::C,
+                hydration_mode: HydrationMode::OnIdle,
+                effect_profile: EffectProfile {
+                    side_effects: true,
+                    ..EffectProfile::default()
+                },
+            },
+        );
+
+        let builder = ManifestBuilder::new(compiler.graph(), metadata, 1000);
+        let assets = AssetManifest::default();
+        let mut order = 0u32;
+
+        let (nodes, map) =
+            builder.collect_layout_islands(&["RootLayout".to_string()], &mut order, &assets);
+
+        assert_eq!(nodes.len(), 1, "the layout's Tier-C island is lifted");
+        let node = &nodes[0];
+        assert_eq!(node.component_id, "Panel");
+        assert!(
+            node.placeholder_id.starts_with("__c_panel_"),
+            "placeholder id is the standard tier-c scheme; got {}",
+            node.placeholder_id
+        );
+        assert_eq!(
+            node.position.parent_placeholder.as_deref(),
+            Some(LAYOUT_ISLAND_PARENT),
+            "sentinel parent keeps it out of the <children /> slot"
+        );
+        assert!(
+            node.side_effects,
+            "effect flag carried so fix #2 keeps it on the A3 hydration path"
+        );
+        assert_eq!(
+            map.get("Panel"),
+            Some(&node.placeholder_id),
+            "renderer map points the island name at its inline placeholder id"
+        );
+
+        // A layout with no island lifts nothing — no spurious blocks.
+        let (empty_nodes, empty_map) =
+            builder.collect_layout_islands(&[], &mut order, &assets);
+        assert!(empty_nodes.is_empty() && empty_map.is_empty());
     }
 }
