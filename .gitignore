@@ -240,3 +240,6 @@ nul
 
 # Private brainstorming / planning docs — not tracked (see legend.md + README.md for public docs)
 /development-plan/
+
+# Personal — for us, not for the repo.
+/FORUS.md
