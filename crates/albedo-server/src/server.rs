@@ -217,6 +217,16 @@ struct RuntimeState {
     /// A persistent server property (not part of the swappable `RenderWorld`),
     /// so a dev hot-swap keeps it. `true` for CLI dev/serve, `false` otherwise.
     request_timings: bool,
+    /// FORGE — the durable storage substrate, opened once at
+    /// [`AlbedoServer::run`] and held here on the **persistent** tier (not the
+    /// swappable `RenderWorld`), so a dev world-swap never reopens the database.
+    /// `None` until `run()` opens it; the field only exists under
+    /// `--features forge`. Shared-slot topic hydration (Gate 1) and
+    /// durable-action writes both resolve the backend through this handle.
+    // Read by the Gate-1 topic-hydration pass, landing in the next task.
+    #[cfg(feature = "forge")]
+    #[allow(dead_code)]
+    forge_substrate: Option<Arc<dyn dom_render_compiler::forge::DataSubstrate>>,
 }
 
 impl RuntimeState {
@@ -927,6 +937,10 @@ impl AlbedoServerBuilder {
             dev_error_registry,
             dev_hmr_registry,
             request_timings: self.request_timings_enabled,
+            // FORGE — opened later, in the async `run()` boot seam; `build()`
+            // is synchronous and `LibSqlSubstrate::open_local` is async.
+            #[cfg(feature = "forge")]
+            forge_substrate: None,
         };
 
         Ok(AlbedoServer {
@@ -1012,7 +1026,45 @@ impl AlbedoServer {
         })
     }
 
-    pub async fn run(self) -> Result<(), RuntimeError> {
+    #[cfg_attr(not(feature = "forge"), allow(unused_mut))]
+    pub async fn run(mut self) -> Result<(), RuntimeError> {
+        // FORGE — open the durable substrate exactly once, before the listener
+        // binds. This is the sole async boot seam (`build()` is synchronous),
+        // and the handle lives on the persistent `RuntimeState` tier so a dev
+        // hot-swap never reopens `forge.db`. Gate-1 topic hydration and the
+        // durable write path both hang off the handle stored here.
+        #[cfg(feature = "forge")]
+        {
+            use dom_render_compiler::forge::{self, LibSqlSubstrate};
+
+            let opened = LibSqlSubstrate::open_local("forge.db").await.map_err(|err| {
+                RuntimeError::ServerStartup(format!("FORGE: failed to open forge.db: {err}"))
+            })?;
+            let substrate: Arc<dyn forge::DataSubstrate> = Arc::new(opened);
+
+            // Gate 1 — hand-authored schema, then materialise every
+            // FORGE-backed shared-slot topic from the substrate into the
+            // broadcast registry BEFORE the listener binds. The register-time
+            // seed leaves these topics at `b"null"`; hydration overwrites them
+            // so the first SSR render reads persisted rows, not the placeholder.
+            forge::skeleton::bootstrap_schema(substrate.as_ref())
+                .await
+                .map_err(|err| {
+                    RuntimeError::ServerStartup(format!("FORGE: schema bootstrap failed: {err}"))
+                })?;
+            forge::skeleton::hydrate_topics(
+                substrate.as_ref(),
+                self.state.world().broadcast.as_ref(),
+            )
+            .await
+            .map_err(|err| {
+                RuntimeError::ServerStartup(format!("FORGE: topic hydration failed: {err}"))
+            })?;
+
+            self.state.forge_substrate = Some(substrate);
+            info!("FORGE substrate opened (forge.db); topics hydrated");
+        }
+
         let addr = self.config.server.socket_addr()?;
         let listener = TcpListener::bind(addr)
             .await
