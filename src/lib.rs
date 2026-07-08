@@ -57,6 +57,7 @@ pub mod bundler;
 pub mod dev;
 pub mod effects;
 pub mod estimator;
+pub mod forge;
 pub mod graph;
 pub mod hydration;
 pub mod incremental;

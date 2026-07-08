@@ -149,7 +149,15 @@ path = "src/bin/dom-compiler.rs"
 name = "albedo-bench"
 path = "src/bin/albedo-bench.rs"
 
+[features]
+# FORGE — the backend-less backend (development-plan/backend.md). Off by
+# default so the standard build never pulls the storage backend; enable
+# with `--features forge`.
+forge = ["dep:libsql"]
+
 [dependencies]
+async-trait.workspace        = true
+libsql                       = { version = "0.6", optional = true }
 crossbeam.workspace          = true
 core_affinity.workspace      = true
 dashmap.workspace            = true
