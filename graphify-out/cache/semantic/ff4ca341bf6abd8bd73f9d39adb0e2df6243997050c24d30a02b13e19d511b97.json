@@ -1,1 +1,0 @@
-{"nodes": [{"id": "to_fixed_expected_to_fixed_feature", "label": "JSX Number.toFixed() fixture", "file_type": "concept", "source_file": "tests/fixtures/jsx_matrix/to_fixed/expected.html", "source_location": null, "source_url": null, "captured_at": null, "author": null, "contributor": null}], "edges": [], "hyperedges": []}

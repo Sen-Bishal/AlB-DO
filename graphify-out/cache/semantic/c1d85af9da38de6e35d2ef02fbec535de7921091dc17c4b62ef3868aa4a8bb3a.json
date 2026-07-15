@@ -1,1 +1,0 @@
-{"nodes": [{"id": "ts_non_null_expected_ts_non_null_feature", "label": "TSX non-null assertion fixture", "file_type": "concept", "source_file": "tests/fixtures/jsx_matrix/ts_non_null/expected.html", "source_location": null, "source_url": null, "captured_at": null, "author": null, "contributor": null}], "edges": [], "hyperedges": []}
