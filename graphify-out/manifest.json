@@ -500,19 +500,14 @@
     "semantic_hash": "b8fe5794940ac0b6545a6bcf4ad9b975"
   },
   "src/bin/albedo.rs": {
-    "mtime": 1783064446.3665047,
-    "ast_hash": "52a3557f1ffebce7156df31373c08bcc",
+    "mtime": 1783066201.6554358,
+    "ast_hash": "e2da88ba6f5c6629c6b6aef82c950bbf",
     "semantic_hash": ""
   },
   "src/bin/albedo/first_run.rs": {
     "mtime": 1781942306.0262885,
     "ast_hash": "7f286acffb66a344e4f2395526cd1a09",
     "semantic_hash": "7f286acffb66a344e4f2395526cd1a09"
-  },
-  "src/bin/albedo/inspector.rs": {
-    "mtime": 1781942546.379347,
-    "ast_hash": "d1a46fdf2d096d1e2848ee8d48f5ed09",
-    "semantic_hash": "d1a46fdf2d096d1e2848ee8d48f5ed09"
   },
   "src/bin/albedo/printer.rs": {
     "mtime": 1782944427.714104,
@@ -700,9 +695,9 @@
     "semantic_hash": ""
   },
   "src/lib.rs": {
-    "mtime": 1781942306.3295944,
-    "ast_hash": "8bc8485b91be3347035d85996946577d",
-    "semantic_hash": "8bc8485b91be3347035d85996946577d"
+    "mtime": 1783176301.4254675,
+    "ast_hash": "6a67b7280306a207c18fa4eca6359b13",
+    "semantic_hash": ""
   },
   "src/manifest/builder.rs": {
     "mtime": 1782855438.8011773,
@@ -1095,9 +1090,9 @@
     "semantic_hash": "c409b9eefeda99705758cd7da2cfe0fb"
   },
   "tests/fixtures/golden/manifest_v2_test_app_components.json": {
-    "mtime": 1781595595.3234081,
-    "ast_hash": "e7c63184fcc75cb49680ebe56537c165",
-    "semantic_hash": "e7c63184fcc75cb49680ebe56537c165"
+    "mtime": 1783065384.5642447,
+    "ast_hash": "d31133f00cd7fa45e9ba58abf2fdf1c5",
+    "semantic_hash": ""
   },
   "tests/fixtures/hook_compile/attr_toggle/Component.tsx": {
     "mtime": 1781707604.805772,
@@ -1489,21 +1484,6 @@
     "ast_hash": "17e5f50d2f95cddd96f15ad8e3846ecb",
     "semantic_hash": "17e5f50d2f95cddd96f15ad8e3846ecb"
   },
-  "ENDGAME.md": {
-    "mtime": 1782999907.711971,
-    "ast_hash": "aff6f353052c2c22a2082d1811bdbf97",
-    "semantic_hash": ""
-  },
-  "ENDGAME2.md": {
-    "mtime": 1782543754.0202045,
-    "ast_hash": "54b6005e2ffb8e78512f5f718272969e",
-    "semantic_hash": ""
-  },
-  "Implemenatation-plan.md": {
-    "mtime": 1779264070.2449818,
-    "ast_hash": "244c461ef5aeb79d71ebae9c6059b526",
-    "semantic_hash": "244c461ef5aeb79d71ebae9c6059b526"
-  },
   "LICENSE.md": {
     "mtime": 1779264070.2449818,
     "ast_hash": "6eb8f44127793baf65a5f4aa4b42c727",
@@ -1518,21 +1498,6 @@
     "mtime": 1779264070.2449818,
     "ast_hash": "3634b1ffff5f5ab021b7db549fef6968",
     "semantic_hash": "3634b1ffff5f5ab021b7db549fef6968"
-  },
-  "TODO.md": {
-    "mtime": 1782981514.4323423,
-    "ast_hash": "532368c0cf1175caaf345a25bfbc113f",
-    "semantic_hash": ""
-  },
-  "USING-ALBEDO.md": {
-    "mtime": 1780257235.3764148,
-    "ast_hash": "173877e5ae63f53e9c2b433425c6619c",
-    "semantic_hash": "173877e5ae63f53e9c2b433425c6619c"
-  },
-  "albdo_fixtures.md": {
-    "mtime": 1779264070.246495,
-    "ast_hash": "33fb5354fd9205f511354fcfbb05575c",
-    "semantic_hash": "33fb5354fd9205f511354fcfbb05575c"
   },
   "assets/stress.md": {
     "mtime": 1779264070.2488878,
@@ -1774,14 +1739,29 @@
     "ast_hash": "2986779359501362205e72195e939af3",
     "semantic_hash": ""
   },
-  "PORT_DIFF.md": {
-    "mtime": 1782981495.8791847,
-    "ast_hash": "084ee5a84f24a8b3e32b4c28178f29e1",
+  "src/forge/mem.rs": {
+    "mtime": 1783176296.860284,
+    "ast_hash": "c123dbf71c237bef635c4a04aaee3a0a",
     "semantic_hash": ""
   },
-  "STRATEGY.md": {
-    "mtime": 1783002213.7443275,
-    "ast_hash": "3da4acaa2f918b5be343186563d38186",
+  "src/forge/mod.rs": {
+    "mtime": 1783176250.5205283,
+    "ast_hash": "01c2b412564bcac0dd12a7ad434e8a1f",
+    "semantic_hash": ""
+  },
+  "src/forge/substrate.rs": {
+    "mtime": 1783176278.0848787,
+    "ast_hash": "4bda60e51cc4ab4a2dd961a2e78e3820",
+    "semantic_hash": ""
+  },
+  "src/forge/value.rs": {
+    "mtime": 1783176265.9691741,
+    "ast_hash": "c8305bdc8236674de5d95d24dd52be29",
+    "semantic_hash": ""
+  },
+  "legend.md": {
+    "mtime": 1783067417.3292994,
+    "ast_hash": "81330d3cdb174b7830e4e9f10f5f481b",
     "semantic_hash": ""
   }
 }

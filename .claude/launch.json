@@ -41,6 +41,13 @@
       "runtimeArgs": ["/c", "cd /d A:\\halation && A:\\AlBDO-v-0.1.0\\target\\debug\\albedo.exe dev --port 3009"],
       "port": 3009,
       "autoPort": false
+    },
+    {
+      "name": "forge-guestbook",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": ["/c", "cd /d A:\\forge-guestbook && A:\\AlBDO-v-0.1.0\\target\\debug\\albedo.exe serve --port 3120"],
+      "port": 3120,
+      "autoPort": false
     }
   ]
 }

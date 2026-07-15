@@ -79,6 +79,13 @@ pub struct ManifestBuilder<'a> {
     /// later `error_component` / `loading_component` once Stream E.2
     /// extends the discovery struct).
     discovered_routes: Vec<DiscoveredRoute>,
+    /// FORGE — build-time materialised shared-slot seeds (`topic → JSON
+    /// bytes`), read from the substrate in [`Self::new`]. `render_tier_b_inline`
+    /// pre-seeds its registry with these so the Stream-B pre-render bakes the
+    /// persisted rows into Tier-B HTML instead of the empty `b"null"`
+    /// placeholder. Empty unless the `forge` feature is on and a `forge.db`
+    /// exists at the project root.
+    forge_topic_seeds: Vec<(String, Vec<u8>)>,
 }
 
 impl<'a> ManifestBuilder<'a> {
@@ -98,6 +105,7 @@ impl<'a> ManifestBuilder<'a> {
         let compiled_render_project = build_compiled_render_project(&static_render_project);
         let discovered_routes =
             discover_routes_from_components(&components, working_dir.as_deref());
+        let forge_topic_seeds = materialize_forge_seeds(working_dir.as_deref());
 
         Self {
             graph,
@@ -108,6 +116,7 @@ impl<'a> ManifestBuilder<'a> {
             static_render_project,
             compiled_render_project,
             discovered_routes,
+            forge_topic_seeds,
         }
     }
 
@@ -934,6 +943,13 @@ impl<'a> ManifestBuilder<'a> {
         let slot_store = Arc::new(SlotStore::new());
         let slots = SessionSlotView::new(session, slot_store);
         let broadcast = BroadcastRegistry::new();
+        // FORGE — pre-seed the topics the substrate materialised at build
+        // start, so a `useSharedSlot` read during this pre-render sees the
+        // persisted rows rather than the empty placeholder. No-op when the
+        // seed list is empty (non-forge builds, or no `forge.db`).
+        for (topic, bytes) in &self.forge_topic_seeds {
+            broadcast.topic(topic.as_str(), bytes.clone());
+        }
         // Buffer = 16: deep enough to absorb the auto-subscribe
         // initial-SlotSet burst for projects with many topics, while
         // staying small enough that a runaway producer dies fast.
@@ -1286,6 +1302,53 @@ impl<'a> ManifestBuilder<'a> {
             .get(&id)
             .unwrap_or_else(|| panic!("missing tier metadata for component '{:?}'", id))
     }
+}
+
+/// FORGE — materialise the shared-slot seeds from `forge.db` at the project
+/// root, at build time, so the Stream-B pre-render bakes persisted rows into
+/// Tier-B HTML. Runs on a dedicated thread with its own current-thread runtime:
+/// `albedo build` drives the manifest build synchronously, but dev hot-reload
+/// rebuilds from *inside* the serve runtime, where a bare `block_on` would
+/// panic. Any failure (no `forge.db`, open/query error) degrades to an empty
+/// seed set, leaving non-FORGE behaviour unchanged.
+#[cfg(feature = "forge")]
+fn materialize_forge_seeds(working_dir: Option<&std::path::Path>) -> Vec<(String, Vec<u8>)> {
+    let db_path = working_dir.map_or_else(|| PathBuf::from("forge.db"), |dir| dir.join("forge.db"));
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return Vec::new();
+                };
+                runtime.block_on(async {
+                    let Ok(substrate) =
+                        crate::forge::LibSqlSubstrate::open_local(&db_path).await
+                    else {
+                        return Vec::new();
+                    };
+                    if crate::forge::skeleton::bootstrap_schema(&substrate)
+                        .await
+                        .is_err()
+                    {
+                        return Vec::new();
+                    }
+                    crate::forge::skeleton::materialize_seeds(&substrate)
+                        .await
+                        .unwrap_or_default()
+                })
+            })
+            .join()
+            .unwrap_or_default()
+    })
+}
+
+/// Non-FORGE builds carry no substrate; the seed set is always empty.
+#[cfg(not(feature = "forge"))]
+fn materialize_forge_seeds(_working_dir: Option<&std::path::Path>) -> Vec<(String, Vec<u8>)> {
+    Vec::new()
 }
 
 /// Phase P · build the Phase K render project from the same component
