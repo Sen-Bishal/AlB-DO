@@ -1,11 +1,11 @@
 //! An in-memory [`DataSubstrate`] test double.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 
-use crate::forge::substrate::DataSubstrate;
+use crate::forge::substrate::{DataSubstrate, Transaction};
 use crate::forge::value::{Result, Rows, SqlValue};
 
 /// In-memory test double for [`DataSubstrate`].
@@ -18,7 +18,7 @@ use crate::forge::value::{Result, Rows, SqlValue};
 /// real backend is attached, and as a fixture in tests.
 #[derive(Default)]
 pub struct RecordingSubstrate {
-    inner: Mutex<Recording>,
+    inner: Arc<Mutex<Recording>>,
 }
 
 #[derive(Default)]
@@ -79,6 +79,52 @@ impl DataSubstrate for RecordingSubstrate {
     async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         self.lock().writes.push((sql.to_owned(), params.to_vec()));
         Ok(1)
+    }
+
+    async fn begin(&self) -> Result<Box<dyn Transaction>> {
+        // Share the substrate's recording log so writes made through the
+        // transaction still show up in `writes()` — the least surprising
+        // behaviour for a wiring double.
+        Ok(Box::new(RecordingTransaction {
+            inner: Arc::clone(&self.inner),
+        }))
+    }
+}
+
+/// A transaction over [`RecordingSubstrate`]. It records like its parent but
+/// **cannot actually roll back** — the double doesn't interpret SQL, so it
+/// has no state to undo, and `commit`/`rollback` are both no-ops. Atomicity
+/// is proven against the real libSQL backend, never here; this exists only
+/// to keep the wiring exercisable through `&dyn DataSubstrate`.
+struct RecordingTransaction {
+    inner: Arc<Mutex<Recording>>,
+}
+
+impl RecordingTransaction {
+    fn lock(&self) -> MutexGuard<'_, Recording> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[async_trait]
+impl Transaction for RecordingTransaction {
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Rows> {
+        let mut guard = self.lock();
+        guard.queries.push((sql.to_owned(), params.to_vec()));
+        Ok(guard.responses.pop_front().unwrap_or_default())
+    }
+
+    async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
+        self.lock().writes.push((sql.to_owned(), params.to_vec()));
+        Ok(1)
+    }
+
+    async fn commit(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<()> {
+        Ok(())
     }
 }
 
