@@ -19,12 +19,24 @@ use crate::forge::value::{Result, Rows, SqlValue};
 /// resolution happens in async Rust and the *already-resolved* props then
 /// enter the synchronous JS world.
 ///
+/// ## Atomic writes
+///
+/// [`begin`](DataSubstrate::begin) opens a [`Transaction`]: multiple
+/// statements committed as one unit, or rolled back together. This is the
+/// primitive the oversell invariant needs — decrement the last unit and
+/// record the purchase *atomically*, so a crash between them can neither
+/// oversell nor lose the write. Single-statement
+/// [`execute`](DataSubstrate::execute) stays for the common
+/// non-transactional write.
+///
 /// ## Not here yet
 ///
-/// Durable actions (Phase 0's "a write that survives a process kill") are
-/// an orchestration layer *on top of* [`execute`](DataSubstrate::execute),
-/// not a change to this surface — they'll arrive alongside the libSQL
-/// backend. Kept out of the first cut so the seam stays minimal.
+/// *Durable actions* — a write that not only commits atomically but
+/// *resumes* a partially-run workflow after a process kill — are an
+/// orchestration layer *on top of* [`begin`](DataSubstrate::begin), not a
+/// change to this surface. The transaction seam gives crash-*atomicity*;
+/// crash-*resumability* (Pillar 6's intent log) layers over it and arrives
+/// separately.
 #[async_trait]
 pub trait DataSubstrate: Send + Sync {
     /// Apply a DDL migration (create table / index). Emitted by
@@ -37,9 +49,37 @@ pub trait DataSubstrate: Send + Sync {
     /// serve path makes to pre-resolve a component's `data_deps`.
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Rows>;
 
-    /// Run a write (`INSERT`/`UPDATE`/`DELETE`), returning rows affected.
-    /// Phase 0 wraps this in a durable action so a crash mid-write rolls
-    /// back and resumes; that orchestration layers over this method rather
-    /// than altering it.
+    /// Run a single-statement write (`INSERT`/`UPDATE`/`DELETE`), returning
+    /// rows affected. For a write that must be atomic with a preceding read
+    /// or another write, use [`begin`](DataSubstrate::begin) instead.
     async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64>;
+
+    /// Open an atomic transaction. Statements run through the returned
+    /// [`Transaction`] commit as one unit on
+    /// [`commit`](Transaction::commit) or vanish on
+    /// [`rollback`](Transaction::rollback) (or on drop). The seam the
+    /// crash-safe, no-oversell write is built on.
+    async fn begin(&self) -> Result<Box<dyn Transaction>>;
+}
+
+/// An in-flight atomic transaction over a [`DataSubstrate`].
+///
+/// Reads see the transaction's own uncommitted writes; other connections do
+/// not until [`commit`](Transaction::commit). [`commit`](Transaction::commit)
+/// and [`rollback`](Transaction::rollback) consume the handle, so it cannot
+/// be reused after resolution; dropping it without committing rolls back.
+#[async_trait]
+pub trait Transaction: Send {
+    /// Read within the transaction — sees its own uncommitted writes.
+    async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Rows>;
+
+    /// Write within the transaction, returning rows affected. Not durable
+    /// until [`commit`](Transaction::commit).
+    async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64>;
+
+    /// Commit every buffered statement as one atomic unit.
+    async fn commit(self: Box<Self>) -> Result<()>;
+
+    /// Discard every buffered statement; the store is left untouched.
+    async fn rollback(self: Box<Self>) -> Result<()>;
 }

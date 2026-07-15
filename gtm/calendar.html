@@ -1,0 +1,426 @@
+<meta charset="utf-8">
+<title>ALKMY · Pre-Reveal Content Calendar · ALB'DO + FORGE</title>
+<style>
+:root{
+  --void:#08090B; --void2:#0d0f13; --argent:#C9CACE; --glass:#BFE9F2;
+  --gold:#E8B33D; --oxblood:#C1272D; --ember:#FF7A2F; --glow:#B8FFE3;
+  --cyan:#4DE1FF; --mag:#FF3DCB;
+  --hair:rgba(201,202,206,0.16);
+  --hair2:rgba(201,202,206,0.30);
+  --dim:rgba(201,202,206,0.62);
+  --faint:rgba(201,202,206,0.40);
+  --glowline:rgba(184,255,227,0.26);
+  --display:"Bahnschrift","Arial Narrow","Arial Black",system-ui,sans-serif;
+  --sans:"Segoe UI","Helvetica Neue",Arial,sans-serif;
+  --mono:"Consolas","Cascadia Mono",ui-monospace,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:var(--void);color:var(--argent);
+  -webkit-print-color-adjust:exact;print-color-adjust:exact;font-family:var(--sans);}
+@page{size:A4;margin:0;}
+.plate{position:relative;width:210mm;height:297mm;padding:14mm 15mm 12mm;
+  overflow:hidden;page-break-after:always;background:var(--void);
+  display:flex;flex-direction:column;}
+.plate:last-child{page-break-after:auto;}
+.frame{position:absolute;inset:8mm;border:1px solid var(--hair);pointer-events:none;}
+.tick{position:absolute;width:3mm;height:3mm;border:0 solid var(--hair2);}
+.tick.tl{top:8mm;left:8mm;border-top-width:1px;border-left-width:1px;transform:translate(-1px,-1px)}
+.tick.tr{top:8mm;right:8mm;border-top-width:1px;border-right-width:1px;transform:translate(1px,-1px)}
+.tick.bl{bottom:8mm;left:8mm;border-bottom-width:1px;border-left-width:1px;transform:translate(-1px,1px)}
+.tick.br{bottom:8mm;right:8mm;border-bottom-width:1px;border-right-width:1px;transform:translate(1px,1px)}
+.runhead{display:flex;justify-content:space-between;align-items:baseline;
+  font-family:var(--mono);font-size:7pt;letter-spacing:.18em;color:var(--faint);
+  text-transform:uppercase;padding-bottom:2.5mm;border-bottom:1px solid var(--hair);margin-bottom:5mm;}
+.foot{position:absolute;left:15mm;right:15mm;bottom:9mm;display:flex;
+  justify-content:space-between;font-family:var(--mono);font-size:6.5pt;
+  letter-spacing:.16em;color:var(--faint);text-transform:uppercase;
+  border-top:1px solid var(--hair);padding-top:2.5mm;}
+.idx{font-family:var(--mono);font-size:7pt;letter-spacing:.2em;color:var(--dim);}
+.kicker{font-family:var(--mono);font-size:7.5pt;letter-spacing:.28em;text-transform:uppercase;color:var(--faint);}
+h1.disp{font-family:var(--display);font-weight:700;text-transform:uppercase;letter-spacing:-.02em;line-height:.92;font-size:33pt;color:var(--argent);}
+h2.disp{font-family:var(--display);font-weight:700;text-transform:uppercase;letter-spacing:-.01em;line-height:.95;font-size:19pt;color:var(--argent);}
+.chrome{background:linear-gradient(177deg,#f6f7f9 0%,#c9cace 16%,#75777c 34%,#eceded 50%,#8d8f94 64%,#cfd0d3 80%,#54565a 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent;}
+.apos{color:var(--argent);text-shadow:-.5px 0 var(--cyan),.5px 0 var(--mag);font-style:normal;}
+.lead{font-size:9.6pt;line-height:1.5;color:var(--dim);max-width:155mm;}
+.hl{color:var(--argent)}
+.hair{height:1px;background:var(--hair);border:0;}
+.mono{font-family:var(--mono);text-transform:uppercase;letter-spacing:.14em;}
+/* cover */
+.cover{justify-content:center;}
+.bloom{position:absolute;top:42%;left:50%;width:130mm;height:130mm;transform:translate(-50%,-50%);border-radius:50%;
+  background:radial-gradient(circle,rgba(184,255,227,.10) 0%,rgba(77,225,255,.05) 34%,transparent 62%);filter:blur(6px);pointer-events:none;}
+.coverglyph{position:absolute;top:49%;left:50%;transform:translate(-50%,-58%);font-family:var(--display);font-weight:700;font-size:150pt;line-height:1;color:transparent;opacity:.9;
+  background:linear-gradient(160deg,#e9eaec,#6c6e73 45%,#f2f3f5 60%,#4a4c50);-webkit-background-clip:text;background-clip:text;}
+.coverwrap{position:relative;z-index:2}
+.timeline{display:flex;margin-top:8mm;font-family:var(--mono);font-size:7.5pt;letter-spacing:.14em;text-transform:uppercase;}
+.tl{flex:1;border-left:1px solid var(--hair2);padding:2.5mm 0 0 3mm;color:var(--dim);}
+.tl b{display:block;font-size:12pt;letter-spacing:.02em;color:var(--argent);font-family:var(--display);font-weight:700;margin-bottom:1.4mm;}
+.tl .ph{display:block;color:var(--argent);font-size:8pt;letter-spacing:.06em;}
+.tl .st{display:block;margin-top:1.2mm;color:var(--faint);font-size:6.5pt;line-height:1.3;}
+/* columns / generic */
+.cols{display:flex;gap:7mm;margin-top:5mm}
+.col{flex:1}
+.col h3{font-family:var(--display);font-weight:700;text-transform:uppercase;font-size:11pt;margin-bottom:2mm;color:var(--argent);}
+.col p{font-size:8.6pt;line-height:1.42;color:var(--dim);}
+.col .who{font-family:var(--mono);font-size:6.4pt;letter-spacing:.1em;text-transform:uppercase;color:var(--glow);opacity:.72;margin-top:2mm;display:block}
+.prow{display:flex;gap:5mm;padding:3mm 0;border-bottom:1px solid var(--hair);align-items:flex-start}
+.pnum{font-family:var(--mono);font-size:8pt;color:var(--faint);letter-spacing:.1em;min-width:9mm;padding-top:1mm}
+.pname{font-family:var(--display);font-weight:700;text-transform:uppercase;font-size:12pt;min-width:48mm;letter-spacing:0;line-height:1.05}
+.pdesc{font-size:8.5pt;line-height:1.4;color:var(--dim);flex:1}
+.pwho{font-family:var(--mono);font-size:6.4pt;letter-spacing:.1em;text-transform:uppercase;color:var(--glow);opacity:.7;white-space:nowrap;padding-top:1mm}
+.laws{margin-top:2mm}
+.law{display:flex;gap:4mm;padding:2.5mm 0;border-bottom:1px solid var(--hair);font-size:8.8pt;color:var(--dim);line-height:1.35}
+.law b{color:var(--argent);font-weight:600}
+.lawn{font-family:var(--mono);font-size:8pt;color:var(--faint);min-width:7mm}
+.oneframe{border:1px solid var(--hair2);padding:4mm;font-size:8.6pt;line-height:1.5;color:var(--dim);}
+.oneframe b{color:var(--argent)}
+.note{font-size:8.4pt;line-height:1.45;color:var(--faint)}
+/* week intent */
+.intent{font-size:8.8pt;line-height:1.4;color:var(--dim);margin:1mm 0 3mm;padding-left:3mm;border-left:2px solid var(--stage,var(--ember));}
+.intent b{color:var(--argent);font-weight:600}
+.wtitle{display:flex;align-items:baseline;gap:5mm;margin-bottom:1mm}
+/* POST CARD */
+.post{padding:3mm 0;border-bottom:1px solid var(--hair);}
+.post:last-child{border-bottom:0}
+.phead{display:flex;align-items:center;gap:2.5mm;margin-bottom:2mm;flex-wrap:wrap}
+.pdate{font-family:var(--display);font-weight:700;font-size:12.5pt;color:var(--argent);line-height:.9}
+.pdate small{font-family:var(--mono);font-size:5.8pt;letter-spacing:.12em;color:var(--faint);display:block;margin-top:.6mm}
+.badge{font-family:var(--mono);font-size:6pt;letter-spacing:.1em;font-weight:700;border:1px solid var(--hair2);padding:.6mm 1.4mm;color:var(--argent);border-radius:1px}
+.tag{font-family:var(--mono);font-size:6pt;letter-spacing:.1em;text-transform:uppercase;padding:.6mm 1.5mm;border:1px solid var(--hair);border-radius:1px;color:var(--dim)}
+.tag.prod{color:var(--glow);border-color:var(--glowline)}
+.pratio{margin-left:auto;font-family:var(--mono);font-size:6pt;letter-spacing:.1em;color:var(--faint);text-align:right}
+.block{display:flex;gap:3mm;margin-top:1.4mm}
+.blabel{font-family:var(--mono);font-size:5.8pt;letter-spacing:.14em;color:var(--faint);min-width:15mm;padding-top:.7mm;text-transform:uppercase}
+.copy{font-size:9pt;line-height:1.4;color:var(--argent);opacity:.95;flex:1}
+.copy .q{color:var(--faint)}
+.design{font-size:8.2pt;line-height:1.42;color:var(--dim);flex:1;border-left:2px solid var(--glowline);padding-left:3mm}
+.design b{color:var(--argent);font-weight:600}
+.bg-note{font-family:var(--mono);font-size:6.2pt;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin-top:2.5mm;padding-left:3mm;border-left:1px solid var(--hair)}
+/* swatches / spec */
+.mat{display:flex;gap:7mm;margin-top:4mm}
+.swcol{flex:1}
+.swatch{display:flex;align-items:center;gap:2.5mm;padding:1.3mm 0}
+.chip{width:8mm;height:8mm;border-radius:1px;border:1px solid var(--hair);flex:none}
+.swatch .nm{font-family:var(--display);font-weight:700;font-size:8.5pt;text-transform:uppercase;min-width:26mm}
+.swatch .hex{font-family:var(--mono);font-size:6.2pt;letter-spacing:.06em;color:var(--faint);min-width:16mm}
+.swatch .use{font-family:var(--mono);font-size:6pt;letter-spacing:.04em;color:var(--dim)}
+.held{opacity:.34}
+.spec h4{font-family:var(--display);font-weight:700;text-transform:uppercase;font-size:9.5pt;margin:0 0 1.5mm;color:var(--argent)}
+.spec p{font-size:8pt;line-height:1.4;color:var(--dim)}
+.ratios{display:flex;gap:3mm;margin-top:2mm;flex-wrap:wrap}
+.rbox{border:1px solid var(--hair);padding:2mm 2.5mm;font-family:var(--mono);font-size:6.2pt;letter-spacing:.08em;color:var(--dim);text-transform:uppercase}
+.rbox b{color:var(--argent)}
+/* reveal */
+.dropgrid{display:flex;flex-wrap:wrap;gap:3mm;margin-top:4mm}
+.drop{flex:1 1 46%;border:1px solid var(--hair);padding:3.5mm;min-height:23mm}
+.drop.locked{opacity:.4;border-style:dashed}
+.drop .n{font-family:var(--mono);font-size:6.4pt;letter-spacing:.16em;color:var(--faint)}
+.drop h4{font-family:var(--display);font-weight:700;text-transform:uppercase;font-size:11.5pt;margin:1.4mm 0}
+.drop p{font-size:8.2pt;line-height:1.38;color:var(--dim)}
+.al{display:flex;gap:3mm;font-size:8.2pt;line-height:1.3;padding:1.9mm 0;border-bottom:1px solid var(--hair);color:var(--dim)}
+.al .when{font-family:var(--mono);font-size:6pt;letter-spacing:.08em;color:var(--glow);opacity:.7;white-space:nowrap;padding-top:.5mm;min-width:22mm;text-align:right}
+.al b{color:var(--argent);font-weight:600}
+.dot{display:inline-block;width:2mm;height:2mm;border-radius:50%;margin-right:1.5mm;vertical-align:middle}
+</style>
+
+<!-- 00 COVER -->
+<section class="plate cover">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="bloom"></div><div class="coverglyph">&rsquo;</div>
+  <div class="runhead" style="position:absolute;top:11mm;left:15mm;right:15mm;border:0"><span>ALKMY // GTM · PRE-REVEAL · ALB&rsquo;DO + FORGE</span><span>CONFIDENTIAL — INTERNAL + DESIGN</span></div>
+  <div class="coverwrap" style="margin:auto 0">
+    <span class="kicker">GTM / 00 &nbsp;·&nbsp; THE HYPE PHASE &nbsp;·&nbsp; PRODUCT-FIRST</span>
+    <h1 class="disp chrome" style="font-size:44pt;margin-top:5mm">PRE&#8209;REVEAL<br>CONTENT<br>CALENDAR</h1>
+    <p class="lead" style="margin-top:6mm">A 22-day campaign to place <span class="hl">ALB&rsquo;DO</span> and <span class="hl">FORGE</span> in the web-framework conversation &mdash; the arena of Next, Astro, Remix. Copy and design direction for every post. We show the <span class="hl">product</span> and the <span class="hl">craft</span>; we hold the numbers, and we hold two stages of the work, until the reveal.</p>
+    <div class="timeline">
+      <div class="tl"><b>25 JUL</b><span class="ph">THE HYPE</span><span class="st">Nigredo &rarr; the blackening</span></div>
+      <div class="tl"><b>15 AUG</b><span class="ph">THE REVEAL</span><span class="st">Numbers · ALB&rsquo;DO · FORGE</span></div>
+      <div class="tl"><b>SEP · END</b><span class="ph">THE RELEASE</span><span class="st">Beta, made real</span></div>
+    </div>
+  </div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · 2026 · A HOUSE OF TRANSMUTATION</span><span>51.5074&deg;N · REF//PRE-REVEAL</span></div>
+</section>
+
+<!-- 01 THE PLAN -->
+<section class="plate">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 01 · THE PLAN IN ONE BREATH</span><span class="idx">01 / 11</span></div>
+  <h2 class="disp">ONE JOB: TAKE A SEAT AT<br>THE FRAMEWORK TABLE.</h2>
+  <p class="lead" style="margin-top:4mm">For 22 days we earn ALB&rsquo;DO a place in the web-framework conversation &mdash; not as another tool, as a different <span class="hl">idea</span> of what a framework is: you write the frontend, and the backend is a tier the <span class="hl">compiler emits</span>. Every post is about the <span class="hl">product</span>. No origin story, no &ldquo;our journey&rdquo; &mdash; the work speaks. We reveal the idea and the craft. We hold the numbers, and we hold two stages, for 15 August.</p>
+
+  <div class="cols">
+    <div class="col"><h3>Consumers</h3><p>The builders shipping on Next / Astro / Remix today. Pulled by the heresy and the pain of the stack they maintain by hand.</p><span class="who">&ldquo;this deletes my backend folder&rdquo;</span></div>
+    <div class="col"><h3>Early adopters</h3><p>The first hands who chase new frameworks for sport. Pulled by craft, determinism, and being first through the door.</p><span class="who">&ldquo;i want to build on this now&rdquo;</span></div>
+    <div class="col"><h3>Investors</h3><p>Pulled by a credible new entry in a huge, contested category &mdash; and by proof (durability, DX) shown, not claimed.</p><span class="who">&ldquo;new paradigm, real demo&rdquo;</span></div>
+  </div>
+
+  <div class="cols" style="margin-top:5mm">
+    <div class="col" style="border:1px solid var(--glowline);padding:3.5mm">
+      <h3 style="color:var(--glow)">IN PLAY NOW</h3>
+      <p><b class="hl">ALB&rsquo;DO</b> &mdash; the frontend framework (Albedo · the mirror).<br><b class="hl">FORGE</b> &mdash; the backend the compiler emits (Nigredo · the crucible).<br><b class="hl">PHOSPHOR</b> &mdash; the runtime glow, used only as light/aesthetic.</p>
+    </div>
+    <div class="col" style="border:1px dashed var(--hair2);padding:3.5mm;opacity:.7">
+      <h3 style="color:var(--faint)">HELD &mdash; AFTER 15 AUG</h3>
+      <p>CTRNI&rsquo;TAS (AI) and RUB&rsquo;DO (fintech) stay dark. Do <b>not</b> name, tease with detail, or use their stage-colours (gold / oxblood) before the reveal. At the reveal they appear only as two locked stages.</p>
+    </div>
+  </div>
+
+  <div class="oneframe" style="margin-top:auto">
+    <span class="kicker" style="color:var(--glow);opacity:.7">THE GOVERNING PARADOX</span><br><br>
+    <b>Generate hype without hype language.</b> The loudest thing in the feed is the quietest voice in the room. Every rival shouts &ldquo;game-changer&rdquo;; we speak like a lab logbook and a poet at once. <b>Cover the handle &mdash; the post still reads dark · precious · transmuted · slightly alive.</b> If it reads generic SaaS, we don&rsquo;t post it.
+  </div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · THE PLAN</span><span>PRODUCT FIRST · NO STORY</span></div>
+</section>
+
+<!-- 02 PILLARS -->
+<section class="plate">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 02 · THE FIVE PILLARS</span><span class="idx">02 / 11</span></div>
+  <h2 class="disp">FIVE THINGS WE POST.<br>ALL OF THEM, THE PRODUCT.</h2>
+  <p class="lead" style="margin-top:3mm">Every post is one of these. Two of them are the products themselves. Rotate; never abandon one.</p>
+  <div style="margin-top:4mm">
+    <div class="prow"><div class="pnum">I</div><div class="pname">THE HERESY</div><div class="pdesc">The reframe that earns the table: the backend was never yours to build &mdash; it is a compile target. The idea people argue about in the replies.</div><div class="pwho">builders<br>+ investors</div></div>
+    <div class="prow"><div class="pnum">II</div><div class="pname">THE OLD WORLD</div><div class="pdesc">The enemy, drawn sharply: the hand-assembled stack &mdash; framework, ORM, database, queue, deploy, a bill that grows while you sleep. The pain everyone normalised.</div><div class="pwho">builders<br>+ investors</div></div>
+    <div class="prow"><div class="pnum">III</div><div class="pname" style="color:var(--glow)">FORGE</div><div class="pdesc">The backend proof. The crucible. THE DROP &mdash; the server killed mid-write, the order that survives. Durability as the default, not a bolt-on.</div><div class="pwho">builders<br>+ early</div></div>
+    <div class="prow"><div class="pnum">IV</div><div class="pname chrome">ALB&rsquo;DO</div><div class="pdesc">The frontend proof. The mirror. The DX &mdash; the app with no backend folder, the code you don&rsquo;t write. The face users touch, rendered as chrome.</div><div class="pwho">builders<br>+ early</div></div>
+    <div class="prow" style="border-bottom:0"><div class="pnum">V</div><div class="pname">THE VOID</div><div class="pdesc">The aesthetic itself as content. Chrome in black, the apostrophe glyph. While the feed is purple gradients, we are a rare object under museum light.</div><div class="pwho">everyone</div></div>
+  </div>
+  <p class="note" style="margin-top:auto">Weekly lean: <span class="hl">WK1</span> Heresy + Old World (win the argument) · <span class="hl">WK2</span> FORGE + ALB&rsquo;DO (show the proof) · <span class="hl">WK3</span> converge + countdown. The Void runs through all three.</p>
+  <div class="foot"><span>ALKMY-GTM-0.2 · PILLARS</span><span>TWO PILLARS ARE THE PRODUCTS</span></div>
+</section>
+
+<!-- 03 CADENCE & LAW -->
+<section class="plate">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 03 · CADENCE, CHANNELS & LAW</span><span class="idx">03 / 11</span></div>
+  <h2 class="disp">TWO PLATFORMS.<br>ONE SUBJECT: THE PRODUCT.</h2>
+  <div class="cols" style="margin-top:4mm">
+    <div class="col" style="border-left:2px solid var(--argent);padding-left:4mm">
+      <h3>X / Twitter</h3><p>The technical surface. Heresy, FORGE proof, ALB&rsquo;DO DX, process. Exact, a little uncanny. The growth engine from zero &mdash; carried as much by <span class="hl">replies</span> as posts.</p>
+      <p style="margin-top:2mm"><span class="mono" style="font-size:7pt;color:var(--faint)">1 POST / WEEKDAY &nbsp;+&nbsp; 3&ndash;5 REPLIES / DAY</span></p></div>
+    <div class="col" style="border-left:2px solid var(--argent);padding-left:4mm">
+      <h3>LinkedIn</h3><p>The category surface &mdash; still product, not person. What the reframe means for teams and cost; where operators and investors read. Polished, plain.</p>
+      <p style="margin-top:2mm"><span class="mono" style="font-size:7pt;color:var(--faint)">2&ndash;3 POSTS / WEEK</span></p></div>
+  </div>
+  <p class="kicker" style="margin-top:5mm;color:var(--glow);opacity:.7">DAILY BACKGROUND WORK</p>
+  <p class="lead" style="margin-top:2mm;font-size:8.8pt">From zero, reach is borrowed before it&rsquo;s owned. Every day: reply with substance into the framework / Rust / &ldquo;is X dead&rdquo; threads where the audience already is. Before the reveal, DM the raw FORGE clip privately to a handful of dev voices &mdash; one repost outweighs a week of posting into your own void.</p>
+  <p class="kicker" style="margin-top:5mm">THE LAWS</p>
+  <div class="laws">
+    <div class="law"><span class="lawn">01</span><span><b>It&rsquo;s about the product.</b> Every post advances ALB&rsquo;DO or FORGE. No founder story, no &ldquo;our journey&rdquo; &mdash; the work is the protagonist.</span></div>
+    <div class="law"><span class="lawn">02</span><span><b>No numbers before 15 August.</b> Teasers show the moment, never the metric.</span></div>
+    <div class="law"><span class="lawn">03</span><span><b>Two stages stay dark.</b> No CTRNI&rsquo;TAS / RUB&rsquo;DO, no gold or oxblood, before the reveal.</span></div>
+    <div class="law"><span class="lawn">04</span><span><b>No hype words.</b> No disrupt, seamless, next-gen, game-changer. Start every frame from true black; if it isn&rsquo;t reflective, it isn&rsquo;t ours. Honour the apostrophe.</span></div>
+    <div class="law" style="border-bottom:0"><span class="lawn">05</span><span><b>Measure waitlist · Discord · saves &mdash; not likes.</b> 400 serious signups beats 40,000 impressions.</span></div>
+  </div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · CADENCE & LAW</span><span>THE WORK IS THE PROTAGONIST</span></div>
+</section>
+
+<!-- 04 VISUAL SYSTEM (DESIGNER) -->
+<section class="plate">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 04 · VISUAL SYSTEM · FOR THE DESIGNER</span><span class="idx">04 / 11</span></div>
+  <h2 class="disp">THE PRODUCTION SPEC.</h2>
+  <p class="lead" style="margin-top:3mm;font-size:9pt">The whole campaign is one look. 90% monochrome, 10% stage-colour, aberration only at light edges. If a comp looks colourful, it is wrong.</p>
+  <div class="mat">
+    <div class="swcol">
+      <p class="kicker" style="margin-bottom:1mm">PALETTE &mdash; IN USE</p>
+      <div class="swatch"><span class="chip" style="background:#08090B"></span><span class="nm">Forge Black</span><span class="hex">#08090B</span><span class="use">the ground</span></div>
+      <div class="swatch"><span class="chip" style="background:#C9CACE"></span><span class="nm">Argent</span><span class="hex">#C9CACE</span><span class="use">chrome · hero</span></div>
+      <div class="swatch"><span class="chip" style="background:#BFE9F2"></span><span class="nm">Glass</span><span class="hex">#BFE9F2</span><span class="use">refraction · clarity</span></div>
+      <div class="swatch"><span class="chip" style="background:#B8FFE3"></span><span class="nm">Phosphor</span><span class="hex">#B8FFE3</span><span class="use">the bloom · rim-light</span></div>
+      <div class="swatch"><span class="chip" style="background:#FF7A2F"></span><span class="nm">Forge Ember</span><span class="hex">#FF7A2F</span><span class="use">heat, inside FORGE only</span></div>
+      <div class="swatch"><span class="chip" style="background:linear-gradient(90deg,#4DE1FF,#FF3DCB)"></span><span class="nm">Aberration</span><span class="hex">cyan/mag</span><span class="use">salt · at edges only</span></div>
+      <div class="swatch held"><span class="chip" style="background:#E8B33D"></span><span class="nm">Citrinitas</span><span class="hex">#E8B33D</span><span class="use">HELD · do not use</span></div>
+      <div class="swatch held"><span class="chip" style="background:#C1272D"></span><span class="nm">Rubedo</span><span class="hex">#C1272D</span><span class="use">HELD · do not use</span></div>
+    </div>
+    <div class="swcol spec">
+      <h4>Materials</h4><p><b>Chrome</b> (hero, mirror-polished, banded, always flowing) · <b>Glass</b> (secondary, refraction) · <b>Void</b> (near-black ground) · <b>Bloom</b> (light as material, a white rim behind every object).</p>
+      <h4 style="margin-top:3mm">Type</h4><p><b>Display</b> &mdash; heavy grotesque, tight, uppercase, negative tracking (Neue Haas / Archivo Black weight). <b>Marginalia</b> &mdash; monospace, small, wide-tracked: dates, coordinates, spec captions, barcodes.</p>
+      <h4 style="margin-top:3mm">The apostrophe</h4><p>ALB&rsquo;DO &mdash; the hero glyph. A chrome sliver / a bead of mercury with a cyan-magenta seam. Never generic punctuation. Doubles as the favicon seed.</p>
+      <h4 style="margin-top:3mm">Composition</h4><p>One object, centred, floating in black with a bloom behind it. Spec-sheet scaffolding &mdash; hairlines, corner ticks, rotated labels, mono coordinates, index numbers. A catalogue plate of a rare artifact. The luxury is the emptiness.</p>
+    </div>
+  </div>
+  <p class="kicker" style="margin-top:4mm">DELIVERY FORMATS</p>
+  <div class="ratios">
+    <div class="rbox"><b>X STATIC</b> · 1:1 1080&times;1080 / 4:5 1080&times;1350</div>
+    <div class="rbox"><b>X VIDEO</b> · 16:9 1920&times;1080 (+1:1 cut)</div>
+    <div class="rbox"><b>LINKEDIN</b> · 1:1 / 4:5 / PDF carousel 1080&times;1080</div>
+    <div class="rbox"><b>COUNTDOWN</b> · 1:1 template, rising luminance</div>
+  </div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · VISUAL SYSTEM</span><span>90% MONO · COLOUR IS SALT</span></div>
+</section>
+
+<!-- 05 WEEK 01 A -->
+<section class="plate" style="--stage:var(--ember)">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 05 · WEEK 01 · NIGREDO · THE BLACKENING (i)</span><span class="idx">05 / 11</span></div>
+  <div class="wtitle"><h2 class="disp">WEEK 01 &middot; THE BLACKENING</h2><span class="mono" style="font-size:7.5pt;color:var(--faint)">25 JUL &ndash; 01 AUG</span></div>
+  <p class="intent"><b>Intent.</b> Win the argument. Plant the heresy, name the enemy stack, and introduce FORGE as the crucible. Establish the void and the apostrophe. <b>Goal:</b> from zero to &ldquo;a new framework idea is in the room.&rdquo;</p>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">25<small>JUL · FRI</small></span><span class="badge">X</span><span class="tag">The Heresy</span><span class="tag prod">ALKMY / ALB&rsquo;DO</span><span class="pratio">PINNED THREAD<br>1:1 hero</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>Every web framework gives you the same deal: write the frontend, then go build a backend by hand &mdash; servers, a database, a queue, a deploy target, a monthly bill. We think that half was never yours to build. It&rsquo;s something the compiler should emit. This is ALB&rsquo;DO. 15 August.<span class="q">&rdquo;</span> <span style="color:var(--faint)">(thread: frontend is authored, backend is derived &mdash; not serverless, not a BaaS; a compile target.)</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>Hero, 1:1.</b> A single liquid-chrome ingot mid-transformation, mirror-polished with banded reflections, floating dead-centre in true black; soft white rim-bloom behind. Bottom-left mono: <b>&ldquo;ALB&rsquo;DO // A FRAMEWORK THAT EMITS ITS OWN BACKEND&rdquo;</b>; top-right index &ldquo;GTM-00 · 51.5074&deg;N&rdquo;; corner ticks. Monochrome but for a whisper of cyan/magenta on the brightest edge. Apostrophe = a chrome sliver.</div></div>
+  </div>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">26<small>JUL · SAT</small></span><span class="badge">X</span><span class="tag">The Void</span><span class="tag prod">ALB&rsquo;DO</span><span class="pratio">IMAGE ONLY<br>4:5</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy">One mono line only: <span class="q">&ldquo;</span>ALB&rsquo;DO. the mark is not missing a letter. it is showing you what we removed.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>The apostrophe, hero glyph, 4:5.</b> Extreme close-up of a bead of liquid mercury caught mid-fall, a vertical seam of light cut through it, cyan/magenta split at the edges &mdash; the one place colour enters. Black void, rim-bloom. Glyph sits high, occupies ~&frac13; frame; the rest is negative space. This asset is also the <b>favicon / app-icon seed</b>.</div></div>
+  </div>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">28<small>JUL · MON</small></span><span class="badge">X</span><span class="tag">The Old World</span><span class="pratio">STATIC<br>1:1</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>Your app in 2026: a frontend framework, a backend framework, a database you babysit, an ORM, a queue, a cache, a deploy platform, and a bill that grows while you sleep. Nobody designed this &mdash; it accreted. A framework should hand you the whole thing, and the backend should cost you zero lines.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>The enemy as an invoice, 1:1.</b> A cold spec-sheet / catalogue plate: a hairline-ruled parts list &mdash; FRONTEND · BACKEND · DATABASE · ORM · QUEUE · CACHE · DEPLOY · $$$ &mdash; each row in dim monospace with a tiny barcode and a rising cost column. At the bottom, one line struck through in bright chrome: <b>&ldquo;ALB&rsquo;DO &mdash; BACKEND: 0 LINES&rdquo;</b>. Aberration only on that struck line&rsquo;s edge.</div></div>
+  </div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · WK01 · NIGREDO</span><span><span class="dot" style="background:var(--ember)"></span>EMBER IN THE DARK</span></div>
+</section>
+
+<!-- 06 WEEK 01 B -->
+<section class="plate" style="--stage:var(--ember)">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 06 · WEEK 01 · NIGREDO · THE BLACKENING (ii)</span><span class="idx">06 / 11</span></div>
+  <div class="wtitle"><h2 class="disp">WEEK 01 &middot; (CONTINUED)</h2><span class="mono" style="font-size:7.5pt;color:var(--faint)">29 JUL &ndash; 01 AUG</span></div>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">29<small>JUL · TUE</small></span><span class="badge">IN</span><span class="tag">The Heresy</span><span class="pratio">POST + DIAGRAM<br>1:1</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>The last decade of web infrastructure sold you a rental &mdash; servers you don&rsquo;t own, priced by the request, scaling into a bill you can&rsquo;t predict. The next decade belongs to compilers that don&rsquo;t need the rental at all. We built a framework where your data model <i>is</i> your backend: the compiler emits the storage and the API from code you already wrote. Here&rsquo;s why &lsquo;serverless&rsquo; was always a half-measure.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>Before/after diagram, 1:1.</b> LEFT (dim, labelled THE OLD WORLD): a tangle of cold-grey boxes &mdash; app &rarr; API &rarr; ORM &rarr; DB &rarr; queue &rarr; cache &mdash; thin connecting lines. RIGHT (chrome, labelled ALB&rsquo;DO): one monolithic chrome object with a thin light-seam, caption <b>&ldquo;you write this &uarr; / the compiler emits the rest&rdquo;</b>. Void ground, spec-sheet framing, mono labels, rim-bloom on the right object.</div></div>
+  </div>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">30<small>JUL · WED</small></span><span class="badge">X</span><span class="tag">FORGE</span><span class="tag prod">FORGE</span><span class="pratio">PROCESS CLIP<br>1:1 · 6&ndash;10s</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>This is FORGE &mdash; the part of the framework you never write. You declare what your app remembers; it becomes a real, durable backend at compile time. Named for the black stage of the work: the crucible where raw input is broken down and remade.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>Silent screen-capture, 1:1, 6&ndash;10s.</b> Chrome-tinted terminal on black: a few lines of ALB&rsquo;DO source (a data declaration) on the left; on the right, the compiler <b>materialising</b> a backend &mdash; tables, an API surface &mdash; each line resolving with a faint chrome sheen and a rim-glow. Mono lower-third: <b>&ldquo;NIGREDO · dissolution · matter broken down to be remade&rdquo;</b>. One low tone or silence. Ember allowed here (FORGE&rsquo;s heat), nowhere else.</div></div>
+  </div>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">01<small>AUG · FRI</small></span><span class="badge">X</span><span class="tag">The Void</span><span class="pratio">IMAGE + TEASE<br>1:1</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>Week one, you&rsquo;ve seen the black &mdash; the crucible, the backend that builds itself. Next week: the mirror. The face you actually touch.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>Transitional image, 1:1.</b> A surface resolving from matte black (left) into liquid mirror-chrome (right) that faintly reflects a hint of a UI; rim-bloom along the seam. Mono marginalia: <b>&ldquo;WK01 &rarr; WK02 · NIGREDO &rarr; ALBEDO&rdquo;</b>. Teases ALB&rsquo;DO&rsquo;s frontend for next week.</div></div>
+  </div>
+  <div class="bg-note">Background &mdash; Sun 27 & Thu 31 Jul: reply-days. Thu 31: quote a live &ldquo;framework X is dying&rdquo; thread with the heresy. No original art.</div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · WK01 · NIGREDO</span><span><span class="dot" style="background:var(--ember)"></span>EMBER IN THE DARK</span></div>
+</section>
+
+<!-- 07 WEEK 02 A -->
+<section class="plate" style="--stage:var(--argent)">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 07 · WEEK 02 · ALBEDO · THE WHITENING (i)</span><span class="idx">07 / 11</span></div>
+  <div class="wtitle"><h2 class="disp">WEEK 02 &middot; THE WHITENING</h2><span class="mono" style="font-size:7.5pt;color:var(--faint)">04 &ndash; 10 AUG</span></div>
+  <p class="intent" style="border-left-color:var(--argent)"><b>Intent.</b> Show the proof. FORGE&rsquo;s durability (THE DROP) and ALB&rsquo;DO&rsquo;s DX &mdash; the moment shown, the numbers withheld. <b>Goal:</b> turn &ldquo;interesting idea&rdquo; into &ldquo;this is real, I need in.&rdquo;</p>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">04<small>AUG · MON</small></span><span class="badge">X</span><span class="tag">FORGE</span><span class="tag prod">FORGE · THE DROP</span><span class="pratio">CENTREPIECE CLIP<br>16:9 (+1:1) · 12&ndash;20s</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>We pulled the power on the server in the middle of a live checkout. On purpose. The last ticket sold exactly once &mdash; no double-sell, no lost order, no cleanup. The framework did that, not us. We&rsquo;ll show you how on 15 August.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>The money clip, 16:9 (cut a 1:1 too), 12&ndash;20s.</b> Split screen: LEFT a live flash-sale UI in chrome-and-black, a stock counter ticking down; RIGHT a terminal running the server. At the climax a switch <b>kills the server</b> &mdash; one frame of screen-tear + cyan/magenta aberration as it dies &mdash; the UI flickers, then resolves: <b>&ldquo;SOLD · 1 &rarr; 0 · no oversell.&rdquo;</b> No metrics on screen. End card: void, chrome apostrophe, <b>&ldquo;FORGE · the order survives the machine. 15 AUG.&rdquo;</b> The kill is the only place aberration spikes.</div></div>
+  </div>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">05<small>AUG · TUE</small></span><span class="badge">IN</span><span class="tag">FORGE</span><span class="tag prod">FORGE</span><span class="pratio">STILL + POST<br>1:1</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>For anyone who&rsquo;s run a launch, a ticket drop, a flash sale: what happens to the order mid-write when your server dies? Today&rsquo;s honest answer is &lsquo;we reconcile later, and sometimes we oversell.&rsquo; We built a framework where the answer is &lsquo;nothing &mdash; it can&rsquo;t lose it.&rsquo; Durability isn&rsquo;t a feature you bolt on. We made it the default.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>Frozen still from the DROP, 1:1.</b> The kill-moment held: the dying server, the UI steady. Heavy negative space, mono caption <b>&ldquo;THE ORDER SURVIVES THE MACHINE&rdquo;</b>. Chrome/black, one rim-bloom. Restrained &mdash; this one is for operators.</div></div>
+  </div>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">06<small>AUG · WED</small></span><span class="badge">X</span><span class="tag">ALB&rsquo;DO</span><span class="tag prod">ALB&rsquo;DO</span><span class="pratio">HERO IMAGE<br>4:5</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>ALB&rsquo;DO &mdash; Albedo, the whitening. The mirror stage of the work: washing to silver, purification, reflection. It&rsquo;s the part users see, so we made it the most polished thing we build. The face, rendered as chrome.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>The flagship &ldquo;alive&rdquo; image, 4:5.</b> The ALB&rsquo;DO mirror motif: reaching liquid-chrome hands, or a molten-chrome face reforming, or the mirror-polished chess queen. Liquid silver, banded reflections, faintly alive; strong Phosphor rim-bloom. Reserve real craft here &mdash; this is the brand&rsquo;s most tender frame. Silver monochrome only; mono marginalia + apostrophe glyph.</div></div>
+  </div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · WK02 · ALBEDO</span><span><span class="dot" style="background:var(--argent)"></span>THE MIRROR STAGE</span></div>
+</section>
+
+<!-- 08 WEEK 02 B -->
+<section class="plate" style="--stage:var(--argent)">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 08 · WEEK 02 · ALBEDO · THE WHITENING (ii)</span><span class="idx">08 / 11</span></div>
+  <div class="wtitle"><h2 class="disp">WEEK 02 &middot; (CONTINUED)</h2><span class="mono" style="font-size:7.5pt;color:var(--faint)">07 &ndash; 08 AUG</span></div>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">07<small>AUG · THU</small></span><span class="badge">X</span><span class="tag">ALB&rsquo;DO</span><span class="tag prod">ALB&rsquo;DO · DX</span><span class="pratio">CLIP OR CAROUSEL<br>1:1</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>This is a complete, deployed application &mdash; auth, a database, a live-updating page. Watch how much of it you don&rsquo;t write. There&rsquo;s no backend folder. There&rsquo;s no API layer. You wrote the part that&rsquo;s yours; the compiler emitted the rest.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>DX reveal, 1:1 &mdash; short capture or 3-panel carousel.</b> Panel 1: a compact ALB&rsquo;DO source file (chrome-tinted editor on black). Panel 2: the running app beside it. Panel 3: the file-tree with the <b>backend/ folder conspicuously absent</b> &mdash; a struck-through ghost label &ldquo;backend/ &mdash; emitted&rdquo;. The magic is the absence. Keep code legible; builders will scrutinise it. Mono lower-third.</div></div>
+  </div>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">08<small>AUG · FRI</small></span><span class="badge">X</span><span class="tag">The Heresy</span><span class="pratio">THREAD + 1 DIAGRAM<br>1:1</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>Determinism is a feature, not an accident. If your framework can&rsquo;t tell you what your app will do &mdash; what it reads, what it writes, what it costs &mdash; before it runs, it isn&rsquo;t finished. Here&rsquo;s how ALB&rsquo;DO decides at compile time what becomes a page, an action, or durable state.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>One hairline diagram, 1:1.</b> A compile-time split: SOURCE &rarr; { PAGE · ACTION · DURABLE STATE } as three chrome nodes branching from one, spec-sheet style, mono labels. Low ink, high clarity. Earns the serious devs without exposing the moat. <b>Same day:</b> DM the raw DROP clip to a few dev voices for reposts.</div></div>
+  </div>
+  <div class="bg-note">Background &mdash; Sat 09 Aug: a single quiet ALB&rsquo;DO aesthetic re-share. Sun 10 Aug: reply-day. Hold the countdown for Monday.</div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · WK02 · ALBEDO</span><span><span class="dot" style="background:var(--argent)"></span>THE MIRROR STAGE</span></div>
+</section>
+
+<!-- 09 WEEK 03 COUNTDOWN -->
+<section class="plate" style="--stage:var(--glow)">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 09 · WEEK 03 · PHOSPHOR · THE COUNTDOWN</span><span class="idx">09 / 11</span></div>
+  <div class="wtitle"><h2 class="disp">WEEK 03 &middot; THE LIGHT&#8209;BEARER</h2><span class="mono" style="font-size:7.5pt;color:var(--faint)">11 &ndash; 14 AUG</span></div>
+  <p class="intent" style="border-left-color:var(--glow)"><b>Intent.</b> Converge ALB&rsquo;DO + FORGE and count down. Phosphor is the rim-light, so the template <b>brightens each day</b> &mdash; IV near-dark, I in full bloom. <b>Goal:</b> fill the room for the 15th.</p>
+
+  <div class="post">
+    <div class="phead"><span class="pdate">11<small>AUG · MON</small></span><span class="badge">X</span><span class="badge">IN</span><span class="tag">The Void</span><span class="pratio">COUNTDOWN IV<br>1:1</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>IV. Four days until a web framework where the backend is a compile target. ALB&rsquo;DO + FORGE. 15 August.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>Countdown template, 1:1.</b> Roman <b>IV</b> in heavy chrome grotesque, centred in void, low rim-bloom (darkest of the four). Mono: &ldquo;IV / I · 15 AUG · THE FIRST FRAME&rdquo;; corner ticks. This sets the template &mdash; reuse for III/II/I with rising luminance.</div></div>
+  </div>
+  <div class="post">
+    <div class="phead"><span class="pdate">12<small>AUG · TUE</small></span><span class="badge">X</span><span class="badge">IN</span><span class="tag">FORGE + ALB&rsquo;DO</span><span class="pratio">COUNTDOWN III<br>1:1</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>III. On Friday we show you the numbers we&rsquo;ve been holding &mdash; build times, cold starts, the cost of the backend you didn&rsquo;t write. We think you&rsquo;ll want to sit down.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>Countdown III</b>, one notch brighter. Behind the numeral, a faint ghosted spec-sheet of <b>redacted numbers</b> (metrics blacked out &mdash; coming, not shown). Aberration on one redaction bar.</div></div>
+  </div>
+  <div class="post">
+    <div class="phead"><span class="pdate">13<small>AUG · WED</small></span><span class="badge">X</span><span class="tag">FORGE + ALB&rsquo;DO</span><span class="pratio">COUNTDOWN II + AMA<br>1:1</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>II. Before the reveal we&rsquo;re opening the doors &mdash; ask us anything about ALB&rsquo;DO and FORGE, Thursday, in the Discord. Bring your hardest &lsquo;but what about&hellip;&rsquo;.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>Countdown II</b>, brighter. Below the numeral, a mono lab-logbook block: <b>&ldquo;OPEN FLOOR · THU · [DISCORD] · ASK ANYTHING&rdquo;</b>.</div></div>
+  </div>
+  <div class="post">
+    <div class="phead"><span class="pdate">14<small>AUG · THU</small></span><span class="badge">X</span><span class="badge">IN</span><span class="tag">The Void</span><span class="pratio">COUNTDOWN I<br>4:5</span></div>
+    <div class="block"><span class="blabel">Copy</span><div class="copy"><span class="q">&ldquo;</span>I. Tomorrow, the light.<span class="q">&rdquo;</span></div></div>
+    <div class="block"><span class="blabel">Design</span><div class="design"><b>The strongest frame of the run, 4:5.</b> The apostrophe glyph fully resolved into brilliant liquid chrome at <b>maximum rim-bloom</b> &mdash; the payoff of the week&rsquo;s brightening. Almost no text: just &ldquo;I&rdquo; and the glyph. The held breath.</div></div>
+  </div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · WK03 · PHOSPHOR</span><span><span class="dot" style="background:var(--glow)"></span>THE MORNING STAR</span></div>
+</section>
+
+<!-- 10 REVEAL -->
+<section class="plate">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 10 · 15 AUGUST · THE FIRST FRAME</span><span class="idx">10 / 11</span></div>
+  <h1 class="disp chrome" style="font-size:29pt">15 AUGUST · THE REVEAL</h1>
+  <p class="lead" style="margin-top:3mm">The one day we speak loudly &mdash; still plainly. Everything the 22 days pointed at drops at once, both platforms. <b class="hl">X</b>: the launch thread + film. <b class="hl">LinkedIn</b> (cofounder): the category post &mdash; &ldquo;a new bet in the web-framework space&rdquo;, product not person. <b class="hl">Landing page</b> + a LinkedIn <b class="hl">PDF carousel</b> walking the arc.</p>
+  <div class="dropgrid">
+    <div class="drop"><span class="n">DROP / 01</span><h4>ALB&rsquo;DO</h4><p>The framework, named and shown. The mirror &mdash; the frontend you write. The heresy answered: the backend is a compile target.</p></div>
+    <div class="drop"><span class="n">DROP / 02</span><h4>FORGE</h4><p>The backend you never build. THE DROP explained in full &mdash; the how behind the order that survives the machine.</p></div>
+    <div class="drop"><span class="n">DROP / 03</span><h4>THE NUMBERS</h4><p>Everything held for 22 days: <span class="hl">[ insert build times · cold start · backend cost · the benchmarks you&rsquo;ll defend ]</span>. Plus PHOSPHOR named as the runtime.</p></div>
+    <div class="drop"><span class="n">DROP / 04</span><h4>THE DOOR</h4><p>Early-access / waitlist opens for the September beta. Discord becomes home. The ALKMY house revealed as the umbrella.</p></div>
+    <div class="drop locked"><span class="n">STAGE · HELD</span><h4>CITRINITAS</h4><p>Shown only as a locked, blacked-out stage. &ldquo;Later.&rdquo;</p></div>
+    <div class="drop locked"><span class="n">STAGE · HELD</span><h4>RUBEDO</h4><p>Shown only as a locked, blacked-out stage. &ldquo;Two stages remain.&rdquo;</p></div>
+  </div>
+  <p class="note" style="margin-top:4mm"><b class="hl">After &rarr; Sep end:</b> convert waitlist to design partners in the open; &ldquo;the first thing built on ALB&rsquo;DO&rdquo; becomes the next wave of proof. The reveal earns the audience; the beta turns them into users.</p>
+  <div class="foot"><span>ALKMY-GTM-0.2 · THE FIRST FRAME</span><span>SPEAK LOUDLY · SPEAK PLAINLY</span></div>
+</section>
+
+<!-- 11 PRODUCTION / ASSETS -->
+<section class="plate">
+  <div class="frame"></div><span class="tick tl"></span><span class="tick tr"></span><span class="tick bl"></span><span class="tick br"></span>
+  <div class="runhead"><span>ALKMY / GTM — 11 · THE ATHANOR · ASSET CHECKLIST</span><span class="idx">11 / 11</span></div>
+  <h2 class="disp">WHAT THE DESIGNER MAKES.</h2>
+  <div style="margin-top:4mm">
+    <div class="al"><span><b>ALB&rsquo;DO chrome-ingot hero</b> (1:1) &mdash; opening manifesto image.</span><span class="when">BEFORE WK1</span></div>
+    <div class="al"><span><b>Apostrophe glyph</b> (4:5) &mdash; mercury bead, aberration seam. Favicon seed.</span><span class="when">BEFORE WK1</span></div>
+    <div class="al"><span><b>&ldquo;The enemy&rdquo; invoice plate</b> (1:1) &mdash; the hand-built stack as a cost sheet.</span><span class="when">BEFORE WK1</span></div>
+    <div class="al"><span><b>Old-world vs ALB&rsquo;DO diagram</b> (1:1) &mdash; tangle vs one chrome object.</span><span class="when">BEFORE WK1</span></div>
+    <div class="al"><span><b>FORGE process clip</b> (1:1, 6&ndash;10s) &mdash; compiler materialising a backend.</span><span class="when">BEFORE WK1</span></div>
+    <div class="al"><span><b>WK1&rarr;WK2 transition image</b> (1:1) &mdash; black resolving to mirror.</span><span class="when">BEFORE WK1</span></div>
+    <div class="al"><span><b>THE DROP clip</b> (16:9 + 1:1, 12&ndash;20s) &mdash; server killed, order survives. <b>No metrics.</b></span><span class="when">BEFORE WK2</span></div>
+    <div class="al"><span><b>DROP still</b> (1:1) + <b>ALB&rsquo;DO mirror hero</b> (4:5) + <b>DX reveal</b> (1:1 / carousel) + <b>determinism diagram</b> (1:1).</span><span class="when">BEFORE WK2</span></div>
+    <div class="al"><span><b>Countdown template IV·III·II·I</b> (1:1 / 4:5) &mdash; rising luminance, redaction + AMA variants.</span><span class="when">BEFORE WK3</span></div>
+    <div class="al" style="border-bottom:0"><span><b>Reveal film</b> (30&ndash;60s) + <b>landing page</b> + <b>LinkedIn carousel</b> + <b>two locked stage plates</b>.</span><span class="when">BEFORE 15 AUG</span></div>
+  </div>
+  <div class="oneframe" style="margin-top:auto">
+    <span class="kicker" style="color:var(--argent)">THE ONE-FRAME TEST &mdash; RUN IT ON EVERY ASSET</span><br><br>
+    <b>Cover the handle.</b> If the frame still reads <span class="hl">dark · precious · transmuted · slightly alive</span>, it&rsquo;s ALKMY &mdash; ship it. If it reads generic SaaS, start over. And two hard checks for this phase: <b>no numbers, and no gold or oxblood</b> &mdash; those belong to stages we haven&rsquo;t revealed.
+  </div>
+  <div class="foot"><span>ALKMY-GTM-0.2 · END · A HOUSE OF TRANSMUTATION</span><span>THE MORTAL, MADE PERMANENT</span></div>
+</section>

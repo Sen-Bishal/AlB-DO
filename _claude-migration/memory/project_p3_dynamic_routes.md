@@ -1,0 +1,23 @@
+---
+name: project_p3_dynamic_routes
+description: "P3 dynamic [slug] routes — DONE & serve-stable: params-on-serve + a type-import parser bug + the arena redesign ([[project-quickjs-arena]] Option A) that unblocked it"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 083a673d-8ffc-4ed9-89dc-fe20914e62e9
+---
+
+P3 (Halation `essays/[slug]`) — ✅ **DONE & serve-stable** as of 2026-06-29. Three fixes (A+B routing, type-import parser bug) made it render-correct; a fourth (the arena redesign) made it serve-stable. All uncommitted (user owns commits).
+
+**Done + verified (A+B, the planned routing gap):**
+- **A — params reach the streaming render.** `should_use_manifest_streaming` now matches by route *pattern* (`target.entry_module`, the manifest key boot.rs sets), not the literal URL; the dispatch arm passes `matched.params` + pattern into a new `streaming_handler_with_match`; `streaming_handler` split into a thin wrapper + shared `serve_manifest_route`; `request_context_from_request` takes `params`. Files: `crates/albedo-server/src/{server.rs,handlers/streaming.rs,handlers/mod.rs}`.
+- **B — build emits `params` object for dynamic routes.** `dynamic_prop_keys_for_component` emits `"params"` (was `"path"`); `RequestContext::resolve("params")` (`render/tier_b.rs`) returns the matched param map as a JSON object → `async function Page({ params })` gets `{ slug }`. Files: `src/manifest/builder.rs`, `crates/albedo-server/src/render/tier_b.rs`.
+- Verified: 120 server-lib + 415 compiler-lib + 5 serve-boot green; manifest carries `/essays/[slug]` with `dynamic_prop_keys:["params"]`, `layout_chain:[RootLayout,EssaysLayout]`; **first request renders the correct essay by slug** (body + nested layout + keyed `body.map`).
+
+**Also fixed en route — type-only-import phantom-edge bug (real engine bug, verified):** `EssayCard.tsx` did `import type { Essay }` (the interface); the scanner's name-match fallback (`scanner.rs build_compiler`, lines ~150-154) linked the binding `Essay` to the *route component* named `Essay`, giving the route a phantom dependent → `entry_components_for_routes` (`src/manifest/mod.rs:197`, "skip components with dependents") dropped `/essays/[slug]` from the manifest entirely. Fix: `parser.rs visit_import_decl` now skips `import type {…}` (decl `type_only`) and inline `import { type X }` (`ImportNamedSpecifier.is_type_only`) — a type import is erased and must create no edge. 11 parser tests green.
+
+**✅ FIXED — the arena residual hazard (was the serve blocker).** Serving `/essays/[slug]` used to render correctly on req1 then abort QuickJS on req2 (`sh->header.ref_count == 0` @ quickjs.c:4577 / AV @ 5843). Root cause: request-time shapes/atoms (the `{params:{slug}}` object shape) interned into QuickJS's global tables but allocated in the bump request region, which `end_request` reset freed → use-after-free on the next request. **Not** a metadata bug (mis-blamed first via a 1-request bisect; a pure-static-metadata route still crashed on req2). **Not** fixable by warmup — you can't pre-intern every shape/atom arbitrary data produces. User directive: "no patchwork — pick a design that works for the framework as a whole." → **arena redesigned (Option A, [[project-quickjs-arena]])**: request-time memory now goes to the system allocator and is freed per-block by QuickJS's own refcount+GC; the O(1)-reset bump request region is gone; the persistent bump is kept for warmup only. Engine call sites (`begin_request`/`run_gc`/`end_request`) unchanged — only the arena internals changed. Files: `src/runtime/arena.rs` (rewritten), guardrail test in `quickjs_engine.rs` rewritten, repro test `dynamic_route_render_survives_reset_after_throwing_warmup` added (kept as regression guard), `engine_pool.rs` (metadata-warmup I'd added removed; warmup now perf-only; pool test updated to `system_peak_bytes`).
+
+**Verified end-to-end:** repro test now passes; 417 lib + 120 server-lib + 5 serve-boot green; live serve (release binary, port 3210/3001) = 9 requests over 6 distinct slugs + repeats + a 404 → all 200, per-essay `generateMetadata` titles correct, 404 → error boundary, server stays up; preview DOM `readyState=complete` with correct title + essay prose. (Screenshot capture times out — ALBEDO's chunked/streaming response keeps the renderer "busy"; DOM eval + HTTP are the proof.)
+
+**Halation app state:** `essays/[slug].tsx` (dynamic `generateMetadata` restored — works now) + `essays/layout.tsx` written ([[project_halation_flagship]]); added `A:\halation\.claude\launch.json` (preview config, `albedo serve`). Binary rebuilt+installed `~/.cargo/bin/albedo.exe` (2026-06-29 ~13:42, has A+B + parser + arena redesign). **P3 render-correct AND serve-stable.** All uncommitted.

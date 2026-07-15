@@ -38,7 +38,7 @@ pub mod value;
 #[cfg(feature = "forge")]
 pub mod libsql;
 
-pub use substrate::DataSubstrate;
+pub use substrate::{DataSubstrate, Transaction};
 pub use value::{Result, Row, Rows, SqlValue, SubstrateError};
 
 #[cfg(feature = "forge")]
