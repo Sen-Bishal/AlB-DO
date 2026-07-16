@@ -168,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn hydrates_guestbook_topic_from_a_real_substrate() {
-        let db = LibSqlSubstrate::open_in_memory().await.unwrap();
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         bootstrap_schema(&db).await.unwrap();
 
         let broadcast = BroadcastRegistry::new();
@@ -189,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn seed_is_idempotent_across_reboots() {
-        let db = LibSqlSubstrate::open_in_memory().await.unwrap();
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         bootstrap_schema(&db).await.unwrap();
         // A second bootstrap against the same (now non-empty) table must not
         // re-seed — the Gate-3 property that runtime writes survive restart.

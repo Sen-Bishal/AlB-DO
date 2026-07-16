@@ -22,6 +22,10 @@
 //! - [`mem`] — [`RecordingSubstrate`](mem::RecordingSubstrate), an
 //!   in-memory test double that lets the wiring be exercised before the
 //!   real libSQL backend is attached.
+//! - [`reserve`] — [`Reservations`](reserve::Reservations), atomic claiming
+//!   of a bounded resource (tickets, stock, seats, quotas). The contention
+//!   primitive: supply never goes negative, never oversells, and a retried
+//!   request never claims twice.
 //!
 //! ## Roadmap (see `development-plan/backend.md`)
 //!
@@ -31,6 +35,7 @@
 //! meet at, and nothing here is wired into the default serve path yet.
 
 pub mod mem;
+pub mod reserve;
 pub mod skeleton;
 pub mod substrate;
 pub mod value;
@@ -38,6 +43,9 @@ pub mod value;
 #[cfg(feature = "forge")]
 pub mod libsql;
 
+pub use reserve::{
+    IdempotencyConflict, ReleaseOutcome, ReserveError, ReserveOutcome, ReserveRequest, Reservations,
+};
 pub use substrate::{DataSubstrate, Transaction};
 pub use value::{Result, Row, Rows, SqlValue, SubstrateError};
 

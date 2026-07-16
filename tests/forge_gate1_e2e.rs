@@ -31,7 +31,7 @@ fn fixture() -> PathBuf {
 async fn seeded_guestbook_rows_render_into_ssr_html() {
     // 1. A real substrate, bootstrapped + seeded, hydrated into the registry —
     //    exactly what `AlbedoServer::run` does at boot before serving.
-    let db = LibSqlSubstrate::open_in_memory().await.unwrap();
+    let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
     skeleton::bootstrap_schema(&db).await.unwrap();
 
     let broadcast = BroadcastRegistry::new();
