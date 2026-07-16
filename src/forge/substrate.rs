@@ -68,8 +68,18 @@ pub trait DataSubstrate: Send + Sync {
 /// not until [`commit`](Transaction::commit). [`commit`](Transaction::commit)
 /// and [`rollback`](Transaction::rollback) consume the handle, so it cannot
 /// be reused after resolution; dropping it without committing rolls back.
+///
+/// ## Why `Sync`
+///
+/// `Send` alone is not enough to be *usable*. Every serve-path request runs as
+/// a spawned task, whose future must be `Send`; any helper that borrows the
+/// transaction (`&dyn Transaction`) across an `.await` makes that future hold a
+/// `&Transaction`, and `&T: Send` requires `T: Sync`. Without this bound a
+/// transaction compiles fine in a single-threaded test and then cannot be used
+/// from a real handler at all. Both implementations already satisfy it — the
+/// bound documents a requirement that was always load-bearing.
 #[async_trait]
-pub trait Transaction: Send {
+pub trait Transaction: Send + Sync {
     /// Read within the transaction — sees its own uncommitted writes.
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Rows>;
 
