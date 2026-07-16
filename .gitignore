@@ -246,6 +246,9 @@ nul
 # Personal — for us, not for the repo.
 /FORUS.md
 
+# Internal dev-team operating manual (graphify/Claude Code/Obsidian system) — not for OSS users.
+/DEVELOPMENT_DOCTRINE.md
+
 # Private brand / pitch / strategy material — company property, not for OSS users.
 /brief/
 /.deck-build/
