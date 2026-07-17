@@ -1532,6 +1532,49 @@ impl CompiledProject {
         self.render_entry_quickjs_inner(engine, entry, props, slots, Some(broadcast))
     }
 
+    /// P6 · the `data-albedo-error` span markup for every form action in
+    /// the project, keyed by action **name** (the key the shim resolves
+    /// from a `<form action="action:NAME">`).
+    ///
+    /// The bottom-up JS shim can't emit these itself: when a field renders,
+    /// the enclosing form's action scope does not exist yet, so it has no
+    /// way to know it should stamp a sibling span (the pure-Rust renderer
+    /// manages it with a render-time scope stack). Generating the markup
+    /// here — from the **same** [`allocate_field_error_id`] and the same
+    /// `<span data-albedo-id=… data-albedo-error=…>` shape the pure-Rust
+    /// path emits — keeps the ids the shim stamps and the ids the P6 submit
+    /// projection ([`crate::runtime::form_result::project_form_result`])
+    /// targets identical by construction. Both read the one field manifest
+    /// (`action_form_fields`), so they cannot drift.
+    ///
+    /// Without these spans the projection's `SetText` (which clears or
+    /// fills every declared field on submit) hits a node the Tier-B form
+    /// never rendered, `_requireNode` throws, and bakabox discards the
+    /// entire opcode frame — the "guestbook needs a reload to show a row it
+    /// already wrote" bug.
+    ///
+    /// Public because the server's request-time Tier-B render path
+    /// (`albedo-server`'s pooled registry) builds its own host seed and must
+    /// inject the identical spans — this method is the one place the markup
+    /// and ids are generated, so the two render paths cannot diverge.
+    pub fn form_error_span_seed(&self) -> serde_json::Map<String, Value> {
+        let mut seed = serde_json::Map::new();
+        for (action_name, fields) in self.action_form_fields.values() {
+            let html: String = fields
+                .iter()
+                .map(|field| {
+                    format!(
+                        "<span data-albedo-id=\"{}\" data-albedo-error=\"{}\"></span>",
+                        crate::transforms::form::allocate_field_error_id(action_name, field),
+                        field,
+                    )
+                })
+                .collect();
+            seed.insert(action_name.clone(), Value::String(html));
+        }
+        seed
+    }
+
     fn render_entry_quickjs_inner(
         &self,
         engine: &mut QuickJsEngine,
@@ -1616,6 +1659,20 @@ impl CompiledProject {
                     let _ = slots.drain_pending();
                 }
             }
+        }
+
+        // P6 · Tier-B error-span parity. Seed the per-action
+        // `data-albedo-error` span markup so the JS shim can emit the same
+        // error sinks the pure-Rust renderer does. Project-global and
+        // independent of the per-component host above — a form can live in
+        // a component with no hooks at all, so this is added unconditionally
+        // (empty when the project has no form actions).
+        let form_error_spans = self.form_error_span_seed();
+        if !form_error_spans.is_empty() {
+            host.insert(
+                "formErrorSpans".to_string(),
+                Value::Object(form_error_spans),
+            );
         }
 
         let props_json = serde_json::to_string(props)

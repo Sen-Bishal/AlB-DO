@@ -915,6 +915,24 @@ if (typeof globalThis.h !== 'function') {
       const contract = globalThis.__ALBEDO_FORM_CONTRACT;
       attrs += ' ' + contract.attr + '="' + __albedo_escape_html(formAction) + '"';
       inner = contract.csrfInput + inner;
+      // P6 · append this action's per-field `data-albedo-error` spans — the
+      // sinks the submit projection's `SetText` targets to clear/fill
+      // validation messages. The pure-Rust renderer interleaves them after
+      // each field via a render-time scope stack; this shim is bottom-up
+      // (children are already stringified before the form runs), so it can't
+      // see which fields belong to the form and instead appends the whole
+      // set at the form's end. The markup + ids come from the server
+      // (`form_error_span_seed`, same `allocate_field_error_id` the pure-Rust
+      // path uses), so the nodes exist with the exact ids the projection
+      // addresses — bakabox no longer hits a missing node and drops the
+      // frame. Placement differs from Tier-A only for a *visible* error
+      // message; on the success path (all spans cleared to empty) it is
+      // indistinguishable.
+      const host = globalThis.__ALBEDO_HOST;
+      const spans = host && host.formErrorSpans ? host.formErrorSpans[formAction] : null;
+      if (typeof spans === 'string') {
+        inner = inner + spans;
+      }
     }
     return new AlbedoHtml('<' + String(type) + attrs + '>' + inner + '</' + String(type) + '>');
   };
@@ -3272,6 +3290,75 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
         assert!(
             !served.contains("value=\"\""),
             "no empty token may reach the browser: {served}",
+        );
+    }
+
+    #[test]
+    fn quickjs_form_appends_seeded_error_spans_for_its_action() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+        engine
+            .load_module(
+                "routes/sign3.tsx",
+                r#"
+                export default function Sign() {
+                    return <form action="action:sign_guestbook">
+                        <input name="author" />
+                        <input name="message" />
+                    </form>;
+                }
+                "#,
+            )
+            .expect("module loads");
+
+        // Seed the spans the way `render_entry_quickjs_inner` does — keyed by
+        // action name. The ids here are arbitrary in this shim-only test; the
+        // compiled-project test proves they equal `allocate_field_error_id`.
+        let host = r#"{"formErrorSpans":{"sign_guestbook":"<span data-albedo-id=\"111\" data-albedo-error=\"author\"></span><span data-albedo-id=\"222\" data-albedo-error=\"message\"></span>"}}"#;
+        let html = engine
+            .render_component_with_host("routes/sign3.tsx", "{}", host)
+            .expect("component renders")
+            .html;
+
+        assert!(
+            html.contains(r#"<span data-albedo-id="111" data-albedo-error="author"></span>"#),
+            "the author error sink must be present: {html}",
+        );
+        assert!(
+            html.contains(r#"<span data-albedo-id="222" data-albedo-error="message"></span>"#),
+            "the message error sink must be present: {html}",
+        );
+        // Spans land inside the form (before its close tag), so a SetText that
+        // targets them by id finds a node under the form subtree.
+        let close = html.find("</form>").expect("form closes");
+        assert!(
+            html.find(r#"data-albedo-error="message""#).unwrap() < close,
+            "error sinks must sit inside the form: {html}",
+        );
+    }
+
+    #[test]
+    fn quickjs_form_emits_no_error_spans_without_a_seed() {
+        // The host-less render path (no `formErrorSpans`) must not fabricate
+        // spans — proves the append is driven by the seed, not hardcoded, and
+        // that the existing host-unaware tests stay honest.
+        let html = engine_rendering(
+            "routes/sign4.tsx",
+            r#"
+            export default function Sign() {
+                return <form action="action:sign_guestbook"><input name="author" /></form>;
+            }
+            "#,
+            "{}",
+        );
+        assert!(
+            !html.contains("data-albedo-error"),
+            "no seed means no error sinks: {html}",
         );
     }
 

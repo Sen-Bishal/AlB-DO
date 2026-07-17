@@ -643,8 +643,22 @@ export function installLegacyHtmlInjector(target, document) {
       el.setAttribute('data-albedo-error', status || 'error');
       return;
     }
+    const parent = el.parentNode;
     el.outerHTML = html;
     flush();
+    // Register the freshly-injected `[data-albedo-id]` nodes with bakabox. A
+    // Tier-B chunk lands by replacing a placeholder's outerHTML with
+    // server-rendered markup bakabox never saw at boot, so its `nodes` map has
+    // no entry for those anchors. Any opcode that later targets one — notably
+    // the P6 form-error `SetText` that clears a field's error span on submit —
+    // then throws in `_requireNode` and takes the entire action-response frame
+    // down with it (the "guestbook needs a reload to show the row it wrote"
+    // bug). Re-seeding the injected subtree is the register step the boot-time
+    // `seedNodesFromDocument` could not do because the markup wasn't there yet.
+    const bakabox = target.__bakabox;
+    if (parent && bakabox && typeof bakabox.seedNodesFromDocument === 'function') {
+      bakabox.seedNodesFromDocument(parent);
+    }
   }
 
   target.__albedo_inject = function inject(id, html, status) {

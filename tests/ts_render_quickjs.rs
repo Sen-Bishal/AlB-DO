@@ -126,6 +126,57 @@ fn seeded_slot_value_drives_the_quickjs_render() {
 }
 
 #[test]
+fn quickjs_form_render_emits_error_spans_at_the_projection_ids() {
+    // The end-to-end proof for the Tier-B error-span fix: a form-action form
+    // rendered through QuickJS must emit a `data-albedo-error` span for every
+    // declared field, at the *exact* id the P6 submit projection targets
+    // (`project_form_result` → `allocate_field_error_id`). Before the fix the
+    // shim emitted none, so on submit the projection's `SetText` hit a missing
+    // node, `_requireNode` threw, and bakabox dropped the whole opcode frame —
+    // the "guestbook needs a reload to show a row it wrote" bug. The ids come
+    // from the same function both sides call, so they line up by construction.
+    use dom_render_compiler::transforms::form::allocate_field_error_id;
+
+    let project =
+        CompiledProject::load_from_dir(render_fixture("form_errors")).expect("form fixture compiles");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store);
+    let mut engine = engine();
+
+    let out = project
+        .render_entry_quickjs(
+            &mut engine,
+            "Component.tsx",
+            &Value::Object(Default::default()),
+            &slots,
+        )
+        .expect("quickjs render succeeds");
+
+    for field in ["author", "message"] {
+        let id = allocate_field_error_id("sign_guestbook", field);
+        let span = format!("<span data-albedo-id=\"{id}\" data-albedo-error=\"{field}\"></span>");
+        assert!(
+            out.html.contains(&span),
+            "missing the error sink for `{field}` at projection id {id}: {}",
+            out.html,
+        );
+    }
+    // The sinks belong to this form, not floating free.
+    assert!(
+        out.html.contains("data-albedo-action=\"sign_guestbook\""),
+        "the form action hook must still be stamped: {}",
+        out.html,
+    );
+    let close = out.html.find("</form>").expect("form closes");
+    assert!(
+        out.html.find("data-albedo-error=\"message\"").unwrap() < close,
+        "error sinks must sit inside the form subtree: {}",
+        out.html,
+    );
+}
+
+#[test]
 fn render_body_using_array_map_renders_under_quickjs() {
     // The render body calls `props.items.map(...)` — a construct the pure-Rust
     // evaluator does not model. Under QuickJS it just runs.

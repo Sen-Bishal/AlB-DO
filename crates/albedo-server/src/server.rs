@@ -835,10 +835,21 @@ impl AlbedoServerBuilder {
             // runtime use — and the one FORGE's boot hydration seeds topics
             // into. Handing the render path a different registry (or a
             // snapshot) would reintroduce the null-slot bug in a subtler form.
+            // P6 · the per-action error-span markup the Tier-B shim appends to
+            // its forms. Generated once here from the compiled project's form
+            // manifest via the SAME `form_error_span_seed` the non-pooled render
+            // path calls, so both emit identical sinks at the ids the submit
+            // projection targets — no missing node, no dropped frame.
+            let form_error_spans = self
+                .reactive_project
+                .as_deref()
+                .map(|project| project.form_error_span_seed())
+                .unwrap_or_default();
             services.registry = Arc::new(PooledTierBRenderRegistry::new(
                 pool.clone(),
                 plan,
                 self.broadcast.clone(),
+                form_error_spans,
             ));
         }
 
