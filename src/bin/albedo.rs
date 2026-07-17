@@ -91,9 +91,10 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
-    // First-run detection — on a fresh install this re-launches as `albdo init`
-    // and exits. On subsequent runs this is a no-op (single Path::exists check).
-    first_run::check_and_run_init();
+    // First-run greeting — one-time welcome on a fresh install, then a no-op
+    // (single Path::exists check). It never dispatches a command itself, so
+    // whatever the user typed still reaches the match below.
+    first_run::welcome_on_first_run();
 
     if args.len() <= 1 {
         print_help();

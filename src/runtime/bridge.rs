@@ -58,27 +58,46 @@ pub enum HandlerEffect {
         slot_id: SlotId,
         value: Vec<u8>,
     },
+    /// FORGE · an `append(collection, record)` call: a **durable** write.
+    ///
+    /// Unlike its siblings this carries no `slot_id` and lowers to no opcode.
+    /// It cannot: the row is not state this session already holds, it is a
+    /// request for the server to change the database. The value a subscriber
+    /// eventually sees comes from rematerialising the collection *after* the
+    /// write commits (`crate::forge::write`), not from echoing back what the
+    /// body passed in — which would announce a row that might never land.
+    ForgeAppend {
+        collection: String,
+        record: serde_json::Map<String, Value>,
+    },
 }
 
 impl HandlerEffect {
-    /// Lowers this effect to the opcode the action dispatcher ships. Both
-    /// variants become a `SlotSet` carrying the JSON value bytes.
+    /// Lowers this effect to the opcode the action dispatcher ships, when it has
+    /// one. `SlotSet` and `Broadcast` both become a `SlotSet` carrying the JSON
+    /// value bytes; [`HandlerEffect::ForgeAppend`] returns `None` — a durable
+    /// write is applied server-side and reported by the topic's post-commit
+    /// fan-out, so there is nothing to send this session inline.
     #[must_use]
-    pub fn into_instruction(self) -> Instruction {
+    pub fn into_instruction(self) -> Option<Instruction> {
         match self {
-            HandlerEffect::SlotSet { slot_id, value } => Instruction::SlotSet { slot_id, value },
-            HandlerEffect::Broadcast { slot_id, value, .. } => {
-                Instruction::SlotSet { slot_id, value }
+            HandlerEffect::SlotSet { slot_id, value } => {
+                Some(Instruction::SlotSet { slot_id, value })
             }
+            HandlerEffect::Broadcast { slot_id, value, .. } => {
+                Some(Instruction::SlotSet { slot_id, value })
+            }
+            HandlerEffect::ForgeAppend { .. } => None,
         }
     }
 
-    /// The slot id this effect writes, regardless of variant.
+    /// The slot id this effect writes, when it writes one.
     #[must_use]
-    pub fn slot_id(&self) -> SlotId {
+    pub fn slot_id(&self) -> Option<SlotId> {
         match self {
             HandlerEffect::SlotSet { slot_id, .. }
-            | HandlerEffect::Broadcast { slot_id, .. } => *slot_id,
+            | HandlerEffect::Broadcast { slot_id, .. } => Some(*slot_id),
+            HandlerEffect::ForgeAppend { .. } => None,
         }
     }
 }
@@ -206,6 +225,25 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
         "const broadcast=function(topic,value){var __t=String(topic);var __v;if(typeof value==='function'){var __cur=Object.prototype.hasOwnProperty.call(__albedo_topic_current,__t)?__albedo_topic_current[__t]:null;__v=value(__cur);}else{__v=value;}if(__v===undefined)__v=null;__albedo_topic_current[__t]=__v;__albedo_effects.push({kind:'broadcast',topic:__t,value:__v});};\n",
     );
 
+    // FORGE · `append(collection, record)` — the durable write builtin, defined
+    // beside `broadcast` because it is the same idea: a body describes an effect
+    // and the server performs it.
+    //
+    // It records ONLY. No `__albedo_topic_current` update and no echo of the
+    // record: unlike `broadcast`, whose value IS the new state, an append's
+    // visible result is whatever the collection looks like once the row commits
+    // — which only the server, post-commit, can say. Guessing here would show a
+    // row that a failed write never created.
+    //
+    // Throws on a non-object record so the author hears about it at the call
+    // site rather than through a server-side type error later.
+    // Emitted in the existing `{kind, topic, value}` shape rather than inventing
+    // fields: the collection IS the topic (a persistent collection is a topic
+    // materialised from the substrate), and the record is the value.
+    script.push_str(
+        "const append=function(collection,record){if(record===null||typeof record!=='object'||Array.isArray(record)){throw new TypeError('append(collection, record): record must be an object');}__albedo_effects.push({kind:'forge_append',topic:String(collection),value:record});return null;};\n",
+    );
+
     // Seed engine-trusted raw-JS bindings first (useState initials, module
     // constants). A later store-backed JSON binding for the same name shadows
     // the initial, which is correct: a written slot is newer than its initial.
@@ -248,6 +286,23 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
         }
         _ => script.push_str("const event=null;\n"),
     }
+
+    // `form` — the same payload under the name a form handler actually reads.
+    //
+    // A submit's payload IS the form's fields, and the action extractor already
+    // preserves `action(({ form, broadcast }) => …)` as the authored shape, so a
+    // body naming `form` must resolve. `event` stays as the general name (an
+    // input/click carries a non-form payload); this is an alias, not a rename,
+    // so nothing that reads `event` changes.
+    //
+    // Only bound for object payloads: a click (`null`) or a typed-input string
+    // is not a form, and binding it as one would let `form.author` silently read
+    // `undefined` off a string instead of failing where the mistake is.
+    // The pure-Rust interpreter binds `form` on the same rule — the two paths
+    // must agree or a body works under one executor and not the other.
+    script.push_str(
+        "const form=(event!==null&&typeof event==='object'&&!Array.isArray(event))?event:undefined;\n",
+    );
 
     // Run the body inside a nested arrow so a userland `return` is CAPTURED as
     // the action's result instead of escaping the effect-collection epilogue.
@@ -353,6 +408,29 @@ fn lower_effect(entry: &str, raw: RawEffect) -> RuntimeResult<HandlerEffect> {
                 slot_id,
                 value,
             })
+        }
+        // FORGE · `append(collection, record)`. Carried in the shared
+        // `{topic, value}` shape: topic = collection, value = the record.
+        "forge_append" => {
+            let collection = raw.topic.ok_or_else(|| {
+                RuntimeError::render(format!(
+                    "forge_append effect in '{entry}' is missing a collection"
+                ))
+            })?;
+            // The shim already rejects a non-object record at the call site;
+            // this is the trust boundary for anything that reached us anyway.
+            let record = serde_json::from_slice::<Value>(&value)
+                .ok()
+                .and_then(|parsed| match parsed {
+                    Value::Object(map) => Some(map),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    RuntimeError::render(format!(
+                        "forge_append effect in '{entry}' for '{collection}' is not an object record"
+                    ))
+                })?;
+            Ok(HandlerEffect::ForgeAppend { collection, record })
         }
         other => Err(RuntimeError::render(format!(
             "handler '{entry}' produced an unknown effect kind '{other}'"
@@ -499,10 +577,72 @@ mod tests {
         };
         assert_eq!(
             effect.into_instruction(),
-            Instruction::SlotSet {
+            Some(Instruction::SlotSet {
                 slot_id: SlotId(3),
                 value: b"1".to_vec()
-            }
+            })
         );
+    }
+
+    /// A durable write is not this session's state, so it lowers to no opcode:
+    /// the rows a subscriber sees come from rematerialising the collection after
+    /// the write commits, not from echoing the record back.
+    #[test]
+    fn a_forge_append_lowers_to_no_opcode() {
+        let effect = HandlerEffect::ForgeAppend {
+            collection: "guestbook".to_string(),
+            record: env(&[("author", Value::String("ada".to_string()))]),
+        };
+        assert_eq!(effect.slot_id(), None);
+        assert_eq!(effect.into_instruction(), None);
+    }
+
+    /// The `append()` builtin and its `form` alias must both be in the script a
+    /// handler body runs against, or a body calling them dies at runtime — which
+    /// is exactly how both were found.
+    #[test]
+    fn the_script_defines_append_and_the_form_alias() {
+        let env = env(&[]);
+        let bc = Map::new();
+        let script = build_handler_script(&HandlerInvocation {
+            body: "0",
+            is_block: false,
+            env: &env,
+            raw_bindings: &[],
+            setters: &[],
+            event_json: None,
+            broadcast_current: &bc,
+        })
+        .unwrap();
+        assert!(script.contains("const append=function(collection,record)"));
+        assert!(script.contains("kind:'forge_append'"));
+        assert!(script.contains("const form="));
+    }
+
+    /// `form` is only bound for an object payload: a click carries `null` and a
+    /// typed input carries a string, and binding either as `form` would let
+    /// `form.field` read `undefined` instead of failing at the mistake.
+    #[test]
+    fn the_form_alias_is_only_bound_for_object_payloads() {
+        let env = env(&[]);
+        let bc = Map::new();
+        let build = |event_json| {
+            build_handler_script(&HandlerInvocation {
+                body: "0",
+                is_block: false,
+                env: &env,
+                raw_bindings: &[],
+                setters: &[],
+                event_json,
+                broadcast_current: &bc,
+            })
+            .unwrap()
+        };
+
+        // The alias is a runtime guard on `event`'s shape, so assert the guard
+        // is present rather than re-deriving what it evaluates to.
+        let form_line = "const form=(event!==null&&typeof event==='object'&&!Array.isArray(event))?event:undefined;";
+        assert!(build(None).contains(form_line));
+        assert!(build(Some(r#"{"author":"ada"}"#)).contains(form_line));
     }
 }

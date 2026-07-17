@@ -361,6 +361,17 @@ impl QuickJsEngine {
             .as_ref()
             .unwrap()
             .with(|ctx| -> RuntimeResult<()> {
+                // Phase L · install the form-action contract before the
+                // helpers that read it. `h()` only dereferences it at render
+                // time, so strict ordering isn't load-bearing — but an engine
+                // whose shim could observe a half-installed contract would
+                // silently render forms without a CSRF input, so the order is
+                // pinned rather than left to chance.
+                ctx.eval::<(), _>(build_form_contract_script())
+                    .map_err(|err| {
+                        RuntimeError::init(format!("failed to install form contract: {err}"))
+                    })?;
+
                 ctx.eval::<(), _>(build_builtin_runtime_helpers_script())
                     .map_err(|err| {
                         RuntimeError::init(format!(
@@ -748,6 +759,35 @@ fn build_npm_runtime_helpers_script() -> String {
     )
 }
 
+/// Phase L · hands the form-action markup contract to the JS side as
+/// data.
+///
+/// The `h()` shim below has to perform the same `action="action:NAME"`
+/// rewrite the pure-Rust renderer does, including emitting the hidden
+/// CSRF input. Restating those literals in JS is exactly how the two
+/// renderers drifted the first time (a Tier-B form shipped with no CSRF
+/// input at all, and the gate that keys off its presence let the submit
+/// through). So the constants cross the language boundary as *values*
+/// from `transforms::form`, and the shim reads them — there is one
+/// spelling, in Rust, and JS cannot disagree with it.
+///
+/// `serde_json` does the encoding: its string output is valid JS source
+/// for the same literal, so a quote or backslash in a constant can't
+/// break out into the surrounding script.
+fn build_form_contract_script() -> String {
+    use crate::transforms::form::{CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR, FORM_ACTION_PREFIX};
+    // Infallible: `serde_json` cannot fail to encode a `&str`.
+    let js = |value: &str| {
+        serde_json::to_string(value).expect("encoding a &str as a JSON string cannot fail")
+    };
+    format!(
+        "globalThis.__ALBEDO_FORM_CONTRACT = {{ prefix: {}, attr: {}, csrfInput: {} }};",
+        js(FORM_ACTION_PREFIX),
+        js(FORM_ACTION_ATTR),
+        js(CSRF_PLACEHOLDER_INPUT),
+    )
+}
+
 fn build_builtin_runtime_helpers_script() -> &'static str {
     r#"
 if (typeof globalThis.h !== 'function') {
@@ -780,6 +820,40 @@ if (typeof globalThis.h !== 'function') {
     out.push(new AlbedoHtml(__albedo_escape_html(String(value))));
   };
 
+  // Framework-level props that are never HTML attributes: `key` (React's
+  // reconciliation identity), `ref` (host-node escape hatch), and `children`
+  // (rendered between the tags, not on them). None is valid HTML.
+  //
+  // MUST match the Rust-side `is_reserved_jsx_prop` in `runtime::eval::component`
+  // — this is the same rule on the far side of a language boundary, and if the
+  // two lists drift, a component's SSR markup stops matching its client markup.
+  const __albedo_is_reserved_prop = function(name) {
+    return name === 'key' || name === 'ref' || name === 'children';
+  };
+
+  // Phase L · `<form action="action:NAME">` detection. The literals come from
+  // `__ALBEDO_FORM_CONTRACT`, injected from the Rust constants in
+  // `transforms::form` that the pure-Rust renderer emits from — so a Tier-B
+  // form and a Tier-A form are the same markup by construction rather than by
+  // two lists someone has to remember to keep in step.
+  //
+  // Returns the bare action name, or null for a plain HTML `<form>` (which must
+  // pass through untouched and keep its native submit behaviour).
+  const __albedo_form_action_name = function(type, props) {
+    if (type !== 'form') {
+      return null;
+    }
+    const contract = globalThis.__ALBEDO_FORM_CONTRACT;
+    if (!contract) {
+      return null;
+    }
+    const action = props.action;
+    if (typeof action !== 'string' || action.indexOf(contract.prefix) !== 0) {
+      return null;
+    }
+    return action.slice(contract.prefix.length);
+  };
+
   const h = function(type, props, ...children) {
     const flatChildren = [];
     __albedo_push_children(children, flatChildren);
@@ -796,8 +870,17 @@ if (typeof globalThis.h !== 'function') {
 
     let attrs = '';
     const safeProps = props || {};
+    const formAction = __albedo_form_action_name(type, safeProps);
     for (const key in safeProps) {
-      if (!Object.prototype.hasOwnProperty.call(safeProps, key) || key === 'children') {
+      if (!Object.prototype.hasOwnProperty.call(safeProps, key)
+          || __albedo_is_reserved_prop(key)) {
+        continue;
+      }
+      // The sentinel `action` attribute is consumed by the rewrite below and
+      // must not also ship as a literal `action="action:NAME"` — that would
+      // make the form navigate to a bogus URL if the client runtime never
+      // loaded, instead of simply doing nothing.
+      if (formAction !== null && key === 'action') {
         continue;
       }
       const value = safeProps[key];
@@ -822,7 +905,17 @@ if (typeof globalThis.h !== 'function') {
       attrs += ' ' + attrName + '="' + __albedo_escape_html(value) + '"';
     }
 
-    const inner = flatChildren.join('');
+    // Phase L · stamp the rewritten action hook and prepend the hidden CSRF
+    // input as the form's first child — byte-identical to what the pure-Rust
+    // renderer emits, because both read the same constants. The input ships
+    // with an empty value; the server fills the per-session token into every
+    // placeholder at request time (`transforms::form::fill_csrf_tokens`).
+    let inner = flatChildren.join('');
+    if (formAction !== null) {
+      const contract = globalThis.__ALBEDO_FORM_CONTRACT;
+      attrs += ' ' + contract.attr + '="' + __albedo_escape_html(formAction) + '"';
+      inner = contract.csrfInput + inner;
+    }
     return new AlbedoHtml('<' + String(type) + attrs + '>' + inner + '</' + String(type) + '>');
   };
 
@@ -2837,6 +2930,77 @@ mod tests {
         assert_eq!(plain.html, "<span></span>");
     }
 
+    /// `key` is React's reconciliation identity, not data about the element, and
+    /// it is not a valid HTML attribute — React strips it. This shim used to
+    /// emit it verbatim, so every keyed list row shipped `key="1"` to the
+    /// browser. `className` is asserted alongside it to prove the guard removes
+    /// only the reserved prop and leaves real attributes (and their rename)
+    /// alone.
+    #[test]
+    fn reserved_props_never_reach_the_rendered_html() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+
+        let src = r#"
+            export default function List() {
+                const items = [{ id: 7, label: "first" }, { id: 8, label: "second" }];
+                return (
+                    <ul className="entries">
+                        {items.map((item) => (
+                            <li className="entry" key={item.id}>{item.label}</li>
+                        ))}
+                    </ul>
+                );
+            }
+        "#;
+        engine.load_module("routes/list.tsx", src).expect("loads");
+
+        let out = engine
+            .render_component("routes/list.tsx", "{}")
+            .expect("list render");
+
+        assert!(
+            !out.html.contains("key="),
+            "`key` must not be emitted as an HTML attribute, got: {}",
+            out.html
+        );
+        assert_eq!(
+            out.html,
+            "<ul class=\"entries\"><li class=\"entry\">first</li><li class=\"entry\">second</li></ul>",
+        );
+    }
+
+    /// `ref` is the same class of prop as `key` — a host-node escape hatch, not
+    /// an attribute.
+    #[test]
+    fn a_ref_prop_never_reaches_the_rendered_html() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+
+        let src = r#"
+            export default function Box() {
+                return <div ref="anchor" id="real">x</div>;
+            }
+        "#;
+        engine.load_module("routes/box.tsx", src).expect("loads");
+
+        let out = engine
+            .render_component("routes/box.tsx", "{}")
+            .expect("box render");
+
+        assert_eq!(out.html, "<div id=\"real\">x</div>");
+    }
+
     // The wider hook surface (useEffect/useRef/useMemo/useCallback) neither
     // fails to load nor crashes a render — effects are no-ops on the server.
     #[test]
@@ -3017,5 +3181,119 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
             .eval_route_metadata("routes/plain.tsx", "{}")
             .expect("eval ok")
             .is_none());
+    }
+
+    // ── Phase L · form-action rewrite under QuickJS ──────────────────
+    //
+    // A `<form action="action:NAME">` rendered by the QuickJS shim used to ship
+    // verbatim: no `data-albedo-action`, and — the part that mattered — no
+    // hidden CSRF input, because only the pure-Rust renderer performed the
+    // rewrite. The form still submitted (the client runtime recognises the raw
+    // sentinel too), so every Tier-B form POSTed with no token and the gate,
+    // which only ran when a token was present, let it through.
+    //
+    // These assert against the shared `transforms::form` constants rather than
+    // against literals typed out here. That is the point: the same constants
+    // the pure-Rust renderer emits are the ones being checked, so the tests
+    // state renderer *parity*, not just "the shim emits some markup".
+
+    fn engine_rendering(specifier: &str, src: &str, props: &str) -> String {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+        engine.load_module(specifier, src).expect("module loads");
+        engine
+            .render_component(specifier, props)
+            .expect("component renders")
+            .html
+    }
+
+    #[test]
+    fn quickjs_form_action_is_rewritten_and_carries_the_csrf_placeholder() {
+        use crate::transforms::form::{CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR};
+
+        let html = engine_rendering(
+            "routes/sign.tsx",
+            r#"
+            export default function Sign() {
+                return <form action="action:sign_guestbook"><input name="author" /></form>;
+            }
+            "#,
+            "{}",
+        );
+
+        assert!(
+            html.contains(&format!("{FORM_ACTION_ATTR}=\"sign_guestbook\"")),
+            "the sentinel must be rewritten to the action hook: {html}",
+        );
+        assert!(
+            html.contains(CSRF_PLACEHOLDER_INPUT),
+            "a Tier-B form must carry the same CSRF placeholder Tier-A emits: {html}",
+        );
+        assert!(
+            !html.contains("action=\"action:sign_guestbook\""),
+            "the raw sentinel must not also ship as an attribute: {html}",
+        );
+        // First child, so it is serialized with the form like any other field.
+        assert!(
+            html.contains(&format!(">{CSRF_PLACEHOLDER_INPUT}")),
+            "the CSRF input belongs at the head of the form body: {html}",
+        );
+    }
+
+    /// The seam the whole fix turns on: what the shim emits must be
+    /// fillable by the server pass. A shim-only fix would satisfy the
+    /// test above and still ship `value=""` to the browser, because the
+    /// Tier-B chunk path never ran the substitution — a failure that is
+    /// invisible in the markup and only shows up as a rejected submit.
+    #[test]
+    fn quickjs_form_placeholder_is_fillable_by_the_server_pass() {
+        use crate::transforms::form::fill_csrf_tokens;
+
+        let html = engine_rendering(
+            "routes/sign2.tsx",
+            r#"
+            export default function Sign() {
+                return <form action="action:sign_guestbook"></form>;
+            }
+            "#,
+            "{}",
+        );
+
+        let served = fill_csrf_tokens(&html, "0123456789abcdef");
+        assert!(
+            served.contains("value=\"0123456789abcdef\""),
+            "the server fill must find the shim's placeholder: {served}",
+        );
+        assert!(
+            !served.contains("value=\"\""),
+            "no empty token may reach the browser: {served}",
+        );
+    }
+
+    #[test]
+    fn quickjs_leaves_a_plain_html_form_untouched() {
+        use crate::transforms::form::{CSRF_MARKER_ATTR, FORM_ACTION_ATTR};
+
+        let html = engine_rendering(
+            "routes/plain_form.tsx",
+            r#"
+            export default function Search() {
+                return <form action="/search" method="get"></form>;
+            }
+            "#,
+            "{}",
+        );
+
+        // Not an Albedo action: it keeps its native submit behaviour and gains
+        // nothing. Stamping a CSRF input here would submit a stray `_csrf`
+        // field to someone else's endpoint.
+        assert!(html.contains("action=\"/search\""), "{html}");
+        assert!(!html.contains(FORM_ACTION_ATTR), "{html}");
+        assert!(!html.contains(CSRF_MARKER_ATTR), "{html}");
     }
 }

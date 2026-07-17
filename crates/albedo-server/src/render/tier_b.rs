@@ -432,6 +432,14 @@ pub struct TierBEntryPlan {
     /// is idempotent by source hash, so re-loading on every checkout is a cheap
     /// hash-compare after an engine has seen the module once.
     pub modules: Vec<(String, String)>,
+    /// Broadcast topics this component reads via `useSharedSlot`, resolved at
+    /// boot from the compiled project (the manifest doesn't carry them).
+    ///
+    /// The request path seeds each topic's *current* value into the render's
+    /// host object; the topic list is fixed at compile time, but the values are
+    /// not, so only the list can be precomputed here. Empty for the vast
+    /// majority of components, which read no shared slots at all.
+    pub shared_topics: Vec<String>,
 }
 
 /// Map from a `TierBNode.render_fn` (e.g. `"render::Stats"`) to its boot-built
@@ -478,13 +486,55 @@ return globalThis.__albedo_island_placeholder({placeholder_id:?}); }});"
 pub struct PooledTierBRenderRegistry {
     pool: Arc<crate::engine_pool::QuickJsEnginePool>,
     plan: TierBRenderPlan,
+    /// The server's live broadcast registry — the same `Arc` the action
+    /// handlers, the WT/SSE runtime and FORGE's boot hydration write through.
+    ///
+    /// Without it this path had no way to resolve `useSharedSlot`, and passed
+    /// an empty host seed instead: the component saw `null`, threw, and the
+    /// island never entered the DOM. It must be the live registry, not a
+    /// snapshot — a topic's value changes under the server, and each request
+    /// must render whatever is current *at that request*.
+    broadcast: Arc<dom_render_compiler::runtime::BroadcastRegistry>,
 }
 
 impl PooledTierBRenderRegistry {
     #[must_use]
-    pub fn new(pool: Arc<crate::engine_pool::QuickJsEnginePool>, plan: TierBRenderPlan) -> Self {
-        Self { pool, plan }
+    pub fn new(
+        pool: Arc<crate::engine_pool::QuickJsEnginePool>,
+        plan: TierBRenderPlan,
+        broadcast: Arc<dom_render_compiler::runtime::BroadcastRegistry>,
+    ) -> Self {
+        Self {
+            pool,
+            plan,
+            broadcast,
+        }
     }
+
+}
+
+/// The `host` object seeding one Tier-B render: the component's shared-slot
+/// topics at their **current** values, read on the request.
+///
+/// `state` is deliberately absent. An omitted hook index tells the JS shim to
+/// use that hook's own initial argument, which on a fresh page GET is exactly
+/// right — and that is precisely why the old hardcoded empty host hid for so
+/// long: it was correct for `useState` and silently wrong for `useSharedSlot`,
+/// whose topic value has no initial-argument fallback to degrade to.
+fn host_seed_for(
+    plan: &TierBEntryPlan,
+    broadcast: &dom_render_compiler::runtime::BroadcastRegistry,
+) -> String {
+    let shared = dom_render_compiler::runtime::shared_slot_host_seed(
+        plan.shared_topics.iter().map(String::as_str),
+        broadcast,
+    );
+    if shared.is_empty() {
+        return "{}".to_string();
+    }
+    let mut host = serde_json::Map::new();
+    host.insert("shared".to_string(), Value::Object(shared));
+    serde_json::to_string(&Value::Object(host)).unwrap_or_else(|_| "{}".to_string())
 }
 
 #[async_trait]
@@ -515,6 +565,9 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
 
         let props_json = serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string());
         let render_fn_owned = render_fn.to_string();
+        // Read the topics' values here, on the request, not at boot — the whole
+        // point is that they are live.
+        let host_json = host_seed_for(&plan, self.broadcast.as_ref());
 
         // The closure crosses to the engine's dedicated thread, so every capture
         // and the return type must be `Send + 'static`. The engine's
@@ -534,7 +587,7 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
                     })?;
                 }
                 engine
-                    .render_component_with_host(&plan.entry, &props_json, "{}")
+                    .render_component_with_host(&plan.entry, &props_json, &host_json)
                     .map(|output| output.html)
                     .map_err(|err| ComponentRenderFailure {
                         thrown_message: err.thrown_message(),
@@ -672,6 +725,84 @@ mod tests {
     use super::*;
     use dom_render_compiler::manifest::schema::{DomPosition, RenderedNode, TierBNode};
     use serde_json::json;
+
+    /// Regression cover for the Tier-B serve gap.
+    ///
+    /// The bug: this registry passed a hardcoded `"{}"` host to
+    /// `render_component_with_host`, so `useSharedSlot(topic)` — which the JS
+    /// shim resolves from `host.shared[topic]` — saw nothing, returned null,
+    /// and the component threw. The island shipped as
+    /// `__albedo_inject(id, null, 'error')` and never entered the DOM, while
+    /// the *same* component rendered correctly through the in-process
+    /// `render_entry_with_broadcast` path. These pin the host seed this
+    /// registry now builds.
+    mod host_seed {
+        use super::*;
+        use dom_render_compiler::runtime::BroadcastRegistry;
+
+        fn plan_reading(topics: &[&str]) -> TierBEntryPlan {
+            TierBEntryPlan {
+                entry: "mod::Comp".to_string(),
+                modules: Vec::new(),
+                shared_topics: topics.iter().map(|t| (*t).to_string()).collect(),
+            }
+        }
+
+        #[test]
+        fn a_component_reading_no_shared_slots_gets_an_empty_host() {
+            let broadcast = BroadcastRegistry::new();
+            assert_eq!(host_seed_for(&plan_reading(&[]), &broadcast), "{}");
+        }
+
+        /// The actual fix: the topic's live value has to reach the render.
+        #[test]
+        fn a_shared_slot_topic_is_seeded_at_its_current_value() {
+            let broadcast = BroadcastRegistry::new();
+            broadcast.topic("guestbook", br#"[{"author":"ada"}]"#.to_vec());
+
+            let host = host_seed_for(&plan_reading(&["guestbook"]), &broadcast);
+            let parsed: Value = serde_json::from_str(&host).expect("host seed is JSON");
+
+            assert_eq!(parsed["shared"]["guestbook"], json!([{"author": "ada"}]));
+        }
+
+        /// A write must be visible to the NEXT request — the registry holds the
+        /// live broadcast `Arc`, not a boot-time snapshot. Seeding from a
+        /// snapshot would pass the test above and still serve stale rows
+        /// forever, which is the subtler version of the same bug.
+        #[test]
+        fn the_seed_reflects_writes_made_after_the_plan_was_built() {
+            let broadcast = BroadcastRegistry::new();
+            broadcast.topic("guestbook", b"[]".to_vec());
+            let plan = plan_reading(&["guestbook"]);
+
+            broadcast
+                .write_topic("guestbook", br#"[{"author":"alan"}]"#.to_vec())
+                .expect("topic is registered");
+
+            let host = host_seed_for(&plan, &broadcast);
+            let parsed: Value = serde_json::from_str(&host).expect("host seed is JSON");
+            assert_eq!(parsed["shared"]["guestbook"], json!([{"author": "alan"}]));
+        }
+
+        /// An unregistered topic is omitted, not seeded null: the shim then
+        /// falls back on its own default instead of being handed a value the
+        /// server never had.
+        #[test]
+        fn a_topic_absent_from_the_registry_is_omitted_from_the_seed() {
+            let broadcast = BroadcastRegistry::new();
+            broadcast.topic("known", b"1".to_vec());
+
+            let host = host_seed_for(&plan_reading(&["known", "never-registered"]), &broadcast);
+            let parsed: Value = serde_json::from_str(&host).expect("host seed is JSON");
+
+            assert!(parsed["shared"].get("known").is_some());
+            assert!(
+                parsed["shared"].get("never-registered").is_none(),
+                "an unknown topic must not be invented as null"
+            );
+        }
+    }
 
     struct TestRegistry;
 
@@ -880,7 +1011,11 @@ mod tests {
         // renders: a component with no boot-built plan must produce a loud
         // `RegistryFailure`, never an empty success.
         let pool = Arc::new(crate::engine_pool::QuickJsEnginePool::with_size(1));
-        let registry = PooledTierBRenderRegistry::new(pool, TierBRenderPlan::new());
+        let registry = PooledTierBRenderRegistry::new(
+            pool,
+            TierBRenderPlan::new(),
+            Arc::new(dom_render_compiler::runtime::BroadcastRegistry::new()),
+        );
 
         let err = registry
             .call("render::Missing", &json!({}), &HashMap::new())

@@ -6,7 +6,7 @@ use crate::contract::{
     RuntimeMiddleware,
 };
 use crate::error::RuntimeError;
-use crate::handlers::action::{run_action_request, ActionRegistry};
+use crate::handlers::action::{run_action_request, ActionRegistry, FormActionIds};
 use crate::handlers::api::dispatch_api_route;
 use crate::handlers::public_assets::PublicAssets;
 use crate::handlers::{
@@ -67,6 +67,19 @@ struct CompiledProjectActionAdapter {
     /// `engine_pool` module docs + `project_a1_bridge`). The QuickJS path unlocks
     /// loops/`try`/array methods in action bodies that the pure-Rust path rejects.
     engine_pool: Option<Arc<crate::engine_pool::QuickJsEnginePool>>,
+    /// FORGE · the substrate a body's `append()` writes land in.
+    ///
+    /// A `OnceLock` because of a boot ordering fact: adapters are built during
+    /// `register_compiled_project` (synchronous, on the builder), while the
+    /// substrate can only be opened in the async `run()` seam much later. The
+    /// same `Arc` is minted on the builder and cloned into every adapter — the
+    /// trick `broadcast` already uses — and `run()` fills it before the listener
+    /// binds, so no request can observe it empty.
+    ///
+    /// Ungated: `DataSubstrate` is a trait with no backend attached, so the seam
+    /// compiles without `--features forge`. It simply stays empty there, and an
+    /// `append()` reports that rather than pretending to write.
+    forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
 }
 
 #[async_trait::async_trait]
@@ -97,9 +110,20 @@ impl ActionHandler for CompiledProjectActionAdapter {
             let broadcast = self.broadcast.clone();
             let envelope = envelope.clone();
             let action_id = self.action_id;
-            return pool
+
+            // FORGE · the write collector is a THREAD-LOCAL, and the body runs on
+            // the pool's own engine thread — so it must be installed inside this
+            // closure, not around the `await`. Installing it out here would leave
+            // an `append()` recording into a collector on the wrong thread, i.e.
+            // silently discarding a durable write.
+            //
+            // `ForgeWrite` is plain data (String + serde_json Map), so the
+            // recorded intents cross back over the thread boundary with the
+            // instructions and are applied below, where we are async again.
+            let (instructions, writes) = pool
                 .with_engine(move |engine| {
-                    project
+                    let collector = dom_render_compiler::forge::install_forge_write_collector();
+                    let instructions = project
                         .invoke_action_quickjs_with_broadcast(
                             engine,
                             &envelope,
@@ -110,14 +134,75 @@ impl ActionHandler for CompiledProjectActionAdapter {
                             RuntimeError::RequestHandling(format!(
                                 "compiled action handler {action_id} (quickjs) failed: {err:#}"
                             ))
-                        })
+                        })?;
+                    Ok::<_, RuntimeError>((instructions, collector.take()))
                 })
                 .await
                 .map_err(|err| {
                     RuntimeError::RequestHandling(format!(
                         "engine pool checkout for action {action_id} failed: {err}"
                     ))
+                })??;
+
+            if !writes.is_empty() {
+                let substrate = self.forge_substrate.get().ok_or_else(|| {
+                    RuntimeError::RequestHandling(format!(
+                        "compiled action handler {action_id} called append() but no FORGE \
+                         substrate is wired; rebuild with --features forge"
+                    ))
                 })?;
+                dom_render_compiler::forge::apply_writes(
+                    substrate.as_ref(),
+                    self.broadcast.as_ref(),
+                    &writes,
+                )
+                .await
+                .map_err(|err| {
+                    RuntimeError::RequestHandling(format!(
+                        "compiled action handler {action_id} FORGE write failed: {err}"
+                    ))
+                })?;
+            }
+
+            return Ok(instructions);
+        }
+
+        // FORGE · the durable write path. `invoke_action_with_forge` installs
+        // the broadcast registry (as below) AND a write collector, so a body's
+        // `append(collection, record)` records an intent instead of attempting
+        // I/O from a synchronous evaluation. The intents are applied here,
+        // where we are async: mutate → rematerialize → fan out, atomically.
+        //
+        // The body still runs when no substrate is wired; `append()` then fails
+        // inside the body with a clear message rather than being silently
+        // dropped, which is the only honest outcome for a durable write.
+        if let Some(substrate) = self.forge_substrate.get() {
+            let (instructions, writes) = self
+                .project
+                .invoke_action_with_forge(envelope, &view, self.broadcast.as_ref())
+                .map_err(|err| {
+                    RuntimeError::RequestHandling(format!(
+                        "compiled action handler {} failed: {err:#}",
+                        self.action_id
+                    ))
+                })?;
+
+            // Applied AFTER the body returned Ok: a body that errored partway
+            // never reaches here, so its earlier appends are discarded with it.
+            dom_render_compiler::forge::apply_writes(
+                substrate.as_ref(),
+                self.broadcast.as_ref(),
+                &writes,
+            )
+            .await
+            .map_err(|err| {
+                RuntimeError::RequestHandling(format!(
+                    "compiled action handler {} FORGE write failed: {err}",
+                    self.action_id
+                ))
+            })?;
+
+            return Ok(instructions);
         }
 
         // Phase P · C.2 — `invoke_action_with_broadcast` installs the
@@ -171,12 +256,17 @@ struct RenderWorld {
     /// pipeline (when bound) holds the same `Arc<SlotStore>` so writes
     /// are visible to both sides without copying.
     slot_store: Arc<SlotStore>,
-    /// Phase L — per-session CSRF token registry. The action
-    /// dispatcher validates `_csrf` fields from JSON form payloads
-    /// against this map; the renderer side will eventually read it
-    /// to substitute the per-session token into hidden form inputs
-    /// stamped with `data-albedo-csrf`.
+    /// Phase L — per-session CSRF token registry. The streaming
+    /// handler mints a token per page response and fills it into every
+    /// hidden form input the renderers stamped; the action dispatcher
+    /// validates submitted `_csrf` fields against this same map.
     csrf: Arc<CsrfRegistry>,
+    /// Phase L — `action_id`s reachable from a form, and so required to
+    /// present a valid CSRF token. Fixed at build time from the
+    /// compiled project's forms plus every `register_form_action`, so
+    /// the dispatcher never has to ask a request whether it ought to be
+    /// checked.
+    form_action_ids: Arc<FormActionIds>,
     layouts: Arc<HashMap<String, SharedLayoutHandler>>,
     middleware: Arc<HashMap<String, SharedMiddleware>>,
     auth_provider: SharedAuthProvider,
@@ -220,13 +310,18 @@ struct RuntimeState {
     /// FORGE — the durable storage substrate, opened once at
     /// [`AlbedoServer::run`] and held here on the **persistent** tier (not the
     /// swappable `RenderWorld`), so a dev world-swap never reopens the database.
-    /// `None` until `run()` opens it; the field only exists under
-    /// `--features forge`. Shared-slot topic hydration (Gate 1) and
-    /// durable-action writes both resolve the backend through this handle.
-    // Read by the Gate-1 topic-hydration pass, landing in the next task.
-    #[cfg(feature = "forge")]
-    #[allow(dead_code)]
-    forge_substrate: Option<Arc<dyn dom_render_compiler::forge::DataSubstrate>>,
+    /// Shared-slot topic hydration (Gate 1) and durable-action writes both
+    /// resolve the backend through this handle.
+    ///
+    /// This is the SAME `Arc` the builder minted and cloned into every action
+    /// adapter, which is what makes the write path work across the boot ordering:
+    /// adapters are constructed synchronously on the builder, long before the
+    /// async `run()` seam can open a database. `run()` fills the cell before the
+    /// listener binds, so no request ever sees it empty.
+    ///
+    /// Ungated on purpose — `DataSubstrate` is a backend-free trait, so the seam
+    /// compiles without `--features forge` and simply stays empty there.
+    forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
 }
 
 impl RuntimeState {
@@ -252,6 +347,12 @@ pub struct AlbedoServerBuilder {
     /// Populated via [`Self::register_action`]; served by the
     /// `POST /_albedo/action` axum route.
     action_handlers: ActionRegistry,
+    /// Phase L — the subset of `action_handlers` a form can submit to,
+    /// which the dispatcher requires a CSRF token from. Fed by
+    /// [`Self::register_form_action`] (explicit) and
+    /// [`Self::register_compiled_project`] (every
+    /// `<form action="action:NAME">` the compiler found).
+    form_action_ids: FormActionIds,
     props_loaders: HashMap<String, SharedPropsLoader>,
     layouts: HashMap<String, SharedLayoutHandler>,
     middleware: HashMap<String, SharedMiddleware>,
@@ -292,6 +393,14 @@ pub struct AlbedoServerBuilder {
     /// so action handlers, the WT runtime, and any userland write all
     /// resolve topics against one registry.
     broadcast: Arc<BroadcastRegistry>,
+    /// FORGE · the substrate handle shared with every action adapter.
+    ///
+    /// Minted here for the same reason `broadcast` is: adapters are built during
+    /// `register_compiled_project`, which runs on the builder. The substrate
+    /// itself can only be opened in the async `run()` seam, so this starts empty
+    /// and `run()` fills it before the listener binds. Cloning the `Arc` at
+    /// adapter-construction time is what lets a later write find the backend.
+    forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
     /// A1 · optional pool of warmed QuickJS engines. When set (via
     /// [`Self::with_quickjs_action_engine_pool`]), every adapter built by a
     /// *subsequent* [`Self::register_compiled_project`] runs its action bodies
@@ -315,6 +424,7 @@ impl AlbedoServerBuilder {
             handlers: HashMap::new(),
             api_handlers: HashMap::new(),
             action_handlers: ActionRegistry::new(),
+            form_action_ids: FormActionIds::new(),
             props_loaders: HashMap::new(),
             layouts: HashMap::new(),
             middleware: HashMap::new(),
@@ -332,6 +442,8 @@ impl AlbedoServerBuilder {
             // runtime state will hold. Idle cost is one empty
             // DashMap; non-broadcast workloads don't pay anything.
             broadcast: Arc::new(BroadcastRegistry::new()),
+            // FORGE · minted empty; `run()` fills it once the substrate opens.
+            forge_substrate: Arc::new(std::sync::OnceLock::new()),
             // A1 · off by default — opt in via `with_quickjs_action_engine_pool`.
             action_engine_pool: None,
             // Step 3 · set by `register_compiled_project`.
@@ -496,9 +608,20 @@ impl AlbedoServerBuilder {
                 // bodies through QuickJS; otherwise the pure-Rust path. Cloning
                 // an `Arc` — every adapter for this project shares one pool.
                 engine_pool: self.action_engine_pool.clone(),
+                // FORGE · the same `Arc` `run()` will fill, so an adapter built
+                // now can still find the substrate opened later.
+                forge_substrate: self.forge_substrate.clone(),
             };
             self.action_handlers.insert(proxy_id, Arc::new(adapter));
         }
+
+        // Phase L · every `<form action="action:NAME">` the compiler found in
+        // this project's JSX names an action that MUST present a CSRF token.
+        // Taking the set from the compiled project (rather than inferring it
+        // per-request from the payload) is what lets the gate fail closed: a
+        // form action with no token is rejected even if the renderer that
+        // produced the form forgot to emit the input.
+        self.form_action_ids.extend(project.form_action_ids());
 
         // Phase P · Stream C.3 — auto-register every `useSharedSlot`
         // topic this project references so the streaming handler's
@@ -578,6 +701,10 @@ impl AlbedoServerBuilder {
             }
         };
         self.action_handlers.insert(action_id, Arc::new(wrapped));
+        // Phase L · registering a handler *as a form action* is itself the
+        // statement that a form submits to it, so the CSRF gate applies —
+        // whether or not a compiled project also declares the form in JSX.
+        self.form_action_ids.insert(action_id);
         self
     }
 
@@ -678,7 +805,10 @@ impl AlbedoServerBuilder {
         // renders it through the same warmed/arena engines actions use, awaiting
         // any returned Promise on the server before lowering to HTML.
         if let (Some(runtime), Some(pool)) = (renderer.as_ref(), self.action_engine_pool.as_ref()) {
-            let plan = runtime.build_tier_b_render_plan();
+            // The compiled project supplies each Tier-B component's
+            // `useSharedSlot` topics — the render manifest doesn't carry them,
+            // and without them the request path can't resolve a shared slot.
+            let plan = runtime.build_tier_b_render_plan(self.reactive_project.as_deref());
 
             // Warm every pool engine's render path with the real Tier-B components
             // before the pool serves a request. The arena's O(1) reset is only safe
@@ -701,7 +831,15 @@ impl AlbedoServerBuilder {
                 tier_b_components = plan.len(),
                 "installed pool-backed Tier-B render registry"
             );
-            services.registry = Arc::new(PooledTierBRenderRegistry::new(pool.clone(), plan));
+            // The SAME broadcast `Arc` the action adapters and the WT/SSE
+            // runtime use — and the one FORGE's boot hydration seeds topics
+            // into. Handing the render path a different registry (or a
+            // snapshot) would reintroduce the null-slot bug in a subtler form.
+            services.registry = Arc::new(PooledTierBRenderRegistry::new(
+                pool.clone(),
+                plan,
+                self.broadcast.clone(),
+            ));
         }
 
         // Phase-H — one shared slot store for the lifetime of the
@@ -922,6 +1060,7 @@ impl AlbedoServerBuilder {
             // tokens minted during page render are the ones the
             // action dispatcher validates against.
             csrf: csrf_registry.clone(),
+            form_action_ids: Arc::new(self.form_action_ids),
             layouts: Arc::new(self.layouts),
             middleware: Arc::new(self.middleware),
             auth_provider: self.auth_provider,
@@ -937,10 +1076,11 @@ impl AlbedoServerBuilder {
             dev_error_registry,
             dev_hmr_registry,
             request_timings: self.request_timings_enabled,
-            // FORGE — opened later, in the async `run()` boot seam; `build()`
-            // is synchronous and `LibSqlSubstrate::open_local` is async.
-            #[cfg(feature = "forge")]
-            forge_substrate: None,
+            // FORGE — the cell is filled later, in the async `run()` boot seam
+            // (`build()` is synchronous and `open_local` is async). Carrying the
+            // builder's `Arc` here rather than a fresh one is what lets `run()`
+            // fill the very cell the action adapters already hold.
+            forge_substrate: self.forge_substrate,
         };
 
         Ok(AlbedoServer {
@@ -1061,8 +1201,11 @@ impl AlbedoServer {
                 RuntimeError::ServerStartup(format!("FORGE: topic hydration failed: {err}"))
             })?;
 
-            self.state.forge_substrate = Some(substrate);
-            info!("FORGE substrate opened (forge.db); topics hydrated");
+            // Fill the cell every action adapter is already holding a clone of.
+            // Before the listener binds, so no request can race an empty cell —
+            // and `set` cannot fail here (nothing else writes it).
+            let _ = self.state.forge_substrate.set(substrate);
+            info!("FORGE substrate opened (forge.db); topics hydrated; writes enabled");
         }
 
         let addr = self.config.server.socket_addr()?;
@@ -1482,6 +1625,7 @@ async fn run_action_route(
     run_action_request(
         world.action_handlers.as_ref(),
         world.csrf.as_ref(),
+        world.form_action_ids.as_ref(),
         ctx,
         body,
         slots,
@@ -2188,6 +2332,18 @@ mod tests {
 
     // ── Phase G — action route tests ──────────────────────────────────
 
+    /// Mint the per-session CSRF token the action gate now requires on
+    /// EVERY POST (see `handlers::action`). Tests that pin
+    /// `x-albedo-session` to `session_uuid` present the returned token in
+    /// the `x-albedo-csrf` header — the server-side mirror of the browser
+    /// reading the shell's `__ALBEDO_CSRF__` global.
+    fn action_csrf_token(server: &AlbedoServer, session_uuid: &str) -> String {
+        let session = dom_render_compiler::runtime::SessionId::new(
+            uuid::Uuid::parse_str(session_uuid).expect("valid session uuid"),
+        );
+        server.csrf_registry().token_for(session)
+    }
+
     #[tokio::test]
     async fn action_route_dispatches_and_returns_wire_encoded_opcode_frame() {
         use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
@@ -2226,12 +2382,18 @@ mod tests {
         })
         .unwrap();
 
+        // The gate requires a token on every action; pin a session and
+        // present its token like the browser runtime does.
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let token = action_csrf_token(&server, &session_uuid);
         let response = server
             .router()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/_albedo/action")
+                    .header("x-albedo-session", session_uuid.as_str())
+                    .header("x-albedo-csrf", token.as_str())
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -2271,12 +2433,19 @@ mod tests {
         })
         .unwrap();
 
+        // Present a valid token so the request clears the CSRF gate and
+        // reaches the handler lookup — the 404 under test is about the
+        // unknown action_id, not a missing token.
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let token = action_csrf_token(&server, &session_uuid);
         let response = server
             .router()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/_albedo/action")
+                    .header("x-albedo-session", session_uuid.as_str())
+                    .header("x-albedo-csrf", token.as_str())
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -2330,13 +2499,20 @@ mod tests {
         })
         .unwrap();
 
+        // A real UUID session so the minted token matches (the gate now
+        // validates the token against the resolved session). The handler
+        // echoes the raw `x-albedo-session` header, so we assert against
+        // that same value.
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let token = action_csrf_token(&server, &session_uuid);
         let response = server
             .router()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/_albedo/action")
-                    .header("x-albedo-session", "sess-abc")
+                    .header("x-albedo-session", session_uuid.as_str())
+                    .header("x-albedo-csrf", token.as_str())
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -2350,7 +2526,7 @@ mod tests {
         let (frame, _) = dom_render_compiler::ir::wire::decode_frame(&bytes).unwrap();
         match &frame.instructions[0] {
             dom_render_compiler::ir::opcode::Instruction::SetText { text, .. } => {
-                assert_eq!(text.as_slice(), b"sess-abc");
+                assert_eq!(text.as_slice(), session_uuid.as_bytes());
             }
             other => panic!("expected SetText, got {other:?}"),
         }
@@ -2401,6 +2577,9 @@ mod tests {
             .unwrap();
 
         let session_uuid = uuid::Uuid::new_v4().to_string();
+        // One token for the session, presented on both POSTs (stable per
+        // session), so each clears the gate.
+        let token = action_csrf_token(&server, &session_uuid);
         let router = server.router();
 
         // First POST — action 1 writes "hello-world" into slot 7.
@@ -2417,6 +2596,7 @@ mod tests {
                     .method("POST")
                     .uri("/_albedo/action")
                     .header("x-albedo-session", session_uuid.as_str())
+                    .header("x-albedo-csrf", token.as_str())
                     .body(Body::from(write_body))
                     .unwrap(),
             )
@@ -2448,6 +2628,7 @@ mod tests {
                     .method("POST")
                     .uri("/_albedo/action")
                     .header("x-albedo-session", session_uuid.as_str())
+                    .header("x-albedo-csrf", token.as_str())
                     .body(Body::from(read_body))
                     .unwrap(),
             )
@@ -2510,6 +2691,8 @@ mod tests {
         let router = server.router();
         let session_a = uuid::Uuid::new_v4().to_string();
         let session_b = uuid::Uuid::new_v4().to_string();
+        let token_a = action_csrf_token(&server, &session_a);
+        let token_b = action_csrf_token(&server, &session_b);
 
         // Write under session A.
         let write_body = encode_action_envelope(&ActionEnvelope {
@@ -2525,6 +2708,7 @@ mod tests {
                     .method("POST")
                     .uri("/_albedo/action")
                     .header("x-albedo-session", session_a.as_str())
+                    .header("x-albedo-csrf", token_a.as_str())
                     .body(Body::from(write_body))
                     .unwrap(),
             )
@@ -2544,6 +2728,7 @@ mod tests {
                     .method("POST")
                     .uri("/_albedo/action")
                     .header("x-albedo-session", session_b.as_str())
+                    .header("x-albedo-csrf", token_b.as_str())
                     .body(Body::from(read_body))
                     .unwrap(),
             )
@@ -2598,12 +2783,16 @@ mod tests {
         })
         .unwrap();
 
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let token = action_csrf_token(&server, &session_uuid);
         let response = server
             .router()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/_albedo/action")
+                    .header("x-albedo-session", session_uuid.as_str())
+                    .header("x-albedo-csrf", token.as_str())
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -2670,27 +2859,13 @@ mod tests {
             .build()
             .unwrap();
 
-        let form_payload = serde_json::to_vec(&serde_json::json!({
-            "username": "alice",
-            "password": "hunter2",
-        }))
-        .unwrap();
-        let body = encode_action_envelope(&ActionEnvelope {
-            action_id: form_action_id(ACTION_NAME),
-            event_kind: 2, // Submit
-            payload: form_payload,
-        })
-        .unwrap();
-
         let response = server
             .router()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/_albedo/action")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
+            .oneshot(signed_form_submit(
+                &server,
+                ACTION_NAME,
+                serde_json::json!({ "username": "alice", "password": "hunter2" }),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -2713,10 +2888,65 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn register_form_action_rejects_malformed_json_with_500() {
+    /// Builds the action POST a browser would send for
+    /// `<form action="action:NAME">`: the envelope the client encodes,
+    /// plus the two things that get the request past the CSRF gate —
+    /// the `albedo-session` cookie and the matching `_csrf` field in the
+    /// form payload.
+    ///
+    /// Form actions fail closed without a token, so a test that means to
+    /// exercise anything *downstream* of the gate has to present one.
+    /// Minting it from the server's own registry (rather than stubbing
+    /// the check) keeps these tests honest about the real request shape.
+    fn signed_form_submit(
+        server: &AlbedoServer,
+        action_name: &str,
+        payload: serde_json::Value,
+    ) -> Request<Body> {
         use crate::render::form_action::form_action_id;
         use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+
+        let session_uuid = uuid::Uuid::new_v4();
+        let token = server
+            .csrf_registry()
+            .token_for(SessionId::new(session_uuid));
+
+        let mut object = payload;
+        object[crate::render::csrf::CSRF_FIELD_NAME] = serde_json::Value::String(token);
+
+        let body = encode_action_envelope(&ActionEnvelope {
+            action_id: form_action_id(action_name),
+            event_kind: 2, // Submit
+            payload: serde_json::to_vec(&object).expect("payload encodes"),
+        })
+        .unwrap();
+
+        Request::builder()
+            .method("POST")
+            .uri("/_albedo/action")
+            .header(
+                axum::http::header::COOKIE,
+                format!(
+                    "{}={session_uuid}",
+                    crate::render::csrf::ALBEDO_SESSION_COOKIE
+                ),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// A payload that clears the CSRF gate but cannot deserialize into
+    /// the handler's declared type must surface as a 500 from the typed
+    /// adapter.
+    ///
+    /// The payload is a well-formed JSON object missing a required field
+    /// — not the raw `b"not json"` this test used to send. Since the gate
+    /// began failing closed, non-JSON bytes can never reach a form
+    /// action's handler at all (they can't carry a token), so a garbage
+    /// payload would now assert the gate's 403 and quietly stop testing
+    /// the decode path it was written for.
+    #[tokio::test]
+    async fn register_form_action_rejects_mismatched_payload_with_500() {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -2725,10 +2955,6 @@ mod tests {
             field: String,
         }
 
-        // Phase L · action name resolves to a stable `action_id` on
-        // both ends; the envelope below uses the same hash so the
-        // dispatcher finds the handler even though the payload will
-        // fail to parse.
         const ACTION_NAME: &str = "malformed_required";
 
         let config = AppConfig {
@@ -2747,10 +2973,52 @@ mod tests {
             .build()
             .unwrap();
 
+        let response = server
+            .router()
+            .oneshot(signed_form_submit(
+                &server,
+                ACTION_NAME,
+                serde_json::json!({ "wrong_field": "value" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The gate, exercised through the whole server rather than the
+    /// dispatcher in isolation: a real `register_form_action` submit
+    /// with no token must be refused before the handler runs.
+    ///
+    /// This is the end-to-end statement of the bug — a Tier-B-rendered
+    /// form used to send exactly this request (no CSRF input existed in
+    /// its markup to serialize) and the server dispatched it.
+    #[tokio::test]
+    async fn form_action_submitted_without_a_token_is_refused_by_the_server() {
+        use crate::render::form_action::form_action_id;
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+
+        const ACTION_NAME: &str = "unsigned_submit";
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+        let server = AlbedoServerBuilder::new(config)
+            .register_form_action::<serde_json::Value, _, _>(
+                ACTION_NAME,
+                |_ctx: RequestContext, _form: serde_json::Value, _slots: SessionSlots| async move {
+                    panic!("handler must not run for an unsigned form submit");
+                },
+            )
+            .build()
+            .unwrap();
+
         let body = encode_action_envelope(&ActionEnvelope {
             action_id: form_action_id(ACTION_NAME),
             event_kind: 2,
-            payload: b"not json".to_vec(),
+            payload: serde_json::to_vec(&serde_json::json!({ "user": "alice" })).unwrap(),
         })
         .unwrap();
 
@@ -2765,7 +3033,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

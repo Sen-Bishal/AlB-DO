@@ -213,9 +213,22 @@
       payload: payload,
     });
 
+    // A form already carries its `_csrf` token in the serialized payload
+    // (the hidden input the renderers stamp), but attach the header too
+    // so every action POST — form, click, input — presents the token the
+    // same way. The server gate checks the `x-albedo-csrf` header first
+    // and falls back to the payload field, so this is belt-and-suspenders,
+    // not a second source of truth. Token comes from the global the
+    // streaming shell publishes.
+    const formHeaders = { 'content-type': 'application/octet-stream' };
+    const csrfToken = globalScope.__ALBEDO_CSRF__;
+    if (typeof csrfToken === 'string' && csrfToken) {
+      formHeaders['x-albedo-csrf'] = csrfToken;
+    }
+
     fetch(ACTION_ENDPOINT, {
       method: 'POST',
-      headers: { 'content-type': 'application/octet-stream' },
+      headers: formHeaders,
       body: envelopeBytes,
       credentials: 'same-origin',
     })

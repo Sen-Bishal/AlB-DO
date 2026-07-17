@@ -115,6 +115,16 @@ async fn compiled_counter_dispatch_increments_slot_through_http_action_route() {
         .expect("server builds with compiled project registered");
 
     // ── 4. POST the action envelope, decode the response frame ──────
+    //
+    // The CSRF gate now requires a valid per-session token on EVERY
+    // action, clicks included (see `handlers::action`). A click envelope
+    // carries no `_csrf` payload field, so — exactly like the browser
+    // runtime reading `__ALBEDO_CSRF__` from the shell — pin a session
+    // and present its token in the `x-albedo-csrf` header.
+    let session_uuid = uuid::Uuid::new_v4().to_string();
+    let csrf_token = server
+        .csrf_registry()
+        .token_for(SessionId::new(uuid::Uuid::parse_str(&session_uuid).unwrap()));
     let body_bytes = encode_action_envelope(&ActionEnvelope {
         action_id: proxy_id,
         event_kind: 0,
@@ -128,6 +138,8 @@ async fn compiled_counter_dispatch_increments_slot_through_http_action_route() {
             Request::builder()
                 .method("POST")
                 .uri("/_albedo/action")
+                .header("x-albedo-session", session_uuid.as_str())
+                .header("x-albedo-csrf", csrf_token.as_str())
                 .body(Body::from(body_bytes))
                 .unwrap(),
         )
@@ -227,6 +239,11 @@ async fn compiled_counter_persists_across_two_action_invocations() {
     // session's lifetime. Pin one here so the three increments share
     // a slot.
     let session_uuid = uuid::Uuid::new_v4().to_string();
+    // The gate requires a token on every click POST; mint the session's
+    // once and present it on each increment (stable per session).
+    let csrf_token = server
+        .csrf_registry()
+        .token_for(SessionId::new(uuid::Uuid::parse_str(&session_uuid).unwrap()));
     let router = server.router();
 
     for expected in [1, 2, 3] {
@@ -243,6 +260,7 @@ async fn compiled_counter_persists_across_two_action_invocations() {
                     .method("POST")
                     .uri("/_albedo/action")
                     .header("x-albedo-session", session_uuid.as_str())
+                    .header("x-albedo-csrf", csrf_token.as_str())
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -335,6 +353,12 @@ async fn compiled_counter_dispatch_via_quickjs_pool_matches_pure_rust_wire() {
     // Two increments over a pinned session: 0→1→2, reading persisted state —
     // the same persistence guarantee the pure-Rust path gives.
     let session_uuid = uuid::Uuid::new_v4().to_string();
+    // Gate parity: the QuickJS path is behind the same CSRF gate, so the
+    // click POSTs must present the session token just like the pure-Rust
+    // test above.
+    let csrf_token = server
+        .csrf_registry()
+        .token_for(SessionId::new(uuid::Uuid::parse_str(&session_uuid).unwrap()));
     let router = server.router();
     for expected in [1, 2] {
         let body = encode_action_envelope(&ActionEnvelope {
@@ -350,6 +374,7 @@ async fn compiled_counter_dispatch_via_quickjs_pool_matches_pure_rust_wire() {
                     .method("POST")
                     .uri("/_albedo/action")
                     .header("x-albedo-session", session_uuid.as_str())
+                    .header("x-albedo-csrf", csrf_token.as_str())
                     .body(Body::from(body))
                     .unwrap(),
             )

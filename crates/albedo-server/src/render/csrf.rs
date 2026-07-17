@@ -21,10 +21,14 @@ use dashmap::DashMap;
 use dom_render_compiler::runtime::SessionId;
 use std::sync::Arc;
 
-/// Hidden form field name the server injects and the dispatcher
-/// validates. Kept here so the renderer's form-render path and the
-/// dispatch-time validator agree without a string-typed contract.
-pub const CSRF_FIELD_NAME: &str = "_csrf";
+/// Hidden form field name the renderers inject and the dispatcher
+/// validates.
+///
+/// Re-exported from `transforms::form`, which owns the whole
+/// form-action markup contract — the field name here and the `name=`
+/// the renderers actually emit are now the same constant rather than
+/// two literals that happen to match today.
+pub use dom_render_compiler::transforms::form::CSRF_FIELD_NAME;
 
 /// Cookie name that carries the per-session id between requests.
 /// The streaming handler mints one on first visit (Set-Cookie); the
@@ -131,34 +135,21 @@ pub fn csrf_hidden_input_html(token: &str) -> String {
 
 /// Phase L · post-render CSRF substitution.
 ///
-/// The renderer (in `dom_render_compiler::runtime::eval::core`) emits
-/// every form-action's hidden CSRF input as
-/// `<input type="hidden" name="_csrf" value="" data-albedo-csrf />`
-/// with an empty `value` and a `data-albedo-csrf` marker. The server
-/// then fills the value at request time with the per-session token
-/// minted via [`CsrfRegistry::token_for`] so the input is ready when
-/// bakabox serializes the form on submit.
+/// Fills the per-session `token` into every hidden CSRF placeholder the
+/// renderers emitted, so the input is ready when the client serializes
+/// the form on submit.
 ///
-/// The substitution is a deliberate byte-for-byte literal replace:
-/// the renderer's output is deterministic for this marker, so a
-/// full HTML parser would be overkill. The cost is one `str::replace`
-/// per response — sub-microsecond for any realistic page.
+/// Thin delegate to `transforms::form::fill_csrf_tokens`, which owns
+/// both halves of this contract: the placeholder the renderers emit and
+/// the anchor this fill matches on. They previously lived on opposite
+/// sides of a crate boundary as two independently-maintained literals
+/// — the arrangement that let a renderer emit markup the fill couldn't
+/// see. This name is kept because it reads better at the call sites.
 ///
-/// Returns the input unchanged when no marker is present (Tier-A
-/// pages without forms; cached responses; tests that don't render
-/// forms).
+/// Returns the input unchanged when no placeholder is present (any page
+/// without a form).
 pub fn substitute_csrf_token_in_html(html: &str, token: &str) -> String {
-    // Anchor: the renderer always emits the value attribute
-    // immediately before the marker attribute, in a single space-
-    // separated order. Pinning the exact sequence here is the contract
-    // both sides depend on; if the renderer's emission order changes,
-    // this constant must update in lockstep.
-    const EMPTY_PATTERN: &str = "value=\"\" data-albedo-csrf";
-    if !html.contains(EMPTY_PATTERN) {
-        return html.to_string();
-    }
-    let filled = format!("value=\"{token}\" data-albedo-csrf");
-    html.replace(EMPTY_PATTERN, &filled)
+    dom_render_compiler::transforms::form::fill_csrf_tokens(html, token)
 }
 
 /// Reads the `albedo-session` cookie value from a request's header

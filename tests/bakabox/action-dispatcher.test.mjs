@@ -64,6 +64,35 @@ test('dispatcher POSTs to the default endpoint with bincode body', async () => {
   assert.deepStrictEqual(Array.from(call.init.body), [42, 0, 0]);
 });
 
+test('dispatcher attaches the CSRF token as x-albedo-csrf when the global is set', async () => {
+  // The server gates click/input actions on this header — their payload
+  // carries no token. The runtime reads `globalThis.__ALBEDO_CSRF__`
+  // (published by the streaming shell). Without the global set, no header
+  // is added (proven by the default-endpoint test above, which asserts
+  // only content-type); with it set, the token must ride along.
+  const previous = globalThis.__ALBEDO_CSRF__;
+  globalThis.__ALBEDO_CSRF__ = 'cafebabecafebabecafebabecafebabe';
+  try {
+    const { fetchImpl, calls } = fakeFetchReturning(new Uint8Array(0));
+    const bakabox = fakeBakabox();
+    const dispatch = createActionDispatcher({ bakabox, fetch: fetchImpl });
+
+    await dispatch(42, { type: 'click' });
+
+    assert.equal(
+      calls[0].init.headers['x-albedo-csrf'],
+      'cafebabecafebabecafebabecafebabe',
+      'the per-session token must be attached as the x-albedo-csrf header',
+    );
+  } finally {
+    if (previous === undefined) {
+      delete globalThis.__ALBEDO_CSRF__;
+    } else {
+      globalThis.__ALBEDO_CSRF__ = previous;
+    }
+  }
+});
+
 test('dispatcher classifies input events and carries the value as payload bytes', async () => {
   const { fetchImpl, calls } = fakeFetchReturning(new Uint8Array(0));
   const bakabox = fakeBakabox();
