@@ -29,6 +29,85 @@ use swc_ecma_ast::{
 /// same literal.
 pub const FORM_ACTION_PREFIX: &str = "action:";
 
+// ─── Served-markup contract ──────────────────────────────────────────
+//
+// A form action is rendered by TWO independent renderers — the
+// pure-Rust evaluator (`runtime::eval::core`, Tier-A) and the QuickJS
+// `h()` shim (`runtime::quickjs_engine`, Tier-B/C) — and the token its
+// CSRF input carries is filled in afterwards by a THIRD party (the
+// server, post-render). Each of those used to spell the markup out for
+// itself, and they drifted: the QuickJS path emitted no CSRF input at
+// all, so a Tier-B form submitted with no token — and the gate, which
+// keyed off the token being *present*, waved it straight through.
+//
+// This section is the single spelling. Renderers emit
+// `FORM_ACTION_ATTR` + `CSRF_PLACEHOLDER_INPUT`; the server calls
+// `fill_csrf_tokens`. The QuickJS shim receives these same constants
+// injected as JS values rather than restating them across the language
+// boundary. Nothing downstream re-types the literals, so there is no
+// longer a pair of spellings that can disagree.
+
+/// Attribute the renderers stamp in place of the `action="action:NAME"`
+/// sentinel, carrying the bare action name. The client runtime
+/// (`assets/albedo-link-forms.js`) keys its submit interception on it.
+pub const FORM_ACTION_ATTR: &str = "data-albedo-action";
+
+/// `name` of the hidden field carrying the per-session CSRF token.
+/// Renderers emit it; the action dispatcher reads it back off the
+/// submitted JSON payload.
+pub const CSRF_FIELD_NAME: &str = "_csrf";
+
+/// Marker attribute identifying a CSRF input the server still has to
+/// fill. Present in both the placeholder and the filled output — it is
+/// the anchor [`fill_csrf_tokens`] matches on.
+pub const CSRF_MARKER_ATTR: &str = "data-albedo-csrf";
+
+/// The hidden CSRF input every renderer emits as the first child of a
+/// form-action `<form>`.
+///
+/// `value` is deliberately EMPTY here: rendering is not per-session
+/// (Tier-A markup is baked at build time, and island markup is
+/// precomputed once at boot), so the renderer has no session to mint a
+/// token for. [`fill_csrf_tokens`] stamps the real token into every
+/// placeholder at request time, once the session is known.
+pub const CSRF_PLACEHOLDER_INPUT: &str =
+    r#"<input type="hidden" name="_csrf" value="" data-albedo-csrf />"#;
+
+/// The exact `value=""` + marker sequence [`fill_csrf_tokens`]
+/// rewrites. A substring of [`CSRF_PLACEHOLDER_INPUT`] by construction
+/// — `emitted_placeholder_contains_the_fill_anchor` fails the build if
+/// that ever stops being true, which is the check that keeps emission
+/// and fill from drifting apart.
+const CSRF_EMPTY_VALUE_ANCHOR: &str = r#"value="" data-albedo-csrf"#;
+
+/// Reads the action name out of a `<form>`'s `action` attribute value,
+/// or `None` when it isn't a form-action sentinel (a plain HTML form,
+/// which every renderer must pass through untouched).
+#[must_use]
+pub fn form_action_name(action_attr: &str) -> Option<&str> {
+    action_attr.strip_prefix(FORM_ACTION_PREFIX)
+}
+
+/// Phase L · post-render CSRF fill.
+///
+/// Replaces the empty `value` of every [`CSRF_PLACEHOLDER_INPUT`] in
+/// `html` with `token`. The server calls this once per rendered chunk,
+/// after any island markup has been spliced in, so a form nested inside
+/// an island is filled by the same pass as one in the shell.
+///
+/// A byte-for-byte literal replace is deliberate: the placeholder is a
+/// constant this module owns, so its shape is not in question and an
+/// HTML parser would be pure cost. Returns the input unchanged when no
+/// marker is present — the common case (any page without a form).
+#[must_use]
+pub fn fill_csrf_tokens(html: &str, token: &str) -> String {
+    if !html.contains(CSRF_EMPTY_VALUE_ANCHOR) {
+        return html.to_string();
+    }
+    let filled = format!("value=\"{token}\" {CSRF_MARKER_ATTR}");
+    html.replace(CSRF_EMPTY_VALUE_ANCHOR, &filled)
+}
+
 /// One `<form action="action:NAME">` surfaced by
 /// [`extract_forms_in_function`].
 #[derive(Debug, Clone)]
@@ -405,6 +484,70 @@ fn fnv1a_32(data: &[u8]) -> u32 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    /// The structural invariant the whole contract rests on: the
+    /// sequence `fill_csrf_tokens` searches for must actually occur in
+    /// the markup the renderers emit. If someone reformats the
+    /// placeholder (reorders the attributes, drops the space, switches
+    /// quote style) the fill silently stops matching and every form
+    /// ships `value=""` — which looks completely fine in the HTML and
+    /// fails only at submit time. This test is what makes that a build
+    /// failure instead.
+    #[test]
+    fn emitted_placeholder_contains_the_fill_anchor() {
+        assert!(
+            CSRF_PLACEHOLDER_INPUT.contains(CSRF_EMPTY_VALUE_ANCHOR),
+            "the fill anchor must be a substring of the emitted placeholder",
+        );
+        assert!(CSRF_PLACEHOLDER_INPUT.contains(&format!("name=\"{CSRF_FIELD_NAME}\"")));
+        assert!(CSRF_PLACEHOLDER_INPUT.contains(CSRF_MARKER_ATTR));
+    }
+
+    /// Emission → fill, composed end to end: the token a browser would
+    /// actually submit. Asserting on the composition (rather than each
+    /// half in isolation) is the point — the bug this contract exists
+    /// to prevent lived precisely in the seam between the two.
+    #[test]
+    fn emit_then_fill_yields_a_submittable_token() {
+        let filled = fill_csrf_tokens(CSRF_PLACEHOLDER_INPUT, "deadbeef");
+        assert!(filled.contains("value=\"deadbeef\""));
+        assert!(!filled.contains("value=\"\""), "no empty value may survive");
+        assert!(
+            filled.contains(CSRF_MARKER_ATTR),
+            "the marker survives the fill",
+        );
+    }
+
+    #[test]
+    fn fill_is_a_noop_without_a_placeholder() {
+        let plain = "<div>no forms here</div>";
+        assert_eq!(fill_csrf_tokens(plain, "abc123"), plain);
+    }
+
+    #[test]
+    fn fill_covers_every_form_on_the_page() {
+        let page =
+            format!("<form>{CSRF_PLACEHOLDER_INPUT}</form><form>{CSRF_PLACEHOLDER_INPUT}</form>");
+        let filled = fill_csrf_tokens(&page, "tok");
+        assert_eq!(filled.matches("value=\"tok\"").count(), 2);
+        assert!(!filled.contains("value=\"\""));
+    }
+
+    #[test]
+    fn form_action_name_reads_only_the_sentinel() {
+        assert_eq!(
+            form_action_name("action:sign_guestbook"),
+            Some("sign_guestbook")
+        );
+        // A plain HTML form must pass through untouched on every renderer.
+        assert_eq!(form_action_name("/submit"), None);
+        assert_eq!(form_action_name(""), None);
+    }
 }
 
 #[cfg(test)]

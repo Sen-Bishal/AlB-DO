@@ -577,12 +577,19 @@ fn build_stream(
     };
     stream! {
         let hydration = app.hydration.get(route.route.as_str());
+
+        // Phase L · one token for the whole response. Minted here rather than
+        // per chunk because the shell and every Tier-B chunk must agree — a
+        // form in the shell and a form in an async page carry the same session's
+        // token. `token_for` mints on first read and is stable per session, so
+        // this is also one fewer registry hit per chunk.
+        let csrf_token = app.csrf().token_for(page_session);
+
         let mut shell = build_shell_chunk(
             &route,
             negotiated_transport,
             app.transport.webtransport_path.as_str(),
-            app.csrf().as_ref(),
-            page_session,
+            &csrf_token,
             hydration,
         );
 
@@ -627,6 +634,12 @@ fn build_stream(
         let island_fills: std::sync::Arc<Vec<(String, String)>> =
             std::sync::Arc::new(hydration.map(|h| h.placeholders.clone()).unwrap_or_default());
 
+        // Shared with each Tier-B future so its resolved HTML goes through the
+        // same fill as the shell. Without this a `<form action="action:NAME">`
+        // inside an `async function Page()` reaches the browser with
+        // `value=""` and the submit arrives tokenless.
+        let csrf_token: std::sync::Arc<str> = std::sync::Arc::from(csrf_token.as_str());
+
         let mut tier_b_futures: FuturesUnordered<_> = route
             .tier_b
             .iter()
@@ -637,6 +650,7 @@ fn build_stream(
                 let error_component = error_component.clone();
                 let loading_component = loading_component.clone();
                 let island_fills = island_fills.clone();
+                let csrf_token = csrf_token.clone();
                 async move {
                     let render_result = timeout(
                         Duration::from_millis(node.timeout_ms.max(1)),
@@ -649,11 +663,17 @@ fn build_stream(
                     )
                     .await;
 
+                    // Every arm below that carries component-rendered markup
+                    // goes through the same fill as the shell — including the
+                    // boundaries, since an `error.tsx` may well render a retry
+                    // form. The two stub arms (`error` / `fallback`) build
+                    // their own markup from a constant and have nothing to fill.
+                    let fill = |html: String| {
+                        fill_server_placeholders(html, &island_fills, &csrf_token)
+                    };
+
                     match render_result {
-                        Ok(Ok(html)) => InjectionChunk::success(
-                            &node,
-                            replace_island_placeholders(html, &island_fills),
-                        ),
+                        Ok(Ok(html)) => InjectionChunk::success(&node, fill(html)),
                         Ok(Err(err)) => {
                             // The component threw. Render the route's `error.tsx`
                             // boundary and inject its HTML; only if there is no
@@ -673,7 +693,7 @@ fn build_stream(
                             )
                             .await
                             {
-                                Some(html) => InjectionChunk::error_boundary(&node, html),
+                                Some(html) => InjectionChunk::error_boundary(&node, fill(html)),
                                 None => InjectionChunk::error(&node, err),
                             }
                         }
@@ -687,7 +707,7 @@ fn build_stream(
                             )
                             .await
                             {
-                                Some(html) => InjectionChunk::fallback_with_html(&node, html),
+                                Some(html) => InjectionChunk::fallback_with_html(&node, fill(html)),
                                 None => InjectionChunk::fallback(&node),
                             }
                         }
@@ -730,8 +750,7 @@ fn build_shell_chunk(
     route: &RouteManifest,
     negotiated_transport: NegotiatedTransport,
     webtransport_path: &str,
-    csrf: &crate::render::csrf::CsrfRegistry,
-    page_session: dom_render_compiler::runtime::SessionId,
+    csrf_token: &str,
     hydration: Option<&crate::renderer_runtime::RouteHydration>,
 ) -> String {
     let mut shell = route.shell.doctype_and_head.clone();
@@ -740,6 +759,7 @@ fn build_shell_chunk(
         negotiated_transport,
         webtransport_path,
     ));
+    shell.push_str(&csrf_bootstrap_script(csrf_token));
     shell.push_str(&route.shell.shim_script);
 
     for node in &route.tier_a_root {
@@ -749,29 +769,43 @@ fn build_shell_chunk(
         );
     }
 
-    // A3 · replace each empty Tier-C placeholder with the island's marked SSR
-    // HTML so the browser has real markup to adopt (and the user something to
-    // interact with). The marker rides on the island's own root element. This
-    // fills island holes that land in the *shell* (a Tier-A parent's island
-    // child); holes that land inside a Tier-B/async page's rendered HTML are
-    // filled by the same pass in `build_stream` when the chunk resolves.
-    if let Some(hydration) = hydration {
-        shell = replace_island_placeholders(shell, &hydration.placeholders);
-    }
+    fill_server_placeholders(
+        shell,
+        hydration
+            .map(|h| h.placeholders.as_slice())
+            .unwrap_or_default(),
+        csrf_token,
+    )
+}
 
-    // Phase L · fill any `value=""` CSRF placeholders the renderer
-    // stamped on form-action inputs. Mints the per-session token on
-    // first access; subsequent calls in the same session return the
-    // same value. No-op when the shell carries no `data-albedo-csrf`
-    // markers (Tier-A pages without forms).
-    let token = csrf.token_for(page_session);
-    crate::render::csrf::substitute_csrf_token_in_html(&shell, &token)
+/// The single server-side fill pass. Every chunk of rendered HTML goes
+/// through exactly this on its way to the browser — the shell here, and
+/// each resolved Tier-B chunk in [`build_stream`].
+///
+/// One function rather than a fill per call site because the previous
+/// arrangement — the shell substituting its CSRF tokens inline while
+/// the Tier-B path did only islands — is what let Tier-B forms reach
+/// the browser with an empty token. A stage that applies to served HTML
+/// belongs here, where a renderer can't be forgotten.
+///
+/// Order matters and is the reason these two are fused: islands are
+/// spliced in FIRST, so a form nested inside an island is filled by the
+/// same CSRF pass as one in the page body. Island markup is precomputed
+/// once at boot and is therefore session-less — its tokens can only be
+/// filled after it lands in a request's HTML.
+fn fill_server_placeholders(
+    html: String,
+    islands: &[(String, String)],
+    csrf_token: &str,
+) -> String {
+    let with_islands = replace_island_placeholders(html, islands);
+    // Phase L · stamp the per-session token into every hidden CSRF input
+    // the renderers emitted. No-op for any page without a form.
+    crate::render::csrf::substitute_csrf_token_in_html(&with_islands, csrf_token)
 }
 
 /// Replace each empty Tier-C island placeholder (`<div id="…"
-/// data-albedo-tier="c"></div>`) with the island's marked SSR HTML. The single
-/// island-fill pass, shared by the shell (a Tier-A parent's island child) and
-/// the Tier-B chunk path (an island inside an `async function Page()`), so every
+/// data-albedo-tier="c"></div>`) with the island's marked SSR HTML, so every
 /// island — whichever renderer emitted its hole — converges on identical served
 /// markup carrying the `data-albedo-island` marker the client hydrates against.
 fn replace_island_placeholders(mut html: String, placeholders: &[(String, String)]) -> String {
@@ -840,8 +874,7 @@ async fn stream_route_over_webtransport(
         &route,
         NegotiatedTransport::WebTransport,
         app.transport.webtransport_path.as_str(),
-        app.csrf().as_ref(),
-        page_session,
+        &app.csrf().token_for(page_session),
         None,
     );
     shell.push_str(&route.shell.body_close);
@@ -1170,6 +1203,28 @@ fn maybe_webtransport_session_id(req: &Request) -> Option<Uuid> {
         .and_then(|value| Uuid::parse_str(value).ok())
 }
 
+/// Publishes the per-session CSRF token to same-origin JavaScript as
+/// `globalThis.__ALBEDO_CSRF__`, so the client runtime can attach it as
+/// the `x-albedo-csrf` header on every action POST. That header is the
+/// only token channel click/input actions have — their bincode payload
+/// carries no field for one — so without this the action gate would
+/// reject every non-form action.
+///
+/// Safe to expose: this is not the session secret (that stays in the
+/// `HttpOnly` `albedo-session` cookie) and it is already present in the
+/// DOM as every form's hidden `_csrf` input, readable by any same-origin
+/// script. A CSRF token defends against cross-*site* forgery, which the
+/// same-origin policy already keeps from reading this value; it does not
+/// defend against XSS, which could read the hidden input regardless.
+///
+/// The token is 32 hex chars from [`crate::render::csrf`], so JSON
+/// string-encoding it is belt-and-suspenders against any character that
+/// would need escaping inside the `<script>`.
+fn csrf_bootstrap_script(csrf_token: &str) -> String {
+    let literal = serde_json::to_string(csrf_token).unwrap_or_else(|_| "\"\"".to_string());
+    format!("<script>globalThis.__ALBEDO_CSRF__={literal};</script>")
+}
+
 fn transport_hint_script(transport: NegotiatedTransport, webtransport_path: &str) -> String {
     let endpoint = match transport {
         NegotiatedTransport::WebTransport => webtransport_path,
@@ -1315,6 +1370,20 @@ mod tests {
     }
 
     #[test]
+    fn csrf_bootstrap_script_publishes_the_token_to_the_global() {
+        // The client runtime reads `globalThis.__ALBEDO_CSRF__` to attach
+        // the `x-albedo-csrf` header on every action POST. If this stops
+        // emitting the token, every click/input action 403s — so pin both
+        // the global name and that the real token lands in it.
+        let script = csrf_bootstrap_script("cafebabecafebabecafebabecafebabe");
+        assert!(
+            script.contains("globalThis.__ALBEDO_CSRF__=\"cafebabecafebabecafebabecafebabe\""),
+            "token must be published to the runtime's global: {script}"
+        );
+        assert!(!script.contains("=\"\""), "an empty token is the silent 403 this guards");
+    }
+
+    #[test]
     fn replace_island_placeholders_fills_holes_in_tier_b_html() {
         // The unified island fill runs over async-page (Tier-B) HTML the same way
         // it runs over the shell: an empty placeholder is swapped for the island's
@@ -1336,6 +1405,50 @@ mod tests {
             "the empty placeholder must be gone: {out}"
         );
         assert!(out.contains("<h1>Essay</h1>"), "page content preserved: {out}");
+    }
+
+    /// Phase L · the fill pass is shared by the shell and the Tier-B
+    /// chunks, and this is the half that used to be missing: Tier-B HTML
+    /// got islands filled but never had its CSRF tokens substituted, so
+    /// a form inside an `async function Page()` reached the browser with
+    /// `value=""` and its submit was tokenless.
+    #[test]
+    fn fill_server_placeholders_stamps_the_csrf_token_into_tier_b_html() {
+        use dom_render_compiler::transforms::form::CSRF_PLACEHOLDER_INPUT;
+
+        let html = format!("<main><form data-albedo-action=\"sign\">{CSRF_PLACEHOLDER_INPUT}</form></main>");
+        let out = fill_server_placeholders(html, &[], "cafebabe");
+
+        assert!(
+            out.contains("value=\"cafebabe\""),
+            "the Tier-B chunk must carry the per-session token: {out}"
+        );
+        assert!(
+            !out.contains("value=\"\""),
+            "an empty token is the silent failure this guards: {out}"
+        );
+    }
+
+    /// Ordering, pinned: islands are spliced in BEFORE the CSRF pass, so
+    /// a form that arrives inside island markup is filled too. Island
+    /// HTML is precomputed once at boot and has no session of its own —
+    /// if the passes ran in the other order it would keep `value=""`
+    /// forever.
+    #[test]
+    fn fill_server_placeholders_reaches_a_form_nested_inside_an_island() {
+        use dom_render_compiler::transforms::form::CSRF_PLACEHOLDER_INPUT;
+
+        let html = "<main><div id=\"__c_1\" data-albedo-tier=\"c\"></div></main>".to_string();
+        let fills = vec![(
+            "__c_1".to_string(),
+            format!("<form data-albedo-action=\"sign\">{CSRF_PLACEHOLDER_INPUT}</form>"),
+        )];
+
+        let out = fill_server_placeholders(html, &fills, "deadbeef");
+        assert!(
+            out.contains("value=\"deadbeef\""),
+            "a form arriving via an island must still get a token: {out}"
+        );
     }
 
     #[test]

@@ -5,6 +5,33 @@
 //! Wire: `POST /_albedo/action`. Body = bincode `ActionEnvelope`.
 //! Response = bincode `OpcodeFrame` (the same shape bakabox already
 //! decodes for the WT patches stream).
+//!
+//! # CSRF coverage, stated plainly
+//!
+//! **Every** action must present a valid per-session token — form,
+//! click, and input alike. The token reaches the server by one of two
+//! channels:
+//!
+//! * the [`CSRF_HEADER`] request header, which the client runtime
+//!   attaches to every action POST. This is the only channel click and
+//!   input actions have: their bincode payload carries no field for a
+//!   token, but a header rides alongside any body.
+//! * the `_csrf` field of a form submit's JSON payload — the hidden
+//!   input the renderers stamp and the streaming handler fills.
+//!
+//! The header is consulted first; a form without it falls back to its
+//! payload field. Whichever channel supplies the token, it is validated
+//! against the session, and **no token on either channel is a 403** —
+//! fail closed for click/input exactly as for forms. Click/input used
+//! to sail through ungated because they could not carry a token; now
+//! that the runtime attaches the header, they can and must.
+//!
+//! The token is safe to hand to same-origin JavaScript (the runtime
+//! reads it from `globalThis.__ALBEDO_CSRF__`): it is not the session
+//! secret — that stays in the `HttpOnly` `albedo-session` cookie — and
+//! it is already in the DOM as every form's hidden `_csrf` input. The
+//! same-origin policy is what keeps a cross-site page from reading it,
+//! which is the exact threat a CSRF token guards against.
 
 use crate::actions::{ActionHandler, SessionSlots};
 use crate::error::RuntimeError;
@@ -25,14 +52,35 @@ use tracing::warn;
 /// [`crate::AlbedoServerBuilder::register_action`].
 pub type ActionRegistry = HashMap<u32, Arc<dyn ActionHandler>>;
 
-/// Runs the action HTTP path. Decodes the envelope, validates CSRF
-/// for form-shaped payloads, looks up the handler by `action_id`,
-/// invokes it, and wire-encodes the returned instructions as an
-/// [`OpcodeFrame`] (no `component_id`).
+/// The set of `action_id`s reachable from a `<form action="action:NAME">`,
+/// and therefore required to present a valid CSRF token.
+///
+/// Assembled at registration time from the server's own knowledge — the
+/// compiled project's form extracts plus every explicit
+/// `register_form_action` — so membership is decided before any request
+/// is served and cannot be influenced by one.
+pub type FormActionIds = std::collections::HashSet<u32>;
+
+/// Request header carrying the per-session CSRF token on every action
+/// POST. The client runtime reads the token from
+/// `globalThis.__ALBEDO_CSRF__` (published by the streaming shell) and
+/// attaches it here — the only token channel click/input actions have,
+/// since their bincode payload has no field to carry one.
+///
+/// Mirrored client-side as the literal `x-albedo-csrf` in
+/// `assets/albedo-runtime.js` and `assets/albedo-link-forms.js`. Header
+/// names are case-insensitive and [`RequestContext`] lowercases them, so
+/// this is spelled lowercase to match the lookup key directly.
+pub const CSRF_HEADER: &str = "x-albedo-csrf";
+
+/// Runs the action HTTP path. Decodes the envelope, enforces the CSRF
+/// gate, looks up the handler by `action_id`, invokes it, and
+/// wire-encodes the returned instructions as an [`OpcodeFrame`] (no
+/// `component_id`).
 ///
 /// Error mapping:
 /// - Malformed body → 400 with a short text reason
-/// - CSRF mismatch → 403 with `csrf` reason
+/// - Missing or mismatched CSRF on a form action → 403 with `csrf` reason
 /// - Unknown `action_id` → 404
 /// - Handler error → 500 with the underlying message
 ///
@@ -42,6 +90,7 @@ pub type ActionRegistry = HashMap<u32, Arc<dyn ActionHandler>>;
 pub async fn run_action_request(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,
+    form_actions: &FormActionIds,
     ctx: RequestContext,
     body: Bytes,
     slots: SessionSlots,
@@ -58,24 +107,69 @@ pub async fn run_action_request(
         }
     };
 
-    // Phase L · CSRF gate. Form submissions carry a `_csrf` field in
-    // their JSON payload (the renderer injects the input via the
-    // `<form action="action:NAME">` rewrite path; the server's
-    // post-render middleware fills in the per-session token). Actions
-    // whose payload is not a JSON object — or that don't carry a
-    // `_csrf` field — skip the check. This keeps button-click
-    // actions and other non-form shapes on the wire unchanged.
-    if let Some(presented) = extract_csrf_field(&envelope.payload) {
-        if let Err(err) = csrf.validate(slots.session_id(), &presented) {
+    // Phase L · CSRF gate.
+    //
+    // Every action must present a valid per-session token. It arrives on
+    // one of two channels — the `x-albedo-csrf` header the client runtime
+    // attaches to every POST, or the `_csrf` field a form submit carries
+    // in its JSON payload. The header is checked first so click/input
+    // actions (whose payloads have no field for a token) are covered by
+    // the same rule as forms; a form without the header falls back to its
+    // payload field.
+    //
+    // The requirement is emphatically NOT inferred from the payload
+    // shape. The gate once ran only `if the payload carried a _csrf
+    // field`, which asked the caller to volunteer the evidence used to
+    // judge it: omitting the field skipped the check entirely, and a
+    // renderer that forgot to emit the input (as the QuickJS/Tier-B path
+    // did) produced submissions that sailed through and looked normal.
+    // `form_actions` is consulted only to phrase the rejection precisely
+    // — it no longer decides whether the check runs, because the check
+    // always runs.
+    let presented = ctx
+        .headers
+        .get(CSRF_HEADER)
+        .cloned()
+        .or_else(|| extract_csrf_field(&envelope.payload));
+    match presented {
+        Some(token) => {
+            if let Err(err) = csrf.validate(slots.session_id(), &token) {
+                warn!(
+                    action_id = envelope.action_id,
+                    session = %slots.session_id(),
+                    error = %err,
+                    "CSRF validation failed",
+                );
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    format!("CSRF validation failed: {err}"),
+                );
+            }
+        }
+        // Fail closed. No token on either channel is a forged cross-site
+        // submit, a client that hasn't attached the header, or a renderer
+        // bug — all 403s, and the last two are ones we want loud rather
+        // than silently accepted.
+        None => {
+            let kind = if form_actions.contains(&envelope.action_id) {
+                "form action"
+            } else {
+                "action"
+            };
             warn!(
                 action_id = envelope.action_id,
                 session = %slots.session_id(),
-                error = %err,
-                "CSRF validation failed",
+                "{kind} submitted without a CSRF token; rejecting",
             );
             return error_response(
                 StatusCode::FORBIDDEN,
-                format!("CSRF validation failed: {err}"),
+                format!(
+                    "CSRF validation failed: {kind} {} carried no token \
+                     (`{}` header or `{}` payload field)",
+                    envelope.action_id,
+                    CSRF_HEADER,
+                    crate::render::csrf::CSRF_FIELD_NAME,
+                ),
             );
         }
     }
@@ -171,10 +265,15 @@ pub(crate) fn status_for_error(err: &RuntimeError) -> StatusCode {
 ///   * `Some(token)` when the payload parses as a JSON object that
 ///     carries a string-valued `_csrf` field.
 ///   * `None` when the payload is not JSON, is JSON but not an
-///     object, or is an object that doesn't carry `_csrf`. The
-///     dispatcher treats `None` as "not a form action, skip the CSRF
-///     check" — button-click actions and other non-form shapes never
-///     have to opt in.
+///     object, or is an object that doesn't carry `_csrf`.
+///
+/// `None` means "no token was presented" and nothing more. It used to
+/// double as "so this isn't a form action, skip the check", which made
+/// the extractor's leniency load-bearing for security — a caller could
+/// silence the gate by sending bytes this can't parse. Whether a token
+/// is *required* is now decided by the caller-independent
+/// `FormActionIds` set, leaving this function to answer only the
+/// narrow question it can actually answer.
 ///
 /// Deliberately lenient on the parse: a bincode payload (or any
 /// non-JSON bytes) returns `None` rather than an error, so non-form
@@ -210,6 +309,16 @@ mod tests {
         }
     }
 
+    /// A request context carrying the `x-albedo-csrf` header — the
+    /// channel the client runtime uses for click/input actions. Keyed
+    /// lowercase because [`RequestContext`] normalises header names that
+    /// way (see `normalize_headers`).
+    fn ctx_with_csrf_header(token: &str) -> RequestContext {
+        let mut ctx = ctx();
+        ctx.headers.insert(CSRF_HEADER.to_string(), token.to_string());
+        ctx
+    }
+
     fn slots() -> SessionSlots {
         SessionSlots::new(SessionId::random(), Arc::new(SlotStore::new()))
     }
@@ -221,6 +330,32 @@ mod tests {
     /// registry to exercise the validate path explicitly.
     fn csrf() -> CsrfRegistry {
         CsrfRegistry::new()
+    }
+
+    /// A server with no form actions registered. `form_actions` no
+    /// longer decides whether the gate runs — every action needs a token
+    /// now — so this only affects how a rejection is *phrased*, not
+    /// whether one happens.
+    fn no_form_actions() -> FormActionIds {
+        FormActionIds::new()
+    }
+
+    /// The dispatcher tests below don't exercise CSRF, but every action
+    /// must now clear the gate, so they need a valid token. Mint one for
+    /// a fresh session in `reg` and return a context presenting it in the
+    /// header plus a slots view on the same session, so `validate`
+    /// matches. This is the server-side mirror of what the browser does
+    /// with the shell's `__ALBEDO_CSRF__` global.
+    fn authed(reg: &CsrfRegistry) -> (RequestContext, SessionSlots) {
+        let session = SessionId::random();
+        let ctx = ctx_with_csrf_header(&reg.token_for(session));
+        (ctx, slots_for(session))
+    }
+
+    /// A server that knows `action_id` is submitted to by a form, and
+    /// therefore demands a valid token from it.
+    fn form_actions(ids: &[u32]) -> FormActionIds {
+        ids.iter().copied().collect()
     }
 
     async fn body_bytes(resp: Response<Body>) -> Bytes {
@@ -249,7 +384,18 @@ mod tests {
             .unwrap(),
         );
 
-        let response = run_action_request(&registry, &csrf(), ctx(), body, slots(), None).await;
+        let reg = csrf();
+        let (ctx, slots) = authed(&reg);
+        let response = run_action_request(
+            &registry,
+            &reg,
+            &no_form_actions(),
+            ctx,
+            body,
+            slots,
+            None,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
@@ -274,6 +420,7 @@ mod tests {
         let response = run_action_request(
             &registry,
             &csrf(),
+            &no_form_actions(),
             ctx(),
             Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]),
             slots(),
@@ -294,7 +441,18 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = run_action_request(&registry, &csrf(), ctx(), body, slots(), None).await;
+        let reg = csrf();
+        let (ctx, slots) = authed(&reg);
+        let response = run_action_request(
+            &registry,
+            &reg,
+            &no_form_actions(),
+            ctx,
+            body,
+            slots,
+            None,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -316,7 +474,18 @@ mod tests {
             })
             .unwrap(),
         );
-        let response = run_action_request(&registry, &csrf(), ctx(), body, slots(), None).await;
+        let reg = csrf();
+        let (ctx, slots) = authed(&reg);
+        let response = run_action_request(
+            &registry,
+            &reg,
+            &no_form_actions(),
+            ctx,
+            body,
+            slots,
+            None,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -326,7 +495,8 @@ mod tests {
         // dispatcher drains the dirty set after handle() returns →
         // SlotSet opcode is appended to the response wire frame.
         let store = Arc::new(SlotStore::new());
-        let view = SessionSlots::new(SessionId::random(), store);
+        let session = SessionId::random();
+        let view = SessionSlots::new(session, store);
 
         let mut registry: ActionRegistry = HashMap::new();
         let handler: Arc<dyn ActionHandler> = Arc::new(
@@ -346,7 +516,18 @@ mod tests {
             .unwrap(),
         );
 
-        let response = run_action_request(&registry, &csrf(), ctx(), body, view, None).await;
+        let reg = csrf();
+        let ctx = ctx_with_csrf_header(&reg.token_for(session));
+        let response = run_action_request(
+            &registry,
+            &reg,
+            &no_form_actions(),
+            ctx,
+            body,
+            view,
+            None,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let bytes = body_bytes(response).await;
@@ -414,6 +595,7 @@ mod tests {
         let response = run_action_request(
             &registry,
             &csrf_registry,
+            &form_actions(&[99]),
             ctx(),
             body,
             slots_for(session),
@@ -452,6 +634,51 @@ mod tests {
         let response = run_action_request(
             &registry,
             &csrf_registry,
+            &form_actions(&[99]),
+            ctx(),
+            body,
+            slots_for(session),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// THE regression test for closing the click/input gap. A click
+    /// action (no form submits to it) that presents NO token on either
+    /// channel used to dispatch — its payload had no field to carry one,
+    /// so the gate let it through. Now the client attaches the token as a
+    /// header, so a tokenless click is a forged or misbehaving caller and
+    /// must 403. The handler panics if it runs, so this cannot pass
+    /// vacuously.
+    #[tokio::test]
+    async fn click_action_without_any_token_is_rejected() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let _token = csrf_registry.token_for(session);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                panic!("handler must not run for a click action with no CSRF token");
+            },
+        );
+        registry.insert(5, handler);
+
+        let payload = serde_json::to_vec(&serde_json::json!({ "user": "alice" })).unwrap();
+        let body = Bytes::from(
+            encode_action_envelope(&ActionEnvelope {
+                action_id: 5,
+                event_kind: 0, // Click — no form payload, no header either
+                payload,
+            })
+            .unwrap(),
+        );
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            &no_form_actions(),
             ctx(),
             body,
             slots_for(session),
@@ -462,14 +689,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn csrf_field_absent_skips_validation_and_dispatches() {
-        // JSON object payload WITHOUT a `_csrf` field — non-form
-        // action shape. Must dispatch normally, validate path
-        // skipped. Registry has a session token but the request
-        // doesn't present one, so the check must not run.
+    async fn click_action_with_valid_header_token_dispatches() {
+        // The header channel: a click action carrying a valid token in
+        // `x-albedo-csrf` (and no `_csrf` payload field) must dispatch.
+        // This is exactly what the client runtime emits for a
+        // BindEvent-wired click after the shell published the token.
         let csrf_registry = CsrfRegistry::new();
         let session = SessionId::random();
-        let _token = csrf_registry.token_for(session);
+        let token = csrf_registry.token_for(session);
 
         let mut registry: ActionRegistry = HashMap::new();
         let handler: Arc<dyn ActionHandler> = Arc::new(
@@ -482,11 +709,12 @@ mod tests {
         );
         registry.insert(5, handler);
 
+        // A click payload with no `_csrf` field — the token rides the header.
         let payload = serde_json::to_vec(&serde_json::json!({ "user": "alice" })).unwrap();
         let body = Bytes::from(
             encode_action_envelope(&ActionEnvelope {
                 action_id: 5,
-                event_kind: 0, // Click — no form payload
+                event_kind: 0,
                 payload,
             })
             .unwrap(),
@@ -495,13 +723,181 @@ mod tests {
         let response = run_action_request(
             &registry,
             &csrf_registry,
-            ctx(),
+            &no_form_actions(),
+            ctx_with_csrf_header(&token),
             body,
             slots_for(session),
             None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn click_action_with_invalid_header_token_returns_403() {
+        // A wrong token in the header must 403, whatever the payload.
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let _real = csrf_registry.token_for(session);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                panic!("handler must not run on a bad header token");
+            },
+        );
+        registry.insert(5, handler);
+
+        let payload = serde_json::to_vec(&serde_json::json!({ "user": "alice" })).unwrap();
+        let body = Bytes::from(
+            encode_action_envelope(&ActionEnvelope {
+                action_id: 5,
+                event_kind: 0,
+                payload,
+            })
+            .unwrap(),
+        );
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            &no_form_actions(),
+            ctx_with_csrf_header("00000000000000000000000000000000"),
+            body,
+            slots_for(session),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn header_token_is_honoured_when_the_payload_field_is_absent_on_a_form() {
+        // A form action whose payload lost its `_csrf` field but whose
+        // POST still carried the header must dispatch — the header is the
+        // fallback that keeps a form working even if its hidden input
+        // never rendered. Proves the two channels are OR'd, header-first.
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let token = csrf_registry.token_for(session);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                Ok(vec![Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(99),
+                }])
+            },
+        );
+        registry.insert(99, handler);
+
+        let payload = serde_json::to_vec(&serde_json::json!({ "user": "alice" })).unwrap();
+        let body = Bytes::from(
+            encode_action_envelope(&ActionEnvelope {
+                action_id: 99,
+                event_kind: 2,
+                payload,
+            })
+            .unwrap(),
+        );
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            &form_actions(&[99]),
+            ctx_with_csrf_header(&token),
+            body,
+            slots_for(session),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// THE regression test for the bug this gate was rebuilt around.
+    ///
+    /// A form action arriving with no `_csrf` field at all is exactly
+    /// what a Tier-B/QuickJS-rendered form used to send, because that
+    /// renderer emitted no CSRF input — and the old gate, which ran only
+    /// when a token was present, dispatched it. The handler panics if it
+    /// runs, so this cannot pass vacuously.
+    #[tokio::test]
+    async fn form_action_without_a_csrf_field_is_rejected() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let _token = csrf_registry.token_for(session);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                panic!("handler must not run for a form action with no CSRF token");
+            },
+        );
+        registry.insert(99, handler);
+
+        // A well-formed form payload — just missing the token.
+        let payload = serde_json::to_vec(&serde_json::json!({ "user": "alice" })).unwrap();
+        let body = Bytes::from(
+            encode_action_envelope(&ActionEnvelope {
+                action_id: 99,
+                event_kind: 2, // Submit
+                payload,
+            })
+            .unwrap(),
+        );
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            &form_actions(&[99]),
+            ctx(),
+            body,
+            slots_for(session),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The gate must not be dodgeable by changing the payload's *shape*.
+    /// `extract_csrf_field` returns `None` for anything that isn't a JSON
+    /// object, so a caller could previously skip the check by sending
+    /// bytes the extractor can't read. Membership in `form_actions` is
+    /// what decides, so this is still a 403.
+    #[tokio::test]
+    async fn form_action_cannot_dodge_the_gate_with_a_non_json_payload() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                panic!("handler must not run for an ungated form action");
+            },
+        );
+        registry.insert(99, handler);
+
+        let body = Bytes::from(
+            encode_action_envelope(&ActionEnvelope {
+                action_id: 99,
+                event_kind: 0, // claiming to be a click changes nothing
+                payload: vec![0xff, 0x00, 0x12, 0x34],
+            })
+            .unwrap(),
+        );
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            &form_actions(&[99]),
+            ctx(),
+            body,
+            slots_for(session),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -39,6 +39,7 @@ pub mod reserve;
 pub mod skeleton;
 pub mod substrate;
 pub mod value;
+pub mod write;
 
 #[cfg(feature = "forge")]
 pub mod libsql;
@@ -48,6 +49,7 @@ pub use reserve::{
 };
 pub use substrate::{DataSubstrate, Transaction};
 pub use value::{Result, Row, Rows, SqlValue, SubstrateError};
+pub use write::{apply_writes, install_forge_write_collector, ForgeWrite, ForgeWriteCollector};
 
 #[cfg(feature = "forge")]
 pub use libsql::LibSqlSubstrate;

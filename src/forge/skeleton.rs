@@ -119,11 +119,34 @@ pub async fn materialize_seeds(
 ) -> crate::forge::value::Result<Vec<(String, Vec<u8>)>> {
     let mut seeds = Vec::with_capacity(FORGE_SLOTS.len());
     for slot in FORGE_SLOTS {
-        let rows = substrate.query(slot.query, &[]).await?;
-        let bytes = serde_json::to_vec(&rows_to_json(&rows)).unwrap_or_else(|_| b"[]".to_vec());
-        seeds.push((slot.topic.to_string(), bytes));
+        seeds.push((slot.topic.to_string(), materialize_slot(substrate, slot).await?));
     }
     Ok(seeds)
+}
+
+/// The FORGE slot backing `topic`, if any. The allowlist that keeps a
+/// collection name arriving from userland from ever reaching SQL as an
+/// identifier — see [`crate::forge::write`].
+#[must_use]
+pub fn slot_for_topic(topic: &str) -> Option<&'static ForgeSlot> {
+    FORGE_SLOTS.iter().find(|slot| slot.topic == topic)
+}
+
+/// Materialise ONE slot to the JSON bytes its topic carries.
+///
+/// The single definition of "what this collection currently looks like",
+/// shared by boot hydration, the build-time bake, and the post-write
+/// rematerialisation. If these ever diverged, a write would fan out a value
+/// shaped differently from the one SSR rendered.
+///
+/// # Errors
+/// Propagates any read error from the substrate.
+pub async fn materialize_slot(
+    substrate: &dyn DataSubstrate,
+    slot: &ForgeSlot,
+) -> crate::forge::value::Result<Vec<u8>> {
+    let rows = substrate.query(slot.query, &[]).await?;
+    Ok(serde_json::to_vec(&rows_to_json(&rows)).unwrap_or_else(|_| b"[]".to_vec()))
 }
 
 /// Map a substrate result set to a JSON array of column-keyed objects —

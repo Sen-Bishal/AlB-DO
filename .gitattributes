@@ -1,0 +1,33 @@
+# Normalize line endings across platforms.
+#
+# Every text blob is stored LF in the repository (the index already is —
+# verified with `git ls-files --eol`). Windows working trees still get
+# CRLF on checkout via core.autocrlf, but the *committed* bytes — which
+# is what Linux and Windows CI both hash, diff, and feed to golden
+# fixtures — are identical on every platform. Without this file that
+# guarantee rests only on each contributor's local core.autocrlf, which
+# is exactly how a CRLF blob slips into history and makes Windows and
+# Linux CI disagree on the same commit.
+* text=auto
+
+# Binary assets: never apply EOL conversion or attempt a text diff.
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.pdf   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.wasm  binary
+*.node  binary
+*.tgz   binary
+*.zip   binary
+*.db    binary
+
+# Windows shell scripts require CRLF to run correctly.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf

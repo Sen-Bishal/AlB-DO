@@ -434,7 +434,15 @@ impl RendererRuntime {
     /// source is missing is skipped (it falls back to the registry's loud
     /// "no plan" error at request time rather than rendering wrong HTML).
     #[must_use]
-    pub fn build_tier_b_render_plan(&self) -> crate::render::tier_b::TierBRenderPlan {
+    ///
+    /// `compiled` supplies each component's `useSharedSlot` topics, which the
+    /// render manifest does not carry. Passing `None` yields plans with no
+    /// shared topics — every component still renders, but any that reads a
+    /// shared slot resolves it to nothing, so prefer to pass the project.
+    pub fn build_tier_b_render_plan(
+        &self,
+        compiled: Option<&dom_render_compiler::runtime::CompiledProject>,
+    ) -> crate::render::tier_b::TierBRenderPlan {
         let by_name: HashMap<&str, &ComponentManifestEntry> = self
             .manifest
             .components
@@ -458,6 +466,7 @@ impl RendererRuntime {
                     &mut plan,
                     &by_name,
                     &island_modules,
+                    compiled,
                     &node.render_fn,
                     &node.component_id,
                 );
@@ -469,10 +478,10 @@ impl RendererRuntime {
             // the bare component name (the registry is called with that name);
             // no collision with the `render::*`-shaped Tier-B keys.
             if let Some(name) = route.error_component.as_deref() {
-                self.add_component_to_plan(&mut plan, &by_name, &island_modules, name, name);
+                self.add_component_to_plan(&mut plan, &by_name, &island_modules, compiled, name, name);
             }
             if let Some(name) = route.loading_component.as_deref() {
-                self.add_component_to_plan(&mut plan, &by_name, &island_modules, name, name);
+                self.add_component_to_plan(&mut plan, &by_name, &island_modules, compiled, name, name);
             }
 
             // Slice 3 — a route exporting `generateMetadata` needs its leaf
@@ -480,7 +489,7 @@ impl RendererRuntime {
             // Registered under the bare component name, the same key the serve
             // path calls `call_metadata` with.
             if let Some(name) = route.dynamic_metadata.as_deref() {
-                self.add_component_to_plan(&mut plan, &by_name, &island_modules, name, name);
+                self.add_component_to_plan(&mut plan, &by_name, &island_modules, compiled, name, name);
             }
         }
         plan
@@ -518,6 +527,7 @@ impl RendererRuntime {
         plan: &mut crate::render::tier_b::TierBRenderPlan,
         by_name: &HashMap<&str, &ComponentManifestEntry>,
         island_modules: &HashMap<String, String>,
+        compiled: Option<&dom_render_compiler::runtime::CompiledProject>,
         key: &str,
         component_name: &str,
     ) {
@@ -534,6 +544,29 @@ impl RendererRuntime {
             return;
         };
         let entry = component.module_path.clone();
+
+        // The component's `useSharedSlot` topics, resolved once at boot so the
+        // request path only has to read their current values.
+        //
+        // Deliberately NOT keyed off `component.module_path`: the manifest's is
+        // absolute, while the compiled project keys on project-relative specs —
+        // `module_spec_for_component` is the bridge (the same one
+        // `build_reactive_blocks` uses).
+        let shared_topics = match compiled {
+            Some(project) => match project.module_spec_for_component(component_name) {
+                Some(spec) => project.shared_slot_topics_for_entry(spec),
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        if !shared_topics.is_empty() {
+            tracing::debug!(
+                target: "albedo.renderer",
+                key = %key,
+                topics = ?shared_topics,
+                "tier-b component reads shared slots; seeding them per request"
+            );
+        }
 
         let order = match self
             .renderer
@@ -583,7 +616,11 @@ impl RendererRuntime {
 
         plan.insert(
             key.to_string(),
-            crate::render::tier_b::TierBEntryPlan { entry, modules },
+            crate::render::tier_b::TierBEntryPlan {
+                entry,
+                modules,
+                shared_topics,
+            },
         );
     }
 

@@ -555,6 +555,19 @@ impl CompiledProject {
         })
     }
 
+    /// Wire `action_id`s that a `<form action="action:NAME">` in this
+    /// project submits to.
+    ///
+    /// This is the compile-time truth about which actions are reachable
+    /// from a form, and therefore which ones MUST present a CSRF token.
+    /// The server's action dispatcher gates on this rather than on the
+    /// shape of the payload a caller sent — the caller is exactly who
+    /// the gate is defending against, so its say in the matter has to
+    /// be zero.
+    pub fn form_action_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.action_form_fields.keys().copied()
+    }
+
     /// Underlying Phase-J project; useful for callers that need access
     /// to component scanning, patch reports, or any of the pre-K API.
     #[must_use]
@@ -1007,6 +1020,33 @@ impl CompiledProject {
         topics.into_iter().collect()
     }
 
+    /// The topics one render `entry`'s component reads via `useSharedSlot`, in
+    /// source order.
+    ///
+    /// Unlike [`Self::shared_slot_topics`] (project-wide, for pre-registering
+    /// every topic at startup) this is per-component, which is what a *render*
+    /// needs: the seed handed to a component should describe that component.
+    ///
+    /// Exists so callers outside this crate can resolve a component's topics
+    /// without re-deriving the `entry -> (module_spec, function_name) -> meta`
+    /// chain themselves. Empty when the entry or its metadata doesn't resolve —
+    /// a component with no shared slots and one that can't be found both want
+    /// the same thing from a seed (nothing).
+    #[must_use]
+    pub fn shared_slot_topics_for_entry(&self, entry: &str) -> Vec<String> {
+        let Some((module_spec, function_name)) = self.project.resolve_entry_component(entry) else {
+            return Vec::new();
+        };
+        let Some(component) = self.component_meta(&module_spec, &function_name) else {
+            return Vec::new();
+        };
+        component
+            .shared_slots
+            .iter()
+            .map(|binding| binding.topic.clone())
+            .collect()
+    }
+
     /// Phase O.2 · all `useSharedSlot` bindings for one component
     /// (`{module_spec}::{function_name}`), in source order. Returns
     /// an empty slice for components that don't use shared slots.
@@ -1075,11 +1115,28 @@ impl CompiledProject {
                 )
             })?;
 
+        // The envelope's payload is the submitted form, when it is one. Decoded
+        // here and bound as `form` in the body's scope — the same data the
+        // QuickJS path exposes (as `event`), so a body reading its own form no
+        // longer depends on which executor happens to be wired.
+        //
+        // Lenient by design, mirroring the CSRF extractor: a click envelope is
+        // empty and an opaque bincode payload is not JSON. Neither is an error —
+        // they simply carry no form, and `form` stays unbound.
+        let form_payload: Option<Value> = if envelope.payload.is_empty() {
+            None
+        } else {
+            serde_json::from_slice::<Value>(&envelope.payload)
+                .ok()
+                .filter(Value::is_object)
+        };
+
         let mut explicit = self.project.eval_handler_body(
             &handler.module_spec,
             &handler.body,
             component,
             slots,
+            form_payload.as_ref(),
         )?;
         explicit.extend(slots.drain_pending());
         Ok(explicit)
@@ -1105,6 +1162,34 @@ impl CompiledProject {
     ) -> Result<Vec<Instruction>> {
         let _broadcast_guard = crate::runtime::eval::core::install_phase_k_broadcast(broadcast);
         self.invoke_action(envelope, slots)
+    }
+
+    /// FORGE · [`Self::invoke_action_with_broadcast`] plus a durable-write
+    /// collector, returning the body's instructions **and** the writes its
+    /// `append()` calls recorded.
+    ///
+    /// The caller must apply the writes — `crate::forge::write::apply_writes`
+    /// does the mutate → rematerialize → fan-out. They come back rather than
+    /// being executed here because this is a **synchronous** call and the
+    /// substrate is async; see [`crate::forge::write`] for the full reasoning.
+    ///
+    /// Writes are returned even when the body ultimately errors? No: an `Err`
+    /// short-circuits and the collector drops, discarding them. That is
+    /// deliberate — a body that failed halfway did not ask for its earlier
+    /// appends to stand on their own.
+    ///
+    /// # Errors
+    /// Propagates any error from the handler body.
+    pub fn invoke_action_with_forge(
+        &self,
+        envelope: &ActionEnvelope,
+        slots: &SessionSlotView,
+        broadcast: &crate::runtime::broadcast::BroadcastRegistry,
+    ) -> Result<(Vec<Instruction>, Vec<crate::forge::ForgeWrite>)> {
+        let collector = crate::forge::install_forge_write_collector();
+        let instructions = self.invoke_action_with_broadcast(envelope, slots, broadcast)?;
+        let writes = collector.take();
+        Ok((instructions, writes))
     }
 
     /// A1 · host-object bridge — dispatch an action by running its handler
@@ -1345,8 +1430,32 @@ impl CompiledProject {
                         let _ = registry.write_topic(topic, value.clone());
                     }
                 }
+                // FORGE · a durable write. Recorded onto the thread-local
+                // collector the caller installed, NOT performed here: this fn is
+                // synchronous and the substrate is async. The caller
+                // (`crate::forge::write` via the action adapter) applies it and
+                // fans out the collection's post-commit value.
+                //
+                // No opcode, so nothing is pushed below — this session learns the
+                // new rows the same way every other subscriber does.
+                HandlerEffect::ForgeAppend { collection, record } => {
+                    if !crate::forge::write::record_forge_write(
+                        crate::forge::ForgeWrite::Append {
+                            collection: collection.clone(),
+                            record: record.clone(),
+                        },
+                    ) {
+                        return Err(anyhow!(
+                            "append('{collection}') was called but no FORGE write collector is \
+                             installed; dispatch this action through a path that installs one \
+                             (the server does when a substrate is wired)"
+                        ));
+                    }
+                }
             }
-            instructions.push(effect.into_instruction());
+            if let Some(instruction) = effect.into_instruction() {
+                instructions.push(instruction);
+            }
         }
 
         // P6 — when this action backs a `<form action="action:NAME">`, project
@@ -1475,20 +1584,17 @@ impl CompiledProject {
                 host.insert("state".to_string(), Value::Object(state));
             }
 
-            // useSharedSlot: shared[topic] = current broadcast value.
+            // useSharedSlot: shared[topic] = current broadcast value. Seeded via
+            // the shared helper so this path and the server's request-time
+            // pooled Tier-B path cannot drift apart.
             if let Some(registry) = broadcast {
-                let mut shared = serde_json::Map::new();
-                for binding in &component.shared_slots {
-                    if let Some(topic) = registry.get(&binding.topic) {
-                        let bytes = topic.current_value();
-                        let value = if bytes.is_empty() {
-                            Value::Null
-                        } else {
-                            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-                        };
-                        shared.insert(binding.topic.clone(), value);
-                    }
-                }
+                let shared = shared_slot_host_seed(
+                    component
+                        .shared_slots
+                        .iter()
+                        .map(|binding| binding.topic.as_str()),
+                    registry,
+                );
                 if !shared.is_empty() {
                     host.insert("shared".to_string(), Value::Object(shared));
                 }
@@ -1758,6 +1864,12 @@ fn jsx_node_to_html_js(node: &Expr, parts: &mut Vec<String>, buf: &mut String) -
             let JSXAttrName::Ident(attr_name) = &jsx_attr.name else {
                 return Err(anyhow!("namespaced attr reached list templater"));
             };
+            // `key` is why this guard exists: keyed lists (`items.map(x => <li
+            // key={x.id}>)`) are exactly what this templater renders, so without
+            // it every generated row carries an invalid `key="..."` attribute.
+            if crate::runtime::eval::component::is_reserved_jsx_prop(attr_name.sym.as_ref()) {
+                continue;
+            }
             let html_name = jsx_attr_name_to_html(attr_name.sym.as_ref());
             match &jsx_attr.value {
                 None => {
@@ -1829,6 +1941,45 @@ fn jsx_node_to_html_js(node: &Expr, parts: &mut Vec<String>, buf: &mut String) -
 ///     `SetTextRef { stable_id, slot_id }` for every slot-bound expression in a text-child
 ///     position.
 ///
+/// Build the `host.shared` seed a QuickJS render resolves `useSharedSlot`
+/// against: `topic -> the topic's current value`.
+///
+/// The JS shim reads `host.shared[topic]` (see `quickjs_engine`), so a topic
+/// missing from this map is a `useSharedSlot` that resolves to nothing.
+///
+/// **One implementation, deliberately shared by both server render paths** —
+/// the in-process [`CompiledProject::render_entry_quickjs_with_broadcast`] and
+/// the server's request-time pooled Tier-B registry. They previously diverged:
+/// the request path passed a hardcoded empty host, so `useSharedSlot` resolved
+/// null on `albedo serve` while the same component rendered correctly through
+/// the in-process path. Two seeds is the bug; keep it one.
+///
+/// A topic absent from the registry is **omitted** rather than seeded `Null`,
+/// which leaves the shim on its own fallback instead of handing the component a
+/// value the server never had.
+#[must_use]
+pub fn shared_slot_host_seed<'a>(
+    topics: impl IntoIterator<Item = &'a str>,
+    broadcast: &BroadcastRegistry,
+) -> serde_json::Map<String, Value> {
+    let mut shared = serde_json::Map::new();
+    for topic in topics {
+        let Some(entry) = broadcast.get(topic) else {
+            continue;
+        };
+        let bytes = entry.current_value();
+        // An empty topic buffer is "registered but never written", which is
+        // JSON `null` — not a decode failure worth surfacing.
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        shared.insert(topic.to_string(), value);
+    }
+    shared
+}
+
 /// When `hook_compile == false`, falls back to Phase J behaviour and
 /// returns an empty opcode vector.
 pub fn render_entry_with_bindings(

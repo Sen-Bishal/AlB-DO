@@ -144,10 +144,32 @@ pub fn escape_attr(value: &str) -> String {
     escape_html(value).replace('"', "&quot;")
 }
 
+/// JSX props that are framework-level and must never reach the HTML.
+///
+/// * `key` — React's reconciliation identity. It addresses an element within a
+///   sibling list; it is not data about the element, and `key` is not a valid
+///   HTML attribute. React strips it rather than emitting it, and so must we.
+/// * `ref` — an escape hatch to the host node. Also not an HTML attribute.
+/// * `children` — the element's content, rendered between the tags.
+///
+/// This is the single Rust-side definition; every HTML-emitting path consults it
+/// (`render_attrs` here, the list templater in `runtime::compiled`). The QuickJS
+/// shim carries its own copy because it lives on the other side of a language
+/// boundary — `runtime::quickjs_engine`'s `__albedo_is_reserved_prop` must be
+/// kept in lockstep with this list, or SSR and CSR emit different attributes for
+/// the same component.
+#[must_use]
+pub fn is_reserved_jsx_prop(name: &str) -> bool {
+    matches!(name, "key" | "ref" | "children")
+}
+
 pub fn render_attrs(attrs: &[(String, Value)]) -> String {
     let mut out = Vec::new();
     for (name, value) in attrs {
         if name.starts_with("on") {
+            continue;
+        }
+        if is_reserved_jsx_prop(name) {
             continue;
         }
         let attr_name = if name == "className" { "class" } else { name };
@@ -379,5 +401,55 @@ pub fn prop_name_to_string(name: &swc_ecma_ast::PropName) -> Option<String> {
         swc_ecma_ast::PropName::Str(str_lit) => Some(str_lit.value.to_string()),
         swc_ecma_ast::PropName::Num(num) => Some(num.value.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attr(name: &str, value: &str) -> (String, Value) {
+        (name.to_string(), Value::String(value.to_string()))
+    }
+
+    /// The leak this guard exists to stop: `key` reached the browser as
+    /// `<li class="entry" key="1">`. It is React's reconciliation identity, not
+    /// data about the element, and not a valid HTML attribute.
+    #[test]
+    fn render_attrs_drops_the_key_prop() {
+        let html = render_attrs(&[attr("className", "entry"), attr("key", "1")]);
+        assert_eq!(html, "class=\"entry\"");
+    }
+
+    #[test]
+    fn render_attrs_drops_ref_and_children() {
+        let html = render_attrs(&[
+            attr("ref", "anchor"),
+            attr("children", "inner"),
+            attr("id", "real"),
+        ]);
+        assert_eq!(html, "id=\"real\"");
+    }
+
+    /// The guard must remove *only* reserved props — a real attribute whose name
+    /// merely contains them (`data-key`, `keygen`) is still an attribute.
+    #[test]
+    fn render_attrs_keeps_attributes_that_only_resemble_reserved_props() {
+        let html = render_attrs(&[
+            attr("data-key", "k"),
+            attr("keygen", "g"),
+            attr("aria-keyshortcuts", "s"),
+        ]);
+        assert_eq!(html, "data-key=\"k\" keygen=\"g\" aria-keyshortcuts=\"s\"");
+    }
+
+    #[test]
+    fn is_reserved_jsx_prop_covers_exactly_the_framework_props() {
+        assert!(is_reserved_jsx_prop("key"));
+        assert!(is_reserved_jsx_prop("ref"));
+        assert!(is_reserved_jsx_prop("children"));
+        assert!(!is_reserved_jsx_prop("class"));
+        assert!(!is_reserved_jsx_prop("data-key"));
+        assert!(!is_reserved_jsx_prop("Key"), "matching must be case-exact");
     }
 }

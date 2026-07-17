@@ -4,7 +4,7 @@
     "css": [],
     "runtime": "/_albedo/runtime.js"
   },
-  "build_id": "f39fb687d9f640c6",
+  "build_id": "<normalized>",
   "components": [
     {
       "can_defer": true,

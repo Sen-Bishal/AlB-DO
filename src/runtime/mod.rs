@@ -29,7 +29,8 @@ pub use broadcast::{
 };
 pub use compiled::{
     allocate_proxy_id, allocate_slot_id, render_entry_with_bindings, render_entry_with_broadcast,
-    CompiledComponent, CompiledProject, RenderOptions, RenderOutput, ResolvedHandler,
+    shared_slot_host_seed, CompiledComponent, CompiledProject, RenderOptions, RenderOutput,
+    ResolvedHandler,
 };
 pub use eval::{render_from_components_dir, ComponentProject, PatchReport};
 pub use session::SessionId;

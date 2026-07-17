@@ -11,15 +11,101 @@ fn load_test_app_components() -> (
     ProjectScanner,
     Vec<dom_render_compiler::parser::ParsedComponent>,
 ) {
+    load_components_from(
+        &project_root()
+            .join("tests")
+            .join("fixtures")
+            .join("components"),
+    )
+}
+
+fn load_components_from(
+    components_root: &Path,
+) -> (
+    ProjectScanner,
+    Vec<dom_render_compiler::parser::ParsedComponent>,
+) {
     let scanner = ProjectScanner::new();
-    let components_root = project_root()
+    let components = scanner
+        .scan_directory(components_root)
+        .expect("test-app components should scan");
+    (scanner, components)
+}
+
+fn build_id_for_components_at(components_root: &Path) -> String {
+    let (scanner, components) = load_components_from(components_root);
+    let compiler = scanner.build_compiler(components);
+    compiler
+        .optimize_manifest_v2()
+        .expect("manifest should optimize")
+        .build_id
+}
+
+/// Copy the fixture components into `dest`, so the same sources can be built
+/// from a different absolute location.
+fn copy_fixture_components_to(dest: &Path) {
+    let src = project_root()
         .join("tests")
         .join("fixtures")
         .join("components");
-    let components = scanner
-        .scan_directory(&components_root)
-        .expect("test-app components should scan");
-    (scanner, components)
+    fs::create_dir_all(dest).expect("destination should be creatable");
+    for entry in fs::read_dir(&src).expect("fixture components should be readable") {
+        let entry = entry.expect("directory entry should read");
+        if entry.file_type().expect("file type should read").is_file() {
+            fs::copy(entry.path(), dest.join(entry.file_name())).expect("fixture should copy");
+        }
+    }
+}
+
+/// `build_id` must identify the PROJECT, not the directory it happens to sit in.
+///
+/// It is a hash over every component's path + source hash, and those paths are
+/// absolute (`ComponentManifestEntry.module_path` is `Component.file_path`
+/// verbatim). Hashing them raw made the id follow the checkout around: moving
+/// this repo from `A:\` to `C:\Development\ALKMY\AlB-DO` silently invalidated
+/// the manifest golden below, because the same source produced a different id.
+///
+/// That is not a stale fixture — it is a build id that cannot be compared across
+/// two machines, which is the only thing a build id is for. Nothing consumes
+/// `build_id` yet, so this pins the property before something does.
+#[test]
+fn build_id_is_independent_of_where_the_project_lives_on_disk() {
+    let first = tempfile::tempdir().expect("temp dir");
+    let second = tempfile::tempdir().expect("temp dir");
+
+    // Different roots, and different nesting depths, so a prefix that merely
+    // happened to be the same length wouldn't hide a location dependency.
+    let a = first.path().join("here");
+    let b = second.path().join("somewhere").join("much").join("deeper");
+    copy_fixture_components_to(&a);
+    copy_fixture_components_to(&b);
+
+    assert_eq!(
+        build_id_for_components_at(&a),
+        build_id_for_components_at(&b),
+        "build_id must not change when the same project is built from a different path"
+    );
+}
+
+/// The id still has to be a real fingerprint: same location, changed source =>
+/// different id. Otherwise the test above could pass with a constant.
+#[test]
+fn build_id_still_changes_when_a_component_source_changes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("app");
+    copy_fixture_components_to(&root);
+
+    let before = build_id_for_components_at(&root);
+
+    let target = root.join("Footer.jsx");
+    let source = fs::read_to_string(&target).expect("fixture should read");
+    fs::write(&target, format!("{source}\n// touched\n")).expect("fixture should write");
+
+    assert_ne!(
+        before,
+        build_id_for_components_at(&root),
+        "build_id must still track component source content"
+    );
 }
 
 fn normalize_generated_at(value: &mut Value) {
@@ -52,6 +138,31 @@ fn normalize_module_paths(value: &mut Value) {
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+/// `build_id` is a hash *of* every component's `source_hash` — the very field
+/// `normalize_source_hashes` already declares too unstable to assert. Pinning
+/// the derived hash while normalizing its input is incoherent, and it made this
+/// fixture a tripwire that has now gone stale twice for reasons unrelated to the
+/// manifest's actual shape.
+///
+/// Concretely, `source_hash` is `xxh3_64` over raw source bytes and this repo has
+/// no `.gitattributes`: git stores LF but checks out CRLF on Windows
+/// (`git ls-files --eol` → `i/lf w/crlf`), so the same commit hashes differently
+/// on a Windows dev box than on Linux CI. A golden cannot pin that.
+///
+/// This is NOT sweeping the real defect under the rug: `build_id` genuinely was
+/// path-dependent (it hashed absolute paths, so moving the checkout changed it),
+/// and that is fixed in `ManifestBuilder::build_build_id`. The property is now
+/// asserted head-on by `build_id_is_independent_of_where_the_project_lives_on_disk`
+/// and `build_id_still_changes_when_a_component_source_changes`, which fail with a
+/// direct message instead of a 5 kB JSON diff.
+fn normalize_build_id(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        if object.contains_key("build_id") {
+            object.insert("build_id".to_string(), Value::String("<normalized>".to_string()));
+        }
     }
 }
 
@@ -88,6 +199,7 @@ fn assert_json_fixture(path: &Path, mut actual: Value) {
     normalize_generated_at(&mut actual);
     normalize_module_paths(&mut actual);
     normalize_source_hashes(&mut actual);
+    normalize_build_id(&mut actual);
 
     let update = std::env::var("ALBEDO_UPDATE_GOLDENS").ok().as_deref() == Some("1");
     if update {

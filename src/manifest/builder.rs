@@ -386,13 +386,43 @@ impl<'a> ManifestBuilder<'a> {
         }
     }
 
+    /// A content hash identifying this build: every component's path and source
+    /// hash, folded in `id` order.
+    ///
+    /// **The paths that feed it are made location-independent**, because a build
+    /// id must answer "is this the same project?", not "is this the same
+    /// directory on the same machine?". `Component.file_path` is ABSOLUTE and
+    /// platform-native (`manifest::mod` copies it straight into
+    /// `ComponentManifestEntry.module_path`, and the renderer depends on that),
+    /// so hashing it raw made the id vary by:
+    ///   * **checkout location** — the same tree at `A:\albedo` and
+    ///     `C:\Development\ALKMY\AlB-DO` produced different ids. This is what
+    ///     silently invalidated the `manifest_v2_test_app_components` golden when
+    ///     the repo moved.
+    ///   * **platform separators** — `\` on Windows vs `/` elsewhere, so the same
+    ///     commit hashed differently on a dev box and Linux CI.
+    ///
+    /// Both are fixed here rather than papered over in the golden: an id that
+    /// changes when nothing about the program changed cannot be used to key a
+    /// cache or compare two builds, which is the only reason to have one.
+    ///
+    /// Nothing reads `build_id` today — it is serialized and never consumed — so
+    /// this is a latent bug being closed before something depends on it.
     pub fn build_build_id(&self) -> String {
         let mut components = self.components.values().collect::<Vec<_>>();
         components.sort_by(|left, right| left.id.as_u64().cmp(&right.id.as_u64()));
 
+        // Slash-normalize first so the prefix scan and the emitted basis agree
+        // on separators regardless of host platform.
+        let paths: Vec<String> = components
+            .iter()
+            .map(|component| component.file_path.replace('\\', "/"))
+            .collect();
+        let root_len = longest_common_dir_prefix(&paths);
+
         let mut basis = String::new();
-        for component in components {
-            basis.push_str(component.file_path.as_str());
+        for (component, path) in components.iter().zip(&paths) {
+            basis.push_str(&path[root_len..]);
             basis.push(':');
             basis.push_str(format!("{:016x}", component.source_hash).as_str());
             basis.push(';');
@@ -1628,6 +1658,45 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Byte length of the longest directory prefix shared by every path, so
+/// `path[len..]` is that path relative to the project's own root — without
+/// needing to be told where the root is (`ManifestBuilder` is constructed
+/// without a `working_dir` on the `optimize_manifest_v2` path, so it cannot ask).
+///
+/// Derived from the component set itself, which is exactly the property wanted:
+/// move the whole tree and every relative path is unchanged. Adding or removing
+/// a component can shift the prefix, but that already changes the component set
+/// and so must change the build id anyway.
+///
+/// Expects slash-normalized input. Returns 0 when there is no shared directory
+/// (e.g. components on different Windows drives) — degrading to full paths,
+/// which is still deterministic for a given layout.
+fn longest_common_dir_prefix(paths: &[String]) -> usize {
+    let Some(first) = paths.first() else {
+        return 0;
+    };
+
+    let mut len = first.len();
+    for other in &paths[1..] {
+        let shared = first
+            .as_bytes()
+            .iter()
+            .zip(other.as_bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        len = len.min(shared);
+    }
+
+    // Cut at a directory boundary, never mid-segment: `/tmp/ab/x` and
+    // `/tmp/ac/y` share the bytes `/tmp/a`, but the shared *directory* is
+    // `/tmp/`. Slicing after an ASCII '/' is also always a valid char boundary,
+    // so a multi-byte path can't panic here.
+    first.as_bytes()[..len]
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(0, |index| index + 1)
+}
+
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
@@ -1642,11 +1711,75 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_shim_script, stream_slot_label, TIER_B_INJECT_BOOTSTRAP};
+    use super::{
+        default_shim_script, longest_common_dir_prefix, stream_slot_label,
+        TIER_B_INJECT_BOOTSTRAP,
+    };
     use crate::runtime::webtransport::{
         WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES, WT_STREAM_SLOT_PREFETCH,
         WT_STREAM_SLOT_SHELL,
     };
+
+    fn strip(paths: &[&str]) -> Vec<String> {
+        let owned: Vec<String> = paths.iter().map(|p| (*p).to_string()).collect();
+        let cut = longest_common_dir_prefix(&owned);
+        owned.iter().map(|p| p[cut..].to_string()).collect()
+    }
+
+    #[test]
+    fn common_prefix_reduces_paths_to_project_relative() {
+        assert_eq!(
+            strip(&["/home/me/proj/src/App.tsx", "/home/me/proj/src/ui/Btn.tsx"]),
+            vec!["App.tsx", "ui/Btn.tsx"]
+        );
+    }
+
+    /// The whole point: the same tree at a different location must reduce to the
+    /// same relative paths, so the build id can't move with the checkout.
+    #[test]
+    fn the_same_tree_at_a_different_location_reduces_identically() {
+        let a = strip(&["/home/me/proj/src/App.tsx", "/home/me/proj/src/ui/Btn.tsx"]);
+        let b = strip(&["C:/Development/thing/src/App.tsx", "C:/Development/thing/src/ui/Btn.tsx"]);
+        assert_eq!(a, b);
+    }
+
+    /// A shared *byte* prefix is not a shared *directory*: `ab/` and `ac/` share
+    /// "a", but cutting there would emit `b/x` and `c/y` and silently conflate
+    /// two different trees.
+    #[test]
+    fn common_prefix_cuts_at_a_directory_boundary_not_mid_segment() {
+        assert_eq!(strip(&["/tmp/ab/x.tsx", "/tmp/ac/y.tsx"]), vec!["ab/x.tsx", "ac/y.tsx"]);
+    }
+
+    #[test]
+    fn a_single_component_reduces_to_its_file_name() {
+        assert_eq!(strip(&["/a/very/deep/root/Only.tsx"]), vec!["Only.tsx"]);
+    }
+
+    /// No shared root (different Windows drives) → keep full paths rather than
+    /// invent a prefix. Still deterministic for a given layout.
+    #[test]
+    fn paths_with_no_shared_directory_are_left_whole() {
+        assert_eq!(
+            strip(&["C:/x/A.tsx", "D:/y/B.tsx"]),
+            vec!["C:/x/A.tsx", "D:/y/B.tsx"]
+        );
+    }
+
+    #[test]
+    fn a_multibyte_path_does_not_panic_on_the_boundary_cut() {
+        // Slicing must land on a char boundary — '/' is ASCII, so cutting after
+        // one is always safe even when segments are multi-byte.
+        assert_eq!(
+            strip(&["/proj/café/A.tsx", "/proj/café/B.tsx"]),
+            vec!["A.tsx", "B.tsx"]
+        );
+    }
+
+    #[test]
+    fn an_empty_component_set_has_no_prefix() {
+        assert_eq!(longest_common_dir_prefix(&[]), 0);
+    }
 
     #[test]
     fn tier_b_inject_bootstrap_is_a_classic_stub_defining_both_globals() {

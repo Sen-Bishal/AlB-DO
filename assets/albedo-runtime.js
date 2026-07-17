@@ -154,11 +154,23 @@ export function createActionDispatcher({ bakabox, endpoint = DEFAULT_ACTION_ENDP
       payload,
     });
 
+    // Phase L · attach the per-session CSRF token the streaming shell
+    // published as `globalThis.__ALBEDO_CSRF__`. A click/input envelope's
+    // bincode payload has no field to carry a token, so the server's
+    // action gate reads it from this header (`x-albedo-csrf`, mirrored in
+    // `crates/albedo-server/src/handlers/action.rs`). Without it every
+    // non-form action 403s.
+    const headers = { 'content-type': 'application/octet-stream' };
+    const csrfToken = globalThis.__ALBEDO_CSRF__;
+    if (typeof csrfToken === 'string' && csrfToken) {
+      headers['x-albedo-csrf'] = csrfToken;
+    }
+
     let response;
     try {
       response = await resolvedFetch(endpoint, {
         method: 'POST',
-        headers: { 'content-type': 'application/octet-stream' },
+        headers: headers,
         credentials: 'same-origin',
         cache: 'no-store',
         body: bytes,

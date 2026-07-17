@@ -87,6 +87,30 @@ fn action_request(envelope: ActionEnvelope, session_cookie: Option<SessionId>) -
     builder.body(Body::from(body)).expect("request builds")
 }
 
+/// Like [`action_request`] but also attaches the `x-albedo-csrf` header
+/// the client runtime now sends on every action POST — the channel that
+/// carries the token for click/input actions, whose payload has no field
+/// for one.
+fn action_request_with_csrf(
+    envelope: ActionEnvelope,
+    session_cookie: Option<SessionId>,
+    token: &str,
+) -> Request<Body> {
+    let body = encode_action_envelope(&envelope).expect("envelope encodes");
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/_albedo/action")
+        .header("content-type", "application/octet-stream")
+        .header("x-albedo-csrf", token);
+    if let Some(session) = session_cookie {
+        builder = builder.header(
+            "Cookie",
+            format!("{ALBEDO_SESSION_COOKIE}={}", session.as_uuid()),
+        );
+    }
+    builder.body(Body::from(body)).expect("request builds")
+}
+
 /// JSON form payload bytes wrapping `_csrf` and the user/pass
 /// fields the action handler decodes via the `LoginForm` shape.
 fn login_payload(token: &str) -> Vec<u8> {
@@ -191,21 +215,29 @@ async fn form_submit_without_cookie_uses_fresh_session_and_403s_on_csrf() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+/// Replaces `form_submit_without_csrf_field_skips_gate_for_non_form_actions`,
+/// which asserted this exact request returned 200.
+///
+/// That test read as though it covered button clicks, but the id it
+/// sent is `form_action_id(ACTION_NAME)` — an action registered through
+/// `register_form_action`. It only counted as "not a form action"
+/// because form-ness used to be inferred from the *payload's shape*: no
+/// `_csrf` field meant no check. So the assertion encoded the hole
+/// rather than the rule, and any caller could open it by dropping a
+/// field and claiming `event_kind=0`.
+///
+/// Form-ness is now the server's own compile/registration-time fact, so
+/// the same request is refused. `event_kind` is the client's word for
+/// what happened and is deliberately not consulted.
 #[tokio::test]
-async fn form_submit_without_csrf_field_skips_gate_for_non_form_actions() {
-    // A button-click action ships event_kind=0 (Click) with a
-    // non-form payload (here: an empty JSON object). The dispatcher
-    // must NOT run CSRF validation on such payloads — the gate is
-    // form-only by design.
+async fn form_action_without_csrf_field_is_refused_whatever_event_kind_it_claims() {
     let server = build_server();
     let session = SessionId::random();
     let _token = server.csrf_registry().token_for(session);
 
     let envelope = ActionEnvelope {
         action_id: form_action_id(ACTION_NAME),
-        event_kind: 0,
-        // Plain JSON object without `_csrf` field — the extractor
-        // returns None and the gate is skipped.
+        event_kind: 0, // claiming "Click" buys nothing
         payload: serde_json::to_vec(&serde_json::json!({
             "user": "alice",
             "pass": "hunter2-very-long",
@@ -219,10 +251,67 @@ async fn form_submit_without_csrf_field_skips_gate_for_non_form_actions() {
         .await
         .expect("router responds");
 
-    // The CSRF check is skipped, but the handler still runs and
-    // returns the Navigate opcode (the handler doesn't care about
-    // event_kind in this test).
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// Click actions are now gated too. Their bincode payload has no field
+/// for a token, so the client runtime attaches it as the `x-albedo-csrf`
+/// header (from the shell's `__ALBEDO_CSRF__` global). This test pins
+/// both halves of the closed gap on a genuinely non-form-backed action
+/// (registered via `register_action`): no token → 403, valid header
+/// token → 200. It supersedes `click_action_without_csrf_field_still_dispatches`,
+/// which asserted the pre-gate 200 and encoded the hole.
+#[tokio::test]
+async fn click_action_is_gated_and_dispatches_only_with_a_token() {
+    const CLICK_ACTION_ID: u32 = 4242;
+
+    let config = AppConfig {
+        server: ServerConfig::default(),
+        renderer: None,
+        layouts: Vec::new(),
+        routes: Vec::new(),
+    };
+    let server = AlbedoServerBuilder::new(config)
+        .register_action(
+            CLICK_ACTION_ID,
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                Ok(vec![Instruction::Navigate {
+                    url: "/clicked".to_string(),
+                }])
+            },
+        )
+        .build()
+        .expect("server build");
+
+    let session = SessionId::random();
+    let token = server.csrf_registry().token_for(session);
+
+    let envelope = || ActionEnvelope {
+        action_id: CLICK_ACTION_ID,
+        event_kind: 0,
+        payload: Vec::new(),
+    };
+
+    // No token on either channel → 403, exactly as a tokenless form.
+    let refused = server
+        .router()
+        .oneshot(action_request(envelope(), Some(session)))
+        .await
+        .expect("router responds");
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "a click with no token must be refused now that the runtime attaches one",
+    );
+
+    // Valid token in the header → dispatches, proving the header is the
+    // click path's token channel.
+    let accepted = server
+        .router()
+        .oneshot(action_request_with_csrf(envelope(), Some(session), &token))
+        .await
+        .expect("router responds");
+    assert_eq!(accepted.status(), StatusCode::OK);
 }
 
 #[tokio::test]

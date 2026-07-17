@@ -2,7 +2,13 @@ use crate::ir::opcode::{Instruction, ProxyId, SlotId, StableId};
 use crate::runtime::compiled::{allocate_proxy_id, CompiledComponent, CompiledProject};
 use crate::runtime::slot_store::SessionSlotView;
 use crate::transforms::events::HandlerBody;
-use crate::transforms::form::{allocate_field_error_id, FORM_ACTION_PREFIX};
+// Aliased on import: the local `form_action_name` binding below holds the
+// *detected* name for the element being rendered, so the parser that
+// produces it needs a distinct name to stay readable.
+use crate::transforms::form::{
+    allocate_field_error_id, form_action_name as parse_form_action_sentinel,
+    CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR,
+};
 use crate::types::ComponentId;
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
@@ -1763,12 +1769,23 @@ impl ComponentProject {
     /// reads. Returns the explicit `Vec<Instruction>` from the body
     /// (the body itself rarely emits anything explicit — the SlotSet
     /// opcodes come from `SessionSlotView::drain_pending` afterwards).
+    /// `form_payload` is the action envelope's decoded JSON payload — the
+    /// submitted form fields — bound into the body's scope as `form`.
+    ///
+    /// Ambient, exactly like the `broadcast()` builtin: an author can write
+    /// `form.author` directly, and destructuring (`action(({ form }) => …)`,
+    /// the shape the extractor already preserves) resolves to the same binding
+    /// because the body is evaluated in this scope either way.
+    ///
+    /// `None` (a click, an opaque payload) leaves `form` unbound, so a body that
+    /// reads it fails loudly rather than reading `null.author`.
     pub fn eval_handler_body(
         &self,
         module_spec: &str,
         body: &HandlerBody,
         component: &CompiledComponent,
         slots: &SessionSlotView,
+        form_payload: Option<&Value>,
     ) -> Result<Vec<Instruction>> {
         let _guard = PhaseKGuard::install(slots.clone());
         // Push the component's scope. We don't need any of the
@@ -1842,6 +1859,13 @@ impl ComponentProject {
                     env.insert(name.clone(), value);
                 }
             }
+        }
+
+        // Seeded LAST so it shadows a module constant or prop of the same name:
+        // `form` is this request's data, and nothing in the component's scope
+        // should be able to quietly stand in for it.
+        if let Some(payload) = form_payload {
+            env.insert("form".to_string(), payload.clone());
         }
 
         let result: Result<Vec<Instruction>> = match body {
@@ -2514,6 +2538,20 @@ impl ComponentProject {
                     ));
                 }
 
+                // FORGE · `append(collection, record)` — the durable write
+                // builtin. Sits beside `broadcast` deliberately: same shape
+                // (framework builtin resolved above setter/user dispatch), same
+                // scope guard.
+                //
+                // It RECORDS rather than writes. The substrate is async and this
+                // evaluation is sync, so the intent is collected here and applied
+                // by the async action adapter once the body returns — see
+                // `crate::forge::write`. Returning Null keeps the handler body's
+                // discarded value from surfacing a cast of the record.
+                if fn_name == "append" {
+                    return self.eval_forge_append(module_spec, call, env);
+                }
+
                 // Phase K · setter dispatch: when the current scope
                 // has registered `fn_name` as a useState setter, the
                 // call is a slot write — evaluate the arg, JSON-encode
@@ -2796,6 +2834,63 @@ impl ComponentProject {
     /// Returns `Value::Null` so the action body's tail expression
     /// (which is discarded by the action dispatcher) doesn't surface
     /// a confusing string-cast of the written value.
+    /// FORGE · `append(collection, record)` — record a durable append.
+    ///
+    /// Evaluates both arguments now (so the record reflects the values the body
+    /// computed) but performs no I/O: the intent goes on the thread-local
+    /// collector and the async action adapter applies it. See
+    /// [`crate::forge::write`] for why the split exists.
+    fn eval_forge_append(
+        &self,
+        module_spec: &str,
+        call: &swc_ecma_ast::CallExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        let collection_arg = call.args.first().ok_or_else(|| {
+            anyhow!("append() requires a collection name as its first argument")
+        })?;
+        let record_arg = call
+            .args
+            .get(1)
+            .ok_or_else(|| anyhow!("append() requires a record object as its second argument"))?;
+        if collection_arg.spread.is_some() || record_arg.spread.is_some() {
+            return Err(anyhow!("append() does not accept spread arguments"));
+        }
+
+        let collection = match self.eval_expr(module_spec, &collection_arg.expr, env)? {
+            Value::String(s) => s,
+            other => {
+                return Err(anyhow!(
+                    "append() collection must evaluate to a string; got {other:?}"
+                ))
+            }
+        };
+        let record = match self.eval_expr(module_spec, &record_arg.expr, env)? {
+            Value::Object(map) => map,
+            other => {
+                return Err(anyhow!(
+                    "append() record must evaluate to an object; got {other:?}"
+                ))
+            }
+        };
+
+        let recorded = crate::forge::write::record_forge_write(crate::forge::ForgeWrite::Append {
+            collection,
+            record,
+        });
+        if !recorded {
+            // Same scope guard as `broadcast()`: outside an action dispatch
+            // there is nothing to apply the write, and silently discarding a
+            // durable write is the worst possible outcome.
+            return Err(anyhow!(
+                "append() is only available inside action handlers dispatched with a \
+                 FORGE write collector installed; no collector is on the current call stack"
+            ));
+        }
+
+        Ok(Value::Null)
+    }
+
     fn eval_broadcast_call(
         &self,
         module_spec: &str,
@@ -3311,7 +3406,7 @@ impl ComponentProject {
                     return None;
                 }
                 if let Value::String(raw) = value {
-                    raw.strip_prefix(FORM_ACTION_PREFIX).map(str::to_string)
+                    parse_form_action_sentinel(raw).map(str::to_string)
                 } else {
                     None
                 }
@@ -3324,7 +3419,7 @@ impl ComponentProject {
                 // element with one form-action hook attached.
                 attrs.retain(|(n, _)| n != "action");
                 attrs.push((
-                    "data-albedo-action".to_string(),
+                    FORM_ACTION_ATTR.to_string(),
                     Value::String(action_name.clone()),
                 ));
             }
@@ -3376,6 +3471,12 @@ impl ComponentProject {
                                     proxy_id: ProxyId(proxy_id),
                                 });
                             }
+                        } else if crate::runtime::eval::component::is_reserved_jsx_prop(&name) {
+                            // A reserved prop is not an HTML attribute, so
+                            // `render_attrs` never emits one. Binding it anyway
+                            // would have the client *add* an attribute the
+                            // server never rendered — the same leak, arriving
+                            // from the CSR side instead.
                         } else if let Some(JSXAttrValue::JSXExprContainer(container)) =
                             &jsx_attr.value
                         {
@@ -3438,15 +3539,15 @@ impl ComponentProject {
 
         phase_k_pop_element();
 
-        // Phase L · for form-action forms, inject a hidden CSRF input
-        // as the first child of the form body. The renderer emits a
-        // placeholder with `value=""` and a `data-albedo-csrf` marker;
-        // the server's CSRF middleware substitutes the `value`
-        // attribute with the per-session token before returning the
-        // response. Empty string for every non-form element so the
-        // format strings below stay branch-free.
+        // Phase L · for form-action forms, inject the hidden CSRF input
+        // as the first child of the form body. The placeholder and the
+        // per-session fill that later replaces its `value` are both
+        // owned by `transforms::form` — the QuickJS shim emits this
+        // same constant, so Tier-A and Tier-B forms are identical here.
+        // Empty string for every non-form element so the format strings
+        // below stay branch-free.
         let body_prefix: &'static str = if form_action_name.is_some() {
-            "<input type=\"hidden\" name=\"_csrf\" value=\"\" data-albedo-csrf />"
+            CSRF_PLACEHOLDER_INPUT
         } else {
             ""
         };

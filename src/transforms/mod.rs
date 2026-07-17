@@ -34,8 +34,9 @@ pub use events::{
     collect_free_idents_in_handler_body, extract_handlers_in_function, HandlerBody, HandlerExtract,
 };
 pub use form::{
-    allocate_field_error_id, allocate_form_action_id, extract_forms_in_function, FormExtract,
-    FormField, FormFieldKind, FormMethod, FORM_ACTION_PREFIX,
+    allocate_field_error_id, allocate_form_action_id, extract_forms_in_function, fill_csrf_tokens,
+    form_action_name, FormExtract, FormField, FormFieldKind, FormMethod, CSRF_FIELD_NAME,
+    CSRF_MARKER_ATTR, CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR, FORM_ACTION_PREFIX,
 };
 pub use hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 pub use link::{extract_links_in_function, LinkExtract};
