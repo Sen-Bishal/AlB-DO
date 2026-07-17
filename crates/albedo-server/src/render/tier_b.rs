@@ -495,6 +495,12 @@ pub struct PooledTierBRenderRegistry {
     /// snapshot — a topic's value changes under the server, and each request
     /// must render whatever is current *at that request*.
     broadcast: Arc<dom_render_compiler::runtime::BroadcastRegistry>,
+    /// P6 · per-action `data-albedo-error` span markup, keyed by action name.
+    /// Computed once at boot by [`dom_render_compiler::runtime::eval::CompiledProject::form_error_span_seed`]
+    /// — the SAME generator the non-pooled render path uses — so a Tier-B
+    /// form emits the exact error sinks the submit projection targets and
+    /// bakabox stops dropping the frame. Empty when the project has no forms.
+    form_error_spans: serde_json::Map<String, Value>,
 }
 
 impl PooledTierBRenderRegistry {
@@ -503,14 +509,15 @@ impl PooledTierBRenderRegistry {
         pool: Arc<crate::engine_pool::QuickJsEnginePool>,
         plan: TierBRenderPlan,
         broadcast: Arc<dom_render_compiler::runtime::BroadcastRegistry>,
+        form_error_spans: serde_json::Map<String, Value>,
     ) -> Self {
         Self {
             pool,
             plan,
             broadcast,
+            form_error_spans,
         }
     }
-
 }
 
 /// The `host` object seeding one Tier-B render: the component's shared-slot
@@ -524,16 +531,29 @@ impl PooledTierBRenderRegistry {
 fn host_seed_for(
     plan: &TierBEntryPlan,
     broadcast: &dom_render_compiler::runtime::BroadcastRegistry,
+    form_error_spans: &serde_json::Map<String, Value>,
 ) -> String {
     let shared = dom_render_compiler::runtime::shared_slot_host_seed(
         plan.shared_topics.iter().map(String::as_str),
         broadcast,
     );
-    if shared.is_empty() {
+    let mut host = serde_json::Map::new();
+    if !shared.is_empty() {
+        host.insert("shared".to_string(), Value::Object(shared));
+    }
+    // P6 · the error sinks the shim appends to a form-action form. Project-
+    // global, so independent of this component's shared topics — a form in a
+    // component that reads no slots still needs them, which the old early
+    // return on empty `shared` would have dropped.
+    if !form_error_spans.is_empty() {
+        host.insert(
+            "formErrorSpans".to_string(),
+            Value::Object(form_error_spans.clone()),
+        );
+    }
+    if host.is_empty() {
         return "{}".to_string();
     }
-    let mut host = serde_json::Map::new();
-    host.insert("shared".to_string(), Value::Object(shared));
     serde_json::to_string(&Value::Object(host)).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -567,7 +587,7 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
         let render_fn_owned = render_fn.to_string();
         // Read the topics' values here, on the request, not at boot — the whole
         // point is that they are live.
-        let host_json = host_seed_for(&plan, self.broadcast.as_ref());
+        let host_json = host_seed_for(&plan, self.broadcast.as_ref(), &self.form_error_spans);
 
         // The closure crosses to the engine's dedicated thread, so every capture
         // and the return type must be `Send + 'static`. The engine's
@@ -751,7 +771,10 @@ mod tests {
         #[test]
         fn a_component_reading_no_shared_slots_gets_an_empty_host() {
             let broadcast = BroadcastRegistry::new();
-            assert_eq!(host_seed_for(&plan_reading(&[]), &broadcast), "{}");
+            assert_eq!(
+                host_seed_for(&plan_reading(&[]), &broadcast, &serde_json::Map::new()),
+                "{}"
+            );
         }
 
         /// The actual fix: the topic's live value has to reach the render.
@@ -760,7 +783,7 @@ mod tests {
             let broadcast = BroadcastRegistry::new();
             broadcast.topic("guestbook", br#"[{"author":"ada"}]"#.to_vec());
 
-            let host = host_seed_for(&plan_reading(&["guestbook"]), &broadcast);
+            let host = host_seed_for(&plan_reading(&["guestbook"]), &broadcast, &serde_json::Map::new());
             let parsed: Value = serde_json::from_str(&host).expect("host seed is JSON");
 
             assert_eq!(parsed["shared"]["guestbook"], json!([{"author": "ada"}]));
@@ -780,7 +803,7 @@ mod tests {
                 .write_topic("guestbook", br#"[{"author":"alan"}]"#.to_vec())
                 .expect("topic is registered");
 
-            let host = host_seed_for(&plan, &broadcast);
+            let host = host_seed_for(&plan, &broadcast, &serde_json::Map::new());
             let parsed: Value = serde_json::from_str(&host).expect("host seed is JSON");
             assert_eq!(parsed["shared"]["guestbook"], json!([{"author": "alan"}]));
         }
@@ -793,13 +816,39 @@ mod tests {
             let broadcast = BroadcastRegistry::new();
             broadcast.topic("known", b"1".to_vec());
 
-            let host = host_seed_for(&plan_reading(&["known", "never-registered"]), &broadcast);
+            let host = host_seed_for(
+                &plan_reading(&["known", "never-registered"]),
+                &broadcast,
+                &serde_json::Map::new(),
+            );
             let parsed: Value = serde_json::from_str(&host).expect("host seed is JSON");
 
             assert!(parsed["shared"].get("known").is_some());
             assert!(
                 parsed["shared"].get("never-registered").is_none(),
                 "an unknown topic must not be invented as null"
+            );
+        }
+
+        /// P6 · the error sinks must reach the render even when the component
+        /// reads no shared slots. The old early return on an empty `shared`
+        /// dropped the whole host, so a form in a slotless component got no
+        /// sinks and its submit dropped the opcode frame.
+        #[test]
+        fn form_error_spans_are_seeded_even_without_shared_slots() {
+            let broadcast = BroadcastRegistry::new();
+            let mut spans = serde_json::Map::new();
+            spans.insert(
+                "sign_guestbook".to_string(),
+                Value::String(
+                    r#"<span data-albedo-id="1" data-albedo-error="author"></span>"#.to_string(),
+                ),
+            );
+            let host = host_seed_for(&plan_reading(&[]), &broadcast, &spans);
+            let parsed: Value = serde_json::from_str(&host).expect("host seed is JSON");
+            assert_eq!(
+                parsed["formErrorSpans"]["sign_guestbook"],
+                json!(r#"<span data-albedo-id="1" data-albedo-error="author"></span>"#),
             );
         }
     }
@@ -1015,6 +1064,7 @@ mod tests {
             pool,
             TierBRenderPlan::new(),
             Arc::new(dom_render_compiler::runtime::BroadcastRegistry::new()),
+            serde_json::Map::new(),
         );
 
         let err = registry
