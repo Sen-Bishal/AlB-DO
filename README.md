@@ -164,4 +164,4 @@ crates/
 
 ---
 
-Built by [Sen-Bishal](https://github.com/Sen-Bishal) 
+Built by [Sen-Bishal](https://github.com/Sen-Bishal) Paushali Banerjee
