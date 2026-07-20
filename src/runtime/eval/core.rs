@@ -2586,6 +2586,17 @@ impl ComponentProject {
                 if fn_name == "append" {
                     return self.eval_forge_append(module_spec, call, env);
                 }
+                // FORGE · `update(collection, key, fields)` and
+                // `delete(collection, key)` — same record-not-write discipline
+                // as `append`, differing only in the intent recorded.
+                if fn_name == "update" {
+                    return self.eval_forge_update(module_spec, call, env);
+                }
+                // `remove`, not `delete`: `delete` is a JS reserved word (the
+                // delete operator), so it can never parse as a call here.
+                if fn_name == "remove" {
+                    return self.eval_forge_delete(module_spec, call, env);
+                }
 
                 // Phase K · setter dispatch: when the current scope
                 // has registered `fn_name` as a useState setter, the
@@ -2881,9 +2892,10 @@ impl ComponentProject {
         call: &swc_ecma_ast::CallExpr,
         env: &HashMap<String, Value>,
     ) -> Result<Value> {
-        let collection_arg = call.args.first().ok_or_else(|| {
-            anyhow!("append() requires a collection name as its first argument")
-        })?;
+        let collection_arg = call
+            .args
+            .first()
+            .ok_or_else(|| anyhow!("append() requires a collection name as its first argument"))?;
         let record_arg = call
             .args
             .get(1)
@@ -2924,6 +2936,126 @@ impl ComponentProject {
         }
 
         Ok(Value::Null)
+    }
+
+    /// FORGE · `update(collection, key, fields)` — record a durable update of
+    /// the row identified by `key`. Mirrors [`Self::eval_forge_append`]'s
+    /// record-not-write discipline and scope guard.
+    fn eval_forge_update(
+        &self,
+        module_spec: &str,
+        call: &swc_ecma_ast::CallExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        let collection =
+            self.forge_string_arg(module_spec, call, env, 0, "update", "collection")?;
+        let key = self.forge_scalar_key_arg(module_spec, call, env, 1, "update")?;
+        let fields_arg = call
+            .args
+            .get(2)
+            .ok_or_else(|| anyhow!("update() requires a fields object as its third argument"))?;
+        if fields_arg.spread.is_some() {
+            return Err(anyhow!("update() does not accept spread arguments"));
+        }
+        let fields = match self.eval_expr(module_spec, &fields_arg.expr, env)? {
+            Value::Object(map) => map,
+            other => {
+                return Err(anyhow!(
+                    "update() fields must evaluate to an object; got {other:?}"
+                ))
+            }
+        };
+
+        let recorded = crate::forge::write::record_forge_write(crate::forge::ForgeWrite::Update {
+            collection,
+            key,
+            fields,
+        });
+        if !recorded {
+            return Err(anyhow!(
+                "update() is only available inside action handlers dispatched with a \
+                 FORGE write collector installed; no collector is on the current call stack"
+            ));
+        }
+        Ok(Value::Null)
+    }
+
+    /// FORGE · `delete(collection, key)` — record a durable delete of the row
+    /// identified by `key`.
+    fn eval_forge_delete(
+        &self,
+        module_spec: &str,
+        call: &swc_ecma_ast::CallExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        let collection =
+            self.forge_string_arg(module_spec, call, env, 0, "remove", "collection")?;
+        let key = self.forge_scalar_key_arg(module_spec, call, env, 1, "remove")?;
+
+        let recorded = crate::forge::write::record_forge_write(crate::forge::ForgeWrite::Delete {
+            collection,
+            key,
+        });
+        if !recorded {
+            return Err(anyhow!(
+                "remove() is only available inside action handlers dispatched with a \
+                 FORGE write collector installed; no collector is on the current call stack"
+            ));
+        }
+        Ok(Value::Null)
+    }
+
+    /// Evaluate a positional argument to a non-spread string. Shared by the
+    /// FORGE builtins for their `collection` argument.
+    fn forge_string_arg(
+        &self,
+        module_spec: &str,
+        call: &swc_ecma_ast::CallExpr,
+        env: &HashMap<String, Value>,
+        index: usize,
+        builtin: &str,
+        what: &str,
+    ) -> Result<String> {
+        let arg = call
+            .args
+            .get(index)
+            .ok_or_else(|| anyhow!("{builtin}() requires a {what} as argument {}", index + 1))?;
+        if arg.spread.is_some() {
+            return Err(anyhow!("{builtin}() does not accept spread arguments"));
+        }
+        match self.eval_expr(module_spec, &arg.expr, env)? {
+            Value::String(s) => Ok(s),
+            other => Err(anyhow!(
+                "{builtin}() {what} must evaluate to a string; got {other:?}"
+            )),
+        }
+    }
+
+    /// Evaluate a positional argument to a scalar row key (string/number/bool).
+    /// Rejects objects, arrays, and null — a key must identify exactly one row,
+    /// and the SQL builder would refuse a non-scalar anyway; catching it here
+    /// gives a builtin-named error instead of a substrate one.
+    fn forge_scalar_key_arg(
+        &self,
+        module_spec: &str,
+        call: &swc_ecma_ast::CallExpr,
+        env: &HashMap<String, Value>,
+        index: usize,
+        builtin: &str,
+    ) -> Result<Value> {
+        let arg = call
+            .args
+            .get(index)
+            .ok_or_else(|| anyhow!("{builtin}() requires a key as argument {}", index + 1))?;
+        if arg.spread.is_some() {
+            return Err(anyhow!("{builtin}() does not accept spread arguments"));
+        }
+        match self.eval_expr(module_spec, &arg.expr, env)? {
+            key @ (Value::String(_) | Value::Number(_) | Value::Bool(_)) => Ok(key),
+            other => Err(anyhow!(
+                "{builtin}() key must be a string, number, or boolean; got {other:?}"
+            )),
+        }
     }
 
     fn eval_broadcast_call(

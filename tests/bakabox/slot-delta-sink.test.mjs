@@ -75,6 +75,21 @@ class FakeElement {
   get nodeType() {
     return 1;
   }
+  /**
+   * The DOM's own serialization of this element. Real elements have it; the
+   * sink reads it when adopting an SSR row so a later resync carrying the same
+   * markup is recognised as a no-op. Reproduced here in the SERVER's attribute
+   * shape (`data-albedo-key="…"`), which is what a browser round-trips for the
+   * simple rows this sink handles.
+   */
+  get outerHTML() {
+    const tag = this.tagName.toLowerCase();
+    const attrs = [...this.attributes.entries()]
+      .map(([name, value]) => ` ${name}="${value}"`)
+      .join('');
+    return `<${tag}${attrs}>${this._textContent}</${tag}>`;
+  }
+
   /** Serialize as `<tag key=…>text</tag>` for structural comparison. */
   serialize() {
     const key = this.getAttribute('data-albedo-key');
@@ -272,4 +287,72 @@ test('oracle: apply(Δ) equals a full render of the resulting list (insert + rem
   // Resulting logical list, in DOM order (b kept its place, c appended).
   const expected = fullRender(doc, [['b', 'bobby'], ['c', 'carol']]);
   assert.equal(serializeList(anchor), expected, 'incremental apply ≡ full render');
+});
+
+// ── Resync (S4 · backpressure recovery) ──────────────────────────────
+
+test('a patch carrying identical markup leaves the row node untouched', () => {
+  // The resync a reconnecting client receives re-asserts EVERY row. Rebuilding
+  // each one would throw away the DOM identity (focus, selection, scroll) of
+  // rows that never changed — turning recovery into a full repaint.
+  const doc = new FakeDocument();
+  const bakabox = new Bakabox({ document: doc });
+  mountList(bakabox, doc, 9, 1, [['a', 'alice'], ['b', 'bob']]);
+  const before = bakabox.listSlots.get(9).rowsByKey.get('a');
+
+  bakabox.applyInstruction({
+    op: 'SlotDelta',
+    slotId: 9,
+    changes: [
+      { weight: 1, key: 'a', payload: enc(rowHtml('a', 'alice')) },
+      { weight: 1, key: 'b', payload: enc(rowHtml('b', 'bob')) },
+    ],
+  });
+
+  assert.equal(
+    bakabox.listSlots.get(9).rowsByKey.get('a'),
+    before,
+    'an unchanged row must keep its identity across a resync',
+  );
+});
+
+test('a resync still lands the rows the client actually missed', () => {
+  const doc = new FakeDocument();
+  const bakabox = new Bakabox({ document: doc });
+  const anchor = mountList(bakabox, doc, 9, 1, [['a', 'alice']]);
+  const untouched = bakabox.listSlots.get(9).rowsByKey.get('a');
+
+  // What the server re-asserts: the row this client has, one it never saw,
+  // and an edit to one it has.
+  bakabox.applyInstruction({
+    op: 'SlotDelta',
+    slotId: 9,
+    changes: [
+      { weight: 1, key: 'a', payload: enc(rowHtml('a', 'alice')) },
+      { weight: 1, key: 'b', payload: enc(rowHtml('b', 'bob')) },
+    ],
+  });
+
+  assert.equal(serializeList(anchor), fullRender(doc, [['a', 'alice'], ['b', 'bob']]));
+  assert.equal(
+    bakabox.listSlots.get(9).rowsByKey.get('a'),
+    untouched,
+    'recovery costs only what changed',
+  );
+});
+
+test('a resync patch with different markup does replace the row', () => {
+  const doc = new FakeDocument();
+  const bakabox = new Bakabox({ document: doc });
+  const anchor = mountList(bakabox, doc, 9, 1, [['a', 'alice']]);
+  const before = bakabox.listSlots.get(9).rowsByKey.get('a');
+
+  bakabox.applyInstruction({
+    op: 'SlotDelta',
+    slotId: 9,
+    changes: [{ weight: 1, key: 'a', payload: enc(rowHtml('a', 'ALICE')) }],
+  });
+
+  assert.notEqual(bakabox.listSlots.get(9).rowsByKey.get('a'), before, 'a real change must land');
+  assert.equal(serializeList(anchor), fullRender(doc, [['a', 'ALICE']]));
 });

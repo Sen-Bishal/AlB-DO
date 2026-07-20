@@ -70,6 +70,17 @@ pub enum HandlerEffect {
         collection: String,
         record: serde_json::Map<String, Value>,
     },
+    /// FORGE · an `update(collection, key, fields)` call. Like `ForgeAppend`,
+    /// durable and opcode-free; the row is identified by `key` (a scalar) and
+    /// only the columns in `fields` change.
+    ForgeUpdate {
+        collection: String,
+        key: Value,
+        fields: serde_json::Map<String, Value>,
+    },
+    /// FORGE · a `remove(collection, key)` call: a durable delete of the row
+    /// identified by `key`.
+    ForgeDelete { collection: String, key: Value },
 }
 
 impl HandlerEffect {
@@ -87,7 +98,9 @@ impl HandlerEffect {
             HandlerEffect::Broadcast { slot_id, value, .. } => {
                 Some(Instruction::SlotSet { slot_id, value })
             }
-            HandlerEffect::ForgeAppend { .. } => None,
+            HandlerEffect::ForgeAppend { .. }
+            | HandlerEffect::ForgeUpdate { .. }
+            | HandlerEffect::ForgeDelete { .. } => None,
         }
     }
 
@@ -95,9 +108,12 @@ impl HandlerEffect {
     #[must_use]
     pub fn slot_id(&self) -> Option<SlotId> {
         match self {
-            HandlerEffect::SlotSet { slot_id, .. }
-            | HandlerEffect::Broadcast { slot_id, .. } => Some(*slot_id),
-            HandlerEffect::ForgeAppend { .. } => None,
+            HandlerEffect::SlotSet { slot_id, .. } | HandlerEffect::Broadcast { slot_id, .. } => {
+                Some(*slot_id)
+            }
+            HandlerEffect::ForgeAppend { .. }
+            | HandlerEffect::ForgeUpdate { .. }
+            | HandlerEffect::ForgeDelete { .. } => None,
         }
     }
 }
@@ -145,6 +161,12 @@ struct RawEffect {
     kind: String,
     slot_id: Option<u32>,
     topic: Option<String>,
+    /// Row key for `forge_update` / `forge_delete`; absent for the others.
+    #[serde(default)]
+    key: Option<Value>,
+    /// Absent for `forge_delete` (a delete carries no value). `#[serde(default)]`
+    /// makes it `Value::Null` there rather than a decode error.
+    #[serde(default)]
     value: Value,
 }
 
@@ -192,7 +214,9 @@ fn is_js_identifier(name: &str) -> bool {
 /// fine here (this is a `<script>`-free `eval`, not HTML).
 fn js_literal(value: &Value) -> RuntimeResult<String> {
     serde_json::to_string(value).map_err(|err| {
-        RuntimeError::render(format!("failed to encode handler binding as JS literal: {err}"))
+        RuntimeError::render(format!(
+            "failed to encode handler binding as JS literal: {err}"
+        ))
     })
 }
 
@@ -242,6 +266,26 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     // materialised from the substrate), and the record is the value.
     script.push_str(
         "const append=function(collection,record){if(record===null||typeof record!=='object'||Array.isArray(record)){throw new TypeError('append(collection, record): record must be an object');}__albedo_effects.push({kind:'forge_append',topic:String(collection),value:record});return null;};\n",
+    );
+    // `update(collection, key, fields)` and `remove(collection, key)` — the
+    // other two durable mutations, same effect-recording discipline as append.
+    // `key` must be a scalar (string/number/boolean) that identifies one row;
+    // `fields` a partial record. Both throw at the call site on a bad shape so
+    // the author hears it there, not through a server type error later. Carried
+    // in the same `{kind, topic, value}` envelope, with the key alongside.
+    //
+    // The delete builtin is named `remove`, not `delete`: `delete` is a JS
+    // reserved word (the delete operator), so `delete(coll, key)` cannot parse
+    // as a call in either the QuickJS engine or the swc-based pure-Rust
+    // evaluator. `remove` is the ergonomic non-reserved name both paths accept.
+    script.push_str(
+        "const __albedo_forge_key=function(name,key){if(key===null||typeof key==='object'){throw new TypeError(name+'(collection, key): key must be a string, number, or boolean');}return key;};\n",
+    );
+    script.push_str(
+        "const update=function(collection,key,fields){if(fields===null||typeof fields!=='object'||Array.isArray(fields)){throw new TypeError('update(collection, key, fields): fields must be an object');}__albedo_effects.push({kind:'forge_update',topic:String(collection),key:__albedo_forge_key('update',key),value:fields});return null;};\n",
+    );
+    script.push_str(
+        "const remove=function(collection,key){__albedo_effects.push({kind:'forge_delete',topic:String(collection),key:__albedo_forge_key('remove',key)});return null;};\n",
     );
 
     // Seed engine-trusted raw-JS bindings first (useState initials, module
@@ -365,7 +409,9 @@ pub(crate) fn decode_handler_envelope(
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
 
     let effects_json = envelope.value.ok_or_else(|| {
-        RuntimeError::render(format!("handler '{entry}' returned success without effects"))
+        RuntimeError::render(format!(
+            "handler '{entry}' returned success without effects"
+        ))
     })?;
     let raw: Vec<RawEffect> = serde_json::from_str(&effects_json).map_err(|err| {
         RuntimeError::render(format!(
@@ -432,8 +478,61 @@ fn lower_effect(entry: &str, raw: RawEffect) -> RuntimeResult<HandlerEffect> {
                 })?;
             Ok(HandlerEffect::ForgeAppend { collection, record })
         }
+        // FORGE · `update(collection, key, fields)`. `topic` = collection,
+        // `key` = the row identity (a scalar), `value` = the partial fields.
+        "forge_update" => {
+            let collection = raw.topic.ok_or_else(|| {
+                RuntimeError::render(format!(
+                    "forge_update effect in '{entry}' is missing a collection"
+                ))
+            })?;
+            let key = forge_scalar_key(raw.key, entry, &collection, "forge_update")?;
+            let fields = serde_json::from_slice::<Value>(&value)
+                .ok()
+                .and_then(|parsed| match parsed {
+                    Value::Object(map) => Some(map),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    RuntimeError::render(format!(
+                        "forge_update effect in '{entry}' for '{collection}' is not an object of fields"
+                    ))
+                })?;
+            Ok(HandlerEffect::ForgeUpdate {
+                collection,
+                key,
+                fields,
+            })
+        }
+        // FORGE · `remove(collection, key)`. Carries no value — just the key.
+        "forge_delete" => {
+            let collection = raw.topic.ok_or_else(|| {
+                RuntimeError::render(format!(
+                    "forge_delete effect in '{entry}' is missing a collection"
+                ))
+            })?;
+            let key = forge_scalar_key(raw.key, entry, &collection, "forge_delete")?;
+            Ok(HandlerEffect::ForgeDelete { collection, key })
+        }
         other => Err(RuntimeError::render(format!(
             "handler '{entry}' produced an unknown effect kind '{other}'"
+        ))),
+    }
+}
+
+/// The trust-boundary check on a row key that crossed from the engine: present
+/// and scalar. The shim already guards the call site; this refuses anything
+/// that reached us anyway rather than lowering a key SQL could not match.
+fn forge_scalar_key(
+    key: Option<Value>,
+    entry: &str,
+    collection: &str,
+    kind: &str,
+) -> Result<Value, RuntimeError> {
+    match key {
+        Some(key @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) => Ok(key),
+        _ => Err(RuntimeError::render(format!(
+            "{kind} effect in '{entry}' for '{collection}' is missing a scalar key"
         ))),
     }
 }
@@ -503,7 +602,9 @@ mod tests {
             broadcast_current: &bc,
         };
         let err = build_handler_script(&inv).unwrap_err();
-        assert!(err.to_string().contains("not a valid JavaScript identifier"));
+        assert!(err
+            .to_string()
+            .contains("not a valid JavaScript identifier"));
     }
 
     #[test]
@@ -535,8 +636,7 @@ mod tests {
             { "kind": "broadcast", "topic": "chat:room", "value": "hi" }
         ]))
         .unwrap();
-        let envelope =
-            serde_json::json!({ "ok": true, "value": effects_json }).to_string();
+        let envelope = serde_json::json!({ "ok": true, "value": effects_json }).to_string();
 
         let outcome = decode_handler_envelope("routes/x", &envelope).unwrap();
         // No `result` key (pre-P6 envelope shape) → degrades to `None`.
@@ -551,7 +651,11 @@ mod tests {
             }
         );
         match &effects[1] {
-            HandlerEffect::Broadcast { topic, slot_id, value } => {
+            HandlerEffect::Broadcast {
+                topic,
+                slot_id,
+                value,
+            } => {
                 assert_eq!(topic, "chat:room");
                 assert_eq!(*slot_id, broadcast_slot_id("chat:room"));
                 assert_eq!(value, b"\"hi\"");
@@ -562,8 +666,7 @@ mod tests {
 
     #[test]
     fn decode_surfaces_a_thrown_error_loudly() {
-        let envelope =
-            serde_json::json!({ "ok": false, "error": "boom" }).to_string();
+        let envelope = serde_json::json!({ "ok": false, "error": "boom" }).to_string();
         let err = decode_handler_envelope("routes/x", &envelope).unwrap_err();
         assert!(err.to_string().contains("threw: boom"));
     }
@@ -617,6 +720,89 @@ mod tests {
         assert!(script.contains("const append=function(collection,record)"));
         assert!(script.contains("kind:'forge_append'"));
         assert!(script.contains("const form="));
+    }
+
+    /// The mutation trio must all be in the script, and the delete builtin must
+    /// be named `remove` — `delete` is a JS reserved word that cannot parse as a
+    /// call, so a script defining `delete` would be unreachable from a body.
+    #[test]
+    fn the_script_defines_the_full_mutation_trio_with_remove_not_delete() {
+        let env = env(&[]);
+        let bc = Map::new();
+        let script = build_handler_script(&HandlerInvocation {
+            body: "0",
+            is_block: false,
+            env: &env,
+            raw_bindings: &[],
+            setters: &[],
+            event_json: None,
+            broadcast_current: &bc,
+        })
+        .unwrap();
+        assert!(script.contains("const update=function(collection,key,fields)"));
+        assert!(script.contains("kind:'forge_update'"));
+        assert!(script.contains("const remove=function(collection,key)"));
+        assert!(script.contains("kind:'forge_delete'"));
+        assert!(
+            !script.contains("const delete="),
+            "delete is reserved; must be remove"
+        );
+    }
+
+    #[test]
+    fn a_forge_update_lowers_to_no_opcode() {
+        let effect = HandlerEffect::ForgeUpdate {
+            collection: "guestbook".to_string(),
+            key: Value::from(3),
+            fields: env(&[("author", Value::String("grace".to_string()))]),
+        };
+        assert_eq!(effect.slot_id(), None);
+        assert_eq!(effect.into_instruction(), None);
+    }
+
+    /// A `forge_update` effect decodes topic→collection, key→row identity,
+    /// value→fields; a `forge_delete` carries the key and no value.
+    #[test]
+    fn forge_update_and_delete_effects_decode_from_the_raw_shape() {
+        let effects = serde_json::json!([
+            { "kind": "forge_update", "topic": "guestbook", "key": 3, "value": { "author": "grace" } },
+            { "kind": "forge_delete", "topic": "guestbook", "key": 7 }
+        ])
+        .to_string();
+        let envelope = serde_json::json!({ "ok": true, "value": effects }).to_string();
+        let outcome = decode_handler_envelope("routes/x", &envelope).unwrap();
+
+        match &outcome.effects[0] {
+            HandlerEffect::ForgeUpdate {
+                collection,
+                key,
+                fields,
+            } => {
+                assert_eq!(collection, "guestbook");
+                assert_eq!(*key, Value::from(3));
+                assert_eq!(fields["author"], "grace");
+            }
+            other => panic!("expected ForgeUpdate, got {other:?}"),
+        }
+        match &outcome.effects[1] {
+            HandlerEffect::ForgeDelete { collection, key } => {
+                assert_eq!(collection, "guestbook");
+                assert_eq!(*key, Value::from(7));
+            }
+            other => panic!("expected ForgeDelete, got {other:?}"),
+        }
+    }
+
+    /// A non-scalar key that somehow reached the decoder is refused — the SQL
+    /// builder would refuse it too, but a builtin-named error is clearer.
+    #[test]
+    fn a_forge_delete_with_a_non_scalar_key_is_refused() {
+        let effects =
+            serde_json::json!([{ "kind": "forge_delete", "topic": "g", "key": { "a": 1 } }])
+                .to_string();
+        let envelope = serde_json::json!({ "ok": true, "value": effects }).to_string();
+        let err = decode_handler_envelope("routes/x", &envelope).unwrap_err();
+        assert!(err.to_string().contains("scalar key"));
     }
 
     /// `form` is only bound for an object payload: a click carries `null` and a

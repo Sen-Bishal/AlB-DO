@@ -702,7 +702,16 @@ export class Bakabox {
     const children = anchor.children || [];
     for (const child of children) {
       const key = child.getAttribute && child.getAttribute('data-albedo-key');
-      if (key !== null && key !== undefined) rowsByKey.set(key, child);
+      if (key === null || key === undefined) continue;
+      // Remember the markup this row was painted from, so a later patch
+      // carrying identical markup can be recognised as a no-op. Seeding it
+      // from `outerHTML` is what makes a RESYNC after a dropped connection
+      // cheap: the server re-asserts every row, and only the ones that really
+      // changed touch the DOM.
+      if (child.__albedoRowHtml === undefined && typeof child.outerHTML === 'string') {
+        child.__albedoRowHtml = child.outerHTML;
+      }
+      rowsByKey.set(key, child);
     }
     return rowsByKey;
   }
@@ -752,6 +761,7 @@ export class Bakabox {
       if (step.action === 'insert') {
         const node = this._instantiateRow(step.payload);
         if (node) {
+          node.__albedoRowHtml = this._rowHtml(step.payload);
           anchor.appendChild(node);
           list.rowsByKey.set(step.key, node);
         }
@@ -761,8 +771,17 @@ export class Bakabox {
         list.rowsByKey.delete(step.key);
       } else if (step.action === 'patch') {
         const existing = list.rowsByKey.get(step.key);
+        const html = this._rowHtml(step.payload);
+        // A patch whose markup matches what the row already holds is a no-op,
+        // and doing it anyway would swap in a fresh node — losing the DOM
+        // identity (focus, selection, scroll, running animation) of a row that
+        // did not change. That matters most on a RESYNC, where the server
+        // re-asserts every row: without this, a reconnect would rebuild the
+        // whole list to restore at most a couple of rows.
+        if (existing && existing.__albedoRowHtml === html) continue;
         const node = this._instantiateRow(step.payload);
         if (existing && node && existing.parentNode) {
+          node.__albedoRowHtml = html;
           existing.parentNode.replaceChild(node, existing);
           list.rowsByKey.set(step.key, node);
         }
@@ -820,6 +839,18 @@ export class Bakabox {
       rowsByKey.set(row.key, node);
       anchor.appendChild(node);
     }
+  }
+
+  /**
+   * The markup a row payload carries, as a string. `SlotDelta` payloads arrive
+   * as bytes off the wire and as strings from the local driver; both are the
+   * same row, and comparing them to `__albedoRowHtml` is how an unchanged row
+   * is recognised without touching the DOM.
+   *
+   * @param {Uint8Array|string} payload
+   */
+  _rowHtml(payload) {
+    return typeof payload === 'string' ? payload : this._decodeBytes(payload);
   }
 
   /**

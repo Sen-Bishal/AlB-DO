@@ -9,21 +9,19 @@
 //!
 //! Audit gaps closed:
 //!
-//! * **#1** — `albedo serve` becomes a real `AlbedoServer` boot
-//!   instead of a static file server.
-//! * **#5** — [`AlbedoServerBuilder::register_compiled_project`]
-//!   gets its first production caller.
-//! * **#6** — [`dom_render_compiler::runtime::CompiledProject::load_from_dir`]
-//!   gets its first production caller.
-//! * **#8** — every Phase K `onClick` handler that Stream B baked
-//!   into the manifest's `initial_opcode_frame` now resolves to a
-//!   live `ActionHandler` via the registered `CompiledProject`.
+//! * **#1** — `albedo serve` becomes a real `AlbedoServer` boot instead of a static file server.
+//! * **#5** — [`AlbedoServerBuilder::register_compiled_project`] gets its first production caller.
+//! * **#6** — [`dom_render_compiler::runtime::CompiledProject::load_from_dir`] gets its first
+//!   production caller.
+//! * **#8** — every Phase K `onClick` handler that Stream B baked into the manifest's
+//!   `initial_opcode_frame` now resolves to a live `ActionHandler` via the registered
+//!   `CompiledProject`.
 
 use crate::config::{AppConfig, RouteSpec, ServerConfig};
 use crate::error::RuntimeError;
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::HttpMethod;
-use crate::server::{AlbedoServer, AlbedoServerBuilder};
+use crate::server::{AlbedoServer, AlbedoServerBuilder, LiveRuntime};
 use dom_render_compiler::dev_contract::ResolvedDevContract;
 use dom_render_compiler::runtime::CompiledProject;
 use std::path::PathBuf;
@@ -82,26 +80,41 @@ impl ProductionServerOptions {
 ///
 /// Steps:
 ///
-/// 1. Load the build-time [`RendererRuntime`] from `dist_dir`. The
-///    manifest carries pre-rendered Tier-B HTML + opcodes from
-///    Stream B, so the streaming handler ships them verbatim without
+/// 1. Load the build-time [`RendererRuntime`] from `dist_dir`. The manifest carries pre-rendered
+///    Tier-B HTML + opcodes from Stream B, so the streaming handler ships them verbatim without
 ///    re-rendering.
-/// 2. Synthesise one `RouteSpec` per manifest route so the manifest-
-///    streaming arm of [`AlbedoServer::dispatch`] activates. The
-///    `handler` id is a non-resolving placeholder — the streaming
-///    path bypasses [`AppConfig.routes`]'s `handler` lookup when
+/// 2. Synthesise one `RouteSpec` per manifest route so the manifest- streaming arm of
+///    [`AlbedoServer::dispatch`] activates. The `handler` id is a non-resolving placeholder — the
+///    streaming path bypasses [`AppConfig.routes`]'s `handler` lookup when
 ///    `should_use_manifest_streaming` returns true.
-/// 3. Load every JSX/TSX module via [`CompiledProject::load_from_dir`]
-///    and register it through
-///    [`AlbedoServerBuilder::register_compiled_project`]. Every
-///    Phase K `onClick` plus every Stream C TS `action()` declaration
-///    becomes a live `ActionHandler` keyed by its FNV-1a-32 id.
-/// 4. Mount `public/` directories: user-authored first, then the
-///    build-time mirror under `dist/public`, then the dist root
-///    itself so the bakabox runtime files at `dist/_albedo/*.js`
+/// 3. Load every JSX/TSX module via [`CompiledProject::load_from_dir`] and register it through
+///    [`AlbedoServerBuilder::register_compiled_project`]. Every Phase K `onClick` plus every Stream
+///    C TS `action()` declaration becomes a live `ActionHandler` keyed by its FNV-1a-32 id.
+/// 4. Mount `public/` directories: user-authored first, then the build-time mirror under
+///    `dist/public`, then the dist root itself so the bakabox runtime files at `dist/_albedo/*.js`
 ///    resolve at `/_albedo/*`.
 pub fn boot_production_server(
     opts: &ProductionServerOptions,
+) -> Result<AlbedoServer, RuntimeError> {
+    boot_inner(opts, None)
+}
+
+/// Boot a fresh server that **reuses** an existing [`LiveRuntime`] — the dev
+/// reload path. The rebuilt world's adapters, streaming state, and topic
+/// pre-registration resolve against the same broadcast registry (keeping
+/// hydrated topic values + open subscribers) and the same already-open FORGE
+/// substrate as the running server, so a hot reload swaps build output without
+/// discarding live state. See `DevReloadHandle::reload`.
+pub(crate) fn boot_production_server_reusing(
+    opts: &ProductionServerOptions,
+    live: LiveRuntime,
+) -> Result<AlbedoServer, RuntimeError> {
+    boot_inner(opts, Some(live))
+}
+
+fn boot_inner(
+    opts: &ProductionServerOptions,
+    live: Option<LiveRuntime>,
 ) -> Result<AlbedoServer, RuntimeError> {
     if !opts.dist_dir.is_dir() {
         return Err(RuntimeError::ServerStartup(format!(
@@ -173,8 +186,17 @@ pub fn boot_production_server(
         // terminal for both `albedo dev` and `albedo serve` — the honest number,
         // published live. See `crate::timing`.
         .with_request_timings(true)
-        .with_quickjs_action_engine_pool(action_engine_pool_size)
-        .register_compiled_project(Arc::new(compiled));
+        .with_quickjs_action_engine_pool(action_engine_pool_size);
+
+    // Dev reload only: reuse the running server's live singletons so the
+    // rebuilt world shares its broadcast registry + substrate rather than
+    // minting empties. Must precede `register_compiled_project`, which clones
+    // the bundle into every adapter. A first boot passes `None` and mints fresh.
+    if let Some(live) = live {
+        builder = builder.with_live_runtime(live);
+    }
+
+    let mut builder = builder.register_compiled_project(Arc::new(compiled));
 
     let user_public = opts.project_dir.join("public");
     if user_public.is_dir() {
