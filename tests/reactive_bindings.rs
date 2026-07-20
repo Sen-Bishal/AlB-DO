@@ -74,14 +74,21 @@ function makeElement(tag) {
 
 globalThis.document = { createElement: makeElement, createTextNode: makeText };
 
-// Focused bakabox stand-in: same node/slot maps and the same SetTextRef /
-// BindEvent / SlotSet semantics as `assets/albedo-runtime.js`, minus the binary
-// frame decode and the streaming-lane opcodes binding mode never uses.
+// Focused bakabox stand-in: the same node/slot maps and the same
+// InitInternTable / SetTextRef / SetAttrRef / SetHtmlRef / BindEvent / SlotSet
+// binding contract `assets/albedo-runtime.js` implements, minus the binary
+// frame decode and the streaming-lane opcodes binding mode never uses. This is
+// the explicit test double for the (retired) production `makeVm`: production
+// now runs `installReactiveRuntime` against the real bakabox — proven under
+// Node in `tests/bakabox/reactive-unify.test.mjs` — while these QuickJS tests
+// keep exercising the Rust payload → driver → handler loop against a
+// contract-faithful VM.
 globalThis.makeVm = function (doc) {
   var vm = {
     nodes: {},          // stableId -> element
     events: {},         // eventId -> name
     slots: {},          // slotId -> [stableId]
+    lists: {},          // slotId -> keyed-list anchor element
     eventDispatcher: function () {},
   };
   vm.seedNodesFromDocument = function (root) {
@@ -105,7 +112,27 @@ globalThis.makeVm = function (doc) {
         }
         return;
       case 'SetTextRef':
-        (vm.slots[op.slotId] || (vm.slots[op.slotId] = [])).push(op.stableId);
+        (vm.slots[op.slotId] || (vm.slots[op.slotId] = [])).push({ kind: 'text', stableId: op.stableId });
+        return;
+      case 'SetAttrRef':
+        (vm.slots[op.slotId] || (vm.slots[op.slotId] = [])).push({ kind: 'attr', stableId: op.stableId, attr: op.attr });
+        return;
+      case 'SetHtmlRef':
+        (vm.slots[op.slotId] || (vm.slots[op.slotId] = [])).push({ kind: 'html', stableId: op.stableId });
+        return;
+      case 'SetListRef':
+        vm.lists[op.slotId] = vm.nodes[op.stableId];
+        return;
+      case 'ReconcileList':
+        // Faithful-enough reflection for the driver contract: the real keyed
+        // reconcile (identity/order) is proven in tests/bakabox/keyed-reconcile.
+        // Here we just assert the driver produced the right ordered rows.
+        var anchor = vm.lists[op.slotId];
+        if (anchor) {
+          var joined = '';
+          for (var r = 0; r < op.rows.length; r++) { joined += op.rows[r].html; }
+          anchor.innerHTML = joined;
+        }
         return;
       case 'BindEvent':
         var el = vm.nodes[op.stableId];
@@ -118,11 +145,16 @@ globalThis.makeVm = function (doc) {
         var sites = vm.slots[op.slotId] || [];
         var text = (typeof op.value === 'string') ? op.value : String(op.value);
         for (var s = 0; s < sites.length; s++) {
-          var node = vm.nodes[sites[s]];
+          var site = sites[s];
+          var node = vm.nodes[site.stableId];
           if (!node) continue;
-          // In-place text patch: mutate the existing text node, mirroring a real
-          // DOM `textContent` write that keeps the same node.
-          if (node.firstChild && node.firstChild.nodeType === 3) {
+          if (site.kind === 'attr') {
+            node.setAttribute(site.attr, text);
+          } else if (site.kind === 'html') {
+            node.innerHTML = text;
+          } else if (node.firstChild && node.firstChild.nodeType === 3) {
+            // In-place text patch: mutate the existing text node, mirroring a real
+            // DOM `textContent` write that keeps the same node.
             node.firstChild.nodeValue = text;
           } else {
             node.textContent = text;
@@ -242,7 +274,7 @@ button.appendChild(document.createTextNode('toggle'));
 body.appendChild(button);
 globalThis.__btn = button;
 
-var vm = globalThis.__albedoReactive.makeVm(document);
+var vm = globalThis.makeVm(document);
 globalThis.__albedoReactive.installReactiveRuntime({ vm: vm, payload: payload, root: body });
 
 var afterInstall = button.getAttribute('class');   // untouched: "off"
@@ -336,7 +368,7 @@ body.appendChild(button);
 body.appendChild(rawSpan);
 body.appendChild(dblSpan);
 
-var vm = globalThis.__albedoReactive.makeVm(document);
+var vm = globalThis.makeVm(document);
 globalThis.__albedoReactive.installReactiveRuntime({ vm: vm, payload: payload, root: body });
 
 var before = { raw: rawSpan.firstChild.nodeValue, dbl: dblSpan.firstChild.nodeValue };
@@ -499,7 +531,7 @@ body.appendChild(button);
 body.appendChild(wrapper);
 globalThis.__wrap = wrapper;
 
-var vm = globalThis.__albedoReactive.makeVm(document);
+var vm = globalThis.makeVm(document);
 globalThis.__albedoReactive.installReactiveRuntime({ vm: vm, payload: payload, root: body });
 
 var afterInstall = wrapper.innerHTML;   // "" — install paints the falsy branch
@@ -653,7 +685,7 @@ body.appendChild(button);
 body.appendChild(ul);
 globalThis.__wrap = wrapper;
 
-var vm = globalThis.__albedoReactive.makeVm(document);
+var vm = globalThis.makeVm(document);
 globalThis.__albedoReactive.installReactiveRuntime({ vm: vm, payload: payload, root: body });
 
 var afterInstall = wrapper.innerHTML;   // <li>a</li><li>b</li>
@@ -751,6 +783,104 @@ fn keyed_list_rerenders_innerhtml_with_zero_network() {
         "re-render reuses the same wrapper node"
     );
     assert_eq!(value["network"], 0, "list mutation must not round-trip");
+}
+
+// Keyed-lists rung · delta-sink lane. `{items.map(item => <li key={item.id}>…)}`
+// carries an explicit key, so it lowers to a `lists` binding (not a `derived`
+// html thunk): the SSR rows are `data-albedo-key`-stamped, the wrapper is a
+// `SetListRef` anchor, and appending drives keyed reconciliation (`ReconcileList`).
+const KEYED_LIST_SCENARIO: &str = r#"
+var payload = globalThis.__PAYLOAD;
+var btnId = payload.events[0].stableId;
+var lb = payload.lists[0];
+
+var body = document.createElement('div');
+var button = document.createElement('button');
+button.setAttribute('data-albedo-id', String(btnId));
+button.appendChild(document.createTextNode('add'));
+var ul = document.createElement('ul');
+var wrapper = document.createElement('span');
+wrapper.setAttribute('data-albedo-id', String(lb.stableId));
+ul.appendChild(wrapper);
+body.appendChild(button);
+body.appendChild(ul);
+
+var vm = globalThis.makeVm(document);
+globalThis.__albedoReactive.installReactiveRuntime({ vm: vm, payload: payload, root: body });
+
+var afterInstall = wrapper.innerHTML;   // reconciled rows for [a,b]
+button.__dispatch('click');             // setItems([...items, {id:3,label:'c'}])
+var afterAdd = wrapper.innerHTML;        // reconciled rows for [a,b,c]
+
+JSON.stringify({ afterInstall: afterInstall, afterAdd: afterAdd, network: globalThis.__net });
+"#;
+
+#[test]
+fn keyed_list_with_key_prop_drives_reconcile_sink() {
+    let project = CompiledProject::load_from_dir(hook_fixture("list_keyed"))
+        .expect("list_keyed fixture compiles");
+    let store = Arc::new(SlotStore::new());
+    let session = SessionId::random();
+    let slots = SessionSlotView::new(session, store);
+
+    let payload = project
+        .build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots)
+        .expect("reactive payload builds");
+
+    // A keyed list lowers to `lists` (delta sink), NOT `derived` (coarse innerHTML).
+    assert_eq!(payload.lists.len(), 1, "one keyed list binding");
+    assert!(
+        payload.derived.is_empty(),
+        "keyed list must not also produce a coarse derived binding"
+    );
+    assert_eq!(payload.events.len(), 1, "one onClick append handler");
+    let thunk = &payload.lists[0].rows_thunk;
+    assert!(thunk.contains("key:"), "rows thunk must project a key; got: {thunk}");
+    assert!(thunk.contains("html:"), "rows thunk must project row html; got: {thunk}");
+    // SSR HTML carries the wrapper anchor and per-row keys.
+    assert!(
+        payload.html.contains("display:contents"),
+        "served HTML wraps the list in a display:contents span; got: {}",
+        payload.html
+    );
+    assert!(
+        payload.html.contains("data-albedo-key=\"1\"")
+            && payload.html.contains("data-albedo-key=\"2\""),
+        "SSR rows must be stamped with data-albedo-key; got: {}",
+        payload.html
+    );
+
+    let payload_json = serde_json::to_string(&payload).expect("payload serializes");
+    let runtime = Runtime::new().expect("quickjs runtime");
+    let context = Context::full(&runtime).expect("quickjs context");
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_AND_VM).expect("DOM + VM shim evaluates");
+        ctx.eval::<(), _>(REACTIVE_DRIVER).expect("reactive driver evaluates");
+        let bootstrap = format!("globalThis.__PAYLOAD = {payload_json};");
+        ctx.eval::<(), _>(bootstrap.as_str()).expect("payload injects");
+        ctx.eval::<String, _>(KEYED_LIST_SCENARIO).expect("scenario evaluates")
+    });
+
+    let value: Value = serde_json::from_str(&summary).expect("scenario summary is JSON");
+    let after_install = value["afterInstall"].as_str().unwrap_or_default();
+    assert!(
+        after_install.contains(">a</li>")
+            && after_install.contains(">b</li>")
+            && !after_install.contains(">c</li>"),
+        "install reconciles rows a,b; got: {after_install}"
+    );
+    assert!(
+        after_install.contains("data-albedo-key=\"1\""),
+        "reconciled client rows carry data-albedo-key; got: {after_install}"
+    );
+    let after_add = value["afterAdd"].as_str().unwrap_or_default();
+    assert!(
+        after_add.contains(">a</li>")
+            && after_add.contains(">b</li>")
+            && after_add.contains(">c</li>"),
+        "after append, rows a,b,c present; got: {after_add}"
+    );
+    assert_eq!(value["network"], 0, "keyed list reconcile must not round-trip");
 }
 
 #[test]

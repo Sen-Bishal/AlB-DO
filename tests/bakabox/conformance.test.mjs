@@ -35,7 +35,7 @@ const FIXTURE_PATH = resolve(
   '..',
   'fixtures',
   'wire',
-  'v2_canonical_frame.bin',
+  'v3_canonical_frame.bin',
 );
 
 /**
@@ -86,6 +86,16 @@ const EXPECTED_FRAME = Object.freeze({
       value: Buffer.from('reactive-value'),
     },
     { op: 'Navigate', url: '/dashboard' },
+    {
+      op: 'SlotDelta',
+      slotId: 11,
+      changes: [
+        { weight: 1, key: 'row-1', payload: Buffer.from('<li>one</li>') },
+        { weight: -1, key: 'row-2', payload: Buffer.from('') },
+        { weight: -1, key: 'row-3', payload: Buffer.from('<li>old</li>') },
+        { weight: 1, key: 'row-3', payload: Buffer.from('<li>new</li>') },
+      ],
+    },
   ],
 });
 
@@ -126,6 +136,16 @@ function normaliseBytePayloads(frame) {
           copy[field] = Array.from(copy[field]);
         }
       }
+      // SlotDelta carries byte payloads one level down, per change.
+      if (Array.isArray(copy.changes)) {
+        copy.changes = copy.changes.map((change) => ({
+          ...change,
+          payload:
+            change.payload instanceof Uint8Array || Buffer.isBuffer(change.payload)
+              ? Array.from(change.payload)
+              : change.payload,
+        }));
+      }
       return copy;
     }),
   };
@@ -142,6 +162,16 @@ function normaliseExpected(frame) {
           copy[field] = Array.from(copy[field]);
         }
       }
+      // SlotDelta carries byte payloads one level down, per change.
+      if (Array.isArray(copy.changes)) {
+        copy.changes = copy.changes.map((change) => ({
+          ...change,
+          payload:
+            change.payload instanceof Uint8Array || Buffer.isBuffer(change.payload)
+              ? Array.from(change.payload)
+              : change.payload,
+        }));
+      }
       return copy;
     }),
   };
@@ -150,14 +180,14 @@ function normaliseExpected(frame) {
 test('LOCKED_WIRE_VERSION matches the Rust side', () => {
   // If this fails, either the JS module bumped its version without a
   // matching Rust change or vice versa. Coordinate the release.
-  assert.equal(LOCKED_WIRE_VERSION, 2);
+  assert.equal(LOCKED_WIRE_VERSION, 3);
 });
 
 test('INSTRUCTION_NAMES is exhaustive and well-ordered', () => {
   // Mirrors `canonical_v2_frame_covers_every_instruction_variant` on
   // the Rust side. The expected count is hard-coded so a wire-format
   // addition fails fast here AND in Rust.
-  const EXPECTED_VARIANT_COUNT = 15;
+  const EXPECTED_VARIANT_COUNT = 16;
   assert.equal(
     INSTRUCTION_NAMES.length,
     EXPECTED_VARIANT_COUNT,
@@ -166,6 +196,7 @@ test('INSTRUCTION_NAMES is exhaustive and well-ordered', () => {
   assert.equal(INSTRUCTION_NAMES[0], 'InitInternTable');
   assert.equal(INSTRUCTION_NAMES[13], 'SlotSet');
   assert.equal(INSTRUCTION_NAMES[14], 'Navigate');
+  assert.equal(INSTRUCTION_NAMES[15], 'SlotDelta');
 });
 
 test('canonical fixture decodes to the expected frame shape', () => {

@@ -1,5 +1,16 @@
 // SPDX-License-Identifier: MIT
-// bakabox / albedo WebTransport bootstrap.
+// bakabox / albedo transport bootstrap.
+//
+// Two lanes carrying one wire vocabulary:
+//
+//   * WebTransport (below) — 4 stream slots over HTTP/3, when available.
+//   * SSE patches (`bootPatchStream`) — the same bincode `OpcodeFrame`s,
+//     base64'd over `GET /_albedo/patches`, for every session that has no
+//     WT (which on `albedo serve` is all of them: WT needs H3). Without it
+//     nothing subscribes a page to a broadcast topic, so a FORGE write
+//     fans out to zero subscribers and the page goes stale until reload.
+//
+// Both feed `__bakabox.applyFrameBytes`. The file name is historical.
 //
 // Opens a WebTransport session to the ALBEDO server, reads framed
 // messages off each of the 4 stream slots, and dispatches them to the
@@ -29,6 +40,9 @@ const SLOT_DISPATCHERS = new Map();
 
 /** Path the server exposes the WT session on. */
 const DEFAULT_WT_PATH = '/_albedo/wt';
+
+/** Path the server exposes the SSE patches lane on. */
+const PATCH_STREAM_PATH = '/_albedo/patches';
 
 /** Header name carrying the session id back to the streaming handler. */
 const SESSION_HEADER = 'x-albedo-wt-session';
@@ -394,8 +408,98 @@ function logDispatchError(slot, err) {
   }
 }
 
+// ── SSE patches lane ─────────────────────────────────────────────────
+
+/**
+ * Opens the server-push lane for pages without WebTransport and subscribes
+ * this page to its route's broadcast topics.
+ *
+ * The request carries only the page path; the SERVER decides which topics
+ * that path reads (from the same manifest the render used). A client that
+ * could name topics could subscribe to any collection's stream — a read
+ * capability nobody granted it.
+ *
+ * Idempotent: a second call returns the existing stream rather than opening a
+ * duplicate subscription, so a re-run after a client-side navigation cannot
+ * double-apply every frame.
+ *
+ * @param {object} g  Object exposing `document`, `EventSource`, `location`, `atob`.
+ * @returns {object|null} the EventSource, or null when the page does not need one.
+ */
+export function bootPatchStream(g) {
+  const document = g.document;
+  if (!document || typeof g.EventSource !== 'function') return null;
+  if (g.__ALBEDO_PATCH_STREAM) return g.__ALBEDO_PATCH_STREAM;
+  // Same gate as the WT boot, plus a stamped list anchor: a page whose only
+  // live surface is a shared-slot list has the anchor and may have no other
+  // tier marker in the shell.
+  if (
+    !document.querySelector(
+      '[data-albedo-tier="b"],[data-albedo-tier="c"],[data-albedo-list-slot]',
+    )
+  ) {
+    return null;
+  }
+
+  const path = (g.location && g.location.pathname) || '/';
+  let source;
+  try {
+    source = new g.EventSource(PATCH_STREAM_PATH + '?p=' + encodeURIComponent(path));
+  } catch {
+    return null;
+  }
+  source.addEventListener('patch', (event) => {
+    applyPatchEvent(g, event && event.data);
+  });
+  g.__ALBEDO_PATCH_STREAM = source;
+  return source;
+}
+
+/**
+ * Decodes one base64 `patch` event and hands the bytes to bakabox — the same
+ * entry point the WT patches slot uses, so both transports converge on one
+ * decoder and one sink.
+ *
+ * Exported for tests, which drive it without a live EventSource.
+ *
+ * @param {object} g
+ * @param {string} data  base64 of a bincode `OpcodeFrame`.
+ */
+export function applyPatchEvent(g, data) {
+  const bytes = decodeBase64(g, data);
+  if (!bytes) return;
+  const bakabox = g.__bakabox;
+  if (!bakabox || typeof bakabox.applyFrameBytes !== 'function') {
+    // The VM script hasn't loaded yet. Dropping is correct rather than
+    // queueing: the frame's own slot values are re-seeded on the next
+    // subscribe, and bakabox already buffers per-slot for the ordering it
+    // does own.
+    return;
+  }
+  bakabox.applyFrameBytes(bytes);
+}
+
+/** base64 → Uint8Array, or null when the input isn't decodable. */
+function decodeBase64(g, text) {
+  if (typeof text !== 'string' || !text) return null;
+  const atob = typeof g.atob === 'function' ? g.atob : null;
+  if (!atob) return null;
+  let binary;
+  try {
+    binary = atob(text);
+  } catch {
+    return null;
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index) & 0xff;
+  }
+  return bytes;
+}
+
 // ── Side-effect: browser boot ────────────────────────────────────────
 
 if (typeof globalThis !== 'undefined' && globalThis.document) {
   bootWebTransport(globalThis);
+  bootPatchStream(globalThis);
 }

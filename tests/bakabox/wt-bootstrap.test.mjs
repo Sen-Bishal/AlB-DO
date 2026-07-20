@@ -30,7 +30,7 @@ const FIXTURE_PATH = resolve(
   '..',
   'fixtures',
   'wire',
-  'v2_canonical_frame.bin',
+  'v3_canonical_frame.bin',
 );
 
 function loadFixtureBytes() {

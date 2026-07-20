@@ -25,7 +25,8 @@ pub use columns::{
 pub use conformance::{canonical_v1_frame, LOCKED_WIRE_VERSION};
 pub use opcode::{
     AttrId, EventId, Instruction, InstructionRange, InternEntry, InternPatchOp, InternTable,
-    InternTableKind, OpcodeFrame, ProxyId, RangeError, SlotId, StableId, SuspenseId, TagId,
+    InternTableKind, OpcodeFrame, ProxyId, RangeError, RowKey, SlotChange, SlotId, StableId,
+    SuspenseId, TagId,
 };
 pub use wire::{
     decode_frame, decode_intern_table, encode_frame, encode_intern_table, WireDecode, WireEncode,

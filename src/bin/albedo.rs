@@ -10,9 +10,7 @@ use dom_render_compiler::dev_contract::{
 use dom_render_compiler::manifest::schema::RenderManifestV2;
 use dom_render_compiler::parser::ParsedComponent;
 use dom_render_compiler::scanner::{ProjectScanner, ScanFailure, ScanMode};
-use notify::{
-    Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher,
-};
+use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -116,12 +114,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
         // manifest, and exits non-zero on violation.
         "budget" => run_budget_command(&args[2..]),
         // Phase J CLI clarity:
-        //   * `albedo files [dir]` — pure static file server; serves any
-        //     directory verbatim. This is what `albedo serve` did before.
-        //   * `albedo serve` — production server: builds the project via
-        //     the same stitcher as `dev` / `dev --prod` / `build`, then
-        //     serves the resulting `.albedo/dist`. One stitcher feeds
-        //     every command — dev/prod parity by construction.
+        //   * `albedo files [dir]` — pure static file server; serves any directory verbatim. This
+        //     is what `albedo serve` did before.
+        //   * `albedo serve` — production server: builds the project via the same stitcher as `dev`
+        //     / `dev --prod` / `build`, then serves the resulting `.albedo/dist`. One stitcher
+        //     feeds every command — dev/prod parity by construction.
         //   * `albedo serve <dir>` — back-compat alias for `files <dir>`.
         "files" => run_files_command(&args[2..]),
         "serve" => run_serve_command(&args[2..]),
@@ -158,7 +155,9 @@ fn run_init_command(raw_args: &[String]) -> Result<(), String> {
         cwd.join(&options.target_dir)
     };
 
-    with_spinner("scaffolding project…", || scaffold_project(&target, &options))?;
+    with_spinner("scaffolding project…", || {
+        scaffold_project(&target, &options)
+    })?;
 
     let relative_target = options.target_dir.display().to_string();
     print_init_success(relative_target.as_str());
@@ -302,7 +301,11 @@ fn run_budget_command(raw_args: &[String]) -> Result<(), String> {
         return Err(format!(
             "tier budget exceeded ({} violation{})",
             report.violations.len(),
-            if report.violations.len() == 1 { "" } else { "s" }
+            if report.violations.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         ));
     }
     Ok(())
@@ -312,9 +315,7 @@ fn run_budget_command(raw_args: &[String]) -> Result<(), String> {
 /// writing artefacts to disk. Used by `albedo budget` (which has no
 /// reason to emit a bundle) and by the build/ship gate (which emits
 /// artefacts first and then re-evaluates against the same manifest).
-fn build_manifest_for_budget(
-    contract: &ResolvedDevContract,
-) -> Result<RenderManifestV2, String> {
+fn build_manifest_for_budget(contract: &ResolvedDevContract) -> Result<RenderManifestV2, String> {
     let components = scan_components_with_contract_policy(contract, "evaluating tier budget")?;
     if components.is_empty() {
         return Err(format!(
@@ -338,8 +339,7 @@ fn resolve_budget_for_contract(
     contract: &ResolvedDevContract,
     strict: bool,
 ) -> Result<(TierBudget, String), String> {
-    let loaded = load_budget_from_dir(&contract.project_dir)
-        .map_err(|err| err.to_string())?;
+    let loaded = load_budget_from_dir(&contract.project_dir).map_err(|err| err.to_string())?;
     match loaded {
         Some(budget) => Ok((budget, "tier-budget.toml".to_string())),
         None => {
@@ -361,9 +361,8 @@ fn resolve_budget_for_contract(
 ///
 /// Two gates run in sequence:
 ///   1. Source-weight (Phase O.1) — fast, uses only the manifest.
-///   2. Bundle-byte (Phase O.3) — measures emitted wrapper bytes.
-///      Only runs when `emit_report` is supplied; absent emit
-///      report falls back to source-weight only.
+///   2. Bundle-byte (Phase O.3) — measures emitted wrapper bytes. Only runs when `emit_report` is
+///      supplied; absent emit report falls back to source-weight only.
 ///
 /// Both gates' violations land in the same printed diff so the user
 /// sees every reason the build is failing in one place.
@@ -376,8 +375,7 @@ fn enforce_budget_after_build(
     if skip {
         return Ok(());
     }
-    let loaded =
-        load_budget_from_dir(&contract.project_dir).map_err(|err| err.to_string())?;
+    let loaded = load_budget_from_dir(&contract.project_dir).map_err(|err| err.to_string())?;
     let Some(budget) = loaded else {
         return Ok(());
     };
@@ -397,7 +395,11 @@ fn enforce_budget_after_build(
     Err(format!(
         "tier budget exceeded ({} violation{})",
         combined.violations.len(),
-        if combined.violations.len() == 1 { "" } else { "s" }
+        if combined.violations.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
     ))
 }
 
@@ -789,10 +791,7 @@ fn boot_and_run_production_server(contract: &ResolvedDevContract) -> Result<(), 
         style(&format!("{}", contract.project_dir.display()), "2")
     );
     println!();
-    println!(
-        "    {}  stop the server",
-        style_256("ctrl+c", MUTED, true)
-    );
+    println!("    {}  stop the server", style_256("ctrl+c", MUTED, true));
     println!();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -852,10 +851,7 @@ fn run_files_command(raw_args: &[String]) -> Result<(), String> {
         style(&format!("{}", root.display()), "2")
     );
     println!();
-    println!(
-        "    {}  stop the server",
-        style_256("ctrl+c", MUTED, true)
-    );
+    println!("    {}  stop the server", style_256("ctrl+c", MUTED, true));
     println!();
 
     for stream in listener.incoming() {
@@ -1083,10 +1079,7 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     print_kv("project", contract.project_dir.display());
     print_kv(
         "server",
-        format!(
-            "http://{}:{}",
-            contract.server.host, contract.server.port
-        ),
+        format!("http://{}:{}", contract.server.host, contract.server.port),
     );
     if contract.verbose {
         print_kv("root", contract.root.display());
@@ -1141,15 +1134,15 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     // 1. Build the dist the production pipeline serves from.
     run_prod_build(&contract)?;
 
-    // 2. Boot the production server with dev mode on (overlay + HMR endpoints +
-    //    the shell dev-script injection from `StreamingAppState::with_dev_mode`).
+    // 2. Boot the production server with dev mode on (overlay + HMR endpoints + the shell
+    //    dev-script injection from `StreamingAppState::with_dev_mode`).
     let mut opts = ProductionServerOptions::from_contract(&contract);
     opts.dev_mode = true;
-    let server = boot_production_server(&opts)
-        .map_err(|err| format!("failed to boot dev server: {err}"))?;
+    let server =
+        boot_production_server(&opts).map_err(|err| format!("failed to boot dev server: {err}"))?;
 
-    // 3. Spawn the watch → rebuild → hot-swap loop. The reload handle shares the
-    //    running server's world slot, so a swap is live for the next request.
+    // 3. Spawn the watch → rebuild → hot-swap loop. The reload handle shares the running server's
+    //    world slot, so a swap is live for the next request.
     if let Some(reload) = server.dev_reload_handle() {
         let watch_contract = contract.clone();
         let watch_opts = opts.clone();
@@ -1180,8 +1173,8 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         }
     }
 
-    // 4. Run the production server on a fresh multi-thread runtime, same as
-    //    `albedo serve` (the dev path stays sync until this point).
+    // 4. Run the production server on a fresh multi-thread runtime, same as `albedo serve` (the dev
+    //    path stays sync until this point).
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1305,7 +1298,11 @@ fn scan_components_with_contract_policy(
             "  {}  scanned {} component{} during {} ({} failure{})",
             style_256("·", ACCENT, false),
             report.components.len(),
-            if report.components.len() == 1 { "" } else { "s" },
+            if report.components.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
             context,
             report.failures.len(),
             if report.failures.len() == 1 { "" } else { "s" }
@@ -1402,7 +1399,10 @@ fn parse_http_request_head<R: std::io::Read>(
     let mut headers = HashMap::new();
     reader.read_line(&mut first_line)?;
     if first_line.len() > MAX_REQUEST_LINE_BYTES {
-        return Err(Error::new(ErrorKind::InvalidData, "request line exceeds limit"));
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "request line exceeds limit",
+        ));
     }
 
     loop {
@@ -1412,7 +1412,10 @@ fn parse_http_request_head<R: std::io::Read>(
             break;
         }
         if line.len() > MAX_REQUEST_LINE_BYTES {
-            return Err(Error::new(ErrorKind::InvalidData, "header line exceeds limit"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "header line exceeds limit",
+            ));
         }
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -1421,7 +1424,10 @@ fn parse_http_request_head<R: std::io::Read>(
         }
 
         if headers.len() >= MAX_REQUEST_HEADER_COUNT {
-            return Err(Error::new(ErrorKind::InvalidData, "header count exceeds limit"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "header count exceeds limit",
+            ));
         }
 
         if let Some((name, value)) = trimmed.split_once(':') {
@@ -1994,9 +2000,8 @@ fn copy_public_dir(src: &Path, dst: &Path) -> Result<usize, String> {
                 .map_err(|err| format!("failed to create '{}': {err}", target.display()))?;
         } else if path.is_file() {
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|err| {
-                    format!("failed to create '{}': {err}", parent.display())
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|err| format!("failed to create '{}': {err}", parent.display()))?;
             }
             std::fs::copy(path, &target).map_err(|err| {
                 format!(
@@ -2137,11 +2142,7 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         SCAFFOLD_TSCONFIG,
         options.force,
     )?;
-    write_scaffold_file(
-        &target.join("README.md"),
-        SCAFFOLD_README,
-        options.force,
-    )?;
+    write_scaffold_file(&target.join("README.md"), SCAFFOLD_README, options.force)?;
     write_scaffold_file(
         &target.join(".gitignore"),
         SCAFFOLD_GITIGNORE,
@@ -2183,7 +2184,10 @@ fn print_init_success(project_name: &str) {
     println!();
     println!(
         "  {}",
-        style("a starter, lit — three components, one at each tier of light.", "2")
+        style(
+            "a starter, lit — three components, one at each tier of light.",
+            "2"
+        )
     );
     println!();
     print_section("next");
@@ -2200,7 +2204,10 @@ fn print_init_success(project_name: &str) {
     println!();
     println!(
         "  {}",
-        style("run it, and watch albedo sort them by how much they move.", "2")
+        style(
+            "run it, and watch albedo sort them by how much they move.",
+            "2"
+        )
     );
     println!();
 }
@@ -2274,15 +2281,13 @@ fn run_completions_command(raw_args: &[String]) -> Result<(), String> {
         "fish" => COMPLETIONS_FISH,
         "powershell" | "pwsh" => COMPLETIONS_POWERSHELL,
         _ => {
-            return Err(
-                "usage: albdo completions <bash|zsh|fish|powershell>\n\
+            return Err("usage: albdo completions <bash|zsh|fish|powershell>\n\
                  Examples:\n  \
                    albdo completions bash        >> ~/.bashrc\n  \
                    albdo completions zsh         >> ~/.zshrc\n  \
                    albdo completions fish        > ~/.config/fish/completions/albdo.fish\n  \
                    albdo completions powershell  >> $PROFILE"
-                    .to_string(),
-            );
+                .to_string());
         }
     };
     print!("{script}");
@@ -2608,10 +2613,7 @@ fn print_budget_help() {
         style("usage", "2"),
         style("albedo budget [dir] [--strict] [--format pretty|json]", "1")
     );
-    print_option(
-        "--strict",
-        "require tier-budget.toml; fail if missing",
-    );
+    print_option("--strict", "require tier-budget.toml; fail if missing");
     print_option("--format <kind>", "pretty (default) | json");
     print_option("--config <FILE>", "explicit albedo config");
     println!();
@@ -2633,7 +2635,10 @@ fn print_serve_help() {
     println!(
         "        {} {}",
         style_256("·", ACCENT_DEEP, false),
-        style("streams every route — static inline, dynamic on demand", "2")
+        style(
+            "streams every route — static inline, dynamic on demand",
+            "2"
+        )
     );
     println!(
         "        {} {}",
@@ -2681,11 +2686,7 @@ fn print_option(option: &str, description: &str) {
 }
 
 fn print_example(cmd: &str) {
-    println!(
-        "    {} {}",
-        style_256("$", ACCENT, true),
-        style(cmd, "2")
-    );
+    println!("    {} {}", style_256("$", ACCENT, true), style(cmd, "2"));
 }
 
 fn print_banner() {
@@ -2755,19 +2756,11 @@ fn print_boot_banner() {
 
 fn print_section(title: &str) {
     println!();
-    println!(
-        "  {} {}",
-        style_256("▸", ACCENT, true),
-        style(title, "1")
-    );
+    println!("  {} {}", style_256("▸", ACCENT, true), style(title, "1"));
 }
 
 fn print_kv(label: &str, value: impl std::fmt::Display) {
-    println!(
-        "    {:<14} {}",
-        style_256(label, MUTED, false),
-        value
-    );
+    println!("    {:<14} {}", style_256(label, MUTED, false), value);
 }
 
 fn print_ok(message: impl std::fmt::Display) {
@@ -3108,5 +3101,4 @@ mod tests {
         let inferred = infer_project_dir_from_root(&root).unwrap();
         assert_eq!(inferred, PathBuf::from("C:/work/demo"));
     }
-
 }

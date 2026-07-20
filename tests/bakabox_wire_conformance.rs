@@ -1,10 +1,10 @@
 //! Wire-format conformance gate between the Rust runtime and the bakabox
 //! client.
 //!
-//! This test encodes the canonical Phase-A wire frame produced by
+//! This test encodes the canonical wire frame produced by
 //! [`dom_render_compiler::ir::canonical_v1_frame`] and compares the bytes
 //! against a checked-in fixture at
-//! `tests/fixtures/wire/v2_canonical_frame.bin`. The bakabox JS decoder
+//! `tests/fixtures/wire/v3_canonical_frame.bin`. The bakabox JS decoder
 //! consumes the same fixture (see `assets/albedo-bincode.js` and its test
 //! suite, landing in Phase C). If the Rust side emits different bytes than
 //! the fixture, either:
@@ -29,7 +29,7 @@ fn fixture_path() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("wire")
-        .join("v2_canonical_frame.bin")
+        .join("v3_canonical_frame.bin")
 }
 
 /// Returns true when the test was invoked with `UPDATE_BAKABOX_FIXTURE=1`.

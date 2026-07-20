@@ -381,7 +381,8 @@ impl RendererRuntime {
                     Ok(p)
                         if (!p.texts.is_empty()
                             || !p.attrs.is_empty()
-                            || !p.derived.is_empty())
+                            || !p.derived.is_empty()
+                            || !p.lists.is_empty())
                             && !p.events.is_empty() =>
                     {
                         p

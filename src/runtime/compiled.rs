@@ -108,6 +108,23 @@ pub struct ReactiveDerivedBinding {
     pub html: bool,
 }
 
+/// One keyed `{arr.map(item => <li key={…}>…)}` list bound to reactive slots.
+/// The client recomputes `rows_thunk(state)` — an array of `{ key, html }` in
+/// order — whenever a `dep_slots` slot changes, and drives the delta sink's
+/// keyed reconciliation (`SetListRef` + `ReconcileList`) against the wrapper
+/// `stable_id`, preserving row node identity across insert/remove/patch/reorder.
+///
+/// This is the delta-sink lane; keyless / fragment-root lists stay on the coarse
+/// [`ReactiveDerivedBinding`] `html` tier instead (see [`ListBindingRaw`]).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactiveListBinding {
+    pub stable_id: u32,
+    pub dep_slots: Vec<u32>,
+    /// `(function(__s){ …; return __arr.map((item,i) => ({ key, html })); })`.
+    pub rows_thunk: String,
+}
+
 /// One `on*` handler wired to a server-rendered element — a client-side
 /// click on `stable_id` runs the handler thunk registered for `proxy_id`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -137,6 +154,8 @@ pub struct ReactivePayload {
     pub attrs: Vec<ReactiveAttrBinding>,
     /// derived `{slot-expr}` → text/attribute bindings (recomputed client-side).
     pub derived: Vec<ReactiveDerivedBinding>,
+    /// keyed `{arr.map(...)}` → delta-sink list bindings (keyed reconciliation).
+    pub lists: Vec<ReactiveListBinding>,
     /// `on*` → element bindings.
     pub events: Vec<ReactiveEventBinding>,
     /// `proxy_id` → handler thunk source `(function(__state,__emit){...})`.
@@ -843,13 +862,20 @@ impl CompiledProject {
             });
         }
 
-        // Keyed-lists rung: each `{arr.map(item => <static JSX>)}` lowers to a
-        // `html: true` derived binding whose recompute reads the array slot and
-        // joins a per-item HTML template over the live data. `__str`/`__esc` are
-        // the runtime stringify+escape helpers the per-item `{expr}` holes call.
+        // Keyed-lists rung. Every `{arr.map(item => <static JSX>)}` shares the
+        // same thunk preamble — the `__str`/`__esc` runtime helpers the per-item
+        // `{expr}` holes call, then each dependency name bound to its slot. What
+        // differs is the tier:
+        //   * keyed (item root is a single host element with `key={…}`) → a
+        //     `ReactiveListBinding` whose thunk returns `[{ key, html }]` and
+        //     drives the delta sink's keyed reconciliation;
+        //   * keyless / fragment-root → the coarse `html: true` derived binding
+        //     that joins a fresh `innerHTML` (correct where index-keying a
+        //     reorder would mis-reconcile).
         let raw_lists = crate::runtime::eval::core::take_phase_k_list_bindings();
+        let mut lists: Vec<ReactiveListBinding> = Vec::new();
         for list in raw_lists {
-            let mut thunk = String::from(
+            let mut preamble = String::from(
                 "(function(__s){\n\
                  function __str(v){return (v===null||v===undefined||v===false)?'':(''+v);}\n\
                  function __esc(v){return __str(v).replace(/&/g,'&amp;').replace(/</g,'&lt;')\
@@ -861,7 +887,7 @@ impl CompiledProject {
                     .get(&slot)
                     .cloned()
                     .unwrap_or_else(|| "undefined".to_string());
-                thunk.push_str(&format!(
+                preamble.push_str(&format!(
                     "var {name}=(__s[{slot}]!==undefined?__s[{slot}]:({initial}));\n"
                 ));
             }
@@ -869,22 +895,45 @@ impl CompiledProject {
                 .index_param
                 .clone()
                 .unwrap_or_else(|| "__i".to_string());
-            thunk.push_str(&format!(
-                "var __arr=({});\n\
-                 if(!Array.isArray(__arr))return '';\n\
-                 return __arr.map(function({item},{index}){{ return ({tmpl}); }}).join('');\n}})",
-                expr_to_js(&list.array)?,
-                item = list.item_param,
-                index = index_param,
-                tmpl = jsx_item_template_js(&list.item_body)?,
-            ));
-            derived.push(ReactiveDerivedBinding {
-                stable_id: list.stable_id,
-                attr: None,
-                dep_slots: list.deps.iter().map(|(_, slot)| slot.0).collect(),
-                thunk,
-                html: true,
-            });
+            let dep_slots: Vec<u32> = list.deps.iter().map(|(_, slot)| slot.0).collect();
+
+            if let Some(key_expr) = &list.key_expr {
+                // Keyed lane: `[{ key, html }]` in array order for the sink.
+                let rows_thunk = format!(
+                    "{preamble}var __arr=({array});\n\
+                     if(!Array.isArray(__arr))return [];\n\
+                     return __arr.map(function({item},{index}){{ \
+                       return {{ key: __str({key}), html: ({tmpl}) }}; }});\n}})",
+                    array = expr_to_js(&list.array)?,
+                    item = list.item_param,
+                    index = index_param,
+                    key = expr_to_js(key_expr)?,
+                    tmpl = jsx_item_template_js(&list.item_body)?,
+                );
+                lists.push(ReactiveListBinding {
+                    stable_id: list.stable_id,
+                    dep_slots,
+                    rows_thunk,
+                });
+            } else {
+                // Coarse tier: join a fresh innerHTML from live data.
+                let thunk = format!(
+                    "{preamble}var __arr=({array});\n\
+                     if(!Array.isArray(__arr))return '';\n\
+                     return __arr.map(function({item},{index}){{ return ({tmpl}); }}).join('');\n}})",
+                    array = expr_to_js(&list.array)?,
+                    item = list.item_param,
+                    index = index_param,
+                    tmpl = jsx_item_template_js(&list.item_body)?,
+                );
+                derived.push(ReactiveDerivedBinding {
+                    stable_id: list.stable_id,
+                    attr: None,
+                    dep_slots,
+                    thunk,
+                    html: true,
+                });
+            }
         }
 
         Ok(ReactivePayload {
@@ -892,6 +941,7 @@ impl CompiledProject {
             texts,
             attrs,
             derived,
+            lists,
             events,
             handlers,
         })

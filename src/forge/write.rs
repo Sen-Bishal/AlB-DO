@@ -27,12 +27,30 @@
 //! observe a collection state that a failed commit then erases — a value that
 //! never existed. Fan-out is therefore strictly a report of durable state.
 //!
+//! # Why the fan-out carries a delta
+//!
+//! Rematerialisation answers "what does this collection look like now"; the
+//! page needs "what changed". Those are the same information at very different
+//! prices — one is `O(|view|)` and forces a keyed list to rebuild every row
+//! (losing the DOM identity of rows that did not change), the other is
+//! `O(|Δ|)`. So the post-commit step ships both: the snapshot as the
+//! authoritative value, and the z-set delta ([`crate::forge::delta`]) that
+//! takes the previous value to it. The delta is computed *inside* the topic's
+//! critical section against the value that is actually being replaced — never
+//! against a read that a concurrent action may have already invalidated.
+//!
+//! Rendering rows is not FORGE's business, so it takes a
+//! [`RowProjector`] from the render path. Without one — or when the diff
+//! cannot be trusted — the write degenerates to exactly the pre-S4 snapshot
+//! fan-out, which is slower and always correct.
+//!
 //! [`CompiledProject::invoke_action_with_broadcast`]: crate::runtime::CompiledProject::invoke_action_with_broadcast
 
+use crate::forge::delta::{diff_records, project_changes, RowProjector};
 use crate::forge::skeleton::{materialize_slot, slot_for_topic};
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Result, SqlValue, SubstrateError};
-use crate::runtime::broadcast::BroadcastRegistry;
+use crate::runtime::broadcast::{BroadcastRegistry, TopicTransition};
 use serde_json::{Map, Value};
 use std::cell::RefCell;
 
@@ -84,7 +102,11 @@ impl ForgeWriteCollector {
     /// The writes recorded since installation, in call order.
     #[must_use]
     pub fn take(&self) -> Vec<ForgeWrite> {
-        FORGE_WRITES.with(|cell| cell.borrow_mut().as_mut().map_or_else(Vec::new, std::mem::take))
+        FORGE_WRITES.with(|cell| {
+            cell.borrow_mut()
+                .as_mut()
+                .map_or_else(Vec::new, std::mem::take)
+        })
     }
 }
 
@@ -210,6 +232,10 @@ fn build_append(collection: &str, record: &Map<String, Value>) -> Result<(String
 /// doubt — the data is already durable, and the next render reads it. Failing
 /// the action there would tell the author their write was lost when it was not.
 ///
+/// `projector` is the render path's row template. Pass `None` to fan out
+/// snapshots only — the pre-S4 behaviour, and the automatic fallback whenever a
+/// delta cannot be proven equivalent to the snapshot beside it.
+///
 /// # Errors
 /// Returns [`SubstrateError`] when a collection is unknown, a record is not a
 /// flat scalar record, or the transaction fails. Nothing is committed in any of
@@ -218,6 +244,7 @@ pub async fn apply_writes(
     substrate: &dyn DataSubstrate,
     broadcast: &BroadcastRegistry,
     writes: &[ForgeWrite],
+    projector: Option<&dyn RowProjector>,
 ) -> Result<()> {
     if writes.is_empty() {
         return Ok(());
@@ -270,12 +297,64 @@ pub async fn apply_writes(
 
     // Durable now — safe to tell the world.
     for slot in touched {
+        // Both awaits happen HERE, outside the topic's critical section:
+        // `write_topic_delta`'s closure runs under that topic's lock, so
+        // awaiting in it would serialise every writer behind the slowest query
+        // — and a projector that reached for the topic's value would deadlock
+        // on the very lock it is running under. What survives into the closure
+        // is only the diff: pure, bounded by the collection size, and the one
+        // step that genuinely needs the pre-state it is replacing.
         let bytes = materialize_slot(substrate, slot).await?;
+        let rows = match projector {
+            Some(projector) => projector.project_rows(slot.topic, &bytes).await,
+            None => None,
+        };
         broadcast.topic(slot.topic, bytes.clone());
-        let _ = broadcast.write_topic(slot.topic, bytes);
+        let _ = broadcast.write_topic_delta(slot.topic, |previous| {
+            let changes = rows
+                .as_ref()
+                .and_then(|rows| row_changes(slot, previous, &bytes, rows))
+                .unwrap_or_default();
+            TopicTransition {
+                value: bytes,
+                changes,
+            }
+        });
     }
 
     Ok(())
+}
+
+/// The delta half of one collection's fan-out: diff the previous materialised
+/// value against the new one and pair the changes with their rendered rows.
+///
+/// `None` at any step means "no delta" — the snapshot alone still ships and is
+/// still correct. Both JSON inputs are the *same* materialisation shape by
+/// construction ([`materialize_slot`] is the single definition), so a parse
+/// failure here means the previous value predates hydration (the `b"null"`
+/// placeholder), not that the two disagree.
+///
+/// `rows` is the projection of `next`, taken before the lock. In the window
+/// between that render and this diff another action may have committed and
+/// fanned out; then `previous` is *its* value, and this diff describes
+/// `their state → our (older) materialisation`. That is still internally
+/// consistent — the delta and the snapshot beside it agree, so no client
+/// diverges — and the next write re-converges everyone. Making the whole
+/// commit-materialise-fan-out sequence atomic per collection is the real fix
+/// and belongs with the substrate, not here.
+fn row_changes(
+    slot: &crate::forge::skeleton::ForgeSlot,
+    previous: &[u8],
+    next: &[u8],
+    rows: &crate::forge::delta::RenderedRows,
+) -> Option<Vec<crate::ir::opcode::SlotChange>> {
+    let previous: Value = serde_json::from_slice(previous).ok()?;
+    let next: Value = serde_json::from_slice(next).ok()?;
+    let changes = diff_records(&previous, &next, slot.key_column)?;
+    if changes.is_empty() {
+        return None;
+    }
+    project_changes(&changes, rows)
 }
 
 #[cfg(test)]
@@ -480,6 +559,7 @@ mod substrate_tests {
                 "guestbook",
                 json!({ "author": "grace", "message": "found the bug" }),
             )],
+            None,
         )
         .await
         .unwrap();
@@ -511,7 +591,11 @@ mod substrate_tests {
         apply_writes(
             &db,
             &broadcast,
-            &[append("guestbook", json!({ "author": hostile, "message": "x" }))],
+            &[append(
+                "guestbook",
+                json!({ "author": hostile, "message": "x" }),
+            )],
+            None,
         )
         .await
         .unwrap();
@@ -531,7 +615,10 @@ mod substrate_tests {
         hydrate_topics(&db, &broadcast).await.unwrap();
 
         let mut bad = serde_json::Map::new();
-        bad.insert("author) VALUES ('x'); DROP TABLE guestbook;--".to_string(), json!("x"));
+        bad.insert(
+            "author) VALUES ('x'); DROP TABLE guestbook;--".to_string(),
+            json!("x"),
+        );
 
         let err = apply_writes(
             &db,
@@ -543,13 +630,18 @@ mod substrate_tests {
                     record: bad,
                 },
             ],
+            None,
         )
         .await
         .expect_err("a malformed record must fail the action");
         assert!(format!("{err}").contains("not a valid column name"));
 
         let rows = db.query("SELECT id FROM guestbook", &[]).await.unwrap();
-        assert_eq!(rows.rows.len(), 2, "the good append rolled back with the bad one");
+        assert_eq!(
+            rows.rows.len(),
+            2,
+            "the good append rolled back with the bad one"
+        );
     }
 
     /// An unknown collection is refused before any lock is taken, and nothing
@@ -565,11 +657,132 @@ mod substrate_tests {
             &db,
             &broadcast,
             &[append("not_a_collection", json!({ "a": 1 }))],
+            None,
         )
         .await
         .expect_err("only FORGE-backed collections are writable");
         assert!(format!("{err}").contains("not a FORGE-backed collection"));
-        assert_eq!(topic_rows(&broadcast, "guestbook").len(), 2, "store untouched");
+        assert_eq!(
+            topic_rows(&broadcast, "guestbook").len(),
+            2,
+            "store untouched"
+        );
+    }
+
+    /// S4 · the beam, minus the transport. A subscriber must learn about an
+    /// append as ONE row, not as a repainted collection — and the row it gets
+    /// must be the row SSR would have rendered, keyed the way SSR keyed it.
+    #[tokio::test]
+    async fn an_append_fans_out_one_row_delta_beside_the_snapshot() {
+        use crate::ir::opcode::{Instruction, RowKey};
+        use crate::ir::wire::decode_frame;
+        use crate::runtime::session::SessionId;
+
+        /// The render path's stand-in: renders the whole collection the way SSR
+        /// would, then hands back its keyed rows — including the round trip
+        /// through the real markup reader, so this test exercises the same
+        /// extraction the pooled projector uses.
+        struct GuestbookRows;
+
+        #[async_trait::async_trait]
+        impl crate::forge::delta::RowProjector for GuestbookRows {
+            async fn project_rows(
+                &self,
+                collection: &str,
+                value: &[u8],
+            ) -> Option<crate::forge::delta::RenderedRows> {
+                if collection != "guestbook" {
+                    return None;
+                }
+                let records: Value = serde_json::from_slice(value).ok()?;
+                let mut html = String::from("<ul data-albedo-list-slot=\"guestbook\">");
+                for record in records.as_array()? {
+                    html.push_str(&format!(
+                        "<li data-albedo-key=\"{}\">{}</li>",
+                        record.get("id")?,
+                        record.get("author")?.as_str()?
+                    ));
+                }
+                html.push_str("</ul>");
+                crate::transforms::shared_slot_lists::extract_keyed_rows(&html, collection)
+            }
+        }
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        bootstrap_schema(&db).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        broadcast
+            .subscribe(SessionId::random(), "guestbook", tx)
+            .unwrap();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &[append(
+                "guestbook",
+                json!({ "author": "grace", "message": "found the bug" }),
+            )],
+            Some(&GuestbookRows),
+        )
+        .await
+        .unwrap();
+
+        let payload = rx.recv().await.expect("the write reaches the subscriber");
+        let (frame, _) = decode_frame(&payload).unwrap();
+        match frame.instructions.as_slice() {
+            [Instruction::SlotSet { value, .. }, Instruction::SlotDelta { changes, .. }] => {
+                // The snapshot is still the truth a reload would show…
+                let snapshot: Value = serde_json::from_slice(value).unwrap();
+                assert_eq!(snapshot.as_array().unwrap().len(), 3);
+
+                // …and the delta is one row, not three.
+                assert_eq!(changes.len(), 1, "an append must cost ONE row on the wire");
+                assert_eq!(changes[0].weight, 1);
+                assert_eq!(changes[0].key, RowKey("3".to_string()));
+                assert_eq!(
+                    String::from_utf8(changes[0].payload.clone()).unwrap(),
+                    "<li data-albedo-key=\"3\">grace</li>"
+                );
+            }
+            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+        }
+    }
+
+    /// No projector (today's serve path) must behave exactly as it did before
+    /// the delta lane existed: snapshot only, nothing row-shaped on the wire.
+    #[tokio::test]
+    async fn without_a_projector_the_write_falls_back_to_a_snapshot() {
+        use crate::ir::wire::decode_frame;
+        use crate::runtime::session::SessionId;
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        bootstrap_schema(&db).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        broadcast
+            .subscribe(SessionId::random(), "guestbook", tx)
+            .unwrap();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &[append(
+                "guestbook",
+                json!({ "author": "grace", "message": "x" }),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let payload = rx.recv().await.unwrap();
+        let (frame, _) = decode_frame(&payload).unwrap();
+        assert_eq!(frame.instructions.len(), 1, "snapshot-only fan-out");
     }
 
     /// Writes survive a reopen — the point of durability, and the property the
@@ -587,7 +800,11 @@ mod substrate_tests {
             apply_writes(
                 &db,
                 &broadcast,
-                &[append("guestbook", json!({ "author": "ada", "message": "again" }))],
+                &[append(
+                    "guestbook",
+                    json!({ "author": "ada", "message": "again" }),
+                )],
+                None,
             )
             .await
             .unwrap();

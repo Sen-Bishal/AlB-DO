@@ -21,6 +21,18 @@ pub struct SlotId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct SuspenseId(pub u32);
 
+/// Reconciliation identity for a z-set row — *which* DOM node a change
+/// targets, deliberately distinct from the row's payload (which weight it
+/// carries). FORGE-backed rows key on their primary key, client `useState`
+/// arrays on the `key` prop, keyless lists on position — all stringified into
+/// this one wire type so the client sink can use it directly as a map key.
+///
+/// A `String` (UTF-8), like [`InternEntry::value`]: it holds an identifier,
+/// never arbitrary payload. Row payload bytes stay `Vec<u8>` (see
+/// [`SlotChange::payload`]) so they can carry non-UTF-8 rendered markup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct RowKey(pub String);
+
 /// Half-open `[start, end)` byte range.
 ///
 /// **Phase D semantics (v1):** offsets resolve into the bytes of the
@@ -124,6 +136,26 @@ pub struct InternTable {
 pub enum InternPatchOp {
     Set { id: u16, value: String },
     Remove { id: u16 },
+}
+
+/// One signed change in a z-set delta ([`Instruction::SlotDelta`]).
+///
+/// `weight` is the multiplicity delta in the signed-multiset algebra: `+1`
+/// inserts a row, `−1` retracts one, and aggregations (`count`/`sum`) produce
+/// other integers. `key` is the reconciliation identity ([`RowKey`]); `payload`
+/// is the row's rendered bytes (server-rendered HTML first slice — a compiled
+/// template op is a later rung).
+///
+/// The client pairs a `−`/`+` on the *same* `key` within one delta into a
+/// single in-place patch; a lone `+` inserts, a lone `−` removes. Coalescing on
+/// the emit side keys on the whole record (`key` **and** `payload`), never on
+/// `key` alone — else an update (retract old + insert new) would cancel to
+/// weight-0 and drop the edit.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct SlotChange {
+    pub weight: i32,
+    pub key: RowKey,
+    pub payload: Vec<u8>,
 }
 
 /// The opcode set that drives the client's slot-table.
@@ -249,6 +281,23 @@ pub enum Instruction {
     /// `LOCKED_WIRE_VERSION` bumps to 2 alongside this variant.
     Navigate {
         url: String,
+    },
+
+    /// Push a **z-set delta** into a keyed slot — the incremental-view
+    /// primitive for lists and derived collections.
+    ///
+    /// Each [`SlotChange`] applies by its [`RowKey`]: `+weight` inserts (or, when
+    /// paired with a same-key `−`, patches in place) the row; `−weight` retracts
+    /// it. This is keyed reconciliation with identity coming from the algebra,
+    /// not a hand-written differ. Scalar [`Instruction::SlotSet`] is the
+    /// degenerate singleton case (`{−old, +new}` on one row).
+    ///
+    /// Added as variant index 15 at the end of the enum, so a decoder that
+    /// doesn't know it surfaces a typed error rather than mis-aligning
+    /// subsequent reads. `LOCKED_WIRE_VERSION` bumps to 3 alongside this variant.
+    SlotDelta {
+        slot_id: SlotId,
+        changes: Vec<SlotChange>,
     },
 }
 
@@ -491,6 +540,45 @@ mod tests {
         let instruction = Instruction::SlotSet {
             slot_id: SlotId(42),
             value: b"new-text".to_vec(),
+        };
+        let bytes =
+            bincode::encode_to_vec(&instruction, bincode::config::standard())
+                .expect("encode");
+        let (decoded, _): (Instruction, _) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("decode");
+        assert_eq!(instruction, decoded);
+    }
+
+    #[test]
+    fn slot_delta_round_trips() {
+        let instruction = Instruction::SlotDelta {
+            slot_id: SlotId(42),
+            changes: vec![
+                // insert
+                SlotChange {
+                    weight: 1,
+                    key: RowKey("row-7".to_string()),
+                    payload: b"<li>alice</li>".to_vec(),
+                },
+                // retract
+                SlotChange {
+                    weight: -1,
+                    key: RowKey("row-3".to_string()),
+                    payload: Vec::new(),
+                },
+                // update = retract old + insert new on the same key
+                SlotChange {
+                    weight: -1,
+                    key: RowKey("row-9".to_string()),
+                    payload: b"<li>old</li>".to_vec(),
+                },
+                SlotChange {
+                    weight: 1,
+                    key: RowKey("row-9".to_string()),
+                    payload: b"<li>new</li>".to_vec(),
+                },
+            ],
         };
         let bytes =
             bincode::encode_to_vec(&instruction, bincode::config::standard())

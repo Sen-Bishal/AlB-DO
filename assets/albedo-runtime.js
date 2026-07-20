@@ -205,10 +205,100 @@ export function createActionDispatcher({ bakabox, endpoint = DEFAULT_ACTION_ENDP
  * re-applies the new value to every site.
  *
  * @typedef {object} BindingSite
- * @property {'text'|'attr'} kind  How to apply a new value at this site.
+ * @property {'text'|'attr'|'html'|'sentinel'} kind  How to apply a new value at this site.
  * @property {number} stableId      Element id; bakabox looks up the DOM node via `nodes`.
- * @property {number} [attrId]      Attribute id (intern table); required when `kind === 'attr'`.
+ * @property {number} [attrId]      Attribute id (intern table); the byte-wire attr binding.
+ * @property {string} [attrName]    Literal attribute name; the local binding-mode attr
+ *   binding (`SetAttrRef` carrying `attr` instead of an interned `attrId`). Preferred over
+ *   `attrId` when present so the reactive driver needn't intern names it already knows.
  */
+
+/**
+ * Reduces a z-set delta to a minimal DOM plan, keyed by `RowKey`.
+ *
+ * This is the algebra's apply side, kept pure (no DOM) so it is unit-testable
+ * on its own. The crux — the S0 finding — is that it does **not** sum weights:
+ * an update arrives as a retract of the old record plus an insert of the new
+ * one (two changes sharing a key, different payloads); summing their weights
+ * to zero would silently drop the edit. Instead the decision is made per key
+ * from *current DOM presence* and *whether an insert payload arrived*:
+ *
+ *   - insert payload present, key not in DOM      → `insert`
+ *   - insert payload present, key already in DOM  → `patch` (in place)
+ *   - only a retract, key in DOM                   → `remove`
+ *   - only a retract, key absent                   → no-op
+ *
+ * Multiple changes to one key within the batch collapse to a single step; keys
+ * are emitted in first-seen order so inserts append in the delta's order (query
+ * order, when the emitter walks the view in order). Sorted/positional insert is
+ * a later rung — this landing appends.
+ *
+ * @param {Array<{ weight: number, key: string, payload: (Uint8Array|string) }>} changes
+ * @param {(key: string) => boolean} hasKey  Is the key currently materialized?
+ * @returns {Array<{ action: 'insert'|'remove'|'patch', key: string, payload?: (Uint8Array|string) }>}
+ */
+export function reconcileSlotDelta(changes, hasKey) {
+  const order = [];
+  const byKey = new Map(); // key -> { insert: payload|null, retract: bool }
+  for (const change of changes) {
+    let entry = byKey.get(change.key);
+    if (!entry) {
+      entry = { insert: null, retract: false };
+      byKey.set(change.key, entry);
+      order.push(change.key);
+    }
+    if (change.weight > 0) entry.insert = change.payload;
+    else if (change.weight < 0) entry.retract = true;
+  }
+
+  const plan = [];
+  for (const key of order) {
+    const entry = byKey.get(key);
+    if (entry.insert !== null) {
+      plan.push({
+        action: hasKey(key) ? 'patch' : 'insert',
+        key,
+        payload: entry.insert,
+      });
+    } else if (entry.retract && hasKey(key)) {
+      plan.push({ action: 'remove', key });
+    }
+  }
+  return plan;
+}
+
+/**
+ * FNV-1a-32 over the UTF-8 bytes of `str`. Byte-exact mirror of the Rust
+ * `dom_render_compiler::runtime::eval::component::fnv1a_32` (offset
+ * `0x811c9dc5`, prime `0x01000193`) — `Math.imul` gives the 32-bit wrapping
+ * multiply. Used to derive a broadcast topic's wire slot id client-side so it
+ * never has to travel on the wire.
+ *
+ * @param {string} str
+ * @returns {number} unsigned 32-bit hash
+ */
+export function fnv1a32Utf8(str) {
+  const bytes = new TextEncoder().encode(str);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i += 1) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Wire slot id for a broadcast `topic` — the client mirror of the Rust
+ * `broadcast_slot_id`: `fnv1a_32("broadcast::{topic}")`. A `useSharedSlot`
+ * list's `data-albedo-list-slot` carries the topic; this turns it into the slot
+ * a `SlotDelta` frame targets.
+ *
+ * @param {string} topic
+ * @returns {number}
+ */
+export function topicSlotId(topic) {
+  return fnv1a32Utf8('broadcast::' + topic);
+}
 
 /**
  * The opcode VM. One instance per document. All public methods are
@@ -265,6 +355,20 @@ export class Bakabox {
      * patches lane (which dev mode doesn't have at all).
      */
     this.pendingSlotValues = new Map();
+
+    /**
+     * Map<SlotId, { anchor: Element, rowsByKey: Map<RowKey, Element> }> —
+     * keyed-list bindings. A `SetListRef` marks an element as the anchor whose
+     * children are the rows of a list slot; `SlotDelta` reconciles those rows
+     * by `RowKey`. Distinct from `slots` (scalar text/attr/html sites).
+     */
+    this.listSlots = new Map();
+    /**
+     * Map<SlotId, SlotChange[]> — `SlotDelta` changes that arrived before the
+     * slot's `SetListRef` bound its anchor. Replayed by `_opSetListRef`, the
+     * z-set analogue of `pendingSlotValues` for scalar `SlotSet`.
+     */
+    this.pendingSlotDeltas = new Map();
 
     /** UTF-8 decoder reused for every SetText/SetAttr payload. */
     this._textDecoder = new TextDecoder('utf-8');
@@ -353,8 +457,16 @@ export class Bakabox {
         return this._opSetTextRef(op);
       case 'SetAttrRef':
         return this._opSetAttrRef(op);
+      case 'SetHtmlRef':
+        return this._opSetHtmlRef(op);
+      case 'SetListRef':
+        return this._opSetListRef(op);
       case 'SlotSet':
         return this._opSlotSet(op);
+      case 'SlotDelta':
+        return this._opSlotDelta(op);
+      case 'ReconcileList':
+        return this._opReconcileList(op);
       case 'Navigate':
         return this._opNavigate(op);
       default:
@@ -494,9 +606,23 @@ export class Bakabox {
     this._replayPendingSlotValue(slotId);
   }
 
-  _opSetAttrRef({ stableId, attrId, slotId }) {
+  _opSetAttrRef({ stableId, attrId, attr, slotId }) {
     this._requireNode(stableId, 'SetAttrRef');
-    this._ensureSlot(slotId).push({ kind: 'attr', stableId, attrId });
+    // Two callers, one binding kind: the byte-wire lane carries an interned
+    // `attrId`; the local binding-mode driver carries the literal `attr` name.
+    // Keep whichever arrived — `_opSlotSet` prefers the name when present.
+    this._ensureSlot(slotId).push({ kind: 'attr', stableId, attrId, attrName: attr });
+    this._replayPendingSlotValue(slotId);
+  }
+
+  _opSetHtmlRef({ stableId, slotId }) {
+    // Binding-mode only (no byte-wire opcode): a conditional/list subtree whose
+    // rendered branch HTML the driver swaps in wholesale. `value` is trusted
+    // server-rendered markup the compiler emitted, never user input — the same
+    // contract the retired `makeVm` honoured. The delta wire (S2) supersedes
+    // this innerHTML swap with a keyed `+`/`−`/`patch` `SlotDelta`.
+    this._requireNode(stableId, 'SetHtmlRef');
+    this._ensureSlot(slotId).push({ kind: 'html', stableId });
     this._replayPendingSlotValue(slotId);
   }
 
@@ -516,14 +642,204 @@ export class Bakabox {
     for (const site of sites) {
       if (site.kind === 'text') {
         const element = this.nodes.get(site.stableId);
-        if (element) element.textContent = decoded;
+        if (!element) continue;
+        // Fine-grained patch: mutate the existing server-rendered text node in
+        // place rather than replacing the subtree, so the DOM node identity the
+        // page was painted with survives the update. Falls back to `textContent`
+        // when the element isn't holding a lone text node.
+        const first = element.firstChild;
+        if (first && first.nodeType === 3) {
+          first.nodeValue = decoded;
+        } else {
+          element.textContent = decoded;
+        }
       } else if (site.kind === 'attr') {
         const element = this.nodes.get(site.stableId);
-        const attrName = this.attrs.get(site.attrId);
+        const attrName = site.attrName || this.attrs.get(site.attrId);
         if (element && attrName) element.setAttribute(attrName, decoded);
+      } else if (site.kind === 'html') {
+        const element = this.nodes.get(site.stableId);
+        if (element) element.innerHTML = decoded;
       }
       // 'sentinel' sites from bare BindSlot are intentionally skipped.
     }
+  }
+
+  // ── Keyed-list handlers (z-set delta sink) ─────────────────────────
+
+  /**
+   * Marks `stableId`'s element as the anchor of a keyed list bound to
+   * `slotId`. Client-only (no byte-wire opcode) — the render path emits it
+   * inline, like `SetHtmlRef`. Seeds `rowsByKey` from any server-rendered
+   * rows already under the anchor (keyed by `data-albedo-key`) so a delta
+   * reconciles against SSR output instead of rebuilding it, then replays any
+   * `SlotDelta` that arrived before this binding.
+   */
+  _opSetListRef({ stableId, slotId }) {
+    this._registerListAnchor(slotId, this._requireNode(stableId, 'SetListRef'));
+  }
+
+  /**
+   * Register an element as the keyed-list anchor for `slotId`: seed `rowsByKey`
+   * from its `data-albedo-key` rows (so a delta reconciles against SSR output
+   * rather than rebuilding it) and replay any `SlotDelta` that arrived first.
+   * The single register point for both the local `SetListRef` lane and the B3
+   * broadcast boot-scan; it stores the anchor *element* directly, since a
+   * broadcast anchor (Tier-B `<ul>`) carries no `data-albedo-id`.
+   */
+  _registerListAnchor(slotId, anchor) {
+    this.listSlots.set(slotId, { anchor, rowsByKey: this._seedRowsByKey(anchor) });
+    const pending = this.pendingSlotDeltas.get(slotId);
+    if (pending) {
+      this.pendingSlotDeltas.delete(slotId);
+      this._opSlotDelta({ slotId, changes: pending });
+    }
+  }
+
+  /** Build a `RowKey → element` map from an anchor's `data-albedo-key` rows. */
+  _seedRowsByKey(anchor) {
+    const rowsByKey = new Map();
+    const children = anchor.children || [];
+    for (const child of children) {
+      const key = child.getAttribute && child.getAttribute('data-albedo-key');
+      if (key !== null && key !== undefined) rowsByKey.set(key, child);
+    }
+    return rowsByKey;
+  }
+
+  /**
+   * B3 · adopt every server-rendered shared-slot list under `scope` (default
+   * `document`). A `data-albedo-list-slot="topic"` container (stamped by the B2
+   * transpile pass) is registered as a keyed-list anchor bound to the topic's
+   * broadcast slot — the seam a FORGE write's `SlotDelta` fans into. Idempotent:
+   * an already-registered slot is skipped so a re-scan (e.g. after a Tier-B
+   * `__albedo_inject`) never resets applied rows. Tier-B islands inject their
+   * markup after boot, so this runs at boot AND after each injection.
+   */
+  scanListAnchors(scope) {
+    const root = scope || this.document;
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+    const anchors = root.querySelectorAll('[data-albedo-list-slot]');
+    for (const anchor of anchors) {
+      const topic = anchor.getAttribute('data-albedo-list-slot');
+      if (topic === null || topic === undefined) continue;
+      const slotId = topicSlotId(topic);
+      if (this.listSlots.has(slotId)) continue;
+      this._registerListAnchor(slotId, anchor);
+    }
+  }
+
+  /**
+   * Applies a z-set delta to a keyed list: `+` inserts a row, `−` removes it,
+   * a same-key `−`/`+` patches in place. Buffers when the slot's anchor isn't
+   * bound yet (mirrors `pendingSlotValues`). The insert/remove/patch decision
+   * is made by the pure `reconcileSlotDelta` — it keys on DOM presence and
+   * payload, never on summed weights, so an update never cancels to a no-op.
+   */
+  _opSlotDelta({ slotId, changes }) {
+    const list = this.listSlots.get(slotId);
+    if (!list) {
+      const buffered = this.pendingSlotDeltas.get(slotId) || [];
+      for (const change of changes) buffered.push(change);
+      this.pendingSlotDeltas.set(slotId, buffered);
+      return;
+    }
+    const anchor = list.anchor;
+    if (!anchor) return;
+
+    const plan = reconcileSlotDelta(changes, (key) => list.rowsByKey.has(key));
+    for (const step of plan) {
+      if (step.action === 'insert') {
+        const node = this._instantiateRow(step.payload);
+        if (node) {
+          anchor.appendChild(node);
+          list.rowsByKey.set(step.key, node);
+        }
+      } else if (step.action === 'remove') {
+        const node = list.rowsByKey.get(step.key);
+        if (node && node.parentNode) node.parentNode.removeChild(node);
+        list.rowsByKey.delete(step.key);
+      } else if (step.action === 'patch') {
+        const existing = list.rowsByKey.get(step.key);
+        const node = this._instantiateRow(step.payload);
+        if (existing && node && existing.parentNode) {
+          existing.parentNode.replaceChild(node, existing);
+          list.rowsByKey.set(step.key, node);
+        }
+      }
+    }
+  }
+
+  /**
+   * Keyed-list reconciliation from the FULL desired row set — the local
+   * (client-satisfiable) list lane's entry point. Where `SlotDelta` carries
+   * only what changed (the append/broadcast lane, minimal by construction), a
+   * local list recomputes its whole array from state each change, so the driver
+   * hands the complete ordered `rows` and this brings the DOM to match: remove
+   * gone keys, create/patch by key, and move nodes into the target order. It
+   * shares the same `listSlots`/`rowsByKey`/anchor as `SlotDelta` — one sink,
+   * two apply modes — and preserves node identity for unchanged rows (so it
+   * handles reorder and mid-insert, which a full innerHTML rebuild lost the
+   * point of and an append-only delta couldn't express).
+   *
+   * `rows` is `[{ key, html }]` in desired order. Each row remembers its source
+   * HTML on the node (`__albedoRowHtml`) so an unchanged row is left untouched.
+   */
+  _opReconcileList({ slotId, rows }) {
+    const list = this.listSlots.get(slotId);
+    if (!list) return;
+    const anchor = list.anchor;
+    if (!anchor) return;
+    const rowsByKey = list.rowsByKey;
+
+    // 1. Drop rows whose key vanished from the desired set.
+    const nextKeys = new Set(rows.map((r) => r.key));
+    for (const [key, node] of Array.from(rowsByKey)) {
+      if (!nextKeys.has(key)) {
+        if (node.parentNode) node.parentNode.removeChild(node);
+        rowsByKey.delete(key);
+      }
+    }
+
+    // 2. Upsert in desired order. Appending an existing child moves it, so
+    //    walking `rows` in order and appending each leaves the anchor's
+    //    children in exactly that order — reorder falls out for free.
+    for (const row of rows) {
+      let node = rowsByKey.get(row.key);
+      if (!node) {
+        node = this._instantiateRow(row.html);
+        if (!node) continue;
+      } else if (node.__albedoRowHtml !== row.html) {
+        const fresh = this._instantiateRow(row.html);
+        if (fresh) {
+          if (node.parentNode) node.parentNode.removeChild(node);
+          node = fresh;
+        }
+      }
+      node.__albedoRowHtml = row.html;
+      rowsByKey.set(row.key, node);
+      anchor.appendChild(node);
+    }
+  }
+
+  /**
+   * Instantiates a single row element from its server-rendered HTML payload.
+   * Uses `createContextualFragment` (real DOM parse) when available, falling
+   * back to an off-document container's `innerHTML`. Returns the row's root
+   * element (or first node), or `null` for empty markup.
+   *
+   * @param {Uint8Array|string} payload
+   */
+  _instantiateRow(payload) {
+    const html = typeof payload === 'string' ? payload : this._decodeBytes(payload);
+    const doc = this.document;
+    if (typeof doc.createRange === 'function') {
+      const fragment = doc.createRange().createContextualFragment(html);
+      return fragment.firstElementChild || fragment.firstChild || null;
+    }
+    const container = doc.createElement('div');
+    container.innerHTML = html;
+    return container.firstElementChild || container.firstChild || null;
   }
 
   /**
@@ -658,6 +974,12 @@ export function installLegacyHtmlInjector(target, document) {
     const bakabox = target.__bakabox;
     if (parent && bakabox && typeof bakabox.seedNodesFromDocument === 'function') {
       bakabox.seedNodesFromDocument(parent);
+      // B3 · a Tier-B island (e.g. the guestbook) injects its keyed-list markup
+      // here, after boot — adopt any `data-albedo-list-slot` anchor it brought so
+      // a broadcast `SlotDelta` on that topic reconciles its rows.
+      if (typeof bakabox.scanListAnchors === 'function') {
+        bakabox.scanListAnchors(parent);
+      }
     }
   }
 
@@ -718,6 +1040,8 @@ const globalScope =
 if (globalScope && globalScope.document) {
   const bakabox = createBakabox({ document: globalScope.document });
   bakabox.seedNodesFromDocument();
+  // B3 · adopt any inline (non-injected) shared-slot list anchors present at boot.
+  bakabox.scanListAnchors();
 
   // Phase-G: install the real action dispatcher so `BindEvent`-wired
   // listeners actually POST to the server when their DOM events fire.
@@ -766,6 +1090,7 @@ if (globalScope && globalScope.document) {
           if (doc && doc.body) {
             globalScope.document.body.innerHTML = doc.body.innerHTML;
             bakabox.seedNodesFromDocument();
+            bakabox.scanListAnchors();
             applyInlineOpcodeFrames(globalScope.document, bakabox);
           }
         });
@@ -788,6 +1113,18 @@ if (globalScope && globalScope.document) {
   applyInlineOpcodeFrames(globalScope.document, bakabox);
 
   installLegacyHtmlInjector(globalScope, globalScope.document);
+
+  // Binding-mode (Tier-C reactive) islands ship a classic inline driver plus
+  // one `boot(payload)` call each. Those ran during parse — before this
+  // deferred module executed and published `__bakabox` — so `boot` only
+  // *queued* its payloads. Drain them now against this single VM: the reactive
+  // driver's `installReactiveRuntime` binds each island's text/attr/html slots
+  // and routes its `on*` handlers locally, no second VM. Guarded so non-reactive
+  // routes (no driver present) are a clean no-op.
+  const reactive = globalScope.__albedoReactive;
+  if (reactive && typeof reactive.drainReactiveQueue === 'function') {
+    reactive.drainReactiveQueue(bakabox);
+  }
 }
 
 function applyInlineOpcodeFrames(document, bakabox) {

@@ -35,7 +35,7 @@ const FIXTURE_PATH = resolve(
   '..',
   'fixtures',
   'wire',
-  'v2_canonical_frame.bin',
+  'v3_canonical_frame.bin',
 );
 
 // ── Minimal DOM shim ─────────────────────────────────────────────────
@@ -204,8 +204,8 @@ test('applyFrameBytes processes the canonical fixture end-to-end', () => {
 
   assert.equal(frame.frameId, 1n);
   assert.equal(frame.componentId, 42n);
-  // 15 in wire v2 — Phase I added Navigate at index 14.
-  assert.equal(frame.instructions.length, 15);
+  // 16 in wire v3 — S2 added SlotDelta at index 15.
+  assert.equal(frame.instructions.length, 16);
 
   // Intern tables populated.
   assert.equal(bakabox.tags.get(0), 'div');
