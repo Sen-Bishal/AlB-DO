@@ -866,12 +866,11 @@ impl CompiledProject {
         // same thunk preamble — the `__str`/`__esc` runtime helpers the per-item
         // `{expr}` holes call, then each dependency name bound to its slot. What
         // differs is the tier:
-        //   * keyed (item root is a single host element with `key={…}`) → a
-        //     `ReactiveListBinding` whose thunk returns `[{ key, html }]` and
-        //     drives the delta sink's keyed reconciliation;
-        //   * keyless / fragment-root → the coarse `html: true` derived binding
-        //     that joins a fresh `innerHTML` (correct where index-keying a
-        //     reorder would mis-reconcile).
+        //   * keyed (item root is a single host element with `key={…}`) → a `ReactiveListBinding`
+        //     whose thunk returns `[{ key, html }]` and drives the delta sink's keyed
+        //     reconciliation;
+        //   * keyless / fragment-root → the coarse `html: true` derived binding that joins a fresh
+        //     `innerHTML` (correct where index-keying a reorder would mis-reconcile).
         let raw_lists = crate::runtime::eval::core::take_phase_k_list_bindings();
         let mut lists: Vec<ReactiveListBinding> = Vec::new();
         for list in raw_lists {
@@ -1489,16 +1488,41 @@ impl CompiledProject {
                 // No opcode, so nothing is pushed below — this session learns the
                 // new rows the same way every other subscriber does.
                 HandlerEffect::ForgeAppend { collection, record } => {
-                    if !crate::forge::write::record_forge_write(
-                        crate::forge::ForgeWrite::Append {
-                            collection: collection.clone(),
-                            record: record.clone(),
-                        },
-                    ) {
+                    if !crate::forge::write::record_forge_write(crate::forge::ForgeWrite::Append {
+                        collection: collection.clone(),
+                        record: record.clone(),
+                    }) {
                         return Err(anyhow!(
                             "append('{collection}') was called but no FORGE write collector is \
                              installed; dispatch this action through a path that installs one \
                              (the server does when a substrate is wired)"
+                        ));
+                    }
+                }
+                HandlerEffect::ForgeUpdate {
+                    collection,
+                    key,
+                    fields,
+                } => {
+                    if !crate::forge::write::record_forge_write(crate::forge::ForgeWrite::Update {
+                        collection: collection.clone(),
+                        key: key.clone(),
+                        fields: fields.clone(),
+                    }) {
+                        return Err(anyhow!(
+                            "update('{collection}') was called but no FORGE write collector is \
+                             installed; dispatch this action through a path that installs one"
+                        ));
+                    }
+                }
+                HandlerEffect::ForgeDelete { collection, key } => {
+                    if !crate::forge::write::record_forge_write(crate::forge::ForgeWrite::Delete {
+                        collection: collection.clone(),
+                        key: key.clone(),
+                    }) {
+                        return Err(anyhow!(
+                            "remove('{collection}') was called but no FORGE write collector is \
+                             installed; dispatch this action through a path that installs one"
                         ));
                     }
                 }

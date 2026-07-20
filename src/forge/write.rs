@@ -56,10 +56,14 @@ use std::cell::RefCell;
 
 /// One durable mutation requested by an action body.
 ///
-/// An enum with a single variant on purpose: update and delete are the *same*
-/// loop (mutate → rematerialize → fan out) differing only in the statement
-/// built, so they land as additional arms here rather than as new machinery.
-/// Append is what the walking skeleton needs to prove the loop closes.
+/// The three variants are the *same* loop (mutate → rematerialise → fan out)
+/// differing only in the statement built — which is the whole point of the z-set
+/// delta path: an `Update` diffs to `−old, +new` under one key (an in-place
+/// patch on the wire), a `Delete` to a lone `−` (a keyed removal), and neither
+/// needs machinery beyond the row-level diff [`crate::forge::delta`] already
+/// performs. `key` identifies the row by the collection's `key_column` (see
+/// [`crate::forge::skeleton::ForgeSlot`]); the column *name* never crosses from
+/// userland — it is resolved from the allowlist here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForgeWrite {
     /// Append a record to a persistent collection. `collection` is the topic
@@ -68,6 +72,15 @@ pub enum ForgeWrite {
         collection: String,
         record: Map<String, Value>,
     },
+    /// Update the row identified by `key`, setting the columns in `fields`.
+    /// `fields` is a partial record — only the columns it names change.
+    Update {
+        collection: String,
+        key: Value,
+        fields: Map<String, Value>,
+    },
+    /// Delete the row identified by `key`.
+    Delete { collection: String, key: Value },
 }
 
 impl ForgeWrite {
@@ -76,7 +89,9 @@ impl ForgeWrite {
     #[must_use]
     pub fn collection(&self) -> &str {
         match self {
-            Self::Append { collection, .. } => collection.as_str(),
+            Self::Append { collection, .. }
+            | Self::Update { collection, .. }
+            | Self::Delete { collection, .. } => collection.as_str(),
         }
     }
 }
@@ -155,9 +170,7 @@ fn is_safe_identifier(name: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Lower one JSON value to a substrate-neutral [`SqlValue`].
@@ -220,6 +233,95 @@ fn build_append(collection: &str, record: &Map<String, Value>) -> Result<(String
     Ok((sql, params))
 }
 
+/// Lower a row-identity value to a bound [`SqlValue`], refusing the shapes that
+/// can't identify a row.
+///
+/// A null key would compile to `WHERE k = NULL`, which SQL never matches — so an
+/// update or delete with a null key is a silent no-op, the worst outcome for a
+/// mutation. Reject it, and objects/arrays, loudly instead.
+fn key_to_sqlvalue(collection: &str, key_column: &str, key: &Value) -> Result<SqlValue> {
+    match key {
+        Value::Null => Err(SubstrateError::Backend(format!(
+            "FORGE write: '{collection}' key ('{key_column}') is null; \
+             a mutation must identify exactly one row"
+        ))),
+        scalar => json_to_sqlvalue(key_column, scalar),
+    }
+}
+
+/// Build the `UPDATE` for one row, with both the new field values and the key
+/// bound. `key_column` comes from the collection's [`ForgeSlot`], never from
+/// userland.
+fn build_update(
+    collection: &str,
+    key_column: &str,
+    key: &Value,
+    fields: &Map<String, Value>,
+) -> Result<(String, Vec<SqlValue>)> {
+    if fields.is_empty() {
+        return Err(SubstrateError::Backend(format!(
+            "FORGE update: no fields to set for '{collection}'; nothing to change"
+        )));
+    }
+
+    let mut assignments = Vec::with_capacity(fields.len());
+    let mut params = Vec::with_capacity(fields.len() + 1);
+    for (index, (column, value)) in fields.iter().enumerate() {
+        if !is_safe_identifier(column) {
+            return Err(SubstrateError::Backend(format!(
+                "FORGE update: '{column}' is not a valid column name"
+            )));
+        }
+        // Refuse an update that would rewrite the row's identity: the delta path
+        // keys on `key_column`, so changing it under an action would strand the
+        // row on every client (its DOM node is addressed by the old key). A key
+        // change is a delete + append, and the author should say so.
+        if column == key_column {
+            return Err(SubstrateError::Backend(format!(
+                "FORGE update: cannot change the key column '{key_column}' of '{collection}'; \
+                 delete and re-append instead"
+            )));
+        }
+        assignments.push(format!("{column} = ?{}", index + 1));
+        params.push(json_to_sqlvalue(column, value)?);
+    }
+    params.push(key_to_sqlvalue(collection, key_column, key)?);
+
+    let sql = format!(
+        "UPDATE {collection} SET {} WHERE {key_column} = ?{}",
+        assignments.join(", "),
+        params.len()
+    );
+    Ok((sql, params))
+}
+
+/// Build the `DELETE` for one row, with the key bound.
+fn build_delete(
+    collection: &str,
+    key_column: &str,
+    key: &Value,
+) -> Result<(String, Vec<SqlValue>)> {
+    let params = vec![key_to_sqlvalue(collection, key_column, key)?];
+    let sql = format!("DELETE FROM {collection} WHERE {key_column} = ?1");
+    Ok((sql, params))
+}
+
+/// Build the statement for one write against its resolved slot. Dispatches on
+/// the variant; the slot supplies the `&'static` collection name and key column,
+/// so no userland string reaches the SQL as an identifier.
+fn build_statement(
+    slot: &crate::forge::skeleton::ForgeSlot,
+    write: &ForgeWrite,
+) -> Result<(String, Vec<SqlValue>)> {
+    match write {
+        ForgeWrite::Append { record, .. } => build_append(slot.topic, record),
+        ForgeWrite::Update { key, fields, .. } => {
+            build_update(slot.topic, slot.key_column, key, fields)
+        }
+        ForgeWrite::Delete { key, .. } => build_delete(slot.topic, slot.key_column, key),
+    }
+}
+
 /// Apply every recorded write, then rematerialise and fan out each collection
 /// they touched.
 ///
@@ -257,7 +359,7 @@ pub async fn apply_writes(
     for write in writes {
         let slot = slot_for_topic(write.collection()).ok_or_else(|| {
             SubstrateError::Backend(format!(
-                "FORGE append: '{}' is not a FORGE-backed collection",
+                "FORGE write: '{}' is not a FORGE-backed collection",
                 write.collection()
             ))
         })?;
@@ -268,29 +370,25 @@ pub async fn apply_writes(
 
     let tx = substrate.begin().await?;
     for write in writes {
-        match write {
-            ForgeWrite::Append { collection, record } => {
-                // `collection` is a `&'static str` from FORGE_SLOTS by way of
-                // the allowlist above — never the userland string itself.
-                let slot_name = touched
-                    .iter()
-                    .find(|slot| slot.topic == collection.as_str())
-                    .expect("collection was resolved above")
-                    .topic;
-                let (sql, params) = match build_append(slot_name, record) {
-                    Ok(built) => built,
-                    Err(err) => {
-                        // Drop the whole action's writes: a malformed record
-                        // must not leave earlier appends committed.
-                        let _ = tx.rollback().await;
-                        return Err(err);
-                    }
-                };
-                if let Err(err) = tx.execute(&sql, &params).await {
-                    let _ = tx.rollback().await;
-                    return Err(err);
-                }
+        // The slot is a `&'static` from FORGE_SLOTS, resolved in `touched`
+        // above — the collection name and key column reach SQL from here, never
+        // from the userland string.
+        let slot = touched
+            .iter()
+            .find(|slot| slot.topic == write.collection())
+            .expect("collection was resolved above");
+        let (sql, params) = match build_statement(slot, write) {
+            Ok(built) => built,
+            Err(err) => {
+                // Drop the whole action's writes: one malformed mutation must
+                // not leave earlier ones committed.
+                let _ = tx.rollback().await;
+                return Err(err);
             }
+        };
+        if let Err(err) = tx.execute(&sql, &params).await {
+            let _ = tx.rollback().await;
+            return Err(err);
         }
     }
     tx.commit().await?;
@@ -380,14 +478,21 @@ mod tests {
     #[test]
     fn the_collector_captures_writes_in_call_order() {
         let collector = install_forge_write_collector();
-        assert!(record_forge_write(append("guestbook", json!({ "author": "ada" }))));
-        assert!(record_forge_write(append("guestbook", json!({ "author": "alan" }))));
+        assert!(record_forge_write(append(
+            "guestbook",
+            json!({ "author": "ada" })
+        )));
+        assert!(record_forge_write(append(
+            "guestbook",
+            json!({ "author": "alan" })
+        )));
 
         let writes = collector.take();
         assert_eq!(writes.len(), 2);
         assert_eq!(writes[0].collection(), "guestbook");
         match &writes[0] {
             ForgeWrite::Append { record, .. } => assert_eq!(record["author"], "ada"),
+            other => panic!("expected Append, got {other:?}"),
         }
     }
 
@@ -407,20 +512,32 @@ mod tests {
     #[test]
     fn a_nested_collector_restores_the_outer_one() {
         let outer = install_forge_write_collector();
-        assert!(record_forge_write(append("guestbook", json!({ "author": "outer" }))));
+        assert!(record_forge_write(append(
+            "guestbook",
+            json!({ "author": "outer" })
+        )));
         {
             let inner = install_forge_write_collector();
-            assert!(record_forge_write(append("guestbook", json!({ "author": "inner" }))));
+            assert!(record_forge_write(append(
+                "guestbook",
+                json!({ "author": "inner" })
+            )));
             let inner_writes = inner.take();
             assert_eq!(inner_writes.len(), 1);
             match &inner_writes[0] {
                 ForgeWrite::Append { record, .. } => assert_eq!(record["author"], "inner"),
+                other => panic!("expected Append, got {other:?}"),
             }
         }
         let outer_writes = outer.take();
-        assert_eq!(outer_writes.len(), 1, "outer writes survived the nested dispatch");
+        assert_eq!(
+            outer_writes.len(),
+            1,
+            "outer writes survived the nested dispatch"
+        );
         match &outer_writes[0] {
             ForgeWrite::Append { record, .. } => assert_eq!(record["author"], "outer"),
+            other => panic!("expected Append, got {other:?}"),
         }
     }
 
@@ -430,8 +547,7 @@ mod tests {
         let (sql, params) = build_append("guestbook", record.as_object().unwrap()).unwrap();
 
         assert_eq!(
-            sql,
-            "INSERT INTO guestbook (author, message) VALUES (?1, ?2)",
+            sql, "INSERT INTO guestbook (author, message) VALUES (?1, ?2)",
             "column order follows the record's (BTreeMap) key order"
         );
         assert_eq!(
@@ -450,7 +566,10 @@ mod tests {
         let (sql, params) = build_append("guestbook", record.as_object().unwrap()).unwrap();
 
         assert_eq!(sql, "INSERT INTO guestbook (author) VALUES (?1)");
-        assert!(!sql.contains("DROP"), "the value must never reach the statement text");
+        assert!(
+            !sql.contains("DROP"),
+            "the value must never reach the statement text"
+        );
         assert_eq!(
             params,
             vec![SqlValue::Text("'); DROP TABLE guestbook;--".to_string())]
@@ -487,7 +606,10 @@ mod tests {
     fn a_nested_value_is_refused_rather_than_guessed_at() {
         let record = json!({ "author": { "name": "ada" } });
         let err = build_append("guestbook", record.as_object().unwrap()).unwrap_err();
-        assert!(format!("{err}").contains("nested"), "unexpected error: {err}");
+        assert!(
+            format!("{err}").contains("nested"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -509,6 +631,99 @@ mod tests {
                 SqlValue::Text("x".to_string()),
             ]
         );
+    }
+
+    // ── Update / Delete statement builders ──────────────────────────────
+
+    #[test]
+    fn update_sets_fields_and_binds_the_key_last() {
+        let fields = json!({ "author": "grace", "message": "edited" });
+        let (sql, params) =
+            build_update("guestbook", "id", &json!(3), fields.as_object().unwrap()).unwrap();
+
+        assert_eq!(
+            sql, "UPDATE guestbook SET author = ?1, message = ?2 WHERE id = ?3",
+            "fields bind first in key order, the row key binds last"
+        );
+        assert_eq!(
+            params,
+            vec![
+                SqlValue::Text("grace".to_string()),
+                SqlValue::Text("edited".to_string()),
+                SqlValue::Integer(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_binds_only_the_key() {
+        let (sql, params) = build_delete("guestbook", "id", &json!(7)).unwrap();
+        assert_eq!(sql, "DELETE FROM guestbook WHERE id = ?1");
+        assert_eq!(params, vec![SqlValue::Integer(7)]);
+    }
+
+    /// A hostile value in an update's fields or key must bind, never interpolate.
+    #[test]
+    fn update_and_delete_bind_hostile_values() {
+        let hostile = "'); DROP TABLE guestbook;--";
+        let (usql, uparams) = build_update(
+            "guestbook",
+            "id",
+            &json!(hostile),
+            json!({ "author": hostile }).as_object().unwrap(),
+        )
+        .unwrap();
+        assert!(!usql.contains("DROP"));
+        assert_eq!(
+            uparams,
+            vec![
+                SqlValue::Text(hostile.into()),
+                SqlValue::Text(hostile.into())
+            ]
+        );
+
+        let (dsql, dparams) = build_delete("guestbook", "id", &json!(hostile)).unwrap();
+        assert!(!dsql.contains("DROP"));
+        assert_eq!(dparams, vec![SqlValue::Text(hostile.into())]);
+    }
+
+    #[test]
+    fn a_field_column_that_is_not_an_identifier_is_refused() {
+        let mut fields = Map::new();
+        fields.insert(
+            "author) VALUES ('x'); DROP TABLE guestbook;--".to_string(),
+            json!("x"),
+        );
+        assert!(build_update("guestbook", "id", &json!(1), &fields).is_err());
+    }
+
+    #[test]
+    fn an_update_with_no_fields_is_refused() {
+        assert!(build_update("guestbook", "id", &json!(1), &Map::new()).is_err());
+    }
+
+    /// Changing the key column would strand the row's DOM node on every client
+    /// (addressed by the OLD key); the author must delete + re-append instead.
+    #[test]
+    fn an_update_that_rewrites_the_key_column_is_refused() {
+        let fields = json!({ "id": 99, "author": "grace" });
+        let err =
+            build_update("guestbook", "id", &json!(3), fields.as_object().unwrap()).unwrap_err();
+        assert!(format!("{err}").contains("key column"), "unexpected: {err}");
+    }
+
+    /// A null key would compile to `WHERE k = NULL`, which matches nothing — a
+    /// silent no-op, the worst outcome for a mutation.
+    #[test]
+    fn a_null_key_is_refused_for_update_and_delete() {
+        assert!(build_delete("guestbook", "id", &Value::Null).is_err());
+        assert!(build_update(
+            "guestbook",
+            "id",
+            &Value::Null,
+            json!({ "a": 1 }).as_object().unwrap()
+        )
+        .is_err());
     }
 }
 
@@ -573,7 +788,11 @@ mod substrate_tests {
 
         // …and visible in the topic the page renders from.
         let materialised = topic_rows(&broadcast, "guestbook");
-        assert_eq!(materialised.len(), 3, "topic rematerialised after the write");
+        assert_eq!(
+            materialised.len(),
+            3,
+            "topic rematerialised after the write"
+        );
         assert_eq!(materialised[2]["author"], "grace");
         assert_eq!(materialised[2]["message"], "found the bug");
     }
@@ -749,6 +968,191 @@ mod substrate_tests {
             }
             other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
         }
+    }
+
+    /// Module-scope stand-in for the render path, shared by the update/delete
+    /// delta tests: renders the whole guestbook to keyed `<li>`s and reads the
+    /// rows back through the real markup extractor.
+    struct Guestbook;
+
+    #[async_trait::async_trait]
+    impl crate::forge::delta::RowProjector for Guestbook {
+        async fn project_rows(
+            &self,
+            collection: &str,
+            value: &[u8],
+        ) -> Option<crate::forge::delta::RenderedRows> {
+            if collection != "guestbook" {
+                return None;
+            }
+            let records: Value = serde_json::from_slice(value).ok()?;
+            let mut html = String::from("<ul data-albedo-list-slot=\"guestbook\">");
+            for record in records.as_array()? {
+                html.push_str(&format!(
+                    "<li data-albedo-key=\"{}\">{}</li>",
+                    record.get("id")?,
+                    record.get("author")?.as_str()?
+                ));
+            }
+            html.push_str("</ul>");
+            crate::transforms::shared_slot_lists::extract_keyed_rows(&html, collection)
+        }
+    }
+
+    fn update(collection: &str, key: Value, fields: Value) -> ForgeWrite {
+        ForgeWrite::Update {
+            collection: collection.to_string(),
+            key,
+            fields: fields.as_object().expect("fields is an object").clone(),
+        }
+    }
+
+    fn delete(collection: &str, key: Value) -> ForgeWrite {
+        ForgeWrite::Delete {
+            collection: collection.to_string(),
+            key,
+        }
+    }
+
+    /// An update must persist AND reach subscribers as an in-place patch — the
+    /// `−old, +new` pair under one key that the client folds into a single node
+    /// replacement, not a repaint. This is the retraction/patch half of the
+    /// delta engine, unreachable until Update existed.
+    #[tokio::test]
+    async fn an_update_persists_and_fans_out_a_keyed_patch() {
+        use crate::ir::opcode::{Instruction, RowKey};
+        use crate::ir::wire::decode_frame;
+        use crate::runtime::session::SessionId;
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        bootstrap_schema(&db).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        broadcast
+            .subscribe(SessionId::random(), "guestbook", tx)
+            .unwrap();
+
+        // Row id=1 is "ada" from the seed; rename its author to "turing".
+        apply_writes(
+            &db,
+            &broadcast,
+            &[update("guestbook", json!(1), json!({ "author": "turing" }))],
+            Some(&Guestbook),
+        )
+        .await
+        .unwrap();
+
+        // Durable: the row changed, the count did not.
+        let rows = db
+            .query("SELECT author FROM guestbook WHERE id = 1", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.rows[0].get(0).and_then(SqlValue::as_str),
+            Some("turing")
+        );
+        assert_eq!(
+            topic_rows(&broadcast, "guestbook").len(),
+            2,
+            "an update changes no count"
+        );
+
+        let payload = rx.recv().await.expect("the update reaches the subscriber");
+        let (frame, _) = decode_frame(&payload).unwrap();
+        match frame.instructions.as_slice() {
+            [Instruction::SlotSet { .. }, Instruction::SlotDelta { changes, .. }] => {
+                assert_eq!(changes.len(), 2, "an update is a -/+ pair under one key");
+                assert_eq!(
+                    (changes[0].weight, &changes[0].key),
+                    (-1, &RowKey("1".to_string()))
+                );
+                assert_eq!(
+                    (changes[1].weight, &changes[1].key),
+                    (1, &RowKey("1".to_string()))
+                );
+                assert_eq!(
+                    String::from_utf8(changes[1].payload.clone()).unwrap(),
+                    "<li data-albedo-key=\"1\">turing</li>"
+                );
+            }
+            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+        }
+    }
+
+    /// A delete must persist AND fan out as a lone retraction — a `−` the client
+    /// removes by key. This is the other half the delta engine could express but
+    /// nothing could produce.
+    #[tokio::test]
+    async fn a_delete_persists_and_fans_out_a_retraction() {
+        use crate::ir::opcode::{Instruction, RowKey};
+        use crate::ir::wire::decode_frame;
+        use crate::runtime::session::SessionId;
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        bootstrap_schema(&db).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        broadcast
+            .subscribe(SessionId::random(), "guestbook", tx)
+            .unwrap();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &[delete("guestbook", json!(2))],
+            Some(&Guestbook),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(topic_rows(&broadcast, "guestbook").len(), 1, "one row gone");
+        let remaining = db.query("SELECT id FROM guestbook", &[]).await.unwrap();
+        assert_eq!(remaining.rows.len(), 1);
+        assert_eq!(remaining.rows[0].get(0).and_then(SqlValue::as_i64), Some(1));
+
+        let payload = rx.recv().await.expect("the delete reaches the subscriber");
+        let (frame, _) = decode_frame(&payload).unwrap();
+        match frame.instructions.as_slice() {
+            [Instruction::SlotSet { .. }, Instruction::SlotDelta { changes, .. }] => {
+                assert_eq!(changes.len(), 1, "a delete is one retraction");
+                assert_eq!(changes[0].weight, -1);
+                assert_eq!(changes[0].key, RowKey("2".to_string()));
+            }
+            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+        }
+    }
+
+    /// Update and delete share the append path's atomicity: a malformed second
+    /// write rolls back the good first one.
+    #[tokio::test]
+    async fn a_bad_write_in_a_batch_rolls_back_the_good_ones() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        bootstrap_schema(&db).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast).await.unwrap();
+
+        // A good delete, then an update with a null key (refused before execute).
+        let err = apply_writes(
+            &db,
+            &broadcast,
+            &[
+                delete("guestbook", json!(1)),
+                update("guestbook", Value::Null, json!({ "author": "x" })),
+            ],
+            None,
+        )
+        .await
+        .expect_err("a null key must fail the action");
+        assert!(format!("{err}").contains("null"), "unexpected: {err}");
+        assert_eq!(
+            topic_rows(&broadcast, "guestbook").len(),
+            2,
+            "the good delete rolled back"
+        );
     }
 
     /// No projector (today's serve path) must behave exactly as it did before

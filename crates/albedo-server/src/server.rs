@@ -48,6 +48,64 @@ const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// `invoke_action` so the explicit return already carries the
 /// `SlotSet` opcodes; the dispatcher's follow-up drain is then a
 /// no-op, which is idempotent and safe.
+/// Runtime singletons that MUST survive a dev world-swap.
+///
+/// A hot reload rebuilds the whole render world from disk and swaps it in. Two
+/// things must NOT be rebuilt with it: the broadcast registry — because it
+/// holds live topic **values** (hydrated once at boot from the substrate) and
+/// live **subscribers** (open SSE/WT connections) that a fresh empty registry
+/// would strand — and the FORGE substrate handle, opened once in `run()`.
+/// Bundling them here lets a reload thread the SAME instances into the fresh
+/// build ([`AlbedoServerBuilder::with_live_runtime`]), so the swap replaces
+/// *build output* (world, Tier-B plan, engine pool, row projector) while
+/// *live state* carries across untouched.
+///
+/// The row projector is build output, not live state — it closes over the new
+/// plan and pool, so a reload must replace it. It lives here anyway, as a
+/// swappable slot the build re-fills, because the two readers that need the
+/// *current* projector (the action adapters' write path and the dispatcher's
+/// reconnect-resync path) both outlive any single world and so must reach it
+/// through one stable handle rather than a per-build clone.
+#[derive(Clone)]
+pub(crate) struct LiveRuntime {
+    broadcast: Arc<BroadcastRegistry>,
+    forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
+    row_projector:
+        Arc<std::sync::RwLock<Option<Arc<dyn dom_render_compiler::forge::RowProjector>>>>,
+}
+
+impl LiveRuntime {
+    /// Fresh, empty singletons for a first boot. `run()` fills the substrate;
+    /// `build()` installs the projector.
+    fn new() -> Self {
+        Self {
+            broadcast: Arc::new(BroadcastRegistry::new()),
+            forge_substrate: Arc::new(std::sync::OnceLock::new()),
+            row_projector: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// The current row projector, cloned out (a refcount bump). Cloned rather
+    /// than borrowed so the caller can hold it across an `.await` without
+    /// keeping the lock — the write path awaits `apply_writes`, the resync path
+    /// awaits `project_rows`.
+    fn projector(&self) -> Option<Arc<dyn dom_render_compiler::forge::RowProjector>> {
+        self.row_projector
+            .read()
+            .expect("row projector lock poisoned")
+            .clone()
+    }
+
+    /// Install the projector the current build produced, replacing any prior
+    /// one. Called by `build()` on first boot AND on every dev reload.
+    fn install_projector(&self, projector: Arc<dyn dom_render_compiler::forge::RowProjector>) {
+        *self
+            .row_projector
+            .write()
+            .expect("row projector lock poisoned") = Some(projector);
+    }
+}
+
 // Phase P · Stream C.2 — adapter carries the per-server
 // `Arc<BroadcastRegistry>` so `handle()` can install it into the
 // interpreter's `PHASE_K_BROADCAST` thread-local for the duration of
@@ -55,10 +113,13 @@ const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 // `broadcast(topic, updater)` would surface a clean error from the
 // interpreter ("broadcast() unavailable") because the builtin only
 // resolves when the thread-local is set.
+//
+// FORGE + S4 · the adapter reaches the substrate and the row projector
+// through the shared `LiveRuntime` so a dev hot-swap can't hand it a stale
+// (rebuilt-empty) registry or an unfilled substrate cell.
 struct CompiledProjectActionAdapter {
     project: Arc<dom_render_compiler::runtime::CompiledProject>,
     action_id: u32,
-    broadcast: Arc<BroadcastRegistry>,
     /// A1 · *scaffolding* — when `Some`, `handle()` routes the action through
     /// the QuickJS executor (`invoke_action_quickjs_with_broadcast`) on a pooled
     /// engine instead of the pure-Rust `invoke_action_with_broadcast`. Currently
@@ -67,29 +128,11 @@ struct CompiledProjectActionAdapter {
     /// `engine_pool` module docs + `project_a1_bridge`). The QuickJS path unlocks
     /// loops/`try`/array methods in action bodies that the pure-Rust path rejects.
     engine_pool: Option<Arc<crate::engine_pool::QuickJsEnginePool>>,
-    /// FORGE · the substrate a body's `append()` writes land in.
-    ///
-    /// A `OnceLock` because of a boot ordering fact: adapters are built during
-    /// `register_compiled_project` (synchronous, on the builder), while the
-    /// substrate can only be opened in the async `run()` seam much later. The
-    /// same `Arc` is minted on the builder and cloned into every adapter — the
-    /// trick `broadcast` already uses — and `run()` fills it before the listener
-    /// binds, so no request can observe it empty.
-    ///
-    /// Ungated: `DataSubstrate` is a trait with no backend attached, so the seam
-    /// compiles without `--features forge`. It simply stays empty there, and an
-    /// `append()` reports that rather than pretending to write.
-    forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
-    /// S4 · the render path's row projector, used to turn a post-commit
-    /// collection into the rows a `SlotDelta` carries.
-    ///
-    /// `OnceLock` for the same boot-ordering reason as `forge_substrate`, one
-    /// step later in the sequence: adapters are built during
-    /// `register_compiled_project`, while the Tier-B render plan this projector
-    /// needs is only assembled in `build()`. Left empty — no renderer, no pool,
-    /// no plan — the write path simply fans out snapshots, exactly as it did
-    /// before the delta lane existed.
-    row_projector: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::RowProjector>>>,
+    /// The broadcast registry, FORGE substrate handle, and row projector — all
+    /// reached through the shared [`LiveRuntime`] so a dev hot-swap hands the
+    /// adapter the live instances, never a rebuilt-empty registry or an
+    /// unfilled substrate cell. See [`LiveRuntime`].
+    live: LiveRuntime,
 }
 
 #[async_trait::async_trait]
@@ -117,7 +160,7 @@ impl ActionHandler for CompiledProjectActionAdapter {
         // Everything captured is `Send` (Arc clones + an owned envelope clone).
         if let Some(pool) = &self.engine_pool {
             let project = self.project.clone();
-            let broadcast = self.broadcast.clone();
+            let broadcast = self.live.broadcast.clone();
             let envelope = envelope.clone();
             let action_id = self.action_id;
 
@@ -155,20 +198,20 @@ impl ActionHandler for CompiledProjectActionAdapter {
                 })??;
 
             if !writes.is_empty() {
-                let substrate = self.forge_substrate.get().ok_or_else(|| {
+                let substrate = self.live.forge_substrate.get().ok_or_else(|| {
                     RuntimeError::RequestHandling(format!(
                         "compiled action handler {action_id} called append() but no FORGE \
                          substrate is wired; rebuild with --features forge"
                     ))
                 })?;
+                // S4 · the current row projector, cloned out of the live slot
+                // so the borrow the write path passes outlives no lock guard.
+                let projector = self.live.projector();
                 dom_render_compiler::forge::apply_writes(
                     substrate.as_ref(),
-                    self.broadcast.as_ref(),
+                    self.live.broadcast.as_ref(),
                     &writes,
-                    // S4 · the render path's row projector, when a pooled
-                    // Tier-B renderer was installed at boot. Absent (no
-                    // renderer/pool) the fan-out is snapshot-only.
-                    self.row_projector.get().map(AsRef::as_ref),
+                    projector.as_deref(),
                 )
                 .await
                 .map_err(|err| {
@@ -190,10 +233,10 @@ impl ActionHandler for CompiledProjectActionAdapter {
         // The body still runs when no substrate is wired; `append()` then fails
         // inside the body with a clear message rather than being silently
         // dropped, which is the only honest outcome for a durable write.
-        if let Some(substrate) = self.forge_substrate.get() {
+        if let Some(substrate) = self.live.forge_substrate.get() {
             let (instructions, writes) = self
                 .project
-                .invoke_action_with_forge(envelope, &view, self.broadcast.as_ref())
+                .invoke_action_with_forge(envelope, &view, self.live.broadcast.as_ref())
                 .map_err(|err| {
                     RuntimeError::RequestHandling(format!(
                         "compiled action handler {} failed: {err:#}",
@@ -203,12 +246,12 @@ impl ActionHandler for CompiledProjectActionAdapter {
 
             // Applied AFTER the body returned Ok: a body that errored partway
             // never reaches here, so its earlier appends are discarded with it.
+            let projector = self.live.projector();
             dom_render_compiler::forge::apply_writes(
                 substrate.as_ref(),
-                self.broadcast.as_ref(),
+                self.live.broadcast.as_ref(),
                 &writes,
-                // S4 · see the QuickJS path above.
-                self.row_projector.get().map(AsRef::as_ref),
+                projector.as_deref(),
             )
             .await
             .map_err(|err| {
@@ -228,7 +271,7 @@ impl ActionHandler for CompiledProjectActionAdapter {
         // `Arc<BroadcastRegistry>`. Fan-out lands on every subscribed
         // session over the WT patches lane without further plumbing.
         self.project
-            .invoke_action_with_broadcast(envelope, &view, self.broadcast.as_ref())
+            .invoke_action_with_broadcast(envelope, &view, self.live.broadcast.as_ref())
             .map_err(|err| {
                 RuntimeError::RequestHandling(format!(
                     "compiled action handler {} failed: {err:#}",
@@ -323,21 +366,15 @@ struct RuntimeState {
     /// A persistent server property (not part of the swappable `RenderWorld`),
     /// so a dev hot-swap keeps it. `true` for CLI dev/serve, `false` otherwise.
     request_timings: bool,
-    /// FORGE — the durable storage substrate, opened once at
-    /// [`AlbedoServer::run`] and held here on the **persistent** tier (not the
-    /// swappable `RenderWorld`), so a dev world-swap never reopens the database.
-    /// Shared-slot topic hydration (Gate 1) and durable-action writes both
-    /// resolve the backend through this handle.
-    ///
-    /// This is the SAME `Arc` the builder minted and cloned into every action
-    /// adapter, which is what makes the write path work across the boot ordering:
-    /// adapters are constructed synchronously on the builder, long before the
-    /// async `run()` seam can open a database. `run()` fills the cell before the
-    /// listener binds, so no request ever sees it empty.
-    ///
-    /// Ungated on purpose — `DataSubstrate` is a backend-free trait, so the seam
-    /// compiles without `--features forge` and simply stays empty there.
-    forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
+    /// The live runtime singletons — broadcast registry, FORGE substrate,
+    /// row projector — held on the **persistent** tier so a dev world-swap
+    /// never strands them. `run()` fills the substrate through this handle;
+    /// the dispatcher reaches the projector through it for reconnect resync;
+    /// and — the point of the whole bundle — a reload threads THIS instance
+    /// into the fresh build so the swapped-in world reuses it rather than
+    /// minting empties. See [`LiveRuntime`]. (The broadcast registry is also
+    /// reachable via `world().broadcast`, which is the same `Arc`.)
+    live: LiveRuntime,
 }
 
 impl RuntimeState {
@@ -402,26 +439,13 @@ pub struct AlbedoServerBuilder {
     /// response. `None` means auto: `public, max-age=3600` when dev
     /// mode is off, `no-store` when dev mode is on.
     public_cache_control: Option<String>,
-    /// Phase P · Stream C.2 — the per-server broadcast registry, minted
-    /// at builder construction so [`Self::register_compiled_project`]
-    /// can clone the same `Arc` into every `CompiledProjectActionAdapter`.
-    /// `build()` reuses this exact `Arc` for `RuntimeState.broadcast`,
-    /// so action handlers, the WT runtime, and any userland write all
-    /// resolve topics against one registry.
-    broadcast: Arc<BroadcastRegistry>,
-    /// FORGE · the substrate handle shared with every action adapter.
-    ///
-    /// Minted here for the same reason `broadcast` is: adapters are built during
-    /// `register_compiled_project`, which runs on the builder. The substrate
-    /// itself can only be opened in the async `run()` seam, so this starts empty
-    /// and `run()` fills it before the listener binds. Cloning the `Arc` at
-    /// adapter-construction time is what lets a later write find the backend.
-    forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
-    /// S4 · minted here for the same boot-ordering reason as `forge_substrate`,
-    /// filled in `build()` once the Tier-B render plan exists. Adapters clone
-    /// the `Arc` at construction time, so a write dispatched later finds the
-    /// projector even though it did not exist when the adapter was built.
-    row_projector: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::RowProjector>>>,
+    /// The runtime singletons — broadcast registry, FORGE substrate handle,
+    /// row projector — shared into every `CompiledProjectActionAdapter` and the
+    /// `RuntimeState`. Minted fresh by [`Self::new`]; a dev reload overrides it
+    /// via [`Self::with_live_runtime`] so the rebuilt world reuses the live
+    /// registry (topic values + subscribers) and the already-open substrate
+    /// rather than stranding them. See [`LiveRuntime`].
+    live: LiveRuntime,
     /// A1 · optional pool of warmed QuickJS engines. When set (via
     /// [`Self::with_quickjs_action_engine_pool`]), every adapter built by a
     /// *subsequent* [`Self::register_compiled_project`] runs its action bodies
@@ -458,16 +482,11 @@ impl AlbedoServerBuilder {
             request_timings_enabled: false,
             public_dirs: Vec::new(),
             public_cache_control: None,
-            // Phase P · C.2 — mint here so `register_compiled_project`
-            // (which may run before `build()`) sees the same `Arc` the
-            // runtime state will hold. Idle cost is one empty
-            // DashMap; non-broadcast workloads don't pay anything.
-            broadcast: Arc::new(BroadcastRegistry::new()),
-            // FORGE · minted empty; `run()` fills it once the substrate opens.
-            forge_substrate: Arc::new(std::sync::OnceLock::new()),
-            // S4 · minted empty; `build()` fills it when a pooled Tier-B
-            // renderer exists to project rows with.
-            row_projector: Arc::new(std::sync::OnceLock::new()),
+            // Minted empty; `register_compiled_project` clones the same handles
+            // into every adapter, `run()` fills the substrate, `build()`
+            // installs the projector. A dev reload replaces this whole bundle
+            // via `with_live_runtime` so live state carries across the swap.
+            live: LiveRuntime::new(),
             // A1 · off by default — opt in via `with_quickjs_action_engine_pool`.
             action_engine_pool: None,
             // Step 3 · set by `register_compiled_project`.
@@ -503,7 +522,21 @@ impl AlbedoServerBuilder {
     /// Cloning the returned `Arc` is cheap; both halves resolve to
     /// the same registry.
     pub fn broadcast(&self) -> Arc<BroadcastRegistry> {
-        self.broadcast.clone()
+        self.live.broadcast.clone()
+    }
+
+    /// Reuse an existing [`LiveRuntime`] instead of the empty one [`Self::new`]
+    /// minted. This is the seam that makes `albedo dev` hot reload correct for
+    /// FORGE: the dev reloader threads the running server's live bundle in, so
+    /// the rebuilt world's adapters, streaming state, and topic pre-registration
+    /// all resolve against the SAME broadcast registry (keeping hydrated topic
+    /// values and open subscribers) and the SAME already-opened substrate.
+    /// Must be called before [`Self::register_compiled_project`], which clones
+    /// the bundle into every adapter.
+    #[must_use]
+    pub(crate) fn with_live_runtime(mut self, live: LiveRuntime) -> Self {
+        self.live = live;
+        self
     }
 
     /// Phase N — mount a directory whose files are served verbatim
@@ -623,21 +656,15 @@ impl AlbedoServerBuilder {
             let adapter = CompiledProjectActionAdapter {
                 project: project.clone(),
                 action_id: proxy_id,
-                // Phase P · C.2 — share the builder's broadcast `Arc`
-                // with the adapter so its `handle()` invocation routes
-                // `broadcast(topic, updater)` calls through the same
-                // registry the WT runtime + route handlers see.
-                broadcast: self.broadcast.clone(),
                 // A1 · when a pool was enabled (before this call), route action
                 // bodies through QuickJS; otherwise the pure-Rust path. Cloning
                 // an `Arc` — every adapter for this project shares one pool.
                 engine_pool: self.action_engine_pool.clone(),
-                // FORGE · the same `Arc` `run()` will fill, so an adapter built
-                // now can still find the substrate opened later.
-                forge_substrate: self.forge_substrate.clone(),
-                // S4 · likewise filled in `build()`; empty means snapshot-only
-                // fan-out, which is the pre-delta behaviour.
-                row_projector: self.row_projector.clone(),
+                // The shared live bundle: broadcast (so `broadcast(topic, fn)`
+                // routes through the same registry the WT/SSE runtime sees),
+                // the substrate cell `run()` fills, and the projector slot
+                // `build()` installs. Reused across a dev reload.
+                live: self.live.clone(),
             };
             self.action_handlers.insert(proxy_id, Arc::new(adapter));
         }
@@ -664,7 +691,10 @@ impl AlbedoServerBuilder {
         // tolerates a `Null` current value by passing it to the
         // updater closure.
         for topic in project.shared_slot_topics() {
-            self.broadcast.topic(topic, b"null".to_vec());
+            // Idempotent: `topic()` returns an existing topic without touching
+            // its value, so on a dev reload (reused registry) this never
+            // clobbers a value FORGE already hydrated.
+            self.live.broadcast.topic(topic, b"null".to_vec());
         }
 
         self
@@ -877,9 +907,8 @@ impl AlbedoServerBuilder {
             // template and engine a request would render it with. Installed
             // here rather than in `register_compiled_project` because the plan
             // does not exist until now; the adapters already hold this cell.
-            let _ = self
-                .row_projector
-                .set(Arc::new(crate::render::PooledRowProjector::new(
+            self.live
+                .install_projector(Arc::new(crate::render::PooledRowProjector::new(
                     pool.clone(),
                     plan.clone(),
                     form_error_spans.clone(),
@@ -888,7 +917,7 @@ impl AlbedoServerBuilder {
             services.registry = Arc::new(PooledTierBRenderRegistry::new(
                 pool.clone(),
                 plan,
-                self.broadcast.clone(),
+                self.live.broadcast.clone(),
                 form_error_spans,
             ));
         }
@@ -914,12 +943,12 @@ impl AlbedoServerBuilder {
         // a topic
         // ──────────────────────────────────────────────────────────
         // Phase P · C.2 trailing note: the same `Arc` is now reused
-        // from `self.broadcast` rather than re-minted here, so
+        // from `self.live.broadcast` rather than re-minted here, so
         // adapters registered before `build()` see the same registry
         // the runtime state ends up with. `subscribe()` / `write_topic()`
         // are themselves concurrent so no further sharing layer is
         // needed.
-        let broadcast = self.broadcast;
+        let broadcast = self.live.broadcast.clone();
 
         // Construct StreamingAppState, binding the optional pipeline +
         // runtime handle when both are present. `with_pipeline` consumes
@@ -937,9 +966,7 @@ impl AlbedoServerBuilder {
             // HTML + inline driver. Each block records, via its placeholder ids,
             // exactly which islands it serve-wired.
             let reactive_blocks = match (renderer.as_ref(), self.reactive_project.as_ref()) {
-                (Some(runtime), Some(compiled)) => {
-                    runtime.build_reactive_blocks(compiled.as_ref())
-                }
+                (Some(runtime), Some(compiled)) => runtime.build_reactive_blocks(compiled.as_ref()),
                 _ => HashMap::new(),
             };
             // The placeholder ids each route already serve-wired — the A3 pass
@@ -949,7 +976,11 @@ impl AlbedoServerBuilder {
                 .map(|(path, block)| {
                     (
                         path.clone(),
-                        block.placeholders.iter().map(|(id, _)| id.clone()).collect(),
+                        block
+                            .placeholders
+                            .iter()
+                            .map(|(id, _)| id.clone())
+                            .collect(),
                     )
                 })
                 .collect();
@@ -1127,11 +1158,12 @@ impl AlbedoServerBuilder {
             dev_error_registry,
             dev_hmr_registry,
             request_timings: self.request_timings_enabled,
-            // FORGE — the cell is filled later, in the async `run()` boot seam
-            // (`build()` is synchronous and `open_local` is async). Carrying the
-            // builder's `Arc` here rather than a fresh one is what lets `run()`
-            // fill the very cell the action adapters already hold.
-            forge_substrate: self.forge_substrate,
+            // The same live bundle the adapters and streaming state hold. `run()`
+            // fills its substrate; `build()` (above) installed its projector.
+            // Carrying THIS instance — not a fresh one — is what lets a dev
+            // reload reuse it (via `with_live_runtime`) instead of stranding the
+            // hydrated topics and open subscribers.
+            live: self.live,
         };
 
         Ok(AlbedoServer {
@@ -1213,6 +1245,12 @@ impl AlbedoServer {
             world: self.state.world.clone(),
             hmr: self.state.dev_hmr_registry.clone(),
             errors: self.state.dev_error_registry.clone(),
+            // The running server's live singletons. Threading these into every
+            // rebuild is what makes a hot reload keep FORGE working: the fresh
+            // world reuses the hydrated broadcast registry (values + open
+            // subscribers) and the already-open substrate instead of stranding
+            // them behind a swapped-out world.
+            live: self.state.live.clone(),
             revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -1228,9 +1266,11 @@ impl AlbedoServer {
         {
             use dom_render_compiler::forge::{self, LibSqlSubstrate};
 
-            let opened = LibSqlSubstrate::open_local("forge.db").await.map_err(|err| {
-                RuntimeError::ServerStartup(format!("FORGE: failed to open forge.db: {err}"))
-            })?;
+            let opened = LibSqlSubstrate::open_local("forge.db")
+                .await
+                .map_err(|err| {
+                    RuntimeError::ServerStartup(format!("FORGE: failed to open forge.db: {err}"))
+                })?;
             let substrate: Arc<dyn forge::DataSubstrate> = Arc::new(opened);
 
             // Gate 1 — hand-authored schema, then materialise every
@@ -1254,8 +1294,10 @@ impl AlbedoServer {
 
             // Fill the cell every action adapter is already holding a clone of.
             // Before the listener binds, so no request can race an empty cell —
-            // and `set` cannot fail here (nothing else writes it).
-            let _ = self.state.forge_substrate.set(substrate);
+            // and `set` cannot fail here (nothing else writes it). Held on the
+            // persistent `LiveRuntime`, so a later dev reload reuses this exact
+            // handle rather than reopening the database or serving an empty one.
+            let _ = self.state.live.forge_substrate.set(substrate);
             info!("FORGE substrate opened (forge.db); topics hydrated; writes enabled");
         }
 
@@ -1336,6 +1378,9 @@ pub struct DevReloadHandle {
     world: Arc<RwLock<Arc<RenderWorld>>>,
     hmr: Option<crate::dev::SharedHmrRegistry>,
     errors: Option<crate::dev::SharedErrorRegistry>,
+    /// The running server's live singletons, threaded into every rebuild so a
+    /// hot reload swaps *build output* without discarding *live state*.
+    live: LiveRuntime,
     revision: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -1350,10 +1395,19 @@ impl DevReloadHandle {
     /// state, slot store — all built together), so grafting it on is trivially
     /// consistent; the fresh server's own dev registries are dropped and the
     /// persistent ones this handle holds carry the SSE streams across the swap.
+    ///
+    /// The rebuild is threaded the running server's [`LiveRuntime`], so the
+    /// fresh world's adapters, streaming state, and topic pre-registration all
+    /// resolve against the SAME broadcast registry (keeping hydrated topic
+    /// values and open subscribers) and the SAME already-open FORGE substrate.
+    /// Without this, every hot reload minted an empty registry + unfilled
+    /// substrate cell — the guestbook rendered nothing and `append()` failed
+    /// after the first save.
     pub fn reload(&self, opts: &crate::boot::ProductionServerOptions) -> Result<(), RuntimeError> {
-        let fresh = crate::boot::boot_production_server(opts).inspect_err(|err| {
-            self.report_build_error(err.to_string());
-        })?;
+        let fresh = crate::boot::boot_production_server_reusing(opts, self.live.clone())
+            .inspect_err(|err| {
+                self.report_build_error(err.to_string());
+            })?;
         let new_world = fresh.state.world();
         *self.world.write().expect("render world lock poisoned") = new_world;
 
@@ -1447,30 +1501,38 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     // resolves it through the same router and manifest the render used, and
     // the client never gets to name a topic itself.
     if path == "/_albedo/patches" {
-        let response = if let Some(streaming_runtime) = &world.streaming_runtime {
-            let page_path = crate::routing::parse_query_string(query.as_deref())
-                .get("p")
-                .and_then(|values| values.first().cloned())
-                .unwrap_or_else(|| "/".to_string());
-            let topics = resolve_route_topics(&world, streaming_runtime, page_path.as_str());
-            match streaming_runtime.broadcast() {
-                Some(broadcast) => {
-                    crate::handlers::serve_patch_stream(broadcast.clone(), &topics).into_response()
+        // `Last-Event-ID` is the browser's own reconnect marker: EventSource
+        // echoes the id of the last event it saw. Its presence is how this
+        // distinguishes a client coming BACK (which may have missed deltas
+        // while disconnected, and whose keyed lists a plain `SlotSet` seed
+        // cannot repair) from one connecting for the first time (whose rows
+        // are already in the HTML that just rendered).
+        let reconnecting = request.headers().contains_key("last-event-id");
+        let response = match &world.streaming_runtime {
+            Some(streaming_runtime) => {
+                let page_path = crate::routing::parse_query_string(query.as_deref())
+                    .get("p")
+                    .and_then(|values| values.first().cloned())
+                    .unwrap_or_else(|| "/".to_string());
+                let topics = resolve_route_topics(&world, streaming_runtime, page_path.as_str());
+                // Only a reconnect needs a resync, and only the current
+                // projector can produce it. Cloned out of the live slot into an
+                // owned local so the borrow survives the `.await` below without
+                // holding the lock.
+                let projector_arc = reconnecting.then(|| state.live.projector()).flatten();
+                let projector = projector_arc.as_deref();
+                match streaming_runtime.broadcast() {
+                    Some(broadcast) => {
+                        crate::handlers::serve_patch_stream(broadcast.clone(), &topics, projector)
+                            .await
+                            .into_response()
+                    }
+                    // No registry wired: nothing can ever publish, so an empty
+                    // stream is the truthful answer, not an error.
+                    None => empty_patch_stream().await,
                 }
-                // No registry wired: nothing can ever publish, so an empty
-                // stream is the truthful answer, not an error.
-                None => crate::handlers::serve_patch_stream(
-                    Arc::new(dom_render_compiler::runtime::BroadcastRegistry::new()),
-                    &[],
-                )
-                .into_response(),
             }
-        } else {
-            crate::handlers::serve_patch_stream(
-                Arc::new(dom_render_compiler::runtime::BroadcastRegistry::new()),
-                &[],
-            )
-            .into_response()
+            None => empty_patch_stream().await,
         };
         if state.request_timings {
             crate::timing::print_request(method.as_str(), &path, started.elapsed());
@@ -1813,6 +1875,19 @@ async fn execute_route(
 
     Ok(response)
 }
+/// A valid patches stream that will never carry anything — the answer when no
+/// broadcast registry is wired, so the client's lane stays unconditional
+/// instead of having a failure branch that only appears in some builds.
+async fn empty_patch_stream() -> axum::response::Response<axum::body::Body> {
+    crate::handlers::serve_patch_stream(
+        Arc::new(dom_render_compiler::runtime::BroadcastRegistry::new()),
+        &[],
+        None,
+    )
+    .await
+    .into_response()
+}
+
 /// The broadcast topics the page at `page_path` reads.
 ///
 /// Resolves the concrete path to its manifest key exactly as the render path

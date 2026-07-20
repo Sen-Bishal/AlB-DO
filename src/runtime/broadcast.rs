@@ -455,13 +455,31 @@ impl BroadcastRegistry {
         Ok(report)
     }
 
-    /// Push one encoded frame to every subscriber of `topic_entry`, pruning
+    /// Push one encoded frame to every subscriber of `topic_entry`, dropping
     /// the sessions whose sink refused it.
     ///
     /// Called with the topic's value lock held (see the module docs on
     /// ordering). Nothing in here blocks: `try_send` is non-blocking by
     /// construction, and the pruning touches only `DashMap`s that no write
     /// path locks the value under.
+    ///
+    /// # A refused send drops the whole session, not one subscription
+    ///
+    /// A full or closed channel is a statement about the session's *sink*, not
+    /// about this topic — the sink is shared by every topic that session reads.
+    /// Removing it from only the topic that noticed leaves the other topics
+    /// holding live clones of the same sender, which is worse than it sounds:
+    /// the channel never closes, so the transport never ends, so the client is
+    /// never told anything went wrong. It keeps receiving updates for its
+    /// quieter topics while silently missing every one on the busy topic —
+    /// stale in a way no reload-free interaction can correct, and invisible in
+    /// logs because from the server's side delivery keeps succeeding.
+    ///
+    /// Dropping the session everywhere makes the failure loud instead: the last
+    /// sender clone goes, the channel closes, the transport's stream ends, and
+    /// the client reconnects and re-subscribes from current state. The cost of
+    /// being wrong in this direction is one reconnect; the cost of being wrong
+    /// in the other is a page that lies.
     fn fan_out(
         &self,
         topic: &str,
@@ -487,10 +505,16 @@ impl BroadcastRegistry {
         }
 
         for session in to_remove {
+            // Remove from this topic first: `cleanup_session` walks the reverse
+            // index, and this topic's entry there is what points back here.
             topic_entry.subscribers.remove(&session);
             if let Some(mut topics) = self.by_session.get_mut(&session) {
                 topics.remove(topic);
             }
+            // …then everywhere else, so the session's sink is fully released
+            // and its channel actually closes. Takes no value locks, so it
+            // cannot deadlock against the one held across this call.
+            self.cleanup_session(session);
         }
 
         report
@@ -783,6 +807,42 @@ mod tests {
         // Slow session is no longer in the subscriber table.
         let topic = registry.get("hot").unwrap();
         assert_eq!(topic.subscriber_count(), 1);
+    }
+
+    /// The backpressure-recovery invariant. A session subscribed to two topics
+    /// whose sink fills up must lose BOTH subscriptions, so the last sender
+    /// clone drops and its channel closes — that closure is the only signal
+    /// the transport has that this client needs to reconnect. Leave the quiet
+    /// topic's clone alive and the channel stays open forever: the client goes
+    /// on receiving that topic's updates while silently missing every one on
+    /// the busy topic.
+    #[tokio::test]
+    async fn a_refused_send_drops_the_sessions_whole_subscription_so_its_channel_closes() {
+        let registry = BroadcastRegistry::new();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        let session = SessionId::random();
+        let _ = registry.auto_subscribe(session, tx, &["busy".to_string(), "quiet".to_string()]);
+        assert_eq!(registry.get("quiet").unwrap().subscriber_count(), 1);
+
+        // Fill the sink, then write to just ONE of the two topics.
+        registry.write_topic("busy", b"fills-the-channel".to_vec()).unwrap();
+        let report = registry.write_topic("busy", b"refused".to_vec()).unwrap();
+        assert_eq!(report.dropped_full, vec![session]);
+
+        assert_eq!(
+            registry.get("quiet").unwrap().subscriber_count(),
+            0,
+            "the untouched topic must release the same broken sink"
+        );
+        assert!(!registry.by_session.contains_key(&session), "reverse index pruned");
+
+        // Draining what was buffered must then see the channel CLOSED, which is
+        // what ends the SSE stream and triggers the client's reconnect.
+        while rx.try_recv().is_ok() {}
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "every sender clone must be gone, or the client is never told to reconnect"
+        );
     }
 
     #[tokio::test]
