@@ -151,6 +151,12 @@ pub struct ListBindingRaw {
     pub index_param: Option<String>,
     /// The arrow body: the per-item JSX element/fragment to template.
     pub item_body: swc_ecma_ast::Expr,
+    /// The item's `key={…}` expression, when the root is a single host element
+    /// carrying an explicit key. `Some` selects the **keyed reconcile lane**
+    /// (`data-albedo-key` + `SetListRef` + `ReconcileList`); `None` keeps the
+    /// coarse `.map().join('')` innerHTML tier — the correct tier for keyless /
+    /// fragment-root lists, where index-keying would mis-reconcile a reorder.
+    pub key_expr: Option<swc_ecma_ast::Expr>,
 }
 
 thread_local! {
@@ -492,6 +498,35 @@ fn classify_jsx_list(expr: &swc_ecma_ast::Expr) -> Option<JsxList<'_>> {
         index_param,
         body,
     })
+}
+
+/// Extract a list item's `key={EXPR}` expression, when the item body is a
+/// single host `JSXElement` carrying an explicit key. Returns `None` for a
+/// keyless item or a fragment root — those stay on the coarse innerHTML tier
+/// (see [`ListBindingRaw::key_expr`]). Bare `key="literal"` is skipped: a static
+/// key can't distinguish rows, so it isn't a usable reconciliation identity.
+fn extract_list_key_expr(body: &swc_ecma_ast::Expr) -> Option<swc_ecma_ast::Expr> {
+    use swc_ecma_ast::{Expr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXExpr};
+    let Expr::JSXElement(el) = unwrap_paren(body) else {
+        return None;
+    };
+    for attr in &el.opening.attrs {
+        let JSXAttrOrSpread::JSXAttr(jsx_attr) = attr else {
+            continue;
+        };
+        let JSXAttrName::Ident(name) = &jsx_attr.name else {
+            continue;
+        };
+        if name.sym.as_ref() != "key" {
+            continue;
+        }
+        if let Some(JSXAttrValue::JSXExprContainer(container)) = &jsx_attr.value {
+            if let JSXExpr::Expr(expr) = &container.expr {
+                return Some((**expr).clone());
+            }
+        }
+    }
+    None
 }
 
 /// True when a per-item JSX subtree is *static relative to the item*: host
@@ -3843,10 +3878,16 @@ impl ComponentProject {
         let deps = phase_k_collect_slot_deps(list.array);
         let item_static =
             is_static_list_item(list.body, &list.item_param, list.index_param.as_deref());
+        // An explicit `key={…}` on a single host-element item selects the keyed
+        // reconcile lane; else the coarse innerHTML tier renders unchanged.
+        let key_expr = extract_list_key_expr(list.body);
 
         // SSR first paint: evaluate the array and render each item with the item
         // (and index) param bound. This is the markup shipped for no-JS / before
-        // the client boots; on boot the driver recomputes and replaces it.
+        // the client boots; on boot the driver recomputes and reconciles it. On
+        // the keyed lane, each row's `key={…}` is stamped as `data-albedo-key` by
+        // `render_attrs` as the row renders, so the client sink seeds its row map
+        // from the SSR rows rather than duplicating them — no separate stamp here.
         let array_value = self.eval_expr(module_spec, list.array, env)?;
         let mut inner = String::new();
         if let Value::Array(items) = &array_value {
@@ -3882,6 +3923,7 @@ impl ComponentProject {
             item_param: list.item_param.clone(),
             index_param: list.index_param.clone(),
             item_body: list.body.clone(),
+            key_expr,
         });
         Ok(())
     }

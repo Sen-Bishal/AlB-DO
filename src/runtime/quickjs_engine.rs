@@ -872,8 +872,25 @@ if (typeof globalThis.h !== 'function') {
     const safeProps = props || {};
     const formAction = __albedo_form_action_name(type, safeProps);
     for (const key in safeProps) {
-      if (!Object.prototype.hasOwnProperty.call(safeProps, key)
-          || __albedo_is_reserved_prop(key)) {
+      if (!Object.prototype.hasOwnProperty.call(safeProps, key)) {
+        continue;
+      }
+      // React's `key` is not an HTML attribute, but it IS the delta sink's
+      // reconciliation identity. Stamp it as `data-albedo-key` so a keyed list's
+      // Tier-B rows can be reconciled by the client sink — the QuickJS mirror of
+      // Phase-K's `stamp_row_key`. `ref`/`children` stay stripped: they carry no
+      // identity. (This is a deliberate, list-scoped divergence from the plain
+      // `is_reserved_jsx_prop` strip; a stray non-list `key` just yields an inert
+      // attribute.)
+      if (key === 'key') {
+        const keyVal = safeProps.key;
+        if (keyVal !== false && keyVal !== null
+            && typeof keyVal !== 'undefined' && typeof keyVal !== 'function') {
+          attrs += ' data-albedo-key="' + __albedo_escape_html(keyVal) + '"';
+        }
+        continue;
+      }
+      if (__albedo_is_reserved_prop(key)) {
         continue;
       }
       // The sentinel `action` attribute is consumed by the rewrite below and
@@ -1792,6 +1809,12 @@ fn transpile_module_source_for_quickjs(specifier: &str, source: &str) -> Runtime
         module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
         module.visit_mut_with(&mut strip_type());
 
+        // B2 · stamp `{sharedSlot.map(...)}` containers with
+        // `data-albedo-list-slot="topic"` while the tree is still JSX, so the
+        // client sink can register the list as a keyed-list anchor bound to the
+        // broadcast topic (the seam a FORGE write's `SlotDelta` fans into).
+        crate::transforms::shared_slot_lists::mark_shared_slot_lists(&mut module);
+
         let mut jsx_options = JsxOptions::default();
         jsx_options.runtime = Some(JsxRuntime::Classic);
         jsx_options.pragma = Some("h".to_string());
@@ -2333,6 +2356,48 @@ mod tests {
         assert!(!compiled.contains("<main>"));
         assert!(!compiled.contains(": string"));
         assert!(!compiled.contains(" as string"));
+    }
+
+    /// B2 · the container of a `{sharedSlot.map(...)}` is stamped with
+    /// `data-albedo-list-slot="topic"` so the client can register it as a keyed
+    /// list anchor bound to the broadcast topic.
+    #[test]
+    fn shared_slot_list_container_is_stamped_with_list_slot_attr() {
+        let source = r#"
+            import { useSharedSlot } from "albedo";
+            export default function Guestbook() {
+                const entries = useSharedSlot("guestbook");
+                return (
+                    <ul className="entries">
+                        {entries.map((entry) => (
+                            <li key={entry.id}>{entry.author}</li>
+                        ))}
+                    </ul>
+                );
+            }
+        "#;
+        let compiled = compile_module_script_for_quickjs("routes/index.tsx", source).unwrap();
+        assert!(
+            compiled.contains("data-albedo-list-slot") && compiled.contains("guestbook"),
+            "the shared-slot list container must carry data-albedo-list-slot=\"guestbook\"; got: {compiled}"
+        );
+    }
+
+    /// A `.map()` over a plain local array is NOT a shared-slot list, so its
+    /// container must not be stamped — the anchor is only for topic-fed lists.
+    #[test]
+    fn non_shared_slot_list_is_not_stamped() {
+        let source = r#"
+            export default function List() {
+                const items = [{ id: 1 }, { id: 2 }];
+                return <ul>{items.map((item) => <li key={item.id}>{item.id}</li>)}</ul>;
+            }
+        "#;
+        let compiled = compile_module_script_for_quickjs("routes/list.tsx", source).unwrap();
+        assert!(
+            !compiled.contains("data-albedo-list-slot"),
+            "a plain local list must not be stamped; got: {compiled}"
+        );
     }
 
     #[test]
@@ -2948,12 +3013,12 @@ mod tests {
         assert_eq!(plain.html, "<span></span>");
     }
 
-    /// `key` is React's reconciliation identity, not data about the element, and
-    /// it is not a valid HTML attribute — React strips it. This shim used to
-    /// emit it verbatim, so every keyed list row shipped `key="1"` to the
-    /// browser. `className` is asserted alongside it to prove the guard removes
-    /// only the reserved prop and leaves real attributes (and their rename)
-    /// alone.
+    /// `key` is React's reconciliation identity, not a valid raw HTML attribute
+    /// — it must never ship as `key="1"`. But it IS the delta sink's row
+    /// identity, so the shim stamps it as `data-albedo-key` (the QuickJS mirror
+    /// of Phase-K's `stamp_row_key`), letting a Tier-B keyed list reconcile.
+    /// `className` is asserted alongside to prove real attributes (and their
+    /// rename) are untouched.
     #[test]
     fn reserved_props_never_reach_the_rendered_html() {
         use super::QuickJsEngine;
@@ -2983,13 +3048,15 @@ mod tests {
             .expect("list render");
 
         assert!(
-            !out.html.contains("key="),
-            "`key` must not be emitted as an HTML attribute, got: {}",
+            !out.html.contains(" key=\""),
+            "raw React `key` must not be emitted as an HTML attribute, got: {}",
             out.html
         );
         assert_eq!(
             out.html,
-            "<ul class=\"entries\"><li class=\"entry\">first</li><li class=\"entry\">second</li></ul>",
+            "<ul class=\"entries\">\
+             <li class=\"entry\" data-albedo-key=\"7\">first</li>\
+             <li class=\"entry\" data-albedo-key=\"8\">second</li></ul>",
         );
     }
 

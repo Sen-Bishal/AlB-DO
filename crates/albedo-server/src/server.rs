@@ -80,6 +80,16 @@ struct CompiledProjectActionAdapter {
     /// compiles without `--features forge`. It simply stays empty there, and an
     /// `append()` reports that rather than pretending to write.
     forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
+    /// S4 · the render path's row projector, used to turn a post-commit
+    /// collection into the rows a `SlotDelta` carries.
+    ///
+    /// `OnceLock` for the same boot-ordering reason as `forge_substrate`, one
+    /// step later in the sequence: adapters are built during
+    /// `register_compiled_project`, while the Tier-B render plan this projector
+    /// needs is only assembled in `build()`. Left empty — no renderer, no pool,
+    /// no plan — the write path simply fans out snapshots, exactly as it did
+    /// before the delta lane existed.
+    row_projector: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::RowProjector>>>,
 }
 
 #[async_trait::async_trait]
@@ -155,6 +165,10 @@ impl ActionHandler for CompiledProjectActionAdapter {
                     substrate.as_ref(),
                     self.broadcast.as_ref(),
                     &writes,
+                    // S4 · the render path's row projector, when a pooled
+                    // Tier-B renderer was installed at boot. Absent (no
+                    // renderer/pool) the fan-out is snapshot-only.
+                    self.row_projector.get().map(AsRef::as_ref),
                 )
                 .await
                 .map_err(|err| {
@@ -193,6 +207,8 @@ impl ActionHandler for CompiledProjectActionAdapter {
                 substrate.as_ref(),
                 self.broadcast.as_ref(),
                 &writes,
+                // S4 · see the QuickJS path above.
+                self.row_projector.get().map(AsRef::as_ref),
             )
             .await
             .map_err(|err| {
@@ -401,6 +417,11 @@ pub struct AlbedoServerBuilder {
     /// and `run()` fills it before the listener binds. Cloning the `Arc` at
     /// adapter-construction time is what lets a later write find the backend.
     forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
+    /// S4 · minted here for the same boot-ordering reason as `forge_substrate`,
+    /// filled in `build()` once the Tier-B render plan exists. Adapters clone
+    /// the `Arc` at construction time, so a write dispatched later finds the
+    /// projector even though it did not exist when the adapter was built.
+    row_projector: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::RowProjector>>>,
     /// A1 · optional pool of warmed QuickJS engines. When set (via
     /// [`Self::with_quickjs_action_engine_pool`]), every adapter built by a
     /// *subsequent* [`Self::register_compiled_project`] runs its action bodies
@@ -444,6 +465,9 @@ impl AlbedoServerBuilder {
             broadcast: Arc::new(BroadcastRegistry::new()),
             // FORGE · minted empty; `run()` fills it once the substrate opens.
             forge_substrate: Arc::new(std::sync::OnceLock::new()),
+            // S4 · minted empty; `build()` fills it when a pooled Tier-B
+            // renderer exists to project rows with.
+            row_projector: Arc::new(std::sync::OnceLock::new()),
             // A1 · off by default — opt in via `with_quickjs_action_engine_pool`.
             action_engine_pool: None,
             // Step 3 · set by `register_compiled_project`.
@@ -611,6 +635,9 @@ impl AlbedoServerBuilder {
                 // FORGE · the same `Arc` `run()` will fill, so an adapter built
                 // now can still find the substrate opened later.
                 forge_substrate: self.forge_substrate.clone(),
+                // S4 · likewise filled in `build()`; empty means snapshot-only
+                // fan-out, which is the pre-delta behaviour.
+                row_projector: self.row_projector.clone(),
             };
             self.action_handlers.insert(proxy_id, Arc::new(adapter));
         }
@@ -845,6 +872,19 @@ impl AlbedoServerBuilder {
                 .as_deref()
                 .map(|project| project.form_error_span_seed())
                 .unwrap_or_default();
+            // S4 · the same pool, plan and error spans back FORGE's row
+            // projector, so a delta's row markup comes off the identical
+            // template and engine a request would render it with. Installed
+            // here rather than in `register_compiled_project` because the plan
+            // does not exist until now; the adapters already hold this cell.
+            let _ = self
+                .row_projector
+                .set(Arc::new(crate::render::PooledRowProjector::new(
+                    pool.clone(),
+                    plan.clone(),
+                    form_error_spans.clone(),
+                )));
+
             services.registry = Arc::new(PooledTierBRenderRegistry::new(
                 pool.clone(),
                 plan,
@@ -1399,6 +1439,45 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
         }
     }
 
+    // S4 · the patches lane. A page on the SSE transport has no WebTransport
+    // session, and `auto_subscribe` used to live only on the WT connect path —
+    // so a broadcast write reached zero subscribers and the open page went
+    // stale until a reload. This subscribes the connection to exactly the
+    // topics ITS route declares: the client sends the page path, the server
+    // resolves it through the same router and manifest the render used, and
+    // the client never gets to name a topic itself.
+    if path == "/_albedo/patches" {
+        let response = if let Some(streaming_runtime) = &world.streaming_runtime {
+            let page_path = crate::routing::parse_query_string(query.as_deref())
+                .get("p")
+                .and_then(|values| values.first().cloned())
+                .unwrap_or_else(|| "/".to_string());
+            let topics = resolve_route_topics(&world, streaming_runtime, page_path.as_str());
+            match streaming_runtime.broadcast() {
+                Some(broadcast) => {
+                    crate::handlers::serve_patch_stream(broadcast.clone(), &topics).into_response()
+                }
+                // No registry wired: nothing can ever publish, so an empty
+                // stream is the truthful answer, not an error.
+                None => crate::handlers::serve_patch_stream(
+                    Arc::new(dom_render_compiler::runtime::BroadcastRegistry::new()),
+                    &[],
+                )
+                .into_response(),
+            }
+        } else {
+            crate::handlers::serve_patch_stream(
+                Arc::new(dom_render_compiler::runtime::BroadcastRegistry::new()),
+                &[],
+            )
+            .into_response()
+        };
+        if state.request_timings {
+            crate::timing::print_request(method.as_str(), &path, started.elapsed());
+        }
+        return response;
+    }
+
     if inspector_routes::matches_inspector_path(path.as_str()) {
         if let Some(inspector) = &state.inspector {
             return inspector_routes::dispatch(inspector, path.as_str()).into_response();
@@ -1734,6 +1813,35 @@ async fn execute_route(
 
     Ok(response)
 }
+/// The broadcast topics the page at `page_path` reads.
+///
+/// Resolves the concrete path to its manifest key exactly as the render path
+/// does — router match, then `entry_module` as the pattern (`/essays/[slug]`)
+/// — so a dynamic route's patches lane subscribes to the same topics its HTML
+/// was rendered from. An unmatched path yields no topics rather than an error:
+/// the client opens this lane unconditionally, and a page that turns out to
+/// read nothing should get a quiet empty stream.
+fn resolve_route_topics(
+    world: &RenderWorld,
+    streaming: &Arc<StreamingAppState>,
+    page_path: &str,
+) -> Vec<String> {
+    let RouteMatch::Matched(matched) = world.router.match_route(HttpMethod::Get, page_path) else {
+        return Vec::new();
+    };
+    let pattern = matched
+        .target
+        .entry_module
+        .clone()
+        .unwrap_or_else(|| page_path.to_string());
+    streaming
+        .manifest
+        .routes
+        .get(pattern.as_str())
+        .map(|route| route.shared_slot_topics.clone())
+        .unwrap_or_default()
+}
+
 fn should_use_manifest_streaming(
     world: &RenderWorld,
     target: &RouteTarget,

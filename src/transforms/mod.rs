@@ -26,6 +26,7 @@ pub mod events;
 pub mod form;
 pub mod hooks;
 pub mod link;
+pub mod shared_slot_lists;
 pub mod shared_slots;
 
 pub use actions::{extract_action_declarations, ActionDeclaration, ActionExtractError};

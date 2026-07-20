@@ -169,6 +169,20 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
         if name.starts_with("on") {
             continue;
         }
+        if name == "key" {
+            // React's `key` is not a raw HTML attribute, but it IS the delta
+            // sink's reconciliation identity — stamp it as `data-albedo-key` so a
+            // keyed list's server-rendered rows can be key-reconciled by the
+            // client. This is the single SSR stamp point (both the Tier-C local
+            // lane and the Tier-B/broadcast lane render host elements through
+            // here); the QuickJS `h` shim mirrors it. `ref`/`children` still carry
+            // no identity and stay stripped below.
+            let text = value_to_string(value);
+            if !text.is_empty() {
+                out.push(format!("data-albedo-key=\"{}\"", escape_attr(&text)));
+            }
+            continue;
+        }
         if is_reserved_jsx_prop(name) {
             continue;
         }
@@ -412,13 +426,14 @@ mod tests {
         (name.to_string(), Value::String(value.to_string()))
     }
 
-    /// The leak this guard exists to stop: `key` reached the browser as
-    /// `<li class="entry" key="1">`. It is React's reconciliation identity, not
-    /// data about the element, and not a valid HTML attribute.
+    /// `key` must never reach the browser as a raw `key="1"` attribute — but it
+    /// IS the delta sink's reconciliation identity, so it is stamped as
+    /// `data-albedo-key` (the single SSR stamp point; the QuickJS `h` shim
+    /// mirrors it). This is what lets a keyed list's rows be key-reconciled.
     #[test]
-    fn render_attrs_drops_the_key_prop() {
+    fn render_attrs_stamps_key_as_data_albedo_key() {
         let html = render_attrs(&[attr("className", "entry"), attr("key", "1")]);
-        assert_eq!(html, "class=\"entry\"");
+        assert_eq!(html, "class=\"entry\" data-albedo-key=\"1\"");
     }
 
     #[test]

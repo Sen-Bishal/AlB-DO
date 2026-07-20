@@ -42,8 +42,11 @@
  * decoders that don't see the new opcode, but a strict version check
  * here prevents a stale client from quietly choking when a v2 server
  * starts emitting Navigate.
+ *
+ * v2 → v3: engine-expansion S2 added `Instruction::SlotDelta { slot_id,
+ * changes }` at variant index 15 — the z-set delta primitive.
  */
-export const LOCKED_WIRE_VERSION = 2;
+export const LOCKED_WIRE_VERSION = 3;
 
 /**
  * Symbolic names for each `InternTableKind`, indexed by the wire's
@@ -72,6 +75,7 @@ export const INSTRUCTION_NAMES = Object.freeze([
   'SetAttrRef',         // 12
   'SlotSet',            // 13
   'Navigate',           // 14 (v2)
+  'SlotDelta',          // 15 (v3)
 ]);
 
 /**
@@ -208,6 +212,24 @@ export class BincodeReader {
    */
   readVarintU64() {
     return this._readVarintAsBigInt();
+  }
+
+  /**
+   * Reads a variable-length SIGNED integer in `i32` range. bincode encodes
+   * signed varints with zig-zag first (so small-magnitude negatives stay
+   * one byte), then as an unsigned varint. Un-zig-zag: `(u >>> 1) ^ -(u & 1)`.
+   * The only i32 field on the wire is `SlotChange.weight`.
+   */
+  readVarintI32() {
+    const value = this._readVarintAsBigInt();
+    if (value > 0xffffffffn) {
+      throw new BakaboxWireError(
+        `zig-zag varint ${value} exceeds i32 range`,
+        this.offset,
+      );
+    }
+    const u = Number(value);
+    return (u >>> 1) ^ -(u & 1);
   }
 
   /** Internal — decodes the bincode v2 varint marker scheme. */
@@ -371,6 +393,20 @@ function readInternPatchOp(r) {
   }
 }
 
+/**
+ * Reads one `SlotChange { weight: i32, key: RowKey(String), payload: Vec<u8> }`.
+ * `RowKey` is a newtype over `String`, so bincode encodes it transparently as
+ * the inner string. `key` becomes the JS map key the sink reconciles on;
+ * `payload` is a zero-copy byte slice (the row's rendered markup).
+ */
+function readSlotChange(r) {
+  return {
+    weight: r.readVarintI32(),
+    key: r.readString(),
+    payload: r.readByteSlice(),
+  };
+}
+
 /** Reads an `InstructionRange { start: u32, end: u32 }`. */
 function readInstructionRange(r) {
   const start = r.readVarintU32();
@@ -490,6 +526,13 @@ const INSTRUCTION_READERS = Object.freeze([
 
   // 14 (v2): Navigate { url: String }
   (r) => ({ op: 'Navigate', url: r.readString() }),
+
+  // 15 (v3): SlotDelta { slot_id, changes: Vec<SlotChange> }
+  (r) => ({
+    op: 'SlotDelta',
+    slotId: r.readVarintU32(),
+    changes: r.readVec(readSlotChange),
+  }),
 ]);
 
 /**

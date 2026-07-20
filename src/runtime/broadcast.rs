@@ -13,18 +13,63 @@
 //!
 //! - **Topics, not sessions.** A topic (`"chat:room-42"`) is global.
 //!   Sessions subscribe to topics, not the other way round.
-//! - **Wire reuse, no version bump.** Fan-out emits the existing
-//!   `Instruction::SlotSet` opcode wrapped in an `OpcodeFrame`. The
-//!   client can't tell whether a SlotSet came from a per-session
-//!   write or a broadcast — it just applies the value to the slot.
-//!   `LOCKED_WIRE_VERSION` stays at 2.
+//! - **Wire reuse.** Fan-out emits `Instruction::SlotSet` wrapped in an
+//!   `OpcodeFrame`; the client can't tell whether a SlotSet came from a
+//!   per-session write or a broadcast — it just applies the value to
+//!   the slot. Since S4 a fan-out MAY carry a second instruction, see
+//!   the delta lane below.
 //! - **Deterministic slot IDs.** A topic string hashes (FNV-1a-32 of
 //!   `"broadcast::{topic}"`) to its `SlotId`. The `"broadcast::"`
 //!   prefix avoids collision with Phase K's per-session slot IDs
 //!   (`"{module}::{fn}#{idx}"`).
 //! - **Server-side state, dumb client.** Subscriptions live on the
-//!   server. The bakabox runtime just receives opcodes on the
-//!   patches lane — same dispatch as any other patch.
+//!   server. The bakabox runtime just receives opcodes on the patches
+//!   lane — same dispatch as any other patch.
+//!
+//! ## S4 · the delta lane
+//!
+//! [`BroadcastRegistry::write_topic_delta`] is the second write path:
+//! the same topic transition expressed *twice* in one frame —
+//! `SlotSet` (the authoritative post-write snapshot) followed by
+//! `SlotDelta` (the z-set describing what changed). Both are needed,
+//! and the order is load-bearing:
+//!
+//! - `SlotSet` keeps every **value** consumer of the topic correct —
+//!   scalar bind sites, coarse `html`-tier bindings, aggregations —
+//!   without each of them having to understand rows.
+//! - `SlotDelta` drives the **keyed-list** sink, which `SlotSet` cannot
+//!   reach: a broadcast list anchor (the Tier-B `<ul>` the B2 pass
+//!   stamped) carries no bind site, so a snapshot alone would leave it
+//!   painted with pre-write rows until a reload.
+//!
+//! The two sinks are disjoint (`bindings` vs `listSlots`), so a
+//! consumer never applies the same change twice; delta-last means a
+//! list anchor that *was* rebuilt by a coarse `html` site is
+//! reconciled against its fresh DOM, not a detached one.
+//!
+//! ## Ordering (why the value mutex is held across fan-out)
+//!
+//! A `SlotSet` is last-write-wins: reorder two of them and the topic
+//! still converges. A `SlotDelta` is **not** self-healing — it is a
+//! function of the state it was computed against, so a delta that
+//! reaches a client out of order corrupts that client's list until it
+//! reloads. The topic's value mutex is therefore the topic's
+//! *linearization lock*: a write holds it across
+//! read-prev → compute → store → encode → fan-out, and a subscribe
+//! holds it across register-sink → read-snapshot. That buys three
+//! invariants worth the (uncontended, non-blocking) cost:
+//!
+//! 1. A delta is always computed against the state the *previous*
+//!    fanned-out delta produced — writers serialize per topic.
+//! 2. Delivery order equals lock order, so `apply(Δ₁..Δₙ) == stored
+//!    value` holds for every subscriber.
+//! 3. A joining session's snapshot is either strictly before or
+//!    strictly after a write, never interleaved with it — so it can
+//!    never apply a delta already folded into its snapshot, nor miss
+//!    one that isn't.
+//!
+//! Fan-out under the lock is `try_send` only — no I/O, no `.await` —
+//! and the lock is per topic, so unrelated topics never contend.
 //!
 //! ## Backpressure policy
 //!
@@ -47,14 +92,15 @@
 //! removes that session from each topic's subscriber map. Call it
 //! from the WT session-drop hook.
 
-use crate::ir::opcode::{Instruction, OpcodeFrame, SlotId};
+use crate::ir::opcode::{Instruction, OpcodeFrame, RowKey, SlotChange, SlotId};
 use crate::ir::wire::{encode_frame, WireError};
 use crate::runtime::eval::component::fnv1a_32;
 use crate::runtime::session::SessionId;
 use dashmap::DashMap;
+use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::mpsc;
 
 /// Subscriber sink. Each session registers one of these per topic;
@@ -74,10 +120,15 @@ pub struct BroadcastTopic {
     /// Wire-level slot id. Derived once from `name` via
     /// [`broadcast_slot_id`]; stable across processes.
     slot_id: SlotId,
-    /// Current value. Late subscribers read this so they don't
-    /// render an empty topic on first paint. `Mutex<Vec<u8>>` rather
-    /// than `RwLock` because writes are common and the read path
-    /// already clones the bytes out before doing anything else.
+    /// Current value, and — since S4 — the topic's **linearization
+    /// lock**. Late subscribers read it so they don't render an empty
+    /// topic on first paint; writers hold it across the whole
+    /// compute → store → fan-out sequence so delta order on the wire
+    /// matches the order the value moved through (see the module
+    /// docs). `Mutex<Vec<u8>>` rather than `RwLock` because writes are
+    /// common and the read path already clones the bytes out before
+    /// doing anything else — and because a shared read lock could not
+    /// serialize writers, which is the whole point.
     value: Mutex<Vec<u8>>,
     /// Subscribed sessions. `DashMap` so an in-progress write iterating
     /// subscribers doesn't block a fresh subscribe on the same topic.
@@ -97,15 +148,50 @@ impl BroadcastTopic {
     /// session to render the initial state without waiting for the
     /// next write.
     pub fn current_value(&self) -> Vec<u8> {
-        self.value
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+        self.lock_value().clone()
     }
 
     pub fn subscriber_count(&self) -> usize {
         self.subscribers.len()
     }
+
+    /// Take the topic's linearization lock, **recovering from poison**.
+    ///
+    /// A poisoned mutex here means some other thread panicked while
+    /// holding it. The protected datum is a plain `Vec<u8>` that is
+    /// always replaced wholesale, so it cannot be left half-updated —
+    /// there is no torn state to protect anyone from. Propagating the
+    /// poison instead (or, as this path used to, silently skipping the
+    /// write on `Err`) would turn one unrelated panic into a topic
+    /// that accepts writes and never delivers them: a permanently
+    /// stale page with no error anywhere.
+    fn lock_value(&self) -> MutexGuard<'_, Vec<u8>> {
+        self.value.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The post-write state of a topic, as produced by the closure passed to
+/// [`BroadcastRegistry::write_topic_delta`]: the authoritative snapshot and
+/// the z-set delta that carries the same transition incrementally.
+///
+/// Both describe *one* transition and must agree — the standing oracle is
+/// `apply(previous, changes) == value`. The registry cannot check that
+/// (it has no row model; rendering rows is a view concern), so the caller
+/// that computes both is responsible for deriving them from the same
+/// pre-state. That is exactly why this arrives as a closure over the
+/// previous bytes rather than as two loose arguments: the read of the
+/// pre-state and the write of the post-state happen inside one critical
+/// section, so a concurrent writer cannot slip between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicTransition {
+    /// Authoritative post-write bytes. Becomes the topic's stored value and
+    /// ships as `SlotSet` — the truth a reload, a late joiner, or a coarse
+    /// value binding sees.
+    pub value: Vec<u8>,
+    /// The same transition as signed row changes. Ships as `SlotDelta`.
+    /// Empty means "nothing row-shaped changed", and the frame degenerates
+    /// to a plain `SlotSet`.
+    pub changes: Vec<SlotChange>,
 }
 
 /// Outcome of a [`BroadcastRegistry::write_topic`] call. The numbers
@@ -232,8 +318,18 @@ impl BroadcastRegistry {
             .topics
             .get(topic)
             .ok_or_else(|| BroadcastError::UnknownTopic(topic.to_string()))?;
-        topic_entry.subscribers.insert(session, sender);
-        let current = topic_entry.current_value();
+        // Register the sink and read the snapshot under the topic's
+        // linearization lock, so this session lands strictly before or
+        // strictly after any concurrent write: either it is in the
+        // subscriber set for that write's delta and holds the pre-state, or
+        // it is not and holds the post-state. Doing these two steps outside
+        // the lock admits both bad interleavings — a delta already folded
+        // into the snapshot (applied twice) and a delta missed entirely.
+        let current = {
+            let guard = topic_entry.lock_value();
+            topic_entry.subscribers.insert(session, sender);
+            guard.clone()
+        };
         drop(topic_entry);
 
         self.by_session
@@ -283,32 +379,101 @@ impl BroadcastRegistry {
         topic: &str,
         value: Vec<u8>,
     ) -> Result<BroadcastDelivery, BroadcastError> {
+        self.write_topic_delta(topic, |_previous| TopicTransition {
+            value,
+            changes: Vec::new(),
+        })
+    }
+
+    /// S4 · the delta write. `compute` is handed the topic's **previous**
+    /// bytes and returns the post-write snapshot together with the z-set
+    /// delta that produced it; the registry stores the snapshot and fans out
+    /// one frame carrying `SlotSet` then `SlotDelta`.
+    ///
+    /// The closure runs inside the topic's critical section, which is what
+    /// makes `previous` trustworthy: two concurrent appends cannot both diff
+    /// against the same pre-state and fan out deltas that, applied in
+    /// sequence, describe a state neither of them produced. That also makes
+    /// the closure a bad place for I/O — it must be a pure, cheap function
+    /// of the bytes it is given. FORGE, for instance, does its substrate read
+    /// *before* the call and only diffs in here.
+    ///
+    /// Changes are [`coalesce_changes`]d before encoding, so a caller may
+    /// emit the naive per-mutation delta and let the registry compact it.
+    /// An empty (or fully-cancelling) delta degenerates to a lone `SlotSet`,
+    /// which is exactly the pre-S4 behaviour and the reason
+    /// [`Self::write_topic`] is now a thin call into this one — there is a
+    /// single fan-out path to reason about, not two.
+    ///
+    /// # Errors
+    /// [`BroadcastError::UnknownTopic`] when `topic` was never registered
+    /// (the closure is not run), or [`BroadcastError::Encode`] if the frame
+    /// cannot be encoded — in which case the value **has** already been
+    /// stored, so a reload still shows the truth.
+    pub fn write_topic_delta<F>(
+        &self,
+        topic: &str,
+        compute: F,
+    ) -> Result<BroadcastDelivery, BroadcastError>
+    where
+        F: FnOnce(&[u8]) -> TopicTransition,
+    {
         let topic_entry = self
             .topics
             .get(topic)
             .ok_or_else(|| BroadcastError::UnknownTopic(topic.to_string()))?
             .clone();
 
-        if let Ok(mut guard) = topic_entry.value.lock() {
-            *guard = value.clone();
+        // ── critical section: prev → compute → store → encode → fan out ──
+        let mut guard = topic_entry.lock_value();
+        let transition = compute(guard.as_slice());
+        *guard = transition.value.clone();
+
+        let mut instructions = Vec::with_capacity(2);
+        instructions.push(Instruction::SlotSet {
+            slot_id: topic_entry.slot_id,
+            value: transition.value,
+        });
+        let changes = coalesce_changes(transition.changes);
+        if !changes.is_empty() {
+            // Delta LAST: a list anchor that a coarse `html` binding just
+            // rebuilt from the SlotSet must be reconciled in its fresh DOM.
+            instructions.push(Instruction::SlotDelta {
+                slot_id: topic_entry.slot_id,
+                changes,
+            });
         }
 
-        let frame = OpcodeFrame {
+        let encoded = encode_frame(&OpcodeFrame {
             frame_id: self.next_frame_id.fetch_add(1, Ordering::Relaxed),
             component_id: None,
-            instructions: vec![Instruction::SlotSet {
-                slot_id: topic_entry.slot_id,
-                value,
-            }],
-        };
-        let encoded = encode_frame(&frame)?;
+            instructions,
+        })?;
 
+        let report = self.fan_out(topic, &topic_entry, &encoded);
+        drop(guard);
+        Ok(report)
+    }
+
+    /// Push one encoded frame to every subscriber of `topic_entry`, pruning
+    /// the sessions whose sink refused it.
+    ///
+    /// Called with the topic's value lock held (see the module docs on
+    /// ordering). Nothing in here blocks: `try_send` is non-blocking by
+    /// construction, and the pruning touches only `DashMap`s that no write
+    /// path locks the value under.
+    fn fan_out(
+        &self,
+        topic: &str,
+        topic_entry: &BroadcastTopic,
+        encoded: &[u8],
+    ) -> BroadcastDelivery {
         let mut report = BroadcastDelivery::default();
         let mut to_remove: Vec<SessionId> = Vec::new();
 
         for entry in topic_entry.subscribers.iter() {
             let session = *entry.key();
-            match entry.value().try_send(encoded.clone()) {
+            match entry.value().try_send(encoded.to_vec()) {
                 Ok(()) => report.delivered += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     report.dropped_full.push(session);
@@ -328,7 +493,7 @@ impl BroadcastRegistry {
             }
         }
 
-        Ok(report)
+        report
     }
 
     /// Phase O.2 · subscribe one session to many topics in a single
@@ -352,14 +517,19 @@ impl BroadcastRegistry {
         let mut out = Vec::with_capacity(topics.len());
         for topic in topics {
             let topic_arc = self.topic(topic.clone(), Vec::new());
-            topic_arc.subscribers.insert(session, sender.clone());
+            // Same atomic register-then-snapshot as `subscribe`.
+            let value = {
+                let guard = topic_arc.lock_value();
+                topic_arc.subscribers.insert(session, sender.clone());
+                guard.clone()
+            };
             self.by_session
                 .entry(session)
                 .or_default()
                 .insert(topic.clone());
             out.push(Instruction::SlotSet {
                 slot_id: topic_arc.slot_id,
-                value: topic_arc.current_value(),
+                value,
             });
         }
         out
@@ -377,6 +547,57 @@ impl BroadcastRegistry {
     pub fn session_count(&self) -> usize {
         self.by_session.len()
     }
+}
+
+/// Compact a z-set delta: sum the weights of **identical records** and drop
+/// the ones that cancel to zero, preserving first-appearance order.
+///
+/// The identity is the whole record — `(key, payload)` — never `key` alone.
+/// That distinction is the single most load-bearing rule on this path, and it
+/// is the S0 spike's finding: an *update* is expressed as a retraction of the
+/// old row plus an insertion of the new one, both under the same `key`. Sum
+/// by key and those two weights cancel to zero, the change vanishes from the
+/// wire, and the client silently keeps showing the stale row — a lost edit
+/// with no error anywhere. Sum by `(key, payload)` and they survive as the
+/// `−`/`+` pair the client pairs back into one in-place patch.
+///
+/// Genuine duplicates *do* collapse: appending the same row twice in one
+/// action yields one record of weight 2, which the client treats as one
+/// insert (multiplicity is a set-algebra property, not a DOM one).
+///
+/// Ordering is stable because insert position is carried by arrival order —
+/// the sink appends `+` rows in the order it receives them, so reordering
+/// here would reorder the page.
+#[must_use]
+pub fn coalesce_changes(changes: Vec<SlotChange>) -> Vec<SlotChange> {
+    if changes.len() < 2 {
+        // Still drop a lone weight-0 record: it says nothing, and shipping it
+        // would make an "empty delta" frame look non-empty.
+        return changes
+            .into_iter()
+            .filter(|change| change.weight != 0)
+            .collect();
+    }
+
+    let mut order: Vec<SlotChange> = Vec::with_capacity(changes.len());
+    let mut seen: FxHashMap<(RowKey, Vec<u8>), usize> = FxHashMap::default();
+    for change in changes {
+        match seen.get(&(change.key.clone(), change.payload.clone())) {
+            Some(&index) => {
+                // Saturating: a weight overflow would flip a sign and turn an
+                // insert into a retraction. Clamping is wrong too, but it is
+                // wrong in the direction that keeps the row on the page.
+                order[index].weight = order[index].weight.saturating_add(change.weight);
+            }
+            None => {
+                seen.insert((change.key.clone(), change.payload.clone()), order.len());
+                order.push(change);
+            }
+        }
+    }
+
+    order.retain(|change| change.weight != 0);
+    order
 }
 
 /// Deterministic mapping from a topic string to its wire `SlotId`.
@@ -439,6 +660,16 @@ mod tests {
         // the same trailing token (paranoid sanity check).
         let collision_candidate = SlotId(fnv1a_32(b"topic-1"));
         assert_ne!(a, collision_candidate);
+    }
+
+    /// Cross-language lock: the client derives the same slot id from a topic
+    /// (`assets/albedo-runtime.js::topicSlotId` / `list-anchor-scan.test.mjs`).
+    /// If this literal changes, update the JS mirror in lockstep or B3/S4 will
+    /// register the guestbook anchor under a slot the broadcast never targets.
+    #[test]
+    fn broadcast_slot_id_matches_the_js_mirror() {
+        assert_eq!(broadcast_slot_id("guestbook"), SlotId(3_800_127_029));
+        assert_eq!(broadcast_slot_id("chat"), SlotId(2_183_019_110));
     }
 
     #[test]
@@ -626,6 +857,300 @@ mod tests {
         registry.unsubscribe(SessionId::random(), "missing-topic");
     }
 
+    // ── S4 · delta lane ────────────────────────────────────────────────
+
+    fn change(weight: i32, key: &str, payload: &str) -> SlotChange {
+        SlotChange {
+            weight,
+            key: RowKey(key.to_string()),
+            payload: payload.as_bytes().to_vec(),
+        }
+    }
+
+    /// Decode a broadcast frame into its instruction list.
+    fn instructions_of(bytes: &[u8]) -> Vec<Instruction> {
+        let (frame, _) = decode_frame(bytes).expect("decode frame");
+        frame.instructions
+    }
+
+    /// The client's `reconcileSlotDelta` + list sink, in miniature: an ordered
+    /// `(key, payload)` list standing in for the anchor's rows. Kept
+    /// deliberately dumb and mirrored from `assets/albedo-runtime.js` so the
+    /// oracle below tests the *wire contract*, not a Rust re-derivation of it.
+    fn apply_delta(rows: &mut Vec<(String, String)>, changes: &[SlotChange]) {
+        let mut order: Vec<String> = Vec::new();
+        let mut plan: std::collections::HashMap<String, (Option<String>, bool)> =
+            std::collections::HashMap::new();
+        for change in changes {
+            let entry = plan.entry(change.key.0.clone()).or_insert_with(|| {
+                order.push(change.key.0.clone());
+                (None, false)
+            });
+            let payload = String::from_utf8(change.payload.clone()).expect("utf8 payload");
+            if change.weight > 0 {
+                entry.0 = Some(payload);
+            } else if change.weight < 0 {
+                entry.1 = true;
+            }
+        }
+        for key in order {
+            let (insert, retract) = plan.remove(&key).expect("planned key");
+            let position = rows.iter().position(|(existing, _)| *existing == key);
+            match (insert, position) {
+                (Some(payload), Some(index)) => rows[index].1 = payload, // patch
+                (Some(payload), None) => rows.push((key, payload)),      // insert
+                (None, Some(index)) if retract => {
+                    rows.remove(index);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delta_write_ships_the_snapshot_first_and_the_delta_last() {
+        let registry = BroadcastRegistry::new();
+        let topic = registry.topic("guestbook", b"[]".to_vec());
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        registry
+            .subscribe(SessionId::random(), "guestbook", tx)
+            .unwrap();
+
+        let report = registry
+            .write_topic_delta("guestbook", |previous| {
+                assert_eq!(previous, b"[]", "the closure sees the pre-write bytes");
+                TopicTransition {
+                    value: br#"[{"id":1}]"#.to_vec(),
+                    changes: vec![change(1, "1", "<li data-albedo-key=\"1\">ada</li>")],
+                }
+            })
+            .unwrap();
+        assert_eq!(report.delivered, 1);
+
+        let payloads = drain_into_vec(&mut rx);
+        assert_eq!(payloads.len(), 1, "one frame carries both instructions");
+        match instructions_of(&payloads[0]).as_slice() {
+            [Instruction::SlotSet {
+                slot_id: set_slot,
+                value,
+            }, Instruction::SlotDelta {
+                slot_id: delta_slot,
+                changes,
+            }] => {
+                assert_eq!(*set_slot, topic.slot_id());
+                assert_eq!(*delta_slot, topic.slot_id());
+                assert_eq!(value, br#"[{"id":1}]"#);
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].key, RowKey("1".to_string()));
+            }
+            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+        }
+        assert_eq!(topic.current_value(), br#"[{"id":1}]"#.to_vec());
+    }
+
+    /// A value-only transition must stay byte-identical to the pre-S4 frame:
+    /// every existing client and test that expects a lone `SlotSet` keeps
+    /// working, and `write_topic` keeps being a special case of one path.
+    #[tokio::test]
+    async fn an_empty_delta_degenerates_to_a_plain_slot_set() {
+        let registry = BroadcastRegistry::new();
+        registry.topic("t", b"".to_vec());
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        registry.subscribe(SessionId::random(), "t", tx).unwrap();
+
+        registry
+            .write_topic_delta("t", |_| TopicTransition {
+                value: b"v".to_vec(),
+                // Cancels to nothing: identical record, opposite weights.
+                changes: vec![change(1, "a", "<li>a</li>"), change(-1, "a", "<li>a</li>")],
+            })
+            .unwrap();
+
+        let payloads = drain_into_vec(&mut rx);
+        assert_eq!(
+            instructions_of(&payloads[0]).len(),
+            1,
+            "no empty SlotDelta on the wire"
+        );
+    }
+
+    /// THE standing correctness property: applying the delta to the previous
+    /// rows must land exactly where a full re-render of the new value lands.
+    /// If this ever fails, the delta lane is lying and the page will drift.
+    #[test]
+    fn apply_delta_equals_full_render_for_insert_update_and_remove() {
+        let render = |rows: &[(&str, &str)]| -> Vec<(String, String)> {
+            rows.iter()
+                .map(|(key, text)| {
+                    (
+                        key.to_string(),
+                        format!("<li data-albedo-key=\"{key}\">{text}</li>"),
+                    )
+                })
+                .collect()
+        };
+
+        let cases: Vec<(Vec<(&str, &str)>, Vec<(&str, &str)>, Vec<SlotChange>)> = vec![
+            // Append — the guestbook case.
+            (
+                vec![("1", "ada"), ("2", "alan")],
+                vec![("1", "ada"), ("2", "alan"), ("3", "grace")],
+                vec![change(1, "3", "<li data-albedo-key=\"3\">grace</li>")],
+            ),
+            // Update — retract + insert under ONE key. The case that a
+            // sum-by-key coalescer silently deletes.
+            (
+                vec![("1", "ada"), ("2", "alan")],
+                vec![("1", "ada"), ("2", "turing")],
+                vec![
+                    change(-1, "2", "<li data-albedo-key=\"2\">alan</li>"),
+                    change(1, "2", "<li data-albedo-key=\"2\">turing</li>"),
+                ],
+            ),
+            // Retraction.
+            (
+                vec![("1", "ada"), ("2", "alan")],
+                vec![("1", "ada")],
+                vec![change(-1, "2", "<li data-albedo-key=\"2\">alan</li>")],
+            ),
+            // Mixed batch in one action.
+            (
+                vec![("1", "ada")],
+                vec![("2", "grace"), ("3", "hopper")],
+                vec![
+                    change(-1, "1", "<li data-albedo-key=\"1\">ada</li>"),
+                    change(1, "2", "<li data-albedo-key=\"2\">grace</li>"),
+                    change(1, "3", "<li data-albedo-key=\"3\">hopper</li>"),
+                ],
+            ),
+        ];
+
+        for (previous, next, changes) in cases {
+            let mut incremental = render(&previous);
+            apply_delta(&mut incremental, &coalesce_changes(changes.clone()));
+            let full = render(&next);
+            assert_eq!(
+                incremental, full,
+                "apply(Δ) != full_render for {previous:?} -> {next:?} via {changes:?}"
+            );
+        }
+    }
+
+    /// The S0 finding, pinned as its own test: an update must survive
+    /// coalescing. Sum by `key` and this returns empty; sum by `(key, payload)`
+    /// and both halves come through.
+    #[test]
+    fn coalescing_never_cancels_an_update_to_nothing() {
+        let compacted = coalesce_changes(vec![
+            change(-1, "2", "<li>alan</li>"),
+            change(1, "2", "<li>turing</li>"),
+        ]);
+        assert_eq!(
+            compacted.len(),
+            2,
+            "the -/+ pair IS the update; it must not cancel"
+        );
+        assert_eq!(compacted[0].weight, -1);
+        assert_eq!(compacted[1].weight, 1);
+    }
+
+    #[test]
+    fn coalescing_folds_identical_records_and_drops_true_cancellations() {
+        let compacted = coalesce_changes(vec![
+            change(1, "a", "<li>a</li>"),
+            change(1, "a", "<li>a</li>"),
+            change(1, "b", "<li>b</li>"),
+            change(-1, "b", "<li>b</li>"),
+            change(0, "c", "<li>c</li>"),
+        ]);
+        assert_eq!(compacted.len(), 1, "only the folded 'a' record survives");
+        assert_eq!(compacted[0].key, RowKey("a".to_string()));
+        assert_eq!(
+            compacted[0].weight, 2,
+            "multiplicity folds; the row stays one row"
+        );
+    }
+
+    #[test]
+    fn coalescing_preserves_arrival_order_because_it_is_insert_order() {
+        let compacted = coalesce_changes(vec![
+            change(1, "c", "<li>c</li>"),
+            change(1, "a", "<li>a</li>"),
+            change(1, "b", "<li>b</li>"),
+            change(1, "a", "<li>a</li>"),
+        ]);
+        let keys: Vec<_> = compacted.iter().map(|c| c.key.0.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["c", "a", "b"],
+            "a folded record keeps its FIRST position"
+        );
+    }
+
+    /// Concurrent writers must serialize per topic: each delta is computed
+    /// against the state the previous one produced, so replaying the deltas in
+    /// delivery order reproduces the stored value. Without the linearization
+    /// lock both writers would diff the same pre-state and one row would be
+    /// lost on every client (while the database kept both).
+    #[tokio::test]
+    async fn concurrent_writers_produce_a_replayable_delta_sequence() {
+        let registry = Arc::new(BroadcastRegistry::new());
+        registry.topic("race", b"".to_vec());
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        registry.subscribe(SessionId::random(), "race", tx).unwrap();
+
+        // Each writer appends "wN" to a comma-joined value, deriving BOTH the
+        // snapshot and the delta from whatever it observes — i.e. the FORGE
+        // shape, minus the substrate.
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let registry = Arc::clone(&registry);
+            handles.push(tokio::task::spawn_blocking(move || {
+                registry
+                    .write_topic_delta("race", |previous| {
+                        let previous = String::from_utf8(previous.to_vec()).unwrap();
+                        let key = format!("w{index}");
+                        let value = if previous.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{previous},{key}")
+                        };
+                        TopicTransition {
+                            value: value.into_bytes(),
+                            changes: vec![change(1, &key, &format!("<li>{key}</li>"))],
+                        }
+                    })
+                    .unwrap()
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Replay every delivered delta in arrival order.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for payload in drain_into_vec(&mut rx) {
+            for instruction in instructions_of(&payload) {
+                if let Instruction::SlotDelta { changes, .. } = instruction {
+                    apply_delta(&mut rows, &changes);
+                }
+            }
+        }
+
+        let stored = String::from_utf8(registry.get("race").unwrap().current_value()).unwrap();
+        let replayed: Vec<&str> = rows.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            replayed,
+            stored.split(',').collect::<Vec<_>>(),
+            "replaying the deltas in delivery order must reproduce the stored value"
+        );
+        assert_eq!(
+            rows.len(),
+            8,
+            "no writer's row was lost to a stale pre-state"
+        );
+    }
+
     #[tokio::test]
     async fn auto_subscribe_creates_unknown_topics_and_returns_initial_slot_sets() {
         let registry = BroadcastRegistry::new();
@@ -634,18 +1159,21 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
         let session = SessionId::random();
 
-        let opcodes = registry.auto_subscribe(
-            session,
-            tx,
-            &["known".to_string(), "fresh".to_string()],
-        );
+        let opcodes =
+            registry.auto_subscribe(session, tx, &["known".to_string(), "fresh".to_string()]);
 
         assert_eq!(opcodes.len(), 2);
         // First topic carries the seeded value; second carries empty.
         match (&opcodes[0], &opcodes[1]) {
             (
-                Instruction::SlotSet { slot_id: s1, value: v1 },
-                Instruction::SlotSet { slot_id: s2, value: v2 },
+                Instruction::SlotSet {
+                    slot_id: s1,
+                    value: v1,
+                },
+                Instruction::SlotSet {
+                    slot_id: s2,
+                    value: v2,
+                },
             ) => {
                 assert_eq!(*s1, broadcast_slot_id("known"));
                 assert_eq!(v1, b"seed");

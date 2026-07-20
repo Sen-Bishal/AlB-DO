@@ -31,6 +31,17 @@ pub struct ForgeSlot {
     pub topic: &'static str,
     /// The read that materialises the topic's value.
     pub query: &'static str,
+    /// Column that identifies a row across two materialisations — the
+    /// reconciliation identity a `SlotDelta` is keyed by, and the value the
+    /// author's `key={row.id}` stamps into `data-albedo-key`.
+    ///
+    /// Hand-authored beside the query for the same reason the query is: both
+    /// are what escape analysis will infer (a collection's primary key is
+    /// already in the schema it reads). Declaring it here rather than sniffing
+    /// for an `id`-ish column keeps the failure honest — a collection whose
+    /// declared key doesn't identify its rows falls back to snapshot fan-out
+    /// (see [`crate::forge::delta`]) instead of reconciling against a guess.
+    pub key_column: &'static str,
 }
 
 /// The walking-skeleton `topic → query` map. One entry: the guestbook.
@@ -38,6 +49,7 @@ pub struct ForgeSlot {
 pub const FORGE_SLOTS: &[ForgeSlot] = &[ForgeSlot {
     topic: "guestbook",
     query: "SELECT id, author, message FROM guestbook ORDER BY id",
+    key_column: "id",
 }];
 
 /// DDL for the skeleton table, plus a one-time seed so the first boot has
@@ -119,7 +131,10 @@ pub async fn materialize_seeds(
 ) -> crate::forge::value::Result<Vec<(String, Vec<u8>)>> {
     let mut seeds = Vec::with_capacity(FORGE_SLOTS.len());
     for slot in FORGE_SLOTS {
-        seeds.push((slot.topic.to_string(), materialize_slot(substrate, slot).await?));
+        seeds.push((
+            slot.topic.to_string(),
+            materialize_slot(substrate, slot).await?,
+        ));
     }
     Ok(seeds)
 }

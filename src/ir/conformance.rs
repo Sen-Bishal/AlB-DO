@@ -14,7 +14,7 @@
 
 use super::opcode::{
     AttrId, EventId, Instruction, InstructionRange, InternEntry, InternPatchOp, InternTable,
-    InternTableKind, OpcodeFrame, ProxyId, SlotId, StableId, SuspenseId, TagId,
+    InternTableKind, OpcodeFrame, ProxyId, RowKey, SlotChange, SlotId, StableId, SuspenseId, TagId,
 };
 
 /// Wire format version. Bump whenever any of the following change:
@@ -34,7 +34,9 @@ use super::opcode::{
 /// Version history:
 /// - **v1** — Phase A locked the original 14 variants (0..=13).
 /// - **v2** — Phase I added `Instruction::Navigate` at index 14.
-pub const LOCKED_WIRE_VERSION: u32 = 2;
+/// - **v3** — Engine-expansion S2 added `Instruction::SlotDelta` at index 15
+///   (the z-set delta primitive).
+pub const LOCKED_WIRE_VERSION: u32 = 3;
 
 /// Returns the deterministic conformance frame for [`LOCKED_WIRE_VERSION`].
 ///
@@ -46,7 +48,7 @@ pub const LOCKED_WIRE_VERSION: u32 = 2;
 /// Do not edit this function casually. Any change that alters the encoded
 /// bytes is a wire-format break and requires:
 ///   1. A [`LOCKED_WIRE_VERSION`] bump.
-///   2. Regenerating `tests/fixtures/wire/v2_canonical_frame.bin`.
+///   2. Regenerating `tests/fixtures/wire/v3_canonical_frame.bin`.
 ///   3. A matching update to the bakabox decoder test suite.
 ///
 /// # Panics
@@ -131,6 +133,34 @@ pub fn canonical_v1_frame() -> OpcodeFrame {
             Instruction::Navigate {
                 url: "/dashboard".to_string(),
             },
+            // Exercises every SlotChange arm the sink pairs: a lone insert, a
+            // lone retract (empty payload), and a same-key retract+insert that
+            // the client collapses into an in-place patch.
+            Instruction::SlotDelta {
+                slot_id: SlotId(11),
+                changes: vec![
+                    SlotChange {
+                        weight: 1,
+                        key: RowKey("row-1".to_string()),
+                        payload: b"<li>one</li>".to_vec(),
+                    },
+                    SlotChange {
+                        weight: -1,
+                        key: RowKey("row-2".to_string()),
+                        payload: Vec::new(),
+                    },
+                    SlotChange {
+                        weight: -1,
+                        key: RowKey("row-3".to_string()),
+                        payload: b"<li>old</li>".to_vec(),
+                    },
+                    SlotChange {
+                        weight: 1,
+                        key: RowKey("row-3".to_string()),
+                        payload: b"<li>new</li>".to_vec(),
+                    },
+                ],
+            },
         ],
     }
 }
@@ -155,7 +185,7 @@ mod tests {
         // If a new variant is added to Instruction, this test fails fast
         // and reminds the author to extend the fixture. Count is hard-coded
         // so adding a variant without updating the fixture is a CI break.
-        const EXPECTED_VARIANT_COUNT: usize = 15;
+        const EXPECTED_VARIANT_COUNT: usize = 16;
         let frame = canonical_v1_frame();
         assert_eq!(
             frame.instructions.len(),

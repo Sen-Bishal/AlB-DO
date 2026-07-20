@@ -34,6 +34,7 @@
 //! escape-analysis pass land next; this scaffold fixes the boundary they
 //! meet at, and nothing here is wired into the default serve path yet.
 
+pub mod delta;
 pub mod mem;
 pub mod reserve;
 pub mod skeleton;
@@ -44,6 +45,7 @@ pub mod write;
 #[cfg(feature = "forge")]
 pub mod libsql;
 
+pub use delta::{diff_records, project_changes, RecordChange, RenderedRows, RowProjector};
 pub use reserve::{
     IdempotencyConflict, ReleaseOutcome, ReserveError, ReserveOutcome, ReserveRequest, Reservations,
 };
