@@ -35,7 +35,7 @@ const FIXTURE_PATH = resolve(
   '..',
   'fixtures',
   'wire',
-  'v3_canonical_frame.bin',
+  'v4_canonical_frame.bin',
 );
 
 /**
@@ -96,6 +96,14 @@ const EXPECTED_FRAME = Object.freeze({
         { weight: 1, key: 'row-3', payload: Buffer.from('<li>new</li>') },
       ],
     },
+    {
+      op: 'ReconcileList',
+      slotId: 11,
+      rows: [
+        { key: 'row-1', html: Buffer.from('<li>one</li>') },
+        { key: 'row-2', html: Buffer.from('<li>two</li>') },
+      ],
+    },
   ],
 });
 
@@ -146,6 +154,16 @@ function normaliseBytePayloads(frame) {
               : change.payload,
         }));
       }
+      // ReconcileList carries byte payloads one level down, per row (`html`).
+      if (Array.isArray(copy.rows)) {
+        copy.rows = copy.rows.map((row) => ({
+          ...row,
+          html:
+            row.html instanceof Uint8Array || Buffer.isBuffer(row.html)
+              ? Array.from(row.html)
+              : row.html,
+        }));
+      }
       return copy;
     }),
   };
@@ -172,6 +190,16 @@ function normaliseExpected(frame) {
               : change.payload,
         }));
       }
+      // ReconcileList carries byte payloads one level down, per row (`html`).
+      if (Array.isArray(copy.rows)) {
+        copy.rows = copy.rows.map((row) => ({
+          ...row,
+          html:
+            row.html instanceof Uint8Array || Buffer.isBuffer(row.html)
+              ? Array.from(row.html)
+              : row.html,
+        }));
+      }
       return copy;
     }),
   };
@@ -180,14 +208,14 @@ function normaliseExpected(frame) {
 test('LOCKED_WIRE_VERSION matches the Rust side', () => {
   // If this fails, either the JS module bumped its version without a
   // matching Rust change or vice versa. Coordinate the release.
-  assert.equal(LOCKED_WIRE_VERSION, 3);
+  assert.equal(LOCKED_WIRE_VERSION, 4);
 });
 
 test('INSTRUCTION_NAMES is exhaustive and well-ordered', () => {
   // Mirrors `canonical_v2_frame_covers_every_instruction_variant` on
   // the Rust side. The expected count is hard-coded so a wire-format
   // addition fails fast here AND in Rust.
-  const EXPECTED_VARIANT_COUNT = 16;
+  const EXPECTED_VARIANT_COUNT = 17;
   assert.equal(
     INSTRUCTION_NAMES.length,
     EXPECTED_VARIANT_COUNT,
@@ -197,6 +225,7 @@ test('INSTRUCTION_NAMES is exhaustive and well-ordered', () => {
   assert.equal(INSTRUCTION_NAMES[13], 'SlotSet');
   assert.equal(INSTRUCTION_NAMES[14], 'Navigate');
   assert.equal(INSTRUCTION_NAMES[15], 'SlotDelta');
+  assert.equal(INSTRUCTION_NAMES[16], 'ReconcileList');
 });
 
 test('canonical fixture decodes to the expected frame shape', () => {

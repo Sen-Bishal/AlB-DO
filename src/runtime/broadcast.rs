@@ -92,7 +92,7 @@
 //! removes that session from each topic's subscriber map. Call it
 //! from the WT session-drop hook.
 
-use crate::ir::opcode::{Instruction, OpcodeFrame, RowKey, SlotChange, SlotId};
+use crate::ir::opcode::{Instruction, OpcodeFrame, ReconcileRow, RowKey, SlotChange, SlotId};
 use crate::ir::wire::{encode_frame, WireError};
 use crate::runtime::eval::component::fnv1a_32;
 use crate::runtime::session::SessionId;
@@ -188,10 +188,33 @@ pub struct TopicTransition {
     /// ships as `SlotSet` — the truth a reload, a late joiner, or a coarse
     /// value binding sees.
     pub value: Vec<u8>,
-    /// The same transition as signed row changes. Ships as `SlotDelta`.
-    /// Empty means "nothing row-shaped changed", and the frame degenerates
-    /// to a plain `SlotSet`.
-    pub changes: Vec<SlotChange>,
+    /// How the keyed-list rows changed, if this topic drives one. Ships after
+    /// the `SlotSet` as the matching list opcode (or nothing).
+    pub update: ListUpdate,
+}
+
+/// The keyed-list half of a topic write: how to bring subscribers' rows to
+/// match the new value, chosen by the caller from how the collection actually
+/// changed.
+///
+/// Two shapes, because two are all the wire needs. A `SlotDelta` is `O(|Δ|)`
+/// and preserves node identity, but its inserts land at the tail — so it is
+/// only correct for an order-preserving tail append. Anything else (a reorder,
+/// a mid-list insert, a first write off a `null` placeholder) ships the full
+/// ordered set as a `ReconcileList`, which is `O(|view|)` on the wire but the
+/// only shape that can express position. The caller picks; the registry just
+/// encodes what it is handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListUpdate {
+    /// Nothing row-shaped changed — the frame degenerates to a plain `SlotSet`.
+    None,
+    /// Order-preserving tail append, as signed row changes. Ships as
+    /// [`Instruction::SlotDelta`] after [`coalesce_changes`].
+    Delta(Vec<SlotChange>),
+    /// The full desired row set, in order. Ships as
+    /// [`Instruction::ReconcileList`]; used for reorder, mid-insert, resync, or
+    /// any transition a tail-append cannot reproduce.
+    Reconcile(Vec<ReconcileRow>),
 }
 
 /// Outcome of a [`BroadcastRegistry::write_topic`] call. The numbers
@@ -381,7 +404,7 @@ impl BroadcastRegistry {
     ) -> Result<BroadcastDelivery, BroadcastError> {
         self.write_topic_delta(topic, |_previous| TopicTransition {
             value,
-            changes: Vec::new(),
+            update: ListUpdate::None,
         })
     }
 
@@ -434,14 +457,28 @@ impl BroadcastRegistry {
             slot_id: topic_entry.slot_id,
             value: transition.value,
         });
-        let changes = coalesce_changes(transition.changes);
-        if !changes.is_empty() {
-            // Delta LAST: a list anchor that a coarse `html` binding just
-            // rebuilt from the SlotSet must be reconciled in its fresh DOM.
-            instructions.push(Instruction::SlotDelta {
-                slot_id: topic_entry.slot_id,
-                changes,
-            });
+        // List op LAST: a list anchor that a coarse `html` binding just rebuilt
+        // from the SlotSet must be reconciled in its fresh DOM.
+        match transition.update {
+            ListUpdate::None => {}
+            ListUpdate::Delta(changes) => {
+                let changes = coalesce_changes(changes);
+                if !changes.is_empty() {
+                    instructions.push(Instruction::SlotDelta {
+                        slot_id: topic_entry.slot_id,
+                        changes,
+                    });
+                }
+            }
+            ListUpdate::Reconcile(rows) => {
+                // A full reconcile is already the desired set — no coalescing,
+                // and an empty set legitimately means "the list is now empty",
+                // which must ship so subscribers drop their last rows.
+                instructions.push(Instruction::ReconcileList {
+                    slot_id: topic_entry.slot_id,
+                    rows,
+                });
+            }
         }
 
         let encoded = encode_frame(&OpcodeFrame {
@@ -981,7 +1018,11 @@ mod tests {
                 assert_eq!(previous, b"[]", "the closure sees the pre-write bytes");
                 TopicTransition {
                     value: br#"[{"id":1}]"#.to_vec(),
-                    changes: vec![change(1, "1", "<li data-albedo-key=\"1\">ada</li>")],
+                    update: ListUpdate::Delta(vec![change(
+                        1,
+                        "1",
+                        "<li data-albedo-key=\"1\">ada</li>",
+                    )]),
                 }
             })
             .unwrap();
@@ -1008,6 +1049,45 @@ mod tests {
         assert_eq!(topic.current_value(), br#"[{"id":1}]"#.to_vec());
     }
 
+    /// A reorder / mid-insert ships the full ordered set as a `ReconcileList`,
+    /// after the `SlotSet`, so a subscriber whose anchor a coarse binding just
+    /// rebuilt gets its rows placed in the right order.
+    #[tokio::test]
+    async fn a_reconcile_update_ships_a_reconcile_list_after_the_snapshot() {
+        let registry = BroadcastRegistry::new();
+        let topic = registry.topic("guestbook", b"[]".to_vec());
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        registry
+            .subscribe(SessionId::random(), "guestbook", tx)
+            .unwrap();
+
+        registry
+            .write_topic_delta("guestbook", |_| TopicTransition {
+                value: br#"[{"id":2},{"id":1}]"#.to_vec(),
+                update: ListUpdate::Reconcile(vec![
+                    ReconcileRow {
+                        key: RowKey("2".to_string()),
+                        payload: b"<li data-albedo-key=\"2\">alan</li>".to_vec(),
+                    },
+                    ReconcileRow {
+                        key: RowKey("1".to_string()),
+                        payload: b"<li data-albedo-key=\"1\">ada</li>".to_vec(),
+                    },
+                ]),
+            })
+            .unwrap();
+
+        let payloads = drain_into_vec(&mut rx);
+        match instructions_of(&payloads[0]).as_slice() {
+            [Instruction::SlotSet { .. }, Instruction::ReconcileList { slot_id, rows }] => {
+                assert_eq!(*slot_id, topic.slot_id());
+                let keys: Vec<_> = rows.iter().map(|r| r.key.0.as_str()).collect();
+                assert_eq!(keys, vec!["2", "1"], "rows ship in desired order");
+            }
+            other => panic!("expected [SlotSet, ReconcileList], got {other:?}"),
+        }
+    }
+
     /// A value-only transition must stay byte-identical to the pre-S4 frame:
     /// every existing client and test that expects a lone `SlotSet` keeps
     /// working, and `write_topic` keeps being a special case of one path.
@@ -1022,7 +1102,10 @@ mod tests {
             .write_topic_delta("t", |_| TopicTransition {
                 value: b"v".to_vec(),
                 // Cancels to nothing: identical record, opposite weights.
-                changes: vec![change(1, "a", "<li>a</li>"), change(-1, "a", "<li>a</li>")],
+                update: ListUpdate::Delta(vec![
+                    change(1, "a", "<li>a</li>"),
+                    change(-1, "a", "<li>a</li>"),
+                ]),
             })
             .unwrap();
 
@@ -1177,7 +1260,11 @@ mod tests {
                         };
                         TopicTransition {
                             value: value.into_bytes(),
-                            changes: vec![change(1, &key, &format!("<li>{key}</li>"))],
+                            update: ListUpdate::Delta(vec![change(
+                                1,
+                                &key,
+                                &format!("<li>{key}</li>"),
+                            )]),
                         }
                     })
                     .unwrap()

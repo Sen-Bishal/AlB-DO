@@ -1,166 +1,356 @@
-//! Walking-skeleton wiring for FORGE **Gate 1** — the read loop.
+//! FORGE's collection registry — the `topic → (query, schema)` map.
 //!
-//! This is the hand-authored stand-in for what escape analysis (Pillar 1)
-//! will later infer. It hard-codes one FORGE-backed collection — a
-//! guestbook — and does the three things Gate 1 needs:
+//! This was a single hand-authored `&'static` slot (one hardcoded guestbook).
+//! It is now an owned, boot-built [`ForgeSchema`] — the seam every source of
+//! collections funnels through:
 //!
-//! 1. [`bootstrap_schema`] — create the table (and seed it once) so there
-//!    is data to render. Stands in for Pillar-3 auto-migration.
-//! 2. [`FORGE_SLOTS`] — the `topic → query` map. Stands in for the
-//!    inferred `DataSource::DbQuery` a component's reads would produce.
-//! 3. [`hydrate_topics`] — run each query through the [`DataSubstrate`],
-//!    materialise the rows to JSON, and seed the matching
-//!    [`BroadcastRegistry`] topic. The serve path already reads that
-//!    topic's value at render time (`useSharedSlot`), so the SSR HTML
-//!    comes out carrying the persisted rows with no per-request I/O.
+//! - **today** — [`ForgeSchema::guestbook_default`], the built-in default that
+//!   reproduces the walking-skeleton guestbook byte-for-byte, so nothing that
+//!   depended on it changed;
+//! - **next (Phase 2)** — an app-declared schema (a `forge` block in the app's
+//!   config, or a schema file) parsed into [`ForgeCollection`]s;
+//! - **endgame (Pillar 1)** — escape analysis emitting the same
+//!   [`ForgeCollection`]s from the component's own `useSharedSlot` reads.
 //!
-//! Everything here is substrate-agnostic (it speaks only the
-//! [`DataSubstrate`] trait), so it is *not* feature-gated: it compiles in
-//! the default build and is exercised against libSQL only where the
-//! `forge` feature supplies a real backend.
+//! All three produce a `Vec<ForgeCollection>` and hand it to
+//! [`ForgeSchema::build`]; the *runtime* never learns which source it came from.
+//!
+//! # Why the schema is keyed by the wire's `SlotId`
+//!
+//! A collection has exactly one identity that already travels everywhere: its
+//! broadcast [`SlotId`], `fnv1a_32("broadcast::{topic}")`
+//! ([`broadcast_slot_id`]). The registry, the wire, and the client all address
+//! it by that 32-bit number. So the schema keys on the *same* number rather than
+//! inventing a second identity — a write's `slot_for_topic` and a fan-out's
+//! slot-id land in the one lookup, and a hash collision (two topics sharing a
+//! wire slot — already a latent wire bug the old `const` never caught) is
+//! promoted to a **boot-time** invariant: [`ForgeSchema::build`] refuses it.
+//!
+//! The lookup itself is a **struct-of-arrays**: a dense, sorted `Box<[u32]>`
+//! search spine kept *separate* from the fat [`ForgeCollection`] payload. A
+//! per-write resolve is a branch-predictable binary search over ~16 ids per
+//! cache line that dereferences the payload exactly once, at the found index —
+//! not a linear pointer-chase through owned `String`s.
 
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Rows, SqlValue};
-use crate::runtime::broadcast::BroadcastRegistry;
+use crate::ir::opcode::SlotId;
+use crate::runtime::broadcast::{broadcast_slot_id, BroadcastRegistry};
 
-/// One FORGE-backed shared slot: a broadcast topic whose value is
-/// materialised from a substrate query. The hand-authored ancestor of an
-/// inferred `(collection, query)` pair.
-pub struct ForgeSlot {
-    /// The `useSharedSlot(topic)` key the component reads.
-    pub topic: &'static str,
-    /// The read that materialises the topic's value.
-    pub query: &'static str,
-    /// Column that identifies a row across two materialisations — the
-    /// reconciliation identity a `SlotDelta` is keyed by, and the value the
-    /// author's `key={row.id}` stamps into `data-albedo-key`.
-    ///
-    /// Hand-authored beside the query for the same reason the query is: both
-    /// are what escape analysis will infer (a collection's primary key is
-    /// already in the schema it reads). Declaring it here rather than sniffing
-    /// for an `id`-ish column keeps the failure honest — a collection whose
-    /// declared key doesn't identify its rows falls back to snapshot fan-out
-    /// (see [`crate::forge::delta`]) instead of reconciling against a guess.
-    pub key_column: &'static str,
+/// One row of a collection's one-time seed: a statement plus its bound params,
+/// run once when the backing table is empty (so runtime writes survive restart).
+/// Params **bind** — they never reach SQL as text — so seed data is not an
+/// identifier hazard the way a table name is.
+#[derive(Debug, Clone)]
+pub struct SeedRow {
+    pub sql: String,
+    pub params: Box<[SqlValue]>,
 }
 
-/// The walking-skeleton `topic → query` map. One entry: the guestbook.
-/// Replaced by escape-analysis output in Phase 1 (#2).
-pub const FORGE_SLOTS: &[ForgeSlot] = &[ForgeSlot {
-    topic: "guestbook",
-    query: "SELECT id, author, message FROM guestbook ORDER BY id",
-    key_column: "id",
-}];
+/// One FORGE-backed collection: a broadcast topic materialised from a substrate
+/// query, plus the schema (DDL + optional seed) that makes the query answerable.
+/// The owned successor of the old `&'static ForgeSlot` — the hand-authored
+/// ancestor of an inferred `(collection, query, key)` triple.
+#[derive(Debug, Clone)]
+pub struct ForgeCollection {
+    /// The `useSharedSlot(topic)` key the component reads, and the broadcast
+    /// topic the write fans out on.
+    pub topic: String,
+    /// Physical table name. Kept explicit (rather than parsed out of `query`)
+    /// so the empty-check probe and future introspection have a first-class
+    /// fact, and so it can be identifier-validated once at build.
+    pub table: String,
+    /// The read that materialises the topic's value.
+    pub query: String,
+    /// Column that identifies a row across two materialisations — the
+    /// reconciliation identity a `SlotDelta`/`ReconcileList` is keyed by, and the
+    /// value the author's `key={row.id}` stamps into `data-albedo-key`.
+    pub key_column: String,
+    /// Precomputed wire identity, `broadcast_slot_id(&topic)`. Set once at
+    /// construction; it is the schema's lookup key and the wire's slot id, one
+    /// and the same. See the module docs.
+    pub slot_id: SlotId,
+    /// Idempotent DDL (`CREATE TABLE IF NOT EXISTS …`, indexes, …) run at every
+    /// boot. Stands in for Pillar-3 auto-migration.
+    pub migrations: Box<[String]>,
+    /// One-time seed rows, applied only when `table` is empty.
+    pub seed: Box<[SeedRow]>,
+}
 
-/// DDL for the skeleton table, plus a one-time seed so the first boot has
-/// something to render. Idempotent: the table is `IF NOT EXISTS` and the
-/// seed only runs when the table is empty, so a restart preserves rows
-/// written at runtime (the Gate-3 durability property).
-///
-/// # Errors
-/// Propagates any [`SubstrateError`](crate::forge::value::SubstrateError)
-/// from the migration or the seed statements.
-pub async fn bootstrap_schema(substrate: &dyn DataSubstrate) -> crate::forge::value::Result<()> {
-    substrate
-        .migrate(
-            "CREATE TABLE IF NOT EXISTS guestbook (\
-                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
-                 author TEXT NOT NULL, \
-                 message TEXT NOT NULL)",
-        )
-        .await?;
-
-    let existing = substrate
-        .query("SELECT COUNT(*) FROM guestbook", &[])
-        .await?;
-    let count = existing
-        .rows
-        .first()
-        .and_then(|row| row.get(0))
-        .and_then(SqlValue::as_i64)
-        .unwrap_or(0);
-
-    if count == 0 {
-        for (author, message) in [("ada", "first light"), ("alan", "the machine stirs")] {
-            substrate
-                .execute(
-                    "INSERT INTO guestbook (author, message) VALUES (?1, ?2)",
-                    &[author.into(), message.into()],
-                )
-                .await?;
+impl ForgeCollection {
+    /// Assemble a collection, precomputing its wire [`SlotId`] from `topic`.
+    #[must_use]
+    pub fn new(
+        topic: impl Into<String>,
+        table: impl Into<String>,
+        query: impl Into<String>,
+        key_column: impl Into<String>,
+        migrations: Box<[String]>,
+        seed: Box<[SeedRow]>,
+    ) -> Self {
+        let topic = topic.into();
+        let slot_id = broadcast_slot_id(&topic);
+        Self {
+            topic,
+            table: table.into(),
+            query: query.into(),
+            key_column: key_column.into(),
+            slot_id,
+            migrations,
+            seed,
         }
     }
+}
 
+/// Why a set of [`ForgeCollection`]s cannot form a valid [`ForgeSchema`].
+#[derive(Debug, thiserror::Error)]
+pub enum ForgeSchemaError {
+    /// Two topics hash to the same wire [`SlotId`]. Undetectable at the wire
+    /// (both would drive the same broadcast slot), so it is refused here where
+    /// the whole collection set is visible at once.
+    #[error(
+        "FORGE schema: topics {a:?} and {b:?} collide on wire slot {slot:#010x}; \
+         rename one collection"
+    )]
+    SlotCollision { a: String, b: String, slot: u32 },
+    /// A `table` or `key_column` is not a plain SQL identifier — it would reach
+    /// SQL as text, and identifiers cannot bind. Refused at build, not at write.
+    #[error("FORGE schema: {field} {value:?} for topic {topic:?} is not a safe SQL identifier")]
+    InvalidIdentifier {
+        topic: String,
+        field: &'static str,
+        value: String,
+    },
+}
+
+/// The FORGE collection registry: an immutable, boot-built lookup from a
+/// collection's wire [`SlotId`] to its [`ForgeCollection`].
+///
+/// Layout is struct-of-arrays (see module docs): `ids` is the dense sorted
+/// search spine, `collections[i]` its parallel payload. Cheap to `Arc`-share and
+/// hold on the live runtime across a dev reload.
+#[derive(Debug, Clone)]
+pub struct ForgeSchema {
+    /// `slot_id.0` for every collection, sorted ascending. The binary-search
+    /// spine — contiguous `u32`s, packed ~16 to a cache line.
+    ids: Box<[u32]>,
+    /// Parallel to `ids`, same order: `collections[i].slot_id.0 == ids[i]`.
+    collections: Box<[ForgeCollection]>,
+}
+
+impl ForgeSchema {
+    /// Build a schema from a collection set, sorting by wire [`SlotId`] and
+    /// rejecting slot collisions and unsafe identifiers.
+    ///
+    /// The single funnel every collection source (default, config, inference)
+    /// passes through, so the invariants hold no matter where the collections
+    /// came from.
+    ///
+    /// # Errors
+    /// [`ForgeSchemaError::SlotCollision`] on a shared wire slot;
+    /// [`ForgeSchemaError::InvalidIdentifier`] on a `table`/`key_column` that
+    /// isn't a plain identifier.
+    pub fn build(mut collections: Vec<ForgeCollection>) -> Result<Self, ForgeSchemaError> {
+        for c in &collections {
+            for (field, value) in [("table", &c.table), ("key_column", &c.key_column)] {
+                if !crate::forge::write::is_safe_identifier(value) {
+                    return Err(ForgeSchemaError::InvalidIdentifier {
+                        topic: c.topic.clone(),
+                        field,
+                        value: value.clone(),
+                    });
+                }
+            }
+        }
+
+        // Sort by the 32-bit wire id so the spine is a searchable dense array
+        // and any collision lands as an adjacent duplicate.
+        collections.sort_unstable_by_key(|c| c.slot_id.0);
+        for pair in collections.windows(2) {
+            if pair[0].slot_id == pair[1].slot_id {
+                return Err(ForgeSchemaError::SlotCollision {
+                    a: pair[0].topic.clone(),
+                    b: pair[1].topic.clone(),
+                    slot: pair[0].slot_id.0,
+                });
+            }
+        }
+
+        let ids = collections.iter().map(|c| c.slot_id.0).collect();
+        Ok(Self {
+            ids,
+            collections: collections.into_boxed_slice(),
+        })
+    }
+
+    /// The collection driving wire slot `slot_id`, if any. `O(log n)` binary
+    /// search over the dense id spine; the payload is touched once.
+    #[must_use]
+    pub fn resolve(&self, slot_id: SlotId) -> Option<&ForgeCollection> {
+        self.ids
+            .binary_search(&slot_id.0)
+            .ok()
+            .map(|i| &self.collections[i])
+    }
+
+    /// The collection named `topic`, if any. The allowlist that keeps a
+    /// collection name arriving from userland from ever reaching SQL as an
+    /// identifier — resolves through the wire id, so it shares the one lookup.
+    #[must_use]
+    pub fn slot_for_topic(&self, topic: &str) -> Option<&ForgeCollection> {
+        self.resolve(broadcast_slot_id(topic))
+    }
+
+    /// Every collection, in wire-id order.
+    #[must_use]
+    pub fn collections(&self) -> &[ForgeCollection] {
+        &self.collections
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.collections.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.collections.len()
+    }
+
+    /// The built-in default: the walking-skeleton guestbook, reproducing the old
+    /// `FORGE_SLOTS` const exactly (same query, same key, same DDL + ada/alan
+    /// seed). Used until an app declares its own schema.
+    #[must_use]
+    pub fn guestbook_default() -> Self {
+        let guestbook = ForgeCollection::new(
+            "guestbook",
+            "guestbook",
+            "SELECT id, author, message FROM guestbook ORDER BY id",
+            "id",
+            Box::new([
+                "CREATE TABLE IF NOT EXISTS guestbook (\
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                     author TEXT NOT NULL, \
+                     message TEXT NOT NULL)"
+                    .to_string(),
+            ]),
+            Box::new([
+                SeedRow {
+                    sql: "INSERT INTO guestbook (author, message) VALUES (?1, ?2)".to_string(),
+                    params: Box::new(["ada".into(), "first light".into()]),
+                },
+                SeedRow {
+                    sql: "INSERT INTO guestbook (author, message) VALUES (?1, ?2)".to_string(),
+                    params: Box::new(["alan".into(), "the machine stirs".into()]),
+                },
+            ]),
+        );
+        Self::build(vec![guestbook]).expect("the single-collection default cannot collide")
+    }
+}
+
+impl Default for ForgeSchema {
+    fn default() -> Self {
+        Self::guestbook_default()
+    }
+}
+
+/// Run every collection's migrations, then seed each one that is still empty.
+///
+/// Idempotent: migrations are `IF NOT EXISTS` and a seed runs only against an
+/// empty table, so a restart preserves rows written at runtime (the Gate-3
+/// durability property). Stands in for Pillar-3 auto-migration.
+///
+/// # Errors
+/// Propagates any [`SubstrateError`](crate::forge::value::SubstrateError) from a
+/// migration, the empty-check probe, or a seed statement.
+pub async fn bootstrap_schema(
+    substrate: &dyn DataSubstrate,
+    schema: &ForgeSchema,
+) -> crate::forge::value::Result<()> {
+    for collection in schema.collections() {
+        for ddl in collection.migrations.iter() {
+            substrate.migrate(ddl).await?;
+        }
+        if collection.seed.is_empty() {
+            continue;
+        }
+        // `table` is identifier-validated at `ForgeSchema::build`, so this
+        // interpolation is safe.
+        let probe = format!("SELECT COUNT(*) FROM {}", collection.table);
+        let existing = substrate.query(&probe, &[]).await?;
+        let count = existing
+            .rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(SqlValue::as_i64)
+            .unwrap_or(0);
+        if count == 0 {
+            for row in collection.seed.iter() {
+                substrate.execute(&row.sql, &row.params).await?;
+            }
+        }
+    }
     Ok(())
 }
 
-/// Materialise every [`FORGE_SLOTS`] entry from the substrate into
-/// `broadcast`. Registers the topic if absent, then writes the materialised
-/// value (overriding the `b"null"` placeholder the serve path seeds shared
-/// topics with at registration). At boot there are no subscribers, so the
-/// `write_topic` fan-out is a no-op that just sets the stored value.
+/// Materialise every collection into `broadcast`. Registers the topic if absent,
+/// then forces the materialised value over the register-time `b"null"`
+/// placeholder. At boot there are no subscribers, so the `write_topic` fan-out
+/// just sets the stored value.
 ///
 /// # Errors
-/// Propagates any read error from the substrate. A broadcast write failure
-/// is non-fatal (no subscribers at boot) and is intentionally swallowed.
+/// Propagates any read error from the substrate. A broadcast write failure is
+/// non-fatal (no subscribers at boot) and is intentionally swallowed.
 pub async fn hydrate_topics(
     substrate: &dyn DataSubstrate,
     broadcast: &BroadcastRegistry,
+    schema: &ForgeSchema,
 ) -> crate::forge::value::Result<()> {
-    for (topic, bytes) in materialize_seeds(substrate).await? {
-        // Ensure the topic exists (idempotent), then force its value — the
-        // register-time `b"null"` seed would otherwise win, since `topic`
-        // never overwrites an existing value.
+    for (topic, bytes) in materialize_seeds(substrate, schema).await? {
         broadcast.topic(topic.as_str(), bytes.clone());
         let _ = broadcast.write_topic(topic.as_str(), bytes);
     }
     Ok(())
 }
 
-/// Materialise every [`FORGE_SLOTS`] entry to `(topic, JSON bytes)` without
-/// touching a broadcast registry. Used at **build time**: the manifest builder
-/// seeds a fresh registry with these before Stream-B pre-renders each Tier-B
-/// island, so the baked HTML carries the persisted rows rather than the empty
-/// `b"null"` placeholder. Same materialisation [`hydrate_topics`] uses at
-/// serve-boot, factored out so both paths agree byte-for-byte.
+/// Materialise every collection to `(topic, JSON bytes)` without touching a
+/// broadcast registry. Used at **build time**: the manifest builder seeds a
+/// fresh registry with these before Stream-B pre-renders each Tier-B island, so
+/// the baked HTML carries persisted rows rather than the `b"null"` placeholder.
+/// Same materialisation [`hydrate_topics`] uses at serve-boot, factored out so
+/// both paths agree byte-for-byte.
 ///
 /// # Errors
 /// Propagates any read error from the substrate.
 pub async fn materialize_seeds(
     substrate: &dyn DataSubstrate,
+    schema: &ForgeSchema,
 ) -> crate::forge::value::Result<Vec<(String, Vec<u8>)>> {
-    let mut seeds = Vec::with_capacity(FORGE_SLOTS.len());
-    for slot in FORGE_SLOTS {
+    let mut seeds = Vec::with_capacity(schema.len());
+    for collection in schema.collections() {
         seeds.push((
-            slot.topic.to_string(),
-            materialize_slot(substrate, slot).await?,
+            collection.topic.clone(),
+            materialize_slot(substrate, collection).await?,
         ));
     }
     Ok(seeds)
 }
 
-/// The FORGE slot backing `topic`, if any. The allowlist that keeps a
-/// collection name arriving from userland from ever reaching SQL as an
-/// identifier — see [`crate::forge::write`].
-#[must_use]
-pub fn slot_for_topic(topic: &str) -> Option<&'static ForgeSlot> {
-    FORGE_SLOTS.iter().find(|slot| slot.topic == topic)
-}
-
-/// Materialise ONE slot to the JSON bytes its topic carries.
+/// Materialise ONE collection to the JSON bytes its topic carries.
 ///
-/// The single definition of "what this collection currently looks like",
-/// shared by boot hydration, the build-time bake, and the post-write
-/// rematerialisation. If these ever diverged, a write would fan out a value
-/// shaped differently from the one SSR rendered.
+/// The single definition of "what this collection currently looks like", shared
+/// by boot hydration, the build-time bake, and post-write rematerialisation. If
+/// these diverged, a write would fan out a value shaped differently from the one
+/// SSR rendered.
 ///
 /// # Errors
 /// Propagates any read error from the substrate.
 pub async fn materialize_slot(
     substrate: &dyn DataSubstrate,
-    slot: &ForgeSlot,
+    collection: &ForgeCollection,
 ) -> crate::forge::value::Result<Vec<u8>> {
-    let rows = substrate.query(slot.query, &[]).await?;
+    let rows = substrate.query(collection.query.as_str(), &[]).await?;
     Ok(serde_json::to_vec(&rows_to_json(&rows)).unwrap_or_else(|_| b"[]".to_vec()))
 }
 
@@ -199,6 +389,86 @@ fn sqlvalue_to_json(value: &SqlValue) -> serde_json::Value {
     }
 }
 
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn coll(topic: &str, table: &str, key: &str) -> ForgeCollection {
+        ForgeCollection::new(
+            topic,
+            table,
+            format!("SELECT {key} FROM {table}"),
+            key,
+            Box::new([]),
+            Box::new([]),
+        )
+    }
+
+    #[test]
+    fn resolve_and_slot_for_topic_agree_with_the_wire_id() {
+        let schema = ForgeSchema::build(vec![
+            coll("guestbook", "guestbook", "id"),
+            coll("todos", "todos", "id"),
+        ])
+        .unwrap();
+
+        let gb = schema.slot_for_topic("guestbook").expect("known topic");
+        assert_eq!(gb.topic, "guestbook");
+        // The lookup key IS the wire id, so resolving by it lands the same row.
+        assert_eq!(
+            schema.resolve(broadcast_slot_id("guestbook")).map(|c| &c.topic),
+            Some(&"guestbook".to_string())
+        );
+        assert!(schema.slot_for_topic("unknown").is_none());
+    }
+
+    #[test]
+    fn the_id_spine_is_sorted_and_parallel_to_the_payload() {
+        let schema =
+            ForgeSchema::build(vec![coll("zeta", "zeta", "id"), coll("alpha", "alpha", "id")])
+                .unwrap();
+        assert!(schema.ids.windows(2).all(|w| w[0] < w[1]), "spine sorted");
+        for (i, id) in schema.ids.iter().enumerate() {
+            assert_eq!(*id, schema.collections[i].slot_id.0, "spine parallel to payload");
+        }
+    }
+
+    #[test]
+    fn a_wire_slot_collision_is_refused_at_build() {
+        // Two ForgeCollections claiming the same slot id (constructed by hand to
+        // simulate an FNV collision) must not build.
+        let mut a = coll("a", "a", "id");
+        let mut b = coll("b", "b", "id");
+        b.slot_id = a.slot_id; // force the collision
+        a.slot_id = SlotId(42);
+        b.slot_id = SlotId(42);
+        let err = ForgeSchema::build(vec![a, b]).unwrap_err();
+        assert!(matches!(err, ForgeSchemaError::SlotCollision { slot: 42, .. }));
+    }
+
+    #[test]
+    fn an_unsafe_table_or_key_is_refused_at_build() {
+        assert!(matches!(
+            ForgeSchema::build(vec![coll("t", "drop table users;--", "id")]).unwrap_err(),
+            ForgeSchemaError::InvalidIdentifier { field: "table", .. }
+        ));
+        assert!(matches!(
+            ForgeSchema::build(vec![coll("t", "t", "1; DELETE")]).unwrap_err(),
+            ForgeSchemaError::InvalidIdentifier { field: "key_column", .. }
+        ));
+    }
+
+    #[test]
+    fn the_default_is_the_guestbook_and_builds_clean() {
+        let schema = ForgeSchema::guestbook_default();
+        assert_eq!(schema.len(), 1);
+        let gb = schema.slot_for_topic("guestbook").unwrap();
+        assert_eq!(gb.key_column, "id");
+        assert_eq!(gb.query, "SELECT id, author, message FROM guestbook ORDER BY id");
+        assert_eq!(gb.seed.len(), 2, "ada + alan");
+    }
+}
+
 #[cfg(all(test, feature = "forge"))]
 mod tests {
     use super::*;
@@ -207,10 +477,11 @@ mod tests {
     #[tokio::test]
     async fn hydrates_guestbook_topic_from_a_real_substrate() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        let schema = ForgeSchema::guestbook_default();
+        bootstrap_schema(&db, &schema).await.unwrap();
 
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &schema).await.unwrap();
 
         let topic = broadcast
             .get("guestbook")
@@ -228,10 +499,11 @@ mod tests {
     #[tokio::test]
     async fn seed_is_idempotent_across_reboots() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        let schema = ForgeSchema::guestbook_default();
+        bootstrap_schema(&db, &schema).await.unwrap();
         // A second bootstrap against the same (now non-empty) table must not
         // re-seed — the Gate-3 property that runtime writes survive restart.
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &schema).await.unwrap();
 
         let rows = db
             .query("SELECT COUNT(*) FROM guestbook", &[])

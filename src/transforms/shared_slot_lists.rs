@@ -17,7 +17,8 @@
 //! marks only the *direct* container of a shared-slot `.map()` — the common
 //! `<ul>{items.map(...)}</ul>` shape, whose keyed `<li>` children are the rows.
 
-use std::collections::{BTreeMap, HashMap};
+use crate::forge::delta::RenderedRows;
+use std::collections::HashMap;
 use swc_common::DUMMY_SP;
 use swc_ecma_ast::{
     CallExpr, Callee, Expr, IdentName, ImportSpecifier, JSXAttr, JSXAttrName, JSXAttrOrSpread,
@@ -69,8 +70,8 @@ pub const ROW_KEY_ATTR: &str = "data-albedo-key";
 /// attribute values, void elements, self-closing tags, and comments, because
 /// those *do* occur inside rows.
 #[must_use]
-pub fn extract_keyed_rows(html: &str, topic: &str) -> Option<BTreeMap<String, String>> {
-    let mut rows = BTreeMap::new();
+pub fn extract_keyed_rows(html: &str, topic: &str) -> Option<RenderedRows> {
+    let mut rows = RenderedRows::new();
     let mut cursor = find_anchor(html, topic)?;
     // Depth within the anchor: 0 means "between rows", 1+ means "inside one".
     let mut depth = 0usize;
@@ -113,7 +114,7 @@ pub fn extract_keyed_rows(html: &str, topic: &str) -> Option<BTreeMap<String, St
 /// Record one direct child of the anchor, if it carries a row key.
 /// Unkeyed children (a `<li>` the author wrote outside the `.map()`, whitespace
 /// wrappers) are structural, not rows, and are skipped.
-fn collect_row(html: &str, start: usize, end: usize, rows: &mut BTreeMap<String, String>) {
+fn collect_row(html: &str, start: usize, end: usize, rows: &mut RenderedRows) {
     let outer = &html[start..end];
     if let Some(key) = attr_value(outer, ROW_KEY_ATTR) {
         rows.insert(key, outer.to_string());

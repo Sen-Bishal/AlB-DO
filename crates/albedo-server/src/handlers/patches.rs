@@ -42,29 +42,27 @@
 //! healthy-looking, and still showing rows that no longer exist. That is the
 //! precise failure this whole lane was built to end, reintroduced one layer up.
 //!
-//! So a reconnect is answered with a **resync**: every row of every topic, as a
-//! `SlotDelta` of positive changes. The sink upserts by key, and the client
-//! skips rows whose markup it already holds, so the cost of recovery is
-//! proportional to what actually changed rather than to the list.
+//! So a reconnect is answered with a **resync**: every topic's full desired row
+//! set, as a `ReconcileList`. The sink drops rows whose key is no longer in the
+//! set, upserts the rest, and skips rows whose markup it already holds — so the
+//! cost of recovery is proportional to what actually changed, and a row that was
+//! *deleted* while the client was gone is retracted rather than left behind. A
+//! positive-only `SlotDelta` could not do that last part: an upsert cannot
+//! retract, so a delete missed during a disconnect used to linger as a ghost
+//! until navigation. `ReconcileList` (put on the byte wire alongside this) is
+//! exactly the shape that closes it.
 //!
 //! Reconnects are told apart from first connections by `Last-Event-ID`, which
 //! the browser echoes automatically because every event here carries an `id`.
 //! A first connection therefore pays nothing: its rows are already in the HTML
 //! that just rendered.
-//!
-//! **Known limit:** an upsert cannot retract. A row *deleted* while the client
-//! was disconnected stays on its page as a ghost until navigation. Unreachable
-//! today — `ForgeWrite` only appends — and the honest fix when deletes land is
-//! to put `ReconcileList` (full desired row set, already implemented in the
-//! sink) on the byte wire, which is a wire-version bump and belongs with that
-//! feature rather than ahead of it.
 
 use axum::body::Body;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use dom_render_compiler::forge::RowProjector;
-use dom_render_compiler::ir::opcode::{Instruction, OpcodeFrame, RowKey, SlotChange};
+use dom_render_compiler::ir::opcode::{Instruction, OpcodeFrame, ReconcileRow, RowKey};
 use dom_render_compiler::ir::wire::encode_frame;
 use dom_render_compiler::runtime::session::SessionId;
 use dom_render_compiler::runtime::{broadcast_slot_id, BroadcastRegistry};
@@ -182,14 +180,16 @@ pub async fn serve_patch_stream(
         .into_response()
 }
 
-/// One frame re-asserting every row of every topic, for a client that just
-/// reconnected and may have missed deltas while it was gone.
+/// One frame re-asserting the full desired row set of every topic, for a client
+/// that just reconnected and may have missed frames while it was gone.
 ///
-/// Each row ships as a `+1` change, which the sink upserts by key: rows the
-/// client already holds are recognised by their markup and left alone (DOM
-/// identity intact), rows it missed are inserted or patched. A topic the
-/// projector cannot speak for is skipped rather than guessed at — the same
-/// fail-safe rule the write path uses.
+/// Each topic ships as a `ReconcileList` of its rows in render order. The sink
+/// retracts rows whose key is no longer present (the ghost a positive-only
+/// upsert could not remove), upserts the rest, and leaves rows whose markup it
+/// already holds untouched (DOM identity intact). An empty set legitimately
+/// ships — it tells a client that lost the deletion of its last row to clear it
+/// — while a topic the projector cannot speak for is skipped rather than guessed
+/// at, the same fail-safe rule the write path uses.
 async fn resync_frame(
     projector: &dyn RowProjector,
     seed_values: &[(String, Vec<u8>)],
@@ -199,15 +199,11 @@ async fn resync_frame(
         let Some(rows) = projector.project_rows(topic, value).await else {
             continue;
         };
-        if rows.is_empty() {
-            continue;
-        }
-        instructions.push(Instruction::SlotDelta {
+        instructions.push(Instruction::ReconcileList {
             slot_id: broadcast_slot_id(topic),
-            changes: rows
+            rows: rows
                 .into_iter()
-                .map(|(key, html)| SlotChange {
-                    weight: 1,
+                .map(|(key, html)| ReconcileRow {
                     key: RowKey(key),
                     payload: html.into_bytes(),
                 })
@@ -353,12 +349,14 @@ mod tests {
         }
     }
 
-    /// A reconnecting client may have missed deltas while it was gone, and the
+    /// A reconnecting client may have missed frames while it was gone, and the
     /// `SlotSet` seed cannot repair a keyed list — it has no bind site. So the
-    /// resync re-asserts every row as a positive change; without it a client
-    /// comes back connected, healthy-looking, and showing stale rows.
+    /// resync re-asserts the full ordered set as a `ReconcileList`; without it a
+    /// client comes back connected, healthy-looking, and showing stale rows —
+    /// including a row that was deleted while it was disconnected, which a
+    /// positive-only delta could never retract.
     #[tokio::test]
-    async fn a_reconnect_re_asserts_every_row_as_a_positive_delta() {
+    async fn a_reconnect_re_asserts_the_full_row_set_as_a_reconcile_list() {
         let broadcast = Arc::new(BroadcastRegistry::new());
         broadcast.topic("guestbook", br#"[{"id":1}]"#.to_vec());
 
@@ -368,19 +366,17 @@ mod tests {
         let (frame, _) = decode_frame(&frame).unwrap();
 
         match frame.instructions.as_slice() {
-            [Instruction::SlotDelta { slot_id, changes }] => {
+            [Instruction::ReconcileList { slot_id, rows }] => {
                 assert_eq!(*slot_id, broadcast_slot_id("guestbook"));
-                assert_eq!(changes.len(), 2);
-                assert!(
-                    changes.iter().all(|change| change.weight == 1),
-                    "a resync upserts; it never retracts"
-                );
+                assert_eq!(rows.len(), 2);
+                let keys: Vec<_> = rows.iter().map(|row| row.key.0.as_str()).collect();
+                assert_eq!(keys, vec!["1", "2"], "rows ride in render order");
                 assert_eq!(
-                    String::from_utf8(changes[0].payload.clone()).unwrap(),
+                    String::from_utf8(rows[0].payload.clone()).unwrap(),
                     "<li data-albedo-key=\"1\">ada</li>"
                 );
             }
-            other => panic!("expected one SlotDelta, got {other:?}"),
+            other => panic!("expected one ReconcileList, got {other:?}"),
         }
     }
 

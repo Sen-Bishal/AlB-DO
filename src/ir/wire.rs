@@ -42,7 +42,7 @@ pub enum WireError {
 /// Any change to **this** (encode) configuration is a wire-format break and
 /// MUST be accompanied by a bump of
 /// [`crate::ir::conformance::LOCKED_WIRE_VERSION`] and a regenerated
-/// `tests/fixtures/wire/v3_canonical_frame.bin`. Changing [`decode_config`]'s
+/// `tests/fixtures/wire/v4_canonical_frame.bin`. Changing [`decode_config`]'s
 /// limit is not a format break (valid frames decode identically).
 #[inline]
 pub(crate) fn config() -> impl bincode::config::Config {

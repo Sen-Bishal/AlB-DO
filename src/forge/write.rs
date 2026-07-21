@@ -46,11 +46,12 @@
 //!
 //! [`CompiledProject::invoke_action_with_broadcast`]: crate::runtime::CompiledProject::invoke_action_with_broadcast
 
-use crate::forge::delta::{diff_records, project_changes, RowProjector};
-use crate::forge::skeleton::{materialize_slot, slot_for_topic};
+use crate::forge::delta::{diff_records, is_tail_append, project_changes, RenderedRows, RowProjector};
+use crate::forge::skeleton::{materialize_slot, ForgeCollection, ForgeSchema};
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Result, SqlValue, SubstrateError};
-use crate::runtime::broadcast::{BroadcastRegistry, TopicTransition};
+use crate::ir::opcode::{ReconcileRow, RowKey};
+use crate::runtime::broadcast::{BroadcastRegistry, ListUpdate, TopicTransition};
 use serde_json::{Map, Value};
 use std::cell::RefCell;
 
@@ -62,7 +63,7 @@ use std::cell::RefCell;
 /// patch on the wire), a `Delete` to a lone `−` (a keyed removal), and neither
 /// needs machinery beyond the row-level diff [`crate::forge::delta`] already
 /// performs. `key` identifies the row by the collection's `key_column` (see
-/// [`crate::forge::skeleton::ForgeSlot`]); the column *name* never crosses from
+/// [`ForgeCollection`]); the column *name* never crosses from
 /// userland — it is resolved from the allowlist here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForgeWrite {
@@ -163,7 +164,11 @@ pub(crate) fn record_forge_write(write: ForgeWrite) -> bool {
 /// practice these are compile-time literals, but "in practice" is not a
 /// security boundary: anything that is not a plain `[A-Za-z_][A-Za-z0-9_]*`
 /// identifier is refused. Values never take this path — they bind.
-fn is_safe_identifier(name: &str) -> bool {
+///
+/// `pub(crate)` so [`crate::forge::skeleton::ForgeSchema::build`] can apply the
+/// same rule to app-declared table/key-column names at schema-build time — one
+/// definition of "safe SQL identifier" for the whole FORGE plane.
+pub(crate) fn is_safe_identifier(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -250,7 +255,7 @@ fn key_to_sqlvalue(collection: &str, key_column: &str, key: &Value) -> Result<Sq
 }
 
 /// Build the `UPDATE` for one row, with both the new field values and the key
-/// bound. `key_column` comes from the collection's [`ForgeSlot`], never from
+/// bound. `key_column` comes from the collection's [`ForgeCollection`], never from
 /// userland.
 fn build_update(
     collection: &str,
@@ -310,15 +315,15 @@ fn build_delete(
 /// the variant; the slot supplies the `&'static` collection name and key column,
 /// so no userland string reaches the SQL as an identifier.
 fn build_statement(
-    slot: &crate::forge::skeleton::ForgeSlot,
+    slot: &ForgeCollection,
     write: &ForgeWrite,
 ) -> Result<(String, Vec<SqlValue>)> {
     match write {
-        ForgeWrite::Append { record, .. } => build_append(slot.topic, record),
+        ForgeWrite::Append { record, .. } => build_append(&slot.topic, record),
         ForgeWrite::Update { key, fields, .. } => {
-            build_update(slot.topic, slot.key_column, key, fields)
+            build_update(&slot.topic, &slot.key_column, key, fields)
         }
-        ForgeWrite::Delete { key, .. } => build_delete(slot.topic, slot.key_column, key),
+        ForgeWrite::Delete { key, .. } => build_delete(&slot.topic, &slot.key_column, key),
     }
 }
 
@@ -345,6 +350,7 @@ fn build_statement(
 pub async fn apply_writes(
     substrate: &dyn DataSubstrate,
     broadcast: &BroadcastRegistry,
+    schema: &ForgeSchema,
     writes: &[ForgeWrite],
     projector: Option<&dyn RowProjector>,
 ) -> Result<()> {
@@ -352,12 +358,12 @@ pub async fn apply_writes(
         return Ok(());
     }
 
-    // Resolve every collection against the allowlist BEFORE opening the
+    // Resolve every collection against the schema BEFORE opening the
     // transaction: an unknown collection is an authoring error, and it should
     // not cost a write lock or leave a half-built transaction to roll back.
-    let mut touched: Vec<&'static crate::forge::skeleton::ForgeSlot> = Vec::new();
+    let mut touched: Vec<&ForgeCollection> = Vec::new();
     for write in writes {
-        let slot = slot_for_topic(write.collection()).ok_or_else(|| {
+        let slot = schema.slot_for_topic(write.collection()).ok_or_else(|| {
             SubstrateError::Backend(format!(
                 "FORGE write: '{}' is not a FORGE-backed collection",
                 write.collection()
@@ -370,9 +376,9 @@ pub async fn apply_writes(
 
     let tx = substrate.begin().await?;
     for write in writes {
-        // The slot is a `&'static` from FORGE_SLOTS, resolved in `touched`
-        // above — the collection name and key column reach SQL from here, never
-        // from the userland string.
+        // The slot is borrowed from the schema, resolved in `touched` above —
+        // the collection name and key column reach SQL from here, never from the
+        // userland string.
         let slot = touched
             .iter()
             .find(|slot| slot.topic == write.collection())
@@ -404,18 +410,18 @@ pub async fn apply_writes(
         // step that genuinely needs the pre-state it is replacing.
         let bytes = materialize_slot(substrate, slot).await?;
         let rows = match projector {
-            Some(projector) => projector.project_rows(slot.topic, &bytes).await,
+            Some(projector) => projector.project_rows(&slot.topic, &bytes).await,
             None => None,
         };
-        broadcast.topic(slot.topic, bytes.clone());
-        let _ = broadcast.write_topic_delta(slot.topic, |previous| {
-            let changes = rows
-                .as_ref()
-                .and_then(|rows| row_changes(slot, previous, &bytes, rows))
-                .unwrap_or_default();
+        broadcast.topic(slot.topic.clone(), bytes.clone());
+        let _ = broadcast.write_topic_delta(&slot.topic, |previous| {
+            let update = match rows.as_ref() {
+                Some(rows) => row_update(slot, previous, &bytes, rows),
+                None => ListUpdate::None,
+            };
             TopicTransition {
                 value: bytes,
-                changes,
+                update,
             }
         });
     }
@@ -423,36 +429,68 @@ pub async fn apply_writes(
     Ok(())
 }
 
-/// The delta half of one collection's fan-out: diff the previous materialised
-/// value against the new one and pair the changes with their rendered rows.
+/// The list half of one collection's fan-out: classify the previous
+/// materialised value against the new one and choose the cheapest wire shape
+/// that reproduces it.
 ///
-/// `None` at any step means "no delta" — the snapshot alone still ships and is
-/// still correct. Both JSON inputs are the *same* materialisation shape by
-/// construction ([`materialize_slot`] is the single definition), so a parse
-/// failure here means the previous value predates hydration (the `b"null"`
-/// placeholder), not that the two disagree.
+/// An order-preserving tail append ships as an `O(|Δ|)` [`ListUpdate::Delta`];
+/// anything a tail append cannot express — a reorder, a mid-list insert, or a
+/// first write off a non-array `previous` (the `b"null"` placeholder) — ships
+/// the full ordered set as a [`ListUpdate::Reconcile`]. The reconcile is
+/// `O(|view|)` on the wire but the only shape that carries position, and it is
+/// always correct, so it is the fallback whenever the delta cannot be trusted.
 ///
-/// `rows` is the projection of `next`, taken before the lock. In the window
-/// between that render and this diff another action may have committed and
-/// fanned out; then `previous` is *its* value, and this diff describes
-/// `their state → our (older) materialisation`. That is still internally
-/// consistent — the delta and the snapshot beside it agree, so no client
-/// diverges — and the next write re-converges everyone. Making the whole
-/// commit-materialise-fan-out sequence atomic per collection is the real fix
-/// and belongs with the substrate, not here.
-fn row_changes(
-    slot: &crate::forge::skeleton::ForgeSlot,
+/// `rows` is the projection of `next`, taken before the lock, and is already in
+/// `next`'s render order — so it *is* the reconcile payload, no re-parse. In the
+/// window between that render and this classification another action may have
+/// committed; then `previous` is *its* value, the delta describes `their state →
+/// our (older) materialisation`, and the snapshot beside it still agrees, so no
+/// client diverges and the next write re-converges everyone. Making the whole
+/// commit-materialise-fan-out sequence atomic per collection is the real fix and
+/// belongs with the substrate, not here.
+fn row_update(
+    slot: &ForgeCollection,
     previous: &[u8],
     next: &[u8],
-    rows: &crate::forge::delta::RenderedRows,
-) -> Option<Vec<crate::ir::opcode::SlotChange>> {
-    let previous: Value = serde_json::from_slice(previous).ok()?;
-    let next: Value = serde_json::from_slice(next).ok()?;
-    let changes = diff_records(&previous, &next, slot.key_column)?;
-    if changes.is_empty() {
-        return None;
+    rows: &RenderedRows,
+) -> ListUpdate {
+    // The always-correct fallback: the full desired set in render order.
+    let reconcile = || {
+        ListUpdate::Reconcile(
+            rows.iter()
+                .map(|(key, html)| ReconcileRow {
+                    key: RowKey(key.clone()),
+                    payload: html.clone().into_bytes(),
+                })
+                .collect(),
+        )
+    };
+
+    let (Ok(previous), Ok(next)) = (
+        serde_json::from_slice::<Value>(previous),
+        serde_json::from_slice::<Value>(next),
+    ) else {
+        // `previous` is the empty-bytes placeholder — no trustworthy pre-state,
+        // so establish the rows with a full reconcile.
+        return reconcile();
+    };
+
+    if !is_tail_append(&previous, &next, &slot.key_column) {
+        // Reorder or mid-list insert (or a non-array `previous`): a tail-append
+        // delta would render the wrong order.
+        return reconcile();
     }
-    project_changes(&changes, rows)
+
+    match diff_records(&previous, &next, &slot.key_column) {
+        Some(changes) if changes.is_empty() => ListUpdate::None,
+        Some(changes) => match project_changes(&changes, rows) {
+            Some(slot_changes) => ListUpdate::Delta(slot_changes),
+            // The diff insists on a row the render never produced: the two
+            // disagree, so ship the whole set rather than a partial delta.
+            None => reconcile(),
+        },
+        None => reconcile(),
+    }
 }
 
 #[cfg(test)]
@@ -762,14 +800,15 @@ mod substrate_tests {
     #[tokio::test]
     async fn an_append_persists_and_rematerialises_the_topic() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
         assert_eq!(topic_rows(&broadcast, "guestbook").len(), 2, "seeded rows");
 
         apply_writes(
             &db,
             &broadcast,
+            &ForgeSchema::guestbook_default(),
             &[append(
                 "guestbook",
                 json!({ "author": "grace", "message": "found the bug" }),
@@ -802,14 +841,15 @@ mod substrate_tests {
     #[tokio::test]
     async fn a_hostile_value_is_stored_as_data_and_the_table_survives() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
         let hostile = "'); DROP TABLE guestbook;--";
         apply_writes(
             &db,
             &broadcast,
+            &ForgeSchema::guestbook_default(),
             &[append(
                 "guestbook",
                 json!({ "author": hostile, "message": "x" }),
@@ -829,9 +869,9 @@ mod substrate_tests {
     #[tokio::test]
     async fn a_failed_write_rolls_back_the_whole_action() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
         let mut bad = serde_json::Map::new();
         bad.insert(
@@ -842,6 +882,7 @@ mod substrate_tests {
         let err = apply_writes(
             &db,
             &broadcast,
+            &ForgeSchema::guestbook_default(),
             &[
                 append("guestbook", json!({ "author": "ok", "message": "first" })),
                 ForgeWrite::Append {
@@ -868,13 +909,14 @@ mod substrate_tests {
     #[tokio::test]
     async fn an_unknown_collection_is_refused() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
         let err = apply_writes(
             &db,
             &broadcast,
+            &ForgeSchema::guestbook_default(),
             &[append("not_a_collection", json!({ "a": 1 }))],
             None,
         )
@@ -928,9 +970,9 @@ mod substrate_tests {
         }
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         broadcast
@@ -940,6 +982,7 @@ mod substrate_tests {
         apply_writes(
             &db,
             &broadcast,
+            &ForgeSchema::guestbook_default(),
             &[append(
                 "guestbook",
                 json!({ "author": "grace", "message": "found the bug" }),
@@ -1025,9 +1068,9 @@ mod substrate_tests {
         use crate::runtime::session::SessionId;
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         broadcast
@@ -1038,6 +1081,7 @@ mod substrate_tests {
         apply_writes(
             &db,
             &broadcast,
+            &ForgeSchema::guestbook_default(),
             &[update("guestbook", json!(1), json!({ "author": "turing" }))],
             Some(&Guestbook),
         )
@@ -1091,9 +1135,9 @@ mod substrate_tests {
         use crate::runtime::session::SessionId;
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         broadcast
@@ -1103,6 +1147,7 @@ mod substrate_tests {
         apply_writes(
             &db,
             &broadcast,
+            &ForgeSchema::guestbook_default(),
             &[delete("guestbook", json!(2))],
             Some(&Guestbook),
         )
@@ -1131,14 +1176,15 @@ mod substrate_tests {
     #[tokio::test]
     async fn a_bad_write_in_a_batch_rolls_back_the_good_ones() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
         // A good delete, then an update with a null key (refused before execute).
         let err = apply_writes(
             &db,
             &broadcast,
+            &ForgeSchema::guestbook_default(),
             &[
                 delete("guestbook", json!(1)),
                 update("guestbook", Value::Null, json!({ "author": "x" })),
@@ -1163,9 +1209,9 @@ mod substrate_tests {
         use crate::runtime::session::SessionId;
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         broadcast
@@ -1175,6 +1221,7 @@ mod substrate_tests {
         apply_writes(
             &db,
             &broadcast,
+            &ForgeSchema::guestbook_default(),
             &[append(
                 "guestbook",
                 json!({ "author": "grace", "message": "x" }),
@@ -1198,12 +1245,13 @@ mod substrate_tests {
 
         {
             let db = LibSqlSubstrate::open_local(&path).await.unwrap();
-            bootstrap_schema(&db).await.unwrap();
+            bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
             let broadcast = BroadcastRegistry::new();
-            hydrate_topics(&db, &broadcast).await.unwrap();
+            hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
             apply_writes(
                 &db,
                 &broadcast,
+            &ForgeSchema::guestbook_default(),
                 &[append(
                     "guestbook",
                     json!({ "author": "ada", "message": "again" }),
@@ -1217,9 +1265,9 @@ mod substrate_tests {
         // Fresh process-shaped boot: reopen, re-bootstrap (must not re-seed),
         // rehydrate — the appended row has to come back.
         let db = LibSqlSubstrate::open_local(&path).await.unwrap();
-        bootstrap_schema(&db).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
         let rows = topic_rows(&broadcast, "guestbook");
         assert_eq!(rows.len(), 3, "the appended row survived the restart");

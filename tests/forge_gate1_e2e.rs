@@ -32,10 +32,11 @@ async fn seeded_guestbook_rows_render_into_ssr_html() {
     // 1. A real substrate, bootstrapped + seeded, hydrated into the registry —
     //    exactly what `AlbedoServer::run` does at boot before serving.
     let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-    skeleton::bootstrap_schema(&db).await.unwrap();
+    let schema = skeleton::ForgeSchema::guestbook_default();
+    skeleton::bootstrap_schema(&db, &schema).await.unwrap();
 
     let broadcast = BroadcastRegistry::new();
-    skeleton::hydrate_topics(&db, &broadcast).await.unwrap();
+    skeleton::hydrate_topics(&db, &broadcast, &schema).await.unwrap();
 
     // 2. Render the guestbook component against that registry.
     let project = CompiledProject::load_from_dir(fixture()).expect("fixture compiles");

@@ -14,7 +14,8 @@
 
 use super::opcode::{
     AttrId, EventId, Instruction, InstructionRange, InternEntry, InternPatchOp, InternTable,
-    InternTableKind, OpcodeFrame, ProxyId, RowKey, SlotChange, SlotId, StableId, SuspenseId, TagId,
+    InternTableKind, OpcodeFrame, ProxyId, ReconcileRow, RowKey, SlotChange, SlotId, StableId,
+    SuspenseId, TagId,
 };
 
 /// Wire format version. Bump whenever any of the following change:
@@ -36,7 +37,10 @@ use super::opcode::{
 /// - **v2** — Phase I added `Instruction::Navigate` at index 14.
 /// - **v3** — Engine-expansion S2 added `Instruction::SlotDelta` at index 15
 ///   (the z-set delta primitive).
-pub const LOCKED_WIRE_VERSION: u32 = 3;
+/// - **v4** — Insert-position work added `Instruction::ReconcileList` at index
+///   16 (the full-desired-set list primitive: reorder, mid-insert, and the
+///   resync that retracts ghost rows).
+pub const LOCKED_WIRE_VERSION: u32 = 4;
 
 /// Returns the deterministic conformance frame for [`LOCKED_WIRE_VERSION`].
 ///
@@ -48,7 +52,7 @@ pub const LOCKED_WIRE_VERSION: u32 = 3;
 /// Do not edit this function casually. Any change that alters the encoded
 /// bytes is a wire-format break and requires:
 ///   1. A [`LOCKED_WIRE_VERSION`] bump.
-///   2. Regenerating `tests/fixtures/wire/v3_canonical_frame.bin`.
+///   2. Regenerating `tests/fixtures/wire/v4_canonical_frame.bin`.
 ///   3. A matching update to the bakabox decoder test suite.
 ///
 /// # Panics
@@ -161,6 +165,21 @@ pub fn canonical_v1_frame() -> OpcodeFrame {
                     },
                 ],
             },
+            // The full-desired-set list op: two rows in order, exercising the
+            // `Vec<ReconcileRow>` shape and a non-empty payload.
+            Instruction::ReconcileList {
+                slot_id: SlotId(11),
+                rows: vec![
+                    ReconcileRow {
+                        key: RowKey("row-1".to_string()),
+                        payload: b"<li>one</li>".to_vec(),
+                    },
+                    ReconcileRow {
+                        key: RowKey("row-2".to_string()),
+                        payload: b"<li>two</li>".to_vec(),
+                    },
+                ],
+            },
         ],
     }
 }
@@ -185,7 +204,7 @@ mod tests {
         // If a new variant is added to Instruction, this test fails fast
         // and reminds the author to extend the fixture. Count is hard-coded
         // so adding a variant without updating the fixture is a CI break.
-        const EXPECTED_VARIANT_COUNT: usize = 16;
+        const EXPECTED_VARIANT_COUNT: usize = 17;
         let frame = canonical_v1_frame();
         assert_eq!(
             frame.instructions.len(),

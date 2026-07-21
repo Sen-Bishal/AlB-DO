@@ -49,6 +49,7 @@ pub use delta::{diff_records, project_changes, RecordChange, RenderedRows, RowPr
 pub use reserve::{
     IdempotencyConflict, ReleaseOutcome, ReserveError, ReserveOutcome, ReserveRequest, Reservations,
 };
+pub use skeleton::{ForgeCollection, ForgeSchema, ForgeSchemaError, SeedRow};
 pub use substrate::{DataSubstrate, Transaction};
 pub use value::{Result, Row, Rows, SqlValue, SubstrateError};
 pub use write::{apply_writes, install_forge_write_collector, ForgeWrite, ForgeWriteCollector};
