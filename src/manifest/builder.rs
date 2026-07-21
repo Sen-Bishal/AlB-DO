@@ -1359,13 +1359,18 @@ fn materialize_forge_seeds(working_dir: Option<&std::path::Path>) -> Vec<(String
                     else {
                         return Vec::new();
                     };
-                    if crate::forge::skeleton::bootstrap_schema(&substrate)
+                    // Phase 1: the built-in default schema. When app-declared
+                    // schemas land (Phase 2) this becomes the same schema the
+                    // serve path loads, so the build-time bake and serve-boot
+                    // hydration stay byte-identical.
+                    let schema = crate::forge::skeleton::ForgeSchema::guestbook_default();
+                    if crate::forge::skeleton::bootstrap_schema(&substrate, &schema)
                         .await
                         .is_err()
                     {
                         return Vec::new();
                     }
-                    crate::forge::skeleton::materialize_seeds(&substrate)
+                    crate::forge::skeleton::materialize_seeds(&substrate, &schema)
                         .await
                         .unwrap_or_default()
                 })

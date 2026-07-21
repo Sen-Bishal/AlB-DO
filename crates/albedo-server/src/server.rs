@@ -72,16 +72,24 @@ pub(crate) struct LiveRuntime {
     forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
     row_projector:
         Arc<std::sync::RwLock<Option<Arc<dyn dom_render_compiler::forge::RowProjector>>>>,
+    /// The FORGE collection registry — the `topic → (query, schema)` allowlist
+    /// the write path resolves against and boot hydrates from. App-static and
+    /// immutable, so it is built once and shared (a hot reload reuses it rather
+    /// than rebuilding). Phase 1: the built-in guestbook default; Phase 2: the
+    /// app-declared schema, loaded here at construction.
+    forge_schema: Arc<dom_render_compiler::forge::ForgeSchema>,
 }
 
 impl LiveRuntime {
     /// Fresh, empty singletons for a first boot. `run()` fills the substrate;
-    /// `build()` installs the projector.
+    /// `build()` installs the projector. The schema is app-static, so it is
+    /// resolved here, once, and never swapped by a reload.
     fn new() -> Self {
         Self {
             broadcast: Arc::new(BroadcastRegistry::new()),
             forge_substrate: Arc::new(std::sync::OnceLock::new()),
             row_projector: Arc::new(std::sync::RwLock::new(None)),
+            forge_schema: Arc::new(dom_render_compiler::forge::ForgeSchema::guestbook_default()),
         }
     }
 
@@ -210,6 +218,7 @@ impl ActionHandler for CompiledProjectActionAdapter {
                 dom_render_compiler::forge::apply_writes(
                     substrate.as_ref(),
                     self.live.broadcast.as_ref(),
+                    self.live.forge_schema.as_ref(),
                     &writes,
                     projector.as_deref(),
                 )
@@ -250,6 +259,7 @@ impl ActionHandler for CompiledProjectActionAdapter {
             dom_render_compiler::forge::apply_writes(
                 substrate.as_ref(),
                 self.live.broadcast.as_ref(),
+                self.live.forge_schema.as_ref(),
                 &writes,
                 projector.as_deref(),
             )
@@ -1278,7 +1288,8 @@ impl AlbedoServer {
             // broadcast registry BEFORE the listener binds. The register-time
             // seed leaves these topics at `b"null"`; hydration overwrites them
             // so the first SSR render reads persisted rows, not the placeholder.
-            forge::skeleton::bootstrap_schema(substrate.as_ref())
+            let schema = self.state.live.forge_schema.as_ref();
+            forge::skeleton::bootstrap_schema(substrate.as_ref(), schema)
                 .await
                 .map_err(|err| {
                     RuntimeError::ServerStartup(format!("FORGE: schema bootstrap failed: {err}"))
@@ -1286,6 +1297,7 @@ impl AlbedoServer {
             forge::skeleton::hydrate_topics(
                 substrate.as_ref(),
                 self.state.world().broadcast.as_ref(),
+                schema,
             )
             .await
             .map_err(|err| {

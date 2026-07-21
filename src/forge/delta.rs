@@ -51,14 +51,94 @@
 use crate::ir::opcode::{RowKey, SlotChange};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::ops::Index;
 
-/// The rendered rows of one collection: `RowKey → the row's outer HTML`.
+/// The rendered rows of one collection, in **render order**: `RowKey → the
+/// row's outer HTML`, but ordered the way the markup lays them out rather than
+/// sorted by key.
 ///
 /// Keys are byte-identical to the `data-albedo-key` the markup carries, because
 /// they were read back out of it — that is what lets a delta name a row the
-/// client can actually find.
-pub type RenderedRows = BTreeMap<String, String>;
+/// client can actually find. Order matters because
+/// [`Instruction::ReconcileList`](crate::ir::opcode::Instruction::ReconcileList)
+/// places rows in the order it receives them: a key-sorted map would silently
+/// reorder the page. A plain map threw that order away; this newtype keeps it
+/// while still answering `get`/`contains_key` in O(n) (row counts are small and
+/// the lookups are per-delta, not per-frame).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RenderedRows {
+    rows: Vec<(String, String)>,
+}
+
+impl RenderedRows {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { rows: Vec::new() }
+    }
+
+    /// Append `value` under `key`, or overwrite it in place if `key` is already
+    /// present (keeping its position). Rows are unique by `data-albedo-key`, so
+    /// the overwrite branch is defensive rather than expected.
+    pub fn insert(&mut self, key: String, value: String) {
+        if let Some(slot) = self.rows.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = value;
+        } else {
+            self.rows.push((key, value));
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.rows.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    #[must_use]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.rows.iter().any(|(k, _)| k == key)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Rows in render order, `(key, html)`.
+    pub fn iter(&self) -> std::slice::Iter<'_, (String, String)> {
+        self.rows.iter()
+    }
+}
+
+impl Index<&str> for RenderedRows {
+    type Output = String;
+    fn index(&self, key: &str) -> &String {
+        self.get(key)
+            .unwrap_or_else(|| panic!("no rendered row for key {key:?}"))
+    }
+}
+
+impl FromIterator<(String, String)> for RenderedRows {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
+        let mut rows = Self::new();
+        for (key, value) in iter {
+            rows.insert(key, value);
+        }
+        rows
+    }
+}
+
+impl IntoIterator for RenderedRows {
+    type Item = (String, String);
+    type IntoIter = std::vec::IntoIter<(String, String)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows.into_iter()
+    }
+}
 
 /// Renders a materialised collection into its keyed rows.
 ///
@@ -114,11 +194,14 @@ pub struct RecordChange {
 /// that `None` is *not* an error — it is the caller's cue to ship the snapshot
 /// alone, which is always correct.
 ///
-/// Reordering alone is deliberately **not** expressed: two collections with the
-/// same records in a different order produce an empty delta, because the wire
-/// has no "move" and a synthesised remove/insert pair would destroy the node
-/// identity this path exists to preserve. Ordering is rung 3 (`sort`) on the
-/// operator ladder and needs an insert-position on the wire to be done right.
+/// Reordering alone is deliberately **not** expressed here: two collections with
+/// the same records in a different order produce an empty delta, because the
+/// wire has no "move" and a synthesised remove/insert pair would destroy the
+/// node identity this path exists to preserve. Position is instead carried by
+/// [`is_tail_append`] + [`ReconcileList`](crate::ir::opcode::Instruction::ReconcileList):
+/// a transition this delta cannot reproduce (a reorder, a mid-list insert) is
+/// classified as non-tail-append and ships the full ordered set, which does have
+/// position. This function stays the `O(|Δ|)` fast path for the tail-append case.
 #[must_use]
 pub fn diff_records(previous: &Value, next: &Value, key_column: &str) -> Option<Vec<RecordChange>> {
     let previous = index_by_key(previous.as_array()?, key_column)?;
@@ -203,6 +286,62 @@ pub fn project_changes(changes: &[RecordChange], rows: &RenderedRows) -> Option<
             })
         })
         .collect()
+}
+
+/// Whether `previous → next` is expressible as a tail-appending
+/// [`SlotChange`] delta, or must ship the full ordered set as a
+/// [`ReconcileList`](crate::ir::opcode::Instruction::ReconcileList).
+///
+/// A `SlotDelta`'s inserts land at the tail in emission order, so a delta
+/// reproduces `next` **only** when two things hold:
+///
+/// 1. the rows surviving the transition keep their relative order (no reorder), and
+/// 2. every inserted row comes after all survivors in `next` (no mid-list insert).
+///
+/// When either fails — a reorder (which [`diff_records`] reports as an empty
+/// delta, since membership didn't change) or an insert into the middle — the
+/// tail-append model would render the wrong order, and the caller falls back to
+/// a full reconcile. Untrustworthy inputs (a non-array `previous`, unkeyable
+/// rows) return `false`: the full set is the fail-safe, exactly as elsewhere.
+#[must_use]
+pub fn is_tail_append(previous: &Value, next: &Value, key_column: &str) -> bool {
+    let (Some(prev), Some(next)) = (previous.as_array(), next.as_array()) else {
+        return false;
+    };
+    let (Some(prev_keys), Some(next_keys)) = (
+        index_by_key(prev, key_column),
+        index_by_key(next, key_column),
+    ) else {
+        return false;
+    };
+    let prev_set: HashMap<&str, ()> = prev_keys.iter().map(|(k, _)| (k.as_str(), ())).collect();
+    let next_set: HashMap<&str, ()> = next_keys.iter().map(|(k, _)| (k.as_str(), ())).collect();
+
+    // (1) survivors keep their relative order between prev and next.
+    let survivors_prev = prev_keys
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .filter(|k| next_set.contains_key(k));
+    let survivors_next = next_keys
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .filter(|k| prev_set.contains_key(k));
+    if !survivors_prev.eq(survivors_next) {
+        return false;
+    }
+
+    // (2) once an inserted key appears in next order, no survivor may follow it.
+    let mut seen_insert = false;
+    for (key, _) in &next_keys {
+        if prev_set.contains_key(key.as_str()) {
+            if seen_insert {
+                return false;
+            }
+        } else {
+            seen_insert = true;
+        }
+    }
+    true
 }
 
 /// `[(key, record)]` in source order, or `None` if the rows cannot be keyed.
@@ -346,6 +485,49 @@ mod tests {
             changes.is_empty(),
             "ordering is rung 3, and it needs an insert position"
         );
+    }
+
+    #[test]
+    fn a_tail_append_is_expressible_as_a_delta() {
+        assert!(is_tail_append(
+            &rows(&[(1, "ada"), (2, "alan")]),
+            &rows(&[(1, "ada"), (2, "alan"), (3, "grace")]),
+            "id",
+        ));
+        // A retraction with the survivors' order intact is still tail-shaped.
+        assert!(is_tail_append(
+            &rows(&[(1, "ada"), (2, "alan")]),
+            &rows(&[(1, "ada")]),
+            "id",
+        ));
+        // The empty-to-populated first write is all tail inserts.
+        assert!(is_tail_append(&rows(&[]), &rows(&[(1, "ada"), (2, "alan")]), "id"));
+    }
+
+    #[test]
+    fn a_mid_list_insert_is_not_a_tail_append() {
+        assert!(!is_tail_append(
+            &rows(&[(1, "ada"), (3, "grace")]),
+            &rows(&[(1, "ada"), (2, "alan"), (3, "grace")]),
+            "id",
+        ));
+    }
+
+    #[test]
+    fn a_reorder_is_not_a_tail_append_even_though_the_delta_is_empty() {
+        // `diff_records` sees no membership change and returns []; the order
+        // check is the only thing that catches this, so it must.
+        let before = rows(&[(1, "ada"), (2, "alan")]);
+        let after = rows(&[(2, "alan"), (1, "ada")]);
+        assert!(diff_records(&before, &after, "id").unwrap().is_empty());
+        assert!(!is_tail_append(&before, &after, "id"));
+    }
+
+    #[test]
+    fn a_null_placeholder_previous_is_not_a_tail_append() {
+        // First write after a `b"null"` registration: no trustworthy prev order,
+        // so the caller ships the full set rather than guessing appends.
+        assert!(!is_tail_append(&Value::Null, &rows(&[(1, "ada")]), "id"));
     }
 
     #[test]

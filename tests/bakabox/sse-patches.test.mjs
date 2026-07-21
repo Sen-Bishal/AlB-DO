@@ -18,7 +18,7 @@ import { test } from 'node:test';
 import { applyPatchEvent, bootPatchStream } from '../../assets/albedo-wt-bootstrap.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_PATH = resolve(__dirname, '..', 'fixtures', 'wire', 'v3_canonical_frame.bin');
+const FIXTURE_PATH = resolve(__dirname, '..', 'fixtures', 'wire', 'v4_canonical_frame.bin');
 
 function loadFixtureBytes() {
   const buffer = readFileSync(FIXTURE_PATH);

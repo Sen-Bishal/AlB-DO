@@ -45,8 +45,13 @@
  *
  * v2 → v3: engine-expansion S2 added `Instruction::SlotDelta { slot_id,
  * changes }` at variant index 15 — the z-set delta primitive.
+ *
+ * v3 → v4: insert-position work added `Instruction::ReconcileList { slot_id,
+ * rows }` at variant index 16 — the full-desired-set list primitive that
+ * expresses reorder / mid-insert and resyncs a reconnecting client without
+ * leaving ghost rows behind.
  */
-export const LOCKED_WIRE_VERSION = 3;
+export const LOCKED_WIRE_VERSION = 4;
 
 /**
  * Symbolic names for each `InternTableKind`, indexed by the wire's
@@ -76,6 +81,7 @@ export const INSTRUCTION_NAMES = Object.freeze([
   'SlotSet',            // 13
   'Navigate',           // 14 (v2)
   'SlotDelta',          // 15 (v3)
+  'ReconcileList',      // 16 (v4)
 ]);
 
 /**
@@ -407,6 +413,19 @@ function readSlotChange(r) {
   };
 }
 
+/**
+ * Reads one `ReconcileRow { key: RowKey(String), payload: Vec<u8> }`.
+ * The field is named `html` (not `payload`) to match the shape
+ * `_opReconcileList` consumes and the shape the local reactive driver hands
+ * it — the sink normalises a `Uint8Array` here to a string via `_rowHtml`.
+ */
+function readReconcileRow(r) {
+  return {
+    key: r.readString(),
+    html: r.readByteSlice(),
+  };
+}
+
 /** Reads an `InstructionRange { start: u32, end: u32 }`. */
 function readInstructionRange(r) {
   const start = r.readVarintU32();
@@ -532,6 +551,13 @@ const INSTRUCTION_READERS = Object.freeze([
     op: 'SlotDelta',
     slotId: r.readVarintU32(),
     changes: r.readVec(readSlotChange),
+  }),
+
+  // 16 (v4): ReconcileList { slot_id, rows: Vec<ReconcileRow> }
+  (r) => ({
+    op: 'ReconcileList',
+    slotId: r.readVarintU32(),
+    rows: r.readVec(readReconcileRow),
   }),
 ]);
 

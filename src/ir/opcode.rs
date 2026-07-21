@@ -158,6 +158,20 @@ pub struct SlotChange {
     pub payload: Vec<u8>,
 }
 
+/// One row of a full-set reconcile ([`Instruction::ReconcileList`]).
+///
+/// Where a [`SlotChange`] is a *signed* edit whose position is implied by
+/// arrival order (inserts land at the tail), a `ReconcileRow` is a positional
+/// assertion: the desired rows in desired order, `payload` being the row's
+/// rendered bytes and `key` its reconciliation identity. The client walks the
+/// list in order, so `ReconcileList` expresses reorder and mid-insert — the
+/// transitions a tail-appending `SlotDelta` cannot.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct ReconcileRow {
+    pub key: RowKey,
+    pub payload: Vec<u8>,
+}
+
 /// The opcode set that drives the client's slot-table.
 ///
 /// Wire-format note: variant order is the bincode discriminant. Adding new
@@ -298,6 +312,24 @@ pub enum Instruction {
     SlotDelta {
         slot_id: SlotId,
         changes: Vec<SlotChange>,
+    },
+
+    /// Reconcile a keyed slot against the **full desired row set**, in order.
+    ///
+    /// The positional counterpart to [`Instruction::SlotDelta`]: the sink drops
+    /// rows whose key is absent from `rows`, upserts the rest by key, and moves
+    /// each into `rows` order (an unchanged row keeps its DOM node, so identity —
+    /// focus, selection, scroll — survives). This is what a `SlotDelta` cannot
+    /// express — a reorder, or an insert that is not at the tail — and what a
+    /// reconnecting client is resynced with, since a full set can retract a row
+    /// that a positive-only upsert would leave behind as a ghost.
+    ///
+    /// Added as variant index 16 at the end of the enum, so a decoder that does
+    /// not know it surfaces a typed error rather than mis-aligning subsequent
+    /// reads. `LOCKED_WIRE_VERSION` bumps to 4 alongside this variant.
+    ReconcileList {
+        slot_id: SlotId,
+        rows: Vec<ReconcileRow>,
     },
 }
 

@@ -824,18 +824,22 @@ export class Bakabox {
     //    walking `rows` in order and appending each leaves the anchor's
     //    children in exactly that order — reorder falls out for free.
     for (const row of rows) {
+      // `html` is a string from the local reactive driver but a Uint8Array off
+      // the byte wire; normalise so the identity comparison and the source-of-
+      // truth stamp are the same shape either way.
+      const html = this._rowHtml(row.html);
       let node = rowsByKey.get(row.key);
       if (!node) {
-        node = this._instantiateRow(row.html);
+        node = this._instantiateRow(html);
         if (!node) continue;
-      } else if (node.__albedoRowHtml !== row.html) {
-        const fresh = this._instantiateRow(row.html);
+      } else if (node.__albedoRowHtml !== html) {
+        const fresh = this._instantiateRow(html);
         if (fresh) {
           if (node.parentNode) node.parentNode.removeChild(node);
           node = fresh;
         }
       }
-      node.__albedoRowHtml = row.html;
+      node.__albedoRowHtml = html;
       rowsByKey.set(row.key, node);
       anchor.appendChild(node);
     }
