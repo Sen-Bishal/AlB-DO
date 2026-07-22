@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use dom_render_compiler::ir::opcode::{Instruction, StableId};
 use dom_render_compiler::manifest::schema::{DataDep, DataSource, TierBNode};
+use dom_render_compiler::transforms::shared_slot_lists::RowProjection;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -440,6 +441,13 @@ pub struct TierBEntryPlan {
     /// not, so only the list can be precomputed here. Empty for the vast
     /// majority of components, which read no shared slots at all.
     pub shared_topics: Vec<String>,
+    /// Per-topic row-template incrementalisation class ([`RowProjection`]),
+    /// derived at boot from the `.map()` callbacks in this entry's modules.
+    /// Lets FORGE's row projector answer a single-record write on a `PerRecord`
+    /// collection by rendering one row instead of the whole view. A topic absent
+    /// from this map is treated as [`RowProjection::WholeView`] — the
+    /// always-correct whole-view render.
+    pub shared_topic_classes: HashMap<String, RowProjection>,
 }
 
 /// Map from a `TierBNode.render_fn` (e.g. `"render::Stats"`) to its boot-built
@@ -765,6 +773,7 @@ mod tests {
                 entry: "mod::Comp".to_string(),
                 modules: Vec::new(),
                 shared_topics: topics.iter().map(|t| (*t).to_string()).collect(),
+                shared_topic_classes: HashMap::new(),
             }
         }
 

@@ -615,12 +615,34 @@ impl RendererRuntime {
             modules.push((specifier.clone(), module.code.clone()));
         }
 
+        // Classify each shared-slot list's row template so FORGE's row projector
+        // can take the single-row fast path for `PerRecord` collections. Every
+        // module in the entry's load set is classified and merged conservatively:
+        // a topic mapped in more than one place collapses to its safest class.
+        let mut shared_topic_classes: HashMap<String, dom_render_compiler::transforms::shared_slot_lists::RowProjection> =
+            HashMap::new();
+        if !shared_topics.is_empty() {
+            for (specifier, code) in &modules {
+                for (topic, class) in
+                    dom_render_compiler::transforms::shared_slot_lists::classify_shared_slot_lists_source(
+                        specifier, code,
+                    )
+                {
+                    shared_topic_classes
+                        .entry(topic)
+                        .and_modify(|existing| *existing = existing.min(class))
+                        .or_insert(class);
+                }
+            }
+        }
+
         plan.insert(
             key.to_string(),
             crate::render::tier_b::TierBEntryPlan {
                 entry,
                 modules,
                 shared_topics,
+                shared_topic_classes,
             },
         );
     }

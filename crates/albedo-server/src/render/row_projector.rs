@@ -110,6 +110,25 @@ impl PooledRowProjector {
 
 #[async_trait]
 impl RowProjector for PooledRowProjector {
+    fn projection_class(
+        &self,
+        collection: &str,
+    ) -> dom_render_compiler::transforms::shared_slot_lists::RowProjection {
+        use dom_render_compiler::transforms::shared_slot_lists::RowProjection;
+        // The class only applies when a single component reads the collection —
+        // the same condition `project_rows` needs a `sole_reader` for. A topic
+        // read by several components is ambiguous to the projector anyway, so it
+        // stays on the always-correct whole-view path.
+        match self.sole_reader(collection) {
+            Some((_, plan)) => plan
+                .shared_topic_classes
+                .get(collection)
+                .copied()
+                .unwrap_or(RowProjection::WholeView),
+            None => RowProjection::WholeView,
+        }
+    }
+
     async fn project_rows(&self, collection: &str, value: &[u8]) -> Option<RenderedRows> {
         let (render_fn, plan) = self.sole_reader(collection)?;
         let render_fn = render_fn.clone();

@@ -49,6 +49,7 @@
 //! snapshot describes.
 
 use crate::ir::opcode::{RowKey, SlotChange};
+use crate::transforms::shared_slot_lists::RowProjection;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -161,6 +162,19 @@ pub trait RowProjector: Send + Sync {
     /// list anchor in it. `None` suppresses the delta entirely; it never
     /// degrades to a partial one.
     async fn project_rows(&self, collection: &str, value: &[u8]) -> Option<RenderedRows>;
+
+    /// The compile-time incrementalisation class of `collection`'s row template
+    /// (see [`RowProjection`]). It decides whether a single-record write may be
+    /// answered by rendering one row over a singleton collection (`PerRecord`,
+    /// `O(1)`) or must re-render the whole view.
+    ///
+    /// Defaults to the always-correct [`RowProjection::WholeView`]: a projector
+    /// that has not classified its templates simply never takes the fast path.
+    /// The pooled render projector overrides it with the class the transpile
+    /// pre-pass derived from the `.map()` callback.
+    fn projection_class(&self, _collection: &str) -> RowProjection {
+        RowProjection::WholeView
+    }
 }
 
 /// One record-level change, before rendering. The renderer-free half of a
