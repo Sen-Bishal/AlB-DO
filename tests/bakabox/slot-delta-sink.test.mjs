@@ -253,7 +253,7 @@ test('SlotDelta arriving before SetListRef is buffered, then replayed on bind', 
     slotId: 9,
     changes: [{ weight: 1, key: 'a', payload: enc(rowHtml('a', 'alice')) }],
   });
-  assert.equal(bakabox.pendingSlotDeltas.get(9)?.length, 1, 'buffered until bound');
+  assert.equal(bakabox.pendingListOps.get(9)?.length, 1, 'buffered until bound');
 
   // Now the anchor binds — the buffered delta replays.
   const anchor = doc.createElement('ul');
@@ -262,7 +262,7 @@ test('SlotDelta arriving before SetListRef is buffered, then replayed on bind', 
   bakabox.applyInstruction({ op: 'SetListRef', stableId: 2, slotId: 9 });
 
   assert.equal(serializeList(anchor), '<li key=a>alice</li>');
-  assert.equal(bakabox.pendingSlotDeltas.has(9), false, 'buffer drained');
+  assert.equal(bakabox.pendingListOps.has(9), false, 'buffer drained');
 });
 
 // ── 3. Differential oracle: apply(Δ) ≡ full_render ────────────────────

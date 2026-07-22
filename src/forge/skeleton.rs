@@ -94,10 +94,15 @@ pub struct ForgeCollection {
     pub seed: Box<[SeedRow]>,
     /// Structured ordering, derived from the query's `ORDER BY` at construction
     /// (see [`parse_order_by`]). Empty when the ordering can't be proven a simple
-    /// column list — in which case the write path stays on the whole-array
-    /// classification, exactly as before. Lets a single-row write compute its
-    /// insert position (tail / head / before-key) by comparing sort keys rather
-    /// than re-materialising and diffing the whole view.
+    /// column list.
+    ///
+    /// Not yet read by the write path. Insert position is currently taken from
+    /// the freshly materialised array's own order (see
+    /// [`classify_positioned_insert`](crate::forge::delta::classify_positioned_insert)),
+    /// which is exact because the substrate did the ordering. This becomes the
+    /// source of position when the whole array stops being materialised — an
+    /// `INSERT … RETURNING` knows the new record but not where it landed, and
+    /// these keys are what will place it.
     pub sort: Box<[SortKey]>,
 }
 

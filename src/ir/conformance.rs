@@ -40,7 +40,10 @@ use super::opcode::{
 /// - **v4** — Insert-position work added `Instruction::ReconcileList` at index
 ///   16 (the full-desired-set list primitive: reorder, mid-insert, and the
 ///   resync that retracts ghost rows).
-pub const LOCKED_WIRE_VERSION: u32 = 4;
+/// - **v5** — Incremental-projection piece (c) added `Instruction::SlotInsert`
+///   at index 17 (positioned insert: `O(|Δ|)` for a non-tail insert, where v4
+///   had to re-assert the whole view).
+pub const LOCKED_WIRE_VERSION: u32 = 5;
 
 /// Returns the deterministic conformance frame for [`LOCKED_WIRE_VERSION`].
 ///
@@ -52,7 +55,7 @@ pub const LOCKED_WIRE_VERSION: u32 = 4;
 /// Do not edit this function casually. Any change that alters the encoded
 /// bytes is a wire-format break and requires:
 ///   1. A [`LOCKED_WIRE_VERSION`] bump.
-///   2. Regenerating `tests/fixtures/wire/v4_canonical_frame.bin`.
+///   2. Regenerating `tests/fixtures/wire/v5_canonical_frame.bin`.
 ///   3. A matching update to the bakabox decoder test suite.
 ///
 /// # Panics
@@ -180,6 +183,19 @@ pub fn canonical_v1_frame() -> OpcodeFrame {
                     },
                 ],
             },
+            // The positioned insert: one row landing ahead of a named anchor.
+            // Carries the `Some` arm of `before` so the fixture exercises the
+            // Option tag *and* its inner string; the `None` arm is covered by
+            // `opcode::tests::slot_insert_at_tail_round_trips`, since the frame
+            // holds exactly one instruction per variant.
+            Instruction::SlotInsert {
+                slot_id: SlotId(11),
+                before: Some(RowKey("row-2".to_string())),
+                rows: vec![ReconcileRow {
+                    key: RowKey("row-0".to_string()),
+                    payload: b"<li>zero</li>".to_vec(),
+                }],
+            },
         ],
     }
 }
@@ -204,7 +220,7 @@ mod tests {
         // If a new variant is added to Instruction, this test fails fast
         // and reminds the author to extend the fixture. Count is hard-coded
         // so adding a variant without updating the fixture is a CI break.
-        const EXPECTED_VARIANT_COUNT: usize = 17;
+        const EXPECTED_VARIANT_COUNT: usize = 18;
         let frame = canonical_v1_frame();
         assert_eq!(
             frame.instructions.len(),

@@ -27,6 +27,7 @@
 *.tgz   binary
 *.zip   binary
 *.db    binary
+*.bin   binary
 
 # Windows shell scripts require CRLF to run correctly.
 *.bat   text eol=crlf

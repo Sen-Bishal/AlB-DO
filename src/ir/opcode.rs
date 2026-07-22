@@ -331,6 +331,38 @@ pub enum Instruction {
         slot_id: SlotId,
         rows: Vec<ReconcileRow>,
     },
+
+    /// Insert rows into a keyed slot at a **named position**.
+    ///
+    /// The missing rung between [`Instruction::SlotDelta`] and
+    /// [`Instruction::ReconcileList`]. A `SlotDelta` insert is `O(|Δ|)` but
+    /// always lands at the tail, so any non-tail insert — the head row of a
+    /// `created_at DESC` feed being the common one — had to fall back to a
+    /// `ReconcileList` that re-asserts the whole view: `O(|view|)` on the wire
+    /// *and* a whole-view server render. `SlotInsert` keeps both sides
+    /// `O(|Δ|)` by naming the anchor instead of re-sending the set.
+    ///
+    /// `before` is the [`RowKey`] the new rows are inserted ahead of; `None`
+    /// means "at the tail" (the degenerate case a `SlotDelta` already covers,
+    /// kept so one opcode expresses every single-position insert). `rows` are
+    /// inserted in order, immediately before the anchor.
+    ///
+    /// The anchor is a *position assertion*, not a full-set assertion: unlike
+    /// `ReconcileList` this op retracts nothing, so it must only be emitted
+    /// when the producer knows the rest of the view is unchanged. A client
+    /// that does not hold `before` cannot honour the position; it appends and
+    /// waits for the next resync `ReconcileList` to correct the order, which
+    /// is the same correctness-via-fallback the tail-append classifier uses.
+    ///
+    /// Added as variant index 17 at the end of the enum, so a decoder that
+    /// does not know it surfaces a typed error rather than mis-aligning
+    /// subsequent reads. `LOCKED_WIRE_VERSION` bumps to 5 alongside this
+    /// variant.
+    SlotInsert {
+        slot_id: SlotId,
+        before: Option<RowKey>,
+        rows: Vec<ReconcileRow>,
+    },
 }
 
 /// One wire frame.
@@ -609,6 +641,55 @@ mod tests {
                     weight: 1,
                     key: RowKey("row-9".to_string()),
                     payload: b"<li>new</li>".to_vec(),
+                },
+            ],
+        };
+        let bytes =
+            bincode::encode_to_vec(&instruction, bincode::config::standard())
+                .expect("encode");
+        let (decoded, _): (Instruction, _) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("decode");
+        assert_eq!(instruction, decoded);
+    }
+
+    /// The `Some` arm: rows land ahead of a named anchor. This is the shape a
+    /// reverse-chron feed emits — the new row goes before the current head.
+    #[test]
+    fn slot_insert_before_anchor_round_trips() {
+        let instruction = Instruction::SlotInsert {
+            slot_id: SlotId(42),
+            before: Some(RowKey("row-3".to_string())),
+            rows: vec![ReconcileRow {
+                key: RowKey("row-9".to_string()),
+                payload: b"<li>newest</li>".to_vec(),
+            }],
+        };
+        let bytes =
+            bincode::encode_to_vec(&instruction, bincode::config::standard())
+                .expect("encode");
+        let (decoded, _): (Instruction, _) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("decode");
+        assert_eq!(instruction, decoded);
+    }
+
+    /// The `None` arm — tail append. The conformance fixture only carries the
+    /// `Some` arm (one instruction per variant), so the option's absent tag is
+    /// covered here or nowhere.
+    #[test]
+    fn slot_insert_at_tail_round_trips() {
+        let instruction = Instruction::SlotInsert {
+            slot_id: SlotId(42),
+            before: None,
+            rows: vec![
+                ReconcileRow {
+                    key: RowKey("row-9".to_string()),
+                    payload: b"<li>alice</li>".to_vec(),
+                },
+                ReconcileRow {
+                    key: RowKey("row-10".to_string()),
+                    payload: b"<li>bob</li>".to_vec(),
                 },
             ],
         };

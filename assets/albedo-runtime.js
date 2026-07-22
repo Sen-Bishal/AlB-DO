@@ -364,11 +364,17 @@ export class Bakabox {
      */
     this.listSlots = new Map();
     /**
-     * Map<SlotId, SlotChange[]> — `SlotDelta` changes that arrived before the
-     * slot's `SetListRef` bound its anchor. Replayed by `_opSetListRef`, the
-     * z-set analogue of `pendingSlotValues` for scalar `SlotSet`.
+     * Map<SlotId, Instruction[]> — keyed-list ops (`SlotDelta`, `SlotInsert`)
+     * that arrived before the slot's `SetListRef` bound its anchor. Replayed
+     * by `_registerListAnchor`, the z-set analogue of `pendingSlotValues` for
+     * scalar `SlotSet`.
+     *
+     * A queue of whole ops rather than a flat change list: `SlotInsert` names
+     * the row it lands ahead of, so replaying it out of arrival order — or
+     * after a later op has already moved the anchor row — would put the row in
+     * the wrong place. Order is the contract; keep the ops intact.
      */
-    this.pendingSlotDeltas = new Map();
+    this.pendingListOps = new Map();
 
     /** UTF-8 decoder reused for every SetText/SetAttr payload. */
     this._textDecoder = new TextDecoder('utf-8');
@@ -467,6 +473,8 @@ export class Bakabox {
         return this._opSlotDelta(op);
       case 'ReconcileList':
         return this._opReconcileList(op);
+      case 'SlotInsert':
+        return this._opSlotInsert(op);
       case 'Navigate':
         return this._opNavigate(op);
       default:
@@ -682,18 +690,32 @@ export class Bakabox {
   /**
    * Register an element as the keyed-list anchor for `slotId`: seed `rowsByKey`
    * from its `data-albedo-key` rows (so a delta reconciles against SSR output
-   * rather than rebuilding it) and replay any `SlotDelta` that arrived first.
+   * rather than rebuilding it) and replay any list op that arrived first.
    * The single register point for both the local `SetListRef` lane and the B3
    * broadcast boot-scan; it stores the anchor *element* directly, since a
    * broadcast anchor (Tier-B `<ul>`) carries no `data-albedo-id`.
    */
   _registerListAnchor(slotId, anchor) {
     this.listSlots.set(slotId, { anchor, rowsByKey: this._seedRowsByKey(anchor) });
-    const pending = this.pendingSlotDeltas.get(slotId);
+    const pending = this.pendingListOps.get(slotId);
     if (pending) {
-      this.pendingSlotDeltas.delete(slotId);
-      this._opSlotDelta({ slotId, changes: pending });
+      // Drop the buffer BEFORE replaying: each op now finds a bound anchor and
+      // applies for real, so re-buffering would be a leak (and, for a delta,
+      // a double-apply on the next registration).
+      this.pendingListOps.delete(slotId);
+      for (const op of pending) this.applyInstruction(op);
     }
+  }
+
+  /**
+   * Buffers a keyed-list op whose slot has no anchor yet. Shared by
+   * `_opSlotDelta` and `_opSlotInsert` so both lanes drain through the same
+   * ordered queue in `_registerListAnchor`.
+   */
+  _bufferListOp(slotId, op) {
+    const buffered = this.pendingListOps.get(slotId) || [];
+    buffered.push(op);
+    this.pendingListOps.set(slotId, buffered);
   }
 
   /** Build a `RowKey → element` map from an anchor's `data-albedo-key` rows. */
@@ -748,9 +770,11 @@ export class Bakabox {
   _opSlotDelta({ slotId, changes }) {
     const list = this.listSlots.get(slotId);
     if (!list) {
-      const buffered = this.pendingSlotDeltas.get(slotId) || [];
-      for (const change of changes) buffered.push(change);
-      this.pendingSlotDeltas.set(slotId, buffered);
+      // Re-tag the op explicitly rather than forwarding the caller's object:
+      // this handler is reached both through `applyInstruction` (which carries
+      // `op`) and by direct call from the local reactive driver (which does
+      // not), and the replay path dispatches on `op`.
+      this._bufferListOp(slotId, { op: 'SlotDelta', slotId, changes });
       return;
     }
     const anchor = list.anchor;
@@ -842,6 +866,68 @@ export class Bakabox {
       node.__albedoRowHtml = html;
       rowsByKey.set(row.key, node);
       anchor.appendChild(node);
+    }
+  }
+
+  /**
+   * Inserts rows at a **named position** in a keyed list — the positional
+   * counterpart to `SlotDelta`'s tail-only insert, without `ReconcileList`'s
+   * whole-view cost. `before` is the `RowKey` the rows land ahead of; `null`
+   * (the wire's `None`) means the tail, so one handler covers every
+   * single-position insert.
+   *
+   * Asserts a position, not a set: nothing is retracted, so a row the server
+   * did not mention is left exactly where it is. When the client does not hold
+   * `before` — it never saw that row, or the row drifted out from under the
+   * anchor — the position cannot be honoured, so the rows go to the tail
+   * rather than nowhere. That is deliberately the same correctness-via-
+   * fallback the tail-append classifier uses on the server: a misplaced row is
+   * repaired by the next resync `ReconcileList`, a dropped row never is.
+   *
+   * `rows` is `[{ key, html }]` in desired order, and is upserted by key — an
+   * insert naming a key the list already holds moves that row (and re-renders
+   * it if its markup changed), which keeps a redelivered op idempotent.
+   */
+  _opSlotInsert({ slotId, before, rows }) {
+    const list = this.listSlots.get(slotId);
+    if (!list) {
+      this._bufferListOp(slotId, { op: 'SlotInsert', slotId, before, rows });
+      return;
+    }
+    const anchor = list.anchor;
+    if (!anchor) return;
+    const rowsByKey = list.rowsByKey;
+
+    // Resolve the marker once, up front. `insertBefore(node, null)` appends,
+    // so an unresolvable anchor and an explicit tail insert share a path.
+    // The `parentNode === anchor` check matters: a stale `rowsByKey` entry for
+    // a detached node would make `insertBefore` throw NotFoundError.
+    let marker = null;
+    if (before !== null && before !== undefined) {
+      const existing = rowsByKey.get(before);
+      if (existing && existing.parentNode === anchor) marker = existing;
+    }
+
+    for (const row of rows) {
+      // `html` is a string from a local driver, a Uint8Array off the byte wire.
+      const html = this._rowHtml(row.html);
+      let node = rowsByKey.get(row.key);
+      if (!node) {
+        node = this._instantiateRow(html);
+        if (!node) continue;
+      } else if (node.__albedoRowHtml !== html) {
+        // Same key, changed markup: rebuild. Detach the old node first so the
+        // insert below doesn't have to reason about it still being in place.
+        const fresh = this._instantiateRow(html);
+        if (fresh) {
+          if (node.parentNode) node.parentNode.removeChild(node);
+          node = fresh;
+        }
+      }
+      node.__albedoRowHtml = html;
+      rowsByKey.set(row.key, node);
+      // Inserting each row before the same marker leaves `rows` in order.
+      anchor.insertBefore(node, marker);
     }
   }
 
