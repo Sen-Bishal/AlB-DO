@@ -46,14 +46,17 @@
 //!
 //! [`CompiledProject::invoke_action_with_broadcast`]: crate::runtime::CompiledProject::invoke_action_with_broadcast
 
-use crate::forge::delta::{diff_records, is_tail_append, project_changes, RenderedRows, RowProjector};
+use crate::forge::delta::{
+    diff_records, is_tail_append, project_changes, RenderedRows, RowProjector,
+};
+use crate::transforms::shared_slot_lists::RowProjection;
 use crate::forge::skeleton::{materialize_slot, ForgeCollection, ForgeSchema};
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Result, SqlValue, SubstrateError};
 use crate::ir::opcode::{ReconcileRow, RowKey};
 use crate::runtime::broadcast::{BroadcastRegistry, ListUpdate, TopicTransition};
 use serde_json::{Map, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 /// One durable mutation requested by an action body.
 ///
@@ -358,6 +361,12 @@ pub async fn apply_writes(
         return Ok(());
     }
 
+    // Temporary write-path instrumentation (env-gated, off by default): times the
+    // four phases per touched slot to `stderr`. Gated so it costs nothing in the
+    // hot path unless `ALBEDO_FORGE_TIMING` is set. Remove once the design call is
+    // made from the numbers.
+    let timing = std::env::var_os("ALBEDO_FORGE_TIMING").is_some();
+
     // Resolve every collection against the schema BEFORE opening the
     // transaction: an unknown collection is an authoring error, and it should
     // not cost a write lock or leave a half-built transaction to roll back.
@@ -374,6 +383,7 @@ pub async fn apply_writes(
         }
     }
 
+    let t_commit = std::time::Instant::now();
     let tx = substrate.begin().await?;
     for write in writes {
         // The slot is borrowed from the schema, resolved in `touched` above —
@@ -398,6 +408,7 @@ pub async fn apply_writes(
         }
     }
     tx.commit().await?;
+    let commit_el = t_commit.elapsed();
 
     // Durable now — safe to tell the world.
     for slot in touched {
@@ -408,25 +419,161 @@ pub async fn apply_writes(
         // on the very lock it is running under. What survives into the closure
         // is only the diff: pure, bounded by the collection size, and the one
         // step that genuinely needs the pre-state it is replacing.
+        let t_mat = std::time::Instant::now();
         let bytes = materialize_slot(substrate, slot).await?;
-        let rows = match projector {
-            Some(projector) => projector.project_rows(&slot.topic, &bytes).await,
-            None => None,
+        let mat_el = t_mat.elapsed();
+
+        // Choose what to render. A `PerRecord` collection renders only the rows
+        // this write changed — each over a singleton collection, `O(1)` in the
+        // view size — because its row template is a proven function of its record
+        // alone (the transpile pre-pass classified it; see `RowProjection`). Every
+        // other class renders the whole view exactly as before. `partial` marks a
+        // render that covers only the changed keys: a reconcile needs every row,
+        // so if the classified fast path can't satisfy one it re-renders after the
+        // lock (`needs_whole` below).
+        let t_proj = std::time::Instant::now();
+        let (rows, partial) = match projector {
+            Some(p) if p.projection_class(&slot.topic) == RowProjection::PerRecord => {
+                match render_changed_rows(p, slot, broadcast, &bytes).await {
+                    // Changed rows attributed and rendered: the fast path.
+                    Some(changed) => (Some(changed), true),
+                    // No prior value to diff against, or unkeyable rows: fall back
+                    // to the whole view, which is always renderable and correct.
+                    None => (p.project_rows(&slot.topic, &bytes).await, false),
+                }
+            }
+            Some(p) => (p.project_rows(&slot.topic, &bytes).await, false),
+            None => (None, false),
         };
+        let proj_el = t_proj.elapsed();
+        let row_count = rows.as_ref().map(|r| r.len()).unwrap_or(0);
+
+        // Dev correctness gate: prove the singleton-rendered rows are byte-identical
+        // to the whole-view render's slice of them. A `PerRecord` misclassification
+        // would surface here loudly rather than as a stranded row in production.
+        if partial && std::env::var_os("ALBEDO_FORGE_VERIFY").is_some() {
+            if let (Some(p), Some(changed)) = (projector, rows.as_ref()) {
+                if let Some(whole) = p.project_rows(&slot.topic, &bytes).await {
+                    for (key, html) in changed.iter() {
+                        match whole.get(key) {
+                            Some(expected) if expected == html => {}
+                            other => eprintln!(
+                                "[forge-verify] DIVERGENCE topic={} key={} \
+                                 singleton={:?} whole={:?}",
+                                slot.topic, key, html, other
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
+        let t_fan = std::time::Instant::now();
         broadcast.topic(slot.topic.clone(), bytes.clone());
+        // `needs_whole` is raised inside the closure when a partial render can't
+        // express the transition (a reorder, a mid-list insert, or a race that
+        // moved `previous` out from under the changed-set guess). The reconcile is
+        // then shipped after the lock, off the critical section.
+        let needs_whole = Cell::new(false);
         let _ = broadcast.write_topic_delta(&slot.topic, |previous| {
             let update = match rows.as_ref() {
-                Some(rows) => row_update(slot, previous, &bytes, rows),
+                Some(rows) => row_update(slot, previous, &bytes, rows, partial, &needs_whole),
                 None => ListUpdate::None,
             };
             TopicTransition {
-                value: bytes,
+                value: bytes.clone(),
                 update,
             }
         });
+        let fan_el = t_fan.elapsed();
+
+        // Rare, off-lock: the changed-only render could not satisfy a reconcile.
+        // Render the whole view now and ship the full ordered set so keyed anchors
+        // reach the new order. The `SlotSet` value already went out above, so a
+        // reload or late joiner is already correct; this repairs live rows.
+        if needs_whole.get() {
+            if let Some(p) = projector {
+                if let Some(whole) = p.project_rows(&slot.topic, &bytes).await {
+                    let _ = broadcast.write_topic_delta(&slot.topic, |_previous| TopicTransition {
+                        value: bytes.clone(),
+                        update: ListUpdate::Reconcile(reconcile_rows(&whole)),
+                    });
+                }
+            }
+        }
+
+        if timing {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!(
+                "[forge-timing] topic={} rows={} partial={} commit={:.3}ms materialize={:.3}ms \
+                 project={:.3}ms fanout={:.3}ms",
+                slot.topic,
+                row_count,
+                partial,
+                ms(commit_el),
+                ms(mat_el),
+                ms(proj_el),
+                ms(fan_el),
+            );
+        }
     }
 
     Ok(())
+}
+
+/// Render only the records a write changed, each over a **singleton** collection
+/// `[record]`, keyed as the whole-view render would key them.
+///
+/// The changed set is derived by diffing the topic's current broadcast value
+/// against `next` (the freshly materialised bytes). That read is racy — a
+/// concurrent write may have advanced the value since — but it is only a *guess*
+/// at what to pre-render: the authoritative diff runs later under the topic lock
+/// ([`row_update`]), and any changed key this guess failed to render collapses
+/// that classification to a whole-view reconcile. So the guess can only cost a
+/// fallback, never a wrong row.
+///
+/// Returns `None` when the changed set can't be attributed — no prior value to
+/// diff against (the topic isn't registered yet, or holds the `null`
+/// placeholder), or rows that can't be keyed — leaving the caller to render the
+/// whole view.
+async fn render_changed_rows(
+    projector: &dyn RowProjector,
+    slot: &ForgeCollection,
+    broadcast: &BroadcastRegistry,
+    next: &[u8],
+) -> Option<RenderedRows> {
+    let previous = broadcast.get(&slot.topic)?.current_value();
+    let previous: Value = serde_json::from_slice(&previous).ok()?;
+    let next_json: Value = serde_json::from_slice(next).ok()?;
+    let changes = diff_records(&previous, &next_json, &slot.key_column)?;
+
+    let mut rows = RenderedRows::new();
+    for change in &changes {
+        // A retraction carries no row to render — its wire payload is empty, and
+        // `project_changes` never reads a rendered row for a `−` change.
+        if change.weight < 0 {
+            continue;
+        }
+        // The row template applied to this record alone. For a `PerRecord`
+        // template the singleton render is byte-identical to the whole-view
+        // render's slice of this row (the classifier's guarantee).
+        let singleton = serde_json::to_vec(&Value::Array(vec![change.record.clone()])).ok()?;
+        let rendered = projector.project_rows(&slot.topic, &singleton).await?;
+        let html = rendered.get(&change.key)?.clone();
+        rows.insert(change.key.clone(), html);
+    }
+    Some(rows)
+}
+
+/// The full desired row set as [`ReconcileRow`]s, in render order — the payload
+/// of a [`ListUpdate::Reconcile`].
+fn reconcile_rows(rows: &RenderedRows) -> Vec<ReconcileRow> {
+    rows.iter()
+        .map(|(key, html)| ReconcileRow {
+            key: RowKey(key.clone()),
+            payload: html.clone().into_bytes(),
+        })
+        .collect()
 }
 
 /// The list half of one collection's fan-out: classify the previous
@@ -440,22 +587,36 @@ pub async fn apply_writes(
 /// `O(|view|)` on the wire but the only shape that carries position, and it is
 /// always correct, so it is the fallback whenever the delta cannot be trusted.
 ///
-/// `rows` is the projection of `next`, taken before the lock, and is already in
-/// `next`'s render order — so it *is* the reconcile payload, no re-parse. In the
-/// window between that render and this classification another action may have
-/// committed; then `previous` is *its* value, the delta describes `their state →
-/// our (older) materialisation`, and the snapshot beside it still agrees, so no
-/// client diverges and the next write re-converges everyone. Making the whole
-/// commit-materialise-fan-out sequence atomic per collection is the real fix and
-/// belongs with the substrate, not here.
+/// `rows` is the projection of `next`, taken before the lock. When `partial` is
+/// false it holds every row in render order, so it *is* the reconcile payload,
+/// no re-parse. When `partial` is true it holds only the rows the write changed
+/// (the `PerRecord` fast path): a `Delta` — which references only changed keys —
+/// is served from it directly, but a reconcile, which needs every row, cannot
+/// be. In that case this raises `needs_whole` and returns [`ListUpdate::None`];
+/// the caller renders the whole view off the lock and ships the reconcile then.
+///
+/// In the window between that render and this classification another action may
+/// have committed; then `previous` is *its* value, the delta describes `their
+/// state → our (older) materialisation`, and the snapshot beside it still agrees,
+/// so no client diverges and the next write re-converges everyone. Making the
+/// whole commit-materialise-fan-out sequence atomic per collection is the real
+/// fix and belongs with the substrate, not here.
 fn row_update(
     slot: &ForgeCollection,
     previous: &[u8],
     next: &[u8],
     rows: &RenderedRows,
+    partial: bool,
+    needs_whole: &Cell<bool>,
 ) -> ListUpdate {
-    // The always-correct fallback: the full desired set in render order.
+    // The always-correct fallback: the full desired set in render order. When
+    // `rows` is only the changed subset it cannot express this, so defer to the
+    // caller's off-lock whole-view render instead.
     let reconcile = || {
+        if partial {
+            needs_whole.set(true);
+            return ListUpdate::None;
+        }
         ListUpdate::Reconcile(
             rows.iter()
                 .map(|(key, html)| ReconcileRow {
@@ -485,8 +646,10 @@ fn row_update(
         Some(changes) if changes.is_empty() => ListUpdate::None,
         Some(changes) => match project_changes(&changes, rows) {
             Some(slot_changes) => ListUpdate::Delta(slot_changes),
-            // The diff insists on a row the render never produced: the two
-            // disagree, so ship the whole set rather than a partial delta.
+            // The diff insists on a row the render never produced: either the
+            // whole-view render and the diff disagree, or the changed-set guess
+            // missed a key. Ship the whole set (or defer to it) rather than a
+            // partial delta.
             None => reconcile(),
         },
         None => reconcile(),
@@ -1011,6 +1174,103 @@ mod substrate_tests {
             }
             other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
         }
+    }
+
+    /// The fast path. A `PerRecord` collection answers an append by rendering
+    /// only the appended row — over a *singleton* collection — never the whole
+    /// view. The wire result is byte-identical to the whole-view path (asserted
+    /// just above); this test asserts the projector was never handed more than
+    /// one row, which is the whole point: the render stops being `O(|view|)`.
+    #[tokio::test]
+    async fn a_per_record_append_renders_only_the_new_row() {
+        use crate::ir::opcode::Instruction;
+        use crate::ir::wire::decode_frame;
+        use crate::runtime::session::SessionId;
+        use crate::transforms::shared_slot_lists::RowProjection;
+
+        /// Records the size of every collection it is asked to render, and
+        /// declares itself `PerRecord` so the singleton fast path engages.
+        struct CountingGuestbook {
+            render_sizes: std::sync::Mutex<Vec<usize>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::forge::delta::RowProjector for CountingGuestbook {
+            async fn project_rows(
+                &self,
+                collection: &str,
+                value: &[u8],
+            ) -> Option<crate::forge::delta::RenderedRows> {
+                if collection != "guestbook" {
+                    return None;
+                }
+                let records: Value = serde_json::from_slice(value).ok()?;
+                let arr = records.as_array()?;
+                self.render_sizes.lock().unwrap().push(arr.len());
+                let mut html = String::from("<ul data-albedo-list-slot=\"guestbook\">");
+                for record in arr {
+                    html.push_str(&format!(
+                        "<li data-albedo-key=\"{}\">{}</li>",
+                        record.get("id")?,
+                        record.get("author")?.as_str()?
+                    ));
+                }
+                html.push_str("</ul>");
+                crate::transforms::shared_slot_lists::extract_keyed_rows(&html, collection)
+            }
+
+            fn projection_class(&self, collection: &str) -> RowProjection {
+                if collection == "guestbook" {
+                    RowProjection::PerRecord
+                } else {
+                    RowProjection::WholeView
+                }
+            }
+        }
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        broadcast
+            .subscribe(SessionId::random(), "guestbook", tx)
+            .unwrap();
+
+        let projector = CountingGuestbook { render_sizes: std::sync::Mutex::new(Vec::new()) };
+        apply_writes(
+            &db,
+            &broadcast,
+            &ForgeSchema::guestbook_default(),
+            &[append(
+                "guestbook",
+                json!({ "author": "grace", "message": "found the bug" }),
+            )],
+            Some(&projector),
+        )
+        .await
+        .unwrap();
+
+        // Identical wire result to the whole-view path: snapshot of 3, delta of 1.
+        let payload = rx.recv().await.expect("the write reaches the subscriber");
+        let (frame, _) = decode_frame(&payload).unwrap();
+        match frame.instructions.as_slice() {
+            [Instruction::SlotSet { .. }, Instruction::SlotDelta { changes, .. }] => {
+                assert_eq!(changes.len(), 1, "an append is still ONE row on the wire");
+                assert_eq!(changes[0].weight, 1);
+            }
+            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+        }
+
+        // The proof of `O(1)`: the projector was only ever asked to render a
+        // single row — never the whole, post-write, three-row collection.
+        let sizes = projector.render_sizes.lock().unwrap();
+        assert!(!sizes.is_empty(), "the projector was invoked");
+        assert!(
+            sizes.iter().all(|&n| n == 1),
+            "every render must be a singleton; got sizes {sizes:?}"
+        );
     }
 
     /// Module-scope stand-in for the render path, shared by the update/delete

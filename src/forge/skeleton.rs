@@ -47,6 +47,23 @@ pub struct SeedRow {
     pub params: Box<[SqlValue]>,
 }
 
+/// Sort direction of one `ORDER BY` term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// One `ORDER BY` term: a column and its direction. The structured form of the
+/// query's ordering, so the write path can decide where a new row lands (tail,
+/// head, or before some sibling key) without re-parsing SQL or comparing whole
+/// arrays at write time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    pub column: String,
+    pub dir: SortDir,
+}
+
 /// One FORGE-backed collection: a broadcast topic materialised from a substrate
 /// query, plus the schema (DDL + optional seed) that makes the query answerable.
 /// The owned successor of the old `&'static ForgeSlot` — the hand-authored
@@ -75,6 +92,13 @@ pub struct ForgeCollection {
     pub migrations: Box<[String]>,
     /// One-time seed rows, applied only when `table` is empty.
     pub seed: Box<[SeedRow]>,
+    /// Structured ordering, derived from the query's `ORDER BY` at construction
+    /// (see [`parse_order_by`]). Empty when the ordering can't be proven a simple
+    /// column list — in which case the write path stays on the whole-array
+    /// classification, exactly as before. Lets a single-row write compute its
+    /// insert position (tail / head / before-key) by comparing sort keys rather
+    /// than re-materialising and diffing the whole view.
+    pub sort: Box<[SortKey]>,
 }
 
 impl ForgeCollection {
@@ -90,16 +114,78 @@ impl ForgeCollection {
     ) -> Self {
         let topic = topic.into();
         let slot_id = broadcast_slot_id(&topic);
+        let query = query.into();
+        let sort = parse_order_by(&query);
         Self {
             topic,
             table: table.into(),
-            query: query.into(),
+            query,
             key_column: key_column.into(),
             slot_id,
             migrations,
             seed,
+            sort,
         }
     }
+}
+
+/// Extract the structured ordering from a query's `ORDER BY` clause.
+///
+/// Deliberately strict: it accepts only a comma-separated list of **plain column
+/// identifiers**, each with an optional `ASC`/`DESC`. Anything it can't prove is
+/// a simple column list — an expression (`lower(name)`), a `COLLATE`, a
+/// `NULLS FIRST`, a subquery, no `ORDER BY` at all — yields an **empty** result,
+/// and an empty `sort` sends the write path to its whole-array classification,
+/// which is always correct. So a parse that gives up costs the fast position
+/// computation, never correctness. The query text stays the single source of
+/// truth for ordering; this is just its structured shadow.
+#[must_use]
+pub fn parse_order_by(query: &str) -> Box<[SortKey]> {
+    let lower = query.to_ascii_lowercase();
+    let Some(at) = lower.rfind("order by") else {
+        return Box::new([]);
+    };
+    // The clause runs from after `order by` to the first trailing clause that can
+    // follow it, or the end of the statement.
+    let tail = &query[at + "order by".len()..];
+    let tail_lower = &lower[at + "order by".len()..];
+    let end = ["limit", "offset", ";", ")"]
+        .iter()
+        .filter_map(|kw| tail_lower.find(kw))
+        .min()
+        .unwrap_or(tail.len());
+    let clause = tail[..end].trim();
+    if clause.is_empty() {
+        return Box::new([]);
+    }
+
+    let mut keys = Vec::new();
+    for term in clause.split(',') {
+        let mut parts = term.split_whitespace();
+        let Some(column) = parts.next() else {
+            return Box::new([]);
+        };
+        // Only a plain identifier can be reasoned about positionally; anything
+        // else (a function call, a quoted expr) fails the whole parse.
+        if !crate::forge::write::is_safe_identifier(column) {
+            return Box::new([]);
+        }
+        let dir = match parts.next() {
+            None => SortDir::Asc,
+            Some(word) if word.eq_ignore_ascii_case("asc") => SortDir::Asc,
+            Some(word) if word.eq_ignore_ascii_case("desc") => SortDir::Desc,
+            // `NULLS FIRST`, a trailing `COLLATE`, a second unexpected token:
+            // give up rather than guess.
+            Some(_) => return Box::new([]),
+        };
+        // A term with more than `<col> <dir>` (e.g. `col desc nulls last`) is
+        // more than we can model.
+        if parts.next().is_some() {
+            return Box::new([]);
+        }
+        keys.push(SortKey { column: column.to_string(), dir });
+    }
+    keys.into_boxed_slice()
 }
 
 /// Why a set of [`ForgeCollection`]s cannot form a valid [`ForgeSchema`].
@@ -402,6 +488,66 @@ mod schema_tests {
             Box::new([]),
             Box::new([]),
         )
+    }
+
+    fn key(column: &str, dir: SortDir) -> SortKey {
+        SortKey { column: column.to_string(), dir }
+    }
+
+    #[test]
+    fn order_by_a_bare_column_is_ascending() {
+        assert_eq!(
+            *parse_order_by("SELECT id, author FROM guestbook ORDER BY id"),
+            [key("id", SortDir::Asc)],
+        );
+    }
+
+    #[test]
+    fn order_by_reads_explicit_direction_case_insensitively() {
+        assert_eq!(
+            *parse_order_by("SELECT * FROM t ORDER BY created_at DESC"),
+            [key("created_at", SortDir::Desc)],
+        );
+        assert_eq!(
+            *parse_order_by("select * from t order by ID desc"),
+            [key("ID", SortDir::Desc)],
+        );
+    }
+
+    #[test]
+    fn order_by_handles_a_multi_column_list() {
+        assert_eq!(
+            *parse_order_by("SELECT * FROM t ORDER BY rank DESC, id ASC"),
+            [key("rank", SortDir::Desc), key("id", SortDir::Asc)],
+        );
+    }
+
+    #[test]
+    fn a_trailing_limit_does_not_leak_into_the_sort() {
+        assert_eq!(
+            *parse_order_by("SELECT * FROM t ORDER BY id DESC LIMIT 10"),
+            [key("id", SortDir::Desc)],
+        );
+    }
+
+    #[test]
+    fn no_order_by_yields_no_sort() {
+        assert!(parse_order_by("SELECT id FROM t").is_empty());
+    }
+
+    #[test]
+    fn an_expression_order_is_not_modelled_and_yields_no_sort() {
+        // A function or expression can't be reasoned about positionally, so the
+        // whole parse gives up — the write path then classifies whole-array.
+        assert!(parse_order_by("SELECT * FROM t ORDER BY lower(name)").is_empty());
+        assert!(parse_order_by("SELECT * FROM t ORDER BY id DESC NULLS LAST").is_empty());
+    }
+
+    #[test]
+    fn guestbook_default_sorts_by_id_ascending() {
+        let schema = ForgeSchema::guestbook_default();
+        let guestbook = schema.slot_for_topic("guestbook").unwrap();
+        assert_eq!(*guestbook.sort, [key("id", SortDir::Asc)]);
     }
 
     #[test]

@@ -19,11 +19,12 @@
 
 use crate::forge::delta::RenderedRows;
 use std::collections::HashMap;
-use swc_common::DUMMY_SP;
+use swc_common::{sync::Lrc, FileName, SourceMap, DUMMY_SP};
+use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_ast::{
-    CallExpr, Callee, Expr, IdentName, ImportSpecifier, JSXAttr, JSXAttrName, JSXAttrOrSpread,
-    JSXAttrValue, JSXElement, JSXElementChild, JSXExpr, Lit, MemberProp, Module, ModuleDecl,
-    ModuleExportName, ModuleItem, Pat, Str, VarDeclarator,
+    BlockStmtOrExpr, CallExpr, Callee, Expr, Ident, IdentName, ImportSpecifier, JSXAttr,
+    JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElement, JSXElementChild, JSXExpr, Lit,
+    MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, Pat, Str, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -363,6 +364,239 @@ fn map_over_shared_slot(expr: &Expr, idents: &HashMap<String, String>) -> Option
     idents.get(obj.sym.as_ref()).cloned()
 }
 
+/// How a shared-slot row template depends on its collection — the compile-time
+/// classification that decides whether a single-record write can be answered by
+/// rendering **one row** (`O(1)`) or must re-render the whole view (`O(|view|)`).
+///
+/// The fast path renders one row by feeding the *same* row template a singleton
+/// collection `[record]` and reading the row back out — not a second renderer
+/// (see [`extract_keyed_rows`]'s contract note), just the one renderer over a
+/// one-element input. That is byte-identical to the whole-view render's slice of
+/// the row **iff** the row's markup does not depend on anything the singleton
+/// changes: the record's index, the collection's length, or the array itself.
+/// This classification is exactly that proof, and it is deliberately
+/// conservative — [`RowProjection::WholeView`] is the answer on any doubt,
+/// because a false `PerRecord` strands a wrong row on the page permanently while
+/// a false `WholeView` only forgoes the optimization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowProjection {
+    /// `map(row => …)` — the row's markup is a function of its record alone. A
+    /// single-record write always renders just that row.
+    PerRecord,
+    /// `map((row, i) => …)` — the row reads its index but not the collection's
+    /// length or the array. A single-row render is correct only where the index
+    /// is unchanged (a tail append or an in-place update); other writes fall back.
+    PositionStable,
+    /// Length-dependent, reads the collection/array directly, a shape the
+    /// classifier cannot inspect (a named `.map(renderRow)` callback, a spread),
+    /// or otherwise unprovable. Always re-renders the whole view.
+    WholeView,
+}
+
+impl RowProjection {
+    /// The more conservative of two classifications (`WholeView` wins, then
+    /// `PositionStable`). Used when one topic is mapped at more than one site —
+    /// across `.map()` calls in one module, or across the modules of one render
+    /// plan.
+    #[must_use]
+    pub fn min(self, other: Self) -> Self {
+        use RowProjection::{PerRecord, PositionStable, WholeView};
+        match (self, other) {
+            (WholeView, _) | (_, WholeView) => WholeView,
+            (PositionStable, _) | (_, PositionStable) => PositionStable,
+            (PerRecord, PerRecord) => PerRecord,
+        }
+    }
+}
+
+/// `topic → row-projection class` for every shared-slot `.map()` in the module.
+///
+/// Runs the same shared-slot binding resolution as [`mark_shared_slot_lists`],
+/// then classifies each `IDENT.map(callback)` it finds. A topic mapped at more
+/// than one site collapses to the most conservative class (its rows are
+/// ambiguous to the projector anyway).
+#[must_use]
+pub fn classify_shared_slot_lists(module: &Module) -> HashMap<String, RowProjection> {
+    let idents = collect_shared_slot_idents(module);
+    if idents.is_empty() {
+        return HashMap::new();
+    }
+    let mut classifier = RowProjectionClassifier { idents, out: HashMap::new() };
+    module.visit_with(&mut classifier);
+    classifier.out
+}
+
+/// Classify a module from its source text, choosing the parser syntax by the
+/// specifier's extension. The server-side render-plan builder calls this per
+/// module so the [`crate::forge::RowProjector`] can report each collection's
+/// class without the caller depending on swc.
+///
+/// A source that fails to parse yields an empty map — every collection then
+/// defaults to [`RowProjection::WholeView`], the always-correct whole-view
+/// render. Classification never *causes* a wrong render; at worst it forgoes the
+/// single-row fast path.
+#[must_use]
+pub fn classify_shared_slot_lists_source(
+    specifier: &str,
+    source: &str,
+) -> HashMap<String, RowProjection> {
+    use std::path::Path;
+    let syntax = match Path::new(specifier).extension().and_then(|e| e.to_str()) {
+        Some("ts") => Syntax::Typescript(TsSyntax::default()),
+        Some("tsx") => Syntax::Typescript(TsSyntax { tsx: true, ..Default::default() }),
+        _ => Syntax::Es(EsSyntax { jsx: true, ..Default::default() }),
+    };
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(FileName::Custom(specifier.to_string()).into(), source.to_string());
+    let mut parser = Parser::new(syntax, StringInput::from(&*fm), None);
+    match parser.parse_module() {
+        Ok(module) => classify_shared_slot_lists(&module),
+        Err(_) => HashMap::new(),
+    }
+}
+
+struct RowProjectionClassifier {
+    /// `local binding -> topic`, as in [`ListAnchorMarker`].
+    idents: HashMap<String, String>,
+    /// `topic -> class`.
+    out: HashMap<String, RowProjection>,
+}
+
+impl Visit for RowProjectionClassifier {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Some((topic, binding)) = map_call_binding(call, &self.idents) {
+            let class = classify_row_projection(call, &binding);
+            self.out
+                .entry(topic)
+                .and_modify(|existing| *existing = existing.min(class))
+                .or_insert(class);
+        }
+        call.visit_children_with(self);
+    }
+}
+
+/// `Some((topic, binding_ident))` when `call` is `IDENT.map(...)` and `IDENT` is
+/// a shared-slot binding. The binding name is returned alongside the topic
+/// because the classifier needs it: a row body that references the array
+/// identifier depends on the whole view.
+fn map_call_binding(
+    call: &CallExpr,
+    idents: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Member(member) = callee.as_ref() else {
+        return None;
+    };
+    let MemberProp::Ident(method) = &member.prop else {
+        return None;
+    };
+    if method.sym.as_ref() != "map" {
+        return None;
+    }
+    let Expr::Ident(obj) = member.obj.as_ref() else {
+        return None;
+    };
+    let topic = idents.get(obj.sym.as_ref())?.clone();
+    Some((topic, obj.sym.to_string()))
+}
+
+/// Classify one shared-slot `.map(callback)` call. `collection_binding` is the
+/// array identifier the map is called on; a body that names it depends on the
+/// whole collection.
+fn classify_row_projection(call: &CallExpr, collection_binding: &str) -> RowProjection {
+    let Some(first) = call.args.first() else {
+        return RowProjection::WholeView;
+    };
+    // `.map(...spread)` — the callback isn't a single inspectable expression.
+    if first.spread.is_some() {
+        return RowProjection::WholeView;
+    }
+
+    // Pull the callback's params and collect every identifier its body uses.
+    let (params, body_idents): (Vec<Pat>, IdentCollector) = match first.expr.as_ref() {
+        Expr::Arrow(arrow) => {
+            let mut idents = IdentCollector::default();
+            match arrow.body.as_ref() {
+                BlockStmtOrExpr::BlockStmt(block) => block.visit_with(&mut idents),
+                BlockStmtOrExpr::Expr(expr) => expr.visit_with(&mut idents),
+            }
+            (arrow.params.clone(), idents)
+        }
+        Expr::Fn(func) => {
+            let mut idents = IdentCollector::default();
+            if let Some(body) = &func.function.body {
+                body.visit_with(&mut idents);
+            }
+            let pats = func.function.params.iter().map(|p| p.pat.clone()).collect();
+            (pats, idents)
+        }
+        // A named callback (`.map(renderRow)`), a member expr, anything we can't
+        // read the body of: cannot prove PerRecord.
+        _ => return RowProjection::WholeView,
+    };
+
+    // Referencing the array identifier itself is a whole-view dependency
+    // (`entries.length`, `entries.find(…)`, a nested map, …).
+    if body_idents.uses(collection_binding) {
+        return RowProjection::WholeView;
+    }
+
+    // The 3rd map param IS the array; the 2nd is the index. A param we can't name
+    // (a destructured index, a rest param) is one we can't prove unused — treat
+    // its presence conservatively.
+    if let Some(third) = params.get(2) {
+        match pat_ident_name(third) {
+            Some(name) if body_idents.uses(&name) => return RowProjection::WholeView,
+            None => return RowProjection::WholeView,
+            _ => {}
+        }
+    }
+    if let Some(second) = params.get(1) {
+        match pat_ident_name(second) {
+            Some(name) if body_idents.uses(&name) => return RowProjection::PositionStable,
+            None => return RowProjection::WholeView,
+            _ => {}
+        }
+    }
+
+    RowProjection::PerRecord
+}
+
+/// The name a param binds, when it is a plain identifier. Destructuring (`{id}`),
+/// rest (`...xs`), and defaults return `None` — the caller decides how to treat a
+/// param it cannot name.
+fn pat_ident_name(pat: &Pat) -> Option<String> {
+    match pat {
+        Pat::Ident(binding) => Some(binding.id.sym.to_string()),
+        _ => None,
+    }
+}
+
+/// Collects every identifier used in expression position within a callback body,
+/// so the classifier can ask whether a given name (the array binding, the index
+/// param) is referenced. Member-property names (`.length`) are `IdentName`, not
+/// `Ident`, so they are not collected — which is what we want: the danger is a
+/// reference to the array *value* (`entries` in `entries.length`), and that obj
+/// is a plain `Ident` this does collect.
+#[derive(Default)]
+struct IdentCollector {
+    used: std::collections::HashSet<String>,
+}
+
+impl IdentCollector {
+    fn uses(&self, name: &str) -> bool {
+        self.used.contains(name)
+    }
+}
+
+impl Visit for IdentCollector {
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.used.insert(ident.sym.to_string());
+    }
+}
+
 fn has_attr(el: &JSXElement, name: &str) -> bool {
     el.opening.attrs.iter().any(|attr| {
         matches!(
@@ -383,6 +617,132 @@ fn list_slot_attr(topic: &str) -> JSXAttrOrSpread {
             raw: None,
         }))),
     })
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    /// Parse a TSX fragment to a raw swc [`Module`] — the input the transpile
+    /// pre-pass classifier runs on, before resolver/type-strip.
+    fn parse_tsx(source: &str) -> Module {
+        let cm: Lrc<SourceMap> = Default::default();
+        let fm = cm.new_source_file(FileName::Custom("test.tsx".into()).into(), source.to_string());
+        let mut parser = Parser::new(
+            Syntax::Typescript(TsSyntax { tsx: true, ..Default::default() }),
+            StringInput::from(&*fm),
+            None,
+        );
+        parser.parse_module().expect("tsx parses")
+    }
+
+    /// Classify a `guestbook` shared-slot list whose `.map(...)` is `map_expr`.
+    fn classify(map_expr: &str) -> RowProjection {
+        let source = format!(
+            r#"
+            import {{ useSharedSlot }} from "albedo";
+            export default function Component() {{
+                const entries = useSharedSlot("guestbook");
+                return <ul>{{{map_expr}}}</ul>;
+            }}
+            "#
+        );
+        let module = parse_tsx(&source);
+        *classify_shared_slot_lists(&module)
+            .get("guestbook")
+            .expect("guestbook was classified")
+    }
+
+    #[test]
+    fn a_record_only_row_is_per_record() {
+        assert_eq!(
+            classify("entries.map(entry => <li key={entry.id}>{entry.message}</li>)"),
+            RowProjection::PerRecord,
+        );
+    }
+
+    #[test]
+    fn a_destructured_record_is_per_record() {
+        assert_eq!(
+            classify("entries.map(({ id, message }) => <li key={id}>{message}</li>)"),
+            RowProjection::PerRecord,
+        );
+    }
+
+    #[test]
+    fn an_unused_index_param_stays_per_record() {
+        // The classifier keys off *usage*, not the arity of the callback: a
+        // second param that never appears in the body cannot change a row.
+        assert_eq!(
+            classify("entries.map((entry, i) => <li key={entry.id}>{entry.message}</li>)"),
+            RowProjection::PerRecord,
+        );
+    }
+
+    #[test]
+    fn a_used_index_is_position_stable() {
+        assert_eq!(
+            classify("entries.map((entry, i) => <li key={entry.id}>{i}. {entry.message}</li>)"),
+            RowProjection::PositionStable,
+        );
+    }
+
+    #[test]
+    fn reading_the_collection_length_is_whole_view() {
+        assert_eq!(
+            classify("entries.map(entry => <li key={entry.id}>{entries.length}</li>)"),
+            RowProjection::WholeView,
+        );
+    }
+
+    #[test]
+    fn using_the_third_array_param_is_whole_view() {
+        assert_eq!(
+            classify("entries.map((entry, i, all) => <li key={entry.id}>{all.length}</li>)"),
+            RowProjection::WholeView,
+        );
+    }
+
+    #[test]
+    fn a_named_callback_cannot_be_proven_and_is_whole_view() {
+        assert_eq!(
+            classify("entries.map(renderRow)"),
+            RowProjection::WholeView,
+        );
+    }
+
+    #[test]
+    fn the_most_conservative_class_wins_across_sites() {
+        // One binding mapped twice: once record-only, once index-using. The
+        // topic collapses to the more conservative (PositionStable).
+        let source = r#"
+            import { useSharedSlot } from "albedo";
+            export default function Component() {
+                const entries = useSharedSlot("guestbook");
+                return <div>
+                    <ul>{entries.map(entry => <li key={entry.id}>{entry.message}</li>)}</ul>
+                    <ol>{entries.map((entry, i) => <li key={entry.id}>{i}</li>)}</ol>
+                </div>;
+            }
+        "#;
+        let module = parse_tsx(source);
+        assert_eq!(
+            *classify_shared_slot_lists(&module).get("guestbook").unwrap(),
+            RowProjection::PositionStable,
+        );
+    }
+
+    #[test]
+    fn a_module_with_no_shared_slot_map_classifies_nothing() {
+        let module = parse_tsx(
+            r#"
+            export default function Component() {
+                return <ul><li>static</li></ul>;
+            }
+            "#,
+        );
+        assert!(classify_shared_slot_lists(&module).is_empty());
+    }
 }
 
 #[cfg(test)]
