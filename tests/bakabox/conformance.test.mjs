@@ -35,7 +35,7 @@ const FIXTURE_PATH = resolve(
   '..',
   'fixtures',
   'wire',
-  'v4_canonical_frame.bin',
+  'v5_canonical_frame.bin',
 );
 
 /**
@@ -103,6 +103,12 @@ const EXPECTED_FRAME = Object.freeze({
         { key: 'row-1', html: Buffer.from('<li>one</li>') },
         { key: 'row-2', html: Buffer.from('<li>two</li>') },
       ],
+    },
+    {
+      op: 'SlotInsert',
+      slotId: 11,
+      before: 'row-2',
+      rows: [{ key: 'row-0', html: Buffer.from('<li>zero</li>') }],
     },
   ],
 });
@@ -208,14 +214,14 @@ function normaliseExpected(frame) {
 test('LOCKED_WIRE_VERSION matches the Rust side', () => {
   // If this fails, either the JS module bumped its version without a
   // matching Rust change or vice versa. Coordinate the release.
-  assert.equal(LOCKED_WIRE_VERSION, 4);
+  assert.equal(LOCKED_WIRE_VERSION, 5);
 });
 
 test('INSTRUCTION_NAMES is exhaustive and well-ordered', () => {
   // Mirrors `canonical_v2_frame_covers_every_instruction_variant` on
   // the Rust side. The expected count is hard-coded so a wire-format
   // addition fails fast here AND in Rust.
-  const EXPECTED_VARIANT_COUNT = 17;
+  const EXPECTED_VARIANT_COUNT = 18;
   assert.equal(
     INSTRUCTION_NAMES.length,
     EXPECTED_VARIANT_COUNT,
@@ -226,6 +232,7 @@ test('INSTRUCTION_NAMES is exhaustive and well-ordered', () => {
   assert.equal(INSTRUCTION_NAMES[14], 'Navigate');
   assert.equal(INSTRUCTION_NAMES[15], 'SlotDelta');
   assert.equal(INSTRUCTION_NAMES[16], 'ReconcileList');
+  assert.equal(INSTRUCTION_NAMES[17], 'SlotInsert');
 });
 
 test('canonical fixture decodes to the expected frame shape', () => {

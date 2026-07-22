@@ -168,10 +168,10 @@ test('a SlotDelta arriving before the scan is buffered, then replayed on registr
     slotId: topicSlotId('guestbook'),
     changes: [{ weight: 1, key: '2', payload: enc(rowHtml('2', 'alan')) }],
   });
-  assert.equal(bakabox.pendingSlotDeltas.get(topicSlotId('guestbook'))?.length, 1);
+  assert.equal(bakabox.pendingListOps.get(topicSlotId('guestbook'))?.length, 1);
 
   bakabox.scanListAnchors(); // registration replays the buffered delta
 
   assert.equal(serialize(ul), '<li key=1>ada</li><li key=2>alan</li>');
-  assert.equal(bakabox.pendingSlotDeltas.has(topicSlotId('guestbook')), false, 'buffer drained');
+  assert.equal(bakabox.pendingListOps.has(topicSlotId('guestbook')), false, 'buffer drained');
 });

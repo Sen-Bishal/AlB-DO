@@ -197,13 +197,15 @@ pub struct TopicTransition {
 /// match the new value, chosen by the caller from how the collection actually
 /// changed.
 ///
-/// Two shapes, because two are all the wire needs. A `SlotDelta` is `O(|Δ|)`
-/// and preserves node identity, but its inserts land at the tail — so it is
-/// only correct for an order-preserving tail append. Anything else (a reorder,
-/// a mid-list insert, a first write off a `null` placeholder) ships the full
-/// ordered set as a `ReconcileList`, which is `O(|view|)` on the wire but the
-/// only shape that can express position. The caller picks; the registry just
-/// encodes what it is handed.
+/// Three shapes, ordered by what the transition actually needs. A `SlotDelta`
+/// is `O(|Δ|)` and preserves node identity, but its inserts land at the tail —
+/// so it is only correct for an order-preserving tail append. A run of rows
+/// inserted somewhere else, with nothing else touched, is `O(|Δ|)` too once the
+/// wire can name the anchor: that is `SlotInsert`. Everything remaining — a
+/// reorder, an update tangled with an insert, a first write off a `null`
+/// placeholder — ships the full ordered set as a `ReconcileList`, which is
+/// `O(|view|)` on the wire but always correct. The caller picks; the registry
+/// just encodes what it is handed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListUpdate {
     /// Nothing row-shaped changed — the frame degenerates to a plain `SlotSet`.
@@ -211,9 +213,17 @@ pub enum ListUpdate {
     /// Order-preserving tail append, as signed row changes. Ships as
     /// [`Instruction::SlotDelta`] after [`coalesce_changes`].
     Delta(Vec<SlotChange>),
+    /// A contiguous run of rows inserted ahead of `before` (`None` = at the
+    /// tail), with no retraction, update or reorder alongside. Ships as
+    /// [`Instruction::SlotInsert`] — the `O(|Δ|)` answer to a mid-list or head
+    /// insert that previously had to re-assert the whole view.
+    Insert {
+        before: Option<RowKey>,
+        rows: Vec<ReconcileRow>,
+    },
     /// The full desired row set, in order. Ships as
-    /// [`Instruction::ReconcileList`]; used for reorder, mid-insert, resync, or
-    /// any transition a tail-append cannot reproduce.
+    /// [`Instruction::ReconcileList`]; used for reorder, resync, or any
+    /// transition the two `O(|Δ|)` shapes cannot reproduce.
     Reconcile(Vec<ReconcileRow>),
 }
 
@@ -467,6 +477,18 @@ impl BroadcastRegistry {
                     instructions.push(Instruction::SlotDelta {
                         slot_id: topic_entry.slot_id,
                         changes,
+                    });
+                }
+            }
+            ListUpdate::Insert { before, rows } => {
+                // No coalescing: the classifier already proved these keys are
+                // new and distinct. An empty run is not a transition — unlike a
+                // reconcile, an empty `SlotInsert` asserts nothing, so drop it.
+                if !rows.is_empty() {
+                    instructions.push(Instruction::SlotInsert {
+                        slot_id: topic_entry.slot_id,
+                        before,
+                        rows,
                     });
                 }
             }
@@ -1086,6 +1108,76 @@ mod tests {
             }
             other => panic!("expected [SlotSet, ReconcileList], got {other:?}"),
         }
+    }
+
+    /// A positioned insert ships as `SlotInsert` after the snapshot, carrying
+    /// only the new rows and the key they land ahead of — the wire shape that
+    /// makes a reverse-chron feed's head insert `O(|Δ|)` instead of `O(|view|)`.
+    #[tokio::test]
+    async fn an_insert_update_ships_a_slot_insert_naming_its_anchor() {
+        let registry = BroadcastRegistry::new();
+        let topic = registry.topic("guestbook", b"[]".to_vec());
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        registry
+            .subscribe(SessionId::random(), "guestbook", tx)
+            .unwrap();
+
+        registry
+            .write_topic_delta("guestbook", |_| TopicTransition {
+                value: br#"[{"id":3},{"id":2},{"id":1}]"#.to_vec(),
+                update: ListUpdate::Insert {
+                    before: Some(RowKey("2".to_string())),
+                    rows: vec![ReconcileRow {
+                        key: RowKey("3".to_string()),
+                        payload: b"<li data-albedo-key=\"3\">grace</li>".to_vec(),
+                    }],
+                },
+            })
+            .unwrap();
+
+        let payloads = drain_into_vec(&mut rx);
+        match instructions_of(&payloads[0]).as_slice() {
+            [Instruction::SlotSet { .. }, Instruction::SlotInsert {
+                slot_id,
+                before,
+                rows,
+            }] => {
+                assert_eq!(*slot_id, topic.slot_id());
+                assert_eq!(*before, Some(RowKey("2".to_string())));
+                assert_eq!(rows.len(), 1, "only the inserted row is on the wire");
+                assert_eq!(rows[0].key, RowKey("3".to_string()));
+            }
+            other => panic!("expected [SlotSet, SlotInsert], got {other:?}"),
+        }
+    }
+
+    /// An empty run asserts nothing — unlike a reconcile, whose empty set really
+    /// does mean "the list is now empty". Shipping it would be a wasted opcode.
+    #[tokio::test]
+    async fn an_empty_insert_degenerates_to_a_plain_slot_set() {
+        let registry = BroadcastRegistry::new();
+        registry.topic("t", b"[]".to_vec());
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        registry.subscribe(SessionId::random(), "t", tx).unwrap();
+
+        registry
+            .write_topic_delta("t", |_| TopicTransition {
+                value: b"[]".to_vec(),
+                update: ListUpdate::Insert {
+                    before: None,
+                    rows: Vec::new(),
+                },
+            })
+            .unwrap();
+
+        let payloads = drain_into_vec(&mut rx);
+        assert!(
+            matches!(
+                instructions_of(&payloads[0]).as_slice(),
+                [Instruction::SlotSet { .. }]
+            ),
+            "an empty insert must not put an opcode on the wire"
+        );
     }
 
     /// A value-only transition must stay byte-identical to the pre-S4 frame:

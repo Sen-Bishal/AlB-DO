@@ -47,13 +47,14 @@
 //! [`CompiledProject::invoke_action_with_broadcast`]: crate::runtime::CompiledProject::invoke_action_with_broadcast
 
 use crate::forge::delta::{
-    diff_records, is_tail_append, project_changes, RenderedRows, RowProjector,
+    appended_rows, classify_positioned_insert, diff_records, is_tail_append, project_changes,
+    project_inserted_rows, RenderedRows, RowProjector,
 };
 use crate::transforms::shared_slot_lists::RowProjection;
 use crate::forge::skeleton::{materialize_slot, ForgeCollection, ForgeSchema};
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Result, SqlValue, SubstrateError};
-use crate::ir::opcode::{ReconcileRow, RowKey};
+use crate::ir::opcode::{ReconcileRow, RowKey, SlotChange};
 use crate::runtime::broadcast::{BroadcastRegistry, ListUpdate, TopicTransition};
 use serde_json::{Map, Value};
 use std::cell::{Cell, RefCell};
@@ -543,6 +544,20 @@ async fn render_changed_rows(
     next: &[u8],
 ) -> Option<RenderedRows> {
     let previous = broadcast.get(&slot.topic)?.current_value();
+
+    // Intent-path shortcut: when `next` is provably `previous` plus a tail, the
+    // appended records ARE the changed set. No parse of either full array, no
+    // diff — the guess costs `O(|Δ|)` instead of `O(|view|)`.
+    if let Some(appended) = appended_rows(&previous, next, &slot.key_column) {
+        let mut rows = RenderedRows::new();
+        for (key, record) in &appended {
+            let singleton = serde_json::to_vec(&Value::Array(vec![record.clone()])).ok()?;
+            let rendered = projector.project_rows(&slot.topic, &singleton).await?;
+            rows.insert(key.clone(), rendered.get(key)?.clone());
+        }
+        return Some(rows);
+    }
+
     let previous: Value = serde_json::from_slice(&previous).ok()?;
     let next_json: Value = serde_json::from_slice(next).ok()?;
     let changes = diff_records(&previous, &next_json, &slot.key_column)?;
@@ -627,6 +642,32 @@ fn row_update(
         )
     };
 
+    // Intent-path shortcut, before either array is parsed: a byte-proven tail
+    // append is a tail append by construction, inserting exactly these keys and
+    // touching nothing else. This is the common write, and it is the whole point
+    // of item 3.3 — the classification below re-derives from two full arrays what
+    // the append already knew.
+    if let Some(appended) = appended_rows(previous, next, &slot.key_column) {
+        if appended.is_empty() {
+            // `next` is byte-identical to `previous` — nothing to reconcile.
+            return ListUpdate::None;
+        }
+        let mut changes = Vec::with_capacity(appended.len());
+        for (key, _record) in &appended {
+            let Some(html) = rows.get(key) else {
+                // The render never produced an appended row: same disagreement
+                // `project_changes` refuses on, same answer.
+                return reconcile();
+            };
+            changes.push(SlotChange {
+                weight: 1,
+                key: RowKey(key.clone()),
+                payload: html.clone().into_bytes(),
+            });
+        }
+        return ListUpdate::Delta(changes);
+    }
+
     let (Ok(previous), Ok(next)) = (
         serde_json::from_slice::<Value>(previous),
         serde_json::from_slice::<Value>(next),
@@ -637,8 +678,26 @@ fn row_update(
     };
 
     if !is_tail_append(&previous, &next, &slot.key_column) {
-        // Reorder or mid-list insert (or a non-array `previous`): a tail-append
-        // delta would render the wrong order.
+        // Not a tail append — but a run of rows inserted at one place, with
+        // nothing else touched, is still `O(|Δ|)` now that the wire can name the
+        // anchor. This is the reverse-chron case: a `created_at DESC` feed puts
+        // every new row at the head, which used to re-assert the whole view on
+        // every single write.
+        //
+        // Deliberately reachable from the `PerRecord` fast path: it reads only
+        // the inserted rows, which is exactly what a partial render holds, so it
+        // never raises `needs_whole`. That is what makes a head insert O(1) to
+        // render *and* O(|Δ|) on the wire.
+        if let Some(insert) = classify_positioned_insert(&previous, &next, &slot.key_column) {
+            if let Some(rows) = project_inserted_rows(&insert, rows) {
+                return ListUpdate::Insert {
+                    before: insert.before.map(RowKey),
+                    rows,
+                };
+            }
+        }
+        // A reorder, or an update tangled with an insert: only the full ordered
+        // set carries this.
         return reconcile();
     }
 
@@ -911,6 +970,158 @@ mod tests {
         let err =
             build_update("guestbook", "id", &json!(3), fields.as_object().unwrap()).unwrap_err();
         assert!(format!("{err}").contains("key column"), "unexpected: {err}");
+    }
+
+    // ── row_update: choosing the wire shape (C3) ────────────────────────
+
+    /// A reverse-chron collection — the feed shape whose every write is a head
+    /// insert, and which before `SlotInsert` re-asserted the whole view each time.
+    fn reverse_chron() -> ForgeCollection {
+        ForgeCollection::new(
+            "guestbook",
+            "guestbook",
+            "SELECT id, author FROM guestbook ORDER BY id DESC",
+            "id",
+            Box::new([]),
+            Box::new([]),
+        )
+    }
+
+    fn json_bytes(entries: &[(i64, &str)]) -> Vec<u8> {
+        let rows: Vec<Value> = entries
+            .iter()
+            .map(|(id, author)| json!({ "id": id, "author": author }))
+            .collect();
+        serde_json::to_vec(&Value::Array(rows)).unwrap()
+    }
+
+    fn rendered(entries: &[(i64, &str)]) -> RenderedRows {
+        entries
+            .iter()
+            .map(|(id, author)| {
+                (
+                    id.to_string(),
+                    format!("<li data-albedo-key=\"{id}\">{author}</li>"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_head_insert_ships_a_positioned_insert_not_a_whole_reconcile() {
+        let needs_whole = Cell::new(false);
+        let update = row_update(
+            &reverse_chron(),
+            &json_bytes(&[(2, "alan"), (1, "ada")]),
+            &json_bytes(&[(3, "grace"), (2, "alan"), (1, "ada")]),
+            &rendered(&[(3, "grace"), (2, "alan"), (1, "ada")]),
+            false,
+            &needs_whole,
+        );
+
+        match update {
+            ListUpdate::Insert { before, rows } => {
+                assert_eq!(before, Some(RowKey("2".to_string())));
+                assert_eq!(rows.len(), 1, "one row on the wire, not the whole view");
+                assert_eq!(rows[0].key, RowKey("3".to_string()));
+            }
+            other => panic!("expected a positioned insert, got {other:?}"),
+        }
+    }
+
+    /// The C3 payoff: a head insert stays on the `PerRecord` fast path. The
+    /// partial render holds only the new record, and that is all the positioned
+    /// insert reads — so it must NOT raise `needs_whole` and drag the write back
+    /// into an `O(|view|)` render.
+    #[test]
+    fn a_head_insert_rides_the_partial_render_without_demanding_the_whole_view() {
+        let needs_whole = Cell::new(false);
+        let update = row_update(
+            &reverse_chron(),
+            &json_bytes(&[(2, "alan"), (1, "ada")]),
+            &json_bytes(&[(3, "grace"), (2, "alan"), (1, "ada")]),
+            &rendered(&[(3, "grace")]), // partial: only the changed record
+            true,
+            &needs_whole,
+        );
+
+        assert!(
+            matches!(update, ListUpdate::Insert { .. }),
+            "expected a positioned insert off a partial render, got {update:?}"
+        );
+        assert!(
+            !needs_whole.get(),
+            "a positioned insert must never demand the whole view"
+        );
+    }
+
+    /// Regression: the cheapest shape still wins. A tail append is classified
+    /// before the positioned insert and stays a `SlotDelta`.
+    #[test]
+    fn a_tail_append_still_ships_as_a_delta() {
+        let needs_whole = Cell::new(false);
+        let update = row_update(
+            &reverse_chron(),
+            &json_bytes(&[(1, "ada")]),
+            &json_bytes(&[(1, "ada"), (2, "alan")]),
+            &rendered(&[(1, "ada"), (2, "alan")]),
+            false,
+            &needs_whole,
+        );
+        assert!(
+            matches!(update, ListUpdate::Delta(_)),
+            "expected a delta, got {update:?}"
+        );
+    }
+
+    /// A reorder is not an insert; only the full ordered set carries it. With a
+    /// partial render it must still defer to the off-lock whole-view reconcile.
+    #[test]
+    fn a_reorder_still_falls_back_to_the_whole_set() {
+        let needs_whole = Cell::new(false);
+        let update = row_update(
+            &reverse_chron(),
+            &json_bytes(&[(1, "ada"), (2, "alan")]),
+            &json_bytes(&[(2, "alan"), (1, "ada")]),
+            &rendered(&[(2, "alan"), (1, "ada")]),
+            false,
+            &needs_whole,
+        );
+        assert!(
+            matches!(update, ListUpdate::Reconcile(_)),
+            "expected a reconcile, got {update:?}"
+        );
+
+        let needs_whole = Cell::new(false);
+        let partial = row_update(
+            &reverse_chron(),
+            &json_bytes(&[(1, "ada"), (2, "alan")]),
+            &json_bytes(&[(2, "alan"), (1, "ada")]),
+            &rendered(&[(2, "alan")]),
+            true,
+            &needs_whole,
+        );
+        assert!(matches!(partial, ListUpdate::None));
+        assert!(needs_whole.get(), "must defer to the off-lock whole render");
+    }
+
+    /// An insert tangled with an edit cannot ship as a positioned insert — the
+    /// op retracts nothing, so the stale row would survive.
+    #[test]
+    fn an_insert_alongside_an_edit_falls_back_to_the_whole_set() {
+        let needs_whole = Cell::new(false);
+        let update = row_update(
+            &reverse_chron(),
+            &json_bytes(&[(2, "alan"), (1, "ada")]),
+            &json_bytes(&[(3, "grace"), (2, "turing"), (1, "ada")]),
+            &rendered(&[(3, "grace"), (2, "turing"), (1, "ada")]),
+            false,
+            &needs_whole,
+        );
+        assert!(
+            matches!(update, ListUpdate::Reconcile(_)),
+            "expected a reconcile, got {update:?}"
+        );
     }
 
     /// A null key would compile to `WHERE k = NULL`, which matches nothing — a

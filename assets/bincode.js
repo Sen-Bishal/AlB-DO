@@ -11,7 +11,7 @@
 //
 // and this module decodes the resulting bytes back into JS objects. Any
 // drift between the two sides is a wire-format break — the conformance
-// fixture `tests/fixtures/wire/v1_canonical_frame.bin` is the gate that
+// fixture `tests/fixtures/wire/v5_canonical_frame.bin` is the gate that
 // catches it. See `LOCKED_WIRE_VERSION` in `src/ir/conformance.rs` and the
 // twin Rust+JS tests that consume the same fixture bytes.
 //
@@ -50,8 +50,13 @@
  * rows }` at variant index 16 — the full-desired-set list primitive that
  * expresses reorder / mid-insert and resyncs a reconnecting client without
  * leaving ghost rows behind.
+ *
+ * v4 → v5: incremental-projection piece (c) added `Instruction::SlotInsert
+ * { slot_id, before, rows }` at variant index 17 — a positioned insert, so a
+ * non-tail insert (the head row of a reverse-chron feed) costs `O(|Δ|)` on
+ * the wire instead of a whole-view `ReconcileList`.
  */
-export const LOCKED_WIRE_VERSION = 4;
+export const LOCKED_WIRE_VERSION = 5;
 
 /**
  * Symbolic names for each `InternTableKind`, indexed by the wire's
@@ -82,6 +87,7 @@ export const INSTRUCTION_NAMES = Object.freeze([
   'Navigate',           // 14 (v2)
   'SlotDelta',          // 15 (v3)
   'ReconcileList',      // 16 (v4)
+  'SlotInsert',         // 17 (v5)
 ]);
 
 /**
@@ -557,6 +563,16 @@ const INSTRUCTION_READERS = Object.freeze([
   (r) => ({
     op: 'ReconcileList',
     slotId: r.readVarintU32(),
+    rows: r.readVec(readReconcileRow),
+  }),
+
+  // 17 (v5): SlotInsert { slot_id, before: Option<RowKey>, rows }
+  // `before` decodes to `null` for the `None` arm — the sink reads that as
+  // "append at the tail", matching the Rust doc comment.
+  (r) => ({
+    op: 'SlotInsert',
+    slotId: r.readVarintU32(),
+    before: r.readOption((inner) => inner.readString()),
     rows: r.readVec(readReconcileRow),
   }),
 ]);

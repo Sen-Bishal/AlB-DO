@@ -48,7 +48,7 @@
 //! rule is total: emit a delta only when it is provably the same transition the
 //! snapshot describes.
 
-use crate::ir::opcode::{RowKey, SlotChange};
+use crate::ir::opcode::{ReconcileRow, RowKey, SlotChange};
 use crate::transforms::shared_slot_lists::RowProjection;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -222,11 +222,26 @@ pub fn diff_records(previous: &Value, next: &Value, key_column: &str) -> Option<
     let next_rows = next.as_array()?;
     let next_index = index_by_key(next_rows, key_column)?;
 
+    // Membership by lookup, not by scan. Both sides are already deduplicated by
+    // `index_by_key`, so a map over them loses nothing — and it is what keeps
+    // this linear. The scan-inside-a-loop this replaced was O(N²): at a couple
+    // of thousand rows it cost more than the render it exists to feed, and it
+    // was paid twice per write (the changed-set guess and the authoritative
+    // classification under the topic lock).
+    let previous_by_key: HashMap<&str, &Value> = previous
+        .iter()
+        .map(|(key, record)| (key.as_str(), *record))
+        .collect();
+    let next_by_key: HashMap<&str, ()> = next_index
+        .iter()
+        .map(|(key, _)| (key.as_str(), ()))
+        .collect();
+
     let mut changes = Vec::new();
 
     // 1. Retractions, in previous order.
     for (key, record) in &previous {
-        if !next_index.iter().any(|(next_key, _)| next_key == key) {
+        if !next_by_key.contains_key(key.as_str()) {
             changes.push(RecordChange {
                 weight: -1,
                 key: key.clone(),
@@ -237,9 +252,9 @@ pub fn diff_records(previous: &Value, next: &Value, key_column: &str) -> Option<
 
     // 2. Insertions and updates, in next order.
     for (key, record) in &next_index {
-        match previous.iter().find(|(prev_key, _)| prev_key == key) {
-            Some((_, before)) if before == record => {}
-            Some((_, before)) => {
+        match previous_by_key.get(key.as_str()) {
+            Some(before) if before == record => {}
+            Some(before) => {
                 // An update is the retraction of the old row AND the insertion
                 // of the new one under the same key. Both halves must reach the
                 // wire — see `coalesce_changes`, which keys on (key, payload)
@@ -356,6 +371,232 @@ pub fn is_tail_append(previous: &Value, next: &Value, key_column: &str) -> bool 
         }
     }
     true
+}
+
+/// The rows `next` appends to `previous`, decided on **bytes** — or `None` when
+/// `next` is not `previous` plus a tail.
+///
+/// The intent path's shortcut. Both buffers are `serde_json::to_vec` of the same
+/// collection shape: no whitespace, and a record that did not change serialises
+/// to the same bytes it did last time. So "`next`'s text begins with `previous`'s
+/// text, minus its closing bracket" is a **stronger** fact than the record diff
+/// establishes — byte equality implies value equality, in the same order — and
+/// it costs one `memcmp` instead of parsing and indexing every row on both sides.
+/// What remains between that prefix and `next`'s closing bracket is exactly what
+/// was appended, and it is the only thing this parses.
+///
+/// That makes the common write — one row onto the end of a collection — `O(1)`
+/// in the collection's size for both the changed-set guess and the authoritative
+/// classification, where before each paid a full parse plus a full walk. Anything
+/// else (an edit, a deletion, a reorder, a non-tail insert, a first write off the
+/// `null` placeholder) fails the prefix test and returns `None`, and the caller
+/// takes the parse-and-diff path exactly as before.
+///
+/// Returning `Some(vec![])` is meaningful and distinct from `None`: `next` is
+/// byte-identical to `previous`, so nothing changed at all.
+#[must_use]
+pub fn appended_rows(
+    previous: &[u8],
+    next: &[u8],
+    key_column: &str,
+) -> Option<Vec<(String, Value)>> {
+    // `[` … `]` on both sides, with room for the brackets themselves. The
+    // `b"null"` / empty placeholder a topic is registered with fails here.
+    if previous.len() < 2
+        || previous.first() != Some(&b'[')
+        || previous.last() != Some(&b']')
+        || next.last() != Some(&b']')
+    {
+        return None;
+    }
+    let prefix = &previous[..previous.len() - 1];
+    if !next.starts_with(prefix) {
+        return None;
+    }
+
+    let tail = &next[prefix.len()..next.len() - 1];
+    if tail.is_empty() {
+        return Some(Vec::new());
+    }
+    // The appended members, re-bracketed into an array to parse. A non-empty
+    // `previous` leaves the separating comma at the front of the tail; an empty
+    // one (`[]`, whose prefix is just `[`) does not.
+    let body = if tail[0] == b',' { &tail[1..] } else { tail };
+    let mut json = Vec::with_capacity(body.len() + 2);
+    json.push(b'[');
+    json.extend_from_slice(body);
+    json.push(b']');
+    let records: Vec<Value> = serde_json::from_slice(&json).ok()?;
+
+    // Uphold `index_by_key`'s refusal to reconcile against a key that does not
+    // identify. The slow path proves uniqueness by indexing every row; doing that
+    // here would cost the parse this function exists to avoid, so instead look for
+    // the appended key's serialised fragment in the previous bytes. A hit can be
+    // incidental — the same text inside some other field — so it only ever costs a
+    // fallback; but a genuine duplicate cannot hide from it.
+    let previous_text = std::str::from_utf8(previous).ok()?;
+    let mut out = Vec::with_capacity(records.len());
+    let mut seen: HashMap<String, ()> = HashMap::with_capacity(records.len());
+    for record in records {
+        let key_value = record.get(key_column)?;
+        let key = row_key(key_value)?;
+        if seen.insert(key.clone(), ()).is_some() {
+            return None;
+        }
+        let fragment = format!(
+            "{}:{}",
+            serde_json::to_string(key_column).ok()?,
+            serde_json::to_string(key_value).ok()?
+        );
+        if previous_text.contains(&fragment) {
+            return None;
+        }
+        out.push((key, record));
+    }
+    Some(out)
+}
+
+/// One contiguous run of newly inserted rows, and the row it lands ahead of —
+/// the record-level shape of
+/// [`Instruction::SlotInsert`](crate::ir::opcode::Instruction::SlotInsert).
+///
+/// `before` is the key of the surviving row the run is inserted before; `None`
+/// means the run is at the tail. `keys` are the inserted keys in `next` order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionedInsert {
+    pub before: Option<String>,
+    pub keys: Vec<String>,
+}
+
+/// Whether `previous → next` is a **pure positioned insert**: rows added at one
+/// place, with nothing else touched.
+///
+/// The rung between [`is_tail_append`] and the whole-set fallback. A tail append
+/// ships as a `SlotDelta`; anything else used to ship the entire ordered view,
+/// because the wire had no way to say *where* a row goes. `SlotInsert` says it,
+/// so this classifier finds the transitions that opcode can reproduce exactly:
+///
+/// 1. **Nothing retracted** — every previous key survives.
+/// 2. **Nothing updated** — every surviving key carries a byte-identical record. An edit is a `−`/`+`
+///    pair; `SlotInsert` upserts but retracts nothing, so a transition containing one is not this
+///    shape.
+/// 3. **Survivors keep their relative order** — the op moves no existing row.
+/// 4. **The inserted keys form a single contiguous run** — one op names one anchor. Two runs at
+///    different positions would need two ops, and splitting them here would let a partial apply
+///    land; the whole set is the honest answer instead.
+///
+/// The anchor is read off `next`'s **own order**, not recomputed from the
+/// collection's `ORDER BY`: `next` is the freshly materialised snapshot, so the
+/// substrate has already done the ordering, exactly and with its own collation.
+/// Re-deriving position from [`ForgeCollection::sort`](crate::forge::skeleton::ForgeCollection)
+/// would mean reimplementing the substrate's comparison semantics — mixed types,
+/// NULL placement, text collation — in Rust, and being subtly wrong there
+/// produces a row stranded at the wrong index rather than an error. `sort` earns
+/// its keep when the whole array stops being materialised; while we have it, it
+/// is the more trustworthy source.
+///
+/// Returns `None` for anything that is not this shape, including "nothing was
+/// inserted" — same fail-safe rule as the rest of the module: the caller ships
+/// the full set, which is always correct.
+#[must_use]
+pub fn classify_positioned_insert(
+    previous: &Value,
+    next: &Value,
+    key_column: &str,
+) -> Option<PositionedInsert> {
+    let prev_rows = index_by_key(previous.as_array()?, key_column)?;
+    let next_rows = index_by_key(next.as_array()?, key_column)?;
+
+    let prev_index: HashMap<&str, &Value> = prev_rows
+        .iter()
+        .map(|(key, record)| (key.as_str(), *record))
+        .collect();
+    let next_keys: HashMap<&str, ()> = next_rows
+        .iter()
+        .map(|(key, _)| (key.as_str(), ()))
+        .collect();
+
+    // (1) nothing retracted.
+    if prev_rows
+        .iter()
+        .any(|(key, _)| !next_keys.contains_key(key.as_str()))
+    {
+        return None;
+    }
+
+    // One walk of `next` settles (2), (4) and the anchor; (3) is checked after,
+    // against the order the survivors came out in.
+    let mut keys: Vec<String> = Vec::new();
+    let mut before: Option<String> = None;
+    let mut run_closed = false;
+    let mut survivors: Vec<&str> = Vec::with_capacity(prev_rows.len());
+
+    for (key, record) in &next_rows {
+        match prev_index.get(key.as_str()) {
+            Some(previous_record) => {
+                // (2) a survivor whose record changed is an update, not an insert.
+                if *previous_record != *record {
+                    return None;
+                }
+                // The first survivor after the run began is the anchor.
+                if !keys.is_empty() && !run_closed {
+                    before = Some(key.clone());
+                    run_closed = true;
+                }
+                survivors.push(key.as_str());
+            }
+            None => {
+                // (4) a new key after the run closed is a second run.
+                if run_closed {
+                    return None;
+                }
+                keys.push(key.clone());
+            }
+        }
+    }
+
+    if keys.is_empty() {
+        return None;
+    }
+
+    // (3) every previous row survived, so the survivors in `next` order must be
+    // the previous order exactly.
+    if !prev_rows
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .eq(survivors.into_iter())
+    {
+        return None;
+    }
+
+    Some(PositionedInsert { before, keys })
+}
+
+/// Pair a [`PositionedInsert`]'s keys with their rendered markup, in run order.
+///
+/// All-or-nothing, for the same reason [`project_changes`] is: a key the render
+/// never produced means the render and the classifier disagree about what was
+/// inserted, and shipping the renderable subset would place rows the snapshot
+/// beside it does not describe.
+///
+/// Note this reads only the *inserted* rows, which is what lets the positioned
+/// insert ride the `PerRecord` fast path — `rows` there holds just the records
+/// the write changed, never the whole view.
+#[must_use]
+pub fn project_inserted_rows(
+    insert: &PositionedInsert,
+    rows: &RenderedRows,
+) -> Option<Vec<ReconcileRow>> {
+    insert
+        .keys
+        .iter()
+        .map(|key| {
+            Some(ReconcileRow {
+                key: RowKey(key.clone()),
+                payload: rows.get(key)?.clone().into_bytes(),
+            })
+        })
+        .collect()
 }
 
 /// `[(key, record)]` in source order, or `None` if the rows cannot be keyed.
@@ -621,5 +862,394 @@ mod tests {
             String::from_utf8(coalesced[1].payload.clone()).unwrap(),
             "<li data-albedo-key=\"2\">turing</li>"
         );
+    }
+
+    // ── Byte-level append shortcut (3.3) ─────────────────────────────
+    //
+    // The intent path. Every rejection here falls back to parse-and-diff, which
+    // is always correct — so these pin that the shortcut fires when it should,
+    // and above all that it does NOT fire on anything but a tail append.
+
+    fn bytes(entries: &[(i64, &str)]) -> Vec<u8> {
+        serde_json::to_vec(&rows(entries)).unwrap()
+    }
+
+    #[test]
+    fn one_appended_row_is_read_off_the_bytes() {
+        let appended = appended_rows(
+            &bytes(&[(1, "ada"), (2, "alan")]),
+            &bytes(&[(1, "ada"), (2, "alan"), (3, "grace")]),
+            "id",
+        )
+        .expect("a tail append is byte-provable");
+
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].0, "3");
+        assert_eq!(appended[0].1["author"], "grace");
+    }
+
+    #[test]
+    fn several_appended_rows_come_back_in_order() {
+        let appended = appended_rows(
+            &bytes(&[(1, "ada")]),
+            &bytes(&[(1, "ada"), (2, "alan"), (3, "grace")]),
+            "id",
+        )
+        .unwrap();
+        assert_eq!(
+            appended.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["2", "3"]
+        );
+    }
+
+    #[test]
+    fn the_first_rows_into_an_empty_collection_are_an_append() {
+        let appended = appended_rows(b"[]", &bytes(&[(1, "ada")]), "id").unwrap();
+        assert_eq!(appended.len(), 1, "the `[` prefix has no trailing comma");
+        assert_eq!(appended[0].0, "1");
+    }
+
+    #[test]
+    fn an_unchanged_collection_appends_nothing_but_is_still_provable() {
+        // `Some(empty)` is distinct from `None`: nothing changed, as opposed to
+        // "cannot tell". The caller ships no list op rather than falling back.
+        let same = bytes(&[(1, "ada")]);
+        assert_eq!(appended_rows(&same, &same, "id"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn an_edit_is_not_an_append() {
+        assert_eq!(
+            appended_rows(
+                &bytes(&[(1, "ada"), (2, "alan")]),
+                &bytes(&[(1, "ada"), (2, "turing")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn an_edit_to_the_last_row_plus_an_append_is_not_an_append() {
+        // The prefix diverges inside the final surviving record, so the byte test
+        // must reject even though the collection did grow at the tail.
+        assert_eq!(
+            appended_rows(
+                &bytes(&[(1, "ada"), (2, "alan")]),
+                &bytes(&[(1, "ada"), (2, "turing"), (3, "grace")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_deletion_is_not_an_append() {
+        assert_eq!(
+            appended_rows(
+                &bytes(&[(1, "ada"), (2, "alan")]),
+                &bytes(&[(1, "ada")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_head_insert_is_not_an_append() {
+        // The reverse-chron case: it must reach `classify_positioned_insert`, not
+        // be mistaken for a tail append.
+        assert_eq!(
+            appended_rows(
+                &bytes(&[(2, "alan"), (1, "ada")]),
+                &bytes(&[(3, "grace"), (2, "alan"), (1, "ada")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_reorder_is_not_an_append() {
+        assert_eq!(
+            appended_rows(
+                &bytes(&[(1, "ada"), (2, "alan")]),
+                &bytes(&[(2, "alan"), (1, "ada")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn the_null_placeholder_is_not_an_append() {
+        // The bytes a topic is registered with, before any materialisation.
+        assert_eq!(appended_rows(b"null", &bytes(&[(1, "ada")]), "id"), None);
+        assert_eq!(appended_rows(b"", &bytes(&[(1, "ada")]), "id"), None);
+    }
+
+    #[test]
+    fn a_record_without_the_key_column_is_refused() {
+        let previous = bytes(&[(1, "ada")]);
+        let mut next: Vec<Value> = rows(&[(1, "ada")]).as_array().unwrap().clone();
+        next.push(json!({ "author": "keyless" }));
+        let next = serde_json::to_vec(&Value::Array(next)).unwrap();
+        assert_eq!(appended_rows(&previous, &next, "id"), None);
+    }
+
+    #[test]
+    fn an_appended_key_that_already_exists_is_refused() {
+        // Upholds `index_by_key`'s rule: a key column that does not identify makes
+        // every later apply guesswork. The shortcut cannot index the previous rows
+        // without the parse it exists to avoid, so it looks for the key's
+        // serialised fragment in the previous bytes instead.
+        let previous = bytes(&[(1, "ada"), (2, "alan")]);
+        let mut next: Vec<Value> = rows(&[(1, "ada"), (2, "alan")]).as_array().unwrap().clone();
+        next.push(json!({ "id": 1, "author": "duplicate" }));
+        let next = serde_json::to_vec(&Value::Array(next)).unwrap();
+        assert_eq!(appended_rows(&previous, &next, "id"), None);
+    }
+
+    #[test]
+    fn two_appended_rows_sharing_a_key_are_refused() {
+        let previous = bytes(&[(1, "ada")]);
+        let mut next: Vec<Value> = rows(&[(1, "ada")]).as_array().unwrap().clone();
+        next.push(json!({ "id": 7, "author": "first" }));
+        next.push(json!({ "id": 7, "author": "second" }));
+        let next = serde_json::to_vec(&Value::Array(next)).unwrap();
+        assert_eq!(appended_rows(&previous, &next, "id"), None);
+    }
+
+    /// The shortcut and the diff must agree about what changed — the shortcut is
+    /// an optimisation, not a second opinion.
+    #[test]
+    fn the_shortcut_agrees_with_the_diff_it_replaces() {
+        let previous = bytes(&[(1, "ada"), (2, "alan")]);
+        let next = bytes(&[(1, "ada"), (2, "alan"), (3, "grace")]);
+
+        let shortcut: Vec<String> = appended_rows(&previous, &next, "id")
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+
+        let diffed: Vec<String> = diff_records(
+            &serde_json::from_slice(&previous).unwrap(),
+            &serde_json::from_slice(&next).unwrap(),
+            "id",
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|change| change.weight > 0)
+        .map(|change| change.key)
+        .collect();
+
+        assert_eq!(shortcut, diffed);
+    }
+
+    // ── Positioned insert (C3) ───────────────────────────────────────
+    //
+    // The shape between `is_tail_append` and the whole-set fallback. Every
+    // rejection below is a transition `SlotInsert` cannot reproduce, and the
+    // caller ships the full ordered set for it — a false positive here strands a
+    // row at the wrong index permanently, so these lean hard on rejection.
+
+    #[test]
+    fn a_head_insert_names_the_old_head_as_its_anchor() {
+        // The reverse-chron case: `created_at DESC` puts every new row first.
+        let insert = classify_positioned_insert(
+            &rows(&[(2, "alan"), (1, "ada")]),
+            &rows(&[(3, "grace"), (2, "alan"), (1, "ada")]),
+            "id",
+        )
+        .expect("a pure head insert is a positioned insert");
+
+        assert_eq!(insert.keys, vec!["3"]);
+        assert_eq!(insert.before.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn a_mid_list_insert_names_the_row_it_lands_before() {
+        let insert = classify_positioned_insert(
+            &rows(&[(1, "ada"), (3, "grace")]),
+            &rows(&[(1, "ada"), (2, "alan"), (3, "grace")]),
+            "id",
+        )
+        .unwrap();
+
+        assert_eq!(insert.keys, vec!["2"]);
+        assert_eq!(insert.before.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn a_contiguous_run_keeps_its_order_under_one_anchor() {
+        let insert = classify_positioned_insert(
+            &rows(&[(1, "ada"), (9, "zoe")]),
+            &rows(&[(1, "ada"), (2, "alan"), (3, "grace"), (9, "zoe")]),
+            "id",
+        )
+        .unwrap();
+
+        assert_eq!(insert.keys, vec!["2", "3"], "run order is `next` order");
+        assert_eq!(insert.before.as_deref(), Some("9"));
+    }
+
+    #[test]
+    fn a_tail_insert_has_no_anchor() {
+        // `row_update` catches this as a tail append first, so the `None` arm is
+        // not reached in production — but the classifier is a pure function and
+        // must still be right on its own terms.
+        let insert = classify_positioned_insert(
+            &rows(&[(1, "ada")]),
+            &rows(&[(1, "ada"), (2, "alan")]),
+            "id",
+        )
+        .unwrap();
+
+        assert_eq!(insert.keys, vec!["2"]);
+        assert_eq!(insert.before, None);
+    }
+
+    #[test]
+    fn two_runs_at_different_positions_are_refused() {
+        // One op names one anchor. Splitting this into two would let a partial
+        // apply land; the whole set is the honest answer.
+        assert_eq!(
+            classify_positioned_insert(
+                &rows(&[(1, "ada"), (5, "zoe")]),
+                &rows(&[(0, "grace"), (1, "ada"), (2, "alan"), (5, "zoe")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn an_insert_alongside_a_retraction_is_refused() {
+        // `SlotInsert` retracts nothing, so the dropped row would linger.
+        assert_eq!(
+            classify_positioned_insert(
+                &rows(&[(1, "ada"), (2, "alan")]),
+                &rows(&[(3, "grace"), (2, "alan")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn an_insert_alongside_an_edit_is_refused() {
+        // An edit is a `−`/`+` pair; this op upserts but cannot retract, and the
+        // edited row is not part of the run.
+        assert_eq!(
+            classify_positioned_insert(
+                &rows(&[(1, "ada"), (2, "alan")]),
+                &rows(&[(3, "grace"), (1, "ada"), (2, "turing")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_reorder_of_survivors_is_refused() {
+        assert_eq!(
+            classify_positioned_insert(
+                &rows(&[(1, "ada"), (2, "alan")]),
+                &rows(&[(3, "grace"), (2, "alan"), (1, "ada")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_pure_reorder_inserts_nothing_and_is_refused() {
+        // No new key: not this shape. Must not be mistaken for an empty insert.
+        assert_eq!(
+            classify_positioned_insert(
+                &rows(&[(1, "ada"), (2, "alan")]),
+                &rows(&[(2, "alan"), (1, "ada")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn an_unchanged_collection_is_refused() {
+        assert_eq!(
+            classify_positioned_insert(
+                &rows(&[(1, "ada"), (2, "alan")]),
+                &rows(&[(1, "ada"), (2, "alan")]),
+                "id",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_non_array_previous_is_refused() {
+        // The `null` placeholder a topic is registered with — no pre-state to
+        // position against.
+        assert_eq!(
+            classify_positioned_insert(&Value::Null, &rows(&[(1, "ada")]), "id"),
+            None,
+        );
+    }
+
+    #[test]
+    fn duplicate_keys_are_refused() {
+        let previous = rows(&[(1, "ada")]);
+        let next = Value::Array(vec![
+            json!({ "id": 2, "author": "alan" }),
+            json!({ "id": 1, "author": "ada" }),
+            json!({ "id": 1, "author": "ada" }),
+        ]);
+        assert_eq!(classify_positioned_insert(&previous, &next, "id"), None);
+    }
+
+    #[test]
+    fn the_first_insert_into_an_empty_collection_has_no_anchor() {
+        let insert =
+            classify_positioned_insert(&Value::Array(vec![]), &rows(&[(1, "ada")]), "id").unwrap();
+        assert_eq!(insert.keys, vec!["1"]);
+        assert_eq!(insert.before, None);
+    }
+
+    #[test]
+    fn projection_reads_only_the_inserted_rows() {
+        // The property that lets this ride the PerRecord fast path: `rows` holds
+        // ONLY the changed record, as a partial render produces, and projection
+        // still succeeds.
+        let insert = classify_positioned_insert(
+            &rows(&[(2, "alan"), (1, "ada")]),
+            &rows(&[(3, "grace"), (2, "alan"), (1, "ada")]),
+            "id",
+        )
+        .unwrap();
+
+        let projected =
+            project_inserted_rows(&insert, &rendered(&[(3, "grace")])).expect("partial render");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].key, RowKey("3".to_string()));
+        assert_eq!(
+            String::from_utf8(projected[0].payload.clone()).unwrap(),
+            "<li data-albedo-key=\"3\">grace</li>"
+        );
+    }
+
+    #[test]
+    fn projection_is_all_or_nothing_when_a_row_is_missing() {
+        // The render and the classifier disagree about what was inserted —
+        // placing the renderable subset would assert rows the snapshot doesn't.
+        let insert = classify_positioned_insert(
+            &rows(&[(9, "zoe")]),
+            &rows(&[(2, "alan"), (3, "grace"), (9, "zoe")]),
+            "id",
+        )
+        .unwrap();
+
+        assert_eq!(project_inserted_rows(&insert, &rendered(&[(2, "alan")])), None);
     }
 }

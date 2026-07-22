@@ -45,7 +45,10 @@ pub mod write;
 #[cfg(feature = "forge")]
 pub mod libsql;
 
-pub use delta::{diff_records, project_changes, RecordChange, RenderedRows, RowProjector};
+pub use delta::{
+    appended_rows, classify_positioned_insert, diff_records, project_changes,
+    project_inserted_rows, PositionedInsert, RecordChange, RenderedRows, RowProjector,
+};
 pub use reserve::{
     IdempotencyConflict, ReleaseOutcome, ReserveError, ReserveOutcome, ReserveRequest, Reservations,
 };
