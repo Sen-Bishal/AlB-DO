@@ -22,6 +22,7 @@ use crate::error::RuntimeError;
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::HttpMethod;
 use crate::server::{AlbedoServer, AlbedoServerBuilder, LiveRuntime};
+use std::collections::BTreeMap;
 use dom_render_compiler::dev_contract::ResolvedDevContract;
 use dom_render_compiler::runtime::CompiledProject;
 use std::path::PathBuf;
@@ -50,6 +51,14 @@ pub struct ProductionServerOptions {
     /// production streaming pipeline. `false` for `albedo serve`; `albedo dev`
     /// boots this same pipeline with it `true`.
     pub dev_mode: bool,
+    /// The app's FORGE collections, as declared in the config's `forge` block.
+    ///
+    /// `None` means the app declared none, and boot installs the built-in
+    /// walking-skeleton guestbook — which is what every project did before an
+    /// app could say what its data was. Kept as the *declarations* rather than a
+    /// built `ForgeSchema` so the failure surfaces here, at boot, with the
+    /// offending collection named.
+    pub forge: BTreeMap<String, dom_render_compiler::forge::CollectionDecl>,
 }
 
 impl ProductionServerOptions {
@@ -67,6 +76,7 @@ impl ProductionServerOptions {
             // `albedo serve` is production by default; `albedo dev` flips this on
             // via `ProductionServerOptions { dev_mode: true, .. }`.
             dev_mode: false,
+            forge: contract.forge.clone(),
         }
     }
 }
@@ -179,8 +189,21 @@ fn boot_inner(
     // Force dev mode off so a release `albedo serve` never leaks the
     // overlay/HMR endpoints. The inspector follows the same default
     // policy; tests can flip it back on via the builder.
+    // The app's declared collections, lowered and validated here so a malformed
+    // `forge` block fails the boot with the offending collection named, rather
+    // than surfacing later as a topic that renders nothing. No declaration keeps
+    // the built-in guestbook, which is what every pre-Phase-2 project relied on.
+    let forge_schema = if opts.forge.is_empty() {
+        dom_render_compiler::forge::ForgeSchema::guestbook_default()
+    } else {
+        dom_render_compiler::forge::ForgeSchema::from_declarations(&opts.forge).map_err(|err| {
+            RuntimeError::ServerStartup(format!("invalid `forge` block in albedo.config: {err}"))
+        })?
+    };
+
     let mut builder = AlbedoServerBuilder::new(app_config)
         .with_renderer_runtime(renderer)
+        .with_forge_schema(forge_schema)
         .with_dev_mode(opts.dev_mode)
         // Surface ALBEDO's own per-request server-compute time (ns/µs) in the
         // terminal for both `albedo dev` and `albedo serve` — the honest number,

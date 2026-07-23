@@ -102,6 +102,10 @@ impl Fixture {
             host: "127.0.0.1".to_string(),
             port: 0,
             dev_mode: false,
+            // No `forge` block — boot installs the built-in guestbook default,
+            // which is what these fixtures asserted against before an app could
+            // declare its own collections.
+            forge: Default::default(),
         }
     }
 }
@@ -221,6 +225,7 @@ fn boot_production_server_fails_loud_when_dist_dir_missing() {
         host: "127.0.0.1".to_string(),
         port: 0,
         dev_mode: false,
+        forge: Default::default(),
     };
 
     let err = match boot_production_server(&opts) {

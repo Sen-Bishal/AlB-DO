@@ -29,23 +29,54 @@
 //! ## S4 · the delta lane
 //!
 //! [`BroadcastRegistry::write_topic_delta`] is the second write path:
-//! the same topic transition expressed *twice* in one frame —
-//! `SlotSet` (the authoritative post-write snapshot) followed by
-//! `SlotDelta` (the z-set describing what changed). Both are needed,
-//! and the order is load-bearing:
+//! a topic transition expressed as the shape that actually carries it.
+//! Two sinks exist on the client and they are disjoint — `bindings`
+//! (value consumers: scalar bind sites, coarse `html`-tier bindings)
+//! and `listSlots` (the keyed-row sink) — so exactly one of them owns
+//! any given transition:
 //!
-//! - `SlotSet` keeps every **value** consumer of the topic correct —
-//!   scalar bind sites, coarse `html`-tier bindings, aggregations —
-//!   without each of them having to understand rows.
-//! - `SlotDelta` drives the **keyed-list** sink, which `SlotSet` cannot
-//!   reach: a broadcast list anchor (the Tier-B `<ul>` the B2 pass
-//!   stamped) carries no bind site, so a snapshot alone would leave it
-//!   painted with pre-write rows until a reload.
+//! - A topic driving a **keyed list** ships its list opcode alone
+//!   (`SlotDelta` / `SlotInsert` / `ReconcileList`). A broadcast list
+//!   anchor (the Tier-B `<ul>` the B2 pass stamped) carries no bind
+//!   site, so a snapshot cannot reach it — and the list sink is the
+//!   only sink the topic has.
+//! - Every **other** topic ships `SlotSet`, the authoritative
+//!   post-write snapshot, which is what value consumers read.
 //!
-//! The two sinks are disjoint (`bindings` vs `listSlots`), so a
-//! consumer never applies the same change twice; delta-last means a
-//! list anchor that *was* rebuilt by a coarse `html` site is
-//! reconciled against its fresh DOM, not a detached one.
+//! ## Why the snapshot does not ride along (the S5 rule)
+//!
+//! Until 2026-07-23 a list write shipped *both*: `SlotSet` first, then
+//! the list opcode. The snapshot was pure overhead on that wire.
+//! Measured on a 2002-row guestbook, one append: **126,023 bytes** of
+//! `SlotSet` beside a **179-byte** `SlotDelta` — 704×, on every write,
+//! to every subscriber, base64'd again by each SSE connection. The
+//! delta kernel's whole claim is `O(|Δ|)` not `O(|view|)`; a snapshot
+//! riding beside every delta defeated it at the last hop.
+//!
+//! The rule now is one line: **the snapshot ships when nothing else on
+//! the frame carries the transition.** A list opcode carries it, so
+//! the `SlotSet` is dropped; a value-only write has no list opcode, so
+//! the `SlotSet` is the frame, byte-identical to the pre-S4 wire.
+//!
+//! What keeps this safe is that the *stored* value is untouched — it
+//! is still updated under the lock on every write, so server truth
+//! (SSR on reload, [`BroadcastRegistry::subscribe`],
+//! [`BroadcastRegistry::auto_subscribe`], the resync frame, and the
+//! FORGE write path's own `previous` diff) is exactly what it was.
+//! Only the *redundant re-assertion to clients that already track the
+//! rows* is gone. A subscriber still receives the whole value once, on
+//! subscribe — the one moment it holds nothing.
+//!
+//! **The bound.** This is correct while a topic is consumed as a list
+//! *or* as a value, never both at once. A topic bound to a keyed
+//! anchor AND a value bind site on the same page would now leave the
+//! value site stale until reload. That configuration is already
+//! unreachable (a broadcast anchor carries no bind site, and a value
+//! site over a collection topic would be painting raw JSON), and it is
+//! the same configuration the `_opSlotSet` re-seed loose end names. If
+//! it ever becomes reachable — the likely route is a live scalar
+//! derived from a collection — the answer is a value *delta* lane, not
+//! a snapshot restored beside every row change.
 //!
 //! ## Ordering (why the value mutex is held across fan-out)
 //!
@@ -182,14 +213,20 @@ impl BroadcastTopic {
 /// previous bytes rather than as two loose arguments: the read of the
 /// pre-state and the write of the post-state happen inside one critical
 /// section, so a concurrent writer cannot slip between them.
+///
+/// Both fields are always required even though only one of them reaches the
+/// wire (see "the S5 rule" in the module docs): `value` is what the topic
+/// *stores*, and it is read by SSR, by every late joiner, and by the next
+/// write's own diff, whether or not it was fanned out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicTransition {
-    /// Authoritative post-write bytes. Becomes the topic's stored value and
-    /// ships as `SlotSet` — the truth a reload, a late joiner, or a coarse
-    /// value binding sees.
+    /// Authoritative post-write bytes. Always becomes the topic's stored value
+    /// — the truth a reload, a late joiner, or the next write's `previous`
+    /// sees. Ships as `SlotSet` only when `update` carries no row transition;
+    /// a list write's rows already say everything the wire needs.
     pub value: Vec<u8>,
-    /// How the keyed-list rows changed, if this topic drives one. Ships after
-    /// the `SlotSet` as the matching list opcode (or nothing).
+    /// How the keyed-list rows changed, if this topic drives one. When it
+    /// describes a real transition it *is* the frame; otherwise the snapshot is.
     pub update: ListUpdate,
 }
 
@@ -421,7 +458,10 @@ impl BroadcastRegistry {
     /// S4 · the delta write. `compute` is handed the topic's **previous**
     /// bytes and returns the post-write snapshot together with the z-set
     /// delta that produced it; the registry stores the snapshot and fans out
-    /// one frame carrying `SlotSet` then `SlotDelta`.
+    /// one frame carrying whichever of the two actually expresses the
+    /// transition — the list opcode when there is one, the `SlotSet`
+    /// otherwise. The snapshot is stored either way; see "the S5 rule" in the
+    /// module docs for why it stops riding the wire beside every delta.
     ///
     /// The closure runs inside the topic's critical section, which is what
     /// makes `previous` trustworthy: two concurrent appends cannot both diff
@@ -436,7 +476,9 @@ impl BroadcastRegistry {
     /// An empty (or fully-cancelling) delta degenerates to a lone `SlotSet`,
     /// which is exactly the pre-S4 behaviour and the reason
     /// [`Self::write_topic`] is now a thin call into this one — there is a
-    /// single fan-out path to reason about, not two.
+    /// single fan-out path to reason about, not two. Every frame this emits
+    /// therefore carries **exactly one** instruction, and never zero: a
+    /// transition that compacts to nothing still re-asserts the value.
     ///
     /// # Errors
     /// [`BroadcastError::UnknownTopic`] when `topic` was never registered
@@ -459,49 +501,31 @@ impl BroadcastRegistry {
 
         // ── critical section: prev → compute → store → encode → fan out ──
         let mut guard = topic_entry.lock_value();
-        let transition = compute(guard.as_slice());
-        *guard = transition.value.clone();
+        let TopicTransition { value, update } = compute(guard.as_slice());
 
-        let mut instructions = Vec::with_capacity(2);
-        instructions.push(Instruction::SlotSet {
-            slot_id: topic_entry.slot_id,
-            value: transition.value,
-        });
-        // List op LAST: a list anchor that a coarse `html` binding just rebuilt
-        // from the SlotSet must be reconciled in its fresh DOM.
-        match transition.update {
-            ListUpdate::None => {}
-            ListUpdate::Delta(changes) => {
-                let changes = coalesce_changes(changes);
-                if !changes.is_empty() {
-                    instructions.push(Instruction::SlotDelta {
-                        slot_id: topic_entry.slot_id,
-                        changes,
-                    });
-                }
+        // One instruction, chosen — see "the S5 rule" in the module docs. The
+        // list opcode is built first precisely so the snapshot can be skipped
+        // when one exists: a caller that hands over a `ListUpdate` which
+        // coalesces away (a fully-cancelling delta, an empty insert run) has
+        // described no row transition at all, and falls back to the snapshot
+        // rather than fanning out an empty frame.
+        let instruction = match list_instruction(topic_entry.slot_id, update) {
+            Some(list_op) => {
+                // The snapshot is stored, not sent: `guard` takes it whole
+                // instead of a clone, so a large collection is moved rather
+                // than memcpy'd on the hot path.
+                *guard = value;
+                list_op
             }
-            ListUpdate::Insert { before, rows } => {
-                // No coalescing: the classifier already proved these keys are
-                // new and distinct. An empty run is not a transition — unlike a
-                // reconcile, an empty `SlotInsert` asserts nothing, so drop it.
-                if !rows.is_empty() {
-                    instructions.push(Instruction::SlotInsert {
-                        slot_id: topic_entry.slot_id,
-                        before,
-                        rows,
-                    });
-                }
-            }
-            ListUpdate::Reconcile(rows) => {
-                // A full reconcile is already the desired set — no coalescing,
-                // and an empty set legitimately means "the list is now empty",
-                // which must ship so subscribers drop their last rows.
-                instructions.push(Instruction::ReconcileList {
+            None => {
+                *guard = value.clone();
+                Instruction::SlotSet {
                     slot_id: topic_entry.slot_id,
-                    rows,
-                });
+                    value,
+                }
             }
-        }
+        };
+        let instructions = vec![instruction];
 
         let encoded = encode_frame(&OpcodeFrame {
             frame_id: self.next_frame_id.fetch_add(1, Ordering::Relaxed),
@@ -629,6 +653,39 @@ impl BroadcastRegistry {
     /// or once the empty set is observed.
     pub fn session_count(&self) -> usize {
         self.by_session.len()
+    }
+}
+
+/// Lower a [`ListUpdate`] to the single opcode that carries it, or `None` when
+/// it describes no row transition at all.
+///
+/// `None` is the signal that the frame still needs the snapshot: it means
+/// either the caller had nothing row-shaped to say ([`ListUpdate::None`] — a
+/// plain value write) or what it said compacted away to nothing. Both must
+/// degenerate to a lone `SlotSet`, which is the pre-S4 wire.
+fn list_instruction(slot_id: SlotId, update: ListUpdate) -> Option<Instruction> {
+    match update {
+        ListUpdate::None => None,
+        ListUpdate::Delta(changes) => {
+            let changes = coalesce_changes(changes);
+            // A delta that fully cancels asserts nothing about the rows.
+            (!changes.is_empty()).then_some(Instruction::SlotDelta { slot_id, changes })
+        }
+        ListUpdate::Insert { before, rows } => {
+            // No coalescing: the classifier already proved these keys are new
+            // and distinct. An empty run is not a transition — unlike a
+            // reconcile, an empty `SlotInsert` asserts nothing, so drop it.
+            (!rows.is_empty()).then_some(Instruction::SlotInsert {
+                slot_id,
+                before,
+                rows,
+            })
+        }
+        // A full reconcile is already the desired set — no coalescing, and an
+        // empty set legitimately means "the list is now empty", which must ship
+        // so subscribers drop their last rows. It is a transition even when
+        // empty, so it never falls back to the snapshot.
+        ListUpdate::Reconcile(rows) => Some(Instruction::ReconcileList { slot_id, rows }),
     }
 }
 
@@ -1026,8 +1083,13 @@ mod tests {
         }
     }
 
+    /// The S5 rule, pinned: a delta write puts the delta on the wire and the
+    /// snapshot in the store. Shipping both is what made a 179-byte append cost
+    /// 126KB; the assertion on `current_value()` at the end is the other half —
+    /// suppressing the snapshot must never mean *forgetting* it, or a reload
+    /// would show pre-write state.
     #[tokio::test]
-    async fn a_delta_write_ships_the_snapshot_first_and_the_delta_last() {
+    async fn a_delta_write_ships_the_delta_alone_and_stores_the_snapshot() {
         let registry = BroadcastRegistry::new();
         let topic = registry.topic("guestbook", b"[]".to_vec());
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
@@ -1051,31 +1113,30 @@ mod tests {
         assert_eq!(report.delivered, 1);
 
         let payloads = drain_into_vec(&mut rx);
-        assert_eq!(payloads.len(), 1, "one frame carries both instructions");
+        assert_eq!(payloads.len(), 1, "one frame per write");
         match instructions_of(&payloads[0]).as_slice() {
-            [Instruction::SlotSet {
-                slot_id: set_slot,
-                value,
-            }, Instruction::SlotDelta {
+            [Instruction::SlotDelta {
                 slot_id: delta_slot,
                 changes,
             }] => {
-                assert_eq!(*set_slot, topic.slot_id());
                 assert_eq!(*delta_slot, topic.slot_id());
-                assert_eq!(value, br#"[{"id":1}]"#);
                 assert_eq!(changes.len(), 1);
                 assert_eq!(changes[0].key, RowKey("1".to_string()));
             }
-            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+            other => panic!("expected [SlotDelta] alone, got {other:?}"),
         }
-        assert_eq!(topic.current_value(), br#"[{"id":1}]"#.to_vec());
+        assert_eq!(
+            topic.current_value(),
+            br#"[{"id":1}]"#.to_vec(),
+            "the snapshot is stored even though it never shipped"
+        );
     }
 
-    /// A reorder / mid-insert ships the full ordered set as a `ReconcileList`,
-    /// after the `SlotSet`, so a subscriber whose anchor a coarse binding just
-    /// rebuilt gets its rows placed in the right order.
+    /// A reorder / mid-insert ships the full ordered set as a `ReconcileList`.
+    /// It is `O(|view|)` on the wire by necessity — it is the only shape that
+    /// carries position — which is exactly why the snapshot must not double it.
     #[tokio::test]
-    async fn a_reconcile_update_ships_a_reconcile_list_after_the_snapshot() {
+    async fn a_reconcile_update_ships_a_reconcile_list_alone() {
         let registry = BroadcastRegistry::new();
         let topic = registry.topic("guestbook", b"[]".to_vec());
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
@@ -1101,18 +1162,18 @@ mod tests {
 
         let payloads = drain_into_vec(&mut rx);
         match instructions_of(&payloads[0]).as_slice() {
-            [Instruction::SlotSet { .. }, Instruction::ReconcileList { slot_id, rows }] => {
+            [Instruction::ReconcileList { slot_id, rows }] => {
                 assert_eq!(*slot_id, topic.slot_id());
                 let keys: Vec<_> = rows.iter().map(|r| r.key.0.as_str()).collect();
                 assert_eq!(keys, vec!["2", "1"], "rows ship in desired order");
             }
-            other => panic!("expected [SlotSet, ReconcileList], got {other:?}"),
+            other => panic!("expected [ReconcileList] alone, got {other:?}"),
         }
     }
 
-    /// A positioned insert ships as `SlotInsert` after the snapshot, carrying
-    /// only the new rows and the key they land ahead of — the wire shape that
-    /// makes a reverse-chron feed's head insert `O(|Δ|)` instead of `O(|view|)`.
+    /// A positioned insert ships as a lone `SlotInsert`, carrying only the new
+    /// rows and the key they land ahead of — the wire shape that makes a
+    /// reverse-chron feed's head insert `O(|Δ|)` instead of `O(|view|)`.
     #[tokio::test]
     async fn an_insert_update_ships_a_slot_insert_naming_its_anchor() {
         let registry = BroadcastRegistry::new();
@@ -1137,7 +1198,7 @@ mod tests {
 
         let payloads = drain_into_vec(&mut rx);
         match instructions_of(&payloads[0]).as_slice() {
-            [Instruction::SlotSet { .. }, Instruction::SlotInsert {
+            [Instruction::SlotInsert {
                 slot_id,
                 before,
                 rows,
@@ -1147,7 +1208,7 @@ mod tests {
                 assert_eq!(rows.len(), 1, "only the inserted row is on the wire");
                 assert_eq!(rows[0].key, RowKey("3".to_string()));
             }
-            other => panic!("expected [SlotSet, SlotInsert], got {other:?}"),
+            other => panic!("expected [SlotInsert] alone, got {other:?}"),
         }
     }
 
@@ -1202,10 +1263,54 @@ mod tests {
             .unwrap();
 
         let payloads = drain_into_vec(&mut rx);
+        assert!(
+            matches!(
+                instructions_of(&payloads[0]).as_slice(),
+                [Instruction::SlotSet { .. }]
+            ),
+            "a transition that compacts to nothing falls back to the snapshot \
+             rather than fanning out an empty frame"
+        );
+    }
+
+    /// The load-bearing half of the S5 rule. Suppressing the snapshot is only
+    /// safe because a client that holds *nothing* still gets the whole value at
+    /// the one moment it needs it — subscribe. This proves a session joining
+    /// AFTER a suppressed write reads the post-write value, not the pre-write
+    /// one, so a late joiner is never behind the deltas it missed.
+    #[tokio::test]
+    async fn a_session_joining_after_a_suppressed_snapshot_still_reads_it() {
+        let registry = BroadcastRegistry::new();
+        registry.topic("guestbook", b"[]".to_vec());
+
+        // A write whose snapshot never reaches the wire.
+        let (early_tx, mut early_rx) = mpsc::channel::<Vec<u8>>(8);
+        registry
+            .subscribe(SessionId::random(), "guestbook", early_tx)
+            .unwrap();
+        registry
+            .write_topic_delta("guestbook", |_| TopicTransition {
+                value: br#"[{"id":1}]"#.to_vec(),
+                update: ListUpdate::Delta(vec![change(1, "1", "<li>ada</li>")]),
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                instructions_of(&drain_into_vec(&mut early_rx)[0]).as_slice(),
+                [Instruction::SlotDelta { .. }]
+            ),
+            "precondition: the snapshot was suppressed on that write"
+        );
+
+        // …and a session that was not there for it.
+        let (late_tx, _late_rx) = mpsc::channel::<Vec<u8>>(8);
+        let seen = registry
+            .subscribe(SessionId::random(), "guestbook", late_tx)
+            .unwrap();
         assert_eq!(
-            instructions_of(&payloads[0]).len(),
-            1,
-            "no empty SlotDelta on the wire"
+            seen,
+            br#"[{"id":1}]"#.to_vec(),
+            "subscribe hands over the full post-write value"
         );
     }
 

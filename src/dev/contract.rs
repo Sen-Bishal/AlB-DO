@@ -1,7 +1,7 @@
 use crate::runtime::hot_set::HOT_SET_MAX;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use swc_common::{sync::Lrc, FileName, SourceMap};
@@ -38,6 +38,16 @@ pub struct DevConfig {
     /// The root entry ("/") is always served from `entry`.
     #[serde(default)]
     pub routes: HashMap<String, String>,
+    /// FORGE collections this app declares — the `forge` block, keyed by
+    /// collection name (which is both the `useSharedSlot` topic and, by default,
+    /// the table). Empty means "no declaration", and the runtime falls back to
+    /// the built-in walking-skeleton guestbook.
+    ///
+    /// A `BTreeMap` so the declaration order that reaches
+    /// [`ForgeSchema::from_declarations`](crate::forge::ForgeSchema::from_declarations)
+    /// is stable across builds.
+    #[serde(default)]
+    pub forge: BTreeMap<String, crate::forge::CollectionDecl>,
 }
 
 impl Default for DevConfig {
@@ -52,6 +62,7 @@ impl Default for DevConfig {
             hot_set: Vec::new(),
             static_slice: StaticSliceConfig::default(),
             routes: HashMap::new(),
+            forge: BTreeMap::new(),
         }
     }
 }
@@ -312,6 +323,11 @@ pub struct ResolvedDevContract {
     /// documents. Empty for routes with no `layout.tsx` in their path.
     #[serde(default)]
     pub route_layouts: HashMap<String, Vec<String>>,
+    /// The app's declared FORGE collections, carried through from
+    /// [`DevConfig::forge`]. Empty means the app declared none, and the boot
+    /// path falls back to the built-in guestbook default.
+    #[serde(default)]
+    pub forge: BTreeMap<String, crate::forge::CollectionDecl>,
 }
 
 pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> {
@@ -546,6 +562,7 @@ pub fn resolve_dev_contract(
         open: cli.open,
         routes,
         route_layouts,
+        forge: config.forge,
     })
 }
 

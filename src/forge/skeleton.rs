@@ -212,6 +212,28 @@ pub enum ForgeSchemaError {
         field: &'static str,
         value: String,
     },
+    /// A declared collection has no fields — there is no table to create and
+    /// nothing to render. Almost always a half-written `forge` block.
+    #[error("FORGE schema: collection {topic:?} declares no fields")]
+    EmptyDeclaration { topic: String },
+    /// The key column was also declared as a field; it would be emitted twice in
+    /// the generated DDL.
+    #[error(
+        "FORGE schema: collection {topic:?} declares its key column {key:?} as a field; \
+         the key is added automatically"
+    )]
+    KeyIsAlsoAField { topic: String, key: String },
+    /// An `order_by` outside the plain `column [asc|desc], …` grammar. Refused
+    /// rather than passed through: the clause is re-emitted from a parse, so
+    /// anything unparseable has no safe lowering.
+    #[error("FORGE schema: collection {topic:?} has an unsupported order_by {order_by:?}")]
+    InvalidOrderBy { topic: String, order_by: String },
+    /// A seed row names a column the collection does not declare.
+    #[error("FORGE schema: seed row for {topic:?} sets {column:?}, which is not a declared field")]
+    UnknownSeedColumn { topic: String, column: String },
+    /// A seed value that is not a scalar — a collection is a table of scalars.
+    #[error("FORGE schema: seed value for {topic:?}.{column} is not a scalar")]
+    UnsupportedSeedValue { topic: String, column: String },
 }
 
 /// The FORGE collection registry: an immutable, boot-built lookup from a
