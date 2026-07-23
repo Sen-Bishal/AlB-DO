@@ -126,6 +126,13 @@ export default function Guestbook() {
 session's patches lane; a write inside an `action()` fans out to every
 subscriber. Try the included `/guestbook` route in two browser tabs.
 
+> **Use `albedo serve` for the two-tab demo, not `albedo dev`.** Dev adds the
+> hot-reload and error-overlay streams on top of the live wire, and a browser
+> allows only six connections per origin — with enough tabs open the next
+> request queues instead of sending, and the page appears to freeze (a reload
+> won't rescue it, because the reload needs a connection too). Closing the extra
+> tabs releases it. Being fixed properly.
+
 **Two rules worth knowing up front:**
 
 - **Don't guard the `.map()`.** Writing `(entries || []).map(...)` stops
