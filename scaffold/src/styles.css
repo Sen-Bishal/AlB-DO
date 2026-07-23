@@ -1,460 +1,630 @@
-/* =====================================================================
-   AlBDO Starter — hand-crafted stylesheet
-   ---------------------------------------------------------------------
-   AlBDO's dev pipeline concatenates every .css file under the project
-   root into a single inline <style> block, so this file ships as-is —
-   no bundler, no PostCSS, no Tailwind required.
-   ===================================================================== */
+/* ═══════════════════════════════════════════════════════════════════
+   ALB'DO — starter stylesheet
+
+   Light ground, serif voice, chrome as the only ornament. The palette
+   is black, white, and the greys between them; "colour" here means a
+   gradient steep enough to read as polished metal.
+
+   Hand-written, concatenated into one inline <style> block by the dev
+   pipeline. No bundler, no PostCSS, no framework. Edit it.
+   ═══════════════════════════════════════════════════════════════════ */
 
 :root {
-  --ink: #f4f5fb;
-  --muted: #a8b0c7;
-  --dim: #6b7390;
-  --panel: rgba(20, 22, 38, 0.72);
-  --panel-hi: rgba(30, 33, 54, 0.86);
-  --line: rgba(160, 176, 220, 0.14);
-  --line-hi: rgba(160, 176, 220, 0.28);
+  /* Ground */
+  --paper: #f6f6f7;
+  --paper-raised: #fcfcfd;
+  --paper-sunk: #ededf0;
 
-  --tier-a: #34d399;
-  --tier-b: #60a5fa;
-  --tier-c: #c084fc;
+  /* Ink */
+  --ink: #08080a;
+  --ink-soft: #3c3c42;
+  --ink-mute: #75757e;
+  --ink-faint: #a3a3ac;
 
-  --glow-a: 0 0 24px rgba(52, 211, 153, 0.35);
-  --glow-b: 0 0 24px rgba(96, 165, 250, 0.35);
-  --glow-c: 0 0 24px rgba(192, 132, 252, 0.35);
+  /* Structure */
+  --rule: rgba(8, 8, 10, 0.13);
+  --rule-soft: rgba(8, 8, 10, 0.07);
+  --rule-bright: rgba(255, 255, 255, 0.9);
 
-  --radius: 14px;
-  --radius-lg: 22px;
+  /* Type */
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+    ui-serif, "Times New Roman", serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo,
+    Consolas, monospace;
 
-  --font-sans: "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont,
-    "Helvetica Neue", Arial, sans-serif;
-  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas,
-    monospace;
+  /* Metal — the one ornament. Steep alternating stops read as chrome;
+     shallow ones just read as a grey gradient. */
+  --chrome: linear-gradient(
+    177deg,
+    #101014 0%,
+    #4a4a54 14%,
+    #cfcfd8 29%,
+    #ffffff 39%,
+    #8e8e9a 50%,
+    #232329 62%,
+    #6e6e7a 72%,
+    #e8e8ef 84%,
+    #2b2b33 96%,
+    #14141a 100%
+  );
+  --chrome-quiet: linear-gradient(
+    177deg,
+    #6d6d78 0%,
+    #b8b8c2 26%,
+    #ffffff 40%,
+    #9a9aa6 56%,
+    #62626e 74%,
+    #adadb8 100%
+  );
+  --steel: linear-gradient(
+    170deg,
+    #4b4b55 0%,
+    #1b1b21 26%,
+    #313139 48%,
+    #0c0c10 74%,
+    #35353d 100%
+  );
+  --brushed: linear-gradient(170deg, #ffffff 0%, #f0f0f3 62%, #e4e4e9 100%);
 }
 
-html,
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
-  font-family: var(--font-sans);
-  font-size: 16px;
-  line-height: 1.55;
+  margin: 0;
+  background:
+    radial-gradient(
+      120% 80% at 12% -10%,
+      rgba(255, 255, 255, 0.95) 0%,
+      rgba(255, 255, 255, 0) 55%
+    ),
+    radial-gradient(
+      90% 60% at 100% 0%,
+      rgba(8, 8, 10, 0.05) 0%,
+      rgba(8, 8, 10, 0) 60%
+    ),
+    var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 17px;
+  line-height: 1.62;
   -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
-.app-shell {
-  max-width: 1120px;
+a {
+  color: inherit;
+}
+
+code,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  letter-spacing: -0.01em;
+}
+
+/* ── Shell ───────────────────────────────────────────────────────── */
+
+.shell {
+  max-width: 760px;
   margin: 0 auto;
-  padding: 72px 28px 120px;
+  padding: 0 32px 96px;
 }
 
-/* --- Nav ----------------------------------------------------------- */
+/* ── Masthead ────────────────────────────────────────────────────── */
 
-.nav {
+.masthead {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding-bottom: 56px;
+  gap: 16px;
+  padding: 22px 0 20px;
+  border-bottom: 1px solid var(--rule-soft);
 }
 
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-weight: 600;
+.mark {
+  font-family: var(--serif);
   font-size: 15px;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
   color: var(--ink);
+  text-decoration: none;
 }
 
-.brand-mark {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  background: conic-gradient(
-    from 210deg at 50% 50%,
-    #34d399,
-    #60a5fa,
-    #c084fc,
-    #34d399
-  );
-  box-shadow: 0 0 20px rgba(96, 165, 250, 0.45);
-}
-
-.nav-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 14px;
-  border-radius: 999px;
-  border: 1px solid var(--line-hi);
-  background: var(--panel);
-  color: var(--muted);
-  font-size: 13px;
-  font-family: var(--font-mono);
-}
-
-.nav-pill .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--tier-a);
-  box-shadow: var(--glow-a);
-}
-
-/* --- Hero ---------------------------------------------------------- */
-
-.hero {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-  padding: 40px 0 56px;
-}
-
-.hero-eyebrow {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  align-self: flex-start;
-  padding: 6px 14px;
-  border-radius: 999px;
-  border: 1px solid var(--line-hi);
-  background: var(--panel);
-  color: var(--muted);
-  font-size: 13px;
-  font-family: var(--font-mono);
-  letter-spacing: 0.02em;
-}
-
-.hero-title {
-  margin: 0;
-  font-size: clamp(42px, 6vw, 68px);
-  line-height: 1.04;
-  letter-spacing: -0.02em;
-  font-weight: 700;
-  color: var(--ink);
-}
-
-.hero-title .accent {
-  background: linear-gradient(
-    100deg,
-    #a7f3d0 0%,
-    #60a5fa 45%,
-    #c084fc 100%
-  );
+/* The apostrophe is the wordmark signature — it gets the metal even at
+   this size, where the rest of the letters stay plain ink. */
+.glyph {
+  background: var(--chrome);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
+  -webkit-text-fill-color: transparent;
+  padding: 0 0.02em;
 }
 
-.hero-sub {
-  max-width: 640px;
-  margin: 0;
-  color: var(--muted);
-  font-size: 18px;
-  line-height: 1.6;
-}
-
-.hero-actions {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-top: 12px;
-}
-
-.btn {
+.pulse {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
   gap: 8px;
-  padding: 12px 22px;
-  border-radius: 10px;
-  font-weight: 500;
-  font-size: 14px;
-  letter-spacing: 0.01em;
-  border: 1px solid transparent;
-  cursor: pointer;
-  transition: transform 120ms ease, background 120ms ease,
-    border-color 120ms ease, box-shadow 200ms ease;
-  text-decoration: none;
-  color: var(--ink);
-  background: transparent;
-  font-family: inherit;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
 }
 
-.btn:hover {
+.pulse::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: linear-gradient(150deg, #ffffff, #6e6e7a 55%, #17171c);
+  box-shadow:
+    0 0 0 1px rgba(8, 8, 10, 0.14),
+    0 0 8px rgba(8, 8, 10, 0.18);
+}
+
+/* ── Hero ────────────────────────────────────────────────────────── */
+
+.hero {
+  padding: 104px 0 0;
+}
+
+.wordmark {
+  margin: 0;
+  font-size: clamp(76px, 17vw, 168px);
+  line-height: 0.88;
+  letter-spacing: -0.035em;
+  font-weight: 400;
+
+  background: var(--chrome);
+  background-size: 100% 260%;
+  background-position: 50% 32%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+
+  animation: molten 14s ease-in-out infinite;
+}
+
+/* The molten pass: the metal moves, the letterforms don't. */
+@keyframes molten {
+  0%,
+  100% {
+    background-position: 50% 28%;
+  }
+  50% {
+    background-position: 50% 74%;
+  }
+}
+
+/* The hero glyph — larger, kerned in, given its own specular. */
+.wordmark .glyph {
+  font-size: 1.08em;
+  margin: 0 -0.04em 0 -0.02em;
+  filter: drop-shadow(0 1px 0 rgba(255, 255, 255, 0.85));
+}
+
+.tagline {
+  margin: 26px 0 0;
+  font-size: 15px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+/* A machined hairline: dark through the middle, bright along the edge. */
+.rule {
+  height: 1px;
+  margin: 44px 0 0;
+  border: 0;
+  background: linear-gradient(
+    90deg,
+    rgba(8, 8, 10, 0) 0%,
+    rgba(8, 8, 10, 0.28) 22%,
+    rgba(8, 8, 10, 0.1) 60%,
+    rgba(8, 8, 10, 0) 100%
+  );
+  position: relative;
+}
+
+.rule::after {
+  content: "";
+  position: absolute;
+  inset: 1px 0 auto;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    var(--rule-bright) 30%,
+    rgba(255, 255, 255, 0) 100%
+  );
+}
+
+.lede {
+  margin: 40px 0 0;
+  font-size: 21px;
+  line-height: 1.58;
+  color: var(--ink-soft);
+  max-width: 56ch;
+}
+
+/* ── Points ──────────────────────────────────────────────────────── */
+
+.points {
+  list-style: none;
+  margin: 52px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+}
+
+.point {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  align-items: baseline;
+  gap: 4px;
+}
+
+/* Numeral in metal — the marginalia voice. */
+.point-n {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  padding-top: 2px;
+  background: var(--chrome-quiet);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+.point-t {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.55;
+  color: var(--ink);
+}
+
+.point-t em {
+  font-style: normal;
+  color: var(--ink-mute);
+}
+
+/* ── Actions ─────────────────────────────────────────────────────── */
+
+.actions {
+  margin: 56px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.act {
+  --lift: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 22px;
+  border-radius: 2px;
+  font-size: 15px;
+  letter-spacing: 0.02em;
+  text-decoration: none;
+  border: 1px solid var(--rule);
+  transition:
+    transform 180ms cubic-bezier(0.2, 0.7, 0.3, 1),
+    box-shadow 180ms ease,
+    border-color 180ms ease;
+  transform: translateY(var(--lift));
+}
+
+/* Polished steel — the primary. */
+.act-metal {
+  color: #fbfbfd;
+  border-color: rgba(8, 8, 10, 0.55);
+  background: var(--steel);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.34),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.5),
+    0 10px 24px -14px rgba(8, 8, 10, 0.75);
+}
+
+/* Brushed white — the secondary. */
+.act-quiet {
+  color: var(--ink);
+  background: var(--brushed);
+  box-shadow:
+    inset 0 1px 0 var(--rule-bright),
+    0 8px 20px -16px rgba(8, 8, 10, 0.5);
+}
+
+.act:hover {
+  --lift: -1px;
+}
+
+.act-metal:hover {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.44),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.5),
+    0 14px 30px -14px rgba(8, 8, 10, 0.8);
+}
+
+.act-quiet:hover {
+  border-color: rgba(8, 8, 10, 0.26);
+}
+
+.arrow {
+  font-family: var(--mono);
+  opacity: 0.6;
+}
+
+/* ── Plate — the shared surface for anything framed ─────────────── */
+
+.plate {
+  margin: 88px 0 0;
+  padding: 30px 32px 32px;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: linear-gradient(168deg, #ffffff 0%, #f4f4f7 55%, #ececef 100%);
+  box-shadow:
+    inset 0 1px 0 var(--rule-bright),
+    0 1px 2px rgba(8, 8, 10, 0.03),
+    0 26px 50px -34px rgba(8, 8, 10, 0.4);
+  position: relative;
+  overflow: hidden;
+}
+
+/* Specular sweep across the top-left of every plate. */
+.plate::before {
+  content: "";
+  position: absolute;
+  inset: -40% -60% auto -20%;
+  height: 150%;
+  background: radial-gradient(
+    50% 40% at 30% 20%,
+    rgba(255, 255, 255, 0.85) 0%,
+    rgba(255, 255, 255, 0) 70%
+  );
+  pointer-events: none;
+}
+
+.plate > * {
+  position: relative;
+}
+
+.plate-eyebrow {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 0 0 12px;
+}
+
+.plate-title {
+  margin: 0;
+  font-size: 27px;
+  line-height: 1.24;
+  letter-spacing: -0.015em;
+  font-weight: 400;
+}
+
+.plate-body {
+  margin: 12px 0 0;
+  color: var(--ink-soft);
+  font-size: 16px;
+  max-width: 58ch;
+}
+
+.plate-note {
+  margin: 22px 0 0;
+  padding-top: 18px;
+  border-top: 1px solid var(--rule-soft);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--ink-mute);
+  letter-spacing: 0.01em;
+}
+
+/* ── Ledger — the guestbook rows ─────────────────────────────────── */
+
+.ledger {
+  list-style: none;
+  margin: 24px 0 0;
+  padding: 0;
+  border-top: 1px solid var(--rule-soft);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 46px 1fr;
+  align-items: baseline;
+  gap: 14px;
+  padding: 13px 2px;
+  border-bottom: 1px solid var(--rule-soft);
+}
+
+.row-n {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  letter-spacing: 0.04em;
+}
+
+.row-who {
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+.row-sep {
+  color: var(--ink-faint);
+  padding: 0 6px;
+}
+
+.row-what {
+  color: var(--ink-soft);
+}
+
+/* ── Fields ──────────────────────────────────────────────────────── */
+
+.entry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 22px 0 0;
+}
+
+.field {
+  flex: 1 1 150px;
+  min-width: 0;
+  padding: 11px 13px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: #fff;
+  box-shadow: inset 0 1px 2px rgba(8, 8, 10, 0.05);
+  font-family: var(--serif);
+  font-size: 15px;
+  color: var(--ink);
+}
+
+.field::placeholder {
+  color: var(--ink-faint);
+}
+
+.field:focus {
+  outline: none;
+  border-color: rgba(8, 8, 10, 0.42);
+  box-shadow:
+    inset 0 1px 2px rgba(8, 8, 10, 0.05),
+    0 0 0 3px rgba(8, 8, 10, 0.07);
+}
+
+.field-narrow {
+  flex: 0 1 118px;
+}
+
+.submit {
+  padding: 11px 20px;
+  border-radius: 2px;
+  border: 1px solid rgba(8, 8, 10, 0.55);
+  color: #fbfbfd;
+  font-family: var(--serif);
+  font-size: 15px;
+  cursor: pointer;
+  background: var(--steel);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.5),
+    0 8px 18px -12px rgba(8, 8, 10, 0.7);
+  transition: transform 160ms ease;
+}
+
+.submit:hover {
   transform: translateY(-1px);
 }
 
-.btn-primary {
-  background: linear-gradient(130deg, #60a5fa 0%, #a78bfa 100%);
-  color: #0b0d18;
-  box-shadow: 0 8px 32px rgba(96, 165, 250, 0.3);
+.submit:active {
+  transform: translateY(0);
 }
 
-.btn-primary:hover {
-  box-shadow: 0 12px 36px rgba(96, 165, 250, 0.45);
-}
-
-.btn-ghost {
-  border-color: var(--line-hi);
-  background: var(--panel);
+.submit-quiet {
   color: var(--ink);
+  border-color: var(--rule);
+  background: var(--brushed);
+  box-shadow:
+    inset 0 1px 0 var(--rule-bright),
+    0 6px 16px -14px rgba(8, 8, 10, 0.5);
 }
 
-.btn-ghost:hover {
-  background: var(--panel-hi);
-  border-color: var(--line-hi);
-}
+/* ── Island (the one hydrated thing on the page) ─────────────────── */
 
-/* --- Tier grid ----------------------------------------------------- */
-
-.section-heading {
+.island {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  margin: 56px 0 20px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--line);
+  align-items: center;
+  gap: 14px;
+  margin: 20px 0 0;
 }
 
-.section-heading h2 {
-  margin: 0;
+.tally {
+  font-family: var(--mono);
   font-size: 22px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  color: var(--ink);
+  letter-spacing: -0.02em;
+  min-width: 2ch;
+  background: var(--chrome);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
 }
 
-.section-heading .tag {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--dim);
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-}
+/* ── Colophon ────────────────────────────────────────────────────── */
 
-.tier-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 18px;
-}
-
-.card {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 22px 22px 24px;
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--line);
-  background: var(--panel);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-  overflow: hidden;
-  isolation: isolate;
-}
-
-.card::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: radial-gradient(
-    120% 80% at 0% 0%,
-    rgba(255, 255, 255, 0.04),
-    transparent 55%
-  );
-  z-index: -1;
-}
-
-.card-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.tier-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  border: 1px solid transparent;
-}
-
-.tier-a .tier-badge {
-  color: var(--tier-a);
-  border-color: rgba(52, 211, 153, 0.35);
-  background: rgba(52, 211, 153, 0.08);
-  box-shadow: var(--glow-a);
-}
-
-.tier-b .tier-badge {
-  color: var(--tier-b);
-  border-color: rgba(96, 165, 250, 0.35);
-  background: rgba(96, 165, 250, 0.08);
-  box-shadow: var(--glow-b);
-}
-
-.tier-c .tier-badge {
-  color: var(--tier-c);
-  border-color: rgba(192, 132, 252, 0.35);
-  background: rgba(192, 132, 252, 0.08);
-  box-shadow: var(--glow-c);
-}
-
-.card-title {
-  margin: 2px 0 0;
-  font-size: 17px;
-  font-weight: 600;
-  color: var(--ink);
-  letter-spacing: -0.01em;
-}
-
-.card-body {
-  color: var(--muted);
-  font-size: 14.5px;
-  line-height: 1.6;
-  margin: 0;
-}
-
-.card-meta {
-  display: flex;
-  gap: 18px;
-  margin-top: 4px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--dim);
-}
-
-.card-meta span {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.card-meta .kv {
-  color: var(--ink);
-}
-
-/* --- Counter (Tier B) --------------------------------------------- */
-
-.counter-action {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-top: 4px;
-}
-
-.counter-value {
-  font-family: var(--font-mono);
-  font-size: 28px;
-  font-weight: 600;
-  color: var(--ink);
-  min-width: 56px;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
-.counter-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 18px;
-  border-radius: 10px;
-  font-weight: 500;
-  font-size: 13px;
-  font-family: inherit;
-  cursor: pointer;
-  background: rgba(96, 165, 250, 0.14);
-  color: #bfdbfe;
-  border: 1px solid rgba(96, 165, 250, 0.35);
-  transition: background 120ms ease, transform 100ms ease;
-}
-
-.counter-btn:hover {
-  background: rgba(96, 165, 250, 0.22);
-}
-
-.counter-btn:active {
-  transform: translateY(1px);
-}
-
-/* --- LiveFeed (Tier C) -------------------------------------------- */
-
-.feed-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.feed-item {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid var(--line);
-  color: var(--ink);
-  font-size: 14px;
-  line-height: 1.45;
-}
-
-.feed-item .index {
-  flex: 0 0 auto;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--tier-c);
-  padding-top: 2px;
-}
-
-/* --- Footer -------------------------------------------------------- */
-
-.footer {
+.colophon {
+  margin: 96px 0 0;
+  padding-top: 22px;
+  border-top: 1px solid var(--rule-soft);
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  gap: 10px 24px;
   justify-content: space-between;
-  gap: 12px;
-  margin-top: 72px;
-  padding-top: 28px;
-  border-top: 1px solid var(--line);
-  color: var(--dim);
-  font-size: 13px;
-  font-family: var(--font-mono);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--ink-faint);
+  text-transform: uppercase;
 }
 
-.footer a {
-  color: var(--muted);
+.colophon a {
+  color: var(--ink-mute);
   text-decoration: none;
-  transition: color 120ms ease;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 1px;
 }
 
-.footer a:hover {
+.colophon a:hover {
   color: var(--ink);
+  border-bottom-color: rgba(8, 8, 10, 0.4);
 }
 
-/* --- Responsive ---------------------------------------------------- */
+/* ── Narrow ──────────────────────────────────────────────────────── */
 
-@media (max-width: 600px) {
-  .app-shell {
-    padding: 40px 18px 80px;
+@media (max-width: 620px) {
+  body {
+    font-size: 16px;
+  }
+  .shell {
+    padding: 0 22px 72px;
   }
   .hero {
-    padding: 24px 0 40px;
+    padding-top: 68px;
   }
-  .nav {
-    padding-bottom: 32px;
+  .lede {
+    font-size: 19px;
   }
-  .section-heading {
-    margin-top: 40px;
+  .plate {
+    padding: 24px 22px 26px;
+    margin-top: 64px;
+  }
+  .point {
+    grid-template-columns: 26px 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wordmark {
+    animation: none;
+  }
+  * {
+    transition-duration: 0.01ms !important;
   }
 }

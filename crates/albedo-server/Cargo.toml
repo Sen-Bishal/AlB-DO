@@ -9,10 +9,12 @@ repository.workspace  = true
 homepage.workspace    = true
 
 [features]
-# FORGE — the backend-less backend (development-plan/backend.md). Off by
-# default so the standard `albedo` build never pulls the storage backend;
-# enabling it here turns on the root crate's `forge` feature, which brings in
-# the libSQL substrate (`dom_render_compiler::forge::LibSqlSubstrate`).
+# FORGE — the backend-less backend (development-plan/backend.md). ON BY
+# DEFAULT so the stock `albedo` binary can serve a declared collection; this
+# turns on the root crate's `forge` feature, which brings in the libSQL
+# substrate (`dom_render_compiler::forge::LibSqlSubstrate`). Opt out with
+# `--no-default-features`.
+default = ["forge"]
 forge = ["dom-render-compiler/forge"]
 
 [dependencies]

@@ -151,9 +151,13 @@ name = "albedo-bench"
 path = "src/bin/albedo-bench.rs"
 
 [features]
-# FORGE — the backend-less backend (development-plan/backend.md). Off by
-# default so the standard build never pulls the storage backend; enable
-# with `--features forge`.
+# FORGE — the backend-less backend (development-plan/backend.md). ON BY
+# DEFAULT: FORGE is the product's differentiator, and a build without it
+# silently yields `null` topics on `serve` — a trap that cost real debugging
+# time and made `albedo init` demonstrate a backend-less framework. Opt OUT
+# with `--no-default-features` when you genuinely want the storage backend
+# left out of the binary.
+default = ["forge"]
 forge = ["dep:libsql"]
 
 [dependencies]

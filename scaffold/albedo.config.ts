@@ -11,4 +11,30 @@ export default {
   hmr: { enabled: true, transport: "sse" },
   hot_set: [],
   static_slice: { enabled: true, opt_out: [] },
+
+  // ── FORGE ────────────────────────────────────────────────────────
+  //
+  // THIS IS THE BACKEND. There is no server directory, no ORM, no
+  // migration folder, no API layer. Declare the shape of the data and
+  // ALBEDO emits the table, the query that materializes it, and the
+  // seed rows — then keeps every connected client in sync with it.
+  //
+  // `id` is implicit on every collection (INTEGER PRIMARY KEY
+  // AUTOINCREMENT) and is what live reconciliation keys on.
+  //
+  // The declared ordering decides where a new row lands, which decides
+  // which opcode the change ships as on the wire. `guestbook` is
+  // ordered ascending, so a new row lands at the TAIL and ships as a
+  // keyed `SlotDelta` — O(|Δ|), not O(|list|), however long it gets.
+  //
+  // Add a collection here and it exists. That is the whole workflow.
+  forge: {
+    guestbook: {
+      fields: { author: "text", message: "text" },
+      seed: [
+        { author: "ada", message: "first light" },
+        { author: "alan", message: "the machine stirs" },
+      ],
+    },
+  },
 };
