@@ -729,14 +729,22 @@ fn build_stream(
             closing.push_str(&hydration.closing_scripts);
         }
 
-        // Dev mode — inject the error-overlay + slot-preserving HMR client. Both
-        // self-connect to their `/_albedo/dev/*` SSE streams on load, so a single
-        // `<script src>` each is enough. This is what makes `albedo dev` the SAME
-        // production pipeline plus the dev affordances, instead of a second
-        // renderer. `defer` so they don't block the island runtime.
+        // Dev mode — inject the shared SSE channel, then the error overlay and
+        // the slot-preserving HMR client that subscribe to it. This is what
+        // makes `albedo dev` the SAME production pipeline plus the dev
+        // affordances, instead of a second renderer. `defer` so they don't
+        // block the island runtime.
+        //
+        // ORDER IS LOAD-BEARING: `stream.js` installs `window.__albedoDev`,
+        // and the two consumers read it at init. `defer` scripts execute in
+        // document order, so the channel must be emitted first. It also owns
+        // the only EventSource — dev used to spend three of the browser's six
+        // per-origin HTTP/1.1 connections per tab, which froze the page (and
+        // blocked reloads) as soon as a second tab was open.
         if app.dev_mode {
             closing.push_str(
-                "<script src=\"/_albedo/dev/overlay.js\" defer></script>\
+                "<script src=\"/_albedo/dev/stream.js\" defer></script>\
+                 <script src=\"/_albedo/dev/overlay.js\" defer></script>\
                  <script src=\"/_albedo/dev/hmr-apply.js\" defer></script>",
             );
         }

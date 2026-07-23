@@ -10,6 +10,12 @@ import { action, useSharedSlot } from "albedo";
 // Open this route in two tabs and sign it in one. The other updates
 // without polling and without rebuilding the list — untouched rows keep
 // their DOM nodes, which is why focus, selection and scroll survive.
+//
+// ⚠️ For the two-tab demo, run `albedo serve` rather than `albedo dev`.
+// Dev adds the hot-reload and error-overlay streams, and a browser only
+// allows six connections per origin — enough tabs and the next request
+// (including a reload) queues instead of sending. Being fixed properly:
+// TODO.md § 2d.
 
 // `append(collection, record)` records a durable write. The server
 // applies it after this body returns, rematerializes the collection and
@@ -81,8 +87,8 @@ export default function Guestbook() {
       </form>
 
       <p className="plate-note">
-        Open this page in a second tab and sign it here. Both update. Neither
-        one asked.
+        Run <code>albedo serve</code>, open this page in a second tab, and sign
+        it here. Both update. Neither one asked.
       </p>
     </section>
   );

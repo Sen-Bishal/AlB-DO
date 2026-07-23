@@ -1593,6 +1593,25 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
                     return crate::handlers::dev::serve_hmr_apply_script().into_response();
                 }
             }
+            "/_albedo/dev/stream.js" => {
+                if state.dev_error_registry.is_some() || state.dev_hmr_registry.is_some() {
+                    return crate::handlers::dev::serve_dev_stream_script().into_response();
+                }
+            }
+            // The merged stream — one connection carrying both event
+            // names. This is what the injected clients use; the two
+            // single-purpose routes below are kept so an existing tab
+            // (or anything in userland that wired itself to them)
+            // keeps working, but nothing we ship subscribes to them.
+            "/_albedo/dev/stream" => {
+                if state.dev_error_registry.is_some() || state.dev_hmr_registry.is_some() {
+                    return crate::handlers::dev::serve_dev_stream(
+                        state.dev_error_registry.clone(),
+                        state.dev_hmr_registry.clone(),
+                    )
+                    .into_response();
+                }
+            }
             "/_albedo/dev/errors" => {
                 if let Some(registry) = &state.dev_error_registry {
                     return crate::handlers::dev::serve_error_stream(registry.clone())

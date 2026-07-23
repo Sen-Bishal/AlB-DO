@@ -234,9 +234,11 @@
   });
 
   // ── SSE wiring ─────────────────────────────────────────────────
-
-  let backoff = 500;
-  let source = null;
+  //
+  // The socket is NOT owned here. `albedo-dev-stream.js` holds one
+  // EventSource for every dev consumer and fans events out by name —
+  // see that file for why (browsers cap HTTP/1.1 at six connections
+  // per origin, and dev used to spend three of them per tab).
 
   function setConn(state, label) {
     connEl.className = `conn ${state}`;
@@ -244,37 +246,27 @@
   }
 
   function connect() {
-    setConn('lost', 'connecting…');
-    try {
-      source = new EventSource('/_albedo/dev/errors');
-    } catch (err) {
-      scheduleReconnect();
+    const channel = globalScope.__albedoDev;
+    if (!channel) {
+      // The shared channel is injected immediately before this script
+      // and both are `defer`, so document order guarantees it. If it
+      // is missing, say so rather than silently showing nothing.
+      setConn('lost', 'dev channel unavailable');
       return;
     }
-    source.addEventListener('open', function () {
-      backoff = 500;
-      setConn('live', 'live');
+
+    channel.on('status', function (status) {
+      setConn(status.state, status.label);
     });
-    source.addEventListener('overlay', function (msgEvent) {
+
+    channel.on('overlay', function (data) {
       try {
-        const payload = JSON.parse(msgEvent.data);
-        handleEvent(payload);
+        handleEvent(JSON.parse(data));
       } catch (_err) {
         // Ignore malformed events — the overlay isn't trying to be
         // a strict decoder.
       }
     });
-    source.addEventListener('error', function () {
-      try { source.close(); } catch (_e) {}
-      source = null;
-      scheduleReconnect();
-    });
-  }
-
-  function scheduleReconnect() {
-    setConn('lost', `reconnecting in ${Math.round(backoff / 1000)}s`);
-    setTimeout(connect, backoff);
-    backoff = Math.min(backoff * 2, 8000);
   }
 
   function handleEvent(payload) {

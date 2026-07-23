@@ -15,39 +15,26 @@
   }
 
   // ── Connection state ──────────────────────────────────────────
+  //
+  // The socket lives in `albedo-dev-stream.js`, shared with the error
+  // overlay. Reconnect and backoff are owned there; this module only
+  // subscribes. See that file for the connection-budget reasoning.
 
-  let backoff = 500;
-  let source = null;
   let lastRevision = 0;
 
   function connect() {
-    try {
-      source = new EventSource('/_albedo/dev/hmr');
-    } catch (_err) {
-      scheduleReconnect();
+    const channel = globalScope.__albedoDev;
+    if (!channel) {
       return;
     }
-    source.addEventListener('open', function () {
-      backoff = 500;
-    });
-    source.addEventListener('hmr', function (msgEvent) {
+    channel.on('hmr', function (data) {
       try {
-        const payload = JSON.parse(msgEvent.data);
+        const payload = JSON.parse(data);
         handleEvent(payload);
       } catch (_err) {
         // Bad frames are ignored — next clean frame resyncs.
       }
     });
-    source.addEventListener('error', function () {
-      try { source.close(); } catch (_e) {}
-      source = null;
-      scheduleReconnect();
-    });
-  }
-
-  function scheduleReconnect() {
-    setTimeout(connect, backoff);
-    backoff = Math.min(backoff * 2, 8000);
   }
 
   function handleEvent(payload) {
