@@ -3055,6 +3055,7 @@ mod tests {
             open: false,
             routes: HashMap::new(),
             route_layouts: HashMap::new(),
+            forge: Default::default(),
         };
         let err = configure_ship_vercel(&contract).unwrap_err();
         assert!(err.contains("vercel is not a supported"));

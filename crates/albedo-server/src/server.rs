@@ -578,6 +578,25 @@ impl AlbedoServerBuilder {
         self
     }
 
+    /// Install the app's FORGE collection registry, replacing the built-in
+    /// guestbook default [`LiveRuntime::new`] mints.
+    ///
+    /// The schema is app-static: it is the `topic → (query, schema)` allowlist
+    /// the write path resolves against, and it is fixed for the life of the
+    /// process. Call this **before** [`Self::with_live_runtime`] — a dev reload
+    /// passes the running server's `LiveRuntime` through that method, and
+    /// reusing its schema (rather than rebuilding one) is what keeps the reload
+    /// swapping build output without disturbing live state. The corollary is
+    /// that editing the config's `forge` block needs a restart, not a reload.
+    #[must_use]
+    pub fn with_forge_schema(
+        mut self,
+        schema: dom_render_compiler::forge::ForgeSchema,
+    ) -> Self {
+        self.live.forge_schema = Arc::new(schema);
+        self
+    }
+
     /// Print each handled request's server-compute time (ns/µs) to stdout.
     /// The CLI (`albedo dev` / `albedo serve`) turns this on via
     /// [`crate::boot_production_server`]; library embedders opt in explicitly.

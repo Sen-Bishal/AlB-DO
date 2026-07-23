@@ -580,6 +580,21 @@ fn pat_ident_name(pat: &Pat) -> Option<String> {
 /// `Ident`, so they are not collected — which is what we want: the danger is a
 /// reference to the array *value* (`entries` in `entries.length`), and that obj
 /// is a plain `Ident` this does collect.
+///
+/// **Event-handler values are skipped**, because the question this answers is
+/// narrower than "what does the callback mention": it is *"can this row's
+/// server-rendered HTML differ when some other row changes?"*. Both SSR
+/// renderers drop `on*` props before markup — `render_attrs` in
+/// `runtime::eval::component` skips every name starting with `on`, and the
+/// QuickJS `h` shim drops function-valued props — so a handler body cannot
+/// reach the row's HTML and therefore cannot make it depend on the collection.
+/// Counting it anyway put the extremely common mutable-list row
+/// (`<li>{p.name}<button onClick={() => setCart(cart.filter(…))}/></li>`) on
+/// the whole-view path for a reference that renders nothing.
+///
+/// The skip is keyed on the `on` prefix to stay in lockstep with `render_attrs`
+/// — exactly the set the renderer *provably* drops, no wider. A function-valued
+/// prop under some other name is still counted, which is the safe direction.
 #[derive(Default)]
 struct IdentCollector {
     used: std::collections::HashSet<String>,
@@ -594,6 +609,15 @@ impl IdentCollector {
 impl Visit for IdentCollector {
     fn visit_ident(&mut self, ident: &Ident) {
         self.used.insert(ident.sym.to_string());
+    }
+
+    fn visit_jsx_attr(&mut self, attr: &JSXAttr) {
+        if let JSXAttrName::Ident(name) = &attr.name {
+            if name.sym.starts_with("on") {
+                return;
+            }
+        }
+        attr.visit_children_with(self);
     }
 }
 
@@ -707,6 +731,63 @@ mod classify_tests {
     fn a_named_callback_cannot_be_proven_and_is_whole_view() {
         assert_eq!(
             classify("entries.map(renderRow)"),
+            RowProjection::WholeView,
+        );
+    }
+
+    #[test]
+    fn a_handler_closing_over_the_collection_stays_per_record() {
+        // The mutable-list row: a per-row control whose handler names the whole
+        // collection. `render_attrs` drops every `on*` prop before markup, so
+        // that reference cannot reach this row's HTML and cannot make it depend
+        // on any other row. Counting it put every cart/todo/admin row on the
+        // whole-view path for markup that is never emitted.
+        assert_eq!(
+            classify(
+                "entries.map(entry => <li key={entry.id}>{entry.message}\
+                 <button onClick={() => remove(entries, entry)}>x</button></li>)"
+            ),
+            RowProjection::PerRecord,
+        );
+    }
+
+    #[test]
+    fn a_handler_using_the_index_stays_per_record_too() {
+        // Same rule, applied to the index param: an `on*` value is not markup,
+        // so a handler reading `i` does not make the row position-dependent.
+        assert_eq!(
+            classify(
+                "entries.map((entry, i) => <li key={entry.id}>{entry.message}\
+                 <button onClick={() => pin(i)}>pin</button></li>)"
+            ),
+            RowProjection::PerRecord,
+        );
+    }
+
+    #[test]
+    fn a_non_handler_attribute_still_counts_the_collection() {
+        // The skip is scoped to the `on` prefix, matching `render_attrs`. A
+        // rendered attribute that reads the collection is a genuine whole-view
+        // dependency and must stay one.
+        assert_eq!(
+            classify(
+                "entries.map(entry => <li key={entry.id} \
+                 data-total={entries.length}>{entry.message}</li>)"
+            ),
+            RowProjection::WholeView,
+        );
+    }
+
+    #[test]
+    fn a_handler_on_the_row_root_is_skipped_but_children_are_not() {
+        // The skip must not swallow the element's children: a handler on the
+        // row root is dropped, while a collection read in the row's text is
+        // still a whole-view dependency.
+        assert_eq!(
+            classify(
+                "entries.map(entry => <li key={entry.id} onClick={() => pick(entries)}>\
+                 {entries.length}</li>)"
+            ),
             RowProjection::WholeView,
         );
     }

@@ -1307,8 +1307,13 @@ mod substrate_tests {
     /// S4 · the beam, minus the transport. A subscriber must learn about an
     /// append as ONE row, not as a repainted collection — and the row it gets
     /// must be the row SSR would have rendered, keyed the way SSR keyed it.
+    ///
+    /// S5 tightened this from "one row *beside* the snapshot" to "one row,
+    /// alone": the snapshot stays in the topic (asserted below, since a reload
+    /// must still show three rows) but no longer rides the wire behind every
+    /// delta. That is the difference between a 179-byte append and a 126KB one.
     #[tokio::test]
-    async fn an_append_fans_out_one_row_delta_beside_the_snapshot() {
+    async fn an_append_fans_out_one_row_delta_and_nothing_else() {
         use crate::ir::opcode::{Instruction, RowKey};
         use crate::ir::wire::decode_frame;
         use crate::runtime::session::SessionId;
@@ -1369,12 +1374,8 @@ mod substrate_tests {
         let payload = rx.recv().await.expect("the write reaches the subscriber");
         let (frame, _) = decode_frame(&payload).unwrap();
         match frame.instructions.as_slice() {
-            [Instruction::SlotSet { value, .. }, Instruction::SlotDelta { changes, .. }] => {
-                // The snapshot is still the truth a reload would show…
-                let snapshot: Value = serde_json::from_slice(value).unwrap();
-                assert_eq!(snapshot.as_array().unwrap().len(), 3);
-
-                // …and the delta is one row, not three.
+            [Instruction::SlotDelta { changes, .. }] => {
+                // The delta is one row, not three — and it is the whole frame.
                 assert_eq!(changes.len(), 1, "an append must cost ONE row on the wire");
                 assert_eq!(changes[0].weight, 1);
                 assert_eq!(changes[0].key, RowKey("3".to_string()));
@@ -1383,8 +1384,16 @@ mod substrate_tests {
                     "<li data-albedo-key=\"3\">grace</li>"
                 );
             }
-            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+            other => panic!("expected [SlotDelta] alone, got {other:?}"),
         }
+
+        // The snapshot is still the truth a reload would show — suppressing it
+        // on the wire must not stop the topic from advancing.
+        assert_eq!(
+            topic_rows(&broadcast, "guestbook").len(),
+            3,
+            "the stored snapshot carries the appended row"
+        );
     }
 
     /// The fast path. A `PerRecord` collection answers an append by rendering
@@ -1463,15 +1472,15 @@ mod substrate_tests {
         .await
         .unwrap();
 
-        // Identical wire result to the whole-view path: snapshot of 3, delta of 1.
+        // Identical wire result to the whole-view path: a lone one-row delta.
         let payload = rx.recv().await.expect("the write reaches the subscriber");
         let (frame, _) = decode_frame(&payload).unwrap();
         match frame.instructions.as_slice() {
-            [Instruction::SlotSet { .. }, Instruction::SlotDelta { changes, .. }] => {
+            [Instruction::SlotDelta { changes, .. }] => {
                 assert_eq!(changes.len(), 1, "an append is still ONE row on the wire");
                 assert_eq!(changes[0].weight, 1);
             }
-            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+            other => panic!("expected [SlotDelta] alone, got {other:?}"),
         }
 
         // The proof of `O(1)`: the projector was only ever asked to render a
@@ -1577,7 +1586,7 @@ mod substrate_tests {
         let payload = rx.recv().await.expect("the update reaches the subscriber");
         let (frame, _) = decode_frame(&payload).unwrap();
         match frame.instructions.as_slice() {
-            [Instruction::SlotSet { .. }, Instruction::SlotDelta { changes, .. }] => {
+            [Instruction::SlotDelta { changes, .. }] => {
                 assert_eq!(changes.len(), 2, "an update is a -/+ pair under one key");
                 assert_eq!(
                     (changes[0].weight, &changes[0].key),
@@ -1592,7 +1601,7 @@ mod substrate_tests {
                     "<li data-albedo-key=\"1\">turing</li>"
                 );
             }
-            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+            other => panic!("expected [SlotDelta] alone, got {other:?}"),
         }
     }
 
@@ -1633,12 +1642,12 @@ mod substrate_tests {
         let payload = rx.recv().await.expect("the delete reaches the subscriber");
         let (frame, _) = decode_frame(&payload).unwrap();
         match frame.instructions.as_slice() {
-            [Instruction::SlotSet { .. }, Instruction::SlotDelta { changes, .. }] => {
+            [Instruction::SlotDelta { changes, .. }] => {
                 assert_eq!(changes.len(), 1, "a delete is one retraction");
                 assert_eq!(changes[0].weight, -1);
                 assert_eq!(changes[0].key, RowKey("2".to_string()));
             }
-            other => panic!("expected [SlotSet, SlotDelta], got {other:?}"),
+            other => panic!("expected [SlotDelta] alone, got {other:?}"),
         }
     }
 
