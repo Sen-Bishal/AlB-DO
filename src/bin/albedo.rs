@@ -57,12 +57,20 @@ const SPINNER_FRAMES_ASCII: [&str; 4] = ["|", "/", "-", "\\"];
 // conventions: `src/routes/` for file-based routing, a root
 // `layout.tsx` wrapping every route, a `tier-budget.toml` at project
 // root, and TS-side `action()` + `useSharedSlot()` demonstrated in
-// the chat route. Old shape (`src/App.tsx` + Tier-C fetch demo)
-// retired — no upgrade path from pre-Phase-P scaffolds; users on
-// the old shape `albedo init --force` into a fresh dir.
+// the guestbook route, which reads and writes a FORGE collection
+// declared in `albedo.config.ts`. Old shape (`src/App.tsx` + Tier-C
+// fetch demo) retired — no upgrade path from pre-Phase-P scaffolds;
+// users on the old shape `albedo init --force` into a fresh dir.
+//
+// The guestbook replaced a scalar `broadcast()` counter route that
+// demonstrated a primitive which does not paint live (TODO.md § 2b):
+// the scaffold's headline demo was a known-broken feature, and it
+// failed in a way that read as "broadcast is broken" rather than as a
+// paint bug. A list topic exercises the same substrate and works.
 const SCAFFOLD_LAYOUT: &str = include_str!("../../scaffold/src/routes/layout.tsx");
 const SCAFFOLD_INDEX_ROUTE: &str = include_str!("../../scaffold/src/routes/index.tsx");
-const SCAFFOLD_CHAT_ROUTE: &str = include_str!("../../scaffold/src/routes/chat.tsx");
+const SCAFFOLD_GUESTBOOK_ROUTE: &str =
+    include_str!("../../scaffold/src/routes/guestbook.tsx");
 const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/components/Hero.tsx");
 const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/src/components/Counter.tsx");
 const SCAFFOLD_ENV_DTS: &str = include_str!("../../scaffold/src/albedo-env.d.ts");
@@ -2103,8 +2111,8 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         options.force,
     )?;
     write_scaffold_file(
-        &target.join("src").join("routes").join("chat.tsx"),
-        SCAFFOLD_CHAT_ROUTE,
+        &target.join("src").join("routes").join("guestbook.tsx"),
+        SCAFFOLD_GUESTBOOK_ROUTE,
         options.force,
     )?;
     // Shared components (imported by routes).
@@ -2974,7 +2982,7 @@ mod tests {
         assert!(target.join(DEV_CONFIG_TS).is_file());
         assert!(target.join("src/routes/layout.tsx").is_file());
         assert!(target.join("src/routes/index.tsx").is_file());
-        assert!(target.join("src/routes/chat.tsx").is_file());
+        assert!(target.join("src/routes/guestbook.tsx").is_file());
         assert!(target.join("src/components/Hero.tsx").is_file());
         assert!(target.join("src/components/Counter.tsx").is_file());
         assert!(target.join("src/styles.css").is_file());

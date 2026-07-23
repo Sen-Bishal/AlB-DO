@@ -1,26 +1,21 @@
+// Tier A — no hooks, no async, no side effects. This whole masthead
+// ships as HTML. Nothing here boots on the client.
+//
+// The apostrophe in ALB'DO is the wordmark signature, so it carries the
+// metal on its own (`.glyph`) rather than being set as plain type.
 export default function Hero() {
-  // Tier A: no hooks, no async IO, no side effects — ships as static HTML.
   return (
     <header className="hero">
-      <span className="hero-eyebrow">
-        <span>●</span> v0.1 · tiered rendering
-      </span>
-      <h1 className="hero-title">
-        Ship the web at the speed of <span className="accent">Rust</span>.
+      <h1 className="wordmark">
+        ALB<span className="glyph">&rsquo;</span>DO
       </h1>
-      <p className="hero-sub">
-        AlBDO is a JSX compiler and render loop that sorts every component
-        into one of three tiers — static, island, or streamed — and ships
-        only what each tier actually needs.
+      <p className="tagline">Evolution simplified</p>
+      <hr className="rule" />
+      <p className="lede">
+        A compiler that reads your components and decides what each one
+        actually costs — what ships as markup, what boots on the client, and
+        what your database looks like.
       </p>
-      <div className="hero-actions">
-        <a className="btn btn-primary" href="#get-started">
-          Open src/routes/index.tsx
-        </a>
-        <a className="btn btn-ghost" href="/chat">
-          Try broadcast →
-        </a>
-      </div>
     </header>
   );
 }

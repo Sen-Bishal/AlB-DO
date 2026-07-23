@@ -373,6 +373,35 @@ declare function broadcast<T>(
   updater: (current: T) => T,
 ): Promise<void>;
 
+// ── FORGE writes ────────────────────────────────────────────────
+//
+// Like `broadcast`, these are free idents recognised inside action
+// handler bodies — not imports. They record a durable write against
+// a collection declared in the `forge` block of `albedo.config.ts`;
+// the server applies it after the handler body returns, then
+// rematerializes the collection and fans the change out to every
+// subscribed client.
+
+// Insert a record. `id` is implicit and assigned by the substrate —
+// do not pass it.
+declare function append<T extends Record<string, unknown>>(
+  collection: string,
+  record: T,
+): Promise<void>;
+
+// Retract the row identified by `key` (its `id`).
+declare function remove(
+  collection: string,
+  key: string | number,
+): Promise<void>;
+
+// Update the row identified by `key` with the given partial fields.
+declare function update<T extends Record<string, unknown>>(
+  collection: string,
+  key: string | number,
+  fields: T,
+): Promise<void>;
+
 // Phase P · Stream E.1 — the `<children />` JSX intrinsic in
 // `routes/layout.tsx` marks where the wrapped route renders.
 // Declared here so the type-checker stops flagging the unknown
