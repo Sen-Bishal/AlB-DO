@@ -190,7 +190,9 @@ pub async fn serve_patch_stream(
 /// ships — it tells a client that lost the deletion of its last row to clear it
 /// — while a topic the projector cannot speak for is skipped rather than guessed
 /// at, the same fail-safe rule the write path uses.
-async fn resync_frame(
+/// `pub(crate)` because the PHOSPHOR lane's takeover/reconnect repair is the
+/// same resync — one spelling of "re-assert the full desired row sets".
+pub(crate) async fn resync_frame(
     projector: &dyn RowProjector,
     seed_values: &[(String, Vec<u8>)],
 ) -> Option<Vec<u8>> {

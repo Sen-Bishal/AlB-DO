@@ -34,6 +34,7 @@
 // `write_framed_payload` on the server side.
 
 import { decodeFrame } from './bincode.js';
+import { bootPhosphor } from './phosphor.js';
 
 /** Map<slot, (payload: Uint8Array) => void> dispatchers, keyed by slot index. */
 const SLOT_DISPATCHERS = new Map();
@@ -508,8 +509,16 @@ function decodeBase64(g, text) {
 }
 
 // ── Side-effect: browser boot ────────────────────────────────────────
+//
+// PHOSPHOR first: when the environment has Web Locks + BroadcastChannel,
+// the shared per-browser trunk replaces the per-tab patches lane entirely
+// (N tabs → 1 connection; see development-plan/PHOSPHOR.md). The legacy
+// lane remains the fallback for environments without those primitives, and
+// keeps today's behavior there bit-for-bit.
 
 if (typeof globalThis !== 'undefined' && globalThis.document) {
   bootWebTransport(globalThis);
-  bootPatchStream(globalThis);
+  if (!bootPhosphor(globalThis)) {
+    bootPatchStream(globalThis);
+  }
 }

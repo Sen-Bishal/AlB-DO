@@ -108,5 +108,34 @@
     },
   };
 
-  connect();
+  // ── PHOSPHOR handoff ──────────────────────────────────────────────
+  //
+  // When the shared per-browser lane is up, dev events (`overlay`/`hmr`)
+  // ride its trunk and this module opens NO socket at all — that is what
+  // takes an N-tab `albedo dev` browser from N dev connections to zero.
+  //
+  // Load order against the lane module is nondeterministic (this script is
+  // deferred; wt-bootstrap is an async module), so the handshake works in
+  // both directions: if phosphor booted first we attach directly; if we ran
+  // first we park the sink where phosphor's boot claims it, and only open
+  // the legacy EventSource after a grace period nobody claimed it in.
+  function phosphorSink(name, payload) {
+    emit(name, payload);
+  }
+
+  var phosphor = globalScope.__ALBEDO_PHOSPHOR__;
+  if (phosphor && typeof phosphor.devAttach === 'function') {
+    phosphor.devAttach(phosphorSink);
+    status('live', 'live · shared lane');
+    return;
+  }
+  globalScope.__ALBEDO_DEV_SINK_WAITING__ = phosphorSink;
+  globalScope.setTimeout(function devFallbackAfterGrace() {
+    if (globalScope.__ALBEDO_DEV_SINK_CLAIMED__) {
+      status('live', 'live · shared lane');
+      return;
+    }
+    globalScope.__ALBEDO_DEV_SINK_WAITING__ = null;
+    connect();
+  }, 250);
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -154,13 +154,15 @@ pub fn serve_dev_stream(
         .into_response()
 }
 
-fn render_overlay_event(event: &OverlayEvent) -> SseEvent {
+/// `pub(crate)` because the PHOSPHOR trunk merges the same dev events into
+/// its stream — one spelling of each event's wire shape, two transports.
+pub(crate) fn render_overlay_event(event: &OverlayEvent) -> SseEvent {
     let payload = serde_json::to_string(event)
         .unwrap_or_else(|_| String::from("{\"event\":\"error\",\"id\":0,\"kind\":\"runtime\",\"message\":\"serialize_failed\",\"timestamp_ms\":0}"));
     SseEvent::default().event("overlay").data(payload)
 }
 
-fn render_hmr_event(event: &HmrEvent) -> SseEvent {
+pub(crate) fn render_hmr_event(event: &HmrEvent) -> SseEvent {
     let payload = serde_json::to_string(event)
         .unwrap_or_else(|_| String::from("{\"event\":\"reload\",\"revision\":0}"));
     SseEvent::default().event("hmr").data(payload)

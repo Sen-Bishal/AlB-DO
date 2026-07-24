@@ -21,6 +21,9 @@ const BINCODE_JS: &str = include_str!("../../../../assets/bincode.js");
 const LINK_FORMS_JS: &str = include_str!("../../../../assets/albedo-link-forms.js");
 const HYDRATION_JS: &str = include_str!("../../../../assets/albedo-hydration.js");
 const WT_BOOTSTRAP_JS: &str = include_str!("../../../../assets/albedo-wt-bootstrap.js");
+// PHOSPHOR · the shared per-browser lane. Imported by wt-bootstrap as
+// `./phosphor.js`, so it must be served at the sibling URL.
+const PHOSPHOR_JS: &str = include_str!("../../../../assets/phosphor.js");
 // A3 · the Tier-C client runtime (Preact-compatible VDOM + hooks). Installs the
 // `h`/`useState`/… globals and `__ALBEDO_HYDRATE_ISLAND` the bootstrap calls.
 const CLIENT_JS: &str = include_str!("../../../../assets/albedo-client.js");
@@ -37,6 +40,7 @@ fn resolve_albedo_asset(path: &str) -> Option<&'static str> {
         "/_albedo/hydration.js" => Some(HYDRATION_JS),
         "/_albedo/client.js" => Some(CLIENT_JS),
         "/_albedo/wt-bootstrap.js" => Some(WT_BOOTSTRAP_JS),
+        "/_albedo/phosphor.js" => Some(PHOSPHOR_JS),
         _ => None,
     }
 }
@@ -77,6 +81,7 @@ mod tests {
             "/_albedo/hydration.js",
             "/_albedo/client.js",
             "/_albedo/wt-bootstrap.js",
+            "/_albedo/phosphor.js",
         ] {
             let body = resolve_albedo_asset(path).unwrap_or_else(|| {
                 panic!("expected asset to resolve: {path}")

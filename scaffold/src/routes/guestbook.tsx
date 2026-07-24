@@ -11,11 +11,9 @@ import { action, useSharedSlot } from "albedo";
 // without polling and without rebuilding the list — untouched rows keep
 // their DOM nodes, which is why focus, selection and scroll survive.
 //
-// ⚠️ For the two-tab demo, run `albedo serve` rather than `albedo dev`.
-// Dev adds the hot-reload and error-overlay streams, and a browser only
-// allows six connections per origin — enough tabs and the next request
-// (including a reload) queues instead of sending. Being fixed properly:
-// TODO.md § 2d.
+// However many tabs you open, the browser holds ONE connection to the
+// server — tabs share it and subscribe by route (the PHOSPHOR lane), so
+// a stack of tabs costs what one costs.
 
 // `append(collection, record)` records a durable write. The server
 // applies it after this body returns, rematerializes the collection and

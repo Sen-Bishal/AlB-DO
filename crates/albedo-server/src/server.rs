@@ -385,6 +385,11 @@ struct RuntimeState {
     /// minting empties. See [`LiveRuntime`]. (The broadcast registry is also
     /// reachable via `world().broadcast`, which is the same `Arc`.)
     live: LiveRuntime,
+    /// PHOSPHOR — the per-browser-profile lane table. Persistent (a trunk
+    /// belongs to a browser, not to a page or a world): a dev hot-swap keeps
+    /// open trunks, and new subscribes bind against whatever world is live
+    /// at subscribe time. See `handlers::phosphor` + `development-plan/PHOSPHOR.md`.
+    phosphor: Arc<crate::handlers::PhosphorState>,
 }
 
 impl RuntimeState {
@@ -1193,6 +1198,7 @@ impl AlbedoServerBuilder {
             // reload reuse it (via `with_live_runtime`) instead of stranding the
             // hydrated topics and open subscribers.
             live: self.live,
+            phosphor: Arc::new(crate::handlers::PhosphorState::new()),
         };
 
         Ok(AlbedoServer {
@@ -1545,7 +1551,8 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
                     .get("p")
                     .and_then(|values| values.first().cloned())
                     .unwrap_or_else(|| "/".to_string());
-                let topics = resolve_route_topics(&world, streaming_runtime, page_path.as_str());
+                let topics = resolve_route_topics(&world, streaming_runtime, page_path.as_str())
+                    .unwrap_or_default();
                 // Only a reconnect needs a resync, and only the current
                 // projector can produce it. Cloned out of the live slot into an
                 // owned local so the borrow survives the `.await` below without
@@ -1565,6 +1572,61 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
             }
             None => empty_patch_stream().await,
         };
+        if state.request_timings {
+            crate::timing::print_request(method.as_str(), &path, started.elapsed());
+        }
+        return response;
+    }
+
+    // PHOSPHOR · the trunk — one SSE connection per browser profile; tabs
+    // attach as route-scoped circuits via the subscribe POST below. The lane
+    // table lives on persistent state, so a dev world-swap keeps open trunks.
+    if path == "/_albedo/phosphor" && method == HttpMethod::Get {
+        let identity = crate::render::csrf::read_session_cookie(request.headers());
+        // `?dev=1` merges the overlay/HMR event streams onto the trunk so a
+        // dev browser holds exactly one connection. Inert in production: the
+        // registries are `None`, so the flag has nothing to stream.
+        let wants_dev = crate::routing::parse_query_string(query.as_deref())
+            .get("dev")
+            .is_some();
+        let dev = if wants_dev {
+            crate::handlers::phosphor::DevTap {
+                errors: state.dev_error_registry.clone(),
+                hmr: state.dev_hmr_registry.clone(),
+            }
+        } else {
+            crate::handlers::phosphor::DevTap::none()
+        };
+        let response =
+            crate::handlers::phosphor::serve_trunk(state.phosphor.clone(), dev, identity).await;
+        if state.request_timings {
+            crate::timing::print_request(method.as_str(), &path, started.elapsed());
+        }
+        return response;
+    }
+
+    // PHOSPHOR · the subscribe delta. Route→topic resolution and (future)
+    // authorization go through `WorldRouteAuthority` — the single choke point
+    // item 4's dynamic topics land into. Resolution binds against the world
+    // that is live NOW, not the one the trunk opened under.
+    if path == "/_albedo/phosphor/routes" && method == HttpMethod::Post {
+        let (_parts, body) = request.into_parts();
+        let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(err) => {
+                return RuntimeError::RequestBodyRead(err.to_string()).into_response();
+            }
+        };
+        let authority = WorldRouteAuthority {
+            world: world.clone(),
+            projector: state.live.projector(),
+        };
+        let response = crate::handlers::phosphor::handle_subscribe(
+            state.phosphor.clone(),
+            &authority,
+            body.as_ref(),
+        )
+        .await;
         if state.request_timings {
             crate::timing::print_request(method.as_str(), &path, started.elapsed());
         }
@@ -1946,25 +2008,63 @@ async fn empty_patch_stream() -> axum::response::Response<axum::body::Body> {
 /// was rendered from. An unmatched path yields no topics rather than an error:
 /// the client opens this lane unconditionally, and a page that turns out to
 /// read nothing should get a quiet empty stream.
+/// `None` when `page_path` matches no GET route at all — the caller decides
+/// whether that means "no topics" (the per-tab lane, which serves an empty
+/// stream) or "denied" (the PHOSPHOR subscribe path, which refuses to
+/// subscribe a path that doesn't exist). A matched route with no topics is
+/// `Some(vec![])` — subscribable, and legitimately quiet.
 fn resolve_route_topics(
     world: &RenderWorld,
     streaming: &Arc<StreamingAppState>,
     page_path: &str,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     let RouteMatch::Matched(matched) = world.router.match_route(HttpMethod::Get, page_path) else {
-        return Vec::new();
+        return None;
     };
     let pattern = matched
         .target
         .entry_module
         .clone()
         .unwrap_or_else(|| page_path.to_string());
-    streaming
-        .manifest
-        .routes
-        .get(pattern.as_str())
-        .map(|route| route.shared_slot_topics.clone())
-        .unwrap_or_default()
+    Some(
+        streaming
+            .manifest
+            .routes
+            .get(pattern.as_str())
+            .map(|route| route.shared_slot_topics.clone())
+            .unwrap_or_default(),
+    )
+}
+
+/// PHOSPHOR's [`crate::handlers::phosphor::RouteAuthority`] over the live
+/// world: the same resolution the render and the per-tab lane use, plus the
+/// deny-on-unmatched rule. Today identity is unused — every topic is a
+/// global compile-time constant, so nothing is grantable that isn't already
+/// public. Item 4 (dynamic topics) changes the body of `authorize_route` and
+/// nothing else: parameterized route → parameterized topics, checked against
+/// the lane identity via the `AuthProvider`.
+struct WorldRouteAuthority {
+    world: Arc<RenderWorld>,
+    projector: Option<Arc<dyn dom_render_compiler::forge::RowProjector>>,
+}
+
+impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority {
+    fn authorize_route(
+        &self,
+        _identity: Option<dom_render_compiler::runtime::session::SessionId>,
+        path: &str,
+    ) -> Option<Vec<String>> {
+        let streaming = self.world.streaming_runtime.as_ref()?;
+        resolve_route_topics(&self.world, streaming, path)
+    }
+
+    fn registry(&self) -> Arc<BroadcastRegistry> {
+        self.world.broadcast.clone()
+    }
+
+    fn projector(&self) -> Option<Arc<dyn dom_render_compiler::forge::RowProjector>> {
+        self.projector.clone()
+    }
 }
 
 fn should_use_manifest_streaming(
@@ -2117,6 +2217,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "user=42");
+    }
+
+    /// § 2d's unclaimed regression test, folded into the PHOSPHOR work: the
+    /// dev endpoints gate on registry presence, so a production server (dev
+    /// mode off) must 404 every one of them — they stream stack traces and
+    /// app HTML, which is dev-only material. The PHOSPHOR trunk, by
+    /// contrast, is a production surface and must stay up; its `?dev=1`
+    /// flag is inert in prod (no registries → nothing to merge).
+    #[tokio::test]
+    async fn dev_endpoints_404_in_production_but_the_phosphor_trunk_stays_up() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+        let server = AlbedoServerBuilder::new(config)
+            .with_dev_mode(false)
+            .build()
+            .unwrap();
+
+        for path in [
+            "/_albedo/dev/stream",
+            "/_albedo/dev/errors",
+            "/_albedo/dev/hmr",
+            "/_albedo/dev/stream.js",
+            "/_albedo/dev/overlay.js",
+            "/_albedo/dev/hmr-apply.js",
+        ] {
+            let response = server
+                .router()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "dev endpoint must not exist in production: {path}"
+            );
+        }
+
+        let trunk = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/_albedo/phosphor?dev=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trunk.status(),
+            StatusCode::OK,
+            "the lane is a production surface; the dev flag is merely inert"
+        );
     }
 
     #[tokio::test]

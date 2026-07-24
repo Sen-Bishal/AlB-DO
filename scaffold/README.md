@@ -124,14 +124,13 @@ export default function Guestbook() {
 
 `useSharedSlot(topic)` reads the live collection and subscribes the
 session's patches lane; a write inside an `action()` fans out to every
-subscriber. Try the included `/guestbook` route in two browser tabs.
+subscriber. Try the included `/guestbook` route in two browser tabs —
+`albedo dev` and `albedo serve` both handle as many as you like.
 
-> **Use `albedo serve` for the two-tab demo, not `albedo dev`.** Dev adds the
-> hot-reload and error-overlay streams on top of the live wire, and a browser
-> allows only six connections per origin — with enough tabs open the next
-> request queues instead of sending, and the page appears to freeze (a reload
-> won't rescue it, because the reload needs a connection too). Closing the extra
-> tabs releases it. Being fixed properly.
+> However many tabs you open, the browser holds **one** connection to the
+> server. Tabs elect an owner (Web Locks), share its stream, and subscribe by
+> route — the PHOSPHOR lane. Hot reload and the error overlay ride the same
+> connection in dev, so a stack of tabs costs what one costs.
 
 **Two rules worth knowing up front:**
 

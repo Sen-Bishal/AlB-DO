@@ -3,6 +3,7 @@ pub mod albedo_assets;
 pub mod api;
 pub mod dev;
 pub mod patches;
+pub mod phosphor;
 pub mod public_assets;
 pub mod streaming;
 
@@ -14,6 +15,7 @@ pub use dev::{
     serve_overlay_script,
 };
 pub use patches::serve_patch_stream;
+pub use phosphor::PhosphorState;
 pub use public_assets::{content_type_for_path, sanitize_public_path, PublicAssets};
 pub use streaming::{
     streaming_handler, streaming_handler_with_match, StreamingAppState, StreamingTransportConfig,

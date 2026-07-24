@@ -1881,6 +1881,15 @@ fn run_prod_build_with_budget(
             wt_bootstrap_asset_path.display()
         )
     })?;
+    // PHOSPHOR · the shared per-browser lane. Imported by the WT bootstrap
+    // as `./phosphor.js`, so it too must sit beside it.
+    let phosphor_asset_path = out_dir.join("_albedo").join("phosphor.js");
+    std::fs::write(&phosphor_asset_path, albedo_phosphor_template()).map_err(|err| {
+        format!(
+            "failed to write phosphor lane '{}': {err}",
+            phosphor_asset_path.display()
+        )
+    })?;
     let hydration_asset_path = out_dir.join("_albedo").join("hydration.js");
     std::fs::write(&hydration_asset_path, albedo_hydration_runtime_template()).map_err(|err| {
         format!(
@@ -2270,6 +2279,13 @@ fn albedo_bincode_template() -> String {
 /// runtime and the decoder.
 fn albedo_wt_bootstrap_template() -> String {
     include_str!("../../assets/albedo-wt-bootstrap.js").to_string()
+}
+
+/// PHOSPHOR · the shared per-browser lane, deployed to
+/// `_albedo/phosphor.js`. Imported by the WT bootstrap as `./phosphor.js`,
+/// so the two ship together or the import 404s at boot.
+fn albedo_phosphor_template() -> String {
+    include_str!("../../assets/phosphor.js").to_string()
 }
 
 /// Phase L · client-side Link / form-action / Navigate interception.

@@ -16,6 +16,9 @@ pub const BUNDLE_ROUTE_PREFETCH_MANIFEST_FILENAME: &str = "route-prefetch-manife
 pub const BUNDLE_STATIC_SLICES_FILENAME: &str = "static-slices.json";
 pub const BUNDLE_PRECOMPILED_MODULES_FILENAME: &str = "precompiled-runtime-modules.json";
 pub const BUNDLE_WT_BOOTSTRAP_FILENAME: &str = "_albedo/wt-bootstrap.js";
+/// PHOSPHOR · the shared per-browser lane; the WT bootstrap imports it as
+/// `./phosphor.js`, so the two ship together or the import 404s at boot.
+pub const BUNDLE_PHOSPHOR_FILENAME: &str = "_albedo/phosphor.js";
 pub const BUNDLE_RUNTIME_MAP_VERSION: &str = "1.0";
 pub const BUNDLE_ROUTE_PREFETCH_MANIFEST_VERSION: &str = "1.0";
 
@@ -331,6 +334,14 @@ fn emit_bundle_artifacts_to_dir_internal(
         bytes: wt_bootstrap_bytes.len(),
     });
 
+    let phosphor_bytes = emit_phosphor_source().into_bytes();
+    let phosphor_path = output_dir.join(relative_path_to_fs_path(BUNDLE_PHOSPHOR_FILENAME));
+    write_artifact(&phosphor_path, &phosphor_bytes)?;
+    artifacts.push(EmittedArtifact {
+        relative_path: BUNDLE_PHOSPHOR_FILENAME.to_string(),
+        bytes: phosphor_bytes.len(),
+    });
+
     let plan_json = emit_bundle_plan_json(plan).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -539,6 +550,10 @@ fn emit_wt_bootstrap_source() -> String {
     include_str!("../../assets/albedo-wt-bootstrap.js").to_string()
 }
 
+fn emit_phosphor_source() -> String {
+    include_str!("../../assets/phosphor.js").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,14 +656,19 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let report = emit_bundle_artifacts_to_dir(&fixture_plan(), temp_dir.path()).unwrap();
 
-        // Phase M.4 · the bundler now emits a `.map` file alongside
-        // every wrapper module; one wrapper in the fixture → one
-        // extra artifact compared to the pre-M.4 count of 6.
-        assert_eq!(report.artifacts.len(), 7);
+        // Phase M.4 added a `.map` per wrapper (6 → 7); PHOSPHOR adds the
+        // lane module the WT bootstrap imports as `./phosphor.js` (7 → 8).
+        assert_eq!(report.artifacts.len(), 8);
 
         let wt_bootstrap_path = temp_dir.path().join("_albedo").join("wt-bootstrap.js");
         let wt_bootstrap_source = std::fs::read_to_string(wt_bootstrap_path).unwrap();
         assert!(wt_bootstrap_source.contains("WebTransport"));
+
+        // The bootstrap imports `./phosphor.js`, so the emit MUST place the
+        // lane module beside it or every built app 404s at boot.
+        let phosphor_path = temp_dir.path().join("_albedo").join("phosphor.js");
+        let phosphor_source = std::fs::read_to_string(phosphor_path).unwrap();
+        assert!(phosphor_source.contains("bootPhosphor"));
 
         let plan_path = temp_dir.path().join(BUNDLE_PLAN_FILENAME);
         let plan_json = std::fs::read_to_string(plan_path).unwrap();
