@@ -766,6 +766,7 @@ fn build_shell_chunk(
     shell.push_str(&transport_hint_script(
         negotiated_transport,
         webtransport_path,
+        route_needs_live_lane(route),
     ));
     shell.push_str(&csrf_bootstrap_script(csrf_token));
     shell.push_str(&route.shell.shim_script);
@@ -1233,17 +1234,50 @@ fn csrf_bootstrap_script(csrf_token: &str) -> String {
     format!("<script>globalThis.__ALBEDO_CSRF__={literal};</script>")
 }
 
-fn transport_hint_script(transport: NegotiatedTransport, webtransport_path: &str) -> String {
+fn transport_hint_script(
+    transport: NegotiatedTransport,
+    webtransport_path: &str,
+    needs_live_lane: bool,
+) -> String {
     let endpoint = match transport {
         NegotiatedTransport::WebTransport => webtransport_path,
         NegotiatedTransport::Sse => "",
     };
     let endpoint_literal = serde_json::to_string(endpoint).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        "<script>globalThis.__ALBEDO_ACTIVE_TRANSPORT__=\"{}\";globalThis.__ALBEDO_WT_ENDPOINT__={};</script>",
+        "<script>globalThis.__ALBEDO_ACTIVE_TRANSPORT__=\"{}\";globalThis.__ALBEDO_WT_ENDPOINT__={};globalThis.__ALBEDO_LIVE__={};</script>",
         transport.as_header_value(),
-        endpoint_literal
+        endpoint_literal,
+        needs_live_lane
     )
+}
+
+/// Does this route need the patches lane?
+///
+/// **The single source of truth.** The client used to answer this itself by
+/// sniffing the DOM for `[data-albedo-tier="b"]`, `[data-albedo-tier="c"]` or
+/// `[data-albedo-list-slot]` — re-deriving, from page shape, a decision the
+/// server had already made from the manifest. The two answers were allowed to
+/// disagree, and they did: a route whose only live surface is a **scalar**
+/// `useSharedSlot` read matched none of those selectors, so the browser never
+/// opened the lane and `broadcast()` could not reach it. A shared-slot *list*
+/// had hit the same wall earlier and was patched by adding a third selector to
+/// the client's list — which is what made the next surface silently regress.
+///
+/// So it is answered once, here, from the same facts
+/// [`stream_route_over_webtransport`] uses to decide whether to `auto_subscribe`
+/// — and shipped to the client as `__ALBEDO_LIVE__`. A new live surface can
+/// never again need a matching edit in a selector string on the other side of
+/// the wire.
+fn route_needs_live_lane(route: &RouteManifest) -> bool {
+    // A broadcast topic the route reads — scalar or list, it is the same
+    // question, and it is exactly what auto-subscribe keys on.
+    if !route.shared_slot_topics.is_empty() {
+        return true;
+    }
+    // A hydrated or streamed island receives patch frames on the same lane even
+    // when the route reads no topic at all.
+    !route.tier_b.is_empty() || !route.tier_c.is_empty()
 }
 
 #[cfg(test)]
@@ -1372,9 +1406,10 @@ mod tests {
 
     #[test]
     fn test_transport_hint_script_disables_wt_endpoint_for_sse_fallback() {
-        let script = transport_hint_script(NegotiatedTransport::Sse, "/_albedo/wt");
+        let script = transport_hint_script(NegotiatedTransport::Sse, "/_albedo/wt", false);
         assert!(script.contains("__ALBEDO_ACTIVE_TRANSPORT__=\"sse\""));
         assert!(script.contains("__ALBEDO_WT_ENDPOINT__=\"\""));
+        assert!(script.contains("__ALBEDO_LIVE__=false"));
     }
 
     #[test]
@@ -1461,9 +1496,54 @@ mod tests {
 
     #[test]
     fn test_transport_hint_script_sets_wt_endpoint_for_webtransport_mode() {
-        let script = transport_hint_script(NegotiatedTransport::WebTransport, "/_albedo/wt");
+        let script = transport_hint_script(NegotiatedTransport::WebTransport, "/_albedo/wt", true);
         assert!(script.contains("__ALBEDO_ACTIVE_TRANSPORT__=\"webtransport\""));
         assert!(script.contains("__ALBEDO_WT_ENDPOINT__=\"/_albedo/wt\""));
+        assert!(script.contains("__ALBEDO_LIVE__=true"));
+    }
+
+    /// The invariant the whole `__ALBEDO_LIVE__` design exists to hold:
+    /// **the flag agrees with auto-subscribe.** `stream_route_over_webtransport`
+    /// subscribes a page when `shared_slot_topics` is non-empty; if this ever
+    /// returned `false` for such a route, the server would subscribe a session
+    /// whose browser never opened the lane — which is exactly the bug that let
+    /// a scalar `useSharedSlot` render dead (§ 2e).
+    #[test]
+    fn a_route_that_auto_subscribes_always_asks_for_the_lane() {
+        let mut route = route_manifest();
+        route.shared_slot_topics = vec!["lobby:counter".to_string()];
+        route.tier_b.clear();
+        route.tier_c.clear();
+        assert!(
+            route_needs_live_lane(&route),
+            "a scalar-only topic route must still get the lane"
+        );
+    }
+
+    /// The converse: a genuinely static route must NOT pay for a connection.
+    /// This is what stops the flag degrading into "always true", which would
+    /// hold one socket per tab on pages with nothing to deliver — and the
+    /// per-tab connection budget is already the scarcest thing we have.
+    #[test]
+    fn a_fully_static_route_does_not_open_a_lane() {
+        let mut route = route_manifest();
+        route.shared_slot_topics.clear();
+        route.tier_b.clear();
+        route.tier_c.clear();
+        assert!(!route_needs_live_lane(&route));
+    }
+
+    /// An island route with no topics still receives patch frames.
+    #[test]
+    fn an_island_route_without_topics_still_gets_the_lane() {
+        let mut route = route_manifest();
+        route.shared_slot_topics.clear();
+        route.tier_c.clear();
+        assert!(
+            !route.tier_b.is_empty(),
+            "fixture must carry a Tier-B node for this to mean anything"
+        );
+        assert!(route_needs_live_lane(&route));
     }
 
     #[test]

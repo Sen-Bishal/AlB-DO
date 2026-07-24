@@ -70,9 +70,17 @@ const utf8Decoder = new TextDecoder('utf-8');
 // ── Entry point ──────────────────────────────────────────────────────
 
 /**
- * Boots the WT session if and only if the environment supports it AND
- * the page contains a Tier-B/C element that wants live streaming. Used
- * as the side-effect at module load time below — exported so tests can
+ * Boots the WT session if and only if the environment supports it AND the
+ * server said this page needs the live lane.
+ *
+ * Gated on the same `__ALBEDO_LIVE__` flag as [`bootPatchStream`], and for the
+ * same reason: this used to sniff `[data-albedo-tier="b"],[data-albedo-tier="c"]`,
+ * which a page whose only live surface is a scalar `useSharedSlot` read does not
+ * match. Both transports now ask the one authority
+ * (`streaming::route_needs_live_lane`), so enabling WebTransport can never
+ * silently reintroduce the SSE lane's § 2e bug.
+ *
+ * Used as the side-effect at module load time below — exported so tests can
  * drive the boot path with an injected globalThis.
  *
  * @param {object} g  Object that exposes `document`, `WebTransport`, `fetch`, `location`.
@@ -80,9 +88,7 @@ const utf8Decoder = new TextDecoder('utf-8');
 export function bootWebTransport(g) {
   const document = g.document;
   if (!document || typeof g.WebTransport !== 'function') return;
-  if (!document.querySelector('[data-albedo-tier="b"],[data-albedo-tier="c"]')) {
-    return;
-  }
+  if (g.__ALBEDO_LIVE__ !== true) return;
 
   const endpoint = resolveEndpoint(g);
   if (!endpoint) return;
@@ -430,16 +436,20 @@ export function bootPatchStream(g) {
   const document = g.document;
   if (!document || typeof g.EventSource !== 'function') return null;
   if (g.__ALBEDO_PATCH_STREAM) return g.__ALBEDO_PATCH_STREAM;
-  // Same gate as the WT boot, plus a stamped list anchor: a page whose only
-  // live surface is a shared-slot list has the anchor and may have no other
-  // tier marker in the shell.
-  if (
-    !document.querySelector(
-      '[data-albedo-tier="b"],[data-albedo-tier="c"],[data-albedo-list-slot]',
-    )
-  ) {
-    return null;
-  }
+
+  // The SERVER decides whether this page needs the lane, and says so in
+  // `__ALBEDO_LIVE__` (see `streaming::route_needs_live_lane`). This used to be
+  // re-derived here by sniffing the DOM for tier markers and a list anchor —
+  // the client guessing at a question the server had already answered from the
+  // manifest. The two were free to disagree, and did: a page whose only live
+  // surface was a scalar `useSharedSlot` read matched none of the selectors, so
+  // the lane never opened and `broadcast()` could not reach it. Lists had hit
+  // the identical wall and were fixed by appending one more selector here,
+  // which is precisely what let the next surface regress in silence.
+  //
+  // Deriving it server-side means a new live surface can never again require a
+  // matching edit to a selector string on this side of the wire.
+  if (g.__ALBEDO_LIVE__ !== true) return null;
 
   const path = (g.location && g.location.pathname) || '/';
   let source;

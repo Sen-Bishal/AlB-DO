@@ -344,6 +344,16 @@ pub struct CompiledProject {
     /// form's field set is the schema, so the runtime never guesses which spans
     /// exist. Empty for actions no form references.
     action_form_fields: HashMap<u32, (String, Vec<String>)>,
+    /// P6 · action ids whose form is rendered inside a list `.map(...)` — so it
+    /// repeats per row. Their per-field `data-albedo-error` ids
+    /// (`allocate_field_error_id`, constant per action+field) would collide
+    /// across rows, so `form_error_span_seed` emits no spans for them and the
+    /// submit projection is skipped: a repeated form gets no inline per-field
+    /// validation (there is no unique node to paint), which is strictly better
+    /// than duplicate ids that misroute a `SetText` or break keyed
+    /// reconciliation. An action stays out of this set unless *some* form for it
+    /// is `in_list`, so an ordinary singleton form keeps its error spans.
+    list_repeated_actions: std::collections::HashSet<u32>,
 }
 
 impl CompiledProject {
@@ -552,6 +562,12 @@ impl CompiledProject {
         // time (see `runtime::form_result`). `action_id` here is the same
         // FNV-1a-32(name) the handler registered under, so the join is by name.
         let mut action_form_fields: HashMap<u32, (String, Vec<String>)> = HashMap::new();
+        // An action whose form ever renders inside a list `.map(...)` cannot own
+        // unique per-field error-span ids across its rows, so record it here and
+        // suppress its spans + projection below. Collected across *all* forms for
+        // the action: one `in_list` occurrence poisons the whole action, so a
+        // top-level form sharing the name loses its (now unaddressable) spans too.
+        let mut list_repeated_actions: std::collections::HashSet<u32> = Default::default();
         for component in components.values() {
             for form in &component.forms {
                 action_form_fields.entry(form.action_id).or_insert_with(|| {
@@ -560,6 +576,9 @@ impl CompiledProject {
                         form.fields.iter().map(|field| field.name.clone()).collect(),
                     )
                 });
+                if form.in_list {
+                    list_repeated_actions.insert(form.action_id);
+                }
             }
         }
 
@@ -571,6 +590,7 @@ impl CompiledProject {
             css_modules,
             npm_bundles,
             action_form_fields,
+            list_repeated_actions,
         })
     }
 
@@ -1539,13 +1559,22 @@ impl CompiledProject {
         // manifest and skip this entirely. zod (or any validator) ran in the
         // body; ALBEDO only maps the returned `{ error }` shape onto slots it
         // reserved at build time.
-        if let Some((action_name, fields)) = self.action_form_fields.get(&envelope.action_id) {
-            let result = outcome.result.unwrap_or(Value::Null);
-            instructions.extend(crate::runtime::form_result::project_form_result(
-                action_name,
-                &result,
-                fields,
-            ));
+        // A form rendered inside a list `.map(...)` has no error spans (the seed
+        // suppresses them — their ids aren't row-unique), so projecting onto them
+        // would target `data-albedo-id`s that were never rendered: the client's
+        // `_requireNode` throws and drops the whole frame, taking the handler's
+        // own opcodes (the list delta) with it. Skip the projection for those
+        // actions — the handler's opcodes still ship; only inline field
+        // validation is unavailable for a repeated form.
+        if !self.list_repeated_actions.contains(&envelope.action_id) {
+            if let Some((action_name, fields)) = self.action_form_fields.get(&envelope.action_id) {
+                let result = outcome.result.unwrap_or(Value::Null);
+                instructions.extend(crate::runtime::form_result::project_form_result(
+                    action_name,
+                    &result,
+                    fields,
+                ));
+            }
         }
 
         // State writes above marked the slot dirty; the returned vector already
@@ -1633,7 +1662,13 @@ impl CompiledProject {
     /// and ids are generated, so the two render paths cannot diverge.
     pub fn form_error_span_seed(&self) -> serde_json::Map<String, Value> {
         let mut seed = serde_json::Map::new();
-        for (action_name, fields) in self.action_form_fields.values() {
+        for (action_id, (action_name, fields)) in &self.action_form_fields {
+            // A form rendered per row can't carry unique error-span ids, so it
+            // gets none — the duplicate `data-albedo-id`s a shared seed would
+            // stamp on every row are worse than the absence of inline validation.
+            if self.list_repeated_actions.contains(action_id) {
+                continue;
+            }
             let html: String = fields
                 .iter()
                 .map(|field| {
