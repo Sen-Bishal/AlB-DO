@@ -176,6 +176,36 @@ fn quickjs_form_render_emits_error_spans_at_the_projection_ids() {
     );
 }
 
+/// The form-in-list-row invariant: a `<form action="…">` inside a `.map()`
+/// repeats per row, and its per-field error-span ids are constant per
+/// (action, field) — so seeding them stamps duplicate `data-albedo-id`s across
+/// rows. The compiled manifest must therefore emit NO error spans for such an
+/// action (the submit projection is skipped in lockstep, so no `SetText` targets
+/// a span that was never rendered). Contrast `form_errors` (a singleton form),
+/// whose spans ARE seeded — proven by `quickjs_form_render_emits_error_spans…`.
+#[test]
+fn form_error_spans_are_suppressed_for_a_form_rendered_inside_a_map() {
+    use dom_render_compiler::transforms::form::allocate_form_action_id;
+
+    let project =
+        CompiledProject::load_from_dir(render_fixture("form_in_list")).expect("fixture compiles");
+
+    let seed = project.form_error_span_seed();
+    assert!(
+        !seed.contains_key("set_score"),
+        "a per-row (.map) form's error spans must be suppressed to avoid duplicate \
+         data-albedo-id across rows; seed was {seed:?}",
+    );
+
+    // …but descending into `.map()` still registers the action for the CSRF
+    // gate, so a tokenless submit is phrased "form action", not "action".
+    let ids: Vec<u32> = project.form_action_ids().collect();
+    assert!(
+        ids.contains(&allocate_form_action_id("set_score")),
+        "the .map()-nested form's action must still register in FormActionIds: {ids:?}",
+    );
+}
+
 #[test]
 fn render_body_using_array_map_renders_under_quickjs() {
     // The render body calls `props.items.map(...)` — a construct the pure-Rust

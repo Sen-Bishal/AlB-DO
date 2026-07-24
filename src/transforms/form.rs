@@ -129,6 +129,19 @@ pub struct FormExtract {
     pub method: FormMethod,
     /// Declared form fields (input/select/textarea) in source order.
     pub fields: Vec<FormField>,
+    /// True when this form is reached by descending through a list
+    /// `.map(...)`/`.flatMap(...)` callback — i.e. it is rendered once per row.
+    ///
+    /// Its per-field `data-albedo-error` ids are
+    /// [`allocate_field_error_id`]`(action, field)`, a constant per
+    /// `(action, field)` pair, so a repeated form stamps the **same**
+    /// `data-albedo-id` on every row — a duplicate-id violation that misroutes a
+    /// validation `SetText` (and, seeded, breaks keyed reconciliation). The
+    /// compiled manifest therefore suppresses the error-span seed *and* the
+    /// submit projection for any action that is ever `in_list`; inline per-field
+    /// validation is simply not offered for a form that repeats. See
+    /// `runtime::compiled`'s `list_repeated_actions`.
+    pub in_list: bool,
 }
 
 /// HTTP method declared on the form element.
@@ -193,7 +206,7 @@ pub fn allocate_field_error_id(action_name: &str, field_name: &str) -> u32 {
 pub fn extract_forms_in_function(stmts: &[Stmt]) -> Vec<FormExtract> {
     let mut sink = Vec::new();
     for stmt in stmts {
-        visit_stmt_for_jsx(stmt, &mut sink);
+        visit_stmt_for_jsx(stmt, &mut sink, false);
     }
     sink
 }
@@ -201,23 +214,26 @@ pub fn extract_forms_in_function(stmts: &[Stmt]) -> Vec<FormExtract> {
 /// Statement-level recursion entry point. Structurally identical to
 /// the other Phase-K/L extractors so the three can be fused into one
 /// walker later.
-fn visit_stmt_for_jsx(stmt: &Stmt, sink: &mut Vec<FormExtract>) {
+///
+/// `in_list` is `true` once the walk has descended through a list
+/// `.map(...)` callback; every form found from there is `in_list`.
+fn visit_stmt_for_jsx(stmt: &Stmt, sink: &mut Vec<FormExtract>, in_list: bool) {
     match stmt {
         Stmt::Return(ret) => {
             if let Some(arg) = &ret.arg {
-                visit_expr_for_jsx(arg, sink);
+                visit_expr_for_jsx(arg, sink, in_list);
             }
         }
-        Stmt::Expr(es) => visit_expr_for_jsx(&es.expr, sink),
+        Stmt::Expr(es) => visit_expr_for_jsx(&es.expr, sink, in_list),
         Stmt::Block(block) => {
             for s in &block.stmts {
-                visit_stmt_for_jsx(s, sink);
+                visit_stmt_for_jsx(s, sink, in_list);
             }
         }
         Stmt::Decl(Decl::Var(var)) => {
             for d in &var.decls {
                 if let Some(init) = &d.init {
-                    visit_expr_for_jsx(init, sink);
+                    visit_expr_for_jsx(init, sink, in_list);
                 }
             }
         }
@@ -227,29 +243,60 @@ fn visit_stmt_for_jsx(stmt: &Stmt, sink: &mut Vec<FormExtract>) {
 
 /// Expression-level walker; descends into the subset of expressions
 /// the Phase J renderer also descends into.
-fn visit_expr_for_jsx(expr: &Expr, sink: &mut Vec<FormExtract>) {
+fn visit_expr_for_jsx(expr: &Expr, sink: &mut Vec<FormExtract>, in_list: bool) {
     match expr {
-        Expr::JSXElement(element) => visit_element(element, sink),
+        Expr::JSXElement(element) => visit_element(element, sink, in_list),
         Expr::JSXFragment(fragment) => {
             for child in &fragment.children {
-                visit_child(child, sink);
+                visit_child(child, sink, in_list);
             }
         }
-        Expr::Paren(paren) => visit_expr_for_jsx(&paren.expr, sink),
+        Expr::Paren(paren) => visit_expr_for_jsx(&paren.expr, sink, in_list),
         Expr::Cond(c) => {
-            visit_expr_for_jsx(&c.cons, sink);
-            visit_expr_for_jsx(&c.alt, sink);
+            visit_expr_for_jsx(&c.cons, sink, in_list);
+            visit_expr_for_jsx(&c.alt, sink, in_list);
         }
         Expr::Arrow(arrow) => match &*arrow.body {
-            BlockStmtOrExpr::Expr(e) => visit_expr_for_jsx(e, sink),
+            BlockStmtOrExpr::Expr(e) => visit_expr_for_jsx(e, sink, in_list),
             BlockStmtOrExpr::BlockStmt(b) => {
                 for s in &b.stmts {
-                    visit_stmt_for_jsx(s, sink);
+                    visit_stmt_for_jsx(s, sink, in_list);
                 }
             }
         },
+        // A list `.map(cb)` / `.flatMap(cb)` renders `cb` once per row, so any
+        // form inside the callback repeats. Descend into the callback arguments
+        // with `in_list = true`; the JSX inside is caught by the arms above. This
+        // is also the only place `.map()`-nested forms become visible to the
+        // extractor at all — without it they were absent from `FormActionIds`
+        // (so a tokenless submit was mis-phrased "action" not "form action") as
+        // well as from the error-span manifest.
+        Expr::Call(call) => {
+            if is_list_map_call(call) {
+                for arg in &call.args {
+                    visit_expr_for_jsx(&arg.expr, sink, true);
+                }
+            }
+        }
         _ => {}
     }
+}
+
+/// True for `obj.map(...)` / `obj.flatMap(...)` — the member calls that render a
+/// JSX element per item. Keyed on the method name only (not the receiver), so a
+/// chained `items.filter(p).map(row => …)` is still recognised.
+fn is_list_map_call(call: &swc_ecma_ast::CallExpr) -> bool {
+    use swc_ecma_ast::{Callee, MemberProp};
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    let Expr::Member(member) = callee.as_ref() else {
+        return false;
+    };
+    let MemberProp::Ident(method) = &member.prop else {
+        return false;
+    };
+    matches!(method.sym.as_ref(), "map" | "flatMap")
 }
 
 /// Visit one element. If it's a `<form>` with an `action:NAME`
@@ -257,7 +304,7 @@ fn visit_expr_for_jsx(expr: &Expr, sink: &mut Vec<FormExtract>) {
 /// the declared input fields. Non-form elements still recurse into
 /// their children so nested form-actions (legal but unusual) are
 /// caught.
-fn visit_element(element: &JSXElement, sink: &mut Vec<FormExtract>) {
+fn visit_element(element: &JSXElement, sink: &mut Vec<FormExtract>, in_list: bool) {
     if is_form_tag(&element.opening.name) {
         if let Some((action_name, method)) = read_form_action(&element.opening.attrs) {
             let mut fields = Vec::new();
@@ -270,13 +317,14 @@ fn visit_element(element: &JSXElement, sink: &mut Vec<FormExtract>) {
                 action_id,
                 method,
                 fields,
+                in_list,
             });
             return;
         }
     }
 
     for child in &element.children {
-        visit_child(child, sink);
+        visit_child(child, sink, in_list);
     }
 }
 
@@ -454,17 +502,17 @@ fn read_field_from_element(element: &JSXElement) -> Option<FormField> {
 
 /// Generic JSX-child walker — symmetric with the event/link
 /// extractors.
-fn visit_child(child: &JSXElementChild, sink: &mut Vec<FormExtract>) {
+fn visit_child(child: &JSXElementChild, sink: &mut Vec<FormExtract>, in_list: bool) {
     match child {
-        JSXElementChild::JSXElement(element) => visit_element(element, sink),
+        JSXElementChild::JSXElement(element) => visit_element(element, sink, in_list),
         JSXElementChild::JSXFragment(fragment) => {
             for c in &fragment.children {
-                visit_child(c, sink);
+                visit_child(c, sink, in_list);
             }
         }
         JSXElementChild::JSXExprContainer(container) => {
             if let JSXExpr::Expr(expr) = &container.expr {
-                visit_expr_for_jsx(expr, sink);
+                visit_expr_for_jsx(expr, sink, in_list);
             }
         }
         _ => {}
@@ -681,5 +729,94 @@ mod tests {
         );
         let forms = extract_forms_in_function(&stmts);
         assert_eq!(forms[0].method, FormMethod::Get);
+    }
+
+    #[test]
+    fn a_top_level_form_is_not_in_list() {
+        let stmts = parse_body(
+            r#"
+            function S() {
+                return <form action="action:save"><input name="title" /></form>;
+            }
+        "#,
+        );
+        let forms = extract_forms_in_function(&stmts);
+        assert_eq!(forms.len(), 1);
+        assert!(!forms[0].in_list, "a form outside any .map() must not be in_list");
+    }
+
+    /// The form-in-list-row case. Before this, `.map()` was not descended at
+    /// all, so a per-row form was invisible to the extractor — absent from
+    /// `FormActionIds` (mis-phrasing a tokenless submit) and from the error-span
+    /// manifest. Now it is surfaced AND flagged `in_list` so its unaddressable
+    /// per-row error spans are suppressed downstream.
+    #[test]
+    fn a_form_inside_a_map_callback_is_surfaced_and_flagged_in_list() {
+        let stmts = parse_body(
+            r#"
+            function List() {
+                return (
+                    <ul>
+                        {rows.map((row) => (
+                            <li key={row.id}>
+                                <form action="action:set_score">
+                                    <input name="id" type="hidden" />
+                                    <input name="score" />
+                                </form>
+                            </li>
+                        ))}
+                    </ul>
+                );
+            }
+        "#,
+        );
+        let forms = extract_forms_in_function(&stmts);
+        assert_eq!(forms.len(), 1, "the .map()-nested form must be surfaced");
+        assert_eq!(forms[0].action_name, "set_score");
+        assert!(forms[0].in_list, "a form inside .map() must be in_list");
+        let names: Vec<_> = forms[0].fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "score"], "its fields are still collected");
+    }
+
+    /// A chained `items.filter(p).map(cb)` still counts — the check keys on the
+    /// method name, not the receiver.
+    #[test]
+    fn a_chained_filter_map_is_still_in_list() {
+        let stmts = parse_body(
+            r#"
+            function L() {
+                return <ul>{xs.filter(x => x.on).map(x => <form action="action:go"><input name="id"/></form>)}</ul>;
+            }
+        "#,
+        );
+        let forms = extract_forms_in_function(&stmts);
+        assert_eq!(forms.len(), 1);
+        assert!(forms[0].in_list);
+    }
+
+    /// Both instances of one action surface; the top-level is not `in_list`, the
+    /// per-row one is. `CompiledProject` collapses this to "the action is
+    /// list-repeated" and suppresses spans for both.
+    #[test]
+    fn an_action_used_top_level_and_in_a_row_surfaces_both() {
+        let stmts = parse_body(
+            r#"
+            function Board() {
+                return (
+                    <div>
+                        <ul>{rows.map(r => <li key={r.id}><form action="action:edit"><input name="v"/></form></li>)}</ul>
+                        <form action="action:edit"><input name="v" /></form>
+                    </div>
+                );
+            }
+        "#,
+        );
+        let forms = extract_forms_in_function(&stmts);
+        assert_eq!(forms.len(), 2);
+        let in_list: Vec<bool> = forms.iter().map(|f| f.in_list).collect();
+        assert!(
+            in_list.contains(&true) && in_list.contains(&false),
+            "one instance is in a row, one is top-level: {in_list:?}"
+        );
     }
 }

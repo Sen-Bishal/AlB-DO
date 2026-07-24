@@ -913,8 +913,15 @@ if (typeof globalThis.h !== 'function') {
       }
       // JSX prop → HTML attribute rename, mirroring the pure-Rust renderer
       // (`render_attrs`) so QuickJS-rendered islands match build-time Tier-A
-      // markup and apply CSS classes in the browser.
-      const attrName = key === 'className' ? 'class' : key;
+      // markup and apply CSS classes in the browser. React's uncontrolled
+      // form-control props map to their DOM attribute equivalents too —
+      // `defaultValue`→`value`, `defaultChecked`→`checked` — so a pre-filled
+      // `<input defaultValue={x}>` shows its value instead of shipping the
+      // browser-inert lowercased `defaultvalue`.
+      const attrName = key === 'className' ? 'class'
+        : key === 'defaultValue' ? 'value'
+        : key === 'defaultChecked' ? 'checked'
+        : key;
       if (value === true) {
         attrs += ' ' + attrName;
         continue;
@@ -1814,6 +1821,15 @@ fn transpile_module_source_for_quickjs(specifier: &str, source: &str) -> Runtime
         // client sink can register the list as a keyed-list anchor bound to the
         // broadcast topic (the seam a FORGE write's `SlotDelta` fans into).
         crate::transforms::shared_slot_lists::mark_shared_slot_lists(&mut module);
+
+        // B4 · the scalar half of the same seam: stamp `<span>{sharedSlot}</span>`
+        // with `data-albedo-slot="topic"` so the client can register a text
+        // binding that holds the ELEMENT. Without it the SSR span carries no
+        // `data-albedo-id`, no binding site exists, and a broadcast `SlotSet`
+        // strands in `pendingSlotValues` — live scalar reads never painted.
+        // Runs after the list pass so a list container is already stamped and
+        // the scalar marker skips it.
+        crate::transforms::shared_slot_lists::mark_shared_slot_scalars(&mut module);
 
         let mut jsx_options = JsxOptions::default();
         jsx_options.runtime = Some(JsxRuntime::Classic);
@@ -2997,6 +3013,11 @@ mod tests {
         "#;
         engine.load_module("routes/room.tsx", src).expect("loads");
 
+        // B4 · the holder is stamped with `data-albedo-slot` by
+        // `mark_shared_slot_scalars`. That attribute IS the fix: SSR output for a
+        // scalar read carries no `data-albedo-id`, so without it the client has
+        // no way to register a paint site and a broadcast `SlotSet` strands in
+        // `pendingSlotValues` — the value only ever appeared on reload.
         let out = engine
             .render_component_with_host(
                 "routes/room.tsx",
@@ -3004,13 +3025,14 @@ mod tests {
                 r#"{"shared":{"chat:room":"hello"}}"#,
             )
             .expect("seeded render");
-        assert_eq!(out.html, "<span>hello</span>");
+        assert_eq!(out.html, "<span data-albedo-slot=\"chat:room\">hello</span>");
 
         // No seed → null binding renders empty (matches the pure-Rust fallback).
+        // The stamp still rides, so a later broadcast has somewhere to land.
         let plain = engine
             .render_component("routes/room.tsx", "{}")
             .expect("plain render");
-        assert_eq!(plain.html, "<span></span>");
+        assert_eq!(plain.html, "<span data-albedo-slot=\"chat:room\"></span>");
     }
 
     /// `key` is React's reconciliation identity, not a valid raw HTML attribute
@@ -3357,6 +3379,46 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
         assert!(
             !served.contains("value=\"\""),
             "no empty token may reach the browser: {served}",
+        );
+    }
+
+    /// React's uncontrolled form-control props (`defaultValue`/`defaultChecked`)
+    /// are not HTML attributes — the DOM spells them `value`/`checked`. The shim
+    /// must translate them exactly as the pure-Rust `render_attrs` does, or a
+    /// pre-filled Tier-B `<input>` renders blank (the browser lowercases a
+    /// passed-through `defaultValue` to the inert `defaultvalue`). Parity with
+    /// `component::tests::render_attrs_translates_uncontrolled_form_props`.
+    #[test]
+    fn quickjs_translates_uncontrolled_form_props_to_html_attributes() {
+        let html = engine_rendering(
+            "routes/edit.tsx",
+            r#"
+            export default function Edit() {
+                return <p>
+                    <input name="score" defaultValue="200" />
+                    <input type="checkbox" defaultChecked={true} />
+                </p>;
+            }
+            "#,
+            "{}",
+        );
+
+        assert!(
+            html.contains("value=\"200\""),
+            "defaultValue must render as the DOM `value` attribute: {html}",
+        );
+        assert!(
+            !html.contains("defaultValue"),
+            "the React prop name must not reach the browser: {html}",
+        );
+        // Boolean → bare attribute, the same path a literal `checked` takes.
+        assert!(
+            html.contains(" checked"),
+            "defaultChecked={{true}} must render as bare `checked`: {html}",
+        );
+        assert!(
+            !html.contains("defaultChecked"),
+            "the React prop name must not reach the browser: {html}",
         );
     }
 

@@ -16,6 +16,16 @@
 //! have to thread the component-level shared-slot analysis in. It intentionally
 //! marks only the *direct* container of a shared-slot `.map()` — the common
 //! `<ul>{items.map(...)}</ul>` shape, whose keyed `<li>` children are the rows.
+//!
+//! # B4 · the scalar half
+//!
+//! [`mark_shared_slot_scalars`] is the same idea for a **scalar** read: it
+//! stamps `<span>{value}</span>` with [`SLOT_ATTR`] so the client can bind a
+//! text site that holds the element. Both markers exist because SSR output for
+//! a `useSharedSlot` read carries no `data-albedo-id` — there is no node id to
+//! bind through, so the topic itself has to be the key. Lists got that seam in
+//! B3; scalars did not, which is why a `broadcast()` write to a scalar topic
+//! reached the client correctly and then had nowhere to paint.
 
 use crate::forge::delta::RenderedRows;
 use std::collections::HashMap;
@@ -33,6 +43,20 @@ use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 /// broadcast registry uses (`broadcast::{topic}`), so the id never has to travel
 /// on the wire.
 pub const LIST_SLOT_ATTR: &str = "data-albedo-list-slot";
+
+/// Attribute a **scalar** shared-slot read's holder is stamped with. Same
+/// contract as [`LIST_SLOT_ATTR`] — the value is the topic and the client
+/// derives the wire slot id with the same FNV-1a hash — but it marks a text
+/// binding rather than a keyed-list anchor.
+///
+/// It exists for exactly the reason the list attribute does. SSR renders
+/// `<span>{counter}</span>` with no `data-albedo-id`, so Phase K's
+/// `SetTextRef` never fires for it, no binding site is ever registered, and a
+/// broadcast `SlotSet` arrives correct and has nowhere to paint — it sits in
+/// `pendingSlotValues` forever while a reload (which re-reads the topic during
+/// SSR) shows the right value. That asymmetry is what made scalar
+/// `useSharedSlot` look like "broadcast is broken".
+pub const SLOT_ATTR: &str = "data-albedo-slot";
 
 /// Attribute carrying a row's reconciliation identity, stamped from the
 /// author's `key={…}` by the two SSR renderers
@@ -185,6 +209,18 @@ struct Tag {
     kind: TagKind,
 }
 
+/// The lowercased element name at the start of `after_bracket` (the slice just
+/// past a `<` or `</`). Reads the leading run of tag-name characters; stops at
+/// the first space, `>`, `/`, or attribute. Shared by the open- and close-tag
+/// arms of [`next_tag`] so both classify voidness against the same name.
+fn tag_name(after_bracket: &str) -> String {
+    after_bracket
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// The next tag at or after `from`, as a half-open byte range and a kind.
 /// Text between tags is skipped.
 fn next_tag(html: &str, from: usize) -> Option<Tag> {
@@ -218,13 +254,24 @@ fn next_tag(html: &str, from: usize) -> Option<Tag> {
     let end = end?;
 
     if rest.starts_with("</") {
-        return Some(Tag { start, end, kind: TagKind::Close });
+        // A void element (`<input>`, `<br>`, `<img>`, …) never incremented the
+        // depth — its open tag is classified `void_or_self_closing` below — so
+        // its *close* tag must not decrement it either. This matters because the
+        // QuickJS `h()` shim renders every childless host element as
+        // `<input></input>` (open + explicit close), not `<input>`. Counting the
+        // stray `</input>` popped the row open one level early: after two inputs
+        // the depth hit zero mid-row, the row was collected truncated, and every
+        // following row was lost — the silent row-drop behind form-in-list-row on
+        // the whole-view / `ReconcileList` extraction path.
+        let close_name = tag_name(&rest[2..]);
+        let kind = if crate::runtime::eval::component::is_void_tag(&close_name) {
+            TagKind::Ignorable
+        } else {
+            TagKind::Close
+        };
+        return Some(Tag { start, end, kind });
     }
-    let name: String = rest[1..]
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .flat_map(char::to_lowercase)
-        .collect();
+    let name = tag_name(&rest[1..]);
     let self_closing = html[start..end].trim_end_matches('>').trim_end().ends_with('/');
     Some(Tag {
         start,
@@ -342,6 +389,91 @@ impl VisitMut for ListAnchorMarker {
             }
         }
     }
+}
+
+/// Stamp every element holding a **scalar** shared-slot read with [`SLOT_ATTR`].
+/// The companion to [`mark_shared_slot_lists`]; a no-op when the module imports
+/// no `albedo` `useSharedSlot` or binds none of its results into JSX text.
+pub fn mark_shared_slot_scalars(module: &mut Module) {
+    let idents = collect_shared_slot_idents(module);
+    if idents.is_empty() {
+        return;
+    }
+    module.visit_mut_with(&mut ScalarSlotMarker { idents });
+}
+
+struct ScalarSlotMarker {
+    idents: HashMap<String, String>,
+}
+
+impl VisitMut for ScalarSlotMarker {
+    fn visit_mut_jsx_element(&mut self, el: &mut JSXElement) {
+        el.visit_mut_children_with(self);
+
+        let Some(topic) = sole_shared_slot_read(el, &self.idents) else {
+            return;
+        };
+        // A list container is already the anchor for its topic; stamping it as a
+        // scalar text site too would let one `SlotSet` clobber the whole list.
+        if has_attr(el, SLOT_ATTR) || has_attr(el, LIST_SLOT_ATTR) {
+            return;
+        }
+        el.opening.attrs.push(slot_attr(&topic));
+    }
+}
+
+/// `Some(topic)` when `el`'s **only** meaningful child is `{IDENT}` and `IDENT`
+/// is a shared-slot binding.
+///
+/// Deliberately narrow, and narrow in the same way [`ListAnchorMarker`] is: it
+/// marks only the common `<span>{value}</span>` shape. The client paints by
+/// replacing the holder's text, so an element with anything else in it —
+/// `<p>Count: {n}</p>`, two reads in one node, a nested element — must not be
+/// stamped, or painting would eat the sibling content. Those shapes keep
+/// today's behaviour (server-rendered, not live) instead of getting a binding
+/// that corrupts the DOM. Widening this means teaching the client to bind a
+/// specific child text node, which is a different change.
+///
+/// JSX whitespace-only text between children is skipped, so the formatting
+/// `<span>\n  {value}\n</span>` counts as a lone read.
+fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, String>) -> Option<String> {
+    let mut found: Option<String> = None;
+    for child in &el.children {
+        match child {
+            JSXElementChild::JSXText(text) => {
+                if !text.value.trim().is_empty() {
+                    return None;
+                }
+            }
+            JSXElementChild::JSXExprContainer(container) => {
+                let JSXExpr::Expr(expr) = &container.expr else {
+                    return None;
+                };
+                let Expr::Ident(ident) = expr.as_ref() else {
+                    return None;
+                };
+                let topic = idents.get(ident.sym.as_ref())?;
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(topic.clone());
+            }
+            _ => return None,
+        }
+    }
+    found
+}
+
+fn slot_attr(topic: &str) -> JSXAttrOrSpread {
+    JSXAttrOrSpread::JSXAttr(JSXAttr {
+        span: DUMMY_SP,
+        name: JSXAttrName::Ident(IdentName { span: DUMMY_SP, sym: SLOT_ATTR.into() }),
+        value: Some(JSXAttrValue::Lit(Lit::Str(Str {
+            span: DUMMY_SP,
+            value: topic.into(),
+            raw: None,
+        }))),
+    })
 }
 
 /// `Some(topic)` when `expr` is `IDENT.map(...)` and `IDENT` is a shared-slot binding.
@@ -649,7 +781,7 @@ mod classify_tests {
 
     /// Parse a TSX fragment to a raw swc [`Module`] — the input the transpile
     /// pre-pass classifier runs on, before resolver/type-strip.
-    fn parse_tsx(source: &str) -> Module {
+    pub(super) fn parse_tsx(source: &str) -> Module {
         let cm: Lrc<SourceMap> = Default::default();
         let fm = cm.new_source_file(FileName::Custom("test.tsx".into()).into(), source.to_string());
         let mut parser = Parser::new(
@@ -950,5 +1082,196 @@ mod extract_tests {
     fn an_empty_list_is_an_empty_map_not_a_failure() {
         let rows = extract_keyed_rows("<ul data-albedo-list-slot=\"t\"></ul>", "t").unwrap();
         assert!(rows.is_empty());
+    }
+
+    /// The form-in-list-row regression. The QuickJS `h()` shim renders every
+    /// childless host element as `<tag></tag>` — so a per-row form's inputs
+    /// arrive as `<input ...></input>`, open tag AND an explicit close. A void
+    /// element's open never increments the scan depth, so its close must not
+    /// decrement it; a scanner that counted the stray `</input>` popped the row
+    /// open early and, after two inputs, hit depth zero mid-row — collecting a
+    /// truncated first row and dropping every row after it. That is a *silent*
+    /// data-loss on the whole-view / `ReconcileList` path (a per-row edit that
+    /// reorders), so it is pinned here on the exact markup the shim emits.
+    #[test]
+    fn void_elements_with_explicit_close_tags_do_not_truncate_a_row() {
+        let row = |k: &str| {
+            format!(
+                "<li class=\"entry\" data-albedo-key=\"{k}\">\
+                 <span class=\"entry-score\">{k}</span>\
+                 <form method=\"POST\" data-albedo-action=\"set_score\">\
+                 <input type=\"hidden\" name=\"_csrf\" value=\"\" data-albedo-csrf />\
+                 <input type=\"hidden\" name=\"id\" value=\"{k}\"></input>\
+                 <input name=\"score\" defaultValue=\"{k}\"></input>\
+                 <button type=\"submit\">save</button></form></li>"
+            )
+        };
+        let body: String = ["4", "2", "3", "1"].iter().map(|k| row(k)).collect();
+        let html = format!("<ol data-albedo-list-slot=\"board\">{body}</ol>");
+
+        let rows = extract_keyed_rows(&html, "board").expect("anchor parses");
+        assert_eq!(rows.len(), 4, "every form-bearing row must survive the scan");
+        // Each row must come back whole — a truncated row loses its `</form></li>`.
+        for k in ["4", "2", "3", "1"] {
+            let outer = rows.get(k).unwrap_or_else(|| panic!("row {k} missing"));
+            assert!(
+                outer.ends_with("</form></li>"),
+                "row {k} was truncated: {outer}"
+            );
+            assert!(outer.contains("<button type=\"submit\">save</button>"));
+        }
+    }
+
+    /// A close tag for a NON-void element still counts — the fix is scoped to
+    /// void tags, and mis-scoping it (ignoring every close) would merge sibling
+    /// rows into one. A nested `<span></span>` inside the row proves close tags
+    /// still balance for ordinary elements.
+    #[test]
+    fn non_void_close_tags_still_balance_after_the_void_fix() {
+        let html = "<ul data-albedo-list-slot=\"t\">\
+            <li data-albedo-key=\"1\"><span><span>deep</span></span><input value=\"a\"></input></li>\
+            <li data-albedo-key=\"2\"><span>flat</span></li></ul>";
+        let rows = extract_keyed_rows(html, "t").unwrap();
+        assert_eq!(rows.len(), 2, "sibling rows must stay distinct");
+        assert!(rows.get("1").unwrap().ends_with("</li>"));
+        assert!(rows.contains_key("2"));
+    }
+}
+
+/// B4 · the scalar marker — `<span>{sharedSlot}</span>` → `data-albedo-slot`.
+#[cfg(test)]
+mod scalar_marker_tests {
+    use super::classify_tests::parse_tsx;
+    use super::*;
+
+    /// Collect every topic stamped under `attr`, so a test can assert on the
+    /// marker's output without rendering.
+    fn stamped(source: &str, attr: &'static str) -> Vec<String> {
+        let mut module = parse_tsx(source);
+        mark_shared_slot_lists(&mut module);
+        mark_shared_slot_scalars(&mut module);
+
+        struct Collect {
+            attr: &'static str,
+            out: Vec<String>,
+        }
+        impl Visit for Collect {
+            fn visit_jsx_element(&mut self, el: &JSXElement) {
+                for a in &el.opening.attrs {
+                    let JSXAttrOrSpread::JSXAttr(a) = a else { continue };
+                    let JSXAttrName::Ident(name) = &a.name else { continue };
+                    if name.sym.as_ref() != self.attr {
+                        continue;
+                    }
+                    if let Some(JSXAttrValue::Lit(Lit::Str(s))) = &a.value {
+                        self.out.push(s.value.to_string());
+                    }
+                }
+                el.visit_children_with(self);
+            }
+        }
+        let mut c = Collect { attr, out: Vec::new() };
+        module.visit_with(&mut c);
+        c.out
+    }
+
+    const IMPORT: &str = "import { useSharedSlot } from \"albedo\";";
+
+    /// The shape the retired `/chat` route rendered, and the one that never
+    /// painted live: a lone scalar read in its own holder.
+    #[test]
+    fn a_lone_scalar_read_is_stamped_with_its_topic() {
+        let src = format!(
+            "{IMPORT} export default function L() {{ \
+             const counter = useSharedSlot(\"lobby:counter\"); \
+             return <span className=\"v\">{{counter}}</span>; }}"
+        );
+        assert_eq!(stamped(&src, SLOT_ATTR), vec!["lobby:counter"]);
+    }
+
+    /// JSX indentation must not defeat the marker — whitespace-only text
+    /// between children is not "other content".
+    #[test]
+    fn formatting_whitespace_still_counts_as_a_lone_read() {
+        let src = format!(
+            "{IMPORT} export default function L() {{ \
+             const n = useSharedSlot(\"t\"); \
+             return <span>\n  {{n}}\n</span>; }}"
+        );
+        assert_eq!(stamped(&src, SLOT_ATTR), vec!["t"]);
+    }
+
+    /// The client paints by replacing the holder's text, so a holder with
+    /// sibling content must NOT be stamped — painting it would eat the label.
+    /// This shape stays server-rendered rather than getting a binding that
+    /// corrupts the DOM.
+    #[test]
+    fn a_read_with_sibling_text_is_left_alone() {
+        let src = format!(
+            "{IMPORT} export default function L() {{ \
+             const n = useSharedSlot(\"t\"); \
+             return <p>Count: {{n}}</p>; }}"
+        );
+        assert!(stamped(&src, SLOT_ATTR).is_empty());
+    }
+
+    /// Two reads in one holder have no single text node to own — refused for
+    /// the same reason.
+    #[test]
+    fn two_reads_in_one_holder_are_left_alone() {
+        let src = format!(
+            "{IMPORT} export default function L() {{ \
+             const a = useSharedSlot(\"a\"); const b = useSharedSlot(\"b\"); \
+             return <span>{{a}}{{b}}</span>; }}"
+        );
+        assert!(stamped(&src, SLOT_ATTR).is_empty());
+    }
+
+    /// A list container is already the keyed anchor for its topic. Stamping it
+    /// as a scalar text site too would let one `SlotSet` clobber every row.
+    #[test]
+    fn a_list_container_is_not_also_stamped_as_a_scalar() {
+        let src = format!(
+            "{IMPORT} export default function L() {{ \
+             const items = useSharedSlot(\"guestbook\"); \
+             return <ul>{{items.map((i) => <li key={{i.id}}>{{i.body}}</li>)}}</ul>; }}"
+        );
+        assert_eq!(stamped(&src, LIST_SLOT_ATTR), vec!["guestbook"]);
+        assert!(
+            stamped(&src, SLOT_ATTR).is_empty(),
+            "the <ul> must carry the list attr only"
+        );
+    }
+
+    /// A row's `{i.body}` is a member expression on the map param, not a slot
+    /// binding — the marker must not mistake rows for scalar reads.
+    #[test]
+    fn a_row_member_read_is_not_a_scalar_slot() {
+        let src = format!(
+            "{IMPORT} export default function L() {{ \
+             const items = useSharedSlot(\"t\"); \
+             return <ul>{{items.map((i) => <li key={{i.id}}><span>{{i.body}}</span></li>)}}</ul>; }}"
+        );
+        assert!(stamped(&src, SLOT_ATTR).is_empty());
+    }
+
+    /// Same import discipline as the list marker: a user function that merely
+    /// shares the name is not the hook.
+    #[test]
+    fn a_useSharedSlot_not_imported_from_albedo_is_ignored() {
+        let src = "import { useSharedSlot } from \"./mine\"; \
+             export default function L() { \
+             const n = useSharedSlot(\"t\"); return <span>{n}</span>; }";
+        assert!(stamped(src, SLOT_ATTR).is_empty());
+    }
+
+    /// An ordinary local is not a slot read.
+    #[test]
+    fn a_plain_local_is_not_stamped() {
+        let src = format!(
+            "{IMPORT} export default function L() {{ \
+             const n = 1; return <span>{{n}}</span>; }}"
+        );
+        assert!(stamped(&src, SLOT_ATTR).is_empty());
     }
 }

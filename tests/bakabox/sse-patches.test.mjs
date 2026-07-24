@@ -25,12 +25,21 @@ function loadFixtureBytes() {
   return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 }
 
-/** Node has no `atob`/`EventSource`; this is the smallest globalThis that boots the lane. */
-function makeGlobal({ selectorHit = true } = {}) {
+/**
+ * Node has no `atob`/`EventSource`; this is the smallest globalThis that boots
+ * the lane.
+ *
+ * `live` models `__ALBEDO_LIVE__`, which the SERVER stamps into the shell from
+ * `streaming::route_needs_live_lane`. It replaced a client-side
+ * `document.querySelector` over tier markers and list anchors — see the
+ * regression test at the bottom of this file for why.
+ */
+function makeGlobal({ live = true, selectorHit = true } = {}) {
   const opened = [];
   const applied = [];
   return {
     g: {
+      __ALBEDO_LIVE__: live,
       // Models the BROWSER's `atob`, which throws `InvalidCharacterError` on
       // anything outside the base64 alphabet. `Buffer.from(x, 'base64')` is
       // lenient and silently skips bad characters — using it here would let a
@@ -104,7 +113,39 @@ test('booting twice reuses one subscription', () => {
 });
 
 test('a page with no live surface opens no stream', () => {
-  const { g, opened } = makeGlobal({ selectorHit: false });
+  const { g, opened } = makeGlobal({ live: false });
+  assert.equal(bootPatchStream(g), null);
+  assert.equal(opened.length, 0);
+});
+
+// ── The § 2e regression guard ────────────────────────────────────────
+//
+// The lane used to be gated client-side on
+// `[data-albedo-tier="b"],[data-albedo-tier="c"],[data-albedo-list-slot]` —
+// the client re-deriving, from page shape, a decision the server had already
+// made from the manifest. A route whose only live surface was a SCALAR
+// `useSharedSlot` read matched none of those selectors, so the browser never
+// opened the lane and `broadcast()` could not reach it. (A shared-slot list
+// had hit the same wall earlier and was "fixed" by appending one more
+// selector, which is exactly what let the next surface regress in silence.)
+//
+// These two pin the contract in both directions: the server's flag decides,
+// and DOM shape has no vote either way.
+
+test('the server flag alone opens the lane — no tier marker or anchor needed', () => {
+  // Scalar-only page: nothing in the DOM to sniff, server says live.
+  const { g, opened } = makeGlobal({ live: true, selectorHit: false });
+
+  assert.ok(bootPatchStream(g), 'a scalar-only route must still get its lane');
+  assert.equal(opened.length, 1);
+});
+
+test('a live-looking DOM cannot open a lane the server did not ask for', () => {
+  // The inverse: page shape says "b/c/list", server says static. The client
+  // must not open a connection nobody will feed — the per-tab connection
+  // budget is the scarcest thing the runtime has.
+  const { g, opened } = makeGlobal({ live: false, selectorHit: true });
+
   assert.equal(bootPatchStream(g), null);
   assert.equal(opened.length, 0);
 });

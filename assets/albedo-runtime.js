@@ -649,7 +649,7 @@ export class Bakabox {
     const decoded = this._decodeBytes(value);
     for (const site of sites) {
       if (site.kind === 'text') {
-        const element = this.nodes.get(site.stableId);
+        const element = this._siteElement(site);
         if (!element) continue;
         // Fine-grained patch: mutate the existing server-rendered text node in
         // place rather than replacing the subtree, so the DOM node identity the
@@ -662,15 +662,28 @@ export class Bakabox {
           element.textContent = decoded;
         }
       } else if (site.kind === 'attr') {
-        const element = this.nodes.get(site.stableId);
+        const element = this._siteElement(site);
         const attrName = site.attrName || this.attrs.get(site.attrId);
         if (element && attrName) element.setAttribute(attrName, decoded);
       } else if (site.kind === 'html') {
-        const element = this.nodes.get(site.stableId);
+        const element = this._siteElement(site);
         if (element) element.innerHTML = decoded;
       }
       // 'sentinel' sites from bare BindSlot are intentionally skipped.
     }
+  }
+
+  /**
+   * The element a binding site paints into.
+   *
+   * Phase-K sites carry a `stableId` and resolve through `nodes`. A broadcast
+   * scalar anchor carries the ELEMENT directly, because SSR markup for a
+   * `useSharedSlot` scalar read is a plain `<span>{value}</span>` with no
+   * `data-albedo-id` to key on — the same reason `_registerListAnchor` stores
+   * its `<ul>` by reference rather than by id.
+   */
+  _siteElement(site) {
+    return site.element || this.nodes.get(site.stableId);
   }
 
   // ── Keyed-list handlers (z-set delta sink) ─────────────────────────
@@ -757,6 +770,49 @@ export class Bakabox {
       const slotId = topicSlotId(topic);
       if (this.listSlots.has(slotId)) continue;
       this._registerListAnchor(slotId, anchor);
+    }
+  }
+
+  /**
+   * Register `element` as a text binding site for `slotId`, holding the ELEMENT
+   * rather than a `stableId`. The scalar mirror of `_registerListAnchor`, and it
+   * exists for the same reason: a `useSharedSlot` scalar read is server-rendered
+   * as a plain `<span>{value}</span>` carrying no `data-albedo-id`, so there is
+   * no node id to bind through and `SetTextRef` never fires for it.
+   *
+   * Idempotent per element — a re-scan of an already-bound span must not stack a
+   * second site, or one `SlotSet` would paint the same node twice.
+   * Registration replays any `SlotSet` that arrived first, which is the whole
+   * point: the value was already sitting in `pendingSlotValues`.
+   */
+  _registerSlotAnchor(slotId, element) {
+    const sites = this._ensureSlot(slotId);
+    for (const site of sites) {
+      if (site.kind === 'text' && site.element === element) return;
+    }
+    sites.push({ kind: 'text', element });
+    this._replayPendingSlotValue(slotId);
+  }
+
+  /**
+   * Adopt every server-rendered scalar shared-slot read under `scope` (default
+   * `document`). A `data-albedo-slot="topic"` element — stamped by the transpile
+   * pass on `<span>{slotBinding}</span>` — becomes a text binding on that
+   * topic's broadcast slot, so a `broadcast()` write paints live instead of
+   * stranding its value in `pendingSlotValues` until someone reloads.
+   *
+   * The scalar half of `scanListAnchors`, and run in the same three places for
+   * the same reasons: at boot, after a Tier-B injection (markup arrives after
+   * boot), and after an SSE-driven document swap.
+   */
+  scanSlotAnchors(scope) {
+    const root = scope || this.document;
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+    const anchors = root.querySelectorAll('[data-albedo-slot]');
+    for (const anchor of anchors) {
+      const topic = anchor.getAttribute('data-albedo-slot');
+      if (topic === null || topic === undefined) continue;
+      this._registerSlotAnchor(topicSlotId(topic), anchor);
     }
   }
 
@@ -1101,6 +1157,11 @@ export function installLegacyHtmlInjector(target, document) {
       if (typeof bakabox.scanListAnchors === 'function') {
         bakabox.scanListAnchors(parent);
       }
+      // …and any scalar `data-albedo-slot` read it brought, so a `broadcast()`
+      // write paints into the injected span too.
+      if (typeof bakabox.scanSlotAnchors === 'function') {
+        bakabox.scanSlotAnchors(parent);
+      }
     }
   }
 
@@ -1163,6 +1224,8 @@ if (globalScope && globalScope.document) {
   bakabox.seedNodesFromDocument();
   // B3 · adopt any inline (non-injected) shared-slot list anchors present at boot.
   bakabox.scanListAnchors();
+  // B4 · and the scalar reads, so a broadcast value has a paint site.
+  bakabox.scanSlotAnchors();
 
   // Phase-G: install the real action dispatcher so `BindEvent`-wired
   // listeners actually POST to the server when their DOM events fire.
@@ -1212,6 +1275,7 @@ if (globalScope && globalScope.document) {
             globalScope.document.body.innerHTML = doc.body.innerHTML;
             bakabox.seedNodesFromDocument();
             bakabox.scanListAnchors();
+            bakabox.scanSlotAnchors();
             applyInlineOpcodeFrames(globalScope.document, bakabox);
           }
         });

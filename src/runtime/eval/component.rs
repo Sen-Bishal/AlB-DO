@@ -186,7 +186,18 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
         if is_reserved_jsx_prop(name) {
             continue;
         }
-        let attr_name = if name == "className" { "class" } else { name };
+        // JSX prop → HTML attribute rename. `className`→`class`, plus React's
+        // uncontrolled form-control props to their DOM attribute equivalents:
+        // `defaultValue`→`value`, `defaultChecked`→`checked`. Without the latter
+        // a pre-filled `<input defaultValue={x}>` ships the browser-inert
+        // `defaultvalue` and the field renders blank. The QuickJS `h` shim
+        // mirrors this exact mapping, so Tier-A and Tier-B emit the same markup.
+        let attr_name = match name.as_str() {
+            "className" => "class",
+            "defaultValue" => "value",
+            "defaultChecked" => "checked",
+            _ => name.as_str(),
+        };
         match value {
             Value::Null => {}
             Value::Bool(false) => {}
@@ -456,6 +467,25 @@ mod tests {
             attr("aria-keyshortcuts", "s"),
         ]);
         assert_eq!(html, "data-key=\"k\" keygen=\"g\" aria-keyshortcuts=\"s\"");
+    }
+
+    /// React's uncontrolled form-control props are not HTML attributes — the DOM
+    /// spells them `value` / `checked`. Shipping `defaultValue` verbatim let the
+    /// browser lowercase it to the inert `defaultvalue`, so a pre-filled
+    /// `<input defaultValue={x}>` (the natural edit-in-a-row shape) rendered
+    /// BLANK. Both SSR renderers translate them; the QuickJS `h` shim mirrors
+    /// this so Tier-A and Tier-B stay byte-for-byte identical.
+    #[test]
+    fn render_attrs_translates_uncontrolled_form_props() {
+        let html = render_attrs(&[attr("name", "score"), attr("defaultValue", "200")]);
+        assert_eq!(html, "name=\"score\" value=\"200\"");
+
+        // `defaultChecked` is boolean: true → bare `checked`, false → omitted,
+        // riding the same path `checked` itself would.
+        let checked = render_attrs(&[("defaultChecked".to_string(), Value::Bool(true))]);
+        assert_eq!(checked, "checked");
+        let unchecked = render_attrs(&[("defaultChecked".to_string(), Value::Bool(false))]);
+        assert_eq!(unchecked, "");
     }
 
     #[test]
