@@ -20,13 +20,14 @@ pub mod scheduler;
 pub mod session;
 pub mod slot_store;
 pub mod static_slice;
+pub mod topics;
 pub mod webtransport;
 
 pub use bridge::{HandlerEffect, HandlerInvocation, HandlerOutcome};
 pub use broadcast::{
     broadcast_slot_id, check_topic_slot_ids, is_valid_partition_key, partition_topic_name,
     BroadcastDelivery, BroadcastError, BroadcastRegistry, BroadcastSender, BroadcastTopic,
-    TopicIdentity,
+    TopicIdentity, DEFAULT_TOPIC_VALUE_BUDGET,
 };
 pub use compiled::{
     allocate_proxy_id, allocate_slot_id, render_entry_with_bindings, render_entry_with_broadcast,
@@ -35,4 +36,5 @@ pub use compiled::{
 };
 pub use eval::{render_from_components_dir, ComponentProject, PatchReport};
 pub use session::SessionId;
+pub use topics::{resolve_partition_topics, split_partition_topic, ResolvedPartition};
 pub use slot_store::{SessionSlotView, SlotStore};

@@ -1275,6 +1275,16 @@ fn route_needs_live_lane(route: &RouteManifest) -> bool {
     if !route.shared_slot_topics.is_empty() {
         return true;
     }
+    // PRISM · a partition is a topic this route reads; it just has no name until
+    // a request supplies one. Asking only about `shared_slot_topics` would be the
+    // same class of mistake this function exists to have fixed once: today it is
+    // masked in any project that also has a static topic, because that list is
+    // project-wide. An app whose *only* live read is a partition — a chat, a
+    // per-user dashboard, the thing this feature is for — would render correct
+    // HTML, open no lane, and never update.
+    if !route.shared_slot_partitions.is_empty() {
+        return true;
+    }
     // A hydrated or streamed island receives patch frames on the same lane even
     // when the route reads no topic at all.
     !route.tier_b.is_empty() || !route.tier_c.is_empty()
@@ -1286,7 +1296,8 @@ mod tests {
     use crate::webtransport::WebTransportSessionHandle;
     use axum::body::to_bytes;
     use dom_render_compiler::manifest::schema::{
-        DataDep, DataSource, DomPosition, HtmlShell, RenderedNode, RouteManifest, TierBNode,
+        DataDep, DataSource, DomPosition, HtmlShell, PartitionTopicSpec, RenderedNode,
+        RouteManifest, TierBNode,
     };
     use serde_json::Value;
     use tokio::sync::mpsc;
@@ -1352,6 +1363,7 @@ mod tests {
             tier_b: vec![tier_b_node()],
             tier_c: Vec::new(),
             shared_slot_topics: Vec::new(),
+            shared_slot_partitions: Vec::new(),
             action_ids: Vec::new(),
             layout_chain: Vec::new(),
             error_component: None,
@@ -1520,6 +1532,28 @@ mod tests {
         );
     }
 
+    /// PRISM · the partition-only route — a chat, a per-user dashboard, the
+    /// shape dynamic topics exist for. It has no compile-time topic at all, so
+    /// asking `shared_slot_topics` alone answers "static" and the browser never
+    /// opens the lane: correct HTML on load, dead forever after. In a project
+    /// that also has a static topic this stays masked (that list is
+    /// project-wide), which is exactly why it is pinned here rather than left to
+    /// a demo app to reveal.
+    #[test]
+    fn a_partition_only_route_still_asks_for_the_lane() {
+        let mut route = route_manifest();
+        route.shared_slot_topics.clear();
+        route.tier_b.clear();
+        route.tier_c.clear();
+        route.shared_slot_partitions = vec![PartitionTopicSpec {
+            binding: "rows".to_string(),
+            collection: "messages".to_string(),
+            column: "room".to_string(),
+            param: "id".to_string(),
+        }];
+        assert!(route_needs_live_lane(&route));
+    }
+
     /// The converse: a genuinely static route must NOT pay for a connection.
     /// This is what stops the flag degrading into "always true", which would
     /// hold one socket per tab on pages with nothing to deliver — and the
@@ -1528,6 +1562,7 @@ mod tests {
     fn a_fully_static_route_does_not_open_a_lane() {
         let mut route = route_manifest();
         route.shared_slot_topics.clear();
+        route.shared_slot_partitions.clear();
         route.tier_b.clear();
         route.tier_c.clear();
         assert!(!route_needs_live_lane(&route));

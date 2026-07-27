@@ -75,6 +75,7 @@ const SCAFFOLD_LAYOUT: &str = include_str!("../../scaffold/src/routes/layout.tsx
 const SCAFFOLD_INDEX_ROUTE: &str = include_str!("../../scaffold/src/routes/index.tsx");
 const SCAFFOLD_GUESTBOOK_ROUTE: &str =
     include_str!("../../scaffold/src/routes/guestbook.tsx");
+const SCAFFOLD_ROOM_ROUTE: &str = include_str!("../../scaffold/src/routes/room/[id].tsx");
 const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/components/Hero.tsx");
 const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/src/components/Counter.tsx");
 const SCAFFOLD_ENV_DTS: &str = include_str!("../../scaffold/src/albedo-env.d.ts");
@@ -2267,6 +2268,15 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         SCAFFOLD_GUESTBOOK_ROUTE,
         options.force,
     )?;
+    write_scaffold_file(
+        &target
+            .join("src")
+            .join("routes")
+            .join("room")
+            .join("[id].tsx"),
+        SCAFFOLD_ROOM_ROUTE,
+        options.force,
+    )?;
     // Shared components (imported by routes).
     write_scaffold_file(
         &target.join("src").join("components").join("Hero.tsx"),
@@ -2316,6 +2326,41 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         options.force,
     )?;
 
+    // PRISM · emit `albedo/forge`'s types now, not on the first build.
+    //
+    // `import { messages } from "albedo/forge"` resolves only through this
+    // generated file. The serve/dev boot regenerates it, which is correct but
+    // too late for the one moment that matters most: a stranger runs
+    // `albedo init`, opens the editor or `npm run typecheck`, and sees errors on
+    // code they did not write. That is exactly the failure TODO #1 item 1.5
+    // closed (146 of them), and shipping a scaffold route that imports the
+    // module would have reopened it — three errors, all of them ours.
+    //
+    // Generated from the scaffold's own config rather than a second hard-coded
+    // copy of the declarations, so the types cannot drift from the `forge` block
+    // the user is reading two files away.
+    write_scaffold_forge_types(target)?;
+
+    Ok(())
+}
+
+/// Generate `.albedo/forge.d.ts` from the config just written.
+///
+/// Best-effort by design: a failure costs autocomplete on a fresh project, and
+/// the next `albedo dev` regenerates it. Failing the scaffold over a types file
+/// would trade a small degradation for a total one.
+fn write_scaffold_forge_types(target: &Path) -> Result<(), String> {
+    let Ok(config) = dom_render_compiler::dev::contract::load_forge_declarations(target) else {
+        return Ok(());
+    };
+    if config.is_empty() {
+        return Ok(());
+    }
+    let dts = dom_render_compiler::forge::emit_forge_dts(&config);
+    let albedo_dir = target.join(".albedo");
+    if std::fs::create_dir_all(&albedo_dir).is_ok() {
+        let _ = std::fs::write(albedo_dir.join("forge.d.ts"), dts);
+    }
     Ok(())
 }
 

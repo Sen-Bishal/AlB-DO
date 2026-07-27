@@ -1120,6 +1120,53 @@ impl CompiledProject {
             .collect()
     }
 
+    /// PRISM · the partitioned shared-slot bindings one render `entry`'s
+    /// component reads, in source order.
+    ///
+    /// The partition counterpart to [`Self::shared_slot_topics_for_entry`], and
+    /// deliberately the same shape of question: *what does this component read?*
+    /// The manifest builder asks it per component so a route carries only its
+    /// own partitions — resolving another route's binding against this route's
+    /// params would mint a topic the page never renders, which is the read
+    /// capability PRISM invariant 2 denies.
+    ///
+    /// A binding whose key source is not a route param is skipped rather than
+    /// approximated. Today `KeySource` has exactly one variant, so the `match`
+    /// is total; it is written as a `match` anyway so adding `Identity` (item 5)
+    /// forces a decision here instead of silently resolving to nothing.
+    #[must_use]
+    pub fn shared_slot_partitions_for_entry(
+        &self,
+        entry: &str,
+    ) -> Vec<crate::manifest::schema::PartitionTopicSpec> {
+        use crate::transforms::shared_slots::{KeySource, TopicSpec};
+
+        let Some((module_spec, function_name)) = self.project.resolve_entry_component(entry) else {
+            return Vec::new();
+        };
+        let Some(component) = self.component_meta(&module_spec, &function_name) else {
+            return Vec::new();
+        };
+        component
+            .shared_slots
+            .iter()
+            .filter_map(|binding| {
+                let TopicSpec::Partition { collection, column, key } = &binding.spec else {
+                    return None;
+                };
+                let param = match key {
+                    KeySource::Param(name) => name.clone(),
+                };
+                Some(crate::manifest::schema::PartitionTopicSpec {
+                    binding: binding.binding_name.clone(),
+                    collection: collection.clone(),
+                    column: column.clone(),
+                    param,
+                })
+            })
+            .collect()
+    }
+
     /// PRISM · every `useSharedSlot(<collection>.where({ … }))` in the project,
     /// for the boot-time check against the declared schema
     /// ([`crate::forge::validate_partition_bindings`]).

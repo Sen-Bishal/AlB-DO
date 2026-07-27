@@ -36,5 +36,24 @@ export default {
         { author: "alan", message: "the machine stirs" },
       ],
     },
+
+    // `partition_by` splits one collection into many independent live
+    // channels — one per distinct value of that field. `/room/a` and
+    // `/room/b` read the same table and never see each other's rows,
+    // and a write to one reaches only the tabs watching it.
+    //
+    // This is what makes per-room chat, per-user data and multi-tenancy
+    // expressible. It also emits an index on (room, id), so reading one
+    // room costs what the room costs, not what the table costs.
+    //
+    // See src/routes/room/[id].tsx for the read.
+    messages: {
+      fields: { room: "text", author: "text", body: "text" },
+      partition_by: "room",
+      seed: [
+        { room: "lobby", author: "ada", body: "welcome to the lobby" },
+        { room: "quiet", author: "alan", body: "a different room entirely" },
+      ],
+    },
   },
 };

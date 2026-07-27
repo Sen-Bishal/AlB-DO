@@ -553,12 +553,18 @@ impl RendererRuntime {
         // absolute, while the compiled project keys on project-relative specs —
         // `module_spec_for_component` is the bridge (the same one
         // `build_reactive_blocks` uses).
-        let shared_topics = match compiled {
+        // PRISM · the partitioned bindings ride along from the same lookup. Boot
+        // can precompute the spec but not the topic: a partition's identity
+        // needs a key, and the key arrives with the request.
+        let (shared_topics, shared_partitions) = match compiled {
             Some(project) => match project.module_spec_for_component(component_name) {
-                Some(spec) => project.shared_slot_topics_for_entry(spec),
-                None => Vec::new(),
+                Some(spec) => (
+                    project.shared_slot_topics_for_entry(spec),
+                    project.shared_slot_partitions_for_entry(spec),
+                ),
+                None => (Vec::new(), Vec::new()),
             },
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
         if !shared_topics.is_empty() {
             tracing::debug!(
@@ -621,7 +627,13 @@ impl RendererRuntime {
         // a topic mapped in more than one place collapses to its safest class.
         let mut shared_topic_classes: HashMap<String, dom_render_compiler::transforms::shared_slot_lists::RowProjection> =
             HashMap::new();
-        if !shared_topics.is_empty() {
+        // PRISM · a component that reads only partitions has an empty
+        // `shared_topics`, so gating on that alone skipped classification
+        // entirely — the collection fell back to `WholeView` and every write
+        // re-rendered the whole room. The same shape of mistake as
+        // `route_needs_live_lane`: asking about the static list when the
+        // question is "does this component read anything live".
+        if !shared_topics.is_empty() || !shared_partitions.is_empty() {
             for (specifier, code) in &modules {
                 for (topic, class) in
                     dom_render_compiler::transforms::shared_slot_lists::classify_shared_slot_lists_source(
@@ -642,6 +654,7 @@ impl RendererRuntime {
                 entry,
                 modules,
                 shared_topics,
+                shared_partitions,
                 shared_topic_classes,
             },
         );

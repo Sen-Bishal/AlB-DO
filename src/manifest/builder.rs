@@ -4,8 +4,9 @@ use super::metadata::{
     hoist_head_tags_from_body, metadata_from_const_expr, render_head_metadata, DYNAMIC_HEAD_MARKER,
 };
 use super::schema::{
-    AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, RenderedNode,
-    RouteActionEntry, RouteManifest, RouteMetadata, Tier, TierBNode, TierCNode, WTStreamSlot,
+    AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, PartitionTopicSpec,
+    RenderedNode, RouteActionEntry, RouteManifest, RouteMetadata, Tier, TierBNode, TierCNode,
+    WTStreamSlot,
 };
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;
@@ -242,6 +243,12 @@ impl<'a> ManifestBuilder<'a> {
             dynamic_metadata.is_some(),
         );
 
+        // PRISM · per-route, and computed here rather than beside
+        // `shared_slot_topics` above because it needs the finished node set —
+        // `tier_c` only carries its layout islands after the extend above.
+        let shared_slot_partitions =
+            self.collect_partition_specs_for_route(&tier_a_root, &tier_b, &tier_c, &layout_chain);
+
         RouteManifest {
             route: route.to_string(),
             shell,
@@ -249,6 +256,7 @@ impl<'a> ManifestBuilder<'a> {
             tier_b,
             tier_c,
             shared_slot_topics,
+            shared_slot_partitions,
             action_ids,
             layout_chain,
             error_component,
@@ -655,6 +663,66 @@ impl<'a> ManifestBuilder<'a> {
             }
         }
         out
+    }
+
+    /// PRISM · the partitioned shared-slot bindings read by the components
+    /// **this route actually renders**.
+    ///
+    /// Walks the same node set as [`Self::collect_scoped_module_css_for_route`]
+    /// plus the Tier-A children nested inside Tier-B nodes and the layout chain,
+    /// because every one of those is markup this route emits — and the set of
+    /// things a route may subscribe to has to be exactly the set of things it
+    /// renders. That equality is PRISM invariant 2, and it is the entire
+    /// security argument for shipping dynamic topics before auth: the subscribe
+    /// path grants precisely the read the page GET already granted.
+    ///
+    /// Sorted and deduplicated so the manifest is byte-stable across builds of
+    /// the same source — a route's topic list shifting between builds would make
+    /// manifest diffs unreadable and slot ids look nondeterministic when they
+    /// are not.
+    fn collect_partition_specs_for_route(
+        &self,
+        tier_a_root: &[RenderedNode],
+        tier_b: &[TierBNode],
+        tier_c: &[TierCNode],
+        layout_chain: &[String],
+    ) -> Vec<PartitionTopicSpec> {
+        let Some(compiled) = self.compiled_render_project.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut specs: BTreeSet<PartitionTopicSpec> = BTreeSet::new();
+        let mut record = |component_name: &str| {
+            if let Some(component) = self.components.values().find(|c| c.name == component_name) {
+                if let Some(spec) =
+                    self.component_entry_for_project(component, compiled.root.as_path())
+                {
+                    specs.extend(compiled.project.shared_slot_partitions_for_entry(&spec));
+                }
+            }
+        };
+
+        for node in tier_a_root {
+            record(&node.component_id);
+        }
+        for node in tier_b {
+            record(&node.component_id);
+            // A Tier-A component nested inside an async page is rendered by this
+            // route as surely as the page is; missing it would make a partition
+            // silently non-live in exactly the composition the framework
+            // encourages.
+            for child in &node.tier_a_children {
+                record(&child.component_id);
+            }
+        }
+        for node in tier_c {
+            record(&node.component_id);
+        }
+        for layout in layout_chain {
+            record(layout);
+        }
+
+        specs.into_iter().collect()
     }
 
     /// Phase P · Stream E.1 — wrap a route's inner body content in

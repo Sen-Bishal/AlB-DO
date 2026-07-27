@@ -198,7 +198,21 @@ pub(crate) async fn resync_frame(
 ) -> Option<Vec<u8>> {
     let mut instructions = Vec::new();
     for (topic, value) in seed_values {
-        let Some(rows) = projector.project_rows(topic, value).await else {
+        // The seed names a *channel*; the projector is keyed by *collection*.
+        // For everything that predates PRISM those are the same string, so that
+        // is tried first — which also settles the ambiguity a static topic
+        // carrying a colon (`broadcast("chat:lobby")`) would otherwise create.
+        // Only when the whole name names no template is it read as a partition.
+        let rows = match projector.project_rows(topic, None, value).await {
+            Some(rows) => Some(rows),
+            None => match dom_render_compiler::runtime::split_partition_topic(topic) {
+                Some((collection, key)) => {
+                    projector.project_rows(collection, Some(key), value).await
+                }
+                None => None,
+            },
+        };
+        let Some(rows) = rows else {
             continue;
         };
         instructions.push(Instruction::ReconcileList {
@@ -338,6 +352,7 @@ mod tests {
         async fn project_rows(
             &self,
             collection: &str,
+            _partition: Option<&str>,
             _value: &[u8],
         ) -> Option<dom_render_compiler::forge::RenderedRows> {
             (collection == "guestbook").then(|| {

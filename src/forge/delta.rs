@@ -161,7 +161,21 @@ pub trait RowProjector: Send + Sync {
     /// template, an ambiguous one, a render failure, or markup with no keyed
     /// list anchor in it. `None` suppresses the delta entirely; it never
     /// degrades to a partial one.
-    async fn project_rows(&self, collection: &str, value: &[u8]) -> Option<RenderedRows>;
+    ///
+    /// `partition` is the bound key for a partitioned collection, `None`
+    /// otherwise — and it is not optional information dressed up as an option.
+    /// A component that reads a partition necessarily reads the route param the
+    /// key came from (it had to, to name the partition at all), so rendering its
+    /// row template without that param renders a *different component* — one
+    /// whose `params` is undefined. The rows would differ from the ones SSR
+    /// produced, or the render would simply throw, and the whole contract of
+    /// this trait is that a projected row is byte-identical to a requested one.
+    async fn project_rows(
+        &self,
+        collection: &str,
+        partition: Option<&str>,
+        value: &[u8],
+    ) -> Option<RenderedRows>;
 
     /// The compile-time incrementalisation class of `collection`'s row template
     /// (see [`RowProjection`]). It decides whether a single-record write may be

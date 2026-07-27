@@ -115,6 +115,23 @@ pub struct RouteManifest {
     /// resolves without explicit subscribe.
     #[serde(default)]
     pub shared_slot_topics: Vec<String>,
+    /// PRISM · the partitioned shared-slot bindings **this route's own
+    /// components** read, still unresolved — a topic identity needs the
+    /// request's params, which do not exist at build time.
+    ///
+    /// Per-route, unlike `shared_slot_topics` above, and that difference is
+    /// load-bearing rather than an optimization. A static topic is a
+    /// compile-time global, so listing every project topic on every route only
+    /// costs a few extra `mpsc::Sender` clones — nothing is grantable that is
+    /// not already public. A *partition* resolves against **this** request's
+    /// params, so a project-wide list would take another route's binding
+    /// (`comments.where({ doc: params.id })`) and resolve it against this
+    /// route's `id`, handing the lane a partition of a collection this page
+    /// never renders. That is precisely the read capability PRISM invariant 2
+    /// exists to deny: a topic is reachable only through a route that renders
+    /// it.
+    #[serde(default)]
+    pub shared_slot_partitions: Vec<PartitionTopicSpec>,
     /// Phase P · TS-side action handler names + their wire
     /// `action_id`s for this route. Populated once Stream C lands
     /// the `action()` extractor; the field exists now so manifests
@@ -201,6 +218,32 @@ pub struct MetaTag {
     pub attr: String,
     pub key: String,
     pub content: String,
+}
+
+/// PRISM · one `useSharedSlot(<collection>.where({ <column>: params.<param> }))`
+/// binding, carried to serve time unresolved.
+///
+/// The extractor lowers the TSX to this; [`crate::runtime::resolve_partition_topics`]
+/// turns it into a topic identity once a request supplies the params. Nothing
+/// here is a topic *string* — that is the whole point of PRISM § 3.2: the author
+/// never spells one, so two logically distinct partitions aliasing onto one
+/// channel is unexpressible rather than merely checked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PartitionTopicSpec {
+    /// The component-local name the binding is assigned to
+    /// (`const rows = useSharedSlot(...)` → `"rows"`). This is the key the
+    /// transpiled `__albedo_topic("rows")` looks up in `host.topics`, so it is
+    /// how a resolved topic reaches the component that reads it.
+    pub binding: String,
+    /// The declared collection name — the `forge` block key.
+    pub collection: String,
+    /// The column `.where({ … })` named. Already checked against the
+    /// collection's declared `partition_by` at build time
+    /// (`validate_partition_bindings`); kept because the write path resolves by
+    /// column and a mismatch here would be silent.
+    pub column: String,
+    /// The route param supplying the key: `params.id` → `"id"`.
+    pub param: String,
 }
 
 /// Phase P · one TS-authored action handler discovered on a route.

@@ -59,6 +59,7 @@ pub mod renderer_runtime;
 pub mod routing;
 pub mod server;
 pub mod timing;
+pub mod topics;
 pub mod webtransport;
 
 pub use actions::{ActionHandler, SessionSlots};

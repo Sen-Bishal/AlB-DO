@@ -51,7 +51,7 @@ use crate::forge::delta::{
     project_inserted_rows, RenderedRows, RowProjector,
 };
 use crate::transforms::shared_slot_lists::RowProjection;
-use crate::forge::skeleton::{materialize_slot, ForgeCollection, ForgeSchema};
+use crate::forge::skeleton::{materialize_slot, ForgeCollection, ForgeSchema, SortDir};
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Result, SqlValue, SubstrateError};
 use crate::ir::opcode::{ReconcileRow, RowKey, SlotChange};
@@ -242,6 +242,54 @@ fn build_append(collection: &str, record: &Map<String, Value>) -> Result<(String
     Ok((sql, params))
 }
 
+/// [`build_append`] with a `RETURNING` list matching the collection's own
+/// `SELECT`, so the insert hands back the row it actually persisted.
+///
+/// This is the piece that makes a zero-query write possible. An append's key is
+/// assigned by the database (`INTEGER PRIMARY KEY AUTOINCREMENT`), so before
+/// this the only way to learn the persisted row was to re-read the collection —
+/// which is precisely the query PRISM wants to stop running. `RETURNING` is the
+/// right tool *here* (unlike on `UPDATE`, where it reports post-update values
+/// and loses the origin partition — see [`read_partition`]): an insert has no
+/// "before", so the returned row is unambiguous.
+fn build_append_returning(
+    table: &str,
+    key_column: &str,
+    record: &Map<String, Value>,
+) -> Result<(String, Vec<SqlValue>, Vec<String>)> {
+    let (sql, params) = build_append(table, record)?;
+    // Same column set the materialising query selects: the key, then every
+    // written column. Byte-agreement with `materialize_slot` depends on the
+    // *names* matching, not the order — `serde_json::Map` is a `BTreeMap`, so
+    // both sides serialize alphabetically regardless.
+    let mut returned: Vec<String> = vec![key_column.to_string()];
+    returned.extend(record.keys().cloned());
+    Ok((
+        format!("{sql} RETURNING {}", returned.join(", ")),
+        params,
+        returned,
+    ))
+}
+
+/// Turn one `RETURNING` row into the JSON object shape the materialised array
+/// carries, so a spliced row and a queried row are indistinguishable.
+fn returned_record(columns: &[String], row: &crate::forge::value::Row) -> Option<Value> {
+    let mut object = Map::new();
+    for (index, column) in columns.iter().enumerate() {
+        let value = match row.get(index)? {
+            SqlValue::Null => Value::Null,
+            SqlValue::Integer(number) => Value::Number((*number).into()),
+            SqlValue::Real(number) => serde_json::Number::from_f64(*number)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
+            SqlValue::Text(text) => Value::String(text.clone()),
+            SqlValue::Blob(_) => return None,
+        };
+        object.insert(column.clone(), value);
+    }
+    Some(Value::Object(object))
+}
+
 /// Lower a row-identity value to a bound [`SqlValue`], refusing the shapes that
 /// can't identify a row.
 ///
@@ -328,6 +376,77 @@ struct Touched<'a> {
     partition: Option<String>,
     /// The broadcast channel name — `slot.topic`, or the minted partition name.
     channel: String,
+    /// Rows this action appended to this channel, exactly as the database
+    /// persisted them (`INSERT … RETURNING`), in insertion order.
+    ///
+    /// When this is the *whole* story for the channel — appends only, nothing
+    /// updated or deleted — the new value can be spliced from the previous one
+    /// and no query is needed at all.
+    appended: Vec<Value>,
+    /// Set when anything other than an append touched this channel. An update or
+    /// a delete rewrites rows in place, which a tail/head splice cannot express,
+    /// so the channel falls back to re-reading its partition.
+    mutated: bool,
+}
+
+/// Splice appended rows onto the previous materialised value, without parsing
+/// either side.
+///
+/// Correct only when the collection's ordering places a new row at one end and
+/// the rows arrive in that order — which is exactly what `sort` proves. `None`
+/// means "cannot place these", and the caller re-reads instead.
+///
+/// The output must be **byte-identical** to what `materialize_slot` would have
+/// produced, or an unpartitioned collection would observe P2 — that equality is
+/// asserted directly by a test.
+fn splice_appended(previous: &[u8], records: &[Value], at_head: bool) -> Option<Vec<u8>> {
+    if records.is_empty() {
+        return Some(previous.to_vec());
+    }
+    // A topic registered but never materialised holds `null`; there is no array
+    // to splice onto, so let the caller materialise.
+    if previous.len() < 2 || previous.first() != Some(&b'[') || previous.last() != Some(&b']') {
+        return None;
+    }
+    let inner = &previous[1..previous.len() - 1];
+
+    let mut encoded = Vec::with_capacity(records.len());
+    for record in records {
+        encoded.push(serde_json::to_vec(record).ok()?);
+    }
+    let joined = encoded.join(&b',');
+
+    let mut out = Vec::with_capacity(previous.len() + joined.len() + 1);
+    out.push(b'[');
+    if inner.is_empty() {
+        out.extend_from_slice(&joined);
+    } else if at_head {
+        out.extend_from_slice(&joined);
+        out.push(b',');
+        out.extend_from_slice(inner);
+    } else {
+        out.extend_from_slice(inner);
+        out.push(b',');
+        out.extend_from_slice(&joined);
+    }
+    out.push(b']');
+    Some(out)
+}
+
+/// Where the collection's ordering puts a freshly inserted row, when that is
+/// knowable at all.
+///
+/// `Some(true)` = head, `Some(false)` = tail, `None` = anywhere (so a splice
+/// would be a guess). Only an ordering whose leading key is the row-identity
+/// column qualifies: `id` ascending appends at the tail, `id DESC` at the head.
+/// An ordering on any other column — `score desc` — places a row by its value,
+/// which is the reorder case a splice cannot express.
+fn insert_at_head(slot: &ForgeCollection) -> Option<bool> {
+    let first = slot.sort.first()?;
+    if first.column != slot.key_column {
+        return None;
+    }
+    Some(matches!(first.dir, SortDir::Desc))
 }
 
 /// The partition value an `Append` lands in, read off the record it is inserting.
@@ -445,9 +564,22 @@ fn note_touched<'a>(
             slot,
             partition,
             channel,
+            appended: Vec::new(),
+            mutated: false,
         });
     }
     Ok(())
+}
+
+/// Record what a write did to its channel, so the fan-out knows whether the new
+/// value can be spliced or has to be re-read.
+fn record_outcome(touched: &mut [Touched<'_>], channel: &str, appended: Option<Value>) {
+    if let Some(entry) = touched.iter_mut().find(|known| known.channel == channel) {
+        match appended {
+            Some(record) => entry.appended.push(record),
+            None => entry.mutated = true,
+        }
+    }
 }
 
 /// Build the statement for one write against its resolved slot. Dispatches on
@@ -458,11 +590,17 @@ fn build_statement(
     write: &ForgeWrite,
 ) -> Result<(String, Vec<SqlValue>)> {
     match write {
-        ForgeWrite::Append { record, .. } => build_append(&slot.topic, record),
+        // `slot.table`, not `slot.topic`. They coincide unless the declaration
+        // overrides `table:`, which `CollectionDecl` explicitly allows — and
+        // until now every write targeted a table named after the collection, so
+        // an override produced statements against a table that does not exist.
+        // The read path always used `table` (it is baked into `query`), so only
+        // writes were affected.
+        ForgeWrite::Append { record, .. } => build_append(&slot.table, record),
         ForgeWrite::Update { key, fields, .. } => {
-            build_update(&slot.topic, &slot.key_column, key, fields)
+            build_update(&slot.table, &slot.key_column, key, fields)
         }
-        ForgeWrite::Delete { key, .. } => build_delete(&slot.topic, &slot.key_column, key),
+        ForgeWrite::Delete { key, .. } => build_delete(&slot.table, &slot.key_column, key),
     }
 }
 
@@ -573,25 +711,78 @@ pub async fn apply_writes(
             }
         }
 
-        let (sql, params) = match build_statement(slot, write) {
-            Ok(built) => built,
-            Err(err) => {
-                // Drop the whole action's writes: one malformed mutation must
-                // not leave earlier ones committed.
-                let _ = tx.rollback().await;
-                return Err(err);
+        // The channel(s) this write just resolved onto. An append records the row
+        // the database persisted; anything else marks the channel as mutated,
+        // which forces the fan-out to re-read rather than splice.
+        let channels: Vec<String> = touched
+            .iter()
+            .filter(|known| known.slot.topic == slot.topic)
+            .map(|known| known.channel.clone())
+            .collect();
+
+        match write {
+            ForgeWrite::Append { record, .. } => {
+                let (sql, params, columns) =
+                    match build_append_returning(&slot.table, &slot.key_column, record) {
+                        Ok(built) => built,
+                        Err(err) => {
+                            let _ = tx.rollback().await;
+                            return Err(err);
+                        }
+                    };
+                let rows = match tx.query(&sql, &params).await {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        let _ = tx.rollback().await;
+                        return Err(err);
+                    }
+                };
+                // A substrate that does not honour `RETURNING` yields no row.
+                // That is not an error — it only costs the zero-query path, and
+                // the fan-out falls back to re-reading (`reserve.rs:266` records
+                // the same defensive posture).
+                let persisted = rows.rows.first().and_then(|row| returned_record(&columns, row));
+                for channel in &channels {
+                    match &persisted {
+                        Some(record) => {
+                            record_outcome(&mut touched, channel, Some(record.clone()))
+                        }
+                        None => record_outcome(&mut touched, channel, None),
+                    }
+                }
             }
-        };
-        if let Err(err) = tx.execute(&sql, &params).await {
-            let _ = tx.rollback().await;
-            return Err(err);
+            _ => {
+                let (sql, params) = match build_statement(slot, write) {
+                    Ok(built) => built,
+                    Err(err) => {
+                        // Drop the whole action's writes: one malformed mutation
+                        // must not leave earlier ones committed.
+                        let _ = tx.rollback().await;
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = tx.execute(&sql, &params).await {
+                    let _ = tx.rollback().await;
+                    return Err(err);
+                }
+                for channel in &channels {
+                    record_outcome(&mut touched, channel, None);
+                }
+            }
         }
     }
     tx.commit().await?;
     let commit_el = t_commit.elapsed();
 
     // Durable now — safe to tell the world.
-    for Touched { slot, partition, channel } in touched {
+    for Touched {
+        slot,
+        partition,
+        channel,
+        appended,
+        mutated,
+    } in touched
+    {
         // Both awaits happen HERE, outside the topic's critical section:
         // `write_topic_delta`'s closure runs under that topic's lock, so
         // awaiting in it would serialise every writer behind the slowest query
@@ -600,7 +791,39 @@ pub async fn apply_writes(
         // is only the diff: pure, bounded by the collection size, and the one
         // step that genuinely needs the pre-state it is replacing.
         let t_mat = std::time::Instant::now();
-        let bytes = materialize_slot(substrate, slot, partition.as_deref()).await?;
+        // PRISM § 6.2 · the write path stops re-running the query.
+        //
+        // An append already knows its record (from `RETURNING`) and its
+        // partition, and `PerRecord` proves the row's markup is a function of
+        // that record alone. So when nothing but appends touched this channel
+        // and the ordering places a new row at one end, the new value is the old
+        // one with the rows spliced in — a memcpy — and the rows are rendered
+        // from the records directly. Cost becomes O(1) in the partition size
+        // instead of O(rows in it).
+        //
+        // Every other shape (an update, a delete, an ordering that places rows
+        // by value, a substrate without `RETURNING`, a topic never materialised)
+        // falls back to the query. The fallback is always correct, so this can
+        // only ever cost time, never truth.
+        let splice_at_head = insert_at_head(slot);
+        let can_splice = !mutated && !appended.is_empty() && splice_at_head.is_some();
+        let spliced = if can_splice {
+            let at_head = splice_at_head.unwrap_or(false);
+            broadcast.get(&channel).and_then(|topic| {
+                // Read the cached bytes in place. Cloning them first would copy
+                // the whole partition just to derive the next version of it —
+                // the splice is exactly the operation that does not need to own
+                // its input.
+                topic.with_value(|previous| splice_appended(previous, &appended, at_head))
+            })
+        } else {
+            None
+        };
+        let queried = spliced.is_none();
+        let bytes = match spliced {
+            Some(bytes) => bytes,
+            None => materialize_slot(substrate, slot, partition.as_deref()).await?,
+        };
         let mat_el = t_mat.elapsed();
 
         // Choose what to render. A `PerRecord` collection renders only the rows
@@ -614,15 +837,15 @@ pub async fn apply_writes(
         let t_proj = std::time::Instant::now();
         let (rows, partial) = match projector {
             Some(p) if p.projection_class(&slot.topic) == RowProjection::PerRecord => {
-                match render_changed_rows(p, slot, &channel, broadcast, &bytes).await {
+                match render_changed_rows(p, slot, &channel, partition.as_deref(), broadcast, &bytes).await {
                     // Changed rows attributed and rendered: the fast path.
                     Some(changed) => (Some(changed), true),
                     // No prior value to diff against, or unkeyable rows: fall back
                     // to the whole view, which is always renderable and correct.
-                    None => (p.project_rows(&slot.topic, &bytes).await, false),
+                    None => (p.project_rows(&slot.topic, partition.as_deref(), &bytes).await, false),
                 }
             }
-            Some(p) => (p.project_rows(&slot.topic, &bytes).await, false),
+            Some(p) => (p.project_rows(&slot.topic, partition.as_deref(), &bytes).await, false),
             None => (None, false),
         };
         let proj_el = t_proj.elapsed();
@@ -633,7 +856,7 @@ pub async fn apply_writes(
         // would surface here loudly rather than as a stranded row in production.
         if partial && std::env::var_os("ALBEDO_FORGE_VERIFY").is_some() {
             if let (Some(p), Some(changed)) = (projector, rows.as_ref()) {
-                if let Some(whole) = p.project_rows(&slot.topic, &bytes).await {
+                if let Some(whole) = p.project_rows(&slot.topic, partition.as_deref(), &bytes).await {
                     for (key, html) in changed.iter() {
                         match whole.get(key) {
                             Some(expected) if expected == html => {}
@@ -653,7 +876,14 @@ pub async fn apply_writes(
         // own partition's topic. `projection_class` / `project_rows` above stay
         // keyed by `slot.topic`, because the row TEMPLATE belongs to the
         // collection while the subscriber set belongs to the partition.
-        broadcast.topic(channel.clone(), bytes.clone());
+        // Register the channel if this is the first anyone has heard of it. The
+        // `initial` argument is ignored when the topic already exists, so
+        // cloning the value unconditionally allocated a full copy of the
+        // partition and dropped it again on **every** write to a warm topic —
+        // the common case, and pure waste.
+        if broadcast.get(&channel).is_none() {
+            broadcast.topic(channel.clone(), bytes.clone());
+        }
         // `needs_whole` is raised inside the closure when a partial render can't
         // express the transition (a reorder, a mid-list insert, or a race that
         // moved `previous` out from under the changed-set guess). The reconcile is
@@ -677,7 +907,7 @@ pub async fn apply_writes(
         // reload or late joiner is already correct; this repairs live rows.
         if needs_whole.get() {
             if let Some(p) = projector {
-                if let Some(whole) = p.project_rows(&slot.topic, &bytes).await {
+                if let Some(whole) = p.project_rows(&slot.topic, partition.as_deref(), &bytes).await {
                     let _ = broadcast.write_topic_delta(&channel, |_previous| TopicTransition {
                         value: bytes.clone(),
                         update: ListUpdate::Reconcile(reconcile_rows(&whole)),
@@ -689,11 +919,13 @@ pub async fn apply_writes(
         if timing {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
-                "[forge-timing] topic={} rows={} partial={} commit={:.3}ms materialize={:.3}ms \
-                 project={:.3}ms fanout={:.3}ms",
-                slot.topic,
+                "[forge-timing] channel={} rows={} partial={} value={} commit={:.3}ms                  materialize={:.3}ms project={:.3}ms fanout={:.3}ms",
+                channel,
                 row_count,
                 partial,
+                // The number this instrumentation exists to move: `spliced` means
+                // the write never touched the database to learn its new value.
+                if queried { "queried" } else { "spliced" },
                 ms(commit_el),
                 ms(mat_el),
                 ms(proj_el),
@@ -701,6 +933,17 @@ pub async fn apply_writes(
             );
         }
     }
+
+    // PRISM § 8 · the one cap. Swept here rather than inside the registry
+    // because this is where the bytes grew, and because the sweep has to run
+    // with no topic lock held — `write_topic_delta` holds one across its whole
+    // critical section, and reading every topic's length from inside that would
+    // deadlock against itself.
+    //
+    // Reclaiming an idle partition costs the next reader one query and nothing
+    // else: the substrate is the truth and the value is a cache. That is the
+    // whole licence for this, and it is why static topics are excluded.
+    broadcast.enforce_byte_budget(crate::runtime::broadcast::DEFAULT_TOPIC_VALUE_BUDGET);
 
     Ok(())
 }
@@ -724,6 +967,7 @@ async fn render_changed_rows(
     projector: &dyn RowProjector,
     slot: &ForgeCollection,
     channel: &str,
+    partition: Option<&str>,
     broadcast: &BroadcastRegistry,
     next: &[u8],
 ) -> Option<RenderedRows> {
@@ -739,7 +983,7 @@ async fn render_changed_rows(
         let mut rows = RenderedRows::new();
         for (key, record) in &appended {
             let singleton = serde_json::to_vec(&Value::Array(vec![record.clone()])).ok()?;
-            let rendered = projector.project_rows(&slot.topic, &singleton).await?;
+            let rendered = projector.project_rows(&slot.topic, partition, &singleton).await?;
             rows.insert(key.clone(), rendered.get(key)?.clone());
         }
         return Some(rows);
@@ -760,7 +1004,7 @@ async fn render_changed_rows(
         // template the singleton render is byte-identical to the whole-view
         // render's slice of this row (the classifier's guarantee).
         let singleton = serde_json::to_vec(&Value::Array(vec![change.record.clone()])).ok()?;
-        let rendered = projector.project_rows(&slot.topic, &singleton).await?;
+        let rendered = projector.project_rows(&slot.topic, partition, &singleton).await?;
         let html = rendered.get(&change.key)?.clone();
         rows.insert(change.key.clone(), html);
     }
@@ -1331,6 +1575,218 @@ mod tests {
 /// a component renders from reflects it afterwards.
 #[cfg(all(test, feature = "forge"))]
 mod substrate_tests {
+    /// **The safety argument for the whole zero-query path, asserted directly.**
+    ///
+    /// A spliced value must be byte-identical to what the query would have
+    /// returned. If it is not, an unpartitioned collection — every app that
+    /// exists today — observes P2, and the difference would surface as a
+    /// mismatched hash or a stale row rather than as an error.
+    #[tokio::test]
+    async fn a_spliced_value_is_byte_identical_to_a_queried_one() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = ForgeSchema::guestbook_default();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast, &schema).await.unwrap();
+
+        let mut record = serde_json::Map::new();
+        record.insert("author".into(), Value::String("grace".into()));
+        record.insert("message".into(), Value::String("spliced".into()));
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[ForgeWrite::Append {
+                collection: "guestbook".into(),
+                record,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let spliced = broadcast.get("guestbook").unwrap().current_value();
+        let collection = schema.slot_for_topic("guestbook").unwrap();
+        let queried = materialize_slot(&db, collection, None).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&spliced),
+            String::from_utf8_lossy(&queried),
+            "splice and query must agree byte for byte"
+        );
+    }
+
+    /// Several appends in one action splice in insertion order.
+    #[tokio::test]
+    async fn multiple_appends_in_one_action_splice_in_order() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = ForgeSchema::guestbook_default();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast, &schema).await.unwrap();
+
+        let entry = |author: &str| {
+            let mut record = serde_json::Map::new();
+            record.insert("author".into(), Value::String(author.into()));
+            record.insert("message".into(), Value::String("m".into()));
+            ForgeWrite::Append {
+                collection: "guestbook".into(),
+                record,
+            }
+        };
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[entry("first"), entry("second")],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = broadcast.get("guestbook").unwrap().current_value();
+        let queried = materialize_slot(&db, schema.slot_for_topic("guestbook").unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&value), String::from_utf8_lossy(&queried));
+
+        let rows: Vec<Value> = serde_json::from_slice(&value).unwrap();
+        let authors: Vec<&str> = rows.iter().filter_map(|r| r["author"].as_str()).collect();
+        assert_eq!(&authors[authors.len() - 2..], &["first", "second"]);
+    }
+
+    /// An update cannot be expressed as a splice, so the channel falls back to
+    /// the query — and must still land on the right value.
+    #[tokio::test]
+    async fn an_update_falls_back_to_the_query_and_stays_correct() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = ForgeSchema::guestbook_default();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast, &schema).await.unwrap();
+
+        let mut fields = serde_json::Map::new();
+        fields.insert("message".into(), Value::String("edited".into()));
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[ForgeWrite::Update {
+                collection: "guestbook".into(),
+                key: Value::Number(1.into()),
+                fields,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = broadcast.get("guestbook").unwrap().current_value();
+        let queried = materialize_slot(&db, schema.slot_for_topic("guestbook").unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&value), String::from_utf8_lossy(&queried));
+        assert!(String::from_utf8_lossy(&value).contains("edited"));
+    }
+
+    /// A `DESC` ordering puts a new row at the head. Splicing it at the tail
+    /// would put every new row in the wrong place — silently, since both are
+    /// valid JSON.
+    #[tokio::test]
+    async fn a_descending_collection_splices_at_the_head() {
+        use crate::forge::declare::{CollectionDecl, FieldType};
+        use std::collections::BTreeMap;
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let mut fields = BTreeMap::new();
+        fields.insert("body".to_string(), FieldType::Text);
+        let mut declarations = BTreeMap::new();
+        declarations.insert(
+            "feed".to_string(),
+            CollectionDecl {
+                fields,
+                order_by: Some("id desc".to_string()),
+                ..CollectionDecl::default()
+            },
+        );
+        let schema = ForgeSchema::from_declarations(&declarations).unwrap();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast, &schema).await.unwrap();
+
+        for body in ["older", "newer"] {
+            let mut record = serde_json::Map::new();
+            record.insert("body".into(), Value::String(body.into()));
+            apply_writes(
+                &db,
+                &broadcast,
+                &schema,
+                &[ForgeWrite::Append {
+                    collection: "feed".into(),
+                    record,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let value = broadcast.get("feed").unwrap().current_value();
+        let queried = materialize_slot(&db, schema.slot_for_topic("feed").unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&value),
+            String::from_utf8_lossy(&queried),
+            "head splice must match the DESC query"
+        );
+        let rows: Vec<Value> = serde_json::from_slice(&value).unwrap();
+        assert_eq!(rows[0]["body"], "newer", "newest first: {rows:?}");
+    }
+
+    /// `table:` is documented as overridable, but every write builder used to
+    /// target the *collection* name — so an override wrote to a table that does
+    /// not exist. Pre-existing, found while wiring the zero-query path.
+    #[tokio::test]
+    async fn a_collection_whose_table_differs_from_its_name_is_writable() {
+        use crate::forge::declare::{CollectionDecl, FieldType};
+        use std::collections::BTreeMap;
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let mut fields = BTreeMap::new();
+        fields.insert("body".to_string(), FieldType::Text);
+        let mut declarations = BTreeMap::new();
+        declarations.insert(
+            "notes".to_string(),
+            CollectionDecl {
+                fields,
+                table: Some("note_rows".to_string()),
+                ..CollectionDecl::default()
+            },
+        );
+        let schema = ForgeSchema::from_declarations(&declarations).unwrap();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast, &schema).await.unwrap();
+
+        let mut record = serde_json::Map::new();
+        record.insert("body".into(), Value::String("into the real table".into()));
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[ForgeWrite::Append {
+                collection: "notes".into(),
+                record,
+            }],
+            None,
+        )
+        .await
+        .expect("a write must reach the declared table, not one named after the collection");
+
+        let rows = db.query("SELECT body FROM note_rows", &[]).await.unwrap();
+        assert_eq!(rows.rows.len(), 1, "the row landed in `note_rows`");
+    }
+
     /// A partitioned collection, declared the way an app would.
     fn partitioned_schema() -> ForgeSchema {
         use crate::forge::declare::{CollectionDecl, FieldType};
@@ -1399,6 +1855,40 @@ mod substrate_tests {
             broadcast.get("messages").is_none(),
             "a partitioned collection has no whole-collection channel to fan out on"
         );
+    }
+
+    /// The steady-state partitioned append — the case the `O(1)`-in-partition-size
+    /// claim actually rests on.
+    ///
+    /// The FIRST append to a room necessarily queries: the channel does not exist
+    /// yet, so there is no previous value to splice onto. Every append after that
+    /// splices, and must still agree byte-for-byte with the query it replaced.
+    #[tokio::test]
+    async fn a_second_append_to_a_partition_splices_and_still_matches_the_query() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = partitioned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "first")], None)
+            .await
+            .unwrap();
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "second")], None)
+            .await
+            .unwrap();
+
+        let live = broadcast.get("messages:a").unwrap().current_value();
+        let queried = materialize_slot(&db, schema.slot_for_topic("messages").unwrap(), Some("a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&live),
+            String::from_utf8_lossy(&queried),
+            "a spliced partition must equal its query"
+        );
+        let rows: Vec<Value> = serde_json::from_slice(&live).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["body"], "second");
     }
 
     /// The edge PRISM named up front: moving a row between partitions touches
@@ -1512,8 +2002,177 @@ mod substrate_tests {
 
     use super::*;
     use crate::forge::skeleton::{bootstrap_schema, hydrate_topics};
+    use crate::forge::substrate::Transaction;
     use crate::forge::LibSqlSubstrate;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    /// A substrate that counts the reads passing through it.
+    ///
+    /// PRISM § 11 asks for the zero-query claim to be asserted, **not
+    /// benchmarked** — and the distinction is the whole point. A benchmark says
+    /// the write got faster, which stays true if the query merely moved
+    /// somewhere cheaper; a count says the query is *gone*. The competitive
+    /// sentence is "a reactive backend that never re-runs your query", and a
+    /// number is what makes that sentence checkable.
+    struct CountingSubstrate {
+        inner: LibSqlSubstrate,
+        queries: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl DataSubstrate for CountingSubstrate {
+        async fn migrate(&self, ddl: &str) -> crate::forge::value::Result<()> {
+            self.inner.migrate(ddl).await
+        }
+        async fn query(
+            &self,
+            sql: &str,
+            params: &[crate::forge::value::SqlValue],
+        ) -> crate::forge::value::Result<crate::forge::value::Rows> {
+            self.queries.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.query(sql, params).await
+        }
+        async fn execute(
+            &self,
+            sql: &str,
+            params: &[crate::forge::value::SqlValue],
+        ) -> crate::forge::value::Result<u64> {
+            self.inner.execute(sql, params).await
+        }
+        async fn begin(&self) -> crate::forge::value::Result<Box<dyn Transaction>> {
+            // Transaction-scoped reads are counted too: an `INSERT … RETURNING`
+            // is the write itself, but a `SELECT` smuggled inside the
+            // transaction would be exactly the re-query this asserts against.
+            Ok(Box::new(CountingTransaction {
+                inner: self.inner.begin().await?,
+                queries: self.queries.clone(),
+            }))
+        }
+    }
+
+    struct CountingTransaction {
+        inner: Box<dyn Transaction>,
+        queries: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transaction for CountingTransaction {
+        async fn query(
+            &self,
+            sql: &str,
+            params: &[crate::forge::value::SqlValue],
+        ) -> crate::forge::value::Result<crate::forge::value::Rows> {
+            // `INSERT`/`UPDATE … RETURNING` runs through `query` because it
+            // returns rows, but it IS the mutation, not a re-read. Counting it
+            // would make the assertion meaningless.
+            if !sql.trim_start().get(..6).is_some_and(|head| {
+                head.eq_ignore_ascii_case("select")
+            }) {
+                return self.inner.query(sql, params).await;
+            }
+            self.queries.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.query(sql, params).await
+        }
+        async fn execute(
+            &self,
+            sql: &str,
+            params: &[crate::forge::value::SqlValue],
+        ) -> crate::forge::value::Result<u64> {
+            self.inner.execute(sql, params).await
+        }
+        async fn commit(self: Box<Self>) -> crate::forge::value::Result<()> {
+            self.inner.commit().await
+        }
+        async fn rollback(self: Box<Self>) -> crate::forge::value::Result<()> {
+            self.inner.rollback().await
+        }
+    }
+
+    /// **§ 6.2, asserted.** An append to a warm partition runs *no* reads.
+    ///
+    /// The row is rendered from the record the `INSERT … RETURNING` handed back
+    /// and spliced into the cached bytes, so the cost is O(1) in the partition
+    /// size rather than O(rows in it). This is the claim that is not parity with
+    /// anything, and it is the one most likely to regress silently — a fallback
+    /// added for some edge case would restore the query and leave every test
+    /// passing.
+    #[tokio::test]
+    async fn an_append_to_a_warm_partition_runs_zero_queries() {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let db = CountingSubstrate {
+            inner: LibSqlSubstrate::open_ephemeral().await.unwrap(),
+            queries: queries.clone(),
+        };
+        let schema = partitioned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        // Warm the partition the way the read-through path does — this read is
+        // expected and is what the counter is reset after.
+        let collection = schema.slot_for_topic("messages").unwrap();
+        let bytes = materialize_slot(&db, collection, Some("a")).await.unwrap();
+        broadcast
+            .try_topic_partition("messages:a".to_string(), "messages".into(), "a".into(), bytes)
+            .unwrap();
+
+        queries.store(0, AtomicOrdering::Relaxed);
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append(
+                "messages",
+                json!({ "room": "a", "body": "hello" }),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            queries.load(AtomicOrdering::Relaxed),
+            0,
+            "a warm-partition append must re-run no query; § 6.2 is the claim \
+             and this count is the proof"
+        );
+    }
+
+    /// The converse, so the test above cannot pass by counting nothing: a
+    /// **cold** partition has no cached bytes to splice into, so the same write
+    /// legitimately falls back to the query. Correct and slower — never wrong.
+    #[tokio::test]
+    async fn an_append_to_a_cold_partition_falls_back_to_the_query() {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let db = CountingSubstrate {
+            inner: LibSqlSubstrate::open_ephemeral().await.unwrap(),
+            queries: queries.clone(),
+        };
+        let schema = partitioned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        queries.store(0, AtomicOrdering::Relaxed);
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append(
+                "messages",
+                json!({ "room": "a", "body": "hello" }),
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            queries.load(AtomicOrdering::Relaxed) > 0,
+            "a cold partition must re-materialise; if this is also zero the \
+             counter is measuring nothing"
+        );
+    }
 
     fn append(collection: &str, record: Value) -> ForgeWrite {
         ForgeWrite::Append {
@@ -1695,6 +2354,7 @@ mod substrate_tests {
             async fn project_rows(
                 &self,
                 collection: &str,
+                _partition: Option<&str>,
                 value: &[u8],
             ) -> Option<crate::forge::delta::RenderedRows> {
                 if collection != "guestbook" {
@@ -1785,6 +2445,7 @@ mod substrate_tests {
             async fn project_rows(
                 &self,
                 collection: &str,
+                _partition: Option<&str>,
                 value: &[u8],
             ) -> Option<crate::forge::delta::RenderedRows> {
                 if collection != "guestbook" {
@@ -1869,6 +2530,7 @@ mod substrate_tests {
         async fn project_rows(
             &self,
             collection: &str,
+            _partition: Option<&str>,
             value: &[u8],
         ) -> Option<crate::forge::delta::RenderedRows> {
             if collection != "guestbook" {

@@ -238,6 +238,14 @@ harness = false
 name    = "parity_cold_start"
 harness = false
 
+# PRISM § 11 — the three merge-gating shape measurements for dynamic topics.
+# Plain `main` rather than criterion: these compare two configurations once at a
+# size where the difference is real, which is not what criterion measures.
+[[bench]]
+name              = "prism_partitions"
+harness           = false
+required-features = ["forge"]
+
 [profile.release]
 opt-level     = 3
 lto           = true

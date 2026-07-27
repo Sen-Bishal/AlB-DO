@@ -103,15 +103,30 @@ const HELLO_EVENT: &str = "hello";
 
 /// The single choke point where a route path becomes a topic list.
 ///
-/// Today this is `resolve_route_topics` + allow-all — every topic is a global
-/// compile-time constant, so nothing is grantable that isn't already public.
-/// Item 4 (dynamic topics) changes only an implementation of this trait:
-/// parameterized route → parameterized topics, checked against the lane's
-/// identity. The subscribe protocol around it does not move. `None` means
-/// *denied or unknown* — the caller reports the route in `denied` and
-/// subscribes nothing.
+/// `None` means *denied or unknown* — the caller reports the route in `denied`
+/// and subscribes nothing.
+///
+/// PRISM · this is now async, and the reason is worth stating. A partitioned
+/// route's topics do not exist until a request names their keys, so resolving
+/// them can require materialising a value out of FORGE. Doing that inside the
+/// choke point rather than after it is what makes "authorized" and "seedable"
+/// the same state: the caller snapshots every granted topic under its lock
+/// immediately afterwards, and a granted-but-cold partition would seed the
+/// joining tab with an empty room — indistinguishable, in the browser, from a
+/// room that really is empty.
+///
+/// Identity still does not affect the decision, and that is not a gap. A
+/// partition is reachable only through a route that renders it (PRISM invariant
+/// 2), so this grants exactly the read the page GET already granted. Item 5 adds
+/// the `user.id` key source and a per-topic policy check inside this same
+/// function; the protocol, envelope, election and caps around it do not move.
+#[async_trait::async_trait]
 pub trait RouteAuthority: Send + Sync {
-    fn authorize_route(&self, identity: Option<SessionId>, path: &str) -> Option<Vec<String>>;
+    async fn authorize_route(
+        &self,
+        identity: Option<SessionId>,
+        path: &str,
+    ) -> Option<Vec<String>>;
     /// The broadcast registry circuits subscribe against. Resolved per
     /// subscribe call (not pinned at trunk-open) so a dev world-swap binds
     /// NEW circuits to the live world; existing circuits keep the registry
@@ -483,7 +498,7 @@ async fn subscribe_routes(
     let mut outcome = SubscribeOutcome::default();
 
     for add in request.add {
-        let Some(topics) = authority.authorize_route(lane.identity, &add.p) else {
+        let Some(topics) = authority.authorize_route(lane.identity, &add.p).await else {
             outcome.denied.push(add.p);
             continue;
         };
@@ -648,8 +663,13 @@ mod tests {
         projector: Option<Arc<dyn RowProjector>>,
     }
 
+    #[async_trait::async_trait]
     impl RouteAuthority for StaticAuthority {
-        fn authorize_route(&self, _identity: Option<SessionId>, path: &str) -> Option<Vec<String>> {
+        async fn authorize_route(
+            &self,
+            _identity: Option<SessionId>,
+            path: &str,
+        ) -> Option<Vec<String>> {
             self.table.get(path).cloned()
         }
         fn registry(&self) -> Arc<BroadcastRegistry> {
@@ -905,6 +925,7 @@ mod tests {
         async fn project_rows(
             &self,
             collection: &str,
+            _partition: Option<&str>,
             _value: &[u8],
         ) -> Option<dom_render_compiler::forge::RenderedRows> {
             (collection == "g").then(|| {

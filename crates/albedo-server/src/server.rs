@@ -28,13 +28,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
-use dom_render_compiler::runtime::{BroadcastRegistry, SessionId, SlotStore};
+use dom_render_compiler::runtime::{
+    resolve_partition_topics, BroadcastRegistry, ResolvedPartition, SessionId, SlotStore,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -111,6 +113,113 @@ impl LiveRuntime {
             .row_projector
             .write()
             .expect("row projector lock poisoned") = Some(projector);
+    }
+
+    /// PRISM · materialise one partition into the registry if it is not already
+    /// there, and report whether the topic ended up live.
+    ///
+    /// The read-through half of "the substrate is the truth, the value is a
+    /// cache". Three outcomes, all of them fine for the page:
+    ///
+    /// - **hit** — the entry exists; stamp it so the byte budget sees a read as
+    ///   use, and do no I/O. A hit is authoritative rather than merely likely:
+    ///   within a process the write path keeps every warm partition exact by
+    ///   splicing or evicting it, so there is no staleness window to re-check.
+    /// - **miss** — one indexed range scan over the partition, then mint.
+    /// - **refused** — a slot-id collision, a collection that is not declared, a
+    ///   substrate error. Logged with the topic named; the topic stays
+    ///   unregistered and the route degrades to no live data.
+    async fn warm_partition(&self, partition: &ResolvedPartition) -> bool {
+        if self.broadcast.touch(&partition.topic) {
+            return true;
+        }
+
+        let Some(substrate) = self.forge_substrate.get() else {
+            return false;
+        };
+        let Some(collection) = self.forge_schema.slot_for_topic(&partition.collection) else {
+            // The boot check (`validate_partition_bindings`) rules this out for
+            // any binding the compiler saw, so reaching it means the schema and
+            // the manifest were built from different sources — worth a warning
+            // rather than a silent empty room.
+            warn!(
+                target: "albedo.prism",
+                topic = %partition.topic,
+                collection = %partition.collection,
+                "partition names a collection the FORGE schema does not declare; \
+                 route will render without live data"
+            );
+            return false;
+        };
+
+        let bytes = match dom_render_compiler::forge::skeleton::materialize_slot(
+            substrate.as_ref(),
+            collection,
+            Some(partition.key.as_str()),
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    target: "albedo.prism",
+                    topic = %partition.topic,
+                    error = %err,
+                    "partition materialisation failed; route will render without live data"
+                );
+                return false;
+            }
+        };
+
+        match self.broadcast.try_topic_partition(
+            partition.topic.clone(),
+            Arc::from(partition.collection.as_str()),
+            Arc::from(partition.key.as_str()),
+            bytes,
+        ) {
+            Ok(_) => true,
+            Err(err) => {
+                // The § 5.3 guard firing. One room loudly refuses to go live,
+                // which is the trade the guard exists to make — the alternative
+                // is two rooms silently sharing a wire slot and cross-delivering
+                // each other's rows.
+                warn!(
+                    target: "albedo.prism",
+                    topic = %partition.topic,
+                    error = %err,
+                    "partition refused: wire slot already held by another topic"
+                );
+                false
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::topics::TopicWarmer for LiveRuntime {
+    /// Warm each partition, then hold the process to its byte budget.
+    ///
+    /// The sweep runs **after** the warm rather than before, so the partitions
+    /// this request just asked for are the newest entries and cannot be the ones
+    /// reclaimed — warming a room only to evict it before rendering would be a
+    /// slow way to serve nothing. Subscribed partitions are never candidates
+    /// either, so a room with a live tab on it survives regardless.
+    async fn warm(&self, partitions: &[ResolvedPartition]) {
+        for partition in partitions {
+            self.warm_partition(partition).await;
+        }
+        if !partitions.is_empty() {
+            let dropped = self
+                .broadcast
+                .enforce_byte_budget(dom_render_compiler::runtime::DEFAULT_TOPIC_VALUE_BUDGET);
+            if dropped > 0 {
+                debug!(
+                    target: "albedo.prism",
+                    dropped,
+                    "topic value cache over budget; reclaimed idle partitions"
+                );
+            }
+        }
     }
 }
 
@@ -948,11 +1057,18 @@ impl AlbedoServerBuilder {
                     form_error_spans.clone(),
                 )));
 
+            // PRISM · the warmer is the `LiveRuntime` itself — the persistent
+            // tier holding the schema, the substrate and the registry. Cloning
+            // it here (a handful of `Arc` bumps) rather than reaching through
+            // the world is what keeps read-through materialisation working
+            // across a dev reload: a rebuilt world has a fresh registry, and a
+            // partition warmed into the previous one would be invisible.
             services.registry = Arc::new(PooledTierBRenderRegistry::new(
                 pool.clone(),
                 plan,
                 self.live.broadcast.clone(),
                 form_error_spans,
+                Arc::new(self.live.clone()),
             ));
         }
 
@@ -1620,6 +1736,7 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
         let authority = WorldRouteAuthority {
             world: world.clone(),
             projector: state.live.projector(),
+            live: state.live.clone(),
         };
         let response = crate::handlers::phosphor::handle_subscribe(
             state.phosphor.clone(),
@@ -2018,6 +2135,25 @@ fn resolve_route_topics(
     streaming: &Arc<StreamingAppState>,
     page_path: &str,
 ) -> Option<Vec<String>> {
+    Some(
+        resolve_route_topics_detailed(world, streaming, page_path)?
+            .0,
+    )
+}
+
+/// [`resolve_route_topics`], keeping the resolved partitions alongside the topic
+/// list.
+///
+/// The topic strings are what the subscribe protocol wants; the
+/// [`ResolvedPartition`]s are what the warmer wants (it needs the collection and
+/// the key to run the query, and re-deriving those by splitting the topic string
+/// back apart would be a second implementation of the naming rule — exactly the
+/// drift invariant 5 forbids).
+fn resolve_route_topics_detailed(
+    world: &RenderWorld,
+    streaming: &Arc<StreamingAppState>,
+    page_path: &str,
+) -> Option<(Vec<String>, Vec<ResolvedPartition>)> {
     let RouteMatch::Matched(matched) = world.router.match_route(HttpMethod::Get, page_path) else {
         return None;
     };
@@ -2026,36 +2162,66 @@ fn resolve_route_topics(
         .entry_module
         .clone()
         .unwrap_or_else(|| page_path.to_string());
-    Some(
-        streaming
-            .manifest
-            .routes
-            .get(pattern.as_str())
-            .map(|route| route.shared_slot_topics.clone())
-            .unwrap_or_default(),
-    )
+    let Some(route) = streaming.manifest.routes.get(pattern.as_str()) else {
+        return Some((Vec::new(), Vec::new()));
+    };
+
+    // PRISM · the same resolver the render path calls, over the same matched
+    // params. A spec whose param the route did not match, or whose key is
+    // outside the alphabet, contributes no topic — the page is live for
+    // everything else it reads and static for this one.
+    let partitions = resolve_partition_topics(&route.shared_slot_partitions, |name| {
+        matched.params.get(name).map(String::as_str)
+    });
+
+    let mut topics = route.shared_slot_topics.clone();
+    topics.extend(partitions.iter().map(|resolved| resolved.topic.clone()));
+    Some((topics, partitions))
 }
 
 /// PHOSPHOR's [`crate::handlers::phosphor::RouteAuthority`] over the live
 /// world: the same resolution the render and the per-tab lane use, plus the
-/// deny-on-unmatched rule. Today identity is unused — every topic is a
-/// global compile-time constant, so nothing is grantable that isn't already
-/// public. Item 4 (dynamic topics) changes the body of `authorize_route` and
-/// nothing else: parameterized route → parameterized topics, checked against
-/// the lane identity via the `AuthProvider`.
+/// deny-on-unmatched rule.
+///
+/// PRISM · this now grants **partitions** as well as compile-time topics, and
+/// identity is still unused — deliberately, and it is not a regression. A
+/// partition is reachable only through a route that renders it (invariant 2), so
+/// the subscribe path grants exactly the read the page GET already granted.
+/// Item 5 adds the `user.id` key source and a per-topic policy check inside this
+/// same function; the protocol, the envelope, the election and the caps do not
+/// move.
 struct WorldRouteAuthority {
     world: Arc<RenderWorld>,
     projector: Option<Arc<dyn dom_render_compiler::forge::RowProjector>>,
+    /// The persistent tier — schema + substrate + registry — so read-through
+    /// materialisation survives a dev world swap. Pinned here rather than
+    /// reached through `world` for the same reason the action adapters hold it:
+    /// a rebuilt world has a fresh registry, and a partition warmed into the
+    /// old one would be invisible to the new one.
+    live: LiveRuntime,
 }
 
+#[async_trait::async_trait]
 impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority {
-    fn authorize_route(
+    /// Resolve, warm, then grant.
+    ///
+    /// The warm is inside the choke point rather than beside it because a topic
+    /// this function returns is one the caller is about to snapshot under its
+    /// lock. Granting a partition that has not been materialised would seed the
+    /// joining tab with an empty room and leave it that way until somebody
+    /// wrote — indistinguishable, from the browser, from a room that really is
+    /// empty.
+    async fn authorize_route(
         &self,
         _identity: Option<dom_render_compiler::runtime::session::SessionId>,
         path: &str,
     ) -> Option<Vec<String>> {
         let streaming = self.world.streaming_runtime.as_ref()?;
-        resolve_route_topics(&self.world, streaming, path)
+        let (topics, partitions) = resolve_route_topics_detailed(&self.world, streaming, path)?;
+        if !partitions.is_empty() {
+            crate::topics::TopicWarmer::warm(&self.live, &partitions).await;
+        }
+        Some(topics)
     }
 
     fn registry(&self) -> Arc<BroadcastRegistry> {

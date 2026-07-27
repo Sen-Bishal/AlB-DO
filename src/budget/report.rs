@@ -402,6 +402,7 @@ mod tests {
             tier_b,
             tier_c,
             shared_slot_topics: Vec::new(),
+            shared_slot_partitions: Vec::new(),
             action_ids: Vec::new(),
             layout_chain: Vec::new(),
             error_component: None,

@@ -228,6 +228,13 @@ pub struct BroadcastTopic {
     /// PRISM · what this topic is. [`TopicIdentity::Static`] for everything
     /// registered today, so nothing changes until P3 mints a partition.
     identity: TopicIdentity,
+    /// PRISM · monotonic stamp of the last time anything used this topic, for
+    /// the byte budget's least-recently-used order.
+    ///
+    /// A counter rather than a clock: an `Instant` would be bigger, slower to
+    /// read, and no more informative — the budget only needs a total order over
+    /// "which of these was used longest ago", and a tick gives that exactly.
+    touched: AtomicU64,
 }
 
 impl BroadcastTopic {
@@ -244,6 +251,36 @@ impl BroadcastTopic {
     /// next write.
     pub fn current_value(&self) -> Vec<u8> {
         self.lock_value().clone()
+    }
+
+    /// Read the current value in place, without copying it.
+    ///
+    /// `current_value()` exists because most readers need to *own* the bytes
+    /// (they cross a thread, or outlive the lock). A reader that only inspects
+    /// them — the write path's splice, which derives new bytes from old — pays a
+    /// full copy of the partition for nothing. At 100,000 rows that copy is
+    /// megabytes, on every write, and it is one of the terms
+    /// `benches/prism_partitions.rs` found between the O(1) claim and the
+    /// measurement.
+    ///
+    /// `f` runs **under the topic's linearization lock**, so it must stay pure
+    /// and bounded: no `.await`, no second topic, no write back into the
+    /// registry. Anything else deadlocks against the lock it is holding.
+    pub fn with_value<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        f(&self.lock_value())
+    }
+
+    /// Byte length of the current value, without copying it.
+    ///
+    /// The byte budget asks this of every live partition on every sweep, and
+    /// `current_value().len()` answers it by **deep-copying the whole value
+    /// first** — so measuring a 4 MB footprint allocated and freed 4 MB, and the
+    /// sweep for 10,000 rooms cost 18.7 s in `benches/prism_partitions.rs`.
+    /// Reading the length under the same lock is the same answer for none of the
+    /// copying.
+    #[must_use]
+    pub fn value_len(&self) -> usize {
+        self.lock_value().len()
     }
 
     pub fn subscriber_count(&self) -> usize {
@@ -482,7 +519,21 @@ pub struct BroadcastRegistry {
     /// before any dynamic topic can be minted, so a dynamic mint always sees the
     /// complete static set.
     slot_ids: DashMap<u32, String>,
+    /// PRISM · source of the monotonic stamps in [`BroadcastTopic::touched`].
+    tick: AtomicU64,
 }
+
+/// Default ceiling on the bytes held by **evictable** topics.
+///
+/// The one cap PRISM v2 kept, in place of v1's reaper, leases, TTL and three
+/// separate counters. A byte budget bounds the thing that actually grows — a
+/// thousand quiet rooms with ten rows each cost far less than one busy room with
+/// a hundred thousand, and an instance count cannot tell those apart.
+///
+/// Static topics are excluded from both the measurement and the sweep: a
+/// `broadcast()` scalar has no derivation, so it is not a cache and must never
+/// be reclaimed.
+pub const DEFAULT_TOPIC_VALUE_BUDGET: usize = 64 * 1024 * 1024;
 
 impl BroadcastRegistry {
     pub fn new() -> Self {
@@ -530,6 +581,7 @@ impl BroadcastRegistry {
                     subscribers: DashMap::new(),
                     version: AtomicU64::new(0),
                     identity,
+                    touched: AtomicU64::new(self.tick.fetch_add(1, Ordering::Relaxed)),
                 })
             });
         entry.clone()
@@ -649,6 +701,70 @@ impl BroadcastRegistry {
         true
     }
 
+    /// Bytes currently held by evictable (partition) topics.
+    ///
+    /// Static topics are excluded on purpose — they are not a cache, so counting
+    /// them would let a large pinned collection permanently starve the budget
+    /// and evict partitions that were doing no harm.
+    #[must_use]
+    pub fn evictable_bytes(&self) -> usize {
+        self.topics
+            .iter()
+            .filter(|entry| entry.identity.is_evictable())
+            .map(|entry| entry.value_len())
+            .sum()
+    }
+
+    /// Reclaim idle partitions, least-recently-used first, until the evictable
+    /// footprint fits in `budget`. Returns how many were dropped.
+    ///
+    /// **This is safe only because the substrate is the truth.** A dropped
+    /// partition is not lost data; the next reader re-materialises it, so the
+    /// worst outcome is one query. That is the entire reason PRISM requires a
+    /// dynamic topic to be FORGE-backed, and why a static topic — which may be a
+    /// `broadcast()` scalar whose value exists nowhere else — is never a
+    /// candidate.
+    ///
+    /// A *subscribed* partition is never dropped either: something is watching
+    /// it, and reclaiming it would force a re-read on the very next write while
+    /// buying nothing. If every partition is subscribed the sweep can legitimately
+    /// finish still over budget rather than spin — being over budget is a
+    /// pressure signal, not an invariant to enforce at any cost.
+    pub fn enforce_byte_budget(&self, budget: usize) -> usize {
+        let mut total = self.evictable_bytes();
+        if total <= budget {
+            return 0;
+        }
+
+        // Snapshot the candidates first: dropping while iterating a `DashMap`
+        // risks deadlocking against the shard the iterator holds.
+        let mut candidates: Vec<(u64, String, usize)> = self
+            .topics
+            .iter()
+            .filter(|entry| entry.identity.is_evictable() && entry.subscribers.is_empty())
+            .map(|entry| {
+                (
+                    entry.touched.load(Ordering::Relaxed),
+                    entry.name.clone(),
+                    entry.value_len(),
+                )
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|(touched, _, _)| *touched);
+
+        let mut dropped = 0;
+        for (_, name, bytes) in candidates {
+            if total <= budget {
+                break;
+            }
+            if self.drop_if_idle(&name) {
+                total = total.saturating_sub(bytes);
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
     /// How many live topics are partitions. The number a cap would bound, and
     /// what a test asserts against after an eviction pass.
     #[must_use]
@@ -662,6 +778,33 @@ impl BroadcastRegistry {
     /// Returns the topic if it has been registered. No side effects.
     pub fn get(&self, topic: &str) -> Option<Arc<BroadcastTopic>> {
         self.topics.get(topic).map(|entry| entry.clone())
+    }
+
+    /// PRISM · mark a topic as used *now*, so the byte budget evicts by least
+    /// recently used rather than by least recently **written**.
+    ///
+    /// The write paths already stamp `touched`, and creation stamps it — so
+    /// before this existed the order was "least recently written", which is a
+    /// different thing wearing the same name. A room that thousands are reading
+    /// and nobody is posting to would sort as the coldest entry in the process
+    /// and be evicted ahead of a room one person wrote to once. Reads are the
+    /// workload PRISM is built for; they have to count.
+    ///
+    /// Called from the read-through path on a **cache hit** (a miss stamps at
+    /// creation instead). Cheap enough for the request path — one `DashMap`
+    /// probe and one relaxed fetch-add — and returns `false` for an
+    /// unregistered topic so a caller can tell a hit from a miss without a
+    /// second lookup.
+    pub fn touch(&self, topic: &str) -> bool {
+        match self.topics.get(topic) {
+            Some(entry) => {
+                entry
+                    .touched
+                    .store(self.tick.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Snapshot of every registered topic's current value, as
@@ -726,6 +869,9 @@ impl BroadcastRegistry {
             topic_entry.subscribers.insert(session, sender);
             guard.clone()
         };
+        topic_entry
+            .touched
+            .store(self.tick.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         drop(topic_entry);
 
         self.by_session
@@ -872,6 +1018,9 @@ impl BroadcastRegistry {
 
         let report = self.fan_out(topic, &topic_entry, &encoded);
         drop(guard);
+        topic_entry
+            .touched
+            .store(self.tick.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         Ok(report)
     }
 
@@ -1399,6 +1548,110 @@ mod tests {
         assert!(!is_valid_partition_key("a/b"));
         assert!(!is_valid_partition_key("a b"));
         assert!(!is_valid_partition_key("café"));
+    }
+
+    fn partition(registry: &BroadcastRegistry, key: &str, bytes: usize) {
+        let value = format!("[\"{}\"]", "x".repeat(bytes)).into_bytes();
+        registry
+            .try_topic_partition(
+                format!("messages:{key}"),
+                "messages".into(),
+                key.into(),
+                value,
+            )
+            .expect("minted");
+    }
+
+    #[test]
+    fn a_footprint_under_budget_is_left_alone() {
+        let registry = BroadcastRegistry::new();
+        partition(&registry, "a", 100);
+        partition(&registry, "b", 100);
+        assert_eq!(registry.enforce_byte_budget(10_000), 0);
+        assert_eq!(registry.dynamic_topic_count(), 2);
+    }
+
+    /// Least-recently-used goes first, and the sweep stops the moment it fits —
+    /// it is a budget, not a purge.
+    #[test]
+    fn the_sweep_drops_least_recently_used_first_and_stops_when_it_fits() {
+        let registry = BroadcastRegistry::new();
+        for key in ["a", "b", "c"] {
+            partition(&registry, key, 100);
+        }
+        // Touch `a` so it is no longer the oldest; `b` becomes the LRU.
+        registry.write_topic("messages:a", b"[\"fresh\"]".to_vec()).unwrap();
+
+        let footprint = registry.evictable_bytes();
+        assert!(footprint > 0);
+        // Budget that forces exactly one eviction.
+        let dropped = registry.enforce_byte_budget(footprint - 1);
+        assert_eq!(dropped, 1, "a budget is not a purge");
+        assert!(registry.get("messages:b").is_none(), "the LRU went first");
+        assert!(registry.get("messages:a").is_some());
+        assert!(registry.get("messages:c").is_some());
+    }
+
+    /// Something is watching it — reclaiming would force a re-read on the next
+    /// write and buy nothing.
+    #[test]
+    fn a_subscribed_partition_is_never_swept() {
+        let registry = BroadcastRegistry::new();
+        partition(&registry, "a", 500);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        registry
+            .subscribe(SessionId::random(), "messages:a", tx)
+            .expect("subscribe");
+
+        assert_eq!(registry.enforce_byte_budget(0), 0);
+        assert!(registry.get("messages:a").is_some());
+    }
+
+    /// A `broadcast()` scalar's value exists nowhere else, so it is not a cache
+    /// and must survive any amount of pressure. If this ever regresses, a busy
+    /// app silently loses shared state that has no other home.
+    #[test]
+    fn a_static_topic_is_never_swept_and_never_counted() {
+        let registry = BroadcastRegistry::new();
+        registry.topic("lobby:counter", vec![b'x'; 4096]);
+        assert_eq!(
+            registry.evictable_bytes(),
+            0,
+            "a static topic is not part of the cache footprint"
+        );
+        assert_eq!(registry.enforce_byte_budget(0), 0);
+        assert!(registry.get("lobby:counter").is_some());
+    }
+
+    /// With every partition subscribed the sweep cannot reach the budget. It
+    /// must finish anyway — being over budget is a pressure signal, not an
+    /// invariant to spin on.
+    #[test]
+    fn a_sweep_that_cannot_reach_the_budget_still_terminates() {
+        let registry = BroadcastRegistry::new();
+        let mut keepalive = Vec::new();
+        for key in ["a", "b"] {
+            partition(&registry, key, 200);
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            registry
+                .subscribe(SessionId::random(), &format!("messages:{key}"), tx)
+                .expect("subscribe");
+            keepalive.push(rx);
+        }
+        assert_eq!(registry.enforce_byte_budget(0), 0);
+        assert!(registry.evictable_bytes() > 0, "still over budget, and that is fine");
+    }
+
+    /// Eviction returns the wire slot, so the name can be re-minted later — the
+    /// property that makes a swept partition genuinely reclaimable rather than
+    /// merely hidden.
+    #[test]
+    fn a_swept_partition_releases_its_wire_slot() {
+        let registry = BroadcastRegistry::new();
+        partition(&registry, "a", 500);
+        assert_eq!(registry.enforce_byte_budget(0), 1);
+        assert!(registry.get("messages:a").is_none());
+        assert!(registry.try_topic("messages:a", b"[]".to_vec()).is_ok());
     }
 
     #[test]

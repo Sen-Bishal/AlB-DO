@@ -524,7 +524,13 @@ pub fn rewrite_shared_slot_topic_args(module: &mut Module) {
 
 /// `local -> export_name` for every identifier imported from
 /// [`FORGE_BINDINGS_MODULE`].
-fn forge_collection_locals(module: &Module) -> HashMap<String, String> {
+///
+/// `pub(crate)` so the B2/B4 anchor markers
+/// ([`crate::transforms::shared_slot_lists`]) resolve a `.where()` receiver to
+/// its *collection* the same way this pass does. Two implementations of the
+/// alias rule would let `import { messages as msgs }` classify under one name
+/// and fan out under another.
+pub(crate) fn forge_collection_locals(module: &Module) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {

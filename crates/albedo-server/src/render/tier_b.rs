@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use dom_render_compiler::ir::opcode::{Instruction, StableId};
-use dom_render_compiler::manifest::schema::{DataDep, DataSource, TierBNode};
+use dom_render_compiler::manifest::schema::{DataDep, DataSource, PartitionTopicSpec, TierBNode};
 use dom_render_compiler::transforms::shared_slot_lists::RowProjection;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
@@ -441,6 +441,15 @@ pub struct TierBEntryPlan {
     /// not, so only the list can be precomputed here. Empty for the vast
     /// majority of components, which read no shared slots at all.
     pub shared_topics: Vec<String>,
+    /// PRISM · the *partitioned* shared-slot bindings this component reads,
+    /// still unresolved.
+    ///
+    /// The counterpart to `shared_topics` for a topic whose identity does not
+    /// exist until a request supplies its key. Boot can precompute the spec and
+    /// nothing else — not the topic string, not the value, not even whether the
+    /// binding will resolve at all, since that depends on a URL nobody has
+    /// requested yet.
+    pub shared_partitions: Vec<PartitionTopicSpec>,
     /// Per-topic row-template incrementalisation class ([`RowProjection`]),
     /// derived at boot from the `.map()` callbacks in this entry's modules.
     /// Lets FORGE's row projector answer a single-record write on a `PerRecord`
@@ -509,6 +518,13 @@ pub struct PooledTierBRenderRegistry {
     /// form emits the exact error sinks the submit projection targets and
     /// bakabox stops dropping the frame. Empty when the project has no forms.
     form_error_spans: serde_json::Map<String, Value>,
+    /// PRISM · read-through materialisation for partitioned topics.
+    ///
+    /// A partition has no value in the registry until something asks for it, and
+    /// a render is usually the first thing to ask. Without this the first paint
+    /// of `/room/42` would show an empty room and only fill in once somebody
+    /// wrote to it — the page would look *wrong*, not merely slow.
+    warmer: Arc<dyn crate::topics::TopicWarmer>,
 }
 
 impl PooledTierBRenderRegistry {
@@ -518,14 +534,41 @@ impl PooledTierBRenderRegistry {
         plan: TierBRenderPlan,
         broadcast: Arc<dom_render_compiler::runtime::BroadcastRegistry>,
         form_error_spans: serde_json::Map<String, Value>,
+        warmer: Arc<dyn crate::topics::TopicWarmer>,
     ) -> Self {
         Self {
             pool,
             plan,
             broadcast,
             form_error_spans,
+            warmer,
         }
     }
+}
+
+/// PRISM · resolve this component's partition bindings against the `params` the
+/// route matched.
+///
+/// The params arrive inside `props` because that is where the render already
+/// puts them: `dynamic_prop_keys` carries `"params"` for any `[slug]` route, and
+/// `RequestContext::resolve("params")` assembles the matched map into the object
+/// a component destructures. So a component that can *write*
+/// `messages.where({ room: params.id })` necessarily receives `params` — the
+/// expression would not compile otherwise — and reading them back out here binds
+/// the topic to exactly the values the component itself sees.
+fn resolve_partitions_for_props(
+    plan: &TierBEntryPlan,
+    props: &Value,
+) -> Vec<dom_render_compiler::runtime::ResolvedPartition> {
+    if plan.shared_partitions.is_empty() {
+        return Vec::new();
+    }
+    let params = props.get("params").and_then(Value::as_object);
+    dom_render_compiler::runtime::resolve_partition_topics(&plan.shared_partitions, |name| {
+        params
+            .and_then(|map| map.get(name))
+            .and_then(Value::as_str)
+    })
 }
 
 /// The `host` object seeding one Tier-B render: the component's shared-slot
@@ -538,16 +581,39 @@ impl PooledTierBRenderRegistry {
 /// whose topic value has no initial-argument fallback to degrade to.
 fn host_seed_for(
     plan: &TierBEntryPlan,
+    partitions: &[dom_render_compiler::runtime::ResolvedPartition],
     broadcast: &dom_render_compiler::runtime::BroadcastRegistry,
     form_error_spans: &serde_json::Map<String, Value>,
 ) -> String {
+    // Static topics and resolved partitions are seeded through the same
+    // function, from the same registry, in one pass — so a component reading one
+    // of each cannot end up with two different notions of "current".
     let shared = dom_render_compiler::runtime::shared_slot_host_seed(
-        plan.shared_topics.iter().map(String::as_str),
+        plan.shared_topics
+            .iter()
+            .map(String::as_str)
+            .chain(partitions.iter().map(|p| p.topic.as_str())),
         broadcast,
     );
     let mut host = serde_json::Map::new();
     if !shared.is_empty() {
         host.insert("shared".to_string(), Value::Object(shared));
+    }
+    // PRISM · `binding -> topic`, read by the `__albedo_topic("<binding>")` call
+    // the transpile folded the `.where(…)` argument into. This is the only place
+    // a minted topic string crosses into JS, and it crosses as *data* — nothing
+    // in the engine ever builds one, which is what keeps the naming rule in one
+    // place (invariant 5) and the client free of a hash path it would otherwise
+    // need (§ 3.3).
+    //
+    // A binding that did not resolve is simply absent, and the shim returns null
+    // for it: the slot reads null, the page renders, nothing throws.
+    if !partitions.is_empty() {
+        let topics = partitions
+            .iter()
+            .map(|p| (p.binding.clone(), Value::String(p.topic.clone())))
+            .collect::<serde_json::Map<String, Value>>();
+        host.insert("topics".to_string(), Value::Object(topics));
     }
     // P6 · the error sinks the shim appends to a form-action form. Project-
     // global, so independent of this component's shared topics — a form in a
@@ -593,9 +659,24 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
 
         let props_json = serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string());
         let render_fn_owned = render_fn.to_string();
+
+        // PRISM · resolve this request's partitions, then materialise them
+        // *before* the seed is read. Order matters: `host_seed_for` reads values
+        // out of the registry, so a warm that ran after it would fill the cache
+        // for the next request and render this one empty.
+        let partitions = resolve_partitions_for_props(&plan, props);
+        if !partitions.is_empty() {
+            self.warmer.warm(&partitions).await;
+        }
+
         // Read the topics' values here, on the request, not at boot — the whole
         // point is that they are live.
-        let host_json = host_seed_for(&plan, self.broadcast.as_ref(), &self.form_error_spans);
+        let host_json = host_seed_for(
+            &plan,
+            &partitions,
+            self.broadcast.as_ref(),
+            &self.form_error_spans,
+        );
 
         // The closure crosses to the engine's dedicated thread, so every capture
         // and the return type must be `Send + 'static`. The engine's
@@ -773,8 +854,20 @@ mod tests {
                 entry: "mod::Comp".to_string(),
                 modules: Vec::new(),
                 shared_topics: topics.iter().map(|t| (*t).to_string()).collect(),
+                shared_partitions: Vec::new(),
                 shared_topic_classes: HashMap::new(),
             }
+        }
+
+        /// The tests below predate partitions and are about the static half of
+        /// the seed, so they pass none — PRISM § 9's "static topics behave
+        /// exactly as today" is precisely what they now also pin.
+        fn host_seed_for(
+            plan: &TierBEntryPlan,
+            broadcast: &BroadcastRegistry,
+            spans: &serde_json::Map<String, Value>,
+        ) -> String {
+            super::host_seed_for(plan, &[], broadcast, spans)
         }
 
         #[test]
@@ -859,6 +952,106 @@ mod tests {
                 parsed["formErrorSpans"]["sign_guestbook"],
                 json!(r#"<span data-albedo-id="1" data-albedo-error="author"></span>"#),
             );
+        }
+    }
+
+    /// PRISM · the render half of dynamic topics: a `.where(…)` binding becomes
+    /// a topic identity bound to *this* request's params, and both halves of the
+    /// seed the JS shims read (`host.topics`, `host.shared`) are filled from it.
+    mod partition_seed {
+        use super::*;
+        use dom_render_compiler::manifest::schema::PartitionTopicSpec;
+        use dom_render_compiler::runtime::BroadcastRegistry;
+
+        fn plan_reading_partition() -> TierBEntryPlan {
+            TierBEntryPlan {
+                entry: "routes/room/[id].tsx::Room".to_string(),
+                modules: Vec::new(),
+                shared_topics: Vec::new(),
+                shared_partitions: vec![PartitionTopicSpec {
+                    binding: "rows".to_string(),
+                    collection: "messages".to_string(),
+                    column: "room".to_string(),
+                    param: "id".to_string(),
+                }],
+                shared_topic_classes: HashMap::new(),
+            }
+        }
+
+        #[test]
+        fn a_partition_resolves_against_the_params_the_component_receives() {
+            let plan = plan_reading_partition();
+            let resolved =
+                resolve_partitions_for_props(&plan, &json!({ "params": { "id": "42" } }));
+
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].topic, "messages:42");
+            assert_eq!(resolved[0].binding, "rows");
+        }
+
+        /// A URL segment the alphabet rejects must produce no topic — and, far
+        /// more importantly, must not fail the render. PRISM § 4: a weird id in
+        /// a URL renders a static page, not a 500.
+        #[test]
+        fn a_hostile_param_yields_no_topic_and_no_failure() {
+            let plan = plan_reading_partition();
+            for hostile in ["a:b", "../secrets", ""] {
+                let resolved = resolve_partitions_for_props(
+                    &plan,
+                    &json!({ "params": { "id": hostile } }),
+                );
+                assert!(resolved.is_empty(), "{hostile:?} must mint nothing");
+            }
+        }
+
+        /// Props with no `params` at all — a static route, or a component
+        /// rendered outside a matched route. Nothing resolves, nothing panics.
+        #[test]
+        fn absent_params_resolve_to_nothing() {
+            let plan = plan_reading_partition();
+            assert!(resolve_partitions_for_props(&plan, &json!({})).is_empty());
+        }
+
+        /// The seed's two halves have to agree: `host.topics[binding]` names the
+        /// topic, and `host.shared[topic]` carries its value. The transpiled
+        /// component reads the first to find the key for the second, so a
+        /// mismatch renders an empty room with no error anywhere.
+        #[test]
+        fn the_seed_carries_the_binding_to_topic_map_and_the_value() {
+            let broadcast = BroadcastRegistry::new();
+            broadcast
+                .try_topic_partition(
+                    "messages:42".to_string(),
+                    "messages".into(),
+                    "42".into(),
+                    br#"[{"body":"hello"}]"#.to_vec(),
+                )
+                .expect("minted");
+
+            let plan = plan_reading_partition();
+            let resolved =
+                resolve_partitions_for_props(&plan, &json!({ "params": { "id": "42" } }));
+            let host = super::super::host_seed_for(
+                &plan,
+                &resolved,
+                &broadcast,
+                &serde_json::Map::new(),
+            );
+            let parsed: Value = serde_json::from_str(&host).expect("host seed is JSON");
+
+            assert_eq!(parsed["topics"]["rows"], json!("messages:42"));
+            assert_eq!(parsed["shared"]["messages:42"], json!([{"body": "hello"}]));
+        }
+
+        /// Two rooms are two topics. If this ever collapses, every room shows
+        /// every other room's rows — the failure the whole design exists to make
+        /// unrepresentable.
+        #[test]
+        fn two_keys_are_two_topics() {
+            let plan = plan_reading_partition();
+            let a = resolve_partitions_for_props(&plan, &json!({ "params": { "id": "a" } }));
+            let b = resolve_partitions_for_props(&plan, &json!({ "params": { "id": "b" } }));
+            assert_ne!(a[0].topic, b[0].topic);
         }
     }
 
@@ -1074,6 +1267,7 @@ mod tests {
             TierBRenderPlan::new(),
             Arc::new(dom_render_compiler::runtime::BroadcastRegistry::new()),
             serde_json::Map::new(),
+            Arc::new(crate::topics::NoTopicWarmer),
         );
 
         let err = registry

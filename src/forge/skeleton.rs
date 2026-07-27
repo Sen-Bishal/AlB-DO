@@ -470,6 +470,16 @@ pub async fn materialize_seeds(
 ) -> crate::forge::value::Result<Vec<(String, Vec<u8>)>> {
     let mut seeds = Vec::with_capacity(schema.len());
     for collection in schema.collections() {
+        // PRISM · a partitioned collection has no boot-time value, because it has
+        // no boot-time *topic*. `messages` is not one channel holding every row;
+        // it is a family of channels, one per key, and no key exists until a
+        // request names one. Materialising it here would have to invent a
+        // whole-table read that nothing subscribes to and that
+        // `materialize_slot` correctly refuses — so it is skipped, and the
+        // read-through path mints each partition on first use.
+        if collection.partition_by.is_some() {
+            continue;
+        }
         seeds.push((
             collection.topic.clone(),
             materialize_slot(substrate, collection, None).await?,

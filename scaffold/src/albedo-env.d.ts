@@ -366,6 +366,23 @@ declare module "albedo" {
   // structured objects all round-trip.
   export function useSharedSlot<T = unknown>(topic: string): T;
 
+  // A collection (or one partition of one) imported from `albedo/forge`.
+  //
+  // Declared structurally rather than by importing the generated
+  // `albedo/forge` types, and deliberately: that module's declarations are
+  // emitted per project on build, so a type reference to them here would
+  // make this file fail to resolve in a project that has not built yet —
+  // which is every project on its first `npm run typecheck`. The `__row`
+  // phantom is the same shape the generator emits, so inference still
+  // carries the row type through.
+  export interface SharedSlotSource<Row = unknown> {
+    readonly __row?: Row;
+  }
+
+  // Reading a collection gives you its rows, typed from your
+  // `albedo.config.ts` — you do not annotate them.
+  export function useSharedSlot<Row>(source: SharedSlotSource<Row>): Row[];
+
   // The submitted fields of a `<form action="action:NAME" method="POST">`,
   // keyed by each input's `name` attribute. The interpreter seeds this as
   // the handler's argument (`eval/core.rs` — "seeded LAST so it shadows a

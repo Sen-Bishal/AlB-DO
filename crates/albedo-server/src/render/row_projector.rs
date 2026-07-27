@@ -68,15 +68,22 @@ impl PooledRowProjector {
 
     /// The single component that reads `collection`, or `None` when none or
     /// more than one does.
+    ///
+    /// PRISM · a partitioned read counts. `shared_topics` alone would miss it —
+    /// `messages.where({ … })` contributes no compile-time topic — and the
+    /// consequence is not a slower path but a dead one: no sole reader means no
+    /// projected rows, which means a partitioned write ships its snapshot with
+    /// `ListUpdate::None` and every keyed list anchor on the page sits still.
     fn sole_reader(&self, collection: &str) -> Option<(&String, &TierBEntryPlan)> {
         let mut found = None;
         for entry in &self.plan {
-            if entry
-                .1
-                .shared_topics
-                .iter()
-                .any(|topic| topic == collection)
-            {
+            let reads = entry.1.shared_topics.iter().any(|topic| topic == collection)
+                || entry
+                    .1
+                    .shared_partitions
+                    .iter()
+                    .any(|spec| spec.collection == collection);
+            if reads {
                 if found.is_some() {
                     return None;
                 }
@@ -89,6 +96,49 @@ impl PooledRowProjector {
     /// The `host` object for a projected render: the collection at the value
     /// being written, plus the project-global form error spans. Deliberately
     /// mirrors `tier_b::host_seed_for` minus its registry read.
+    ///
+    /// PRISM · for a partitioned reader the seed also has to satisfy
+    /// `__albedo_topic(binding)`, or the component reads null and renders no
+    /// rows at all. It is seeded with the **collection name** standing in for the
+    /// topic, and that substitution is exact rather than convenient: the topic
+    /// string reaches the output in one place only — the anchor attribute on the
+    /// list's container — and rows are the container's keyed *children*.
+    /// [`extract_keyed_rows`] is handed the same stand-in, so it finds the same
+    /// anchor, and every row it lifts out is byte-identical to the one a real
+    /// request rendered.
+    ///
+    /// Doing it this way keeps the projector keyed by collection, which is what
+    /// it should be: the row **template** belongs to the collection, while the
+    /// subscriber set belongs to the partition. The write path already routes the
+    /// fan-out by channel.
+    /// The props a projected render runs with.
+    ///
+    /// `{}` for an unpartitioned collection, exactly as before. For a
+    /// partitioned one it carries `params`, rebuilt from the partition key and
+    /// the param name the binding declared — because a component that reads a
+    /// partition read a route param to name it, and very likely renders that
+    /// param too (`<h1>Room {params.id}</h1>`, a hidden field carrying the room
+    /// into the write). Rendering it with no props does not merely lose a
+    /// heading: `params.id` throws, the projection fails, and the write silently
+    /// degrades to a snapshot no keyed anchor repaints from.
+    fn props_for(&self, collection: &str, partition: Option<&str>) -> String {
+        let Some(key) = partition else {
+            return "{}".to_string();
+        };
+        let params = self
+            .sole_reader(collection)
+            .map(|(_, plan)| {
+                plan.shared_partitions
+                    .iter()
+                    .filter(|spec| spec.collection == collection)
+                    .map(|spec| (spec.param.clone(), Value::String(key.to_string())))
+                    .collect::<serde_json::Map<String, Value>>()
+            })
+            .unwrap_or_default();
+        serde_json::to_string(&serde_json::json!({ "params": params }))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
     fn host_seed(&self, collection: &str, value: &[u8]) -> Option<String> {
         // Same lowering the registry-backed seed performs: topic bytes are the
         // materialised JSON the component's `useSharedSlot` sees as a value.
@@ -98,6 +148,22 @@ impl PooledRowProjector {
 
         let mut host = serde_json::Map::new();
         host.insert("shared".to_string(), Value::Object(shared));
+        if let Some((_, plan)) = self.sole_reader(collection) {
+            let topics = plan
+                .shared_partitions
+                .iter()
+                .filter(|spec| spec.collection == collection)
+                .map(|spec| {
+                    (
+                        spec.binding.clone(),
+                        Value::String(collection.to_string()),
+                    )
+                })
+                .collect::<serde_json::Map<String, Value>>();
+            if !topics.is_empty() {
+                host.insert("topics".to_string(), Value::Object(topics));
+            }
+        }
         if !self.form_error_spans.is_empty() {
             host.insert(
                 "formErrorSpans".to_string(),
@@ -129,11 +195,17 @@ impl RowProjector for PooledRowProjector {
         }
     }
 
-    async fn project_rows(&self, collection: &str, value: &[u8]) -> Option<RenderedRows> {
+    async fn project_rows(
+        &self,
+        collection: &str,
+        partition: Option<&str>,
+        value: &[u8],
+    ) -> Option<RenderedRows> {
         let (render_fn, plan) = self.sole_reader(collection)?;
         let render_fn = render_fn.clone();
         let plan = plan.clone();
         let host_json = self.host_seed(collection, value)?;
+        let props_json = self.props_for(collection, partition);
 
         let html = self
             .pool
@@ -145,7 +217,7 @@ impl RowProjector for PooledRowProjector {
                         .map_err(|err| err.to_string())?;
                 }
                 engine
-                    .render_component_with_host(&plan.entry, "{}", &host_json)
+                    .render_component_with_host(&plan.entry, &props_json, &host_json)
                     .map(|output| output.html)
                     .map_err(|err| err.to_string())
             })

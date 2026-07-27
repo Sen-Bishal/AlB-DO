@@ -632,6 +632,22 @@ fn validate_entry_module(entry: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The `forge` block of the project at `project_dir`, and nothing else.
+///
+/// Exists so `albedo init` can emit `.albedo/forge.d.ts` from the config it just
+/// wrote without standing up a whole dev contract (which wants a resolvable
+/// root, an entry, CLI overrides — none of which apply while scaffolding). Reads
+/// through the same parser the dev and serve paths use, so the types a fresh
+/// project gets are the types its first build would have produced.
+///
+/// # Errors
+/// Propagates a config that cannot be found or parsed.
+pub fn load_forge_declarations(
+    project_dir: &Path,
+) -> Result<BTreeMap<String, crate::forge::CollectionDecl>, String> {
+    Ok(load_dev_config(project_dir, None)?.config.forge)
+}
+
 #[derive(Debug)]
 struct LoadedDevConfig {
     config: DevConfig,

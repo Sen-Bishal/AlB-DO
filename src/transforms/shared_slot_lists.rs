@@ -32,9 +32,10 @@ use std::collections::HashMap;
 use swc_common::{sync::Lrc, FileName, SourceMap, DUMMY_SP};
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_ast::{
-    BlockStmtOrExpr, CallExpr, Callee, Expr, Ident, IdentName, ImportSpecifier, JSXAttr,
-    JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElement, JSXElementChild, JSXExpr, Lit,
-    MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, Pat, Str, VarDeclarator,
+    BlockStmtOrExpr, CallExpr, Callee, Expr, ExprOrSpread, Ident, IdentName, ImportSpecifier,
+    JSXAttr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElement, JSXElementChild, JSXExpr,
+    JSXExprContainer, Lit, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, Pat, Str,
+    VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -295,11 +296,15 @@ pub fn mark_shared_slot_lists(module: &mut Module) {
 
 /// `local_binding -> topic` for every `const X = useSharedSlot("T")` whose
 /// `useSharedSlot` resolves to the `albedo` import.
-fn collect_shared_slot_idents(module: &Module) -> HashMap<String, String> {
+fn collect_shared_slot_idents(module: &Module) -> HashMap<String, SlotAnchor> {
     let Some(local_name) = use_shared_slot_local_name(module) else {
         return HashMap::new();
     };
-    let mut collector = SlotDeclCollector { local_name, out: HashMap::new() };
+    let mut collector = SlotDeclCollector {
+        local_name,
+        collections: crate::transforms::shared_slots::forge_collection_locals(module),
+        out: HashMap::new(),
+    };
     module.visit_with(&mut collector);
     collector.out
 }
@@ -334,22 +339,70 @@ fn use_shared_slot_local_name(module: &Module) -> Option<String> {
 
 struct SlotDeclCollector {
     local_name: String,
-    out: HashMap<String, String>,
+    /// `local -> export name` for `albedo/forge` imports, so a `.where()`
+    /// receiver resolves to its collection through the same alias rule the
+    /// extractor uses.
+    collections: HashMap<String, String>,
+    out: HashMap<String, SlotAnchor>,
 }
 
 impl Visit for SlotDeclCollector {
     fn visit_var_declarator(&mut self, decl: &VarDeclarator) {
         if let (Pat::Ident(name), Some(init)) = (&decl.name, &decl.init) {
-            if let Some(topic) = shared_slot_topic(init, &self.local_name) {
-                self.out.insert(name.id.sym.to_string(), topic);
+            let binding = name.id.sym.to_string();
+            if let Some(anchor) =
+                shared_slot_topic(init, &binding, &self.local_name, &self.collections)
+            {
+                self.out.insert(binding, anchor);
             }
         }
         decl.visit_children_with(self);
     }
 }
 
-/// `Some(topic)` when `expr` is `<local_name>("topic")` with a string-literal arg.
-fn shared_slot_topic(expr: &Expr, local_name: &str) -> Option<String> {
+/// Where a marked element's anchor attribute value comes from.
+///
+/// PRISM · a partitioned binding has no topic string at compile time, so the
+/// marker cannot write one into the attribute. It writes the *lookup* instead
+/// and lets the render evaluate it — `data-albedo-list-slot={__albedo_topic("rows")}`
+/// — which produces exactly the same HTML a static topic produces
+/// (`data-albedo-list-slot="messages:42"`) from markup that could not have named
+/// it.
+///
+/// That this stays an attribute holding a plain string is the whole of § 3.3's
+/// "zero client change": the browser hashes the stamped string to reach the wire
+/// slot, and it neither knows nor cares that the server minted this one a
+/// millisecond ago.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlotAnchor {
+    /// A compile-time topic: `useSharedSlot("guestbook")`, or a whole collection.
+    Literal(String),
+    /// One partition. Carries the component-local binding name (the key the
+    /// render seeds `host.topics` under) **and** the collection it partitions.
+    ///
+    /// The collection is what the row-projection classifier keys by. Without it
+    /// a partitioned list is unclassifiable, falls back to
+    /// [`RowProjection::WholeView`], and every write re-renders the entire
+    /// partition — measured at 4.9× a small room's write cost before this
+    /// carried the name.
+    Deferred {
+        binding: String,
+        collection: String,
+    },
+}
+
+/// How the marker classifies one `const <binding> = useSharedSlot(<arg>)`.
+///
+/// Mirrors [`crate::transforms::shared_slots`]' accepted argument forms
+/// deliberately: if these two disagreed about what counts as a shared slot, a
+/// binding would be extracted (and therefore subscribed) without being stamped,
+/// which is a list that goes live on the wire and never paints.
+fn shared_slot_topic(
+    expr: &Expr,
+    binding: &str,
+    local_name: &str,
+    collections: &HashMap<String, String>,
+) -> Option<SlotAnchor> {
     let Expr::Call(CallExpr { callee: Callee::Expr(callee), args, .. }) = expr else {
         return None;
     };
@@ -359,21 +412,55 @@ fn shared_slot_topic(expr: &Expr, local_name: &str) -> Option<String> {
     if id.sym.as_ref() != local_name {
         return None;
     }
-    let Expr::Lit(Lit::Str(s)) = args.first()?.expr.as_ref() else {
+    match args.first()?.expr.as_ref() {
+        Expr::Lit(Lit::Str(s)) => Some(SlotAnchor::Literal(s.value.to_string())),
+        // A whole collection, `useSharedSlot(guestbook)` — its topic IS the
+        // collection name, so it anchors exactly like a literal.
+        Expr::Ident(ident) => collections
+            .get(ident.sym.as_ref())
+            .map(|collection| SlotAnchor::Literal(collection.clone())),
+        // `messages.where({ room: params.id })`.
+        Expr::Call(inner) => where_receiver(inner, collections).map(|collection| {
+            SlotAnchor::Deferred {
+                binding: binding.to_string(),
+                collection,
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// The **collection** `<receiver>.where(…)` partitions, resolved through the
+/// module's `albedo/forge` imports so an aliased `import { messages as msgs }`
+/// still yields `messages`.
+fn where_receiver(call: &CallExpr, collections: &HashMap<String, String>) -> Option<String> {
+    let Callee::Expr(callee) = &call.callee else {
         return None;
     };
-    Some(s.value.to_string())
+    let Expr::Member(member) = callee.as_ref() else {
+        return None;
+    };
+    let MemberProp::Ident(method) = &member.prop else {
+        return None;
+    };
+    if method.sym.as_ref() != "where" {
+        return None;
+    }
+    let Expr::Ident(receiver) = member.obj.as_ref() else {
+        return None;
+    };
+    collections.get(receiver.sym.as_ref()).cloned()
 }
 
 struct ListAnchorMarker {
-    idents: HashMap<String, String>,
+    idents: HashMap<String, SlotAnchor>,
 }
 
 impl VisitMut for ListAnchorMarker {
     fn visit_mut_jsx_element(&mut self, el: &mut JSXElement) {
         el.visit_mut_children_with(self);
 
-        let topic = el.children.iter().find_map(|child| {
+        let anchor = el.children.iter().find_map(|child| {
             let JSXElementChild::JSXExprContainer(container) = child else {
                 return None;
             };
@@ -383,9 +470,9 @@ impl VisitMut for ListAnchorMarker {
             map_over_shared_slot(expr, &self.idents)
         });
 
-        if let Some(topic) = topic {
+        if let Some(anchor) = anchor {
             if !has_attr(el, LIST_SLOT_ATTR) {
-                el.opening.attrs.push(list_slot_attr(&topic));
+                el.opening.attrs.push(list_slot_attr(&anchor));
             }
         }
     }
@@ -403,14 +490,14 @@ pub fn mark_shared_slot_scalars(module: &mut Module) {
 }
 
 struct ScalarSlotMarker {
-    idents: HashMap<String, String>,
+    idents: HashMap<String, SlotAnchor>,
 }
 
 impl VisitMut for ScalarSlotMarker {
     fn visit_mut_jsx_element(&mut self, el: &mut JSXElement) {
         el.visit_mut_children_with(self);
 
-        let Some(topic) = sole_shared_slot_read(el, &self.idents) else {
+        let Some(anchor) = sole_shared_slot_read(el, &self.idents) else {
             return;
         };
         // A list container is already the anchor for its topic; stamping it as a
@@ -418,7 +505,7 @@ impl VisitMut for ScalarSlotMarker {
         if has_attr(el, SLOT_ATTR) || has_attr(el, LIST_SLOT_ATTR) {
             return;
         }
-        el.opening.attrs.push(slot_attr(&topic));
+        el.opening.attrs.push(slot_attr(&anchor));
     }
 }
 
@@ -436,8 +523,8 @@ impl VisitMut for ScalarSlotMarker {
 ///
 /// JSX whitespace-only text between children is skipped, so the formatting
 /// `<span>\n  {value}\n</span>` counts as a lone read.
-fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, String>) -> Option<String> {
-    let mut found: Option<String> = None;
+fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, SlotAnchor>) -> Option<SlotAnchor> {
+    let mut found: Option<SlotAnchor> = None;
     for child in &el.children {
         match child {
             JSXElementChild::JSXText(text) => {
@@ -464,20 +551,65 @@ fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, String>) -> O
     found
 }
 
-fn slot_attr(topic: &str) -> JSXAttrOrSpread {
+fn slot_attr(anchor: &SlotAnchor) -> JSXAttrOrSpread {
+    anchor_attr(SLOT_ATTR, anchor)
+}
+
+/// Build `<attr>="topic"` or `<attr>={__albedo_topic("binding")}`.
+///
+/// Both flavours reach the browser as the same attribute holding the same kind
+/// of string; the difference is only *when* the string exists. A deferred lookup
+/// that resolves to null is dropped by the `h` shim's attribute path rather than
+/// stamped as `"null"`, so an unresolvable partition leaves the element with no
+/// anchor at all — correctly inert, rather than bound to a topic named "null".
+fn anchor_attr(attr: &str, anchor: &SlotAnchor) -> JSXAttrOrSpread {
+    let value = match anchor {
+        SlotAnchor::Literal(topic) => JSXAttrValue::Lit(Lit::Str(Str {
+            span: DUMMY_SP,
+            value: topic.as_str().into(),
+            raw: None,
+        })),
+        SlotAnchor::Deferred { binding, .. } => JSXAttrValue::JSXExprContainer(JSXExprContainer {
+            span: DUMMY_SP,
+            expr: JSXExpr::Expr(Box::new(topic_lookup_call(binding))),
+        }),
+    };
     JSXAttrOrSpread::JSXAttr(JSXAttr {
         span: DUMMY_SP,
-        name: JSXAttrName::Ident(IdentName { span: DUMMY_SP, sym: SLOT_ATTR.into() }),
-        value: Some(JSXAttrValue::Lit(Lit::Str(Str {
-            span: DUMMY_SP,
-            value: topic.into(),
-            raw: None,
-        }))),
+        name: JSXAttrName::Ident(IdentName { span: DUMMY_SP, sym: attr.into() }),
+        value: Some(value),
     })
 }
 
-/// `Some(topic)` when `expr` is `IDENT.map(...)` and `IDENT` is a shared-slot binding.
-fn map_over_shared_slot(expr: &Expr, idents: &HashMap<String, String>) -> Option<String> {
+/// `__albedo_topic("<binding>")` — the same global
+/// [`crate::transforms::shared_slots`] folds the hook's own argument into, so the
+/// anchor and the value it anchors are resolved by one lookup rather than two
+/// that could disagree.
+fn topic_lookup_call(binding: &str) -> Expr {
+    Expr::Call(CallExpr {
+        span: DUMMY_SP,
+        callee: Callee::Expr(Box::new(Expr::Ident(Ident::new_no_ctxt(
+            crate::transforms::shared_slots::TOPIC_LOOKUP_FN.into(),
+            DUMMY_SP,
+        )))),
+        args: vec![ExprOrSpread {
+            spread: None,
+            expr: Box::new(Expr::Lit(Lit::Str(Str {
+                span: DUMMY_SP,
+                value: binding.into(),
+                raw: None,
+            }))),
+        }],
+        type_args: None,
+        ctxt: Default::default(),
+    })
+}
+
+/// The anchor when `expr` is `IDENT.map(...)` and `IDENT` is a shared-slot binding.
+fn map_over_shared_slot(
+    expr: &Expr,
+    idents: &HashMap<String, SlotAnchor>,
+) -> Option<SlotAnchor> {
     let Expr::Call(CallExpr { callee: Callee::Expr(callee), .. }) = expr else {
         return None;
     };
@@ -588,8 +720,8 @@ pub fn classify_shared_slot_lists_source(
 }
 
 struct RowProjectionClassifier {
-    /// `local binding -> topic`, as in [`ListAnchorMarker`].
-    idents: HashMap<String, String>,
+    /// `local binding -> anchor`, as in [`ListAnchorMarker`].
+    idents: HashMap<String, SlotAnchor>,
     /// `topic -> class`.
     out: HashMap<String, RowProjection>,
 }
@@ -611,9 +743,25 @@ impl Visit for RowProjectionClassifier {
 /// a shared-slot binding. The binding name is returned alongside the topic
 /// because the classifier needs it: a row body that references the array
 /// identifier depends on the whole view.
+///
+/// PRISM · a **partitioned** binding classifies under its **collection** name,
+/// which is what the projector keys by (`projection_class(&slot.topic)`, and
+/// `slot.topic` is the collection — the row *template* belongs to the
+/// collection while the subscriber set belongs to the partition).
+///
+/// An earlier cut returned `None` here, on the theory that a partition without
+/// a compile-time topic simply had no key. It does have one, and the cost of
+/// pretending otherwise was not the "resync only" degradation that reasoning
+/// predicted: an unclassified collection is [`RowProjection::WholeView`], and
+/// `apply_writes` takes that arm on **every write**, re-rendering the entire
+/// partition through the engine. Measured at 4.9× a small room's write cost in
+/// `benches/prism_partitions.rs`, against a claim of ~1×.
+///
+/// The row template is a property of the collection, identical across every
+/// partition of it, so one class for all of them is not an approximation.
 fn map_call_binding(
     call: &CallExpr,
-    idents: &HashMap<String, String>,
+    idents: &HashMap<String, SlotAnchor>,
 ) -> Option<(String, String)> {
     let Callee::Expr(callee) = &call.callee else {
         return None;
@@ -630,8 +778,11 @@ fn map_call_binding(
     let Expr::Ident(obj) = member.obj.as_ref() else {
         return None;
     };
-    let topic = idents.get(obj.sym.as_ref())?.clone();
-    Some((topic, obj.sym.to_string()))
+    let key = match idents.get(obj.sym.as_ref())? {
+        SlotAnchor::Literal(topic) => topic.clone(),
+        SlotAnchor::Deferred { collection, .. } => collection.clone(),
+    };
+    Some((key, obj.sym.to_string()))
 }
 
 /// Classify one shared-slot `.map(callback)` call. `collection_binding` is the
@@ -763,16 +914,8 @@ fn has_attr(el: &JSXElement, name: &str) -> bool {
     })
 }
 
-fn list_slot_attr(topic: &str) -> JSXAttrOrSpread {
-    JSXAttrOrSpread::JSXAttr(JSXAttr {
-        span: DUMMY_SP,
-        name: JSXAttrName::Ident(IdentName { span: DUMMY_SP, sym: LIST_SLOT_ATTR.into() }),
-        value: Some(JSXAttrValue::Lit(Lit::Str(Str {
-            span: DUMMY_SP,
-            value: topic.into(),
-            raw: None,
-        }))),
-    })
+fn list_slot_attr(anchor: &SlotAnchor) -> JSXAttrOrSpread {
+    anchor_attr(LIST_SLOT_ATTR, anchor)
 }
 
 #[cfg(test)]
@@ -955,6 +1098,141 @@ mod classify_tests {
             "#,
         );
         assert!(classify_shared_slot_lists(&module).is_empty());
+    }
+}
+
+/// PRISM · the anchor for a partitioned list.
+///
+/// This is the seam that makes a `/room/[id]` list live at all. The marker
+/// cannot write the topic into the attribute — it does not exist yet — so it
+/// writes the lookup and the render evaluates it. If these regress, the list
+/// renders correct HTML with no anchor: the page looks right on load and never
+/// updates again, which is the hardest kind of bug to see.
+#[cfg(test)]
+mod partition_anchor_tests {
+    use super::*;
+    use classify_tests::parse_tsx;
+
+    /// Run both markers and print the module back out. Asserting on emitted
+    /// source rather than on the AST is deliberate: what actually has to be true
+    /// is that the *attribute* holds the lookup, and an AST assertion can pass
+    /// while the attribute ends up somewhere the codegen drops.
+    fn marked(source: &str) -> String {
+        use swc_ecma_codegen::{text_writer::JsWriter, Config, Emitter};
+
+        let mut module = parse_tsx(source);
+        mark_shared_slot_lists(&mut module);
+        mark_shared_slot_scalars(&mut module);
+
+        let cm: Lrc<SourceMap> = Default::default();
+        let mut buf = Vec::new();
+        {
+            let writer = JsWriter::new(cm.clone(), "\n", &mut buf, None);
+            let mut emitter = Emitter {
+                cfg: Config::default(),
+                cm: cm.clone(),
+                comments: None,
+                wr: writer,
+            };
+            emitter.emit_module(&module).expect("module emits");
+        }
+        String::from_utf8(buf).expect("emitted source is UTF-8")
+    }
+
+    const PARTITIONED_LIST: &str = r#"
+        import { useSharedSlot } from "albedo";
+        import { messages } from "albedo/forge";
+        export default function Room({ params }) {
+            const rows = useSharedSlot(messages.where({ room: params.id }));
+            return <ul>{rows.map(row => <li key={row.id}>{row.body}</li>)}</ul>;
+        }
+    "#;
+
+    #[test]
+    fn a_partitioned_list_is_anchored_by_a_render_time_lookup() {
+        let out = marked(PARTITIONED_LIST);
+        assert!(
+            out.contains("data-albedo-list-slot") && out.contains("__albedo_topic(\"rows\")"),
+            "the anchor must resolve through the same lookup the hook argument \
+             does, not a compile-time string; got:\n{out}"
+        );
+    }
+
+    /// The static form is the one every app in existence takes. It must still
+    /// emit a plain string literal — no lookup, no behaviour change, byte-stable
+    /// output. PRISM § 9.
+    #[test]
+    fn a_static_topic_still_stamps_a_literal() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            export default function Guestbook() {
+                const entries = useSharedSlot("guestbook");
+                return <ul>{entries.map(e => <li key={e.id}>{e.message}</li>)}</ul>;
+            }
+            "#,
+        );
+        assert!(out.contains(r#"data-albedo-list-slot="guestbook""#));
+        assert!(!out.contains("__albedo_topic"));
+    }
+
+    /// A partitioned scalar read gets the same treatment as a list — the two
+    /// markers share one anchor representation, so neither can be fixed without
+    /// the other.
+    #[test]
+    fn a_partitioned_scalar_read_is_anchored_the_same_way() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { presence } from "albedo/forge";
+            export default function Room({ params }) {
+                const count = useSharedSlot(presence.where({ room: params.id }));
+                return <span>{count}</span>;
+            }
+            "#,
+        );
+        assert!(out.contains("data-albedo-slot") && out.contains("__albedo_topic(\"count\")"));
+    }
+
+    /// A partitioned list **is** row-classified, under its collection name.
+    ///
+    /// This is the difference between an append shipping one row and an append
+    /// re-rendering the whole room. `apply_writes` reads
+    /// `projection_class(&slot.topic)` where `slot.topic` is the collection; an
+    /// absent entry means `WholeView`, and `WholeView` is taken on every write,
+    /// not just on resync. `benches/prism_partitions.rs` measured that at 4.9×
+    /// a small room's write cost.
+    #[test]
+    fn a_partitioned_list_is_classified_under_its_collection() {
+        let module = parse_tsx(PARTITIONED_LIST);
+        let classes = classify_shared_slot_lists(&module);
+        assert_eq!(
+            classes.get("messages"),
+            Some(&RowProjection::PerRecord),
+            "a `map(row => …)` over a partition is a function of its record \
+             alone, exactly as it is over a whole collection; got {classes:?}"
+        );
+    }
+
+    /// The alias rule, shared with the extractor rather than reimplemented: the
+    /// class must land under the *declared* collection, since that is the name
+    /// the write path resolves with. Under the local alias it would never be
+    /// found, silently restoring the whole-view render.
+    #[test]
+    fn an_aliased_collection_classifies_under_its_declared_name() {
+        let module = parse_tsx(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { messages as msgs } from "albedo/forge";
+            export default function Room({ params }) {
+                const rows = useSharedSlot(msgs.where({ room: params.id }));
+                return <ul>{rows.map(row => <li key={row.id}>{row.body}</li>)}</ul>;
+            }
+            "#,
+        );
+        let classes = classify_shared_slot_lists(&module);
+        assert!(classes.contains_key("messages"), "got {classes:?}");
+        assert!(!classes.contains_key("msgs"));
     }
 }
 
