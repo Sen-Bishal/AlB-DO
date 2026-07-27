@@ -87,6 +87,10 @@ time          = { version = "0.3", features = ["formatting"] }
 # File system / watching
 notify   = { version = "6" }
 walkdir  = { version = "2" }
+# The `albedo` CLI's terminal UI. `ratatui` re-exports the `crossterm`
+# it was built against, so the binary uses `ratatui::crossterm` rather
+# than declaring a second, independently-versioned backend.
+ratatui  = { version = "0.30" }
 
 # QUIC / TLS
 quinn            = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }

@@ -305,8 +305,35 @@ mod tests {
                     }
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // Drain the request head before answering.
+                            //
+                            // This used to be a single `read` into a 1 KiB
+                            // buffer, then a response, then a drop. Dropping a
+                            // socket while the client still has unsent request
+                            // bytes makes the OS send RST rather than FIN, and
+                            // the client sees "connection forcibly closed"
+                            // (Windows 10054) or "aborted by the software in
+                            // your host machine" (10053) — an intermittent
+                            // failure with nothing to do with what this bench
+                            // measures. Read to the end of the headers first,
+                            // then close the write side explicitly.
+                            // The accepted socket INHERITS the listener's
+                            // non-blocking mode on Windows, so `read` returns
+                            // `WouldBlock` immediately and a naive drain loop
+                            // exits having read nothing — which is how the first
+                            // attempt at this fix silently did nothing at all.
+                            // Put the stream back into blocking mode and bound
+                            // it with a read timeout instead.
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
                             let mut buf = [0u8; 1024];
-                            let _ = stream.read(&mut buf);
+                            let mut head = Vec::new();
+                            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                match stream.read(&mut buf) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                                }
+                            }
                             let resp = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 body.len(),
@@ -314,6 +341,7 @@ mod tests {
                             );
                             let _ = stream.write_all(resp.as_bytes());
                             let _ = stream.flush();
+                            let _ = stream.shutdown(std::net::Shutdown::Write);
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(2));

@@ -140,6 +140,47 @@ use tokio::sync::mpsc;
 /// forwards verbatim to stream slot 2 (patches).
 pub type BroadcastSender = mpsc::Sender<Vec<u8>>;
 
+/// What a topic *is*, as opposed to what it is called.
+///
+/// PRISM § 5.1 splits a topic's **identity** (this, plus the subscriber set and
+/// the version — around a hundred bytes) from its **value** (large, cached,
+/// evictable). This is the identity half.
+///
+/// The design sketched a separate `Lifetime { Pinned, Dynamic }` field beside a
+/// `(collection, key)` pair. That was one field too many: a topic is evictable
+/// **exactly when** it is a partition, because a partition is the only kind that
+/// can be re-derived from the substrate after being dropped. Encoding the
+/// lifetime as a second field invites the two to disagree; deriving it from the
+/// identity makes that unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicIdentity {
+    /// A compile-time topic: a whole collection, or a `broadcast()` scalar with
+    /// no collection behind it at all. Registered at boot from a finite set and
+    /// **never dropped** — a `broadcast()` scalar has no derivation, so dropping
+    /// it would destroy the only copy of its value.
+    Static,
+    /// One partition of a collection, minted on demand for a runtime key.
+    ///
+    /// Safe to drop when nothing is watching it: FORGE is the truth and the
+    /// value is a cache, so the next reader re-materializes it. That is the
+    /// whole reason PRISM requires a dynamic topic to be FORGE-backed.
+    Partition {
+        collection: Arc<str>,
+        key: Arc<str>,
+    },
+}
+
+impl TopicIdentity {
+    /// Whether this topic may be dropped once it has no subscribers.
+    ///
+    /// The single place the "is it safe to forget this?" question is answered,
+    /// so no caller has to re-derive the rule from the variant.
+    #[must_use]
+    pub fn is_evictable(&self) -> bool {
+        matches!(self, TopicIdentity::Partition { .. })
+    }
+}
+
 /// One topic's state. Constructed by [`BroadcastRegistry::topic`]
 /// and held behind an `Arc` so handlers can clone cheaply and write
 /// without re-resolving the topic by string each time.
@@ -164,6 +205,29 @@ pub struct BroadcastTopic {
     /// Subscribed sessions. `DashMap` so an in-progress write iterating
     /// subscribers doesn't block a fresh subscribe on the same topic.
     subscribers: DashMap<SessionId, BroadcastSender>,
+    /// PRISM · monotonic version of `value`, bumped on every write **under the
+    /// same lock that publishes it**, so a version and the bytes it names cannot
+    /// disagree.
+    ///
+    /// Added *alongside* the mutex, not in place of it. The mutex is the proven
+    /// linearization point (the S4/S5 rules depend on it) and nothing here has
+    /// taken over that job — today this is a stamp that rides along, consumed by
+    /// no one, verified by tests.
+    ///
+    /// Why bother now: the mutex is what makes the whole design single-process,
+    /// permanently. A version that travels with the seed and with each delta
+    /// (subscriber drops anything `≤` its seed) is the same guarantee expressed
+    /// in a form a second process could participate in, and it is what makes an
+    /// evictable value cache safe — a cached entry carrying its version can be
+    /// *detected* as stale rather than merely thrown away. Retrofitting it onto
+    /// a live wire later is expensive; carrying it now is nearly free.
+    ///
+    /// **Process-local.** This is a contract, not a distributed clock; do not
+    /// read it as multi-process support.
+    version: AtomicU64,
+    /// PRISM · what this topic is. [`TopicIdentity::Static`] for everything
+    /// registered today, so nothing changes until P3 mints a partition.
+    identity: TopicIdentity,
 }
 
 impl BroadcastTopic {
@@ -184,6 +248,36 @@ impl BroadcastTopic {
 
     pub fn subscriber_count(&self) -> usize {
         self.subscribers.len()
+    }
+
+    /// PRISM · what this topic is — static, or one partition of a collection.
+    #[must_use]
+    pub fn identity(&self) -> &TopicIdentity {
+        &self.identity
+    }
+
+    /// PRISM · how many times this topic's value has been published.
+    ///
+    /// `0` for a topic that has been registered but never written. Monotonic,
+    /// process-local, and bumped under the value lock — so reading it beside a
+    /// [`Self::current_value`] taken under the same lock gives a
+    /// `(bytes, version)` pair that agree. Read outside the lock it is only a
+    /// hint, which is all a staleness check needs.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
+    }
+
+    /// The value and the version that names it, read together under the lock.
+    ///
+    /// The seed shape PRISM's subscribe path wants: a joining subscriber holds
+    /// the bytes *and* knows which deltas it has already absorbed, so a delta
+    /// arriving with `version <= seed` can be dropped instead of double-applied.
+    #[must_use]
+    pub fn value_and_version(&self) -> (Vec<u8>, u64) {
+        let guard = self.lock_value();
+        let version = self.version.load(Ordering::Relaxed);
+        (guard.clone(), version)
     }
 
     /// Take the topic's linearization lock, **recovering from poison**.
@@ -298,6 +392,62 @@ pub enum BroadcastError {
     UnknownTopic(String),
     #[error("failed to encode broadcast frame: {0}")]
     Encode(#[from] WireError),
+    /// PRISM · two distinct topic names hash to the same wire slot id.
+    ///
+    /// The wire carries a `u32`, so the second topic is unrepresentable: if it
+    /// were registered anyway, its subscribers would receive the first topic's
+    /// frames and vice versa. Refusing is the only safe answer, and it is loud.
+    ///
+    /// Unreachable for a well-formed app — the static set is checked at boot by
+    /// [`check_topic_slot_ids`] — so seeing this at runtime means a *dynamic*
+    /// topic lost a 1-in-2³² coin flip against a live one.
+    #[error(
+        "topic '{topic}' hashes to wire slot {slot}, already held by '{existing}'; \
+         refusing to register it rather than cross-deliver their frames"
+    )]
+    SlotIdCollision {
+        topic: String,
+        existing: String,
+        slot: u32,
+    },
+}
+
+/// Check a set of topic names for wire-slot collisions.
+///
+/// The finite, build-time counterpart to the registry's runtime guard, and the
+/// mirror of [`crate::forge::ForgeSchema::build`]'s `SlotCollision` check —
+/// which covers FORGE collections only. Every `useSharedSlot` topic reaches the
+/// registry through the unguarded [`BroadcastRegistry::topic`], so without this
+/// two colliding non-FORGE topics would silently share a wire slot.
+///
+/// `Err` carries one message per colliding pair, already formatted.
+///
+/// # Errors
+/// Any two names in `topics` that share a [`broadcast_slot_id`].
+pub fn check_topic_slot_ids(topics: &[String]) -> Result<(), Vec<String>> {
+    let mut seen: FxHashMap<u32, &String> = FxHashMap::default();
+    let mut problems = Vec::new();
+    // Sorted, so a project with a collision reports it identically on every
+    // machine — a build error whose text shuffles between runs is hard to trust.
+    let mut sorted: Vec<&String> = topics.iter().collect();
+    sorted.sort();
+    for topic in sorted {
+        let slot = broadcast_slot_id(topic).0;
+        match seen.get(&slot) {
+            Some(existing) if *existing != topic => problems.push(format!(
+                "topics '{existing}' and '{topic}' both hash to wire slot {slot}; \
+                 rename one — they would share a slot and cross-deliver"
+            )),
+            _ => {
+                seen.insert(slot, topic);
+            }
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
 }
 
 /// Process-global broadcast registry. Hold one per server (clone the
@@ -319,6 +469,19 @@ pub struct BroadcastRegistry {
     /// [`crate::ir::opcode::OpcodeFrame`]) treats it as a standalone
     /// frame even when the underlying WT transport splits it.
     next_frame_id: AtomicU64,
+    /// PRISM · reverse index, wire slot id → the topic name holding it.
+    ///
+    /// The registry is keyed by *name*; the wire is keyed by a `u32` hash of it.
+    /// Nothing previously connected the two, so two names colliding on that hash
+    /// would each get their own entry here and the same slot on the wire — the
+    /// subscribers of one receiving the frames of the other, silently.
+    ///
+    /// Populated by every registration, including the unguarded
+    /// [`Self::topic`]. [`Self::try_topic`] consults it and fails closed. The
+    /// ordering that makes this sound: statics are all registered at boot,
+    /// before any dynamic topic can be minted, so a dynamic mint always sees the
+    /// complete static set.
+    slot_ids: DashMap<u32, String>,
 }
 
 impl BroadcastRegistry {
@@ -332,11 +495,30 @@ impl BroadcastRegistry {
     /// second call with the same `topic` string the existing value
     /// is preserved (the `initial` argument is ignored).
     pub fn topic(&self, topic: impl Into<String>, initial: Vec<u8>) -> Arc<BroadcastTopic> {
-        let topic = topic.into();
+        self.topic_with_identity(topic.into(), initial, TopicIdentity::Static)
+    }
+
+    /// The one constructor. `identity` applies only when the topic is *created*
+    /// — a second call for a name that already exists returns the existing
+    /// topic untouched, identity included, which is what makes boot
+    /// registration idempotent across a dev reload.
+    fn topic_with_identity(
+        &self,
+        topic: String,
+        initial: Vec<u8>,
+        identity: TopicIdentity,
+    ) -> Arc<BroadcastTopic> {
         if let Some(existing) = self.topics.get(&topic) {
             return existing.clone();
         }
         let slot_id = broadcast_slot_id(&topic);
+        // Claim the wire slot for this name. First writer wins; a later
+        // *different* name that hashes here is refused by `try_topic`. This
+        // path stays infallible on purpose — it is the boot/static registration
+        // path, where a collision is a build-time fact that
+        // `check_topic_slot_ids` reports with both names, not a per-call error
+        // every caller would have to invent a recovery for.
+        self.slot_ids.entry(slot_id.0).or_insert_with(|| topic.clone());
         let entry = self
             .topics
             .entry(topic.clone())
@@ -346,9 +528,135 @@ impl BroadcastRegistry {
                     slot_id,
                     value: Mutex::new(initial),
                     subscribers: DashMap::new(),
+                    version: AtomicU64::new(0),
+                    identity,
                 })
             });
         entry.clone()
+    }
+
+    /// [`Self::topic`], but refusing to register a name whose wire slot is
+    /// already held by a *different* name.
+    ///
+    /// This is the path a dynamically minted topic must take. The static set is
+    /// finite and checked at boot; the dynamic set is not bounded, and FNV-1a-32
+    /// over *n* live topics collides with probability ≈ `n²/2³³` — about 0.2% at
+    /// 4,096. Rare, but the failure it prevents is two rooms silently merging,
+    /// so it is checked rather than assumed.
+    ///
+    /// # Errors
+    /// [`BroadcastError::SlotIdCollision`] when the slot belongs to another name.
+    pub fn try_topic(
+        &self,
+        topic: impl Into<String>,
+        initial: Vec<u8>,
+    ) -> Result<Arc<BroadcastTopic>, BroadcastError> {
+        let topic = topic.into();
+        if let Some(existing) = self.topics.get(&topic) {
+            return Ok(existing.clone());
+        }
+        let slot_id = broadcast_slot_id(&topic);
+        if let Some(holder) = self.slot_ids.get(&slot_id.0) {
+            if holder.value() != &topic {
+                return Err(BroadcastError::SlotIdCollision {
+                    topic,
+                    existing: holder.value().clone(),
+                    slot: slot_id.0,
+                });
+            }
+        }
+        Ok(self.topic_with_identity(topic, initial, TopicIdentity::Static))
+    }
+
+    /// Mint (or resolve) one **partition** of a collection.
+    ///
+    /// `name` is the already-minted topic string — the registry deliberately
+    /// does not build it. PRISM invariant 5 puts topic naming in exactly one
+    /// resolver, shared by the render, subscribe and write paths; a second
+    /// implementation down here is precisely the drift that invariant exists to
+    /// prevent. What the registry adds is the *identity*, which is what makes
+    /// the topic evictable later.
+    ///
+    /// Goes through the same slot-id guard as [`Self::try_topic`], because an
+    /// unbounded set of partitions is exactly where an FNV-1a-32 collision
+    /// becomes reachable.
+    ///
+    /// # Errors
+    /// [`BroadcastError::SlotIdCollision`] when the wire slot belongs to another
+    /// name.
+    pub fn try_topic_partition(
+        &self,
+        name: impl Into<String>,
+        collection: Arc<str>,
+        key: Arc<str>,
+        initial: Vec<u8>,
+    ) -> Result<Arc<BroadcastTopic>, BroadcastError> {
+        let name = name.into();
+        if let Some(existing) = self.topics.get(&name) {
+            return Ok(existing.clone());
+        }
+        self.guard_slot_id(&name)?;
+        Ok(self.topic_with_identity(
+            name,
+            initial,
+            TopicIdentity::Partition { collection, key },
+        ))
+    }
+
+    /// Refuse a name whose wire slot is held by a different name.
+    fn guard_slot_id(&self, topic: &str) -> Result<(), BroadcastError> {
+        let slot_id = broadcast_slot_id(topic);
+        if let Some(holder) = self.slot_ids.get(&slot_id.0) {
+            if holder.value() != topic {
+                return Err(BroadcastError::SlotIdCollision {
+                    topic: topic.to_string(),
+                    existing: holder.value().clone(),
+                    slot: slot_id.0,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop a partition that nothing is watching, releasing its wire slot.
+    ///
+    /// `true` when the topic was removed. A [`TopicIdentity::Static`] topic is
+    /// never removed however idle it looks: it may be a `broadcast()` scalar
+    /// whose value exists nowhere else, so forgetting it would destroy data.
+    /// A partition is safe because FORGE is the truth and the value is a cache —
+    /// the next reader re-materializes it.
+    ///
+    /// A caller still holding an `Arc` to a removed topic can technically write
+    /// to it; that write fans out to the zero subscribers it had and is then
+    /// garbage-collected with the `Arc`. It cannot corrupt anything, because the
+    /// authoritative copy was never in memory to begin with.
+    pub fn drop_if_idle(&self, topic: &str) -> bool {
+        let evictable = match self.topics.get(topic) {
+            Some(entry) => entry.identity.is_evictable() && entry.subscribers.is_empty(),
+            None => false,
+        };
+        if !evictable {
+            return false;
+        }
+        // Remove the slot claim first: while the name is still present, a
+        // concurrent `try_topic` for a colliding name is correctly refused. The
+        // reverse order would open a window where the slot is free but the name
+        // still resolves.
+        let slot_id = broadcast_slot_id(topic);
+        self.slot_ids
+            .remove_if(&slot_id.0, |_, holder| holder == topic);
+        self.topics.remove(topic);
+        true
+    }
+
+    /// How many live topics are partitions. The number a cap would bound, and
+    /// what a test asserts against after an eviction pass.
+    #[must_use]
+    pub fn dynamic_topic_count(&self) -> usize {
+        self.topics
+            .iter()
+            .filter(|entry| entry.identity.is_evictable())
+            .count()
     }
 
     /// Returns the topic if it has been registered. No side effects.
@@ -543,6 +851,17 @@ impl BroadcastRegistry {
                 }
             }
         };
+
+        // PRISM · stamp the new state while the lock still covers it, so a
+        // version can never name bytes other than the ones just stored. This is
+        // the single write site — `write_topic` delegates here — so one bump
+        // covers every path a value can change through.
+        //
+        // Nothing consumes this yet (§ P1: alongside the mutex, not replacing
+        // it). It exists so the seed a subscriber receives, and any cached copy
+        // of the value, can later be *ordered* against the deltas that follow.
+        topic_entry.version.fetch_add(1, Ordering::Relaxed);
+
         let instructions = vec![instruction];
 
         let encoded = encode_frame(&OpcodeFrame {
@@ -804,6 +1123,209 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         // The "ignored" initial must NOT overwrite the existing value.
         assert_eq!(second.current_value(), b"[]".to_vec());
+    }
+
+    /// A REAL FNV-1a-32 collision in the topic namespace, found by search.
+    /// Both are `room:<id>` — exactly the shape PRISM mints — and they are a
+    /// million ids apart, which is the honest picture: rare, and reachable.
+    const COLLIDING_A: &str = "room:80939";
+    const COLLIDING_B: &str = "room:1016344";
+
+    #[test]
+    fn the_collision_fixture_really_collides() {
+        // If this ever fails, the hash changed and every test below is testing
+        // nothing. Pinned deliberately rather than computed in the test.
+        assert_eq!(
+            broadcast_slot_id(COLLIDING_A),
+            broadcast_slot_id(COLLIDING_B)
+        );
+        assert_ne!(COLLIDING_A, COLLIDING_B);
+    }
+
+    #[test]
+    fn a_clean_topic_set_passes_the_slot_check() {
+        let topics = ["guestbook", "feed", "leaderboard", "lobby:counter"]
+            .map(str::to_string)
+            .to_vec();
+        assert!(check_topic_slot_ids(&topics).is_ok());
+    }
+
+    /// The gap this closes: `ForgeSchema::build` collision-checks FORGE
+    /// collections, but every `useSharedSlot` topic reaches the registry
+    /// through the unguarded `topic()`. Two colliding names each got an entry
+    /// and shared a wire slot, silently.
+    #[test]
+    fn a_colliding_static_topic_set_is_reported_with_both_names() {
+        let topics = vec![
+            "guestbook".to_string(),
+            COLLIDING_A.to_string(),
+            COLLIDING_B.to_string(),
+        ];
+        let problems = check_topic_slot_ids(&topics).expect_err("collision reported");
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains(COLLIDING_A), "{}", problems[0]);
+        assert!(problems[0].contains(COLLIDING_B), "{}", problems[0]);
+    }
+
+    #[test]
+    fn a_repeated_topic_name_is_not_a_collision() {
+        let topics = vec!["guestbook".to_string(), "guestbook".to_string()];
+        assert!(check_topic_slot_ids(&topics).is_ok());
+    }
+
+    /// The runtime half: a dynamically minted topic that loses the coin flip is
+    /// refused rather than registered, so the holder keeps its wire slot and
+    /// nothing cross-delivers.
+    #[test]
+    fn try_topic_refuses_a_name_whose_wire_slot_is_taken() {
+        let registry = BroadcastRegistry::new();
+        registry.topic(COLLIDING_A, b"[]".to_vec());
+
+        let err = registry
+            .try_topic(COLLIDING_B, b"[]".to_vec())
+            .expect_err("refused");
+        match err {
+            BroadcastError::SlotIdCollision { topic, existing, .. } => {
+                assert_eq!(topic, COLLIDING_B);
+                assert_eq!(existing, COLLIDING_A);
+            }
+            other => panic!("expected SlotIdCollision, got {other:?}"),
+        }
+
+        assert!(
+            registry.get(COLLIDING_B).is_none(),
+            "the refused topic must not be registered — a half-registered topic \
+             accepts writes nobody receives"
+        );
+        assert!(registry.get(COLLIDING_A).is_some(), "the holder is untouched");
+    }
+
+    #[test]
+    fn try_topic_is_idempotent_for_the_same_name() {
+        let registry = BroadcastRegistry::new();
+        let first = registry.try_topic("guestbook", b"[]".to_vec()).expect("first");
+        let second = registry
+            .try_topic("guestbook", b"ignored".to_vec())
+            .expect("second");
+        assert_eq!(first.slot_id(), second.slot_id());
+        assert_eq!(second.current_value(), b"[]".to_vec());
+    }
+
+    /// The version is stamped under the same lock that publishes the bytes, so
+    /// the pair can never disagree. Nothing consumes it yet — it rides along
+    /// beside the mutex until the cache and the seed path need it.
+    #[test]
+    fn a_write_bumps_the_version_together_with_the_value() {
+        let registry = BroadcastRegistry::new();
+        let topic = registry.topic("counter", b"0".to_vec());
+        assert_eq!(topic.version(), 0, "registered but never written");
+
+        registry.write_topic("counter", b"1".to_vec()).expect("write");
+        let (value, version) = topic.value_and_version();
+        assert_eq!(value, b"1".to_vec());
+        assert_eq!(version, 1);
+
+        registry.write_topic("counter", b"2".to_vec()).expect("write");
+        assert_eq!(topic.version(), 2);
+        assert!(
+            topic.version() > version,
+            "monotonic: a subscriber seeded at {version} must be able to drop \
+             everything at or below it"
+        );
+    }
+
+    /// Everything registered today is static, so nothing about P1 is
+    /// observable — the property that lets it ship dark.
+    #[test]
+    fn every_topic_registered_the_old_way_is_static_and_unevictable() {
+        let registry = BroadcastRegistry::new();
+        let topic = registry.topic("guestbook", b"[]".to_vec());
+        assert_eq!(topic.identity(), &TopicIdentity::Static);
+        assert!(!topic.identity().is_evictable());
+        assert_eq!(registry.dynamic_topic_count(), 0);
+
+        assert!(
+            !registry.drop_if_idle("guestbook"),
+            "a static topic is never dropped, however idle — it may be a \
+             `broadcast()` scalar whose value exists nowhere else"
+        );
+        assert!(registry.get("guestbook").is_some());
+    }
+
+    #[test]
+    fn a_partition_carries_its_collection_and_key() {
+        let registry = BroadcastRegistry::new();
+        let topic = registry
+            .try_topic_partition("messages:42", "messages".into(), "42".into(), b"[]".to_vec())
+            .expect("minted");
+        assert_eq!(
+            topic.identity(),
+            &TopicIdentity::Partition {
+                collection: "messages".into(),
+                key: "42".into(),
+            }
+        );
+        assert!(topic.identity().is_evictable());
+        assert_eq!(registry.dynamic_topic_count(), 1);
+    }
+
+    /// The eviction rule in full: droppable only with nothing watching, and the
+    /// wire slot comes back with it so a later name can claim it.
+    #[test]
+    fn an_idle_partition_is_dropped_and_releases_its_wire_slot() {
+        let registry = BroadcastRegistry::new();
+        registry
+            .try_topic_partition("messages:42", "messages".into(), "42".into(), b"[]".to_vec())
+            .expect("minted");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let session = SessionId::random();
+        registry
+            .subscribe(session, "messages:42", tx)
+            .expect("subscribe");
+        assert!(
+            !registry.drop_if_idle("messages:42"),
+            "a watched partition must not be dropped out from under its subscriber"
+        );
+
+        registry.cleanup_session(session);
+        assert!(registry.drop_if_idle("messages:42"));
+        assert!(registry.get("messages:42").is_none());
+        assert_eq!(registry.dynamic_topic_count(), 0);
+
+        // The slot is free again: a different name that hashes there is now
+        // accepted rather than refused by a claim nobody holds.
+        assert!(registry.try_topic("messages:42", b"[]".to_vec()).is_ok());
+    }
+
+    /// A partition goes through the same collision guard as anything else —
+    /// an unbounded partition set is exactly where a collision becomes reachable.
+    #[test]
+    fn a_partition_is_refused_when_its_wire_slot_is_taken() {
+        let registry = BroadcastRegistry::new();
+        registry.topic(COLLIDING_A, b"[]".to_vec());
+        let err = registry
+            .try_topic_partition(COLLIDING_B, "rooms".into(), "x".into(), b"[]".to_vec())
+            .expect_err("refused");
+        assert!(matches!(err, BroadcastError::SlotIdCollision { .. }), "{err:?}");
+        assert_eq!(registry.dynamic_topic_count(), 0);
+    }
+
+    /// Re-resolving an existing name returns it untouched. Boot registration is
+    /// idempotent across a dev reload, and that must not reclassify a topic.
+    #[test]
+    fn re_resolving_a_name_preserves_the_identity_it_was_created_with() {
+        let registry = BroadcastRegistry::new();
+        registry
+            .try_topic_partition("messages:42", "messages".into(), "42".into(), b"[1]".to_vec())
+            .expect("minted");
+
+        let again = registry.topic("messages:42", b"ignored".to_vec());
+        assert!(
+            again.identity().is_evictable(),
+            "the plain constructor must not downgrade an existing partition to static"
+        );
+        assert_eq!(again.current_value(), b"[1]".to_vec());
     }
 
     #[test]

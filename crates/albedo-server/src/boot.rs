@@ -217,6 +217,21 @@ fn boot_inner(
         )));
     }
 
+    // PRISM · the wire carries a `u32` hash of a topic name, and until now
+    // nothing checked the static set for collisions on it: `ForgeSchema::build`
+    // covers FORGE collections only, while every `useSharedSlot` topic reaches
+    // the registry through the unguarded `topic()`. Two colliding names would
+    // each get their own entry and the same wire slot — each one's subscribers
+    // receiving the other's frames, with nothing anywhere reporting it.
+    if let Err(problems) =
+        dom_render_compiler::runtime::check_topic_slot_ids(&compiled.shared_slot_topics())
+    {
+        return Err(RuntimeError::ServerStartup(format!(
+            "broadcast topics collide on the wire:\n  - {}",
+            problems.join("\n  - ")
+        )));
+    }
+
     // Regenerate the editor's view of the collections. Types only — nothing
     // imports this at runtime (see `is_framework_runtime_import`) — so a failed
     // write costs autocomplete, never a boot. `.albedo/` is the dist dir's

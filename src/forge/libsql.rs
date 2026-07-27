@@ -131,13 +131,31 @@ impl LibSqlSubstrate {
     /// database cannot be created.
     pub async fn open_ephemeral() -> Result<Self> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // `pid + counter` alone is unique only *within* a process, and the
+        // cleanup in `Drop` is best-effort — on Windows the database file is
+        // routinely still locked when it runs, so directories survive. Windows
+        // then recycles PIDs, and a later process that draws a used one reopens
+        // `forge-<pid>-0` and finds the previous run's tables still in it. That
+        // is the opposite of ephemeral, and it surfaced as tests failing with
+        // "table t already exists" against a database they had just created.
+        //
+        // The wall-clock component makes the name unique across runs, so a
+        // leaked directory is untidy rather than load-bearing.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0);
         let unique = format!(
-            "forge-{}-{}",
+            "forge-{}-{stamp}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let dir = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&dir).map_err(|e| SubstrateError::Backend(e.to_string()))?;
+        // `create_dir`, not `create_dir_all`: the parent always exists, and the
+        // non-recursive form *fails* on an existing directory instead of
+        // silently adopting it. If uniqueness is ever defeated again, this says
+        // so rather than handing back someone else's data.
+        std::fs::create_dir(&dir).map_err(|e| SubstrateError::Backend(e.to_string()))?;
 
         let mut substrate = Self::open_local(dir.join("forge.db")).await?;
         substrate.ephemeral_dir = Some(dir);

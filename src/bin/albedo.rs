@@ -10,6 +10,7 @@ use dom_render_compiler::dev_contract::{
 use dom_render_compiler::manifest::schema::RenderManifestV2;
 use dom_render_compiler::parser::ParsedComponent;
 use dom_render_compiler::scanner::{ProjectScanner, ScanFailure, ScanMode};
+use dom_render_compiler::types::TierReport;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -26,6 +27,9 @@ mod printer;
 
 #[path = "albedo/first_run.rs"]
 mod first_run;
+
+#[path = "albedo/tui/mod.rs"]
+mod tui;
 
 const PORT_AUTO_INCREMENT_LIMIT: u16 = 10;
 
@@ -785,6 +789,24 @@ fn boot_and_run_production_server(contract: &ResolvedDevContract) -> Result<(), 
         )
     })?;
 
+    let url = format!("http://{}:{}", contract.server.host, contract.server.port);
+
+    // `serve` is long-running and holds the same live state `dev` does — minus
+    // the watcher, so its event log stays quiet. Same dashboard, same fallback:
+    // piped or `ALBEDO_NO_TUI=1` and it prints exactly as before.
+    if tui::available() {
+        let (dash_tx, dash_rx) = mpsc::channel::<tui::dev::DashEvent>();
+        return run_dev_dashboard(
+            tui::dev::Mode::Serve,
+            url,
+            contract.project_dir.display().to_string(),
+            None,
+            server,
+            dash_tx,
+            dash_rx,
+        );
+    }
+
     print_ok(format!(
         "serving · {}",
         style_256(
@@ -1139,8 +1161,17 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
 fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     use albedo_server::{boot_production_server, ProductionServerOptions};
 
-    // 1. Build the dist the production pipeline serves from.
-    run_prod_build(&contract)?;
+    // 1. Build the dist the production pipeline serves from. The tier report it
+    //    produces is the dashboard's opening view — the same numbers
+    //    `albedo build` prints, kept instead of discarded.
+    let tier_report = run_prod_build(&contract)?;
+
+    // Decide up front whether this session gets a dashboard. Everything below
+    // branches on it exactly once: with a dashboard the request timings and the
+    // watcher's results are routed into it, without one they keep printing as
+    // they always have.
+    let dashboard = tui::available();
+    let (dash_tx, dash_rx) = mpsc::channel::<tui::dev::DashEvent>();
 
     // 2. Boot the production server with dev mode on (overlay + HMR endpoints + the shell
     //    dev-script injection from `StreamingAppState::with_dev_mode`).
@@ -1155,12 +1186,30 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         let watch_contract = contract.clone();
         let watch_opts = opts.clone();
         let debounce = Duration::from_millis(contract.watch.debounce_ms.max(1));
+        let watch_tx = dashboard.then(|| dash_tx.clone());
         std::thread::spawn(move || {
-            dev_watch_and_reload(watch_contract, watch_opts, reload, debounce);
+            dev_watch_and_reload(watch_contract, watch_opts, reload, debounce, watch_tx);
         });
     }
 
     let addr = format!("{}:{}", contract.server.host, contract.server.port);
+    let url = format!("http://{addr}");
+
+    if dashboard {
+        if contract.open {
+            let _ = try_open_browser(url.as_str());
+        }
+        return run_dev_dashboard(
+            tui::dev::Mode::Dev,
+            url,
+            contract.project_dir.display().to_string(),
+            Some(tier_report),
+            server,
+            dash_tx,
+            dash_rx,
+        );
+    }
+
     println!();
     print_ok(format!(
         "dev · {}",
@@ -1192,6 +1241,72 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         .map_err(|err| format!("dev server runtime error: {err}"))
 }
 
+/// Own the main thread with the dashboard while the server runs behind it.
+///
+/// The order matters. The request sink is installed **before** the server is
+/// spawned, so no timing can reach stdout and tear the first frame; the terminal
+/// is claimed after that, so a boot failure still reports on a normal screen.
+/// When the dashboard returns — the user pressed `q` — the guard restores the
+/// terminal on the way out and the runtime is dropped, which stops the server.
+fn run_dev_dashboard(
+    mode: tui::dev::Mode,
+    url: String,
+    project: String,
+    report: Option<TierReport>,
+    server: albedo_server::AlbedoServer,
+    dash_tx: mpsc::Sender<tui::dev::DashEvent>,
+    dash_rx: mpsc::Receiver<tui::dev::DashEvent>,
+) -> Result<(), String> {
+    // Bridge the server's timing records onto the dashboard channel. A thread
+    // rather than a shared type, so `albedo-server` stays unaware the CLI has a
+    // UI at all — it publishes measurements and does not care who listens.
+    let (req_tx, req_rx) = mpsc::channel::<albedo_server::timing::RequestRecord>();
+    if albedo_server::timing::install_request_sink(req_tx) {
+        let bridge_tx = dash_tx.clone();
+        std::thread::spawn(move || {
+            for record in req_rx {
+                if bridge_tx
+                    .send(tui::dev::DashEvent::Request {
+                        method: record.method,
+                        path: record.path,
+                        elapsed: record.elapsed,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    // The one line the print path opens with, kept rather than lost to the
+    // dashboard: it tells the reader that `dev` is not a lesser pipeline.
+    let _ = dash_tx.send(tui::dev::DashEvent::Note {
+        message: match mode {
+            tui::dev::Mode::Dev => {
+                "same pipeline as `albedo serve` · overlay + hot reload on".to_string()
+            }
+            tui::dev::Mode::Serve => "production pipeline · no watcher".to_string(),
+        },
+    });
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to start tokio runtime: {err}"))?;
+    runtime.spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut guard = tui::TerminalGuard::new()
+        .map_err(|err| format!("failed to start the terminal UI: {err}"))?;
+    let result = tui::dev::Dashboard::new(mode, url, project, report)
+        .run(&mut guard, dash_rx)
+        .map_err(|err| format!("terminal UI error: {err}"));
+    drop(guard);
+    result
+}
+
 /// The dev file-watcher loop. Watches the source tree (NOT `.albedo/dist`, which
 /// the rebuild writes to — so a rebuild can't retrigger itself), debounces a
 /// save-burst, then rebuilds the dist and asks the reload handle to hot-swap the
@@ -1202,6 +1317,7 @@ fn dev_watch_and_reload(
     opts: albedo_server::ProductionServerOptions,
     reload: albedo_server::DevReloadHandle,
     debounce: Duration,
+    dash: Option<mpsc::Sender<tui::dev::DashEvent>>,
 ) {
     let (event_tx, event_rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = match RecommendedWatcher::new(
@@ -1235,20 +1351,44 @@ fn dev_watch_and_reload(
         while event_rx.recv_timeout(debounce).is_ok() {}
 
         let rebuild_start = Instant::now();
+        // Two sinks, one decision made at startup: with a dashboard every
+        // outcome becomes a row in its event log, without one it prints exactly
+        // as it always did. The browser overlay is told either way — a build
+        // error belongs on the page that failed to render, regardless of what
+        // the terminal is doing.
+        let report = |event: tui::dev::DashEvent| {
+            if let Some(sender) = &dash {
+                let _ = sender.send(event);
+            }
+        };
         match run_prod_build_quiet(&contract) {
-            Ok(()) => match reload.reload(&opts) {
-                Ok(()) => print_ok(format!(
-                    "reloaded in {}",
-                    colorize_timing_ms(rebuild_start.elapsed().as_secs_f64() * 1000.0)
-                )),
+            Ok(_tiers) => match reload.reload(&opts) {
+                Ok(()) => {
+                    let millis = rebuild_start.elapsed().as_secs_f64() * 1000.0;
+                    if dash.is_some() {
+                        report(tui::dev::DashEvent::Reloaded { millis });
+                    } else {
+                        print_ok(format!("reloaded in {}", colorize_timing_ms(millis)));
+                    }
+                }
                 Err(err) => {
                     reload.report_build_error(err.to_string());
-                    eprintln!("  {} reload failed: {err}", style("✗", "1;31"));
+                    if dash.is_some() {
+                        report(tui::dev::DashEvent::BuildFailed {
+                            message: format!("reload failed: {err}"),
+                        });
+                    } else {
+                        eprintln!("  {} reload failed: {err}", style("✗", "1;31"));
+                    }
                 }
             },
             Err(err) => {
                 reload.report_build_error(err.clone());
-                eprintln!("  {} rebuild failed: {err}", style("✗", "1;31"));
+                if dash.is_some() {
+                    report(tui::dev::DashEvent::BuildFailed { message: err });
+                } else {
+                    eprintln!("  {} rebuild failed: {err}", style("✗", "1;31"));
+                }
             }
         }
     }
@@ -1724,7 +1864,7 @@ fn is_benign_network_error(err: &std::io::Error) -> bool {
 /// Phase O.1 · convenience wrapper preserving the old call sites'
 /// signature; the gate work happens in
 /// [`run_prod_build_with_budget`].
-fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
+fn run_prod_build(contract: &ResolvedDevContract) -> Result<TierReport, String> {
     // serve / dev startup call this — full build presentation, no tier report
     // (that's reserved for the explicit `albedo build`).
     run_prod_build_with_budget(contract, false, false, false)
@@ -1733,7 +1873,7 @@ fn run_prod_build(contract: &ResolvedDevContract) -> Result<(), String> {
 /// Silent build for the dev hot-reload path — does the full build but prints
 /// nothing (the watcher prints a single "reloaded in Xms" line instead of the
 /// whole build log on every save). Warnings and errors still surface.
-fn run_prod_build_quiet(contract: &ResolvedDevContract) -> Result<(), String> {
+fn run_prod_build_quiet(contract: &ResolvedDevContract) -> Result<TierReport, String> {
     run_prod_build_with_budget(contract, false, false, true)
 }
 
@@ -1742,7 +1882,7 @@ fn run_prod_build_with_budget(
     skip_budget: bool,
     show_tiers: bool,
     quiet: bool,
-) -> Result<(), String> {
+) -> Result<TierReport, String> {
     let out_dir = contract.project_dir.join(".albedo").join("dist");
 
     let scan_start = Instant::now();
@@ -1987,7 +2127,10 @@ fn run_prod_build_with_budget(
     // out of both passes even when the file is present.
     enforce_budget_after_build(contract, &manifest, Some(&report), skip_budget)?;
 
-    Ok(())
+    // Handed back so the dev dashboard can show the tier mix it just computed.
+    // Every existing caller discards it with `?;`, which is why this widened
+    // rather than growing an out-parameter.
+    Ok(tier_report)
 }
 
 /// Phase N · recursive directory copy used by the `public/` ship
@@ -2761,8 +2904,12 @@ fn print_boot_banner() {
     // Sol → Equinox → Umbra → Persephone) as the signature line — muted so the
     // hierarchy holds: mark brightest, Version Beta next, the tiers a quiet
     // footer. Slashes dimmed to let the names carry.
+    // Version label and ladder come from the dashboard's constants, not a second
+    // copy — the banner and the TUI masthead are the same statement rendered by
+    // two different engines, and a drift between them is the kind of thing
+    // nobody notices until a screenshot goes out.
     let sep = style(" / ", "2");
-    let tiers = ["SOL", "EQUINOX", "UMBRA", "PERSEPHONE"]
+    let tiers = tui::dev::TIER_LADDER
         .iter()
         .map(|name| style_256(name, MUTED, false))
         .collect::<Vec<_>>()
@@ -2770,7 +2917,7 @@ fn print_boot_banner() {
     println!(
         "  {}  {}   {}",
         gradient_text("ALB'DO", &BRAND_PALETTE, true),
-        style_256("Version Beta", ACCENT_SOFT, true),
+        style_256(tui::dev::VERSION_LABEL, ACCENT_SOFT, true),
         tiers,
     );
     // Full-width champagne hairline — the halo under the mark (41 to match art).

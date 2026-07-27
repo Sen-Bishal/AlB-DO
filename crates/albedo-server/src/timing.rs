@@ -30,7 +30,48 @@ const PATH_COL: usize = 34;
 /// server-compute span. Padding is applied to the *plain* strings before
 /// colorizing — ANSI escapes carry zero display width, so styling first would
 /// skew the column (the same bug the CLI restyle fixed in `printer.rs`).
+/// Where a request timing goes instead of stdout, when something has claimed it.
+///
+/// The CLI's dashboard owns the screen while it runs, so a `println!` from here
+/// would tear a hole in the frame it is drawing. Rather than teach every call
+/// site about the UI, the one choke point learns to forward — install a sink and
+/// the same measurement becomes a dashboard row.
+///
+/// `OnceLock` because there is exactly one consumer per process and it is
+/// installed during boot, before the first request can arrive.
+static SINK: std::sync::OnceLock<std::sync::mpsc::Sender<RequestRecord>> =
+    std::sync::OnceLock::new();
+
+/// One measured request, as handed to an installed sink.
+#[derive(Debug, Clone)]
+pub struct RequestRecord {
+    pub method: String,
+    pub path: String,
+    pub elapsed: Duration,
+}
+
+/// Route request timings to `sender` instead of stdout.
+///
+/// Returns `false` if a sink was already installed — first caller wins, and the
+/// second is told rather than silently ignored.
+pub fn install_request_sink(sender: std::sync::mpsc::Sender<RequestRecord>) -> bool {
+    SINK.set(sender).is_ok()
+}
+
 pub fn print_request(method: &str, path: &str, elapsed: Duration) {
+    if let Some(sink) = SINK.get() {
+        // A closed channel means the dashboard exited; the server may still be
+        // draining in-flight requests. Dropping the record is right — falling
+        // back to `println!` here would print into a terminal that has just been
+        // restored, after the final frame.
+        let _ = sink.send(RequestRecord {
+            method: method.to_string(),
+            path: path.to_string(),
+            elapsed,
+        });
+        return;
+    }
+
     let color = supports_color();
 
     let method_field = format!("{method:<4}");

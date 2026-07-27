@@ -54,6 +54,7 @@ xxhash-rust.workspace          = true
 # none of them.
 notify  = { workspace = true }
 walkdir = { workspace = true }
+ratatui = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
