@@ -33,7 +33,7 @@
 //! not a linear pointer-chase through owned `String`s.
 
 use crate::forge::substrate::DataSubstrate;
-use crate::forge::value::{Rows, SqlValue};
+use crate::forge::value::{Rows, SqlValue, SubstrateError};
 use crate::ir::opcode::SlotId;
 use crate::runtime::broadcast::{broadcast_slot_id, BroadcastRegistry};
 
@@ -472,7 +472,7 @@ pub async fn materialize_seeds(
     for collection in schema.collections() {
         seeds.push((
             collection.topic.clone(),
-            materialize_slot(substrate, collection).await?,
+            materialize_slot(substrate, collection, None).await?,
         ));
     }
     Ok(seeds)
@@ -487,11 +487,37 @@ pub async fn materialize_seeds(
 ///
 /// # Errors
 /// Propagates any read error from the substrate.
+///
+/// `partition` is the bound key for a partitioned collection and **must** be
+/// `Some` for one, `None` otherwise. The mismatch is refused rather than
+/// tolerated: reading a partitioned collection with no key would bind nothing to
+/// its `?1` placeholder, and reading an unpartitioned one with a key would
+/// silently ignore it — both produce a plausible-looking wrong answer, which is
+/// the worst kind.
 pub async fn materialize_slot(
     substrate: &dyn DataSubstrate,
     collection: &ForgeCollection,
+    partition: Option<&str>,
 ) -> crate::forge::value::Result<Vec<u8>> {
-    let rows = substrate.query(collection.query.as_str(), &[]).await?;
+    let params: Vec<SqlValue> = match (&collection.partition_by, partition) {
+        (Some(_), Some(key)) => vec![SqlValue::Text(key.to_string())],
+        (None, None) => Vec::new(),
+        (Some(column), None) => {
+            return Err(SubstrateError::Backend(format!(
+                "collection '{}' is partitioned by '{column}'; materialising it needs a \
+                 partition key",
+                collection.topic
+            )))
+        }
+        (None, Some(_)) => {
+            return Err(SubstrateError::Backend(format!(
+                "collection '{}' is not partitioned; materialising it must not be given a \
+                 partition key",
+                collection.topic
+            )))
+        }
+    };
+    let rows = substrate.query(collection.query.as_str(), &params).await?;
     Ok(serde_json::to_vec(&rows_to_json(&rows)).unwrap_or_else(|_| b"[]".to_vec()))
 }
 
@@ -695,6 +721,126 @@ mod tests {
         assert_eq!(rows[0]["author"], "ada");
         assert_eq!(rows[0]["message"], "first light");
         assert!(rows[0]["id"].is_number(), "id column carried through as a number");
+    }
+
+    /// Build a partitioned collection the way the config path would.
+    fn partitioned_messages() -> ForgeSchema {
+        use crate::forge::declare::{CollectionDecl, FieldType};
+        use std::collections::BTreeMap;
+
+        let mut fields = BTreeMap::new();
+        fields.insert("room".to_string(), FieldType::Text);
+        fields.insert("body".to_string(), FieldType::Text);
+        let mut declarations = BTreeMap::new();
+        declarations.insert(
+            "messages".to_string(),
+            CollectionDecl {
+                fields,
+                partition_by: Some("room".to_string()),
+                ..CollectionDecl::default()
+            },
+        );
+        ForgeSchema::from_declarations(&declarations).expect("schema")
+    }
+
+    /// The headline P2 property: a partitioned read returns **only** its
+    /// partition. Without this, every room sees every other room's rows — the
+    /// exact leak PRISM's whole identity story exists to prevent.
+    #[tokio::test]
+    async fn a_partitioned_read_returns_only_its_own_partition() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = partitioned_messages();
+        bootstrap_schema(&db, &schema).await.unwrap();
+
+        for (room, body) in [("a", "first"), ("b", "other"), ("a", "second")] {
+            db.execute(
+                "INSERT INTO messages (room, body) VALUES (?1, ?2)",
+                &[SqlValue::Text(room.into()), SqlValue::Text(body.into())],
+            )
+            .await
+            .unwrap();
+        }
+
+        let collection = schema.slot_for_topic("messages").expect("collection");
+        let bytes = materialize_slot(&db, collection, Some("a")).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = value.as_array().expect("array");
+
+        assert_eq!(rows.len(), 2, "only room a's rows: {value}");
+        assert_eq!(rows[0]["body"], "first");
+        assert_eq!(rows[1]["body"], "second");
+        assert!(
+            rows.iter().all(|row| row["room"] == "a"),
+            "no foreign partition leaked in: {value}"
+        );
+    }
+
+    /// Assert the **plan**, not the timing. A timing assertion on a small table
+    /// passes whether or not the index exists; `EXPLAIN QUERY PLAN` says so
+    /// directly, and this is the whole justification for emitting the index
+    /// alongside the `WHERE`.
+    #[tokio::test]
+    async fn the_partitioned_read_uses_its_composite_index() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = partitioned_messages();
+        bootstrap_schema(&db, &schema).await.unwrap();
+
+        let collection = schema.slot_for_topic("messages").expect("collection");
+        let plan = db
+            .query(
+                &format!("EXPLAIN QUERY PLAN {}", collection.query),
+                &[SqlValue::Text("a".into())],
+            )
+            .await
+            .unwrap();
+
+        let detail = plan
+            .rows
+            .iter()
+            .filter_map(|row| {
+                // `EXPLAIN QUERY PLAN` puts the human-readable step in the last
+                // column; the leading ones are ids. Scan for the first text
+                // column rather than hard-coding an index, which differs across
+                // SQLite versions.
+                (0..8).filter_map(|idx| match row.get(idx) {
+                    Some(SqlValue::Text(text)) => Some(text.clone()),
+                    _ => None,
+                }).next()
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        assert!(
+            detail.contains("idx_messages_room_id"),
+            "the partitioned read must use its composite index, not scan: {detail}"
+        );
+        assert!(
+            !detail.contains("SCAN messages") || detail.contains("idx_messages_room_id"),
+            "no full table scan: {detail}"
+        );
+    }
+
+    /// Presence of a key must match the declaration. Both mismatches produce a
+    /// plausible-looking wrong answer if tolerated — an empty partition, or a
+    /// silently ignored key — so both are refused.
+    #[tokio::test]
+    async fn materialising_with_the_wrong_key_arity_is_refused() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let partitioned = partitioned_messages();
+        bootstrap_schema(&db, &partitioned).await.unwrap();
+        let messages = partitioned.slot_for_topic("messages").expect("collection");
+        assert!(
+            materialize_slot(&db, messages, None).await.is_err(),
+            "a partitioned collection needs a key"
+        );
+
+        let plain = ForgeSchema::guestbook_default();
+        bootstrap_schema(&db, &plain).await.unwrap();
+        let guestbook = plain.slot_for_topic("guestbook").expect("collection");
+        assert!(
+            materialize_slot(&db, guestbook, Some("a")).await.is_err(),
+            "an unpartitioned collection must not silently ignore a key"
+        );
     }
 
     #[tokio::test]

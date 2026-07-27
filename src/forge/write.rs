@@ -315,6 +315,141 @@ fn build_delete(
     Ok((sql, params))
 }
 
+/// One channel a write touches: a collection, and — when that collection is
+/// partitioned — which partition of it.
+///
+/// A write used to touch a *collection*; it now touches a **channel**. Keeping
+/// both here matters because they are read by different things: the row template
+/// belongs to the collection (`projection_class`, `project_rows` key off
+/// `slot.topic`), while the subscriber set belongs to the partition.
+struct Touched<'a> {
+    slot: &'a ForgeCollection,
+    /// The bound partition key, `None` for an unpartitioned collection.
+    partition: Option<String>,
+    /// The broadcast channel name — `slot.topic`, or the minted partition name.
+    channel: String,
+}
+
+/// The partition value an `Append` lands in, read off the record it is inserting.
+fn append_partition(slot: &ForgeCollection, record: &Map<String, Value>) -> Result<Option<String>> {
+    let Some(column) = &slot.partition_by else {
+        return Ok(None);
+    };
+    let value = record.get(column).ok_or_else(|| {
+        SubstrateError::Backend(format!(
+            "FORGE append: collection '{}' is partitioned by '{column}', but the record does not \
+             set it — an append with no partition would be invisible to every reader",
+            slot.topic
+        ))
+    })?;
+    Ok(Some(partition_value_to_key(&slot.topic, column, value)?))
+}
+
+/// Render a partition value as the key that names its channel.
+///
+/// Text and integers only: those are what a URL segment and a declared column
+/// can both express, and the key has to survive a round trip through a topic
+/// name unchanged.
+fn partition_value_to_key(topic: &str, column: &str, value: &Value) -> Result<String> {
+    let key = match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) if number.is_i64() => number.to_string(),
+        other => {
+            return Err(SubstrateError::Backend(format!(
+                "FORGE write: partition column '{column}' of '{topic}' must be text or an \
+                 integer; got {other}"
+            )))
+        }
+    };
+    if !crate::runtime::broadcast::is_valid_partition_key(&key) {
+        return Err(SubstrateError::Backend(format!(
+            "FORGE write: partition key {key:?} for '{topic}' is outside the permitted \
+             alphabet ([A-Za-z0-9_-], 1..=64)"
+        )));
+    }
+    Ok(key)
+}
+
+/// Read the partition a row currently sits in, **before** it is changed.
+///
+/// Deliberately a `SELECT` rather than `RETURNING`, which is what PRISM's draft
+/// called for. `RETURNING` on an `UPDATE` yields the row's **post**-update
+/// values, so for the one case that actually needs care — an update that moves a
+/// row between partitions — it reports the destination and the origin is lost.
+/// The origin is exactly what the old partition's subscribers need in order to
+/// be told the row left. One indexed read by primary key inside the transaction
+/// buys correctness for both `Update` and `Delete` with no substrate-capability
+/// dependency, which is also why the `RETURNING`-not-honoured fallback
+/// (`reserve.rs:266`) is moot here.
+async fn read_partition(
+    tx: &dyn crate::forge::substrate::Transaction,
+    slot: &ForgeCollection,
+    key: &Value,
+) -> Result<Option<String>> {
+    let Some(column) = &slot.partition_by else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "SELECT {column} FROM {} WHERE {} = ?1",
+        slot.table, slot.key_column
+    );
+    let bound = key_to_sqlvalue(&slot.topic, &slot.key_column, key)?;
+    let rows = tx.query(&sql, &[bound]).await?;
+    let Some(row) = rows.rows.first() else {
+        // The row is gone (or never existed). Not an error: the mutation below
+        // will simply affect nothing, and there is no partition to notify.
+        return Ok(None);
+    };
+    match row.get(0) {
+        Some(SqlValue::Text(text)) => Ok(Some(partition_value_to_key(
+            &slot.topic,
+            column,
+            &Value::String(text.clone()),
+        )?)),
+        Some(SqlValue::Integer(number)) => Ok(Some(partition_value_to_key(
+            &slot.topic,
+            column,
+            &Value::Number((*number).into()),
+        )?)),
+        other => Err(SubstrateError::Backend(format!(
+            "FORGE write: partition column '{column}' of '{}' read back as {other:?}, which is \
+             not a usable key",
+            slot.topic
+        ))),
+    }
+}
+
+/// Record a channel this action touched, minting the partition name through the
+/// single resolver so the write path cannot invent a name the render and
+/// subscribe paths would not produce.
+fn note_touched<'a>(
+    touched: &mut Vec<Touched<'a>>,
+    slot: &'a ForgeCollection,
+    partition: Option<String>,
+) -> Result<()> {
+    let channel = match (&slot.partition_by, &partition) {
+        (Some(_), Some(key)) => {
+            crate::runtime::broadcast::partition_topic_name(&slot.topic, key).ok_or_else(|| {
+                SubstrateError::Backend(format!(
+                    "FORGE write: partition key {key:?} for '{}' cannot name a channel",
+                    slot.topic
+                ))
+            })?
+        }
+        // A partitioned write whose row vanished: nothing to notify.
+        (Some(_), None) => return Ok(()),
+        _ => slot.topic.clone(),
+    };
+    if !touched.iter().any(|known| known.channel == channel) {
+        touched.push(Touched {
+            slot,
+            partition,
+            channel,
+        });
+    }
+    Ok(())
+}
+
 /// Build the statement for one write against its resolved slot. Dispatches on
 /// the variant; the slot supplies the `&'static` collection name and key column,
 /// so no userland string reaches the SQL as an identifier.
@@ -371,7 +506,7 @@ pub async fn apply_writes(
     // Resolve every collection against the schema BEFORE opening the
     // transaction: an unknown collection is an authoring error, and it should
     // not cost a write lock or leave a half-built transaction to roll back.
-    let mut touched: Vec<&ForgeCollection> = Vec::new();
+    let mut slots: Vec<&ForgeCollection> = Vec::new();
     for write in writes {
         let slot = schema.slot_for_topic(write.collection()).ok_or_else(|| {
             SubstrateError::Backend(format!(
@@ -379,10 +514,16 @@ pub async fn apply_writes(
                 write.collection()
             ))
         })?;
-        if !touched.iter().any(|known| known.topic == slot.topic) {
-            touched.push(slot);
+        if !slots.iter().any(|known| known.topic == slot.topic) {
+            slots.push(slot);
         }
     }
+
+    // Channels touched by this action, accumulated as the writes are applied.
+    // An `Append` knows its partition from its own record; `Update`/`Delete`
+    // have to read it out of the row before they change it, so this cannot be
+    // fully resolved before the transaction opens.
+    let mut touched: Vec<Touched<'_>> = Vec::new();
 
     let t_commit = std::time::Instant::now();
     let tx = substrate.begin().await?;
@@ -390,10 +531,48 @@ pub async fn apply_writes(
         // The slot is borrowed from the schema, resolved in `touched` above —
         // the collection name and key column reach SQL from here, never from the
         // userland string.
-        let slot = touched
+        let slot = slots
             .iter()
             .find(|slot| slot.topic == write.collection())
+            .copied()
             .expect("collection was resolved above");
+
+        // Learn which channel(s) this write moves, before it moves them.
+        let resolved = match write {
+            ForgeWrite::Append { record, .. } => append_partition(slot, record).map(|p| vec![p]),
+            ForgeWrite::Update { key, fields, .. } => match read_partition(tx.as_ref(), slot, key).await {
+                // A partition-CHANGING update touches two channels: the row
+                // leaves one and arrives in the other, and each side's
+                // subscribers need to hear about their half. Naming it here is
+                // the difference between "the row moved" and "the row vanished".
+                Ok(before) => match (&slot.partition_by, before) {
+                    (Some(column), before) => match fields.get(column) {
+                        Some(moved) => partition_value_to_key(&slot.topic, column, moved)
+                            .map(|after| vec![before, Some(after)]),
+                        None => Ok(vec![before]),
+                    },
+                    (None, _) => Ok(vec![None]),
+                },
+                Err(err) => Err(err),
+            },
+            ForgeWrite::Delete { key, .. } => {
+                read_partition(tx.as_ref(), slot, key).await.map(|p| vec![p])
+            }
+        };
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+        };
+        for partition in resolved {
+            if let Err(err) = note_touched(&mut touched, slot, partition) {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+        }
+
         let (sql, params) = match build_statement(slot, write) {
             Ok(built) => built,
             Err(err) => {
@@ -412,7 +591,7 @@ pub async fn apply_writes(
     let commit_el = t_commit.elapsed();
 
     // Durable now — safe to tell the world.
-    for slot in touched {
+    for Touched { slot, partition, channel } in touched {
         // Both awaits happen HERE, outside the topic's critical section:
         // `write_topic_delta`'s closure runs under that topic's lock, so
         // awaiting in it would serialise every writer behind the slowest query
@@ -421,7 +600,7 @@ pub async fn apply_writes(
         // is only the diff: pure, bounded by the collection size, and the one
         // step that genuinely needs the pre-state it is replacing.
         let t_mat = std::time::Instant::now();
-        let bytes = materialize_slot(substrate, slot).await?;
+        let bytes = materialize_slot(substrate, slot, partition.as_deref()).await?;
         let mat_el = t_mat.elapsed();
 
         // Choose what to render. A `PerRecord` collection renders only the rows
@@ -435,7 +614,7 @@ pub async fn apply_writes(
         let t_proj = std::time::Instant::now();
         let (rows, partial) = match projector {
             Some(p) if p.projection_class(&slot.topic) == RowProjection::PerRecord => {
-                match render_changed_rows(p, slot, broadcast, &bytes).await {
+                match render_changed_rows(p, slot, &channel, broadcast, &bytes).await {
                     // Changed rows attributed and rendered: the fast path.
                     Some(changed) => (Some(changed), true),
                     // No prior value to diff against, or unkeyable rows: fall back
@@ -470,13 +649,17 @@ pub async fn apply_writes(
         }
 
         let t_fan = std::time::Instant::now();
-        broadcast.topic(slot.topic.clone(), bytes.clone());
+        // The channel, not the collection: a partitioned write fans out on its
+        // own partition's topic. `projection_class` / `project_rows` above stay
+        // keyed by `slot.topic`, because the row TEMPLATE belongs to the
+        // collection while the subscriber set belongs to the partition.
+        broadcast.topic(channel.clone(), bytes.clone());
         // `needs_whole` is raised inside the closure when a partial render can't
         // express the transition (a reorder, a mid-list insert, or a race that
         // moved `previous` out from under the changed-set guess). The reconcile is
         // then shipped after the lock, off the critical section.
         let needs_whole = Cell::new(false);
-        let _ = broadcast.write_topic_delta(&slot.topic, |previous| {
+        let _ = broadcast.write_topic_delta(&channel, |previous| {
             let update = match rows.as_ref() {
                 Some(rows) => row_update(slot, previous, &bytes, rows, partial, &needs_whole),
                 None => ListUpdate::None,
@@ -495,7 +678,7 @@ pub async fn apply_writes(
         if needs_whole.get() {
             if let Some(p) = projector {
                 if let Some(whole) = p.project_rows(&slot.topic, &bytes).await {
-                    let _ = broadcast.write_topic_delta(&slot.topic, |_previous| TopicTransition {
+                    let _ = broadcast.write_topic_delta(&channel, |_previous| TopicTransition {
                         value: bytes.clone(),
                         update: ListUpdate::Reconcile(reconcile_rows(&whole)),
                     });
@@ -540,10 +723,14 @@ pub async fn apply_writes(
 async fn render_changed_rows(
     projector: &dyn RowProjector,
     slot: &ForgeCollection,
+    channel: &str,
     broadcast: &BroadcastRegistry,
     next: &[u8],
 ) -> Option<RenderedRows> {
-    let previous = broadcast.get(&slot.topic)?.current_value();
+    // The previous value belongs to the CHANNEL — this partition's rows, not the
+    // whole collection's. Diffing against the collection would attribute every
+    // other partition's rows as "changed".
+    let previous = broadcast.get(channel)?.current_value();
 
     // Intent-path shortcut: when `next` is provably `previous` plus a tail, the
     // appended records ARE the changed set. No parse of either full array, no
@@ -1144,6 +1331,185 @@ mod tests {
 /// a component renders from reflects it afterwards.
 #[cfg(all(test, feature = "forge"))]
 mod substrate_tests {
+    /// A partitioned collection, declared the way an app would.
+    fn partitioned_schema() -> ForgeSchema {
+        use crate::forge::declare::{CollectionDecl, FieldType};
+        use std::collections::BTreeMap;
+
+        let mut fields = BTreeMap::new();
+        fields.insert("room".to_string(), FieldType::Text);
+        fields.insert("body".to_string(), FieldType::Text);
+        let mut declarations = BTreeMap::new();
+        declarations.insert(
+            "messages".to_string(),
+            CollectionDecl {
+                fields,
+                partition_by: Some("room".to_string()),
+                ..CollectionDecl::default()
+            },
+        );
+        ForgeSchema::from_declarations(&declarations).expect("schema")
+    }
+
+    fn msg(room: &str, body: &str) -> ForgeWrite {
+        let mut record = serde_json::Map::new();
+        record.insert("room".into(), Value::String(room.into()));
+        record.insert("body".into(), Value::String(body.into()));
+        ForgeWrite::Append {
+            collection: "messages".into(),
+            record,
+        }
+    }
+
+    fn rows_of(broadcast: &BroadcastRegistry, channel: &str) -> Vec<Value> {
+        broadcast
+            .get(channel)
+            .map(|topic| {
+                serde_json::from_slice::<Value>(&topic.current_value())
+                    .ok()
+                    .and_then(|value| value.as_array().cloned())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// An append fans out on **its own partition's channel** and nowhere else.
+    /// Without this, one room's message lands in every room.
+    #[tokio::test]
+    async fn an_append_fans_out_only_on_its_own_partition() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = partitioned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "hello")], None)
+            .await
+            .unwrap();
+        apply_writes(&db, &broadcast, &schema, &[msg("b", "other")], None)
+            .await
+            .unwrap();
+
+        let room_a = rows_of(&broadcast, "messages:a");
+        let room_b = rows_of(&broadcast, "messages:b");
+        assert_eq!(room_a.len(), 1, "room a: {room_a:?}");
+        assert_eq!(room_a[0]["body"], "hello");
+        assert_eq!(room_b.len(), 1, "room b: {room_b:?}");
+        assert_eq!(room_b[0]["body"], "other");
+        assert!(
+            broadcast.get("messages").is_none(),
+            "a partitioned collection has no whole-collection channel to fan out on"
+        );
+    }
+
+    /// The edge PRISM named up front: moving a row between partitions touches
+    /// **two** channels. The origin has to hear that the row left, or it shows a
+    /// message that is no longer there until someone reloads.
+    #[tokio::test]
+    async fn a_partition_changing_update_notifies_both_sides() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = partitioned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "movable")], None)
+            .await
+            .unwrap();
+        assert_eq!(rows_of(&broadcast, "messages:a").len(), 1);
+
+        let mut fields = serde_json::Map::new();
+        fields.insert("room".into(), Value::String("b".into()));
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[ForgeWrite::Update {
+                collection: "messages".into(),
+                key: Value::Number(1.into()),
+                fields,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rows_of(&broadcast, "messages:a").is_empty(),
+            "the origin must be told the row left"
+        );
+        let arrived = rows_of(&broadcast, "messages:b");
+        assert_eq!(arrived.len(), 1, "the destination gains it: {arrived:?}");
+        assert_eq!(arrived[0]["body"], "movable");
+    }
+
+    /// A delete has to learn the partition from the row before removing it —
+    /// afterwards there is nothing left to ask.
+    #[tokio::test]
+    async fn a_delete_fans_out_on_the_partition_the_row_was_in() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = partitioned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "doomed")], None)
+            .await
+            .unwrap();
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[ForgeWrite::Delete {
+                collection: "messages".into(),
+                key: Value::Number(1.into()),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(rows_of(&broadcast, "messages:a").is_empty());
+    }
+
+    /// An append that omits the partition column would be written but invisible
+    /// to every reader — refused rather than silently orphaned.
+    #[tokio::test]
+    async fn an_append_missing_its_partition_column_is_refused() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = partitioned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        let mut record = serde_json::Map::new();
+        record.insert("body".into(), Value::String("orphan".into()));
+        let err = apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[ForgeWrite::Append {
+                collection: "messages".into(),
+                record,
+            }],
+            None,
+        )
+        .await
+        .expect_err("refused");
+        assert!(format!("{err}").contains("partitioned by"), "{err}");
+    }
+
+    /// A key outside the topic alphabet cannot name a channel, so it is refused
+    /// at the write rather than producing an unreachable partition.
+    #[tokio::test]
+    async fn a_partition_key_outside_the_alphabet_is_refused() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = partitioned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        let err = apply_writes(&db, &broadcast, &schema, &[msg("a:b", "sneaky")], None)
+            .await
+            .expect_err("refused");
+        assert!(format!("{err}").contains("alphabet"), "{err}");
+    }
+
     use super::*;
     use crate::forge::skeleton::{bootstrap_schema, hydrate_topics};
     use crate::forge::LibSqlSubstrate;

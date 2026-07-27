@@ -24,8 +24,9 @@ pub mod webtransport;
 
 pub use bridge::{HandlerEffect, HandlerInvocation, HandlerOutcome};
 pub use broadcast::{
-    broadcast_slot_id, check_topic_slot_ids, BroadcastDelivery, BroadcastError, BroadcastRegistry,
-    BroadcastSender, BroadcastTopic, TopicIdentity,
+    broadcast_slot_id, check_topic_slot_ids, is_valid_partition_key, partition_topic_name,
+    BroadcastDelivery, BroadcastError, BroadcastRegistry, BroadcastSender, BroadcastTopic,
+    TopicIdentity,
 };
 pub use compiled::{
     allocate_proxy_id, allocate_slot_id, render_entry_with_bindings, render_entry_with_broadcast,

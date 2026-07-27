@@ -1077,6 +1077,39 @@ pub fn coalesce_changes(changes: Vec<SlotChange>) -> Vec<SlotChange> {
     order
 }
 
+/// The **one** place a `(collection, key)` pair becomes a topic name.
+///
+/// PRISM invariant 5: the render, subscribe and write paths must derive the same
+/// identity or they silently drift into three different channels — a page
+/// rendering from one, a subscriber listening on another, a write fanning out on
+/// a third, each individually plausible. A second implementation of this format
+/// anywhere is that bug.
+///
+/// `None` when the key is outside `[A-Za-z0-9_-]{1,64}`. That alphabet is not
+/// cosmetic — it is what makes aliasing *unexpressible* rather than merely
+/// checked. Excluding `:` means a resolved name decomposes against its
+/// collection unambiguously no matter how many collections coexist, so two
+/// distinct partitions can never land on one channel and cross-deliver. Length
+/// is bounded because the key arrives from a URL segment.
+#[must_use]
+pub fn partition_topic_name(collection: &str, key: &str) -> Option<String> {
+    if !is_valid_partition_key(key) {
+        return None;
+    }
+    Some(format!("{collection}:{key}"))
+}
+
+/// The partition-key alphabet. See [`partition_topic_name`] for why it is this
+/// narrow.
+#[must_use]
+pub fn is_valid_partition_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Deterministic mapping from a topic string to its wire `SlotId`.
 ///
 /// Two processes running the same build produce the same slot id
@@ -1326,6 +1359,46 @@ mod tests {
             "the plain constructor must not downgrade an existing partition to static"
         );
         assert_eq!(again.current_value(), b"[1]".to_vec());
+    }
+
+    #[test]
+    fn a_partition_name_is_the_collection_and_the_key() {
+        assert_eq!(
+            partition_topic_name("messages", "42").as_deref(),
+            Some("messages:42")
+        );
+        assert_eq!(
+            partition_topic_name("messages", "room_a-1").as_deref(),
+            Some("messages:room_a-1")
+        );
+    }
+
+    /// The alphabet is what makes aliasing unexpressible. A key containing the
+    /// separator would let two distinct partitions resolve to one name and
+    /// cross-deliver their rows — the exact failure the v1 design needed a
+    /// grammar proof to rule out.
+    #[test]
+    fn a_key_containing_the_separator_is_refused() {
+        assert_eq!(partition_topic_name("messages", "1:2"), None);
+        assert_eq!(partition_topic_name("x", "a:b"), None);
+        // …so the pair that would have aliased cannot both be minted.
+        assert_eq!(partition_topic_name("x", "1"), Some("x:1".to_string()));
+        assert_eq!(partition_topic_name("x:1", "2"), Some("x:1:2".to_string()));
+        assert_eq!(
+            partition_topic_name("x", "1:2"),
+            None,
+            "the only other way to reach `x:1:2` is refused"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_overlong_or_exotic_key_is_refused() {
+        assert!(!is_valid_partition_key(""));
+        assert!(!is_valid_partition_key(&"a".repeat(65)));
+        assert!(is_valid_partition_key(&"a".repeat(64)));
+        assert!(!is_valid_partition_key("a/b"));
+        assert!(!is_valid_partition_key("a b"));
+        assert!(!is_valid_partition_key("café"));
     }
 
     #[test]

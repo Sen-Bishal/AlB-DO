@@ -189,11 +189,47 @@ impl CollectionDecl {
         ddl.push(')');
 
         // ── The materialising query ──
+        //
+        // A partitioned collection is read one partition at a time, so the query
+        // carries a `WHERE` and takes a bound parameter. The column name comes
+        // from the schema and was identifier-checked above; the *value* is only
+        // ever bound, never interpolated, so there is no path from a URL segment
+        // to SQL text.
         let order_by = self.order_by_sql(topic, &key)?;
-        let query = format!(
-            "SELECT {key}, {} FROM {table} ORDER BY {order_by}",
-            columns.join(", ")
-        );
+        let select = format!("SELECT {key}, {} FROM {table}", columns.join(", "));
+        let query = match &self.partition_by {
+            Some(column) => format!("{select} WHERE {column} = ?1 ORDER BY {order_by}"),
+            None => format!("{select} ORDER BY {order_by}"),
+        };
+
+        // ── The index that makes the `WHERE` worth having ──
+        //
+        // Emitted in the same breath as the clause it serves, deliberately.
+        // Without `(partition, sort…)` indexed, every partitioned read is a full
+        // table scan plus a sort — indistinguishable from the unpartitioned
+        // version at one partition, and unusable at a thousand. Shipping the
+        // `WHERE` without the index would be a performance cliff that only
+        // appears under real data.
+        let mut migrations = vec![ddl];
+        if let Some(column) = &self.partition_by {
+            let mut index_columns = vec![column.clone()];
+            let mut name_parts = vec![table.clone(), column.clone()];
+            for sort in parse_order_by(&query).iter() {
+                if &sort.column == column {
+                    continue;
+                }
+                name_parts.push(sort.column.clone());
+                index_columns.push(match sort.dir {
+                    SortDir::Asc => sort.column.clone(),
+                    SortDir::Desc => format!("{} DESC", sort.column),
+                });
+            }
+            migrations.push(format!(
+                "CREATE INDEX IF NOT EXISTS idx_{} ON {table}({})",
+                name_parts.join("_"),
+                index_columns.join(", ")
+            ));
+        }
 
         // ── Seeds ──
         let mut seed = Vec::with_capacity(self.seed.len());
@@ -201,10 +237,15 @@ impl CollectionDecl {
             seed.push(self.lower_seed_row(topic, &table, row)?);
         }
 
-        Ok(
-            ForgeCollection::new(topic, table, query, key, Box::new([ddl]), seed.into_boxed_slice())
-                .with_partition_by(self.partition_by.clone()),
+        Ok(ForgeCollection::new(
+            topic,
+            table,
+            query,
+            key,
+            migrations.into_boxed_slice(),
+            seed.into_boxed_slice(),
         )
+        .with_partition_by(self.partition_by.clone()))
     }
 
     /// The `ORDER BY` clause, re-emitted from a *parse* rather than passed
@@ -376,12 +417,61 @@ mod tests {
         d.partition_by = Some("room".to_string());
         let collection = d.lower("messages").expect("lowers");
         assert_eq!(collection.partition_by.as_deref(), Some("room"));
-        // P0 records the column; the query is untouched until P2 adds the
-        // `WHERE` and its matching composite index together.
+
+        // P2 · the read is now per-partition, and the key is BOUND, never
+        // interpolated — the column name comes from the schema, the value from
+        // a parameter.
+        assert_eq!(
+            collection.query,
+            "SELECT id, body, room FROM messages WHERE room = ?1 ORDER BY id"
+        );
+
+        // …and the index that makes it worth having ships in the same
+        // migration set. A `WHERE` without `(partition, sort)` indexed is a full
+        // scan plus a sort on every read: identical at one partition, unusable
+        // at a thousand. These two must never land apart.
+        let index = collection
+            .migrations
+            .iter()
+            .find(|sql| sql.contains("CREATE INDEX"))
+            .expect("a partitioned collection emits its composite index");
+        assert_eq!(
+            index,
+            "CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room, id)"
+        );
+    }
+
+    /// A DESC ordering has to be mirrored in the index, or the index serves the
+    /// filter but the sort still happens in memory.
+    #[test]
+    fn a_descending_order_is_carried_into_the_partition_index() {
+        let mut d = decl(&[("room", FieldType::Text), ("body", FieldType::Text)]);
+        d.partition_by = Some("room".to_string());
+        d.order_by = Some("id desc".to_string());
+        let collection = d.lower("messages").expect("lowers");
+        let index = collection
+            .migrations
+            .iter()
+            .find(|sql| sql.contains("CREATE INDEX"))
+            .expect("index");
+        assert!(index.contains("(room, id DESC)"), "{index}");
+    }
+
+    /// An unpartitioned collection is untouched by all of this — the property
+    /// that keeps P2 invisible to every app that exists today.
+    #[test]
+    fn an_unpartitioned_collection_gets_no_where_and_no_index() {
+        let collection = decl(&[("author", FieldType::Text)])
+            .lower("guestbook")
+            .expect("lowers");
+        assert_eq!(
+            collection.query,
+            "SELECT id, author FROM guestbook ORDER BY id"
+        );
         assert!(
-            !collection.query.to_ascii_uppercase().contains("WHERE"),
-            "P0 must not change the query: {}",
-            collection.query
+            !collection.migrations.iter().any(|sql| sql.contains("CREATE INDEX")),
+            "no partition, no index: {:?}",
+            collection.migrations
         );
     }
 
