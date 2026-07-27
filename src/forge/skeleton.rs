@@ -96,6 +96,11 @@ pub struct ForgeCollection {
     /// (see [`parse_order_by`]). Empty when the ordering can't be proven a simple
     /// column list.
     ///
+    /// PRISM · the declared partition column, when this collection is read one
+    /// partition at a time. Recorded in P0 so the build check can compare it
+    /// against what a component's `.where({ <column>: … })` names; the query
+    /// itself does not consult it until P2 adds the `WHERE` and its index.
+    pub partition_by: Option<String>,
     /// Not yet read by the write path. Insert position is currently taken from
     /// the freshly materialised array's own order (see
     /// [`classify_positioned_insert`](crate::forge::delta::classify_positioned_insert)),
@@ -130,7 +135,17 @@ impl ForgeCollection {
             migrations,
             seed,
             sort,
+            partition_by: None,
         }
+    }
+
+    /// Attach the declared partition column. Separate from [`Self::new`] so the
+    /// four existing construction sites — the built-in default, inference, and
+    /// the tests — stay untouched by a field only declared collections set.
+    #[must_use]
+    pub fn with_partition_by(mut self, column: Option<String>) -> Self {
+        self.partition_by = column;
+        self
     }
 }
 
@@ -234,6 +249,19 @@ pub enum ForgeSchemaError {
     /// A seed value that is not a scalar — a collection is a table of scalars.
     #[error("FORGE schema: seed value for {topic:?}.{column} is not a scalar")]
     UnsupportedSeedValue { topic: String, column: String },
+    /// PRISM · `partition_by` names something that is not a declared field.
+    /// Lists what *is* declared, because the overwhelmingly likely cause is a
+    /// typo and the answer is three words away.
+    #[error(
+        "FORGE schema: collection {topic:?} is partitioned by {column:?}, which is not a declared \
+         field (declared: {})",
+        if declared.is_empty() { "none".to_string() } else { declared.join(", ") }
+    )]
+    UnknownPartitionColumn {
+        topic: String,
+        column: String,
+        declared: Vec<String>,
+    },
 }
 
 /// The FORGE collection registry: an immutable, boot-built lookup from a

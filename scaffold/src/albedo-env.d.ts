@@ -38,6 +38,15 @@ declare namespace JSX {
 
   // The base properties every JSX element accepts.
   interface AlbedoBaseAttributes extends DataAttributes, AriaAttributes {
+    // Framework-reserved props. These are consumed by the renderer and
+    // never reach the DOM — the authoritative list is
+    // `runtime::eval::component::is_reserved_jsx_prop`, which covers
+    // exactly `key`, `ref` and `children`. `key` in particular is not
+    // decoration: it supplies the `RowKey` that keyed-list
+    // reconciliation uses to keep untouched rows' DOM nodes across a
+    // write, so a `.map()` over a slot needs it.
+    key?: string | number;
+    ref?: unknown;
     children?: AlbedoChildren;
     id?: string;
     class?: string;
@@ -357,12 +366,75 @@ declare module "albedo" {
   // structured objects all round-trip.
   export function useSharedSlot<T = unknown>(topic: string): T;
 
+  // The submitted fields of a `<form action="action:NAME" method="POST">`,
+  // keyed by each input's `name` attribute. The interpreter seeds this as
+  // the handler's argument (`eval/core.rs` — "seeded LAST so it shadows a
+  // module constant or prop of the same name"). Values arrive as strings:
+  // an `<input name="id">` is `"3"`, not `3`.
+  export type ActionForm = Record<string, string>;
+
+  // What every action handler receives.
+  export interface ActionArgs {
+    form: ActionForm;
+  }
+
   // Phase P · Stream C.1 — declare an HTTP action handler. Body
   // runs server-side when bakabox POSTs `/_albedo/action` for this
   // declaration's `action_id` (FNV-1a-32 of the export name).
-  export function action<Args = unknown, R = void>(
+  //
+  // `Args` defaults to the concrete `ActionArgs` rather than `unknown` so
+  // that `action(({ form }) => …)` infers without an annotation — a
+  // destructuring pattern gives TypeScript nothing to infer from, so an
+  // `unknown` default makes the framework's own idiom fail to compile.
+  // Narrow it when the field set is known:
+  //
+  //   action<{ form: { author: string; message: string } }>(({ form }) => …)
+  export function action<Args extends ActionArgs = ActionArgs, R = void>(
     handler: (args: Args) => R | Promise<R>,
   ): (args: Args) => Promise<R>;
+}
+
+// ── The supported React surface ─────────────────────────────────
+//
+// ALBEDO is React-shaped, and `useState` is only recognised when it
+// resolves to an import from `"react"` — `transforms/hooks.rs` checks the
+// binding's source, exactly as `useSharedSlot` is checked against
+// `"albedo"`. So this import is load-bearing, not a compatibility shim,
+// and it has to be declared for the scaffold's own Counter to type-check.
+//
+// What is declared here is what the runtime actually implements: the
+// surface pinned by `quickjs_engine.rs::full_hook_surface_renders_without_crashing`
+// (server: effects are no-ops) and by `assets/albedo-client.js` (client:
+// `useEffect` runs after paint). Anything absent from this list is absent
+// on purpose — a missing export is a build error, which is the honest
+// signal. Do not widen it to match React's API without a runtime path to
+// match; a declaration the interpreter cannot honour turns a compile-time
+// error into a silent no-op at runtime.
+declare module "react" {
+  // Slot-backed state. The setter takes a VALUE, not an updater function:
+  // setter dispatch in `eval/core.rs` evaluates the first argument and
+  // JSON-encodes it, so `setCount(c => c + 1)` would store a function and
+  // is deliberately not typed. Read the current value and pass the next
+  // one — `setCount(count + 1)`.
+  export function useState<S>(initial: S): [S, (next: S) => void];
+
+  // Runs after the component is painted on the client; a no-op on the
+  // server. Returning a function registers teardown. A component that
+  // calls this hydrates eagerly rather than on interaction — a passive
+  // effect would otherwise never run (see `effects.rs`).
+  export function useEffect(
+    effect: () => void | (() => void),
+    deps?: readonly unknown[],
+  ): void;
+
+  export function useRef<T>(initial: T): { current: T };
+
+  export function useMemo<T>(factory: () => T, deps?: readonly unknown[]): T;
+
+  export function useCallback<T extends (...args: never[]) => unknown>(
+    callback: T,
+    deps?: readonly unknown[],
+  ): T;
 }
 
 // Phase P · Stream C.2 — `broadcast(topic, updater)` is a free
@@ -409,23 +481,29 @@ declare function update<T extends Record<string, unknown>>(
 
 // Side-channel globals the client runtime publishes for advanced
 // userland integrations (e.g. instrumenting the WT debug slot).
-declare global {
-  interface Window {
-    __ALBEDO_RUNTIME?: {
-      applyFrameBytes?: (bytes: Uint8Array) => void;
-      encodeActionEnvelope?: (envelope: {
-        action_id: number;
-        event_kind: number;
-        payload: Uint8Array;
-      }) => Uint8Array;
-      requestRouteRefresh?: (path: string) => Promise<void>;
-      registerInstructionHandler?: (
-        name: string,
-        handler: (instruction: unknown) => void,
-      ) => void;
-      hashActionName?: (name: string) => number;
-    };
-  }
+//
+// Declared at top level, NOT inside `declare global { … }` — and this
+// file must never gain a top-level `import`/`export`. A `.d.ts` with one
+// becomes a *module*, at which point `declare namespace JSX` is only
+// file-local (every JSX tag then errors TS7026), the free idents below
+// stop being globals (TS2304), and `declare module "albedo"` is reparsed
+// as an augmentation of a module that must already resolve (TS2307).
+// That single trailing `export {}` cost 139 errors in a freshly
+// generated app. In a script file `declare global` is itself an error,
+// so `interface Window` augments the global scope directly.
+interface Window {
+  __ALBEDO_RUNTIME?: {
+    applyFrameBytes?: (bytes: Uint8Array) => void;
+    encodeActionEnvelope?: (envelope: {
+      action_id: number;
+      event_kind: number;
+      payload: Uint8Array;
+    }) => Uint8Array;
+    requestRouteRefresh?: (path: string) => Promise<void>;
+    registerInstructionHandler?: (
+      name: string,
+      handler: (instruction: unknown) => void,
+    ) => void;
+    hashActionName?: (name: string) => number;
+  };
 }
-
-export {};

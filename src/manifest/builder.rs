@@ -55,6 +55,14 @@ struct ShellPlaceholder {
 /// layout render emits at its authored position instead.
 const LAYOUT_ISLAND_PARENT: &str = "__albedo_layout_island__";
 
+/// Sentinel `parent_placeholder` for a Tier-C island authored *inside* another
+/// element of its route (`<section class="plate"><Counter /></section>`). Same
+/// contract as [`LAYOUT_ISLAND_PARENT`]: it keeps the node out of
+/// `collect_shell_placeholders`, because its anchor is the inline placeholder
+/// the Tier-A static render emits at the authored position. Without it the
+/// island is anchored at the END of the shell while its wrapper renders empty.
+const ROUTE_ISLAND_PARENT: &str = "__albedo_route_island__";
+
 #[derive(Debug, Clone)]
 pub struct ComponentTierMetadata {
     pub tier: Tier,
@@ -139,6 +147,18 @@ impl<'a> ManifestBuilder<'a> {
         let island_names = self.tier_c_component_names();
         let _island_guard = crate::runtime::eval::core::install_island_skip_set(&island_names);
 
+        // …but "anchored at its own placeholder" only lands the island back in
+        // the right place when that placeholder is a sibling of the root. An
+        // island authored INSIDE another element — `<section class="plate">
+        // <Counter /></section>` — would render the section empty and anchor the
+        // island at the end of the shell, escaping its wrapper. So collect those
+        // nested islands first and install their placeholder ids, which makes
+        // `render_static` emit each island's anchor inline at its authored
+        // position (the mechanism layouts already use).
+        let route_island_map = self.collect_route_island_placeholders(root_component);
+        let _island_placeholder_guard =
+            crate::runtime::eval::core::install_island_placeholders(&route_island_map);
+
         self.traverse(
             root_component,
             None,
@@ -149,6 +169,16 @@ impl<'a> ManifestBuilder<'a> {
             &mut order_counter,
             assets,
         );
+
+        // Anchored inline above ⇒ keep them out of the shell-level collection,
+        // or the island renders twice (once in its wrapper, once at the end).
+        for node in &mut tier_c {
+            if node.position.parent_placeholder.is_none()
+                && route_island_map.contains_key(&node.component_id)
+            {
+                node.position.parent_placeholder = Some(ROUTE_ISLAND_PARENT.to_string());
+            }
+        }
 
         // Phase P · per-route metadata. Topics are global today (every
         // route knows every topic the project references) — the
@@ -666,7 +696,7 @@ impl<'a> ManifestBuilder<'a> {
         // `render_layout_html` below, so a Tier-C island in the layout emits its
         // real placeholder div inline (instead of nothing) at its authored spot.
         let _island_anchor_guard =
-            crate::runtime::eval::core::install_layout_island_placeholders(layout_island_map);
+            crate::runtime::eval::core::install_island_placeholders(layout_island_map);
 
         let mut accumulated = leaf_html;
         for layout_name in layout_chain.iter().rev() {
@@ -716,7 +746,7 @@ impl<'a> ManifestBuilder<'a> {
     /// block on serve.
     ///
     /// Returns the nodes plus the `name → placeholder_id` map the renderer
-    /// consults (via `install_layout_island_placeholders`) to emit each island's
+    /// consults (via `install_island_placeholders`) to emit each island's
     /// inline placeholder while the layout is rendered. Each node carries the
     /// [`LAYOUT_ISLAND_PARENT`] sentinel so `collect_shell_placeholders` leaves
     /// it out of the `<children />` slot — its anchor is the inline div instead.
@@ -779,6 +809,60 @@ impl<'a> ManifestBuilder<'a> {
         }
 
         (nodes, map)
+    }
+
+    /// Every Tier-C island authored *inside* another component's markup on this
+    /// route, as `component-name → placeholder_id`.
+    ///
+    /// The route root is deliberately excluded: if the root itself is Tier-C
+    /// there is no enclosing static HTML to anchor into, and its shell-level
+    /// placeholder is correct. Everything below it is authored inside a rendered
+    /// ancestor — a Tier-A parent inlines the whole authored tree (emitting a
+    /// hole where each island sits), and a Tier-B parent renders its own static
+    /// HTML the same way — so both need the inline anchor.
+    ///
+    /// Ids are recomputed with the same formula as [`Self::build_tier_c_node`];
+    /// they have to agree, since the serve path matches the emitted div by id.
+    /// `visited` guards dependency cycles.
+    fn collect_route_island_placeholders(
+        &self,
+        root: ComponentId,
+    ) -> std::collections::HashMap<String, String> {
+        use std::collections::HashSet;
+
+        let mut map = std::collections::HashMap::new();
+        let mut visited: HashSet<ComponentId> = HashSet::new();
+        visited.insert(root);
+
+        let mut stack = self.sorted_children(root);
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            match self.tier_of(id) {
+                // An island boundary: anchor it inline, and stop — its own
+                // subtree belongs to the island, not to the enclosing render.
+                Some(Tier::C) => {
+                    let component = self.component_or_panic(id);
+                    map.insert(
+                        component.name.clone(),
+                        format!(
+                            "__c_{}_{}",
+                            slugify(component.name.as_str()),
+                            component.id.as_u64()
+                        ),
+                    );
+                }
+                Some(Tier::A) | Some(Tier::B) => {
+                    for child in self.sorted_children(id) {
+                        stack.push(child);
+                    }
+                }
+                None => {}
+            }
+        }
+
+        map
     }
 
     fn traverse(
@@ -1916,5 +2000,86 @@ mod tests {
         let (empty_nodes, empty_map) =
             builder.collect_layout_islands(&[], &mut order, &assets);
         assert!(empty_nodes.is_empty() && empty_map.is_empty());
+    }
+
+    /// A Tier-C island authored inside another element of the route
+    /// (`<section class="plate"><Counter /></section>`) must anchor INLINE at
+    /// that position, not at the end of the shell.
+    ///
+    /// The regression this pins: the Tier-A parent's static render emits a hole
+    /// where the island sits, and the island was then anchored by
+    /// `collect_shell_placeholders` as a sibling of the route root — so the
+    /// wrapper rendered empty and the island escaped its container. It was
+    /// invisible on a light theme (an empty white box) and obvious on black.
+    /// Both the map entry and the sentinel parent are required: the map makes
+    /// the renderer emit the anchor inline, the sentinel keeps the shell from
+    /// emitting a second one.
+    #[test]
+    fn a_nested_tier_c_island_anchors_inline_not_at_the_shell_root() {
+        use super::{ComponentTierMetadata, ManifestBuilder, ROUTE_ISLAND_PARENT};
+        use crate::effects::EffectProfile;
+        use crate::manifest::schema::{HydrationMode, Tier};
+        use crate::types::{Component, ComponentId};
+        use crate::RenderCompiler;
+        use std::collections::HashMap;
+
+        let mut compiler = RenderCompiler::new();
+
+        let mut home = Component::new(ComponentId::new(0), "Home".to_string());
+        home.file_path = "src/routes/index.tsx".to_string();
+        let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
+        counter.file_path = "src/components/Counter.tsx".to_string();
+
+        let home_id = compiler.add_component(home);
+        let counter_id = compiler.add_component(counter);
+        compiler.add_dependency(home_id, counter_id).unwrap();
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            home_id,
+            ComponentTierMetadata {
+                tier: Tier::A,
+                hydration_mode: HydrationMode::None,
+                effect_profile: EffectProfile::default(),
+            },
+        );
+        metadata.insert(
+            counter_id,
+            ComponentTierMetadata {
+                tier: Tier::C,
+                hydration_mode: HydrationMode::OnInteraction,
+                effect_profile: EffectProfile {
+                    hooks: true,
+                    ..EffectProfile::default()
+                },
+            },
+        );
+
+        let builder = ManifestBuilder::new(compiler.graph(), metadata, 1000);
+        let map = builder.collect_route_island_placeholders(home_id);
+
+        assert_eq!(
+            map.get("Counter").map(String::as_str),
+            Some("__c_counter_1"),
+            "the nested island is registered for an inline anchor, with the same \
+             placeholder id build_tier_c_node mints; got {map:?}"
+        );
+        assert!(
+            !map.contains_key("Home"),
+            "the route root is never inline-anchored — it has no enclosing render"
+        );
+
+        // A Tier-C route root anchors at the shell, as before: nothing to nest
+        // it into, so the map must stay empty and leave the old path alone.
+        let root_only = builder.collect_route_island_placeholders(counter_id);
+        assert!(
+            root_only.is_empty(),
+            "a Tier-C root keeps its shell-level placeholder; got {root_only:?}"
+        );
+
+        assert_eq!(
+            ROUTE_ISLAND_PARENT, "__albedo_route_island__",
+            "sentinel is matched by value in collect_shell_placeholders"
+        );
     }
 }

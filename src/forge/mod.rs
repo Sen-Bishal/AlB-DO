@@ -34,12 +34,14 @@
 //! escape-analysis pass land next; this scaffold fixes the boundary they
 //! meet at, and nothing here is wired into the default serve path yet.
 
+pub mod bindings;
 pub mod declare;
 pub mod delta;
 pub mod mem;
 pub mod reserve;
 pub mod skeleton;
 pub mod substrate;
+pub mod typegen;
 pub mod value;
 pub mod write;
 
@@ -53,7 +55,9 @@ pub use delta::{
 pub use reserve::{
     IdempotencyConflict, ReleaseOutcome, ReserveError, ReserveOutcome, ReserveRequest, Reservations,
 };
+pub use bindings::{validate_partition_bindings, PartitionBinding};
 pub use declare::{CollectionDecl, FieldType};
+pub use typegen::emit_forge_dts;
 pub use skeleton::{ForgeCollection, ForgeSchema, ForgeSchemaError, SeedRow};
 pub use substrate::{DataSubstrate, Transaction};
 pub use value::{Result, Row, Rows, SqlValue, SubstrateError};

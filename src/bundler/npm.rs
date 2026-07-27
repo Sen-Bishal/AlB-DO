@@ -169,7 +169,10 @@ pub fn is_bare_npm_specifier(specifier: &str) -> bool {
     {
         return false;
     }
-    if matches!(s, "react" | "react-dom" | "albedo") || s.starts_with("react/") {
+    // `albedo/forge` is the generated collection-binding module: types only, no
+    // runtime record, folded away by the transpile. Resolving it through
+    // node_modules would look for a package that deliberately does not exist.
+    if matches!(s, "react" | "react-dom" | "albedo" | "albedo/forge") || s.starts_with("react/") {
         return false;
     }
     // A Windows drive path ("C:\…" / "C:/…") is absolute, not bare.

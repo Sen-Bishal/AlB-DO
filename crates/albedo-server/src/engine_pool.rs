@@ -366,7 +366,7 @@ fn warm_engine(engine: &mut QuickJsEngine) {
         broadcast('__albedo_warm_topic', function (n) { return (n || 0) + 1; });";
 
     let env = Map::new();
-    let broadcast_current = Map::new();
+    let broadcast_current: Vec<(String, Vec<u8>)> = Vec::new();
     let setters = [("__warm".to_string(), SlotId(0))];
     let invocation = HandlerInvocation {
         body,
@@ -453,7 +453,7 @@ mod tests {
         let peak = pool
             .with_engine(|engine| {
                 let env = Map::new();
-                let bc = Map::new();
+                let bc: Vec<(String, Vec<u8>)> = Vec::new();
                 let inv = HandlerInvocation {
                     body: "1 + 1",
                     is_block: false,

@@ -370,6 +370,24 @@ impl BroadcastRegistry {
             .collect()
     }
 
+    /// Current values for just these topics, skipping any that are not
+    /// registered.
+    ///
+    /// The narrow counterpart to [`Self::snapshot_values`]. A handler that
+    /// broadcasts to two named topics should pay for two, not for every topic in
+    /// the process — which at 2,000 rows was measured at 1.7 ms per dispatch,
+    /// for data the handler never reads (`OPTIMIZATIONS.md` § 7).
+    pub fn values_for(&self, topics: &[String]) -> Vec<(String, Vec<u8>)> {
+        topics
+            .iter()
+            .filter_map(|topic| {
+                self.topics
+                    .get(topic.as_str())
+                    .map(|entry| (topic.clone(), entry.current_value()))
+            })
+            .collect()
+    }
+
     /// Subscribe `session` to `topic` with a sink (typically the
     /// session's WT patches-lane sender). Returns the topic's
     /// current value so the caller can ship an initial SlotSet to

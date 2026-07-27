@@ -103,6 +103,18 @@ pub struct CollectionDecl {
     /// interpolated.
     #[serde(default)]
     pub order_by: Option<String>,
+    /// PRISM · the column this collection is partitioned by, when it is read one
+    /// partition at a time: `useSharedSlot(messages.where({ room: params.id }))`.
+    ///
+    /// Must name a declared field (never the key). Declared, never inferred —
+    /// guessing which column a key refers to has a silent wrong answer.
+    ///
+    /// **P0 records it and validates it; it does not yet change the query.** The
+    /// `WHERE` clause and the matching composite index land together in P2, and
+    /// they must land together: a partitioned read without
+    /// `(partition, sort)` indexed is a full scan plus a sort on every read.
+    #[serde(default)]
+    pub partition_by: Option<String>,
     /// One-time seed rows, applied only when the table is empty. Keys must be
     /// declared fields; values bind as parameters.
     #[serde(default)]
@@ -149,6 +161,21 @@ impl CollectionDecl {
             }
         }
 
+        // PRISM · a partition column must be a real, declared field. The key is
+        // excluded on purpose: partitioning by row identity would make every
+        // partition exactly one row, which is never what anyone means and is
+        // silently useless rather than loudly wrong.
+        if let Some(column) = &self.partition_by {
+            Self::require_identifier(topic, "partition_by", column)?;
+            if !self.fields.contains_key(column) {
+                return Err(ForgeSchemaError::UnknownPartitionColumn {
+                    topic: topic.to_string(),
+                    column: column.clone(),
+                    declared: self.fields.keys().cloned().collect(),
+                });
+            }
+        }
+
         let columns: Vec<&str> = self.fields.keys().map(String::as_str).collect();
 
         // ── DDL ──
@@ -174,14 +201,10 @@ impl CollectionDecl {
             seed.push(self.lower_seed_row(topic, &table, row)?);
         }
 
-        Ok(ForgeCollection::new(
-            topic,
-            table,
-            query,
-            key,
-            Box::new([ddl]),
-            seed.into_boxed_slice(),
-        ))
+        Ok(
+            ForgeCollection::new(topic, table, query, key, Box::new([ddl]), seed.into_boxed_slice())
+                .with_partition_by(self.partition_by.clone()),
+        )
     }
 
     /// The `ORDER BY` clause, re-emitted from a *parse* rather than passed
@@ -345,6 +368,49 @@ mod tests {
                 .collect(),
             ..CollectionDecl::default()
         }
+    }
+
+    #[test]
+    fn a_declared_partition_column_is_carried_onto_the_collection() {
+        let mut d = decl(&[("room", FieldType::Text), ("body", FieldType::Text)]);
+        d.partition_by = Some("room".to_string());
+        let collection = d.lower("messages").expect("lowers");
+        assert_eq!(collection.partition_by.as_deref(), Some("room"));
+        // P0 records the column; the query is untouched until P2 adds the
+        // `WHERE` and its matching composite index together.
+        assert!(
+            !collection.query.to_ascii_uppercase().contains("WHERE"),
+            "P0 must not change the query: {}",
+            collection.query
+        );
+    }
+
+    #[test]
+    fn a_partition_column_that_is_not_a_declared_field_is_refused() {
+        let mut d = decl(&[("room", FieldType::Text)]);
+        d.partition_by = Some("channel".to_string());
+        let err = d.lower("messages").expect_err("refused");
+        let message = err.to_string();
+        assert!(message.contains("channel"), "{message}");
+        assert!(
+            message.contains("room"),
+            "the message must list what IS declared — the cause is almost always a typo: {message}"
+        );
+    }
+
+    /// Partitioning by row identity gives one row per partition: useless, and
+    /// silently so. The key is not a declared field, so the same check catches it.
+    #[test]
+    fn partitioning_by_the_key_column_is_refused() {
+        let mut d = decl(&[("room", FieldType::Text)]);
+        d.partition_by = Some("id".to_string());
+        assert!(d.lower("messages").is_err());
+    }
+
+    #[test]
+    fn an_unpartitioned_collection_lowers_exactly_as_before() {
+        let collection = decl(&[("author", FieldType::Text)]).lower("guestbook").expect("lowers");
+        assert_eq!(collection.partition_by, None);
     }
 
     fn seed_row(pairs: &[(&str, serde_json::Value)]) -> BTreeMap<String, serde_json::Value> {

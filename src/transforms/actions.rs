@@ -51,6 +51,98 @@ use crate::transforms::events::HandlerBody;
 use std::collections::HashMap;
 use swc_ecma_ast::{ArrowExpr, BlockStmtOrExpr, CallExpr, Callee, Expr, Function};
 
+/// Which broadcast topics a handler body can read before it writes.
+///
+/// The pre-write snapshot exists so an updater-form `broadcast(topic, fn)` sees
+/// the current value. Seeding it used to mean cloning and parsing **every**
+/// registered topic on every dispatch whose body text merely contained the
+/// substring `broadcast` — measured at 1.7 ms for a 2,000-row collection, paid
+/// for data the handler never touches (`OPTIMIZATIONS.md` § 7).
+///
+/// This narrows it to what the body actually names, and — the part that makes it
+/// safe — falls back to everything the moment it cannot prove the set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastReads {
+    /// The body never mentions `broadcast`. Seed nothing.
+    None,
+    /// Every `broadcast` reference is a call with a string-literal topic, and
+    /// these are those topics. Seed exactly them.
+    Literal(Vec<String>),
+    /// At least one `broadcast` reference this analysis cannot pin to a literal
+    /// topic — a computed topic (`broadcast("room:" + id, …)`), or the function
+    /// escaping into something else. Seed everything.
+    ///
+    /// **This arm is load-bearing.** Guessing wrong here does not throw: the
+    /// updater silently receives `null` instead of the current value, so
+    /// forge-lab's `(n) => n + 1` would quietly reset the counter to 1. A
+    /// missing topic is invisible, which is exactly why the uncertain case must
+    /// cost performance rather than correctness.
+    Unknown,
+}
+
+/// Classify a handler body's `broadcast()` use.
+///
+/// Matches the identifier by name because that is what the runtime does too:
+/// `broadcast` is a free identifier in an action body (a global shim under
+/// QuickJS, a builtin in the interpreter), not an import. Strictly tighter than
+/// the substring test it replaces, which fired on the word appearing in a
+/// comment.
+#[must_use]
+pub fn broadcast_reads_in_body(body: &HandlerBody) -> BroadcastReads {
+    use swc_ecma_visit::{Visit, VisitWith};
+
+    #[derive(Default)]
+    struct Scan {
+        topics: Vec<String>,
+        /// References that resolved to a literal-topic call. Compared against
+        /// `mentions` — any surplus is a use we could not account for.
+        accounted: usize,
+        mentions: usize,
+    }
+
+    impl Visit for Scan {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            if let Callee::Expr(callee) = &call.callee {
+                if matches!(callee.as_ref(), Expr::Ident(i) if i.sym.as_ref() == "broadcast") {
+                    if let Some(swc_ecma_ast::Expr::Lit(swc_ecma_ast::Lit::Str(topic))) =
+                        call.args.first().map(|a| a.expr.as_ref())
+                    {
+                        self.topics.push(topic.value.to_string());
+                        self.accounted += 1;
+                    }
+                }
+            }
+            call.visit_children_with(self);
+        }
+
+        fn visit_ident(&mut self, ident: &swc_ecma_ast::Ident) {
+            if ident.sym.as_ref() == "broadcast" {
+                self.mentions += 1;
+            }
+        }
+    }
+
+    let mut scan = Scan::default();
+    match body {
+        HandlerBody::Expr(expr) => expr.visit_with(&mut scan),
+        HandlerBody::Block(stmts) => {
+            for stmt in stmts {
+                stmt.visit_with(&mut scan);
+            }
+        }
+    }
+
+    if scan.mentions == 0 {
+        BroadcastReads::None
+    } else if scan.mentions == scan.accounted {
+        scan.topics.sort();
+        scan.topics.dedup();
+        BroadcastReads::Literal(scan.topics)
+    } else {
+        BroadcastReads::Unknown
+    }
+}
+
 /// One `export const NAME = action(<handler>)` declaration extracted
 /// from a module's top-level constants.
 #[derive(Debug, Clone)]
@@ -282,6 +374,64 @@ mod tests {
 
     fn parse(source: &str) -> ParsedModule {
         parse_module(source, Path::new("test_module.tsx")).expect("parse")
+    }
+
+    /// Classify the `broadcast()` use of a single action's body.
+    fn reads(body: &str) -> BroadcastReads {
+        let source = format!(
+            "import {{ action }} from \"albedo\";\nexport const a = action(() => {{ {body} }});"
+        );
+        let declarations = extract_or_panic(&source);
+        broadcast_reads_in_body(&declarations[0].body)
+    }
+
+    #[test]
+    fn a_body_without_broadcast_seeds_nothing() {
+        assert_eq!(reads("append(\"guestbook\", { author: \"x\" });"), BroadcastReads::None);
+    }
+
+    /// The old gate was a substring test on the body source, so this body paid
+    /// for every topic in the process.
+    #[test]
+    fn the_word_broadcast_in_a_comment_is_not_a_broadcast() {
+        assert_eq!(reads("// we could broadcast here later\nlet x = 1;"), BroadcastReads::None);
+    }
+
+    #[test]
+    fn literal_topics_are_collected_deduped_and_sorted() {
+        assert_eq!(
+            reads(
+                "broadcast(\"b\", n => n + 1); broadcast(\"a\", 2); broadcast(\"b\", n => n + 1);"
+            ),
+            BroadcastReads::Literal(vec!["a".to_string(), "b".to_string()]),
+        );
+    }
+
+    /// The load-bearing arm. A computed topic cannot be pinned, and guessing
+    /// wrong does not throw — the updater silently receives `null`, so
+    /// forge-lab's `(n) => n + 1` would reset the counter to 1 instead of
+    /// incrementing. Uncertainty must cost time, never correctness.
+    #[test]
+    fn a_computed_topic_falls_back_to_seeding_everything() {
+        assert_eq!(
+            reads("broadcast(\"room:\" + event.id, n => n + 1);"),
+            BroadcastReads::Unknown,
+        );
+    }
+
+    /// `broadcast` escaping into another call could reach any topic at all.
+    #[test]
+    fn broadcast_used_as_a_value_falls_back_to_seeding_everything() {
+        assert_eq!(reads("later(broadcast);"), BroadcastReads::Unknown);
+    }
+
+    /// One literal call plus one computed call is still uncertain overall.
+    #[test]
+    fn a_mixed_body_is_unknown_not_partially_literal() {
+        assert_eq!(
+            reads("broadcast(\"a\", 1); broadcast(topicVar, n => n + 1);"),
+            BroadcastReads::Unknown,
+        );
     }
 
     fn extract_or_panic(source: &str) -> Vec<ActionDeclaration> {

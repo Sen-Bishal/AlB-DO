@@ -13,12 +13,21 @@
     "isolatedModules": true,
     "noEmit": true,
     "allowSyntheticDefaultImports": true,
-    "moduleDetection": "force",
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["./src/*"]
-    }
+    "moduleDetection": "force"
+
+    // No `paths` alias on purpose. ALBEDO's module resolver does not read
+    // this file, so an `@/*` mapping would type-check green in the editor
+    // and then fail at build — the worst possible split. Use relative
+    // imports ("../components/Hero"), as the routes here do. If aliases
+    // are ever wanted, the resolver has to learn them first.
   },
+
+  // `.albedo/**/*.d.ts` picks up generated ambient types.
+  //
+  // Do NOT put `.albedo` back in `exclude`: exclude filters include, so it
+  // silently voids that entry — and an ambient `.d.ts` is loaded ONLY via
+  // include, since nothing imports it. `include` is a whitelist, so the
+  // build output under `.albedo/dist` is not pulled in regardless.
   "include": ["src/**/*.ts", "src/**/*.tsx", "*.ts", ".albedo/**/*.d.ts"],
-  "exclude": ["node_modules", "dist", ".albedo"]
+  "exclude": ["node_modules", "dist"]
 }

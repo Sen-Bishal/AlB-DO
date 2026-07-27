@@ -62,7 +62,7 @@ export default function Home() {
         </a>
         <a
           className="act act-quiet"
-          href="https://github.com/anthropic-ai/albedo"
+          href="https://albdo.dev"
           rel="noreferrer"
         >
           Read the docs <span className="arrow">&rarr;</span>

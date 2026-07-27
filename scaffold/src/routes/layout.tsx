@@ -19,7 +19,7 @@ export default function RootLayout() {
       <footer className="colophon">
         <span>src/routes/index.tsx</span>
         <span>
-          <a href="https://github.com/anthropic-ai/albedo" rel="noreferrer">
+          <a href="https://albdo.dev" rel="noreferrer">
             docs
           </a>
         </span>

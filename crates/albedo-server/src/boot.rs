@@ -201,6 +201,42 @@ fn boot_inner(
         })?
     };
 
+    // PRISM · the schema and the components finally meet. Everything up to here
+    // validated one side in isolation: the extractor recorded what a component
+    // wrote with no schema to check it against, and the schema knows nothing
+    // about components. A `.where` naming the wrong column mints a topic nothing
+    // ever writes to — an empty list forever, with no error anywhere — so it
+    // stops the boot instead.
+    if let Err(problems) = dom_render_compiler::forge::validate_partition_bindings(
+        &compiled.partition_bindings(),
+        &forge_schema,
+    ) {
+        return Err(RuntimeError::ServerStartup(format!(
+            "`forge` block and component reads disagree:\n  - {}",
+            problems.join("\n  - ")
+        )));
+    }
+
+    // Regenerate the editor's view of the collections. Types only — nothing
+    // imports this at runtime (see `is_framework_runtime_import`) — so a failed
+    // write costs autocomplete, never a boot. `.albedo/` is the dist dir's
+    // parent, and the scaffold's tsconfig already loads `.albedo/**/*.d.ts`.
+    if let Some(albedo_dir) = opts.dist_dir.parent() {
+        let dts_path = albedo_dir.join("forge.d.ts");
+        if opts.forge.is_empty() {
+            // No declarations means nothing to import. Emitting an empty
+            // `declare module` would be worse than emitting nothing — it turns
+            // a missing collection into "has no exported member", which points
+            // at the wrong problem — and a file left over from a previous
+            // config would declare collections that no longer exist.
+            let _ = std::fs::remove_file(&dts_path);
+        } else {
+            let dts = dom_render_compiler::forge::emit_forge_dts(&opts.forge);
+            let _ = std::fs::create_dir_all(albedo_dir);
+            let _ = std::fs::write(&dts_path, dts);
+        }
+    }
+
     let mut builder = AlbedoServerBuilder::new(app_config)
         .with_renderer_runtime(renderer)
         .with_forge_schema(forge_schema)

@@ -15,6 +15,20 @@ import { action, useSharedSlot } from "albedo";
 // server — tabs share it and subscribe by route (the PHOSPHOR lane), so
 // a stack of tabs costs what one costs.
 
+// One row of the `guestbook` collection. `id` is assigned by the
+// substrate (the key column is `INTEGER PRIMARY KEY AUTOINCREMENT`, so
+// never pass it to `append`); `author` and `message` are the fields the
+// `forge` block declares.
+//
+// Today you write this shape and keep it agreeing with the config by
+// hand. It is the one piece of duplication left in this file, and it is
+// the seam a compiler that reads the `forge` block would close.
+interface Entry {
+  id: number;
+  author: string;
+  message: string;
+}
+
 // `append(collection, record)` records a durable write. The server
 // applies it after this body returns, rematerializes the collection and
 // fans the change out. `form` is ambient here and carries the submitted
@@ -29,8 +43,10 @@ export const remove_entry = action(({ form }) => remove("guestbook", form.id));
 export default function Guestbook() {
   // The topic is materialized from forge.db at boot and seeded before
   // any listener binds, so it already holds real rows when a request
-  // arrives.
-  const entries = useSharedSlot("guestbook");
+  // arrives. The type argument is what makes `entry` below a real
+  // `Entry` instead of `unknown` — without it, `strict` mode rejects the
+  // `.map()` and every field read inside it.
+  const entries = useSharedSlot<Entry[]>("guestbook");
 
   return (
     <section className="plate">

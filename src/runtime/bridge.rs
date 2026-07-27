@@ -146,13 +146,21 @@ pub struct HandlerInvocation<'a> {
     pub setters: &'a [(String, SlotId)],
     /// Optional event payload exposed to the body as the global `event`.
     pub event_json: Option<&'a str>,
-    /// Pre-write snapshot of broadcast topic values (topic → current JSON
-    /// value), used to resolve updater-form `broadcast(topic, fn)` calls inside
-    /// JS: the builtin reads the current value here, applies `fn`, and writes
-    /// the new value back into the snapshot so a later updater for the same
-    /// topic in the same body chains correctly. A topic absent from the map is
-    /// treated as `null` (first-call default). Empty for value-only handlers.
-    pub broadcast_current: &'a Map<String, Value>,
+    /// Pre-write snapshot of broadcast topic values as **raw JSON bytes**
+    /// (topic → the topic's stored encoding), used to resolve updater-form
+    /// `broadcast(topic, fn)` calls inside JS: the builtin reads the current
+    /// value here, applies `fn`, and writes the new value back into the snapshot
+    /// so a later updater for the same topic in the same body chains correctly.
+    /// A topic absent from the list is treated as `null` (first-call default).
+    /// Empty for value-only handlers.
+    ///
+    /// **Bytes, not `Value`, deliberately** — this is exactly what
+    /// [`crate::runtime::BroadcastRegistry::snapshot_values`] returns, and a
+    /// topic's stored bytes are already its JSON encoding. Materializing them
+    /// into a `serde_json::Value` here bought nothing: the only consumer
+    /// (`build_handler_script`) immediately re-encodes them back to JSON text to
+    /// splice into the script. See `OPTIMIZATIONS.md` § 7.
+    pub broadcast_current: &'a [(String, Vec<u8>)],
 }
 
 /// Raw shape the generated script emits per effect; decoded then lowered.
@@ -232,10 +240,38 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     // Pre-write snapshot of topic values, so updater-form `broadcast(topic, fn)`
     // can read the current value. Always defined (at least `{}`) since the
     // builtin references it. A strict-JSON object literal is valid JS.
-    script.push_str(&format!(
-        "const __albedo_topic_current={};\n",
-        js_literal(&Value::Object(inv.broadcast_current.clone()))?
-    ));
+    //
+    // Built straight from the stored bytes. A topic's value IS its JSON
+    // encoding, so the old `bytes → Value → to_string` round-trip walked the
+    // same data three times (parse + allocate a tree, deep-clone the map,
+    // re-encode) to arrive at text equivalent to the bytes we started with.
+    // Measured at 1.011 ms for a 2,000-row collection on **every** action whose
+    // body mentions `broadcast`, paid for topics the body never reads —
+    // `OPTIMIZATIONS.md` § 7.
+    script.push_str("const __albedo_topic_current={");
+    for (index, (topic, bytes)) in inv.broadcast_current.iter().enumerate() {
+        if index > 0 {
+            script.push(',');
+        }
+        // The key goes through the JSON encoder: a topic is userland-authored
+        // text and may contain quotes or backslashes.
+        script.push_str(&js_literal(&Value::String(topic.clone()))?);
+        script.push(':');
+        // Validate before splicing — unvalidated bytes would turn one corrupt
+        // topic into a SyntaxError that fails the whole action, where the old
+        // path degraded that topic to `null` and ran everything else.
+        // `IgnoredAny` walks the JSON without building a tree, so this keeps the
+        // graceful-degradation property at a fraction of the cost. A successful
+        // parse also proves the bytes are UTF-8, which is why `from_utf8` below
+        // cannot realistically fail.
+        let valid = !bytes.is_empty()
+            && serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok();
+        match valid.then(|| std::str::from_utf8(bytes).ok()).flatten() {
+            Some(json) => script.push_str(json),
+            None => script.push_str("null"),
+        }
+    }
+    script.push_str("};\n");
 
     // `broadcast(topic, value)` records a broadcast effect. The second argument
     // may be a plain value (value form) or an updater function (React
@@ -552,7 +588,7 @@ mod tests {
     fn script_seeds_bindings_setters_and_event() {
         let env = env(&[("count", Value::from(41))]);
         let setters = vec![("setCount".to_string(), SlotId(7))];
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let inv = HandlerInvocation {
             body: "setCount(count + 1)",
             is_block: false,
@@ -574,7 +610,7 @@ mod tests {
     fn raw_bindings_seed_engine_trusted_expressions() {
         let env = Map::new();
         let raw = vec![("count".to_string(), "1 + 2".to_string())];
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let inv = HandlerInvocation {
             body: "0",
             is_block: false,
@@ -591,7 +627,7 @@ mod tests {
     #[test]
     fn invalid_binding_name_is_rejected_loudly() {
         let env = env(&[("not-an-ident", Value::Null)]);
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let inv = HandlerInvocation {
             body: "0",
             is_block: false,
@@ -610,8 +646,7 @@ mod tests {
     #[test]
     fn script_seeds_broadcast_snapshot_and_updater_handling() {
         let env = Map::new();
-        let mut bc = Map::new();
-        bc.insert("count".to_string(), Value::from(5));
+        let bc = vec![("count".to_string(), b"5".to_vec())];
         let inv = HandlerInvocation {
             body: "broadcast(\"count\", n => n + 1)",
             is_block: false,
@@ -706,7 +741,7 @@ mod tests {
     #[test]
     fn the_script_defines_append_and_the_form_alias() {
         let env = env(&[]);
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let script = build_handler_script(&HandlerInvocation {
             body: "0",
             is_block: false,
@@ -728,7 +763,7 @@ mod tests {
     #[test]
     fn the_script_defines_the_full_mutation_trio_with_remove_not_delete() {
         let env = env(&[]);
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let script = build_handler_script(&HandlerInvocation {
             body: "0",
             is_block: false,
@@ -811,7 +846,7 @@ mod tests {
     #[test]
     fn the_form_alias_is_only_bound_for_object_payloads() {
         let env = env(&[]);
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let build = |event_json| {
             build_handler_script(&HandlerInvocation {
                 body: "0",

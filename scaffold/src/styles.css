@@ -1,30 +1,45 @@
 /* ═══════════════════════════════════════════════════════════════════
    ALB'DO — starter stylesheet
 
-   Light ground, serif voice, chrome as the only ornament. The palette
-   is black, white, and the greys between them; "colour" here means a
+   OLED ground, serif voice, chrome as the only ornament. The palette is
+   black, silver, and the greys between them; "colour" here means a
    gradient steep enough to read as polished metal.
+
+   ── The one thing to know before editing the metal ──────────────────
+   On a light ground, chrome works by dropping stops to near-black — the
+   dark bands read as shadow. On a black ground that inverts into a
+   defect: any stop near the background punches a *hole* through the
+   letterform and the glyph loses mass. So the dark ramps below keep a
+   raised floor (nothing under ~#4a4a56) and put the contrast into the
+   bright half instead. The alternation still has to be steep — shallow
+   stops read as a grey smear at any brightness.
 
    Hand-written, concatenated into one inline <style> block by the dev
    pipeline. No bundler, no PostCSS, no framework. Edit it.
    ═══════════════════════════════════════════════════════════════════ */
 
 :root {
-  /* Ground */
-  --paper: #f6f6f7;
-  --paper-raised: #fcfcfd;
-  --paper-sunk: #ededf0;
+  /* Tell the browser this is a dark document, so scrollbars, autofill
+     and any native control render dark without being restyled. */
+  color-scheme: dark;
+
+  /* Ground — true black, so an OLED panel actually powers the pixels
+     down. Raised surfaces lift off it rather than the reverse. */
+  --void: #000000;
+  --ground-raised: #0d0d11;
+  --ground-sunk: #08080b;
 
   /* Ink */
-  --ink: #08080a;
-  --ink-soft: #3c3c42;
-  --ink-mute: #75757e;
-  --ink-faint: #a3a3ac;
+  --ink: #f4f4f7;
+  --ink-soft: #b9b9c4;
+  --ink-mute: #9a9aa6;
+  --ink-faint: #7a7a86;
 
   /* Structure */
-  --rule: rgba(8, 8, 10, 0.13);
-  --rule-soft: rgba(8, 8, 10, 0.07);
-  --rule-bright: rgba(255, 255, 255, 0.9);
+  --rule: rgba(255, 255, 255, 0.14);
+  --rule-soft: rgba(255, 255, 255, 0.07);
+  --rule-bright: rgba(255, 255, 255, 0.16);
+  --rule-dark: rgba(0, 0, 0, 0.8);
 
   /* Type */
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
@@ -33,38 +48,52 @@
     Consolas, monospace;
 
   /* Metal — the one ornament. Steep alternating stops read as chrome;
-     shallow ones just read as a grey gradient. */
+     shallow ones just read as a grey gradient. Floor stays well above
+     the ground (see the note at the top of this file). */
   --chrome: linear-gradient(
     177deg,
-    #101014 0%,
-    #4a4a54 14%,
-    #cfcfd8 29%,
-    #ffffff 39%,
-    #8e8e9a 50%,
-    #232329 62%,
-    #6e6e7a 72%,
-    #e8e8ef 84%,
-    #2b2b33 96%,
-    #14141a 100%
+    #6f6f7d 0%,
+    #b4b4c2 13%,
+    #f2f2f8 27%,
+    #ffffff 37%,
+    #8d8d9c 49%,
+    #4a4a56 60%,
+    #9d9dab 71%,
+    #e6e6ee 84%,
+    #5a5a67 95%,
+    #7c7c8a 100%
   );
+
+  /* Small type in metal needs a brighter, narrower range — an 11px
+     numeral cannot afford the deep bands. */
   --chrome-quiet: linear-gradient(
     177deg,
-    #6d6d78 0%,
-    #b8b8c2 26%,
-    #ffffff 40%,
-    #9a9aa6 56%,
-    #62626e 74%,
-    #adadb8 100%
+    #9a9aa8 0%,
+    #d6d6e0 26%,
+    #ffffff 42%,
+    #b0b0be 58%,
+    #8a8a98 76%,
+    #c2c2ce 100%
   );
-  --steel: linear-gradient(
+
+  /* Polished silver — the primary face. On black this is the loud one,
+     which is the inversion of the light theme, where dark steel led. */
+  --silver: linear-gradient(
     170deg,
-    #4b4b55 0%,
-    #1b1b21 26%,
-    #313139 48%,
-    #0c0c10 74%,
-    #35353d 100%
+    #f4f4f8 0%,
+    #d4d4de 46%,
+    #b6b6c4 72%,
+    #dadae4 100%
   );
-  --brushed: linear-gradient(170deg, #ffffff 0%, #f0f0f3 62%, #e4e4e9 100%);
+
+  /* Graphite — the quiet face. */
+  --graphite: linear-gradient(
+    170deg,
+    #26262e 0%,
+    #16161b 40%,
+    #1e1e25 72%,
+    #101015 100%
+  );
 }
 
 *,
@@ -75,6 +104,7 @@
 
 html {
   -webkit-text-size-adjust: 100%;
+  background: var(--void);
 }
 
 body {
@@ -82,15 +112,15 @@ body {
   background:
     radial-gradient(
       120% 80% at 12% -10%,
-      rgba(255, 255, 255, 0.95) 0%,
-      rgba(255, 255, 255, 0) 55%
+      rgba(196, 196, 220, 0.1) 0%,
+      rgba(196, 196, 220, 0) 55%
     ),
     radial-gradient(
       90% 60% at 100% 0%,
-      rgba(8, 8, 10, 0.05) 0%,
-      rgba(8, 8, 10, 0) 60%
+      rgba(130, 130, 165, 0.06) 0%,
+      rgba(130, 130, 165, 0) 60%
     ),
-    var(--paper);
+    var(--void);
   color: var(--ink);
   font-family: var(--serif);
   font-size: 17px;
@@ -101,6 +131,11 @@ body {
 
 a {
   color: inherit;
+}
+
+::selection {
+  background: #d8d8e4;
+  color: var(--void);
 }
 
 code,
@@ -165,10 +200,10 @@ code,
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: linear-gradient(150deg, #ffffff, #6e6e7a 55%, #17171c);
+  background: linear-gradient(150deg, #ffffff, #b9b9c8 55%, #6a6a78);
   box-shadow:
-    0 0 0 1px rgba(8, 8, 10, 0.14),
-    0 0 8px rgba(8, 8, 10, 0.18);
+    0 0 0 1px rgba(255, 255, 255, 0.14),
+    0 0 10px rgba(200, 200, 228, 0.4);
 }
 
 /* ── Hero ────────────────────────────────────────────────────────── */
@@ -206,11 +241,12 @@ code,
   }
 }
 
-/* The hero glyph — larger, kerned in, given its own specular. */
+/* The hero glyph — larger, kerned in, seated against the ground with a
+   shadow rather than the light theme's white rim. */
 .wordmark .glyph {
   font-size: 1.08em;
   margin: 0 -0.04em 0 -0.02em;
-  filter: drop-shadow(0 1px 0 rgba(255, 255, 255, 0.85));
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.9));
 }
 
 .tagline {
@@ -221,17 +257,18 @@ code,
   color: var(--ink-soft);
 }
 
-/* A machined hairline: dark through the middle, bright along the edge. */
+/* A machined hairline: bright through the middle, dark along the under
+   edge — the inverse of the light theme's bevel. */
 .rule {
   height: 1px;
   margin: 44px 0 0;
   border: 0;
   background: linear-gradient(
     90deg,
-    rgba(8, 8, 10, 0) 0%,
-    rgba(8, 8, 10, 0.28) 22%,
-    rgba(8, 8, 10, 0.1) 60%,
-    rgba(8, 8, 10, 0) 100%
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.32) 22%,
+    rgba(255, 255, 255, 0.1) 60%,
+    rgba(255, 255, 255, 0) 100%
   );
   position: relative;
 }
@@ -243,9 +280,9 @@ code,
   height: 1px;
   background: linear-gradient(
     90deg,
-    rgba(255, 255, 255, 0) 0%,
-    var(--rule-bright) 30%,
-    rgba(255, 255, 255, 0) 100%
+    rgba(0, 0, 0, 0) 0%,
+    var(--rule-dark) 30%,
+    rgba(0, 0, 0, 0) 100%
   );
 }
 
@@ -327,24 +364,25 @@ code,
   transform: translateY(var(--lift));
 }
 
-/* Polished steel — the primary. */
+/* Polished silver — the primary. */
 .act-metal {
-  color: #fbfbfd;
-  border-color: rgba(8, 8, 10, 0.55);
-  background: var(--steel);
+  color: #0a0a0c;
+  border-color: rgba(0, 0, 0, 0.45);
+  background: var(--silver);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.34),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.5),
-    0 10px 24px -14px rgba(8, 8, 10, 0.75);
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22),
+    0 12px 30px -16px rgba(198, 198, 228, 0.45);
 }
 
-/* Brushed white — the secondary. */
+/* Graphite — the secondary. */
 .act-quiet {
   color: var(--ink);
-  background: var(--brushed);
+  background: var(--graphite);
   box-shadow:
     inset 0 1px 0 var(--rule-bright),
-    0 8px 20px -16px rgba(8, 8, 10, 0.5);
+    inset 0 -1px 0 rgba(0, 0, 0, 0.6),
+    0 10px 24px -18px rgba(0, 0, 0, 0.9);
 }
 
 .act:hover {
@@ -353,13 +391,13 @@ code,
 
 .act-metal:hover {
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.44),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.5),
-    0 14px 30px -14px rgba(8, 8, 10, 0.8);
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22),
+    0 16px 38px -16px rgba(206, 206, 236, 0.6);
 }
 
 .act-quiet:hover {
-  border-color: rgba(8, 8, 10, 0.26);
+  border-color: rgba(255, 255, 255, 0.28);
 }
 
 .arrow {
@@ -374,16 +412,17 @@ code,
   padding: 30px 32px 32px;
   border: 1px solid var(--rule);
   border-radius: 3px;
-  background: linear-gradient(168deg, #ffffff 0%, #f4f4f7 55%, #ececef 100%);
+  background: linear-gradient(168deg, #131318 0%, #0e0e13 55%, #08080c 100%);
   box-shadow:
     inset 0 1px 0 var(--rule-bright),
-    0 1px 2px rgba(8, 8, 10, 0.03),
-    0 26px 50px -34px rgba(8, 8, 10, 0.4);
+    0 1px 2px rgba(0, 0, 0, 0.6),
+    0 26px 50px -34px rgba(0, 0, 0, 0.95);
   position: relative;
   overflow: hidden;
 }
 
-/* Specular sweep across the top-left of every plate. */
+/* Specular sweep across the top-left of every plate. Far weaker than on
+   the light theme — at light-theme alpha it reads as fog on black. */
 .plate::before {
   content: "";
   position: absolute;
@@ -391,8 +430,8 @@ code,
   height: 150%;
   background: radial-gradient(
     50% 40% at 30% 20%,
-    rgba(255, 255, 255, 0.85) 0%,
-    rgba(255, 255, 255, 0) 70%
+    rgba(214, 214, 240, 0.07) 0%,
+    rgba(214, 214, 240, 0) 70%
   );
   pointer-events: none;
 }
@@ -490,8 +529,10 @@ code,
   padding: 11px 13px;
   border: 1px solid var(--rule);
   border-radius: 2px;
-  background: #fff;
-  box-shadow: inset 0 1px 2px rgba(8, 8, 10, 0.05);
+  background: var(--ground-sunk);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.7),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.04);
   font-family: var(--serif);
   font-size: 15px;
   color: var(--ink);
@@ -503,10 +544,10 @@ code,
 
 .field:focus {
   outline: none;
-  border-color: rgba(8, 8, 10, 0.42);
+  border-color: rgba(255, 255, 255, 0.46);
   box-shadow:
-    inset 0 1px 2px rgba(8, 8, 10, 0.05),
-    0 0 0 3px rgba(8, 8, 10, 0.07);
+    inset 0 1px 2px rgba(0, 0, 0, 0.7),
+    0 0 0 3px rgba(214, 214, 240, 0.14);
 }
 
 .field-narrow {
@@ -516,16 +557,16 @@ code,
 .submit {
   padding: 11px 20px;
   border-radius: 2px;
-  border: 1px solid rgba(8, 8, 10, 0.55);
-  color: #fbfbfd;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  color: #0a0a0c;
   font-family: var(--serif);
   font-size: 15px;
   cursor: pointer;
-  background: var(--steel);
+  background: var(--silver);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.32),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.5),
-    0 8px 18px -12px rgba(8, 8, 10, 0.7);
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22),
+    0 10px 24px -14px rgba(198, 198, 228, 0.42);
   transition: transform 160ms ease;
 }
 
@@ -540,10 +581,11 @@ code,
 .submit-quiet {
   color: var(--ink);
   border-color: var(--rule);
-  background: var(--brushed);
+  background: var(--graphite);
   box-shadow:
     inset 0 1px 0 var(--rule-bright),
-    0 6px 16px -14px rgba(8, 8, 10, 0.5);
+    inset 0 -1px 0 rgba(0, 0, 0, 0.6),
+    0 8px 20px -16px rgba(0, 0, 0, 0.9);
 }
 
 /* ── Island (the one hydrated thing on the page) ─────────────────── */
@@ -593,7 +635,7 @@ code,
 
 .colophon a:hover {
   color: var(--ink);
-  border-bottom-color: rgba(8, 8, 10, 0.4);
+  border-bottom-color: rgba(255, 255, 255, 0.45);
 }
 
 /* ── Narrow ──────────────────────────────────────────────────────── */

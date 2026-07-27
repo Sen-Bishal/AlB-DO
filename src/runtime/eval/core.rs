@@ -1022,17 +1022,23 @@ fn current_phase_k_component(module_spec: &str, function_name: &str) -> Option<C
         // is possible because access is thread-local.
         let project = unsafe { &*ptr };
         let meta = project.component_meta(module_spec, function_name)?;
+        // Static topics only: a partitioned binding (PRISM `.where(…)`) has no
+        // compile-time topic string, so it cannot be given a slot id here. The
+        // render path resolves those from route params — until it does, such a
+        // binding is simply absent from scope, which is the same thing an
+        // unregistered topic has always been.
         let shared_slots = meta
             .shared_slots
             .iter()
-            .map(|binding| {
-                (
+            .filter_map(|binding| {
+                let topic = binding.static_topic()?;
+                Some((
                     binding.binding_name.clone(),
                     (
-                        crate::runtime::broadcast::broadcast_slot_id(&binding.topic),
-                        binding.topic.clone(),
+                        crate::runtime::broadcast::broadcast_slot_id(topic),
+                        topic.to_string(),
                     ),
-                )
+                ))
             })
             .collect();
         Some(ComponentScope {
@@ -1172,43 +1178,51 @@ fn island_skip_contains(name: &str) -> bool {
 }
 
 thread_local! {
-    static LAYOUT_ISLAND_PLACEHOLDERS: Cell<
+    static ISLAND_PLACEHOLDERS: Cell<
         Option<*const std::collections::HashMap<String, String>>,
     > = const { Cell::new(None) };
 }
 
-/// Install the `component-name → placeholder-id` map of Tier-C islands mounted
-/// in a layout, for the duration of that layout's static render. A route's own
-/// islands emit nothing here (their placeholder is collected separately into the
-/// `<children />` slot); but a layout island has no children slot to fall back
-/// to, so while this map is installed the skipped island emits its real
-/// `<div id="…" data-albedo-tier="c"></div>` placeholder INLINE at its authored
-/// position (masthead, footer, …). The serve path then replaces that exact div
-/// with the hydrated island, anchoring it where the layout put it. RAII guard
-/// restores the previous installation on drop.
-pub(crate) fn install_layout_island_placeholders(
+/// Install the `component-name → placeholder-id` map of Tier-C islands whose
+/// anchor must be emitted INLINE, for the duration of a static render.
+///
+/// A skipped island emits nothing by default, on the assumption that something
+/// else will anchor it. That assumption only holds when the island is a direct
+/// child of the route root, where `collect_shell_placeholders` appends a
+/// shell-level anchor. It is false the moment the island is authored *inside*
+/// another element — `<section class="plate"><Counter /></section>` renders the
+/// section empty and anchors the island at the end of the shell instead, which
+/// is how it visibly escapes its container.
+///
+/// So while this map is installed the skipped island emits its real
+/// `<div id="…" data-albedo-tier="c"></div>` INLINE at its authored position and
+/// the serve path replaces that exact div with the hydrated island. Both callers
+/// need it: a layout (which has no `<children />` slot to fall back to) and a
+/// route (whose nested islands would otherwise be hoisted out of their parent).
+/// RAII guard restores the previous installation on drop, so a layout render
+/// nested inside a route build shadows the route's map and restores it after.
+pub(crate) fn install_island_placeholders(
     map: &std::collections::HashMap<String, String>,
-) -> LayoutIslandPlaceholderGuard {
-    let previous = LAYOUT_ISLAND_PLACEHOLDERS.with(|cell| cell.replace(Some(map as *const _)));
-    LayoutIslandPlaceholderGuard { previous }
+) -> IslandPlaceholderGuard {
+    let previous = ISLAND_PLACEHOLDERS.with(|cell| cell.replace(Some(map as *const _)));
+    IslandPlaceholderGuard { previous }
 }
 
-pub(crate) struct LayoutIslandPlaceholderGuard {
+pub(crate) struct IslandPlaceholderGuard {
     previous: Option<*const std::collections::HashMap<String, String>>,
 }
 
-impl Drop for LayoutIslandPlaceholderGuard {
+impl Drop for IslandPlaceholderGuard {
     fn drop(&mut self) {
-        LAYOUT_ISLAND_PLACEHOLDERS.with(|cell| cell.set(self.previous));
+        ISLAND_PLACEHOLDERS.with(|cell| cell.set(self.previous));
     }
 }
 
-/// Return the placeholder id for a layout-mounted Tier-C island by name, when a
-/// layout-island map is installed and contains it. `None` everywhere else — so
-/// outside a layout render (or for an island not collected as a layout island)
-/// the skip branch keeps its historical emit-nothing behavior.
-fn layout_island_placeholder_for(name: &str) -> Option<String> {
-    LAYOUT_ISLAND_PLACEHOLDERS.with(|cell| match cell.get() {
+/// Return the inline placeholder id for a Tier-C island by name, when a map is
+/// installed and contains it. `None` everywhere else — so an island outside any
+/// installed map keeps the historical emit-nothing behavior.
+fn island_placeholder_for(name: &str) -> Option<String> {
+    ISLAND_PLACEHOLDERS.with(|cell| match cell.get() {
         // Safety: same stack-frame contract as the other Phase K thread-locals.
         Some(ptr) => unsafe { &*ptr }.get(name).cloned(),
         None => None,
@@ -1826,17 +1840,19 @@ impl ComponentProject {
         // Push the component's scope. We don't need any of the
         // pre-cache work because a handler only ever runs against one
         // component scope at a time.
+        // Static topics only — see the sibling comment in `install_project`.
         let shared_slots = component
             .shared_slots
             .iter()
-            .map(|binding| {
-                (
+            .filter_map(|binding| {
+                let topic = binding.static_topic()?;
+                Some((
                     binding.binding_name.clone(),
                     (
-                        crate::runtime::broadcast::broadcast_slot_id(&binding.topic),
-                        binding.topic.clone(),
+                        crate::runtime::broadcast::broadcast_slot_id(topic),
+                        topic.to_string(),
                     ),
-                )
+                ))
             })
             .collect();
         let scope = ComponentScope {
@@ -3512,12 +3528,13 @@ impl ComponentProject {
             // island, not part of its Tier-A parent's static HTML. When the
             // manifest builder has installed the island set, emit nothing here
             // so the component renders only once — at its placeholder anchor.
-            // EXCEPTION: while a layout-island map is installed (layout render),
-            // emit the island's real placeholder div INLINE so it anchors at its
-            // authored position in the layout — a layout has no `<children />`
-            // slot for the separate placeholder collection to target.
+            // EXCEPTION: while an island-placeholder map is installed, emit the
+            // island's real placeholder div INLINE so it anchors at its authored
+            // position. Both a layout (no `<children />` slot to fall back to)
+            // and a route (a nested island would otherwise be hoisted out of the
+            // element that wraps it) install one.
             if island_skip_contains(&tag) {
-                if let Some(placeholder_id) = layout_island_placeholder_for(&tag) {
+                if let Some(placeholder_id) = island_placeholder_for(&tag) {
                     // Emit RAW (no escaping): the serve path string-replaces this
                     // exact div, and placeholder ids are always `__c_<slug>_<id>`
                     // (no markup-significant chars), so escaping would only risk

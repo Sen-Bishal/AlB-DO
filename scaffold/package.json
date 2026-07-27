@@ -6,11 +6,12 @@
   "scripts": {
     "dev": "albedo dev",
     "build": "albedo build",
-    "ship": "albedo ship"
+    "ship": "albedo ship",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {},
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "clsx": "^2.0.0"
+    "clsx": "^2.0.0",
+    "typescript": "^7.0.0"
   }
 }

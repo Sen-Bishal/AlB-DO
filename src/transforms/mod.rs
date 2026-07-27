@@ -42,5 +42,5 @@ pub use form::{
 pub use hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 pub use link::{extract_links_in_function, LinkExtract};
 pub use shared_slots::{
-    extract_shared_slot_hooks, SharedSlotBinding, SharedSlotExtractError,
+    extract_shared_slot_hooks, KeySource, SharedSlotBinding, SharedSlotExtractError, TopicSpec,
 };

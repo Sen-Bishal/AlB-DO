@@ -29,6 +29,7 @@ use crate::transforms::events::{
 use crate::transforms::form::{allocate_form_action_id, extract_forms_in_function, FormExtract};
 use crate::transforms::hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 use crate::transforms::link::{extract_links_in_function, LinkExtract};
+use crate::transforms::actions::{broadcast_reads_in_body, BroadcastReads};
 use crate::transforms::shared_slots::{
     extract_shared_slot_hooks, SharedSlotBinding, SharedSlotExtractError,
 };
@@ -1082,8 +1083,11 @@ impl CompiledProject {
     pub fn shared_slot_topics(&self) -> Vec<String> {
         let mut topics: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for component in self.components.values() {
-            for binding in &component.shared_slots {
-                topics.insert(binding.topic.clone());
+            // Partitioned bindings are absent by construction: a partition
+            // cannot be pre-registered at boot because its key does not exist
+            // until a request names it. PRISM § 5 registers those on resolve.
+            for topic in component.shared_slots.iter().filter_map(|b| b.static_topic()) {
+                topics.insert(topic.to_string());
             }
         }
         topics.into_iter().collect()
@@ -1112,8 +1116,44 @@ impl CompiledProject {
         component
             .shared_slots
             .iter()
-            .map(|binding| binding.topic.clone())
+            .filter_map(|binding| binding.static_topic().map(str::to_string))
             .collect()
+    }
+
+    /// PRISM · every `useSharedSlot(<collection>.where({ … }))` in the project,
+    /// for the boot-time check against the declared schema
+    /// ([`crate::forge::validate_partition_bindings`]).
+    ///
+    /// Sorted, so a project with several problems reports them in the same order
+    /// on every machine — a build error whose lines shuffle between runs is
+    /// hard to diff and hard to trust.
+    #[must_use]
+    pub fn partition_bindings(&self) -> Vec<crate::forge::PartitionBinding> {
+        use crate::transforms::shared_slots::TopicSpec;
+
+        let mut out: Vec<crate::forge::PartitionBinding> = Vec::new();
+        for component in self.components.values() {
+            for binding in &component.shared_slots {
+                let TopicSpec::Partition { collection, column, .. } = &binding.spec else {
+                    continue;
+                };
+                out.push(crate::forge::PartitionBinding {
+                    module_spec: component.module_spec.clone(),
+                    function_name: component.function_name.clone(),
+                    binding_name: binding.binding_name.clone(),
+                    collection: collection.clone(),
+                    column: column.clone(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            (&a.module_spec, &a.function_name, &a.binding_name).cmp(&(
+                &b.module_spec,
+                &b.function_name,
+                &b.binding_name,
+            ))
+        });
+        out
     }
 
     /// Phase O.2 · all `useSharedSlot` bindings for one component
@@ -1453,19 +1493,25 @@ impl CompiledProject {
         // pure-Rust `eval_broadcast_call`, which reads `current_value()` before
         // applying the updater). Only built when broadcast is wired AND the body
         // references `broadcast` — non-broadcasting handlers pay nothing.
-        let mut broadcast_current = serde_json::Map::new();
-        if let Some(registry) = broadcast {
-            if body_src.contains("broadcast") {
-                for (topic, bytes) in registry.snapshot_values() {
-                    let value = if bytes.is_empty() {
-                        Value::Null
-                    } else {
-                        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-                    };
-                    broadcast_current.insert(topic, value);
-                }
-            }
-        }
+        // Handed over as raw bytes: the script builder splices a topic's stored
+        // JSON straight into the object literal, so decoding each value into a
+        // `serde_json::Value` here only to have it re-encoded was three passes
+        // over every topic in the process. `OPTIMIZATIONS.md` § 7.
+        //
+        // …and seeded from what the body actually names, rather than from every
+        // registered topic. The old gate was `body_src.contains("broadcast")`,
+        // which fired on the word in a comment and then paid for the whole
+        // process's data. `Unknown` still seeds everything — a topic missing
+        // from the snapshot does not throw, it silently hands the updater `null`,
+        // so uncertainty has to cost time rather than correctness.
+        let broadcast_current = match broadcast {
+            Some(registry) => match broadcast_reads_in_body(&handler.body) {
+                BroadcastReads::None => Vec::new(),
+                BroadcastReads::Literal(topics) => registry.values_for(&topics),
+                BroadcastReads::Unknown => registry.snapshot_values(),
+            },
+            None => Vec::new(),
+        };
 
         let entry = format!("{}::{}", handler.module_spec, handler.function_name);
         let invocation = HandlerInvocation {
@@ -1744,7 +1790,7 @@ impl CompiledProject {
                     component
                         .shared_slots
                         .iter()
-                        .map(|binding| binding.topic.as_str()),
+                        .filter_map(|binding| binding.static_topic()),
                     registry,
                 );
                 if !shared.is_empty() {

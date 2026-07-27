@@ -1026,6 +1026,23 @@ if (typeof globalThis.useState !== 'function') {
     return null;
   };
 
+  // PRISM · a partitioned topic (`messages.where({ room: params.id })`) is not
+  // knowable until a request supplies the key, so the transpile rewrites the
+  // argument to this lookup and the render seeds `host.topics` by binding name
+  // after resolving the spec against the route's params. Resolution lives in
+  // Rust — the same resolver the subscribe path uses — so nothing mints a topic
+  // string here. An unresolved binding yields null, which `useSharedSlot`
+  // stringifies to a key `host.shared` will not have: the slot reads null, the
+  // page renders, nothing throws.
+  globalThis.__albedo_topic = function(binding) {
+    const host = globalThis.__ALBEDO_HOST;
+    const key = String(binding);
+    if (host && host.topics && __albedo_has_own.call(host.topics, key)) {
+      return host.topics[key];
+    }
+    return null;
+  };
+
   // Server-side no-ops / pass-throughs so a component using the rest of the
   // hook surface neither fails to load nor crashes mid-render. Effects never
   // run during SSR; refs/memo/callback return shapes the render can read.
@@ -1831,6 +1848,14 @@ fn transpile_module_source_for_quickjs(specifier: &str, source: &str) -> Runtime
         // the scalar marker skips it.
         crate::transforms::shared_slot_lists::mark_shared_slot_scalars(&mut module);
 
+        // PRISM · fold `useSharedSlot`'s topic argument to something this engine
+        // can evaluate. The shim stringifies whatever it is handed, and an
+        // `albedo/forge` collection has no runtime record to stringify — the
+        // pure-Rust interpreter never evaluates the call at all, so without this
+        // the two engines disagree. A string-literal topic is left untouched,
+        // which is every app that exists today.
+        crate::transforms::shared_slots::rewrite_shared_slot_topic_args(&mut module);
+
         let mut jsx_options = JsxOptions::default();
         jsx_options.runtime = Some(JsxRuntime::Classic);
         jsx_options.pragma = Some("h".to_string());
@@ -2081,7 +2106,32 @@ fn strip_export_default_prefix(source: &str) -> Option<String> {
 /// component could not render under QuickJS before. Binding them to globals
 /// instead is what makes `import { useState } from "react"` load and run.
 fn is_framework_runtime_import(source: &str) -> bool {
-    matches!(source, "react" | "react-dom" | "albedo")
+    matches!(source, "react" | "react-dom" | "albedo") || source == FORGE_BINDINGS_MODULE
+}
+
+/// The compiler-generated collection bindings (`import { messages } from
+/// "albedo/forge"`). A **types-only** module: it exists as a generated `.d.ts`
+/// for the editor and has no runtime record at all, because
+/// `transforms::shared_slots::rewrite_shared_slot_topic_args` folds every use
+/// away before this point.
+///
+/// The binding emitted below is therefore a tripwire, not a value — see
+/// `forge_collection_stub`.
+const FORGE_BINDINGS_MODULE: &str = "albedo/forge";
+
+/// What an `albedo/forge` name binds to when it survives the transpile fold.
+///
+/// It should never be reached. If it is, the fold missed a call shape and the
+/// alternative is a bare `ReferenceError: messages is not defined` pointing at
+/// the wrong layer — so this throws with the actual cause and the actual fix.
+fn forge_collection_stub(collection: &str) -> String {
+    let message = format!(
+        "collection '{collection}' can only be read through useSharedSlot(...) — e.g. \
+         useSharedSlot({collection}) or useSharedSlot({collection}.where({{ col: params.id }})). \
+         It has no runtime value of its own."
+    );
+    let escaped = message.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("{{ where: function() {{ throw new Error('{escaped}'); }} }}")
 }
 
 fn rewrite_import_declaration(
@@ -2229,6 +2279,39 @@ action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";
     if import_decl.specifiers.is_empty() {
         // A bare side-effect import of a framework module is a no-op at load.
         return Ok(Vec::new());
+    }
+
+    // `albedo/forge` names have no globals to bind to — the transpile fold has
+    // already replaced every legitimate use. Bind a tripwire so a shape the fold
+    // missed reports its own cause instead of a bare ReferenceError.
+    if import_decl.src.value.as_ref() == FORGE_BINDINGS_MODULE {
+        let mut statements = Vec::new();
+        for import_specifier in &import_decl.specifiers {
+            let (local, collection) = match import_specifier {
+                ImportSpecifier::Named(named) => {
+                    let local = named.local.sym.to_string();
+                    let exported = match named.imported.as_ref() {
+                        None => local.clone(),
+                        Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
+                        Some(ModuleExportName::Str(s)) => s.value.to_string(),
+                    };
+                    (local, exported)
+                }
+                ImportSpecifier::Default(spec) => {
+                    let local = spec.local.sym.to_string();
+                    (local.clone(), local)
+                }
+                ImportSpecifier::Namespace(spec) => {
+                    let local = spec.local.sym.to_string();
+                    (local.clone(), local)
+                }
+            };
+            statements.push(format!(
+                "const {local} = {};",
+                forge_collection_stub(&collection)
+            ));
+        }
+        return Ok(statements);
     }
 
     let mut statements = Vec::new();
@@ -2624,7 +2707,7 @@ mod tests {
             setTotal(total);
             broadcast("chat:room", "hi");
         "#;
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let invocation = HandlerInvocation {
             body,
             is_block: true,
@@ -2677,7 +2760,7 @@ mod tests {
             .expect("engine init");
 
         let env = Map::new();
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let invocation = HandlerInvocation {
             body: "throw new Error('handler exploded')",
             is_block: true,
@@ -2715,7 +2798,7 @@ mod tests {
             .expect("engine init");
 
         let env = Map::new();
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let setters = vec![("touch".to_string(), SlotId(4))];
         // A setter fires, THEN the body returns early — pre-fix, the `return`
         // escaped the wrapper and both the effect serialization and the result
@@ -2756,7 +2839,7 @@ mod tests {
             .expect("engine init");
 
         let env = Map::new();
-        let bc = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
         let setters = vec![("setName".to_string(), SlotId(2))];
         let invocation = HandlerInvocation {
             body: "setName(event.value)",
@@ -2797,8 +2880,7 @@ mod tests {
             .expect("engine init");
 
         let env = Map::new();
-        let mut bc = Map::new();
-        bc.insert("count".to_string(), Value::from(5));
+        let bc = vec![("count".to_string(), b"5".to_vec())];
         let invocation = HandlerInvocation {
             body: "broadcast(\"count\", n => n + 1); broadcast(\"count\", n => n + 1);",
             is_block: true,
