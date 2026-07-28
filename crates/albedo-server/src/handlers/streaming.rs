@@ -675,6 +675,18 @@ fn build_stream(
                     match render_result {
                         Ok(Ok(html)) => InjectionChunk::success(&node, fill(html)),
                         Ok(Err(err)) => {
+                            // Logged before anything is decided about the
+                            // response. Without this a throwing Tier-B node with
+                            // no `error.tsx` produced a blank placeholder and
+                            // **nothing anywhere** — the diagnostic chain the
+                            // error carries for exactly this purpose was built
+                            // and then dropped on the floor.
+                            warn!(
+                                target: "albedo.render",
+                                node = %node.placeholder_id,
+                                error = %err,
+                                "tier-B component failed to render"
+                            );
                             // The component threw. Render the route's `error.tsx`
                             // boundary and inject its HTML; only if there is no
                             // boundary (or it too fails) do we fall back to the
@@ -1364,6 +1376,7 @@ mod tests {
             tier_c: Vec::new(),
             shared_slot_topics: Vec::new(),
             shared_slot_partitions: Vec::new(),
+            shared_slot_sources: Vec::new(),
             action_ids: Vec::new(),
             layout_chain: Vec::new(),
             error_component: None,

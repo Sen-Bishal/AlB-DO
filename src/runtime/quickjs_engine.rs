@@ -2106,7 +2106,9 @@ fn strip_export_default_prefix(source: &str) -> Option<String> {
 /// component could not render under QuickJS before. Binding them to globals
 /// instead is what makes `import { useState } from "react"` load and run.
 fn is_framework_runtime_import(source: &str) -> bool {
-    matches!(source, "react" | "react-dom" | "albedo") || source == FORGE_BINDINGS_MODULE
+    matches!(source, "react" | "react-dom" | "albedo")
+        || source == FORGE_BINDINGS_MODULE
+        || source == SOURCE_BINDINGS_MODULE
 }
 
 /// The compiler-generated collection bindings (`import { messages } from
@@ -2118,6 +2120,8 @@ fn is_framework_runtime_import(source: &str) -> bool {
 /// The binding emitted below is therefore a tripwire, not a value — see
 /// `forge_collection_stub`.
 const FORGE_BINDINGS_MODULE: &str = "albedo/forge";
+
+use crate::transforms::shared_slots::SOURCE_BINDINGS_MODULE;
 
 /// What an `albedo/forge` name binds to when it survives the transpile fold.
 ///
@@ -2132,6 +2136,32 @@ fn forge_collection_stub(collection: &str) -> String {
     );
     let escaped = message.replace('\\', "\\\\").replace('\'', "\\'");
     format!("{{ where: function() {{ throw new Error('{escaped}'); }} }}")
+}
+
+/// What an `albedo/sources` name binds to when it survives the transpile fold.
+///
+/// [`SOURCE_BINDINGS_MODULE`] is APERTURE's exact analogue of
+/// [`FORGE_BINDINGS_MODULE`] and has to be handled here for the same reason:
+/// both are types-only modules with no loadable record, so routing the import
+/// through `__albedo_require` throws `MODULE_MISSING` at **load** time and the
+/// whole component fails before a line of it runs.
+///
+/// A `Proxy` rather than [`forge_collection_stub`]'s fixed `{ where }` object,
+/// because the method being called is the author's **route name** — `status`,
+/// `repo`, anything — and there is no fixed set to enumerate. Without the trap a
+/// missed fold would surface as `undefined is not a function`, which points at
+/// the call site instead of at the fold that should have removed it.
+fn source_route_stub(source: &str) -> String {
+    let message = format!(
+        "source '{source}' can only be read through useSharedSlot(...) — e.g. \
+         useSharedSlot({source}.someRoute({{ id: params.id }})). It has no runtime value of \
+         its own."
+    );
+    let escaped = message.replace('\\', "\\\\").replace('\'', "\\'");
+    format!(
+        "new Proxy({{}}, {{ get: function() {{ \
+         return function() {{ throw new Error('{escaped}'); }}; }} }})"
+    )
 }
 
 fn rewrite_import_declaration(
@@ -2281,10 +2311,16 @@ action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";
         return Ok(Vec::new());
     }
 
-    // `albedo/forge` names have no globals to bind to — the transpile fold has
-    // already replaced every legitimate use. Bind a tripwire so a shape the fold
-    // missed reports its own cause instead of a bare ReferenceError.
-    if import_decl.src.value.as_ref() == FORGE_BINDINGS_MODULE {
+    // `albedo/forge` and `albedo/sources` names have no globals to bind to — the
+    // transpile fold has already replaced every legitimate use. Bind a tripwire
+    // so a shape the fold missed reports its own cause instead of a bare
+    // ReferenceError.
+    let bindings_stub: Option<fn(&str) -> String> = match import_decl.src.value.as_ref() {
+        FORGE_BINDINGS_MODULE => Some(forge_collection_stub),
+        SOURCE_BINDINGS_MODULE => Some(source_route_stub),
+        _ => None,
+    };
+    if let Some(stub) = bindings_stub {
         let mut statements = Vec::new();
         for import_specifier in &import_decl.specifiers {
             let (local, collection) = match import_specifier {
@@ -2306,10 +2342,7 @@ action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";
                     (local.clone(), local)
                 }
             };
-            statements.push(format!(
-                "const {local} = {};",
-                forge_collection_stub(&collection)
-            ));
+            statements.push(format!("const {local} = {};", stub(&collection)));
         }
         return Ok(statements);
     }
@@ -2455,6 +2488,54 @@ mod tests {
         assert!(!compiled.contains("<main>"));
         assert!(!compiled.contains(": string"));
         assert!(!compiled.contains(" as string"));
+    }
+
+    /// APERTURE · `albedo/sources` is a runtime module, not something to load.
+    ///
+    /// The regression, found by the first browser run of a declared source: this
+    /// import fell through to `__albedo_import_named("albedo/sources")`, which
+    /// throws `MODULE_MISSING` at **load** time — so the component never ran at
+    /// all and the page shipped a blank Tier-B stub. A1's whole test suite was
+    /// green, because nothing in it ever loaded a component module.
+    #[test]
+    fn a_source_bindings_import_is_bound_rather_than_loaded() {
+        let source = r#"
+            import { useSharedSlot } from "albedo";
+            import { ops } from "albedo/sources";
+            export default function Ops() {
+                const status = useSharedSlot(ops.status());
+                return <span>{status}</span>;
+            }
+        "#;
+        let compiled = compile_module_script_for_quickjs("routes/ops.tsx", source).unwrap();
+        assert!(
+            !compiled.contains("albedo/sources"),
+            "the specifier must never reach a module lookup; got: {compiled}"
+        );
+        assert!(
+            compiled.contains("data-albedo-slot") && compiled.contains("__albedo_topic"),
+            "and the read must still be anchored for live paint; got: {compiled}"
+        );
+    }
+
+    /// The tripwire, for a call shape the fold missed: a `Proxy` rather than a
+    /// fixed object, because the method is the author's route name and there is
+    /// no set to enumerate. It must name its own cause, not `undefined is not a
+    /// function`.
+    #[test]
+    fn an_unfolded_source_reference_throws_with_its_own_cause() {
+        let source = r#"
+            import { ops } from "albedo/sources";
+            export default function Ops() {
+                return <span>{ops.status()}</span>;
+            }
+        "#;
+        let compiled = compile_module_script_for_quickjs("routes/ops.tsx", source).unwrap();
+        assert!(compiled.contains("new Proxy"), "got: {compiled}");
+        assert!(
+            compiled.contains("can only be read through useSharedSlot"),
+            "got: {compiled}"
+        );
     }
 
     /// B2 · the container of a `{sharedSlot.map(...)}` is stamped with

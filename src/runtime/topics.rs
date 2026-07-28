@@ -21,7 +21,8 @@
 //! is [`crate::runtime::TopicIdentity`]-consistent (nothing was minted, so
 //! nothing can be subscribed to) and recoverable by fixing the URL.
 
-use crate::manifest::schema::PartitionTopicSpec;
+use crate::aperture::SourceRegistry;
+use crate::manifest::schema::{PartitionTopicSpec, SourceArgSpec, SourceTopicSpec};
 use crate::runtime::broadcast::partition_topic_name;
 
 /// One partition spec resolved against a request's route params.
@@ -71,6 +72,71 @@ where
                 topic,
                 collection: spec.collection.clone(),
                 key: key.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// APERTURE · one source binding resolved against a request's route params.
+///
+/// The analogue of [`ResolvedPartition`], carrying the extra thing a remote
+/// derivation needs and a local one does not: the URL to actually fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSourceTopic {
+    /// The component-local binding name — the key `__albedo_topic("…")` reads
+    /// out of `host.topics` during a Tier-B render.
+    pub binding: String,
+    /// The minted topic identity, `aperture:{source}.{route}[:args]`.
+    pub topic: String,
+    /// The declared source.
+    pub source: String,
+    /// The declared route.
+    pub route: String,
+    /// The absolute URL this topic derives from.
+    pub url: String,
+}
+
+/// Resolve every source spec this request supplies usable arguments for.
+///
+/// The APERTURE half of PRISM invariant 5 — *one resolver*. Render and subscribe
+/// both call this, so a page cannot render from one identity while its lane
+/// listens on another.
+///
+/// Resolution is delegated to
+/// [`SourceRoute::resolve`](crate::aperture::SourceRoute::resolve) rather than
+/// reimplemented, so the URL and the identity are always built from the same
+/// template walk, in template order. A spec naming a route the registry does not
+/// have — or one whose arguments do not satisfy the key alphabet — yields **no
+/// topic**, not an error, exactly as a partition does: PRISM § 4's rule that a
+/// weird value in a URL must not take the page down.
+pub fn resolve_source_topics<'a, F>(
+    specs: &[SourceTopicSpec],
+    registry: &SourceRegistry,
+    param: F,
+) -> Vec<ResolvedSourceTopic>
+where
+    F: Fn(&str) -> Option<&'a str>,
+{
+    specs
+        .iter()
+        .filter_map(|spec| {
+            let route = registry.get(&spec.source, &spec.route)?;
+            // The spec's own arguments are the lookup the route resolves
+            // against: a literal answers itself, a param defers to the request.
+            let resolved = route.resolve(|name| {
+                spec.args.iter().find(|arg| arg.name() == name).and_then(
+                    |arg| match arg {
+                        SourceArgSpec::Literal { value, .. } => Some(value.as_str()),
+                        SourceArgSpec::Param { param: from, .. } => param(from.as_str()),
+                    },
+                )
+            })?;
+            Some(ResolvedSourceTopic {
+                binding: spec.binding.clone(),
+                topic: resolved.topic,
+                source: resolved.source,
+                route: resolved.route,
+                url: resolved.url,
             })
         })
         .collect()
@@ -207,6 +273,185 @@ mod tests {
             let minted = partition_topic_name(collection, key).expect("mints");
             assert_eq!(split_partition_topic(&minted), Some((collection, key)));
         }
+    }
+
+    // ── APERTURE · the source resolver ───────────────────────────────────
+
+    fn source_registry() -> crate::aperture::SourceRegistry {
+        use crate::aperture::{RouteDecl, SourceDecl};
+        let mut routes = std::collections::BTreeMap::new();
+        routes.insert(
+            "repo".to_string(),
+            RouteDecl {
+                path: "/repos/{owner}/{name}".to_string(),
+                refresh: None,
+                method: None,
+            },
+        );
+        let decls: std::collections::BTreeMap<String, SourceDecl> = [(
+            "github".to_string(),
+            SourceDecl {
+                base: "https://api.github.com".to_string(),
+                auth: None,
+                headers: std::collections::BTreeMap::new(),
+                routes,
+            },
+        )]
+        .into_iter()
+        .collect();
+        crate::aperture::SourceRegistry::from_declarations(&decls, |_| None).expect("lowers")
+    }
+
+    fn source_spec(args: Vec<SourceArgSpec>) -> SourceTopicSpec {
+        SourceTopicSpec {
+            binding: "repo".to_string(),
+            source: "github".to_string(),
+            route: "repo".to_string(),
+            args,
+        }
+    }
+
+    #[test]
+    fn a_source_spec_resolves_to_a_topic_and_a_url() {
+        let specs = vec![source_spec(vec![
+            SourceArgSpec::Literal {
+                name: "name".to_string(),
+                value: "claude-code".to_string(),
+            },
+            SourceArgSpec::Param {
+                name: "owner".to_string(),
+                param: "org".to_string(),
+            },
+        ])];
+        let bound = params(&[("org", "anthropics")]);
+        let resolved = resolve_source_topics(&specs, &source_registry(), |name| {
+            bound.get(name).map(String::as_str)
+        });
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].binding, "repo");
+        assert_eq!(
+            resolved[0].topic,
+            "aperture:github.repo:owner=anthropics,name=claude-code"
+        );
+        assert_eq!(
+            resolved[0].url,
+            "https://api.github.com/repos/anthropics/claude-code"
+        );
+    }
+
+    /// The identity must follow the **route template's** order, not the spec's.
+    /// Otherwise the same resource reached from two components with differently
+    /// ordered object literals would mint two topics and fetch twice.
+    #[test]
+    fn identity_order_follows_the_template_not_the_spec() {
+        let forward = vec![source_spec(vec![
+            SourceArgSpec::Literal {
+                name: "name".to_string(),
+                value: "b".to_string(),
+            },
+            SourceArgSpec::Literal {
+                name: "owner".to_string(),
+                value: "a".to_string(),
+            },
+        ])];
+        let reverse = vec![source_spec(vec![
+            SourceArgSpec::Literal {
+                name: "owner".to_string(),
+                value: "a".to_string(),
+            },
+            SourceArgSpec::Literal {
+                name: "name".to_string(),
+                value: "b".to_string(),
+            },
+        ])];
+        let registry = source_registry();
+        let one = resolve_source_topics(&forward, &registry, |_| None);
+        let two = resolve_source_topics(&reverse, &registry, |_| None);
+        assert_eq!(one, two);
+        assert_eq!(one[0].topic, "aperture:github.repo:owner=a,name=b");
+    }
+
+    /// PRISM § 4's rule, inherited: an unmatched param yields no topic, so the
+    /// page renders static rather than failing.
+    #[test]
+    fn an_unmatched_param_resolves_to_no_source_topic() {
+        let specs = vec![source_spec(vec![
+            SourceArgSpec::Param {
+                name: "owner".to_string(),
+                param: "org".to_string(),
+            },
+            SourceArgSpec::Literal {
+                name: "name".to_string(),
+                value: "b".to_string(),
+            },
+        ])];
+        let bound = params(&[("other", "x")]);
+        assert!(
+            resolve_source_topics(&specs, &source_registry(), |name| bound
+                .get(name)
+                .map(String::as_str))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_hostile_param_resolves_to_no_source_topic() {
+        let registry = source_registry();
+        for hostile in ["../../etc", "a/b", "a?x=1", "a#f", "", &"x".repeat(65)] {
+            let specs = vec![source_spec(vec![
+                SourceArgSpec::Param {
+                    name: "owner".to_string(),
+                    param: "org".to_string(),
+                },
+                SourceArgSpec::Literal {
+                    name: "name".to_string(),
+                    value: "b".to_string(),
+                },
+            ])];
+            let bound = params(&[("org", hostile)]);
+            assert!(
+                resolve_source_topics(&specs, &registry, |name| bound
+                    .get(name)
+                    .map(String::as_str))
+                .is_empty(),
+                "param {hostile:?} must not resolve"
+            );
+        }
+    }
+
+    /// A spec naming a route the registry does not have contributes nothing
+    /// rather than panicking — the boot check is what makes this loud, and by
+    /// the time a request runs the mismatch is already a build failure.
+    #[test]
+    fn a_spec_for_an_undeclared_route_resolves_to_nothing() {
+        let mut spec = source_spec(vec![]);
+        spec.route = "issues".to_string();
+        assert!(resolve_source_topics(&[spec], &source_registry(), |_| None).is_empty());
+    }
+
+    /// Render and subscribe call this with different containers over the same
+    /// matched params. Disagreement here is the drift PRISM invariant 5 forbids.
+    #[test]
+    fn the_same_params_resolve_identically_whatever_the_container_for_sources() {
+        let specs = vec![source_spec(vec![
+            SourceArgSpec::Param {
+                name: "owner".to_string(),
+                param: "org".to_string(),
+            },
+            SourceArgSpec::Literal {
+                name: "name".to_string(),
+                value: "b".to_string(),
+            },
+        ])];
+        let registry = source_registry();
+        let hash: HashMap<String, String> = params(&[("org", "anthropics")]);
+        let tree: std::collections::BTreeMap<String, String> = hash.clone().into_iter().collect();
+
+        assert_eq!(
+            resolve_source_topics(&specs, &registry, |n| hash.get(n).map(String::as_str)),
+            resolve_source_topics(&specs, &registry, |n| tree.get(n).map(String::as_str))
+        );
     }
 
     #[test]

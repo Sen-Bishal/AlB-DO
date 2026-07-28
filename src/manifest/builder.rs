@@ -5,6 +5,7 @@ use super::metadata::{
 };
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, PartitionTopicSpec,
+    SourceTopicSpec,
     RenderedNode, RouteActionEntry, RouteManifest, RouteMetadata, Tier, TierBNode, TierCNode,
     WTStreamSlot,
 };
@@ -249,6 +250,14 @@ impl<'a> ManifestBuilder<'a> {
         let shared_slot_partitions =
             self.collect_partition_specs_for_route(&tier_a_root, &tier_b, &tier_c, &layout_chain);
 
+        // APERTURE · the same walk over the same finished node set, for the
+        // other derivation. Kept as a separate list rather than a merged one
+        // because the two resolve against different registries and warm through
+        // different paths — a single list would force every consumer to
+        // re-discriminate.
+        let shared_slot_sources =
+            self.collect_source_specs_for_route(&tier_a_root, &tier_b, &tier_c, &layout_chain);
+
         RouteManifest {
             route: route.to_string(),
             shell,
@@ -257,6 +266,7 @@ impl<'a> ManifestBuilder<'a> {
             tier_c,
             shared_slot_topics,
             shared_slot_partitions,
+            shared_slot_sources,
             action_ids,
             layout_chain,
             error_component,
@@ -711,6 +721,54 @@ impl<'a> ManifestBuilder<'a> {
             // route as surely as the page is; missing it would make a partition
             // silently non-live in exactly the composition the framework
             // encourages.
+            for child in &node.tier_a_children {
+                record(&child.component_id);
+            }
+        }
+        for node in tier_c {
+            record(&node.component_id);
+        }
+        for layout in layout_chain {
+            record(layout);
+        }
+
+        specs.into_iter().collect()
+    }
+
+    /// APERTURE · every declared-source binding this route renders.
+    ///
+    /// Deliberately the same walk as [`Self::collect_partition_specs_for_route`],
+    /// including the nested Tier-A children inside an async page — a source read
+    /// in a nested component is rendered by this route as surely as one in the
+    /// page, and missing it would make the slot silently non-live in exactly the
+    /// composition the framework encourages.
+    fn collect_source_specs_for_route(
+        &self,
+        tier_a_root: &[RenderedNode],
+        tier_b: &[TierBNode],
+        tier_c: &[TierCNode],
+        layout_chain: &[String],
+    ) -> Vec<SourceTopicSpec> {
+        let Some(compiled) = self.compiled_render_project.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut specs: BTreeSet<SourceTopicSpec> = BTreeSet::new();
+        let mut record = |component_name: &str| {
+            if let Some(component) = self.components.values().find(|c| c.name == component_name) {
+                if let Some(spec) =
+                    self.component_entry_for_project(component, compiled.root.as_path())
+                {
+                    specs.extend(compiled.project.shared_slot_sources_for_entry(&spec));
+                }
+            }
+        };
+
+        for node in tier_a_root {
+            record(&node.component_id);
+        }
+        for node in tier_b {
+            record(&node.component_id);
             for child in &node.tier_a_children {
                 record(&child.component_id);
             }

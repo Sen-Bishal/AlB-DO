@@ -199,14 +199,26 @@ mod tests {
 
     #[derive(Default)]
     struct Recorder {
-        events: Mutex<Vec<RenderInfo>>,
+        /// Events tagged with the thread that produced them.
+        ///
+        /// `OBSERVER_LOCK` below serializes the tests in *this* module, but the
+        /// observer it installs is process-global and stays installed: from the
+        /// first install onward, every rendering test anywhere in the suite
+        /// publishes here too. A baseline offset alone therefore does not bound
+        /// the window to "events `f` produced" — only to "events produced while
+        /// `f` ran", which is a different and much larger set under `-j8`.
+        ///
+        /// A frame guard publishes on the thread that created it and `STACK` is
+        /// already a thread-local, so the thread id is the unit that actually
+        /// separates one test's frames from the suite's.
+        events: Mutex<Vec<(std::thread::ThreadId, RenderInfo)>>,
     }
 
     impl RenderObserver for Recorder {
         fn on_render(&self, info: RenderInfo) {
             // unwrap_used is denied; lock poisoning here would only affect tests.
             if let Ok(mut events) = self.events.lock() {
-                events.push(info);
+                events.push((std::thread::current().id(), info));
             }
         }
     }
@@ -233,17 +245,29 @@ mod tests {
             let _ = install_render_observer(r.clone());
             r
         });
-        // Snapshot baseline so we only report events produced inside `f`.
+        // Baseline bounds the window in time; the thread id bounds it to this
+        // test. Both are needed — the baseline because the three tests here
+        // share the recorder in sequence on whatever thread the harness gives
+        // them, the thread id because the rest of the suite shares it in
+        // parallel.
         let baseline = active
             .events
             .lock()
             .map(|events| events.len())
             .unwrap_or(0);
+        let this_thread = std::thread::current().id();
         let result = f(active);
         let new_events = active
             .events
             .lock()
-            .map(|events| events.iter().skip(baseline).cloned().collect::<Vec<_>>())
+            .map(|events| {
+                events
+                    .iter()
+                    .skip(baseline)
+                    .filter(|(thread, _)| *thread == this_thread)
+                    .map(|(_, info)| info.clone())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         (result, new_events)
     }

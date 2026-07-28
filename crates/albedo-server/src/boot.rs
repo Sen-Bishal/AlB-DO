@@ -59,6 +59,14 @@ pub struct ProductionServerOptions {
     /// built `ForgeSchema` so the failure surfaces here, at boot, with the
     /// offending collection named.
     pub forge: BTreeMap<String, dom_render_compiler::forge::CollectionDecl>,
+    /// APERTURE · the app's declared external sources, from the config's
+    /// `sources` block.
+    ///
+    /// Empty means the app declared none, and no outbound host is allowlisted.
+    /// Kept as declarations rather than a built registry for the same reason
+    /// `forge` is: the failure surfaces here, at boot, naming the offending
+    /// source — and lowering needs the real environment, which only exists here.
+    pub sources: BTreeMap<String, dom_render_compiler::aperture::SourceDecl>,
 }
 
 impl ProductionServerOptions {
@@ -77,6 +85,7 @@ impl ProductionServerOptions {
             // via `ProductionServerOptions { dev_mode: true, .. }`.
             dev_mode: false,
             forge: contract.forge.clone(),
+            sources: contract.sources.clone(),
         }
     }
 }
@@ -217,6 +226,52 @@ fn boot_inner(
         )));
     }
 
+    // APERTURE · the same meeting, for the other derivation. A component calling
+    // `github.repo({ owner })` without `name` is well-formed TSX and a valid
+    // `sources` block; only here can the two be compared. Left unchecked its
+    // binding resolves to nothing and the slot stays empty forever, with no
+    // error anywhere — the identical failure shape the PRISM check above exists
+    // to prevent.
+    //
+    // Lowered with the **real** environment, unlike `DevConfig::validate`'s
+    // structural pass: a `bearerEnv` naming an unset variable is fatal here and
+    // merely unknowable on a build machine.
+    let source_reader = if opts.sources.is_empty() {
+        None
+    } else {
+        let reader = dom_render_compiler::aperture::SourceReader::from_declarations(
+            &opts.sources,
+            if opts.dev_mode {
+                dom_render_compiler::aperture::EgressMode::Dev
+            } else {
+                dom_render_compiler::aperture::EgressMode::Serve
+            },
+            |name| std::env::var(name).ok(),
+        )
+        .map_err(|err| {
+            RuntimeError::ServerStartup(format!("invalid `sources` block in albedo.config: {err}"))
+        })?;
+        Some(std::sync::Arc::new(reader))
+    };
+
+    {
+        let registry = source_reader.as_ref().map(|reader| reader.registry());
+        let empty = dom_render_compiler::aperture::SourceRegistry::default();
+        if let Err(problems) = dom_render_compiler::aperture::validate_source_bindings(
+            &compiled.source_bindings(),
+            registry.map_or(&empty, |registry| registry.as_ref()),
+        ) {
+            return Err(RuntimeError::ServerStartup(format!(
+                "`sources` block and component reads disagree:\n  - {}",
+                problems
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n  - ")
+            )));
+        }
+    }
+
     // PRISM · the wire carries a `u32` hash of a topic name, and until now
     // nothing checked the static set for collisions on it: `ForgeSchema::build`
     // covers FORGE collections only, while every `useSharedSlot` topic reaches
@@ -250,6 +305,27 @@ fn boot_inner(
             let _ = std::fs::create_dir_all(albedo_dir);
             let _ = std::fs::write(&dts_path, dts);
         }
+
+        // APERTURE · the same for declared sources, on the same terms and for
+        // the same reasons — including the removal: a `sources.d.ts` left over
+        // from a previous config would declare routes that no longer exist, and
+        // it carries the `useSharedSlot` overload that consumes them, so a stale
+        // one is worse than none.
+        //
+        // Generated from the **lowered registry** rather than `opts.sources`, so
+        // the argument lists are printed from the same `lower_path` output the
+        // resolver mints identities from. See `aperture::typegen`.
+        let sources_dts_path = albedo_dir.join("sources.d.ts");
+        match source_reader.as_ref() {
+            Some(reader) => {
+                let dts = dom_render_compiler::aperture::emit_sources_dts(reader.registry());
+                let _ = std::fs::create_dir_all(albedo_dir);
+                let _ = std::fs::write(&sources_dts_path, dts);
+            }
+            None => {
+                let _ = std::fs::remove_file(&sources_dts_path);
+            }
+        }
     }
 
     let mut builder = AlbedoServerBuilder::new(app_config)
@@ -269,6 +345,11 @@ fn boot_inner(
     if let Some(live) = live {
         builder = builder.with_live_runtime(live);
     }
+
+    // APERTURE · after `with_live_runtime`, so a dev reload installs onto the
+    // runtime it is actually reusing rather than onto a fresh one that is about
+    // to be replaced.
+    builder = builder.with_source_reader(source_reader);
 
     let mut builder = builder.register_compiled_project(Arc::new(compiled));
 

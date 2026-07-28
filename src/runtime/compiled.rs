@@ -1167,6 +1167,97 @@ impl CompiledProject {
             .collect()
     }
 
+    /// APERTURE · this entry's `useSharedSlot(<source>.<route>({ … }))` bindings,
+    /// lowered for the manifest.
+    ///
+    /// The sibling of [`Self::shared_slot_partitions_for_entry`], and per-entry
+    /// for the same invariant-2 reason: a binding whose arguments come from
+    /// `params` must only ever resolve against the params of a route that
+    /// actually renders it.
+    #[must_use]
+    pub fn shared_slot_sources_for_entry(
+        &self,
+        entry: &str,
+    ) -> Vec<crate::manifest::schema::SourceTopicSpec> {
+        use crate::manifest::schema::{SourceArgSpec, SourceTopicSpec};
+        use crate::transforms::shared_slots::{SourceArg, TopicSpec};
+
+        let Some((module_spec, function_name)) = self.project.resolve_entry_component(entry) else {
+            return Vec::new();
+        };
+        let Some(component) = self.component_meta(&module_spec, &function_name) else {
+            return Vec::new();
+        };
+        component
+            .shared_slots
+            .iter()
+            .filter_map(|binding| {
+                let TopicSpec::Source {
+                    source,
+                    route,
+                    args,
+                } = &binding.spec
+                else {
+                    return None;
+                };
+                Some(SourceTopicSpec {
+                    binding: binding.binding_name.clone(),
+                    source: source.clone(),
+                    route: route.clone(),
+                    args: args
+                        .iter()
+                        .map(|(name, value)| match value {
+                            SourceArg::Param(param) => SourceArgSpec::Param {
+                                name: name.clone(),
+                                param: param.clone(),
+                            },
+                            SourceArg::Literal(literal) => SourceArgSpec::Literal {
+                                name: name.clone(),
+                                value: literal.clone(),
+                            },
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
+    /// APERTURE · every `useSharedSlot(<source>.<route>({ … }))` in the project,
+    /// for the boot-time check against the declared `sources` block
+    /// ([`crate::aperture::validate_source_bindings`]).
+    ///
+    /// Sorted for the same reason [`Self::partition_bindings`] is: a build error
+    /// whose lines shuffle between runs is hard to diff and hard to trust.
+    #[must_use]
+    pub fn source_bindings(&self) -> Vec<crate::aperture::SourceBinding> {
+        use crate::transforms::shared_slots::TopicSpec;
+
+        let mut bindings: Vec<crate::aperture::SourceBinding> = Vec::new();
+        for component in self.components.values() {
+            for slot in &component.shared_slots {
+                let TopicSpec::Source {
+                    source,
+                    route,
+                    args,
+                } = &slot.spec
+                else {
+                    continue;
+                };
+                bindings.push(crate::aperture::SourceBinding {
+                    module: component.module_spec.clone(),
+                    component: component.function_name.clone(),
+                    binding: slot.binding_name.clone(),
+                    source: source.clone(),
+                    route: route.clone(),
+                    args: args.iter().map(|(name, _)| name.clone()).collect(),
+                });
+            }
+        }
+        bindings.sort();
+        bindings.dedup();
+        bindings
+    }
+
     /// PRISM · every `useSharedSlot(<collection>.where({ … }))` in the project,
     /// for the boot-time check against the declared schema
     /// ([`crate::forge::validate_partition_bindings`]).

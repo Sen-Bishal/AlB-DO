@@ -48,6 +48,16 @@ pub struct DevConfig {
     /// is stable across builds.
     #[serde(default)]
     pub forge: BTreeMap<String, crate::forge::CollectionDecl>,
+    /// APERTURE · external sources this app declares — the `sources` block,
+    /// keyed by the name the author calls (`github.repo(…)`).
+    ///
+    /// A `BTreeMap` for the same reason `forge` is one: the lowering order that
+    /// reaches
+    /// [`SourceRegistry::from_declarations`](crate::aperture::SourceRegistry::from_declarations)
+    /// must be identical on every machine and every build, because the declared
+    /// hosts it yields become the egress allowlist.
+    #[serde(default)]
+    pub sources: BTreeMap<String, crate::aperture::SourceDecl>,
 }
 
 impl Default for DevConfig {
@@ -63,6 +73,7 @@ impl Default for DevConfig {
             static_slice: StaticSliceConfig::default(),
             routes: HashMap::new(),
             forge: BTreeMap::new(),
+            sources: BTreeMap::new(),
         }
     }
 }
@@ -91,6 +102,22 @@ impl DevConfig {
         self.hmr.validate()?;
         self.static_slice.validate()?;
         validate_hot_set(&self.hot_set)?;
+
+        // APERTURE · structural validation of the `sources` block, so a typo in
+        // a path template or a missing `scope` fails the build rather than
+        // surfacing at serve time as a route that reads nothing.
+        //
+        // The env lookup is deliberately permissive here: whether `GITHUB_TOKEN`
+        // is set is a property of the machine, not of the config, and `albedo
+        // build` on a laptop must not fail because a production secret is
+        // absent. Boot re-lowers with the real environment, where a missing
+        // variable is genuinely fatal.
+        if !self.sources.is_empty() {
+            crate::aperture::SourceRegistry::from_declarations(&self.sources, |_| {
+                Some(String::new())
+            })
+            .map_err(|err| format!("invalid `sources` block: {err}"))?;
+        }
         Ok(())
     }
 }
@@ -328,6 +355,11 @@ pub struct ResolvedDevContract {
     /// path falls back to the built-in guestbook default.
     #[serde(default)]
     pub forge: BTreeMap<String, crate::forge::CollectionDecl>,
+    /// APERTURE · the app's declared sources, carried through from
+    /// [`DevConfig::sources`]. Empty means the app declared none, and no
+    /// outbound host is allowlisted.
+    #[serde(default)]
+    pub sources: BTreeMap<String, crate::aperture::SourceDecl>,
 }
 
 pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> {
@@ -563,6 +595,7 @@ pub fn resolve_dev_contract(
         routes,
         route_layouts,
         forge: config.forge,
+        sources: config.sources,
     })
 }
 

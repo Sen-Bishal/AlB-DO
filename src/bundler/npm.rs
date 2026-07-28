@@ -169,10 +169,14 @@ pub fn is_bare_npm_specifier(specifier: &str) -> bool {
     {
         return false;
     }
-    // `albedo/forge` is the generated collection-binding module: types only, no
-    // runtime record, folded away by the transpile. Resolving it through
-    // node_modules would look for a package that deliberately does not exist.
-    if matches!(s, "react" | "react-dom" | "albedo" | "albedo/forge") || s.starts_with("react/") {
+    // `albedo/forge` and `albedo/sources` are the generated binding modules:
+    // types only, no runtime record, folded away by the transpile. Resolving
+    // either through node_modules would look for a package that deliberately
+    // does not exist.
+    if matches!(s, "react" | "react-dom" | "albedo" | "albedo/forge")
+        || s == crate::transforms::shared_slots::SOURCE_BINDINGS_MODULE
+        || s.starts_with("react/")
+    {
         return false;
     }
     // A Windows drive path ("C:\…" / "C:/…") is absolute, not bare.
@@ -758,6 +762,10 @@ mod tests {
         assert!(!is_bare_npm_specifier("react"));
         assert!(!is_bare_npm_specifier("react-dom"));
         assert!(!is_bare_npm_specifier("albedo"));
+        // The generated binding modules: types only, folded away by the
+        // transpile, and no package by either name exists to resolve.
+        assert!(!is_bare_npm_specifier("albedo/forge"));
+        assert!(!is_bare_npm_specifier("albedo/sources"));
         assert!(!is_bare_npm_specifier("styles.css"));
         assert!(!is_bare_npm_specifier("https://cdn.example/x.js"));
     }

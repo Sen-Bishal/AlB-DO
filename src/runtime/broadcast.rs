@@ -168,6 +168,58 @@ pub enum TopicIdentity {
         collection: Arc<str>,
         key: Arc<str>,
     },
+    /// APERTURE · a declared external resource, minted on demand for a resolved
+    /// argument set.
+    ///
+    /// Evictable for the same reason a partition is, and it earns that the same
+    /// way: it **has a derivation**. `PRISM.md` § 13 excluded non-FORGE dynamic
+    /// topics because "a topic with no derivation cannot be re-derived after a
+    /// cache miss, a process restart, or a second process" — the rule was never
+    /// *FORGE only*, it was *must have a derivation*. Re-issuing the GET is one.
+    ///
+    /// Kept distinct from [`TopicIdentity::Partition`] rather than borrowing its
+    /// shape: the write path resolves a partition by `(collection, key)` against
+    /// the FORGE schema, and a topic that answers that lookup with a source name
+    /// would be one schema change away from a confusing bug.
+    ///
+    /// The `url` is here — rather than left to be re-derived — because the
+    /// refresh loop (`aperture::refresh`) must be able to re-issue the GET for a
+    /// topic it did not mint. The alternative was a reverse parser over the
+    /// minted name, which is a second implementation of a format PRISM
+    /// invariant 5 keeps in exactly one place. Safe to hold: a credential
+    /// reaches headers only, never the URL (APERTURE § 11 R6).
+    External {
+        source: Arc<str>,
+        route: Arc<str>,
+        url: Arc<str>,
+    },
+}
+
+/// APERTURE · the outcome of warming one external topic.
+///
+/// `published` exists because the interesting number on the refresh path is not
+/// "how many polls happened" but "how many of them were worth telling anyone
+/// about". The loop logs and the gates assert on it.
+#[derive(Debug, Clone)]
+pub struct ExternalWarm {
+    /// The topic, minted or resolved.
+    pub topic: Arc<BroadcastTopic>,
+    /// Whether the value changed and a frame was fanned out.
+    pub published: bool,
+}
+
+/// APERTURE · one external topic somebody is currently watching, with the
+/// derivation needed to refresh it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveExternalTopic {
+    /// The minted topic identity.
+    pub topic: String,
+    /// The declared source.
+    pub source: Arc<str>,
+    /// The declared route.
+    pub route: Arc<str>,
+    /// The absolute URL to re-issue.
+    pub url: Arc<str>,
 }
 
 impl TopicIdentity {
@@ -177,7 +229,10 @@ impl TopicIdentity {
     /// so no caller has to re-derive the rule from the variant.
     #[must_use]
     pub fn is_evictable(&self) -> bool {
-        matches!(self, TopicIdentity::Partition { .. })
+        matches!(
+            self,
+            TopicIdentity::Partition { .. } | TopicIdentity::External { .. }
+        )
     }
 }
 
@@ -653,6 +708,113 @@ impl BroadcastRegistry {
             initial,
             TopicIdentity::Partition { collection, key },
         ))
+    }
+
+    /// APERTURE · mint (or resolve, or **replace the value of**) one declared
+    /// external resource.
+    ///
+    /// `name` is the already-minted topic string, for PRISM invariant 5's
+    /// reason: naming lives in one resolver and the registry does not build one.
+    ///
+    /// Unlike [`Self::try_topic_partition`] this **overwrites** an existing
+    /// topic's value rather than returning the existing one untouched, and the
+    /// difference is not an inconsistency. A partition's warm is a read-through
+    /// of a substrate that has already accepted every write, so a resident value
+    /// is by construction current. An external topic's warm is a *refresh*: the
+    /// caller has just spoken to the upstream and holds an answer that is newer
+    /// than whatever is resident. Returning the stale one would make `refresh:`
+    /// mean nothing.
+    ///
+    /// **Newer is not the same as different.** A refresh that comes back byte
+    /// -identical is republished to nobody: [`ExternalWarm::published`] is
+    /// `false` and no frame goes out. Every other write path in the registry
+    /// fans out unconditionally, and rightly — an author calling `broadcast()`
+    /// with the value already there has *asked* for a frame. Here the caller is
+    /// a poller, and the whole liveness story is "N viewers cost one request";
+    /// answering an unchanged poll with a full-body `SlotSet` to every open tab
+    /// would spend on the wire exactly what the cache saved upstream. The
+    /// comparison happens under the topic's own lock, so it is the same
+    /// linearization point the write would have used.
+    ///
+    /// # Errors
+    /// [`BroadcastError::SlotIdCollision`] when the wire slot belongs to another
+    /// name.
+    pub fn try_topic_external(
+        &self,
+        name: impl Into<String>,
+        source: Arc<str>,
+        route: Arc<str>,
+        url: Arc<str>,
+        value: Vec<u8>,
+    ) -> Result<ExternalWarm, BroadcastError> {
+        let name = name.into();
+        if let Some(existing) = self.topics.get(&name) {
+            let topic = existing.clone();
+            drop(existing);
+            if topic.with_value(|resident| resident == value.as_slice()) {
+                return Ok(ExternalWarm {
+                    topic,
+                    published: false,
+                });
+            }
+            // Through `write_topic` so subscribers see a version bump and a
+            // delta, exactly as they would for any other value change. A silent
+            // in-place swap would leave every live tab showing the old body
+            // until something unrelated happened to bump the topic.
+            //
+            // The delivery report is intentionally dropped: which sessions
+            // received this frame is not something a *warm* can act on, and
+            // `write_topic` has already evicted any session whose channel was
+            // closed.
+            let _ = self.write_topic(&name, value);
+            return Ok(ExternalWarm {
+                topic,
+                published: true,
+            });
+        }
+        self.guard_slot_id(&name)?;
+        Ok(ExternalWarm {
+            topic: self.topic_with_identity(
+                name,
+                value,
+                TopicIdentity::External { source, route, url },
+            ),
+            // A first warm mints the topic with the value already in it, so
+            // there is no fan-out and — by construction — nobody subscribed yet
+            // to receive one. Reporting `true` here would make the loop's
+            // "published" count mean two different things.
+            published: false,
+        })
+    }
+
+    /// APERTURE · every external topic that currently has at least one
+    /// subscriber, with everything needed to re-derive it.
+    ///
+    /// The refresh loop's input, and deliberately *derived* rather than
+    /// maintained: the set of live external topics has exactly one home — this
+    /// registry — so a poller that kept its own list would be one eviction away
+    /// from refreshing a topic nobody holds, or missing one somebody does. The
+    /// same argument APERTURE invariant 2.7 makes for the egress allowlist.
+    ///
+    /// The subscriber filter is the "who pays" rule: a topic with no live tab on
+    /// it is answered from cache on its next render, so polling it would spend
+    /// somebody's upstream quota on nobody.
+    #[must_use]
+    pub fn live_external_topics(&self) -> Vec<LiveExternalTopic> {
+        self.topics
+            .iter()
+            .filter_map(|entry| match entry.identity() {
+                TopicIdentity::External { source, route, url } if !entry.subscribers.is_empty() => {
+                    Some(LiveExternalTopic {
+                        topic: entry.name.clone(),
+                        source: Arc::clone(source),
+                        route: Arc::clone(route),
+                        url: Arc::clone(url),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Refuse a name whose wire slot is held by a different name.

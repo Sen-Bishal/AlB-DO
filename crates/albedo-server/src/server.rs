@@ -29,7 +29,8 @@ use axum::routing::any;
 use axum::Router;
 use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
 use dom_render_compiler::runtime::{
-    resolve_partition_topics, BroadcastRegistry, ResolvedPartition, SessionId, SlotStore,
+    resolve_partition_topics, BroadcastRegistry, ResolvedPartition, ResolvedSourceTopic, SessionId,
+    SlotStore,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -80,6 +81,15 @@ pub(crate) struct LiveRuntime {
     /// than rebuilding). Phase 1: the built-in guestbook default; Phase 2: the
     /// app-declared schema, loaded here at construction.
     forge_schema: Arc<dom_render_compiler::forge::ForgeSchema>,
+    /// APERTURE · the declared-source read path, or `None` when the app declared
+    /// no `sources` block.
+    ///
+    /// Held here beside `forge_schema` because it is the same kind of thing: an
+    /// app-static registry plus the client that derives from it. Pinned in the
+    /// persistent tier rather than the world so a dev hot reload keeps its
+    /// response cache — re-minting it on every file save would make every source
+    /// cold on every keystroke and hammer the upstream while an author types.
+    source_reader: Arc<std::sync::OnceLock<Arc<dom_render_compiler::aperture::SourceReader>>>,
 }
 
 impl LiveRuntime {
@@ -92,7 +102,19 @@ impl LiveRuntime {
             forge_substrate: Arc::new(std::sync::OnceLock::new()),
             row_projector: Arc::new(std::sync::RwLock::new(None)),
             forge_schema: Arc::new(dom_render_compiler::forge::ForgeSchema::guestbook_default()),
+            source_reader: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Install the APERTURE read path. Idempotent; a second call is ignored, so
+    /// a dev world swap cannot replace a warm cache with a cold one.
+    fn install_source_reader(&self, reader: Arc<dom_render_compiler::aperture::SourceReader>) {
+        let _ = self.source_reader.set(reader);
+    }
+
+    /// The installed APERTURE read path, if the app declared any sources.
+    fn source_reader(&self) -> Option<&Arc<dom_render_compiler::aperture::SourceReader>> {
+        self.source_reader.get()
     }
 
     /// The current row projector, cloned out (a refcount bump). Cloned rather
@@ -219,6 +241,46 @@ impl crate::topics::TopicWarmer for LiveRuntime {
                     "topic value cache over budget; reclaimed idle partitions"
                 );
             }
+        }
+    }
+
+    /// APERTURE · read each declared source and publish its body as the topic's
+    /// value.
+    ///
+    /// Fail-soft per source, not per batch: a dashboard reading six widgets
+    /// where one upstream is down must still show the other five. A failed read
+    /// leaves its topic unregistered, which renders an empty slot rather than
+    /// publishing "this resource is empty" as though it were an answer.
+    ///
+    /// The refresh window is enforced *inside* the client, so calling this on
+    /// every render and every subscribe is cheap by construction — a fresh entry
+    /// never reaches the wire.
+    ///
+    /// It is **not** the schedule, though an earlier version of this comment
+    /// claimed it was. A cache is consulted only when something asks, and a
+    /// viewer sitting on an open tab asks for nothing; keeping a topic current
+    /// for that viewer is [`dom_render_compiler::aperture::RefreshLoop`]'s job,
+    /// spawned in `run()`. This path is the call-driven half — first render,
+    /// new subscriber — and the two share
+    /// [`dom_render_compiler::aperture::refresh_topic`] so they cannot disagree
+    /// about when a poll is worth a frame.
+    async fn warm_sources(&self, sources: &[ResolvedSourceTopic]) {
+        let Some(reader) = self.source_reader.get() else {
+            return;
+        };
+        for wanted in sources {
+            let resolved = dom_render_compiler::aperture::ResolvedSource {
+                topic: wanted.topic.clone(),
+                url: wanted.url.clone(),
+                source: wanted.source.clone(),
+                route: wanted.route.clone(),
+            };
+            dom_render_compiler::aperture::refresh_topic(
+                reader.as_ref(),
+                self.broadcast.as_ref(),
+                &resolved,
+            )
+            .await;
         }
     }
 }
@@ -663,6 +725,23 @@ impl AlbedoServerBuilder {
         self
     }
 
+    /// APERTURE · install the declared-source read path onto the live runtime.
+    ///
+    /// Installed here rather than constructed in `build()` because lowering the
+    /// `sources` block needs the real environment and must fail the *boot* with
+    /// the offending source named — which `boot.rs` can do and this builder
+    /// cannot. Idempotent: a dev reload passing the same live runtime keeps the
+    /// reader it already has, cache and all.
+    pub(crate) fn with_source_reader(
+        self,
+        reader: Option<Arc<dom_render_compiler::aperture::SourceReader>>,
+    ) -> Self {
+        if let Some(reader) = reader {
+            self.live.install_source_reader(reader);
+        }
+        self
+    }
+
     /// Phase N — mount a directory whose files are served verbatim
     /// at the URL root (`<dir>/logo.svg` → `GET /logo.svg`). Multiple
     /// calls stack; the first matching root wins. Lookups go through
@@ -1063,13 +1142,24 @@ impl AlbedoServerBuilder {
             // the world is what keeps read-through materialisation working
             // across a dev reload: a rebuilt world has a fresh registry, and a
             // partition warmed into the previous one would be invisible.
-            services.registry = Arc::new(PooledTierBRenderRegistry::new(
-                pool.clone(),
-                plan,
-                self.live.broadcast.clone(),
-                form_error_spans,
-                Arc::new(self.live.clone()),
-            ));
+            services.registry = Arc::new(
+                PooledTierBRenderRegistry::new(
+                    pool.clone(),
+                    plan,
+                    self.live.broadcast.clone(),
+                    form_error_spans,
+                    Arc::new(self.live.clone()),
+                )
+                // APERTURE · the registry comes from the same persistent tier as
+                // the warmer, and for the same reason: a dev reload must not
+                // re-mint it and discard a warm response cache.
+                .with_sources(
+                    self.live
+                        .source_reader
+                        .get()
+                        .map(|reader| Arc::clone(reader.registry())),
+                ),
+            );
         }
 
         // Phase-H — one shared slot store for the lifetime of the
@@ -1467,6 +1557,31 @@ impl AlbedoServer {
         if let Some(inspector_state) = self.state.inspector.clone() {
             info!("ALBEDO dev inspector mounted at /__albedo");
             crate::inspector::heartbeat::spawn(inspector_state, shutdown_rx.clone());
+        }
+
+        // APERTURE · the thing that asks. Without it a declared source is a
+        // shared cache and nothing more: a viewer sitting on an open tab issues
+        // no render and no subscribe, so nothing consults the cache, so nothing
+        // ever refreshes. Spawned here rather than at install time because this
+        // is where a runtime and a shutdown signal both exist — and binding it
+        // to `shutdown_rx` is what stops a dev reload, which stands up a new
+        // server over the same broadcast registry, from accumulating one loop
+        // per reload.
+        if let Some(reader) = self.state.live.source_reader() {
+            let refresher = dom_render_compiler::aperture::RefreshLoop::new(
+                self.state.live.broadcast.clone(),
+                reader.clone(),
+            );
+            let shutdown = shutdown_rx.clone();
+            info!(
+                "APERTURE refresh loop active ({}s tick)",
+                dom_render_compiler::aperture::DEFAULT_TICK.as_secs()
+            );
+            tokio::spawn(async move {
+                refresher
+                    .run(dom_render_compiler::aperture::DEFAULT_TICK, shutdown)
+                    .await;
+            });
         }
 
         let webtransport_task = if self.config.server.webtransport.enabled {
@@ -2135,10 +2250,7 @@ fn resolve_route_topics(
     streaming: &Arc<StreamingAppState>,
     page_path: &str,
 ) -> Option<Vec<String>> {
-    Some(
-        resolve_route_topics_detailed(world, streaming, page_path)?
-            .0,
-    )
+    Some(resolve_route_topics_detailed(world, streaming, page_path, None)?.0)
 }
 
 /// [`resolve_route_topics`], keeping the resolved partitions alongside the topic
@@ -2149,11 +2261,19 @@ fn resolve_route_topics(
 /// the key to run the query, and re-deriving those by splitting the topic string
 /// back apart would be a second implementation of the naming rule — exactly the
 /// drift invariant 5 forbids).
+///
+/// APERTURE · `sources_registry` is threaded in rather than reached through
+/// `world` because the registry lives in the **persistent** tier beside the
+/// FORGE schema, not in the swappable world — a dev hot reload must not re-mint
+/// it and throw away a warm response cache. `None` means the app declared no
+/// sources, in which case the manifest's source specs cannot resolve and the
+/// list is empty.
 fn resolve_route_topics_detailed(
     world: &RenderWorld,
     streaming: &Arc<StreamingAppState>,
     page_path: &str,
-) -> Option<(Vec<String>, Vec<ResolvedPartition>)> {
+    sources_registry: Option<&dom_render_compiler::aperture::SourceRegistry>,
+) -> Option<(Vec<String>, Vec<ResolvedPartition>, Vec<ResolvedSourceTopic>)> {
     let RouteMatch::Matched(matched) = world.router.match_route(HttpMethod::Get, page_path) else {
         return None;
     };
@@ -2163,7 +2283,7 @@ fn resolve_route_topics_detailed(
         .clone()
         .unwrap_or_else(|| page_path.to_string());
     let Some(route) = streaming.manifest.routes.get(pattern.as_str()) else {
-        return Some((Vec::new(), Vec::new()));
+        return Some((Vec::new(), Vec::new(), Vec::new()));
     };
 
     // PRISM · the same resolver the render path calls, over the same matched
@@ -2174,9 +2294,21 @@ fn resolve_route_topics_detailed(
         matched.params.get(name).map(String::as_str)
     });
 
+    // APERTURE · the other derivation, resolved from the same matched params by
+    // the same rule. A source binding is reachable only through a route that
+    // renders it — invariant 2 is not weakened by the topic being remote.
+    let sources = sources_registry.map_or_else(Vec::new, |registry| {
+        dom_render_compiler::runtime::resolve_source_topics(
+            &route.shared_slot_sources,
+            registry,
+            |name| matched.params.get(name).map(String::as_str),
+        )
+    });
+
     let mut topics = route.shared_slot_topics.clone();
     topics.extend(partitions.iter().map(|resolved| resolved.topic.clone()));
-    Some((topics, partitions))
+    topics.extend(sources.iter().map(|resolved| resolved.topic.clone()));
+    Some((topics, partitions, sources))
 }
 
 /// PHOSPHOR's [`crate::handlers::phosphor::RouteAuthority`] over the live
@@ -2217,9 +2349,18 @@ impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority {
         path: &str,
     ) -> Option<Vec<String>> {
         let streaming = self.world.streaming_runtime.as_ref()?;
-        let (topics, partitions) = resolve_route_topics_detailed(&self.world, streaming, path)?;
+        let registry = self
+            .live
+            .source_reader
+            .get()
+            .map(|reader| reader.registry().as_ref());
+        let (topics, partitions, sources) =
+            resolve_route_topics_detailed(&self.world, streaming, path, registry)?;
         if !partitions.is_empty() {
             crate::topics::TopicWarmer::warm(&self.live, &partitions).await;
+        }
+        if !sources.is_empty() {
+            crate::topics::TopicWarmer::warm_sources(&self.live, &sources).await;
         }
         Some(topics)
     }

@@ -16,7 +16,7 @@
 //! rows the lane then replaces with a differently-ordered set on first frame.
 
 use async_trait::async_trait;
-use dom_render_compiler::runtime::ResolvedPartition;
+use dom_render_compiler::runtime::{ResolvedPartition, ResolvedSourceTopic};
 
 /// Materialise partition topics into the broadcast registry, on demand.
 ///
@@ -29,6 +29,19 @@ pub trait TopicWarmer: Send + Sync {
     /// Ensure every partition in `partitions` is registered and carries its
     /// current value. Safe to call repeatedly for the same partition.
     async fn warm(&self, partitions: &[ResolvedPartition]);
+
+    /// APERTURE · the same contract for a topic whose derivation is an HTTP GET
+    /// rather than a substrate query.
+    ///
+    /// Defaulted to a no-op so a server with no `sources` block — every server
+    /// that exists today — keeps its current behaviour without implementing
+    /// anything. The fail-soft rule is identical and matters more here: an
+    /// upstream can be down, rate-limited, or simply slow, none of which is a
+    /// reason for a page to fail. A source that cannot be warmed leaves its slot
+    /// empty, exactly as an unmaterialisable partition does.
+    async fn warm_sources(&self, sources: &[ResolvedSourceTopic]) {
+        let _ = sources;
+    }
 }
 
 /// The warmer for a server with no FORGE substrate wired.

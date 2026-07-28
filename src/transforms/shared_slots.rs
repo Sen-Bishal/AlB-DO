@@ -66,8 +66,8 @@ use std::collections::HashMap;
 use swc_common::DUMMY_SP;
 use swc_ecma_ast::{
     BlockStmtOrExpr, CallExpr, Callee, Decl, Expr, ExprOrSpread, ExprStmt, ForStmt, Ident, IfStmt,
-    ImportSpecifier, Lit, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, Pat, Prop,
-    PropName, PropOrSpread, Stmt, Str, VarDeclarator,
+    ImportSpecifier, Lit, MemberExpr, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem,
+    Pat, Prop, PropName, PropOrSpread, Stmt, Str, VarDeclarator,
 };
 use swc_ecma_visit::{VisitMut, VisitMutWith};
 
@@ -86,6 +86,21 @@ use swc_ecma_visit::{VisitMut, VisitMutWith};
 pub enum KeySource {
     /// A route parameter: `params.id` on `/room/[id]`.
     Param(String),
+}
+
+/// One argument to a declared APERTURE source route.
+///
+/// Unlike [`KeySource`], a literal is a first-class case here and not an
+/// oversight. A FORGE partition key is dynamic by definition — a fixed one would
+/// mean a collection with a single partition. An external resource is very often
+/// fixed: `github.repo({ owner: "anthropics", name: "claude-code" })` is the
+/// common spelling, not the exception.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceArg {
+    /// A route parameter: `params.owner` on `/repo/[owner]`.
+    Param(String),
+    /// A string literal fixed at build time.
+    Literal(String),
 }
 
 /// Which broadcast topic a `useSharedSlot` binding reads.
@@ -117,6 +132,25 @@ pub enum TopicSpec {
         column: String,
         key: KeySource,
     },
+    /// APERTURE · one declared external resource:
+    /// `useSharedSlot(github.repo({ owner: "anthropics", name: params.name }))`.
+    ///
+    /// Like [`TopicSpec::Partition`] it has no compile-time topic string when any
+    /// argument is a param, so it is resolved per request by the same single
+    /// resolver. Unlike it, the derivation behind the topic is an HTTP GET rather
+    /// than a substrate query — which is precisely what `PRISM.md` § 13 required
+    /// of any non-FORGE topic: *it must have a derivation*.
+    Source {
+        /// The declared source name (the `sources` block key), taken from the
+        /// import's **export name** so an alias still resolves.
+        source: String,
+        /// The route name — the method called on the source.
+        route: String,
+        /// Arguments by parameter name, sorted so the recorded spec is identical
+        /// on every build. The *minted identity* uses the route template's order,
+        /// not this one; see `aperture::declare::source_topic_name`.
+        args: Vec<(String, SourceArg)>,
+    },
 }
 
 /// One `useSharedSlot` call extracted from a component body.
@@ -147,7 +181,12 @@ impl SharedSlotBinding {
     pub fn static_topic(&self) -> Option<&str> {
         match &self.spec {
             TopicSpec::Static(topic) => Some(topic.as_str()),
-            TopicSpec::Partition { .. } => None,
+            // A source is excluded even when every argument is a literal. Its
+            // value is not in the broadcast registry at boot — it has to be
+            // fetched — so pre-registering the name would publish an empty topic
+            // as though it were an answer, which is the mistake `NoTopicWarmer`
+            // exists to avoid.
+            TopicSpec::Partition { .. } | TopicSpec::Source { .. } => None,
         }
     }
 }
@@ -173,6 +212,15 @@ pub enum SharedSlotExtractError {
     /// Distinguished from [`Self::PartitionKeyUnsupported`] so the author learns
     /// the feature is *coming*, not that they wrote nonsense.
     IdentityKeyNotYetSupported { binding_name: Option<String> },
+    /// APERTURE · a source route call whose argument is not a single object
+    /// literal of named arguments.
+    UnsupportedSourceShape { binding_name: Option<String> },
+    /// APERTURE · a source route argument the resolver cannot reproduce.
+    SourceArgUnsupported {
+        binding_name: Option<String>,
+        arg: String,
+        found: String,
+    },
 }
 
 impl std::fmt::Display for SharedSlotExtractError {
@@ -194,7 +242,9 @@ impl std::fmt::Display for SharedSlotExtractError {
             Self::NonStringLiteralTopic { binding_name } => write!(
                 f,
                 "useSharedSlot{} takes a string-literal topic, a collection imported from \
-                 'albedo/forge', or one partition of one (`messages.where({{ room: params.id }})`) \
+                 'albedo/forge', one partition of one (`messages.where({{ room: params.id }})`), \
+                 or a declared source route imported from 'albedo/sources' \
+                 (`github.repo({{ owner: \"anthropics\", name: \"claude-code\" }})`) \
                  — the topic has to be derivable without running the component, because the \
                  subscribe path resolves it from the route alone",
                 binding_name
@@ -231,6 +281,31 @@ impl std::fmt::Display for SharedSlotExtractError {
                 f,
                 "useSharedSlot{}: per-user partitions (`user.id`) need sessions, which land with \
                  auth — TODO #1 item 5. Route parameters (`params.id`) work today",
+                binding_name
+                    .as_deref()
+                    .map(|name| format!(" assigned to '{name}'"))
+                    .unwrap_or_default(),
+            ),
+            Self::UnsupportedSourceShape { binding_name } => write!(
+                f,
+                "useSharedSlot{}: a source route takes one object literal of named arguments, \
+                 e.g. `github.repo({{ owner: \"anthropics\", name: params.name }})`, or no \
+                 argument at all when the route's path has no placeholders",
+                binding_name
+                    .as_deref()
+                    .map(|name| format!(" assigned to '{name}'"))
+                    .unwrap_or_default(),
+            ),
+            Self::SourceArgUnsupported {
+                binding_name,
+                arg,
+                found,
+            } => write!(
+                f,
+                "useSharedSlot{}: source argument `{arg}` must be a string literal or a route \
+                 parameter (`params.id`); found `{found}`. The subscribe path resolves this \
+                 binding from the route path alone, with no component render to evaluate an \
+                 expression in",
                 binding_name
                     .as_deref()
                     .map(|name| format!(" assigned to '{name}'"))
@@ -351,8 +426,12 @@ fn extract_topic_spec(
             .ok_or_else(|| SharedSlotExtractError::NonStringLiteralTopic {
                 binding_name: binding_name.clone(),
             }),
-        // `useSharedSlot(messages.where({ room: params.id }))` — one partition.
-        Expr::Call(inner) => extract_partition(inner, binding_name, imports),
+        // A call: either `messages.where({ room: params.id })` — one FORGE
+        // partition — or `github.repo({ … })` — one declared source route. Both
+        // are `<ident>.<method>(<object>)`, so the receiver's *import* decides
+        // which, never the method name. A source route may legitimately be
+        // called `where`.
+        Expr::Call(inner) => extract_call_spec(inner, binding_name, imports),
         _ => Err(SharedSlotExtractError::NonStringLiteralTopic {
             binding_name: binding_name.clone(),
         }),
@@ -370,6 +449,150 @@ fn collection_for_ident(local: &str, imports: &HashMap<String, ImportBinding>) -
         .get(local)
         .filter(|binding| binding.source == FORGE_BINDINGS_MODULE)
         .map(|binding| binding.export_name.clone())
+}
+
+/// The module specifier the compiler-generated source bindings come from.
+/// Pinned exactly as [`FORGE_BINDINGS_MODULE`] is: a local variable that happens
+/// to share a source's name is user code, not a source reference.
+pub(crate) const SOURCE_BINDINGS_MODULE: &str = "albedo/sources";
+
+/// The declared source name behind a local identifier, when it is bound by an
+/// import from [`SOURCE_BINDINGS_MODULE`]. Returns the **export name**, so
+/// `import { github as gh }` still resolves to `github`.
+fn source_for_ident(local: &str, imports: &HashMap<String, ImportBinding>) -> Option<String> {
+    imports
+        .get(local)
+        .filter(|binding| binding.source == SOURCE_BINDINGS_MODULE)
+        .map(|binding| binding.export_name.clone())
+}
+
+/// Dispatch a `<ident>.<method>(…)` topic argument on what `<ident>` was
+/// imported from.
+///
+/// Deciding on the *import* rather than the method name is what keeps the two
+/// namespaces from constraining each other: a source is free to declare a route
+/// named `where`, and a collection is free to be read by a source-shaped call
+/// that simply is not one.
+fn extract_call_spec(
+    call: &CallExpr,
+    binding_name: &Option<String>,
+    imports: &HashMap<String, ImportBinding>,
+) -> Result<TopicSpec, SharedSlotExtractError> {
+    let unsupported = || SharedSlotExtractError::NonStringLiteralTopic {
+        binding_name: binding_name.clone(),
+    };
+    let Callee::Expr(callee) = &call.callee else {
+        return Err(unsupported());
+    };
+    let Expr::Member(member) = unwrap_parens(callee) else {
+        return Err(unsupported());
+    };
+    let Expr::Ident(receiver) = unwrap_parens(&member.obj) else {
+        return Err(unsupported());
+    };
+
+    if source_for_ident(receiver.sym.as_ref(), imports).is_some() {
+        extract_source(call, member, binding_name, imports)
+    } else {
+        extract_partition(call, binding_name, imports)
+    }
+}
+
+/// Lower `<source>.<route>({ <name>: <value>, … })`.
+fn extract_source(
+    call: &CallExpr,
+    member: &MemberExpr,
+    binding_name: &Option<String>,
+    imports: &HashMap<String, ImportBinding>,
+) -> Result<TopicSpec, SharedSlotExtractError> {
+    let bad_shape = || SharedSlotExtractError::UnsupportedSourceShape {
+        binding_name: binding_name.clone(),
+    };
+
+    let MemberProp::Ident(route) = &member.prop else {
+        return Err(bad_shape());
+    };
+    let Expr::Ident(receiver) = unwrap_parens(&member.obj) else {
+        return Err(bad_shape());
+    };
+    let source = source_for_ident(receiver.sym.as_ref(), imports).ok_or_else(bad_shape)?;
+
+    // No argument is legal: a route whose path carries no `{placeholder}` needs
+    // nothing bound. `github.status()`.
+    let args = match call.args.as_slice() {
+        [] => Vec::new(),
+        [arg] => {
+            let Expr::Object(object) = unwrap_parens(&arg.expr) else {
+                return Err(bad_shape());
+            };
+            let mut collected: Vec<(String, SourceArg)> = Vec::with_capacity(object.props.len());
+            for prop in &object.props {
+                let PropOrSpread::Prop(prop) = prop else {
+                    return Err(bad_shape());
+                };
+                let Prop::KeyValue(entry) = prop.as_ref() else {
+                    return Err(bad_shape());
+                };
+                let name = match &entry.key {
+                    PropName::Ident(ident) => ident.sym.to_string(),
+                    PropName::Str(text) => text.value.to_string(),
+                    _ => return Err(bad_shape()),
+                };
+                let value = extract_source_arg(&entry.value, &name, binding_name)?;
+                collected.push((name, value));
+            }
+            // Sorted so the recorded spec is byte-identical on every build
+            // regardless of how the author ordered the object literal. The
+            // minted identity uses the route template's order instead, which is
+            // why sorting here is free.
+            collected.sort_by(|left, right| left.0.cmp(&right.0));
+            collected
+        }
+        _ => return Err(bad_shape()),
+    };
+
+    Ok(TopicSpec::Source {
+        source,
+        route: route.sym.to_string(),
+        args,
+    })
+}
+
+/// Lower the value side of one `{ name: <here> }` source argument.
+fn extract_source_arg(
+    expr: &Expr,
+    arg: &str,
+    binding_name: &Option<String>,
+) -> Result<SourceArg, SharedSlotExtractError> {
+    match unwrap_parens(expr) {
+        Expr::Lit(Lit::Str(text)) => Ok(SourceArg::Literal(text.value.to_string())),
+        Expr::Member(member) => {
+            if let (Expr::Ident(base), MemberProp::Ident(field)) =
+                (unwrap_parens(&member.obj), &member.prop)
+            {
+                if base.sym.as_ref() == "params" {
+                    return Ok(SourceArg::Param(field.sym.to_string()));
+                }
+                // Recognised on purpose, same as the partition path: the author
+                // is asking for the right thing, it just is not wired yet.
+                if matches!(base.sym.as_ref(), "user" | "session") {
+                    return Err(SharedSlotExtractError::IdentityKeyNotYetSupported {
+                        binding_name: binding_name.clone(),
+                    });
+                }
+            }
+            Err(SharedSlotExtractError::SourceArgUnsupported {
+                binding_name: binding_name.clone(),
+                arg: arg.to_string(),
+                found: describe_expr(expr),
+            })
+        }
+        other => Err(SharedSlotExtractError::SourceArgUnsupported {
+            binding_name: binding_name.clone(),
+            arg: arg.to_string(),
+            found: describe_expr(other),
+        }),
+    }
 }
 
 /// Lower `<collection>.where({ <column>: <key> })`.
@@ -519,7 +742,12 @@ pub fn rewrite_shared_slot_topic_args(module: &mut Module) {
         return;
     };
     let collections = forge_collection_locals(module);
-    module.visit_mut_with(&mut TopicArgRewriter { hook_local, collections });
+    let sources = import_locals(module, SOURCE_BINDINGS_MODULE);
+    module.visit_mut_with(&mut TopicArgRewriter {
+        hook_local,
+        collections,
+        sources,
+    });
 }
 
 /// `local -> export_name` for every identifier imported from
@@ -531,12 +759,33 @@ pub fn rewrite_shared_slot_topic_args(module: &mut Module) {
 /// alias rule would let `import { messages as msgs }` classify under one name
 /// and fan out under another.
 pub(crate) fn forge_collection_locals(module: &Module) -> HashMap<String, String> {
+    import_locals(module, FORGE_BINDINGS_MODULE)
+}
+
+/// `local -> export_name` for every identifier imported from
+/// [`SOURCE_BINDINGS_MODULE`].
+///
+/// The APERTURE half of [`forge_collection_locals`], and `pub(crate)` for the
+/// same reason: the B2/B4 anchor markers must resolve a source receiver exactly
+/// as this pass does, or a binding gets extracted and subscribed without being
+/// stamped — live on the wire, never painting.
+pub(crate) fn source_locals(module: &Module) -> HashMap<String, String> {
+    import_locals(module, SOURCE_BINDINGS_MODULE)
+}
+
+/// `local -> export_name` for every named import from `specifier`.
+///
+/// Extracted from [`forge_collection_locals`] when APERTURE needed the identical
+/// rule for `albedo/sources`. Two copies of an alias rule is exactly how
+/// `import { messages as msgs }` ends up classified under one name and resolved
+/// under another.
+fn import_locals(module: &Module, specifier: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;
         };
-        if import.src.value.as_ref() != FORGE_BINDINGS_MODULE {
+        if import.src.value.as_ref() != specifier {
             continue;
         }
         for spec in &import.specifiers {
@@ -585,6 +834,7 @@ fn local_name_for(module: &Module, source: &str, export_name: &str) -> Option<St
 struct TopicArgRewriter {
     hook_local: String,
     collections: HashMap<String, String>,
+    sources: HashMap<String, String>,
 }
 
 impl TopicArgRewriter {
@@ -600,8 +850,14 @@ impl TopicArgRewriter {
                 .collections
                 .get(ident.sym.as_ref())
                 .map(|collection| string_expr(collection)),
-            // A partition: only the render knows the key, so defer to the host.
-            Expr::Call(inner) if self.is_where_on_collection(inner) => {
+            // A partition or a declared source route: only the render knows the
+            // resolved topic, so both defer to the host through the *same*
+            // lookup. APERTURE adds no new shim — a source topic reaches JS as
+            // data exactly like a partition does, which is what keeps the naming
+            // rule in one place (PRISM invariant 5).
+            Expr::Call(inner)
+                if self.is_where_on_collection(inner) || self.is_source_route_call(inner) =>
+            {
                 Some(topic_lookup_expr(binding))
             }
             _ => None,
@@ -617,6 +873,21 @@ impl TopicArgRewriter {
         }
         matches!(unwrap_parens(&member.obj), Expr::Ident(receiver)
             if self.collections.contains_key(receiver.sym.as_ref()))
+    }
+
+    /// `<source>.<route>(…)` where `<source>` came from `albedo/sources`.
+    ///
+    /// The method name is deliberately unconstrained: a route may be called
+    /// anything the author declared, including `where`. The receiver's import is
+    /// the whole test, mirroring the extractor's dispatch.
+    fn is_source_route_call(&self, call: &CallExpr) -> bool {
+        let Callee::Expr(callee) = &call.callee else { return false };
+        let Expr::Member(member) = unwrap_parens(callee) else { return false };
+        if !matches!(&member.prop, MemberProp::Ident(_)) {
+            return false;
+        }
+        matches!(unwrap_parens(&member.obj), Expr::Ident(receiver)
+            if self.sources.contains_key(receiver.sym.as_ref()))
     }
 }
 
@@ -1111,6 +1382,64 @@ mod tests {
             assert_eq!(out, format!("{TOPIC_LOOKUP_FN}(\"rows\")"));
         }
 
+        const SOURCES: &str = "import { github } from \"albedo/sources\";";
+
+        /// APERTURE · a declared source route folds to the **same** host lookup
+        /// a partition does.
+        ///
+        /// The fold and the extractor must claim exactly the same calls. A
+        /// source call the fold missed would survive into emitted JS as
+        /// `github.repo({…})` — a call on an object QuickJS has never heard of,
+        /// throwing at render time. One it folded that the extractor skipped
+        /// would read a `host.topics` entry nobody filled, and be null forever.
+        #[test]
+        fn a_source_route_folds_to_a_host_lookup_keyed_by_binding_name() {
+            let out = folded_arg(&format!(
+                "{HOOK} {SOURCES} export default function C() {{ \
+                 const repo = useSharedSlot(github.repo({{ owner: \"a\", name: \"b\" }})); \
+                 return <div>{{repo}}</div>; }}"
+            ));
+            assert_eq!(out, format!("{TOPIC_LOOKUP_FN}(\"repo\")"));
+        }
+
+        /// A paramless route folds too — its identity still has to cross into JS
+        /// as data rather than being rebuilt there.
+        #[test]
+        fn a_paramless_source_route_folds() {
+            let out = folded_arg(&format!(
+                "{HOOK} {SOURCES} export default function C() {{ \
+                 const s = useSharedSlot(github.status()); return <div>{{s}}</div>; }}"
+            ));
+            assert_eq!(out, format!("{TOPIC_LOOKUP_FN}(\"s\")"));
+        }
+
+        /// The receiver's import decides, not the method name — so a source
+        /// route named `where` folds as a source, and a collection's `.where`
+        /// still folds as a partition. Both land on the same lookup, which is
+        /// why this is about *claiming* the call rather than the output.
+        #[test]
+        fn a_source_route_named_where_is_still_folded() {
+            let out = folded_arg(&format!(
+                "{HOOK} {SOURCES} export default function C() {{ \
+                 const hits = useSharedSlot(github.where({{ q: \"rust\" }})); \
+                 return <div>{{hits}}</div>; }}"
+            ));
+            assert_eq!(out, format!("{TOPIC_LOOKUP_FN}(\"hits\")"));
+        }
+
+        /// A local object that merely shares a source's name is user code, and
+        /// folding it would rewrite a call the extractor never claimed.
+        #[test]
+        fn a_call_on_a_non_source_value_is_left_alone() {
+            let out = folded_arg(&format!(
+                "{HOOK} import {{ github }} from \"./mine\"; \
+                 export default function C() {{ \
+                 const repo = useSharedSlot(github.repo({{ owner: \"a\" }})); \
+                 return <div>{{repo}}</div>; }}"
+            ));
+            assert_eq!(out, "<member call>(…)");
+        }
+
         /// `.where` on something that is not a forge import is user code. The
         /// fold must not claim it — same import-pin discipline as the extractor.
         #[test]
@@ -1288,5 +1617,242 @@ mod tests {
         let first = extract_or_panic(source);
         let second = extract_or_panic(source);
         assert_eq!(first, second);
+    }
+
+    // ── APERTURE · declared source routes ────────────────────────────────
+
+    #[test]
+    fn a_source_route_with_literal_arguments_is_extracted() {
+        let bindings = extract_or_panic(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { github } from "albedo/sources";
+            export default function Component() {
+                const repo = useSharedSlot(github.repo({ owner: "anthropics", name: "claude-code" }));
+                return <div>{repo}</div>;
+            }
+            "#,
+        );
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].binding_name, "repo");
+        assert_eq!(
+            bindings[0].spec,
+            TopicSpec::Source {
+                source: "github".to_string(),
+                route: "repo".to_string(),
+                // Sorted by argument name, not source order.
+                args: vec![
+                    ("name".to_string(), SourceArg::Literal("claude-code".to_string())),
+                    ("owner".to_string(), SourceArg::Literal("anthropics".to_string())),
+                ],
+            }
+        );
+        // Not a static topic: its value has to be fetched, so pre-registering
+        // the name at boot would publish an empty topic as an answer.
+        assert_eq!(bindings[0].static_topic(), None);
+    }
+
+    #[test]
+    fn a_source_route_mixing_params_and_literals_is_extracted() {
+        let bindings = extract_or_panic(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { github } from "albedo/sources";
+            export default function Component({ params }) {
+                const repo = useSharedSlot(github.repo({ owner: params.org, name: "claude-code" }));
+                return <div>{repo}</div>;
+            }
+            "#,
+        );
+        assert_eq!(
+            bindings[0].spec,
+            TopicSpec::Source {
+                source: "github".to_string(),
+                route: "repo".to_string(),
+                args: vec![
+                    ("name".to_string(), SourceArg::Literal("claude-code".to_string())),
+                    ("owner".to_string(), SourceArg::Param("org".to_string())),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn a_paramless_source_route_needs_no_argument() {
+        let bindings = extract_or_panic(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { status } from "albedo/sources";
+            export default function Component() {
+                const s = useSharedSlot(status.current());
+                return <div>{s}</div>;
+            }
+            "#,
+        );
+        assert_eq!(
+            bindings[0].spec,
+            TopicSpec::Source {
+                source: "status".to_string(),
+                route: "current".to_string(),
+                args: vec![],
+            }
+        );
+    }
+
+    /// An aliased import resolves to the declared name, exactly as a collection
+    /// alias does. Two implementations of the alias rule is how a source gets
+    /// classified under one name and resolved under another.
+    #[test]
+    fn an_aliased_source_import_resolves_to_its_export_name() {
+        let bindings = extract_or_panic(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { github as gh } from "albedo/sources";
+            export default function Component() {
+                const repo = useSharedSlot(gh.repo({ owner: "a", name: "b" }));
+                return <div>{repo}</div>;
+            }
+            "#,
+        );
+        let TopicSpec::Source { source, .. } = &bindings[0].spec else {
+            panic!("expected a source spec");
+        };
+        assert_eq!(source, "github");
+    }
+
+    /// The receiver's *import* decides which derivation a call is, never the
+    /// method name — so a source is free to declare a route called `where`.
+    #[test]
+    fn a_source_route_may_be_named_where() {
+        let bindings = extract_or_panic(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { search } from "albedo/sources";
+            export default function Component() {
+                const hits = useSharedSlot(search.where({ q: "rust" }));
+                return <div>{hits}</div>;
+            }
+            "#,
+        );
+        assert!(matches!(bindings[0].spec, TopicSpec::Source { .. }));
+    }
+
+    /// …and the mirror: a collection's `.where` is still a partition even
+    /// though a source with the same local name would not be.
+    #[test]
+    fn a_collection_where_is_still_a_partition() {
+        let bindings = extract_or_panic(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { messages } from "albedo/forge";
+            export default function Component({ params }) {
+                const rows = useSharedSlot(messages.where({ room: params.id }));
+                return <div>{rows}</div>;
+            }
+            "#,
+        );
+        assert!(matches!(bindings[0].spec, TopicSpec::Partition { .. }));
+    }
+
+    /// A local object that merely looks like a source is user code. The import
+    /// pin is the whole test.
+    #[test]
+    fn an_unimported_receiver_is_not_a_source() {
+        let err = extract_err(
+            r#"
+            import { useSharedSlot } from "albedo";
+            const github = { repo: () => "x" };
+            export default function Component() {
+                const repo = useSharedSlot(github.repo({ owner: "a" }));
+                return <div>{repo}</div>;
+            }
+            "#,
+        );
+        assert!(matches!(
+            err,
+            SharedSlotExtractError::NonStringLiteralTopic { .. }
+        ));
+    }
+
+    #[test]
+    fn a_computed_source_argument_is_refused() {
+        let err = extract_err(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { github } from "albedo/sources";
+            export default function Component({ props }) {
+                const repo = useSharedSlot(github.repo({ owner: props.owner.toLowerCase() }));
+                return <div>{repo}</div>;
+            }
+            "#,
+        );
+        assert!(matches!(
+            err,
+            SharedSlotExtractError::SourceArgUnsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn a_user_scoped_source_argument_names_item_five() {
+        let err = extract_err(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { billing } from "albedo/sources";
+            export default function Component() {
+                const plan = useSharedSlot(billing.plan({ customer: user.id }));
+                return <div>{plan}</div>;
+            }
+            "#,
+        );
+        assert!(matches!(
+            err,
+            SharedSlotExtractError::IdentityKeyNotYetSupported { .. }
+        ));
+        assert!(err.to_string().contains("item 5"));
+    }
+
+    #[test]
+    fn a_non_object_source_argument_is_refused() {
+        let err = extract_err(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { github } from "albedo/sources";
+            export default function Component() {
+                const repo = useSharedSlot(github.repo("anthropics"));
+                return <div>{repo}</div>;
+            }
+            "#,
+        );
+        assert!(matches!(
+            err,
+            SharedSlotExtractError::UnsupportedSourceShape { .. }
+        ));
+    }
+
+    #[test]
+    fn source_extraction_is_deterministic_regardless_of_argument_order() {
+        // The recorded spec must not depend on how the author spelled the
+        // object literal, or two builds of equivalent code would differ.
+        let one = extract_or_panic(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { github } from "albedo/sources";
+            export default function Component() {
+                const repo = useSharedSlot(github.repo({ owner: "a", name: "b" }));
+                return <div>{repo}</div>;
+            }
+            "#,
+        );
+        let two = extract_or_panic(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { github } from "albedo/sources";
+            export default function Component() {
+                const repo = useSharedSlot(github.repo({ name: "b", owner: "a" }));
+                return <div>{repo}</div>;
+            }
+            "#,
+        );
+        assert_eq!(one[0].spec, two[0].spec);
     }
 }

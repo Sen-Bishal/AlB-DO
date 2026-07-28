@@ -132,6 +132,15 @@ pub struct RouteManifest {
     /// it.
     #[serde(default)]
     pub shared_slot_partitions: Vec<PartitionTopicSpec>,
+    /// APERTURE · the declared external resources this route reads.
+    ///
+    /// Per-route for exactly the reason `shared_slot_partitions` is: a source
+    /// binding whose arguments come from `params` resolves against **this**
+    /// request's params, so a project-wide list would resolve another route's
+    /// binding against this route's values. Invariant 2 is the same for both
+    /// derivations — a topic is reachable only through a route that renders it.
+    #[serde(default)]
+    pub shared_slot_sources: Vec<SourceTopicSpec>,
     /// Phase P · TS-side action handler names + their wire
     /// `action_id`s for this route. Populated once Stream C lands
     /// the `action()` extractor; the field exists now so manifests
@@ -244,6 +253,56 @@ pub struct PartitionTopicSpec {
     pub column: String,
     /// The route param supplying the key: `params.id` → `"id"`.
     pub param: String,
+}
+
+/// APERTURE · one `useSharedSlot(<source>.<route>({ … }))` binding on a route.
+///
+/// The sibling of [`PartitionTopicSpec`], and shaped the same way on purpose:
+/// the extractor lowers TSX to this, and
+/// [`crate::runtime::resolve_source_topics`] turns it into a topic identity once
+/// a request supplies the params. Nothing here is a topic *string* either.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SourceTopicSpec {
+    /// The component-local name the binding is assigned to — the key the
+    /// transpiled `__albedo_topic("repo")` looks up in `host.topics`.
+    pub binding: String,
+    /// The declared source name — the `sources` block key.
+    pub source: String,
+    /// The route name called on it.
+    pub route: String,
+    /// Arguments by name, sorted. Checked against the declared route's path
+    /// placeholders at build time (`validate_source_bindings`).
+    pub args: Vec<SourceArgSpec>,
+}
+
+/// Where one source-route argument's value comes from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum SourceArgSpec {
+    /// Bound from a route parameter: `owner: params.owner`.
+    Param {
+        /// The argument name, matching a `{placeholder}` in the route's path.
+        name: String,
+        /// The route parameter supplying it.
+        param: String,
+    },
+    /// Fixed at build time: `owner: "anthropics"`.
+    Literal {
+        /// The argument name, matching a `{placeholder}` in the route's path.
+        name: String,
+        /// The value.
+        value: String,
+    },
+}
+
+impl SourceArgSpec {
+    /// The argument name, whichever variant this is.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            SourceArgSpec::Param { name, .. } | SourceArgSpec::Literal { name, .. } => name,
+        }
+    }
 }
 
 /// Phase P · one TS-authored action handler discovered on a route.

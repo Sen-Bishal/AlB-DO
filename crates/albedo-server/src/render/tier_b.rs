@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use dom_render_compiler::ir::opcode::{Instruction, StableId};
-use dom_render_compiler::manifest::schema::{DataDep, DataSource, PartitionTopicSpec, TierBNode};
+use dom_render_compiler::manifest::schema::{
+    DataDep, DataSource, PartitionTopicSpec, SourceTopicSpec, TierBNode,
+};
 use dom_render_compiler::transforms::shared_slot_lists::RowProjection;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
@@ -450,6 +452,10 @@ pub struct TierBEntryPlan {
     /// binding will resolve at all, since that depends on a URL nobody has
     /// requested yet.
     pub shared_partitions: Vec<PartitionTopicSpec>,
+    /// APERTURE · the declared-source bindings this component reads, still
+    /// unresolved. The counterpart to `shared_partitions` for a topic whose
+    /// derivation is an HTTP GET.
+    pub shared_sources: Vec<SourceTopicSpec>,
     /// Per-topic row-template incrementalisation class ([`RowProjection`]),
     /// derived at boot from the `.map()` callbacks in this entry's modules.
     /// Lets FORGE's row projector answer a single-record write on a `PerRecord`
@@ -525,6 +531,10 @@ pub struct PooledTierBRenderRegistry {
     /// of `/room/42` would show an empty room and only fill in once somebody
     /// wrote to it — the page would look *wrong*, not merely slow.
     warmer: Arc<dyn crate::topics::TopicWarmer>,
+    /// APERTURE · the declared `sources` block, or `None` when the app declared
+    /// none. Needed here because resolving a source spec means walking the
+    /// route's path template, which only the registry knows.
+    source_registry: Option<Arc<dom_render_compiler::aperture::SourceRegistry>>,
 }
 
 impl PooledTierBRenderRegistry {
@@ -542,7 +552,46 @@ impl PooledTierBRenderRegistry {
             broadcast,
             form_error_spans,
             warmer,
+            source_registry: None,
         }
+    }
+
+    /// Attach the declared sources. Separate from [`Self::new`] so a server with
+    /// no `sources` block — every server that exists today — is unchanged.
+    #[must_use]
+    pub fn with_sources(
+        mut self,
+        registry: Option<Arc<dom_render_compiler::aperture::SourceRegistry>>,
+    ) -> Self {
+        self.source_registry = registry;
+        self
+    }
+
+    /// APERTURE · resolve this component's source bindings against the `params`
+    /// the route matched.
+    ///
+    /// The params come out of `props` for the identical reason
+    /// [`resolve_partitions_for_props`] reads them there: a component that can
+    /// write `github.repo({ owner: params.org })` necessarily receives `params`,
+    /// so binding the topic to those values binds it to exactly what the
+    /// component itself sees.
+    fn resolve_sources_for_props(
+        &self,
+        plan: &TierBEntryPlan,
+        props: &Value,
+    ) -> Vec<dom_render_compiler::runtime::ResolvedSourceTopic> {
+        if plan.shared_sources.is_empty() {
+            return Vec::new();
+        }
+        let Some(registry) = self.source_registry.as_ref() else {
+            return Vec::new();
+        };
+        let params = props.get("params").and_then(Value::as_object);
+        dom_render_compiler::runtime::resolve_source_topics(
+            &plan.shared_sources,
+            registry,
+            |name| params.and_then(|map| map.get(name)).and_then(Value::as_str),
+        )
     }
 }
 
@@ -582,17 +631,22 @@ fn resolve_partitions_for_props(
 fn host_seed_for(
     plan: &TierBEntryPlan,
     partitions: &[dom_render_compiler::runtime::ResolvedPartition],
+    sources: &[dom_render_compiler::runtime::ResolvedSourceTopic],
     broadcast: &dom_render_compiler::runtime::BroadcastRegistry,
     form_error_spans: &serde_json::Map<String, Value>,
 ) -> String {
-    // Static topics and resolved partitions are seeded through the same
-    // function, from the same registry, in one pass — so a component reading one
-    // of each cannot end up with two different notions of "current".
+    // Static topics, resolved partitions and resolved sources are seeded through
+    // the same function, from the same registry, in one pass — so a component
+    // reading one of each cannot end up with three different notions of
+    // "current". This is the payoff for APERTURE reusing the broadcast registry
+    // rather than carrying its own store: past this line the render does not
+    // know or care which derivation produced a value.
     let shared = dom_render_compiler::runtime::shared_slot_host_seed(
         plan.shared_topics
             .iter()
             .map(String::as_str)
-            .chain(partitions.iter().map(|p| p.topic.as_str())),
+            .chain(partitions.iter().map(|p| p.topic.as_str()))
+            .chain(sources.iter().map(|s| s.topic.as_str())),
         broadcast,
     );
     let mut host = serde_json::Map::new();
@@ -608,10 +662,20 @@ fn host_seed_for(
     //
     // A binding that did not resolve is simply absent, and the shim returns null
     // for it: the slot reads null, the page renders, nothing throws.
-    if !partitions.is_empty() {
+    //
+    // A source binding lands in the *same* map, under the same rule, because the
+    // transpile folded both call shapes into the same `__albedo_topic(binding)`.
+    // Binding names are component-local and unique per declarator, so the two
+    // derivations cannot collide here.
+    if !partitions.is_empty() || !sources.is_empty() {
         let topics = partitions
             .iter()
             .map(|p| (p.binding.clone(), Value::String(p.topic.clone())))
+            .chain(
+                sources
+                    .iter()
+                    .map(|s| (s.binding.clone(), Value::String(s.topic.clone()))),
+            )
             .collect::<serde_json::Map<String, Value>>();
         host.insert("topics".to_string(), Value::Object(topics));
     }
@@ -669,11 +733,22 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
             self.warmer.warm(&partitions).await;
         }
 
+        // APERTURE · the same order, for the same reason. The refresh window is
+        // enforced inside the client, so a fresh resource costs a cache lookup
+        // here and a stale one costs a conditional request that most often comes
+        // back 304 — which is why warming on every render is affordable rather
+        // than something a scheduler has to ration.
+        let sources = self.resolve_sources_for_props(&plan, props);
+        if !sources.is_empty() {
+            self.warmer.warm_sources(&sources).await;
+        }
+
         // Read the topics' values here, on the request, not at boot — the whole
         // point is that they are live.
         let host_json = host_seed_for(
             &plan,
             &partitions,
+            &sources,
             self.broadcast.as_ref(),
             &self.form_error_spans,
         );
@@ -855,6 +930,7 @@ mod tests {
                 modules: Vec::new(),
                 shared_topics: topics.iter().map(|t| (*t).to_string()).collect(),
                 shared_partitions: Vec::new(),
+                shared_sources: Vec::new(),
                 shared_topic_classes: HashMap::new(),
             }
         }
@@ -867,7 +943,7 @@ mod tests {
             broadcast: &BroadcastRegistry,
             spans: &serde_json::Map<String, Value>,
         ) -> String {
-            super::host_seed_for(plan, &[], broadcast, spans)
+            super::host_seed_for(plan, &[], &[], broadcast, spans)
         }
 
         #[test]
@@ -968,6 +1044,7 @@ mod tests {
                 entry: "routes/room/[id].tsx::Room".to_string(),
                 modules: Vec::new(),
                 shared_topics: Vec::new(),
+                shared_sources: Vec::new(),
                 shared_partitions: vec![PartitionTopicSpec {
                     binding: "rows".to_string(),
                     collection: "messages".to_string(),
@@ -1034,6 +1111,7 @@ mod tests {
             let host = super::super::host_seed_for(
                 &plan,
                 &resolved,
+                &[],
                 &broadcast,
                 &serde_json::Map::new(),
             );

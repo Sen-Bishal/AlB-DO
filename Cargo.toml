@@ -35,6 +35,13 @@ bytes            = { version = "1.7" }
 http             = { version = "1.1" }
 matchit          = { version = "0.8" }
 url              = { version = "2.5" }
+# APERTURE · A0 — the outbound HTTP client (development-plan/APERTURE.md).
+# `rustls-tls` rather than native-tls so the TLS stack is the one `quinn`
+# already pulls in; `default-features = false` drops the default native-tls
+# path and its OpenSSL/schannel probing. `hyper`, `rustls`, `tokio-rustls`,
+# `webpki-roots` and `h2` were already in `Cargo.lock` transitively, so this
+# adds far less to the tree than its dependency list suggests.
+reqwest          = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset"] }
 uuid             = { version = "1", features = ["v4"] }
 
 # Serialization
@@ -193,6 +200,8 @@ walkdir.workspace            = true
 notify.workspace             = true
 rquickjs.workspace           = true
 time.workspace               = true
+reqwest.workspace            = true
+url.workspace                = true
 
 swc_common.workspace                     = true
 swc_ecma_ast.workspace                   = true

@@ -303,6 +303,7 @@ fn collect_shared_slot_idents(module: &Module) -> HashMap<String, SlotAnchor> {
     let mut collector = SlotDeclCollector {
         local_name,
         collections: crate::transforms::shared_slots::forge_collection_locals(module),
+        sources: crate::transforms::shared_slots::source_locals(module),
         out: HashMap::new(),
     };
     module.visit_with(&mut collector);
@@ -343,6 +344,9 @@ struct SlotDeclCollector {
     /// receiver resolves to its collection through the same alias rule the
     /// extractor uses.
     collections: HashMap<String, String>,
+    /// `local -> export name` for `albedo/sources` imports, the APERTURE half
+    /// of the same rule.
+    sources: HashMap<String, String>,
     out: HashMap<String, SlotAnchor>,
 }
 
@@ -350,9 +354,13 @@ impl Visit for SlotDeclCollector {
     fn visit_var_declarator(&mut self, decl: &VarDeclarator) {
         if let (Pat::Ident(name), Some(init)) = (&decl.name, &decl.init) {
             let binding = name.id.sym.to_string();
-            if let Some(anchor) =
-                shared_slot_topic(init, &binding, &self.local_name, &self.collections)
-            {
+            if let Some(anchor) = shared_slot_topic(
+                init,
+                &binding,
+                &self.local_name,
+                &self.collections,
+                &self.sources,
+            ) {
                 self.out.insert(binding, anchor);
             }
         }
@@ -389,6 +397,16 @@ enum SlotAnchor {
         binding: String,
         collection: String,
     },
+    /// APERTURE · one declared external resource, `ops.status(…)`.
+    ///
+    /// Deferred exactly as a partition is — the topic is minted per request, so
+    /// the attribute carries the lookup rather than a string — but carrying **no
+    /// collection**, because there is no row model behind an arbitrary JSON
+    /// response to classify a projection against (`APERTURE.md` § 4.4). Keeping
+    /// that as a distinct variant rather than an `Option<String>` is what makes
+    /// [`map_call_binding`] state the exclusion instead of silently threading a
+    /// `None` into a classifier that would read it as "unclassified".
+    External { binding: String },
 }
 
 /// How the marker classifies one `const <binding> = useSharedSlot(<arg>)`.
@@ -402,6 +420,7 @@ fn shared_slot_topic(
     binding: &str,
     local_name: &str,
     collections: &HashMap<String, String>,
+    sources: &HashMap<String, String>,
 ) -> Option<SlotAnchor> {
     let Expr::Call(CallExpr { callee: Callee::Expr(callee), args, .. }) = expr else {
         return None;
@@ -419,15 +438,44 @@ fn shared_slot_topic(
         Expr::Ident(ident) => collections
             .get(ident.sym.as_ref())
             .map(|collection| SlotAnchor::Literal(collection.clone())),
-        // `messages.where({ room: params.id })`.
-        Expr::Call(inner) => where_receiver(inner, collections).map(|collection| {
-            SlotAnchor::Deferred {
+        // `messages.where({ room: params.id })`, or `ops.status({ … })`.
+        //
+        // Dispatched on the receiver's **import**, not the method name — the
+        // same rule `shared_slots::extract_call_spec` uses, and for the same
+        // reason: keying on `where` would forbid a source route called `where`.
+        Expr::Call(inner) => match where_receiver(inner, collections) {
+            Some(collection) => Some(SlotAnchor::Deferred {
                 binding: binding.to_string(),
                 collection,
-            }
-        }),
+            }),
+            None => source_receiver(inner, sources).map(|_| SlotAnchor::External {
+                binding: binding.to_string(),
+            }),
+        },
         _ => None,
     }
+}
+
+/// The declared **source** behind a `<receiver>.<route>(…)` call, resolved
+/// through the module's `albedo/sources` imports so an aliased
+/// `import { github as gh }` still yields `github`.
+///
+/// Unlike [`where_receiver`] the method name is not checked, because it is the
+/// author's route name and any identifier is legal.
+fn source_receiver(call: &CallExpr, sources: &HashMap<String, String>) -> Option<String> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Member(member) = callee.as_ref() else {
+        return None;
+    };
+    if !matches!(member.prop, MemberProp::Ident(_)) {
+        return None;
+    }
+    let Expr::Ident(receiver) = member.obj.as_ref() else {
+        return None;
+    };
+    sources.get(receiver.sym.as_ref()).cloned()
 }
 
 /// The **collection** `<receiver>.where(…)` partitions, resolved through the
@@ -569,10 +617,12 @@ fn anchor_attr(attr: &str, anchor: &SlotAnchor) -> JSXAttrOrSpread {
             value: topic.as_str().into(),
             raw: None,
         })),
-        SlotAnchor::Deferred { binding, .. } => JSXAttrValue::JSXExprContainer(JSXExprContainer {
-            span: DUMMY_SP,
-            expr: JSXExpr::Expr(Box::new(topic_lookup_call(binding))),
-        }),
+        SlotAnchor::Deferred { binding, .. } | SlotAnchor::External { binding } => {
+            JSXAttrValue::JSXExprContainer(JSXExprContainer {
+                span: DUMMY_SP,
+                expr: JSXExpr::Expr(Box::new(topic_lookup_call(binding))),
+            })
+        }
     };
     JSXAttrOrSpread::JSXAttr(JSXAttr {
         span: DUMMY_SP,
@@ -781,6 +831,11 @@ fn map_call_binding(
     let key = match idents.get(obj.sym.as_ref())? {
         SlotAnchor::Literal(topic) => topic.clone(),
         SlotAnchor::Deferred { collection, .. } => collection.clone(),
+        // APERTURE · an external topic is value-consumed: an arbitrary JSON body
+        // has no row identity, so there is no projection to classify and nothing
+        // for the row kernel to do (`APERTURE.md` § 4.4). Mapping over one still
+        // renders — it just renders whole, server-side, like any other value.
+        SlotAnchor::External { .. } => return None,
     };
     Some((key, obj.sym.to_string()))
 }
@@ -1192,6 +1247,75 @@ mod partition_anchor_tests {
             "#,
         );
         assert!(out.contains("data-albedo-slot") && out.contains("__albedo_topic(\"count\")"));
+    }
+
+    /// APERTURE · **the browser-proof regression.** A declared source read is a
+    /// third accepted argument form, and this marker knew only two — so the
+    /// binding was extracted, subscribed, warmed and pushed, and the value
+    /// landed on a page with nowhere to paint it. SSR showed the first value
+    /// forever while the wire carried every update.
+    ///
+    /// Every unit and integration test for A1 passed throughout, because each
+    /// tested one stage and this is a disagreement *between* stages — exactly
+    /// the hazard `shared_slot_topic`'s own doc comment names: *"if these two
+    /// disagreed about what counts as a shared slot, a binding would be
+    /// extracted (and therefore subscribed) without being stamped."* It was
+    /// written about lists and came true about scalars.
+    #[test]
+    fn a_declared_source_read_is_anchored_like_a_partition() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { ops } from "albedo/sources";
+            export default function Ops() {
+                const status = useSharedSlot(ops.status());
+                return <span>{status}</span>;
+            }
+            "#,
+        );
+        assert!(
+            out.contains("data-albedo-slot") && out.contains("__albedo_topic(\"status\")"),
+            "a source topic is minted per request, so the anchor carries the \
+             lookup exactly as a partition's does; got {out}"
+        );
+    }
+
+    /// The dispatch is on the receiver's **import**, not the method name — so a
+    /// route may be called anything, including `where`.
+    #[test]
+    fn a_source_route_named_where_is_still_a_source() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { legacy as api } from "albedo/sources";
+            export default function W() {
+                const rows = useSharedSlot(api.where({ q: "x" }));
+                return <span>{rows}</span>;
+            }
+            "#,
+        );
+        assert!(out.contains("__albedo_topic(\"rows\")"), "got {out}");
+    }
+
+    /// An external topic must **not** be row-classified. An arbitrary JSON body
+    /// has no row identity (`APERTURE.md` § 4.4), and a class under the binding
+    /// name would send `apply_writes` looking for rows in a value.
+    #[test]
+    fn a_mapped_source_read_is_not_row_classified() {
+        let module = parse_tsx(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { ops } from "albedo/sources";
+            export default function Ops() {
+                const items = useSharedSlot(ops.list());
+                return <ul>{items.map(item => <li key={item.id}>{item.name}</li>)}</ul>;
+            }
+            "#,
+        );
+        assert!(
+            classify_shared_slot_lists(&module).is_empty(),
+            "an external response is value-consumed; there is no row model to classify"
+        );
     }
 
     /// A partitioned list **is** row-classified, under its collection name.

@@ -556,15 +556,19 @@ impl RendererRuntime {
         // PRISM · the partitioned bindings ride along from the same lookup. Boot
         // can precompute the spec but not the topic: a partition's identity
         // needs a key, and the key arrives with the request.
-        let (shared_topics, shared_partitions) = match compiled {
+        // APERTURE · the declared-source bindings come from the same lookup, for
+        // the same reason: boot knows the spec, and only the request knows the
+        // params that turn it into a topic.
+        let (shared_topics, shared_partitions, shared_sources) = match compiled {
             Some(project) => match project.module_spec_for_component(component_name) {
                 Some(spec) => (
                     project.shared_slot_topics_for_entry(spec),
                     project.shared_slot_partitions_for_entry(spec),
+                    project.shared_slot_sources_for_entry(spec),
                 ),
-                None => (Vec::new(), Vec::new()),
+                None => (Vec::new(), Vec::new(), Vec::new()),
             },
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
         if !shared_topics.is_empty() {
             tracing::debug!(
@@ -633,7 +637,10 @@ impl RendererRuntime {
         // re-rendered the whole room. The same shape of mistake as
         // `route_needs_live_lane`: asking about the static list when the
         // question is "does this component read anything live".
-        if !shared_topics.is_empty() || !shared_partitions.is_empty() {
+        if !shared_topics.is_empty()
+            || !shared_partitions.is_empty()
+            || !shared_sources.is_empty()
+        {
             for (specifier, code) in &modules {
                 for (topic, class) in
                     dom_render_compiler::transforms::shared_slot_lists::classify_shared_slot_lists_source(
@@ -655,6 +662,7 @@ impl RendererRuntime {
                 modules,
                 shared_topics,
                 shared_partitions,
+                shared_sources,
                 shared_topic_classes,
             },
         );
