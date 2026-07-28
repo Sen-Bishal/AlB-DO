@@ -161,6 +161,66 @@ pub struct HandlerInvocation<'a> {
     /// (`build_handler_script`) immediately re-encodes them back to JSON text to
     /// splice into the script. See `OPTIMIZATIONS.md` § 7.
     pub broadcast_current: &'a [(String, Vec<u8>)],
+    /// APERTURE A2 · the workflow journal as
+    /// [`crate::aperture::Journal::to_script_value`] encodes it — a dense array
+    /// indexed by step.
+    ///
+    /// `None` seeds an empty log, which is the first pass of every dispatch and
+    /// also the permanent state of a body that never calls out. The `fetch`
+    /// builtin is installed either way: a body that does not fetch pays one
+    /// closure definition, and making its presence conditional would mean the
+    /// engine's surface depended on a static analysis that can be wrong.
+    pub journal: Option<&'a Value>,
+}
+
+/// One outbound call a suspended body is waiting on.
+///
+/// The body described it; nothing has been sent. That distinction is what makes
+/// the compiler's hoisting sound (§ 11 R1.3) — requests are *staged*, so
+/// issuing two of them together reorders nothing observable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRequest {
+    /// Journal position. **This is the idempotency key** once paired with the
+    /// workflow id (§ 5.3), so it is carried from JS rather than re-derived.
+    pub step: u32,
+    /// Uppercased HTTP method.
+    pub method: String,
+    /// The URL exactly as the body wrote it.
+    pub url: String,
+    /// Request body, if the call carried one.
+    pub body: Option<String>,
+    /// Headers the body supplied. **Not covered by [`Self::digest`]** — § 11 R6:
+    /// credentials must not reach the journal.
+    pub headers: Vec<(String, String)>,
+    /// Digest of method + URL + body, computed by the body's own pass. A later
+    /// pass producing a different digest at the same step has diverged.
+    pub digest: String,
+}
+
+/// The result of one pass of a handler body.
+///
+/// A pass either finishes or asks for I/O. Making that an enum rather than an
+/// error case is the point: a suspension is an ordinary, expected outcome, and
+/// treating it as a failure is how a framework ends up committing the effects of
+/// a body that never actually ran to completion.
+#[derive(Debug)]
+pub enum HandlerRun {
+    /// The body ran to completion. Its effects may commit.
+    Completed(HandlerOutcome),
+    /// The body needs these calls resolved, then wants to be run again.
+    ///
+    /// **No effects come back with this.** `__albedo_effects` is rebuilt per
+    /// pass, so a discarded pass discards its effects — the property § 5.4 leans
+    /// on for "effects cannot double-apply". It is not added here; it is what
+    /// the existing design already did.
+    Suspended {
+        /// Everything the body asked for in this pass, in step order.
+        pending: Vec<PendingRequest>,
+        /// How many steps the body had already read back when it suspended.
+        /// A pass that suspends without consuming its whole seeded journal is a
+        /// body that took a different path — caught by the driver, not here.
+        journal_len: u32,
+    },
 }
 
 /// Raw shape the generated script emits per effect; decoded then lowered.
@@ -178,9 +238,29 @@ struct RawEffect {
     value: Value,
 }
 
+/// Raw shape of one staged request, as the `fetch` builtin pushes it.
+#[derive(Debug, Deserialize)]
+struct RawPending {
+    step: u32,
+    method: String,
+    url: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    digest: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct HandlerEnvelope {
     ok: bool,
+    /// A2 · present when the pass suspended: a JSON-encoded `Vec<RawPending>`,
+    /// double-encoded for the same reason `value` is.
+    #[serde(default)]
+    suspend: Option<String>,
+    /// A2 · how many journal steps were seeded into the pass that suspended.
+    #[serde(default)]
+    journal_len: Option<u32>,
     /// On success: a JSON-encoded `Vec<RawEffect>` (double-encoded so the outer
     /// render envelope stays a flat `{ok, value, error}` shape).
     value: Option<String>,
@@ -234,6 +314,29 @@ fn js_literal(value: &Value) -> RuntimeResult<String> {
 pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<String> {
     let mut script = String::new();
     script.push_str("(function(){\n");
+
+    // A2 · the suspend state is declared OUTSIDE the try, because the catch
+    // reads it. `let`/`const` are block-scoped, so declaring these beside the
+    // effect list — inside the try, where they naturally belong — makes the
+    // epilogue's own catch throw a ReferenceError and turns every handler that
+    // throws anything at all into an opaque engine exception.
+    script.push_str("let __albedo_suspended=false;\n");
+    script.push_str("const __albedo_pending=[];\n");
+    script.push_str("const __ALBEDO_SUSPEND={__albedo_suspend:true};\n");
+    // Recognising the sentinel is a named function because the R3 catch fold
+    // calls it from inside every userland `catch` — see `transforms::workflow`.
+    // Identity is checked first and the marker property second, so a sentinel
+    // that crossed a bundle boundary and lost its identity is still recognised.
+    script.push_str(
+        "const __albedo_is_suspend=function(e){return e===__ALBEDO_SUSPEND||(e!==null&&typeof e==='object'&&e.__albedo_suspend===true);};\n",
+    );
+    script.push_str("const __albedo_journal=");
+    match inv.journal {
+        Some(journal) => script.push_str(&js_literal(journal)?),
+        None => script.push_str("[]"),
+    }
+    script.push_str(";\n");
+
     script.push_str("try{\n");
     script.push_str("const __albedo_effects=[];\n");
 
@@ -324,6 +427,70 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
         "const remove=function(collection,key){__albedo_effects.push({kind:'forge_delete',topic:String(collection),key:__albedo_forge_key('remove',key)});return null;};\n",
     );
 
+    // ── APERTURE A2 · the suspend protocol ───────────────────────────────
+    //
+    // `fetch()` cannot block: the engine must be released across the round trip
+    // (invariant 2.6 — a blocking host function holds an engine, its arena and a
+    // worker for the whole RTT, which gate 5 measured at 403.9 ms against
+    // 52.7 ms for this design, and no pool size fixes it because the engine is
+    // the thing waiting).
+    //
+    // So a call is a JOURNAL STEP. On a hit the body reads the recorded answer;
+    // on a miss it records the intent and throws a sentinel, and Rust resolves
+    // every request the pass asked for, appends the outcomes, and runs the body
+    // again. Suspend-replay-with-memoisation is event sourcing, which is why the
+    // same machinery buys crash recovery and exactly-once (§ 5.1).
+    script.push_str("let __albedo_step=0;\n");
+
+    // FNV-1a-32 over the canonical request text. The same hash family the wire
+    // slot ids use, and it is a CONSISTENCY check, not a security one: it
+    // catches a replay that asks for something different at the same step
+    // (§ 10), where the adversary is the author's own nondeterminism. It runs on
+    // UTF-16 code units, which is fine for that job and cheap in QuickJS.
+    script.push_str(
+        "const __albedo_digest=function(s){var h=2166136261;for(var i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return (h>>>0).toString(16);};\n",
+    );
+
+    // Headers travel with the request and are NEVER digested or journaled
+    // (§ 11 R6): a journal dump must not be a credential dump.
+    script.push_str(
+        "const __albedo_headers=function(init){var out=[];if(!init||!init.headers)return out;var h=init.headers;if(Array.isArray(h)){for(var i=0;i<h.length;i++){out.push([String(h[i][0]),String(h[i][1])]);}return out;}for(var k in h){if(Object.prototype.hasOwnProperty.call(h,k)){out.push([String(k),String(h[k])]);}}return out;};\n",
+    );
+
+    // The response a recorded step replays as. Shaped like the web platform's
+    // because § 5.5 requires copy-pasted vendor code to run verbatim — but
+    // `.json()` and `.text()` return values rather than promises, which is
+    // invisible to a body whose `await` the compiler already lowered away.
+    script.push_str(
+        "const __albedo_response=function(rec){var headers=rec.headers||{};return {status:rec.status,ok:rec.status>=200&&rec.status<300,url:rec.url,headers:{get:function(n){var k=String(n).toLowerCase();return Object.prototype.hasOwnProperty.call(headers,k)?headers[k]:null;}},text:function(){return rec.body;},json:function(){return JSON.parse(rec.body);}};};\n",
+    );
+
+    // `fetch(url, init)` — one journal step.
+    //
+    // The step index is taken BEFORE anything can throw, so the same call site
+    // occupies the same index on every pass. That is what keeps a derived
+    // idempotency key stable across a retry (§ 5.3) and what makes a divergent
+    // replay detectable rather than silently re-keyed.
+    script.push_str(
+        "const fetch=function(url,init){\
+var step=__albedo_step++;\
+var method=(init&&init.method)?String(init.method).toUpperCase():'GET';\
+var target=String(url);\
+var body=null;\
+if(init&&init.body!==undefined&&init.body!==null){body=(typeof init.body==='string')?init.body:JSON.stringify(init.body);}\
+var digest=__albedo_digest(method+'\\n'+target+'\\n'+(body===null?'':body));\
+var recorded=(step<__albedo_journal.length)?__albedo_journal[step]:null;\
+if(recorded){\
+if(recorded.d!==digest){throw new Error('albedo: this action asked for a different request at step '+step+' when it re-ran. A body that calls out must ask for the same things in the same order every time it runs.');}\
+if(recorded.ok===true){return __albedo_response(recorded.v);}\
+throw new Error(recorded.e);\
+}\
+__albedo_pending.push({step:step,method:method,url:target,body:body,headers:__albedo_headers(init),digest:digest});\
+__albedo_suspended=true;\
+throw __ALBEDO_SUSPEND;\
+};\n",
+    );
+
     // Seed engine-trusted raw-JS bindings first (useState initials, module
     // constants). A later store-backed JSON binding for the same name shadows
     // the initial, which is correct: a written slot is newer than its initial.
@@ -404,28 +571,67 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     // the body's return value. Both double-encoded so the outer envelope stays a
     // flat `{ok, value, result, error}` string shape. `undefined` normalizes to
     // `null` so the result lane is always valid JSON.
+    // A2 · the suspend envelope, checked on the SUCCESS path too.
+    //
+    // That is § 11 R3's backstop and it is the whole reason the flag exists
+    // beside the sentinel. A userland `try/catch` — or a `catch` inside an npm
+    // bundle, which the AST fold cannot reach — can swallow the sentinel, and
+    // the body then runs on garbage and "succeeds". Checking the flag here means
+    // a swallowed sentinel degrades to *suspend anyway*, never to *commit the
+    // effects of a body that never got its data*.
+    script.push_str(
+        "if(__albedo_suspended){return JSON.stringify({ok:false,suspend:JSON.stringify(__albedo_pending),journal_len:__albedo_journal.length});}\n",
+    );
     script.push_str(
         "return JSON.stringify({ok:true,value:JSON.stringify(__albedo_effects),result:JSON.stringify(__albedo_result===undefined?null:__albedo_result)});\n",
     );
     script.push_str(
-        "}catch(err){const message=(err&&typeof err.message==='string')?err.message:String(err);return JSON.stringify({ok:false,error:message});}\n",
+        "}catch(err){if(__albedo_suspended||__albedo_is_suspend(err)){return JSON.stringify({ok:false,suspend:JSON.stringify(__albedo_pending),journal_len:__albedo_journal.length});}const message=(err&&typeof err.message==='string')?err.message:String(err);return JSON.stringify({ok:false,error:message});}\n",
     );
     script.push_str("})()");
     Ok(script)
 }
 
+/// Decode one pass of a handler body — completion or suspension.
+///
 /// Decodes the engine's raw envelope string into effects plus the body's return
 /// value, mapping a JS throw to a loud [`RuntimeError`]. `entry` is only used
 /// for the error message.
-pub(crate) fn decode_handler_envelope(
+///
+/// The suspension arm is checked **before** the error arm on purpose. Both are
+/// `ok:false` on the wire (the script has one return shape), and reading them in
+/// the other order would turn every outbound call into a handler crash.
+pub(crate) fn decode_handler_run(
     entry: &str,
     envelope_json: &str,
-) -> RuntimeResult<HandlerOutcome> {
+) -> RuntimeResult<HandlerRun> {
     let envelope: HandlerEnvelope = serde_json::from_str(envelope_json).map_err(|err| {
         RuntimeError::render(format!(
             "failed to decode handler effect envelope for '{entry}': {err}"
         ))
     })?;
+
+    if let Some(raw) = envelope.suspend.as_deref() {
+        let staged: Vec<RawPending> = serde_json::from_str(raw).map_err(|err| {
+            RuntimeError::render(format!(
+                "failed to decode suspended requests for '{entry}': {err}"
+            ))
+        })?;
+        return Ok(HandlerRun::Suspended {
+            pending: staged
+                .into_iter()
+                .map(|p| PendingRequest {
+                    step: p.step,
+                    method: p.method,
+                    url: p.url,
+                    body: p.body,
+                    headers: p.headers,
+                    digest: p.digest,
+                })
+                .collect(),
+            journal_len: envelope.journal_len.unwrap_or(0),
+        });
+    }
 
     if !envelope.ok {
         let message = envelope
@@ -460,7 +666,7 @@ pub(crate) fn decode_handler_envelope(
         .map(|effect| lower_effect(entry, effect))
         .collect::<RuntimeResult<Vec<HandlerEffect>>>()?;
 
-    Ok(HandlerOutcome { effects, result })
+    Ok(HandlerRun::Completed(HandlerOutcome { effects, result }))
 }
 
 fn lower_effect(entry: &str, raw: RawEffect) -> RuntimeResult<HandlerEffect> {
@@ -584,6 +790,18 @@ mod tests {
             .collect()
     }
 
+    /// Decode a pass that is expected to have COMPLETED.
+    ///
+    /// These tests predate A2 and are about effect lowering, so a suspension
+    /// here would mean the envelope shape changed under them — worth a panic
+    /// rather than a silently different assertion.
+    fn decode_completed(entry: &str, envelope: &str) -> RuntimeResult<HandlerOutcome> {
+        match decode_handler_run(entry, envelope)? {
+            HandlerRun::Completed(outcome) => Ok(outcome),
+            HandlerRun::Suspended { .. } => panic!("unexpected suspension in '{entry}'"),
+        }
+    }
+
     #[test]
     fn script_seeds_bindings_setters_and_event() {
         let env = env(&[("count", Value::from(41))]);
@@ -597,6 +815,7 @@ mod tests {
             setters: &setters,
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         };
         let script = build_handler_script(&inv).unwrap();
         assert!(script.contains("let count=41;"));
@@ -619,6 +838,7 @@ mod tests {
             setters: &[],
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         };
         let script = build_handler_script(&inv).unwrap();
         assert!(script.contains("let count=(1 + 2);"));
@@ -636,6 +856,7 @@ mod tests {
             setters: &[],
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         };
         let err = build_handler_script(&inv).unwrap_err();
         assert!(err
@@ -655,6 +876,7 @@ mod tests {
             setters: &[],
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         };
         let script = build_handler_script(&inv).unwrap();
         // The pre-write snapshot is seeded as a JS object literal.
@@ -673,7 +895,7 @@ mod tests {
         .unwrap();
         let envelope = serde_json::json!({ "ok": true, "value": effects_json }).to_string();
 
-        let outcome = decode_handler_envelope("routes/x", &envelope).unwrap();
+        let outcome = decode_completed("routes/x", &envelope).unwrap();
         // No `result` key (pre-P6 envelope shape) → degrades to `None`.
         assert!(outcome.result.is_none());
         let effects = outcome.effects;
@@ -702,7 +924,7 @@ mod tests {
     #[test]
     fn decode_surfaces_a_thrown_error_loudly() {
         let envelope = serde_json::json!({ "ok": false, "error": "boom" }).to_string();
-        let err = decode_handler_envelope("routes/x", &envelope).unwrap_err();
+        let err = decode_completed("routes/x", &envelope).unwrap_err();
         assert!(err.to_string().contains("threw: boom"));
     }
 
@@ -750,6 +972,7 @@ mod tests {
             setters: &[],
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         })
         .unwrap();
         assert!(script.contains("const append=function(collection,record)"));
@@ -772,6 +995,7 @@ mod tests {
             setters: &[],
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         })
         .unwrap();
         assert!(script.contains("const update=function(collection,key,fields)"));
@@ -805,7 +1029,7 @@ mod tests {
         ])
         .to_string();
         let envelope = serde_json::json!({ "ok": true, "value": effects }).to_string();
-        let outcome = decode_handler_envelope("routes/x", &envelope).unwrap();
+        let outcome = decode_completed("routes/x", &envelope).unwrap();
 
         match &outcome.effects[0] {
             HandlerEffect::ForgeUpdate {
@@ -836,7 +1060,7 @@ mod tests {
             serde_json::json!([{ "kind": "forge_delete", "topic": "g", "key": { "a": 1 } }])
                 .to_string();
         let envelope = serde_json::json!({ "ok": true, "value": effects }).to_string();
-        let err = decode_handler_envelope("routes/x", &envelope).unwrap_err();
+        let err = decode_completed("routes/x", &envelope).unwrap_err();
         assert!(err.to_string().contains("scalar key"));
     }
 
@@ -856,6 +1080,7 @@ mod tests {
                 setters: &[],
                 event_json,
                 broadcast_current: &bc,
+                journal: None,
             })
             .unwrap()
         };

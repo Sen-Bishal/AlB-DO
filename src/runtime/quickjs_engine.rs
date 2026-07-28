@@ -1,6 +1,6 @@
 use super::arena::{ArenaAllocator, ArenaControl, ArenaStats};
 use super::bridge::{
-    build_handler_script, decode_handler_envelope, HandlerInvocation, HandlerOutcome,
+    build_handler_script, decode_handler_run, HandlerInvocation, HandlerOutcome, HandlerRun,
 };
 use super::engine::{
     stable_source_hash, BootstrapPayload, LoadErrorKind, RenderOutput, RuntimeEngine, RuntimeError,
@@ -158,6 +158,26 @@ impl QuickJsEngine {
         entry: &str,
         invocation: &HandlerInvocation,
     ) -> RuntimeResult<HandlerOutcome> {
+        match self.eval_handler_run(entry, invocation)? {
+            HandlerRun::Completed(outcome) => Ok(outcome),
+            HandlerRun::Suspended { pending, .. } => Err(RuntimeError::render(format!(
+                "handler '{entry}' called fetch() ({} request(s) staged) on a path that cannot \
+                 replay it; use `eval_handler_run` and drive the passes",
+                pending.len()
+            ))),
+        }
+    }
+
+    /// APERTURE A2 · one pass of a handler body — completion **or** a request
+    /// for I/O.
+    ///
+    /// [`Self::eval_handler`] is this with the second case declared impossible,
+    /// which is right for every caller that has no journal to replay against.
+    pub fn eval_handler_run(
+        &mut self,
+        entry: &str,
+        invocation: &HandlerInvocation,
+    ) -> RuntimeResult<HandlerRun> {
         self.ensure_initialized()?;
         let script = build_handler_script(invocation)?;
 
@@ -177,7 +197,7 @@ impl QuickJsEngine {
         }
 
         let envelope_json = eval_result?;
-        decode_handler_envelope(entry, &envelope_json)
+        decode_handler_run(entry, &envelope_json)
     }
 
     /// Shared body for [`RuntimeEngine::render_component`] and
@@ -1041,6 +1061,54 @@ if (typeof globalThis.useState !== 'function') {
       return host.topics[key];
     }
     return null;
+  };
+
+  // B4 · the paint rule for a stamped scalar shared-slot read. The marker
+  // (`transforms::shared_slot_lists`) folds every anchored read through this,
+  // so what SSR writes into the holder is what a later `SlotSet` will write
+  // over it — the client applies the same table to the topic's JSON.
+  //
+  // Only anchored reads are folded, so this does not change how JSX coerces
+  // anything else. The table:
+  //
+  //   null / undefined -> ""          (matches `h`'s child skip)
+  //   string           -> the string  (unquoted — the SSR behaviour, kept)
+  //   number / boolean -> String(v)
+  //   anything else    -> JSON        (was `[object Object]`, and `123` for
+  //                                    the array [1,2,3])
+  //
+  // JSON for the object case rather than `String(v)` because the live wire
+  // carries the topic's JSON encoding: agreeing on `[object Object]` would
+  // mean shipping a value the client cannot paint back, and agreeing on
+  // anything else would mean a second encoding on the wire.
+  // `path` is the dotted projection the holder also carries as
+  // `data-albedo-slot-path`, present only for `<span>{status.state}</span>`.
+  // Walking it here rather than leaving `status.state` in the tree is what
+  // keeps an unresolved topic from throwing: `useSharedSlot` answers null for a
+  // topic this request had no value for, and `null.state` would take the route
+  // down instead of rendering empty and going live when the value arrives.
+  globalThis.__albedo_slot_text = function(value, path) {
+    if (typeof path === 'string' && path.length > 0) {
+      const segments = path.split('.');
+      for (let i = 0; i < segments.length; i++) {
+        if (value === null || typeof value !== 'object') { return ''; }
+        value = value[segments[i]];
+      }
+    }
+    if (value === null || typeof value === 'undefined') { return ''; }
+    if (typeof value === 'string') { return value; }
+    if (typeof value === 'number' || typeof value === 'boolean') { return String(value); }
+    let text;
+    try {
+      text = JSON.stringify(value);
+    } catch (err) {
+      // A cycle, or a `toJSON` that throws. A render must not die over the
+      // formatting of one text node.
+      return '';
+    }
+    // `JSON.stringify` answers `undefined` for a function or a symbol, and
+    // `String(undefined)` downstream would paint the word "undefined".
+    return typeof text === 'string' ? text : '';
   };
 
   // Server-side no-ops / pass-throughs so a component using the rest of the
@@ -2797,6 +2865,7 @@ mod tests {
             setters: &setters,
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         };
 
         let effects = engine
@@ -2850,6 +2919,7 @@ mod tests {
             setters: &[],
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         };
 
         let err = engine
@@ -2858,6 +2928,403 @@ mod tests {
         assert!(
             err.to_string().contains("handler exploded"),
             "error should carry the thrown message, got: {err}"
+        );
+    }
+
+    /// **Capability probe, not a feature test.** A2's replay design rests on
+    /// "the engine cannot suspend a body", and the alternative to replay —
+    /// lowering an `async` body to a generator and driving it with `.next(v)`
+    /// from Rust — rests on the opposite. Which of those is true is a fact about
+    /// this engine, so it is asserted here rather than assumed in a document.
+    ///
+    /// Generators are ES2015 and QuickJS is ES2020-complete, but the load-bearing
+    /// part is the second half: a value passed INTO `.next(v)` becomes the result
+    /// of the paused `yield`, which is exactly the resume protocol a suspended
+    /// outbound call needs.
+    #[test]
+    fn the_engine_drives_generators_and_resumes_them_with_a_value() {
+        use super::QuickJsEngine;
+        use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use crate::ir::opcode::SlotId;
+        use serde_json::Map;
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let env = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
+        let setters = vec![("out".to_string(), SlotId(1))];
+        let invocation = HandlerInvocation {
+            // Pause, receive a value from the driver, use it, pause again.
+            body: "function* flow(){ const a = yield 'ask-a'; const b = yield 'ask-' + a; \
+                   return a + '/' + b; } \
+                   const g = flow(); const first = g.next(); const second = g.next('A'); \
+                   const done = g.next('B'); \
+                   out([first.value, second.value, done.value, done.done].join('|'));",
+            is_block: true,
+            env: &env,
+            raw_bindings: &[],
+            setters: &setters,
+            event_json: None,
+            broadcast_current: &bc,
+            journal: None,
+        };
+
+        let outcome = engine
+            .eval_handler("routes/gen", &invocation)
+            .expect("generators run");
+        let value = match &outcome.effects[0] {
+            HandlerEffect::SlotSet { value, .. } => String::from_utf8(value.clone()).unwrap(),
+            other => panic!("expected a slot write, got {other:?}"),
+        };
+        assert_eq!(
+            value, "\"ask-a|ask-A|A/B|true\"",
+            "the engine can pause a body, hand the pause point out, and resume it \
+             with a value — the resume protocol suspend/replay was assumed to lack"
+        );
+    }
+
+    // ── APERTURE A2 · suspend and replay ─────────────────────────────────
+
+    /// Drive a body to completion the way an async caller does: run a pass,
+    /// resolve whatever it asked for, append, run again. `answer` stands in for
+    /// the HTTP layer and records what it was asked, so these tests assert
+    /// **counts** — how many times a call was actually issued — rather than
+    /// timing.
+    fn drive(
+        engine: &mut super::QuickJsEngine,
+        body: &str,
+        setters: &[(String, crate::ir::opcode::SlotId)],
+        mut answer: impl FnMut(&crate::runtime::bridge::PendingRequest) -> crate::aperture::StepOutcome,
+    ) -> (
+        crate::runtime::bridge::HandlerOutcome,
+        crate::aperture::Journal,
+        usize,
+    ) {
+        use crate::aperture::{Journal, StepKind};
+        use crate::runtime::bridge::{HandlerInvocation, HandlerRun};
+        use serde_json::Map;
+
+        let env = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut journal = Journal::new("w_test", "build-test");
+        let mut passes = 0usize;
+        loop {
+            passes += 1;
+            assert!(passes < 10, "runaway replay");
+            let seeded = journal.to_script_value();
+            let invocation = HandlerInvocation {
+                body,
+                is_block: true,
+                env: &env,
+                raw_bindings: &[],
+                setters,
+                event_json: None,
+                broadcast_current: &bc,
+                journal: Some(&seeded),
+            };
+            match engine
+                .eval_handler_run("routes/flow", &invocation)
+                .expect("pass runs")
+            {
+                HandlerRun::Completed(outcome) => return (outcome, journal, passes),
+                HandlerRun::Suspended { pending, .. } => {
+                    for request in &pending {
+                        let outcome = answer(request);
+                        journal
+                            .append(request.step, StepKind::Fetch, &request.digest, outcome)
+                            .expect("append");
+                    }
+                }
+            }
+        }
+    }
+
+    fn response(status: u16, body: &str) -> crate::aperture::StepOutcome {
+        crate::aperture::StepOutcome::Completed(serde_json::json!({
+            "status": status,
+            "body": body,
+            "headers": { "content-type": "application/json" },
+        }))
+    }
+
+    /// The protocol, end to end: a body that calls out suspends with the
+    /// request staged and **no effects**, and the same body run again against a
+    /// journal carrying the answer completes and emits them.
+    #[test]
+    fn a_body_that_calls_out_suspends_then_completes_on_replay() {
+        use super::QuickJsEngine;
+        use crate::ir::opcode::SlotId;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let setters = vec![("setName".to_string(), SlotId(3))];
+        let mut issued: Vec<String> = Vec::new();
+        let (outcome, journal, passes) = drive(
+            &mut engine,
+            "const res = fetch('https://api.test/user/7'); setName(res.json().name);",
+            &setters,
+            |request| {
+                issued.push(format!("{} {}", request.method, request.url));
+                response(200, r#"{"name":"ada"}"#)
+            },
+        );
+
+        assert_eq!(passes, 2, "one pass to ask, one to finish");
+        assert_eq!(issued, vec!["GET https://api.test/user/7"]);
+        assert_eq!(journal.len(), 1);
+        assert_eq!(
+            outcome.effects,
+            vec![crate::runtime::bridge::HandlerEffect::SlotSet {
+                slot_id: SlotId(3),
+                value: b"\"ada\"".to_vec(),
+            }],
+            "the effect carries the value the upstream returned"
+        );
+    }
+
+    /// 🔴 **This test falsifies `APERTURE.md` § 5.4's second property.**
+    ///
+    /// The design says *"independent fetches parallelise for free — everything
+    /// issued in one pass resolves concurrently, `Promise.all` semantics without
+    /// Promises. Only dependent chains cost a replay each."* Three independent
+    /// GETs, written as three lines, cost **four passes and three round trips**.
+    ///
+    /// The reason is structural and was visible in the protocol all along: a
+    /// missed `fetch` *throws*. The first call unwinds the body before the
+    /// second is ever evaluated, so a pass can only ever stage more than one
+    /// request if something put them there before the body ran.
+    ///
+    /// So § 11 R1.3's hoisting is **not an optimisation** — it is the only
+    /// mechanism by which batching happens at all, and until it lands every
+    /// outbound call costs a round trip whether or not the calls are
+    /// independent. This test asserts the real number so the claim cannot be
+    /// quietly believed again; it flips to 2 passes when hoisting lands.
+    #[test]
+    fn independent_calls_cost_a_pass_each_until_the_compiler_hoists_them() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let mut issued = 0usize;
+        let (_outcome, journal, passes) = drive(
+            &mut engine,
+            "const a = fetch('https://api.test/a'); const b = fetch('https://api.test/b'); \
+             const c = fetch('https://api.test/c'); a.json(); b.json(); c.json();",
+            &[],
+            |_request| {
+                issued += 1;
+                response(200, "{}")
+            },
+        );
+
+        assert_eq!(
+            passes, 4,
+            "one pass per call plus the completing pass — NOT the 2 the design claims"
+        );
+        assert_eq!(issued, 3);
+        assert_eq!(journal.len(), 3);
+    }
+
+    /// A dependent chain costs a pass each — the honest cost of replay (§ 11
+    /// R1), and the thing the compiler's hoisting pass exists to avoid paying
+    /// when the calls were never actually dependent.
+    #[test]
+    fn a_dependent_chain_costs_one_pass_per_link() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let (_outcome, journal, passes) = drive(
+            &mut engine,
+            "const one = fetch('https://api.test/first').json(); \
+             const two = fetch('https://api.test/' + one.next).json(); two.done;",
+            &[],
+            |request| {
+                if request.url.ends_with("/first") {
+                    response(200, r#"{"next":"second"}"#)
+                } else {
+                    response(200, r#"{"done":true}"#)
+                }
+            },
+        );
+
+        assert_eq!(passes, 3, "two dependent links, two round trips, three passes");
+        assert_eq!(journal.len(), 2);
+    }
+
+    /// § 11 R3 — **the sentinel cannot be swallowed.** A body that wraps its
+    /// call in `try/catch` (or hands it to a bundled library that does) would
+    /// otherwise eat the suspension and run on garbage. The flag the epilogue
+    /// checks means the worst case is "suspend anyway", never "commit the
+    /// effects of a body that never got its data".
+    #[test]
+    fn a_userland_catch_cannot_swallow_the_suspension() {
+        use super::QuickJsEngine;
+        use crate::ir::opcode::SlotId;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let setters = vec![("setName".to_string(), SlotId(1))];
+        let (outcome, journal, passes) = drive(
+            &mut engine,
+            "let name = 'fallback'; \
+             try { name = fetch('https://api.test/u').json().name; } catch (e) { name = 'swallowed'; } \
+             setName(name);",
+            &setters,
+            |_| response(200, r#"{"name":"ada"}"#),
+        );
+
+        assert_eq!(passes, 2);
+        assert_eq!(journal.len(), 1);
+        assert_eq!(
+            outcome.effects,
+            vec![crate::runtime::bridge::HandlerEffect::SlotSet {
+                slot_id: SlotId(1),
+                value: b"\"ada\"".to_vec(),
+            }],
+            "the catch ran on the suspending pass and was DISCARDED with it"
+        );
+    }
+
+    /// A failed step replays as a throw the body can see and handle — the
+    /// journal records failure as an outcome, not as an absence.
+    #[test]
+    fn a_failed_step_replays_as_a_throw_the_body_can_catch() {
+        use super::QuickJsEngine;
+        use crate::ir::opcode::SlotId;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let setters = vec![("setName".to_string(), SlotId(1))];
+        let (outcome, _journal, passes) = drive(
+            &mut engine,
+            "let name; try { name = fetch('https://api.test/u').json().name; } \
+             catch (e) { name = 'unreachable: ' + e.message; } setName(name);",
+            &setters,
+            |_| crate::aperture::StepOutcome::Failed("upstream refused the connection".into()),
+        );
+
+        assert_eq!(passes, 2);
+        let value = match &outcome.effects[0] {
+            crate::runtime::bridge::HandlerEffect::SlotSet { value, .. } => {
+                String::from_utf8(value.clone()).unwrap()
+            }
+            other => panic!("expected a slot write, got {other:?}"),
+        };
+        assert!(
+            value.contains("upstream refused the connection"),
+            "the body caught the recorded failure; got {value}"
+        );
+    }
+
+    /// § 10 — a replay that asks for something *different* at the same step is
+    /// loud. It cannot be answered from the journal without lying about which
+    /// request was made, and the step index is an idempotency key, so a silent
+    /// re-key would be a double-send waiting to happen.
+    #[test]
+    fn a_divergent_replay_fails_loudly_instead_of_re_keying() {
+        use super::QuickJsEngine;
+        use crate::aperture::{Journal, StepKind, StepOutcome};
+        use crate::runtime::bridge::HandlerInvocation;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use serde_json::Map;
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        // A journal recorded against a DIFFERENT url than the body asks for.
+        let mut journal = Journal::new("w", "b");
+        journal
+            .append(
+                0,
+                StepKind::Fetch,
+                "deadbeef",
+                StepOutcome::Completed(serde_json::json!({"status":200,"body":"{}"})),
+            )
+            .unwrap();
+        let seeded = journal.to_script_value();
+
+        let env = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
+        let invocation = HandlerInvocation {
+            body: "fetch('https://api.test/u');",
+            is_block: true,
+            env: &env,
+            raw_bindings: &[],
+            setters: &[],
+            event_json: None,
+            broadcast_current: &bc,
+            journal: Some(&seeded),
+        };
+
+        let err = engine
+            .eval_handler_run("routes/flow", &invocation)
+            .expect_err("divergence must be loud");
+        assert!(
+            err.to_string().contains("different request at step 0"),
+            "got {err}"
+        );
+    }
+
+    /// § 11 R6 — credentials reach the request and never the journal. The
+    /// digest is method + URL + body, so an `Authorization` header cannot make
+    /// two identical calls look different, and a journal dump is not a
+    /// credential dump.
+    #[test]
+    fn headers_travel_with_the_request_but_never_enter_the_digest() {
+        use super::QuickJsEngine;
+        use crate::runtime::bridge::{HandlerInvocation, HandlerRun};
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use serde_json::Map;
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let env = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
+        let digest_of = |engine: &mut QuickJsEngine, body: &'static str| {
+            let invocation = HandlerInvocation {
+                body,
+                is_block: true,
+                env: &env,
+                raw_bindings: &[],
+                setters: &[],
+                event_json: None,
+                broadcast_current: &bc,
+                journal: None,
+            };
+            match engine.eval_handler_run("routes/flow", &invocation).unwrap() {
+                HandlerRun::Suspended { pending, .. } => pending,
+                other => panic!("expected a suspension, got {other:?}"),
+            }
+        };
+
+        let bare = digest_of(&mut engine, "fetch('https://api.test/u');");
+        let authed = digest_of(
+            &mut engine,
+            "fetch('https://api.test/u', { headers: { Authorization: 'Bearer sk_live_secret' } });",
+        );
+
+        assert_eq!(
+            bare[0].digest, authed[0].digest,
+            "headers are outside the digest"
+        );
+        assert_eq!(
+            authed[0].headers,
+            vec![("Authorization".to_string(), "Bearer sk_live_secret".to_string())],
+            "but they do travel with the request"
         );
     }
 
@@ -2892,6 +3359,7 @@ mod tests {
             setters: &setters,
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         };
 
         let outcome = engine
@@ -2930,6 +3398,7 @@ mod tests {
             setters: &setters,
             event_json: Some(r#"{"value":"typed text"}"#),
             broadcast_current: &bc,
+            journal: None,
         };
 
         let effects = engine
@@ -2970,6 +3439,7 @@ mod tests {
             setters: &[],
             event_json: None,
             broadcast_current: &bc,
+            journal: None,
         };
 
         let effects = engine
@@ -3196,6 +3666,126 @@ mod tests {
             .render_component("routes/room.tsx", "{}")
             .expect("plain render");
         assert_eq!(plain.html, "<span data-albedo-slot=\"chat:room\"></span>");
+    }
+
+    /// The SSR half of the paint rule, as a table. Each row is a value a topic
+    /// can hold and the text a stamped holder must show for it — and the client
+    /// must produce the same text from the same topic's JSON, or the page
+    /// changes shape on the first update without the data changing.
+    ///
+    /// Two rows are the bug this closed. An object rendered `[object Object]`
+    /// and then flipped to JSON the moment anything live arrived, and `[1,2,3]`
+    /// rendered `123` — JavaScript's array-join coercion, which reads as data
+    /// loss. Both were measured with curl rather than from the DOM: the client
+    /// runtime has already overwritten the holder's text by the time a browser
+    /// can be asked, so the browser is not a witness to SSR.
+    #[test]
+    fn a_stamped_scalar_read_renders_by_the_slot_text_rule() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .load_module(
+                "routes/ops.tsx",
+                r#"
+                import { useSharedSlot } from "albedo";
+                export default function Ops() {
+                    const status = useSharedSlot("ops");
+                    return <span>{status}</span>;
+                }
+                "#,
+            )
+            .expect("loads");
+
+        // Expected text is HTML-ESCAPED, because a topic value is a plain user
+        // value and `h` escapes those before embedding — `&quot;` decodes back
+        // to `"` in the DOM, which is the text the live path writes directly
+        // into the node. The agreement is about the text node, not the bytes of
+        // the markup.
+        for (seeded, expected) in [
+            (r#""green""#, "green"),
+            ("4242", "4242"),
+            ("true", "true"),
+            ("null", ""),
+            (r#"{"state":"ok"}"#, "{&quot;state&quot;:&quot;ok&quot;}"),
+            ("[1,2,3]", "[1,2,3]"),
+        ] {
+            let out = engine
+                .render_component_with_host(
+                    "routes/ops.tsx",
+                    "{}",
+                    &format!(r#"{{"shared":{{"ops":{seeded}}}}}"#),
+                )
+                .expect("seeded render");
+            assert_eq!(
+                out.html,
+                format!("<span data-albedo-slot=\"ops\">{expected}</span>"),
+                "seeded {seeded}"
+            );
+        }
+    }
+
+    /// A member read is the only sensible markup for an object-valued topic, so
+    /// it renders its member *and* carries the path that makes it live. Before
+    /// this, the two available shapes were live-but-wrong and right-but-static.
+    #[test]
+    fn a_member_read_renders_the_member_and_stamps_its_path() {
+        use super::QuickJsEngine;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .load_module(
+                "routes/ops.tsx",
+                r#"
+                import { useSharedSlot } from "albedo";
+                export default function Ops() {
+                    const status = useSharedSlot("ops");
+                    return <span>{status.state}</span>;
+                }
+                "#,
+            )
+            .expect("loads");
+
+        let out = engine
+            .render_component_with_host(
+                "routes/ops.tsx",
+                "{}",
+                r#"{"shared":{"ops":{"state":"ok","depth":3}}}"#,
+            )
+            .expect("seeded render");
+        assert_eq!(
+            out.html,
+            "<span data-albedo-slot=\"ops\" data-albedo-slot-path=\"state\">ok</span>"
+        );
+
+        // A topic that has not arrived yet must not throw mid-render. This is
+        // the case that decided where the path is walked: left in the tree as
+        // `status.state`, an unresolved topic is `null.state` and the route
+        // 500s — which is what the author's own workaround did before this, and
+        // widening the marker would have shipped that failure to more pages.
+        // Walked by the formatter, it renders empty and goes live when the
+        // value arrives, like every other unresolved read here.
+        let plain = engine
+            .render_component("routes/ops.tsx", "{}")
+            .expect("an unresolved topic renders empty rather than throwing");
+        assert_eq!(
+            plain.html,
+            "<span data-albedo-slot=\"ops\" data-albedo-slot-path=\"state\"></span>"
+        );
+
+        // A value that is not an object at all takes the same exit — the client
+        // answers `''` for this shape too, from its own copy of the walk.
+        let scalar = engine
+            .render_component_with_host("routes/ops.tsx", "{}", r#"{"shared":{"ops":7}}"#)
+            .expect("render");
+        assert_eq!(
+            scalar.html,
+            "<span data-albedo-slot=\"ops\" data-albedo-slot-path=\"state\"></span>"
+        );
     }
 
     /// `key` is React's reconciliation identity, not a valid raw HTML attribute

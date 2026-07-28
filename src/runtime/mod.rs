@@ -23,7 +23,9 @@ pub mod static_slice;
 pub mod topics;
 pub mod webtransport;
 
-pub use bridge::{HandlerEffect, HandlerInvocation, HandlerOutcome};
+pub use bridge::{
+    HandlerEffect, HandlerInvocation, HandlerOutcome, HandlerRun, PendingRequest,
+};
 pub use broadcast::{
     broadcast_slot_id, check_topic_slot_ids, is_valid_partition_key, partition_topic_name,
     BroadcastDelivery, BroadcastError, BroadcastRegistry, BroadcastSender, BroadcastTopic,

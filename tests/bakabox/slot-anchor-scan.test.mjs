@@ -19,7 +19,7 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 
-import { Bakabox, topicSlotId } from '../../assets/albedo-runtime.js';
+import { Bakabox, topicSlotId, slotAnchorText, slotValueText } from '../../assets/albedo-runtime.js';
 
 // ── DOM shim ─────────────────────────────────────────────────────────
 
@@ -66,9 +66,10 @@ class FakeDocument {
 const enc = (s) => new TextEncoder().encode(s);
 
 /** The SSR shape: a stamped holder whose lone text node is the rendered value. */
-function mountScalar(doc, topic, ssrValue) {
+function mountScalar(doc, topic, ssrValue, path) {
   const span = doc.createElement('span');
   span.setAttribute('data-albedo-slot', topic);
+  if (path) span.setAttribute('data-albedo-slot-path', path);
   span.textContent = ssrValue;
   doc.body.appendChild(span);
   return span;
@@ -167,6 +168,115 @@ test('two spans on the same topic both paint from one SlotSet', () => {
 
   assert.equal(a.textContent, '5');
   assert.equal(b.textContent, '5', 'a topic can have more than one holder on a page');
+});
+
+// ── The paint rule ───────────────────────────────────────────────────
+//
+// A topic's wire value is its JSON encoding, and SSR rendered this holder by
+// parsing that same JSON — so the two only agree if the client decodes before
+// it formats. It did not, and every non-number disagreed: a string painted
+// with its quotes, and an object arrived as JSON over an SSR pass that had
+// written `[object Object]`. The table below is the same one
+// `__albedo_slot_text` applies in the engine; if they drift, a page changes
+// shape on its first update without the data changing.
+
+test('the paint rule matches the SSR table, value for value', () => {
+  for (const [json, expected] of [
+    ['"green"', 'green'],
+    ['4242', '4242'],
+    ['true', 'true'],
+    ['null', ''],
+    ['{"state":"ok"}', '{"state":"ok"}'],
+    ['[1,2,3]', '[1,2,3]'],
+  ]) {
+    assert.equal(slotAnchorText(json, undefined), expected, `for ${json}`);
+  }
+});
+
+test('a JSON string paints unquoted — SSR never showed the quotes', () => {
+  const doc = new FakeDocument();
+  const span = mountScalar(doc, 'ops', 'green');
+  const bakabox = new Bakabox({ document: doc });
+  bakabox.scanSlotAnchors();
+
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: topicSlotId('ops'), value: enc('"amber"') });
+
+  assert.equal(span.textContent, 'amber', 'not `"amber"`');
+});
+
+test('a path projects the topic value — the read that used to be static', () => {
+  const doc = new FakeDocument();
+  const span = mountScalar(doc, 'ops', 'ok', 'state');
+  const bakabox = new Bakabox({ document: doc });
+  bakabox.scanSlotAnchors();
+
+  bakabox.applyInstruction({
+    op: 'SlotSet',
+    slotId: topicSlotId('ops'),
+    value: enc('{"state":"degraded","depth":3}'),
+  });
+
+  assert.equal(span.textContent, 'degraded', 'only the member this holder shows');
+});
+
+test('a nested path walks every segment', () => {
+  const doc = new FakeDocument();
+  const span = mountScalar(doc, 'ops', 'abc', 'build.commit');
+  const bakabox = new Bakabox({ document: doc });
+  bakabox.scanSlotAnchors();
+
+  bakabox.applyInstruction({
+    op: 'SlotSet',
+    slotId: topicSlotId('ops'),
+    value: enc('{"build":{"commit":"def"}}'),
+  });
+
+  assert.equal(span.textContent, 'def');
+});
+
+test('a projection that fails against parsed JSON blanks, exactly as SSR does', () => {
+  const doc = new FakeDocument();
+  const span = mountScalar(doc, 'ops', 'ok', 'state');
+  const bakabox = new Bakabox({ document: doc });
+  bakabox.scanSlotAnchors();
+
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: topicSlotId('ops'), value: enc('7') });
+
+  assert.equal(span.textContent, '', 'the server would render nothing for this shape too');
+});
+
+// The initial-paint case, and the reason the two failure modes are not the
+// same: an unwritten topic's value is EMPTY BYTES, which are not JSON. A
+// projecting holder must keep what the server rendered rather than blank
+// itself while waiting for the first real value.
+test('non-JSON bytes leave a projecting holder alone, and paint a bare one verbatim', () => {
+  const doc = new FakeDocument();
+  const projecting = mountScalar(doc, 'a', 'ok', 'state');
+  const bare = mountScalar(doc, 'b', 'ok');
+  const bakabox = new Bakabox({ document: doc });
+  bakabox.scanSlotAnchors();
+
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: topicSlotId('a'), value: enc('') });
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: topicSlotId('b'), value: enc('raw') });
+
+  assert.equal(projecting.textContent, 'ok', 'server text survives an unwritten topic');
+  assert.equal(bare.textContent, 'raw', 'a non-JSON producer still paints verbatim');
+});
+
+// Phase-K text sites are fed by the action lane (JSON) *and* by the local
+// reactive driver (already-formatted text), with nothing at the site to tell
+// them apart — so only the anchor lane, whose producer is fixed by the slot id
+// its `data-albedo-slot` hashes to, may decode.
+test('a Phase-K text site is untouched by the rule', () => {
+  const doc = new FakeDocument();
+  const bakabox = new Bakabox({ document: doc });
+  const el = doc.createElement('span');
+  bakabox.nodes.set(1, el);
+  bakabox.applyInstruction({ op: 'SetTextRef', stableId: 1, slotId: 99 });
+
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: 99, value: enc('"quoted"') });
+
+  assert.equal(el.textContent, '"quoted"', 'verbatim, as before');
 });
 
 test('scanSlotAnchors scoped to a subtree only adopts that subtree', () => {

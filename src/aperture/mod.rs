@@ -49,6 +49,7 @@ pub mod cache;
 pub mod client;
 pub mod declare;
 pub mod egress;
+pub mod journal;
 pub mod reader;
 pub mod refresh;
 pub mod transport;
@@ -58,6 +59,9 @@ pub use bindings::{validate_source_bindings, SourceBinding, SourceBindingProblem
 pub use declare::{
     source_topic_name, AuthDecl, AuthScope, PathSegment, ResolvedSource, RouteDecl, SourceDecl,
     SourceRegistry, SourceRoute, SourceSchemaError, DEFAULT_REFRESH,
+};
+pub use journal::{
+    Journal, JournalError, Step, StepKind, StepOutcome, DEFAULT_PASS_CAP, DEFAULT_STEP_CAP,
 };
 pub use reader::{SourceRead, SourceReadError, SourceReader};
 pub use refresh::{

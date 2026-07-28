@@ -211,7 +211,77 @@ export function createActionDispatcher({ bakabox, endpoint = DEFAULT_ACTION_ENDP
  * @property {string} [attrName]    Literal attribute name; the local binding-mode attr
  *   binding (`SetAttrRef` carrying `attr` instead of an interned `attrId`). Preferred over
  *   `attrId` when present so the reactive driver needn't intern names it already knows.
+ * @property {Element} [element]    The holder itself, for a scanned scalar anchor (no
+ *   `data-albedo-id` exists on SSR'd `useSharedSlot` markup to bind through).
+ * @property {string[]} [path]      Projection from the topic's value to what this holder
+ *   paints, from `data-albedo-slot-path`. Only ever set on an anchor site.
  */
+
+/**
+ * Display form of a decoded topic value — the client half of the rule the
+ * QuickJS `__albedo_slot_text` applies during SSR. The two must agree: they
+ * write the same text node, one on the server and one over it.
+ *
+ *   null / undefined -> ''            string  -> the string, unquoted
+ *   number / boolean -> String(v)     other   -> JSON
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function slotValueText(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  let text;
+  try {
+    text = JSON.stringify(value);
+  } catch (err) {
+    return '';
+  }
+  return typeof text === 'string' ? text : '';
+}
+
+/**
+ * What a scanned scalar anchor should paint for one `SlotSet`, or `null` for
+ * "leave the server's text alone".
+ *
+ * A topic's wire value is its JSON encoding — that is what the store holds and
+ * what SSR parsed to render this holder in the first place — so the anchor
+ * lane, and only the anchor lane, decodes before formatting. Phase-K text
+ * sites keep taking the bytes verbatim: they are fed both by the action lane
+ * (JSON) and by the local reactive driver (already-formatted text), and
+ * nothing distinguishes those at the site, so guessing there would be a
+ * heuristic. An anchor site has one producer by construction — the topic slot
+ * its `data-albedo-slot` hashes to.
+ *
+ * Bytes that are not JSON are painted verbatim, which is what a topic seeded
+ * with raw bytes did before this existed — and it is also the initial-paint
+ * case that matters most: an unwritten topic's value is EMPTY, which is not
+ * JSON, and a projecting holder must keep the server's text rather than blank
+ * itself while waiting. That is the one case that answers `null`; a projection
+ * that fails against a value we *did* parse answers `''`, exactly as the SSR
+ * walk does for the same shape.
+ *
+ * @param {string} decoded  The `SlotSet` payload, already `TextDecoder`'d.
+ * @param {string[]|undefined} path
+ * @returns {string|null}
+ */
+export function slotAnchorText(decoded, path) {
+  const projecting = Array.isArray(path) && path.length > 0;
+  let value;
+  try {
+    value = JSON.parse(decoded);
+  } catch (err) {
+    return projecting ? null : decoded;
+  }
+  if (projecting) {
+    for (const segment of path) {
+      if (value === null || typeof value !== 'object') return '';
+      value = value[segment];
+    }
+  }
+  return slotValueText(value);
+}
 
 /**
  * Reduces a z-set delta to a minimal DOM plan, keyed by `RowKey`.
@@ -651,15 +721,21 @@ export class Bakabox {
       if (site.kind === 'text') {
         const element = this._siteElement(site);
         if (!element) continue;
+        // A scanned anchor holds a topic value (JSON) and paints it by the
+        // shared rule; every other text site takes the bytes as they are.
+        // `null` means the value said nothing this holder can show — leave the
+        // server's text rather than blanking it.
+        const text = site.element ? slotAnchorText(decoded, site.path) : decoded;
+        if (text === null) continue;
         // Fine-grained patch: mutate the existing server-rendered text node in
         // place rather than replacing the subtree, so the DOM node identity the
         // page was painted with survives the update. Falls back to `textContent`
         // when the element isn't holding a lone text node.
         const first = element.firstChild;
         if (first && first.nodeType === 3) {
-          first.nodeValue = decoded;
+          first.nodeValue = text;
         } else {
-          element.textContent = decoded;
+          element.textContent = text;
         }
       } else if (site.kind === 'attr') {
         const element = this._siteElement(site);
@@ -785,12 +861,12 @@ export class Bakabox {
    * Registration replays any `SlotSet` that arrived first, which is the whole
    * point: the value was already sitting in `pendingSlotValues`.
    */
-  _registerSlotAnchor(slotId, element) {
+  _registerSlotAnchor(slotId, element, path) {
     const sites = this._ensureSlot(slotId);
     for (const site of sites) {
       if (site.kind === 'text' && site.element === element) return;
     }
-    sites.push({ kind: 'text', element });
+    sites.push({ kind: 'text', element, path });
     this._replayPendingSlotValue(slotId);
   }
 
@@ -812,7 +888,12 @@ export class Bakabox {
     for (const anchor of anchors) {
       const topic = anchor.getAttribute('data-albedo-slot');
       if (topic === null || topic === undefined) continue;
-      this._registerSlotAnchor(topicSlotId(topic), anchor);
+      // `data-albedo-slot-path` is present only where the holder paints a
+      // member of the topic's value (`<span>{status.state}</span>`); the
+      // segments are JS identifiers, so `.` cannot occur inside one.
+      const rawPath = anchor.getAttribute('data-albedo-slot-path');
+      const path = rawPath ? rawPath.split('.') : undefined;
+      this._registerSlotAnchor(topicSlotId(topic), anchor, path);
     }
   }
 

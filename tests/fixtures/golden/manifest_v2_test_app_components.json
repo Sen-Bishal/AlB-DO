@@ -138,6 +138,8 @@
       "loading_component": null,
       "metadata": {},
       "route": "/",
+      "shared_slot_partitions": [],
+      "shared_slot_sources": [],
       "shared_slot_topics": [],
       "shell": {
         "body_close": "</body></html>",

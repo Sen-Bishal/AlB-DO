@@ -59,6 +59,27 @@ pub const LIST_SLOT_ATTR: &str = "data-albedo-list-slot";
 /// `useSharedSlot` look like "broadcast is broken".
 pub const SLOT_ATTR: &str = "data-albedo-slot";
 
+/// Attribute carrying the path from a scalar anchor's **topic value** to the
+/// member the holder actually paints — `data-albedo-slot-path="state"` for
+/// `<span>{status.state}</span>`.
+///
+/// It exists because a topic value is not always a scalar. An APERTURE source
+/// answers with whatever JSON the upstream sends, so the useful read is a
+/// member of it, and without this the two available shapes were both wrong:
+/// `{status}` painted the whole object (live, but a JSON blob in the UI) and
+/// `{status.state}` painted the right text and was **not live**, because the
+/// marker only ever recognised a bare identifier and so stamped no anchor at
+/// all. The author had to pick which half to lose.
+///
+/// Absent for the bare-identifier case, which is every app written before
+/// sources existed — the attribute appears only where a path is actually
+/// walked.
+///
+/// Segments are non-computed member names, i.e. JS identifiers, which cannot
+/// contain `.` — so joining them with `.` is unambiguous and the client splits
+/// on the same character to get the original segments back.
+pub const SLOT_PATH_ATTR: &str = "data-albedo-slot-path";
+
 /// Attribute carrying a row's reconciliation identity, stamped from the
 /// author's `key={…}` by the two SSR renderers
 /// (`runtime::eval::component::render_attrs` and the QuickJS `h` shim).
@@ -545,7 +566,7 @@ impl VisitMut for ScalarSlotMarker {
     fn visit_mut_jsx_element(&mut self, el: &mut JSXElement) {
         el.visit_mut_children_with(self);
 
-        let Some(anchor) = sole_shared_slot_read(el, &self.idents) else {
+        let Some(site) = sole_shared_slot_read(el, &self.idents) else {
             return;
         };
         // A list container is already the anchor for its topic; stamping it as a
@@ -553,26 +574,52 @@ impl VisitMut for ScalarSlotMarker {
         if has_attr(el, SLOT_ATTR) || has_attr(el, LIST_SLOT_ATTR) {
             return;
         }
-        el.opening.attrs.push(slot_attr(&anchor));
+        el.opening.attrs.push(slot_attr(&site.anchor));
+        let path = site.path.join(".");
+        if !path.is_empty() {
+            el.opening.attrs.push(slot_path_attr(&path));
+        }
+        fold_read_through_slot_text(el, &site.root, &path);
     }
 }
 
-/// `Some(topic)` when `el`'s **only** meaningful child is `{IDENT}` and `IDENT`
-/// is a shared-slot binding.
+/// One stamped scalar site: the topic it binds to, the binding the read starts
+/// from, and the path from that topic's value to what this holder paints
+/// (empty for `{value}` itself).
+struct ScalarSite {
+    anchor: SlotAnchor,
+    root: String,
+    path: Vec<String>,
+}
+
+/// `Some(site)` when `el`'s **only** meaningful child is a shared-slot read —
+/// `{IDENT}` or a non-computed member chain over it, `{IDENT.a.b}`.
 ///
-/// Deliberately narrow, and narrow in the same way [`ListAnchorMarker`] is: it
-/// marks only the common `<span>{value}</span>` shape. The client paints by
-/// replacing the holder's text, so an element with anything else in it —
-/// `<p>Count: {n}</p>`, two reads in one node, a nested element — must not be
-/// stamped, or painting would eat the sibling content. Those shapes keep
-/// today's behaviour (server-rendered, not live) instead of getting a binding
-/// that corrupts the DOM. Widening this means teaching the client to bind a
-/// specific child text node, which is a different change.
+/// Deliberately narrow in one axis and not the other. Narrow in the same way
+/// [`ListAnchorMarker`] is about the element: it marks only the common
+/// `<span>{…}</span>` shape, because the client paints by replacing the
+/// holder's text, so an element with anything else in it — `<p>Count: {n}</p>`,
+/// two reads in one node, a nested element — must not be stamped, or painting
+/// would eat the sibling content. Those shapes keep today's behaviour
+/// (server-rendered, not live); widening *that* means teaching the client to
+/// bind a specific child text node, which is still a different change.
+///
+/// The member chain is admitted because refusing it did not leave the author
+/// with a working alternative, which is what separates it from the shapes
+/// above. A topic whose value is an object has no bare-identifier read worth
+/// painting — `{status}` is a JSON blob — so the only sensible markup was
+/// exactly the one shape that silently lost liveness. The path travels to the
+/// client in [`SLOT_PATH_ATTR`]; the anchor is still the topic, because the
+/// wire carries topic values and a projection is a client-side read of one.
+///
+/// Computed access (`{rows[0]}`, `{o[k]}`) stays out: the index would have to
+/// be evaluated to be stamped, and a key that changes between renders would
+/// leave the attribute describing a projection the page is no longer showing.
 ///
 /// JSX whitespace-only text between children is skipped, so the formatting
 /// `<span>\n  {value}\n</span>` counts as a lone read.
-fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, SlotAnchor>) -> Option<SlotAnchor> {
-    let mut found: Option<SlotAnchor> = None;
+fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, SlotAnchor>) -> Option<ScalarSite> {
+    let mut found: Option<ScalarSite> = None;
     for child in &el.children {
         match child {
             JSXElementChild::JSXText(text) => {
@@ -584,14 +631,12 @@ fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, SlotAnchor>) 
                 let JSXExpr::Expr(expr) = &container.expr else {
                     return None;
                 };
-                let Expr::Ident(ident) = expr.as_ref() else {
-                    return None;
-                };
-                let topic = idents.get(ident.sym.as_ref())?;
+                let (root, path) = split_member_chain(expr)?;
+                let anchor = idents.get(root)?.clone();
                 if found.is_some() {
                     return None;
                 }
-                found = Some(topic.clone());
+                found = Some(ScalarSite { anchor, root: root.to_string(), path });
             }
             _ => return None,
         }
@@ -599,8 +644,81 @@ fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, SlotAnchor>) 
     found
 }
 
+/// `IDENT` → `(IDENT, [])`, `IDENT.a.b` → `(IDENT, ["a", "b"])`.
+///
+/// `None` for anything else, including a computed member anywhere in the chain
+/// — one computed link makes the whole path unstampable, not just its own
+/// segment.
+fn split_member_chain(expr: &Expr) -> Option<(&str, Vec<String>)> {
+    match expr {
+        Expr::Ident(ident) => Some((ident.sym.as_ref(), Vec::new())),
+        Expr::Member(member) => {
+            let MemberProp::Ident(prop) = &member.prop else {
+                return None;
+            };
+            let (root, mut path) = split_member_chain(member.obj.as_ref())?;
+            path.push(prop.sym.to_string());
+            Some((root, path))
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite the stamped holder's read as `__albedo_slot_text(<binding>, "a.b")`
+/// — the binding itself, with the projection handed over as data rather than
+/// evaluated in the tree.
+///
+/// This is the SSR half of the agreement the anchor promises. The client paints
+/// a topic value by one rule; the server rendered it by JavaScript's own
+/// `String(…)`, and the two only agree for numbers. An object SSR'd as
+/// `[object Object]` and then flipped to JSON on the first live update — the
+/// page changed shape without the data changing — and an array SSR'd as `123`
+/// for `[1,2,3]`.
+///
+/// **The path is walked by the formatter, not left in the tree, because a
+/// member chain over an unresolved topic throws.** `useSharedSlot` answers
+/// `null` for a topic the request had no value for — an APERTURE source that
+/// has not warmed yet, a partition whose key did not resolve — and `null.state`
+/// takes the whole route down with it. Every other unresolved read in this
+/// system renders empty and goes live when the value arrives (the shim's own
+/// note: *the slot reads null, the page renders, nothing throws*), and folding
+/// the walk into the formatter is what buys the member form the same property.
+/// It also makes the two sides of the wire run the *same* walk, with the same
+/// guard, rather than one in JS syntax and one in a client loop.
+///
+/// Applied only where an anchor was stamped, because "agreement" is only
+/// meaningful where something live paints later. An unstamped read keeps
+/// JavaScript's coercion, which is also what every non-shared expression in the
+/// tree does.
+fn fold_read_through_slot_text(el: &mut JSXElement, root: &str, path: &str) {
+    for child in &mut el.children {
+        let JSXElementChild::JSXExprContainer(container) = child else {
+            continue;
+        };
+        let JSXExpr::Expr(expr) = &mut container.expr else {
+            continue;
+        };
+        *expr = Box::new(slot_text_call(root, path));
+    }
+}
+
 fn slot_attr(anchor: &SlotAnchor) -> JSXAttrOrSpread {
     anchor_attr(SLOT_ATTR, anchor)
+}
+
+/// `data-albedo-slot-path="a.b"` — always a compile-time string, unlike the
+/// anchor beside it. The path is read off the source text, so it is knowable at
+/// build time even when the topic it projects out of is not.
+fn slot_path_attr(path: &str) -> JSXAttrOrSpread {
+    JSXAttrOrSpread::JSXAttr(JSXAttr {
+        span: DUMMY_SP,
+        name: JSXAttrName::Ident(IdentName { span: DUMMY_SP, sym: SLOT_PATH_ATTR.into() }),
+        value: Some(JSXAttrValue::Lit(Lit::Str(Str {
+            span: DUMMY_SP,
+            value: path.into(),
+            raw: None,
+        }))),
+    })
 }
 
 /// Build `<attr>="topic"` or `<attr>={__albedo_topic("binding")}`.
@@ -654,6 +772,45 @@ fn topic_lookup_call(binding: &str) -> Expr {
         ctxt: Default::default(),
     })
 }
+
+/// `__albedo_slot_text(<binding>)`, or `__albedo_slot_text(<binding>, "a.b")`
+/// for a projection — the engine-side half of the paint rule, named once here
+/// and defined once in the QuickJS hook prelude.
+///
+/// The path is a **string literal in the same spelling the attribute carries**,
+/// so the text SSR renders and the projection the client walks come from one
+/// value; they cannot drift into describing different members.
+fn slot_text_call(root: &str, path: &str) -> Expr {
+    let mut args = vec![ExprOrSpread {
+        spread: None,
+        expr: Box::new(Expr::Ident(Ident::new_no_ctxt(root.into(), DUMMY_SP))),
+    }];
+    if !path.is_empty() {
+        args.push(ExprOrSpread {
+            spread: None,
+            expr: Box::new(Expr::Lit(Lit::Str(Str {
+                span: DUMMY_SP,
+                value: path.into(),
+                raw: None,
+            }))),
+        });
+    }
+    Expr::Call(CallExpr {
+        span: DUMMY_SP,
+        callee: Callee::Expr(Box::new(Expr::Ident(Ident::new_no_ctxt(
+            SLOT_TEXT_FN.into(),
+            DUMMY_SP,
+        )))),
+        args,
+        type_args: None,
+        ctxt: Default::default(),
+    })
+}
+
+/// Name of the render-side formatter the marker folds a stamped read into.
+/// Defined in `runtime::quickjs_engine`'s hook prelude; only Tier-B ever sees
+/// it, because this pass runs only in that engine's transpile.
+pub const SLOT_TEXT_FN: &str = "__albedo_slot_text";
 
 /// The anchor when `expr` is `IDENT.map(...)` and `IDENT` is a shared-slot binding.
 fn map_over_shared_slot(
@@ -1295,6 +1452,143 @@ mod partition_anchor_tests {
             "#,
         );
         assert!(out.contains("__albedo_topic(\"rows\")"), "got {out}");
+    }
+
+    /// A member read over a shared slot is the **only** sensible markup for an
+    /// object-valued topic — and until this landed it was the one shape that
+    /// silently lost liveness. `{status}` painted the whole body as JSON;
+    /// `{status.state}` painted the right text and was never stamped, so no
+    /// paint site existed and every update went to a page that ignored it. The
+    /// author had to choose between live-but-wrong and right-but-static.
+    #[test]
+    fn a_member_read_over_a_shared_slot_is_anchored_and_carries_its_path() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { ops } from "albedo/sources";
+            export default function Ops() {
+                const status = useSharedSlot(ops.status());
+                return <span>{status.state}</span>;
+            }
+            "#,
+        );
+        assert!(out.contains("__albedo_topic(\"status\")"), "anchored; got {out}");
+        assert!(
+            out.contains(r#"data-albedo-slot-path="state""#),
+            "the anchor is the topic; the path says which member of it this \
+             holder shows; got {out}"
+        );
+    }
+
+    /// A nested chain joins with `.`, which is unambiguous because every
+    /// segment is a JS identifier.
+    #[test]
+    fn a_nested_member_chain_joins_its_segments() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { ops } from "albedo/sources";
+            export default function Ops() {
+                const s = useSharedSlot(ops.status());
+                return <span>{s.build.commit}</span>;
+            }
+            "#,
+        );
+        assert!(out.contains(r#"data-albedo-slot-path="build.commit""#), "got {out}");
+    }
+
+    /// A bare read carries no path attribute at all — every app written before
+    /// sources existed emits byte-identical markup but for the text fold.
+    #[test]
+    fn a_bare_read_stamps_no_path() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            export default function C() {
+                const count = useSharedSlot("lobby:counter");
+                return <span>{count}</span>;
+            }
+            "#,
+        );
+        assert!(out.contains(r#"data-albedo-slot="lobby:counter""#), "got {out}");
+        assert!(!out.contains("data-albedo-slot-path"), "got {out}");
+    }
+
+    /// Computed access is refused: the index would have to be evaluated to be
+    /// stamped, and one that changes between renders would leave the attribute
+    /// describing a projection the page is no longer showing.
+    #[test]
+    fn a_computed_member_is_not_anchored() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { ops } from "albedo/sources";
+            export default function Ops() {
+                const rows = useSharedSlot(ops.list());
+                return <span>{rows[0]}</span>;
+            }
+            "#,
+        );
+        assert!(!out.contains("data-albedo-slot"), "got {out}");
+    }
+
+    /// A member chain over something that is **not** a shared slot is ordinary
+    /// JSX — `props.title` must not become a live binding on a topic named
+    /// "props".
+    #[test]
+    fn a_member_read_over_a_non_slot_binding_is_untouched() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            export default function C({ props }) {
+                const count = useSharedSlot("t");
+                return <div><span>{props.title}</span><b>{count}</b></div>;
+            }
+            "#,
+        );
+        assert!(!out.contains("data-albedo-slot-path"), "got {out}");
+        assert!(out.contains(r#"data-albedo-slot="t""#), "the real read still anchors; got {out}");
+    }
+
+    /// The stamped read is folded through the render-side formatter, so SSR
+    /// writes the same text a later `SlotSet` writes over it. Unstamped
+    /// expressions keep JavaScript's own coercion.
+    #[test]
+    fn a_stamped_read_is_folded_through_the_slot_text_formatter() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            export default function C({ other }) {
+                const v = useSharedSlot("t");
+                return <div><span>{v}</span><p>x {other}</p></div>;
+            }
+            "#,
+        );
+        assert!(out.contains("__albedo_slot_text(v)"), "got {out}");
+        assert!(!out.contains("__albedo_slot_text(other)"), "got {out}");
+    }
+
+    /// The projection travels as an ARGUMENT, not as `status.state` left in the
+    /// tree — a member chain over an unresolved topic (`null.state`) throws and
+    /// takes the route down, and an unresolved topic is the ordinary state of a
+    /// source that has not warmed yet.
+    #[test]
+    fn a_member_read_hands_its_path_to_the_formatter_rather_than_walking_it_inline() {
+        let out = marked(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { ops } from "albedo/sources";
+            export default function Ops() {
+                const status = useSharedSlot(ops.status());
+                return <span>{status.build.commit}</span>;
+            }
+            "#,
+        );
+        assert!(
+            out.contains(r#"__albedo_slot_text(status, "build.commit")"#),
+            "got {out}"
+        );
+        assert!(!out.contains("status.build.commit"), "got {out}");
     }
 
     /// An external topic must **not** be row-classified. An arbitrary JSON body

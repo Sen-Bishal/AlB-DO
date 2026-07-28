@@ -376,6 +376,7 @@ fn warm_engine(engine: &mut QuickJsEngine) {
         setters: &setters,
         event_json: None,
         broadcast_current: &broadcast_current,
+        journal: None,
     };
 
     for _ in 0..POOL_WARMUP_RENDERS {
@@ -462,6 +463,7 @@ mod tests {
                     setters: &[],
                     event_json: None,
                     broadcast_current: &bc,
+                    journal: None,
                 };
                 let _ = engine.eval_handler("__warm_probe", &inv);
                 engine.arena_stats().system_peak_bytes

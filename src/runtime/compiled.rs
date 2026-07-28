@@ -13,7 +13,7 @@
 use crate::bundler::npm::{bundle_npm_dependency, scan_bare_imports, NpmDependencyBundle};
 use crate::ir::action::ActionEnvelope;
 use crate::ir::opcode::{Instruction, InternTableKind, SlotId};
-use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
+use crate::runtime::bridge::{HandlerEffect, HandlerInvocation, HandlerRun, PendingRequest};
 use crate::runtime::broadcast::BroadcastRegistry;
 use crate::runtime::engine::RuntimeEngine;
 use crate::runtime::eval::component::fnv1a_32;
@@ -1491,6 +1491,43 @@ impl CompiledProject {
         slots: &SessionSlotView,
         broadcast: Option<&BroadcastRegistry>,
     ) -> Result<Vec<Instruction>> {
+        match self.invoke_action_quickjs_pass(engine, envelope, slots, broadcast, None)? {
+            ActionPass::Completed(instructions) => Ok(instructions),
+            ActionPass::Suspended { pending, .. } => Err(anyhow!(
+                "action {} called fetch() ({} request(s) staged) but was dispatched without a \
+                 workflow journal; drive it through the pass loop so the calls can be resolved",
+                envelope.action_id,
+                pending.len()
+            )),
+        }
+    }
+
+    /// APERTURE A2 · run **one pass** of an action body against `journal`.
+    ///
+    /// One pass, not one dispatch, and the distinction is the design. A body
+    /// that calls out suspends (§ 5.4); resolving what it asked for is async and
+    /// this function is not, so the loop belongs to the *caller* — which is
+    /// precisely what lets the engine go back to the pool across the round trip
+    /// (invariant 2.6). A driver that looped in here would be holding the engine
+    /// while it waited, which is the blocking host function this design exists to
+    /// avoid, wearing a different shape. Gate 5 measured that difference at
+    /// 403.9 ms versus 52.7 ms, and at a peak of 2 in flight versus 16.
+    ///
+    /// `journal` seeds the answers already recorded. `None` is an empty log, so
+    /// the first pass and a non-fetching body take the same path.
+    ///
+    /// **Nothing commits on a suspended pass.** `__albedo_effects` is rebuilt per
+    /// pass, so a discarded pass discards its effects, its slot writes and its
+    /// FORGE writes together. That was already the semantics before replay
+    /// existed; replay is what makes it load-bearing.
+    pub fn invoke_action_quickjs_pass(
+        &self,
+        engine: &mut QuickJsEngine,
+        envelope: &ActionEnvelope,
+        slots: &SessionSlotView,
+        broadcast: Option<&BroadcastRegistry>,
+        journal: Option<&crate::aperture::Journal>,
+    ) -> Result<ActionPass> {
         let handler = self
             .handler(envelope.action_id)
             .ok_or_else(|| anyhow!("no handler registered for action_id {}", envelope.action_id))?;
@@ -1652,6 +1689,7 @@ impl CompiledProject {
         };
 
         let entry = format!("{}::{}", handler.module_spec, handler.function_name);
+        let seeded_journal = journal.map(crate::aperture::Journal::to_script_value);
         let invocation = HandlerInvocation {
             body: &body_src,
             is_block,
@@ -1660,9 +1698,21 @@ impl CompiledProject {
             setters: &setters,
             event_json: event_string.as_deref(),
             broadcast_current: &broadcast_current,
+            journal: seeded_journal.as_ref(),
         };
 
-        let outcome = engine.eval_handler(&entry, &invocation)?;
+        let outcome = match engine.eval_handler_run(&entry, &invocation)? {
+            HandlerRun::Completed(outcome) => outcome,
+            HandlerRun::Suspended {
+                pending,
+                journal_len,
+            } => {
+                return Ok(ActionPass::Suspended {
+                    pending,
+                    journal_len,
+                })
+            }
+        };
 
         let mut instructions = Vec::with_capacity(outcome.effects.len());
         for effect in outcome.effects {
@@ -1767,7 +1817,7 @@ impl CompiledProject {
         // to the pure-Rust `invoke_action` path.
         let _ = slots.drain_pending();
 
-        Ok(instructions)
+        Ok(ActionPass::Completed(instructions))
     }
 
     /// A1 · host-object bridge (render side) — render an entry component under
@@ -2000,6 +2050,28 @@ fn json_string_literal(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+/// APERTURE A2 · what one pass of an action body produced.
+///
+/// The two arms are not success and failure — they are *finished* and *not
+/// finished yet*. A suspended pass carries no instructions because it committed
+/// nothing, which is the property that makes replay safe rather than a source of
+/// double effects.
+#[derive(Debug)]
+pub enum ActionPass {
+    /// The body ran to completion; these opcodes may ship.
+    Completed(Vec<Instruction>),
+    /// The body is waiting on outbound calls. Resolve them, append the outcomes
+    /// to the journal, and run another pass.
+    Suspended {
+        /// Everything this pass asked for, in step order. Independent calls all
+        /// arrive here together, which is `Promise.all` semantics without
+        /// Promises (§ 5.4) — the caller resolves them concurrently.
+        pending: Vec<PendingRequest>,
+        /// How many steps were seeded into the pass that suspended.
+        journal_len: u32,
+    },
+}
+
 /// Emit a sequence of module items as JS source.
 fn emit_module_js(items: Vec<ModuleItem>) -> Result<String> {
     let cm: Lrc<SourceMap> = Default::default();
@@ -2089,10 +2161,27 @@ fn extract_derived_locals(stmts: &[Stmt]) -> HashMap<String, Expr> {
 /// Codegen a handler body to `(source, is_block)`. An expression body yields a
 /// bare expression; a block body yields its statements verbatim.
 fn handler_body_to_js(body: &HandlerBody) -> Result<(String, bool)> {
+    use crate::transforms::workflow;
+
     match body {
-        HandlerBody::Expr(expr) => Ok((expr_to_js(expr)?, false)),
+        // APERTURE A2 · `await` is a compiler lowering, not a runtime feature
+        // (§ 5.5). The body is spliced into an ordinary function, so an `await`
+        // is a SyntaxError before it is anything else — and the engine's `fetch`
+        // answers from the journal, returning its value directly, so removing
+        // the marker is exact rather than approximate. The catch guard rides
+        // along because the two only work together: the strip is what makes the
+        // source run, the guard is what keeps the author's own `try/catch` from
+        // eating the suspension it produces.
+        HandlerBody::Expr(expr) => {
+            let mut expr = expr.clone();
+            workflow::strip_await_expr(&mut expr);
+            workflow::guard_userland_catches_expr(&mut expr);
+            Ok((expr_to_js(&expr)?, false))
+        }
         HandlerBody::Block(stmts) => {
-            let items = stmts.iter().cloned().map(ModuleItem::Stmt).collect();
+            let mut stmts = stmts.clone();
+            workflow::lower_handler_body(&mut stmts).map_err(|err| anyhow!("{err}"))?;
+            let items = stmts.into_iter().map(ModuleItem::Stmt).collect();
             Ok((emit_module_js(items)?, true))
         }
     }

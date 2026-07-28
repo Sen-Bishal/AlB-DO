@@ -28,6 +28,7 @@ pub mod hooks;
 pub mod link;
 pub mod shared_slot_lists;
 pub mod shared_slots;
+pub mod workflow;
 
 pub use actions::{extract_action_declarations, ActionDeclaration, ActionExtractError};
 pub use css_modules::{is_css_module_path, scope_module_css, ScopedCssModule};
@@ -43,4 +44,7 @@ pub use hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 pub use link::{extract_links_in_function, LinkExtract};
 pub use shared_slots::{
     extract_shared_slot_hooks, KeySource, SharedSlotBinding, SharedSlotExtractError, TopicSpec,
+};
+pub use workflow::{
+    body_calls_fetch, lower_handler_body, strip_await, WorkflowLoweringError, IS_SUSPEND_FN,
 };
