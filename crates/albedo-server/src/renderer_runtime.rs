@@ -655,6 +655,25 @@ impl RendererRuntime {
             }
         }
 
+        // The absolute→project-relative bridge for anchor ids. Same lookup the
+        // shared-topic block above uses and for the same underlying reason: the
+        // manifest speaks in absolute paths and the compiled project speaks in
+        // project-relative specs. Built per entry because only the modules in
+        // *this* load set can render into this component's markup.
+        let mut stamp_specs = HashMap::new();
+        if let Some(project) = compiled {
+            for (specifier, _) in &modules {
+                if let Some(component) = by_name
+                    .values()
+                    .find(|candidate| &candidate.module_path == specifier)
+                {
+                    if let Some(spec) = project.module_spec_for_component(component.name.as_str()) {
+                        stamp_specs.insert(specifier.clone(), spec.to_string());
+                    }
+                }
+            }
+        }
+
         plan.insert(
             key.to_string(),
             crate::render::tier_b::TierBEntryPlan {
@@ -664,6 +683,7 @@ impl RendererRuntime {
                 shared_partitions,
                 shared_sources,
                 shared_topic_classes,
+                stamp_specs,
             },
         );
     }

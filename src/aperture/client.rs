@@ -113,6 +113,20 @@ pub struct WireResponse {
     pub status: u16,
     /// Body bytes. Empty for a `304`.
     pub body: Vec<u8>,
+    /// Every response header, **names lowercased**, in the order the upstream
+    /// sent them.
+    ///
+    /// Carried whole rather than as the three fields below it because a
+    /// workflow body reaches `res.headers.get(name)` (§ 5.5 — copy-pasted vendor
+    /// code has to run), and rate limits, pagination `Link`s and `Location` all
+    /// live outside the validator set. A response that answered a header and
+    /// then reports `null` for it is a silent wrong answer, which is worse than
+    /// having no header surface at all.
+    ///
+    /// The read path does **not** use this — a source topic's value is its body
+    /// — so [`crate::aperture::CachedResponse`] deliberately does not store it
+    /// and the cache's byte budget is unaffected.
+    pub headers: Vec<(String, String)>,
     /// `ETag`, if the upstream sent one.
     pub etag: Option<String>,
     /// `Last-Modified`, if the upstream sent one.
@@ -458,6 +472,45 @@ impl ApertureClient {
         }
     }
 
+    /// Issue one request as a **workflow step**: egress-checked, timed out, and
+    /// neither cached nor coalesced. Returns the raw response, headers included.
+    ///
+    /// ## Why a journal step never touches the cache
+    ///
+    /// [`Self::fetch`] decides cacheability from the method, which is right for
+    /// a *declared read* — the author wrote a refresh window and a sharing scope
+    /// and the client honours them. A bare `fetch()` inside an action body has
+    /// neither. Serving it from the shared store would key a response on its URL
+    /// while its authority lives in a header the key never saw, which is
+    /// invariant 2.3's failure and § 11 R5's CVE-class risk: user A's bearer
+    /// token fetches `/me`, user B reads it back.
+    ///
+    /// § 11 R5 allows a bare call single-flight without a cross-session cache.
+    /// This goes one step further and coalesces nothing either, on the same
+    /// ground the non-idempotent path already stands on: **a step in a workflow
+    /// is an effect.** Two bodies asking for the same URL at the same moment are
+    /// two distinct intentions holding two distinct idempotency keys, and
+    /// merging them would be exactly the bug derived keys exist to prevent.
+    /// Reads that *should* be shared have a declaration and go through
+    /// [`Self::fetch`].
+    ///
+    /// # Errors
+    /// [`ApertureError::InvalidUrl`] or [`ApertureError::Egress`] before any
+    /// network contact; [`ApertureError::Transport`] or
+    /// [`ApertureError::Timeout`] from the transport. There is no last-good
+    /// value to fall back on and offering one would be a fabricated answer, so
+    /// a failed step fails.
+    pub async fn send_effect(
+        &self,
+        request: &ApertureRequest,
+    ) -> Result<WireResponse, ApertureError> {
+        let url =
+            Url::parse(&request.url).map_err(|_| ApertureError::InvalidUrl(request.url.clone()))?;
+        self.policy.check_url(&url).map_err(ApertureError::Egress)?;
+        let wire = build_wire_request(request, &Validators::default());
+        self.send_with_timeout(&wire).await
+    }
+
     /// Non-idempotent path: straight to the wire, nothing stored.
     async fn send_uncached(
         &self,
@@ -620,6 +673,7 @@ mod tests {
         WireResponse {
             status: 200,
             body: body.to_vec(),
+            headers: Vec::new(),
             etag: etag.map(str::to_string),
             last_modified: None,
             content_type: Some("application/json".to_string()),
@@ -630,6 +684,7 @@ mod tests {
         WireResponse {
             status: 304,
             body: Vec::new(),
+            headers: Vec::new(),
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
             content_type: None,

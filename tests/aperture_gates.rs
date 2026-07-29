@@ -22,6 +22,7 @@ fn body_response(body: &[u8], etag: &str) -> WireResponse {
     WireResponse {
         status: 200,
         body: body.to_vec(),
+        headers: Vec::new(),
         etag: Some(etag.to_string()),
         last_modified: None,
         content_type: Some("application/json".to_string()),
@@ -32,6 +33,7 @@ fn not_modified(etag: &str) -> WireResponse {
     WireResponse {
         status: 304,
         body: Vec::new(),
+        headers: Vec::new(),
         etag: Some(etag.to_string()),
         last_modified: None,
         content_type: None,

@@ -245,14 +245,18 @@ export function slotValueText(value) {
  * What a scanned scalar anchor should paint for one `SlotSet`, or `null` for
  * "leave the server's text alone".
  *
- * A topic's wire value is its JSON encoding — that is what the store holds and
- * what SSR parsed to render this holder in the first place — so the anchor
- * lane, and only the anchor lane, decodes before formatting. Phase-K text
- * sites keep taking the bytes verbatim: they are fed both by the action lane
- * (JSON) and by the local reactive driver (already-formatted text), and
- * nothing distinguishes those at the site, so guessing there would be a
- * heuristic. An anchor site has one producer by construction — the topic slot
- * its `data-albedo-slot` hashes to.
+ * A slot's wire value is its JSON encoding — that is what the store holds and
+ * what SSR parsed to render this holder in the first place — so every site
+ * decodes before formatting, and `path` is the only thing that varies.
+ *
+ * This was once the anchor lane's rule alone. Phase-K text sites took their
+ * bytes verbatim because they were fed by two producers with two encodings (the
+ * action lane in JSON, the Tier-C reactive driver in display text), and no
+ * inspection at the site can tell `"green"` the JSON string from `"green"` the
+ * seven literal characters. The cost of that ambiguity was a string `useState`
+ * value painting with its quotes on while SSR rendered it without them. It was
+ * fixed where it was created — the driver now sends JSON like everyone else —
+ * so the rule is one rule again, and this function is it.
  *
  * Bytes that are not JSON are painted verbatim, which is what a topic seeded
  * with raw bytes did before this existed — and it is also the initial-paint
@@ -717,15 +721,31 @@ export class Bakabox {
       return;
     }
     const decoded = this._decodeBytes(value);
+    // A slot's wire value is its JSON encoding — from the action lane
+    // (`serde_json::to_vec`), the broadcast lane, FORGE, and now the Tier-C
+    // reactive driver, which used to be the one producer sending display text.
+    // So every site decodes by the same rule, and the projection path is the
+    // only thing that varies.
+    //
+    // That disagreement is what made a string `useState` value paint as
+    // `"green"` — quotes and all — where SSR had rendered `green`. It could not
+    // be fixed here while two encodings shared the wire: `"green"` is either the
+    // JSON for a five-character string or the seven characters themselves, and
+    // no amount of inspection at the site distinguishes them. The fix was to
+    // make the producers agree; this is the half that then becomes unambiguous.
+    //
+    // Bytes that are not JSON are still painted verbatim, which keeps a topic
+    // seeded with raw bytes working and, more importantly, keeps an unwritten
+    // topic's EMPTY value from blanking a holder that SSR filled.
+    const paint = slotAnchorText(decoded, undefined);
     for (const site of sites) {
       if (site.kind === 'text') {
         const element = this._siteElement(site);
         if (!element) continue;
-        // A scanned anchor holds a topic value (JSON) and paints it by the
-        // shared rule; every other text site takes the bytes as they are.
-        // `null` means the value said nothing this holder can show — leave the
+        // A scanned anchor may project into the value (`data-albedo-slot-path`);
+        // `null` means the value said nothing this holder can show, so leave the
         // server's text rather than blanking it.
-        const text = site.element ? slotAnchorText(decoded, site.path) : decoded;
+        const text = site.element ? slotAnchorText(decoded, site.path) : paint;
         if (text === null) continue;
         // Fine-grained patch: mutate the existing server-rendered text node in
         // place rather than replacing the subtree, so the DOM node identity the
@@ -738,12 +758,15 @@ export class Bakabox {
           element.textContent = text;
         }
       } else if (site.kind === 'attr') {
+        // Same rule as text: an attribute is a string, so `class={label}` must
+        // set `green`, not `"green"`. This was the same quoting bug wearing a
+        // different site kind.
         const element = this._siteElement(site);
         const attrName = site.attrName || this.attrs.get(site.attrId);
-        if (element && attrName) element.setAttribute(attrName, decoded);
+        if (element && attrName) element.setAttribute(attrName, paint);
       } else if (site.kind === 'html') {
         const element = this._siteElement(site);
-        if (element) element.innerHTML = decoded;
+        if (element) element.innerHTML = paint;
       }
       // 'sentinel' sites from bare BindSlot are intentionally skipped.
     }
@@ -1369,6 +1392,18 @@ if (globalScope && globalScope.document) {
     },
   };
 
+  // Tier-B chunks FIRST. `installLegacyHtmlInjector` drains the queue the
+  // head-level stub buffered during parse, so this is where a Tier-B
+  // component's server-rendered markup actually enters the document — and
+  // where `seedNodesFromDocument` runs over it to register its anchors.
+  //
+  // It used to run *after* the frame pass below, which meant every Tier-B
+  // `BindEvent` was applied against a document that still held nothing but an
+  // empty placeholder. `_requireNode` threw, `applyInlineOpcodeFrames` caught
+  // it and abandoned the whole frame, and no Tier-B click handler on the page
+  // was ever bound. Ordering is the entire fix; neither function changed.
+  installLegacyHtmlInjector(globalScope, globalScope.document);
+
   // Phase P · post-P wire-through — apply any inline opcode frames
   // the renderer baked into the page. The dev `render_all_routes`
   // and the production manifest builder emit
@@ -1377,8 +1412,6 @@ if (globalScope && globalScope.document) {
   // SetTextRef bindings activate even without a WT patches lane
   // (which dev mode doesn't have at all).
   applyInlineOpcodeFrames(globalScope.document, bakabox);
-
-  installLegacyHtmlInjector(globalScope, globalScope.document);
 
   // Binding-mode (Tier-C reactive) islands ship a classic inline driver plus
   // one `boot(payload)` call each. Those ran during parse — before this

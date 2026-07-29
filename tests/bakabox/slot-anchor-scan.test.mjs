@@ -263,11 +263,13 @@ test('non-JSON bytes leave a projecting holder alone, and paint a bare one verba
   assert.equal(bare.textContent, 'raw', 'a non-JSON producer still paints verbatim');
 });
 
-// Phase-K text sites are fed by the action lane (JSON) *and* by the local
-// reactive driver (already-formatted text), with nothing at the site to tell
-// them apart — so only the anchor lane, whose producer is fixed by the slot id
-// its `data-albedo-slot` hashes to, may decode.
-test('a Phase-K text site is untouched by the rule', () => {
+// A Phase-K text site once took its bytes verbatim, because it was fed by the
+// action lane (JSON) *and* by the Tier-C reactive driver (display text) with
+// nothing at the site to tell them apart. That cost a string `useState` value
+// its quotes: `setLabel("green")` ships `"green"` and the holder painted all
+// seven characters, where SSR had rendered five. The driver now sends JSON like
+// every other producer, so the rule is uniform and the site can decode.
+test('a Phase-K text site decodes, so a string value loses its JSON quotes', () => {
   const doc = new FakeDocument();
   const bakabox = new Bakabox({ document: doc });
   const el = doc.createElement('span');
@@ -275,8 +277,49 @@ test('a Phase-K text site is untouched by the rule', () => {
   bakabox.applyInstruction({ op: 'SetTextRef', stableId: 1, slotId: 99 });
 
   bakabox.applyInstruction({ op: 'SlotSet', slotId: 99, value: enc('"quoted"') });
+  assert.equal(el.textContent, 'quoted', 'the string, not its encoding');
 
-  assert.equal(el.textContent, '"quoted"', 'verbatim, as before');
+  // The rest of the shared table reaches this site too, and each row is the
+  // value SSR would have rendered for the same state.
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: 99, value: enc('42') });
+  assert.equal(el.textContent, '42');
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: 99, value: enc('true') });
+  assert.equal(el.textContent, 'true');
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: 99, value: enc('null') });
+  assert.equal(el.textContent, '', 'null blanks the holder');
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: 99, value: enc('{"a":1}') });
+  assert.equal(el.textContent, '{"a":1}', 'an object still shows as JSON');
+});
+
+// The escape hatch survives: bytes that are not JSON at all are painted as they
+// are, which is what a topic seeded with raw bytes relies on.
+test('a Phase-K text site paints non-JSON bytes verbatim', () => {
+  const doc = new FakeDocument();
+  const bakabox = new Bakabox({ document: doc });
+  const el = doc.createElement('span');
+  bakabox.nodes.set(1, el);
+  bakabox.applyInstruction({ op: 'SetTextRef', stableId: 1, slotId: 99 });
+
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: 99, value: enc('raw bytes') });
+  assert.equal(el.textContent, 'raw bytes');
+});
+
+// An attribute is a string too, so the same quoting bug lived here: an action
+// setting `class={label}` wrote `class="green"` with the quotes inside it.
+test('an attr site decodes by the same rule', () => {
+  const doc = new FakeDocument();
+  const bakabox = new Bakabox({ document: doc });
+  const el = doc.createElement('span');
+  bakabox.nodes.set(1, el);
+  bakabox.applyInstruction({
+    op: 'SetAttrRef',
+    stableId: 1,
+    attr: 'class',
+    slotId: 99,
+  });
+
+  bakabox.applyInstruction({ op: 'SlotSet', slotId: 99, value: enc('"green"') });
+  assert.equal(el.getAttribute('class'), 'green', 'the string, not its encoding');
 });
 
 test('scanSlotAnchors scoped to a subtree only adopts that subtree', () => {

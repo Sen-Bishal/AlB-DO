@@ -236,9 +236,17 @@ fn test_golden_manifest_v2_for_test_app_components() {
 /// Phase J static-slicer dedup contract: when a Tier-A root inlines its
 /// Tier-A descendants into one HTML string, those descendants must NOT
 /// also appear as separate `tier_a_root` entries (and the shell's
-/// `body_open` must not contain their `__SLOT_` placeholders). Tier-B
-/// islands nested inside an inlined Tier-A subtree keep their own body
-/// anchor — they are not absorbed by the parent's render.
+/// `body_open` must not contain their `__SLOT_` placeholders). A Tier-B
+/// node nested inside an inlined Tier-A subtree keeps its own anchor —
+/// it is not absorbed by the parent's render.
+///
+/// **Where that anchor lives changed.** It used to be appended to the shell's
+/// `body_open`; it is now emitted inline, at the position the author wrote the
+/// component, by the same mechanism Tier-C islands already used. The old
+/// placement is what let a Tier-B child be rendered twice — inlined into its
+/// parent's static HTML *and* anchored at the end of the shell — with the two
+/// copies numbered by different element counters, so the component's opcode
+/// frame bound to neither and no Tier-B `onClick` ever fired.
 ///
 /// This test is the regression guard for the manifest builder's
 /// `traverse` logic. If a refactor reintroduces double-counting, this
@@ -286,9 +294,16 @@ fn test_static_slicer_dedup_does_not_double_count_inlined_tier_a_children() {
         "App's tier-A slot must remain in body_open"
     );
     assert!(
-        body_open.contains("__b_button_1"),
-        "Button's tier-B anchor must remain in body_open even when its \
-         Tier-A ancestors are inlined into App's html"
+        !body_open.contains("__b_button_1"),
+        "Button is anchored inline in its parent's html, so the shell must not \
+         carry a second anchor for it — two holes for one component is the \
+         double-render this contract exists to prevent"
+    );
+    let app_html = route.tier_a_root[0].html.as_str();
+    assert!(
+        app_html.contains("<div id=\"__b_button_1\" data-albedo-tier=\"b\"></div>"),
+        "Button's tier-B anchor must be emitted inline, at its authored \
+         position inside App's html; got: {app_html}"
     );
     for inlined in [
         "__a_header_",

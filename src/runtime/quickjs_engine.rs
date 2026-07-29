@@ -440,18 +440,24 @@ impl QuickJsEngine {
         self.initialized = true;
         Ok(())
     }
-}
 
-impl RuntimeEngine for QuickJsEngine {
-    fn init(&mut self, bootstrap: &BootstrapPayload) -> RuntimeResult<()> {
-        if self.initialized {
-            return Ok(());
-        }
-        self.bootstrap = Some(bootstrap.clone());
-        self.ensure_initialized()
-    }
-
-    fn load_module(&mut self, specifier: &str, code: &str) -> RuntimeResult<()> {
+    /// [`RuntimeEngine::load_module`], plus the **project-relative** spec this
+    /// module's rendered `data-albedo-id` anchors should be keyed to.
+    ///
+    /// `None` stamps nothing. That is the honest degradation for a module the
+    /// caller cannot place in the project: no anchors is what shipped before
+    /// this existed, whereas anchors hashed from the wrong string would name
+    /// elements the opcode frame never mentions — a silent mis-binding instead
+    /// of a visible absence.
+    ///
+    /// # Errors
+    /// As [`RuntimeEngine::load_module`].
+    pub fn load_module_with_spec(
+        &mut self,
+        specifier: &str,
+        code: &str,
+        stamp_module_spec: Option<&str>,
+    ) -> RuntimeResult<()> {
         if code.len() > MAX_MODULE_SIZE {
             return Err(RuntimeError::load(
                 LoadErrorKind::EngineFailure,
@@ -462,13 +468,21 @@ impl RuntimeEngine for QuickJsEngine {
             ));
         }
 
-        let code_hash = stable_source_hash(code);
+        // The stamp spec is part of the compiled output, so it has to be part of
+        // the idempotency key too — otherwise a module warmed without one (the
+        // pool's boot warm) would keep its anchorless script forever, and the
+        // request path's spec would be silently ignored.
+        let mut code_hash = stable_source_hash(code);
+        if let Some(spec) = stamp_module_spec {
+            code_hash ^= stable_source_hash(spec).rotate_left(1);
+        }
         if self.loaded_module_hashes.get(specifier).copied() == Some(code_hash) {
             return Ok(());
         }
 
         self.ensure_initialized()?;
-        let script = compile_module_script_for_quickjs(specifier, code)?;
+        let script =
+            compile_module_script_for_quickjs_with_spec(specifier, code, stamp_module_spec)?;
 
         self.context.as_ref().unwrap().with(|ctx| {
             ctx.eval::<(), _>(script.as_str()).map_err(|err| {
@@ -482,6 +496,20 @@ impl RuntimeEngine for QuickJsEngine {
         self.loaded_module_hashes
             .insert(specifier.to_string(), code_hash);
         Ok(())
+    }
+}
+
+impl RuntimeEngine for QuickJsEngine {
+    fn init(&mut self, bootstrap: &BootstrapPayload) -> RuntimeResult<()> {
+        if self.initialized {
+            return Ok(());
+        }
+        self.bootstrap = Some(bootstrap.clone());
+        self.ensure_initialized()
+    }
+
+    fn load_module(&mut self, specifier: &str, code: &str) -> RuntimeResult<()> {
+        self.load_module_with_spec(specifier, code, None)
     }
 
     fn load_precompiled_module(
@@ -544,6 +572,12 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
     // means "no seed" — every hook falls back to its initial.
     globalThis.__ALBEDO_HOST = (hostJson && hostJson.length > 0) ? JSON.parse(hostJson) : null;
     globalThis.__ALBEDO_HOOK_INDEX = 0;
+    // Anchor ids are per-render, exactly as `render_entry`'s
+    // `reset_element_counter()` is on the pure-Rust side — the two counters must
+    // start together or every id after the first render drifts.
+    if (typeof globalThis.__albedo_reset_element_counter === 'function') {{
+      globalThis.__albedo_reset_element_counter();
+    }}
     const __albedo_record = globalThis.__ALBEDO_MODULES[entry];
     const __albedo_has_own = Object.prototype.hasOwnProperty;
     const __albedo_is_record = function(candidate) {{
@@ -1002,6 +1036,49 @@ if (typeof globalThis.h !== 'function') {
     return new AlbedoHtml('<div id="' + placeholderId + '" data-albedo-tier="c"></div>');
   };
 
+  // Shell-stamped anchor ids, the QuickJS half of `eval::core`'s
+  // `next_element_stable_id`. Same function of the same inputs:
+  // `fnv1a_32("{module_spec}#{counter}")`, one shared counter per render,
+  // advanced in pre-order.
+  //
+  // Pre-order falls out of JS argument evaluation: JSX lowers to nested
+  // `h(type, props, ...children)`, and a parent's props object — where the
+  // transform put this call — is built before any child's `h(…)` runs. That is
+  // why the stamp is injected as a JSX attribute rather than added inside `h`,
+  // which by then has already stringified its children and would number the
+  // parent last.
+  let __albedo_element_counter = 0;
+  globalThis.__albedo_reset_element_counter = function() {
+    __albedo_element_counter = 0;
+  };
+  globalThis.__albedo_stable_id = function(moduleSpec) {
+    const counter = __albedo_element_counter++;
+    const key = String(moduleSpec) + '#' + counter;
+    // FNV-1a over UTF-8 BYTES, matching `fnv1a_32(key.as_bytes())`. Specs are
+    // ASCII in practice, but a project under a non-ASCII path would otherwise
+    // hash differently on each side and silently unbind every element in it.
+    let hash = 0x811c9dc5 >>> 0;
+    for (let i = 0; i < key.length; i++) {
+      const code = key.charCodeAt(i);
+      if (code < 0x80) {
+        hash = Math.imul((hash ^ code) >>> 0, 16777619) >>> 0;
+        continue;
+      }
+      const point = key.codePointAt(i);
+      if (point > 0xffff) i++;
+      const bytes = point < 0x800
+        ? [0xc0 | (point >> 6), 0x80 | (point & 0x3f)]
+        : point < 0x10000
+          ? [0xe0 | (point >> 12), 0x80 | ((point >> 6) & 0x3f), 0x80 | (point & 0x3f)]
+          : [0xf0 | (point >> 18), 0x80 | ((point >> 12) & 0x3f),
+             0x80 | ((point >> 6) & 0x3f), 0x80 | (point & 0x3f)];
+      for (let b = 0; b < bytes.length; b++) {
+        hash = Math.imul((hash ^ bytes[b]) >>> 0, 16777619) >>> 0;
+      }
+    }
+    return String(hash >>> 0);
+  };
+
   globalThis.h = h;
 }
 
@@ -1165,6 +1242,22 @@ pub(crate) fn compile_module_script_for_quickjs(
     specifier: &str,
     code: &str,
 ) -> RuntimeResult<String> {
+    compile_module_script_for_quickjs_with_spec(specifier, code, None)
+}
+
+/// [`compile_module_script_for_quickjs`] with the **project-relative** module
+/// spec the rendered markup's `data-albedo-id`s should be keyed to.
+///
+/// Separate from `specifier` on purpose: the engine keys modules by the path
+/// imports resolve against (absolute, machine-specific), while an anchor id must
+/// hash the same string the pure-Rust renderer hashes, or the opcode frame and
+/// the DOM name different elements. `None` stamps nothing — the Tier-C island
+/// build and any caller with no project context.
+pub(crate) fn compile_module_script_for_quickjs_with_spec(
+    specifier: &str,
+    code: &str,
+    stamp_module_spec: Option<&str>,
+) -> RuntimeResult<String> {
     let normalized = code.trim();
     if normalized.is_empty() {
         return Err(RuntimeError::load(
@@ -1173,7 +1266,8 @@ pub(crate) fn compile_module_script_for_quickjs(
         ));
     }
 
-    let transpiled = transpile_module_source_for_quickjs(specifier, normalized)?;
+    let transpiled =
+        transpile_module_source_for_quickjs(specifier, normalized, stamp_module_spec)?;
 
     if !transpiled.contains("export") && !transpiled.contains("import") {
         return compile_legacy_expression_module(specifier, transpiled.as_str());
@@ -1449,7 +1543,10 @@ pub fn compile_client_island_module(
     component_id: u64,
 ) -> RuntimeResult<String> {
     let normalized = source.trim_start_matches('\u{feff}');
-    let transpiled = transpile_module_source_for_quickjs(specifier, normalized)?;
+    // `None`: an island's markup is produced by the browser runtime, which has
+    // no `__albedo_stable_id` — stamping here would be a ReferenceError on the
+    // island's first render.
+    let transpiled = transpile_module_source_for_quickjs(specifier, normalized, None)?;
 
     let lowered = if !transpiled.contains("export") && !transpiled.contains("import") {
         // A bare expression module (`(props) => …`) — the expression itself is
@@ -1889,7 +1986,11 @@ fn build_npm_factory_script(
     Ok(script)
 }
 
-fn transpile_module_source_for_quickjs(specifier: &str, source: &str) -> RuntimeResult<String> {
+fn transpile_module_source_for_quickjs(
+    specifier: &str,
+    source: &str,
+    stamp_module_spec: Option<&str>,
+) -> RuntimeResult<String> {
     let globals = Globals::new();
     GLOBALS.set(&globals, || {
         let preferred_syntax = syntax_for_specifier(specifier);
@@ -1923,6 +2024,18 @@ fn transpile_module_source_for_quickjs(specifier: &str, source: &str) -> Runtime
         // the two engines disagree. A string-literal topic is left untouched,
         // which is every app that exists today.
         crate::transforms::shared_slots::rewrite_shared_slot_topic_args(&mut module);
+
+        // Stamp `data-albedo-id` so the markup this engine renders is
+        // addressable by the opcode frame built against the same component.
+        // Runs LAST of the JSX passes and before the JSX lowering: the marker
+        // passes above key off element shape (`<span>{topic}</span>`), and an
+        // extra attribute must not change what they recognise.
+        //
+        // `None` for a Tier-C client island — it hydrates in the browser, where
+        // `__albedo_stable_id` does not exist. See `transforms::stable_ids`.
+        if let Some(spec) = stamp_module_spec {
+            crate::transforms::stable_ids::stamp_stable_ids(&mut module, spec);
+        }
 
         let mut jsx_options = JsxOptions::default();
         jsx_options.runtime = Some(JsxRuntime::Classic);

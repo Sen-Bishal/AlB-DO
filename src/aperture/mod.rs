@@ -28,6 +28,8 @@
 //! - [`client`] — cache lookup, single-flight coalescing, conditional revalidation, and the
 //!   counters the gates assert on.
 //! - [`transport`] — the `reqwest` implementation of the network seam.
+//! - [`workflow`] — A2's driver: the pass loop that resolves what a suspended body asked for and
+//!   runs it again, above the sync/async boundary so no engine is held across a round trip.
 //!
 //! ## The two invariants this phase carries
 //!
@@ -54,6 +56,7 @@ pub mod reader;
 pub mod refresh;
 pub mod transport;
 pub mod typegen;
+pub mod workflow;
 
 pub use bindings::{validate_source_bindings, SourceBinding, SourceBindingProblem};
 pub use declare::{
@@ -68,6 +71,10 @@ pub use refresh::{
     refresh_topic, RefreshLoop, RefreshOutcome, RefreshReport, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TICK,
 };
 pub use typegen::emit_sources_dts;
+pub use workflow::{
+    drive_workflow, resolve_pending, WorkflowError, WorkflowLimits, DEFAULT_WORKFLOW_DEADLINE,
+    IDEMPOTENCY_KEY_HEADER,
+};
 
 pub use cache::{
     CacheHit, CacheScope, CachedResponse, Freshness, ResourceKey, ResponseCache, Validators,

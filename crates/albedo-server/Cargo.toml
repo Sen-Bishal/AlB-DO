@@ -58,6 +58,11 @@ ratatui = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# APERTURE gate 5c only: the context-pool gate builds runtimes and contexts
+# directly, because the question it settles is what the pool should be made OF.
+# Nothing in the crate's own code links rquickjs — the engine stays behind
+# `dom-render-compiler`'s seam.
+rquickjs.workspace = true
 tower.workspace = true
 
 [[bin]]

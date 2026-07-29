@@ -18,12 +18,39 @@
 (function (global) {
   'use strict';
 
-  // Display form of a slot value. Matches bakabox: a slot's painted text is the
-  // value verbatim (numbers stringified, null/undefined blanked).
+  // Display form of a slot value. Still used for a keyed row's
+  // `data-albedo-key`, which is an identity written into an attribute and must
+  // match the SSR-stamped one byte for byte — never a JSON encoding.
   function formatSlotValue(v) {
     if (typeof v === 'string') return v;
     if (v === null || v === undefined) return '';
     return String(v);
+  }
+
+  // Wire form of a slot value: **its JSON encoding**, which is what every other
+  // producer of a `SlotSet` already sends — the action lane
+  // (`serde_json::to_vec`), the broadcast lane, and FORGE.
+  //
+  // This driver used to send display text instead, and that disagreement was the
+  // whole bug. A text site fed by two producers with two encodings cannot decide
+  // what it is holding: `"green"` is either the JSON for the string `green` or
+  // the literal five characters, and the site has no way to tell. Painting the
+  // bytes verbatim — the old behaviour — meant a string `useState` value arrived
+  // through the action lane with its JSON quotes still on and rendered as
+  // `"green"`, while SSR had rendered the same value as `green`.
+  //
+  // Fixing it at the paint site would have been a guess. Fixing it here removes
+  // the ambiguity instead: one encoding on the wire, one formatting rule when it
+  // lands. `undefined` normalises to `null` so the payload is always valid JSON.
+  function jsonSlotValue(v) {
+    try {
+      var text = JSON.stringify(v === undefined ? null : v);
+      return typeof text === 'string' ? text : 'null';
+    } catch (err) {
+      // A cycle or a BigInt. `null` blanks the holder, which is the same thing
+      // the paint side does for an unrepresentable value.
+      return 'null';
+    }
   }
 
   // bakabox's `SlotSet` carries UTF-8 bytes (it `TextDecoder`s them). In a real
@@ -237,7 +264,7 @@
         vm.applyInstruction({
           op: 'SlotSet',
           slotId: vmSlot(slotId),
-          value: encodeSlotValue(formatSlotValue(value)),
+          value: encodeSlotValue(jsonSlotValue(value)),
         });
       });
       // Recompute derived bindings whose dependency slots changed.
@@ -251,7 +278,7 @@
         vm.applyInstruction({
           op: 'SlotSet',
           slotId: entry.synthId,
-          value: encodeSlotValue(formatSlotValue(entry.fn(state))),
+          value: encodeSlotValue(jsonSlotValue(entry.fn(state))),
         });
       }
       // Reconcile keyed lists whose dependency slots changed.
@@ -292,7 +319,7 @@
       vm.applyInstruction({
         op: 'SlotSet',
         slotId: derivedFns[di].synthId,
-        value: encodeSlotValue(formatSlotValue(derivedFns[di].fn(state))),
+        value: encodeSlotValue(jsonSlotValue(derivedFns[di].fn(state))),
       });
     }
 

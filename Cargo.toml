@@ -173,6 +173,9 @@ forge = ["dep:libsql"]
 
 [dependencies]
 async-trait.workspace        = true
+# APERTURE · A2 — `join_all` over the requests one suspension staged. Already in
+# the lock file via albedo-server; no new vendor cost.
+futures-util.workspace       = true
 libsql                       = { version = "0.6", optional = true }
 crossbeam.workspace          = true
 core_affinity.workspace      = true

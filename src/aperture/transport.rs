@@ -118,6 +118,21 @@ impl Transport for ReqwestTransport {
         let last_modified = header_string(&response, "last-modified");
         let content_type = header_string(&response, "content-type");
 
+        // Names arrive lowercased from `http::HeaderMap` already; `to_str`
+        // drops any value that is not visible ASCII rather than lossily
+        // reconstructing one, because a header a workflow body reads back
+        // mangled is worse than one it does not find.
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
+
         // A 304 carries no body by definition; asking for one is a wasted
         // allocation on the path whose whole point is that it is nearly free.
         let body = if status == 304 {
@@ -133,6 +148,7 @@ impl Transport for ReqwestTransport {
         Ok(WireResponse {
             status,
             body,
+            headers,
             etag,
             last_modified,
             content_type,

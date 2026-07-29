@@ -143,7 +143,23 @@ globalThis.makeVm = function (doc) {
         return;
       case 'SlotSet':
         var sites = vm.slots[op.slotId] || [];
-        var text = (typeof op.value === 'string') ? op.value : String(op.value);
+        var raw = (typeof op.value === 'string') ? op.value : String(op.value);
+        // Mirrors `slotAnchorText`/`slotValueText` in `assets/albedo-runtime.js`:
+        // a slot's wire value is its JSON encoding, so decode before painting.
+        // Non-JSON bytes paint verbatim. Kept in step with the real runtime on
+        // purpose — this double exists to prove the payload → driver → handler
+        // loop, and a double that paints by a rule production no longer uses
+        // would assert a contract nothing ships.
+        var text = raw;
+        var parsed;
+        var parsedOk = true;
+        try { parsed = JSON.parse(raw); } catch (e) { parsedOk = false; }
+        if (parsedOk) {
+          if (parsed === null || parsed === undefined) { text = ''; }
+          else if (typeof parsed === 'string') { text = parsed; }
+          else if (typeof parsed === 'number' || typeof parsed === 'boolean') { text = String(parsed); }
+          else { text = JSON.stringify(parsed); }
+        }
         for (var s = 0; s < sites.length; s++) {
           var site = sites[s];
           var node = vm.nodes[site.stableId];

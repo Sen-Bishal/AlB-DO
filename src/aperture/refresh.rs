@@ -350,6 +350,7 @@ mod tests {
         WireResponse {
             status: 200,
             body: body.as_bytes().to_vec(),
+            headers: Vec::new(),
             etag: Some(etag.to_string()),
             last_modified: None,
             content_type: Some("application/json".to_string()),
@@ -360,6 +361,7 @@ mod tests {
         WireResponse {
             status: 304,
             body: Vec::new(),
+            headers: Vec::new(),
             etag: Some(etag.to_string()),
             last_modified: None,
             content_type: None,
@@ -488,6 +490,7 @@ mod tests {
         let transport = Arc::new(CountingTransport::always(WireResponse {
             status: 200,
             body: br#"{"n":1}"#.to_vec(),
+            headers: Vec::new(),
             etag: None,
             last_modified: None,
             content_type: Some("application/json".to_string()),

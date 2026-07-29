@@ -146,7 +146,7 @@ impl<'a> ManifestBuilder<'a> {
         // (which would render them twice: once inline, once at the island).
         // Install the island-name set so the tier-blind static renderer emits
         // a hole for them during `traverse`'s `render_static` calls.
-        let island_names = self.tier_c_component_names();
+        let island_names = self.deferred_component_names();
         let _island_guard = crate::runtime::eval::core::install_island_skip_set(&island_names);
 
         // …but "anchored at its own placeholder" only lands the island back in
@@ -175,6 +175,20 @@ impl<'a> ManifestBuilder<'a> {
         // Anchored inline above ⇒ keep them out of the shell-level collection,
         // or the island renders twice (once in its wrapper, once at the end).
         for node in &mut tier_c {
+            if node.position.parent_placeholder.is_none()
+                && route_island_map.contains_key(&node.component_id)
+            {
+                node.position.parent_placeholder = Some(ROUTE_ISLAND_PARENT.to_string());
+            }
+        }
+        // The same for Tier-B, now that a Tier-B child is anchored inline too.
+        // Without this the node keeps its shell-level placeholder as well and
+        // the page carries two holes for one component — which is the "renders
+        // twice" the loop above exists to prevent, arriving through the other
+        // tier. A Tier-B *route* has no entry in the map (the collector starts
+        // at the root's children), so it is untouched and still anchors at the
+        // shell, exactly as before.
+        for node in &mut tier_b {
             if node.position.parent_placeholder.is_none()
                 && route_island_map.contains_key(&node.component_id)
             {
@@ -966,20 +980,25 @@ impl<'a> ManifestBuilder<'a> {
                 continue;
             }
             match self.tier_of(id) {
-                // An island boundary: anchor it inline, and stop — its own
-                // subtree belongs to the island, not to the enclosing render.
-                Some(Tier::C) => {
+                // A deferred boundary: anchor it inline, and stop — its own
+                // subtree belongs to that node, not to the enclosing render.
+                //
+                // Both tiers, and the placeholder id must match the one
+                // `traverse` mints for the node, or the serve path replaces
+                // nothing and the hole stays empty forever.
+                Some(tier @ (Tier::B | Tier::C)) => {
                     let component = self.component_or_panic(id);
+                    let prefix = if tier == Tier::B { 'b' } else { 'c' };
                     map.insert(
                         component.name.clone(),
                         format!(
-                            "__c_{}_{}",
+                            "__{prefix}_{}_{}",
                             slugify(component.name.as_str()),
                             component.id.as_u64()
                         ),
                     );
                 }
-                Some(Tier::A) | Some(Tier::B) => {
+                Some(Tier::A) => {
                     for child in self.sorted_children(id) {
                         stack.push(child);
                     }
@@ -1501,13 +1520,24 @@ impl<'a> ManifestBuilder<'a> {
         self.metadata.get(&id).map(|entry| entry.tier)
     }
 
-    /// Names of every Tier-C component — the hydration islands a Tier-A parent
-    /// must NOT inline. Drives the `install_island_skip_set` guard around the
-    /// static render pass.
-    fn tier_c_component_names(&self) -> std::collections::HashSet<String> {
+    /// Names of every component a Tier-A parent must NOT inline: Tier-C
+    /// hydration islands **and Tier-B nodes**. Drives the
+    /// `install_island_skip_set` guard around the static render pass.
+    ///
+    /// Tier B belongs here for the same reason Tier C does, and its absence was
+    /// a bug with the same shape: a Tier-B child inlined into its parent's
+    /// static HTML *and* anchored at its own placeholder renders twice. Worse
+    /// than for an island, because the two copies disagree — the inline one is
+    /// numbered by the route render's element counter and the chunk by the
+    /// component's own, so the opcode frame built against the component names
+    /// ids that exist in neither, and every `BindEvent` on the page is dropped.
+    /// It stayed invisible while the only Tier-B components anyone shipped were
+    /// whole routes (nothing to inline them into) or form-driven (bound by
+    /// attribute, never by `BindEvent`).
+    fn deferred_component_names(&self) -> std::collections::HashSet<String> {
         self.components
             .iter()
-            .filter(|(id, _)| self.tier_of(**id) == Some(Tier::C))
+            .filter(|(id, _)| matches!(self.tier_of(**id), Some(Tier::B) | Some(Tier::C)))
             .map(|(_, component)| component.name.clone())
             .collect()
     }

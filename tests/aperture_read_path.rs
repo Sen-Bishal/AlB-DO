@@ -111,6 +111,7 @@ async fn a_declared_source_read_survives_every_stage() {
     let transport = Arc::new(CountingTransport::always(WireResponse {
         status: 200,
         body: br#"{"stargazers_count":42}"#.to_vec(),
+        headers: Vec::new(),
         etag: Some("\"v1\"".to_string()),
         last_modified: None,
         content_type: Some("application/json".to_string()),
@@ -208,6 +209,7 @@ async fn two_spellings_of_one_resource_are_one_topic_and_one_request() {
     let transport = Arc::new(CountingTransport::always(WireResponse {
         status: 200,
         body: br#"{"n":1}"#.to_vec(),
+        headers: Vec::new(),
         etag: Some("\"v1\"".to_string()),
         last_modified: None,
         content_type: Some("application/json".to_string()),

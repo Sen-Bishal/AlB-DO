@@ -328,7 +328,14 @@ fn boot_inner(
         }
     }
 
+    // APERTURE · § 11 R8. The manifest's `build_id` is derived from the build's
+    // inputs, so it survives a restart of the same build and changes on a
+    // rebuild — which is exactly what a journal resumed from disk (A3) has to
+    // compare against. Read before `renderer` is moved into the builder.
+    let build_id = renderer.manifest().build_id.clone();
+
     let mut builder = AlbedoServerBuilder::new(app_config)
+        .with_build_id(build_id)
         .with_renderer_runtime(renderer)
         .with_forge_schema(forge_schema)
         .with_dev_mode(opts.dev_mode)

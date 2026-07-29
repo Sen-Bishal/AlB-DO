@@ -284,13 +284,28 @@ impl EgressPolicy {
     /// Scheme and host checks, run on the request path where the full URL is
     /// still available.
     ///
-    /// Address classes are **not** checked here — see the module docs. This
-    /// returning `Ok` does not mean the request will connect; it means nothing
-    /// about the URL itself is disqualifying.
+    /// For a URL naming a **hostname**, address classes are not checked here —
+    /// see the module docs; the resolver is where they belong, and this
+    /// returning `Ok` does not mean the request will connect.
+    ///
+    /// For a URL naming an **IP literal** they are checked here, because
+    /// otherwise nothing checks them at all. A resolver only runs when there is
+    /// a name to resolve: `http://169.254.169.254/` gives `reqwest` an authority
+    /// it can turn into a socket address directly, so [`ApertureResolver`] is
+    /// never consulted and the entire address-class deny is skipped.
+    ///
+    /// [`ApertureResolver`]: crate::aperture::transport::ApertureResolver
+    ///
+    /// This was reachable only from a bare `fetch()` in an action body — the
+    /// declared read path builds every URL from a `base`, and a `base` that is
+    /// an IP literal is an author declaring exactly that address. So it became
+    /// live with APERTURE A2's server seam, which is the change that first let
+    /// userland name a URL. § 8: *the metadata-endpoint deny is not optional.*
     ///
     /// # Errors
     /// [`EgressDenial::Scheme`] for a non-HTTP scheme, [`EgressDenial::NoHost`]
-    /// when the URL carries no host.
+    /// when the URL carries no host, [`EgressDenial::Address`] for an
+    /// undeclared IP literal in a refused class.
     pub fn check_url(&self, url: &Url) -> Result<(), EgressDenial> {
         match url.scheme() {
             "http" | "https" => {}
@@ -300,10 +315,19 @@ impl EgressPolicy {
                 })
             }
         }
-        if url.host_str().is_none() {
+        let Some(host) = url.host_str() else {
             return Err(EgressDenial::NoHost);
+        };
+
+        // `Url::host()` has already parsed the authority, so the literal case is
+        // a match rather than a re-parse — and matching on the parsed form is
+        // what makes this correct for the spellings a string test would miss:
+        // `[::1]`, `[::ffff:127.0.0.1]`, and IPv4 in any of its accepted forms.
+        match url.host() {
+            Some(url::Host::Ipv4(addr)) => self.check_address(host, IpAddr::V4(addr)),
+            Some(url::Host::Ipv6(addr)) => self.check_address(host, IpAddr::V6(addr)),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// Whether a resolved address may be connected to on behalf of `host`.
@@ -412,6 +436,79 @@ mod tests {
     fn public_addresses_are_not_classified() {
         assert_eq!(classify(v4("93.184.216.34")), None);
         assert_eq!(classify(v4("2606:2800:220:1:248:1893:25c8:1946")), None);
+    }
+
+    /// **The bypass this check exists for.**
+    ///
+    /// A resolver only runs when there is a name to resolve, so every
+    /// address-class deny in this module was unreachable for a URL that named an
+    /// address directly. `classify` was right the whole time and nothing ever
+    /// asked it. Found by driving a real `albedo serve` — the unit tests all
+    /// passed, because each one called `check_address` itself.
+    #[test]
+    fn an_ip_literal_url_is_classified_by_check_url_because_no_resolver_will_see_it() {
+        let policy = EgressPolicy::new(EgressMode::Serve);
+
+        for refused in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:4599/charge",
+            "http://10.0.0.5/internal",
+            "http://192.168.1.1/",
+            "http://[::1]:8080/",
+            "http://[fd00::1]/",
+            // The mapped and compatible spellings of the metadata endpoint,
+            // which `classify` already handled and nothing routed to it.
+            "http://[::ffff:169.254.169.254]/",
+        ] {
+            let url = Url::parse(refused).expect("parses");
+            assert!(
+                matches!(
+                    policy.check_url(&url),
+                    Err(EgressDenial::Address { .. })
+                ),
+                "serve must refuse {refused}"
+            );
+        }
+
+        // A public literal is fine — the rule is the address class, not the
+        // spelling.
+        assert!(policy
+            .check_url(&Url::parse("http://93.184.216.34/").unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn a_hostname_url_is_still_left_to_the_resolver() {
+        // The split the module docs describe has to survive the fix: checking a
+        // *name* here would mean resolving it here, and resolving it twice is
+        // the DNS-rebinding window `ApertureResolver` exists to close.
+        let policy = EgressPolicy::new(EgressMode::Serve);
+        assert!(policy
+            .check_url(&Url::parse("http://localhost:4599/charge").unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn a_declared_literal_and_dev_mode_both_still_pass() {
+        // A `base` that names an address is an author declaring that address,
+        // which is the same authority a declared hostname carries.
+        let declared =
+            EgressPolicy::with_declared_hosts(EgressMode::Serve, ["127.0.0.1"]);
+        assert!(declared
+            .check_url(&Url::parse("http://127.0.0.1:4599/charge").unwrap())
+            .is_ok());
+        assert!(
+            matches!(
+                declared.check_url(&Url::parse("http://10.0.0.5/").unwrap()),
+                Err(EgressDenial::Address { .. })
+            ),
+            "declaring one address must not vouch for another"
+        );
+
+        let dev = EgressPolicy::new(EgressMode::Dev);
+        assert!(dev
+            .check_url(&Url::parse("http://127.0.0.1:4599/charge").unwrap())
+            .is_ok());
     }
 
     #[test]

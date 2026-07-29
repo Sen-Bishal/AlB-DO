@@ -279,6 +279,7 @@ mod tests {
         WireResponse {
             status: 200,
             body: body.as_bytes().to_vec(),
+            headers: Vec::new(),
             etag: Some(etag.to_string()),
             last_modified: None,
             content_type: Some("application/json".to_string()),
@@ -415,6 +416,7 @@ mod tests {
         let transport = Arc::new(CountingTransport::always(WireResponse {
             status: 200,
             body: b"<html>nope</html>".to_vec(),
+            headers: Vec::new(),
             etag: None,
             last_modified: None,
             content_type: Some("text/html".to_string()),
@@ -435,6 +437,7 @@ mod tests {
         let transport = Arc::new(CountingTransport::always(WireResponse {
             status: 404,
             body: br#"{"message":"Not Found"}"#.to_vec(),
+            headers: Vec::new(),
             etag: None,
             last_modified: None,
             content_type: Some("application/json".to_string()),

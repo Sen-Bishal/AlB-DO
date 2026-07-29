@@ -90,6 +90,18 @@ pub(crate) struct LiveRuntime {
     /// response cache — re-minting it on every file save would make every source
     /// cold on every keystroke and hammer the upstream while an author types.
     source_reader: Arc<std::sync::OnceLock<Arc<dom_render_compiler::aperture::SourceReader>>>,
+    /// APERTURE A2 · the outbound client an action body's `fetch()` goes
+    /// through. Always present after `build()`.
+    ///
+    /// Separate from `source_reader` because it must exist for an app that
+    /// declared no `sources` at all — a bare `fetch()` is § 6's escape hatch and
+    /// does not require a declaration — but it is the **same client** when there
+    /// is a reader, so a declared host's connection pool, its egress allowlist
+    /// and a bare call's are one thing rather than two that can disagree.
+    ///
+    /// Live state, not build output: it owns a connection pool, so re-minting it
+    /// on every dev file save would drop every keep-alive an author is watching.
+    aperture_client: Arc<std::sync::OnceLock<Arc<dom_render_compiler::aperture::ApertureClient>>>,
 }
 
 impl LiveRuntime {
@@ -103,13 +115,35 @@ impl LiveRuntime {
             row_projector: Arc::new(std::sync::RwLock::new(None)),
             forge_schema: Arc::new(dom_render_compiler::forge::ForgeSchema::guestbook_default()),
             source_reader: Arc::new(std::sync::OnceLock::new()),
+            aperture_client: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
     /// Install the APERTURE read path. Idempotent; a second call is ignored, so
     /// a dev world swap cannot replace a warm cache with a cold one.
+    ///
+    /// Also adopts the reader's client as the workflow client, unless one is
+    /// already installed. One statement of intent: the `sources` block is what
+    /// derives the egress allowlist (invariant 2.7), and a workflow reaching a
+    /// declared host through a *different* policy object would be a second place
+    /// for that intent to live.
     fn install_source_reader(&self, reader: Arc<dom_render_compiler::aperture::SourceReader>) {
+        let _ = self.aperture_client.set(Arc::clone(reader.client()));
         let _ = self.source_reader.set(reader);
+    }
+
+    /// Install the outbound client for action-body `fetch()`. Idempotent, on the
+    /// same terms as the reader.
+    fn install_aperture_client(
+        &self,
+        client: Arc<dom_render_compiler::aperture::ApertureClient>,
+    ) {
+        let _ = self.aperture_client.set(client);
+    }
+
+    /// The workflow client, if one has been installed.
+    fn aperture_client(&self) -> Option<&Arc<dom_render_compiler::aperture::ApertureClient>> {
+        self.aperture_client.get()
     }
 
     /// The installed APERTURE read path, if the app declared any sources.
@@ -312,6 +346,12 @@ struct CompiledProjectActionAdapter {
     /// adapter the live instances, never a rebuilt-empty registry or an
     /// unfilled substrate cell. See [`LiveRuntime`].
     live: LiveRuntime,
+    /// APERTURE A2 · the build this adapter belongs to (§ 11 R8).
+    ///
+    /// Build output, so it lives here and not on [`LiveRuntime`] — a dev reload
+    /// mints new adapters and this value goes with them, which is exactly what
+    /// makes it a *different* build.
+    build_id: Arc<str>,
 }
 
 #[async_trait::async_trait]
@@ -332,49 +372,110 @@ impl ActionHandler for CompiledProjectActionAdapter {
             slots.store().clone(),
         );
 
-        // A1 · QuickJS path (scaffolding, opt-in). When a pool is wired, ship
-        // the action to a pooled engine on its dedicated thread: the closure
-        // gets `&mut QuickJsEngine`, runs the same broadcast-aware executor, and
-        // its `Vec<Instruction>` result is returned across the thread boundary.
-        // Everything captured is `Send` (Arc clones + an owned envelope clone).
+        // A1 · QuickJS path. When a pool is wired, ship the action to a pooled
+        // engine on its dedicated thread: the closure gets `&mut QuickJsEngine`,
+        // runs the broadcast-aware executor, and its result crosses back over
+        // the thread boundary. Everything captured is `Send` (Arc clones + an
+        // owned envelope clone).
+        //
+        // APERTURE A2 · and it runs **one pass**, not one dispatch. A body that
+        // called out comes back suspended with its requests staged; the engine
+        // is checked back in, the round trip happens with nothing checked out,
+        // and the body runs again against a journal that answers it. That is
+        // invariant 2.6 — the seam where the engine is either released across
+        // the RTT or quietly held — and gate 5 measured the difference at
+        // 403.9 ms against 52.7 ms, peak 2 engines in flight against 16.
+        //
+        // The loop belongs here because resolving is async and dispatch is not.
+        // `drive_workflow` owns the caps, the ordering and the commit rule; this
+        // closure owns only "run one pass on an engine".
         if let Some(pool) = &self.engine_pool {
-            let project = self.project.clone();
-            let broadcast = self.live.broadcast.clone();
-            let envelope = envelope.clone();
             let action_id = self.action_id;
+            let Some(client) = self.live.aperture_client() else {
+                return Err(RuntimeError::RequestHandling(format!(
+                    "action {action_id} cannot run: no APERTURE client is installed, so an \
+                     outbound fetch() has nothing to send it. This is a server construction \
+                     bug — `build()` installs one."
+                )));
+            };
 
-            // FORGE · the write collector is a THREAD-LOCAL, and the body runs on
-            // the pool's own engine thread — so it must be installed inside this
-            // closure, not around the `await`. Installing it out here would leave
-            // an `append()` recording into a collector on the wrong thread, i.e.
-            // silently discarding a durable write.
-            //
-            // `ForgeWrite` is plain data (String + serde_json Map), so the
-            // recorded intents cross back over the thread boundary with the
-            // instructions and are applied below, where we are async again.
-            let (instructions, writes) = pool
-                .with_engine(move |engine| {
-                    let collector = dom_render_compiler::forge::install_forge_write_collector();
-                    let instructions = project
-                        .invoke_action_quickjs_with_broadcast(
-                            engine,
-                            &envelope,
-                            &view,
-                            broadcast.as_ref(),
-                        )
+            // The workflow id is half of every derived idempotency key
+            // (§ 5.3, `{workflow}:{step}`), so it is minted per dispatch and
+            // never reused. Two clicks are two intentions and must not
+            // deduplicate against each other; a *retry inside one* dispatch
+            // reuses the key, which is the case the header exists for.
+            let workflow_id = format!("w_{}", uuid::Uuid::new_v4().simple());
+            let mut journal = dom_render_compiler::aperture::Journal::new(
+                workflow_id,
+                self.build_id.as_ref(),
+            );
+
+            let (instructions, writes) = dom_render_compiler::aperture::drive_workflow(
+                client.as_ref(),
+                &mut journal,
+                &dom_render_compiler::aperture::WorkflowLimits::default(),
+                self.build_id.as_ref(),
+                |seeded| {
+                    // Cloned per pass, outside the async block, so the future
+                    // owns everything and borrows neither `self` nor the pool.
+                    let pool = Arc::clone(pool);
+                    let project = self.project.clone();
+                    let broadcast = self.live.broadcast.clone();
+                    let envelope = envelope.clone();
+                    // Two `Arc` bumps. The view must be cloned rather than moved
+                    // because a suspended body will need it again.
+                    let view = view.clone();
+
+                    async move {
+                        pool.with_engine(move |engine| {
+                            // FORGE · the write collector is a THREAD-LOCAL and
+                            // the body runs on the pool's own engine thread, so
+                            // it must be installed inside this closure. Around
+                            // the `await` it would leave an `append()` recording
+                            // into a collector on the wrong thread — silently
+                            // discarding a durable write.
+                            //
+                            // Installed per *pass*, which is what makes the
+                            // discard rule work: a pass that suspends hands its
+                            // intents back and `drive_workflow` drops them, on
+                            // the same terms `__albedo_effects` is rebuilt.
+                            let collector =
+                                dom_render_compiler::forge::install_forge_write_collector();
+                            let pass = project.invoke_action_quickjs_pass(
+                                engine,
+                                &envelope,
+                                &view,
+                                Some(broadcast.as_ref()),
+                                Some(&seeded),
+                            );
+                            // `ForgeWrite` is plain data, so the recorded
+                            // intents cross back over the thread boundary.
+                            pass.map(|pass| (pass, collector.take())).map_err(|err| {
+                                format!(
+                                    "compiled action handler {action_id} (quickjs) failed: {err:#}"
+                                )
+                            })
+                        })
+                        .await
                         .map_err(|err| {
-                            RuntimeError::RequestHandling(format!(
-                                "compiled action handler {action_id} (quickjs) failed: {err:#}"
-                            ))
-                        })?;
-                    Ok::<_, RuntimeError>((instructions, collector.take()))
-                })
-                .await
-                .map_err(|err| {
-                    RuntimeError::RequestHandling(format!(
-                        "engine pool checkout for action {action_id} failed: {err}"
-                    ))
-                })??;
+                            format!("engine pool checkout for action {action_id} failed: {err}")
+                        })
+                        .and_then(|inner| inner)
+                        .map_err(dom_render_compiler::aperture::WorkflowError::Pass)
+                    }
+                },
+            )
+            .await
+            .map_err(|err| RuntimeError::RequestHandling(err.to_string()))?;
+
+            if !journal.is_empty() {
+                debug!(
+                    target: "albedo.aperture",
+                    action_id,
+                    steps = journal.len(),
+                    "action completed a workflow"
+                );
+            }
 
             if !writes.is_empty() {
                 let substrate = self.live.forge_substrate.get().ok_or_else(|| {
@@ -646,6 +747,12 @@ pub struct AlbedoServerBuilder {
     /// components are driveable from text bindings alone. `None` keeps the A3
     /// whole-component island path for every route.
     reactive_project: Option<Arc<dom_render_compiler::runtime::CompiledProject>>,
+    /// APERTURE A2 · the id every adapter stamps on the workflows it starts
+    /// (§ 11 R8). Set from the manifest's `build_id` by [`Self::with_build_id`];
+    /// otherwise a marker that names its own absence, because a build id that
+    /// silently defaulted to `""` would compare equal across two builds and the
+    /// check would pass by accident.
+    build_id: Option<String>,
 }
 
 impl AlbedoServerBuilder {
@@ -677,7 +784,38 @@ impl AlbedoServerBuilder {
             action_engine_pool: None,
             // Step 3 · set by `register_compiled_project`.
             reactive_project: None,
+            // APERTURE · set by `with_build_id` from the manifest.
+            build_id: None,
         }
+    }
+
+    /// APERTURE A2 · the build id workflows started by this server are stamped
+    /// with (§ 11 R8).
+    ///
+    /// Pass the manifest's `build_id`: it is derived from the build's inputs, so
+    /// it is the same across a restart of the same build and different across a
+    /// rebuild — which is the property A3 needs when it resumes a journal it
+    /// read back from disk.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
+        self.build_id = Some(build_id.into());
+        self
+    }
+
+    /// APERTURE · install the client an action body's `fetch()` goes out
+    /// through, overriding the one [`Self::build`] would otherwise mint.
+    ///
+    /// Two callers: a test that wants a `CountingTransport` instead of a socket,
+    /// and any embedder that wants its own egress policy. When a source reader
+    /// is installed this is redundant — the reader's own client is adopted, so
+    /// declared reads and bare calls share one policy.
+    #[must_use]
+    pub fn with_aperture_client(
+        self,
+        client: Arc<dom_render_compiler::aperture::ApertureClient>,
+    ) -> Self {
+        self.live.install_aperture_client(client);
+        self
     }
 
     /// A1 · route compiled action bodies through a pool of warmed QuickJS
@@ -874,6 +1012,16 @@ impl AlbedoServerBuilder {
         // clone; the same instance drives render bindings + action dispatch).
         self.reactive_project = Some(project.clone());
 
+        // APERTURE · one allocation for the whole registration rather than one
+        // per adapter. `<no-build-id>` is deliberately not the empty string: two
+        // builds that both defaulted to `""` would compare equal and R8's check
+        // would pass without ever having been configured.
+        let build_id: Arc<str> = Arc::from(
+            self.build_id
+                .as_deref()
+                .unwrap_or("<no-build-id>"),
+        );
+
         for proxy_id in project.handler_proxy_ids() {
             let adapter = CompiledProjectActionAdapter {
                 project: project.clone(),
@@ -887,6 +1035,7 @@ impl AlbedoServerBuilder {
                 // the substrate cell `run()` fills, and the projector slot
                 // `build()` installs. Reused across a dev reload.
                 live: self.live.clone(),
+                build_id: Arc::clone(&build_id),
             };
             self.action_handlers.insert(proxy_id, Arc::new(adapter));
         }
@@ -1051,6 +1200,41 @@ impl AlbedoServerBuilder {
 
     pub fn build(self) -> Result<AlbedoServer, RuntimeError> {
         self.config.validate()?;
+
+        // APERTURE · an action body's `fetch()` needs a client whether or not
+        // the app declared any `sources` — a bare call is § 6's escape hatch, not
+        // a declared read. `install_*` is idempotent, so a reader's client (or a
+        // test's) already installed above wins and this is a no-op.
+        //
+        // Failing the boot rather than degrading: a server that could not build
+        // an HTTP client is a server on which every outbound call will fail, and
+        // discovering that on the first user click is strictly worse than
+        // discovering it at startup.
+        if self.live.aperture_client().is_none() {
+            let mode = if self.dev_mode_enabled.unwrap_or(false) {
+                dom_render_compiler::aperture::EgressMode::Dev
+            } else {
+                dom_render_compiler::aperture::EgressMode::Serve
+            };
+            let policy = Arc::new(dom_render_compiler::aperture::EgressPolicy::new(mode));
+            let transport =
+                dom_render_compiler::aperture::ReqwestTransport::new(Arc::clone(&policy)).map_err(
+                    |err| {
+                        RuntimeError::ServerStartup(format!(
+                            "could not build the APERTURE outbound client: {err}"
+                        ))
+                    },
+                )?;
+            self.live.install_aperture_client(Arc::new(
+                dom_render_compiler::aperture::ApertureClient::new(
+                    Arc::new(transport),
+                    Arc::new(dom_render_compiler::aperture::ResponseCache::new(
+                        dom_render_compiler::aperture::DEFAULT_RESPONSE_BUDGET,
+                    )),
+                    policy,
+                ),
+            ));
+        }
 
         let router = CompiledRouter::from_route_and_layout_specs(
             self.config.routes.as_slice(),

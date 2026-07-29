@@ -1218,9 +1218,26 @@ impl Drop for IslandPlaceholderGuard {
     }
 }
 
-/// Return the inline placeholder id for a Tier-C island by name, when a map is
-/// installed and contains it. `None` everywhere else — so an island outside any
-/// installed map keeps the historical emit-nothing behavior.
+/// The tier a placeholder id belongs to, read off the prefix the manifest
+/// builder minted it with (`__b_…` / `__c_…`).
+///
+/// Not a heuristic over a name: those two prefixes are written by two `format!`
+/// calls in `manifest::builder`, and the prefix is the *only* thing that
+/// distinguishes them — so reading it back is reading the same fact, not
+/// guessing at one. Anything else defaults to `c`, which is where this
+/// mechanism started and the only tier that existed when it did.
+fn placeholder_tier(placeholder_id: &str) -> char {
+    if placeholder_id.starts_with("__b_") {
+        'b'
+    } else {
+        'c'
+    }
+}
+
+/// Return the inline placeholder id for a deferred child (Tier-B or a Tier-C
+/// island) by name, when a map is installed and contains it. `None` everywhere
+/// else — so a component outside any installed map keeps the historical
+/// emit-nothing behavior.
 fn island_placeholder_for(name: &str) -> Option<String> {
     ISLAND_PLACEHOLDERS.with(|cell| match cell.get() {
         // Safety: same stack-frame contract as the other Phase K thread-locals.
@@ -3536,11 +3553,12 @@ impl ComponentProject {
             if island_skip_contains(&tag) {
                 if let Some(placeholder_id) = island_placeholder_for(&tag) {
                     // Emit RAW (no escaping): the serve path string-replaces this
-                    // exact div, and placeholder ids are always `__c_<slug>_<id>`
-                    // (no markup-significant chars), so escaping would only risk
-                    // a mismatch.
+                    // exact div, and placeholder ids are always
+                    // `__<tier>_<slug>_<id>` (no markup-significant chars), so
+                    // escaping would only risk a mismatch.
+                    let tier = placeholder_tier(&placeholder_id);
                     return Ok(format!(
-                        "<div id=\"{placeholder_id}\" data-albedo-tier=\"c\"></div>"
+                        "<div id=\"{placeholder_id}\" data-albedo-tier=\"{tier}\"></div>"
                     ));
                 }
                 return Ok(String::new());

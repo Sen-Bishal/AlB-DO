@@ -463,6 +463,21 @@ pub struct TierBEntryPlan {
     /// from this map is treated as [`RowProjection::WholeView`] — the
     /// always-correct whole-view render.
     pub shared_topic_classes: HashMap<String, RowProjection>,
+    /// Absolute module specifier → the **project-relative** spec its rendered
+    /// `data-albedo-id` anchors are keyed to.
+    ///
+    /// Two strings for one module because they answer different questions. The
+    /// specifier is what imports resolve against, so it is the absolute path the
+    /// manifest carries. An anchor id is `fnv1a_32("{spec}#{n}")` and has to hash
+    /// the string the *pure-Rust* renderer hashed when it built this component's
+    /// opcode frame — project-relative, and deliberately not machine-specific.
+    /// Feed the engine the wrong one and every `BindEvent` in the frame names an
+    /// element that does not exist.
+    ///
+    /// A module with no entry here is stamped with nothing, which is the correct
+    /// degradation: no anchors is what shipped before, and a *wrong* anchor would
+    /// be worse than none.
+    pub stamp_specs: HashMap<String, String>,
 }
 
 /// Map from a `TierBNode.render_fn` (e.g. `"render::Stats"`) to its boot-built
@@ -763,12 +778,20 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
             .with_engine(move |engine| -> Result<String, ComponentRenderFailure> {
                 use dom_render_compiler::runtime::engine::RuntimeEngine;
                 for (specifier, code) in &plan.modules {
-                    engine.load_module(specifier, code).map_err(|err| {
-                        ComponentRenderFailure {
+                    // With the stamp spec, so this render's markup carries the
+                    // same `data-albedo-id`s the component's opcode frame names.
+                    // Without it the chunk is unaddressable and every
+                    // `BindEvent` in the frame throws.
+                    engine
+                        .load_module_with_spec(
+                            specifier,
+                            code,
+                            plan.stamp_specs.get(specifier).map(String::as_str),
+                        )
+                        .map_err(|err| ComponentRenderFailure {
                             thrown_message: err.thrown_message(),
                             diagnostic: err.to_string(),
-                        }
-                    })?;
+                        })?;
                 }
                 engine
                     .render_component_with_host(&plan.entry, &props_json, &host_json)
@@ -932,6 +955,7 @@ mod tests {
                 shared_partitions: Vec::new(),
                 shared_sources: Vec::new(),
                 shared_topic_classes: HashMap::new(),
+                stamp_specs: HashMap::new(),
             }
         }
 
@@ -1052,6 +1076,7 @@ mod tests {
                     param: "id".to_string(),
                 }],
                 shared_topic_classes: HashMap::new(),
+                stamp_specs: HashMap::new(),
             }
         }
 
