@@ -2,7 +2,7 @@ use dom_render_compiler::bundler::emit::{
     emit_bundle_artifacts_to_dir, emit_bundle_artifacts_to_dir_with_sources, emit_bundle_plan_json,
     emit_bundle_runtime_map_json, emit_precompiled_runtime_modules_json,
     emit_route_prefetch_manifest_json, emit_static_slices_json, emit_vendor_chunk_modules,
-    emit_wrapper_modules, BUNDLE_PLAN_FILENAME, BUNDLE_PRECOMPILED_MODULES_FILENAME,
+    BUNDLE_PLAN_FILENAME, BUNDLE_PRECOMPILED_MODULES_FILENAME,
     BUNDLE_ROUTE_PREFETCH_MANIFEST_FILENAME, BUNDLE_RUNTIME_MAP_FILENAME,
     BUNDLE_STATIC_SLICES_FILENAME, BUNDLE_WT_BOOTSTRAP_FILENAME,
 };
@@ -176,67 +176,38 @@ fn snapshot_artifacts(root: &Path) -> BTreeMap<String, Vec<u8>> {
     files
 }
 
+/// Replaces `test_wrapper_sources_match_golden_fixtures`, which asserted the
+/// *contents* of `__albedo__/wrappers/*.mjs` against golden fixtures
+/// (`home_wrapper.mjs`, `header_wrapper.mjs`, both now deleted). Those files
+/// are no longer written at all — nothing loaded them, and each embedded the
+/// build machine's absolute source path. The invariant worth keeping is the
+/// negative one: a build must not put the developer's directory layout in the
+/// output tree.
 #[test]
-fn test_wrapper_sources_match_golden_fixtures() {
+fn no_wrapper_module_is_emitted_and_no_absolute_path_leaks() {
     let plan = build_bundle_plan(&fixture_manifest(), &BundlePlanOptions::default());
-    let wrappers = emit_wrapper_modules(&plan);
+    let out = tempdir().unwrap();
+    emit_bundle_artifacts_to_dir(&plan, out.path()).unwrap();
 
-    let home_wrapper_path = plan
-        .modules
-        .iter()
-        .find(|module| module.module_path == "src/routes/home.tsx")
-        .expect("home module should exist")
-        .wrapper_module_path
-        .clone();
-    let header_wrapper_path = plan
-        .modules
-        .iter()
-        .find(|module| module.module_path == "src/components/header.tsx")
-        .expect("header module should exist")
-        .wrapper_module_path
-        .clone();
+    let snapshot = snapshot_artifacts(out.path());
 
-    let home_source = wrappers
-        .get(&home_wrapper_path)
-        .expect("home wrapper source should exist");
-    let header_source = wrappers
-        .get(&header_wrapper_path)
-        .expect("header wrapper source should exist");
+    assert!(
+        !snapshot
+            .keys()
+            .any(|path| path.starts_with("__albedo__/wrappers/")),
+        "wrapper modules must not be emitted; found: {:?}",
+        snapshot.keys().collect::<Vec<_>>()
+    );
 
-    // Phase M.4 · the wrapper now appends a `//# sourceMappingURL=`
-    // comment whose target name depends on the wrapper's stable
-    // hash. Compare the body (everything up to that comment)
-    // against the golden fixture, and assert the sourceMappingURL
-    // anchors the trailing `.mjs.map` file the bundler also emits.
-    let (home_body, home_map_line) = split_wrapper_at_sourcemap(home_source);
-    let (header_body, header_map_line) = split_wrapper_at_sourcemap(header_source);
-    assert_eq!(home_body, read_fixture("home_wrapper.mjs"));
-    assert_eq!(header_body, read_fixture("header_wrapper.mjs"));
-    assert!(home_map_line.ends_with(".mjs.map"));
-    assert!(header_map_line.ends_with(".mjs.map"));
-}
-
-/// Splits the wrapper source into (body, sourceMappingURL line). The
-/// body is everything before the comment, normalised for line
-/// endings; the sourceMappingURL line is the URL only, with the
-/// `//# sourceMappingURL=` prefix and any trailing newline
-/// stripped, so the caller can do a simple `.ends_with` check.
-fn split_wrapper_at_sourcemap(source: &str) -> (String, String) {
-    let normalised = normalize_newlines(source);
-    if let Some(idx) = normalised.find("//# sourceMappingURL=") {
-        let body = normalised[..idx].to_string();
-        let comment_line = normalised[idx..]
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim_end()
-            .to_string();
-        let url = comment_line
-            .trim_start_matches("//# sourceMappingURL=")
-            .to_string();
-        return (body, url);
+    // The wrapper was the only artifact that inlined an absolute source path.
+    // Guard the class, not just the one file that used to do it.
+    for (path, contents) in &snapshot {
+        let text = String::from_utf8_lossy(contents);
+        assert!(
+            !text.contains("C:/") && !text.contains("C:\\"),
+            "artifact {path} leaks an absolute build-host path"
+        );
     }
-    (normalised, String::new())
 }
 
 #[test]
@@ -306,13 +277,7 @@ fn test_emit_bundle_artifacts_is_byte_identical_across_runs() {
     assert!(snapshot_a.contains_key(BUNDLE_WT_BOOTSTRAP_FILENAME));
     assert!(snapshot_a
         .keys()
-        .any(|path| path.starts_with("__albedo__/wrappers/")));
-    assert!(snapshot_a
-        .keys()
         .any(|path| path.starts_with("__albedo__/vendor/")));
-    assert!(snapshot_a
-        .keys()
-        .any(|path| path.ends_with("_src_routes_home_tsx.mjs")));
 }
 
 #[test]

@@ -87,7 +87,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # System / utilities
 core_affinity = { version = "0.8" }
 num_cpus      = { version = "1" }
-sysinfo       = { version = "0.30" }
 rquickjs      = { version = "0.9" }
 time          = { version = "0.3", features = ["formatting"] }
 
@@ -113,7 +112,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 tempfile  = { version = "3" }
 regex     = { version = "1" }
 tower     = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["catch-panic"] }
+# `compression-gzip` is a *runtime* feature, not a test one: without it the
+# server ships ~96 KB of uncompressed client JS on every page. gzip rather than
+# brotli because `flate2` is one small crate and captures most of the ratio on
+# text; adding `compression-br` later is a one-word change here.
+tower-http = { version = "0.6", features = ["catch-panic", "compression-gzip"] }
 
 [workspace.lints.rust]
 unsafe_code      = "forbid"
@@ -197,7 +200,6 @@ tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 uuid.workspace               = true
-sysinfo.workspace            = true
 num_cpus.workspace           = true
 walkdir.workspace            = true
 notify.workspace             = true

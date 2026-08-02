@@ -15,8 +15,10 @@ use dom_render_compiler::budget::{
     compute_bundle_byte_report, evaluate_bundle_budget, format_report_pretty, BudgetDefaults,
     TierBudget, ViolationKind,
 };
-use dom_render_compiler::bundler::{build_bundle_plan, BundlePlanOptions};
-use dom_render_compiler::bundler::emit::{emit_bundle_artifacts_to_dir, EmittedArtifact};
+use dom_render_compiler::bundler::emit::{
+    emit_bundle_artifacts_to_dir, BundleEmitReport, EmittedArtifact,
+};
+use dom_render_compiler::bundler::{build_bundle_plan, BundlePlan, BundlePlanOptions};
 use dom_render_compiler::manifest::schema::{
     ComponentManifestEntry, HydrationMode, RenderManifestV2, Tier,
 };
@@ -61,6 +63,44 @@ fn small_tier_b_component_passes_default_bundle_ceiling() {
     );
 }
 
+/// Attaches a synthetic per-component artifact at the plan's wrapper path.
+///
+/// ⚠️ **These tests used to inflate an artifact the emit had really produced.**
+/// Wrapper modules are no longer written (they were unloaded by anything and
+/// leaked the build host's absolute paths), so there is nothing on disk to
+/// inflate and the byte source has to be injected.
+///
+/// That is not a testing inconvenience, it is the finding: `budget_bytes()` is
+/// `wrapper_bytes`, and a wrapper was a fixed 4-line trampoline whose length
+/// varied only with **how long the source file's path was**. The gate never
+/// measured a component's cost — it measured its path. So per-component bundle
+/// attribution is inert in a real build today, and these tests now cover the
+/// evaluator and its diff text *only*.
+///
+/// 🔗 The real number exists: `compile_client_island_module`, the same lowering
+/// item 4.6 used to replace the fabricated tier-report figure. Pointing
+/// attribution at it is the scoped follow-up (`OPTIMIZATIONS.md` § O.3).
+fn with_component_bytes(
+    emit_report: &BundleEmitReport,
+    plan: &BundlePlan,
+    component_id: u64,
+    bytes: usize,
+) -> BundleEmitReport {
+    let wrapper_path = plan
+        .modules
+        .iter()
+        .find(|m| m.component_id == component_id)
+        .map(|m| m.wrapper_module_path.clone())
+        .expect("component present in plan");
+
+    let mut inflated = emit_report.clone();
+    inflated.artifacts.push(EmittedArtifact {
+        relative_path: wrapper_path,
+        bytes,
+    });
+    inflated
+}
+
 #[test]
 fn oversized_tier_b_wrapper_trips_bundle_ceiling_with_actionable_diff() {
     let temp = tempdir().unwrap();
@@ -68,30 +108,9 @@ fn oversized_tier_b_wrapper_trips_bundle_ceiling_with_actionable_diff() {
     let plan = build_bundle_plan(&manifest, &BundlePlanOptions::default());
     let emit_report = emit_bundle_artifacts_to_dir(&plan, temp.path()).unwrap();
 
-    // The real emit produces a small wrapper (Phase J stub). For the
-    // gate test we mutate the artifact report to simulate a heavy
-    // import — the evaluator only cares about the reported bytes,
-    // not the file's actual on-disk size. This isolates the test
-    // from compiler-stage size estimates.
-    //
-    // Wrapper paths take the form `__albedo__/wrappers/{hash}_{slug}.mjs`
-    // — derive the exact path from the plan so we don't depend on
-    // hash stability across builds.
-    let wrapper_path = plan
-        .modules
-        .iter()
-        .find(|m| m.component_id == 2)
-        .map(|m| m.wrapper_module_path.clone())
-        .expect("BloatedIsland present in plan");
-
-    let mut inflated = emit_report.clone();
-    for artifact in inflated.artifacts.iter_mut() {
-        if artifact.relative_path == wrapper_path {
-            // 142 KB — the same number the sprint plan's lodash
-            // example uses, so the diff text matches the spec.
-            artifact.bytes = 142 * 1024;
-        }
-    }
+    // 142 KB — the same number the sprint plan's lodash example uses, so the
+    // diff text matches the spec.
+    let inflated = with_component_bytes(&emit_report, &plan, 2, 142 * 1024);
 
     let bundle_report = compute_bundle_byte_report(&inflated, &plan, &manifest);
     let budget = TierBudget::default();
@@ -130,19 +149,7 @@ fn raising_bundle_ceiling_via_budget_config_relaxes_the_gate() {
     let plan = build_bundle_plan(&manifest, &BundlePlanOptions::default());
     let emit_report = emit_bundle_artifacts_to_dir(&plan, temp.path()).unwrap();
 
-    let wrapper_path = plan
-        .modules
-        .iter()
-        .find(|m| m.component_id == 3)
-        .map(|m| m.wrapper_module_path.clone())
-        .expect("BigIsland present in plan");
-
-    let mut inflated = emit_report.clone();
-    for artifact in inflated.artifacts.iter_mut() {
-        if artifact.relative_path == wrapper_path {
-            artifact.bytes = 50 * 1024;
-        }
-    }
+    let inflated = with_component_bytes(&emit_report, &plan, 3, 50 * 1024);
 
     let bundle_report = compute_bundle_byte_report(&inflated, &plan, &manifest);
 
@@ -171,12 +178,8 @@ fn tier_a_and_tier_c_wrappers_are_never_flagged_by_bundle_gate() {
     let plan = build_bundle_plan(&manifest, &BundlePlanOptions::default());
     let emit_report = emit_bundle_artifacts_to_dir(&plan, temp.path()).unwrap();
 
-    let mut inflated = emit_report.clone();
-    for artifact in inflated.artifacts.iter_mut() {
-        if artifact.relative_path.ends_with(".mjs") && !artifact.relative_path.ends_with(".map") {
-            artifact.bytes = 250 * 1024;
-        }
-    }
+    let inflated = with_component_bytes(&emit_report, &plan, 1, 250 * 1024);
+    let inflated = with_component_bytes(&inflated, &plan, 2, 250 * 1024);
 
     let bundle_report = compute_bundle_byte_report(&inflated, &plan, &manifest);
     let report = evaluate_bundle_budget(&bundle_report, &TierBudget::default());

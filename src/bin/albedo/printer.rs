@@ -10,7 +10,32 @@ const MUTED: u8 = 245; // warm-neutral gray
 // — Tier A (static, settled) is deep gold, Tier C (live island) burns brightest.
 const TIER_LUMEN: [u8; 3] = [137, 179, 222];
 
-pub fn print_tier_report(report: &TierReport, root: &str) {
+/// Client bytes the build actually produced, as opposed to estimated.
+///
+/// `TierReport::tier_b_hydration_bytes` — which this replaces on the summary
+/// line — is a sum of `WeightEstimator::estimate`, i.e.
+/// `500 + imports*100 + name.len()*50 + …`. It is a proxy for source size and
+/// has no relationship to any byte the browser downloads. Worse, it was printed
+/// against Tier B, which ships **no** component JavaScript at all: a Tier-B
+/// component is rendered on the server and delivered as markup.
+///
+/// Every field here is measured from the build's own output, so a reader can
+/// check each one with `curl … | wc -c`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MeasuredBytes {
+    /// Sum of the compiled client-island module bytes across Tier-C
+    /// components — the real payload an island costs, straight from
+    /// `compile_client_island_module`, which is the same lowering the serve
+    /// path ships.
+    pub tier_c_island_bytes: u64,
+    /// Tier-C components whose island compiled and was measured.
+    pub tier_c_measured: usize,
+    /// Framework client runtime emitted to `_albedo/` — the shared cost every
+    /// live page pays regardless of how its components tiered.
+    pub runtime_bytes: u64,
+}
+
+pub fn print_tier_report(report: &TierReport, root: &str, measured: &MeasuredBytes) {
     println!();
     println!(
         "  {} {}  {}",
@@ -70,18 +95,57 @@ pub fn print_tier_report(report: &TierReport, root: &str) {
         report.tier_b_count,
         total,
         "B",
-        &format!(
-            "hydrated → {} payload",
-            dim(&format!("{:.1} kB", report.tier_b_hydration_bytes as f64 / 1024.0))
-        ),
+        &format!("server-rendered → {}", dim("zero JS")),
     );
-    print_tier_summary(
-        2,
-        report.tier_c_count,
-        total,
-        "C",
-        &format!("streamed → {}", dim("non-blocking")),
-    );
+    // Tier C is the only tier that ships component code, so it is the only one
+    // that gets a byte count.
+    //
+    // Reported as a ceiling (`<=`), and that is not hedging. A Tier-C component
+    // reaches the browser one of two ways, and only the server knows which:
+    // fully compiled as an island module, or — when the analysis proves it
+    // driveable from bindings alone — as the far smaller inline reactive
+    // payload. `build_reactive_blocks` makes that choice at boot, so at build
+    // time the compiled module is the honest upper bound. An island that failed
+    // to compile is excluded rather than estimated, so the figure never
+    // includes a guess.
+    let tier_c_hint = if measured.tier_c_measured == 0 {
+        format!("island → {}", dim("no island compiled"))
+    } else if measured.tier_c_measured < report.tier_c_count {
+        format!(
+            "island → {}",
+            dim(&format!(
+                "≤ {:.1} kB across {}/{} compiled",
+                measured.tier_c_island_bytes as f64 / 1024.0,
+                measured.tier_c_measured,
+                report.tier_c_count
+            ))
+        )
+    } else {
+        format!(
+            "island → {}",
+            dim(&format!(
+                "≤ {:.1} kB compiled",
+                measured.tier_c_island_bytes as f64 / 1024.0
+            ))
+        )
+    };
+    print_tier_summary(2, report.tier_c_count, total, "C", &tier_c_hint);
+
+    // The shared cost. Leaving it out is what made the per-tier numbers
+    // misleading even when they were right: a page can ship zero component
+    // bytes and still load the framework.
+    if measured.runtime_bytes > 0 {
+        println!();
+        println!(
+            "    {} {}  {}",
+            style_256("·", MUTED, false),
+            style("runtime", "1"),
+            dim(&format!(
+                "{:.1} kB framework client, shared by every route (gzipped on the wire)",
+                measured.runtime_bytes as f64 / 1024.0
+            )),
+        );
+    }
     println!();
 }
 

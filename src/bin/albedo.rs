@@ -7,7 +7,7 @@ use dom_render_compiler::bundler::BundlePlanOptions;
 use dom_render_compiler::dev_contract::{
     parse_dev_cli_args, resolve_dev_contract, ResolvedDevContract, DEV_CONFIG_TS,
 };
-use dom_render_compiler::manifest::schema::RenderManifestV2;
+use dom_render_compiler::manifest::schema::{RenderManifestV2, Tier};
 use dom_render_compiler::parser::ParsedComponent;
 use dom_render_compiler::scanner::{ProjectScanner, ScanFailure, ScanMode};
 use dom_render_compiler::types::TierReport;
@@ -414,6 +414,75 @@ fn enforce_budget_after_build(
             "s"
         }
     ))
+}
+
+/// Measure the client bytes this build actually produced.
+///
+/// Two numbers, both checkable by hand:
+///
+/// * **Tier-C island bytes** — each Tier-C component lowered through
+///   [`compile_client_island_module`], which is the *same* lowering
+///   `RendererRuntime::build_hydration_blocks` ships to the browser, so the
+///   count is the payload rather than a proxy for it. A component whose island
+///   fails to compile is skipped and reported as skipped; the total is then a
+///   floor, never a guess.
+/// * **Runtime bytes** — the framework client a rendered page actually loads,
+///   stat'd off disk. This is the cost a page pays no matter how its components
+///   tiered, and omitting it is what let a "zero JS" build still transfer ~96 KB
+///   of JavaScript.
+///
+/// The runtime set is read from the output directory rather than from
+/// [`BundleEmitReport`], which carries only the assets the bundler itself wrote
+/// (`wt-bootstrap.js`, `phosphor.js`) and not the ones copied out of the binary.
+/// Summing the report gave 39.9 kB against a real 93.9 kB — and a number that
+/// under-reports is worse than no number at all.
+///
+/// Deliberately *not* measured: the emitted `__albedo__/wrappers/*.mjs`. They
+/// are ~610-byte re-export shims pointing at absolute source paths, nothing in
+/// `assets/*.js` references them, and no browser loads one — counting them
+/// would swap one meaningless number for another.
+fn measure_client_bytes(
+    manifest: &RenderManifestV2,
+    module_sources: &HashMap<String, String>,
+    out_dir: &Path,
+) -> printer::MeasuredBytes {
+    use dom_render_compiler::runtime::quickjs_engine::compile_client_island_module;
+
+    let mut tier_c_island_bytes = 0u64;
+    let mut tier_c_measured = 0usize;
+
+    for component in &manifest.components {
+        if component.tier != Tier::C {
+            continue;
+        }
+        let Some(source) = module_sources.get(&component.module_path) else {
+            continue;
+        };
+        if let Ok(iife) = compile_client_island_module(&component.module_path, source, component.id)
+        {
+            tier_c_island_bytes = tier_c_island_bytes.saturating_add(iife.len() as u64);
+            tier_c_measured += 1;
+        }
+    }
+
+    // Exactly the three scripts `manifest::builder`'s shell emits a tag for
+    // (`runtime.js` and `link-forms.js` unconditionally, `wt-bootstrap.js` on a
+    // live route). Not the whole `_albedo/` directory: `bincode.js`,
+    // `phosphor.js` and `hydration.js` are imported on demand, so summing the
+    // folder would overstate by ~47 kB in the other direction.
+    const SHELL_RUNTIME_ASSETS: [&str; 3] =
+        ["runtime.js", "link-forms.js", "wt-bootstrap.js"];
+    let runtime_bytes = SHELL_RUNTIME_ASSETS
+        .iter()
+        .filter_map(|name| std::fs::metadata(out_dir.join("_albedo").join(name)).ok())
+        .map(|meta| meta.len())
+        .sum();
+
+    printer::MeasuredBytes {
+        tier_c_island_bytes,
+        tier_c_measured,
+        runtime_bytes,
+    }
 }
 
 /// Build the bundle-byte report by re-deriving the plan from the
@@ -1628,8 +1697,16 @@ fn collect_css_bundle_filtered(root: &Path, keep: impl Fn(&Path) -> bool) -> Str
     let mut out = String::new();
     for path in css_files {
         if let Ok(source) = std::fs::read_to_string(&path) {
+            // Project-relative, never absolute. This comment is inlined into a
+            // `<style>` block in **every route shell**, so an absolute path here
+            // does not sit in a build artifact — it is served to every visitor's
+            // browser, disclosing the author's directory layout on each page
+            // load. (Found 2026-08-03 while removing the wrapper modules, which
+            // leaked the same thing into files nobody ever fetched. This one
+            // ships.)
+            let display = path.strip_prefix(root).unwrap_or(path.as_path());
             out.push_str("\n/* ");
-            out.push_str(path.to_string_lossy().replace('\\', "/").as_str());
+            out.push_str(display.to_string_lossy().replace('\\', "/").as_str());
             out.push_str(" */\n");
             out.push_str(source.as_str());
             out.push('\n');
@@ -1943,9 +2020,10 @@ fn run_prod_build_with_budget(
                 &out_dir_for_closure,
             )
             .map_err(|err| format!("failed to emit production artifacts: {err}"))?;
-        Ok::<_, String>((manifest, tier_report, report, missing_sources))
+        let measured = measure_client_bytes(&manifest, &module_sources, &out_dir_for_closure);
+        Ok::<_, String>((manifest, tier_report, report, missing_sources, measured))
     };
-    let (mut manifest, tier_report, report, missing_sources) = if quiet {
+    let (mut manifest, tier_report, report, missing_sources, measured) = if quiet {
         build_work()?
     } else {
         with_spinner("compiling production bundle…", build_work)?
@@ -1955,7 +2033,7 @@ fn run_prod_build_with_budget(
     // of what the app compiled to (luminance bars per tier). Suppressed for
     // serve / dev (re)builds so a hot reload stays a single line.
     if show_tiers {
-        printer::print_tier_report(&tier_report, &contract.root.display().to_string());
+        printer::print_tier_report(&tier_report, &contract.root.display().to_string(), &measured);
     }
 
     // A4 · inline global CSS into every route shell so prod ships the

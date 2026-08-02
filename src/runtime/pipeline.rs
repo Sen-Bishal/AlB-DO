@@ -12,7 +12,7 @@ use super::webtransport::{
     FramePayload, LaneRenderedChunk, WTRenderMode, WTStreamRouter, WebTransportError,
     WebTransportFrame, WebTransportMuxer, WT_STREAM_SLOT_PATCHES,
 };
-use crate::analysis::adaptive::GranularityController;
+use crate::analysis::adaptive::should_parallelize;
 use crate::ir::opcode::{Instruction, InstructionRange, OpcodeFrame, StableId, SuspenseId};
 use crate::ir::wire::{self, WireError};
 use crate::graph::ComponentGraph;
@@ -89,8 +89,6 @@ pub struct FourLaneRuntimePipeline {
     // first tick floods the bitmap with bootstrap deltas. Co-designed
     // with the kernel; ship together.
     prev_source_hashes: Vec<u64>,
-    // Constructed once at pipeline build time — `new()` does sysinfo I/O.
-    granularity: GranularityController,
     // Optional core-pinned rayon pool; when present, `tick_frame` runs
     // inside `pool.install` so every lane worker stays on a fixed core.
     // `None` falls back to the global rayon pool with no behavior change.
@@ -178,7 +176,6 @@ impl FourLaneRuntimePipeline {
             columns,
             dirty_bitmap,
             prev_source_hashes,
-            granularity: GranularityController::new(),
             pinned_pool,
             frame_metrics,
             prev_intern_snapshot,
@@ -482,17 +479,14 @@ impl FourLaneRuntimePipeline {
 
     /// Recomputes per-slot `source_hashes` for every lane by folding the
     /// hot scheduling columns (`effects`, `priorities`, `phases`) into a
-    /// stable FxHash digest. Picks the rayon fan-out path when the
-    /// granularity controller expects parallelism to amortize, otherwise
+    /// stable FxHash digest. Picks the rayon fan-out path when
+    /// [`should_parallelize`] expects parallelism to amortize, otherwise
     /// drives each lane serially via `lane_column_pass_mut`.
     ///
     /// Pair with [`Self::reconcile_source_hashes`] to surface mutations:
     /// this pass writes the new digests, the reconcile diffs them.
     pub fn run_column_analysis_pass(&mut self) {
-        if self
-            .granularity
-            .should_parallelize(self.columns.len(), std::mem::size_of::<u64>())
-        {
+        if should_parallelize(self.columns.len(), std::mem::size_of::<u64>()) {
             self.columns.parallel_lane_column_pass(
                 |pass| recompute_lane_source_hashes(pass),
                 |pass| recompute_lane_source_hashes(pass),

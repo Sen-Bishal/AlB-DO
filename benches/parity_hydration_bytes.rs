@@ -1,23 +1,34 @@
 //! Phase P · Stream G — Hydration cost per Tier-B island.
 //!
 //! Measures the **bytes the browser downloads to make a single
-//! component interactive**: the wrapper module JS (`__albedo__/wrappers/*.mjs`)
-//! plus the bincode-encoded `OpcodeFrame` that Stream B baked into
-//! the manifest. This is the per-island incremental hydration cost
-//! over the Tier-A static shell.
+//! component interactive**: the bincode-encoded `OpcodeFrame` that
+//! Stream B baked into the manifest. This is the per-island
+//! incremental hydration cost over the Tier-A static shell.
+//!
+//! ⚠️ **This bench used to add the wrapper module JS
+//! (`__albedo__/wrappers/*.mjs`) to that total, and that was wrong** —
+//! no browser ever loaded a wrapper, so those bytes were never
+//! downloaded by anyone. They are no longer emitted at all (see
+//! `bundler::emit::emit_bundle_artifacts_to_dir_internal`), and the
+//! term is gone from the total here. The reported number went *down*
+//! as a result, which is the direction that costs us nothing — but it
+//! was reported as a download cost when it was not one, and that is
+//! the same defect the tier report had before item 4.6.
 //!
 //! The number maps onto "how big is your React island bundle" for
 //! Next.js / Remix. React's smallest hydrated counter shipping the
-//! framework runtime is typically 40+ KB; ALBEDO's wrapper is a
-//! 4-line trampoline (Stream F.1 design note) so the per-component
-//! cost is dominated by the opcode frame, which is bincode-encoded
-//! and typically under 200 bytes for a counter.
+//! framework runtime is typically 40+ KB; ALBEDO's per-component cost
+//! is the opcode frame, bincode-encoded and typically under 200 bytes
+//! for a counter.
+//!
+//! ⬜ **Still not counted, and it dominates:** the shared framework
+//! runtime every page pays regardless of tiering. Quote this number
+//! only alongside that one.
 //!
 //! Reproduce with:
 //!   cargo bench --bench parity_hydration_bytes
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use dom_render_compiler::bundler::rewrite::build_wrapper_module_source;
 use dom_render_compiler::ir::opcode::{
     Instruction, OpcodeFrame, ProxyId, SlotId, StableId, TagId,
 };
@@ -102,29 +113,18 @@ fn list_frame() -> OpcodeFrame {
     }
 }
 
-fn report_island_bytes(label: &str, source_module: &str, frame: &OpcodeFrame) {
-    let wrapper = build_wrapper_module_source(source_module);
+fn report_island_bytes(label: &str, frame: &OpcodeFrame) {
     let encoded = encode_frame(frame).expect("encode frame");
     let opcode_bytes = encoded.len();
-    let total = wrapper.len() + opcode_bytes;
-    eprintln!(
-        "  {label:<10} wrapper {wrapper:>4} B · opcodes {ops:>4} B · total {total:>5} B",
-        wrapper = wrapper.len(),
-        ops = opcode_bytes,
-        total = total,
-    );
+    eprintln!("  {label:<10} opcodes {ops:>4} B", ops = opcode_bytes);
 }
 
 fn print_hydration_summary() {
     eprintln!();
-    eprintln!("─── Phase P · G — Hydration bytes per island (wrapper JS + opcode frame) ───");
-    report_island_bytes(
-        "counter",
-        "src/components/Counter.tsx",
-        &counter_frame(),
-    );
-    report_island_bytes("form", "src/routes/login.tsx", &form_frame());
-    report_island_bytes("list", "src/routes/feed.tsx", &list_frame());
+    eprintln!("─── Phase P · G — Hydration bytes per island (opcode frame) ───");
+    report_island_bytes("counter", &counter_frame());
+    report_island_bytes("form", &form_frame());
+    report_island_bytes("list", &list_frame());
     eprintln!();
     eprintln!(
         "  Reference: React 18 minimal counter bundle (Next.js `app/`)\n  \
@@ -136,15 +136,13 @@ fn print_hydration_summary() {
 fn bench_hydration(c: &mut Criterion) {
     print_hydration_summary();
 
-    // Microbenchmark the wrapper-bytes computation + opcode encoding.
-    // The numbers above are the deliverable; this timing is here to
-    // round out the bench harness output.
-    c.bench_function("hydration_wrapper_plus_opcode_encode", |b| {
+    // Microbenchmark the opcode encoding. The numbers above are the
+    // deliverable; this timing is here to round out the bench harness output.
+    c.bench_function("hydration_opcode_encode", |b| {
         let frame = counter_frame();
         b.iter(|| {
-            let wrapper = build_wrapper_module_source("src/Counter.tsx");
             let encoded = encode_frame(&frame).expect("encode");
-            black_box((wrapper, encoded));
+            black_box(encoded);
         });
     });
 }

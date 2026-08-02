@@ -37,6 +37,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tower_http::compression::predicate::{And, DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::CompressionLayer;
 use tracing::{debug, error, info, warn};
 
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -1609,6 +1611,7 @@ impl AlbedoServer {
             .route("/", any(dispatch))
             .route("/{*path}", any(dispatch))
             .with_state(self.state.clone())
+            .layer(compression_layer())
     }
 
     /// Handle on the dev inspector's shared state, when one is mounted.
@@ -1896,6 +1899,29 @@ impl DevReloadHandle {
 /// Top-level axum entry point. Runs the real dispatch in a separate tokio
 /// task so a panicking handler surfaces as a 500 rather than a dropped
 /// connection.
+/// gzip for every text response, and **never** for an event stream.
+///
+/// Without this the server ships its client JS uncompressed — ~96 KB across
+/// `runtime.js`, `link-forms.js` and `wt-bootstrap.js` on a page that reports
+/// its cost in kilobytes, which made the reported number and the transferred
+/// number two unrelated things.
+///
+/// The SSE exclusion is spelled out rather than inherited from
+/// [`DefaultPredicate`], whose membership has moved between `tower-http`
+/// releases. Compressing `text/event-stream` is not a performance question: the
+/// encoder holds bytes until it has a worthwhile block, so a `patch` frame
+/// would sit in the compressor instead of reaching the browser, and every live
+/// lane in the system (PHOSPHOR trunk, per-tab patches, dev overlay/HMR) rides
+/// that content type. Streamed **HTML** is still compressed — the encoder
+/// flushes per polled chunk, so Tier-B injection chunks keep arriving
+/// progressively.
+fn compression_layer() -> CompressionLayer<And<DefaultPredicate, NotForContentType>> {
+    CompressionLayer::new()
+        .compress_when(DefaultPredicate::new().and(NotForContentType::const_new(
+            "text/event-stream",
+        )))
+}
+
 async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> Response {
     match tokio::task::spawn(dispatch_inner(state, request)).await {
         Ok(response) => response,

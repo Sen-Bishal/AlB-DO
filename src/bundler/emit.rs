@@ -1,7 +1,7 @@
 use super::classify::BundleClass;
 use super::plan::BundlePlan;
 use super::precompiled::build_precompiled_runtime_modules_artifact;
-use super::rewrite::{build_wrapper_module_source, build_wrapper_source_map, RewriteAction};
+use super::rewrite::RewriteAction;
 use super::static_slice::build_bundle_static_slice_manifest;
 use crate::manifest::schema::{DomPosition, PrecompiledRuntimeModulesArtifact, RenderManifestV2};
 use serde::{Deserialize, Serialize};
@@ -96,51 +96,6 @@ pub fn emit_precompiled_runtime_modules_json(
     let precompiled: PrecompiledRuntimeModulesArtifact =
         build_precompiled_runtime_modules_artifact(manifest, module_sources);
     serde_json::to_string_pretty(&precompiled)
-}
-
-pub fn emit_wrapper_modules(plan: &BundlePlan) -> BTreeMap<String, String> {
-    let mut emitted = BTreeMap::new();
-
-    for action in &plan.rewrite_actions {
-        if let RewriteAction::WrapModule {
-            source_module,
-            wrapper_module,
-            ..
-        } = action
-        {
-            emitted
-                .entry(wrapper_module.clone())
-                .or_insert_with(|| build_wrapper_module_source(source_module));
-        }
-    }
-
-    emitted
-}
-
-/// Phase M.4 · sibling source-map files for every wrapper module
-/// emitted by [`emit_wrapper_modules`]. Keyed by `{wrapper}.map`
-/// path so the relative `sourceMappingURL` in the wrapper resolves
-/// to a peer file in the bundle output tree. Stage 1 emits a v3
-/// stub map (no per-line mappings); Stage 2 will collect real
-/// mappings from the SWC transpile pass.
-pub fn emit_wrapper_source_maps(plan: &BundlePlan) -> BTreeMap<String, String> {
-    let mut emitted = BTreeMap::new();
-
-    for action in &plan.rewrite_actions {
-        if let RewriteAction::WrapModule {
-            source_module,
-            wrapper_module,
-            ..
-        } = action
-        {
-            let map_path = format!("{wrapper_module}.map");
-            emitted
-                .entry(map_path)
-                .or_insert_with(|| build_wrapper_source_map(source_module));
-        }
-    }
-
-    emitted
 }
 
 pub fn emit_vendor_chunk_modules(plan: &BundlePlan) -> BTreeMap<String, String> {
@@ -356,31 +311,27 @@ fn emit_bundle_artifacts_to_dir_internal(
         bytes: plan_bytes.len(),
     });
 
-    for (relative_wrapper_path, source) in emit_wrapper_modules(plan) {
-        let normalized = normalize_relative_artifact_path(&relative_wrapper_path);
-        let wrapper_path = output_dir.join(relative_path_to_fs_path(&normalized));
-        let source_bytes = source.into_bytes();
-        write_artifact(&wrapper_path, &source_bytes)?;
-        artifacts.push(EmittedArtifact {
-            relative_path: normalized,
-            bytes: source_bytes.len(),
-        });
-    }
-
-    // Phase M.4 · sibling .map files for every emitted wrapper. The
-    // wrapper JS carries a `//# sourceMappingURL=...` comment that
-    // resolves to this peer file in the same directory.
-    for (relative_map_path, map_source) in emit_wrapper_source_maps(plan) {
-        let normalized = normalize_relative_artifact_path(&relative_map_path);
-        let map_path = output_dir.join(relative_path_to_fs_path(&normalized));
-        let map_bytes = map_source.into_bytes();
-        write_artifact(&map_path, &map_bytes)?;
-        artifacts.push(EmittedArtifact {
-            relative_path: normalized,
-            bytes: map_bytes.len(),
-        });
-    }
-
+    // Wrapper modules (`__albedo__/wrappers/*.mjs`) and their sibling `.map`
+    // files are deliberately **not** written. They were emitted for every
+    // component at every tier and **nothing ever loaded one** — no `assets/*.js`
+    // references the directory, no browser fetches it, and neither
+    // `bundle-plan.json` nor `bundle-runtime-map.json` (the only artifacts that
+    // name a wrapper path) is read by `albedo-server` at all.
+    //
+    // Measured on forge-lab before removal: 34 files, 54 KB per build.
+    //
+    // The stronger reason is what was *in* them. A wrapper is
+    // `import * as target from "<absolute source path>"`, so all 34 files
+    // embedded the build machine's own directory layout —
+    // `C:/Development/ALKMY/forge-lab/src/routes/island.tsx` — and `.albedo/dist`
+    // is what `albedo ship` copies into the image. That is a build-host
+    // disclosure in a deployed artifact, and it also made the output tree
+    // non-reproducible across machines for bytes no one reads.
+    //
+    // `RewriteAction::WrapModule` and `BundlePlan::wrapper_module_path` survive:
+    // they are how the plan *names* a component's module, which the budget
+    // attribution in `budget/bundle.rs` still groups by. Naming a path is free;
+    // writing a file to it was not.
     for (relative_vendor_path, source) in emit_vendor_chunk_modules(plan) {
         let normalized = normalize_relative_artifact_path(&relative_vendor_path);
         let vendor_path = output_dir.join(relative_path_to_fs_path(&normalized));
@@ -604,16 +555,6 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_wrapper_modules_contains_wrapper_source() {
-        let wrappers = emit_wrapper_modules(&fixture_plan());
-        assert_eq!(wrappers.len(), 1);
-        let source = wrappers
-            .get("__albedo__/wrappers/abc_src_routes_home_tsx.mjs")
-            .unwrap();
-        assert!(source.contains("export default resolved;"));
-    }
-
-    #[test]
     fn test_emit_vendor_chunk_modules_contains_package_imports() {
         let chunks = emit_vendor_chunk_modules(&fixture_plan());
         assert_eq!(chunks.len(), 1);
@@ -658,7 +599,8 @@ mod tests {
 
         // Phase M.4 added a `.map` per wrapper (6 → 7); PHOSPHOR adds the
         // lane module the WT bootstrap imports as `./phosphor.js` (7 → 8).
-        assert_eq!(report.artifacts.len(), 8);
+        // Dropping the wrapper module and its `.map` takes it back to 6.
+        assert_eq!(report.artifacts.len(), 6);
 
         let wt_bootstrap_path = temp_dir.path().join("_albedo").join("wt-bootstrap.js");
         let wt_bootstrap_source = std::fs::read_to_string(wt_bootstrap_path).unwrap();
@@ -684,13 +626,15 @@ mod tests {
         let prefetch_manifest_json = std::fs::read_to_string(prefetch_manifest_path).unwrap();
         assert!(prefetch_manifest_json.contains("\"entry_module\": \"src/routes/home.tsx\""));
 
-        let wrapper_path = temp_dir
-            .path()
-            .join("__albedo__")
-            .join("wrappers")
-            .join("abc_src_routes_home_tsx.mjs");
-        let wrapper_source = std::fs::read_to_string(wrapper_path).unwrap();
-        assert!(wrapper_source.contains("export default resolved;"));
+        // No wrapper module, and no `wrappers/` directory at all. The plan
+        // still *names* one (`rewrite_actions` above), which is the point:
+        // naming a component's module is free, writing a file to that name was
+        // 54 KB per build of nothing plus an absolute-path leak.
+        let wrappers_dir = temp_dir.path().join("__albedo__").join("wrappers");
+        assert!(
+            !wrappers_dir.exists(),
+            "wrapper modules must not be emitted"
+        );
 
         let vendor_path = report
             .artifacts

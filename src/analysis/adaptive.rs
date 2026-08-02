@@ -1,154 +1,102 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use sysinfo::System;
-// Fix this
-pub struct GranularityController {
-    system: System,
-    recent_cache_misses: AtomicUsize,
-    recent_throughput: AtomicUsize,
-    min_chunk_size: usize,
-    max_chunk_size: usize,
-}
+//! Whether a fan-out is worth its thread-spawn overhead.
+//!
+//! This module used to be a `GranularityController` struct holding a
+//! `sysinfo::System`, live CPU/memory sampling and a cache-miss counter. Every
+//! one of those fields existed for `calculate_chunk_size` and
+//! `record_batch_metrics` — which **no caller ever invoked**, in `src/`, in
+//! `tests/`, or in the benches. Meanwhile `GranularityController::new()` runs
+//! `System::new_all()`, a full enumeration of every process, disk and network
+//! interface on the machine, and it ran on **every** `optimize()`,
+//! `optimize_incremental()`, `optimize_canonical_ir_columns()` and
+//! `RenderPipeline` construction.
+//!
+//! The only method anything called was `should_parallelize`, and it reads no
+//! field of `self` — so the scan was pure cost. It is now the free function
+//! below, with the arithmetic preserved operation-for-operation (including the
+//! integer divisions, which truncate and are load-bearing at small
+//! `total_items`). `threshold_is_unchanged_by_the_collapse` pins that.
+//!
+//! Deliberately still a heuristic, not a cost model: the constants below are
+//! unitless and were never calibrated against a measurement. That is fine for
+//! what it decides — serial-vs-rayon on a graph whose size is known — and
+//! calling it a heuristic in the open is better than dressing it up with a
+//! system scan whose result is discarded.
 
-impl GranularityController {
-    pub fn new() -> Self {
-        Self {
-            system: System::new_all(),
-            recent_cache_misses: AtomicUsize::new(0),
-            recent_throughput: AtomicUsize::new(0),
-            min_chunk_size: 4,
-            max_chunk_size: 1024,
-        }
-    }
+/// Cost of putting one worker thread to use, in the same unitless currency as
+/// [`WORK_PER_BYTE`].
+const PARALLELISM_OVERHEAD: usize = 1_000;
 
-    pub fn calculate_chunk_size(&mut self, total_items: usize) -> usize {
-        self.system.refresh_cpu();
-        self.system.refresh_memory();
+/// Work attributed to one item, as a multiple of its size in bytes.
+const WORK_PER_BYTE: usize = 10;
 
-        let cpu_load = self.system.global_cpu_info().cpu_usage();
-        let cpu_factor = if cpu_load > 80.0 {
-            0.5
-        } else if cpu_load < 20.0 {
-            2.0
-        } else {
-            1.0
-        };
+/// Parallel has to beat serial by this margin (8/10) before it is worth it —
+/// headroom for the fact that the estimate either side of the comparison is a
+/// guess.
+const MARGIN_NUMERATOR: usize = 8;
+const MARGIN_DENOMINATOR: usize = 10;
 
-        let mem_available = self.system.available_memory();
-        let mem_total = self.system.total_memory();
-        let mem_pressure = 1.0 - (mem_available as f64 / mem_total as f64);
-        let mem_factor = if mem_pressure > 0.8 {
-            0.3
-        } else if mem_pressure < 0.3 {
-            1.5
-        } else {
-            1.0
-        };
+/// Returns `true` when fanning `total_items` out across the available cores is
+/// expected to beat processing them serially.
+///
+/// `item_size_bytes` stands in for per-item work: bigger items are assumed to
+/// cost proportionally more to process, which is crude but monotonic in the
+/// right direction. Small graphs amortize thread spawn poorly, so they stay
+/// serial.
+pub fn should_parallelize(total_items: usize, item_size_bytes: usize) -> bool {
+    let workers = num_cpus::get();
+    let work_per_item = item_size_bytes * WORK_PER_BYTE;
 
-        let cache_miss_rate = self.recent_cache_misses.load(Ordering::Relaxed) as f64
-            / self.recent_throughput.load(Ordering::Relaxed).max(1) as f64;
-        let cache_factor = if cache_miss_rate > 0.3 { 0.4 } else { 1.2 };
+    let sequential_cost = total_items * work_per_item;
+    let parallel_cost = (total_items / workers) * work_per_item + workers * PARALLELISM_OVERHEAD;
 
-        let base_chunk_size = (total_items as f64 / num_cpus::get() as f64).sqrt();
-        let adjusted = base_chunk_size * cpu_factor * mem_factor * cache_factor;
-
-        adjusted
-            .max(self.min_chunk_size as f64)
-            .min(self.max_chunk_size as f64) as usize
-    }
-
-    pub fn should_parallelize(&self, total_items: usize, item_size_bytes: usize) -> bool {
-        let parallelism_overhead = 1000;
-        let estimated_work_per_item = item_size_bytes * 10;
-
-        let sequential_cost = total_items * estimated_work_per_item;
-        let parallel_cost = (total_items / num_cpus::get()) * estimated_work_per_item
-            + (num_cpus::get() * parallelism_overhead);
-
-        parallel_cost < (sequential_cost * 8 / 10)
-    }
-
-    pub fn record_batch_metrics(&self, cache_misses: usize, items_processed: usize) {
-        self.recent_cache_misses
-            .fetch_add(cache_misses, Ordering::Relaxed);
-        self.recent_throughput
-            .fetch_add(items_processed, Ordering::Relaxed);
-    }
-}
-
-impl Default for GranularityController {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn cache_aligned_chunk_size<T>() -> usize {
-    const L3_CACHE_SIZE: usize = 8 * 1024 * 1024;
-    const SAFETY_FACTOR: f64 = 0.7;
-
-    let item_size = std::mem::size_of::<T>();
-    let max_items = (L3_CACHE_SIZE as f64 * SAFETY_FACTOR) / item_size as f64;
-
-    2_usize.pow(max_items.log2().floor() as u32)
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ProcessingStrategy {
-    Sequential,
-    Parallel { chunk_size: usize },
-}
-
-pub fn determine_strategy<T>(total_size: usize) -> ProcessingStrategy {
-    let item_size = std::mem::size_of::<T>();
-    let total_bytes = total_size * item_size;
-
-    match total_bytes {
-        size if size < 32_000 => ProcessingStrategy::Sequential,
-        size if size < 256_000 => ProcessingStrategy::Parallel {
-            chunk_size: cache_aligned_chunk_size::<T>() / 4,
-        },
-        size if size < 8_000_000 => ProcessingStrategy::Parallel {
-            chunk_size: cache_aligned_chunk_size::<T>(),
-        },
-        _ => ProcessingStrategy::Parallel {
-            chunk_size: cache_aligned_chunk_size::<T>() * 2,
-        },
-    }
+    parallel_cost < sequential_cost * MARGIN_NUMERATOR / MARGIN_DENOMINATOR
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_granularity_controller() {
-        let mut controller = GranularityController::new();
-
-        let chunk_size = controller.calculate_chunk_size(1000);
-        assert!(chunk_size >= 4);
-        assert!(chunk_size <= 1024);
-    }
-
+    /// The two cases the old `GranularityController` test asserted, kept
+    /// verbatim so the collapse is provably behavior-preserving at the
+    /// boundaries anyone had written down.
     #[test]
     fn test_should_parallelize() {
-        let controller = GranularityController::new();
-
-        assert!(!controller.should_parallelize(10, 100));
-        assert!(controller.should_parallelize(1000, 1000));
+        assert!(!should_parallelize(10, 100));
+        assert!(should_parallelize(1000, 1000));
     }
 
+    /// Re-implements the pre-collapse expression *literally* — including
+    /// `self`-free access to the same globals — and asserts agreement across a
+    /// sweep. This is the regression guard for the refactor itself: it fails if
+    /// anyone "tidies" the integer division into float math.
     #[test]
-    fn test_cache_aligned_chunk_size() {
-        let chunk_size = cache_aligned_chunk_size::<u64>();
-        assert!(chunk_size > 0);
-        assert!(chunk_size.is_power_of_two());
+    fn threshold_is_unchanged_by_the_collapse() {
+        fn original(total_items: usize, item_size_bytes: usize) -> bool {
+            let parallelism_overhead = 1000;
+            let estimated_work_per_item = item_size_bytes * 10;
+
+            let sequential_cost = total_items * estimated_work_per_item;
+            let parallel_cost = (total_items / num_cpus::get()) * estimated_work_per_item
+                + (num_cpus::get() * parallelism_overhead);
+
+            parallel_cost < (sequential_cost * 8 / 10)
+        }
+
+        for total_items in [0, 1, 2, 4, 8, 15, 16, 17, 32, 64, 128, 1_000, 10_000] {
+            for item_size_bytes in [1, 8, 64, 100, 256, 1_000, 4_096] {
+                assert_eq!(
+                    should_parallelize(total_items, item_size_bytes),
+                    original(total_items, item_size_bytes),
+                    "disagreement at total_items={total_items}, item_size_bytes={item_size_bytes}"
+                );
+            }
+        }
     }
 
+    /// An empty graph must never pay for threads.
     #[test]
-    fn test_determine_strategy() {
-        let strategy = determine_strategy::<u64>(100);
-        matches!(strategy, ProcessingStrategy::Sequential);
-
-        let strategy = determine_strategy::<u64>(100_000);
-        matches!(strategy, ProcessingStrategy::Parallel { .. });
+    fn empty_and_singleton_inputs_stay_serial() {
+        assert!(!should_parallelize(0, 1_000));
+        assert!(!should_parallelize(1, 1_000));
     }
 }

@@ -25,69 +25,24 @@ pub fn stable_wrapper_module_path(source_module: &str) -> String {
     format!("__albedo__/wrappers/{hash}_{slug}.mjs")
 }
 
-pub fn build_wrapper_module_source(source_module: &str) -> String {
-    let normalized = normalize_module_path(source_module);
-    let escaped = escape_js_string(&normalized);
-
-    format!(
-        "import * as target from \"{escaped}\";\nconst resolved = target.default ?? target.render ?? target;\nexport default resolved;\nexport * from \"{escaped}\";\n//# sourceMappingURL={map_url}\n",
-        map_url = stable_wrapper_source_map_url(source_module)
-    )
-}
-
-/// Phase M.4 — emit-time wrapper JS source map. Stage 1 produces a
-/// minimal but v3-spec-compliant map that points browser DevTools at
-/// the original `.tsx` file without claiming per-line mappings.
-///
-/// Phase P · Stream F.1 deferral note: the "Stage 2" the audit gap
-/// (#17) imagined — threading SWC's source-map collector through to
-/// per-line mappings — doesn't slot cleanly onto this architecture.
-/// The wrapper module is a 4-line trampoline (`import * as target`
-/// + re-export), NOT the SWC-transpiled output of the component
-/// TSX. SWC transpilation happens server-side for QuickJS execution
-/// in `runtime/quickjs_engine.rs`; the browser never sees that JS.
-/// Per-line mappings between trampoline lines and original TSX
-/// positions aren't meaningful.
-///
-/// The current `sources: ["..."]` entry IS the actionable piece —
-/// DevTools surfaces the original `.tsx` name in the call stack and
-/// "open in editor" flows, which is the practically useful 80%. Real
-/// per-line debugging would require shipping the transpiled TSX to
-/// the browser too (so the browser runs it client-side and maps
-/// against the original) — an architecture change bigger than F.1's
-/// scope. Revisit when client-side execution of authored TSX
-/// becomes a goal.
-pub fn build_wrapper_source_map(source_module: &str) -> String {
-    let normalized = normalize_module_path(source_module);
-    // Manual JSON write so we don't need to bring in `serde_json`
-    // for a 4-field struct. Both fields are server-controlled
-    // identifiers; escaping is single-character only.
-    let escaped = escape_js_string(&normalized);
-    format!(
-        "{{\"version\":3,\"file\":\"{wrapper_basename}\",\"sources\":[\"{escaped}\"],\"sourcesContent\":[null],\"names\":[],\"mappings\":\"\"}}",
-        wrapper_basename = wrapper_basename(source_module)
-    )
-}
-
-/// Filename portion of the wrapper module, used as the `file` field
-/// inside the source map.
-fn wrapper_basename(source_module: &str) -> String {
-    let path = stable_wrapper_module_path(source_module);
-    path.rsplit('/').next().unwrap_or(&path).to_string()
-}
-
-/// `sourceMappingURL` value the wrapper JS emits. Relative path so
-/// the map file lives next to the JS in the bundle output tree.
-fn stable_wrapper_source_map_url(source_module: &str) -> String {
-    format!("{}.map", wrapper_basename(source_module))
-}
+// `build_wrapper_module_source` and `build_wrapper_source_map` used to live
+// here, alongside `wrapper_basename`, `stable_wrapper_source_map_url` and
+// `escape_js_string` which existed only to serve them.
+//
+// They built the *contents* of `__albedo__/wrappers/*.mjs` and its sibling
+// `.map`. Those files are no longer written — nothing ever loaded one, and each
+// embedded the build machine's absolute source path into a shipped artifact.
+// See the note in `bundler::emit::emit_bundle_artifacts_to_dir_internal`.
+//
+// `stable_wrapper_module_path` above stays: naming a component's module is how
+// `RewriteAction::WrapModule` and the budget attribution in `budget/bundle.rs`
+// group per-component bytes, and that never required a file to exist at the
+// path. The Phase M.4 "Stage 2 source maps" deferral note went with the
+// functions — it described per-line mappings for a trampoline the browser
+// never received, so there is nothing left to defer.
 
 fn normalize_module_path(value: &str) -> String {
     value.replace('\\', "/")
-}
-
-fn escape_js_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn fnv1a_64_hex(input: &[u8]) -> String {
@@ -115,36 +70,14 @@ mod tests {
         assert!(first.starts_with("__albedo__/wrappers/"));
     }
 
+    /// The path is still a stable, machine-independent identity even though no
+    /// file is written to it — backslash normalisation is what keeps a Windows
+    /// build and a Linux build agreeing on the same component key.
     #[test]
-    fn test_build_wrapper_module_source_contains_exports() {
-        let source = build_wrapper_module_source("src/routes/home.tsx");
-        assert!(source.contains("import * as target"));
-        assert!(source.contains("export default resolved;"));
-        assert!(source.contains("export * from"));
-    }
-
-    #[test]
-    fn test_build_wrapper_module_source_carries_sourcemap_url() {
-        // Phase M.4 · every emitted wrapper points at a peer .map
-        // file for browser DevTools.
-        let source = build_wrapper_module_source("src/routes/home.tsx");
-        assert!(source.contains("//# sourceMappingURL="));
-        assert!(source.contains(".mjs.map"));
-    }
-
-    #[test]
-    fn test_build_wrapper_source_map_is_v3_compliant_stub() {
-        // Stage 1 stub: valid v3 JSON pointing browser DevTools at
-        // the original .tsx; empty mappings until Stage 2 wires SWC.
-        let map = build_wrapper_source_map("src/routes/home.tsx");
-        assert!(map.contains("\"version\":3"));
-        assert!(map.contains("\"sources\":[\"src/routes/home.tsx\"]"));
-        assert!(map.contains("\"mappings\":\"\""));
-    }
-
-    #[test]
-    fn test_build_wrapper_source_map_normalises_backslashes() {
-        let map = build_wrapper_source_map("src\\routes\\home.tsx");
-        assert!(map.contains("\"sources\":[\"src/routes/home.tsx\"]"));
+    fn wrapper_module_path_is_separator_independent() {
+        assert_eq!(
+            stable_wrapper_module_path("src\\routes\\home.tsx"),
+            stable_wrapper_module_path("src/routes/home.tsx")
+        );
     }
 }

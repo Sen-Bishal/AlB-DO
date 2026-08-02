@@ -11,7 +11,9 @@ use axum::http::{header, HeaderValue, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use dom_render_compiler::ir::opcode::InternTableKind;
-use dom_render_compiler::manifest::schema::{HydrationMode, RenderManifestV2, RouteManifest};
+use dom_render_compiler::manifest::schema::{
+    HydrationMode, RenderManifestV2, RouteManifest, TierBNode,
+};
 use dom_render_compiler::runtime::pipeline::{FourLaneRuntimePipeline, RuntimePipelineError};
 use dom_render_compiler::runtime::webtransport::{
     FramePayload, LaneRenderedChunk, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
@@ -790,6 +792,11 @@ fn build_shell_chunk(
         );
     }
 
+    // Seed before the fill pass, not after: a `<form action="action:…">` inside
+    // the build-time HTML carries an unfilled CSRF placeholder, and
+    // `fill_server_placeholders` below is the single stage that stamps it.
+    shell = seed_tier_b_placeholders(shell, &route.tier_b);
+
     fill_server_placeholders(
         shell,
         hydration
@@ -833,6 +840,52 @@ fn replace_island_placeholders(mut html: String, placeholders: &[(String, String
     for (placeholder_id, marked_html) in placeholders {
         let empty = format!("<div id=\"{placeholder_id}\" data-albedo-tier=\"c\"></div>");
         html = html.replace(&empty, marked_html);
+    }
+    html
+}
+
+/// Seed each Tier-B placeholder with the HTML the **build** already rendered
+/// for it, so the shell is never served with an empty hole where the page's
+/// content belongs.
+///
+/// `TierBNode::initial_html` has been produced at build time since Phase P
+/// (`manifest::builder` renders it through the pure-Rust renderer against a
+/// fresh, empty slot store) and nothing read it. Without this the body of a
+/// Tier-B route exists only as a JavaScript string argument inside
+/// `<script>__albedo_inject(…)</script>`, which means the page has no content
+/// at all for a reader without JS, and none for a crawler that does not execute
+/// it. The per-request render still arrives and still wins: `__albedo_inject`
+/// assigns `el.outerHTML`, replacing the seeded div wholesale.
+///
+/// # Why this is gated
+///
+/// The build-time render saw no request. A node with `dynamic_prop_keys` or
+/// `data_deps` was rendered without the values it actually needs — `/room/[id]`
+/// carries `dynamic_prop_keys: ["params"]`, so its `initial_html` is a room with
+/// no id — and seeding that would paint markup for the wrong entity before
+/// correcting it. Seeding is therefore limited to nodes whose render is a pure
+/// function of the build: no request props, no request-scoped data.
+///
+/// Live data may still have moved since the build (a FORGE collection gains
+/// rows), so a seeded list can be briefly stale. That is the ordinary
+/// server-streaming trade and it is strictly better than an empty element: the
+/// content is correct in shape, correct in structure, and replaced within the
+/// same response.
+fn seed_tier_b_placeholders(mut html: String, nodes: &[TierBNode]) -> String {
+    for node in nodes {
+        if !node.dynamic_prop_keys.is_empty() || !node.data_deps.is_empty() {
+            continue;
+        }
+        let Some(initial) = node.initial_html.as_deref() else {
+            continue;
+        };
+        if initial.is_empty() {
+            continue;
+        }
+        let id = &node.placeholder_id;
+        let empty = format!("<div id=\"{id}\" data-albedo-tier=\"b\"></div>");
+        let seeded = format!("<div id=\"{id}\" data-albedo-tier=\"b\">{initial}</div>");
+        html = html.replace(&empty, &seeded);
     }
     html
 }
@@ -1358,6 +1411,81 @@ mod tests {
             initial_html: None,
             initial_opcode_frame: Vec::new(),
         }
+    }
+
+    /// The seed lands, so the served shell carries the page's content instead
+    /// of an empty hole. Without this the body of a Tier-B route exists only as
+    /// a JS string inside `__albedo_inject(…)`, invisible to a reader without
+    /// scripting and to any crawler that doesn't execute them.
+    #[test]
+    fn tier_b_placeholder_is_seeded_with_the_build_time_html() {
+        let mut node = tier_b_node();
+        node.data_deps.clear();
+        node.initial_html = Some("<section>built</section>".to_string());
+
+        let html = seed_tier_b_placeholders(
+            "<body><div id=\"__b_feature\" data-albedo-tier=\"b\"></div></body>".to_string(),
+            std::slice::from_ref(&node),
+        );
+
+        assert_eq!(
+            html,
+            "<body><div id=\"__b_feature\" data-albedo-tier=\"b\">\
+             <section>built</section></div></body>",
+            "the placeholder keeps its id and tier attribute so __albedo_inject \
+             can still find it and swap its outerHTML"
+        );
+    }
+
+    /// The gate. `/room/[id]` carries `dynamic_prop_keys: ["params"]`, and its
+    /// build-time render therefore saw no id — seeding it would paint one
+    /// entity's markup while the request is for another.
+    #[test]
+    fn a_request_dependent_node_is_left_empty() {
+        let mut node = tier_b_node();
+        node.data_deps.clear();
+        node.dynamic_prop_keys = vec!["params".to_string()];
+        node.initial_html = Some("<section>wrong room</section>".to_string());
+
+        let shell = "<div id=\"__b_feature\" data-albedo-tier=\"b\"></div>".to_string();
+        assert_eq!(
+            seed_tier_b_placeholders(shell.clone(), std::slice::from_ref(&node)),
+            shell,
+            "a node whose render depends on the request must not be seeded"
+        );
+
+        // Same rule for request-scoped data, which is what the fixture carries
+        // by default.
+        let with_deps = tier_b_node();
+        let mut with_deps = with_deps;
+        with_deps.initial_html = Some("<section>stale</section>".to_string());
+        assert_eq!(
+            seed_tier_b_placeholders(shell.clone(), std::slice::from_ref(&with_deps)),
+            shell,
+            "a node with request-context data_deps must not be seeded"
+        );
+    }
+
+    /// A build that produced no `initial_html` degrades to exactly the old
+    /// behaviour rather than emitting a malformed element.
+    #[test]
+    fn a_node_without_initial_html_is_untouched() {
+        let mut node = tier_b_node();
+        node.data_deps.clear();
+        node.initial_html = None;
+
+        let shell = "<div id=\"__b_feature\" data-albedo-tier=\"b\"></div>".to_string();
+        assert_eq!(
+            seed_tier_b_placeholders(shell.clone(), std::slice::from_ref(&node)),
+            shell
+        );
+
+        node.initial_html = Some(String::new());
+        assert_eq!(
+            seed_tier_b_placeholders(shell.clone(), std::slice::from_ref(&node)),
+            shell,
+            "an empty string is not content"
+        );
     }
 
     fn route_manifest() -> RouteManifest {
