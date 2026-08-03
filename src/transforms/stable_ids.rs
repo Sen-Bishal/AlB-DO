@@ -45,6 +45,13 @@
 //! * **The Tier-C client-island build.** Islands hydrate in the browser against their own runtime;
 //!   `__albedo_stable_id` does not exist there, and a call to it would be a `ReferenceError` on the
 //!   first render. Gated by the caller passing `None`.
+//! * **`<children />`.** Lowercase, so it *looks* like a host tag, but it is the layout-wrap
+//!   intrinsic: both renderers lower it to a sentinel comment and neither allocates an id for it.
+//!   Stamping it advanced this side's counter and not the evaluator's, so in any layout with markup
+//!   **after** the sentinel — a footer, a closing `</nav>`'s siblings — every subsequent element was
+//!   numbered one step ahead on the QuickJS side. The two renders stayed byte-identical up to the
+//!   sentinel and disagreed on every id after it, which is the worst version of this bug: it looks
+//!   fine in a diff of the opening markup.
 
 use swc_common::DUMMY_SP;
 use swc_ecma_ast::{
@@ -92,6 +99,11 @@ impl VisitMut for StableIdStamper {
     }
 }
 
+/// The layout-wrap intrinsic. Lowercase like a host tag, but neither renderer
+/// serialises it as an element — both lower it to the layout-children sentinel —
+/// so neither allocates an id for it, and this pass must not either.
+const LAYOUT_CHILDREN_TAG: &str = "children";
+
 /// A host element is a lowercase (or dashed) tag: `div`, `my-widget`. A
 /// capitalised or dotted name is a component, which `h` calls rather than
 /// serialises.
@@ -99,6 +111,9 @@ fn is_host_element(name: &JSXElementName) -> bool {
     match name {
         JSXElementName::Ident(ident) => {
             let sym = ident.sym.as_ref();
+            if sym == LAYOUT_CHILDREN_TAG {
+                return false;
+            }
             sym.starts_with(|c: char| c.is_ascii_lowercase()) || sym.contains('-')
         }
         // `<Foo.Bar />` and `<ns:tag />` are never plain host tags here.

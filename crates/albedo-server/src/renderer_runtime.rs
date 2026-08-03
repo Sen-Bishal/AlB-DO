@@ -207,6 +207,8 @@ impl RendererRuntime {
             module_path: String,
             source: String,
             trigger: HydrationTrigger,
+            /// 4.8 · what the parent passed this island, from the manifest.
+            props: serde_json::Value,
         }
 
         // Phase 1 — gather island metadata from the manifest (immutable borrows
@@ -247,6 +249,7 @@ impl RendererRuntime {
                     module_path: component.module_path.clone(),
                     source: module.code.clone(),
                     trigger: trigger_from_mode(node.hydration_mode),
+                    props: node.initial_props.clone(),
                 });
             }
             if !islands.is_empty() {
@@ -262,7 +265,7 @@ impl RendererRuntime {
             let mut plan_islands = Vec::new();
 
             for island in &islands {
-                if let Some(html) = self.render_island_html(&island.module_path) {
+                if let Some(html) = self.render_island_html(&island.module_path, &island.props) {
                     placeholders.push((
                         island.placeholder_id.clone(),
                         inject_island_marker(&html, island.component_id),
@@ -282,12 +285,16 @@ impl RendererRuntime {
                     module_path: island.module_path.clone(),
                     trigger: island.trigger,
                     dependencies: Vec::new(),
+                    props: island.props.clone(),
                 });
             }
 
             // Payload + bootstrap reuse the hydration crate's pure builders. The
-            // plan `entry` is the route path (matches no module), so every island
-            // hydrates from `{}` — consistent with the standalone SSR above.
+            // plan `entry` is the route path and matches no module, so the
+            // `"{}"` below seeds nothing — each island carries its own captured
+            // props on its plan entry, which is the same props the standalone
+            // SSR above rendered from. The two agreeing is what makes hydration
+            // an adoption rather than a replacement.
             let plan = HydrationPlan {
                 version: HYDRATION_PLAN_VERSION.to_string(),
                 entry: path.clone(),
@@ -372,8 +379,17 @@ impl RendererRuntime {
                     continue;
                 };
 
+                // 4.8 · render from what the parent passed. `build_reactive_payload`
+                // always took props; it was only ever handed an empty object, so a
+                // serve-wired island's initial paint ignored `<Counter start={41} />`
+                // and its `useState(start)` opened on `undefined`.
+                let props = match &node.initial_props {
+                    serde_json::Value::Null => &empty_props,
+                    captured => captured,
+                };
+
                 let slots = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
-                let payload = match compiled.build_reactive_payload(entry, &empty_props, &slots) {
+                let payload = match compiled.build_reactive_payload(entry, props, &slots) {
                     // Binding mode requires at least one text/attr/derived binding
                     // driven by at least one client handler. Anything else (no
                     // handler, no slot read, structural-only) is not eligible —
@@ -688,12 +704,20 @@ impl RendererRuntime {
         );
     }
 
-    /// Render one island component to its SSR HTML from default props. Soft-fails
-    /// to `None` so a single bad island can't sink the whole boot.
-    fn render_island_html(&mut self, module_path: &str) -> Option<String> {
+    /// Render one island component to its SSR HTML from the props its parent
+    /// passed it. Soft-fails to `None` so a single bad island can't sink the
+    /// whole boot.
+    ///
+    /// `props` is `Value::Null` for an island nobody passed anything, which
+    /// lowers to `{}` — the historical behaviour, and still the right one.
+    fn render_island_html(&mut self, module_path: &str, props: &serde_json::Value) -> Option<String> {
+        let props_json = match props {
+            serde_json::Value::Null => "{}".to_string(),
+            other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+        };
         let request = RouteRenderRequest {
             entry: module_path.to_string(),
-            props_json: "{}".to_string(),
+            props_json,
             module_order: Vec::new(),
             hydration_payload: None,
             host_json: None,

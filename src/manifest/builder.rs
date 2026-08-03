@@ -196,6 +196,23 @@ impl<'a> ManifestBuilder<'a> {
             }
         }
 
+        // 4.8 · attach the props each island's parent passed it.
+        //
+        // Drained here, after `traverse`, because a route is assembled from many
+        // renders and the parent that names the island may be any of them — the
+        // root, a Tier-A child, a layout. Every one of those ran inside the
+        // guards installed above, so by this line the channel holds the whole
+        // route's captures. Draining also resets it for the next route.
+        //
+        // An island with no entry keeps `Value::Null`, which every consumer
+        // reads as "no props" — the pre-4.8 behaviour, unchanged.
+        let island_props = crate::runtime::eval::core::take_island_props();
+        for node in &mut tier_c {
+            if let Some(props) = island_props.get(&node.component_id) {
+                node.initial_props = props.clone();
+            }
+        }
+
         // Phase P · per-route metadata. Topics are global today (every
         // route knows every topic the project references) — the
         // session over-subscribes a few extra mpsc::Sender clones,
@@ -1274,10 +1291,14 @@ impl<'a> ManifestBuilder<'a> {
                 component.id.as_u64()
             ),
             bundle_path,
-            initial_props: json!({
-                "component_id": component.id.as_u64(),
-                "component_name": component.name,
-            }),
+            // Filled in after `traverse` from what the parent actually passed
+            // (see the `take_island_props` drain). `Null` is the honest default:
+            // nothing here knows the props yet, and the parent may pass none.
+            //
+            // This field previously held `{component_id, component_name}` —
+            // identity, under a name that promises props, duplicating two
+            // values the node already carries, and read by nothing in the tree.
+            initial_props: Value::Null,
             hydration_mode: metadata.hydration_mode.into_streaming(),
             position: DomPosition {
                 parent_placeholder,

@@ -392,6 +392,14 @@ impl QuickJsEngine {
                         RuntimeError::init(format!("failed to install form contract: {err}"))
                     })?;
 
+                // Installed alongside the form contract and for the same
+                // reason: `h()` must not carry its own copy of a markup rule
+                // the pure-Rust renderer also holds.
+                ctx.eval::<(), _>(build_markup_contract_script())
+                    .map_err(|err| {
+                        RuntimeError::init(format!("failed to install markup contract: {err}"))
+                    })?;
+
                 ctx.eval::<(), _>(build_builtin_runtime_helpers_script())
                     .map_err(|err| {
                         RuntimeError::init(format!(
@@ -842,11 +850,69 @@ fn build_form_contract_script() -> String {
     )
 }
 
+/// Hands the JS shim the two markup rules it cannot be trusted to restate:
+/// which tags are void, and what a `<children />` sink lowers to.
+///
+/// Same reasoning as [`build_form_contract_script`], and the same failure it
+/// prevents. Before this existed the shim closed *every* tag, so a Tier-B
+/// `<hr />` shipped as `<hr></hr>` while the Tier-A render of the same source
+/// shipped `<hr />` — two renderers, one component, different bytes. The stray
+/// end tag is inert in a browser but not in the string-level row templating
+/// this codebase does downstream, which had already grown a workaround for it
+/// (`shared_slot_lists`' "void elements with explicit close tags do not
+/// truncate a row"). And `<children />` was worse than a byte difference: the
+/// pure-Rust renderer lowers it to the sentinel `wrap_in_layouts` substitutes,
+/// so a layout rendered through QuickJS emitted a literal `<children></children>`
+/// element and dropped the entire page body it was supposed to receive.
+///
+/// Both constants cross as *values* from Rust. There is one spelling of each
+/// and JS cannot disagree with it.
+fn build_markup_contract_script() -> String {
+    use crate::runtime::eval::component::HTML_VOID_ELEMENTS;
+    use crate::runtime::eval::LAYOUT_CHILDREN_SENTINEL;
+    // Infallible: `serde_json` cannot fail to encode `&str` / `&[&str]`.
+    let json = |value: &serde_json::Value| {
+        serde_json::to_string(value).expect("encoding string data as JSON cannot fail")
+    };
+    let void = serde_json::Value::Array(
+        HTML_VOID_ELEMENTS
+            .iter()
+            .map(|tag| serde_json::Value::String((*tag).to_string()))
+            .collect(),
+    );
+    format!(
+        "globalThis.__ALBEDO_MARKUP_CONTRACT = {{ voidTags: {}, layoutChildren: {} }};",
+        json(&void),
+        json(&serde_json::Value::String(
+            LAYOUT_CHILDREN_SENTINEL.to_string()
+        )),
+    )
+}
+
 fn build_builtin_runtime_helpers_script() -> &'static str {
     r#"
 if (typeof globalThis.h !== 'function') {
-  const __albedo_escape_html = function(str) {
-    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#x27;');
+  // Text content and attribute values are escaped DIFFERENTLY, and both must
+  // match `runtime::eval::component`'s `escape_html` / `escape_attr` exactly.
+  //
+  // A single over-escaping function served both for a long time. It is safe —
+  // over-escaping never under-escapes — but it is not *equal*, and equality is
+  // the property that matters here: a `"` in text came out as `&quot;` from
+  // QuickJS and as `"` from the pure-Rust renderer. Same page in a browser,
+  // different bytes, and the bytes are what the row-delta path compares. A row
+  // rendered once by each renderer would read as changed when nothing had
+  // changed, and it cost five bytes per quote on every wire that carried one.
+  //
+  // Dropping `'` and `"` from the *text* escape is safe because neither can
+  // terminate a text node; dropping `'` from the *attribute* escape is safe
+  // because every attribute here is emitted double-quoted. `&`, `<` and `>` are
+  // escaped in both, which is what actually prevents breaking out.
+  const __albedo_escape_text = function(str) {
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  };
+
+  const __albedo_escape_attr = function(str) {
+    return __albedo_escape_text(str).replace(/"/g, '&quot;');
   };
 
   // Marker type for HTML strings produced by h() that are already safe to
@@ -871,7 +937,7 @@ if (typeof globalThis.h !== 'function') {
       return;
     }
     // Plain user value (string, number, …) — escape before embedding in HTML.
-    out.push(new AlbedoHtml(__albedo_escape_html(String(value))));
+    out.push(new AlbedoHtml(__albedo_escape_text(String(value))));
   };
 
   // Framework-level props that are never HTML attributes: `key` (React's
@@ -908,9 +974,37 @@ if (typeof globalThis.h !== 'function') {
     return action.slice(contract.prefix.length);
   };
 
+  // Phase P · Stream E.1 — `<children />` is the layout-wrap intrinsic, not a
+  // host element. It lowers to the sentinel comment that the manifest builder's
+  // `wrap_in_layouts` substitutes the inner page HTML into. Intercepted here,
+  // ahead of the host-element path, exactly as the pure-Rust renderer does it —
+  // otherwise a layout rendered through QuickJS emits a literal
+  // `<children></children>`, nothing ever substitutes it, and the page body the
+  // layout was supposed to wrap is silently dropped.
+  const __albedo_layout_children_sentinel = function() {
+    const contract = globalThis.__ALBEDO_MARKUP_CONTRACT;
+    return contract && contract.layoutChildren ? contract.layoutChildren : '';
+  };
+
+  // Void elements take no closing tag. The set crosses from Rust on
+  // `__ALBEDO_MARKUP_CONTRACT` so it cannot drift from `is_void_tag`.
+  const __albedo_is_void_tag = function(tag) {
+    const contract = globalThis.__ALBEDO_MARKUP_CONTRACT;
+    if (!contract || !contract.voidTags) {
+      return false;
+    }
+    return contract.voidTags.indexOf(tag) !== -1;
+  };
+
   const h = function(type, props, ...children) {
     const flatChildren = [];
     __albedo_push_children(children, flatChildren);
+
+    if (type === 'children') {
+      // A content sink, not a wrapper: attrs and children are ignored, matching
+      // the pure-Rust intrinsic.
+      return new AlbedoHtml(__albedo_layout_children_sentinel());
+    }
 
     if (typeof type === 'function') {
       const mergedProps = Object.assign({}, props || {});
@@ -940,7 +1034,7 @@ if (typeof globalThis.h !== 'function') {
         const keyVal = safeProps.key;
         if (keyVal !== false && keyVal !== null
             && typeof keyVal !== 'undefined' && typeof keyVal !== 'function') {
-          attrs += ' data-albedo-key="' + __albedo_escape_html(keyVal) + '"';
+          attrs += ' data-albedo-key="' + __albedo_escape_attr(keyVal) + '"';
         }
         continue;
       }
@@ -980,7 +1074,7 @@ if (typeof globalThis.h !== 'function') {
         attrs += ' ' + attrName;
         continue;
       }
-      attrs += ' ' + attrName + '="' + __albedo_escape_html(value) + '"';
+      attrs += ' ' + attrName + '="' + __albedo_escape_attr(value) + '"';
     }
 
     // Phase L · stamp the rewritten action hook and prepend the hidden CSRF
@@ -991,7 +1085,7 @@ if (typeof globalThis.h !== 'function') {
     let inner = flatChildren.join('');
     if (formAction !== null) {
       const contract = globalThis.__ALBEDO_FORM_CONTRACT;
-      attrs += ' ' + contract.attr + '="' + __albedo_escape_html(formAction) + '"';
+      attrs += ' ' + contract.attr + '="' + __albedo_escape_attr(formAction) + '"';
       inner = contract.csrfInput + inner;
       // P6 · append this action's per-field `data-albedo-error` spans — the
       // sinks the submit projection's `SetText` targets to clear/fill
@@ -1011,6 +1105,12 @@ if (typeof globalThis.h !== 'function') {
       if (typeof spans === 'string') {
         inner = inner + spans;
       }
+    }
+    // Void elements close themselves. The ` />` spelling (and the space before
+    // it) is the pure-Rust renderer's, so the two agree byte-for-byte rather
+    // than merely parsing to the same tree.
+    if (inner === '' && __albedo_is_void_tag(String(type))) {
+      return new AlbedoHtml('<' + String(type) + attrs + ' />');
     }
     return new AlbedoHtml('<' + String(type) + attrs + '>' + inner + '</' + String(type) + '>');
   };
@@ -3812,17 +3912,25 @@ mod tests {
             )
             .expect("loads");
 
-        // Expected text is HTML-ESCAPED, because a topic value is a plain user
-        // value and `h` escapes those before embedding — `&quot;` decodes back
-        // to `"` in the DOM, which is the text the live path writes directly
-        // into the node. The agreement is about the text node, not the bytes of
-        // the markup.
+        // A topic value is a plain user value, so `h` escapes it before
+        // embedding — but as TEXT, which means `&`, `<` and `>` and not `"`.
+        //
+        // This case previously expected `{&quot;state&quot;:&quot;ok&quot;}`,
+        // and settled the discrepancy by declaring that "the agreement is about
+        // the text node, not the bytes of the markup" — both spellings do decode
+        // to the same DOM text. That concession is what the renderer conformance
+        // gate exists to withdraw. The bytes are not incidental: the pure-Rust
+        // renderer emits `{"state":"ok"}` here (its `escape_html` leaves quotes
+        // alone), the live path writes that same string into the node directly,
+        // and the row-delta path compares markup as bytes — so a value that
+        // rendered one way at SSR and another way live read as a change that had
+        // not happened. Now all three spell it identically.
         for (seeded, expected) in [
             (r#""green""#, "green"),
             ("4242", "4242"),
             ("true", "true"),
             ("null", ""),
-            (r#"{"state":"ok"}"#, "{&quot;state&quot;:&quot;ok&quot;}"),
+            (r#"{"state":"ok"}"#, r#"{"state":"ok"}"#),
             ("[1,2,3]", "[1,2,3]"),
         ] {
             let out = engine

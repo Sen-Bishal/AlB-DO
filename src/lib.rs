@@ -55,6 +55,7 @@ pub mod analysis;
 pub mod aperture;
 pub mod budget;
 pub mod bundler;
+pub mod conformance;
 pub mod dev;
 pub mod effects;
 pub mod estimator;

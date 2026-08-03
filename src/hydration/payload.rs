@@ -11,9 +11,13 @@ pub struct HydrationIslandPayload {
     pub trigger: HydrationTrigger,
     pub dependencies: Vec<u64>,
     /// A3.2 · the initial props the client renders from, so its first render
-    /// matches the server markup it hydrates. Only the route-entry island is
-    /// seeded today (nested islands hydrate from their own defaults — the same
-    /// bound as A1's SSR hook seeding); absent in older payloads.
+    /// matches the server markup it hydrates. Absent in older payloads.
+    ///
+    /// 4.8 · every island is seeded now, from the props its parent passed
+    /// ([`super::plan::HydrationIslandPlan::props`]). Previously only the route
+    /// entry was, and every nested island hydrated from `{}` — so a client
+    /// island's first render disagreed with the server markup it was adopting
+    /// the moment its parent passed it anything.
     #[serde(default)]
     pub props: serde_json::Value,
 }
@@ -47,10 +51,18 @@ pub fn build_hydration_payload(
             module_path: island.module_path.clone(),
             trigger: island.trigger,
             dependencies: island.dependencies.clone(),
-            props: if island.module_path == plan.entry {
-                entry_props.clone()
-            } else {
-                serde_json::Value::Object(Default::default())
+            // The island's own captured props win. `props_json` stays the
+            // fallback for the route-entry island, which has no parent inside
+            // this route to capture from — its props come from the request.
+            props: match &island.props {
+                serde_json::Value::Null => {
+                    if island.module_path == plan.entry {
+                        entry_props.clone()
+                    } else {
+                        serde_json::Value::Object(Default::default())
+                    }
+                }
+                captured => captured.clone(),
             },
         })
         .collect();
@@ -141,6 +153,7 @@ mod tests {
                 module_path: "routes/home".to_string(),
                 trigger: HydrationTrigger::Idle,
                 dependencies: vec![1],
+                props: serde_json::Value::Null,
             }],
         };
 
@@ -159,6 +172,7 @@ mod tests {
                 module_path: "routes/home".to_string(),
                 trigger: HydrationTrigger::Idle,
                 dependencies: vec![1],
+                props: serde_json::Value::Null,
             }],
         };
         let plan_b = HydrationPlan {
@@ -169,6 +183,7 @@ mod tests {
                 module_path: "routes/home".to_string(),
                 trigger: HydrationTrigger::Visible,
                 dependencies: vec![1],
+                props: serde_json::Value::Null,
             }],
         };
 

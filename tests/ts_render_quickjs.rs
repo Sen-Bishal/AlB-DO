@@ -12,6 +12,17 @@
 //! reflects current state; (3) a render body using `Array.map` — which the
 //! pure-Rust evaluator does not model — renders correctly; (4) captured props
 //! are snapshotted into the slot store so a follow-up action reads them.
+//!
+//! ⚠️ The expected markup below carries `data-albedo-id` stamps, and the exact
+//! ids are load-bearing: they are `fnv1a_32("Component.tsx#<n>")`, the same
+//! function of the same inputs the pure-Rust renderer uses, so they are the ids
+//! `render_entry_with_bindings` allocates for these fixtures. Until the renderer
+//! conformance work these assertions expected *unstamped* markup, because
+//! `render_entry_quickjs` loaded its module without a stamp spec — which made
+//! its output unaddressable by any opcode frame, and made this "symmetric
+//! counterpart" to the pure-Rust path symmetric in signature only. If these ids
+//! ever need updating, that is a signal to check `tests/renderer_conformance.rs`
+//! first: the two renderers agreeing is the property, not the literals.
 
 use dom_render_compiler::ir::action::ActionEnvelope;
 use dom_render_compiler::ir::opcode::Instruction;
@@ -88,7 +99,7 @@ fn counter_renders_initial_under_quickjs() {
         .expect("quickjs render succeeds");
 
     assert_eq!(
-        out.html, "<button>0</button>",
+        out.html, "<button data-albedo-id=\"1808301642\">0</button>",
         "initial render must show the useState initial; got: {}",
         out.html
     );
@@ -119,7 +130,7 @@ fn seeded_slot_value_drives_the_quickjs_render() {
         .expect("quickjs render succeeds");
 
     assert_eq!(
-        out.html, "<button>5</button>",
+        out.html, "<button data-albedo-id=\"1808301642\">5</button>",
         "render must reflect the persisted slot value (5), not the initial (0); got: {}",
         out.html
     );
@@ -222,7 +233,8 @@ fn render_body_using_array_map_renders_under_quickjs() {
         .expect("quickjs render succeeds");
 
     assert_eq!(
-        out.html, "<ul><li>alpha</li><li>beta</li><li>gamma</li></ul>",
+        out.html,
+        "<ul data-albedo-id=\"1808301642\"><li data-albedo-id=\"1825079261\">alpha</li><li data-albedo-id=\"1774746404\">beta</li><li data-albedo-id=\"1791524023\">gamma</li></ul>",
         "Array.map render body must produce the list; got: {}",
         out.html
     );

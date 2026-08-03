@@ -44,6 +44,35 @@ fn compile(name: &str) -> CompiledProject {
     CompiledProject::load_from_dir(fixture(name)).expect("project compiles")
 }
 
+/// The slot a component's reactive text reads, however that text is bound.
+///
+/// A `{slot}` that owns its element's whole text binds through `SetTextRef`. A
+/// `{slot}` sharing the element with static text — `{LABEL}: {n}` — does not:
+/// setting the element's text from the slot alone would delete the static part,
+/// so the whole text is bound as a template on the derived rung instead. Both
+/// name the same slot; only the route differs, and a test looking for the value
+/// of `n` should not care which one carried it.
+fn reactive_value_slot(project: &CompiledProject, slots: &SessionSlotView) -> SlotId {
+    let (_, opcodes) = render_initial(project, slots);
+    if let Some(slot) = opcodes.iter().find_map(|op| match op {
+        Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+        _ => None,
+    }) {
+        return slot;
+    }
+    let payload = project
+        .build_reactive_payload("Component.tsx", &Value::Object(Default::default()), slots)
+        .expect("component builds a reactive payload");
+    payload
+        .derived
+        .iter()
+        .flat_map(|binding| binding.dep_slots.iter())
+        .copied()
+        .map(SlotId)
+        .next()
+        .expect("a reactive text binding must name at least one slot")
+}
+
 fn render_initial(project: &CompiledProject, slots: &SessionSlotView) -> (String, Vec<Instruction>) {
     let opts = RenderOptions { hook_compile: true };
     let out = render_entry_with_bindings(
@@ -423,14 +452,7 @@ fn stage2_handler_reads_captured_prop_and_writes_correct_increment() {
             _ => None,
         })
         .expect("BindEvent");
-    let slot_id = render
-        .opcodes
-        .iter()
-        .find_map(|op| match op {
-            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
-            _ => None,
-        })
-        .expect("SetTextRef");
+    let slot_id = reactive_value_slot(&project, &slots);
 
     let response = project
         .invoke_action(
@@ -479,14 +501,7 @@ fn stage2_re_render_with_new_props_updates_captured_snapshot() {
             _ => None,
         })
         .expect("BindEvent");
-    let slot_id = render
-        .opcodes
-        .iter()
-        .find_map(|op| match op {
-            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
-            _ => None,
-        })
-        .expect("SetTextRef");
+    let slot_id = reactive_value_slot(&project, &slots);
 
     // Re-render with new prop value — capture slot is rewritten.
     let _ = render_entry_with_bindings(
@@ -545,14 +560,7 @@ fn stage2_greeter_captures_multiple_props_of_different_shapes() {
             _ => None,
         })
         .expect("BindEvent");
-    let slot_id = render
-        .opcodes
-        .iter()
-        .find_map(|op| match op {
-            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
-            _ => None,
-        })
-        .expect("SetTextRef");
+    let slot_id = reactive_value_slot(&project, &slots);
 
     project
         .invoke_action(
@@ -622,14 +630,7 @@ fn stage3_handler_resolves_module_constant_in_setter_arg() {
             _ => None,
         })
         .expect("BindEvent");
-    let slot_id = render
-        .opcodes
-        .iter()
-        .find_map(|op| match op {
-            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
-            _ => None,
-        })
-        .expect("SetTextRef");
+    let slot_id = reactive_value_slot(&project, &slots);
 
     // Click — `Math.min(0 + 1, MAX=5)` = 1.
     project
@@ -676,14 +677,7 @@ fn stage3_handler_caps_at_module_constant_after_many_clicks() {
             _ => None,
         })
         .expect("BindEvent");
-    let slot_id = render
-        .opcodes
-        .iter()
-        .find_map(|op| match op {
-            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
-            _ => None,
-        })
-        .expect("SetTextRef");
+    let slot_id = reactive_value_slot(&project, &slots);
 
     for _ in 0..10 {
         project
@@ -738,14 +732,7 @@ fn stage3_chained_consts_resolve_in_source_order() {
             _ => None,
         })
         .expect("BindEvent");
-    let slot_id = render
-        .opcodes
-        .iter()
-        .find_map(|op| match op {
-            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
-            _ => None,
-        })
-        .expect("SetTextRef");
+    let slot_id = reactive_value_slot(&project, &slots);
 
     project
         .invoke_action(

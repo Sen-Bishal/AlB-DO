@@ -18,6 +18,14 @@ pub struct HydrationIslandPlan {
     pub module_path: String,
     pub trigger: HydrationTrigger,
     pub dependencies: Vec<u64>,
+    /// 4.8 · the props this island's parent passed it, captured during the
+    /// parent's render and carried on the manifest's `TierCNode`.
+    ///
+    /// Per-island, because that is the only granularity that is correct: a
+    /// route has many islands and they do not share a props object. Defaulted
+    /// so a plan built by an older caller (or a test) still deserialises.
+    #[serde(default)]
+    pub props: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +60,7 @@ pub fn build_hydration_plan(manifest: &RenderManifestV2, entry: &str) -> Hydrati
                         module_path: component.module_path.clone(),
                         trigger,
                         dependencies,
+                        props: island_props_for(manifest, &component.name),
                     });
                 }
             }
@@ -63,6 +72,24 @@ pub fn build_hydration_plan(manifest: &RenderManifestV2, entry: &str) -> Hydrati
         entry: entry.to_string(),
         islands,
     }
+}
+
+/// 4.8 · the props a Tier-C island's parent passed it, as recorded on the
+/// manifest's `TierCNode` during the build.
+///
+/// The plan is assembled from the manifest's *component* list, which carries no
+/// props, so this reaches across to the route nodes — which are keyed by
+/// component name, the same `component_id` the node stores. `Null` when the
+/// island appears on no route or nobody passed it anything; every consumer
+/// reads that as "no props".
+fn island_props_for(manifest: &RenderManifestV2, component_name: &str) -> serde_json::Value {
+    manifest
+        .routes
+        .values()
+        .flat_map(|route| route.tier_c.iter())
+        .find(|node| node.component_id == component_name)
+        .map(|node| node.initial_props.clone())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn collect_reachable(

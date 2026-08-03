@@ -213,24 +213,21 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
     out.join(" ")
 }
 
+/// The HTML void elements — the tags that take no closing tag.
+///
+/// This is the single spelling of the set. The pure-Rust renderer reads it
+/// through [`is_void_tag`], the list templater in `runtime::compiled` reads it
+/// directly, and the QuickJS `h()` shim receives it as *data* on
+/// `__ALBEDO_MARKUP_CONTRACT` rather than restating it in JS. Three copies of
+/// this list is three chances for one renderer to close a tag the other leaves
+/// open — which is precisely the drift the conformance harness exists to catch.
+pub const HTML_VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
 pub fn is_void_tag(tag: &str) -> bool {
-    matches!(
-        tag,
-        "area"
-            | "base"
-            | "br"
-            | "col"
-            | "embed"
-            | "hr"
-            | "img"
-            | "input"
-            | "link"
-            | "meta"
-            | "param"
-            | "source"
-            | "track"
-            | "wbr"
-    )
+    HTML_VOID_ELEMENTS.contains(&tag)
 }
 
 pub fn is_truthy(val: &Value) -> bool {

@@ -80,16 +80,64 @@ pub struct DerivedBindingRaw {
     pub expr: swc_ecma_ast::Expr,
 }
 
+/// One piece of an element's text, when that text is part static and part
+/// reactive.
+#[derive(Debug, Clone)]
+pub enum TextTemplatePart {
+    /// Literal text from the source, already JSX-normalised. Not HTML-escaped:
+    /// this is applied as `textContent`, where escaping would be visible.
+    Static(String),
+    /// A `{…}` hole that reads at least one reactive slot.
+    Dynamic(swc_ecma_ast::Expr),
+    /// A `{…}` hole that reads none — evaluated once, at render time, and
+    /// carried as the text it produced.
+    Frozen(String),
+}
+
+/// An element whose text is a template rather than a single value.
+///
+/// A plain text binding sets its target's whole `textContent`, which is right
+/// only when the reactive read is the element's *only* content.
+/// `<span>total: {count}</span>` broke that assumption: the binding addressed
+/// the span, so the first update replaced `total: 0` with `1` and deleted the
+/// literal prefix. The element rendered correctly and then destroyed itself on
+/// contact — and the same shape reproduces with no island and no props, which
+/// is why it is fixed here rather than anywhere further out.
+///
+/// Recording the whole template, and recomputing all of it, keeps the one thing
+/// the client is allowed to do to that node (replace its text) *correct*, with
+/// no wrapper element and therefore no change to a single byte of markup.
+#[derive(Debug, Clone)]
+pub struct TextTemplateBindingRaw {
+    pub stable_id: u32,
+    /// `(binding name, slot id)` across every dynamic part, deduplicated.
+    pub deps: Vec<(String, SlotId)>,
+    pub parts: Vec<TextTemplatePart>,
+}
+
 thread_local! {
     /// Derived bindings collected during the current render. Reset at the top of
     /// every `render_entry_compiled*` call (like the element counter) and taken
     /// by `build_reactive_payload` right after the render returns. Renders that
     /// don't consume it just overwrite it next time — no leak, no wire impact.
     static DERIVED_OUT: RefCell<Vec<DerivedBindingRaw>> = const { RefCell::new(Vec::new()) };
+    /// Mixed static/reactive element texts. Same lifecycle as `DERIVED_OUT`.
+    static TEXT_TEMPLATE_OUT: RefCell<Vec<TextTemplateBindingRaw>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn push_text_template_binding(binding: TextTemplateBindingRaw) {
+    TEXT_TEMPLATE_OUT.with(|cell| cell.borrow_mut().push(binding));
+}
+
+/// Take the text-template bindings collected by the most recent render.
+pub fn take_phase_k_text_template_bindings() -> Vec<TextTemplateBindingRaw> {
+    TEXT_TEMPLATE_OUT.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 fn reset_derived_bindings() {
     DERIVED_OUT.with(|cell| cell.borrow_mut().clear());
+    TEXT_TEMPLATE_OUT.with(|cell| cell.borrow_mut().clear());
 }
 
 fn push_derived_binding(binding: DerivedBindingRaw) {
@@ -197,6 +245,51 @@ fn push_conditional_binding(binding: ConditionalBindingRaw) {
 /// Take the conditional bindings collected by the most recent render.
 pub fn take_phase_k_conditional_bindings() -> Vec<ConditionalBindingRaw> {
     CONDITIONAL_OUT.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+thread_local! {
+    /// Props the parent render passed to each Tier-C island it skipped over,
+    /// keyed by the island's component name.
+    ///
+    /// **Lifecycle is deliberately NOT the Phase-K one.** The other side
+    /// channels reset at the top of every `render_entry_*` call because they
+    /// describe that one render. These describe a *route*, which is assembled
+    /// from many renders — the route root, each Tier-A child, each layout — and
+    /// the island whose props we want may be authored in any of them. So this
+    /// accumulates across a route build and is drained once, by
+    /// [`take_island_props`], after the manifest builder's `traverse`.
+    ///
+    /// Keyed by component name rather than placeholder id because the props are
+    /// captured in both island branches below, and the branch that emits no
+    /// inline anchor has no placeholder id to hand. That costs nothing today:
+    /// a placeholder id is itself minted from the component, so the manifest
+    /// already cannot tell two uses of one island apart (see
+    /// [`take_island_props`]).
+    static ISLAND_PROPS_OUT: RefCell<std::collections::HashMap<String, Value>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Record the props a parent passed to a skipped Tier-C island.
+///
+/// Last write wins, which is the same collapsing the placeholder-id scheme
+/// already performs.
+fn push_island_props(component_name: &str, props: Value) {
+    ISLAND_PROPS_OUT.with(|cell| {
+        cell.borrow_mut().insert(component_name.to_string(), props);
+    });
+}
+
+/// Take the island props collected since the last drain, as
+/// `component name → props object`.
+///
+/// ⚠️ **One entry per island component, not per use site.** Two
+/// `<Counter start={1} />` / `<Counter start={9} />` on one route collapse to
+/// the last one rendered. That is not a new limitation introduced here — the
+/// manifest mints one `placeholder_id` per *component* (`__c_<slug>_<id>`), so
+/// two uses of one island have always shared a single node. Giving each use its
+/// own props means giving each use its own placeholder first.
+pub fn take_island_props() -> std::collections::HashMap<String, Value> {
+    ISLAND_PROPS_OUT.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 fn mark_structural_fallback() {
@@ -2687,6 +2780,35 @@ impl ComponentProject {
                     return Ok(Value::Array(vec![initial, Value::Null]));
                 }
 
+                // useMemo shim — the value of `useMemo(() => EXPR, deps)` on a
+                // first render is just `EXPR`. Without this the call fell
+                // through to the generic path, `const doubled = useMemo(…)`
+                // bound nothing, and `{doubled}` rendered as an EMPTY node
+                // while QuickJS rendered the number. Silent-wrong, and worst on
+                // the static path, where the empty span is the final markup and
+                // no client ever fills it in.
+                //
+                // Deliberately the *same* subset `derived_locals` recognises —
+                // an expression-body arrow — so the value this renders and the
+                // expression the client recomputes are the one expression. A
+                // block-bodied memo resolves neither here nor there, and falls
+                // through to the generic call path as before.
+                let is_react_use_memo = fn_name == "useMemo"
+                    && import
+                        .map(|b| b.source == "react" && b.export_name == "useMemo")
+                        .unwrap_or(false);
+                if is_react_use_memo {
+                    if let Some(arg) = call.args.first() {
+                        if arg.spread.is_none() {
+                            if let Expr::Arrow(arrow) = &*arg.expr {
+                                if let swc_ecma_ast::BlockStmtOrExpr::Expr(body) = &*arrow.body {
+                                    return self.eval_expr(module_spec, body, env);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // JS-style coercions.
                 if fn_name == "String" || fn_name == "Number" || fn_name == "Boolean" {
                     let arg = match call.args.first() {
@@ -3551,6 +3673,31 @@ impl ComponentProject {
             // and a route (a nested island would otherwise be hoisted out of the
             // element that wraps it) install one.
             if island_skip_contains(&tag) {
+                // Capture what the parent passed before dropping the subtree.
+                // This is the only moment the island's props exist: the island
+                // itself is rendered later, standalone, from a module path — by
+                // which point `start={41}` is gone. Skipping without capturing
+                // is why an island rendered from `{}` and every prop an author
+                // wrote silently evaporated.
+                //
+                // Best-effort on purpose. An attribute expression the evaluator
+                // cannot model must not take the page down with it: the island
+                // has always rendered here (from nothing), and the worst this
+                // may do is leave it rendering from nothing. `?` would convert
+                // a working page into a failed render.
+                if let Ok(attrs) = self.read_attrs(module_spec, &element.opening.attrs, env) {
+                    let mut props = Map::new();
+                    for (name, value) in attrs {
+                        // Handlers are not data and do not survive the trip: a
+                        // closure cannot be serialised into a payload, and the
+                        // island's own `onClick`s are compiled into its bundle.
+                        if !name.starts_with("on") {
+                            props.insert(name, value);
+                        }
+                    }
+                    push_island_props(&tag, Value::Object(props));
+                }
+
                 if let Some(placeholder_id) = island_placeholder_for(&tag) {
                     // Emit RAW (no escaping): the serve path string-replaces this
                     // exact div, and placeholder ids are always
@@ -4095,6 +4242,122 @@ impl ComponentProject {
         Ok(())
     }
 
+    /// Record the containing element's text as a template, when it mixes static
+    /// text with at least one reactive read.
+    ///
+    /// Emits nothing — and so leaves the element with no binding at all — when
+    /// the text cannot be rebuilt from parts:
+    ///
+    /// * **A child element.** `<p>{name} <b>x</b></p>` cannot be repainted by
+    ///   setting the paragraph's text without deleting the `<b>`, along with any
+    ///   anchor or handler inside it. That is a structural change, so it takes
+    ///   the structural fallback and the whole component hydrates instead —
+    ///   correct, rather than fast and wrong.
+    /// * **No reactive part.** Fully static text needs no binding.
+    fn record_text_template(
+        &self,
+        module_spec: &str,
+        children: &[swc_ecma_ast::JSXElementChild],
+        env: &HashMap<String, Value>,
+    ) -> Result<()> {
+        use swc_ecma_ast::*;
+
+        let Some(stable_id) = phase_k_top_element() else {
+            return Ok(());
+        };
+
+        fn child_expr(child: &JSXElementChild) -> Option<&Expr> {
+            match child {
+                JSXElementChild::JSXExprContainer(JSXExprContainer {
+                    expr: JSXExpr::Expr(expr),
+                    ..
+                }) => Some(expr),
+                _ => None,
+            }
+        }
+
+        // A conditional or list child is structural: it owns its own
+        // `display:contents` wrapper and its own binding, and the surrounding
+        // element's text is not a template over it. Leave those rungs alone —
+        // treating one as untemplatable text would fall a component back to A3
+        // that binding mode handles perfectly well today.
+        if children.iter().filter_map(child_expr).any(|expr| {
+            classify_jsx_conditional(expr).is_some() || classify_jsx_list(expr).is_some()
+        }) {
+            return Ok(());
+        }
+
+        let has_reactive_text = children
+            .iter()
+            .filter_map(child_expr)
+            .any(|expr| phase_k_collect_slot_deps(expr).is_some());
+        if !has_reactive_text {
+            return Ok(());
+        }
+
+        // An element child cannot be rebuilt from text. Repainting the parent's
+        // text would delete it — along with any anchor or handler inside it — so
+        // this is structural and the whole component hydrates instead. Correct,
+        // rather than fast and wrong: the alternative on this path was a plain
+        // text binding that destroyed the child on the first update.
+        if children.iter().any(|child| {
+            matches!(
+                child,
+                JSXElementChild::JSXElement(_)
+                    | JSXElementChild::JSXFragment(_)
+                    | JSXElementChild::JSXSpreadChild(_)
+            )
+        }) {
+            mark_structural_fallback();
+            return Ok(());
+        }
+
+        let mut parts: Vec<TextTemplatePart> = Vec::new();
+        let mut deps: Vec<(String, SlotId)> = Vec::new();
+
+        for child in children {
+            match child {
+                JSXElementChild::JSXText(text) => {
+                    if let Some(normalized) = normalize_jsx_text(text.value.as_ref()) {
+                        parts.push(TextTemplatePart::Static(normalized));
+                    }
+                }
+                JSXElementChild::JSXExprContainer(container) => {
+                    let JSXExpr::Expr(expr) = &container.expr else {
+                        continue;
+                    };
+                    match phase_k_collect_slot_deps(expr) {
+                        Some((resolved, expr_deps)) => {
+                            for (name, slot) in expr_deps {
+                                if !deps.iter().any(|(existing, _)| existing == &name) {
+                                    deps.push((name, slot));
+                                }
+                            }
+                            parts.push(TextTemplatePart::Dynamic(resolved));
+                        }
+                        None => {
+                            // Reads no slot, so it cannot change client-side.
+                            // Freeze the text it produced rather than shipping an
+                            // expression the client has no scope to evaluate.
+                            let value = self.eval_expr(module_spec, expr, env)?;
+                            if !matches!(value, Value::Null | Value::Bool(false)) {
+                                parts.push(TextTemplatePart::Frozen(value_to_string(&value)));
+                            }
+                        }
+                    }
+                }
+                _ => return Ok(()),
+            }
+        }
+
+        push_text_template_binding(TextTemplateBindingRaw {
+            stable_id,
+            deps,
+            parts,
+        });
+        Ok(())
+    }
+
     fn render_children(
         &self,
         module_spec: &str,
@@ -4104,6 +4367,24 @@ impl ComponentProject {
     ) -> Result<String> {
         use swc_ecma_ast::*;
         let mut html = String::new();
+
+        // A text binding replaces its anchor's WHOLE `textContent`, so it may
+        // only address the containing element when that element has nothing
+        // else in it. `<span>total: {count}</span>` has something else in it:
+        // pointing the binding at the span made the first click overwrite
+        // `total: 0` with `1` and delete the literal prefix — the element
+        // rendered correctly and then destroyed itself on contact.
+        //
+        // When there are siblings, the dynamic read gets its own anchor and the
+        // binding addresses that instead, leaving everything around it alone.
+        // Deliberately not applied to the single-child case: that anchor is
+        // already exact, and wrapping it would add bytes and churn every golden
+        // for no correctness gain.
+        let needs_own_anchor = content_child_count(children) > 1;
+        if needs_own_anchor && phase_k_enabled() {
+            self.record_text_template(module_spec, children, env)?;
+        }
+
         for child in children {
             match child {
                 JSXElementChild::JSXText(text) => {
@@ -4143,25 +4424,32 @@ impl ComponentProject {
                         // (top of element_stack) so bakabox subscribes
                         // it to the slot store and re-applies on
                         // future SlotSet opcodes.
-                        if let Some(slot_id) = phase_k_detect_slot_text_read(expr) {
-                            if let Some(stable_id) = phase_k_top_element() {
-                                phase_k_emit(Instruction::SetTextRef {
-                                    stable_id: StableId(stable_id),
-                                    slot_id,
-                                });
-                            }
-                        } else if phase_k_enabled() {
-                            // Derived text: `{count * 2}`, `{open ? 'a' : 'b'}` —
-                            // reads slots but isn't a bare read. Record it so the
-                            // client recomputes the value from state on change.
-                            if let Some(stable_id) = phase_k_top_element() {
-                                if let Some((resolved, deps)) = phase_k_collect_slot_deps(expr) {
-                                    push_derived_binding(DerivedBindingRaw {
-                                        stable_id,
-                                        attr: None,
-                                        deps,
-                                        expr: resolved,
+                        // A binding may address the containing element only when
+                        // it owns the element's whole text. With siblings, the
+                        // element's text is a TEMPLATE — some static, some
+                        // reactive — and it is recorded once for the element
+                        // below rather than per-read here.
+                        if !needs_own_anchor {
+                            if let Some(slot_id) = phase_k_detect_slot_text_read(expr) {
+                                if let Some(stable_id) = phase_k_top_element() {
+                                    phase_k_emit(Instruction::SetTextRef {
+                                        stable_id: StableId(stable_id),
+                                        slot_id,
                                     });
+                                }
+                            } else if phase_k_enabled() {
+                                // Derived text: `{count * 2}`, `{open ? 'a' : 'b'}` —
+                                // reads slots but isn't a bare read. Record it so the
+                                // client recomputes the value from state on change.
+                                if let Some(stable_id) = phase_k_top_element() {
+                                    if let Some((resolved, deps)) = phase_k_collect_slot_deps(expr) {
+                                        push_derived_binding(DerivedBindingRaw {
+                                            stable_id,
+                                            attr: None,
+                                            deps,
+                                            expr: resolved,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -4220,6 +4508,32 @@ impl ComponentProject {
 /// Human-readable label for a statement the pure-Rust evaluator does not model,
 /// used in the loud-error message so the dev knows exactly which construct hit
 /// the Tier-B/C boundary.
+/// How many of `children` put anything into the parent's markup.
+///
+/// Whitespace-only JSX text does not count — JSX drops it, and counting it
+/// would wrap every `{count}` that happens to sit on its own line, which is
+/// most of them.
+///
+/// Everything that is not plainly nothing counts, including an expression whose
+/// value turns out to be `null` at this render: whether a sibling *renders*
+/// depends on state, and an anchor decision that flips with state is an anchor
+/// decision that is wrong half the time.
+fn content_child_count(children: &[swc_ecma_ast::JSXElementChild]) -> usize {
+    use swc_ecma_ast::*;
+    children
+        .iter()
+        .filter(|child| match child {
+            JSXElementChild::JSXText(text) => normalize_jsx_text(text.value.as_ref()).is_some(),
+            JSXElementChild::JSXExprContainer(container) => {
+                !matches!(container.expr, JSXExpr::JSXEmptyExpr(_))
+            }
+            JSXElementChild::JSXElement(_)
+            | JSXElementChild::JSXFragment(_)
+            | JSXElementChild::JSXSpreadChild(_) => true,
+        })
+        .count()
+}
+
 fn statement_kind(stmt: &swc_ecma_ast::Stmt) -> &'static str {
     use swc_ecma_ast::{Decl, Stmt};
     match stmt {

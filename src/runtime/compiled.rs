@@ -818,7 +818,7 @@ impl CompiledProject {
 
         let mut handlers = Vec::with_capacity(proxy_ids.len());
         for proxy_id in proxy_ids {
-            handlers.push((proxy_id, self.build_client_handler_thunk(proxy_id)?));
+            handlers.push((proxy_id, self.build_client_handler_thunk(proxy_id, slots)?));
         }
 
         // Derived bindings: the render recorded each `{slot-expr}` (text or attr)
@@ -826,7 +826,7 @@ impl CompiledProject {
         // over the live state object — every dependency name binds to its slot
         // (falling back to that slot's initial value), then the expression is
         // returned. The client re-runs this when any dependency changes.
-        let slot_initials = self.slot_initial_js_map()?;
+        let slot_initials = self.slot_initial_js_map(slots)?;
         let raw_derived = crate::runtime::eval::core::take_phase_k_derived_bindings();
         let mut derived = Vec::with_capacity(raw_derived.len());
         for binding in raw_derived {
@@ -846,6 +846,61 @@ impl CompiledProject {
                 stable_id: binding.stable_id,
                 attr: binding.attr,
                 dep_slots: binding.deps.iter().map(|(_, slot)| slot.0).collect(),
+                thunk,
+                html: false,
+            });
+        }
+
+        // Mixed static/reactive element text (`<span>total: {count}</span>`).
+        //
+        // Lowered to the same derived rung, because the client-side operation is
+        // the same one — recompute a string, apply it as the element's text. The
+        // difference is only in what gets recomputed: the WHOLE text, static
+        // parts included, rather than one hole's value. That is what stops the
+        // update from deleting the parts it does not own.
+        //
+        // `__str` gives `null` / `undefined` / `false` the same empty rendering
+        // the server gives them, so the first client repaint does not introduce
+        // the string "null" where the server rendered nothing.
+        use crate::runtime::eval::core::TextTemplatePart;
+        let raw_templates = crate::runtime::eval::core::take_phase_k_text_template_bindings();
+        for template in raw_templates {
+            let mut thunk = String::from(
+                "(function(__s){\n\
+                 function __str(v){return (v===null||v===undefined||v===false)?'':(''+v);}\n",
+            );
+            for (name, slot_id) in &template.deps {
+                let slot = slot_id.0;
+                let initial = slot_initials
+                    .get(&slot)
+                    .cloned()
+                    .unwrap_or_else(|| "undefined".to_string());
+                thunk.push_str(&format!(
+                    "var {name}=(__s[{slot}]!==undefined?__s[{slot}]:({initial}));\n"
+                ));
+            }
+
+            // Anchored on a leading `''` so every `+` is string concatenation.
+            // Without it `{a}{b}` over two numbers would ADD them: `1 + 2` is
+            // `3`, where the server rendered `12`.
+            let mut expression = String::from("''");
+            for part in &template.parts {
+                expression.push_str(" + ");
+                match part {
+                    TextTemplatePart::Static(text) | TextTemplatePart::Frozen(text) => {
+                        expression.push_str(&json_string_literal(text));
+                    }
+                    TextTemplatePart::Dynamic(expr) => {
+                        expression.push_str(&format!("__str({})", expr_to_js(expr)?));
+                    }
+                }
+            }
+            thunk.push_str(&format!("return ({expression});\n}})"));
+
+            derived.push(ReactiveDerivedBinding {
+                stable_id: template.stable_id,
+                attr: None,
+                dep_slots: template.deps.iter().map(|(_, slot)| slot.0).collect(),
                 thunk,
                 html: false,
             });
@@ -970,28 +1025,63 @@ impl CompiledProject {
     /// Map every `useState` value slot id → its initial expression lowered to JS,
     /// across all components. Used to seed derived-binding dependency fallbacks
     /// so a recompute that reads a slot not yet written still gets the SSR value.
-    fn slot_initial_js_map(&self) -> Result<HashMap<u32, String>> {
+    fn slot_initial_js_map(&self, slots: &SessionSlotView) -> Result<HashMap<u32, String>> {
         let mut out = HashMap::new();
         for component in self.components.values() {
             for hook in &component.hooks {
                 if let Some(slot_id) = component.value_slots.get(&hook.value_name) {
-                    out.insert(slot_id.0, expr_to_js(&hook.initial)?);
+                    out.insert(slot_id.0, self.slot_initial_js(*slot_id, &hook.initial, slots)?);
                 }
             }
         }
         Ok(out)
     }
 
+    /// The JS source a client thunk should use as a slot's initial value.
+    ///
+    /// Prefers the value the render just computed, read back out of the slot
+    /// store, and falls back to codegen of the initial *expression*.
+    ///
+    /// The order matters, and it is the whole fix for islands taking props.
+    /// `useState(start)` lowers, expression-first, to a fallback that names
+    /// `start` — an identifier that exists in the component's scope on the
+    /// server and **nowhere at all** inside `(function(__state,__emit){…})` on
+    /// the client. The thunk threw `ReferenceError` on the first click and the
+    /// island simply did not respond. The value is strictly better information:
+    /// the render already evaluated that expression, with props in scope, so
+    /// the number `41` is both smaller on the wire and free of every scope
+    /// question the expression drags along — props, module constants, imports.
+    ///
+    /// Slot values are stored as their JSON encoding, and JSON literals are
+    /// valid JS expression source, so the bytes transfer verbatim.
+    fn slot_initial_js(
+        &self,
+        slot_id: SlotId,
+        initial: &swc_ecma_ast::Expr,
+        slots: &SessionSlotView,
+    ) -> Result<String> {
+        if let Some(bytes) = slots.read(slot_id) {
+            if let Ok(json) = String::from_utf8(bytes) {
+                // Guard against a torn/empty write producing bare `` as source.
+                if !json.trim().is_empty() {
+                    return Ok(json);
+                }
+            }
+        }
+        expr_to_js(initial)
+    }
+
     /// Lower one handler to a client thunk `(function(__state,__emit){...})`.
     ///
     /// Mirror of the server's `build_handler_script`, but over a *live* JS
     /// state object instead of the session slot store: each `useState` value
-    /// binds to `__state[slot]` (falling back to its initial expression on the
-    /// first interaction), each setter writes `__state[slot]` and emits the
-    /// change via `__emit(slot, value)`. The driver turns each `__emit` into a
-    /// `SlotSet` against bakabox. Sequential clicks accumulate because the
-    /// state object persists between dispatches (the server re-seeds per call).
-    fn build_client_handler_thunk(&self, proxy_id: u32) -> Result<String> {
+    /// binds to `__state[slot]` (falling back to the value this render computed
+    /// for it — see [`Self::slot_initial_js`]), each setter writes
+    /// `__state[slot]` and emits the change via `__emit(slot, value)`. The
+    /// driver turns each `__emit` into a `SlotSet` against bakabox. Sequential
+    /// clicks accumulate because the state object persists between dispatches
+    /// (the server re-seeds per call).
+    fn build_client_handler_thunk(&self, proxy_id: u32, slots: &SessionSlotView) -> Result<String> {
         let handler = self
             .handler(proxy_id)
             .ok_or_else(|| anyhow!("no handler registered for proxy_id {proxy_id}"))?;
@@ -1004,8 +1094,9 @@ impl CompiledProject {
                     handler.function_name,
                 )
             })?;
-        // Binding mode wires only `__state`, setters, and captured props into the
-        // client thunk — NOT the DOM event. A handler that reads its event
+        // Binding mode wires only `__state` and setters into the client thunk —
+        // NOT the DOM event, and not the component's scope. A handler that reads
+        // its event
         // argument (`onInput={(e) => setCount(e.target.value.length)}`) therefore
         // can't be faithfully lowered here; decline so `build_reactive_payload`
         // fails and `build_reactive_blocks` falls the component back to A3
@@ -1036,13 +1127,10 @@ impl CompiledProject {
         let mut s = String::from("(function(__state,__emit){\n");
         // useState value bindings — read live state, fall back to the initial.
         for (name, slot_id) in &component.value_slots {
-            let initial = component
-                .hooks
-                .iter()
-                .find(|h| &h.value_name == name)
-                .map(|h| expr_to_js(&h.initial))
-                .transpose()?
-                .unwrap_or_else(|| "undefined".to_string());
+            let initial = match component.hooks.iter().find(|h| &h.value_name == name) {
+                Some(hook) => self.slot_initial_js(*slot_id, &hook.initial, slots)?,
+                None => "undefined".to_string(),
+            };
             let slot = slot_id.0;
             s.push_str(&format!(
                 "var {name}=(__state[{slot}]!==undefined?__state[{slot}]:({initial}));\n"
@@ -1946,8 +2034,19 @@ impl CompiledProject {
 
         // Idempotent by source hash — re-loading an unchanged module is a no-op
         // inside the engine, so calling this every render is cheap after warmup.
+        //
+        // With the stamp spec, and it is the *project-relative* `module_spec` on
+        // purpose. The id is hashed from that string, so this is the one value
+        // that makes these ids equal the ones `render_entry_with_bindings`
+        // allocates for the same component; the manifest's absolute path would
+        // produce a numbering that is self-consistent and useless. Loading
+        // unstamped — which this did — yields markup with no `data-albedo-id`
+        // at all, so every `BindEvent` in the frame built from the pure-Rust
+        // render addresses a node that does not exist. The server's Tier-B path
+        // has always passed a stamp; this "symmetric counterpart" did not, which
+        // made it symmetric in signature only.
         engine
-            .load_module(&module_spec, &source)
+            .load_module_with_spec(&module_spec, &source, Some(&module_spec))
             .map_err(|err| anyhow!("failed to load '{module_spec}' for quickjs render: {err}"))?;
 
         // Build the per-render host seed from the component's compiled metadata.
@@ -2188,10 +2287,10 @@ fn handler_body_to_js(body: &HandlerBody) -> Result<(String, bool)> {
 }
 
 /// HTML void elements — emitted self-contained with no closing tag.
-const HTML_VOID_ELEMENTS: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
-    "track", "wbr",
-];
+///
+/// Re-exported from `runtime::eval::component` rather than restated: this
+/// templater and the pure-Rust renderer must close exactly the same tags.
+use crate::runtime::eval::component::HTML_VOID_ELEMENTS;
 
 /// Map a JSX attribute name to the HTML attribute name the server renders.
 fn jsx_attr_name_to_html(name: &str) -> &str {
