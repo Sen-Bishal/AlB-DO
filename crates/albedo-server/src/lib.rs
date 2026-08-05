@@ -95,7 +95,7 @@ pub use renderer_runtime::{
     RendererRuntime, RENDER_MANIFEST_FILENAME, RUNTIME_MODULE_SOURCES_FILENAME,
 };
 pub use routing::{AuthPolicy, CompiledRouter, HttpMethod, MatchedRoute, RouteMatch, RouteTarget};
-pub use server::{AlbedoServer, AlbedoServerBuilder, DevReloadHandle};
+pub use server::{AlbedoServer, AlbedoServerBuilder, BootReport, DevReloadHandle};
 pub use webtransport::{
     WebTransportRuntime, WebTransportSessionHandle, WebTransportSessionRegistry,
 };

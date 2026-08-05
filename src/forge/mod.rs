@@ -26,6 +26,10 @@
 //!   of a bounded resource (tickets, stock, seats, quotas). The contention
 //!   primitive: supply never goes negative, never oversells, and a retried
 //!   request never claims twice.
+//! - [`drift`] — [`evolve_schema`](drift::evolve_schema), the boot gate that
+//!   reconciles the declaration with the database: it adds new nullable columns
+//!   and refuses to serve any other disagreement. Migrations are `IF NOT EXISTS`
+//!   only, so an edited `forge` block would otherwise apply as silence.
 //!
 //! ## Roadmap (see `development-plan/backend.md`)
 //!
@@ -37,6 +41,7 @@
 pub mod bindings;
 pub mod declare;
 pub mod delta;
+pub mod drift;
 pub mod mem;
 pub mod reserve;
 pub mod skeleton;
@@ -57,6 +62,7 @@ pub use reserve::{
 };
 pub use bindings::{validate_partition_bindings, PartitionBinding};
 pub use declare::{CollectionDecl, FieldType};
+pub use drift::{evolve_schema, Addition, Change, CollectionDrift, SchemaDrift, VerifyError};
 pub use typegen::emit_forge_dts;
 pub use skeleton::{ForgeCollection, ForgeSchema, ForgeSchemaError, SeedRow};
 pub use substrate::{DataSubstrate, Transaction};

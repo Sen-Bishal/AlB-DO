@@ -19,7 +19,7 @@ use dom_render_compiler::manifest::schema::{
 use dom_render_compiler::runtime::engine::BootstrapPayload;
 use dom_render_compiler::runtime::quickjs_engine::{compile_client_island_module, QuickJsEngine};
 use dom_render_compiler::runtime::renderer::{
-    inject_island_marker, RouteRenderRequest, RouteRenderStreamResult, ServerRenderer,
+    inject_island_marker, RouteRenderRequest, ServerRenderer,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -127,49 +127,57 @@ impl RendererRuntime {
             )
             .map_err(|err| RuntimeError::RendererFailure(err.to_string()))?;
 
-        // Startup priming pass: pre-render every manifest route so the
-        // static-slice and normalized-props caches are warm on the very
-        // first request after deploy instead of paying engine + encoder
-        // warmup on every cold entry. Soft-fail by design — a priming
-        // error degrades to a cold cache, no new failure mode.
-        let warm_requests: Vec<RouteRenderRequest> = manifest
-            .routes
-            .keys()
-            .map(|entry| RouteRenderRequest {
-                entry: entry.clone(),
-                props_json: "{}".to_string(),
-                module_order: Vec::new(),
-                hydration_payload: None,
-                host_json: None,
-            })
-            .collect();
-
-        if !warm_requests.is_empty() {
-            if let Err(err) = renderer.prime_runtime_cache(&warm_requests) {
-                tracing::warn!(target: "albedo.renderer", error = %err, "cache priming failed");
-            }
+        // Warm the QuickJS engine. The island SSR renders in
+        // `build_hydration_blocks` run on this same engine a moment later, on
+        // the boot thread, so paying warmup once here rather than inside the
+        // first of them is the whole benefit — and it is the only benefit
+        // available, because this renderer does not outlive boot.
+        //
+        // ## What used to be here, and why it never worked
+        //
+        // A per-route pre-render loop: `manifest.routes.keys()` mapped into
+        // `RouteRenderRequest { entry, .. }` and pushed through
+        // `prime_runtime_cache`. It failed on **every boot of every project**
+        // with `entry module missing: '/'`, and had done so unnoticed for as
+        // long as the manifest-streaming path has existed — the warning went to
+        // `tracing`, which until 2026-08-04 had no subscriber.
+        //
+        // Three independent reasons it could not have worked:
+        //
+        // 1. **The key is a category error.** `routes` is keyed by URL path
+        //    (`/`, `/room/[id]`); the module registry is keyed by module
+        //    specifier (an absolute path to `routes/index.tsx`). No route path
+        //    is ever a registry key, so `resolve_topological_order` rejects the
+        //    first one and `?` aborts the loop — zero routes were primed, ever.
+        // 2. **Nothing reads that cache.** The concurrent request path never
+        //    touches QuickJS; it serves the baked manifest through
+        //    `StreamingAppState` with the hydration map built once at boot.
+        //    `RendererRuntime::render_route_stream` had zero callers.
+        // 3. **The cache does not survive.** `AlbedoServerBuilder::build` holds
+        //    this `RendererRuntime` in a local, takes what it needs into `Arc`s,
+        //    and drops it on return. Anything warmed here dies with it.
+        //
+        // So the loop was residue from an architecture where a request rendered
+        // its route through the engine by route entry. Removing it changes no
+        // observable behaviour — it never completed a single render — it only
+        // stops the boot lying about having tried.
+        if let Err(err) = renderer.warm_runtime() {
+            tracing::warn!(target: "albedo.renderer", error = %err, "engine warmup failed");
         }
 
         Ok(Self { manifest, renderer })
     }
 
-    pub fn render_route_stream(
-        &mut self,
-        entry_module: &str,
-        props_json: String,
-    ) -> Result<RouteRenderStreamResult, RuntimeError> {
-        let request = RouteRenderRequest {
-            entry: entry_module.to_string(),
-            props_json,
-            module_order: Vec::new(),
-            hydration_payload: None,
-            host_json: None,
-        };
-
-        self.renderer
-            .render_route_stream_with_manifest_hydration(&request, &self.manifest)
-            .map_err(|err| RuntimeError::RendererFailure(err.to_string()))
-    }
+    // `render_route_stream(entry_module, props_json)` used to live here: render
+    // one route through QuickJS, on demand, keyed by route entry. It had no
+    // callers in the workspace — the manifest-streaming path replaced it — and
+    // it is what made the priming loop above look reasonable, since it implied
+    // a route path was a thing the engine could render. Removed with the loop,
+    // deliberately together: leaving the method would leave the wrong model
+    // documented in code, which is how the loop survived this long.
+    //
+    // The engine is still rendered *to* at boot, by `render_island_html`, keyed
+    // by island module path — that is the shape a QuickJS render actually takes.
 
     pub fn revalidate_path(&mut self, path: &str) {
         self.renderer.revalidate_path(path);

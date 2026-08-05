@@ -28,6 +28,17 @@ export default {
   // keyed `SlotDelta` — O(|Δ|), not O(|list|), however long it gets.
   //
   // Add a collection here and it exists. That is the whole workflow.
+  //
+  // Editing one that already holds rows works too: add a NULLABLE field and
+  // ALBEDO alters the table on the next boot and says so. Anything else — a
+  // drop, a rename, a type change, or a new REQUIRED field — refuses to start
+  // and names the field, because there is no value it could invent for the rows
+  // written before it. A refusal never touches your data.
+  //
+  // A field is `text`, `int`, `real`, `bool` or `timestamp`, with a trailing
+  // `?` for nullable (`nickname: "text?"`). These decide the shape your rows
+  // arrive in: a `bool` is `true`, never `1`; a `timestamp` is epoch
+  // milliseconds, so `new Date(row.posted_at)` works with no conversion.
   forge: {
     guestbook: {
       fields: { author: "text", message: "text" },

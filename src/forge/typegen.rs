@@ -23,17 +23,29 @@
 //! machines and runs. It is generated output that lands in a project directory;
 //! a nondeterministic one would show up as spurious diffs forever.
 
-use super::declare::{CollectionDecl, FieldType};
+use super::declare::{CollectionDecl, FieldSpec, FieldType};
 use std::collections::BTreeMap;
 
 /// The TypeScript type a declared field lowers to.
-fn ts_type(field: FieldType) -> &'static str {
-    match field {
+///
+/// A nullable field widens with `| null` rather than becoming an optional
+/// property (`nickname?:`). They are different claims: the column is always
+/// *present* in a row the substrate returns, it may just hold `null`. Marking it
+/// optional would tell the editor the key can be missing, and `row.nickname`
+/// would then narrow to `string | undefined` — a value that never occurs.
+fn ts_type(spec: FieldSpec) -> String {
+    let base = match spec.ty {
         FieldType::Text => "string",
-        // Both are JS numbers. Kept as one arm with a note rather than two
-        // identical ones, so a future `Bool`/`Timestamp` (item 6) has an obvious
-        // place to land and the difference is visible when it does.
-        FieldType::Int | FieldType::Real => "number",
+        FieldType::Bool => "boolean",
+        // `Timestamp` is epoch milliseconds, so it is a `number` — and the same
+        // number `Date.now()` produces, which is what makes `new Date(row.at)`
+        // just work. Not a `Date`: nothing reconstitutes one across the wire.
+        FieldType::Int | FieldType::Real | FieldType::Timestamp => "number",
+    };
+    if spec.nullable {
+        format!("{base} | null")
+    } else {
+        base.to_string()
     }
 }
 
@@ -132,7 +144,7 @@ mod tests {
         CollectionDecl {
             fields: fields
                 .iter()
-                .map(|(name, ty)| ((*name).to_string(), *ty))
+                .map(|(name, ty)| ((*name).to_string(), FieldSpec::new(*ty)))
                 .collect(),
             partition_by: partition_by.map(str::to_string),
             ..CollectionDecl::default()
@@ -184,6 +196,47 @@ mod tests {
             dts.contains("export const messages: Collection<MessagesRow, \"room\">;"),
             "{dts}"
         );
+    }
+
+    /// Item 6 · a `bool` is a `boolean`, and a `timestamp` is the `number`
+    /// `Date.now()` produces — not a `Date`, because nothing reconstitutes one
+    /// across the wire.
+    #[test]
+    fn bool_is_boolean_and_timestamp_is_a_number() {
+        let dts = emit(&[(
+            "todos",
+            decl(
+                &[("done", FieldType::Bool), ("created_at", FieldType::Timestamp)],
+                None,
+            ),
+        )]);
+        assert!(dts.contains("done: boolean;"), "{dts}");
+        assert!(dts.contains("created_at: number;"), "{dts}");
+    }
+
+    /// Nullable widens the type rather than making the property optional. The
+    /// column is always present in a row the substrate returns; it may hold
+    /// `null`. `nickname?:` would additionally promise `undefined`, which never
+    /// occurs.
+    #[test]
+    fn a_nullable_field_widens_with_null_and_stays_required() {
+        let dts = emit(&[(
+            "people",
+            CollectionDecl {
+                fields: [
+                    ("nickname".to_string(), FieldSpec::nullable(FieldType::Text)),
+                    ("age".to_string(), FieldSpec::nullable(FieldType::Int)),
+                    ("name".to_string(), FieldSpec::new(FieldType::Text)),
+                ]
+                .into_iter()
+                .collect(),
+                ..CollectionDecl::default()
+            },
+        )]);
+        assert!(dts.contains("nickname: string | null;"), "{dts}");
+        assert!(dts.contains("age: number | null;"), "{dts}");
+        assert!(dts.contains("name: string;"), "{dts}");
+        assert!(!dts.contains("nickname?:"), "not optional, nullable: {dts}");
     }
 
     #[test]

@@ -34,6 +34,9 @@ thiserror.workspace            = true
 tokio.workspace                = true
 tokio-stream.workspace         = true
 tracing.workspace              = true
+# The `albedo` binary is the only thing that *subscribes*; the library only
+# emits. Without this the ~66 instrumentation sites in the tree have no receiver.
+tracing-subscriber.workspace   = true
 url.workspace                  = true
 uuid.workspace                 = true
 quinn.workspace                = true

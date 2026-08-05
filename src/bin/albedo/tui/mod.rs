@@ -38,10 +38,20 @@ pub mod theme;
 ///
 /// `ALBEDO_NO_TUI` is the explicit escape hatch — for a user who simply prefers
 /// the log, and for reproducing a report against the print path.
+///
+/// `RUST_LOG` opts out too, because the two cannot share a terminal: the
+/// dashboard owns the alternate screen and repaints it every frame, so a
+/// subscriber writing log lines to the same tty would be scribbled over
+/// immediately — and it is the *log* the user asked for by setting the variable.
+/// Asking for logs is therefore asking for the plain lane. (stderr does not
+/// escape this: redirecting the stream elsewhere still leaves `RUST_LOG` set, so
+/// `ALBEDO_NO_TUI= ` is not needed but the dashboard is still skipped — a
+/// deliberate trade of one rare combination for a rule with no exceptions.)
 pub fn available() -> bool {
     io::stdout().is_terminal()
         && std::env::var_os("ALBEDO_NO_TUI").is_none()
         && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var_os("RUST_LOG").is_none()
 }
 
 /// Owns the terminal's alternate screen and raw mode for as long as it lives.

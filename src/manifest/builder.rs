@@ -1620,11 +1620,38 @@ fn materialize_forge_seeds(working_dir: Option<&std::path::Path>) -> Vec<(String
                     else {
                         return Vec::new();
                     };
-                    // Phase 1: the built-in default schema. When app-declared
-                    // schemas land (Phase 2) this becomes the same schema the
-                    // serve path loads, so the build-time bake and serve-boot
-                    // hydration stay byte-identical.
-                    let schema = crate::forge::skeleton::ForgeSchema::guestbook_default();
+                    // The app's declared collections, or the built-in default
+                    // when it declares none — **the same choice
+                    // `boot_production_server` makes**, and it has to be.
+                    //
+                    // This bake runs before the serve boot and *creates*
+                    // `forge.db` when it is absent, so a schema that disagrees
+                    // with the serve path's does not merely bake stale seeds:
+                    // it creates the wrong table, and every later boot is
+                    // measured against it. Until item 6 this was pinned to
+                    // `guestbook_default()` with a comment promising to change
+                    // "when app-declared schemas land (Phase 2)" — they landed,
+                    // this did not follow, and the result was that an app
+                    // declaring its own `guestbook` with any extra field could
+                    // never start: the build recreated the two-column default,
+                    // then the boot refused against it. It read as the drift
+                    // check being broken; the drift check was the only reason
+                    // anyone could see it at all.
+                    let declarations = crate::dev::contract::load_forge_declarations(
+                        working_dir.unwrap_or_else(|| std::path::Path::new(".")),
+                    )
+                    .unwrap_or_default();
+                    let schema = if declarations.is_empty() {
+                        crate::forge::skeleton::ForgeSchema::guestbook_default()
+                    } else {
+                        match crate::forge::ForgeSchema::from_declarations(&declarations) {
+                            Ok(schema) => schema,
+                            // A malformed block fails the serve boot with the
+                            // offending collection named. Baking nothing here
+                            // lets that be the message the author sees.
+                            Err(_) => return Vec::new(),
+                        }
+                    };
                     if crate::forge::skeleton::bootstrap_schema(&substrate, &schema)
                         .await
                         .is_err()

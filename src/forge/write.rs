@@ -273,18 +273,28 @@ fn build_append_returning(
 
 /// Turn one `RETURNING` row into the JSON object shape the materialised array
 /// carries, so a spliced row and a queried row are indistinguishable.
-fn returned_record(columns: &[String], row: &crate::forge::value::Row) -> Option<Value> {
+///
+/// `fields` are the collection's declared types, and passing them is what keeps
+/// that promise true for a `bool`: the full materialisation renders it `true`,
+/// so a row spliced in by this path has to as well, or the same record would
+/// look different depending on whether it arrived by write or by re-read.
+fn returned_record(
+    columns: &[String],
+    row: &crate::forge::value::Row,
+    fields: &std::collections::BTreeMap<String, crate::forge::declare::FieldSpec>,
+) -> Option<Value> {
     let mut object = Map::new();
     for (index, column) in columns.iter().enumerate() {
-        let value = match row.get(index)? {
-            SqlValue::Null => Value::Null,
-            SqlValue::Integer(number) => Value::Number((*number).into()),
-            SqlValue::Real(number) => serde_json::Number::from_f64(*number)
-                .map(Value::Number)
-                .unwrap_or(Value::Null),
-            SqlValue::Text(text) => Value::String(text.clone()),
-            SqlValue::Blob(_) => return None,
-        };
+        let stored = row.get(index)?;
+        // Blobs have no JSON form and no declared type that produces them;
+        // refusing keeps the fast path from inventing one.
+        if matches!(stored, SqlValue::Blob(_)) {
+            return None;
+        }
+        let value = crate::forge::skeleton::column_value_to_json(
+            stored,
+            fields.get(column).map(|spec| spec.ty),
+        );
         object.insert(column.clone(), value);
     }
     Some(Value::Object(object))
@@ -741,7 +751,10 @@ pub async fn apply_writes(
                 // That is not an error — it only costs the zero-query path, and
                 // the fan-out falls back to re-reading (`reserve.rs:266` records
                 // the same defensive posture).
-                let persisted = rows.rows.first().and_then(|row| returned_record(&columns, row));
+                let persisted = rows
+                    .rows
+                    .first()
+                    .and_then(|row| returned_record(&columns, row, &slot.fields));
                 for channel in &channels {
                     match &persisted {
                         Some(record) => {
@@ -1688,17 +1701,83 @@ mod substrate_tests {
         assert!(String::from_utf8_lossy(&value).contains("edited"));
     }
 
+    /// Item 6 · the two JSON conversions must agree about a declared type.
+    ///
+    /// A write splices its row in through `returned_record` (the zero-query
+    /// `RETURNING` path); a re-read builds the same row through `rows_to_json`.
+    /// If only one of them consults the declared type, an appended `true` shows
+    /// as `true` until the next full materialisation and then turns into `1` —
+    /// or the reverse — and both are valid JSON, so nothing would ever throw.
+    /// Byte equality across the two is the only assertion that catches it.
+    #[tokio::test]
+    async fn a_bool_is_identical_whether_spliced_or_queried() {
+        use crate::forge::declare::{CollectionDecl, FieldSpec, FieldType};
+        use std::collections::BTreeMap;
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let mut fields = BTreeMap::new();
+        fields.insert("done".to_string(), FieldSpec::new(FieldType::Bool));
+        fields.insert("note".to_string(), FieldSpec::nullable(FieldType::Text));
+        let mut declarations = BTreeMap::new();
+        declarations.insert(
+            "todos".to_string(),
+            CollectionDecl {
+                fields,
+                ..CollectionDecl::default()
+            },
+        );
+        let schema = ForgeSchema::from_declarations(&declarations).unwrap();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast, &schema).await.unwrap();
+
+        for (done, note) in [(true, Value::String("first".into())), (false, Value::Null)] {
+            let mut record = serde_json::Map::new();
+            record.insert("done".into(), Value::Bool(done));
+            record.insert("note".into(), note);
+            apply_writes(
+                &db,
+                &broadcast,
+                &schema,
+                &[ForgeWrite::Append {
+                    collection: "todos".into(),
+                    record,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let spliced = broadcast.get("todos").unwrap().current_value();
+        let queried = materialize_slot(&db, schema.slot_for_topic("todos").unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&spliced),
+            String::from_utf8_lossy(&queried),
+            "the spliced row and the queried row must be byte-identical"
+        );
+
+        // And the shared answer is the declared one, not the stored one.
+        let rows: Vec<Value> = serde_json::from_slice(&spliced).unwrap();
+        assert_eq!(rows[0]["done"], Value::Bool(true), "{rows:?}");
+        assert_eq!(rows[1]["done"], Value::Bool(false), "{rows:?}");
+        assert_eq!(rows[0]["note"], Value::String("first".into()), "{rows:?}");
+        assert_eq!(rows[1]["note"], Value::Null, "{rows:?}");
+    }
+
     /// A `DESC` ordering puts a new row at the head. Splicing it at the tail
     /// would put every new row in the wrong place — silently, since both are
     /// valid JSON.
     #[tokio::test]
     async fn a_descending_collection_splices_at_the_head() {
-        use crate::forge::declare::{CollectionDecl, FieldType};
+        use crate::forge::declare::{CollectionDecl, FieldSpec, FieldType};
         use std::collections::BTreeMap;
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let mut fields = BTreeMap::new();
-        fields.insert("body".to_string(), FieldType::Text);
+        fields.insert("body".to_string(), FieldSpec::new(FieldType::Text));
         let mut declarations = BTreeMap::new();
         declarations.insert(
             "feed".to_string(),
@@ -1748,12 +1827,12 @@ mod substrate_tests {
     /// not exist. Pre-existing, found while wiring the zero-query path.
     #[tokio::test]
     async fn a_collection_whose_table_differs_from_its_name_is_writable() {
-        use crate::forge::declare::{CollectionDecl, FieldType};
+        use crate::forge::declare::{CollectionDecl, FieldSpec, FieldType};
         use std::collections::BTreeMap;
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let mut fields = BTreeMap::new();
-        fields.insert("body".to_string(), FieldType::Text);
+        fields.insert("body".to_string(), FieldSpec::new(FieldType::Text));
         let mut declarations = BTreeMap::new();
         declarations.insert(
             "notes".to_string(),
@@ -1789,12 +1868,12 @@ mod substrate_tests {
 
     /// A partitioned collection, declared the way an app would.
     fn partitioned_schema() -> ForgeSchema {
-        use crate::forge::declare::{CollectionDecl, FieldType};
+        use crate::forge::declare::{CollectionDecl, FieldSpec, FieldType};
         use std::collections::BTreeMap;
 
         let mut fields = BTreeMap::new();
-        fields.insert("room".to_string(), FieldType::Text);
-        fields.insert("body".to_string(), FieldType::Text);
+        fields.insert("room".to_string(), FieldSpec::new(FieldType::Text));
+        fields.insert("body".to_string(), FieldSpec::new(FieldType::Text));
         let mut declarations = BTreeMap::new();
         declarations.insert(
             "messages".to_string(),

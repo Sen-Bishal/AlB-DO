@@ -65,6 +65,23 @@ forge: {
 },
 ```
 
+A field is one of `text`, `int`, `real`, `bool` or `timestamp`, and a trailing
+`?` makes it nullable — `nickname: "text?"`. The types are not decoration: they
+decide what your rows look like in JavaScript. A `bool` reads back as `true`,
+not `1`; a `timestamp` is epoch **milliseconds**, the same number `Date.now()`
+gives you, so `new Date(row.created_at)` just works; a `text?` is `string | null`
+rather than an absent key. `.albedo/forge.d.ts` is generated from this block, so
+your editor knows all of it without you writing a type.
+
+Editing the block after rows exist is safe. On startup ALBEDO compares what you
+declared against the database, and **adds a new nullable field to the live
+table** — one line on the console saying it did, and the rows you already had
+read it as `null`. Every other edit refuses to start and names the field:
+dropping one, renaming it, changing its type, or adding a *required* one, which
+would mean inventing a value for every row written before it existed. A refusal
+never touches your data; revert that field, or delete `forge.db` to rebuild from
+the declaration.
+
 Inside an `action()` body you get three free functions against it:
 `append(collection, record)`, `update(collection, key, fields)` and
 `remove(collection, key)`. A write is applied after the handler returns,

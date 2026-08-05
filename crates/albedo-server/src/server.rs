@@ -1605,6 +1605,33 @@ pub struct AlbedoServer {
     state: RuntimeState,
 }
 
+/// What a boot changed on the author's behalf, handed to the readiness callback.
+///
+/// Only durable, author-visible side effects belong here — things someone would
+/// want to know happened to a file they own. Routine startup work does not.
+/// Empty on every boot that changed nothing, which is nearly all of them.
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct BootReport {
+    /// Columns added to existing FORGE tables to match an edited `forge` block.
+    /// See [`evolve_schema`](dom_render_compiler::forge::evolve_schema).
+    pub schema_additions: Vec<dom_render_compiler::forge::Addition>,
+}
+
+impl BootReport {
+    /// One human-readable line per change, in the order they were applied.
+    ///
+    /// Lives here rather than in each lane so `serve`, `dev` and the dashboard
+    /// cannot drift into describing the same event three different ways.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        self.schema_additions
+            .iter()
+            .map(|addition| format!("FORGE · {addition}"))
+            .collect()
+    }
+}
+
 impl AlbedoServer {
     pub fn router(&self) -> Router {
         Router::new()
@@ -1683,8 +1710,38 @@ impl AlbedoServer {
         })
     }
 
-    #[cfg_attr(not(feature = "forge"), allow(unused_mut))]
-    pub async fn run(mut self) -> Result<(), RuntimeError> {
+    /// Boot and serve until shutdown.
+    ///
+    /// Every startup failure — an unopenable `forge.db`, a schema the database
+    /// disagrees with, a port already bound — returns `Err` from here without
+    /// ever serving a request.
+    ///
+    /// Discards the [`BootReport`]. Use [`run_with_ready`](Self::run_with_ready)
+    /// from anything a person is watching.
+    pub async fn run(self) -> Result<(), RuntimeError> {
+        self.run_with_ready(|_| {}).await
+    }
+
+    /// [`run`](Self::run), with a signal for the moment the server is actually
+    /// up.
+    ///
+    /// `on_ready` fires exactly once, after every fallible startup step has
+    /// succeeded and the listener is accepting — and **never** if any of them
+    /// failed. That ordering is the whole point: a caller that prints "serving"
+    /// or opens a browser before this has fired is announcing a server that may
+    /// not exist, which turns a diagnosable startup failure into what looks like
+    /// a crash after a successful boot.
+    ///
+    /// It receives a [`BootReport`] describing what the boot changed. The caller
+    /// is the only party that knows how to reach this user — a plain lane
+    /// prints, the dashboard lane posts a note — so the report is handed over
+    /// rather than logged. Nothing initialises a `tracing` subscriber in the
+    /// shipped CLI, which makes `info!` a way of telling no one.
+    pub async fn run_with_ready<F>(self, on_ready: F) -> Result<(), RuntimeError>
+    where
+        F: FnOnce(&BootReport) + Send + 'static,
+    {
+        let mut report = BootReport::default();
         // FORGE — open the durable substrate exactly once, before the listener
         // binds. This is the sole async boot seam (`build()` is synchronous),
         // and the handle lives on the persistent `RuntimeState` tier so a dev
@@ -1707,6 +1764,21 @@ impl AlbedoServer {
             // seed leaves these topics at `b"null"`; hydration overwrites them
             // so the first SSR render reads persisted rows, not the placeholder.
             let schema = self.state.live.forge_schema.as_ref();
+            // Before anything else: reconcile the database with what we are
+            // about to serve. Migrations are `IF NOT EXISTS`, so an edited
+            // `forge` block would otherwise apply as silence and surface later
+            // as missing columns and failing writes — indistinguishable, from
+            // the outside, from losing the data. A new nullable column is added
+            // here; any other disagreement refuses the boot naming the field.
+            // The refusal message is written for the author, so it is passed
+            // through without a prefix of its own.
+            // Carried out to the caller rather than logged here. Silently
+            // altering someone's database is the failure mode this whole path
+            // exists to eliminate, and applying the *correct* migration without
+            // saying so is still not saying so.
+            report.schema_additions = forge::drift::evolve_schema(substrate.as_ref(), schema)
+                .await
+                .map_err(|err| RuntimeError::ServerStartup(format!("FORGE: {err}")))?;
             forge::skeleton::bootstrap_schema(substrate.as_ref(), schema)
                 .await
                 .map_err(|err| {
@@ -1799,6 +1871,12 @@ impl AlbedoServer {
                 let _ = shutdown_tx.send(true);
             }
         };
+
+        // Everything that can fail a boot has now succeeded: the substrate is
+        // open and agrees with the schema, the TCP listener is bound, and the
+        // QUIC listener (if enabled) is too. Only from here is it true to tell
+        // anyone the server is up.
+        on_ready(&report);
 
         let http_result = axum::serve(listener, router)
             .with_graceful_shutdown(graceful_shutdown)

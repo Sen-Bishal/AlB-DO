@@ -26,7 +26,7 @@
 //! expression many times, which is the wrong instrument for "compare these two
 //! configurations once, at a size big enough that the difference is real".
 
-use dom_render_compiler::forge::declare::{CollectionDecl, FieldType};
+use dom_render_compiler::forge::declare::{CollectionDecl, FieldSpec, FieldType};
 use dom_render_compiler::forge::skeleton::{
     bootstrap_schema, materialize_slot, ForgeCollection, ForgeSchema,
 };
@@ -39,8 +39,8 @@ use std::time::{Duration, Instant};
 /// `messages`, partitioned by `room` — the shape the whole feature is for.
 fn partitioned_schema() -> ForgeSchema {
     let mut fields = BTreeMap::new();
-    fields.insert("room".to_string(), FieldType::Text);
-    fields.insert("body".to_string(), FieldType::Text);
+    fields.insert("room".to_string(), FieldSpec::new(FieldType::Text));
+    fields.insert("body".to_string(), FieldSpec::new(FieldType::Text));
     let mut declarations = BTreeMap::new();
     declarations.insert(
         "messages".to_string(),

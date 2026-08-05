@@ -112,8 +112,13 @@ impl Fixture {
 }
 
 /// Tiny render-manifest-v2 with one Tier-A route at `/`. Schema-faithful
-/// enough that `RendererRuntime::from_artifacts_dir` deserialises and
-/// `prime_runtime_cache` warms QuickJS without complaint.
+/// enough that `RendererRuntime::from_artifacts_dir` deserialises it and warms
+/// QuickJS without complaint.
+///
+/// It did *not* warm without complaint until 2026-08-04: the boot ran a
+/// per-route pre-render keyed by URL path, which cannot resolve to a module and
+/// logged `entry module missing: '/'` here too. Invisible, because nothing
+/// subscribed to `tracing`.
 fn build_minimal_manifest_json(hello_module: &Path) -> String {
     let module_path = hello_module.display().to_string().replace('\\', "/");
     format!(
@@ -258,6 +263,71 @@ async fn boot_production_server_serves_manifest_routes_via_streaming() {
         status,
         StatusCode::NOT_FOUND,
         "GET / on a manifest route must not 404; got {status:?}"
+    );
+}
+
+// ── 3b ── boot is quiet ──────────────────────────────────────────
+
+/// Booting a valid project must emit **no `WARN` or `ERROR`**.
+///
+/// This exists because a soft-fail hid in this exact path for months: the boot
+/// ran a per-route pre-render keyed by URL path, which can never resolve to a
+/// module, and logged `entry module missing: '/'` on every boot of every
+/// project. Nobody saw it — the CLI installed no `tracing` subscriber until
+/// 2026-08-04, so the warning had no receiver.
+///
+/// The lesson generalises past that one bug: a diagnostic that degrades quietly
+/// is indistinguishable from one that never fires, and "the server still
+/// serves" is not evidence the boot did what it meant to. Asserting silence is
+/// how a *soft* failure becomes a *hard* one, which is the only way it gets
+/// noticed.
+///
+/// `with_default` scopes the collector to this thread, so it cannot race the
+/// process-global subscriber another test might install.
+#[tokio::test]
+async fn boot_production_server_emits_no_warnings() {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    #[derive(Default)]
+    struct Collect(Arc<Mutex<Vec<String>>>);
+
+    impl<S: Subscriber> Layer<S> for Collect {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            let level = *event.metadata().level();
+            if level > Level::WARN {
+                return;
+            }
+            // Render the message and every field, so the assertion message
+            // names the actual problem rather than just its level.
+            struct Render(String);
+            impl Visit for Render {
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    self.0
+                        .push_str(&format!(" {}={:?}", field.name(), value));
+                }
+            }
+            let mut render = Render(format!("{level} {}", event.metadata().target()));
+            event.record(&mut render);
+            self.0.lock().unwrap().push(render.0);
+        }
+    }
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::default();
+    let subscriber = tracing_subscriber::registry().with(Collect(captured.clone()));
+
+    let fixture = Fixture::with_counter();
+    tracing::subscriber::with_default(subscriber, || {
+        boot_production_server(&fixture.options()).expect("boot");
+    });
+
+    let diagnostics = captured.lock().unwrap();
+    assert!(
+        diagnostics.is_empty(),
+        "a clean boot must be silent at WARN and above; got:\n  {}",
+        diagnostics.join("\n  ")
     );
 }
 

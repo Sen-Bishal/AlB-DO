@@ -123,6 +123,17 @@ struct LoginForm {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Same contract as the `albedo` CLI: the library emits, a binary subscribes,
+    // and `RUST_LOG` decides. Without this the server's instrumentation has no
+    // receiver here either. A demo has no curated console to protect, but
+    // matching the CLI means one rule to remember rather than two.
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+
     let demo_token = demo_token();
     let config = showcase_config();
     let port = config.server.port;

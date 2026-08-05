@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Duration};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const WEBTRANSPORT_STREAM_COUNT: usize = 4;
@@ -350,7 +350,11 @@ fn spawn_stream_writer(connection: Connection, stream_slot: u8, mut rx: mpsc::Re
             warn!(stream_slot, error = %err, "failed to write WT stream open frame");
             return;
         }
-        info!(stream_slot, "webtransport stream opened");
+        // `debug`, not `info`: one line per stream, and a session opens many.
+        // Session accept/close above stay at `info` because they are per
+        // connection — that is the granularity `RUST_LOG=info` has to remain
+        // readable at, or nobody will leave it on long enough to see anything.
+        debug!(stream_slot, "webtransport stream opened");
 
         while let Some(payload) = rx.recv().await {
             if let Err(err) = write_framed_payload(&mut stream, payload.as_slice()).await {

@@ -24,7 +24,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::time::{timeout, Duration};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Shared handle to the opcode pipeline that produces binary frames for
@@ -428,7 +428,10 @@ async fn serve_manifest_route(
                 .await
                 {
                     Ok(()) => {
-                        info!(
+                        // `debug`, not `info`: this fires on every streamed
+                        // route, so at `info` it buries the once-per-boot and
+                        // once-per-session lines someone turned logging on for.
+                        debug!(
                             session_id = %session_id,
                             route = %path,
                             transport = "webtransport",

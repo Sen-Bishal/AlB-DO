@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 /// The scalar shapes a declared field can take.
 ///
 /// Deliberately few. These are the types that lower to a substrate column, a JSON
-/// value, and a bound parameter without ambiguity; anything richer (dates, enums,
+/// value, and a bound parameter without ambiguity; anything richer (enums,
 /// relations) is a later rung and should not be faked with `TEXT` here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,18 +52,130 @@ pub enum FieldType {
     Text,
     Int,
     Real,
+    /// `true`/`false`. Stored as `0`/`1` — SQLite has no boolean — but it is a
+    /// distinct *declared* type, which is what keeps it distinguishable from an
+    /// `Int` both on the wire and in a schema diff.
+    Bool,
+    /// A moment in time, as **milliseconds since the Unix epoch**.
+    ///
+    /// Integer rather than ISO-8601 text because a timestamp's whole job is to
+    /// be compared and ordered: `ORDER BY created_at` and `expires_at > ?` are
+    /// exact on an integer and lexical accidents on a string. Milliseconds
+    /// rather than seconds because the consumer is JavaScript — `Date.now()`
+    /// and `new Date(n)` are both milliseconds, so a round trip through the
+    /// wire needs no unit conversion and no place to forget one.
+    ///
+    /// (`reserve.rs`'s internal `created_at` uses `strftime('%s')` seconds. It
+    /// is not user-facing and not read through this type; the two never meet.)
+    Timestamp,
 }
 
 impl FieldType {
-    /// The SQL column type. Paired with `NOT NULL` at emit time — a declared
-    /// field is required, and nullability is a later rung rather than an
-    /// accident of leaving it out.
+    /// The SQL column type as it is *declared*.
+    ///
+    /// `BOOLEAN` and `TIMESTAMP` both carry NUMERIC affinity in SQLite and store
+    /// the integers they are given, so the storage is identical to `INTEGER` —
+    /// but the declared name survives in `PRAGMA table_info`, which is what lets
+    /// [`drift`](crate::forge::drift) catch a `bool` retyped to an `int` and
+    /// what makes the table legible to someone opening it in a SQL shell.
     fn sql_type(self) -> &'static str {
         match self {
             FieldType::Text => "TEXT",
             FieldType::Int => "INTEGER",
             FieldType::Real => "REAL",
+            FieldType::Bool => "BOOLEAN",
+            FieldType::Timestamp => "TIMESTAMP",
         }
+    }
+
+    /// The spelling an author writes in the `forge` block.
+    fn as_str(self) -> &'static str {
+        match self {
+            FieldType::Text => "text",
+            FieldType::Int => "int",
+            FieldType::Real => "real",
+            FieldType::Bool => "bool",
+            FieldType::Timestamp => "timestamp",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "text" => FieldType::Text,
+            "int" => FieldType::Int,
+            "real" => FieldType::Real,
+            "bool" => FieldType::Bool,
+            "timestamp" => FieldType::Timestamp,
+            _ => return None,
+        })
+    }
+}
+
+/// A declared field: its type, and whether it accepts `null`.
+///
+/// Written as a single string in the config, with a trailing `?` for nullable —
+/// `{ author: "text", nickname: "text?" }`. That spelling is deliberate: it is
+/// what a TypeScript author already means by optional, it keeps `fields` a flat
+/// string map rather than growing a nested object for one boolean, and it makes
+/// the *required* case the shorter one to write, which is the one that should be
+/// the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldSpec {
+    pub ty: FieldType,
+    /// `true` when the column omits `NOT NULL` and the wire may carry `null`.
+    pub nullable: bool,
+}
+
+impl FieldSpec {
+    #[must_use]
+    pub fn new(ty: FieldType) -> Self {
+        Self { ty, nullable: false }
+    }
+
+    #[must_use]
+    pub fn nullable(ty: FieldType) -> Self {
+        Self { ty, nullable: true }
+    }
+
+    /// The declaration string this spec round-trips through.
+    fn as_declared(self) -> String {
+        let mut out = self.ty.as_str().to_string();
+        if self.nullable {
+            out.push('?');
+        }
+        out
+    }
+}
+
+/// Every field is required unless it says otherwise, so a bare [`FieldType`]
+/// is a complete spec. Keeps the many `FieldType::Text` construction sites
+/// (tests, the built-in default) reading as they did.
+impl From<FieldType> for FieldSpec {
+    fn from(ty: FieldType) -> Self {
+        Self::new(ty)
+    }
+}
+
+impl Serialize for FieldSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_declared())
+    }
+}
+
+impl<'de> Deserialize<'de> for FieldSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        let (name, nullable) = match raw.strip_suffix('?') {
+            Some(base) => (base, true),
+            None => (raw.as_str(), false),
+        };
+        let ty = FieldType::parse(name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown field type '{raw}' — expected one of text, int, real, bool, timestamp, \
+                 each optionally suffixed with '?' to allow null"
+            ))
+        })?;
+        Ok(Self { ty, nullable })
     }
 }
 
@@ -97,7 +209,7 @@ pub struct CollectionDecl {
     /// wire carries — deriving it from a hash map's iteration order, or from
     /// whether `serde_json`'s `preserve_order` feature happens to be on, would
     /// make the rendered page depend on the build.
-    pub fields: BTreeMap<String, FieldType>,
+    pub fields: BTreeMap<String, FieldSpec>,
     /// The collection's ordering, e.g. `"id"` or `"created_at desc, id"`.
     /// Defaults to the key column ascending. Parsed and re-emitted, never
     /// interpolated.
@@ -183,8 +295,12 @@ impl CollectionDecl {
         // NOT NULL column of its scalar type. `IF NOT EXISTS` because migrations
         // re-run on every boot.
         let mut ddl = format!("CREATE TABLE IF NOT EXISTS {table} ({key} INTEGER PRIMARY KEY AUTOINCREMENT");
-        for (column, ty) in &self.fields {
-            ddl.push_str(&format!(", {column} {} NOT NULL", ty.sql_type()));
+        for (column, spec) in &self.fields {
+            // A required field keeps the `NOT NULL` it always had — which is
+            // what preserves the built-in default's DDL byte for byte. Only an
+            // explicitly nullable one drops it.
+            let required = if spec.nullable { "" } else { " NOT NULL" };
+            ddl.push_str(&format!(", {column} {}{required}", spec.ty.sql_type()));
         }
         ddl.push(')');
 
@@ -245,7 +361,10 @@ impl CollectionDecl {
             migrations.into_boxed_slice(),
             seed.into_boxed_slice(),
         )
-        .with_partition_by(self.partition_by.clone()))
+        .with_partition_by(self.partition_by.clone())
+        // Carried onto the runtime collection so the read path can render a
+        // `bool` as `true` rather than the `1` it is stored as.
+        .with_fields(self.fields.clone()))
     }
 
     /// The `ORDER BY` clause, re-emitted from a *parse* rather than passed
@@ -300,14 +419,14 @@ impl CollectionDecl {
         let mut columns = Vec::with_capacity(row.len());
         let mut params = Vec::with_capacity(row.len());
         for (column, value) in row {
-            if !self.fields.contains_key(column) {
+            let Some(spec) = self.fields.get(column) else {
                 return Err(ForgeSchemaError::UnknownSeedColumn {
                     topic: topic.to_string(),
                     column: column.clone(),
                 });
-            }
+            };
             columns.push(column.as_str());
-            params.push(Self::seed_value(topic, column, value)?);
+            params.push(Self::seed_value(topic, column, *spec, value)?);
         }
         if columns.is_empty() {
             return Err(ForgeSchemaError::UnknownSeedColumn {
@@ -328,33 +447,50 @@ impl CollectionDecl {
         })
     }
 
-    /// Lower one seed value to a bound parameter. Nested shapes are refused for
-    /// the same reason `append` refuses them: a collection is a table of scalars.
+    /// Lower one seed value to a bound parameter, **checked against the column's
+    /// declared type**.
+    ///
+    /// The check is the point. A seed is the one place an author writes data in
+    /// the same file where they declared its shape, so a mismatch there is a
+    /// typo they can see and fix — `{ done: "yes" }` against a `bool` is worth a
+    /// boot error naming the column, not a silent `TEXT` in a `BOOLEAN` column
+    /// that reads back as a string forever after. (SQLite would happily store
+    /// it: affinity converts what it can and keeps the rest as-is.)
+    ///
+    /// Nested shapes are refused for the same reason `append` refuses them: a
+    /// collection is a table of scalars.
     fn seed_value(
         topic: &str,
         column: &str,
+        spec: FieldSpec,
         value: &serde_json::Value,
     ) -> Result<SqlValue, ForgeSchemaError> {
         use serde_json::Value;
-        match value {
-            Value::String(s) => Ok(SqlValue::Text(s.clone())),
-            Value::Bool(b) => Ok(SqlValue::Integer(i64::from(*b))),
-            Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Ok(SqlValue::Integer(i))
-                } else if let Some(f) = n.as_f64() {
-                    Ok(SqlValue::Real(f))
-                } else {
-                    Err(ForgeSchemaError::UnsupportedSeedValue {
-                        topic: topic.to_string(),
-                        column: column.to_string(),
-                    })
-                }
+
+        let mismatch = || ForgeSchemaError::UnsupportedSeedValue {
+            topic: topic.to_string(),
+            column: column.to_string(),
+        };
+
+        if value.is_null() {
+            // A null in a required column would fail the `NOT NULL` at insert
+            // time, on boot, with SQLite's wording instead of ours.
+            return if spec.nullable { Ok(SqlValue::Null) } else { Err(mismatch()) };
+        }
+
+        match (spec.ty, value) {
+            (FieldType::Text, Value::String(s)) => Ok(SqlValue::Text(s.clone())),
+            (FieldType::Bool, Value::Bool(b)) => Ok(SqlValue::Integer(i64::from(*b))),
+            // A timestamp is epoch milliseconds; there is no date parsing here,
+            // and a string that looks like a date is refused rather than
+            // guessed at across formats and time zones.
+            (FieldType::Int | FieldType::Timestamp, Value::Number(n)) => {
+                n.as_i64().map(SqlValue::Integer).ok_or_else(mismatch)
             }
-            _ => Err(ForgeSchemaError::UnsupportedSeedValue {
-                topic: topic.to_string(),
-                column: column.to_string(),
-            }),
+            // Reals accept whole numbers too — `1` for a ratio is not a typo,
+            // and JSON has no way to write `1.0` distinctly.
+            (FieldType::Real, Value::Number(n)) => n.as_f64().map(SqlValue::Real).ok_or_else(mismatch),
+            _ => Err(mismatch()),
         }
     }
 
@@ -405,7 +541,7 @@ mod tests {
         CollectionDecl {
             fields: fields
                 .iter()
-                .map(|(name, ty)| ((*name).to_string(), *ty))
+                .map(|(name, ty)| ((*name).to_string(), FieldSpec::new(*ty)))
                 .collect(),
             ..CollectionDecl::default()
         }
@@ -517,8 +653,8 @@ mod tests {
     fn guestbook_declaration_reproduces_the_builtin_default() {
         let declared = CollectionDecl {
             fields: [
-                ("author".to_string(), FieldType::Text),
-                ("message".to_string(), FieldType::Text),
+                ("author".to_string(), FieldSpec::new(FieldType::Text)),
+                ("message".to_string(), FieldSpec::new(FieldType::Text)),
             ]
             .into_iter()
             .collect(),
@@ -708,23 +844,138 @@ mod tests {
                 ("amount", serde_json::json!(1.5)),
                 ("done", serde_json::json!(true)),
                 ("quantity", serde_json::json!(3)),
+                ("placed_at", serde_json::json!(1_754_180_000_000_i64)),
             ])],
             ..decl(&[
                 ("amount", FieldType::Real),
-                ("done", FieldType::Int),
+                ("done", FieldType::Bool),
                 ("quantity", FieldType::Int),
+                ("placed_at", FieldType::Timestamp),
             ])
         }
         .lower("orders")
         .unwrap();
 
+        // A bool binds as 0/1 and a timestamp as epoch milliseconds — both
+        // integers in the substrate. The declared type is what tells them apart
+        // again on the way out; see `column_value_to_json`.
         assert_eq!(
             *lowered.seed[0].params,
             [
                 SqlValue::Real(1.5),
                 SqlValue::Integer(1),
-                SqlValue::Integer(3)
-            ]
+                SqlValue::Integer(1_754_180_000_000),
+                SqlValue::Integer(3),
+            ],
+            "params bind in the record's BTreeMap order: amount, done, placed_at, quantity"
+        );
+    }
+
+    /// Previously this was accepted — `seed_value` read the JSON shape and never
+    /// consulted the declaration, so `true` in an `int` column silently became
+    /// `1`. It is a typo with a plausible-looking result, which is the worst
+    /// kind, and the author is looking right at the declaration when they make
+    /// it.
+    #[test]
+    fn a_seed_value_that_contradicts_its_declared_type_is_refused() {
+        for (ty, bad) in [
+            (FieldType::Int, serde_json::json!(true)),
+            (FieldType::Bool, serde_json::json!(1)),
+            (FieldType::Bool, serde_json::json!("yes")),
+            (FieldType::Text, serde_json::json!(3)),
+            // A timestamp is epoch millis; a date string is not parsed, guessed
+            // at, or accepted.
+            (FieldType::Timestamp, serde_json::json!("2026-08-03T00:00:00Z")),
+        ] {
+            let result = CollectionDecl {
+                seed: vec![seed_row(&[("field", bad.clone())])],
+                ..decl(&[("field", ty)])
+            }
+            .lower("orders");
+            assert!(
+                matches!(result, Err(ForgeSchemaError::UnsupportedSeedValue { .. })),
+                "{ty:?} must refuse {bad}"
+            );
+        }
+    }
+
+    /// Null is a declaration-level decision, not a per-value one.
+    #[test]
+    fn null_seeds_only_where_the_field_is_declared_nullable() {
+        let nullable = CollectionDecl {
+            seed: vec![seed_row(&[("nickname", serde_json::json!(null))])],
+            fields: [("nickname".to_string(), FieldSpec::nullable(FieldType::Text))]
+                .into_iter()
+                .collect(),
+            ..CollectionDecl::default()
+        }
+        .lower("people")
+        .expect("a nullable field takes null");
+        assert_eq!(*nullable.seed[0].params, [SqlValue::Null]);
+
+        let required = CollectionDecl {
+            seed: vec![seed_row(&[("nickname", serde_json::json!(null))])],
+            ..decl(&[("nickname", FieldType::Text)])
+        }
+        .lower("people");
+        assert!(
+            matches!(required, Err(ForgeSchemaError::UnsupportedSeedValue { .. })),
+            "a required field must refuse null here rather than fail NOT NULL at boot"
+        );
+    }
+
+    /// The `forge` block is JSON by the time it reaches here, so the declaration
+    /// language *is* this string grammar. `?` is the whole of the nullability
+    /// syntax.
+    #[test]
+    fn a_field_spec_round_trips_through_its_declaration_string() {
+        for (written, expected) in [
+            ("text", FieldSpec::new(FieldType::Text)),
+            ("int", FieldSpec::new(FieldType::Int)),
+            ("real", FieldSpec::new(FieldType::Real)),
+            ("bool", FieldSpec::new(FieldType::Bool)),
+            ("timestamp", FieldSpec::new(FieldType::Timestamp)),
+            ("text?", FieldSpec::nullable(FieldType::Text)),
+            ("bool?", FieldSpec::nullable(FieldType::Bool)),
+            ("timestamp?", FieldSpec::nullable(FieldType::Timestamp)),
+        ] {
+            let parsed: FieldSpec = serde_json::from_value(serde_json::json!(written))
+                .unwrap_or_else(|err| panic!("'{written}' must parse: {err}"));
+            assert_eq!(parsed, expected, "parsing '{written}'");
+            assert_eq!(
+                serde_json::to_value(parsed).unwrap(),
+                serde_json::json!(written),
+                "'{written}' must serialize back to itself"
+            );
+        }
+    }
+
+    /// A typo in a type name is a config error the author can fix in seconds if
+    /// the message says what was expected — and an unfixable mystery if it just
+    /// says "invalid".
+    #[test]
+    fn an_unknown_field_type_names_what_was_expected() {
+        let err = serde_json::from_value::<FieldSpec>(serde_json::json!("boolean"))
+            .expect_err("'boolean' is not the spelling");
+        let message = err.to_string();
+        assert!(message.contains("boolean"), "quotes the input: {message}");
+        assert!(message.contains("bool"), "lists the real names: {message}");
+        assert!(message.contains("timestamp"), "{message}");
+        assert!(message.contains('?'), "mentions the nullable suffix: {message}");
+    }
+
+    /// The conformance property in this module's docs, extended: a declaration
+    /// with no nullable fields must still emit exactly the DDL it always did.
+    #[test]
+    fn required_fields_keep_the_not_null_they_always_had() {
+        let ddl = &decl(&[("author", FieldType::Text)])
+            .lower("guestbook")
+            .unwrap()
+            .migrations[0];
+        assert_eq!(
+            **ddl,
+            *"CREATE TABLE IF NOT EXISTS guestbook (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+              author TEXT NOT NULL)"
         );
     }
 

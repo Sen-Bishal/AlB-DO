@@ -111,7 +111,7 @@ fn declared_list(schema: &ForgeSchema) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forge::declare::{CollectionDecl, FieldType};
+    use crate::forge::declare::{CollectionDecl, FieldSpec, FieldType};
     use std::collections::BTreeMap;
 
     fn schema(pairs: &[(&str, &[(&str, FieldType)], Option<&str>)]) -> ForgeSchema {
@@ -122,7 +122,7 @@ mod tests {
                 CollectionDecl {
                     fields: fields
                         .iter()
-                        .map(|(f, ty)| ((*f).to_string(), *ty))
+                        .map(|(f, ty)| ((*f).to_string(), FieldSpec::new(*ty)))
                         .collect(),
                     partition_by: partition_by.map(str::to_string),
                     ..CollectionDecl::default()

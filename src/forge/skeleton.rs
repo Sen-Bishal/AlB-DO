@@ -32,6 +32,9 @@
 //! cache line that dereferences the payload exactly once, at the found index —
 //! not a linear pointer-chase through owned `String`s.
 
+use std::collections::BTreeMap;
+
+use crate::forge::declare::{FieldSpec, FieldType};
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Rows, SqlValue, SubstrateError};
 use crate::ir::opcode::SlotId;
@@ -101,6 +104,16 @@ pub struct ForgeCollection {
     /// against what a component's `.where({ <column>: … })` names; the query
     /// itself does not consult it until P2 adds the `WHERE` and its index.
     pub partition_by: Option<String>,
+    /// The declared type of each non-key field, when this collection came from a
+    /// `forge` block.
+    ///
+    /// Carried at runtime because SQL storage is lossy about intent: a `bool`
+    /// and an `int` are both `INTEGER` coming back out of the substrate, so
+    /// without this the wire cannot tell `true` from `1`. **Empty** for the
+    /// built-in default and for inferred collections, and an empty map means
+    /// "convert structurally", which is byte-for-byte what those paths did
+    /// before types existed.
+    pub fields: BTreeMap<String, FieldSpec>,
     /// Not yet read by the write path. Insert position is currently taken from
     /// the freshly materialised array's own order (see
     /// [`classify_positioned_insert`](crate::forge::delta::classify_positioned_insert)),
@@ -136,6 +149,7 @@ impl ForgeCollection {
             seed,
             sort,
             partition_by: None,
+            fields: BTreeMap::new(),
         }
     }
 
@@ -145,6 +159,14 @@ impl ForgeCollection {
     #[must_use]
     pub fn with_partition_by(mut self, column: Option<String>) -> Self {
         self.partition_by = column;
+        self
+    }
+
+    /// Attach the declared field types, for the same reason and with the same
+    /// shape as [`with_partition_by`](Self::with_partition_by).
+    #[must_use]
+    pub fn with_fields(mut self, fields: BTreeMap<String, FieldSpec>) -> Self {
+        self.fields = fields;
         self
     }
 }
@@ -402,6 +424,27 @@ impl Default for ForgeSchema {
 /// empty table, so a restart preserves rows written at runtime (the Gate-3
 /// durability property). Stands in for Pillar-3 auto-migration.
 ///
+/// ## It does not evolve a table — [`evolve_schema`] does
+///
+/// `IF NOT EXISTS` means this call is a **no-op against a table that already
+/// exists in a different shape**, which is how an edited `forge` block applies
+/// as silence. [`evolve_schema`](crate::forge::drift::evolve_schema) is the
+/// guard, and the serve path runs it immediately before this: it adds new
+/// nullable columns and refuses to boot on any other disagreement. Running it
+/// first is also what lets a `partition_by` added in the same edit as its column
+/// find that column when the `CREATE INDEX` below reaches it.
+///
+/// The check lives there rather than inside this function on purpose. The
+/// build-time seed bake ([`materialize_forge_seeds`]) also calls this, but with
+/// the *built-in default* schema rather than the app's — so against an app that
+/// declares its own `guestbook`, an inlined check would report drift for a
+/// disagreement between two schemas neither of which is wrong, and silently
+/// stop baking seeds. The question "does this database match what is about to
+/// be served" is only well-posed where the schema being passed is the one that
+/// will serve.
+///
+/// [`materialize_forge_seeds`]: crate::manifest::builder
+///
 /// # Errors
 /// Propagates any [`SubstrateError`](crate::forge::value::SubstrateError) from a
 /// migration, the empty-check probe, or a seed statement.
@@ -528,13 +571,19 @@ pub async fn materialize_slot(
         }
     };
     let rows = substrate.query(collection.query.as_str(), &params).await?;
-    Ok(serde_json::to_vec(&rows_to_json(&rows)).unwrap_or_else(|_| b"[]".to_vec()))
+    Ok(serde_json::to_vec(&rows_to_json(&rows, &collection.fields))
+        .unwrap_or_else(|_| b"[]".to_vec()))
 }
 
 /// Map a substrate result set to a JSON array of column-keyed objects —
 /// the shape a component reading `data.map(row => …)` expects, and the
 /// contract the inferred query (#2) must later satisfy.
-fn rows_to_json(rows: &Rows) -> serde_json::Value {
+///
+/// `fields` carries the declared types, so a column the author called `bool`
+/// comes back as `true`, not `1`. A column absent from `fields` — every column
+/// of an undeclared collection, and the implicit key of a declared one —
+/// converts structurally, exactly as it did before types existed.
+fn rows_to_json(rows: &Rows, fields: &BTreeMap<String, FieldSpec>) -> serde_json::Value {
     let records = rows
         .rows
         .iter()
@@ -544,7 +593,9 @@ fn rows_to_json(rows: &Rows) -> serde_json::Value {
                 .iter()
                 .enumerate()
                 .map(|(idx, column)| {
-                    let value = row.get(idx).map_or(serde_json::Value::Null, sqlvalue_to_json);
+                    let value = row.get(idx).map_or(serde_json::Value::Null, |value| {
+                        column_value_to_json(value, fields.get(column).map(|spec| spec.ty))
+                    });
                     (column.clone(), value)
                 })
                 .collect::<serde_json::Map<String, serde_json::Value>>();
@@ -552,6 +603,34 @@ fn rows_to_json(rows: &Rows) -> serde_json::Value {
         })
         .collect();
     serde_json::Value::Array(records)
+}
+
+/// Lower one stored value to JSON **as its declared type**.
+///
+/// The single place the storage representation is translated back into the one
+/// the author wrote, and the reason it exists: `append({ done: true })` already
+/// binds `1`, so without this the same field reads back as `1` and a round trip
+/// silently changes the value's type. `write::returned_record` performs the
+/// identical mapping for the `RETURNING` fast path — a spliced row and a queried
+/// row have to be indistinguishable, so these two must not drift.
+///
+/// `NULL` stays `null` whatever the declared type says; a nullable column is the
+/// only way to get one, and a non-nullable column cannot hold one.
+pub(crate) fn column_value_to_json(
+    value: &SqlValue,
+    declared: Option<FieldType>,
+) -> serde_json::Value {
+    use serde_json::Value;
+    match (declared, value) {
+        (_, SqlValue::Null) => Value::Null,
+        // The one type whose JSON shape differs from its storage shape.
+        // `Integer` is the only representation `append` and a seed can produce,
+        // but tolerate a stray `Real` rather than emitting a number for a field
+        // the author declared boolean.
+        (Some(FieldType::Bool), SqlValue::Integer(i)) => Value::Bool(*i != 0),
+        (Some(FieldType::Bool), SqlValue::Real(r)) => Value::Bool(*r != 0.0),
+        _ => sqlvalue_to_json(value),
+    }
 }
 
 /// Lower one neutral [`SqlValue`] into JSON.
@@ -711,6 +790,142 @@ mod tests {
     use super::*;
     use crate::forge::LibSqlSubstrate;
 
+    /// Build a typed collection the way a `forge` block does.
+    fn typed_schema(fields: &[(&str, FieldSpec)]) -> ForgeSchema {
+        use crate::forge::declare::CollectionDecl;
+
+        let mut declarations = BTreeMap::new();
+        declarations.insert(
+            "records".to_string(),
+            CollectionDecl {
+                fields: fields
+                    .iter()
+                    .map(|(name, spec)| ((*name).to_string(), *spec))
+                    .collect(),
+                ..CollectionDecl::default()
+            },
+        );
+        ForgeSchema::from_declarations(&declarations).expect("schema")
+    }
+
+    /// The defect item 6 exists to close. `append({ done: true })` binds `1`
+    /// (`json_to_sqlvalue` has always done that), so before the declared type
+    /// reached the read path the same field came back as `1` — a round trip that
+    /// silently changed a boolean into a number.
+    #[tokio::test]
+    async fn a_bool_survives_the_round_trip_as_a_bool() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = typed_schema(&[
+            ("done", FieldSpec::new(FieldType::Bool)),
+            ("label", FieldSpec::new(FieldType::Text)),
+        ]);
+        bootstrap_schema(&db, &schema).await.unwrap();
+
+        for (done, label) in [(1, "yes"), (0, "no")] {
+            db.execute(
+                "INSERT INTO records (done, label) VALUES (?1, ?2)",
+                &[SqlValue::Integer(done), SqlValue::Text(label.into())],
+            )
+            .await
+            .unwrap();
+        }
+
+        let collection = schema.slot_for_topic("records").expect("collection");
+        let bytes = materialize_slot(&db, collection, None).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = value.as_array().expect("array");
+
+        assert_eq!(rows[0]["done"], serde_json::json!(true), "{value}");
+        assert_eq!(rows[1]["done"], serde_json::json!(false), "{value}");
+        assert!(
+            rows[0]["done"].is_boolean(),
+            "a declared bool must be JSON true/false, not 1/0: {value}"
+        );
+        // The key stays a number, and it is not in `fields` — proof the
+        // conversion consults the declaration per column rather than guessing
+        // from the stored value.
+        assert!(rows[0]["id"].is_number(), "{value}");
+    }
+
+    /// A timestamp is epoch milliseconds and stays a plain number, so
+    /// `new Date(row.at)` works with no conversion on either side.
+    #[tokio::test]
+    async fn a_timestamp_is_epoch_millis_on_the_wire() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = typed_schema(&[("at", FieldSpec::new(FieldType::Timestamp))]);
+        bootstrap_schema(&db, &schema).await.unwrap();
+        db.execute(
+            "INSERT INTO records (at) VALUES (?1)",
+            &[SqlValue::Integer(1_754_180_000_000)],
+        )
+        .await
+        .unwrap();
+
+        let collection = schema.slot_for_topic("records").expect("collection");
+        let bytes = materialize_slot(&db, collection, None).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value[0]["at"], serde_json::json!(1_754_180_000_000_i64));
+    }
+
+    /// A nullable column carries `null` through to the wire rather than being
+    /// omitted — the key is present, the value is null, which is what the
+    /// generated `string | null` type promises.
+    #[tokio::test]
+    async fn a_nullable_field_reaches_the_wire_as_null() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = typed_schema(&[
+            ("nickname", FieldSpec::nullable(FieldType::Text)),
+            ("flag", FieldSpec::nullable(FieldType::Bool)),
+        ]);
+        bootstrap_schema(&db, &schema).await.unwrap();
+        db.execute("INSERT INTO records (nickname, flag) VALUES (NULL, NULL)", &[])
+            .await
+            .unwrap();
+
+        let collection = schema.slot_for_topic("records").expect("collection");
+        let bytes = materialize_slot(&db, collection, None).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let row = value[0].as_object().expect("object");
+
+        assert!(row.contains_key("nickname"), "the key is present: {value}");
+        assert_eq!(row["nickname"], serde_json::Value::Null, "{value}");
+        assert_eq!(
+            row["flag"],
+            serde_json::Value::Null,
+            "null wins over the declared bool: {value}"
+        );
+    }
+
+    /// A nullable column omits `NOT NULL`; a required one keeps it, which is
+    /// what preserves the built-in default's DDL byte for byte.
+    #[test]
+    fn nullability_is_visible_in_the_emitted_ddl() {
+        let schema = typed_schema(&[
+            ("required", FieldSpec::new(FieldType::Text)),
+            ("optional", FieldSpec::nullable(FieldType::Text)),
+        ]);
+        let ddl = &schema.slot_for_topic("records").unwrap().migrations[0];
+        assert!(ddl.contains("required TEXT NOT NULL"), "{ddl}");
+        assert!(ddl.contains("optional TEXT,") || ddl.contains("optional TEXT)"), "{ddl}");
+        assert!(!ddl.contains("optional TEXT NOT NULL"), "{ddl}");
+    }
+
+    /// `BOOLEAN` and `TIMESTAMP` are declared names SQLite keeps verbatim, so a
+    /// `bool` retyped to an `int` is a diff `drift` can see rather than an
+    /// invisible semantic change under an identical `INTEGER`.
+    #[test]
+    fn bool_and_timestamp_are_distinguishable_from_int_in_the_ddl() {
+        let schema = typed_schema(&[
+            ("a", FieldSpec::new(FieldType::Bool)),
+            ("b", FieldSpec::new(FieldType::Timestamp)),
+            ("c", FieldSpec::new(FieldType::Int)),
+        ]);
+        let ddl = &schema.slot_for_topic("records").unwrap().migrations[0];
+        assert!(ddl.contains("a BOOLEAN NOT NULL"), "{ddl}");
+        assert!(ddl.contains("b TIMESTAMP NOT NULL"), "{ddl}");
+        assert!(ddl.contains("c INTEGER NOT NULL"), "{ddl}");
+    }
+
     #[tokio::test]
     async fn hydrates_guestbook_topic_from_a_real_substrate() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
@@ -739,8 +954,8 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut fields = BTreeMap::new();
-        fields.insert("room".to_string(), FieldType::Text);
-        fields.insert("body".to_string(), FieldType::Text);
+        fields.insert("room".to_string(), FieldSpec::new(FieldType::Text));
+        fields.insert("body".to_string(), FieldSpec::new(FieldType::Text));
         let mut declarations = BTreeMap::new();
         declarations.insert(
             "messages".to_string(),

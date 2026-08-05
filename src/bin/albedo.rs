@@ -95,10 +95,52 @@ const SCAFFOLD_GITIGNORE: &str = include_str!("../../scaffold/.gitignore");
 const SCAFFOLD_TIER_BUDGET: &str = include_str!("../../scaffold/tier-budget.toml");
 
 fn main() {
+    install_tracing();
     if let Err(err) = run(std::env::args().collect()) {
         print_error(err);
         std::process::exit(1);
     }
+}
+
+/// Attach a `tracing` subscriber, but only when `RUST_LOG` asks for one.
+///
+/// Until this existed **nothing in this binary ever subscribed**, so all ~66
+/// `info!`/`warn!`/`error!` sites in the tree — a panicked request handler, a
+/// rejected action envelope, every WebTransport failure — wrote to no one. They
+/// were not dead code, they were live code with no receiver, which is worse:
+/// grepping the source suggests the diagnostics exist.
+///
+/// ## Why silent by default
+///
+/// The two audiences want opposite things and there is no default that serves
+/// both. An author running `albedo dev` gets a composed, styled console; a line
+/// like `2026-08-04T…Z  INFO albedo_server::server: ALBEDO server listening on
+/// 127.0.0.1:3000` underneath `✓ dev · http://…` is noise restating what the
+/// banner already said. Someone debugging wants all of it. `RUST_LOG` is the
+/// switch every Rust operator already reaches for, so it decides — and its
+/// absence means the curated output stays curated.
+///
+/// **This is not a way to reach a user.** Anything an author *must* see is not a
+/// log: it belongs in the CLI's own output, the way a FORGE schema migration
+/// travels out through [`albedo_server::BootReport`] and gets printed. That
+/// split is the whole lesson — a message on a channel nobody is listening to is
+/// indistinguishable from no message at all.
+fn install_tracing() {
+    use tracing_subscriber::EnvFilter;
+
+    // `try_from_default_env` errs when RUST_LOG is unset or unparseable. Both
+    // mean "the operator did not ask for logs", and an unparseable filter is
+    // not worth failing a build command over.
+    let Ok(filter) = EnvFilter::try_from_default_env() else {
+        return;
+    };
+    // stderr, so logs never interleave into stdout for anything piping our
+    // output. `try_init` rather than `init`: a double install should not panic
+    // a CLI over its logging.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
@@ -872,35 +914,41 @@ fn boot_and_run_production_server(contract: &ResolvedDevContract) -> Result<(), 
             contract.project_dir.display().to_string(),
             None,
             server,
+            // `serve` has no `--open`; it is a production run, not an on-ramp.
+            false,
             dash_tx,
             dash_rx,
         );
     }
-
-    print_ok(format!(
-        "serving · {}",
-        style_256(
-            &format!("http://{}:{}", contract.server.host, contract.server.port),
-            ACCENT_SOFT,
-            true,
-        )
-    ));
-    println!(
-        "    {} {}",
-        style_256("·", MUTED, false),
-        style(&format!("{}", contract.project_dir.display()), "2")
-    );
-    println!();
-    println!("    {}  stop the server", style_256("ctrl+c", MUTED, true));
-    println!();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| format!("failed to start tokio runtime: {err}"))?;
 
+    // The banner is the server's own readiness signal, not ours to guess at.
+    // Printed from `run_with_ready`, it cannot claim a server that failed to
+    // boot — and a startup error now reaches the user with nothing above it
+    // contradicting it.
+    let banner_url = format!("http://{}:{}", contract.server.host, contract.server.port);
+    let banner_dir = contract.project_dir.display().to_string();
+
     runtime
-        .block_on(server.run())
+        .block_on(server.run_with_ready(move |report| {
+            print_boot_report(report);
+            print_ok(format!(
+                "serving · {}",
+                style_256(&banner_url, ACCENT_SOFT, true)
+            ));
+            println!(
+                "    {} {}",
+                style_256("·", MUTED, false),
+                style(&banner_dir, "2")
+            );
+            println!();
+            println!("    {}  stop the server", style_256("ctrl+c", MUTED, true));
+            println!();
+        }))
         .map_err(|err| format!("server runtime error: {err}"))
 }
 
@@ -1266,38 +1314,16 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     let url = format!("http://{addr}");
 
     if dashboard {
-        if contract.open {
-            let _ = try_open_browser(url.as_str());
-        }
         return run_dev_dashboard(
             tui::dev::Mode::Dev,
             url,
             contract.project_dir.display().to_string(),
             Some(tier_report),
             server,
+            contract.open,
             dash_tx,
             dash_rx,
         );
-    }
-
-    println!();
-    print_ok(format!(
-        "dev · {}",
-        style_256(&format!("http://{addr}"), ACCENT_SOFT, true)
-    ));
-    println!(
-        "    {} same pipeline as `albedo serve` · overlay + hot reload on",
-        style_256("·", MUTED, false)
-    );
-    println!();
-    println!("    {}  stop the server", style_256("ctrl+c", MUTED, true));
-    println!();
-
-    if contract.open {
-        let target = format!("http://{addr}");
-        if let Err(err) = try_open_browser(target.as_str()) {
-            print_warn(format!("failed to open browser automatically: {err}"));
-        }
     }
 
     // 4. Run the production server on a fresh multi-thread runtime, same as `albedo serve` (the dev
@@ -1306,8 +1332,34 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|err| format!("failed to start tokio runtime: {err}"))?;
+
+    // Banner *and* browser both wait on the server's own readiness signal.
+    // Opening a tab at a URL that never bound is the same lie the banner was
+    // telling, just harder to notice.
+    let banner_url = url.clone();
+    let open_browser = contract.open;
     runtime
-        .block_on(server.run())
+        .block_on(server.run_with_ready(move |report| {
+            println!();
+            print_boot_report(report);
+            print_ok(format!(
+                "dev · {}",
+                style_256(&banner_url, ACCENT_SOFT, true)
+            ));
+            println!(
+                "    {} same pipeline as `albedo serve` · overlay + hot reload on",
+                style_256("·", MUTED, false)
+            );
+            println!();
+            println!("    {}  stop the server", style_256("ctrl+c", MUTED, true));
+            println!();
+
+            if open_browser {
+                if let Err(err) = try_open_browser(banner_url.as_str()) {
+                    print_warn(format!("failed to open browser automatically: {err}"));
+                }
+            }
+        }))
         .map_err(|err| format!("dev server runtime error: {err}"))
 }
 
@@ -1318,12 +1370,23 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
 /// is claimed after that, so a boot failure still reports on a normal screen.
 /// When the dashboard returns — the user pressed `q` — the guard restores the
 /// terminal on the way out and the runtime is dropped, which stops the server.
+///
+/// ## Boot is awaited, not assumed
+///
+/// This blocks on the server's readiness signal before claiming the terminal.
+/// It has to: the dashboard is a full-screen alternate buffer showing a URL, so
+/// painting it before the listener binds turns *any* startup failure — a busy
+/// port, an unopenable `forge.db`, a schema the database disagrees with — into
+/// a confident dashboard for a server that does not exist. This lane runs
+/// whenever stdout is a TTY, which is every interactive user, so a message that
+/// only survives the piped path is a message nobody reads.
 fn run_dev_dashboard(
     mode: tui::dev::Mode,
     url: String,
     project: String,
     report: Option<TierReport>,
     server: albedo_server::AlbedoServer,
+    open_browser: bool,
     dash_tx: mpsc::Sender<tui::dev::DashEvent>,
     dash_rx: mpsc::Receiver<tui::dev::DashEvent>,
 ) -> Result<(), String> {
@@ -1364,9 +1427,44 @@ fn run_dev_dashboard(
         .enable_all()
         .build()
         .map_err(|err| format!("failed to start tokio runtime: {err}"))?;
+
+    // One channel carries both outcomes, so the wait below is a single blocking
+    // `recv` and the first message decides. Readiness fires from inside the
+    // server once everything fallible has succeeded; the failure arm can only
+    // win the race if `run_with_ready` returned before signalling, which is
+    // exactly the definition of a boot that did not finish.
+    let (boot_tx, boot_rx) = mpsc::channel::<Result<(), String>>();
+    let ready_tx = boot_tx.clone();
+    // The dashboard owns the screen, so a `println!` here would be painted over
+    // by the first frame. A note is how this lane says things, and it survives
+    // in the log pane where the author can still find it.
+    let note_tx = dash_tx.clone();
     runtime.spawn(async move {
-        let _ = server.run().await;
+        let outcome = server.run_with_ready(move |report| {
+            for message in report.lines() {
+                let _ = note_tx.send(tui::dev::DashEvent::Note { message });
+            }
+            let _ = ready_tx.send(Ok(()));
+        });
+        if let Err(err) = outcome.await {
+            // After readiness nobody is receiving and this send is dropped —
+            // the dashboard owns the screen by then. Before it, this is the
+            // startup error, and it is the whole reason for the channel.
+            let _ = boot_tx.send(Err(err.to_string()));
+        }
     });
+
+    match boot_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(format!("server startup failed: {err}")),
+        // The task ended without either signalling ready or reporting an error.
+        Err(_) => return Err("server exited before it finished starting".to_string()),
+    }
+
+    // Only now is there something at the other end of this URL.
+    if open_browser {
+        let _ = try_open_browser(url.as_str());
+    }
 
     let mut guard = tui::TerminalGuard::new()
         .map_err(|err| format!("failed to start the terminal UI: {err}"))?;
@@ -3063,6 +3161,22 @@ fn print_ok(message: impl std::fmt::Display) {
 
 fn print_warn(message: impl std::fmt::Display) {
     println!("  {} {}", style("!", "1;33"), message);
+}
+
+/// Announce anything the boot changed on the author's behalf, above the banner.
+///
+/// A FORGE schema migration is the one startup side effect that alters a file
+/// the author owns, so it is *told* to them rather than logged: nothing in this
+/// binary installs a `tracing` subscriber, so `info!` reaches no one — and a
+/// change to someone's database that reaches no one is the exact defect the
+/// drift check exists to remove.
+///
+/// Printed with `!` rather than `✓` on purpose. It is not a step that succeeded,
+/// it is a thing that happened, and the author should look at it once.
+fn print_boot_report(report: &albedo_server::BootReport) {
+    for line in report.lines() {
+        print_warn(line);
+    }
 }
 
 fn print_error(message: impl std::fmt::Display) {
