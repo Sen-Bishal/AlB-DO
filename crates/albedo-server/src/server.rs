@@ -23,7 +23,7 @@ use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
 use crate::webtransport::{WebTransportRuntime, WebTransportSessionRegistry};
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
@@ -32,7 +32,9 @@ use dom_render_compiler::runtime::{
     resolve_partition_topics, BroadcastRegistry, ResolvedPartition, ResolvedSourceTopic, SessionId,
     SlotStore,
 };
+use dom_render_compiler::shutter::{Cost, Key, OperationClass, Verdict};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -104,6 +106,15 @@ pub(crate) struct LiveRuntime {
     /// Live state, not build output: it owns a connection pool, so re-minting it
     /// on every dev file save would drop every keep-alive an author is watching.
     aperture_client: Arc<std::sync::OnceLock<Arc<dom_render_compiler::aperture::ApertureClient>>>,
+    /// AUTH · the request-time identity path.
+    ///
+    /// Held here, beside the FORGE substrate and the APERTURE reader, because
+    /// all three answer one question — *what does this request get to see* — and
+    /// keeping them on one handle is what stops a request from resolving its
+    /// identity through a different world than its data. `None` until boot
+    /// installs one; an app that declared no providers installs one anyway, and
+    /// it resolves everybody as anonymous without spending a query.
+    auth: Arc<std::sync::OnceLock<Arc<crate::auth::AuthRuntime>>>,
 }
 
 impl LiveRuntime {
@@ -118,6 +129,30 @@ impl LiveRuntime {
             forge_schema: Arc::new(dom_render_compiler::forge::ForgeSchema::guestbook_default()),
             source_reader: Arc::new(std::sync::OnceLock::new()),
             aperture_client: Arc::new(std::sync::OnceLock::new()),
+            auth: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Install the AUTH request path. Idempotent, on the same terms as the
+    /// APERTURE reader: a dev world swap must not replace the runtime that open
+    /// sessions were resolved through.
+    fn install_auth(&self, auth: Arc<crate::auth::AuthRuntime>) {
+        let _ = self.auth.set(auth);
+    }
+
+    /// Resolve this request's identity.
+    ///
+    /// The single entry point for all three paths — render, action dispatch and
+    /// the PHOSPHOR subscribe lane. One function rather than three call sites so
+    /// there is exactly one answer per request to *who is this*, and no way for
+    /// the page and its live lane to disagree about it.
+    ///
+    /// Before boot installs a runtime, everybody is anonymous — which is the
+    /// same answer an app with no declared providers gets, and the safe one.
+    async fn identity(&self, headers: &axum::http::HeaderMap) -> crate::auth::Identity {
+        match self.auth.get() {
+            Some(auth) => auth.resolve(headers).await,
+            None => crate::auth::Identity::Anonymous,
         }
     }
 
@@ -360,7 +395,10 @@ struct CompiledProjectActionAdapter {
 impl ActionHandler for CompiledProjectActionAdapter {
     async fn handle(
         &self,
-        _ctx: &RequestContext,
+        // AUTH F1 · read at last. The context has always reached this method and
+        // was always ignored; it is what carries the request's principal to the
+        // write path, which is the one place a row's owner can be checked.
+        ctx: &RequestContext,
         envelope: &dom_render_compiler::ir::action::ActionEnvelope,
         slots: SessionSlots,
     ) -> Result<Vec<dom_render_compiler::ir::opcode::Instruction>, RuntimeError> {
@@ -489,12 +527,13 @@ impl ActionHandler for CompiledProjectActionAdapter {
                 // S4 · the current row projector, cloned out of the live slot
                 // so the borrow the write path passes outlives no lock guard.
                 let projector = self.live.projector();
-                dom_render_compiler::forge::apply_writes(
+                let fan_out = dom_render_compiler::forge::apply_writes(
                     substrate.as_ref(),
                     self.live.broadcast.as_ref(),
                     self.live.forge_schema.as_ref(),
                     &writes,
                     projector.as_deref(),
+                    ctx.principal.as_ref(),
                 )
                 .await
                 .map_err(|err| {
@@ -502,6 +541,10 @@ impl ActionHandler for CompiledProjectActionAdapter {
                         "compiled action handler {action_id} FORGE write failed: {err}"
                     ))
                 })?;
+                // SHUTTER · report the blast radius back to the dispatcher, which
+                // is the only layer that knows who to charge for it. See
+                // `shutter::note_fan_out`.
+                crate::shutter::note_fan_out(fan_out.subscribers);
             }
 
             return Ok(instructions);
@@ -530,12 +573,13 @@ impl ActionHandler for CompiledProjectActionAdapter {
             // Applied AFTER the body returned Ok: a body that errored partway
             // never reaches here, so its earlier appends are discarded with it.
             let projector = self.live.projector();
-            dom_render_compiler::forge::apply_writes(
+            let fan_out = dom_render_compiler::forge::apply_writes(
                 substrate.as_ref(),
                 self.live.broadcast.as_ref(),
                 self.live.forge_schema.as_ref(),
                 &writes,
                 projector.as_deref(),
+                ctx.principal.as_ref(),
             )
             .await
             .map_err(|err| {
@@ -544,6 +588,7 @@ impl ActionHandler for CompiledProjectActionAdapter {
                     self.action_id
                 ))
             })?;
+            crate::shutter::note_fan_out(fan_out.subscribers);
 
             return Ok(instructions);
         }
@@ -664,6 +709,11 @@ struct RuntimeState {
     /// open trunks, and new subscribes bind against whatever world is live
     /// at subscribe time. See `handlers::phosphor` + `development-plan/PHOSPHOR.md`.
     phosphor: Arc<crate::handlers::PhosphorState>,
+    /// SHUTTER — the rate limiter and the trusted-proxy rule. Persistent for the
+    /// same reason the broadcast registry is: a dev world swap replaces build
+    /// output, and one that also reset every accumulated limit would hand out a
+    /// fresh budget on every file save. See `development-plan/AUTH.md` R6.
+    shutter: Arc<crate::shutter::Limiter>,
 }
 
 impl RuntimeState {
@@ -724,6 +774,11 @@ pub struct AlbedoServerBuilder {
     /// Phase N — directories served verbatim at the URL root. Each
     /// `with_public_dir` call appends; the first matching root wins.
     public_dirs: Vec<std::path::PathBuf>,
+    /// AUTH · the lowered `auth` block, waiting for a substrate.
+    ///
+    /// `None` until `boot.rs` supplies one; the resulting runtime resolves
+    /// everybody as anonymous when no providers were declared.
+    auth_registry: Option<dom_render_compiler::auth::AuthRegistry>,
     /// Phase N — `Cache-Control` value applied to every public asset
     /// response. `None` means auto: `public, max-age=3600` when dev
     /// mode is off, `no-store` when dev mode is on.
@@ -776,6 +831,7 @@ impl AlbedoServerBuilder {
             dev_mode_enabled: None,
             request_timings_enabled: false,
             public_dirs: Vec::new(),
+            auth_registry: None,
             public_cache_control: None,
             // Minted empty; `register_compiled_project` clones the same handles
             // into every adapter, `run()` fills the substrate, `build()`
@@ -862,6 +918,22 @@ impl AlbedoServerBuilder {
     #[must_use]
     pub(crate) fn with_live_runtime(mut self, live: LiveRuntime) -> Self {
         self.live = live;
+        self
+    }
+
+    /// AUTH · carry the lowered `auth` block toward the live runtime.
+    ///
+    /// Stored rather than installed, because an [`crate::auth::AuthRuntime`]
+    /// needs the substrate and the substrate is not open until `run()`. Lowered
+    /// in `boot.rs` for the same reason `sources` is — it needs the real
+    /// environment, and a bad block must fail the boot naming the offending
+    /// provider.
+    #[must_use]
+    pub(crate) fn with_auth_registry(
+        mut self,
+        registry: dom_render_compiler::auth::AuthRegistry,
+    ) -> Self {
+        self.auth_registry = Some(registry);
         self
     }
 
@@ -1591,11 +1663,20 @@ impl AlbedoServerBuilder {
             // hydrated topics and open subscribers.
             live: self.live,
             phosphor: Arc::new(crate::handlers::PhosphorState::new()),
+            // SHUTTER · built here so a limits configuration that could never
+            // admit its own heaviest operation fails the build rather than
+            // surfacing later as one endpoint that 429s at every instant — a
+            // symptom indistinguishable from load. See `Limits::check_admits_heaviest`.
+            shutter: Arc::new(
+                crate::shutter::Limiter::from_env()
+                    .map_err(|err| RuntimeError::ServerStartup(format!("SHUTTER: {err}")))?,
+            ),
         };
 
         Ok(AlbedoServer {
             config: self.config,
             state,
+            auth_registry: self.auth_registry,
         })
     }
 }
@@ -1603,6 +1684,9 @@ impl AlbedoServerBuilder {
 pub struct AlbedoServer {
     config: AppConfig,
     state: RuntimeState,
+    /// AUTH · the lowered `auth` block, installed onto the live runtime by
+    /// `run()` once the substrate it resolves against is open.
+    auth_registry: Option<dom_render_compiler::auth::AuthRegistry>,
 }
 
 /// What a boot changed on the author's behalf, handed to the readiness callback.
@@ -1633,6 +1717,16 @@ impl BootReport {
 }
 
 impl AlbedoServer {
+    /// The service, without connect info.
+    ///
+    /// ⚠️ **Serving this directly leaves SHUTTER unable to tell callers apart.**
+    /// The peer address arrives as a request extension that only
+    /// `into_make_service_with_connect_info` installs, so a router mounted
+    /// without it rations every anonymous caller through one shared bucket (see
+    /// `shutter::UNATTRIBUTED` — strict rather than absent, which is the right
+    /// direction to be wrong in, but it is not what a real deployment wants).
+    /// [`run`](Self::run) does the right thing; this exists for tests and for
+    /// embedders composing their own stack, who should add the layer themselves.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/", any(dispatch))
@@ -1803,11 +1897,59 @@ impl AlbedoServer {
             info!("FORGE substrate opened (forge.db); topics hydrated; writes enabled");
         }
 
+        // AUTH · install the identity path, now that the substrate it resolves
+        // against is open. Before the listener binds, so no request can reach a
+        // half-installed runtime and resolve as anonymous when it should not
+        // have — a race that would look like an intermittent logout.
+        //
+        // An app that declared no providers still gets a runtime: it answers
+        // "anonymous" without spending a query, which keeps the request path
+        // free of an `Option` that only one kind of app would ever fill.
+        if let Some(registry) = self.auth_registry.clone() {
+            match self.state.live.forge_substrate.get() {
+                Some(substrate) => {
+                    let providers = registry.providers.len();
+                    self.state
+                        .live
+                        .install_auth(Arc::new(crate::auth::AuthRuntime::new(
+                            registry,
+                            Arc::clone(substrate),
+                        )));
+                    if providers > 0 {
+                        info!("AUTH: {providers} provider(s) declared; sessions enabled");
+                    }
+                }
+                // Declaring providers with no substrate is not a warning, it is
+                // a broken app: every login would write to a database that is
+                // not there, and the failure would surface as a login that
+                // silently does nothing.
+                None if !registry.is_empty() => {
+                    return Err(RuntimeError::ServerStartup(
+                        "the `auth` block declares providers but no FORGE substrate is open — \
+                         sessions, users and credentials are FORGE rows, so auth cannot run \
+                         without one"
+                            .to_string(),
+                    ));
+                }
+                None => {}
+            }
+        }
+
         let addr = self.config.server.socket_addr()?;
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|err| RuntimeError::ServerStartup(err.to_string()))?;
         info!("ALBEDO server listening on {}", addr);
+        // SHUTTER · the trust question, answered out loud. Zero trusted proxies
+        // behind a load balancer is a misconfiguration whose only symptom is
+        // over-strict limiting — the whole internet arriving as one address —
+        // and an operator chasing that needs to be able to find this line.
+        info!(
+            target: "albedo.shutter",
+            trusted_proxies = self.state.shutter.trusted_proxies(),
+            "SHUTTER active; set {} when running behind a load balancer",
+            crate::shutter::TRUSTED_PROXIES_ENV
+        );
         let router = self.router();
 
         let shutdown_timeout = Duration::from_millis(self.config.server.shutdown_timeout_ms);
@@ -1878,8 +2020,16 @@ impl AlbedoServer {
         // anyone the server is up.
         on_ready(&report);
 
-        let http_result = axum::serve(listener, router)
-            .with_graceful_shutdown(graceful_shutdown)
+        // SHUTTER · `into_make_service_with_connect_info` is what puts the peer
+        // address in front of the limiter. Without it every anonymous request in
+        // the process shares one bucket — see `shutter::UNATTRIBUTED`, which is
+        // the deliberate answer for an embedder that mounts `router()` itself,
+        // not something the serve path should ever rely on.
+        let http_result = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(graceful_shutdown)
             .await
             .map_err(|err| RuntimeError::ServerRuntime(err.to_string()));
 
@@ -2001,7 +2151,18 @@ fn compression_layer() -> CompressionLayer<And<DefaultPredicate, NotForContentTy
 }
 
 async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> Response {
-    match tokio::task::spawn(dispatch_inner(state, request)).await {
+    // SHUTTER · the peer address, read as an extension rather than through the
+    // `ConnectInfo` extractor so its absence is a value and not a 500. It is
+    // absent exactly when the router was mounted without connect info — an
+    // in-process test, or an embedder calling `router()` directly — and
+    // `Limiter::key` has a defined, strict answer for that. Reading it here also
+    // keeps `dispatch_inner`'s signature honest about needing it.
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|connect| connect.0.ip());
+
+    match tokio::task::spawn(dispatch_inner(state, peer, request)).await {
         Ok(response) => response,
         Err(join_err) => {
             let msg = if join_err.is_panic() {
@@ -2021,7 +2182,66 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
     }
 }
 
-async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response {
+/// SHUTTER · charge this request, and refuse it if the budget is spent.
+///
+/// Returns the [`Key`] that was charged so a caller who learns the real price
+/// later can settle up against the same bucket (the action path, whose fan-out
+/// is not knowable until the write resolves).
+///
+/// `identity` is passed rather than resolved because the branches differ on
+/// purpose: the render, action and subscribe paths have already paid for an
+/// identity lookup and should ration the *actor*, while a static asset has not
+/// and must not — an indexed session query per image on the page is a real cost
+/// for an answer that branch never reads. An asset therefore rations by address,
+/// which is the correct subject for an unauthenticated byte stream anyway.
+fn ration(
+    state: &RuntimeState,
+    peer: Option<IpAddr>,
+    headers: &HeaderMap,
+    identity: &crate::auth::Identity,
+    cost: Cost,
+    rationed: &mut Option<Verdict>,
+) -> Result<Key, Response> {
+    let key = state.shutter.key(identity, peer, headers, cost.class);
+    let verdict = state.shutter.charge(&key, cost);
+    if !verdict.is_admitted() {
+        debug!(
+            target: "albedo.shutter",
+            class = cost.class.as_str(),
+            why = %cost.explain(),
+            "request refused"
+        );
+        return Err(crate::shutter::too_many_requests(&verdict));
+    }
+    *rationed = Some(verdict);
+    Ok(key)
+}
+
+async fn dispatch_inner(
+    state: RuntimeState,
+    peer: Option<IpAddr>,
+    request: Request<Body>,
+) -> Response {
+    let mut rationed: Option<Verdict> = None;
+    let mut response = dispatch_routed(&state, peer, request, &mut rationed).await;
+    // SHUTTER · budget headers on **admitted** responses too, not only on
+    // refusals. A client that first learns its budget when it has already run out
+    // cannot pace itself, which is how a well-behaved integration becomes a
+    // thundering herd. Refusals carry their own headers already; this is the one
+    // place the successful path gets them, which is why the verdict is threaded
+    // out rather than stamped at each of the branches below.
+    if let Some(verdict) = &rationed {
+        crate::shutter::stamp(response.headers_mut(), verdict);
+    }
+    response
+}
+
+async fn dispatch_routed(
+    state: &RuntimeState,
+    peer: Option<IpAddr>,
+    request: Request<Body>,
+    rationed: &mut Option<Verdict>,
+) -> Response {
     // Start the server-compute clock at the very top so the reported number
     // includes routing (the perfect-hash matcher is ours to claim) — but not a
     // byte of network. Only page-render GETs and action POSTs read it back out
@@ -2043,6 +2263,19 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
 
     if path == "/_albedo/wt" {
         if let Some(streaming_runtime) = &world.streaming_runtime {
+            // A live lane is charged once, at open, not per frame: what it costs
+            // to establish is a subscribe, and what it costs to feed is already
+            // priced on the writer's side as fan-out.
+            if let Err(refusal) = ration(
+                state,
+                peer,
+                request.headers(),
+                &crate::auth::Identity::Anonymous,
+                Cost::flat(OperationClass::Read),
+                rationed,
+            ) {
+                return refusal;
+            }
             return streaming_handler(State(streaming_runtime.clone()), request)
                 .await
                 .into_response();
@@ -2064,14 +2297,37 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
         // cannot repair) from one connecting for the first time (whose rows
         // are already in the HTML that just rendered).
         let reconnecting = request.headers().contains_key("last-event-id");
+        // AUTH item 5 P1 · resolve the principal here too, and for the reason the
+        // dispatcher gives: one request, one answer to *who is this*. This lane
+        // is the SSE fallback for the same page the render served, so if it
+        // resolved anonymously while the render resolved a principal, a
+        // signed-in user would see their rows on load and then never see an
+        // update to them — live data that is silently only-on-reload, which is
+        // the worst shape of all because it looks like it works.
+        let identity = state.live.identity(request.headers()).await;
+        if let Err(refusal) = ration(
+            state,
+            peer,
+            request.headers(),
+            &identity,
+            Cost::flat(OperationClass::Read),
+            rationed,
+        ) {
+            return refusal;
+        }
         let response = match &world.streaming_runtime {
             Some(streaming_runtime) => {
                 let page_path = crate::routing::parse_query_string(query.as_deref())
                     .get("p")
                     .and_then(|values| values.first().cloned())
                     .unwrap_or_else(|| "/".to_string());
-                let topics = resolve_route_topics(&world, streaming_runtime, page_path.as_str())
-                    .unwrap_or_default();
+                let topics = resolve_route_topics(
+                    &world,
+                    streaming_runtime,
+                    page_path.as_str(),
+                    identity.principal().map(|who| &who.id),
+                )
+                .unwrap_or_default();
                 // Only a reconnect needs a resync, and only the current
                 // projector can produce it. Cloned out of the live slot into an
                 // owned local so the borrow survives the `.await` below without
@@ -2102,6 +2358,31 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     // table lives on persistent state, so a dev world-swap keeps open trunks.
     if path == "/_albedo/phosphor" && method == HttpMethod::Get {
         let identity = crate::render::csrf::read_session_cookie(request.headers());
+        // AUTH · R2 — the live lane learns *who*, not just *which tab*.
+        //
+        // `identity` above is the tab: a `SessionId` minted for anyone who
+        // visits, with no login involved. The principal is a different fact, and
+        // the lane needs it because a subscribe grants topics — so from P1 on,
+        // "which topics may this connection name" is a question about the human,
+        // not the tab. Resolved here, at trunk open, so every route the lane
+        // subscribes to over its lifetime is judged against one identity rather
+        // than re-resolved per subscribe.
+        let principal = state.live.identity(request.headers()).await;
+
+        // Rationed against the principal when there is one — a trunk is per
+        // browser profile, so an address bucket would make one office share one
+        // browser's budget.
+        if let Err(refusal) = ration(
+            state,
+            peer,
+            request.headers(),
+            &principal,
+            Cost::flat(OperationClass::Read),
+            rationed,
+        ) {
+            return refusal;
+        }
+
         // `?dev=1` merges the overlay/HMR event streams onto the trunk so a
         // dev browser holds exactly one connection. Inert in production: the
         // registries are `None`, so the flag has nothing to stream.
@@ -2116,8 +2397,13 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
         } else {
             crate::handlers::phosphor::DevTap::none()
         };
-        let response =
-            crate::handlers::phosphor::serve_trunk(state.phosphor.clone(), dev, identity).await;
+        let response = crate::handlers::phosphor::serve_trunk(
+            state.phosphor.clone(),
+            dev,
+            identity,
+            principal,
+        )
+        .await;
         if state.request_timings {
             crate::timing::print_request(method.as_str(), &path, started.elapsed());
         }
@@ -2129,6 +2415,19 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     // item 4's dynamic topics land into. Resolution binds against the world
     // that is live NOW, not the one the trunk opened under.
     if path == "/_albedo/phosphor/routes" && method == HttpMethod::Post {
+        // A subscribe resolves a route's topics and **warms** any cold partition
+        // it names, which is an indexed range scan per partition. That is a read
+        // that reaches FORGE, so it is priced as one.
+        if let Err(refusal) = ration(
+            state,
+            peer,
+            request.headers(),
+            &crate::auth::Identity::Anonymous,
+            Cost::flat(OperationClass::Read),
+            rationed,
+        ) {
+            return refusal;
+        }
         let (_parts, body) = request.into_parts();
         let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
             Ok(body) => body,
@@ -2218,7 +2517,56 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     // POST is accepted; other methods fall through to the normal
     // router (which will surface 405 or 404 as appropriate).
     if path == "/_albedo/action" && method == HttpMethod::Post {
-        let response = run_action_route(&world, state.dev_error_registry.as_ref(), request).await;
+        // AUTH · resolved before the body is read so the handler is dispatched
+        // under a known identity rather than acquiring one partway through.
+        // Per-branch rather than once at the top of the dispatcher: a static
+        // asset request carries the same cookies, and paying an indexed lookup
+        // for every image on the page would be a real cost for an answer
+        // nothing on that path reads.
+        let principal = state.live.identity(request.headers()).await;
+
+        // SHUTTER · an action is charged in two parts, because its price is only
+        // half knowable in advance.
+        //
+        // **Admission** is the flat write cost: an action runs a user-authored
+        // body against the substrate, and refusing it here is the only refusal
+        // that saves any work at all.
+        //
+        // **The surcharge** is its blast radius, and no amount of analysis at
+        // this line can produce it — a write to a partitioned collection lands on
+        // a channel whose name depends on the record, and an update that moves a
+        // row across partitions touches two. The write path resolves that inside
+        // its transaction and reports it back through the meter below.
+        let key = match ration(
+            state,
+            peer,
+            request.headers(),
+            &principal,
+            Cost::flat(OperationClass::Write),
+            rationed,
+        ) {
+            Ok(key) => key,
+            Err(refusal) => return refusal,
+        };
+
+        let (response, fan_out) = crate::shutter::metered(run_action_route(
+            &world,
+            state.dev_error_registry.as_ref(),
+            request,
+            principal,
+        ))
+        .await;
+
+        // Settled unconditionally, and deliberately after the fact: the write is
+        // committed and a limiter does not un-commit one. What this buys is that
+        // the *next* request is priced by what this one actually reached, which
+        // is the difference between a derived weight and a guessed one. See
+        // `Shutter::debit` for why it cannot go through `charge`.
+        if fan_out > 0 {
+            state
+                .shutter
+                .debit(&key, Cost::surcharge(OperationClass::Write, fan_out));
+        }
         if state.request_timings {
             crate::timing::print_request(method.as_str(), &path, started.elapsed());
         }
@@ -2235,6 +2583,19 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     if matches!(method, HttpMethod::Get | HttpMethod::Head) {
         if let Some(response) = crate::handlers::albedo_assets::dispatch_albedo_asset(path.as_str())
         {
+            // Charged after the lookup rather than before it: the lookup is a
+            // match against a static table, and charging first would price every
+            // request in the system as an asset on the way past.
+            if let Err(refusal) = ration(
+                state,
+                peer,
+                request.headers(),
+                &crate::auth::Identity::Anonymous,
+                Cost::flat(OperationClass::StaticRead),
+                rationed,
+            ) {
+                return refusal;
+            }
             let mut response = response;
             if method == HttpMethod::Head {
                 *response.body_mut() = Body::empty();
@@ -2250,6 +2611,16 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     if matches!(method, HttpMethod::Get | HttpMethod::Head) {
         if let Some(assets) = &world.public_assets {
             if let Some(file) = assets.resolve(path.as_str()) {
+                if let Err(refusal) = ration(
+                    state,
+                    peer,
+                    request.headers(),
+                    &crate::auth::Identity::Anonymous,
+                    Cost::flat(OperationClass::StaticRead),
+                    rationed,
+                ) {
+                    return refusal;
+                }
                 let mut response = assets.read_response(&file);
                 if method == HttpMethod::Head {
                     *response.body_mut() = Body::empty();
@@ -2260,97 +2631,184 @@ async fn dispatch_inner(state: RuntimeState, request: Request<Body>) -> Response
     }
 
     let route_match = world.router.match_route(method, path.as_str());
-    let response = match route_match {
-        RouteMatch::NotFound => RuntimeError::RouteNotFound {
-            method: method.as_str().to_string(),
-            path,
-        }
-        .into_response(),
-        RouteMatch::MethodNotAllowed { allowed } => ResponsePayload::new(
-            StatusCode::METHOD_NOT_ALLOWED,
-            format!("method '{}' is not allowed for this route", method.as_str()),
-        )
-        .with_header(
-            "allow",
-            allowed
-                .iter()
-                .map(|method| method.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        )
-        .into_response(),
-        RouteMatch::Matched(matched) => {
-            if should_use_manifest_streaming(&world, &matched.target, method, path.as_str()) {
-                if let Some(streaming_runtime) = &world.streaming_runtime {
-                    // The manifest is keyed by route *pattern* (`/essays/[slug]`),
-                    // which `boot_production_server` mirrors into `entry_module`.
-                    // Pass that key plus the params `CompiledRouter` already
-                    // extracted so dynamic routes stream their async body + head.
-                    let route_pattern = matched
-                        .target
-                        .entry_module
-                        .clone()
-                        .unwrap_or_else(|| path.clone());
-                    let params: HashMap<String, String> = matched
-                        .params
+
+    // SHUTTER · what this route answers to, derived from what the build recorded
+    // about it rather than from its path. A route that declares no live topics is
+    // a cached render and is priced as one; a route that reads a FORGE partition
+    // or an APERTURE source reaches the substrate on every request and is not.
+    // **That distinction is the whole differentiation**: a limiter that sees only
+    // a path and an address cannot make it, so every number it enforces has to
+    // cover the worst case of both.
+    //
+    // An unmatched path is charged too, at the static rate. A 404 flood is still
+    // a flood, and leaving the cheapest branch unrationed would make it the one
+    // an attacker uses.
+    let matched = match route_match {
+        RouteMatch::Matched(matched) => matched,
+        unmatched => {
+            if let Err(refusal) = ration(
+                state,
+                peer,
+                request.headers(),
+                &crate::auth::Identity::Anonymous,
+                Cost::flat(OperationClass::StaticRead),
+                rationed,
+            ) {
+                return refusal;
+            }
+            return match unmatched {
+                RouteMatch::MethodNotAllowed { allowed } => ResponsePayload::new(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    format!("method '{}' is not allowed for this route", method.as_str()),
+                )
+                .with_header(
+                    "allow",
+                    allowed
                         .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect();
-                    let response = streaming_handler_with_match(
-                        streaming_runtime.clone(),
-                        request,
-                        route_pattern,
-                        params,
-                    )
-                    .await
-                    .into_response();
-                    if state.request_timings {
-                        crate::timing::print_request(method.as_str(), &path, started.elapsed());
-                    }
-                    return response;
+                        .map(|method| method.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+                .into_response(),
+                // `NotFound`, and `Matched` which the arm above took.
+                _ => RuntimeError::RouteNotFound {
+                    method: method.as_str().to_string(),
+                    path,
                 }
-            }
-
-            let (parts, body) = request.into_parts();
-            let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
-                Ok(body) => body,
-                Err(err) => {
-                    return RuntimeError::RequestBodyRead(err.to_string()).into_response();
-                }
+                .into_response(),
             };
+        }
+    };
+    let class = matched_route_class(&world, &matched, method, path.as_str());
 
-            let request_context = RequestContext::new(
-                method,
-                path.clone(),
-                query.as_deref(),
-                matched.params,
-                &parts.headers,
-                body,
-            );
+    // AUTH · resolved once for the whole matched branch, and handed to whichever
+    // arm needs it. One request has one answer to *who is this*: a render whose
+    // head was built for a stranger and whose body was built for somebody is
+    // precisely the cross-principal bleed invariant 2.2 forbids, and two lookups
+    // are two chances to disagree. Costs nothing when no session cookie was
+    // presented — `AuthRuntime::resolve` returns without spending a query.
+    let identity = state.live.identity(request.headers()).await;
+    if let Err(refusal) = ration(
+        state,
+        peer,
+        request.headers(),
+        &identity,
+        Cost::flat(class),
+        rationed,
+    ) {
+        return refusal;
+    }
 
-            // Phase-F: if `handler_id` resolves to an API handler,
-            // dispatch through the API path. Otherwise fall through to
-            // the page-route flow (middleware, auth, handler, layout).
-            if let Some(api_handler) = world.api_handlers.get(&matched.target.handler_id).cloned() {
-                return run_api_request(&world, matched.target, request_context, api_handler).await;
-            }
-
-            let mut request_context = request_context;
-            let rendered = match execute_route(&world, matched.target, &mut request_context).await {
-                Ok(response) => response.into_response(),
-                Err(err) => {
-                    error!(request_id = request_context.request_id, error = %err, "request failed");
-                    err.into_response()
-                }
-            };
+    if should_use_manifest_streaming(&world, &matched.target, method, path.as_str()) {
+        if let Some(streaming_runtime) = &world.streaming_runtime {
+            // The manifest is keyed by route *pattern* (`/essays/[slug]`),
+            // which `boot_production_server` mirrors into `entry_module`.
+            // Pass that key plus the params `CompiledRouter` already
+            // extracted so dynamic routes stream their async body + head.
+            let route_pattern = matched
+                .target
+                .entry_module
+                .clone()
+                .unwrap_or_else(|| path.clone());
+            let params: HashMap<String, String> = matched
+                .params
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            // AUTH · the render path's identity — the third of the three
+            // (render, action, subscribe) `AUTH.md` § 5 says resolve through one
+            // place, and the one P1 consumes, because `user.id` in a component
+            // body is read here. Resolved above, before the render rather than
+            // inside it: a render that acquired its own principal partway through
+            // could produce a page whose head was built for a stranger and whose
+            // body was built for somebody, which is precisely the
+            // cross-principal bleed invariant 2.2 forbids.
+            let response = streaming_handler_with_match(
+                streaming_runtime.clone(),
+                request,
+                route_pattern,
+                params,
+                identity,
+            )
+            .await
+            .into_response();
             if state.request_timings {
                 crate::timing::print_request(method.as_str(), &path, started.elapsed());
             }
-            rendered
+            return response;
+        }
+    }
+
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(err) => {
+            return RuntimeError::RequestBodyRead(err.to_string()).into_response();
         }
     };
 
-    response
+    let request_context = RequestContext::new(
+        method,
+        path.clone(),
+        query.as_deref(),
+        matched.params,
+        &parts.headers,
+        body,
+    );
+
+    // Phase-F: if `handler_id` resolves to an API handler,
+    // dispatch through the API path. Otherwise fall through to
+    // the page-route flow (middleware, auth, handler, layout).
+    if let Some(api_handler) = world.api_handlers.get(&matched.target.handler_id).cloned() {
+        return run_api_request(&world, matched.target, request_context, api_handler).await;
+    }
+
+    let mut request_context = request_context;
+    let rendered = match execute_route(&world, matched.target, &mut request_context).await {
+        Ok(response) => response.into_response(),
+        Err(err) => {
+            error!(request_id = request_context.request_id, error = %err, "request failed");
+            err.into_response()
+        }
+    };
+    if state.request_timings {
+        crate::timing::print_request(method.as_str(), &path, started.elapsed());
+    }
+    rendered
+}
+
+/// SHUTTER · the class a matched route answers to.
+///
+/// 🔑 **Derived from the build, not authored and not guessed from the path** —
+/// and the rule itself lives in
+/// [`classify_route`](dom_render_compiler::shutter::classify_route) rather than
+/// here, because `albedo doctor` prints the same derivation. Two copies would let
+/// the audit artefact drift from the system it claims to describe, which is the
+/// standing "three implementations of the paint rule" shape.
+///
+/// Non-streaming routes run a userland handler and are priced as reads — the
+/// handler is opaque to us, and pricing "we cannot see inside this" as free would
+/// make it the cheapest thing to abuse.
+fn matched_route_class(
+    world: &RenderWorld,
+    matched: &crate::routing::MatchedRoute,
+    method: HttpMethod,
+    path: &str,
+) -> OperationClass {
+    if !should_use_manifest_streaming(world, &matched.target, method, path) {
+        return OperationClass::Read;
+    }
+    let Some(streaming) = world.streaming_runtime.as_ref() else {
+        return OperationClass::Read;
+    };
+    let pattern = matched.target.entry_module.as_deref().unwrap_or(path);
+    streaming
+        .manifest
+        .routes
+        .get(pattern)
+        .map_or(OperationClass::StaticRead, |route| {
+            dom_render_compiler::shutter::classify_route(route)
+        })
 }
 
 /// HTTP header bakabox sets to carry the session id alongside each
@@ -2370,6 +2828,12 @@ async fn run_action_route(
     world: &RenderWorld,
     dev_error_registry: Option<&crate::dev::SharedErrorRegistry>,
     request: Request<Body>,
+    // AUTH · who is invoking this action. Carried in rather than resolved here
+    // so the identity a request renders under and the one it acts under come
+    // from the same call — two resolutions could disagree, and an action running
+    // as a different principal than the page that offered it is the
+    // confused-deputy shape.
+    principal: crate::auth::Identity,
 ) -> Response {
     let (parts, body) = request.into_parts();
     let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
@@ -2377,7 +2841,7 @@ async fn run_action_route(
         Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
     };
 
-    // Phase L · prefer the `albedo-session` cookie (set by the
+    // Phase L · prefer the `__Host-albedo-session` cookie (set by the
     // streaming handler on first page render) over the explicit
     // `x-albedo-session` header. Browser-driven form POSTs auto-send
     // the cookie; programmatic clients can still override via the
@@ -2396,6 +2860,14 @@ async fn run_action_route(
         .unwrap_or_else(SessionId::random);
 
     let query = parts.uri.query().map(str::to_string);
+    // AUTH F1 · the resolved principal rides the context to the write path.
+    //
+    // Carried on the value that already reaches `ActionHandler::handle` rather
+    // than through a new parameter or a task-local: the context is the request's
+    // "what is known here" object, the handler already receives it, and an
+    // ambient identity is the shape a confused deputy takes. `principal` was
+    // resolved by the caller, so this cannot disagree with the identity the page
+    // was rendered under.
     let ctx = RequestContext::new(
         HttpMethod::Post,
         parts.uri.path().to_string(),
@@ -2403,7 +2875,20 @@ async fn run_action_route(
         Default::default(),
         &parts.headers,
         body.clone(),
-    );
+    )
+    .with_principal(principal.principal().map(|who| who.id.clone()));
+
+    // AUTH · P0 records the identity on the action path; F1's write-path
+    // enforcement is what consumes it. Logged at debug so a "why did this action
+    // see nobody" question stays answerable from the outside.
+    if let Some(who) = principal.principal() {
+        tracing::debug!(
+            target: "albedo.auth",
+            principal = %who.id,
+            provider = %who.provider,
+            "action dispatched under a resolved principal"
+        );
+    }
 
     let slots = SessionSlots::new(session_id, world.slot_store.clone());
     run_action_request(
@@ -2537,8 +3022,9 @@ fn resolve_route_topics(
     world: &RenderWorld,
     streaming: &Arc<StreamingAppState>,
     page_path: &str,
+    principal: Option<&dom_render_compiler::auth::PrincipalId>,
 ) -> Option<Vec<String>> {
-    Some(resolve_route_topics_detailed(world, streaming, page_path, None)?.0)
+    Some(resolve_route_topics_detailed(world, streaming, page_path, None, principal)?.0)
 }
 
 /// [`resolve_route_topics`], keeping the resolved partitions alongside the topic
@@ -2561,6 +3047,11 @@ fn resolve_route_topics_detailed(
     streaming: &Arc<StreamingAppState>,
     page_path: &str,
     sources_registry: Option<&dom_render_compiler::aperture::SourceRegistry>,
+    // AUTH item 5 P1 · the *lane's* principal, not the tab's session. A lane
+    // that is not signed in resolves no identity-keyed topic and is therefore
+    // granted none, which is what makes "cannot name it" an enforcement rather
+    // than a description.
+    principal: Option<&dom_render_compiler::auth::PrincipalId>,
 ) -> Option<(Vec<String>, Vec<ResolvedPartition>, Vec<ResolvedSourceTopic>)> {
     let RouteMatch::Matched(matched) = world.router.match_route(HttpMethod::Get, page_path) else {
         return None;
@@ -2578,9 +3069,10 @@ fn resolve_route_topics_detailed(
     // params. A spec whose param the route did not match, or whose key is
     // outside the alphabet, contributes no topic — the page is live for
     // everything else it reads and static for this one.
-    let partitions = resolve_partition_topics(&route.shared_slot_partitions, |name| {
-        matched.params.get(name).map(String::as_str)
-    });
+    let partitions =
+        resolve_partition_topics(&route.shared_slot_partitions, principal, |name| {
+            matched.params.get(name).map(String::as_str)
+        });
 
     // APERTURE · the other derivation, resolved from the same matched params by
     // the same rule. A source binding is reachable only through a route that
@@ -2633,7 +3125,7 @@ impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority {
     /// empty.
     async fn authorize_route(
         &self,
-        _identity: Option<dom_render_compiler::runtime::session::SessionId>,
+        principal: Option<&dom_render_compiler::auth::PrincipalId>,
         path: &str,
     ) -> Option<Vec<String>> {
         let streaming = self.world.streaming_runtime.as_ref()?;
@@ -2643,7 +3135,7 @@ impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority {
             .get()
             .map(|reader| reader.registry().as_ref());
         let (topics, partitions, sources) =
-            resolve_route_topics_detailed(&self.world, streaming, path, registry)?;
+            resolve_route_topics_detailed(&self.world, streaming, path, registry, principal)?;
         if !partitions.is_empty() {
             crate::topics::TopicWarmer::warm(&self.live, &partitions).await;
         }
@@ -2812,6 +3304,166 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "user=42");
+    }
+
+    /// A server whose only route is a plain handler, for the SHUTTER tests
+    /// below. Every one of them shares a single limiter, because
+    /// `AlbedoServer::router()` clones the same `RuntimeState`.
+    fn rationed_server() -> AlbedoServer {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: vec![RouteSpec {
+                name: "ping".to_string(),
+                method: HttpMethod::Get,
+                path: "/ping".to_string(),
+                handler: "ping".to_string(),
+                entry_module: None,
+                props_loader: None,
+                middleware: Vec::new(),
+                auth: None,
+            }],
+        };
+        AlbedoServerBuilder::new(config)
+            .register_handler("ping", |_ctx: RequestContext| async move {
+                Ok(ResponsePayload::ok_text("pong"))
+            })
+            .build()
+            .unwrap()
+    }
+
+    fn get(uri: &str, peer: Option<SocketAddr>) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        if let Some(peer) = peer {
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+        }
+        request
+    }
+
+    /// SHUTTER · a client that only learns its budget once it has run out cannot
+    /// pace itself, which is how a well-behaved integration becomes a thundering
+    /// herd. The headers therefore ride **admitted** responses, which is a
+    /// property of the dispatcher and not of the header helper.
+    #[tokio::test]
+    async fn an_admitted_response_carries_its_remaining_budget() {
+        let server = rationed_server();
+        let response = server.router().oneshot(get("/ping", None)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().contains_key("ratelimit-remaining"),
+            "an admitted response was not stamped: {:?}",
+            response.headers()
+        );
+        assert!(response.headers().contains_key("ratelimit-limit"));
+    }
+
+    /// The limiter is actually on the request path. Not "the module compiles" —
+    /// a flood through the real dispatcher must come back 429 with everything a
+    /// client needs to back off correctly.
+    #[tokio::test]
+    async fn a_flood_is_refused_by_the_dispatcher_with_an_actionable_refusal() {
+        let server = rationed_server();
+        let peer: SocketAddr = "198.51.100.7:4444".parse().unwrap();
+
+        let mut refusal = None;
+        for _ in 0..1_000 {
+            let response = server
+                .router()
+                .oneshot(get("/ping", Some(peer)))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                refusal = Some(response);
+                break;
+            }
+        }
+
+        let refusal = refusal.expect("a thousand requests were all admitted — nothing is rationed");
+        assert!(
+            refusal.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "a refusal without Retry-After tells a client to guess"
+        );
+        let body = to_bytes(refusal.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("rate_limited"), "{body}");
+        // The refusal explains its own derivation — the thing a path-and-IP
+        // limiter cannot do, and the reason this one does not get disabled.
+        assert!(body.contains("\"why\""), "{body}");
+    }
+
+    /// The peer address reaches the limiter. Without the connect-info plumbing
+    /// this passes trivially and means nothing, so it asserts the *separation*:
+    /// one address exhausting its budget must not refuse another's first request.
+    #[tokio::test]
+    async fn one_address_cannot_spend_another_addresss_budget() {
+        let server = rationed_server();
+        let attacker: SocketAddr = "203.0.113.9:5555".parse().unwrap();
+        let bystander: SocketAddr = "198.51.100.7:6666".parse().unwrap();
+
+        let mut exhausted = false;
+        for _ in 0..1_000 {
+            let response = server
+                .router()
+                .oneshot(get("/ping", Some(attacker)))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                exhausted = true;
+                break;
+            }
+        }
+        assert!(exhausted, "the attacker was never refused");
+
+        let response = server
+            .router()
+            .oneshot(get("/ping", Some(bystander)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "one address's flood refused a different address — the peer never reached the limiter"
+        );
+    }
+
+    /// **The differentiation, made observable.** The class a request answers to
+    /// is derived from what the route does, so two paths through the same
+    /// dispatcher are charged against different limits — and the `RateLimit-Policy`
+    /// header says which. A path-and-IP limiter has one answer for both.
+    #[tokio::test]
+    async fn the_class_a_request_is_charged_is_derived_from_the_route() {
+        let server = rationed_server();
+
+        let handled = server.router().oneshot(get("/ping", None)).await.unwrap();
+        let policy = handled.headers()["ratelimit-policy"].to_str().unwrap().to_string();
+        assert!(
+            policy.contains("class=read"),
+            "a route running a userland handler should answer to the read limit: {policy}"
+        );
+
+        // An unmatched path is still charged — a 404 flood is a flood — but at
+        // the static rate, because that is what it costs.
+        let missing = server
+            .router()
+            .oneshot(get("/nothing-here", None))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let policy = missing.headers()["ratelimit-policy"].to_str().unwrap().to_string();
+        assert!(
+            policy.contains("class=static-read"),
+            "an unmatched path should answer to the static limit: {policy}"
+        );
     }
 
     /// § 2d's unclaimed regression test, folded into the PHOSPHOR work: the
@@ -3344,6 +3996,95 @@ mod tests {
             uuid::Uuid::parse_str(session_uuid).expect("valid session uuid"),
         );
         server.csrf_registry().token_for(session)
+    }
+
+    /// **The two-part payment, through the real dispatcher.** An action's blast
+    /// radius is not knowable at admission, so it is settled afterwards — and the
+    /// place that has to be true is the composition, not the pieces. This drives
+    /// the actual `/_albedo/action` branch and asserts that a dispatch which
+    /// reported fan-out leaves *less* budget behind than one that reported none.
+    ///
+    /// Note which response carries the drop: not the noisy one. Its own headers
+    /// are stamped from the admission verdict, because at that instant nobody
+    /// knew what it would cost. The next request is the one that pays, which is
+    /// the honest shape — a limiter does not un-commit a write.
+    #[tokio::test]
+    async fn a_dispatch_that_reached_many_lanes_costs_the_next_one_more() {
+        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
+        use dom_render_compiler::ir::opcode::{Instruction, StableId, TagId};
+
+        const QUIET: u32 = 7;
+        const NOISY: u32 = 8;
+
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+        };
+        let server = AlbedoServerBuilder::new(config)
+            .register_action(QUIET, |_ctx, envelope: ActionEnvelope, _slots| async move {
+                Ok(vec![Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(envelope.action_id),
+                }])
+            })
+            .register_action(NOISY, |_ctx, envelope: ActionEnvelope, _slots| async move {
+                // Stands in for what `apply_writes` reports back from inside its
+                // transaction: this write is about to reach 512 open lanes.
+                crate::shutter::note_fan_out(512);
+                Ok(vec![Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(envelope.action_id),
+                }])
+            })
+            .build()
+            .unwrap();
+
+        async fn dispatch(server: &AlbedoServer, action_id: u32, peer: SocketAddr) -> u32 {
+            let body = encode_action_envelope(&ActionEnvelope {
+                action_id,
+                event_kind: 0,
+                payload: Vec::new(),
+            })
+            .unwrap();
+            let session_uuid = uuid::Uuid::new_v4().to_string();
+            let token = action_csrf_token(server, &session_uuid);
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/_albedo/action")
+                .header("x-albedo-session", session_uuid.as_str())
+                .header("x-albedo-csrf", token.as_str())
+                .body(Body::from(body))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+
+            let response = server.router().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.headers()["ratelimit-remaining"]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+
+        // Two addresses so the two histories cannot contaminate each other.
+        let calm: SocketAddr = "198.51.100.7:1111".parse().unwrap();
+        let busy: SocketAddr = "203.0.113.9:2222".parse().unwrap();
+
+        dispatch(&server, QUIET, calm).await;
+        let after_quiet = dispatch(&server, QUIET, calm).await;
+
+        dispatch(&server, NOISY, busy).await;
+        let after_noisy = dispatch(&server, QUIET, busy).await;
+
+        assert!(
+            after_noisy < after_quiet,
+            "a write that reached 512 lanes cost the same as one that reached none \
+             ({after_noisy} vs {after_quiet} remaining) — the surcharge never landed"
+        );
     }
 
     #[tokio::test]
@@ -3893,7 +4634,7 @@ mod tests {
     /// Builds the action POST a browser would send for
     /// `<form action="action:NAME">`: the envelope the client encodes,
     /// plus the two things that get the request past the CSRF gate —
-    /// the `albedo-session` cookie and the matching `_csrf` field in the
+    /// the `__Host-albedo-session` cookie and the matching `_csrf` field in the
     /// form payload.
     ///
     /// Form actions fail closed without a token, so a test that means to

@@ -60,7 +60,7 @@
     if (!payload || typeof payload.html !== 'string') return;
     // Phase M.2 Stage 1: simple replace of the document body's
     // inner HTML. Server-side slot store is keyed by the
-    // `albedo-session` cookie (Phase L) and the cookie survives
+    // `__Host-albedo-session` cookie (Phase L) and the cookie survives
     // this swap, so useState values are preserved through the
     // round-trip server → next render → next page → new HTML.
     const oldRoot = globalScope.document.body;

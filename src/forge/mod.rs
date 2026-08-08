@@ -67,7 +67,9 @@ pub use typegen::emit_forge_dts;
 pub use skeleton::{ForgeCollection, ForgeSchema, ForgeSchemaError, SeedRow};
 pub use substrate::{DataSubstrate, Transaction};
 pub use value::{Result, Row, Rows, SqlValue, SubstrateError};
-pub use write::{apply_writes, install_forge_write_collector, ForgeWrite, ForgeWriteCollector};
+pub use write::{
+    apply_writes, install_forge_write_collector, FanOut, ForgeWrite, ForgeWriteCollector,
+};
 
 #[cfg(feature = "forge")]
 pub use libsql::LibSqlSubstrate;

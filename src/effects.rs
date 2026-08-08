@@ -54,6 +54,10 @@ impl EffectProfile {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TieringReason {
     PureStaticEligible,
+    /// Item 4.9 T1. The component holds state that is **proven to escape the
+    /// client** — shared, persisted, or server-computed — so the server owns it
+    /// and the updates ride the wire instead of an island.
+    ServerOwnedState,
     HookDrivenHydration,
     AsyncBoundary,
     IoBoundary,
@@ -85,10 +89,21 @@ pub struct TieringInputs {
 ///   reaches no server boundary). This is the lever that promotes to Tier-C (client island, zero
 ///   round-trip). A handler that must round-trip (e.g. `onClick` → `fetch`) leaves this false,
 ///   keeping the component Tier-B.
+///   ⚠️ **Measured 2026-08-05: this bit is true for 534 of 536 interactive components in the
+///   real-world corpus** (`TIER_DISTRIBUTION.md`). Its negative case is a 12-name list that real
+///   code almost never hits, so on its own it is closer to a constant than a lever. That is why
+///   `state_escapes` exists and why it is consulted first.
+/// - `state_escapes` — item 4.9 T1 · **who owns the state.** True when the state is *proven* to
+///   leave this client (a `useSharedSlot` topic, a FORGE write, a server `action`, a network
+///   boundary), which makes it the server's and keeps the component Tier-B with no island.
+///   **False means "not proven to escape", never "proven local"** — the unknown case must round
+///   toward Tier C, because a wrong Tier C still works (an island is the general fallback) while a
+///   wrong Tier B ships a binding for state the wire cannot drive.
 pub fn decide_tier_and_hydration(
     effects: EffectProfile,
     has_event_handler: bool,
     client_interactive: bool,
+    state_escapes: bool,
     is_above_fold: bool,
     weight_bytes: u64,
     inputs: TieringInputs,
@@ -158,6 +173,29 @@ pub fn decide_tier_and_hydration(
     }
 
     if effects.hooks {
+        // Item 4.9 T1 · **state ownership decides B vs C.**
+        //
+        // If the state is proven to leave this client — a `useSharedSlot`
+        // topic, a FORGE write, a server `action` — then the *server* owns it.
+        // Its updates already have to travel as opcodes so every other client
+        // sees them, and the component ships no code.
+        //
+        // 🔑 This is checked BEFORE `client_interactive` on purpose. A shared
+        // counter with an `onClick` is client-satisfiable *and* server-owned;
+        // the old cascade saw only the first fact and shipped an island for
+        // state the wire was already carrying.
+        //
+        // ⚠️ Deliberately does NOT override `side_effects`/`io` above: a
+        // `useEffect` body must run in the browser no matter who owns the
+        // state, so escaping state cannot pull it back to B.
+        if state_escapes {
+            return TieringDecision {
+                tier: Tier::B,
+                hydration_mode: inputs.tier_b_mode,
+                reason: TieringReason::ServerOwnedState,
+            };
+        }
+
         return if client_interactive {
             TieringDecision {
                 tier: Tier::C,
@@ -219,7 +257,7 @@ mod tests {
     #[test]
     fn test_pure_small_component_is_tier_a() {
         let decision =
-            decide_tier_and_hydration(EffectProfile::pure(), false, false, false, 1024, inputs());
+            decide_tier_and_hydration(EffectProfile::pure(), false, false, false, false, 1024, inputs());
         assert_eq!(decision.tier, Tier::A);
         assert_eq!(decision.hydration_mode, HydrationMode::None);
         assert_eq!(decision.reason, TieringReason::PureStaticEligible);
@@ -230,7 +268,7 @@ mod tests {
         // A pure component that nonetheless declares an `on*` handler must
         // hydrate to run the handler — it can never collapse to static Tier-A.
         let decision =
-            decide_tier_and_hydration(EffectProfile::pure(), true, false, false, 1024, inputs());
+            decide_tier_and_hydration(EffectProfile::pure(), true, false, false, false, 1024, inputs());
         assert_ne!(decision.tier, Tier::A);
     }
 
@@ -241,6 +279,7 @@ mod tests {
                 hooks: true,
                 ..EffectProfile::default()
             },
+            false,
             false,
             false,
             false,
@@ -259,6 +298,7 @@ mod tests {
             c.effect_profile,
             c.is_interactive,
             c.is_client_interactive,
+            c.state_escapes,
             false,
             1024,
             inputs(),
@@ -326,6 +366,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             1024,
             inputs(),
         );
@@ -347,6 +388,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             1024,
             inputs(),
         );
@@ -360,6 +402,7 @@ mod tests {
                 side_effects: true,
                 ..EffectProfile::default()
             },
+            false,
             false,
             false,
             true,

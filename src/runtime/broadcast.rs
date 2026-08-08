@@ -969,6 +969,27 @@ impl BroadcastRegistry {
         }
     }
 
+    /// SHUTTER · how many lanes a write to `topic` would reach.
+    ///
+    /// **The blast radius, read before the write happens** — which is what lets
+    /// the rate limiter price a write by what it actually costs rather than by a
+    /// constant somebody guessed. A write to a topic five hundred people are
+    /// watching does five hundred frame encodings and sends; pricing it the same
+    /// as one nobody is subscribed to is the approximation every path-and-IP
+    /// limiter is forced into, because seeing this needs the subscription graph
+    /// and the write path to be the same system's.
+    ///
+    /// Zero for an unregistered topic: nothing is subscribed to a topic that
+    /// does not exist yet, so the first write to it genuinely does reach nobody.
+    ///
+    /// One `DashMap` probe and a length read — cheap enough for the request path.
+    #[must_use]
+    pub fn subscriber_count(&self, topic: &str) -> usize {
+        self.topics
+            .get(topic)
+            .map_or(0, |entry| entry.subscriber_count())
+    }
+
     /// Snapshot of every registered topic's current value, as
     /// `(topic, value_bytes)`. Used by the QuickJS action path to seed an
     /// updater-form `broadcast(topic, fn)` evaluator with the pre-write state so

@@ -53,6 +53,7 @@
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, StatusCode};
+use dom_render_compiler::auth::PrincipalId;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
@@ -115,16 +116,28 @@ const HELLO_EVENT: &str = "hello";
 /// joining tab with an empty room — indistinguishable, in the browser, from a
 /// room that really is empty.
 ///
-/// Identity still does not affect the decision, and that is not a gap. A
-/// partition is reachable only through a route that renders it (PRISM invariant
-/// 2), so this grants exactly the read the page GET already granted. Item 5 adds
-/// the `user.id` key source and a per-topic policy check inside this same
-/// function; the protocol, envelope, election and caps around it do not move.
+/// ✅ **Identity affects the decision as of AUTH item 5 P1**, and the shape the
+/// pre-P1 note predicted held: the key source widened and nothing around it
+/// moved — protocol, envelope, election and caps are untouched.
+///
+/// The argument that made identity *irrelevant* before is what makes it
+/// *sufficient* now. A partition is reachable only through a route that renders
+/// it (PRISM invariant 2), so this grants exactly the read the page GET already
+/// granted — and a page GET by an anonymous visitor resolves no identity-keyed
+/// topic, so neither does this. There is no separate policy check, because there
+/// is no separate question: an unauthorized read is one this function cannot
+/// produce a topic name for.
+///
+/// 🔑 **`principal`, not `SessionId`.** The two are different things and the
+/// distinction is load-bearing: a `SessionId` is a *tab* — minted for anyone who
+/// visits, with no login — while a principal is a *person*. Taking the former
+/// here is what made pre-P1 authorization unexpressible rather than merely
+/// unimplemented (AUTH R2).
 #[async_trait::async_trait]
 pub trait RouteAuthority: Send + Sync {
     async fn authorize_route(
         &self,
-        identity: Option<SessionId>,
+        principal: Option<&PrincipalId>,
         path: &str,
     ) -> Option<Vec<String>>;
     /// The broadcast registry circuits subscribe against. Resolved per
@@ -211,6 +224,32 @@ pub struct Lane {
     /// authorization today (every topic is public); it is the accounting key
     /// per-identity caps and item-4 authz attach to.
     identity: Option<SessionId>,
+    /// AUTH · R2 — **who** this lane belongs to, resolved at trunk open.
+    ///
+    /// Distinct from [`Self::identity`], which is the *tab*: a `SessionId` is
+    /// minted for anyone who visits, with no login involved, so it can never be
+    /// the basis of an authorization decision. This can.
+    ///
+    /// Held for the lane's lifetime rather than re-resolved per subscribe,
+    /// which is what makes every route a lane subscribes to be judged against
+    /// one identity. The consequence — a session revoked mid-lane keeps its open
+    /// trunk until the lane closes — is not a hole: revocation deletes the
+    /// session *row*, which is a delta on a topic the lane is subscribed to, so
+    /// the lane learns about its own death on the wire it already has. That is
+    /// `AUTH.md` § 5 doing the work a re-resolution loop would otherwise do.
+    principal: crate::auth::Identity,
+}
+
+impl Lane {
+    /// AUTH · R2 — who this lane belongs to.
+    ///
+    /// The value [`RouteAuthority::authorize_route`] will consult in P1, when a
+    /// topic's identity can contain a principal and "may this connection name
+    /// it" stops being answerable from the path alone.
+    #[must_use]
+    pub fn principal(&self) -> &crate::auth::Identity {
+        &self.principal
+    }
 }
 
 /// Process-wide lane table. Lives on the persistent side of `RuntimeState`
@@ -266,6 +305,11 @@ pub async fn serve_trunk(
     phosphor: Arc<PhosphorState>,
     dev: DevTap,
     identity: Option<SessionId>,
+    // AUTH · R2 — the resolved principal, so the lane knows *who* and not only
+    // *which tab*. Passed in rather than resolved here: the dispatcher already
+    // holds the request headers and the live runtime, and one resolution per
+    // request is what keeps a page and its live lane from disagreeing.
+    principal: crate::auth::Identity,
 ) -> Response<Body> {
     if phosphor.lanes.len() >= MAX_LANES {
         let mut response = Response::new(Body::from("phosphor lane limit reached"));
@@ -285,6 +329,7 @@ pub async fn serve_trunk(
         routes: Mutex::new(HashMap::new()),
         budget: Mutex::new(TokenBucket::new()),
         identity,
+        principal,
     });
     phosphor.lanes.insert(lane_id.clone(), lane);
 
@@ -498,7 +543,11 @@ async fn subscribe_routes(
     let mut outcome = SubscribeOutcome::default();
 
     for add in request.add {
-        let Some(topics) = authority.authorize_route(lane.identity, &add.p).await else {
+        // AUTH R2 · the lane's *principal* decides, not its tab id.
+        let Some(topics) = authority
+            .authorize_route(lane.principal().principal().map(|who| &who.id), &add.p)
+            .await
+        else {
             outcome.denied.push(add.p);
             continue;
         };
@@ -667,7 +716,7 @@ mod tests {
     impl RouteAuthority for StaticAuthority {
         async fn authorize_route(
             &self,
-            _identity: Option<SessionId>,
+            _principal: Option<&PrincipalId>,
             path: &str,
         ) -> Option<Vec<String>> {
             self.table.get(path).cloned()
@@ -706,6 +755,7 @@ mod tests {
                 routes: Mutex::new(HashMap::new()),
                 budget: Mutex::new(TokenBucket::new()),
                 identity: None,
+                principal: crate::auth::Identity::Anonymous,
             }),
             rx,
         )
@@ -969,7 +1019,13 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_trunk_releases_the_lane_and_its_circuits() {
         let phosphor = Arc::new(PhosphorState::new());
-        let response = serve_trunk(phosphor.clone(), DevTap::none(), None).await;
+        let response = serve_trunk(
+            phosphor.clone(),
+            DevTap::none(),
+            None,
+            crate::auth::Identity::Anonymous,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(phosphor.lane_count(), 1);
 
@@ -1004,10 +1060,17 @@ mod tests {
                     routes: Mutex::new(HashMap::new()),
                     budget: Mutex::new(TokenBucket::new()),
                     identity: None,
+                    principal: crate::auth::Identity::Anonymous,
                 }),
             );
         }
-        let response = serve_trunk(phosphor, DevTap::none(), None).await;
+        let response = serve_trunk(
+            phosphor,
+            DevTap::none(),
+            None,
+            crate::auth::Identity::Anonymous,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key(header::RETRY_AFTER));
     }

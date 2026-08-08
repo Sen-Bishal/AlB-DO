@@ -70,13 +70,24 @@ pub enum BroadcastReads {
     Literal(Vec<String>),
     /// At least one `broadcast` reference this analysis cannot pin to a literal
     /// topic — a computed topic (`broadcast("room:" + id, …)`), or the function
-    /// escaping into something else. Seed everything.
+    /// escaping into something else.
     ///
-    /// **This arm is load-bearing.** Guessing wrong here does not throw: the
-    /// updater silently receives `null` instead of the current value, so
-    /// forge-lab's `(n) => n + 1` would quietly reset the counter to 1. A
-    /// missing topic is invisible, which is exactly why the uncertain case must
-    /// cost performance rather than correctness.
+    /// 🔴 **This arm now REFUSES the dispatch.** It used to seed everything, and
+    /// that was correct reasoning under the old threat model: guessing wrong
+    /// does not throw — the updater silently receives `null` instead of the
+    /// current value, so `(n) => n + 1` would quietly reset a counter to 1 — so
+    /// the uncertain case was made to cost performance rather than correctness.
+    ///
+    /// AUTH item 5 P1 added identity-keyed topics, which changed what "seed
+    /// everything" *means*: the registry now holds one partition per principal,
+    /// so the broad fallback handed a handler every user's rows (`AUTH.md`
+    /// § 8.1.2 F2). Both remaining options were silent failures — seeding
+    /// nothing corrupts the updater, seeding everything leaks — so the third
+    /// option is the only honest one, and it is the house rule anyway: **a thing
+    /// the author must see is not a log.**
+    ///
+    /// The way out for an author is the rule `useSharedSlot` already imposes on
+    /// partition keys, for the same reason: name the topic with a literal.
     Unknown,
 }
 

@@ -168,6 +168,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         // otherwise), runs the eval against the freshly-compiled
         // manifest, and exits non-zero on violation.
         "budget" => run_budget_command(&args[2..]),
+        // Trust polish · what the build already knows about itself. Every check
+        // is a derivation, never a maintained list — see `doctor::matrix`.
+        "doctor" => run_doctor_command(&args[2..]),
         // Phase J CLI clarity:
         //   * `albedo files [dir]` — pure static file server; serves any directory verbatim. This
         //     is what `albedo serve` did before.
@@ -364,6 +367,395 @@ fn run_budget_command(raw_args: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// `albedo doctor` — report what the build already knows about itself.
+///
+/// 🔑 **Every section is a derivation, and that is the organising rule.** A
+/// health tool that carried a hand-maintained list would drift from the system
+/// exactly the way the things it is auditing drift, which is the failure it
+/// exists to remove. So doctor may report what the compiler established for its
+/// own reasons — the reads on each route, the class SHUTTER charges — and may
+/// shell out to a checker that is itself authoritative (`tsc`), and nothing else.
+///
+/// It exits non-zero only on a **hard failure** (a type error), never on a
+/// finding. A finding is a judgement the author has to make — a partition keyed
+/// by a route parameter is correct for an unguessable id and a leak for a
+/// sequential one — and a tool that failed the build over a judgement would be
+/// turned off, taking the type check with it.
+fn run_doctor_command(raw_args: &[String]) -> Result<(), String> {
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_doctor_help();
+        return Ok(());
+    }
+    let json = raw_args.iter().any(|arg| arg == "--json");
+    let forwarded: Vec<String> = raw_args
+        .iter()
+        .filter(|arg| arg.as_str() != "--json")
+        .cloned()
+        .collect();
+
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let contract = resolve_dev_contract(&forwarded, &cwd)?;
+
+    // Compiled fresh rather than read out of `.albedo/dist`. A report derived
+    // from a stale build describes a system that is not running, which is the
+    // one thing an audit artefact must never do.
+    let manifest = build_manifest_for_budget(&contract)?;
+    let matrix = dom_render_compiler::doctor::Matrix::derive(&manifest.routes);
+    let findings = matrix.findings();
+    let types = check_types(&contract.project_dir);
+    let unattributed = unattributed_route_files(&contract.root);
+
+    if json {
+        // Built as a typed value rather than through `serde_json::json!`, which
+        // unwraps internally — so a type that stops serializing cleanly takes the
+        // CLI down with a panic instead of an error. That is not hypothetical:
+        // the first cut panicked here on a newtype variant serde's tagged
+        // representation cannot encode.
+        let report = DoctorReport {
+            typescript: match &types {
+                TypeCheck::Clean => TypeCheckReport {
+                    status: "clean",
+                    detail: None,
+                },
+                TypeCheck::Skipped(why) => TypeCheckReport {
+                    status: "skipped",
+                    detail: Some(why.clone()),
+                },
+                TypeCheck::Failed(output) => TypeCheckReport {
+                    status: "failed",
+                    detail: Some(output.clone()),
+                },
+            },
+            matrix: &matrix,
+            findings: findings
+                .iter()
+                .map(|finding| FindingReport {
+                    route: finding.route().to_string(),
+                    explain: finding.explain(),
+                    detail: finding,
+                })
+                .collect(),
+            unattributed_route_files: unattributed.clone(),
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|err| format!("failed to serialize doctor report: {err}"))?
+        );
+    } else {
+        print_banner();
+        print_doctor_report(
+            &matrix,
+            &findings,
+            &types,
+            &unattributed,
+            contract.detected_layout.as_deref(),
+        );
+    }
+
+    match types {
+        TypeCheck::Failed(_) => Err("typescript reported errors".to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// The `--json` shape, for CI.
+#[derive(serde::Serialize)]
+struct DoctorReport<'a> {
+    typescript: TypeCheckReport,
+    matrix: &'a dom_render_compiler::doctor::Matrix,
+    findings: Vec<FindingReport<'a>>,
+    /// Route-shaped files that produced no row in the matrix. See
+    /// [`unattributed_route_files`] for why this is the most important field in
+    /// the report.
+    unattributed_route_files: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct TypeCheckReport {
+    status: &'static str,
+    /// Why it was skipped, or what it reported. Absent when clean — there is
+    /// nothing to say and an empty string would read like output nobody parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct FindingReport<'a> {
+    route: String,
+    /// The same sentence the pretty printer shows, so a CI log and a terminal
+    /// never describe one finding two ways.
+    explain: String,
+    detail: &'a dom_render_compiler::doctor::Finding,
+}
+
+/// What `tsc --noEmit` had to say, if it could be asked at all.
+enum TypeCheck {
+    Clean,
+    /// No local TypeScript, or no `tsconfig.json`. Reported rather than
+    /// silently passing: "we did not check" and "we checked and it was fine"
+    /// are different claims, and only one of them is reassuring.
+    Skipped(String),
+    Failed(String),
+}
+
+/// Run the project's own TypeScript against its own config.
+///
+/// `TODO.md` item 8 names this as doctor's obvious first check, and the reason
+/// is item 1.5: `tsconfig`'s `exclude` shadowed its `include` for `.albedo/`, so
+/// the generated `.d.ts` files never loaded — a defect invisible to every check
+/// we own, and a one-line `tsc --noEmit` away from being caught.
+///
+/// 🪤 **Resolved as a path, never through `npx`.** The first cut shelled out to
+/// `npx --no-install tsc`, which exits non-zero *and prints to stderr* when the
+/// package is simply absent — so a project with no TypeScript installed was
+/// reported as having type errors, and doctor failed the run. Sniffing npx's
+/// wording to tell the two apart is guessing at another tool's prose. Looking for
+/// the binary is a fact.
+///
+/// Offline by construction as a consequence, which is the behaviour a check
+/// wants anyway: one that silently downloads a toolchain behaves differently in
+/// CI than on a laptop.
+fn check_types(project_dir: &Path) -> TypeCheck {
+    if !project_dir.join("tsconfig.json").exists() {
+        return TypeCheck::Skipped("no tsconfig.json in the project".to_string());
+    }
+
+    let binary = project_dir.join("node_modules").join(".bin").join(if cfg!(windows) {
+        "tsc.cmd"
+    } else {
+        "tsc"
+    });
+    if !binary.exists() {
+        return TypeCheck::Skipped(
+            "typescript is not installed in this project (`npm i -D typescript`)".to_string(),
+        );
+    }
+
+    // `.cmd` is a batch script, so on Windows it needs a shell to launch it.
+    let mut command = if cfg!(windows) {
+        let mut command = std::process::Command::new("cmd");
+        command.arg("/C").arg(&binary).arg("--noEmit");
+        command
+    } else {
+        let mut command = std::process::Command::new(&binary);
+        command.arg("--noEmit");
+        command
+    };
+
+    match command.current_dir(project_dir).output() {
+        Ok(output) if output.status.success() => TypeCheck::Clean,
+        Ok(output) => TypeCheck::Failed(
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .trim()
+            .to_string(),
+        ),
+        Err(err) => TypeCheck::Skipped(format!("could not run {}: {err}", binary.display())),
+    }
+}
+
+/// Say so when the root and entry came from a *foreign* convention.
+///
+/// 🔴 **Adding layout auto-discovery created a new way to be quietly wrong, and
+/// this is the line that closes it.** Before detection, `albedo build` on a
+/// Next.js project failed loudly. After it, the build *succeeds* — over one
+/// entry module, because ALBEDO discovers routes from `<root>/routes` and knows
+/// nothing about `app/**/page.tsx`. A green build over a fraction of an app is a
+/// worse outcome than a refusal, so the fraction has to be stated where the
+/// build is announced.
+///
+/// Silent for an ALBEDO layout, and silent when the author declared `root` and
+/// `entry` themselves: neither is a guess, and there is nothing to disclose.
+fn print_foreign_layout_notice(contract: &ResolvedDevContract) {
+    let Some(layout) = contract.detected_layout.as_deref() else {
+        return;
+    };
+    if layout.starts_with("ALBEDO") {
+        return;
+    }
+    print_kv("layout", style_256(layout, ACCENT_SOFT, true));
+    print_warn(format!(
+        "{}",
+        style(
+            "root and entry were inferred. ALBEDO discovers routes from `routes/`, so this \
+             framework's own routes are NOT in the build — run `albedo doctor` to see which.",
+            "2"
+        )
+    ));
+}
+
+/// Route-shaped files that ALBEDO's own convention did not pick up.
+///
+/// 🔴 **The failure this exists to prevent is silent understatement, which for an
+/// audit artefact is worse than being wrong.** Found by running doctor against a
+/// real Next.js app: routes are discovered from `<root>/routes`
+/// ([`ROUTES_DIRNAME`](dom_render_compiler::routing::file_based::ROUTES_DIRNAME)),
+/// so an App Router project's `app/**/page.tsx` contributed nothing — and the
+/// report listed one route for a three-route app while announcing "nothing to
+/// report". A reader has no way to tell that from a genuinely clean bill of
+/// health.
+///
+/// Doctor cannot know how many routes a foreign project "really" has, and must
+/// not guess. What it can do is name the files that *look* like routes under
+/// conventions it does not implement, and say plainly that they are not in the
+/// table above. That is a fact, which is all this tool is allowed to report.
+fn unattributed_route_files(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    // The two conventions a foreign project is overwhelmingly likely to use.
+    for convention in ["app", "pages"] {
+        let dir = root.join(convention);
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(&dir)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = entry.path();
+            let is_route_shaped = matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("tsx" | "jsx" | "ts" | "js")
+            );
+            let name = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+            // App Router names the route file; Pages Router makes every file one.
+            if is_route_shaped && (convention == "pages" || matches!(name, "page" | "route")) {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    found.push(relative.display().to_string().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn print_doctor_report(
+    matrix: &dom_render_compiler::doctor::Matrix,
+    findings: &[dom_render_compiler::doctor::Finding],
+    types: &TypeCheck,
+    unattributed: &[String],
+    detected_layout: Option<&str>,
+) {
+    if let Some(layout) = detected_layout {
+        print_section("layout");
+        print_kv("detected", style_256(layout, ACCENT_SOFT, true));
+        if !layout.starts_with("ALBEDO") {
+            println!(
+                "    {}",
+                style(
+                    "root and entry were inferred — nothing here was declared in an albedo config",
+                    "2"
+                )
+            );
+        }
+    }
+
+    print_section("types");
+    match types {
+        TypeCheck::Clean => print_ok("tsc --noEmit clean"),
+        TypeCheck::Skipped(why) => print_kv("skipped", style(why, "2")),
+        TypeCheck::Failed(output) => {
+            print_warn("tsc --noEmit reported errors");
+            for line in output.lines().take(20) {
+                println!("      {}", style(line, "2"));
+            }
+        }
+    }
+
+    print_section("reach");
+    println!(
+        "    {}",
+        style("what each route reads, and what decides which rows come back", "2")
+    );
+    println!();
+    for row in &matrix.routes {
+        println!(
+            "    {}  {}",
+            style_256(&row.route, ACCENT_SOFT, true),
+            style(&format!("[{}]", row.cost.class.as_str()), "2")
+        );
+        if row.reads.is_empty() {
+            println!("      {}", style("reads nothing — served from the manifest", "2"));
+        }
+        for read in &row.reads {
+            // Pad the PLAIN text and colorize after. ANSI escapes have zero
+            // display width, so padding a pre-styled string counts the escape
+            // bytes and skews the column — the same trap `print_command` names.
+            let subject = read.subject.to_string();
+            println!(
+                "      {}{}  {}{}  {}",
+                style_256(&read.binding, MUTED, false),
+                " ".repeat(20usize.saturating_sub(read.binding.chars().count())),
+                subject,
+                " ".repeat(26usize.saturating_sub(subject.chars().count())),
+                style_256(&format!("← {}", read.key), ACCENT_DEEP, false)
+            );
+        }
+    }
+
+    print_section("findings");
+    if findings.is_empty() {
+        print_ok("nothing to report");
+    }
+    for finding in findings {
+        print_warn(format!(
+            "{}  {}",
+            style_256(finding.route(), ACCENT_SOFT, true),
+            finding.explain()
+        ));
+    }
+
+    // The honest half. A report that lists only what it can answer reads as a
+    // clean bill of health, and this one is not entitled to give one yet.
+    print_section("not yet answerable");
+    if !unattributed.is_empty() {
+        print_warn(format!(
+            "{} route-shaped file{} produced no row above — ALBEDO discovers routes from \
+             `routes/`, not `app/`/`pages/`:",
+            unattributed.len(),
+            if unattributed.len() == 1 { "" } else { "s" }
+        ));
+        for path in unattributed.iter().take(10) {
+            println!("      {}", style_256(path, MUTED, false));
+        }
+        if unattributed.len() > 10 {
+            println!(
+                "      {}",
+                style(&format!("… and {} more", unattributed.len() - 10), "2")
+            );
+        }
+        println!(
+            "    {}",
+            style(
+                "the matrix above therefore describes only part of this project.",
+                "2"
+            )
+        );
+        println!();
+    }
+    println!(
+        "    {}",
+        style(
+            "no read can be keyed by the signed-in user until AUTH item 5's P1 lands, so every",
+            "2"
+        )
+    );
+    println!(
+        "    {}",
+        style(
+            "`← user.id` row above is absent by construction rather than by omission.",
+            "2"
+        )
+    );
+    println!();
 }
 
 /// Compile the project just far enough to produce a manifest without
@@ -873,6 +1265,7 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     print_boot_banner();
     print_section("serve");
     print_kv("project", contract.project_dir.display());
+    print_foreign_layout_notice(&contract);
     print_kv("mode", "production (build + serve)");
     println!();
     run_prod_build(&contract)?;
@@ -1225,6 +1618,7 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     print_boot_banner();
     print_section(if prod_mode { "build" } else { "dev" });
     print_kv("project", contract.project_dir.display());
+    print_foreign_layout_notice(&contract);
     print_kv(
         "server",
         format!("http://{}:{}", contract.server.host, contract.server.port),
@@ -2693,7 +3087,7 @@ _albdo_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local commands="init dev build ship serve files budget run completions help"
+    local commands="init dev build ship serve files budget doctor run completions help"
 
     case "$prev" in
         albdo)
@@ -2718,6 +3112,10 @@ _albdo_completions() {
             ;;
         budget)
             COMPREPLY=( $(compgen -W "--strict --format --config" -- "$cur") )
+            return 0
+            ;;
+        doctor)
+            COMPREPLY=( $(compgen -W "--json --config" -- "$cur") )
             return 0
             ;;
         --format)
@@ -2750,6 +3148,7 @@ _albdo() {
         'serve:Production build + serve via the same stitcher as dev'
         'files:Static file server (defaults to .albedo/dist)'
         'budget:Evaluate the tier budget against the current build'
+        'doctor:Report what the build already knows about itself'
         'run:Run a sub-mode (e.g. run dev)'
         'completions:Emit shell completion script to stdout'
         'help:Show command list and examples'
@@ -2802,6 +3201,11 @@ _albdo() {
                         '--format[Output format]:format:(pretty json)' \
                         '--config[Use explicit albedo.config.json/ts]:file:_files'
                     ;;
+                (doctor)
+                    _arguments \
+                        '--json[Machine-readable report for CI]' \
+                        '--config[Use explicit albedo.config.json/ts]:file:_files'
+                    ;;
                 (serve)
                     _arguments \
                         '--dir[Directory to serve]:directory:_files -/' \
@@ -2819,7 +3223,7 @@ _albdo "$@"
 "#;
 
 const COMPLETIONS_FISH: &str = r#"# albdo fish completions
-set -l albdo_commands init dev build ship serve files budget run completions help
+set -l albdo_commands init dev build ship serve files budget doctor run completions help
 
 # Disable file completions for the main command
 complete -c albdo -f
@@ -2831,6 +3235,7 @@ complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a build       -d '
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a ship        -d 'Build and configure deployment target files'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a serve       -d 'Serve static files from a directory'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a budget      -d 'Evaluate the tier budget against the current build'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a doctor      -d 'Report what the build already knows about itself'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a run         -d 'Run a sub-mode'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a completions -d 'Emit shell completion script to stdout'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a help        -d 'Show command list and examples'
@@ -2877,7 +3282,7 @@ Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptB
     $tokens = $commandAst.CommandElements
     $nTokens = $tokens.Count
 
-    $commands = @('init','dev','build','ship','serve','files','budget','run','completions','help')
+    $commands = @('init','dev','build','ship','serve','files','budget','doctor','run','completions','help')
     $devFlags = @('--config','--entry','--host','--port','--no-hmr','--strict','--verbose','--open','--prod','--no-budget')
 
     if ($nTokens -le 2) {
@@ -2915,6 +3320,10 @@ Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptB
                     ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
             }
         }
+        'doctor' {
+            @('--json','--config') | Where-Object { $_ -like "$wordToComplete*" } |
+                ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
+        }
         { $_ -in 'serve','files' } {
             @('--dir','--host','--port') | Where-Object { $_ -like "$wordToComplete*" } |
                 ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
@@ -2943,6 +3352,7 @@ fn print_help() {
     print_command("ship", "[dir]", "build and configure a deploy target");
     print_command("files", "[dir]", "serve static files from a folder");
     print_command("budget", "[dir]", "check the tier budget");
+    print_command("doctor", "[dir]", "report what the build knows about itself");
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
 
@@ -2990,6 +3400,34 @@ fn print_ship_help() {
     print_option("--config <FILE>", "explicit albedo config");
     print_option("--entry <FILE>", "override entry module");
     print_option("--no-budget", "skip the tier-budget gate");
+    println!();
+}
+
+fn print_doctor_help() {
+    print_banner();
+    print_section("doctor");
+    println!(
+        "  {}  {}",
+        style("usage", "2"),
+        style("albedo doctor [dir] [--json]", "1")
+    );
+    print_option("--json", "machine-readable report for CI");
+    print_option("--config <FILE>", "explicit albedo config");
+    println!();
+    println!(
+        "  {}",
+        style(
+            "reports the reach matrix (what each route reads and what keys it), the rate-limit",
+            "2"
+        )
+    );
+    println!(
+        "  {}",
+        style(
+            "class each route answers to, and `tsc --noEmit`. Exits non-zero on a type error only.",
+            "2"
+        )
+    );
     println!();
 }
 
@@ -3453,6 +3891,7 @@ mod tests {
             config_path: None,
             root: temp.path().to_path_buf(),
             entry: "App.tsx".to_string(),
+            detected_layout: None,
             server: dom_render_compiler::dev_contract::DevServerConfig::default(),
             watch: dom_render_compiler::dev_contract::DevWatchConfig::default(),
             hmr: dom_render_compiler::dev_contract::DevHmrConfig::default(),
@@ -3465,6 +3904,7 @@ mod tests {
             route_layouts: HashMap::new(),
             forge: Default::default(),
             sources: Default::default(),
+            auth: Default::default(),
         };
         let err = configure_ship_vercel(&contract).unwrap_err();
         assert!(err.contains("vercel is not a supported"));

@@ -28,7 +28,7 @@
 //!
 //! The token is safe to hand to same-origin JavaScript (the runtime
 //! reads it from `globalThis.__ALBEDO_CSRF__`): it is not the session
-//! secret — that stays in the `HttpOnly` `albedo-session` cookie — and
+//! secret — that stays in the `HttpOnly` `__Host-albedo-session` cookie — and
 //! it is already in the DOM as every form's hidden `_csrf` input. The
 //! same-origin policy is what keeps a cross-site page from reading it,
 //! which is the exact threat a CSRF token guards against.
@@ -306,6 +306,7 @@ mod tests {
             headers: Default::default(),
             body: Bytes::new(),
             metadata: Default::default(),
+            principal: None,
         }
     }
 

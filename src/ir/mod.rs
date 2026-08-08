@@ -459,6 +459,7 @@ mod tests {
             effect_profile: EffectProfile::default(),
             is_interactive: false,
             is_client_interactive: false,
+            state_escapes: false,
             source_hash: 42,
             import_sources: Vec::new(),
             is_module_only: false,

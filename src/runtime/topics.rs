@@ -22,7 +22,10 @@
 //! nothing can be subscribed to) and recoverable by fixing the URL.
 
 use crate::aperture::SourceRegistry;
-use crate::manifest::schema::{PartitionTopicSpec, SourceArgSpec, SourceTopicSpec};
+use crate::auth::PrincipalId;
+use crate::manifest::schema::{
+    PartitionKeySource, PartitionTopicSpec, SourceArgSpec, SourceTopicSpec,
+};
 use crate::runtime::broadcast::partition_topic_name;
 
 /// One partition spec resolved against a request's route params.
@@ -48,6 +51,25 @@ pub struct ResolvedPartition {
 /// same `RouteMatch`, so passing the lookup rather than a concrete map keeps one
 /// resolver without forcing the two callers to agree on a container type.
 ///
+/// `principal` is the request's authenticated identity, or `None` for anonymous.
+/// AUTH § 3 — *identity is one more key source, beside `params`* — and this
+/// function is where "one more key source" stops being a slogan: both callers
+/// resolve through here, so a page cannot render one principal's partition while
+/// its lane listens on another's.
+///
+/// # The rule that carries the security property
+///
+/// 🔒 **An identity-keyed spec resolves to nothing when `principal` is `None`.**
+/// Not to an empty key, not to a `"anonymous"` sentinel, not to the collection's
+/// unpartitioned value. A signed-out visitor must be unable to *name* the topic
+/// at all, because naming it is the entire access-control mechanism — there is no
+/// second check downstream to catch a bad name here. A shared fallback partition
+/// would be one namespace holding every anonymous visitor's rows, and it would
+/// look completely normal in a browser.
+///
+/// This falls out of the existing skip rule rather than being bolted beside it,
+/// which is deliberate: the safe behaviour is the one the function already had.
+///
 /// Specs that resolve to nothing are **skipped silently here** and reported by
 /// the caller that has somewhere to report to (the render path logs a dev-mode
 /// warning; the subscribe path simply grants fewer topics). Returning them as
@@ -57,6 +79,7 @@ pub struct ResolvedPartition {
 /// topic list is stable across builds and a diff of two manifests is readable.
 pub fn resolve_partition_topics<'a, F>(
     specs: &[PartitionTopicSpec],
+    principal: Option<&'a PrincipalId>,
     param: F,
 ) -> Vec<ResolvedPartition>
 where
@@ -65,7 +88,14 @@ where
     specs
         .iter()
         .filter_map(|spec| {
-            let key = param(spec.param.as_str())?;
+            let key = match &spec.key {
+                PartitionKeySource::RouteParam(name) => param(name.as_str())?,
+                // `?` on the anonymous case is the whole rule. It is written as
+                // an early return rather than a branch with a fallback so that
+                // there is no place for a fallback to later be added by someone
+                // fixing "the page is empty when logged out".
+                PartitionKeySource::Identity => principal?.as_str(),
+            };
             let topic = partition_topic_name(spec.collection.as_str(), key)?;
             Some(ResolvedPartition {
                 binding: spec.binding.clone(),
@@ -176,8 +206,23 @@ mod tests {
             binding: binding.to_string(),
             collection: collection.to_string(),
             column: column.to_string(),
-            param: param.to_string(),
+            key: PartitionKeySource::RouteParam(param.to_string()),
         }
+    }
+
+    /// The identity-keyed sibling of [`spec`] — no param name, because there is
+    /// nothing to look up.
+    fn identity_spec(binding: &str, collection: &str, column: &str) -> PartitionTopicSpec {
+        PartitionTopicSpec {
+            binding: binding.to_string(),
+            collection: collection.to_string(),
+            column: column.to_string(),
+            key: PartitionKeySource::Identity,
+        }
+    }
+
+    fn principal(id: &str) -> PrincipalId {
+        PrincipalId::parse(id).expect("test principal must be in the partition-key alphabet")
     }
 
     fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -191,7 +236,7 @@ mod tests {
     fn a_matched_param_mints_the_canonical_identity() {
         let specs = vec![spec("rows", "messages", "room", "id")];
         let bound = params(&[("id", "42")]);
-        let resolved = resolve_partition_topics(&specs, |name| {
+        let resolved = resolve_partition_topics(&specs, None, |name| {
             bound.get(name).map(String::as_str)
         });
 
@@ -202,6 +247,83 @@ mod tests {
         assert_eq!(resolved[0].key, "42");
     }
 
+    // ── AUTH item 5 P1 · identity as a key source ──────────────────────────
+
+    #[test]
+    fn a_principal_mints_a_partition_of_its_own() {
+        let specs = vec![identity_spec("rows", "todos", "owner")];
+        let who = principal("u_7f3a");
+        let resolved = resolve_partition_topics(&specs, Some(&who), |_| None);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].topic, "todos:u_7f3a");
+        assert_eq!(resolved[0].key, "u_7f3a");
+        // Resolved with a params lookup that answers nothing: an identity key
+        // owes the URL nothing, which is what lets `/todos` be a static path
+        // serving per-user data.
+    }
+
+    /// 🔒 **The security property, as one assertion.**
+    ///
+    /// If this ever returns a topic, every signed-out visitor shares one
+    /// namespace and reads each other's rows — and it would look completely
+    /// normal in a browser, because a populated list is exactly what the page is
+    /// supposed to show.
+    #[test]
+    fn an_anonymous_request_resolves_no_identity_topic_at_all() {
+        let specs = vec![identity_spec("rows", "todos", "owner")];
+        let resolved = resolve_partition_topics(&specs, None, |_| None);
+
+        assert!(
+            resolved.is_empty(),
+            "anonymous must resolve to NO topic, not an empty key or a fallback: {resolved:?}"
+        );
+    }
+
+    /// The gate `AUTH.md` § 9 states for P1: *two browsers on one route see
+    /// different rows.* At this layer that is two principals producing disjoint
+    /// topic sets from the same spec and the same path.
+    #[test]
+    fn two_principals_on_one_route_get_disjoint_topics() {
+        let specs = vec![identity_spec("rows", "todos", "owner")];
+        let alice = principal("u_alice");
+        let bob = principal("u_bob");
+
+        let a = resolve_partition_topics(&specs, Some(&alice), |_| None);
+        let b = resolve_partition_topics(&specs, Some(&bob), |_| None);
+
+        assert_eq!(a[0].topic, "todos:u_alice");
+        assert_eq!(b[0].topic, "todos:u_bob");
+        assert_ne!(
+            a[0].topic, b[0].topic,
+            "the whole moat is that these differ with no policy written anywhere"
+        );
+    }
+
+    /// A route may key one binding by the URL and another by the caller. They
+    /// resolve independently, so a signed-out visitor to `/room/42` still gets
+    /// the room — losing only the binding that was about them.
+    #[test]
+    fn a_mixed_route_degrades_only_the_identity_binding_when_anonymous() {
+        let specs = vec![
+            spec("messages", "messages", "room", "id"),
+            identity_spec("mine", "todos", "owner"),
+        ];
+        let bound = params(&[("id", "42")]);
+
+        let anonymous =
+            resolve_partition_topics(&specs, None, |name| bound.get(name).map(String::as_str));
+        assert_eq!(anonymous.len(), 1);
+        assert_eq!(anonymous[0].topic, "messages:42");
+
+        let who = principal("u_7f3a");
+        let signed_in = resolve_partition_topics(&specs, Some(&who), |name| {
+            bound.get(name).map(String::as_str)
+        });
+        assert_eq!(signed_in.len(), 2);
+        assert_eq!(signed_in[1].topic, "todos:u_7f3a");
+    }
+
     /// The route matched, but not with the param this binding names — so the
     /// binding has no key and the page renders without live data rather than
     /// failing. PRISM § 4.
@@ -209,7 +331,7 @@ mod tests {
     fn an_unmatched_param_resolves_to_nothing() {
         let specs = vec![spec("rows", "messages", "room", "id")];
         let bound = params(&[("slug", "42")]);
-        assert!(resolve_partition_topics(&specs, |name| bound
+        assert!(resolve_partition_topics(&specs, None, |name| bound
             .get(name)
             .map(String::as_str))
         .is_empty());
@@ -225,7 +347,7 @@ mod tests {
         for hostile in ["a:b", "", "../etc", "a b", &"x".repeat(65)] {
             let bound = params(&[("id", hostile)]);
             assert!(
-                resolve_partition_topics(&specs, |name| bound.get(name).map(String::as_str))
+                resolve_partition_topics(&specs, None, |name| bound.get(name).map(String::as_str))
                     .is_empty(),
                 "key {hostile:?} must not mint a topic"
             );
@@ -246,9 +368,9 @@ mod tests {
         let tree: std::collections::BTreeMap<String, String> = hash.clone().into_iter().collect();
 
         let from_hash =
-            resolve_partition_topics(&specs, |name| hash.get(name).map(String::as_str));
+            resolve_partition_topics(&specs, None, |name| hash.get(name).map(String::as_str));
         let from_tree =
-            resolve_partition_topics(&specs, |name| tree.get(name).map(String::as_str));
+            resolve_partition_topics(&specs, None, |name| tree.get(name).map(String::as_str));
 
         assert_eq!(from_hash, from_tree);
         assert_eq!(
@@ -472,7 +594,7 @@ mod tests {
         ];
         let bound = params(&[("id", "9")]);
         let resolved =
-            resolve_partition_topics(&specs, |name| bound.get(name).map(String::as_str));
+            resolve_partition_topics(&specs, None, |name| bound.get(name).map(String::as_str));
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].topic, "messages:9");

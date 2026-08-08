@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use dom_render_compiler::auth::PrincipalId;
 use dom_render_compiler::ir::opcode::{Instruction, StableId};
 use dom_render_compiler::manifest::schema::{
     DataDep, DataSource, PartitionTopicSpec, SourceTopicSpec, TierBNode,
@@ -63,10 +64,34 @@ pub struct RequestContext {
     pub params: HashMap<String, String>,
     pub headers: HashMap<String, String>,
     pub cookies: HashMap<String, String>,
+    /// AUTH item 5 · the request's authenticated principal, or `None` for
+    /// anonymous.
+    ///
+    /// It sits beside `params` because it answers the same kind of question —
+    /// *what does this request know?* — and because both feed the same resolver.
+    /// `cookies` already carries the raw session cookie; this is what the
+    /// dispatcher turned it into, and components and topic resolution must never
+    /// re-derive identity from the cookie themselves.
+    pub principal: Option<PrincipalId>,
 }
 
 impl RequestContext {
     pub fn resolve(&self, key: &str) -> Result<Value, RenderError> {
+        // AUTH § 3 · `user` in component scope. An anonymous request resolves to
+        // `null` rather than to an absent prop, so `user?.id` is the honest
+        // spelling and a component cannot accidentally read a stale binding.
+        //
+        // Only `id` is exposed here. Profile fields live on `albedo_users` and
+        // are read like any other row; putting them in scope would make every
+        // component that mentions `user` a reason to join a table it never asked
+        // for, and would tempt a partition key that cannot be one.
+        if key == "user" {
+            return Ok(match &self.principal {
+                Some(id) => serde_json::json!({ "id": id.as_str() }),
+                None => Value::Null,
+            });
+        }
+
         // Dynamic `[slug]` routes request the whole parsed route-params map as a
         // single `params` object prop. Assemble it here so a component authored
         // as `async function Page({ params })` receives `{ slug: "..." }`.
@@ -628,11 +653,26 @@ fn resolve_partitions_for_props(
         return Vec::new();
     }
     let params = props.get("params").and_then(Value::as_object);
-    dom_render_compiler::runtime::resolve_partition_topics(&plan.shared_partitions, |name| {
-        params
-            .and_then(|map| map.get(name))
-            .and_then(Value::as_str)
-    })
+    // AUTH item 5 P1 · the principal is read back out of `props` for the same
+    // reason `params` is, and it is the same argument: the component renders
+    // from these props, so binding the topic to them makes "what the page shows"
+    // and "what the lane listens on" the same fact rather than two facts that
+    // agree by convention.
+    //
+    // A malformed id yields `None` and therefore no topic — `PrincipalId::parse`
+    // enforces the partition-key alphabet, so this is also the point where a
+    // principal that could not be a topic name stops being one quietly instead
+    // of minting something the registry would refuse later.
+    let principal = props
+        .get("user")
+        .and_then(|user| user.get("id"))
+        .and_then(Value::as_str)
+        .and_then(|id| PrincipalId::parse(id).ok());
+    dom_render_compiler::runtime::resolve_partition_topics(
+        &plan.shared_partitions,
+        principal.as_ref(),
+        |name| params.and_then(|map| map.get(name)).and_then(Value::as_str),
+    )
 }
 
 /// The `host` object seeding one Tier-B render: the component's shared-slot
@@ -1073,7 +1113,7 @@ mod tests {
                     binding: "rows".to_string(),
                     collection: "messages".to_string(),
                     column: "room".to_string(),
-                    param: "id".to_string(),
+                    key: dom_render_compiler::manifest::schema::PartitionKeySource::RouteParam("id".to_string()),
                 }],
                 shared_topic_classes: HashMap::new(),
                 stamp_specs: HashMap::new(),

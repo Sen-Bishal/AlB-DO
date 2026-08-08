@@ -45,6 +45,7 @@
 
 pub mod actions;
 pub mod api;
+pub mod auth;
 pub mod boot;
 pub mod config;
 pub mod contract;
@@ -58,6 +59,7 @@ pub mod render;
 pub mod renderer_runtime;
 pub mod routing;
 pub mod server;
+pub mod shutter;
 pub mod timing;
 pub mod topics;
 pub mod webtransport;

@@ -52,11 +52,13 @@ use crate::forge::delta::{
 };
 use crate::transforms::shared_slot_lists::RowProjection;
 use crate::forge::skeleton::{materialize_slot, ForgeCollection, ForgeSchema, SortDir};
+use crate::auth::PrincipalId;
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Result, SqlValue, SubstrateError};
 use crate::ir::opcode::{ReconcileRow, RowKey, SlotChange};
 use crate::runtime::broadcast::{BroadcastRegistry, ListUpdate, TopicTransition};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 
 /// One durable mutation requested by an action body.
@@ -474,6 +476,150 @@ fn append_partition(slot: &ForgeCollection, record: &Map<String, Value>) -> Resu
     Ok(Some(partition_value_to_key(&slot.topic, column, value)?))
 }
 
+/// AUTH F1 · the refusal an anonymous request gets from a per-user collection.
+///
+/// Shared by all three rules so the wording is one sentence in one place: the
+/// distinction that matters to a reader is *not* which statement was refused,
+/// it is that a collection whose owner column is a principal cannot be written
+/// by nobody.
+fn anonymous_write_refused(slot: &ForgeCollection) -> SubstrateError {
+    SubstrateError::Backend(format!(
+        "FORGE write refused: '{}' is partitioned by the signed-in principal, and this request is \
+         anonymous. There is no owner to check the write against, so it is refused rather than run \
+         unconstrained",
+        slot.topic
+    ))
+}
+
+/// AUTH F1 · the owner check for a row that **already exists** — Postgres RLS's
+/// `USING`, in Rust.
+///
+/// 🔑 In Rust and not as `AND {partition} = ?` on the statement, for one
+/// decisive reason: [`crate::forge::substrate::Transaction::execute`] returns
+/// rows affected and this module discards it (see the `_` at the call below). A
+/// `WHERE` that excluded another principal's row would therefore commit, affect
+/// nothing, and report **success** — telling an author their write happened when
+/// it did not. A refusal is the honest outcome, and only Rust can give one here.
+///
+/// `before` is the row's current partition, already read inside this transaction
+/// by [`read_partition`] for the fan-out. So this check costs no query and has
+/// no window between the check and the write.
+///
+/// A missing row is **not** a refusal. The statement affects nothing either way,
+/// and failing here would report "you may not" for what is really "there was
+/// nothing there" — two different facts, and only one of them is about identity.
+fn authorize_existing_row(
+    slot: &ForgeCollection,
+    before: Option<&str>,
+    principal: Option<&PrincipalId>,
+) -> Result<()> {
+    if !slot.identity_partitioned {
+        return Ok(());
+    }
+    let Some(principal) = principal else {
+        return Err(anonymous_write_refused(slot));
+    };
+    match before {
+        None => Ok(()),
+        Some(owner) if owner == principal.as_str() => Ok(()),
+        // The other principal's id is deliberately absent from this message: it
+        // is someone else's identifier, and an error a caller can read is not a
+        // place to disclose one.
+        Some(_) => Err(SubstrateError::Backend(format!(
+            "FORGE write refused: this row of '{}' belongs to a different principal. A write may \
+             only touch the caller's own partition",
+            slot.topic
+        ))),
+    }
+}
+
+/// AUTH F1 · the owner check for the row a write **leaves behind** — Postgres
+/// RLS's `WITH CHECK`.
+///
+/// 🔴 The case the first draft of `AUTH.md` § 8.1.2 missed, and the one the
+/// Postgres docs name as the canonical `USING`-only loophole: update your own
+/// row and reassign its owner. Checking the row *as found* lets that through,
+/// because as found it was yours.
+///
+/// A move to the caller's own id is allowed and is a no-op, which is the honest
+/// answer — refusing it would make `update` fail on a record that merely restates
+/// what is already true.
+fn authorize_partition_move(
+    slot: &ForgeCollection,
+    fields: &Map<String, Value>,
+    principal: Option<&PrincipalId>,
+) -> Result<()> {
+    if !slot.identity_partitioned {
+        return Ok(());
+    }
+    let Some(column) = &slot.partition_by else {
+        return Ok(());
+    };
+    // Not a move: the update does not touch the owning column at all.
+    let Some(moved) = fields.get(column) else {
+        return Ok(());
+    };
+    let Some(principal) = principal else {
+        return Err(anonymous_write_refused(slot));
+    };
+    match moved {
+        Value::String(to) if to == principal.as_str() => Ok(()),
+        _ => Err(SubstrateError::Backend(format!(
+            "FORGE update refused: '{column}' is what makes a row of '{}' belong to someone, so \
+             setting it to another principal would hand the row away. A row cannot be given to a \
+             different owner",
+            slot.topic
+        ))),
+    }
+}
+
+/// AUTH F1 · an append's partition is **supplied**, not validated.
+///
+/// Hasura's column-preset semantics: for an identity-partitioned collection the
+/// owning column is not an input. A record that omits it has the caller's id
+/// injected; one that names the caller is taken unchanged; one that names anybody
+/// else is refused.
+///
+/// 🔑 **Injection rather than validation**, because it makes the wrong partition
+/// unrepresentable rather than merely caught — the argument
+/// [`crate::manifest::schema::PartitionTopicSpec`] already makes for topics one
+/// layer up, applied to the row itself.
+///
+/// The refusal on a *conflicting* value is the one thing validation still buys.
+/// Silently overwriting a value an author wrote by hand would hide their mistake,
+/// and the mistake is usually that they believed they could choose.
+fn authorize_append<'a>(
+    slot: &ForgeCollection,
+    record: &'a Map<String, Value>,
+    principal: Option<&PrincipalId>,
+) -> Result<Cow<'a, Map<String, Value>>> {
+    if !slot.identity_partitioned {
+        return Ok(Cow::Borrowed(record));
+    }
+    let Some(column) = &slot.partition_by else {
+        return Ok(Cow::Borrowed(record));
+    };
+    let Some(principal) = principal else {
+        return Err(anonymous_write_refused(slot));
+    };
+    match record.get(column) {
+        // The ordinary path after this change: the author does not write the
+        // owner at all, and the server is the only thing that can name it.
+        None => {
+            let mut owned = record.clone();
+            owned.insert(column.clone(), Value::String(principal.as_str().to_string()));
+            Ok(Cow::Owned(owned))
+        }
+        Some(Value::String(owner)) if owner == principal.as_str() => Ok(Cow::Borrowed(record)),
+        Some(_) => Err(SubstrateError::Backend(format!(
+            "FORGE append refused: '{column}' names the owner of a row in '{}', and this record \
+             sets it to someone other than the caller. Leave it out — the server fills it in from \
+             the signed-in principal",
+            slot.topic
+        ))),
+    }
+}
+
 /// Render a partition value as the key that names its channel.
 ///
 /// Text and integers only: those are what a URL segment and a declared column
@@ -614,6 +760,27 @@ fn build_statement(
     }
 }
 
+/// What a write is about to reach.
+///
+/// 🔑 **Sampled before the commit, over the channels the write actually resolved
+/// onto** — not over the collection, and not estimated from the route. A write
+/// to `messages` where `owner` moves a row from one partition to another touches
+/// two channels with two different audiences, and neither is knowable until the
+/// row has been read inside the transaction.
+///
+/// This is the number SHUTTER prices a write by, and the reason that price is
+/// not a guess: it takes owning the write path *and* the subscription graph to
+/// see it, which is exactly what a path-and-IP rate limiter does not have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FanOut {
+    /// Subscribed lanes summed across every channel this write moves.
+    ///
+    /// Summed rather than maxed because it counts **frames delivered**, not
+    /// people: one session subscribed to both sides of a partition-changing
+    /// update receives two, and both are work.
+    pub subscribers: u32,
+}
+
 /// Apply every recorded write, then rematerialise and fan out each collection
 /// they touched.
 ///
@@ -630,6 +797,11 @@ fn build_statement(
 /// snapshots only — the pre-S4 behaviour, and the automatic fallback whenever a
 /// delta cannot be proven equivalent to the snapshot beside it.
 ///
+/// Returns the write's [`FanOut`] — how many lanes it is about to reach, read
+/// before the commit. SHUTTER prices a write by that number, and this is the
+/// only place it is knowable: an `Update` or `Delete` does not know which
+/// partition it moves until the row has been read inside the transaction.
+///
 /// # Errors
 /// Returns [`SubstrateError`] when a collection is unknown, a record is not a
 /// flat scalar record, or the transaction fails. Nothing is committed in any of
@@ -640,9 +812,10 @@ pub async fn apply_writes(
     schema: &ForgeSchema,
     writes: &[ForgeWrite],
     projector: Option<&dyn RowProjector>,
-) -> Result<()> {
+    principal: Option<&PrincipalId>,
+) -> Result<FanOut> {
     if writes.is_empty() {
-        return Ok(());
+        return Ok(FanOut::default());
     }
 
     // Temporary write-path instrumentation (env-gated, off by default): times the
@@ -685,27 +858,57 @@ pub async fn apply_writes(
             .copied()
             .expect("collection was resolved above");
 
+        // AUTH F1 · an append's owner is decided here, before anything is built.
+        // `Cow::Borrowed` for every collection that is not identity-partitioned,
+        // so the pre-AUTH path allocates nothing and behaves byte for byte as it
+        // did. `Cow::Owned` only when the server injected the owner.
+        let appended = match write {
+            ForgeWrite::Append { record, .. } => match authorize_append(slot, record, principal) {
+                Ok(record) => Some(record),
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(err);
+                }
+            },
+            _ => None,
+        };
+
         // Learn which channel(s) this write moves, before it moves them.
         let resolved = match write {
-            ForgeWrite::Append { record, .. } => append_partition(slot, record).map(|p| vec![p]),
+            ForgeWrite::Append { record, .. } => {
+                append_partition(slot, appended.as_deref().unwrap_or(record)).map(|p| vec![p])
+            }
             ForgeWrite::Update { key, fields, .. } => match read_partition(tx.as_ref(), slot, key).await {
                 // A partition-CHANGING update touches two channels: the row
                 // leaves one and arrives in the other, and each side's
                 // subscribers need to hear about their half. Naming it here is
                 // the difference between "the row moved" and "the row vanished".
-                Ok(before) => match (&slot.partition_by, before) {
-                    (Some(column), before) => match fields.get(column) {
-                        Some(moved) => partition_value_to_key(&slot.topic, column, moved)
-                            .map(|after| vec![before, Some(after)]),
-                        None => Ok(vec![before]),
+                //
+                // AUTH F1 · and it is where both owner checks land, because both
+                // need what this read just produced. `USING` on the row as found,
+                // `WITH CHECK` on the row it would become.
+                Ok(before) => match authorize_existing_row(slot, before.as_deref(), principal)
+                    .and_then(|()| authorize_partition_move(slot, fields, principal))
+                {
+                    Err(err) => Err(err),
+                    Ok(()) => match (&slot.partition_by, before) {
+                        (Some(column), before) => match fields.get(column) {
+                            Some(moved) => partition_value_to_key(&slot.topic, column, moved)
+                                .map(|after| vec![before, Some(after)]),
+                            None => Ok(vec![before]),
+                        },
+                        (None, _) => Ok(vec![None]),
                     },
-                    (None, _) => Ok(vec![None]),
                 },
                 Err(err) => Err(err),
             },
-            ForgeWrite::Delete { key, .. } => {
-                read_partition(tx.as_ref(), slot, key).await.map(|p| vec![p])
-            }
+            ForgeWrite::Delete { key, .. } => match read_partition(tx.as_ref(), slot, key).await {
+                Ok(before) => match authorize_existing_row(slot, before.as_deref(), principal) {
+                    Ok(()) => Ok(vec![before]),
+                    Err(err) => Err(err),
+                },
+                Err(err) => Err(err),
+            },
         };
         let resolved = match resolved {
             Ok(resolved) => resolved,
@@ -732,6 +935,9 @@ pub async fn apply_writes(
 
         match write {
             ForgeWrite::Append { record, .. } => {
+                // The authorized record, which for an identity-partitioned
+                // collection carries the owner the server put there.
+                let record = appended.as_deref().unwrap_or(record);
                 let (sql, params, columns) =
                     match build_append_returning(&slot.table, &slot.key_column, record) {
                         Ok(built) => built,
@@ -784,6 +990,19 @@ pub async fn apply_writes(
             }
         }
     }
+    // SHUTTER · price the write by what it is about to reach, while the
+    // transaction is still open. Read here rather than after the fan-out loop
+    // because the loop is where the lanes are *served*: a subscriber who
+    // disconnects mid-fan-out was still work, and a late reader would let a write
+    // that reached a thousand people be priced as if it reached none.
+    let fan_out = FanOut {
+        subscribers: touched.iter().fold(0u32, |total, touched| {
+            let lanes = u32::try_from(broadcast.subscriber_count(&touched.channel))
+                .unwrap_or(u32::MAX);
+            total.saturating_add(lanes)
+        }),
+    };
+
     tx.commit().await?;
     let commit_el = t_commit.elapsed();
 
@@ -958,7 +1177,7 @@ pub async fn apply_writes(
     // whole licence for this, and it is why static topics are excluded.
     broadcast.enforce_byte_budget(crate::runtime::broadcast::DEFAULT_TOPIC_VALUE_BUDGET);
 
-    Ok(())
+    Ok(fan_out)
 }
 
 /// Render only the records a write changed, each over a **singleton** collection
@@ -1614,6 +1833,7 @@ mod substrate_tests {
                 record,
             }],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1625,6 +1845,69 @@ mod substrate_tests {
             String::from_utf8_lossy(&spliced),
             String::from_utf8_lossy(&queried),
             "splice and query must agree byte for byte"
+        );
+    }
+
+    /// **SHUTTER's headline claim, asserted where it is made.** The price of a
+    /// write is its blast radius, and the blast radius is a fact about the live
+    /// subscription graph at the moment of the write — not a constant, not a
+    /// per-route setting, and not something a limiter outside the write path can
+    /// obtain at all.
+    #[tokio::test]
+    async fn a_write_reports_the_lanes_it_is_about_to_reach() {
+        use crate::runtime::session::SessionId;
+        use tokio::sync::mpsc;
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = ForgeSchema::guestbook_default();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast, &schema).await.unwrap();
+
+        let entry = |message: &str| {
+            let mut record = serde_json::Map::new();
+            record.insert("author".into(), Value::String("grace".into()));
+            record.insert("message".into(), Value::String(message.into()));
+            ForgeWrite::Append {
+                collection: "guestbook".into(),
+                record,
+            }
+        };
+
+        // Nobody watching: a write that reaches no one costs no fan-out.
+        let quiet = apply_writes(&db, &broadcast, &schema, &[entry("quiet")], None, None)
+            .await
+            .unwrap();
+        assert_eq!(quiet.subscribers, 0);
+
+        // Three lanes attach, then the same write is worth three times the
+        // delivery. Nothing about the *statement* changed.
+        let mut sinks = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+            broadcast
+                .subscribe(SessionId::random(), "guestbook", tx)
+                .unwrap();
+            sinks.push(rx);
+        }
+        let busy = apply_writes(&db, &broadcast, &schema, &[entry("busy")], None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            busy.subscribers, 3,
+            "the write did not see the lanes it was about to feed"
+        );
+
+        // And it is the *live* graph, not a high-water mark: lanes that leave
+        // stop being paid for.
+        drop(sinks);
+        broadcast.cleanup_session(SessionId::random());
+        let after = apply_writes(&db, &broadcast, &schema, &[entry("after")], None, None)
+            .await
+            .unwrap();
+        assert!(
+            after.subscribers <= 3,
+            "fan-out is not derived from the live subscriber set"
         );
     }
 
@@ -1651,6 +1934,7 @@ mod substrate_tests {
             &broadcast,
             &schema,
             &[entry("first"), entry("second")],
+            None,
             None,
         )
         .await
@@ -1688,6 +1972,7 @@ mod substrate_tests {
                 key: Value::Number(1.into()),
                 fields,
             }],
+            None,
             None,
         )
         .await
@@ -1743,6 +2028,7 @@ mod substrate_tests {
                     collection: "todos".into(),
                     record,
                 }],
+                None,
                 None,
             )
             .await
@@ -1804,6 +2090,7 @@ mod substrate_tests {
                     record,
                 }],
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1857,6 +2144,7 @@ mod substrate_tests {
                 collection: "notes".into(),
                 record,
             }],
+            None,
             None,
         )
         .await
@@ -1917,10 +2205,10 @@ mod substrate_tests {
         bootstrap_schema(&db, &schema).await.unwrap();
         let broadcast = BroadcastRegistry::new();
 
-        apply_writes(&db, &broadcast, &schema, &[msg("a", "hello")], None)
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "hello")], None, None)
             .await
             .unwrap();
-        apply_writes(&db, &broadcast, &schema, &[msg("b", "other")], None)
+        apply_writes(&db, &broadcast, &schema, &[msg("b", "other")], None, None)
             .await
             .unwrap();
 
@@ -1949,10 +2237,10 @@ mod substrate_tests {
         bootstrap_schema(&db, &schema).await.unwrap();
         let broadcast = BroadcastRegistry::new();
 
-        apply_writes(&db, &broadcast, &schema, &[msg("a", "first")], None)
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "first")], None, None)
             .await
             .unwrap();
-        apply_writes(&db, &broadcast, &schema, &[msg("a", "second")], None)
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "second")], None, None)
             .await
             .unwrap();
 
@@ -1980,7 +2268,7 @@ mod substrate_tests {
         bootstrap_schema(&db, &schema).await.unwrap();
         let broadcast = BroadcastRegistry::new();
 
-        apply_writes(&db, &broadcast, &schema, &[msg("a", "movable")], None)
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "movable")], None, None)
             .await
             .unwrap();
         assert_eq!(rows_of(&broadcast, "messages:a").len(), 1);
@@ -1996,6 +2284,7 @@ mod substrate_tests {
                 key: Value::Number(1.into()),
                 fields,
             }],
+            None,
             None,
         )
         .await
@@ -2019,7 +2308,7 @@ mod substrate_tests {
         bootstrap_schema(&db, &schema).await.unwrap();
         let broadcast = BroadcastRegistry::new();
 
-        apply_writes(&db, &broadcast, &schema, &[msg("a", "doomed")], None)
+        apply_writes(&db, &broadcast, &schema, &[msg("a", "doomed")], None, None)
             .await
             .unwrap();
         apply_writes(
@@ -2030,6 +2319,7 @@ mod substrate_tests {
                 collection: "messages".into(),
                 key: Value::Number(1.into()),
             }],
+            None,
             None,
         )
         .await
@@ -2058,6 +2348,7 @@ mod substrate_tests {
                 record,
             }],
             None,
+            None,
         )
         .await
         .expect_err("refused");
@@ -2073,7 +2364,7 @@ mod substrate_tests {
         bootstrap_schema(&db, &schema).await.unwrap();
         let broadcast = BroadcastRegistry::new();
 
-        let err = apply_writes(&db, &broadcast, &schema, &[msg("a:b", "sneaky")], None)
+        let err = apply_writes(&db, &broadcast, &schema, &[msg("a:b", "sneaky")], None, None)
             .await
             .expect_err("refused");
         assert!(format!("{err}").contains("alphabet"), "{err}");
@@ -2206,6 +2497,7 @@ mod substrate_tests {
                 json!({ "room": "a", "body": "hello" }),
             )],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2241,6 +2533,7 @@ mod substrate_tests {
                 "messages",
                 json!({ "room": "a", "body": "hello" }),
             )],
+            None,
             None,
         )
         .await
@@ -2292,6 +2585,7 @@ mod substrate_tests {
                 json!({ "author": "grace", "message": "found the bug" }),
             )],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2333,6 +2627,7 @@ mod substrate_tests {
                 json!({ "author": hostile, "message": "x" }),
             )],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2369,6 +2664,7 @@ mod substrate_tests {
                 },
             ],
             None,
+            None,
         )
         .await
         .expect_err("a malformed record must fail the action");
@@ -2396,6 +2692,7 @@ mod substrate_tests {
             &broadcast,
             &ForgeSchema::guestbook_default(),
             &[append("not_a_collection", json!({ "a": 1 }))],
+            None,
             None,
         )
         .await
@@ -2472,6 +2769,7 @@ mod substrate_tests {
                 json!({ "author": "grace", "message": "found the bug" }),
             )],
             Some(&GuestbookRows),
+            None,
         )
         .await
         .unwrap();
@@ -2574,6 +2872,7 @@ mod substrate_tests {
                 json!({ "author": "grace", "message": "found the bug" }),
             )],
             Some(&projector),
+            None,
         )
         .await
         .unwrap();
@@ -2671,6 +2970,7 @@ mod substrate_tests {
             &ForgeSchema::guestbook_default(),
             &[update("guestbook", json!(1), json!({ "author": "turing" }))],
             Some(&Guestbook),
+            None,
         )
         .await
         .unwrap();
@@ -2737,6 +3037,7 @@ mod substrate_tests {
             &ForgeSchema::guestbook_default(),
             &[delete("guestbook", json!(2))],
             Some(&Guestbook),
+            None,
         )
         .await
         .unwrap();
@@ -2777,6 +3078,7 @@ mod substrate_tests {
                 update("guestbook", Value::Null, json!({ "author": "x" })),
             ],
             None,
+            None,
         )
         .await
         .expect_err("a null key must fail the action");
@@ -2814,6 +3116,7 @@ mod substrate_tests {
                 json!({ "author": "grace", "message": "x" }),
             )],
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2844,6 +3147,7 @@ mod substrate_tests {
                     json!({ "author": "ada", "message": "again" }),
                 )],
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2859,5 +3163,411 @@ mod substrate_tests {
         let rows = topic_rows(&broadcast, "guestbook");
         assert_eq!(rows.len(), 3, "the appended row survived the restart");
         assert_eq!(rows[2]["message"], "again");
+    }
+}
+
+/// AUTH F1 · the write path's owner rules (`AUTH.md` § 8.1.2).
+///
+/// The shape under test is Postgres RLS's, deliberately: `USING` on the row as
+/// found, `WITH CHECK` on the row left behind, and an append whose owner is
+/// **supplied** rather than validated. Three mature implementations agree on that
+/// matrix, which is the argument for it.
+///
+/// 🔑 Every refusal here is asserted to be an **error**, never a quiet no-op. The
+/// design turns on that distinction: `Transaction::execute`'s rows-affected is
+/// discarded by this module, so the SQL-constraint version of this feature would
+/// have committed, changed nothing and returned success.
+#[cfg(all(test, feature = "forge"))]
+mod owner_rules_tests {
+    use super::*;
+    use crate::forge::skeleton::bootstrap_schema;
+    use crate::forge::LibSqlSubstrate;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn alice() -> PrincipalId {
+        PrincipalId::parse("u_alice").expect("a valid principal id")
+    }
+
+    fn bob() -> PrincipalId {
+        PrincipalId::parse("u_bob").expect("a valid principal id")
+    }
+
+    /// `todos`, partitioned by `owner`, **marked identity-partitioned** — which
+    /// at boot is derived from a component reading `.where({ owner: user.id })`.
+    fn owned_schema() -> ForgeSchema {
+        use crate::forge::declare::{CollectionDecl, FieldSpec, FieldType};
+
+        let mut fields = BTreeMap::new();
+        fields.insert("owner".to_string(), FieldSpec::new(FieldType::Text));
+        fields.insert("text".to_string(), FieldSpec::new(FieldType::Text));
+        let mut declarations = BTreeMap::new();
+        declarations.insert(
+            "todos".to_string(),
+            CollectionDecl {
+                fields,
+                partition_by: Some("owner".to_string()),
+                ..CollectionDecl::default()
+            },
+        );
+        ForgeSchema::from_declarations(&declarations)
+            .expect("schema")
+            .with_identity_partitions(&BTreeSet::from(["todos".to_string()]))
+    }
+
+    /// The same collection, **not** marked — the `params.id` case, which F1
+    /// deliberately leaves alone.
+    fn room_schema() -> ForgeSchema {
+        use crate::forge::declare::{CollectionDecl, FieldSpec, FieldType};
+
+        let mut fields = BTreeMap::new();
+        fields.insert("owner".to_string(), FieldSpec::new(FieldType::Text));
+        fields.insert("text".to_string(), FieldSpec::new(FieldType::Text));
+        let mut declarations = BTreeMap::new();
+        declarations.insert(
+            "todos".to_string(),
+            CollectionDecl {
+                fields,
+                partition_by: Some("owner".to_string()),
+                ..CollectionDecl::default()
+            },
+        );
+        ForgeSchema::from_declarations(&declarations).expect("schema")
+    }
+
+    fn append_todo(owner: Option<&str>, text: &str) -> ForgeWrite {
+        let mut record = Map::new();
+        if let Some(owner) = owner {
+            record.insert("owner".into(), Value::String(owner.into()));
+        }
+        record.insert("text".into(), Value::String(text.into()));
+        ForgeWrite::Append {
+            collection: "todos".into(),
+            record,
+        }
+    }
+
+    fn set_text(key: i64, text: &str) -> ForgeWrite {
+        let mut fields = Map::new();
+        fields.insert("text".into(), Value::String(text.into()));
+        ForgeWrite::Update {
+            collection: "todos".into(),
+            key: Value::from(key),
+            fields,
+        }
+    }
+
+    fn set_owner(key: i64, owner: &str) -> ForgeWrite {
+        let mut fields = Map::new();
+        fields.insert("owner".into(), Value::String(owner.into()));
+        ForgeWrite::Update {
+            collection: "todos".into(),
+            key: Value::from(key),
+            fields,
+        }
+    }
+
+    fn delete(key: i64) -> ForgeWrite {
+        ForgeWrite::Delete {
+            collection: "todos".into(),
+            key: Value::from(key),
+        }
+    }
+
+    async fn stored(db: &LibSqlSubstrate) -> Vec<(String, String)> {
+        let rows = db
+            .query("SELECT owner, text FROM todos ORDER BY id", &[])
+            .await
+            .expect("read back");
+        rows.rows
+            .iter()
+            .map(|row| {
+                let owner = match row.get(0) {
+                    Some(SqlValue::Text(t)) => t.clone(),
+                    other => panic!("owner came back as {other:?}"),
+                };
+                let text = match row.get(1) {
+                    Some(SqlValue::Text(t)) => t.clone(),
+                    other => panic!("text came back as {other:?}"),
+                };
+                (owner, text)
+            })
+            .collect()
+    }
+
+    /// The ordinary path after F1: the author does not write the owner at all.
+    #[tokio::test]
+    async fn an_append_omitting_the_owner_has_it_injected() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = owned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append_todo(None, "buy milk")],
+            None,
+            Some(&alice()),
+        )
+        .await
+        .expect("an append with no owner is the normal case, not an error");
+
+        assert_eq!(
+            stored(&db).await,
+            vec![("u_alice".to_string(), "buy milk".to_string())],
+            "the server supplied the owner from the principal"
+        );
+    }
+
+    /// Restating your own id is accepted — it is what the record would have got
+    /// anyway.
+    #[tokio::test]
+    async fn an_append_naming_the_caller_is_accepted() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = owned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append_todo(Some("u_alice"), "mine")],
+            None,
+            Some(&alice()),
+        )
+        .await
+        .expect("naming your own partition is not a conflict");
+
+        assert_eq!(stored(&db).await.len(), 1);
+    }
+
+    /// 🔴 **The hole F1 exists to close**, and the one demonstrated in a real
+    /// browser before it was: a form carrying somebody else's id.
+    #[tokio::test]
+    async fn an_append_naming_another_principal_is_refused() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = owned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        let err = apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append_todo(Some("u_alice"), "planted")],
+            None,
+            Some(&bob()),
+        )
+        .await
+        .expect_err("bob must not append into alice's partition");
+
+        assert!(
+            err.to_string().contains("refused"),
+            "the message must say it was refused: {err}"
+        );
+        assert!(
+            stored(&db).await.is_empty(),
+            "a refused append must leave nothing behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_write_to_a_per_user_collection_is_refused() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = owned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        let err = apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append_todo(Some("u_alice"), "from nobody")],
+            None,
+            None,
+        )
+        .await
+        .expect_err("an anonymous write to a per-user collection has no owner");
+
+        assert!(
+            err.to_string().contains("anonymous"),
+            "the message must name the reason: {err}"
+        );
+        assert!(stored(&db).await.is_empty());
+    }
+
+    /// `USING` · another principal's row cannot be updated — **and it errors**.
+    ///
+    /// The `assert` on the stored rows is the point: the rejected design would
+    /// have passed the error-free half of this test by committing zero rows.
+    #[tokio::test]
+    async fn another_principals_row_cannot_be_updated_and_it_errors() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = owned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append_todo(None, "alice's own")],
+            None,
+            Some(&alice()),
+        )
+        .await
+        .unwrap();
+
+        let err = apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[set_text(1, "bob was here")],
+            None,
+            Some(&bob()),
+        )
+        .await
+        .expect_err("bob must not update alice's row");
+
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert_eq!(
+            stored(&db).await,
+            vec![("u_alice".to_string(), "alice's own".to_string())],
+            "the row must be untouched, not quietly unchanged-and-reported-ok"
+        );
+    }
+
+    /// `USING` · the same, for a delete.
+    #[tokio::test]
+    async fn another_principals_row_cannot_be_deleted_and_it_errors() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = owned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append_todo(None, "alice's own")],
+            None,
+            Some(&alice()),
+        )
+        .await
+        .unwrap();
+
+        let err = apply_writes(&db, &broadcast, &schema, &[delete(1)], None, Some(&bob()))
+            .await
+            .expect_err("bob must not delete alice's row");
+
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert_eq!(stored(&db).await.len(), 1, "the row must still be there");
+    }
+
+    /// `WITH CHECK` · the case the first draft missed — update your own row and
+    /// reassign its owner. Checking the row *as found* would let this through.
+    #[tokio::test]
+    async fn an_update_moving_the_row_to_another_principal_is_refused() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = owned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append_todo(None, "alice's own")],
+            None,
+            Some(&alice()),
+        )
+        .await
+        .unwrap();
+
+        // Alice owns this row, so `USING` alone is satisfied. Only the check on
+        // the row she would leave behind catches it.
+        let err = apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[set_owner(1, "u_bob")],
+            None,
+            Some(&alice()),
+        )
+        .await
+        .expect_err("a row cannot be handed to another principal");
+
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert_eq!(
+            stored(&db).await,
+            vec![("u_alice".to_string(), "alice's own".to_string())],
+            "ownership must not have moved"
+        );
+    }
+
+    /// A move that is not a move: restating your own id must still work, or
+    /// `update` would fail on a record that merely repeats what is already true.
+    #[tokio::test]
+    async fn an_update_restating_the_same_owner_still_succeeds() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = owned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append_todo(None, "alice's own")],
+            None,
+            Some(&alice()),
+        )
+        .await
+        .unwrap();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[set_owner(1, "u_alice")],
+            None,
+            Some(&alice()),
+        )
+        .await
+        .expect("restating the same owner is a no-op, not a refusal");
+
+        assert_eq!(stored(&db).await.len(), 1);
+    }
+
+    /// 🔑 The parked case, asserted rather than assumed: a collection partitioned
+    /// by a **route param** is not identity-partitioned, so none of these rules
+    /// apply to it and an anonymous write behaves exactly as it did before F1.
+    ///
+    /// This is the boundary `AUTH.md` § 8.1.2 draws, and the scaffold's chat room
+    /// lives on this side of it.
+    #[tokio::test]
+    async fn a_param_partitioned_collection_is_untouched_by_the_owner_rules() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = room_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[append_todo(Some("anyones-room"), "hello")],
+            None,
+            None,
+        )
+        .await
+        .expect("a param-partitioned collection still takes an anonymous write");
+
+        assert_eq!(
+            stored(&db).await,
+            vec![("anyones-room".to_string(), "hello".to_string())]
+        );
     }
 }

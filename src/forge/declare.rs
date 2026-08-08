@@ -520,6 +520,9 @@ impl ForgeSchema {
     /// gates the built-in default does: safe identifiers, and no two collections
     /// sharing a wire slot.
     ///
+    /// AUTH's own tables are refused here rather than shadowed — see
+    /// [`ForgeSchemaError::ReservedCollectionName`].
+    ///
     /// # Errors
     /// Any [`ForgeSchemaError`] from lowering a declaration or from `build`.
     pub fn from_declarations(
@@ -527,6 +530,16 @@ impl ForgeSchema {
     ) -> Result<Self, ForgeSchemaError> {
         let mut collections = Vec::with_capacity(declarations.len());
         for (topic, decl) in declarations {
+            if crate::auth::schema::is_reserved(topic) {
+                return Err(ForgeSchemaError::ReservedCollectionName {
+                    topic: topic.clone(),
+                    prefix: crate::auth::schema::RESERVED_PREFIX,
+                    reserved: crate::auth::schema::RESERVED_COLLECTIONS
+                        .iter()
+                        .map(|name| (*name).to_string())
+                        .collect(),
+                });
+            }
             collections.push(decl.lower(topic)?);
         }
         Self::build(collections)
@@ -1038,5 +1051,34 @@ mod tests {
     fn an_empty_forge_block_builds_an_empty_schema() {
         let schema = ForgeSchema::from_declarations(&BTreeMap::new()).unwrap();
         assert!(schema.is_empty());
+    }
+
+    /// AUTH · an app must not be able to declare over the session table, and
+    /// must not be able to mint a readable topic over rows that belong to
+    /// everyone. Both failures would be silent, so the name is refused outright.
+    #[test]
+    fn an_app_cannot_declare_a_collection_under_the_auth_prefix() {
+        for name in crate::auth::schema::RESERVED_COLLECTIONS {
+            let declarations: BTreeMap<String, CollectionDecl> =
+                [((*name).to_string(), decl(&[("body", FieldType::Text)]))]
+                    .into_iter()
+                    .collect();
+            let error = ForgeSchema::from_declarations(&declarations)
+                .expect_err("a reserved name must be refused");
+            assert!(
+                matches!(error, ForgeSchemaError::ReservedCollectionName { .. }),
+                "`{name}` produced {error:?}"
+            );
+        }
+
+        // The rule is the prefix, not the four names — a table we add later must
+        // not become declarable in the meantime.
+        let future: BTreeMap<String, CollectionDecl> = [(
+            "albedo_not_a_table_yet".to_string(),
+            decl(&[("body", FieldType::Text)]),
+        )]
+        .into_iter()
+        .collect();
+        assert!(ForgeSchema::from_declarations(&future).is_err());
     }
 }

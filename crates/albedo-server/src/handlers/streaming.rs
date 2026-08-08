@@ -362,7 +362,7 @@ pub async fn streaming_handler(
     // pattern, so an exact-path lookup only resolves static routes. Dynamic
     // routes flow through `streaming_handler_with_match` instead, which
     // carries the matched pattern + params resolved by `CompiledRouter`.
-    serve_manifest_route(app, req, path, HashMap::new()).await
+    serve_manifest_route(app, req, path, HashMap::new(), None).await
 }
 
 /// Dispatch-path entry for the manifest-streaming arm. The caller has already
@@ -376,8 +376,21 @@ pub async fn streaming_handler_with_match(
     req: Request,
     route_pattern: String,
     params: HashMap<String, String>,
+    // AUTH · the request's principal, resolved by the dispatcher. P0 carried it
+    // this far; **P1 is what reads it** — `user.id` is a key source now, so this
+    // page's topics depend on who asked for it.
+    identity: crate::auth::Identity,
 ) -> Response {
-    serve_manifest_route(app, req, route_pattern, params).await
+    if let Some(who) = identity.principal() {
+        tracing::debug!(
+            target: "albedo.auth",
+            principal = %who.id,
+            route = %route_pattern,
+            "page rendered under a resolved principal"
+        );
+    }
+    let principal = identity.principal().map(|who| who.id.clone());
+    serve_manifest_route(app, req, route_pattern, params, principal).await
 }
 
 /// Shared body of the streaming handler. `route_pattern` is the manifest key to
@@ -389,6 +402,12 @@ async fn serve_manifest_route(
     req: Request,
     route_pattern: String,
     params: HashMap<String, String>,
+    // AUTH item 5 P1 · `None` on the standalone entry below, which is not a
+    // dispatched request and therefore has no resolved session. That is the
+    // correct value rather than a shortcut: an undispatched render must not
+    // invent an identity, and an identity-keyed binding on it resolves to no
+    // topic, which is the same answer an anonymous visitor gets.
+    principal: Option<dom_render_compiler::auth::PrincipalId>,
 ) -> Response {
     let path = req.uri().path().to_string();
     let negotiated_transport = negotiate_transport(&req, &app.transport);
@@ -400,10 +419,10 @@ async fn serve_manifest_route(
     let transport_config = app.transport.clone();
     let mut response_transport = negotiated_transport;
     let route = route.clone();
-    let ctx = request_context_from_request(&req, params);
+    let ctx = request_context_from_request(&req, params, principal);
 
     // Phase L · resolve the per-session id used to address the CSRF
-    // token table. Read from the `albedo-session` cookie when the
+    // token table. Read from the `__Host-albedo-session` cookie when the
     // browser carries one; mint a fresh id otherwise. We track
     // `is_fresh_session` so we know whether to emit a Set-Cookie on
     // the response — repeat visits don't pay the header cost.
@@ -939,7 +958,7 @@ async fn stream_route_over_webtransport(
     // Phase L · the WT session id doubles as the CSRF session id on
     // this path. The same uuid the client carries on the WT
     // handshake is what the action route will see in the
-    // `albedo-session` cookie (or `x-albedo-wt-session` header) when
+    // `__Host-albedo-session` cookie (or `x-albedo-wt-session` header) when
     // it later POSTs a form, so the token table keys align without
     // any cookie round-trip on the WT path.
     let page_session = dom_render_compiler::runtime::SessionId::new(session_id);
@@ -1169,6 +1188,10 @@ async fn drain_async_islands_into_session(
 fn request_context_from_request(
     req: &Request,
     params: HashMap<String, String>,
+    // AUTH item 5 P1 · resolved once by the dispatcher and carried, never
+    // re-derived here from `cookies`. Two places deciding who the caller is is
+    // two places that can disagree, and the one that renders would win silently.
+    principal: Option<dom_render_compiler::auth::PrincipalId>,
 ) -> TierBRequestContext {
     let mut headers = HashMap::new();
     let mut cookies = HashMap::new();
@@ -1188,19 +1211,25 @@ fn request_context_from_request(
         params,
         headers,
         cookies,
+        principal,
     }
 }
 
+/// Collect a `Cookie` header into the map Tier-B's `cookie:` data source reads.
+///
+/// The policy is **first wins**, matching every other cookie reader in the tree.
+/// It did not used to: this was built with `insert`, which silently means *last*
+/// wins, so a duplicate name appended to the header overrode the one the browser
+/// put first. Nobody chose that — it is just what `insert` does — and it made a
+/// component reading `cookie:x` disagree with the CSRF path reading the very
+/// same header. `or_insert_with` is the entire fix, and is why the shared
+/// tokenizer yields entries in the order they arrived rather than a map.
 fn parse_cookie_header(raw: &str) -> HashMap<String, String> {
     let mut cookies = HashMap::new();
-    for pair in raw.split(';') {
-        let trimmed = pair.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some((name, value)) = trimmed.split_once('=') {
-            cookies.insert(name.trim().to_string(), value.trim().to_string());
-        }
+    for (name, value) in dom_render_compiler::auth::cookie_entries(raw) {
+        cookies
+            .entry(name.to_string())
+            .or_insert_with(|| value.to_string());
     }
     cookies
 }
@@ -1288,7 +1317,7 @@ fn maybe_webtransport_session_id(req: &Request) -> Option<Uuid> {
 /// reject every non-form action.
 ///
 /// Safe to expose: this is not the session secret (that stays in the
-/// `HttpOnly` `albedo-session` cookie) and it is already present in the
+/// `HttpOnly` `__Host-albedo-session` cookie) and it is already present in the
 /// DOM as every form's hidden `_csrf` input, readable by any same-origin
 /// script. A CSRF token defends against cross-*site* forgery, which the
 /// same-origin policy already keeps from reading this value; it does not
@@ -1369,6 +1398,40 @@ mod tests {
     };
     use serde_json::Value;
     use tokio::sync::mpsc;
+
+    /// The third cookie parser in the tree, and the one that feeds Tier-B's
+    /// `cookie:` data source. A valueless entry must drop out of the map
+    /// without taking its neighbours with it — the auth cookie's parser once
+    /// aborted the whole scan on this shape, and here the blast radius is
+    /// every cookie a Tier-B component reads, not just one.
+    #[test]
+    fn a_valueless_entry_does_not_swallow_the_cookies_around_it() {
+        let name = crate::render::ALBEDO_SESSION_COOKIE;
+        let cookies = parse_cookie_header(&format!("consent; {name}=abc; dnt; theme=dark"));
+        assert_eq!(cookies.get(name).map(String::as_str), Some("abc"));
+        assert_eq!(cookies.get("theme").map(String::as_str), Some("dark"));
+        // The valueless entries are absent, not present-and-empty: a component
+        // asking for `cookie:consent` must see "unset", not "".
+        assert!(!cookies.contains_key("consent"));
+        assert!(!cookies.contains_key("dnt"));
+    }
+
+    /// Was `Some("second")` before the three parsers were unified, because
+    /// `insert` overwrites. A Tier-B component reading `cookie:x` and the CSRF
+    /// path reading the same header would then disagree about which duplicate
+    /// was real, which is the kind of divergence that only shows up under an
+    /// attack or a client bug — the two situations where you least want the
+    /// answer to depend on which function asked.
+    #[test]
+    fn the_first_of_two_duplicates_wins_as_it_does_everywhere_else() {
+        let cookies = parse_cookie_header("dup=first; dup=second");
+        assert_eq!(cookies.get("dup").map(String::as_str), Some("first"));
+    }
+
+    #[test]
+    fn a_header_of_only_valueless_entries_yields_no_cookies() {
+        assert!(parse_cookie_header("consent; dnt").is_empty());
+    }
 
     fn test_request(headers: &[(&str, &str)], version: Version) -> Request {
         let mut builder = Request::builder()
@@ -1693,7 +1756,7 @@ mod tests {
             binding: "rows".to_string(),
             collection: "messages".to_string(),
             column: "room".to_string(),
-            param: "id".to_string(),
+            key: dom_render_compiler::manifest::schema::PartitionKeySource::RouteParam("id".to_string()),
         }];
         assert!(route_needs_live_lane(&route));
     }

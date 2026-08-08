@@ -1,6 +1,7 @@
 use crate::error::RuntimeError;
 use crate::routing::{parse_query_string, HttpMethod};
 use axum::body::Body;
+use dom_render_compiler::auth::PrincipalId;
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
@@ -21,6 +22,19 @@ pub struct RequestContext {
     pub headers: BTreeMap<String, String>,
     pub body: Bytes,
     pub metadata: BTreeMap<String, Value>,
+    /// AUTH F1 · who is making this request, or `None` for anonymous.
+    ///
+    /// It sits beside `params` for the reason the render path's own context
+    /// gives for the same field (`render::tier_b::RequestContext.principal`):
+    /// both answer *what does this request know?*, and the write path is about
+    /// to derive a row's owner from one of them.
+    ///
+    /// Set through [`with_principal`](Self::with_principal) rather than through
+    /// [`new`](Self::new), so the call sites that predate AUTH stay untouched.
+    /// **The default is the safe one**: `None` means anonymous, and an anonymous
+    /// write to an identity-partitioned collection is refused outright — so a
+    /// new call site that forgets this fails loudly and closed, never open.
+    pub principal: Option<PrincipalId>,
 }
 
 impl RequestContext {
@@ -41,7 +55,20 @@ impl RequestContext {
             headers: normalize_headers(headers),
             body,
             metadata: BTreeMap::new(),
+            principal: None,
         }
+    }
+
+    /// Attach the request's resolved principal.
+    ///
+    /// Takes the resolved value rather than the headers on purpose: identity is
+    /// resolved once per request, at the dispatcher, and a context that could
+    /// re-derive it from its own headers would be a second answer to a question
+    /// that must have exactly one.
+    #[must_use]
+    pub fn with_principal(mut self, principal: Option<PrincipalId>) -> Self {
+        self.principal = principal;
+        self
     }
 
     pub fn query_value(&self, key: &str) -> Option<&str> {

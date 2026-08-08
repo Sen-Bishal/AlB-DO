@@ -16,11 +16,15 @@
 //!
 //! Every component is classified into one of three tiers at compile time:
 //!
-//! | Tier | Profile | Client JS |
-//! |------|---------|----------|
-//! | A | No hooks, no async, no side effects | Zero bytes |
-//! | B | Light interactivity / event handlers | Island only |
-//! | C | Full hook surface, async I/O | Full hydration |
+//! | Tier | Who owns the state | What ships |
+//! |------|--------------------|------------|
+//! | A | nothing — no state at all | markup only, zero JS |
+//! | B | the **server** — the state escapes this client (shared, persisted, or server-computed) | markup only, **zero component JS**; updates ride the wire as opcodes |
+//! | C | the **client** — the state escapes nothing | a compiled island, the only tier that ships component code |
+//!
+//! ⚠️ **This table used to have B and C inverted** (B "Island only", C "Full
+//! hydration") — the same defect item 4.9 T0 fixed in `tier_reason_to_message`
+//! and the `albedo dev` dashboard. **Tier B ships no component JavaScript.**
 //!
 //! ## Quick start
 //!
@@ -53,10 +57,12 @@
 
 pub mod analysis;
 pub mod aperture;
+pub mod auth;
 pub mod budget;
 pub mod bundler;
 pub mod conformance;
 pub mod dev;
+pub mod doctor;
 pub mod effects;
 pub mod estimator;
 pub mod forge;
@@ -69,6 +75,7 @@ pub mod parser;
 pub mod routing;
 pub mod runtime;
 pub mod scanner;
+pub mod shutter;
 pub mod transforms;
 pub mod types;
 
@@ -580,6 +587,7 @@ impl RenderCompiler {
                 component.effect_profile,
                 component.is_interactive,
                 component.is_client_interactive,
+                component.state_escapes,
                 component.is_above_fold,
                 weight_bytes,
                 tiering_inputs,
@@ -609,32 +617,66 @@ impl RenderCompiler {
     }
 }
 
+/// Explain a tier decision in the vocabulary the tiers actually have.
+///
+/// 🔴 **Every branch of this function used to be inverted** (item 4.9 T0,
+/// 2026-08-05). Tier **C** — the client island, the only tier that ships
+/// component code — was described as *"streamed from server"*, and Tier **B**,
+/// which ships **no component JavaScript at all**, was described as a
+/// *"hydration island"* / *"client hydration required"*. The two tiers' meanings
+/// were printed swapped, by the one command whose whole job is explaining the
+/// decision. Item 4.6 corrected the byte figure on the summary line and left
+/// this vocabulary untouched.
+///
+/// The vocabulary, fixed once, matching `bin/albedo/printer.rs`:
+/// - **A** — static markup, zero JS.
+/// - **B** — server-rendered markup, **zero component JS**; updates arrive as
+///   opcodes over the wire.
+/// - **C** — ships a compiled client island.
+///
+/// ⚠️ **These messages describe the signal the classifier actually used, not the
+/// rule we intend it to use.** The design rule is *state ownership* (B = the
+/// state escapes the client, C = it does not), but nothing computes escape yet —
+/// that is item 4.9 **T1**. Printing "server-owned state" today would be the tool
+/// claiming an analysis it does not perform, which is the same defect class as
+/// the fabricated byte count. So B/C say `client-satisfiable handler`, because
+/// that is literally the bit [`decide_tier_and_hydration`] branched on.
 fn tier_reason_to_message(reason: TieringReason, tier: Tier) -> String {
     match reason {
-        TieringReason::PureStaticEligible => "no hooks, no IO, no side effects".to_string(),
+        TieringReason::PureStaticEligible => {
+            "no hooks, no async, no IO, no side effects - static markup".to_string()
+        }
+        // Item 4.9 T1. The one reason that names the actual rule, because it is
+        // the one the classifier actually proves.
+        TieringReason::ServerOwnedState => {
+            "state escapes this client - server-owned, no component JS".to_string()
+        }
         TieringReason::HookDrivenHydration => {
             if tier == Tier::C {
-                "hooks + interaction boundary - streamed".to_string()
+                "hooks + a client-satisfiable handler - ships a client island".to_string()
             } else {
-                "hooks detected - client hydration required".to_string()
+                "hooks, no client-satisfiable handler - server-rendered, no component JS"
+                    .to_string()
             }
         }
         TieringReason::AsyncBoundary => {
             if tier == Tier::C {
-                "async boundary - streamed from server".to_string()
+                "async + client interaction - ships a client island".to_string()
             } else {
-                "async boundary - hydrated island".to_string()
+                "async server data, awaited on the server - no component JS".to_string()
             }
         }
-        TieringReason::IoBoundary => "async fetch/IO boundary - streamed from server".to_string(),
+        // `effects.io` and `effects.side_effects` both return Tier C
+        // unconditionally, so these need no tier branch.
+        TieringReason::IoBoundary => "IO boundary - ships a client island".to_string(),
         TieringReason::SideEffectBoundary => {
-            "side effects boundary - streamed from server".to_string()
+            "side effect on mount - ships a client island".to_string()
         }
         TieringReason::WeightBasedPromotion => {
             if tier == Tier::C {
-                "size/interaction threshold promoted to streamed tier".to_string()
+                "size threshold - ships a client island".to_string()
             } else {
-                "size threshold promoted to hydration island".to_string()
+                "size threshold - server-rendered, no component JS".to_string()
             }
         }
     }

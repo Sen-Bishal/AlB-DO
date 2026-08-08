@@ -67,6 +67,14 @@ pub struct ProductionServerOptions {
     /// `forge` is: the failure surfaces here, at boot, naming the offending
     /// source — and lowering needs the real environment, which only exists here.
     pub sources: BTreeMap<String, dom_render_compiler::aperture::SourceDecl>,
+    /// AUTH · the app's declared providers, from the config's `auth` block.
+    ///
+    /// No providers means the app has no way to authenticate anyone, and boot
+    /// emits none of AUTH's tables — an app without login should not carry four
+    /// empty ones. Kept as the declaration for the same reason `forge` and
+    /// `sources` are: lowering needs the real environment, and a bad `auth`
+    /// block should stop the boot here with the offending provider named.
+    pub auth: dom_render_compiler::auth::AuthDeclaration,
 }
 
 impl ProductionServerOptions {
@@ -86,6 +94,7 @@ impl ProductionServerOptions {
             dev_mode: false,
             forge: contract.forge.clone(),
             sources: contract.sources.clone(),
+            auth: contract.auth.clone(),
         }
     }
 }
@@ -210,21 +219,56 @@ fn boot_inner(
         })?
     };
 
+    // AUTH · lower the `auth` block, then let it contribute its tables to the
+    // same schema the app's collections live in.
+    //
+    // Lowered with the real environment for the same reason `sources` is: a
+    // `{ env: … }` naming an unset variable is knowable here and nowhere
+    // earlier. An empty block contributes nothing at all — no providers means
+    // no login, which means four empty tables would be four empty tables.
+    //
+    // The tables ride the ordinary FORGE schema rather than a private one
+    // because that is what makes `AUTH.md` § 5 true: a session is a row, a row
+    // change is already a delta, so revoking on one device drops every other
+    // tab's lane on the wire that already exists. A side table would need a
+    // second mechanism to say the same thing.
+    let auth_registry = opts.auth.lower().map_err(|err| {
+        RuntimeError::ServerStartup(format!("invalid `auth` block in albedo.config: {err}"))
+    })?;
+    let forge_schema = if auth_registry.is_empty() {
+        forge_schema
+    } else {
+        dom_render_compiler::auth::schema::augment(&forge_schema).map_err(|err| {
+            RuntimeError::ServerStartup(format!("AUTH tables cannot join the schema: {err}"))
+        })?
+    };
+
     // PRISM · the schema and the components finally meet. Everything up to here
     // validated one side in isolation: the extractor recorded what a component
     // wrote with no schema to check it against, and the schema knows nothing
     // about components. A `.where` naming the wrong column mints a topic nothing
     // ever writes to — an empty list forever, with no error anywhere — so it
     // stops the boot instead.
-    if let Err(problems) = dom_render_compiler::forge::validate_partition_bindings(
+    //
+    // AUTH F1 · the same meeting answers a second question the schema cannot:
+    // whether a partition column holds a *principal*. `partition_by: "owner"`
+    // does not say, and only the reads do — `.where({ owner: user.id })` versus
+    // `.where({ owner: params.id })`. The answer is stamped onto the schema here
+    // and nowhere else, because this is the last moment it is still locally
+    // owned; after `with_forge_schema` there is no seam that could add it.
+    let identity_partitions = match dom_render_compiler::forge::validate_partition_bindings(
         &compiled.partition_bindings(),
         &forge_schema,
     ) {
-        return Err(RuntimeError::ServerStartup(format!(
-            "`forge` block and component reads disagree:\n  - {}",
-            problems.join("\n  - ")
-        )));
-    }
+        Ok(identity) => identity,
+        Err(problems) => {
+            return Err(RuntimeError::ServerStartup(format!(
+                "`forge` block and component reads disagree:\n  - {}",
+                problems.join("\n  - ")
+            )));
+        }
+    };
+    let forge_schema = forge_schema.with_identity_partitions(&identity_partitions);
 
     // APERTURE · the same meeting, for the other derivation. A component calling
     // `github.repo({ owner })` without `name` is well-formed TSX and a valid
@@ -357,6 +401,10 @@ fn boot_inner(
     // runtime it is actually reusing rather than onto a fresh one that is about
     // to be replaced.
     builder = builder.with_source_reader(source_reader);
+
+    // AUTH · same placement, same reason: after `with_live_runtime`, so a dev
+    // reload carries the identity path onto the runtime it is actually reusing.
+    builder = builder.with_auth_registry(auth_registry);
 
     let mut builder = builder.register_compiled_project(Arc::new(compiled));
 

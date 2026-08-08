@@ -106,7 +106,10 @@ impl Fixture {
             // which is what these fixtures asserted against before an app could
             // declare its own collections.
             forge: Default::default(),
-        sources: Default::default(),
+            sources: Default::default(),
+            // No `auth` block either — every request resolves as anonymous,
+            // and none of AUTH's tables are emitted.
+            auth: Default::default(),
         }
     }
 }
@@ -233,6 +236,7 @@ fn boot_production_server_fails_loud_when_dist_dir_missing() {
         dev_mode: false,
         forge: Default::default(),
         sources: Default::default(),
+        auth: Default::default(),
     };
 
     let err = match boot_production_server(&opts) {

@@ -36,7 +36,24 @@ pub use dom_render_compiler::transforms::form::CSRF_FIELD_NAME;
 /// form action POSTs. Both the page-render path and the action
 /// dispatch path read from this cookie so the CSRF token table
 /// stays addressable by the same `SessionId` on both sides.
-pub const ALBEDO_SESSION_COOKIE: &str = "albedo-session";
+///
+/// The `__Host-` prefix is load-bearing and enforced by the browser,
+/// not by us: it refuses the cookie unless it is `Secure`, `Path=/`
+/// and carries no `Domain`, which is precisely what stops a sibling
+/// subdomain from setting one the parent will then honour. Without
+/// it, a foothold on any `*.example.com` can pin this id to a value
+/// the attacker chose, and since this id is the key into the CSRF
+/// token table, a pinned id is a CSRF token the attacker can also
+/// mint for themselves. The auth cookie closed this at P0; the tab
+/// cookie is not a credential, but it is the address the credential
+/// check hangs off, so it needs the same guarantee.
+///
+/// Note the deliberate near-miss with the auth cookie's default
+/// `__Host-albedo_session` (underscore). They are different cookies
+/// with different trust: this one names a tab, that one authorises a
+/// principal. `the_tab_cookie_is_not_mistaken_for_the_auth_cookie`
+/// in the compiler crate is what keeps the two from converging.
+pub const ALBEDO_SESSION_COOKIE: &str = "__Host-albedo-session";
 
 /// Server-wide CSRF registry. Cloneable — internally an
 /// `Arc<DashMap>` — so the renderer and the dispatcher can both hold
@@ -152,45 +169,78 @@ pub fn substitute_csrf_token_in_html(html: &str, token: &str) -> String {
     dom_render_compiler::transforms::form::fill_csrf_tokens(html, token)
 }
 
-/// Reads the `albedo-session` cookie value from a request's header
+/// Reads the `__Host-albedo-session` cookie value from a request's header
 /// map and parses it into a [`SessionId`].
 ///
-/// Returns `None` when the cookie is absent, malformed, or doesn't
-/// parse as a UUID. Callers that need a session id even on first
-/// visit should pair this with [`SessionId::random`] for a
-/// fresh-mint fallback (and remember to set the matching
+/// Returns `None` when no entry in the header carries the name with
+/// a value that parses as a UUID. Callers that need a session id
+/// even on first visit should pair this with [`SessionId::random`]
+/// for a fresh-mint fallback (and remember to set the matching
 /// `Set-Cookie` on the response — see [`build_session_set_cookie`]).
 ///
-/// Multiple cookies in a single header are supported (the
-/// `Cookie` header semicolon-separates them). The first matching
-/// `albedo-session=...` value wins; later duplicates are ignored.
+/// Multiple cookies in a single header are supported (the `Cookie`
+/// header semicolon-separates them). Where two entries carry this
+/// name, **the first one that parses wins** — the scan steps over an
+/// entry it cannot read rather than giving up at it.
+///
+/// That is a deliberate bias toward continuity, and it is the
+/// opposite of what the auth cookie does. Giving up at the first
+/// unreadable entry would hand anyone able to get one junk entry
+/// into the header a free session-reset primitive: the page renders
+/// with a CSRF token bound to session A, the next request resolves
+/// to nothing and mints session B, and the user's submit answers 403
+/// for reasons nothing in the response explains. A tab id is not a
+/// credential, so there is nothing to be gained by being strict with
+/// it. [`read_cookie`](dom_render_compiler::auth::read_cookie) takes
+/// the other side for exactly that reason: it returns the first
+/// name match and lets validation fail closed, because falling
+/// through to a *second* credential is not something a credential
+/// reader should ever do.
+///
+/// In practice a conforming browser cannot produce the duplicate at
+/// all: `__Host-` pins the cookie host-only at `Path=/`, and a
+/// cookie is keyed by name plus domain plus path, so one origin has
+/// exactly one of these. The rule governs handwritten and
+/// programmatic clients, which is also why it is pinned by test
+/// rather than left to the shape of the loop.
 pub fn read_session_cookie(headers: &HeaderMap) -> Option<SessionId> {
     let cookie_header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
-    for entry in cookie_header.split(';') {
-        let trimmed = entry.trim();
-        if let Some(value) = trimmed.strip_prefix(&format!("{ALBEDO_SESSION_COOKIE}=")) {
-            if let Ok(uuid) = uuid::Uuid::parse_str(value) {
-                return Some(SessionId::new(uuid));
-            }
-        }
-    }
-    None
+    // The policy, in one line: entries with our name, first one that parses.
+    // `find_map` rather than `find(...).and_then(...)` is the whole difference
+    // between "first parseable" and "first, then give up" — see above.
+    dom_render_compiler::auth::cookie_entries(cookie_header)
+        .filter(|(name, _)| *name == ALBEDO_SESSION_COOKIE)
+        .find_map(|(_, value)| uuid::Uuid::parse_str(value).ok())
+        .map(SessionId::new)
 }
 
-/// Build a `Set-Cookie` header value that pins `albedo-session` to
+/// Build a `Set-Cookie` header value that pins the tab session to
 /// the supplied [`SessionId`]. Attributes:
-///   * `Path=/` — every route on the origin sees the cookie.
+///   * `Path=/` — every route on the origin sees the cookie, and the
+///     `__Host-` prefix requires exactly this value.
 ///   * `HttpOnly` — JavaScript can't read it, so token leakage via
 ///     XSS doesn't directly compromise the CSRF surface.
+///   * `Secure` — required by the `__Host-` prefix, and correct
+///     regardless. A cookie that also rides plain HTTP is one a
+///     network attacker can both read and overwrite.
 ///   * `SameSite=Lax` — sent on top-level same-site navigations but
 ///     not on cross-site POSTs, which is exactly the threat CSRF
 ///     tokens guard against.
+///   * No `Domain` — also required by `__Host-`, and the half of the
+///     prefix that actually closes sibling-subdomain cookie tossing.
 /// The cookie is session-scoped (no `Max-Age` / `Expires`) so it
 /// rolls when the browser closes — matches the lifetime semantics
 /// of the in-memory `CsrfRegistry`.
+///
+/// `Secure` means the browser will not store this over plain HTTP
+/// unless the origin is potentially-trustworthy — `localhost` and
+/// `127.0.0.1` are, a bare LAN address is not. That constraint is
+/// not new: the auth cookie has been unconditionally `Secure` since
+/// P0, so any deployment this would break was already broken for
+/// anything that signs a user in.
 pub fn build_session_set_cookie(session: SessionId) -> String {
     format!(
-        "{ALBEDO_SESSION_COOKIE}={uuid}; Path=/; HttpOnly; SameSite=Lax",
+        "{ALBEDO_SESSION_COOKIE}={uuid}; Path=/; HttpOnly; Secure; SameSite=Lax",
         uuid = session.as_uuid()
     )
 }
@@ -370,6 +420,47 @@ mod tests {
         assert!(read_session_cookie(&headers).is_none());
     }
 
+    /// Pins which of two same-named entries wins, because the answer was
+    /// previously only implied by the nesting of two `if let`s and the doc
+    /// comment above claimed the opposite. Scanning past an entry that does
+    /// not parse is the deliberate behaviour: see the note on
+    /// [`read_session_cookie`] for why continuity beats strictness here.
+    #[test]
+    fn an_unparseable_duplicate_does_not_mask_a_valid_one_behind_it() {
+        let mut headers = HeaderMap::new();
+        let session = SessionId::random();
+        let cookie = format!(
+            "{ALBEDO_SESSION_COOKIE}=not-a-uuid; {ALBEDO_SESSION_COOKIE}={}",
+            session.as_uuid()
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            cookie.parse().expect("cookie header value"),
+        );
+        assert_eq!(read_session_cookie(&headers), Some(session));
+    }
+
+    /// The other order: two parseable entries, and the earlier one wins. This
+    /// is the half that is genuinely "first wins", and it must not quietly
+    /// become "last wins" — that would hand ordering control to whoever can
+    /// append to the header.
+    #[test]
+    fn the_earlier_of_two_parseable_duplicates_wins() {
+        let mut headers = HeaderMap::new();
+        let first = SessionId::random();
+        let second = SessionId::random();
+        let cookie = format!(
+            "{ALBEDO_SESSION_COOKIE}={}; {ALBEDO_SESSION_COOKIE}={}",
+            first.as_uuid(),
+            second.as_uuid()
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            cookie.parse().expect("cookie header value"),
+        );
+        assert_eq!(read_session_cookie(&headers), Some(first));
+    }
+
     #[test]
     fn read_session_cookie_returns_none_for_malformed_uuid() {
         let mut headers = HeaderMap::new();
@@ -381,6 +472,47 @@ mod tests {
         assert!(read_session_cookie(&headers).is_none());
     }
 
+    /// The valueless-entry regression, pinned on the tab cookie because it is
+    /// a *second, separate* parser: a `Cookie: consent; __Host-albedo-session=…`
+    /// header is legal and real browsers send it. On the auth cookie the same
+    /// shape once aborted the whole scan and signed the user out; nothing but
+    /// a test stops that from being reintroduced here.
+    #[test]
+    fn read_session_cookie_survives_a_valueless_entry_before_it() {
+        let mut headers = HeaderMap::new();
+        let session = SessionId::random();
+        let cookie = format!("consent; {ALBEDO_SESSION_COOKIE}={}", session.as_uuid());
+        headers.insert(
+            axum::http::header::COOKIE,
+            cookie.parse().expect("cookie header value"),
+        );
+        assert_eq!(read_session_cookie(&headers), Some(session));
+    }
+
+    /// The same header the other way round, so the test above cannot pass on a
+    /// scan that merely stops early.
+    #[test]
+    fn read_session_cookie_survives_a_valueless_entry_after_it() {
+        let mut headers = HeaderMap::new();
+        let session = SessionId::random();
+        let cookie = format!("{ALBEDO_SESSION_COOKIE}={}; consent", session.as_uuid());
+        headers.insert(
+            axum::http::header::COOKIE,
+            cookie.parse().expect("cookie header value"),
+        );
+        assert_eq!(read_session_cookie(&headers), Some(session));
+    }
+
+    #[test]
+    fn read_session_cookie_returns_none_for_a_header_of_only_valueless_entries() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            "consent; dnt".parse().expect("cookie header value"),
+        );
+        assert!(read_session_cookie(&headers).is_none());
+    }
+
     #[test]
     fn build_session_set_cookie_carries_expected_attributes() {
         let session = SessionId::random();
@@ -388,10 +520,31 @@ mod tests {
         assert!(header.contains(&session.as_uuid().to_string()));
         assert!(header.contains("Path=/"));
         assert!(header.contains("HttpOnly"));
+        assert!(header.contains("Secure"));
         assert!(header.contains("SameSite=Lax"));
         // No Max-Age / Expires — session cookie rolls when the
         // browser closes, matching the in-memory registry's lifetime.
         assert!(!header.contains("Max-Age"));
         assert!(!header.contains("Expires"));
+    }
+
+    /// The `__Host-` prefix is only honoured by the browser when every
+    /// one of its conditions holds, so a cookie that carries the name
+    /// but violates them is silently *dropped* — the failure mode is a
+    /// session that never pins, not a loud error. Assert the name and
+    /// the conditions together, because either alone is a trap.
+    #[test]
+    fn the_tab_cookie_satisfies_every_host_prefix_condition() {
+        let header = build_session_set_cookie(SessionId::random());
+        assert!(
+            ALBEDO_SESSION_COOKIE.starts_with("__Host-"),
+            "{ALBEDO_SESSION_COOKIE}"
+        );
+        assert!(header.starts_with(&format!("{ALBEDO_SESSION_COOKIE}=")));
+        assert!(header.contains("Secure"), "{header}");
+        assert!(header.contains("Path=/"), "{header}");
+        // A `Domain` is the one attribute that breaks the prefix while
+        // looking harmless, and it is the sibling-subdomain vector.
+        assert!(!header.contains("Domain"), "{header}");
     }
 }

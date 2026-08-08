@@ -4,8 +4,8 @@ use super::metadata::{
     hoist_head_tags_from_body, metadata_from_const_expr, render_head_metadata, DYNAMIC_HEAD_MARKER,
 };
 use super::schema::{
-    AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, PartitionTopicSpec,
-    SourceTopicSpec,
+    AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, PartitionKeySource,
+    PartitionTopicSpec, SourceTopicSpec,
     RenderedNode, RouteActionEntry, RouteManifest, RouteMetadata, Tier, TierBNode, TierCNode,
     WTStreamSlot,
 };
@@ -1534,7 +1534,41 @@ impl<'a> ManifestBuilder<'a> {
             // assembles the matched params map into a JSON object.
             keys.push("params".to_string());
         }
+        // AUTH item 5 P1 · a component that partitions by `user.id` receives
+        // `user`, by the same rule that gives a `[slug]` route its `params`.
+        //
+        // 🔑 This is derived from the *binding*, never from a route declaration.
+        // The component asked to be keyed by the principal when it wrote
+        // `.where({ owner: user.id })`, so the prop it needs is a consequence of
+        // the read rather than a second thing an author has to remember — which
+        // is AUTH § 4's whole claim ("derived, not authored") holding at the
+        // level of the props object.
+        if self.component_partitions_by_identity(component) {
+            keys.push("user".to_string());
+        }
         keys
+    }
+
+    /// Whether any of `component`'s partitioned shared slots is keyed by the
+    /// signed-in principal.
+    ///
+    /// Returns `false` when the compiled project is unavailable rather than
+    /// guessing, which matches every other lookup on this builder. The cost of
+    /// `false` is an identity-keyed binding that resolves to no topic — an empty
+    /// slot, never someone else's rows.
+    fn component_partitions_by_identity(&self, component: &Component) -> bool {
+        let Some(compiled) = self.compiled_render_project.as_ref() else {
+            return false;
+        };
+        let Some(entry) = self.component_entry_for_project(component, compiled.root.as_path())
+        else {
+            return false;
+        };
+        compiled
+            .project
+            .shared_slot_partitions_for_entry(&entry)
+            .iter()
+            .any(|spec| matches!(spec.key, PartitionKeySource::Identity))
     }
 
     fn tier_of(&self, id: ComponentId) -> Option<Tier> {

@@ -1218,10 +1218,12 @@ impl CompiledProject {
     /// params would mint a topic the page never renders, which is the read
     /// capability PRISM invariant 2 denies.
     ///
-    /// A binding whose key source is not a route param is skipped rather than
-    /// approximated. Today `KeySource` has exactly one variant, so the `match`
-    /// is total; it is written as a `match` anyway so adding `Identity` (item 5)
-    /// forces a decision here instead of silently resolving to nothing.
+    /// The `match` on `KeySource` is total, which is what it was written for:
+    /// item 5 P1 added `Identity` and the compiler pointed here. Both variants
+    /// lower — an identity-keyed binding is carried to serve time exactly like a
+    /// param-keyed one, and the decision about *whether it resolves* belongs to
+    /// [`crate::runtime::resolve_partition_topics`], which is the one place that
+    /// knows whether a request has a principal.
     #[must_use]
     pub fn shared_slot_partitions_for_entry(
         &self,
@@ -1242,14 +1244,17 @@ impl CompiledProject {
                 let TopicSpec::Partition { collection, column, key } = &binding.spec else {
                     return None;
                 };
-                let param = match key {
-                    KeySource::Param(name) => name.clone(),
+                let key = match key {
+                    KeySource::Param(name) => {
+                        crate::manifest::schema::PartitionKeySource::RouteParam(name.clone())
+                    }
+                    KeySource::Identity => crate::manifest::schema::PartitionKeySource::Identity,
                 };
                 Some(crate::manifest::schema::PartitionTopicSpec {
                     binding: binding.binding_name.clone(),
                     collection: collection.clone(),
                     column: column.clone(),
-                    param,
+                    key,
                 })
             })
             .collect()
@@ -1360,7 +1365,7 @@ impl CompiledProject {
         let mut out: Vec<crate::forge::PartitionBinding> = Vec::new();
         for component in self.components.values() {
             for binding in &component.shared_slots {
-                let TopicSpec::Partition { collection, column, .. } = &binding.spec else {
+                let TopicSpec::Partition { collection, column, key } = &binding.spec else {
                     continue;
                 };
                 out.push(crate::forge::PartitionBinding {
@@ -1369,6 +1374,7 @@ impl CompiledProject {
                     binding_name: binding.binding_name.clone(),
                     collection: collection.clone(),
                     column: column.clone(),
+                    key: key.clone(),
                 });
             }
         }
@@ -1771,7 +1777,31 @@ impl CompiledProject {
             Some(registry) => match broadcast_reads_in_body(&handler.body) {
                 BroadcastReads::None => Vec::new(),
                 BroadcastReads::Literal(topics) => registry.values_for(&topics),
-                BroadcastReads::Unknown => registry.snapshot_values(),
+                // AUTH item 5 · **`Unknown` used to seed `snapshot_values()` —
+                // every topic in the process.** That was safe while every topic
+                // was reachable by anyone who could reach the route that
+                // rendered it: a broad seed handed the updater nothing it could
+                // not already read. P1 changed what the set *contains*, not this
+                // line — `todos:u_alice` and `todos:u_bob` are now in it — so the
+                // old fallback became a way for one handler to be handed every
+                // principal's rows. See `AUTH.md` § 8.1.2 F2.
+                //
+                // The original comment's reasoning still stands and is why this
+                // refuses rather than seeding nothing: an absent topic does not
+                // throw, it silently hands the updater `null`, so `(n) => n + 1`
+                // would quietly reset a counter to 1. Uncertainty must not cost
+                // correctness — and it must no longer cost confidentiality
+                // either, which leaves exactly one honest answer: **fail loudly.**
+                BroadcastReads::Unknown => {
+                    return Err(anyhow!(
+                        "this action calls `broadcast` with a topic this build cannot pin to a \
+                         string literal, so the pre-write value it should see cannot be \
+                         determined. Seeding every topic would hand this handler every user's \
+                         data, and seeding none would silently pass `null` to the updater. \
+                         Name the topic with a string literal — the same rule `useSharedSlot` \
+                         already follows, and for the same reason"
+                    ));
+                }
             },
             None => Vec::new(),
         };

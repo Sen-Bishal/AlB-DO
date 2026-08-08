@@ -79,13 +79,30 @@ use swc_ecma_visit::{VisitMut, VisitMutWith};
 /// is refused here — and a key that reaches both a topic namespace and a SQL
 /// parameter is not a place to accept arbitrary expressions.
 ///
-/// `user.id` is **not** a variant yet: it is recognised and rejected with a
-/// message naming item 5 (auth), and becomes `Identity` when a session is
-/// actually in scope. See [`SharedSlotExtractError::IdentityKeyNotYetSupported`].
+/// `user.id` **is** a variant, as of item 5 P1. It is the only identity field
+/// admitted, and that is forced rather than chosen — see [`Self::Identity`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySource {
     /// A route parameter: `params.id` on `/room/[id]`.
     Param(String),
+    /// The authenticated principal: `user.id`.
+    ///
+    /// AUTH § 3 — *identity is one more key source, beside `params`*. The whole
+    /// of derived authorization is this variant: `todos.where({ owner: user.id })`
+    /// mints `todos:owner=u_7f3a`, and a session that is not `u_7f3a` cannot
+    /// *name* that topic, so there is no policy to write and none to forget.
+    ///
+    /// **Only `id`.** `user.email` and friends are refused, and not out of
+    /// caution: a key reaches a topic namespace, so it is bound by
+    /// [`crate::runtime::broadcast::is_valid_partition_key`]'s
+    /// `[A-Za-z0-9_-]{1,64}`. An email contains `@` and `.` and can never be a
+    /// partition key; `PrincipalId` is minted as `u_` + uuid-simple precisely so
+    /// that it always can. The alphabet is the reason the id is ours.
+    ///
+    /// **Carries no name**, unlike [`Self::Param`]. There is exactly one
+    /// principal per request, so there is nothing to look up — which is also why
+    /// the subscribe path can resolve this without a component render.
+    Identity,
 }
 
 /// One argument to a declared APERTURE source route.
@@ -208,10 +225,27 @@ pub enum SharedSlotExtractError {
         binding_name: Option<String>,
         found: String,
     },
-    /// The partition key is `user.…`, which is real and scheduled — item 5.
-    /// Distinguished from [`Self::PartitionKeyUnsupported`] so the author learns
-    /// the feature is *coming*, not that they wrote nonsense.
+    /// An APERTURE source argument is `user.…`/`session.…`, which is real and
+    /// scheduled — item 5 **P5** (`scope: "user"`), not P1. Distinguished from
+    /// [`Self::PartitionKeyUnsupported`] so the author learns the feature is
+    /// *coming*, not that they wrote nonsense.
+    ///
+    /// 🔑 No longer reachable from the *partition* path: `user.id` lands there
+    /// as [`KeySource::Identity`] as of P1, and any other identity field is
+    /// [`Self::UnsupportedIdentityField`] — a permanent refusal, not a schedule.
     IdentityKeyNotYetSupported { binding_name: Option<String> },
+    /// The partition key is an identity field that can never be a partition key.
+    ///
+    /// Separate from [`Self::IdentityKeyNotYetSupported`] because the answer is
+    /// different in kind: that one says *later*, this one says *never*. Only
+    /// `user.id` is in the partition-key alphabet
+    /// (`[A-Za-z0-9_-]{1,64}`) — `user.email` carries `@` and `.`, and a
+    /// `session.*` field is a tab, not a human, so it is not an authorization
+    /// basis at all.
+    UnsupportedIdentityField {
+        binding_name: Option<String>,
+        found: String,
+    },
     /// APERTURE · a source route call whose argument is not a single object
     /// literal of named arguments.
     UnsupportedSourceShape { binding_name: Option<String> },
@@ -269,9 +303,25 @@ impl std::fmt::Display for SharedSlotExtractError {
                 found,
             } => write!(
                 f,
-                "useSharedSlot{}: a partition key must be a route parameter (`params.id`); \
-                 found `{found}`. The subscribe path resolves this binding from the route path \
-                 alone, with no component render to evaluate an expression in",
+                "useSharedSlot{}: a partition key must be a route parameter (`params.id`) or the \
+                 signed-in principal (`user.id`); found `{found}`. The subscribe path resolves \
+                 this binding from the route path and the session alone, with no component render \
+                 to evaluate an expression in",
+                binding_name
+                    .as_deref()
+                    .map(|name| format!(" assigned to '{name}'"))
+                    .unwrap_or_default(),
+            ),
+            Self::UnsupportedIdentityField {
+                binding_name,
+                found,
+            } => write!(
+                f,
+                "useSharedSlot{}: `{found}` cannot be a partition key — only `user.id` can. A key \
+                 becomes a topic namespace, so it must match [A-Za-z0-9_-]{{1,64}}, and an email \
+                 or a provider subject never will. (A `session.*` field is a browser tab, not a \
+                 person, so it is not an authorization basis at all.) Store the field on the row \
+                 and partition by `user.id`",
                 binding_name
                     .as_deref()
                     .map(|name| format!(" assigned to '{name}'"))
@@ -279,8 +329,9 @@ impl std::fmt::Display for SharedSlotExtractError {
             ),
             Self::IdentityKeyNotYetSupported { binding_name } => write!(
                 f,
-                "useSharedSlot{}: per-user partitions (`user.id`) need sessions, which land with \
-                 auth — TODO #1 item 5. Route parameters (`params.id`) work today",
+                "useSharedSlot{}: per-user *source* arguments (`user.id` on an APERTURE route) \
+                 land with item 5 P5 (`scope: \"user\"`). Per-user FORGE partitions \
+                 (`todos.where({{ owner: user.id }})`) and route parameters work today",
                 binding_name
                     .as_deref()
                     .map(|name| format!(" assigned to '{name}'"))
@@ -666,11 +717,15 @@ fn extract_key_source(
         {
             match base.sym.as_ref() {
                 "params" => return Ok(KeySource::Param(field.sym.to_string())),
-                // Recognised on purpose: the author is asking for the right
-                // thing, it just isn't wired yet.
+                // AUTH item 5 P1. Only `id` — every other identity field fails
+                // the partition-key alphabet, so admitting one would mint a
+                // topic name the registry refuses at runtime instead of a build
+                // error the author can read. See [`KeySource::Identity`].
+                "user" if field.sym.as_ref() == "id" => return Ok(KeySource::Identity),
                 "user" | "session" => {
-                    return Err(SharedSlotExtractError::IdentityKeyNotYetSupported {
+                    return Err(SharedSlotExtractError::UnsupportedIdentityField {
                         binding_name: binding_name.clone(),
+                        found: format!("{}.{}", base.sym, field.sym),
                     })
                 }
                 _ => {}
@@ -1190,8 +1245,12 @@ mod tests {
     /// `user.id` is the right idea at the wrong time. It must not be lumped in
     /// with genuine nonsense — the author should learn it is scheduled.
     #[test]
-    fn a_user_partition_key_names_item_5_rather_than_failing_generically() {
-        let err = extract_err(
+    /// AUTH item 5 P1 · the sentence the whole design is built on, as a test:
+    /// *an authorization policy is never written — it is derived from the read
+    /// that needs it.* This is the read. There is no policy anywhere in the
+    /// source, and the binding still comes out keyed by the principal.
+    fn a_user_id_partition_key_lowers_to_the_identity_key_source() {
+        let bindings = extract_or_panic(
             r#"
             import { useSharedSlot } from "albedo";
             import { todos } from "albedo/forge";
@@ -1201,13 +1260,77 @@ mod tests {
             }
             "#,
         );
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].binding_name, "rows");
+        assert_eq!(
+            bindings[0].spec,
+            TopicSpec::Partition {
+                collection: "todos".to_string(),
+                column: "owner".to_string(),
+                key: KeySource::Identity,
+            },
+            "`user.id` must lower to Identity — nothing else in P1 works if it does not"
+        );
+    }
+
+    /// The refusal that has to survive P1, and the reason it is permanent rather
+    /// than scheduled: a partition key becomes a topic namespace, so it lives in
+    /// `[A-Za-z0-9_-]{1,64}`. An email never will.
+    #[test]
+    fn an_identity_field_that_is_not_id_is_refused_permanently() {
+        for source_field in ["user.email", "user.name", "session.id"] {
+            let (base, field) = source_field.split_once('.').expect("dotted");
+            let err = extract_err(&format!(
+                r#"
+                import {{ useSharedSlot }} from "albedo";
+                import {{ todos }} from "albedo/forge";
+                export default function Component({{ {base} }}) {{
+                    const rows = useSharedSlot(todos.where({{ owner: {base}.{field} }}));
+                    return <ul>{{rows}}</ul>;
+                }}
+                "#,
+            ));
+            assert!(
+                matches!(err, SharedSlotExtractError::UnsupportedIdentityField { .. }),
+                "{source_field} got {err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("only `user.id`"),
+                "the message must say what *does* work: {message}"
+            );
+            // A permanent refusal must not read like a schedule — an author who
+            // is told to wait for a feature that is never coming will wait.
+            assert!(
+                !message.contains("item 5"),
+                "a permanent refusal must not name a milestone: {message}"
+            );
+        }
+    }
+
+    /// APERTURE's identity arguments are genuinely still scheduled (P5), so that
+    /// path keeps the *later*-shaped message. Kept as its own test because the
+    /// two refusals now say different things and confusing them would tell an
+    /// author to wait for something that already shipped.
+    #[test]
+    fn an_aperture_source_argument_keyed_by_identity_still_names_its_milestone() {
+        let err = extract_err(
+            r#"
+            import { useSharedSlot } from "albedo";
+            import { gh } from "albedo/sources";
+            export default function Component({ user }) {
+                const repo = useSharedSlot(gh.repo({ owner: user.id }));
+                return <div>{repo}</div>;
+            }
+            "#,
+        );
         assert!(
             matches!(err, SharedSlotExtractError::IdentityKeyNotYetSupported { .. }),
             "got {err:?}"
         );
         assert!(
-            err.to_string().contains("item 5"),
-            "the message must name the item that unblocks it: {err}"
+            err.to_string().contains("P5"),
+            "the message must name the phase that unblocks it: {err}"
         );
     }
 

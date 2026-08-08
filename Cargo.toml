@@ -44,6 +44,18 @@ url              = { version = "2.5" }
 reqwest          = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset"] }
 uuid             = { version = "1", features = ["v4"] }
 
+# AUTH · P0 — session tokens.
+# `sha2` hashes the bearer token before it is stored, so a database read yields
+# nothing replayable (AUTH.md invariant 2.6). SHA-256 and not a password KDF on
+# purpose: the token is 256 bits of CSPRNG output, so there is no dictionary to
+# slow down, and a deliberately slow hash on the *every-request* lookup path
+# would be a self-inflicted DoS. Argon2 arrives with passwords, where the input
+# really is low-entropy.
+# `rand` supplies the token itself — `uuid`'s v4 gives 122 bits, which is fine
+# for a tab id and short of what a bearer credential should carry.
+sha2             = { version = "0.10" }
+rand             = { version = "0.8" }
+
 # Serialization
 # SWC 0.37.x still relies on serde::__private, which changed in newer serde releases.
 serde            = { version = "=1.0.217", features = ["derive"] }
@@ -200,6 +212,9 @@ tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 uuid.workspace               = true
+sha2.workspace               = true
+rand.workspace               = true
+base64.workspace             = true
 num_cpus.workspace           = true
 walkdir.workspace            = true
 notify.workspace             = true

@@ -58,6 +58,13 @@ pub struct DevConfig {
     /// hosts it yields become the egress allowlist.
     #[serde(default)]
     pub sources: BTreeMap<String, crate::aperture::SourceDecl>,
+    /// AUTH · where principals come from — the `auth` block.
+    ///
+    /// The third sibling of `forge` and `sources`, and carried the same way. An
+    /// absent block is not a misconfiguration: it means every request is
+    /// anonymous, which is what an app without login wants.
+    #[serde(default)]
+    pub auth: crate::auth::AuthDeclaration,
 }
 
 impl Default for DevConfig {
@@ -74,6 +81,7 @@ impl Default for DevConfig {
             routes: HashMap::new(),
             forge: BTreeMap::new(),
             sources: BTreeMap::new(),
+            auth: crate::auth::AuthDeclaration::default(),
         }
     }
 }
@@ -332,6 +340,17 @@ pub struct ResolvedDevContract {
     pub config_path: Option<PathBuf>,
     pub root: PathBuf,
     pub entry: String,
+    /// Which convention in [`SOURCE_LAYOUTS`] supplied `root` and `entry`, when
+    /// the author declared neither. `None` means they were declared, and nothing
+    /// was guessed.
+    ///
+    /// 🔴 **Carried so a foreign layout cannot be adopted silently.** ALBEDO
+    /// discovers routes from `<root>/routes` only, so matching, say, Next's App
+    /// Router finds one entry module and none of that router's pages — a project
+    /// that builds but describes a fraction of itself. Naming the match is what
+    /// lets every lane say so; a boolean "was detected" could not.
+    #[serde(default)]
+    pub detected_layout: Option<String>,
     pub server: DevServerConfig,
     pub watch: DevWatchConfig,
     pub hmr: DevHmrConfig,
@@ -360,6 +379,10 @@ pub struct ResolvedDevContract {
     /// outbound host is allowlisted.
     #[serde(default)]
     pub sources: BTreeMap<String, crate::aperture::SourceDecl>,
+    /// AUTH · the app's declared providers, carried through from
+    /// [`DevConfig::auth`]. Empty `providers` means every request is anonymous.
+    #[serde(default)]
+    pub auth: crate::auth::AuthDeclaration,
 }
 
 pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> {
@@ -449,12 +472,36 @@ pub fn resolve_dev_contract(
     config.validate()?;
 
     let project_dir = loaded.project_dir;
-    let root_input = if let Some(root) = cli.root_override {
-        root
-    } else if let Some(root) = config.root.take() {
-        PathBuf::from(root)
+    let declared_root = cli
+        .root_override
+        .clone()
+        .or_else(|| config.root.take().map(PathBuf::from));
+
+    // Detected only when the author declared no root — a declared one is
+    // authoritative and must not be second-guessed by a heuristic. Computed
+    // before the entry because the two are one fact: see `SourceLayout`.
+    let detected = if declared_root.is_none() && cli.entry_override.is_none() && config.entry.is_none()
+    {
+        detect_source_layout(&project_dir)
     } else {
-        PathBuf::from(default_root())
+        None
+    };
+
+    let root_input = match (&declared_root, &detected) {
+        (Some(root), _) => root.clone(),
+        (None, Some(layout)) => layout.root.clone(),
+        // No layout matched and nothing was declared: fall back to `src`, then
+        // to the project directory. The second rung matters for every framework
+        // that puts its sources at the top level — without it the failure is
+        // "dev root does not exist", which points at a directory the author
+        // never asked for.
+        (None, None) => {
+            if project_dir.join(default_root()).is_dir() {
+                PathBuf::from(default_root())
+            } else {
+                PathBuf::from(".")
+            }
+        }
     };
 
     let root = if root_input.is_absolute() {
@@ -488,11 +535,20 @@ pub fn resolve_dev_contract(
     } else if let Some(entry) = config.entry.take() {
         validate_entry_module(&entry)?;
         entry
+    } else if let Some(layout) = &detected {
+        layout.entry.clone()
     } else {
         detect_default_entry_module(&root).ok_or_else(|| {
             format!(
-                "no entry module found in '{}'; pass --entry <FILE> or set 'entry' in {}",
+                "no entry module found in '{}', and none of the layouts ALBEDO recognises \
+                 ({}) matched '{}'. Pass --entry <FILE> or set 'entry' in {}",
                 root.display(),
+                SOURCE_LAYOUTS
+                    .iter()
+                    .map(|layout| layout.name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                project_dir.display(),
                 loaded
                     .config_path
                     .as_ref()
@@ -502,14 +558,24 @@ pub fn resolve_dev_contract(
         })?
     };
 
-    let entry_path = root.join(&entry);
-    if !entry_path.is_file() {
-        return Err(format!(
-            "entry module '{}' does not exist under root '{}'",
-            entry,
-            root.display()
-        ));
-    }
+    // 🪤 An entry is root-relative, and the root is frequently NOT the directory
+    // the author is standing in — `src/` by default, `app/` for Remix. So the
+    // path that is true on disk (`src/app/page.tsx`) is the one that fails, and
+    // the message used to insist a file the author can plainly see does not
+    // exist. Accept the project-relative spelling when it lands inside the root
+    // and rewrite it, rather than making a person compute the difference.
+    let entry = match resolve_entry_path(&project_dir, &root, &entry) {
+        Some((rewritten, _)) => rewritten,
+        None => {
+            return Err(format!(
+                "entry module '{}' does not exist under root '{}' (also tried it relative to \
+                 the project directory '{}')",
+                entry,
+                root.display(),
+                project_dir.display()
+            ));
+        }
+    };
 
     // Phase N · file-based routing. `<root>/routes/` is the convention;
     // when it exists, every `*.tsx` / `*.jsx` / `*.ts` / `*.js` becomes
@@ -584,6 +650,7 @@ pub fn resolve_dev_contract(
         config_path: loaded.config_path,
         root,
         entry,
+        detected_layout: detected.map(|layout| layout.name.to_string()),
         server: config.server,
         watch: config.watch,
         hmr: config.hmr,
@@ -596,27 +663,199 @@ pub fn resolve_dev_contract(
         route_layouts,
         forge: config.forge,
         sources: config.sources,
+        auth: config.auth,
     })
 }
 
+/// A source layout ALBEDO knows how to find its way into.
+///
+/// 🔑 **Root and entry are detected together, because they are one fact.** A
+/// Next project created with `--src-dir` puts its router under `src/app`; the
+/// same project without it puts the router at the top level and has no `src/` at
+/// all. Resolving the root first and *then* hunting for an entry inside it
+/// cannot express that — it fails on the second shape before it ever looks for
+/// an entry. So a convention names both halves.
+///
+/// Only JSX/TSX layouts appear here, and that is a boundary rather than an
+/// omission: this is a JSX compiler, so Svelte, Vue and Astro projects are not
+/// half-supported, they are out of scope.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceLayout {
+    /// What to call it when telling the author what was detected.
+    pub name: &'static str,
+    /// Source root, relative to the project directory. `""` is the project
+    /// directory itself.
+    pub root: &'static str,
+    /// Entry candidates relative to [`Self::root`], in preference order.
+    pub entries: &'static [&'static str],
+}
+
+/// The layouts probed when a project declares neither `root` nor `entry`.
+///
+/// **Order is the specification.** ALBEDO's own convention is tried first and
+/// unconditionally, so nothing here can ever take precedence over a real ALBEDO
+/// project that happens to also carry an `app/` directory. Everything after it is
+/// a foreign layout, tried most-specific-first.
+///
+/// 🔴 **Detecting a foreign layout finds an entry, not a working port.** ALBEDO
+/// discovers *routes* from `<root>/routes` only, so a Next project resolves one
+/// entry module and none of its router's pages. That is why detection reports
+/// which convention it matched — see [`ResolvedDevContract::detected_layout`] —
+/// rather than quietly proceeding as though the project were understood.
+pub const SOURCE_LAYOUTS: &[SourceLayout] = &[
+    // ALBEDO · Phase N+ file-based routing, then the pre-Phase-N `App.tsx`.
+    SourceLayout {
+        name: "ALBEDO",
+        root: "src",
+        entries: &[
+            "routes/index.tsx",
+            "routes/index.jsx",
+            "routes/index.ts",
+            "routes/index.js",
+            "App.tsx",
+            "App.jsx",
+            "App.ts",
+            "App.js",
+        ],
+    },
+    // ALBEDO with the sources at the top level rather than under `src/`.
+    SourceLayout {
+        name: "ALBEDO (flat)",
+        root: "",
+        entries: &["routes/index.tsx", "routes/index.jsx", "App.tsx", "App.jsx"],
+    },
+    // Next.js · App Router. `page` is the route file; `layout` is checked too
+    // because a route group can push the first `page` deeper than the top level.
+    SourceLayout {
+        name: "Next.js App Router (src/)",
+        root: "src",
+        entries: &["app/page.tsx", "app/page.jsx", "app/layout.tsx"],
+    },
+    SourceLayout {
+        name: "Next.js App Router",
+        root: "",
+        entries: &["app/page.tsx", "app/page.jsx", "app/layout.tsx"],
+    },
+    // Next.js · Pages Router.
+    SourceLayout {
+        name: "Next.js Pages Router (src/)",
+        root: "src",
+        entries: &["pages/index.tsx", "pages/index.jsx", "pages/_app.tsx"],
+    },
+    SourceLayout {
+        name: "Next.js Pages Router",
+        root: "",
+        entries: &["pages/index.tsx", "pages/index.jsx", "pages/_app.tsx"],
+    },
+    // Remix, and React Router v7 in framework mode — same shape, same file.
+    SourceLayout {
+        name: "Remix / React Router",
+        root: "app",
+        entries: &["root.tsx", "root.jsx"],
+    },
+    // Expo Router — file-based, and the closest cousin to ALBEDO's own shape.
+    SourceLayout {
+        name: "Expo Router",
+        root: "app",
+        entries: &["index.tsx", "index.jsx", "_layout.tsx"],
+    },
+    // Vite, Create React App, and every hand-rolled bundler setup. Last,
+    // because `src/main.tsx` and `src/index.tsx` are generic enough that a
+    // framework project may also contain one.
+    SourceLayout {
+        name: "Vite / CRA",
+        root: "src",
+        entries: &[
+            "main.tsx",
+            "main.jsx",
+            "index.tsx",
+            "index.jsx",
+            "App.tsx",
+            "App.jsx",
+        ],
+    },
+];
+
+/// A layout that matched a real project on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedLayout {
+    /// The matched convention's name, for reporting.
+    pub name: &'static str,
+    /// Absolute source root.
+    pub root: PathBuf,
+    /// Entry module, relative to [`Self::root`].
+    pub entry: String,
+}
+
+/// Find the source root and entry of a project that declared neither.
+///
+/// Returns the first convention in [`SOURCE_LAYOUTS`] whose root exists and one
+/// of whose entries is a file. `None` means no known layout matched, which the
+/// caller turns into an error that names what was looked for — a bare "no entry
+/// module found" tells an author nothing about how to fix it.
+#[must_use]
+pub fn detect_source_layout(project_dir: &Path) -> Option<DetectedLayout> {
+    for layout in SOURCE_LAYOUTS {
+        let root = if layout.root.is_empty() {
+            project_dir.to_path_buf()
+        } else {
+            project_dir.join(layout.root)
+        };
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in layout.entries {
+            if root.join(entry).is_file() {
+                return Some(DetectedLayout {
+                    name: layout.name,
+                    root,
+                    entry: (*entry).to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Resolve an entry spelling to `(root-relative entry, absolute path)`.
+///
+/// Tries the entry as root-relative first — that is what it means — and falls
+/// back to project-relative, accepting it only when the file actually lands
+/// inside the root. The fallback cannot smuggle a module in from outside the
+/// source tree, because a path that does not sit under the root is rejected the
+/// same as one that does not exist.
+#[allow(clippy::type_complexity)]
+fn resolve_entry_path(project_dir: &Path, root: &Path, entry: &str) -> Option<(String, PathBuf)> {
+    let direct = root.join(entry);
+    if direct.is_file() {
+        return Some((entry.to_string(), direct));
+    }
+
+    let from_project = project_dir.join(entry);
+    if !from_project.is_file() {
+        return None;
+    }
+    // Compared through `canonicalize` so `src/../src/app/page.tsx` and a
+    // symlinked root both answer the same question the filesystem would.
+    let canonical_root = root.canonicalize().ok()?;
+    let canonical_entry = from_project.canonicalize().ok()?;
+    let relative = canonical_entry.strip_prefix(&canonical_root).ok()?;
+    Some((
+        relative.to_string_lossy().replace('\\', "/"),
+        from_project,
+    ))
+}
+
+/// Find an entry inside a root the author *did* declare.
+///
+/// Every convention's candidates are tried, in table order, because a declared
+/// root says where the sources are and not which framework put them there.
 fn detect_default_entry_module(root: &Path) -> Option<String> {
-    // Phase N+ file-based routing — `routes/index.tsx` is the
-    // canonical entry; fall back to the legacy `App.tsx` shape so
-    // pre-Phase-N projects still resolve. Forward slashes are
-    // normalised through PathBuf::is_file on both platforms.
-    let candidates = [
-        "routes/index.tsx",
-        "routes/index.jsx",
-        "routes/index.ts",
-        "routes/index.js",
-        "App.tsx",
-        "App.jsx",
-        "App.ts",
-        "App.js",
-    ];
-    for candidate in candidates {
-        if root.join(candidate).is_file() {
-            return Some(candidate.to_string());
+    for layout in SOURCE_LAYOUTS {
+        for candidate in layout.entries {
+            if root.join(candidate).is_file() {
+                return Some((*candidate).to_string());
+            }
         }
     }
     None
@@ -1174,6 +1413,118 @@ export default defineConfig({
         assert_eq!(resolved.server.port, 4999);
         assert!(resolved.strict);
         assert!(resolved.open);
+    }
+
+    /// Write a component file, creating parents.
+    fn place(root: &Path, relative: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("relative path has a parent")).unwrap();
+        std::fs::write(&path, "export default function P(){return null;}").unwrap();
+    }
+
+    /// Every layout in the table, matched against the shape it names.
+    ///
+    /// Written as one table-driven test rather than nine, because the property
+    /// under test is the *table* — that each convention resolves, and that none
+    /// of them shadows a project belonging to another.
+    #[test]
+    fn every_known_layout_resolves_its_own_shape() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            // (label, file to place, expected layout name, expected entry)
+            ("albedo", "src/routes/index.tsx", "ALBEDO", "routes/index.tsx"),
+            ("albedo-legacy", "src/App.tsx", "ALBEDO", "App.tsx"),
+            ("albedo-flat", "routes/index.tsx", "ALBEDO (flat)", "routes/index.tsx"),
+            (
+                "next-app-src",
+                "src/app/page.tsx",
+                "Next.js App Router (src/)",
+                "app/page.tsx",
+            ),
+            ("next-app", "app/page.tsx", "Next.js App Router", "app/page.tsx"),
+            (
+                "next-pages-src",
+                "src/pages/index.tsx",
+                "Next.js Pages Router (src/)",
+                "pages/index.tsx",
+            ),
+            (
+                "next-pages",
+                "pages/index.tsx",
+                "Next.js Pages Router",
+                "pages/index.tsx",
+            ),
+            ("remix", "app/root.tsx", "Remix / React Router", "root.tsx"),
+            ("expo", "app/index.tsx", "Expo Router", "index.tsx"),
+            ("vite", "src/main.tsx", "Vite / CRA", "main.tsx"),
+            ("cra", "src/index.tsx", "Vite / CRA", "index.tsx"),
+        ];
+
+        for (label, file, expected_name, expected_entry) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            place(temp.path(), file);
+            let detected = detect_source_layout(temp.path())
+                .unwrap_or_else(|| panic!("{label}: no layout matched for '{file}'"));
+            assert_eq!(detected.name, *expected_name, "{label}: wrong layout");
+            assert_eq!(detected.entry, *expected_entry, "{label}: wrong entry");
+        }
+    }
+
+    /// 🔑 **ALBEDO's own convention wins outright.** A project that is ours and
+    /// also happens to carry an `app/` directory must never be read as somebody
+    /// else's — the table's order is the specification, and this pins it.
+    #[test]
+    fn an_albedo_project_is_never_mistaken_for_a_foreign_one() {
+        let temp = tempfile::tempdir().unwrap();
+        place(temp.path(), "src/routes/index.tsx");
+        place(temp.path(), "src/app/page.tsx");
+        place(temp.path(), "app/root.tsx");
+
+        let detected = detect_source_layout(temp.path()).expect("a layout matched");
+        assert_eq!(detected.name, "ALBEDO");
+        assert_eq!(detected.entry, "routes/index.tsx");
+    }
+
+    /// Nothing recognisable must stay `None` rather than guessing at the first
+    /// `.tsx` it trips over — a wrong entry produces a build that is confidently
+    /// about the wrong thing.
+    #[test]
+    fn an_unrecognised_project_matches_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        place(temp.path(), "lib/deep/thing.tsx");
+        assert!(detect_source_layout(temp.path()).is_none());
+    }
+
+    /// 🪤 The papercut this fixes: with a `src` root, the path that is true on
+    /// disk (`src/app/page.tsx`) was the one rejected, and the error insisted a
+    /// visible file did not exist.
+    #[test]
+    fn an_entry_may_be_spelled_relative_to_the_project_or_the_root() {
+        let temp = tempfile::tempdir().unwrap();
+        place(temp.path(), "src/app/page.tsx");
+        let root = temp.path().join("src");
+
+        let (root_relative, _) =
+            resolve_entry_path(temp.path(), &root, "app/page.tsx").expect("root-relative");
+        assert_eq!(root_relative, "app/page.tsx");
+
+        let (rewritten, _) =
+            resolve_entry_path(temp.path(), &root, "src/app/page.tsx").expect("project-relative");
+        assert_eq!(
+            rewritten, "app/page.tsx",
+            "the project-relative spelling should be rewritten, not rejected"
+        );
+    }
+
+    /// The fallback must not become a hole: a file outside the source root is
+    /// still refused, however it is spelled.
+    #[test]
+    fn an_entry_outside_the_root_is_still_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        place(temp.path(), "src/app/page.tsx");
+        place(temp.path(), "elsewhere/sneaky.tsx");
+        let root = temp.path().join("src");
+
+        assert!(resolve_entry_path(temp.path(), &root, "elsewhere/sneaky.tsx").is_none());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! clients. Each event carries the new HTML for the affected route(s)
 //! so the client can swap the DOM subtree in place — slot state lives
 //! on the server (Phase H `SlotStore` keyed by `SessionId`), so the
-//! cookie's albedo-session survives and the next render reads the
+//! cookie's __Host-albedo-session survives and the next render reads the
 //! same per-session values.
 
 use serde::Serialize;

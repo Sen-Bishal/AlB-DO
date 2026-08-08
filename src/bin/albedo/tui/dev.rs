@@ -399,10 +399,33 @@ impl Dashboard {
             report.tier_c_count,
         ];
         let total: usize = counts.iter().sum();
+        // 🔴 Item 4.9 T0, 2026-08-05. These three strings used to read
+        // `zero JS · static` / `hydrated · {tier_b_hydration_bytes} kB` /
+        // `streamed`, which was wrong twice over:
+        //
+        // 1. **The vocabulary was inverted.** Tier C — the only tier that ships
+        //    component code — was labelled `streamed`, and Tier B, which ships
+        //    none, was labelled `hydrated`.
+        // 2. **`tier_b_hydration_bytes` is the fabricated number item 4.6
+        //    deleted** — a sum of `WeightEstimator::estimate`
+        //    (`500 + imports*100 + …`), a proxy for source size with no
+        //    relationship to any shipped byte, billed against the tier that
+        //    downloads nothing.
+        //
+        // 4.6 fixed `bin/albedo/printer.rs` and never swept this lane, so the
+        // dashboard kept printing a number the build output had already
+        // retracted. Same failure mode item 6.5's `BootReport` exists to
+        // prevent: **three lanes describing one event three ways.** Kept
+        // deliberately in step with `printer.rs` — if that file's wording
+        // changes, change it here in the same edit.
+        //
+        // No byte figure here on purpose: the honest Tier-C number comes from
+        // `compile_client_island_module` via `MeasuredTierBytes`, which the
+        // dashboard's `TierReport` does not carry.
         let hints = [
             "zero JS · static".to_string(),
-            format!("hydrated · {:.1} kB", report.tier_b_hydration_bytes as f64 / 1024.0),
-            "streamed".to_string(),
+            "server-rendered · zero JS".to_string(),
+            "client island".to_string(),
         ];
 
         let mut lines: Vec<Line> = vec![Line::from("")];
@@ -726,10 +749,34 @@ mod tests {
     #[test]
     fn the_tier_panel_shows_the_mix_and_the_components() {
         let text = screen(&dashboard(), 120, 30);
-        assert!(text.contains("5.7 kB"), "tier B payload: {text}");
         assert!(text.contains("zero JS"), "{text}");
         assert!(text.contains("Guestbook"), "{text}");
         assert!(text.contains("Overview"), "{text}");
+
+        // 🪤 Item 4.9 T0. This test used to assert `text.contains("5.7 kB")`
+        // under the label "tier B payload" — it was **pinning the defect**.
+        // That figure is `tier_b_hydration_bytes`, the `WeightEstimator` proxy
+        // item 4.6 deleted from `albedo build`, billed against the tier that
+        // downloads nothing. The dashboard lane was never swept, so the number
+        // survived here with a test holding it in place.
+        //
+        // The assertion is inverted deliberately: **no kB figure may be
+        // attributed to Tier B**, because there is no Tier-B payload to
+        // measure. The report fixture still carries a non-zero
+        // `tier_b_hydration_bytes`, so this fails the moment anyone prints it
+        // again.
+        assert!(
+            !text.contains("5.7 kB"),
+            "Tier B ships no component JS — no byte figure may be billed to it: {text}"
+        );
+        assert!(
+            text.contains("server-rendered"),
+            "Tier B's hint must say what it actually is: {text}"
+        );
+        assert!(
+            text.contains("client island"),
+            "Tier C is the tier that ships code, and must say so: {text}"
+        );
     }
 
     #[test]

@@ -78,6 +78,7 @@ fn ctx() -> RequestContext {
         headers: BTreeMap::new(),
         body: Bytes::new(),
         metadata: BTreeMap::new(),
+        principal: None,
     }
 }
 

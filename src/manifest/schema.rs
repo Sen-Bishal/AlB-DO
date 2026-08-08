@@ -229,8 +229,10 @@ pub struct MetaTag {
     pub content: String,
 }
 
-/// PRISM · one `useSharedSlot(<collection>.where({ <column>: params.<param> }))`
-/// binding, carried to serve time unresolved.
+/// PRISM · one `useSharedSlot(<collection>.where({ <column>: <key source> }))`
+/// binding, carried to serve time unresolved. The key source is a route param
+/// (`params.id`) or the signed-in principal (`user.id`) — see
+/// [`PartitionKeySource`].
 ///
 /// The extractor lowers the TSX to this; [`crate::runtime::resolve_partition_topics`]
 /// turns it into a topic identity once a request supplies the params. Nothing
@@ -251,8 +253,50 @@ pub struct PartitionTopicSpec {
     /// (`validate_partition_bindings`); kept because the write path resolves by
     /// column and a mismatch here would be silent.
     pub column: String,
-    /// The route param supplying the key: `params.id` → `"id"`.
-    pub param: String,
+    /// Where the partition key comes from: `params.id` → `RouteParam("id")`,
+    /// `user.id` → `Identity`.
+    pub key: PartitionKeySource,
+}
+
+/// Where a [`PartitionTopicSpec`]'s key is read from on a request.
+///
+/// The serve-time mirror of [`crate::transforms::shared_slots::KeySource`],
+/// which is the compile-time one. They are separate types on purpose: this one
+/// crosses the manifest and so is a wire format, and collapsing them would let a
+/// change to the extractor's vocabulary silently change a serialized artifact.
+///
+/// Serialized externally tagged, so a manifest diff reads as
+/// `"key": {"route_param": "id"}` or `"key": "identity"` — the distinction a
+/// reviewer most needs to see is the one between "keyed by the URL" and "keyed
+/// by who is asking".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionKeySource {
+    /// A route parameter: `params.id` on `/room/[id]`.
+    RouteParam(String),
+    /// The authenticated principal's id — AUTH § 3, item 5 P1.
+    ///
+    /// 🔒 **Resolves to no topic at all when the request is anonymous.** Not to
+    /// an empty key, and not to a shared fallback: a partition every signed-out
+    /// visitor could name would be one namespace holding everyone's rows, which
+    /// is the exact failure the derived-authorization design exists to make
+    /// unexpressible. See [`crate::runtime::resolve_partition_topics`].
+    Identity,
+}
+
+impl PartitionKeySource {
+    /// The route param name, when the key comes from the URL.
+    ///
+    /// `None` for [`Self::Identity`] — which is the honest answer, and callers
+    /// that reconstruct a `params` object for a re-render depend on it being
+    /// absent rather than empty.
+    #[must_use]
+    pub fn route_param(&self) -> Option<&str> {
+        match self {
+            Self::RouteParam(name) => Some(name.as_str()),
+            Self::Identity => None,
+        }
+    }
 }
 
 /// APERTURE · one `useSharedSlot(<source>.<route>({ … }))` binding on a route.
@@ -505,10 +549,54 @@ impl PrecompiledRuntimeModulesArtifact {
 
 #[cfg(test)]
 mod tests {
-    use super::HydrationMode;
+    use super::{HydrationMode, PartitionKeySource, PartitionTopicSpec};
 
     #[test]
     fn test_hydration_mode_none_stays_none_for_streaming() {
         assert_eq!(HydrationMode::None.into_streaming(), HydrationMode::None);
+    }
+
+    /// AUTH item 5 P1 · the manifest is an artifact a reviewer reads, so the
+    /// spelling is pinned rather than left to serde's defaults. The distinction
+    /// this encodes — *keyed by the URL* vs *keyed by who is asking* — is the one
+    /// an auditor most needs to see at a glance in a diff.
+    #[test]
+    fn a_partition_key_source_serializes_to_a_readable_shape() {
+        let by_param = serde_json::to_string(&PartitionKeySource::RouteParam("id".to_string()))
+            .expect("serialize");
+        assert_eq!(by_param, r#"{"route_param":"id"}"#);
+
+        let by_identity = serde_json::to_string(&PartitionKeySource::Identity).expect("serialize");
+        assert_eq!(by_identity, r#""identity""#);
+    }
+
+    #[test]
+    fn a_partition_spec_round_trips_through_the_manifest() {
+        for key in [
+            PartitionKeySource::RouteParam("id".to_string()),
+            PartitionKeySource::Identity,
+        ] {
+            let spec = PartitionTopicSpec {
+                binding: "rows".to_string(),
+                collection: "todos".to_string(),
+                column: "owner".to_string(),
+                key,
+            };
+            let encoded = serde_json::to_string(&spec).expect("serialize");
+            let decoded: PartitionTopicSpec = serde_json::from_str(&encoded).expect("deserialize");
+            assert_eq!(spec, decoded);
+        }
+    }
+
+    /// `route_param()` returning `None` for `Identity` is depended on by the row
+    /// projector, which reconstructs props for a re-render: an identity key must
+    /// land under `user`, never under a param name it does not have.
+    #[test]
+    fn identity_reports_no_route_param() {
+        assert_eq!(
+            PartitionKeySource::RouteParam("id".to_string()).route_param(),
+            Some("id")
+        );
+        assert_eq!(PartitionKeySource::Identity.route_param(), None);
     }
 }

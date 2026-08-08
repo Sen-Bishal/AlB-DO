@@ -69,7 +69,7 @@ fn build_server() -> albedo_server::server::AlbedoServer {
 }
 
 /// Construct a POST /_albedo/action request carrying the bincoded
-/// envelope, with an optional `albedo-session` cookie pinned to the
+/// envelope, with an optional `__Host-albedo-session` cookie pinned to the
 /// supplied session id. Mirrors what the browser's link-forms client
 /// emits during a form submit.
 fn action_request(envelope: ActionEnvelope, session_cookie: Option<SessionId>) -> Request<Body> {

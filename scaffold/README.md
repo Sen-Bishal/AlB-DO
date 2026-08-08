@@ -28,7 +28,7 @@ albedo ship     # package for deployment (docker / fly / static)
 │   │   └── guestbook.tsx   — `/guestbook` live FORGE collection
 │   ├── components/
 │   │   ├── Hero.tsx        — Tier A · pure, static HTML
-│   │   └── Counter.tsx     — Tier B · hydrated island
+│   │   └── Counter.tsx     — Tier C · a client island
 │   ├── albedo-env.d.ts     — ambient JSX + framework module types
 │   └── styles.css          — hand-crafted stylesheet (auto-bundled)
 └── tsconfig.json
@@ -36,16 +36,34 @@ albedo ship     # package for deployment (docker / fly / static)
 
 ## The three tiers
 
-AlBDO sorts every component into exactly one tier based on its effect
-profile — hooks, async, IO, side effects, and weight. The compiler picks
-for you, but you can see each one at work in the starter:
+AlBDO sorts every component into exactly one tier. **The compiler decides —
+you never mark a component with a directive.** All three are in the starter:
 
-| Tier | Example          | What ships                                        |
-|------|------------------|---------------------------------------------------|
-| A    | `Hero.tsx`       | HTML only · zero JS, zero hydration               |
-| B    | `Counter.tsx`    | small hydration island, boots on idle             |
-| B    | `guestbook.tsx`  | `useSharedSlot` on a FORGE collection — live rows |
-| C    | (add one)        | streamed from the server as data lands            |
+| Tier | Example          | What ships                                                  |
+|------|------------------|-------------------------------------------------------------|
+| A    | `Hero.tsx`       | markup only · zero JS                                        |
+| B    | `guestbook.tsx`  | markup only · **zero component JS** — updates ride the wire  |
+| C    | `Counter.tsx`    | a compiled client island — **the only tier that ships code** |
+
+**The question the compiler is answering is who owns the state.**
+
+`guestbook.tsx` holds its rows in a FORGE collection, so the *server* owns
+them — every connected client has to see the same list. That state can never
+live in one browser, so its updates travel as instructions over an open
+connection and **no component code is sent at all**. That is Tier B, and it is
+the tier most frameworks do not have: not static, not shipped.
+
+`Counter.tsx` holds a number that nobody else will ever see. Nothing outside
+that one tab cares, so pushing each click through the server would buy a
+network round trip and nothing else. It gets a small island instead. That is
+Tier C, and **it is the right answer, not a failure** — the island is there
+because the state genuinely is local.
+
+`Hero.tsx` holds no state at all. Tier A.
+
+> Run `albedo build` to see the letter and the byte cost for every component in
+> your project. **Trust that output over any comment, including this one** —
+> the compiler is the only thing that actually decides.
 
 ## The backend is a config block
 

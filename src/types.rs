@@ -30,6 +30,16 @@ pub struct Component {
     /// Distinct from `is_interactive` (any handler). See the tier design step 2.
     #[serde(default)]
     pub is_client_interactive: bool,
+    /// Item 4.9 T1 · **state ownership.** True when this component's state is
+    /// *proven* to leave the client (a `useSharedSlot` topic, a FORGE write, a
+    /// server `action`, a network boundary) — so the **server** owns it and its
+    /// updates ride the wire as opcodes instead of shipping an island.
+    ///
+    /// False means "not proven to escape", **never** "proven local". Defaults
+    /// to `false` so existing manifests deserialize unchanged, and so an
+    /// unanalyzed component keeps the tier it has today.
+    #[serde(default)]
+    pub state_escapes: bool,
     pub is_lcp_candidate: bool,
     pub effect_profile: EffectProfile,
     pub source_hash: u64,
@@ -55,6 +65,7 @@ impl Component {
             is_above_fold: false,
             is_interactive: false,
             is_client_interactive: false,
+            state_escapes: false,
             is_lcp_candidate: false,
             effect_profile: EffectProfile::default(),
             source_hash: 0,

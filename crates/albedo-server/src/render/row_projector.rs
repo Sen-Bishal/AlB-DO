@@ -34,6 +34,7 @@
 
 use async_trait::async_trait;
 use dom_render_compiler::forge::{RenderedRows, RowProjector};
+use dom_render_compiler::manifest::schema::PartitionKeySource;
 use dom_render_compiler::transforms::shared_slot_lists::extract_keyed_rows;
 use serde_json::Value;
 use std::sync::Arc;
@@ -121,21 +122,35 @@ impl PooledRowProjector {
     /// into the write). Rendering it with no props does not merely lose a
     /// heading: `params.id` throws, the projection fails, and the write silently
     /// degrades to a snapshot no keyed anchor repaints from.
+    /// AUTH item 5 P1 · an identity-keyed partition reconstructs `user`, not
+    /// `params`. Same argument one step over: the key *is* the principal, and a
+    /// component that partitions by `user.id` is at least as likely to render it
+    /// (`<h1>{user.id}'s list</h1>`) as a room component is to render its param.
+    /// Putting the principal under a made-up param name would render the right
+    /// rows behind the wrong heading — or throw, which costs the whole delta.
     fn props_for(&self, collection: &str, partition: Option<&str>) -> String {
         let Some(key) = partition else {
             return "{}".to_string();
         };
-        let params = self
-            .sole_reader(collection)
-            .map(|(_, plan)| {
-                plan.shared_partitions
-                    .iter()
-                    .filter(|spec| spec.collection == collection)
-                    .map(|spec| (spec.param.clone(), Value::String(key.to_string())))
-                    .collect::<serde_json::Map<String, Value>>()
-            })
-            .unwrap_or_default();
-        serde_json::to_string(&serde_json::json!({ "params": params }))
+        let mut params = serde_json::Map::new();
+        let mut user = Value::Null;
+        if let Some((_, plan)) = self.sole_reader(collection) {
+            for spec in plan
+                .shared_partitions
+                .iter()
+                .filter(|spec| spec.collection == collection)
+            {
+                match &spec.key {
+                    PartitionKeySource::RouteParam(name) => {
+                        params.insert(name.clone(), Value::String(key.to_string()));
+                    }
+                    PartitionKeySource::Identity => {
+                        user = serde_json::json!({ "id": key });
+                    }
+                }
+            }
+        }
+        serde_json::to_string(&serde_json::json!({ "params": params, "user": user }))
             .unwrap_or_else(|_| "{}".to_string())
     }
 

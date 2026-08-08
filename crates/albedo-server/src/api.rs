@@ -167,6 +167,7 @@ mod tests {
             headers: BTreeMap::new(),
             body: Bytes::from_static(b"payload"),
             metadata: BTreeMap::new(),
+            principal: None,
         };
         let response = handler.handle(ctx).await.unwrap();
         assert_eq!(response.body.as_ref(), b"payload");

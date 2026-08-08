@@ -75,6 +75,7 @@ impl ComponentParser {
                 effect_profile: EffectProfile::default(),
                 is_interactive: false,
                 is_client_interactive: false,
+                state_escapes: false,
                 source_hash,
                 is_module_only: true,
             });
@@ -130,6 +131,12 @@ pub struct ParsedComponent {
     /// (server round-trip). A `Counter` (onClick→setState) is client-satisfiable;
     /// a `LikeButton` (onClick→`fetch`) is not. See step 2 in the tier design.
     pub is_client_interactive: bool,
+    /// Item 4.9 T1 · **the state-ownership signal.** True when the component's
+    /// state is *proven* to leave the client — a `useSharedSlot` topic, a FORGE
+    /// write, a server `action`, or a network boundary. False means "not proven
+    /// to escape", **not** "proven local": see [`is_escape_call`] for why the
+    /// unknown case must round toward Tier C.
+    pub state_escapes: bool,
     pub source_hash: u64,
     /// True when this node represents a file that declared NO component but
     /// DOES export something (a pure data/util/lib module). It is a graph +
@@ -228,6 +235,7 @@ impl ComponentVisitor {
             effect_profile: analysis.profile,
             is_interactive: analysis.is_interactive,
             is_client_interactive: analysis.is_client_interactive,
+            state_escapes: analysis.state_escapes,
             source_hash: self.source_hash,
             is_module_only: false,
         });
@@ -336,6 +344,7 @@ impl Visit for ComponentVisitor {
                 comp.is_interactive = comp.is_interactive || analysis.is_interactive;
                 comp.is_client_interactive =
                     comp.is_client_interactive || analysis.is_client_interactive;
+                comp.state_escapes = comp.state_escapes || analysis.state_escapes;
             } else {
                 self.push_component(name, estimated_size, true, analysis);
             }
@@ -351,6 +360,9 @@ struct ComponentAnalysis {
     is_interactive: bool,
     /// At least one handler is provably client-satisfiable (no server boundary).
     is_client_interactive: bool,
+    /// This component's state is **proven** to escape the client — see
+    /// [`is_escape_call`] and `Component::state_escapes`.
+    state_escapes: bool,
 }
 
 #[derive(Default)]
@@ -361,10 +373,22 @@ struct EffectCollector {
     /// the component body before the main walk so handler references such as
     /// `onClick={inc}` can be resolved against it.
     local_safety: HashMap<String, bool>,
+    /// Per-component map: local function/const name -> **escapes** (its body
+    /// reaches an escape construct, transitively via other locals). Same
+    /// fixpoint as `local_safety`, opposite polarity, so `onClick={handleAdd}`
+    /// where `const handleAdd = () => append(…)` is seen as an escape. That
+    /// indirection is the common idiom, not an edge case.
+    local_escapes: HashMap<String, bool>,
     /// Saw at least one `on*` JSX handler prop.
     has_handler: bool,
     /// Saw at least one provably client-satisfiable `on*` handler.
     has_client_handler: bool,
+    /// Saw at least one escape construct, at render scope **or inside a handler
+    /// closure**.
+    escapes: bool,
+    /// Names bound locally in the component body. These **shadow** ALBEDO's
+    /// ambient globals — see [`DefScan::found_escape`].
+    shadowed: HashSet<String>,
 }
 
 impl EffectCollector {
@@ -373,6 +397,7 @@ impl EffectCollector {
             profile: self.profile,
             is_interactive: self.has_handler,
             is_client_interactive: self.has_client_handler,
+            state_escapes: self.escapes,
         }
     }
 
@@ -381,9 +406,16 @@ impl EffectCollector {
     /// network/server boundary, transitively through other locals). This lets a
     /// handler reference like `onClick={inc}` resolve to `inc`'s analysis.
     fn prime_local_defs(&mut self, stmts: &[Stmt]) {
-        // direct[name] = body directly contains a server-boundary io call.
-        // calls[name]  = function names this def invokes (for transitivity).
+        // Shadowing is collected first: every scan below consults it, and a
+        // name bound by `const { append } = useFieldArray(…)` must never be
+        // read as ALBEDO's ambient FORGE write.
+        collect_bound_names(stmts, &mut self.shadowed);
+
+        // direct[name]        = body directly contains a server-boundary io call.
+        // direct_escape[name] = body directly contains an escape construct.
+        // calls[name]         = function names this def invokes (for transitivity).
         let mut direct: HashMap<String, bool> = HashMap::new();
+        let mut direct_escape: HashMap<String, bool> = HashMap::new();
         let mut calls: HashMap<String, Vec<String>> = HashMap::new();
 
         for stmt in stmts {
@@ -395,15 +427,18 @@ impl EffectCollector {
                     }
                     let name = f.ident.sym.to_string();
                     direct.insert(name.clone(), scan.found_io);
+                    direct_escape.insert(name.clone(), scan.found_escape(&self.shadowed));
                     calls.insert(name, scan.called);
                 }
                 Stmt::Decl(Decl::Var(var)) => {
                     for decl in &var.decls {
                         if let Some(name) = decl.name.as_ident().map(|i| i.sym.to_string()) {
                             if let Some(init) = &decl.init {
-                                if let Some((found_io, called)) = scan_closure(init) {
-                                    direct.insert(name.clone(), found_io);
-                                    calls.insert(name, called);
+                                if let Some(scan) = scan_closure(init) {
+                                    direct.insert(name.clone(), scan.found_io);
+                                    direct_escape
+                                        .insert(name.clone(), scan.found_escape(&self.shadowed));
+                                    calls.insert(name, scan.called);
                                 }
                             }
                         }
@@ -413,33 +448,80 @@ impl EffectCollector {
             }
         }
 
-        // Fixpoint: a def is unsafe if it directly hits a boundary, or it calls
-        // a local def already known to be unsafe.
-        let mut unsafe_defs: HashSet<String> = direct
-            .iter()
-            .filter(|(_, io)| **io)
-            .map(|(name, _)| name.clone())
-            .collect();
-        loop {
-            let mut changed = false;
-            for (name, callees) in &calls {
-                if unsafe_defs.contains(name) {
-                    continue;
+        /// Least fixpoint over the local call graph: a def is tainted if it is
+        /// directly tainted, or it calls a local def already known tainted.
+        /// Shared by the two analyses so they cannot drift apart.
+        fn propagate(
+            direct: &HashMap<String, bool>,
+            calls: &HashMap<String, Vec<String>>,
+        ) -> HashSet<String> {
+            let mut tainted: HashSet<String> = direct
+                .iter()
+                .filter(|(_, hit)| **hit)
+                .map(|(name, _)| name.clone())
+                .collect();
+            loop {
+                let mut changed = false;
+                for (name, callees) in calls {
+                    if tainted.contains(name) {
+                        continue;
+                    }
+                    if callees.iter().any(|c| tainted.contains(c)) {
+                        tainted.insert(name.clone());
+                        changed = true;
+                    }
                 }
-                if callees.iter().any(|c| unsafe_defs.contains(c)) {
-                    unsafe_defs.insert(name.clone());
-                    changed = true;
+                if !changed {
+                    break;
                 }
             }
-            if !changed {
-                break;
-            }
+            tainted
         }
+
+        let unsafe_defs = propagate(&direct, &calls);
+        let escaping_defs = propagate(&direct_escape, &calls);
 
         self.local_safety = direct
             .keys()
             .map(|name| (name.clone(), !unsafe_defs.contains(name)))
             .collect();
+        self.local_escapes = direct_escape
+            .keys()
+            .map(|name| (name.clone(), escaping_defs.contains(name)))
+            .collect();
+    }
+
+    /// Does this `on*` handler value reach an escape construct?
+    ///
+    /// Deliberately **descends into the closure**, unlike the effect-profile
+    /// walk in `visit_jsx_attr`, which must not: a `fetch` inside `onClick` is
+    /// not a *render-time* io boundary, but an `append()` inside `onClick` is
+    /// still state leaving the client. Escape is a property of the transition,
+    /// not of when it runs.
+    fn handler_escapes(&self, value: Option<&JSXAttrValue>) -> bool {
+        let Some(JSXAttrValue::JSXExprContainer(container)) = value else {
+            return false;
+        };
+        let JSXExpr::Expr(expr) = &container.expr else {
+            return false;
+        };
+
+        // `onClick={handleAdd}` — resolve through the local fixpoint.
+        if let Expr::Ident(ident) = &**expr {
+            return self
+                .local_escapes
+                .get(ident.sym.as_ref())
+                .copied()
+                .unwrap_or(false);
+        }
+
+        let mut scan = DefScan::default();
+        expr.visit_with(&mut scan);
+        scan.found_escape(&self.shadowed)
+            || scan
+                .called
+                .iter()
+                .any(|name| self.local_escapes.get(name) == Some(&true))
     }
 
     /// Is this `on*` handler value provably client-satisfiable?
@@ -479,6 +561,12 @@ impl EffectCollector {
         let name = call_name.trim();
         if is_hook_call(name) {
             self.profile.hooks = true;
+        }
+        if is_escape_call(name) && !self.shadowed.contains(name) {
+            // Item 4.9 T1. Render-scope escapes — `useSharedSlot(…)` is the
+            // load-bearing one: the state IS a broadcast topic, so it is shared
+            // by construction and no analysis of *who else reads it* is needed.
+            self.escapes = true;
         }
         if is_effect_hook_call(name) {
             // An effect hook requires client execution → fully hydrated Tier-C
@@ -522,6 +610,13 @@ impl Visit for EffectCollector {
                 if self.handler_is_client_safe(attr.value.as_ref()) {
                     self.has_client_handler = true;
                 }
+                // Item 4.9 T1. Escape IS read out of the handler closure, even
+                // though the effect profile deliberately is not — see
+                // `handler_escapes`. `onClick={() => append(…)}` writes to
+                // FORGE, and that is state leaving the client whenever it runs.
+                if self.handler_escapes(attr.value.as_ref()) {
+                    self.escapes = true;
+                }
                 // Do NOT descend into the handler closure: its effects run at
                 // interaction time, not render time, so they must not pollute
                 // the render-time effect profile (a `fetch` inside onClick is
@@ -536,6 +631,43 @@ impl Visit for EffectCollector {
 fn is_event_handler_prop(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() > 2 && &bytes[..2] == b"on" && bytes[2].is_ascii_uppercase()
+}
+
+/// Does this call make the component's state **escape the client**?
+///
+/// Item 4.9 **T1**. This is the signal the tier ladder is actually about: state
+/// that leaves one browser is state the *server* owns, so its updates travel as
+/// opcodes over the wire and the component ships no code (Tier B). State no one
+/// outside the tab can observe is client-owned, and an island is the honest
+/// answer (Tier C).
+///
+/// 🔑 **Only positive evidence counts.** Absence of a match means *"not proven
+/// to escape"*, never *"proven local"* — so an unmatched component keeps the
+/// tier it has today. That direction is deliberate: **a wrong Tier C still
+/// works** (an island is the general fallback), while a wrong Tier B ships a
+/// binding for state the wire cannot drive. Unknown must round toward C, the
+/// top of the lattice.
+///
+/// 🪤 This is the lesson of the signal it sits beside. `is_server_boundary_call`
+/// is a 12-name list that fires on **2 of 536** interactive components in the
+/// real-world corpus (`TIER_DISTRIBUTION.md`) — a bit that cannot say "no" is
+/// not a lever. These names are different in kind: they are **ALBEDO's own
+/// constructs**, so a match is a fact about the framework's semantics rather
+/// than a guess about an ecosystem's naming conventions.
+fn is_escape_call(name: &str) -> bool {
+    const ESCAPES: &[&str] = &[
+        // The state IS a broadcast topic — another client observes it.
+        "useSharedSlot",
+        "broadcast",
+        // FORGE writes: the state escapes to persistence and outlives the tab.
+        "append",
+        "update",
+        "remove",
+        // A server action: the transition is computed on the server.
+        "action",
+    ];
+    let name = name.trim();
+    ESCAPES.contains(&name) || is_server_boundary_call(name)
 }
 
 /// A network/server boundary reachable from a handler closure forces Tier-B.
@@ -567,6 +699,28 @@ struct DefScan {
     called: Vec<String>,
 }
 
+impl DefScan {
+    /// Item 4.9 T1. Did this body reach an escape construct that is **not
+    /// shadowed by a local binding**?
+    ///
+    /// 🔴 The shadow check is not a nicety — it is what keeps the analysis
+    /// sound. `append`/`update`/`remove` are ALBEDO's ambient FORGE writes, but
+    /// they are also exactly what `react-hook-form` hands you:
+    /// `const { fields, append, remove, update } = useFieldArray(…)`. That is
+    /// **purely client-side form state**, and calling it an escape would ship a
+    /// Tier-B binding for state the wire cannot drive — a broken component, in
+    /// the one direction this analysis must never round toward.
+    ///
+    /// 🪤 Measured: without this, 6 of 1,398 real-world components were
+    /// misclassified, **all of them `useFieldArray` destructures in cal.com**.
+    /// A locally-bound name is a local, never the global.
+    fn found_escape(&self, shadowed: &HashSet<String>) -> bool {
+        self.called
+            .iter()
+            .any(|name| is_escape_call(name) && !shadowed.contains(name.trim()))
+    }
+}
+
 impl Visit for DefScan {
     fn visit_call_expr(&mut self, call: &CallExpr) {
         if let Some(name) = callee_name(&call.callee) {
@@ -579,9 +733,49 @@ impl Visit for DefScan {
     }
 }
 
-/// Returns `(direct_io, called_names)` for a closure expression, or `None` when
-/// the initializer is not a function (so it is not a callable local handler).
-fn scan_closure(expr: &Expr) -> Option<(bool, Vec<String>)> {
+/// Every identifier bound by a `const`/`let`/`var` in these statements,
+/// including destructuring patterns — `const { append, remove } = …` binds both.
+/// Used to shadow ALBEDO's ambient globals; see [`DefScan::found_escape`].
+fn collect_bound_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    fn from_pat(pat: &Pat, out: &mut HashSet<String>) {
+        match pat {
+            Pat::Ident(ident) => {
+                out.insert(ident.id.sym.to_string());
+            }
+            Pat::Array(array) => {
+                for element in array.elems.iter().flatten() {
+                    from_pat(element, out);
+                }
+            }
+            Pat::Object(object) => {
+                for prop in &object.props {
+                    match prop {
+                        ObjectPatProp::KeyValue(kv) => from_pat(&kv.value, out),
+                        ObjectPatProp::Assign(assign) => {
+                            out.insert(assign.key.sym.to_string());
+                        }
+                        ObjectPatProp::Rest(rest) => from_pat(&rest.arg, out),
+                    }
+                }
+            }
+            Pat::Assign(assign) => from_pat(&assign.left, out),
+            Pat::Rest(rest) => from_pat(&rest.arg, out),
+            _ => {}
+        }
+    }
+
+    for stmt in stmts {
+        if let Stmt::Decl(Decl::Var(var)) = stmt {
+            for decl in &var.decls {
+                from_pat(&decl.name, out);
+            }
+        }
+    }
+}
+
+/// Returns the [`DefScan`] for a closure expression, or `None` when the
+/// initializer is not a function (so it is not a callable local handler).
+fn scan_closure(expr: &Expr) -> Option<DefScan> {
     let mut scan = DefScan::default();
     match expr {
         Expr::Arrow(arrow) => match &*arrow.body {
@@ -595,7 +789,7 @@ fn scan_closure(expr: &Expr) -> Option<(bool, Vec<String>)> {
         }
         _ => return None,
     }
-    Some((scan.found_io, scan.called))
+    Some(scan)
 }
 
 /// Walks a handler closure and flags whether it reaches a server boundary —

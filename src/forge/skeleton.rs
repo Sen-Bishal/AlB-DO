@@ -32,7 +32,7 @@
 //! cache line that dereferences the payload exactly once, at the found index —
 //! not a linear pointer-chase through owned `String`s.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::forge::declare::{FieldSpec, FieldType};
 use crate::forge::substrate::DataSubstrate;
@@ -122,6 +122,20 @@ pub struct ForgeCollection {
     /// `INSERT … RETURNING` knows the new record but not where it landed, and
     /// these keys are what will place it.
     pub sort: Box<[SortKey]>,
+    /// AUTH F1 · whether [`partition_by`](Self::partition_by) names a *principal*
+    /// rather than a route param.
+    ///
+    /// Not declarable, and deliberately so: a `forge` block can say
+    /// `partition_by: "owner"` but has no way to say whether `owner` holds a
+    /// `PrincipalId` or a room number. Only the component reads know — so this is
+    /// derived from them at boot by
+    /// [`validate_partition_bindings`](crate::forge::validate_partition_bindings)
+    /// and stamped on here, at the one moment the schema is still locally owned.
+    ///
+    /// `false` for every collection that came from the built-in default,
+    /// inference, or a `params`-keyed read, which is what keeps those paths
+    /// byte-for-byte what they were.
+    pub identity_partitioned: bool,
 }
 
 impl ForgeCollection {
@@ -150,6 +164,7 @@ impl ForgeCollection {
             sort,
             partition_by: None,
             fields: BTreeMap::new(),
+            identity_partitioned: false,
         }
     }
 
@@ -284,6 +299,23 @@ pub enum ForgeSchemaError {
         column: String,
         declared: Vec<String>,
     },
+    /// AUTH · the app declared a collection under the reserved `albedo_` prefix.
+    ///
+    /// Refused rather than merged, because the two ways it could go wrong are
+    /// both silent: an app-declared `albedo_sessions` would *replace* the session
+    /// table and take its DDL with it, and a reserved name that resolved would be
+    /// a readable topic over rows that are nobody's business — an unpartitioned
+    /// `useSharedSlot(albedo_users)` is every user in the system.
+    #[error(
+        "FORGE schema: collection {topic:?} uses the reserved {prefix:?} prefix — those names \
+         belong to AUTH's own tables ({}). Rename the collection",
+        reserved.join(", ")
+    )]
+    ReservedCollectionName {
+        topic: String,
+        prefix: &'static str,
+        reserved: Vec<String>,
+    },
 }
 
 /// The FORGE collection registry: an immutable, boot-built lookup from a
@@ -344,6 +376,26 @@ impl ForgeSchema {
             ids,
             collections: collections.into_boxed_slice(),
         })
+    }
+
+    /// Stamp identity-partitioning onto the collections the boot check derived.
+    ///
+    /// AUTH F1 step 2. Consumes and returns the schema rather than mutating in
+    /// place because this happens exactly once, at the one moment the schema is
+    /// still locally owned — before `with_forge_schema` hands it to the server.
+    /// After that no principal-shaped fact can be added to it, which is the
+    /// property that makes the write-time check trustworthy: it reads a flag that
+    /// nothing later in the process could have changed.
+    ///
+    /// Collections not named keep `false`, including any the set names that this
+    /// schema does not contain — an unknown collection is already a build error
+    /// from the same pass, so there is nothing to report a second time here.
+    #[must_use]
+    pub fn with_identity_partitions(mut self, identity: &BTreeSet<String>) -> Self {
+        for collection in &mut self.collections {
+            collection.identity_partitioned = identity.contains(&collection.topic);
+        }
+        self
     }
 
     /// The collection driving wire slot `slot_id`, if any. `O(log n)` binary
