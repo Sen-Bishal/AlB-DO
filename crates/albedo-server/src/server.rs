@@ -2715,6 +2715,36 @@ async fn dispatch_routed(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
+
+            // AUTH § 4 · the route's own gate, discharged before the render runs.
+            //
+            // Placed here rather than inside the renderer because a refusal must
+            // cost nothing: the point of gating a route is to not do the work,
+            // and a check inside the render has already built the shell. It also
+            // reads the identity resolved above, so the gate and the body agree
+            // about who is asking by construction rather than by two lookups.
+            //
+            // 🔑 This is a *route* gate, not the data boundary. An identity-keyed
+            // read is already unreachable for a stranger — it resolves to no
+            // topic — so what this adds is the case derivation cannot reach: a
+            // route over global data that should still require signing in. See
+            // `RouteAuth` for why it is authored rather than derived.
+            let gated = streaming_runtime
+                .manifest
+                .routes
+                .get(route_pattern.as_str())
+                .is_some_and(|route| !route.auth.allows_anonymous());
+            if gated && identity.principal().is_none() {
+                debug!(
+                    target: "albedo.auth",
+                    route = %route_pattern,
+                    "anonymous request refused by the route's `auth = \"required\"`"
+                );
+                if state.request_timings {
+                    crate::timing::print_request(method.as_str(), &path, started.elapsed());
+                }
+                return crate::handlers::auth_gate::refuse_anonymous(&route_pattern);
+            }
             // AUTH · the render path's identity — the third of the three
             // (render, action, subscribe) `AUTH.md` § 5 says resolve through one
             // place, and the one P1 consumes, because `user.id` in a component

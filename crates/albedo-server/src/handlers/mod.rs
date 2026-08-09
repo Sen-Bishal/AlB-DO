@@ -1,6 +1,7 @@
 pub mod action;
 pub mod albedo_assets;
 pub mod api;
+pub mod auth_gate;
 pub mod dev;
 pub mod patches;
 pub mod phosphor;

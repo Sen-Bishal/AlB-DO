@@ -680,6 +680,19 @@ impl CompiledProject {
         self.project.modules().get(spec)
     }
 
+    /// Every parsed module, keyed by spec.
+    ///
+    /// The enumeration [`Self::module`] cannot give. Needed by whole-project
+    /// checks that must visit files the component graph never names — a route
+    /// declaring `export const auth` is one, because the declaration has to be
+    /// found before anything knows to look for it.
+    #[must_use]
+    pub fn modules(
+        &self,
+    ) -> &std::collections::HashMap<String, crate::runtime::eval::ParsedModule> {
+        self.project.modules()
+    }
+
     /// Look up the metadata for one component. Returns `None` when the
     /// project doesn't contain a matching `(module_spec, function_name)`.
     #[must_use]

@@ -115,6 +115,14 @@ pub struct RouteManifest {
     /// resolves without explicit subscribe.
     #[serde(default)]
     pub shared_slot_topics: Vec<String>,
+    /// AUTH § 4 · whether an anonymous request may render this route.
+    ///
+    /// `#[serde(default)]` so every manifest written before this field existed
+    /// deserializes as [`RouteAuth::Public`] — which is what those routes did,
+    /// so an old manifest keeps its meaning rather than acquiring a gate nobody
+    /// asked for.
+    #[serde(default)]
+    pub auth: RouteAuth,
     /// PRISM · the partitioned shared-slot bindings **this route's own
     /// components** read, still unresolved — a topic identity needs the
     /// request's params, which do not exist at build time.
@@ -417,6 +425,74 @@ pub struct TierCNode {
     pub side_effects: bool,
 }
 
+/// AUTH § 4 · whether a **page route** may be rendered for an anonymous request.
+///
+/// 🔑 **This is authored, and that is not a hole in "derived, not authored".**
+/// Derived authorization answers *which rows may this caller read* — an identity
+/// spec resolves to no topic when anonymous, so the data is protected whether or
+/// not a route says anything. This answers a different question: *may this page
+/// be rendered at all.* For a route whose components read identity-keyed topics
+/// the two nearly coincide (an anonymous visitor just sees empty lists). For a
+/// route that reads **global** data — an admin dashboard over aggregate stats —
+/// nothing about the reads implies a restriction, so there is no derivation to
+/// make and a declaration is the only thing that can express it.
+///
+/// 🔴 **Why it is not derived even where it could be.** Defaulting a route to
+/// `Required` because some component on it reads identity-keyed data was
+/// considered and rejected: the gate would then silently flip when somebody edits
+/// an unrelated component's `.where(…)`, and a security property that changes on
+/// an unrelated edit is the same defect refused for mixed-mode partitions
+/// (`AUTH.md` § 8.1.2). Derivation gets to **report** the mismatch —
+/// `albedo doctor` can say *"this route reads per-user data but is public"* —
+/// and never to decide it.
+///
+/// 🪤 **Not [`crate::manifest::schema`]'s neighbour `AuthPolicy`.** The server
+/// crate's `AuthPolicy { Optional, Required, Role }` governs **API** routes and
+/// is discharged through the `AuthProvider` trait. This governs page routes and
+/// is discharged against the request's resolved principal. Two mechanisms, two
+/// types, deliberately not merged — one of them can express a role and the other
+/// cannot.
+///
+/// **There is no `Role` variant, and its absence is the point.** Roles do not
+/// exist in this system yet; `AUTH.md` § 8.1 records that RBAC is additive
+/// (`org.id` as one more key source) rather than architectural. A `Role(String)`
+/// here today would be a declaration nothing enforces — precisely the dead
+/// loaded variant deleted as F3 in the same audit that produced this field.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteAuth {
+    /// Anyone may render this route. The default, and the behaviour of every
+    /// route authored before this field existed.
+    #[default]
+    Public,
+    /// Only a request carrying a resolved principal may render this route. An
+    /// anonymous request is refused **before** the render runs.
+    Required,
+}
+
+impl RouteAuth {
+    /// The spelling accepted in `export const auth = "…"`.
+    ///
+    /// # Errors
+    /// The set of valid spellings, for an error message that can be acted on
+    /// without opening the docs.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "public" => Ok(Self::Public),
+            "required" => Ok(Self::Required),
+            other => Err(format!(
+                "`export const auth` must be \"public\" or \"required\"; found \"{other}\""
+            )),
+        }
+    }
+
+    /// Whether an anonymous request may render this route.
+    #[must_use]
+    pub fn allows_anonymous(self) -> bool {
+        matches!(self, Self::Public)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DomPosition {
     pub parent_placeholder: Option<String>,
@@ -430,13 +506,30 @@ pub struct DataDep {
     pub source: DataSource,
 }
 
+/// Where a [`DataDep`]'s value comes from.
+///
+/// 🔴 **There is deliberately no raw-query variant, and adding one back is a
+/// design decision, not a gap to fill.** AUTH § 8.1.2 F3 — a
+/// `DbQuery { query, param_keys }` carrying raw SQL with positional binding was
+/// carried here, dead, until 2026-08-08. Nothing ever produced it and the sole
+/// fetcher returned `"rows": []`, so it was never exploitable. It was removed
+/// rather than documented, because a comment saying *"never implement this"* is
+/// the weakest enforcement there is, and the blank invites filling in.
+///
+/// 🔑 **Why it must not come back in that shape.** A read expressed as raw SQL
+/// has no collection, so it cannot be a topic; no partition, so it cannot be
+/// keyed by a principal; and no name the reach matrix can report. It would be a
+/// read path that `albedo doctor` cannot audit and AUTH cannot key — *by
+/// construction*, not by oversight. Every FORGE read reaches the caller through
+/// a collection and mints a topic; that is the property the whole derived
+/// authorization argument rests on, and one raw query would end it.
+///
+/// If "just run a query" is genuinely needed, it goes through a declared
+/// collection so it inherits partitioning and naming — the same answer PRISM
+/// gives for topics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataSource {
-    DbQuery {
-        query: String,
-        param_keys: Vec<String>,
-    },
     HttpFetch {
         url_template: String,
         method: String,

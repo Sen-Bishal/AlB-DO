@@ -270,6 +270,21 @@ fn boot_inner(
     };
     let forge_schema = forge_schema.with_identity_partitions(&identity_partitions);
 
+    // AUTH § 4 · the third meeting of a declaration and the code that has to
+    // satisfy it. A route's `export const auth` and the `auth` block are each
+    // well-formed alone; only together do they say whether the gate can ever be
+    // opened. Checked after the registry is lowered (it is what "are there
+    // providers" asks) and before the listener binds, so a route nobody could
+    // ever reach fails the boot instead of serving a permanent refusal.
+    if let Err(problems) =
+        dom_render_compiler::manifest::validate_route_auth(&compiled, !auth_registry.is_empty())
+    {
+        return Err(RuntimeError::ServerStartup(format!(
+            "route `auth` declarations cannot be satisfied:\n  - {}",
+            problems.join("\n  - ")
+        )));
+    }
+
     // APERTURE · the same meeting, for the other derivation. A component calling
     // `github.repo({ owner })` without `name` is well-formed TSX and a valid
     // `sources` block; only here can the two be compared. Left unchecked its

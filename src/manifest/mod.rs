@@ -2,6 +2,9 @@ pub mod builder;
 pub mod metadata;
 pub mod schema;
 
+mod route_auth;
+pub use route_auth::validate_route_auth;
+
 use crate::effects::{decide_tier_and_hydration, TieringInputs};
 use crate::graph::ComponentGraph;
 use crate::types::{Component, ComponentId, OptimizationResult};

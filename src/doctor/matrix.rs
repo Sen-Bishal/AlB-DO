@@ -374,6 +374,7 @@ mod tests {
             tier_b: Vec::new(),
             tier_c: Vec::new(),
             shared_slot_topics: Vec::new(),
+            auth: Default::default(),
             shared_slot_partitions: Vec::new(),
             shared_slot_sources: Vec::new(),
             action_ids: Vec::new(),

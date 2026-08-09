@@ -234,11 +234,6 @@ impl TierBDataFetcher for DefaultTierBDataFetcher {
                 "method": method,
                 "status": "not_fetched_in_default_fetcher"
             }),
-            DataSource::DbQuery { query, param_keys } => serde_json::json!({
-                "query": query,
-                "param_keys": param_keys,
-                "rows": []
-            }),
         };
 
         Ok((dep.key.clone(), value))

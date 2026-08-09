@@ -1,11 +1,12 @@
 // CiCD reviewer rules
 
 use super::metadata::{
-    hoist_head_tags_from_body, metadata_from_const_expr, render_head_metadata, DYNAMIC_HEAD_MARKER,
+    auth_from_const_expr, hoist_head_tags_from_body, metadata_from_const_expr,
+    render_head_metadata, DYNAMIC_HEAD_MARKER,
 };
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, PartitionKeySource,
-    PartitionTopicSpec, SourceTopicSpec,
+    PartitionTopicSpec, RouteAuth, SourceTopicSpec,
     RenderedNode, RouteActionEntry, RouteManifest, RouteMetadata, Tier, TierBNode, TierCNode,
     WTStreamSlot,
 };
@@ -263,6 +264,10 @@ impl<'a> ManifestBuilder<'a> {
         // serve path resolves the real metadata per request.
         let dynamic_metadata = self.detect_dynamic_metadata(root_component);
 
+        // AUTH § 4 — the route's own gate, recorded here and enforced by the
+        // dispatcher before any render runs.
+        let auth = self.extract_route_auth(root_component);
+
         let shell = self.build_shell(
             route,
             assets,
@@ -296,6 +301,7 @@ impl<'a> ManifestBuilder<'a> {
             tier_b,
             tier_c,
             shared_slot_topics,
+            auth,
             shared_slot_partitions,
             shared_slot_sources,
             action_ids,
@@ -321,6 +327,41 @@ impl<'a> ManifestBuilder<'a> {
             .functions
             .contains_key("generateMetadata")
             .then(|| component.name.clone())
+    }
+
+    /// AUTH § 4 — read the route leaf component's `export const auth = "…"`.
+    ///
+    /// 🔑 **This function records; it does not refuse.** An unreadable or
+    /// misspelled value yields [`RouteAuth::Public`] here and is caught by
+    /// [`validate_route_auth`](crate::manifest::validate_route_auth) at boot,
+    /// which stops the server with the offending route named. That split is the
+    /// same one `partition_by` already uses — the schema records what was
+    /// written, boot refuses what disagrees — and it is what keeps this builder
+    /// infallible.
+    ///
+    /// 🔒 The permissive default is safe *only* because of that pairing: a
+    /// manifest carrying a wrongly-`Public` route is never served, because the
+    /// boot that would serve it does not start.
+    fn extract_route_auth(&self, root_component: ComponentId) -> RouteAuth {
+        let Some(compiled) = self.compiled_render_project.as_ref() else {
+            return RouteAuth::Public;
+        };
+        let Some(component) = self.components.get(&root_component) else {
+            return RouteAuth::Public;
+        };
+        let Some(entry) = self.component_entry_for_project(component, compiled.root.as_path())
+        else {
+            return RouteAuth::Public;
+        };
+        let Some(module) = compiled.project.module(entry.as_str()) else {
+            return RouteAuth::Public;
+        };
+        module
+            .module_constants
+            .iter()
+            .find(|(name, _)| name == "auth")
+            .and_then(|(_, expr)| auth_from_const_expr(expr).ok())
+            .unwrap_or(RouteAuth::Public)
     }
 
     /// Gate 2 · B (slice 1) — read the route leaf component's

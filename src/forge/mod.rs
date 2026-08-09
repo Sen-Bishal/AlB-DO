@@ -5,12 +5,17 @@
 //! integrate and becomes an artifact the compiler emits.*
 //!
 //! This module is the **runtime (storage) plane** of that idea. The
-//! compile-time half already has a seam in the manifest: escape analysis
-//! populates [`DataDep`](crate::manifest::schema::DataDep)s carrying a
-//! [`DataSource::DbQuery`](crate::manifest::schema::DataSource), and the
-//! serve path pre-resolves those queries into component props before the
-//! synchronous QuickJS render. What was missing is the thing that actually
-//! *runs* a query: the pluggable [`DataSubstrate`].
+//! compile-time half is the `forge` block: declarations lower to
+//! [`ForgeCollection`](skeleton::ForgeCollection)s, each carrying the DDL and
+//! the query that materialises it, and a component's `useSharedSlot(collection)`
+//! mints the topic that read is served from. What this module supplies is the
+//! thing that actually *runs* those queries: the pluggable [`DataSubstrate`].
+//!
+//! 🔑 **Every read reaches a caller through a declared collection**, which is
+//! what makes it a topic, which is what lets it be partitioned and keyed by a
+//! principal. There is deliberately no raw-query path into a component's props —
+//! see [`DataSource`](crate::manifest::schema::DataSource), where the reasoning
+//! is recorded next to the variant that was removed to keep it true.
 //!
 //! ## Shape
 //!

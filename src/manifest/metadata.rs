@@ -14,7 +14,7 @@
 use serde_json::{Map, Number, Value};
 use swc_ecma_ast::{Expr, Lit, Prop, PropName, PropOrSpread, UnaryOp};
 
-use crate::manifest::schema::{MetaTag, RouteMetadata};
+use crate::manifest::schema::{MetaTag, RouteAuth, RouteMetadata};
 
 /// Slice 2 — hoist JSX-rendered `<title>` / `<meta>` tags out of the
 /// rendered body HTML into a [`RouteMetadata`], returning the body with
@@ -267,6 +267,29 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+/// AUTH § 4 · lower a route module's `export const auth = "…"`.
+///
+/// 🔴 **Literal-only, and a non-literal is an ERROR — deliberately unlike
+/// [`metadata_from_const_expr`] below, which silently skips what it cannot
+/// read.** Skipping is right for metadata: an unreadable `title` costs a page its
+/// `<title>`, and the dynamic `generateMetadata()` layer covers the rest.
+/// Skipping is exactly wrong here, because the result is a route that *looks*
+/// gated in source and is served to everyone. A thing the author must see is not
+/// a log, and it is certainly not silence.
+///
+/// # Errors
+/// A message naming the valid spellings, when `auth` is present but is not one
+/// of the two string literals.
+pub fn auth_from_const_expr(expr: &Expr) -> Result<RouteAuth, String> {
+    match expr {
+        Expr::Lit(Lit::Str(s)) => RouteAuth::parse(s.value.as_ref()),
+        _ => Err("`export const auth` must be a plain string literal — \"public\" or \
+                  \"required\". A computed value cannot be read at build time, and a route whose \
+                  gate cannot be read at build time would be served to everyone"
+            .to_string()),
+    }
 }
 
 /// Lower a `export const metadata = { ... }` initializer into a
