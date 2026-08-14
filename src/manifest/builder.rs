@@ -1575,16 +1575,30 @@ impl<'a> ManifestBuilder<'a> {
             // assembles the matched params map into a JSON object.
             keys.push("params".to_string());
         }
-        // AUTH item 5 P1 · a component that partitions by `user.id` receives
-        // `user`, by the same rule that gives a `[slug]` route its `params`.
+        // AUTH § 3 · a component that names `user` receives it.
         //
-        // 🔑 This is derived from the *binding*, never from a route declaration.
-        // The component asked to be keyed by the principal when it wrote
-        // `.where({ owner: user.id })`, so the prop it needs is a consequence of
-        // the read rather than a second thing an author has to remember — which
-        // is AUTH § 4's whole claim ("derived, not authored") holding at the
+        // 🔑 Derived from the component's own source, never from a declaration.
+        // Writing `user.id` already said the principal is needed; asking the
+        // author to record that a second time somewhere else is the copy that
+        // gets forgotten — AUTH § 4's "derived, not authored" holding at the
         // level of the props object.
-        if self.component_partitions_by_identity(component) {
+        //
+        // 🔴 **This used to be `component_partitions_by_identity` alone**, which
+        // supplied `user` only to a component reading an identity-partitioned
+        // collection. Its comment claimed to work "by the same rule that gives a
+        // `[slug]` route its `params`", and that was the bug: `params` is derived
+        // from the *file path* above, while `user` was derived from a *partition
+        // binding*. Two different rules wearing one description. A component that
+        // merely wanted to greet the signed-in person got no prop at all, and —
+        // because nothing made it request-scoped either — was baked at build time
+        // with `user` undefined. Found 2026-08-12 building the scaffold's
+        // sign-in page.
+        //
+        // The identity-partition check is kept as a second source rather than
+        // replaced: it holds for the component that reaches `user.id` only
+        // through a `.where(…)` the transform rewrote, where the identifier may
+        // no longer survive in the form this scan reads.
+        if component.reads_principal || self.component_partitions_by_identity(component) {
             keys.push("user".to_string());
         }
         keys

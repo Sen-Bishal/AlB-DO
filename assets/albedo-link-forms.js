@@ -220,7 +220,17 @@
     // and falls back to the payload field, so this is belt-and-suspenders,
     // not a second source of truth. Token comes from the global the
     // streaming shell publishes.
-    const formHeaders = { 'content-type': 'application/octet-stream' };
+    // `accept` is what distinguishes this caller from a browser's own submit.
+    // The server's form endpoint (`/_albedo/action/{name}`, used when no JS ran)
+    // answers a redirect by default and an opcode frame only to a caller that
+    // asks for one — so declaring it here is what would let this function move
+    // onto that URL unchanged. It is inert on the envelope endpoint below, and
+    // that is fine: stating what you can handle is not conditional on the peer
+    // currently caring.
+    const formHeaders = {
+      'content-type': 'application/octet-stream',
+      accept: 'application/octet-stream',
+    };
     const csrfToken = globalScope.__ALBEDO_CSRF__;
     if (typeof csrfToken === 'string' && csrfToken) {
       formHeaders['x-albedo-csrf'] = csrfToken;

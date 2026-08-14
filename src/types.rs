@@ -40,6 +40,21 @@ pub struct Component {
     /// unanalyzed component keeps the tier it has today.
     #[serde(default)]
     pub state_escapes: bool,
+    /// AUTH § 3 · **this render needs the request's principal.** True when the
+    /// component names `user` in value position — read off the AST by
+    /// `parser::scan_reads_principal`, not declared.
+    ///
+    /// Two consequences, and they are the whole point of the fact:
+    /// - the manifest records `user` among the component's dynamic prop keys, so
+    ///   the serve path resolves it per request;
+    /// - the component **can never be Tier A**, because Tier-A markup is baked
+    ///   once at build time and there is no request in scope to read a principal
+    ///   from. Before this existed such a component was baked with `user`
+    ///   undefined and its signed-in branch could never render.
+    ///
+    /// Defaults to `false` so existing manifests deserialize unchanged.
+    #[serde(default)]
+    pub reads_principal: bool,
     pub is_lcp_candidate: bool,
     pub effect_profile: EffectProfile,
     pub source_hash: u64,
@@ -66,6 +81,7 @@ impl Component {
             is_interactive: false,
             is_client_interactive: false,
             state_escapes: false,
+            reads_principal: false,
             is_lcp_candidate: false,
             effect_profile: EffectProfile::default(),
             source_hash: 0,

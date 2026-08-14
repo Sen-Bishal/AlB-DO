@@ -360,11 +360,13 @@ pub async fn render_tier_b_opcodes(
         })
 }
 
+#[derive(Clone)]
 pub struct InjectionChunk {
     placeholder_id: String,
     kind: ChunkKind,
 }
 
+#[derive(Clone)]
 enum ChunkKind {
     Success { html: String },
     Fallback { html: String },
@@ -417,6 +419,43 @@ impl InjectionChunk {
             placeholder_id: node.placeholder_id.clone(),
             kind: ChunkKind::Error,
         }
+    }
+
+    /// The markup this chunk becomes when it is painted into the served
+    /// document instead of injected by a script.
+    ///
+    /// 🔑 **This is the `outerHTML` semantics of `__albedo_inject`, in Rust.**
+    /// The client's injector does `el.outerHTML = html`, which *replaces* the
+    /// placeholder rather than filling it, so the painted form must replace it
+    /// too — otherwise a page rendered without JavaScript and the same page
+    /// after injection would differ by a wrapper element, and every selector,
+    /// stylesheet and delta anchor that resolved against one would be reasoning
+    /// about the other. The two paths converge on identical DOM by construction.
+    ///
+    /// The error arm mirrors the injector's other branch: it keeps the
+    /// placeholder and marks it, because there is no markup to put there.
+    #[must_use]
+    pub fn into_painted_markup(self) -> String {
+        // Written raw, exactly as `seed_tier_b_placeholders` writes the same
+        // element — the id is a compiler-generated placeholder name, and two
+        // spellings of one element is how the CSRF input came to disagree with
+        // itself. Keeping them byte-identical is what lets the seeder's matcher
+        // and this painter never drift.
+        let id = &self.placeholder_id;
+        match self.kind {
+            ChunkKind::Success { html }
+            | ChunkKind::Fallback { html }
+            | ChunkKind::ErrorBoundary { html } => html,
+            ChunkKind::Error => {
+                format!("<div id=\"{id}\" data-albedo-tier=\"b\" data-albedo-error=\"error\"></div>")
+            }
+        }
+    }
+
+    /// The placeholder this chunk targets.
+    #[must_use]
+    pub fn placeholder_id(&self) -> &str {
+        &self.placeholder_id
     }
 
     pub fn into_script_tag(self) -> String {

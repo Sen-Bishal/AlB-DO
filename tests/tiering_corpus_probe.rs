@@ -115,6 +115,7 @@ fn reason_label(reason: TieringReason) -> &'static str {
         TieringReason::IoBoundary => "IoBoundary",
         TieringReason::SideEffectBoundary => "SideEffectBoundary",
         TieringReason::WeightBasedPromotion => "WeightBasedPromotion",
+        TieringReason::RequestScoped => "RequestScoped",
     }
 }
 
@@ -272,6 +273,7 @@ fn measure(name: &str, kind: Kind, dir: &Path) -> CorpusResult {
             component.is_interactive,
             component.is_client_interactive,
             component.state_escapes,
+            component.reads_principal,
             component.is_above_fold,
             weight,
             inputs,

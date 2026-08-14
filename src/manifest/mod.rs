@@ -55,6 +55,7 @@ pub fn build_render_manifest_v2(
                 component.is_interactive,
                 component.is_client_interactive,
                 component.state_escapes,
+                component.reads_principal,
                 component.is_above_fold,
                 weight_bytes,
                 tiering_inputs_from_options(options),

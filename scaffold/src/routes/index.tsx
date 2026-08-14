@@ -51,6 +51,15 @@ export default function Home() {
             05
           </span>
           <p className="point-t">
+            Accounts are a block in the same config. Sessions, hashing and the
+            sign-in endpoints <em>are not yours to write.</em>
+          </p>
+        </li>
+        <li className="point">
+          <span className="point-n" aria-hidden="true">
+            06
+          </span>
+          <p className="point-t">
             One binary runs all of it. <em>No Node, no bundler, no daemon.</em>
           </p>
         </li>
@@ -59,6 +68,9 @@ export default function Home() {
       <div className="actions">
         <a className="act act-metal" href="/guestbook">
           See the backend <span className="arrow">&rarr;</span>
+        </a>
+        <a className="act act-quiet" href="/sign-in">
+          Make an account <span className="arrow">&rarr;</span>
         </a>
         <a
           className="act act-quiet"

@@ -67,4 +67,31 @@ export default {
       ],
     },
   },
+
+  // ── AUTH ─────────────────────────────────────────────────────────
+  //
+  // Accounts, from a declaration. This block emits four tables
+  // (`albedo_users`, `albedo_accounts`, `albedo_sessions`,
+  // `albedo_credentials`), mounts the sign-in endpoints, and puts a `user`
+  // prop on every render — either a principal or null. There is no auth
+  // library to install and no users table to design.
+  //
+  // `password` is a known provider, so it infers what it is. Anything that
+  // is not a known name has to say (`kind: "oauth" | "oidc" | "delegated" |
+  // "custom"`) — guessing at an unknown name has a silently wrong answer.
+  //
+  // See src/routes/sign-in.tsx. Gate any route on a session with
+  // `export const auth = "required"` in that route's file; a stranger who
+  // asks for it is sent to `login` below.
+  //
+  // 🔑 `albedo_` is a reserved prefix. A collection declared under it above
+  // is refused at boot — otherwise an app could replace the session table,
+  // or read every user's row as one live topic.
+  auth: {
+    session: { ttl: "30d" },
+    providers: {
+      password: {},
+    },
+    login: "/sign-in",
+  },
 };

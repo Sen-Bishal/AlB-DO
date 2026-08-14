@@ -76,6 +76,9 @@ impl ComponentParser {
                 is_interactive: false,
                 is_client_interactive: false,
                 state_escapes: false,
+                // A module-only node is never rendered, so it has no render to
+                // be request-scoped.
+                reads_principal: false,
                 source_hash,
                 is_module_only: true,
             });
@@ -137,6 +140,9 @@ pub struct ParsedComponent {
     /// to escape", **not** "proven local": see [`is_escape_call`] for why the
     /// unknown case must round toward Tier C.
     pub state_escapes: bool,
+    /// AUTH § 3 · this component names `user`, so the render needs the
+    /// request's principal. See [`scan_reads_principal`].
+    pub reads_principal: bool,
     pub source_hash: u64,
     /// True when this node represents a file that declared NO component but
     /// DOES export something (a pure data/util/lib module). It is a graph +
@@ -186,11 +192,18 @@ impl ComponentVisitor {
         if function.is_async {
             collector.profile.asynchronous = true;
         }
-        if let Some(body) = &function.body {
+        let params: Vec<Pat> = function.params.iter().map(|p| p.pat.clone()).collect();
+        let mut analysis = if let Some(body) = &function.body {
             collector.prime_local_defs(&body.stmts);
             body.visit_with(&mut collector);
-        }
-        collector.finish()
+            let mut analysis = collector.finish();
+            analysis.reads_principal = scan_reads_principal(&body.stmts, &params);
+            analysis
+        } else {
+            collector.finish()
+        };
+        analysis.reads_principal |= scan_reads_principal(&[], &params);
+        analysis
     }
 
     fn analyze_arrow(&self, arrow: &ArrowExpr) -> ComponentAnalysis {
@@ -198,14 +211,26 @@ impl ComponentVisitor {
         if arrow.is_async {
             collector.profile.asynchronous = true;
         }
+        let mut body_stmts: Vec<Stmt> = Vec::new();
         match &*arrow.body {
             BlockStmtOrExpr::BlockStmt(block) => {
                 collector.prime_local_defs(&block.stmts);
                 block.visit_with(&mut collector);
+                body_stmts = block.stmts.clone();
             }
-            BlockStmtOrExpr::Expr(expr) => expr.visit_with(&mut collector),
+            BlockStmtOrExpr::Expr(expr) => {
+                expr.visit_with(&mut collector);
+                // An expression-bodied arrow has no statements to walk, so wrap
+                // it in one rather than duplicating the scan for the two shapes.
+                body_stmts.push(Stmt::Expr(ExprStmt {
+                    span: Default::default(),
+                    expr: expr.clone(),
+                }));
+            }
         }
-        collector.finish()
+        let mut analysis = collector.finish();
+        analysis.reads_principal = scan_reads_principal(&body_stmts, &arrow.params);
+        analysis
     }
 
     fn analyze_expr(&self, expr: &Expr) -> ComponentAnalysis {
@@ -236,6 +261,7 @@ impl ComponentVisitor {
             is_interactive: analysis.is_interactive,
             is_client_interactive: analysis.is_client_interactive,
             state_escapes: analysis.state_escapes,
+            reads_principal: analysis.reads_principal,
             source_hash: self.source_hash,
             is_module_only: false,
         });
@@ -363,6 +389,11 @@ struct ComponentAnalysis {
     /// This component's state is **proven** to escape the client — see
     /// [`is_escape_call`] and `Component::state_escapes`.
     state_escapes: bool,
+    /// This component reads the request's principal — see
+    /// [`scan_reads_principal`]. Like `state_escapes` this is a fact read off
+    /// the AST rather than a heuristic, which is the distinction
+    /// `TODO.md` P-c asks the decision path to stop losing.
+    reads_principal: bool,
 }
 
 #[derive(Default)]
@@ -398,6 +429,12 @@ impl EffectCollector {
             is_interactive: self.has_handler,
             is_client_interactive: self.has_client_handler,
             state_escapes: self.escapes,
+            // Filled by `scan_reads_principal` at the call site. It is a separate
+            // walk on purpose: this collector deliberately does *not* descend
+            // into `on*` handler closures (their effects run at interaction
+            // time), but a `user` read anywhere in the component still means the
+            // render needs the principal.
+            reads_principal: false,
         }
     }
 
@@ -736,6 +773,92 @@ impl Visit for DefScan {
 /// Every identifier bound by a `const`/`let`/`var` in these statements,
 /// including destructuring patterns — `const { append, remove } = …` binds both.
 /// Used to shadow ALBEDO's ambient globals; see [`DefScan::found_escape`].
+/// The one identifier that means "the request's signed-in principal".
+///
+/// Named here rather than spelled at each use site because three things have to
+/// agree on it: this scan, the prop key the manifest records
+/// (`dynamic_prop_keys_for_component`), and the key the server resolves
+/// (`RequestContext::resolve`). Two spellings of one contract is the drift the
+/// form-markup constants already had to be centralised to prevent.
+pub const PRINCIPAL_IDENT: &str = "user";
+
+/// Does this component read the request's principal?
+///
+/// ## Why this is a component fact and not a route declaration
+///
+/// AUTH § 4's claim is *derived, never authored*. A component that writes
+/// `user.id` has already said it needs the principal; asking the author to also
+/// record that somewhere is the second thing to keep in step, and the one that
+/// gets forgotten. So the fact is read off the AST — the same shape as
+/// `state_escapes`, and the same free-variable walk `item_expr_only_refs` does
+/// for the keyed-list rung.
+///
+/// ## What counts
+///
+/// A **value-position** `user`. Member-property names (`row.user`) are
+/// `IdentName`s inside `MemberProp` and JSX attribute names (`<Row user={x} />`)
+/// are `JSXAttrName`s — neither is an `Expr::Ident`, so neither is visited. That
+/// is exactly right: those name someone else's field, not our principal.
+///
+/// A `user` **bound locally** (`const user = rows[0]`) shadows the ambient one
+/// and does not count, by the same rule that stops `const { append } = …` from
+/// reading as a FORGE write.
+///
+/// 🔑 **Unknown rounds toward "reads it".** A false positive costs a build-time
+/// bake — the component renders per request instead of once — which is slower
+/// and correct. A false negative is the defect this function exists to fix: the
+/// component is baked with no principal and its signed-in branch can never
+/// render. The cheap error is the one to make.
+fn scan_reads_principal(stmts: &[Stmt], params: &[Pat]) -> bool {
+    // A `user` destructured from props is a *parameter* binding, so it must not
+    // be collected as a shadow — it is precisely the case we are looking for.
+    // Only body-local bindings shadow.
+    let mut shadowed = HashSet::new();
+    collect_bound_names(stmts, &mut shadowed);
+    if shadowed.contains(PRINCIPAL_IDENT) {
+        return false;
+    }
+
+    struct Scan {
+        found: bool,
+    }
+    impl Visit for Scan {
+        fn visit_expr(&mut self, expr: &Expr) {
+            if let Expr::Ident(ident) = expr {
+                if ident.sym.as_ref() == PRINCIPAL_IDENT {
+                    self.found = true;
+                    return;
+                }
+            }
+            expr.visit_children_with(self);
+        }
+    }
+
+    let mut scan = Scan { found: false };
+    // Destructuring `{ user }` out of the props parameter is a read on its own —
+    // the component asked for it in its signature even if the body then only
+    // passes it along.
+    for param in params {
+        if let Pat::Object(object) = param {
+            for prop in &object.props {
+                let named = match prop {
+                    ObjectPatProp::Assign(assign) => assign.key.sym.as_ref() == PRINCIPAL_IDENT,
+                    ObjectPatProp::KeyValue(kv) => matches!(
+                        &kv.key,
+                        PropName::Ident(ident) if ident.sym.as_ref() == PRINCIPAL_IDENT
+                    ),
+                    ObjectPatProp::Rest(_) => false,
+                };
+                if named {
+                    return true;
+                }
+            }
+        }
+    }
+    stmts.visit_with(&mut scan);
+    scan.found
+}
+
 fn collect_bound_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     fn from_pat(pat: &Pat, out: &mut HashSet<String>) {
         match pat {

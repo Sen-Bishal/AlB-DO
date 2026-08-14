@@ -57,6 +57,81 @@ pub const FORM_ACTION_ATTR: &str = "data-albedo-action";
 /// submitted JSON payload.
 pub const CSRF_FIELD_NAME: &str = "_csrf";
 
+/// Path prefix of the endpoint a form-action `<form>` actually posts to.
+///
+/// ## Why a real URL exists at all now
+///
+/// The sentinel used to be *replaced* by [`FORM_ACTION_ATTR`] and nothing else,
+/// so the served `<form>` had **no `action` attribute**. A browser resolves that
+/// to the current URL, and a page route answers `405` to a POST — which meant the
+/// only working write path in the framework ran through
+/// `assets/albedo-link-forms.js`. "Zero JS" described the render and not a single
+/// mutation.
+///
+/// Emitting the endpoint restores the browser's own submit as the baseline: with
+/// JavaScript the interceptor still calls `preventDefault()` and posts a bincode
+/// envelope for an in-place patch; without it the browser posts the form to this
+/// URL and gets `303 See Other` back to the page it came from. Same action, same
+/// handler, same CSRF gate.
+///
+/// ## Why the *name* and not the `action_id`
+///
+/// The id is `fnv1a_32(name)` and is what the registry is keyed by, so putting it
+/// in the URL would work. The name is used instead because the server can then
+/// route, gate and *price* the request from the request line alone —
+/// `AUTH.md` § "P2's shape": our `action_id` rides inside a bincode envelope, so
+/// today the server cannot know what an action is until it has buffered the whole
+/// body, which is why SHUTTER charges a flat `Write` before it knows what it is
+/// charging for and why streaming uploads are foreclosed. A readable segment also
+/// makes a failing submit greppable, which a `u32` never is.
+pub const ACTION_ENDPOINT_PREFIX: &str = "/_albedo/action/";
+
+/// `name` of the hidden field naming the page a no-JS submit returns to.
+///
+/// Mirrored in `albedo_server::forms`, which re-exports this constant rather
+/// than restating it — the CSRF input already demonstrated what two spellings of
+/// one markup contract costs.
+pub const RETURN_FIELD_NAME: &str = "_albedo_return";
+
+/// Marker attribute identifying a return-path input the server still has to
+/// fill. The anchor [`fill_return_paths`] matches on.
+pub const RETURN_MARKER_ATTR: &str = "data-albedo-return";
+
+/// The hidden return-path input every renderer emits as a child of a
+/// form-action `<form>`, beside the CSRF input.
+///
+/// Empty for the same reason the CSRF placeholder is: Tier-A markup is baked at
+/// build time and island markup is precomputed once at boot, so the renderer has
+/// no request whose path it could stamp. [`fill_return_paths`] fills it once the
+/// request is known.
+///
+/// 🔑 **This is not a redirect the client gets to choose.** The value is
+/// re-parsed server-side by `albedo_server::forms::ReturnPath`, which accepts
+/// only a rooted same-origin path — so an edited field can at worst send the
+/// submitter to a different page of the same app. A login form that trusted this
+/// value would be the classic credential-phishing chain, which is why the
+/// validation lives at the reader and not here.
+pub const RETURN_PLACEHOLDER_INPUT: &str =
+    r#"<input type="hidden" name="_albedo_return" value="" data-albedo-return />"#;
+
+/// The exact `value=""` + marker sequence [`fill_return_paths`] rewrites.
+/// A substring of [`RETURN_PLACEHOLDER_INPUT`] by construction — asserted by
+/// `emitted_placeholder_contains_the_fill_anchor`.
+const RETURN_EMPTY_VALUE_ANCHOR: &str = r#"value="" data-albedo-return"#;
+
+/// Both hidden inputs, in the order a renderer emits them.
+///
+/// A `concat!` and therefore a restatement of the two constants above, which is
+/// the drift this module exists to prevent — so `the_fused_prefix_is_exactly_its_two_parts`
+/// fails the build the moment it stops being their concatenation. Const string
+/// concatenation of two `const`s is not expressible in stable Rust without a
+/// macro crate, and a test that cannot pass silently is cheaper than the
+/// dependency.
+pub const FORM_HIDDEN_INPUTS: &str = concat!(
+    r#"<input type="hidden" name="_csrf" value="" data-albedo-csrf />"#,
+    r#"<input type="hidden" name="_albedo_return" value="" data-albedo-return />"#,
+);
+
 /// Marker attribute identifying a CSRF input the server still has to
 /// fill. Present in both the placeholder and the filled output — it is
 /// the anchor [`fill_csrf_tokens`] matches on.
@@ -88,6 +163,49 @@ pub fn form_action_name(action_attr: &str) -> Option<&str> {
     action_attr.strip_prefix(FORM_ACTION_PREFIX)
 }
 
+/// Whether a **plain** `<form>` — one carrying no `action:` sentinel — still
+/// needs the hidden inputs [`FORM_HIDDEN_INPUTS`] supplies.
+///
+/// ## Why this exists
+///
+/// The sentinel was the only thing that earned a CSRF token, which quietly made
+/// one kind of form **unauthorable**: the first-party sign-in endpoints
+/// (`/_albedo/auth/password/login` and friends) are real URLs, not action names,
+/// so a `<form action="/_albedo/auth/password/login" method="POST">` rendered
+/// with no token and `run_auth_route` answered every submit with `403 This form
+/// is stale`. There was no spelling of a working login form. `AUTH.md`
+/// § "P2's shape" asks for the general seam rather than a login special case,
+/// and this is it: the rule is about *where the form posts*, not about which
+/// feature asked.
+///
+/// ## The rule, and why each half of it
+///
+/// - **POST only.** A GET form puts its fields in the URL, so a token emitted
+///   there would land in the history, the `Referer` and the access log — the
+///   leak the token exists to prevent. A GET form is also not a mutation, so
+///   there is nothing to forge.
+/// - **Same-origin only**, meaning an absent `action` (the browser resolves it
+///   to the current URL) or one that is a **rooted path**. 🔑 An absolute or
+///   protocol-relative `action` is refused *specifically* because emitting the
+///   token there would hand this session's CSRF token to a third-party origin on
+///   the next submit — a token-disclosure bug introduced by the very mechanism
+///   meant to stop forgery. `//evil.example` is a URL, not a path, which is why
+///   the `//` case is rejected rather than treated as rooted.
+///
+/// Both renderers ask this one function, for the reason the "served-markup
+/// contract" section above exists: the CSRF input had two spellings once
+/// already, and the Tier-B copy emitted nothing.
+#[must_use]
+pub fn plain_form_needs_hidden_inputs(action: Option<&str>, method: Option<&str>) -> bool {
+    if !method.is_some_and(|m| m.trim().eq_ignore_ascii_case("post")) {
+        return false;
+    }
+    match action.map(str::trim) {
+        None | Some("") => true,
+        Some(path) => path.starts_with('/') && !path.starts_with("//"),
+    }
+}
+
 /// Phase L · post-render CSRF fill.
 ///
 /// Replaces the empty `value` of every [`CSRF_PLACEHOLDER_INPUT`] in
@@ -106,6 +224,83 @@ pub fn fill_csrf_tokens(html: &str, token: &str) -> String {
     }
     let filled = format!("value=\"{token}\" {CSRF_MARKER_ATTR}");
     html.replace(CSRF_EMPTY_VALUE_ANCHOR, &filled)
+}
+
+/// The URL a form carrying `action:NAME` posts to, or `None` when `name`
+/// cannot be a URL path segment.
+///
+/// ## Why `None` rather than an escaped name
+///
+/// Percent-encoding the segment would work and would be wrong: the name also has
+/// to survive being read back out of a route match, so an encoded form means two
+/// spellings of the same action and a decode step that can disagree with the
+/// encode step. Refusing is cheaper and has no failure mode.
+///
+/// The alphabet is the identifier characters every real action name already uses
+/// (`sign_guestbook`, `submit-login`). A name outside it keeps exactly the
+/// behaviour it had before this function existed — [`FORM_ACTION_ATTR`] and a
+/// JS-only submit.
+///
+/// 🪤 **`.` is not in the alphabet, and that is the point.** It is a perfectly
+/// reasonable character in an action name (`todos.add`), and admitting it also
+/// admits `..` — a path segment with a meaning the router assigns rather than we
+/// do. The rule that has no traversal question is worth more than the naming
+/// style it costs.
+///
+/// 🔲 **This should be a build error, not a silent narrowing.** An action name
+/// with a space in it produces a form that works with JavaScript and silently
+/// does nothing without it, which is precisely the class of difference this whole
+/// change exists to remove. Making it one needs a fallible channel out of
+/// [`extract_forms_in_function`], which today returns a plain `Vec`.
+#[must_use]
+pub fn action_endpoint(action_name: &str) -> Option<String> {
+    if !is_url_safe_action_name(action_name) {
+        return None;
+    }
+    Some(format!("{ACTION_ENDPOINT_PREFIX}{action_name}"))
+}
+
+/// Whether an action name can appear verbatim as a URL path segment.
+#[must_use]
+pub fn is_url_safe_action_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Post-render return-path fill, the sibling of [`fill_csrf_tokens`].
+///
+/// Stamps the request's own path into every [`RETURN_PLACEHOLDER_INPUT`] on the
+/// page so a browser submit lands back where it started. Runs in the same pass as
+/// the CSRF fill, because a form that got one and not the other is a form that
+/// works and then redirects to `/`.
+///
+/// `path` is HTML-escaped: it comes from the request line and routinely carries
+/// `&` (query strings do), which unescaped would truncate the attribute at the
+/// first parameter — and a `"` would end it entirely.
+#[must_use]
+pub fn fill_return_paths(html: &str, path: &str) -> String {
+    if !html.contains(RETURN_EMPTY_VALUE_ANCHOR) {
+        return html.to_string();
+    }
+    let filled = format!(
+        "value=\"{}\" {RETURN_MARKER_ATTR}",
+        escape_attribute_value(path)
+    );
+    html.replace(RETURN_EMPTY_VALUE_ANCHOR, &filled)
+}
+
+/// Minimal HTML attribute-value escape for a double-quoted attribute.
+///
+/// Four characters, in the order that matters: `&` first, or the ampersands
+/// introduced by the other three get escaped a second time.
+fn escape_attribute_value(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// One `<form action="action:NAME">` surfaced by
@@ -554,6 +749,139 @@ mod contract_tests {
         );
         assert!(CSRF_PLACEHOLDER_INPUT.contains(&format!("name=\"{CSRF_FIELD_NAME}\"")));
         assert!(CSRF_PLACEHOLDER_INPUT.contains(CSRF_MARKER_ATTR));
+
+        // Same invariant for the return-path input, which arrived later and
+        // would otherwise have been the one nobody checked.
+        assert!(RETURN_PLACEHOLDER_INPUT.contains(RETURN_EMPTY_VALUE_ANCHOR));
+        assert!(RETURN_PLACEHOLDER_INPUT.contains(&format!("name=\"{RETURN_FIELD_NAME}\"")));
+        assert!(RETURN_PLACEHOLDER_INPUT.contains(RETURN_MARKER_ATTR));
+    }
+
+    /// The rule that makes a sign-in form authorable: a same-origin POST form
+    /// earns the hidden inputs whether or not it carries an `action:` sentinel.
+    #[test]
+    fn a_same_origin_post_form_earns_the_hidden_inputs() {
+        assert!(plain_form_needs_hidden_inputs(
+            Some("/_albedo/auth/password/login"),
+            Some("POST")
+        ));
+        // Case and surrounding space are the author's, not the rule's.
+        assert!(plain_form_needs_hidden_inputs(Some("/submit"), Some("post")));
+        assert!(plain_form_needs_hidden_inputs(Some(" /submit "), Some(" Post ")));
+        // No action at all resolves to the current URL, which is same-origin.
+        assert!(plain_form_needs_hidden_inputs(None, Some("post")));
+        assert!(plain_form_needs_hidden_inputs(Some(""), Some("post")));
+    }
+
+    /// 🔑 The half that is a *disclosure* rule rather than a forgery one. A
+    /// token emitted into a form that posts off-origin is handed to that origin
+    /// on submit, so the mechanism meant to stop CSRF would be leaking the
+    /// secret it depends on. A GET form leaks it a different way — into the URL,
+    /// the history and the access log.
+    #[test]
+    fn a_token_is_never_emitted_where_it_would_leak() {
+        // Off-origin, in each spelling that is not a rooted path.
+        for action in [
+            "https://evil.example/collect",
+            "http://evil.example/collect",
+            "//evil.example/collect",
+            "javascript:void(0)",
+            "relative/path",
+        ] {
+            assert!(
+                !plain_form_needs_hidden_inputs(Some(action), Some("post")),
+                "{action} must not receive a CSRF token",
+            );
+        }
+        // GET, however same-origin.
+        assert!(!plain_form_needs_hidden_inputs(Some("/search"), Some("get")));
+        assert!(!plain_form_needs_hidden_inputs(Some("/search"), None));
+    }
+
+    /// [`FORM_HIDDEN_INPUTS`] restates the two placeholder literals because
+    /// stable Rust cannot concatenate two `const`s. This is the check that makes
+    /// the restatement safe: edit either placeholder without editing the fused
+    /// constant and the build stops here rather than shipping a form whose
+    /// hidden inputs no fill can see.
+    #[test]
+    fn the_fused_prefix_is_exactly_its_two_parts() {
+        assert_eq!(
+            FORM_HIDDEN_INPUTS,
+            format!("{CSRF_PLACEHOLDER_INPUT}{RETURN_PLACEHOLDER_INPUT}")
+        );
+    }
+
+    /// The two fills run over the same HTML in the same pass, so neither may
+    /// match the other's anchor. They differ only in their marker attribute,
+    /// which is exactly the kind of near-collision worth pinning.
+    #[test]
+    fn the_two_placeholder_fills_do_not_match_each_others_anchors() {
+        let both = format!("<form>{CSRF_PLACEHOLDER_INPUT}{RETURN_PLACEHOLDER_INPUT}</form>");
+        let filled = fill_return_paths(&fill_csrf_tokens(&both, "tok"), "/mine");
+        assert!(filled.contains(&format!("name=\"{CSRF_FIELD_NAME}\" value=\"tok\"")));
+        assert!(filled.contains(&format!("name=\"{RETURN_FIELD_NAME}\" value=\"/mine\"")));
+        assert!(!filled.contains("value=\"\""), "nothing may stay empty: {filled}");
+    }
+
+    /// A query string is the common case and it is full of ampersands. Left
+    /// unescaped the attribute truncates at the first one, so the submit returns
+    /// to a path missing half its parameters — a bug that only shows up on pages
+    /// with more than one query parameter.
+    #[test]
+    fn a_query_string_survives_the_fill_intact() {
+        let filled = fill_return_paths(RETURN_PLACEHOLDER_INPUT, "/search?q=a&page=2");
+        assert!(
+            filled.contains("value=\"/search?q=a&amp;page=2\""),
+            "{filled}"
+        );
+    }
+
+    /// A path that could close the attribute must not be able to.
+    #[test]
+    fn a_quote_in_the_path_cannot_escape_the_attribute() {
+        let filled = fill_return_paths(RETURN_PLACEHOLDER_INPUT, "/x\"><script>alert(1)</script>");
+        assert!(!filled.contains("<script>"), "{filled}");
+        assert!(filled.contains("&quot;"), "{filled}");
+    }
+
+    #[test]
+    fn the_return_fill_is_a_noop_without_a_placeholder() {
+        let plain = "<div>no forms here</div>";
+        assert_eq!(fill_return_paths(plain, "/mine"), plain);
+    }
+
+    /// The endpoint is what makes a submit work with no JavaScript at all, so
+    /// its shape is a contract and not an implementation detail.
+    #[test]
+    fn the_action_endpoint_is_the_prefix_plus_the_name() {
+        assert_eq!(
+            action_endpoint("sign_guestbook").as_deref(),
+            Some("/_albedo/action/sign_guestbook")
+        );
+        assert_eq!(
+            action_endpoint("submit-login").as_deref(),
+            Some("/_albedo/action/submit-login")
+        );
+    }
+
+    /// A name that cannot be a path segment gets no URL rather than a broken
+    /// one. Path traversal is in here deliberately: `..` must never become a
+    /// route.
+    #[test]
+    fn an_unusable_action_name_yields_no_endpoint() {
+        for name in [
+            "sign guestbook",
+            "a/b",
+            "..",
+            ".",
+            "todos.add",
+            "a?b",
+            "a#b",
+            "a%2Fb",
+            "",
+        ] {
+            assert_eq!(action_endpoint(name), None, "`{name}` must not build a URL");
+        }
     }
 
     /// Emission → fill, composed end to end: the token a browser would

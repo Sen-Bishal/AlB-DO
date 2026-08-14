@@ -63,6 +63,11 @@ pub enum TieringReason {
     IoBoundary,
     SideEffectBoundary,
     WeightBasedPromotion,
+    /// AUTH § 3. The component reads the request's principal, so its render
+    /// cannot be hoisted out of the request — not to build time (Tier A) and not
+    /// to boot time (a Tier-C island's props). Tier B is the only tier that has
+    /// a request to read.
+    RequestScoped,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,11 +104,18 @@ pub struct TieringInputs {
 ///   **False means "not proven to escape", never "proven local"** — the unknown case must round
 ///   toward Tier C, because a wrong Tier C still works (an island is the general fallback) while a
 ///   wrong Tier B ships a binding for state the wire cannot drive.
+/// - `reads_principal` — AUTH § 3 · **the render needs the request.** True when the component
+///   names `user`, read off the AST by `parser::scan_reads_principal`. It is not a tier *preference*
+///   but a tier *impossibility*: Tier-A markup is baked once at build time, so there is no request
+///   for a principal to come from, and a component baked that way renders its anonymous branch
+///   forever. Like `state_escapes` this is a proof rather than a guess — the distinction
+///   `TODO.md` P-c asks this signature to stop losing.
 pub fn decide_tier_and_hydration(
     effects: EffectProfile,
     has_event_handler: bool,
     client_interactive: bool,
     state_escapes: bool,
+    reads_principal: bool,
     is_above_fold: bool,
     weight_bytes: u64,
     inputs: TieringInputs,
@@ -212,11 +224,33 @@ pub fn decide_tier_and_hydration(
     }
 
     // A handler with no hooks/effects still must hydrate to run — never Tier-A.
-    if weight_bytes <= inputs.tier_a_inline_max_bytes && !has_event_handler {
+    //
+    // AUTH § 3 · and neither may a component that reads the principal. Tier-A
+    // markup is baked once, at build time, into the manifest's `tier_a_root`;
+    // there is no request in scope, so `user` is whatever it was when the build
+    // ran — nothing. A component baked that way does not fail, which is the
+    // problem: it renders its anonymous branch to everyone, forever, and the
+    // signed-in branch is absent from the artifact rather than merely unreached.
+    // Falling through leaves it Tier B, where `RequestContext::resolve("user")`
+    // runs per request.
+    if weight_bytes <= inputs.tier_a_inline_max_bytes && !has_event_handler && !reads_principal {
         return TieringDecision {
             tier: Tier::A,
             hydration_mode: HydrationMode::None,
             reason: TieringReason::PureStaticEligible,
+        };
+    }
+
+    // 🔑 Checked before the weight rule below, which would otherwise promote a
+    // large principal-reading component to Tier C — an island whose props are
+    // computed once at boot, so it has the same no-request problem Tier A does,
+    // one tier up. A component that needs the request is served from the tier
+    // that has one.
+    if reads_principal {
+        return TieringDecision {
+            tier: Tier::B,
+            hydration_mode: inputs.tier_b_mode,
+            reason: TieringReason::RequestScoped,
         };
     }
 
@@ -257,7 +291,7 @@ mod tests {
     #[test]
     fn test_pure_small_component_is_tier_a() {
         let decision =
-            decide_tier_and_hydration(EffectProfile::pure(), false, false, false, false, 1024, inputs());
+            decide_tier_and_hydration(EffectProfile::pure(), false, false, false, false, false, 1024, inputs());
         assert_eq!(decision.tier, Tier::A);
         assert_eq!(decision.hydration_mode, HydrationMode::None);
         assert_eq!(decision.reason, TieringReason::PureStaticEligible);
@@ -268,7 +302,7 @@ mod tests {
         // A pure component that nonetheless declares an `on*` handler must
         // hydrate to run the handler — it can never collapse to static Tier-A.
         let decision =
-            decide_tier_and_hydration(EffectProfile::pure(), true, false, false, false, 1024, inputs());
+            decide_tier_and_hydration(EffectProfile::pure(), true, false, false, false, false, 1024, inputs());
         assert_ne!(decision.tier, Tier::A);
     }
 
@@ -279,6 +313,7 @@ mod tests {
                 hooks: true,
                 ..EffectProfile::default()
             },
+            false,
             false,
             false,
             false,
@@ -299,10 +334,121 @@ mod tests {
             c.is_interactive,
             c.is_client_interactive,
             c.state_escapes,
+            c.reads_principal,
             false,
             1024,
             inputs(),
         )
+    }
+
+    /// AUTH § 3 · the defect this signal exists for.
+    ///
+    /// Before `reads_principal`, this component was small and pure, so it took
+    /// the Tier-A branch and its markup was baked into the manifest at build
+    /// time — with `user` undefined, because there is no request at build time.
+    /// It did not fail; it rendered the anonymous branch to everyone forever,
+    /// and the signed-in branch was absent from the artifact entirely.
+    #[test]
+    fn a_component_that_reads_user_is_never_tier_a() {
+        let decision = tier_of(
+            r#"
+            export default function Greeting({ user }) {
+                return <p>{user ? user.id : "stranger"}</p>;
+            }
+            "#,
+            "Greeting.tsx",
+        );
+        assert_eq!(decision.tier, Tier::B, "it must be rendered per request");
+        assert_eq!(decision.reason, TieringReason::RequestScoped);
+    }
+
+    /// Asking for it in the signature is asking for it. A component that
+    /// destructures `user` and only passes it down still needs the prop.
+    #[test]
+    fn destructuring_user_is_enough_even_if_the_body_never_names_it() {
+        let decision = tier_of(
+            r#"
+            export default function Shell({ user }) {
+                return <div className="shell" />;
+            }
+            "#,
+            "Shell.tsx",
+        );
+        assert_eq!(decision.tier, Tier::B);
+        assert_eq!(decision.reason, TieringReason::RequestScoped);
+    }
+
+    /// 🔑 The size rule must not reclaim it. A large principal-reading component
+    /// would otherwise be promoted to Tier C — an island whose props are computed
+    /// once at boot, which has the same no-request problem one tier up.
+    #[test]
+    fn a_large_component_that_reads_user_is_tier_b_not_an_island() {
+        let parsed = crate::parser::ComponentParser::new()
+            .parse_source(
+                r#"
+                export default function Big({ user }) {
+                    return <p>{user.id}</p>;
+                }
+                "#,
+                "Big.tsx",
+            )
+            .unwrap();
+        let c = &parsed[0];
+        let decision = decide_tier_and_hydration(
+            c.effect_profile,
+            c.is_interactive,
+            c.is_client_interactive,
+            c.state_escapes,
+            c.reads_principal,
+            false,
+            // Well past `tier_c_split_min_bytes`.
+            256 * 1024,
+            inputs(),
+        );
+        assert_eq!(decision.tier, Tier::B);
+        assert_eq!(decision.reason, TieringReason::RequestScoped);
+    }
+
+    /// The three near-misses, which must all stay Tier A. Each one is a `user`
+    /// that is not *the* user, and treating any of them as the principal would
+    /// drag an ordinary static component into a per-request render.
+    #[test]
+    fn a_user_that_is_not_the_principal_does_not_move_the_tier() {
+        // A local binding shadows the ambient one — same rule that stops
+        // `const { append } = …` from reading as a FORGE write.
+        let shadowed = tier_of(
+            r#"
+            export default function Row() {
+                const user = { id: "local" };
+                return <p>{user.id}</p>;
+            }
+            "#,
+            "Row.tsx",
+        );
+        assert_eq!(shadowed.tier, Tier::A, "a local `user` is not the principal");
+
+        // A member-property name: `row.user` is someone else's column.
+        let member = tier_of(
+            r#"
+            export default function Row({ row }) {
+                return <p>{row.user}</p>;
+            }
+            "#,
+            "Member.tsx",
+        );
+        assert_eq!(member.tier, Tier::A, "`row.user` is a field, not the principal");
+
+        // A JSX attribute name: `<Profile user={author} />` names a prop on
+        // someone else's component.
+        let attr = tier_of(
+            r#"
+            export default function Page({ author }) {
+                return <Profile user={author} />;
+            }
+            "#,
+            "Attr.tsx",
+        );
+        assert_eq!(attr.tier, Tier::A, "a JSX attr named `user` is not a read");
     }
 
     #[test]
@@ -367,6 +513,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             1024,
             inputs(),
         );
@@ -389,6 +536,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             1024,
             inputs(),
         );
@@ -402,6 +550,7 @@ mod tests {
                 side_effects: true,
                 ..EffectProfile::default()
             },
+            false,
             false,
             false,
             false,

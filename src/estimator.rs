@@ -118,6 +118,7 @@ mod tests {
             is_interactive: false,
             is_client_interactive: false,
             state_escapes: false,
+            reads_principal: false,
             source_hash: 1,
             import_sources: Vec::new(),
             is_module_only: false,

@@ -440,6 +440,177 @@ pub async fn delete_principal(db: &dyn DataSubstrate, principal: &PrincipalId) -
     Ok(())
 }
 
+/// A password account and the hash to verify against.
+///
+/// One value rather than two lookups: the login path needs the principal *and*
+/// the secret, and asking for them separately is a second round trip on the
+/// exact path where an extra measurable step is a timing oracle.
+#[derive(Debug, Clone)]
+pub struct PasswordCredential {
+    /// Who this is.
+    pub principal: PrincipalId,
+    /// The stored PHC string. Never the password.
+    pub secret_hash: String,
+}
+
+/// Register a first-party credential account — **P2's write.**
+///
+/// Returns `Ok(None)` when `(provider, subject)` already exists. That is *not*
+/// [`upsert_principal`]'s behaviour and the difference is the whole reason this
+/// is a separate function: upserting a credential account would let anyone who
+/// knows an existing address re-register it and **overwrite the password**,
+/// which is account takeover spelled as a convenience. A signup for a taken
+/// address must fail, and it must fail before any hash is written.
+///
+/// The two inserts plus the credential row are one transaction, so a crash
+/// cannot leave a user with an account and no way to sign into it.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn create_credential_account(
+    db: &dyn DataSubstrate,
+    provider: &str,
+    subject: &str,
+    profile: &ProviderProfile,
+    secret_hash: &str,
+    now_ms: i64,
+) -> Result<Option<Principal>> {
+    // A cheap pre-check so the ordinary "that address is taken" answer costs one
+    // indexed read rather than a failed transaction. It is **not** the guard —
+    // two concurrent signups can both pass it. The `(provider, subject)` unique
+    // index is the guard, and the failed-insert arm below is what honours it.
+    if lookup_account(db, provider, subject).await?.is_some() {
+        return Ok(None);
+    }
+
+    let minted = PrincipalId::mint();
+    let tx = db.begin().await?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {USERS} (principal, email, name, image, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)"
+        ),
+        &[
+            SqlValue::Text(minted.as_str().to_string()),
+            optional_param(profile.email.as_deref()),
+            optional_param(profile.name.as_deref()),
+            optional_param(profile.image.as_deref()),
+            SqlValue::Integer(now_ms),
+        ],
+    )
+    .await?;
+
+    let claimed = tx
+        .execute(
+            &format!(
+                "INSERT INTO {ACCOUNTS} (principal, provider, subject, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)"
+            ),
+            &[
+                SqlValue::Text(minted.as_str().to_string()),
+                SqlValue::Text(provider.to_string()),
+                SqlValue::Text(subject.to_string()),
+                SqlValue::Integer(now_ms),
+            ],
+        )
+        .await;
+
+    if claimed.is_err() {
+        // Lost the race to a concurrent signup for the same address. Roll back
+        // and report "taken" — the same answer the pre-check gives, so the two
+        // paths are indistinguishable from outside. Emphatically NOT "adopt the
+        // winner", which is what `upsert_principal` does: here that would hand
+        // this caller a session on somebody else's brand-new account.
+        tx.rollback().await?;
+        return Ok(None);
+    }
+
+    tx.execute(
+        &format!(
+            "INSERT INTO {CREDENTIALS} (principal, provider, secret_hash, created_at) \
+             VALUES (?1, ?2, ?3, ?4)"
+        ),
+        &[
+            SqlValue::Text(minted.as_str().to_string()),
+            SqlValue::Text(provider.to_string()),
+            SqlValue::Text(secret_hash.to_string()),
+            SqlValue::Integer(now_ms),
+        ],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(build_principal(minted, provider, profile)))
+}
+
+/// Look up the credential behind `(provider, subject)`.
+///
+/// `Ok(None)` covers both "no such account" and "an account with no password
+/// row" — a principal who registered a passkey and never set a password. The
+/// caller must treat them identically and must still
+/// [`absorb_timing`](crate::auth::password::absorb_timing), because the whole
+/// point is that a caller cannot tell them apart.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn lookup_credential(
+    db: &dyn DataSubstrate,
+    provider: &str,
+    subject: &str,
+) -> Result<Option<PasswordCredential>> {
+    // One join rather than account-then-credential, for the reason above: two
+    // sequential reads make "the account exists but has no password" a
+    // distinguishable duration.
+    let rows = db
+        .query(
+            &format!(
+                "SELECT a.principal, c.secret_hash FROM {ACCOUNTS} a \
+                 JOIN {CREDENTIALS} c ON c.principal = a.principal AND c.provider = a.provider \
+                 WHERE a.provider = ?1 AND a.subject = ?2 AND c.secret_hash IS NOT NULL"
+            ),
+            &[
+                SqlValue::Text(provider.to_string()),
+                SqlValue::Text(subject.to_string()),
+            ],
+        )
+        .await?;
+
+    let Some(row) = rows.rows.first() else {
+        return Ok(None);
+    };
+    let principal = PrincipalId::parse(text_at(row, 0, "accounts.principal")?)
+        .map_err(|err| StoreError::Corrupt(err.to_string()))?;
+    Ok(Some(PasswordCredential {
+        principal,
+        secret_hash: text_at(row, 1, "credentials.secret_hash")?,
+    }))
+}
+
+/// The profile stored for a principal, for building a [`Principal`] after a
+/// credential check has already established *who*.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn profile_for(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+) -> Result<ProviderProfile> {
+    let rows = db
+        .query(
+            &format!("SELECT email, name, image FROM {USERS} WHERE principal = ?1"),
+            &[SqlValue::Text(principal.as_str().to_string())],
+        )
+        .await?;
+    let Some(row) = rows.rows.first() else {
+        return Ok(ProviderProfile::default());
+    };
+    Ok(ProviderProfile {
+        email: optional_text_at(row, 0),
+        name: optional_text_at(row, 1),
+        image: optional_text_at(row, 2),
+        claims: JsonMap::new(),
+    })
+}
+
 /// What a provider told us about a human, already projected out of its own
 /// claim shape by the provider's `claimMap`.
 #[derive(Debug, Clone, Default, PartialEq)]

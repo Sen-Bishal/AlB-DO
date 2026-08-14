@@ -69,17 +69,37 @@ pub fn normalize_slashes(value: &str) -> String {
     value.replace('\\', "/")
 }
 
+/// Extensions a specifier may already carry and be considered fully resolved.
+/// Mirrors `is_component_module` — a module is only ever keyed under one of
+/// these, so anything else is not an extension as far as resolution goes.
+const MODULE_EXTENSIONS: [&str; 4] = ["jsx", "tsx", "js", "ts"];
+
 pub fn import_candidates(base: &str) -> Vec<String> {
     let mut out = Vec::new();
-    if std::path::Path::new(base).extension().is_some() {
+    // The test is "does it END IN a module extension", not "does
+    // `Path::extension()` return anything". A dot in the FILENAME is not an
+    // extension: `./WelcomeScreen.Center` yields `Some("Center")`, and reading
+    // that as "already resolved" made every dotted component name
+    // (`Foo.Bar.tsx`, `Button.styles.ts`) unimportable — the module is keyed
+    // under `WelcomeScreen.Center.tsx`, a candidate we then never tried.
+    let extension = std::path::Path::new(base)
+        .extension()
+        .and_then(|ext| ext.to_str());
+    if matches!(extension, Some(ext) if MODULE_EXTENSIONS.contains(&ext)) {
         out.push(base.to_string());
-    } else {
-        for ext in ["jsx", "tsx", "js", "ts"] {
-            out.push(format!("{base}.{ext}"));
-        }
-        for ext in ["jsx", "tsx", "js", "ts"] {
-            out.push(format!("{base}/index.{ext}"));
-        }
+        return out;
+    }
+    // A non-module extension (`./data.json`, `./theme.css`) still resolves to
+    // itself first if the map holds it verbatim, then falls through to the
+    // dotted-filename reading below.
+    if extension.is_some() {
+        out.push(base.to_string());
+    }
+    for ext in MODULE_EXTENSIONS {
+        out.push(format!("{base}.{ext}"));
+    }
+    for ext in MODULE_EXTENSIONS {
+        out.push(format!("{base}/index.{ext}"));
     }
     out
 }
@@ -198,6 +218,20 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
             "defaultChecked" => "checked",
             _ => name.as_str(),
         };
+        // `style` takes an object in JSX and CSS text in HTML. Without this the
+        // object fell through to `value_to_string`, which JSON-encodes it, and a
+        // `<div style={{height:"1px"}}>` shipped a `style` attribute holding
+        // `{"height":"1px"}` — not a style the browser applies, and not what the
+        // QuickJS shim produced from the same source either.
+        if attr_name == "style" {
+            if let Value::Object(map) = value {
+                let css = style_object_to_css(map.iter().map(|(k, v)| (k.as_str(), v)));
+                if !css.is_empty() {
+                    out.push(format!("style=\"{}\"", escape_attr(&css)));
+                }
+                continue;
+            }
+        }
         match value {
             Value::Null => {}
             Value::Bool(false) => {}
@@ -228,6 +262,177 @@ pub const HTML_VOID_ELEMENTS: &[&str] = &[
 
 pub fn is_void_tag(tag: &str) -> bool {
     HTML_VOID_ELEMENTS.contains(&tag)
+}
+
+/// CSS properties React leaves unitless when handed a bare number.
+///
+/// Lifted from React's `isUnitlessNumber`. Every property *not* here gets `px`
+/// appended to a non-zero numeric value, which is the rule that turns
+/// `style={{ width: 10 }}` into `width:10px` but leaves `style={{ flex: 1 }}`
+/// as `flex:1`.
+///
+/// Base spellings only — [`css_unitless_properties`] derives the vendor-prefixed
+/// variants the way React does, so `WebkitLineClamp` is covered without being
+/// written out.
+pub const CSS_UNITLESS_BASE_PROPERTIES: &[&str] = &[
+    "animationIterationCount",
+    "aspectRatio",
+    "borderImageOutset",
+    "borderImageSlice",
+    "borderImageWidth",
+    "boxFlex",
+    "boxFlexGroup",
+    "boxOrdinalGroup",
+    "columnCount",
+    "columns",
+    "flex",
+    "flexGrow",
+    "flexPositive",
+    "flexShrink",
+    "flexNegative",
+    "flexOrder",
+    "gridArea",
+    "gridRow",
+    "gridRowEnd",
+    "gridRowSpan",
+    "gridRowStart",
+    "gridColumn",
+    "gridColumnEnd",
+    "gridColumnSpan",
+    "gridColumnStart",
+    "fontWeight",
+    "lineClamp",
+    "lineHeight",
+    "opacity",
+    "order",
+    "orphans",
+    "tabSize",
+    "widows",
+    "zIndex",
+    "zoom",
+    // SVG-related, unitless for the same reason.
+    "fillOpacity",
+    "floodOpacity",
+    "stopOpacity",
+    "strokeDasharray",
+    "strokeDashoffset",
+    "strokeMiterlimit",
+    "strokeOpacity",
+    "strokeWidth",
+];
+
+/// Vendor prefixes React generates a unitless variant for.
+const CSS_VENDOR_PREFIXES: &[&str] = &["Webkit", "ms", "Moz", "O"];
+
+/// The full unitless set — base names plus their vendor-prefixed spellings.
+///
+/// This is the single spelling of the set, in exactly the sense
+/// [`HTML_VOID_ELEMENTS`] is one: the pure-Rust renderer reads it through
+/// [`is_unitless_style_property`], and the QuickJS `h()` shim receives it as
+/// *data* on `__ALBEDO_MARKUP_CONTRACT` rather than restating it in JS. Two
+/// copies would be two chances for one renderer to emit `flex:1` where the
+/// other emits `flex:1px` — a divergence a browser would render differently,
+/// not merely spell differently.
+pub fn css_unitless_properties() -> &'static std::collections::HashSet<String> {
+    static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let mut set = std::collections::HashSet::new();
+        for base in CSS_UNITLESS_BASE_PROPERTIES {
+            set.insert((*base).to_string());
+            let mut capitalized = base.chars();
+            let capitalized = match capitalized.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + capitalized.as_str(),
+                None => continue,
+            };
+            for prefix in CSS_VENDOR_PREFIXES {
+                set.insert(format!("{prefix}{capitalized}"));
+            }
+        }
+        set
+    })
+}
+
+pub fn is_unitless_style_property(property: &str) -> bool {
+    css_unitless_properties().contains(property)
+}
+
+/// React's `hyphenateStyleName`: `backgroundColor` → `background-color`.
+///
+/// A leading uppercase letter yields a leading dash, which is what makes
+/// `WebkitTransform` come out as `-webkit-transform`. The Microsoft spelling is
+/// the one exception React special-cases — `msTransform` hyphenates to
+/// `ms-transform`, but CSS wants `-ms-transform`.
+pub fn hyphenate_style_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for ch in name.chars() {
+        if ch.is_ascii_uppercase() {
+            out.push('-');
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    match out.strip_prefix("ms-") {
+        Some(rest) => format!("-ms-{rest}"),
+        None => out,
+    }
+}
+
+/// One `style` declaration's value, or `None` when React would omit the
+/// declaration entirely.
+///
+/// `null`, booleans and the empty string are dropped rather than emitted as an
+/// empty declaration. A non-zero number on a property that takes a length gets
+/// `px`; zero never does, matching React's `value !== 0` guard.
+pub fn style_value_to_css(property: &str, value: &Value) -> Option<String> {
+    match value {
+        Value::Null | Value::Bool(_) => None,
+        Value::Number(number) => {
+            let text = format_number_for_output(number);
+            if text == "0" || property.starts_with("--") || is_unitless_style_property(property) {
+                Some(text)
+            } else {
+                Some(format!("{text}px"))
+            }
+        }
+        other => {
+            let text = value_to_string(other);
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+    }
+}
+
+/// A JSX `style` object lowered to CSS text, React's way.
+///
+/// Declarations are emitted in the order the iterator yields them, joined with
+/// `;` and no trailing separator. Custom properties (`--brand`) keep their name
+/// verbatim; everything else is hyphenated.
+///
+/// **Order is the caller's responsibility and it matters.** CSS is
+/// order-sensitive — `{ margin: 0, marginTop: 4 }` and its reverse mean
+/// different things — so a caller holding the authored order must preserve it.
+/// See `read_attrs`, which lowers object *literals* straight from the AST for
+/// exactly this reason.
+pub fn style_object_to_css<'a>(entries: impl Iterator<Item = (&'a str, &'a Value)>) -> String {
+    let mut out = String::new();
+    for (name, value) in entries {
+        let Some(rendered) = style_value_to_css(name, value) else {
+            continue;
+        };
+        let property = if name.starts_with("--") {
+            name.to_string()
+        } else {
+            hyphenate_style_name(name)
+        };
+        if !out.is_empty() {
+            out.push(';');
+        }
+        out.push_str(&property);
+        out.push(':');
+        out.push_str(&rendered);
+    }
+    out
 }
 
 pub fn is_truthy(val: &Value) -> bool {
@@ -483,6 +688,127 @@ mod tests {
         assert_eq!(checked, "checked");
         let unchecked = render_attrs(&[("defaultChecked".to_string(), Value::Bool(false))]);
         assert_eq!(unchecked, "");
+    }
+
+    /// A dot in the filename is not an extension. `Path::extension()` says
+    /// `Foo.Bar` carries extension `Bar`, and treating that as "already
+    /// resolved" meant the resolver never tried `Foo.Bar.tsx` — the spec the
+    /// module is actually keyed under — so any component file with a dot in
+    /// its name (`Foo.Bar.tsx`, `Button.styles.ts`) was unimportable.
+    #[test]
+    fn import_candidates_extends_a_dotted_filename() {
+        let candidates = import_candidates("dir/Foo.Bar");
+        assert!(
+            candidates.contains(&"dir/Foo.Bar.tsx".to_string()),
+            "expected the dotted name to be extended, got {candidates:?}"
+        );
+        // The `index.*` fallbacks still apply to it.
+        assert!(candidates.contains(&"dir/Foo.Bar/index.ts".to_string()));
+    }
+
+    /// A specifier that already ends in a module extension is resolved — it
+    /// must not sprout `Foo.tsx.jsx` candidates.
+    #[test]
+    fn import_candidates_leaves_a_module_extension_alone() {
+        for spec in ["dir/Foo.tsx", "dir/Foo.jsx", "dir/Foo.js", "dir/Foo.ts"] {
+            assert_eq!(import_candidates(spec), vec![spec.to_string()]);
+        }
+    }
+
+    /// A non-module extension is neither: it resolves to itself first, but
+    /// still gets extended, because `theme.css` and `Foo.Bar` are the same
+    /// shape and only the module map can tell them apart.
+    #[test]
+    fn import_candidates_tries_a_non_module_extension_verbatim_first() {
+        let candidates = import_candidates("dir/theme.css");
+        assert_eq!(candidates.first().unwrap(), "dir/theme.css");
+        assert!(candidates.contains(&"dir/theme.css.tsx".to_string()));
+    }
+
+    #[test]
+    fn import_candidates_extends_a_bare_specifier() {
+        assert_eq!(
+            import_candidates("dir/Foo"),
+            vec![
+                "dir/Foo.jsx",
+                "dir/Foo.tsx",
+                "dir/Foo.js",
+                "dir/Foo.ts",
+                "dir/Foo/index.jsx",
+                "dir/Foo/index.tsx",
+                "dir/Foo/index.js",
+                "dir/Foo/index.ts",
+            ]
+        );
+    }
+
+    /// `backgroundColor` → `background-color`, and the two prefix spellings
+    /// that are not just "lowercase it".
+    #[test]
+    fn hyphenate_style_name_matches_reacts_spelling() {
+        assert_eq!(hyphenate_style_name("backgroundColor"), "background-color");
+        assert_eq!(hyphenate_style_name("height"), "height");
+        assert_eq!(hyphenate_style_name("WebkitTransform"), "-webkit-transform");
+        assert_eq!(hyphenate_style_name("msFlexOrder"), "-ms-flex-order");
+    }
+
+    /// The `px` rule and its three exemptions: zero, the unitless set, and
+    /// custom properties. A wrong answer here is browser-visible — `flex:1px`
+    /// is discarded outright.
+    #[test]
+    fn numeric_style_values_take_px_unless_the_property_is_exempt() {
+        let n = |v: f64| Value::Number(serde_json::Number::from_f64(v).unwrap());
+        assert_eq!(style_value_to_css("width", &n(10.0)).unwrap(), "10px");
+        assert_eq!(style_value_to_css("marginTop", &n(0.0)).unwrap(), "0");
+        assert_eq!(style_value_to_css("flexGrow", &n(2.0)).unwrap(), "2");
+        assert_eq!(style_value_to_css("lineHeight", &n(1.5)).unwrap(), "1.5");
+        assert_eq!(style_value_to_css("--brand", &n(3.0)).unwrap(), "3");
+        // Vendor-prefixed spellings inherit the base property's exemption.
+        assert!(is_unitless_style_property("WebkitLineClamp"));
+        assert!(is_unitless_style_property("msFlexOrder"));
+        assert!(!is_unitless_style_property("width"));
+    }
+
+    /// React omits the declaration entirely for these rather than emitting an
+    /// empty value.
+    #[test]
+    fn empty_style_values_drop_their_declaration() {
+        for value in [Value::Null, Value::Bool(false), Value::Bool(true)] {
+            assert_eq!(style_value_to_css("color", &value), None);
+        }
+        assert_eq!(style_value_to_css("padding", &Value::String(String::new())), None);
+    }
+
+    /// The whole rule end to end, on the excalidraw shape that found the bug.
+    /// Order here is the authored order, not the alphabetical one a
+    /// `serde_json::Map` would hand back.
+    #[test]
+    fn style_object_renders_as_css_text_in_the_order_given() {
+        let entries = [
+            ("height".to_string(), Value::String("1px".into())),
+            (
+                "backgroundColor".to_string(),
+                Value::String("var(--default-border-color)".into()),
+            ),
+            ("margin".to_string(), Value::String("6px 0".into())),
+            ("flex".to_string(), Value::String("0 0 auto".into())),
+        ];
+        assert_eq!(
+            style_object_to_css(entries.iter().map(|(k, v)| (k.as_str(), v))),
+            "height:1px;background-color:var(--default-border-color);margin:6px 0;flex:0 0 auto"
+        );
+    }
+
+    /// The attribute path, which is what actually reaches the page. Before this
+    /// the object fell through to `value_to_string` and shipped as JSON.
+    #[test]
+    fn render_attrs_lowers_a_style_object_instead_of_json_encoding_it() {
+        let style = serde_json::json!({ "height": "1px", "color": "red" });
+        let html = render_attrs(&[("style".to_string(), style)]);
+        // A `serde_json::Map` is a `BTreeMap`, so this path is alphabetical —
+        // the documented residual. What matters is that it is CSS, not JSON.
+        assert_eq!(html, "style=\"color:red;height:1px\"");
+        assert!(!html.contains('{'), "a style object must never ship as JSON: {html}");
     }
 
     #[test]

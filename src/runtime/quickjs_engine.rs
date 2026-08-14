@@ -837,16 +837,22 @@ fn build_npm_runtime_helpers_script() -> String {
 /// for the same literal, so a quote or backslash in a constant can't
 /// break out into the surrounding script.
 fn build_form_contract_script() -> String {
-    use crate::transforms::form::{CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR, FORM_ACTION_PREFIX};
+    use crate::transforms::form::{
+        ACTION_ENDPOINT_PREFIX, CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR, FORM_ACTION_PREFIX,
+        FORM_HIDDEN_INPUTS,
+    };
     // Infallible: `serde_json` cannot fail to encode a `&str`.
     let js = |value: &str| {
         serde_json::to_string(value).expect("encoding a &str as a JSON string cannot fail")
     };
     format!(
-        "globalThis.__ALBEDO_FORM_CONTRACT = {{ prefix: {}, attr: {}, csrfInput: {} }};",
+        "globalThis.__ALBEDO_FORM_CONTRACT = {{ prefix: {}, attr: {}, csrfInput: {}, \
+         endpointPrefix: {}, hiddenInputs: {} }};",
         js(FORM_ACTION_PREFIX),
         js(FORM_ACTION_ATTR),
         js(CSRF_PLACEHOLDER_INPUT),
+        js(ACTION_ENDPOINT_PREFIX),
+        js(FORM_HIDDEN_INPUTS),
     )
 }
 
@@ -880,12 +886,29 @@ fn build_markup_contract_script() -> String {
             .map(|tag| serde_json::Value::String((*tag).to_string()))
             .collect(),
     );
+    // The unitless-CSS set crosses for the same reason the void tags do. It is
+    // the one part of React's style rule that is *data* rather than algorithm,
+    // and it is the part with a browser-visible failure mode: a second copy in
+    // JS that fell behind would emit `flex:1px`, which the browser discards, on
+    // a component whose Tier-A render said `flex:1`.
+    let mut unitless: Vec<&String> = crate::runtime::eval::component::css_unitless_properties()
+        .iter()
+        .collect();
+    unitless.sort();
+    let unitless = serde_json::Value::Array(
+        unitless
+            .into_iter()
+            .map(|name| serde_json::Value::String(name.clone()))
+            .collect(),
+    );
     format!(
-        "globalThis.__ALBEDO_MARKUP_CONTRACT = {{ voidTags: {}, layoutChildren: {} }};",
+        "globalThis.__ALBEDO_MARKUP_CONTRACT = {{ voidTags: {}, layoutChildren: {}, \
+         styleUnitless: {} }};",
         json(&void),
         json(&serde_json::Value::String(
             LAYOUT_CHILDREN_SENTINEL.to_string()
         )),
+        json(&unitless),
     )
 }
 
@@ -974,6 +997,57 @@ if (typeof globalThis.h !== 'function') {
     return action.slice(contract.prefix.length);
   };
 
+  // The URL a form-action `<form>` actually posts to when no client runtime
+  // ever ran, or null when the action name cannot be a path segment.
+  //
+  // Mirrors `transforms::form::action_endpoint`. The prefix crosses from Rust
+  // on the contract; the alphabet is restated here because a byte predicate has
+  // no JSON representation — so the parity is pinned behaviourally instead, by
+  // `a_form_action_name_that_cannot_be_a_url_segment_ships_no_action_attribute`
+  // rendering through this shim and asserting the same refusal the pure-Rust
+  // renderer makes. `.` is excluded on both sides: allowing it allows `..`.
+  const __albedo_action_endpoint = function(name) {
+    if (typeof name !== 'string' || name.length === 0 || name.length > 64) {
+      return null;
+    }
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+      return null;
+    }
+    const contract = globalThis.__ALBEDO_FORM_CONTRACT;
+    if (!contract || typeof contract.endpointPrefix !== 'string') {
+      return null;
+    }
+    return contract.endpointPrefix + name;
+  };
+
+  // Whether a plain `<form>` — no `action:` sentinel — still earns the hidden
+  // inputs. Mirrors `transforms::form::plain_form_needs_hidden_inputs`, which
+  // carries the reasoning: POST only (a GET would put the token in the URL),
+  // same-origin only (an absolute action would hand the token to a third
+  // party). Parity with the pure-Rust renderer is pinned behaviourally by
+  // `a_plain_post_form_gets_the_hidden_inputs_through_the_shim`.
+  const __albedo_plain_form_needs_hidden_inputs = function(type, props) {
+    if (type !== 'form') {
+      return false;
+    }
+    const method = props.method;
+    if (typeof method !== 'string' || method.trim().toLowerCase() !== 'post') {
+      return false;
+    }
+    const action = props.action;
+    if (action === undefined || action === null || action === '') {
+      return true;
+    }
+    if (typeof action !== 'string') {
+      return false;
+    }
+    const trimmed = action.trim();
+    if (trimmed === '') {
+      return true;
+    }
+    return trimmed.charAt(0) === '/' && trimmed.slice(0, 2) !== '//';
+  };
+
   // Phase P · Stream E.1 — `<children />` is the layout-wrap intrinsic, not a
   // host element. It lowers to the sentinel comment that the manifest builder's
   // `wrap_in_layouts` substitutes the inner page HTML into. Intercepted here,
@@ -994,6 +1068,70 @@ if (typeof globalThis.h !== 'function') {
       return false;
     }
     return contract.voidTags.indexOf(tag) !== -1;
+  };
+
+  // React's style rule, mirroring `runtime::eval::component`'s
+  // `style_object_to_css` / `hyphenate_style_name` / `style_value_to_css`.
+  //
+  // The *set* of unitless properties is not restated here — it crosses from
+  // Rust on `__ALBEDO_MARKUP_CONTRACT` so there is one spelling of it. The
+  // transform itself is algorithm, not data, and is duplicated in the same way
+  // `__albedo_escape_attr` duplicates `escape_attr`: the conformance fixture
+  // `render_quickjs/style_object` is what holds the two implementations equal.
+  const __albedo_is_unitless_style = function(property) {
+    const contract = globalThis.__ALBEDO_MARKUP_CONTRACT;
+    if (!contract || !contract.styleUnitless) {
+      return false;
+    }
+    return contract.styleUnitless.indexOf(property) !== -1;
+  };
+
+  const __albedo_hyphenate_style_name = function(name) {
+    let out = '';
+    for (let i = 0; i < name.length; i++) {
+      const ch = name.charAt(i);
+      if (ch >= 'A' && ch <= 'Z') {
+        out += '-' + ch.toLowerCase();
+      } else {
+        out += ch;
+      }
+    }
+    // `msTransform` hyphenates to `ms-transform`, but CSS wants `-ms-transform`.
+    return out.indexOf('ms-') === 0 ? '-' + out : out;
+  };
+
+  const __albedo_style_to_css = function(style) {
+    let out = '';
+    // `for…in` walks a JS object in insertion order for string keys, which is
+    // the authored order of the object literal — the same order the pure-Rust
+    // side reconstructs from the AST.
+    for (const name in style) {
+      if (!Object.prototype.hasOwnProperty.call(style, name)) {
+        continue;
+      }
+      const value = style[name];
+      let rendered;
+      if (value === null || typeof value === 'undefined' || typeof value === 'boolean') {
+        continue;
+      } else if (typeof value === 'number') {
+        // `0` never takes a unit; nor do custom properties or the unitless set.
+        rendered = String(value);
+        if (value !== 0 && name.indexOf('--') !== 0 && !__albedo_is_unitless_style(name)) {
+          rendered += 'px';
+        }
+      } else {
+        rendered = String(value).trim();
+        if (rendered === '') {
+          continue;
+        }
+      }
+      const property = name.indexOf('--') === 0 ? name : __albedo_hyphenate_style_name(name);
+      if (out !== '') {
+        out += ';';
+      }
+      out += property + ':' + rendered;
+    }
+    return out;
   };
 
   const h = function(type, props, ...children) {
@@ -1019,6 +1157,7 @@ if (typeof globalThis.h !== 'function') {
     let attrs = '';
     const safeProps = props || {};
     const formAction = __albedo_form_action_name(type, safeProps);
+    const formActionEndpoint = formAction === null ? null : __albedo_action_endpoint(formAction);
     for (const key in safeProps) {
       if (!Object.prototype.hasOwnProperty.call(safeProps, key)) {
         continue;
@@ -1048,6 +1187,14 @@ if (typeof globalThis.h !== 'function') {
       if (formAction !== null && key === 'action') {
         continue;
       }
+      // An authored `method` on a form we are giving a real endpoint to is
+      // overwritten below, not honoured: an action is a mutation, and a GET
+      // form would put every field in the URL bar, the history and the access
+      // log. Skipped here only when there IS an endpoint, so a form whose name
+      // could not become one keeps whatever the author wrote.
+      if (formActionEndpoint !== null && key === 'method') {
+        continue;
+      }
       const value = safeProps[key];
       if (value === false || value === null || typeof value === 'undefined') {
         continue;
@@ -1074,19 +1221,37 @@ if (typeof globalThis.h !== 'function') {
         attrs += ' ' + attrName;
         continue;
       }
+      // `style` is an object in JSX and CSS text in HTML. Without this it fell
+      // through to `String(value)` and shipped `style="[object Object]"`.
+      if (attrName === 'style' && typeof value === 'object') {
+        const css = __albedo_style_to_css(value);
+        if (css !== '') {
+          attrs += ' style="' + __albedo_escape_attr(css) + '"';
+        }
+        continue;
+      }
       attrs += ' ' + attrName + '="' + __albedo_escape_attr(value) + '"';
     }
 
-    // Phase L · stamp the rewritten action hook and prepend the hidden CSRF
-    // input as the form's first child — byte-identical to what the pure-Rust
-    // renderer emits, because both read the same constants. The input ships
-    // with an empty value; the server fills the per-session token into every
-    // placeholder at request time (`transforms::form::fill_csrf_tokens`).
+    // Phase L · stamp the real endpoint, the rewritten action hook, and the
+    // hidden inputs as the form's first children — byte-identical to what the
+    // pure-Rust renderer emits, because both read the same constants and emit
+    // them in the same order (`action`, `method`, `data-albedo-action`).
+    //
+    // Both the URL and the attribute, not either: the attribute is what the
+    // client interceptor keys on, the URL is what the browser uses when no
+    // interceptor ran. The inputs ship empty; the server fills the per-session
+    // token and the request's own path at request time
+    // (`fill_csrf_tokens` / `fill_return_paths`).
     let inner = flatChildren.join('');
     if (formAction !== null) {
       const contract = globalThis.__ALBEDO_FORM_CONTRACT;
+      if (formActionEndpoint !== null) {
+        attrs += ' action="' + __albedo_escape_attr(formActionEndpoint) + '"';
+        attrs += ' method="post"';
+      }
       attrs += ' ' + contract.attr + '="' + __albedo_escape_attr(formAction) + '"';
-      inner = contract.csrfInput + inner;
+      inner = (formActionEndpoint !== null ? contract.hiddenInputs : contract.csrfInput) + inner;
       // P6 · append this action's per-field `data-albedo-error` spans — the
       // sinks the submit projection's `SetText` targets to clear/fill
       // validation messages. The pure-Rust renderer interleaves them after
@@ -1105,6 +1270,13 @@ if (typeof globalThis.h !== 'function') {
       if (typeof spans === 'string') {
         inner = inner + spans;
       }
+    } else if (__albedo_plain_form_needs_hidden_inputs(type, safeProps)) {
+      // A plain same-origin POST form — the sign-in forms are the first
+      // instance. No `data-albedo-action` and no rewritten `action`: the
+      // author's URL is the one that posts, and there is nothing for the
+      // client interceptor to key on. It gets the hidden inputs and nothing
+      // else.
+      inner = globalThis.__ALBEDO_FORM_CONTRACT.hiddenInputs + inner;
     }
     // Void elements close themselves. The ` />` spelling (and the space before
     // it) is the pure-Rust renderer's, so the two agree byte-for-byte rather
@@ -3373,6 +3545,99 @@ mod tests {
         assert_eq!(journal.len(), 2);
     }
 
+    /// 🧪 **The runtime-substrate gating test.** `FLOOR.md` § 5.8 asks: *one
+    /// body awaits a host function twice, sequentially — does it execute
+    /// **once**, and do the effects still arrive as **one set** at the end?*
+    ///
+    /// The timing half is **no** under replay, by construction: three passes
+    /// for two dependent links (`a_dependent_chain_costs_one_pass_per_link`).
+    /// This test pins the half that decides whether a future async bridge is
+    /// an improvement or a regression wearing a speedup — **the authority
+    /// property**. § 5.8's trap clause is explicit that a bridge which passes
+    /// the timing test and drops this is a failure, not partial success.
+    ///
+    /// The body issues a **durable** write between each pair of awaits, so an
+    /// implementation that accumulated effects across passes would emit
+    /// `a, a, b, a, b, c` — six writes, four of them duplicates, and the last
+    /// three double-charged against F1's rules. The contract is `a, b, c`:
+    /// exactly one copy of each, delivered once, after the last await.
+    ///
+    /// 🔑 **The oracle a bridge must reproduce is the effect block below, not
+    /// the pass count.** Today the one-set property is free: `__albedo_effects`
+    /// is a fresh `const` per script (`bridge.rs`) and a suspended pass returns
+    /// before any instruction is built (`compiled.rs`), so a discarded pass
+    /// discards its writes by construction. **A true async bridge has no
+    /// passes to discard** — it must hold the accumulating array across the
+    /// suspension and apply it exactly once at the end, which means the
+    /// property stops being free and starts being something you build.
+    ///
+    /// ⚠️ When that lands, `passes` becomes 1 and *that* assertion flips. The
+    /// three effect assertions must not.
+    #[test]
+    fn two_sequential_awaits_replay_the_body_but_emit_exactly_one_effect_set() {
+        use super::QuickJsEngine;
+        use crate::runtime::bridge::HandlerEffect;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let mut issued: Vec<String> = Vec::new();
+        let (outcome, journal, passes) = drive(
+            &mut engine,
+            "append('trail', { step: 'a' }); \
+             const one = fetch('https://api.test/first').json(); \
+             append('trail', { step: 'b', via: one.next }); \
+             const two = fetch('https://api.test/' + one.next).json(); \
+             append('trail', { step: 'c', done: two.done });",
+            &[],
+            |request| {
+                issued.push(request.url.clone());
+                if request.url.ends_with("/first") {
+                    response(200, r#"{"next":"second"}"#)
+                } else {
+                    response(200, r#"{"done":true}"#)
+                }
+            },
+        );
+
+        // Timing half — recorded, not celebrated.
+        assert_eq!(passes, 3, "the body runs three times, not once");
+
+        // No double-send: each upstream call is issued exactly once even
+        // though the body that issues it ran three times.
+        assert_eq!(
+            issued,
+            vec!["https://api.test/first", "https://api.test/second"],
+            "the journal answered the replayed calls instead of re-issuing them"
+        );
+        assert_eq!(journal.len(), 2);
+
+        // 🔑 The authority property: ONE set, one copy of each write.
+        let steps: Vec<String> = outcome
+            .effects
+            .iter()
+            .map(|effect| match effect {
+                HandlerEffect::ForgeAppend { collection, record } => {
+                    assert_eq!(collection, "trail");
+                    record
+                        .get("step")
+                        .and_then(|v| v.as_str())
+                        .expect("every write carries its step")
+                        .to_string()
+                }
+                other => panic!("expected a durable append, got {other:?}"),
+            })
+            .collect();
+
+        assert_eq!(
+            steps,
+            vec!["a", "b", "c"],
+            "writes from the two suspending passes were discarded with them; \
+             an accumulating implementation would read a,a,b,a,b,c"
+        );
+    }
+
     /// § 11 R3 — **the sentinel cannot be swallowed.** A body that wraps its
     /// call in `try/catch` (or hands it to a bundled library that does) would
     /// otherwise eat the suspension and run on garbage. The flag the epilogue
@@ -4333,7 +4598,7 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
     /// invisible in the markup and only shows up as a rejected submit.
     #[test]
     fn quickjs_form_placeholder_is_fillable_by_the_server_pass() {
-        use crate::transforms::form::fill_csrf_tokens;
+        use crate::transforms::form::{fill_csrf_tokens, fill_return_paths};
 
         let html = engine_rendering(
             "routes/sign2.tsx",
@@ -4345,14 +4610,81 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
             "{}",
         );
 
-        let served = fill_csrf_tokens(&html, "0123456789abcdef");
+        // Both fills, because the server runs both in one pass. Asserting only
+        // the CSRF one would let a shim that emits an unfillable return input
+        // pass — the same shape of miss this test was written for.
+        let served = fill_return_paths(&fill_csrf_tokens(&html, "0123456789abcdef"), "/sign2");
         assert!(
             served.contains("value=\"0123456789abcdef\""),
             "the server fill must find the shim's placeholder: {served}",
         );
         assert!(
+            served.contains("value=\"/sign2\""),
+            "the return path must be fillable too: {served}",
+        );
+        assert!(
             !served.contains("value=\"\""),
             "no empty token may reach the browser: {served}",
+        );
+    }
+
+    /// The no-JS path, asserted on the shim's own output: a Tier-B form must
+    /// carry a real endpoint and a forced POST, or a browser with no client
+    /// runtime submits to the current page and gets a 405.
+    #[test]
+    fn a_tier_b_form_action_ships_a_real_endpoint_and_a_forced_post() {
+        let html = engine_rendering(
+            "routes/sign3.tsx",
+            r#"
+            export default function Sign() {
+                return <form action="action:sign_guestbook" method="get"></form>;
+            }
+            "#,
+            "{}",
+        );
+        assert!(
+            html.contains("action=\"/_albedo/action/sign_guestbook\""),
+            "{html}"
+        );
+        assert!(html.contains("method=\"post\""), "{html}");
+        assert!(
+            !html.contains("method=\"get\""),
+            "an authored GET on an action form must be overwritten, not honoured: {html}"
+        );
+        // The interceptor's hook survives alongside it — with JS the browser
+        // submit never happens, and both paths reach the same handler.
+        assert!(
+            html.contains("data-albedo-action=\"sign_guestbook\""),
+            "{html}"
+        );
+    }
+
+    /// Parity with `transforms::form::action_endpoint`, pinned behaviourally
+    /// because a byte predicate has no JSON representation and the shim
+    /// restates the alphabet. A name that cannot be a path segment must ship no
+    /// `action` at all on this renderer, exactly as on the pure-Rust one — a
+    /// Tier-B form that navigated to `/_albedo/action/..` would be worse than
+    /// one that does nothing.
+    #[test]
+    fn a_form_action_name_that_cannot_be_a_url_segment_ships_no_action_attribute() {
+        let html = engine_rendering(
+            "routes/sign4.tsx",
+            r#"
+            export default function Sign() {
+                return <form action="action:sign guestbook" method="get"></form>;
+            }
+            "#,
+            "{}",
+        );
+        assert!(!html.contains("action=\"/_albedo/action/"), "{html}");
+        assert!(!html.contains("action=\"action:"), "{html}");
+        assert!(
+            html.contains("data-albedo-action=\"sign guestbook\""),
+            "the JS path still works: {html}"
+        );
+        assert!(
+            html.contains("method=\"get\""),
+            "with no endpoint to force, the authored method is left alone: {html}"
         );
     }
 
@@ -4479,11 +4811,70 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
             "{}",
         );
 
-        // Not an Albedo action: it keeps its native submit behaviour and gains
-        // nothing. Stamping a CSRF input here would submit a stray `_csrf`
-        // field to someone else's endpoint.
+        // Not an Albedo action: it keeps its native submit behaviour and never
+        // gains `data-albedo-action`. It gains no token either — a GET form puts
+        // its fields in the URL, so a token here would land in the history and
+        // the access log. (A same-origin *POST* form does get one; see
+        // `a_plain_post_form_gets_the_hidden_inputs_through_the_shim`.)
         assert!(html.contains("action=\"/search\""), "{html}");
         assert!(!html.contains(FORM_ACTION_ATTR), "{html}");
         assert!(!html.contains(CSRF_MARKER_ATTR), "{html}");
+    }
+
+    /// The Tier-B half of what makes a sign-in form authorable. The pure-Rust
+    /// renderer's copy of this rule is unit-tested in `transforms::form`; this
+    /// is the parity check that the shim agrees, which is the failure mode the
+    /// whole served-markup contract exists to prevent — the QuickJS path once
+    /// emitted no CSRF input at all and the gate waved it through.
+    #[test]
+    fn a_plain_post_form_gets_the_hidden_inputs_through_the_shim() {
+        use crate::transforms::form::{FORM_ACTION_ATTR, FORM_HIDDEN_INPUTS};
+
+        let html = engine_rendering(
+            "routes/login.tsx",
+            r#"
+            export default function Login() {
+                return <form action="/_albedo/auth/password/login" method="POST"></form>;
+            }
+            "#,
+            "{}",
+        );
+
+        assert!(
+            html.contains(FORM_HIDDEN_INPUTS),
+            "a same-origin POST form must carry both hidden inputs: {html}",
+        );
+        // The author's URL is the one that posts. Nothing is rewritten and there
+        // is no action name for a client interceptor to key on.
+        assert!(
+            html.contains("action=\"/_albedo/auth/password/login\""),
+            "{html}",
+        );
+        assert!(!html.contains(FORM_ACTION_ATTR), "{html}");
+    }
+
+    /// The disclosure half, through the shim: an off-origin POST form must not
+    /// be handed this session's token to submit elsewhere.
+    #[test]
+    fn an_off_origin_post_form_gets_no_token_through_the_shim() {
+        use crate::transforms::form::CSRF_MARKER_ATTR;
+
+        for action in ["https://evil.example/collect", "//evil.example/collect"] {
+            let html = engine_rendering(
+                "routes/leak.tsx",
+                &format!(
+                    r#"
+                    export default function Leak() {{
+                        return <form action="{action}" method="POST"></form>;
+                    }}
+                    "#
+                ),
+                "{}",
+            );
+            assert!(
+                !html.contains(CSRF_MARKER_ATTR),
+                "{action} must not receive a token: {html}",
+            );
+        }
     }
 }

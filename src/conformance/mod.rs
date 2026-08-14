@@ -275,9 +275,52 @@ pub fn classify_evaluator_error(message: &str) -> Verdict {
             construct: "jsx: namespaced attribute".to_string(),
         };
     }
+
+    // An unresolved import is a decline or a defect depending on the specifier,
+    // and the specifier is in the message. `resolve_import` returns `None` for
+    // anything that does not start with `.` *by construction* — bare package
+    // specifiers go through the npm bundler, and tsconfig path aliases are not
+    // read at all — so those are boundaries the evaluator declares. A
+    // **relative** specifier is one it undertook to resolve and did not, which
+    // is a defect and must stay one.
+    if let Some(specifier) = unresolved_import_specifier(message) {
+        return match import_specifier_kind(&specifier) {
+            Some(construct) => Verdict::EvaluatorDeclined {
+                construct: construct.to_string(),
+            },
+            None => Verdict::EvaluatorFaulted {
+                reason: message.to_string(),
+            },
+        };
+    }
+
     Verdict::EvaluatorFaulted {
         reason: message.to_string(),
     }
+}
+
+/// The specifier out of `could not resolve import '<spec>' from '<module>'`.
+fn unresolved_import_specifier(message: &str) -> Option<String> {
+    let rest = message.split("could not resolve import '").nth(1)?;
+    Some(rest.split('\'').next()?.to_string())
+}
+
+/// The coverage-frontier bucket for a specifier the resolver refuses, or `None`
+/// when the resolver was supposed to handle it.
+///
+/// The two non-relative buckets are kept apart because they rank differently: a
+/// path alias is a tsconfig read away, a bare package specifier means running
+/// the bundler inside the harness. Merging them would produce one large number
+/// that recommends nothing.
+fn import_specifier_kind(specifier: &str) -> Option<&'static str> {
+    if specifier.starts_with('.') {
+        return None;
+    }
+    // `@/x`, `~/x` and `#x` are alias roots; `@scope/pkg` is a real package.
+    if specifier.starts_with("@/") || specifier.starts_with("~/") || specifier.starts_with('#') {
+        return Some("import: tsconfig path alias");
+    }
+    Some("import: bare package specifier")
 }
 
 /// Render one entry both ways and compare.
@@ -651,6 +694,33 @@ mod tests {
 
         assert!(matches!(
             classify_evaluator_error("index out of bounds: the len is 3 but the index is 7"),
+            Verdict::EvaluatorFaulted { .. }
+        ));
+    }
+
+    /// The same rule, applied to module resolution. A specifier the resolver
+    /// never undertook to follow is a boundary; a relative one it did undertake
+    /// and failed is a defect — and the dotted-filename case (`./A.B` reading
+    /// as "extension `B`" in `import_candidates`) is exactly why that half must
+    /// keep failing the gate.
+    #[test]
+    fn an_unresolved_import_is_a_decline_only_when_the_resolver_declared_it_out_of_scope() {
+        let msg = |spec: &str| format!("could not resolve import '{spec}' from 'a.tsx'");
+
+        match classify_evaluator_error(&msg("@/components/ui/button")) {
+            Verdict::EvaluatorDeclined { construct } => {
+                assert_eq!(construct, "import: tsconfig path alias")
+            }
+            other => panic!("expected a decline, got {other:?}"),
+        }
+        match classify_evaluator_error(&msg("@radix-ui/react-dialog")) {
+            Verdict::EvaluatorDeclined { construct } => {
+                assert_eq!(construct, "import: bare package specifier")
+            }
+            other => panic!("expected a decline, got {other:?}"),
+        }
+        assert!(matches!(
+            classify_evaluator_error(&msg("./WelcomeScreen.Center")),
             Verdict::EvaluatorFaulted { .. }
         ));
     }

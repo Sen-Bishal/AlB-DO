@@ -76,6 +76,10 @@ const SCAFFOLD_INDEX_ROUTE: &str = include_str!("../../scaffold/src/routes/index
 const SCAFFOLD_GUESTBOOK_ROUTE: &str =
     include_str!("../../scaffold/src/routes/guestbook.tsx");
 const SCAFFOLD_ROOM_ROUTE: &str = include_str!("../../scaffold/src/routes/room/[id].tsx");
+// AUTH P2 — the on-ramp's account page. The `auth` block in
+// `scaffold/albedo.config.ts` is what mounts the endpoints these forms post
+// to, so the two are edited together or not at all.
+const SCAFFOLD_SIGN_IN_ROUTE: &str = include_str!("../../scaffold/src/routes/sign-in.tsx");
 const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/components/Hero.tsx");
 const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/src/components/Counter.tsx");
 const SCAFFOLD_ENV_DTS: &str = include_str!("../../scaffold/src/albedo-env.d.ts");
@@ -171,6 +175,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
         // Trust polish · what the build already knows about itself. Every check
         // is a derivation, never a maintained list — see `doctor::matrix`.
         "doctor" => run_doctor_command(&args[2..]),
+        // The instrument panel as intended, drawn from synthetic signal. Kept
+        // behind its own verb precisely so `dev`'s rule — if a number appears,
+        // something measured it — stays true of `dev`. See `tui::demo`.
+        "demo" => tui::demo::run(),
         // Phase J CLI clarity:
         //   * `albedo files [dir]` — pure static file server; serves any directory verbatim. This
         //     is what `albedo serve` did before.
@@ -2847,6 +2855,11 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         SCAFFOLD_ROOM_ROUTE,
         options.force,
     )?;
+    write_scaffold_file(
+        &target.join("src").join("routes").join("sign-in.tsx"),
+        SCAFFOLD_SIGN_IN_ROUTE,
+        options.force,
+    )?;
     // Shared components (imported by routes).
     write_scaffold_file(
         &target.join("src").join("components").join("Hero.tsx"),
@@ -3087,7 +3100,7 @@ _albdo_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local commands="init dev build ship serve files budget doctor run completions help"
+    local commands="init dev build ship serve files budget doctor demo run completions help"
 
     case "$prev" in
         albdo)
@@ -3149,6 +3162,7 @@ _albdo() {
         'files:Static file server (defaults to .albedo/dist)'
         'budget:Evaluate the tier budget against the current build'
         'doctor:Report what the build already knows about itself'
+        'demo:Draw the instrument panel from synthetic signal'
         'run:Run a sub-mode (e.g. run dev)'
         'completions:Emit shell completion script to stdout'
         'help:Show command list and examples'
@@ -3223,7 +3237,7 @@ _albdo "$@"
 "#;
 
 const COMPLETIONS_FISH: &str = r#"# albdo fish completions
-set -l albdo_commands init dev build ship serve files budget doctor run completions help
+set -l albdo_commands init dev build ship serve files budget doctor demo run completions help
 
 # Disable file completions for the main command
 complete -c albdo -f
@@ -3236,6 +3250,7 @@ complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a ship        -d '
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a serve       -d 'Serve static files from a directory'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a budget      -d 'Evaluate the tier budget against the current build'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a doctor      -d 'Report what the build already knows about itself'
+complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a demo        -d 'Draw the instrument panel from synthetic signal'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a run         -d 'Run a sub-mode'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a completions -d 'Emit shell completion script to stdout'
 complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a help        -d 'Show command list and examples'
@@ -3282,7 +3297,7 @@ Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptB
     $tokens = $commandAst.CommandElements
     $nTokens = $tokens.Count
 
-    $commands = @('init','dev','build','ship','serve','files','budget','doctor','run','completions','help')
+    $commands = @('init','dev','build','ship','serve','files','budget','doctor','demo','run','completions','help')
     $devFlags = @('--config','--entry','--host','--port','--no-hmr','--strict','--verbose','--open','--prod','--no-budget')
 
     if ($nTokens -le 2) {
@@ -3353,6 +3368,7 @@ fn print_help() {
     print_command("files", "[dir]", "serve static files from a folder");
     print_command("budget", "[dir]", "check the tier budget");
     print_command("doctor", "[dir]", "report what the build knows about itself");
+    print_command("demo", "", "draw the instrument panel — synthetic signal");
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
 

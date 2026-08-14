@@ -45,6 +45,7 @@
 //! it is last and why it is explicit.
 
 pub mod declare;
+pub mod password;
 pub mod principal;
 pub mod schema;
 pub mod session;
@@ -55,9 +56,13 @@ pub use declare::{
     Preset, ProviderDecl, ProviderKind, ResolvedProvider, SecretDecl, SessionDecl,
     DEFAULT_SESSION_COOKIE, DEFAULT_SESSION_TTL, PRESETS,
 };
+pub use password::{
+    absorb_timing, hash_password, normalize_email, verify_password, PasswordError,
+    MAX_PASSWORD_BYTES, MIN_PASSWORD_BYTES,
+};
 pub use principal::{Principal, PrincipalId, PrincipalIdError, PRINCIPAL_ID_PREFIX};
 pub use session::{
     clear_cookie_value, cookie_entries, read_cookie, set_cookie_value, SessionRecord,
     SessionRejection, SessionToken, TokenHash,
 };
-pub use store::{ProviderProfile, Resolved, StoreError};
+pub use store::{PasswordCredential, ProviderProfile, Resolved, StoreError};

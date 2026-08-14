@@ -25,7 +25,9 @@ albedo ship     # package for deployment (docker / fly / static)
 │   ├── routes/             — file-based routes (Phase N)
 │   │   ├── layout.tsx      — root layout wrapping every route below
 │   │   ├── index.tsx       — `/`          landing
-│   │   └── guestbook.tsx   — `/guestbook` live FORGE collection
+│   │   ├── guestbook.tsx   — `/guestbook` live FORGE collection
+│   │   ├── sign-in.tsx     — `/sign-in`   accounts, from the `auth` block
+│   │   └── room/[id].tsx   — `/room/:id`  one live channel per room
 │   ├── components/
 │   │   ├── Hero.tsx        — Tier A · pure, static HTML
 │   │   └── Counter.tsx     — Tier C · a client island
@@ -107,6 +109,57 @@ the collection is rematerialized, and the change fans out to every open
 tab — see `src/routes/guestbook.tsx`.
 
 Add a collection to that block and it exists. That is the whole workflow.
+
+## Accounts
+
+The `auth` block is the same idea applied to identity:
+
+```ts
+auth: {
+  session: { ttl: "30d" },
+  providers: { password: {} },
+  login: "/sign-in",
+}
+```
+
+From that, AlBDO emits four tables (`albedo_users`, `albedo_accounts`,
+`albedo_sessions`, `albedo_credentials`) and mounts the sign-in endpoints.
+There is no auth library to install, no users table to design and no callback
+route to write. See `src/routes/sign-in.tsx`.
+
+The part worth understanding is how you read a signed-in person's data:
+
+```tsx
+const notes = useSharedSlot(notes.where({ owner: user.id }));
+```
+
+A component that reads an identity-partitioned collection receives the `user`
+prop, and that read **is** the policy — there is no channel name you could
+write, so there is nothing to keep in step and nothing to get wrong. Declare a
+collection with `partition_by: "owner"`, read it that way, and every signed-in
+person sees their own rows with no policy file anywhere.
+
+Gate a route on a session with one line in that route's file:
+
+```tsx
+export const auth = "required";
+```
+
+A stranger who asks for it is sent to `login`. The principal is **ours**, not
+the provider's — which is what lets one person attach a second provider later
+and stay the same account.
+
+Two things worth knowing:
+
+- **`albedo_` is a reserved prefix.** Declaring a collection under it is
+  refused at boot, so an app cannot replace the session table or read every
+  user's row as one live topic.
+- **Sign-in works with JavaScript switched off**, render and submit both. The
+  forms post to real URLs with the CSRF token stamped in by the renderer, and
+  the page itself is rendered on the request that asked for it — so the markup
+  arrives as markup. Passkeys are the better credential, but
+  `navigator.credentials` is a JS API with no HTML fallback; password is what
+  keeps that floor honest.
 
 ## File-based routing
 

@@ -589,6 +589,140 @@ async fn render_route_boundary(
     }
 }
 
+/// Everything a Tier-B node needs from the request, gathered once so the two
+/// passes below can share one resolver rather than growing two copies of the
+/// timeout / error-boundary / loading-boundary ladder.
+struct TierBResolveCtx<'a> {
+    app: &'a Arc<StreamingAppState>,
+    ctx: &'a TierBRequestContext,
+    error_component: Option<String>,
+    loading_component: Option<String>,
+    island_fills: std::sync::Arc<Vec<(String, String)>>,
+    csrf_token: std::sync::Arc<str>,
+    return_path: std::sync::Arc<str>,
+}
+
+/// Resolve one Tier-B node to the chunk that represents it — success, the
+/// route's `error.tsx`, the route's `loading.tsx`, or the blank error stub.
+///
+/// This is the single implementation of that ladder. It is called from **two**
+/// places that differ only in what they do with the result: the inline pass
+/// paints the chunk into the shell before the response starts, and the streamed
+/// pass ships it as a `<script>__albedo_inject(…)</script>` after. Keeping one
+/// resolver is the point — an error path that only one of them handled would be
+/// a difference nobody notices until the boundary fails to render on whichever
+/// path is rarer.
+async fn resolve_tier_b_node(node: TierBNode, shared: &TierBResolveCtx<'_>) -> InjectionChunk {
+    let render_result = timeout(
+        Duration::from_millis(node.timeout_ms.max(1)),
+        render_tier_b(
+            &node,
+            shared.ctx,
+            shared.app.services.registry.as_ref(),
+            shared.app.services.data_fetcher.as_ref(),
+        ),
+    )
+    .await;
+
+    // Every arm below that carries component-rendered markup goes through the
+    // same fill as the shell — including the boundaries, since an `error.tsx`
+    // may well render a retry form. The two stub arms (`error` / `fallback`)
+    // build their own markup from a constant and have nothing to fill.
+    let fill = |html: String| {
+        fill_server_placeholders(
+            html,
+            &shared.island_fills,
+            &shared.csrf_token,
+            &shared.return_path,
+        )
+    };
+
+    match render_result {
+        Ok(Ok(html)) => InjectionChunk::success(&node, fill(html)),
+        Ok(Err(err)) => {
+            // Logged before anything is decided about the response. Without
+            // this a throwing Tier-B node with no `error.tsx` produced a blank
+            // placeholder and **nothing anywhere** — the diagnostic chain the
+            // error carries for exactly this purpose was built and then dropped
+            // on the floor.
+            warn!(
+                target: "albedo.render",
+                node = %node.placeholder_id,
+                error = %err,
+                "tier-B component failed to render"
+            );
+            // The component threw. Render the route's `error.tsx` boundary and
+            // use its HTML; only if there is no boundary (or it too fails) do we
+            // fall back to the blank error stub.
+            //
+            // Reader-facing copy: the raw thrown message only, never the wrapped
+            // diagnostic chain or a filesystem path. The full `err` still
+            // reaches logs/overlay (Display) on the boundary-render failure path.
+            let error_props = json!({
+                "error": { "message": err.user_message() }
+            });
+            match render_route_boundary(
+                shared.app.as_ref(),
+                shared.error_component.as_deref(),
+                &error_props,
+            )
+            .await
+            {
+                Some(html) => InjectionChunk::error_boundary(&node, fill(html)),
+                None => InjectionChunk::error(&node, err),
+            }
+        }
+        Err(_) => {
+            // The component timed out. Prefer the route's `loading.tsx` UI over
+            // the generic timeout div.
+            match render_route_boundary(
+                shared.app.as_ref(),
+                shared.loading_component.as_deref(),
+                &json!({}),
+            )
+            .await
+            {
+                Some(html) => InjectionChunk::fallback_with_html(&node, fill(html)),
+                None => InjectionChunk::fallback(&node),
+            }
+        }
+    }
+}
+
+/// Which Tier-B nodes are resolved *before* the shell is sent, and which stream
+/// in after it.
+///
+/// ## The rule, and why it is this one
+///
+/// A node is painted inline when its render needs **no external data**
+/// (`data_deps.is_empty()`). That render is a function of the request's props
+/// and state this process already holds — a materialized FORGE topic, the
+/// resolved principal — so it is CPU-bound and local, and awaiting it is the
+/// ordinary server-render cost every non-streaming framework pays.
+///
+/// A node **with** `data_deps` declares an external fetch. That is the case
+/// streaming exists for, and it keeps streaming: blocking the first byte on a
+/// remote host is the thing the shell-first design is protecting.
+///
+/// ## What this replaced, and why the old cut was wrong
+///
+/// The previous rule seeded a placeholder only when the node had **neither**
+/// dynamic props nor data deps, and it seeded the HTML the *build* had rendered.
+/// Both halves of that were forced by the same limitation: build-time HTML saw
+/// no request, so any node needing one had to be left empty. The consequence was
+/// that a route reading `user` or `params` — every auth-aware page, and every
+/// `[id]` route — reached the browser with its content existing **only as a
+/// JavaScript string argument**, so a reader without JS got a blank page and a
+/// crawler that does not execute scripts got nothing.
+///
+/// Rendering on the request path removes the reason for the narrower cut: there
+/// *is* a request now, so dynamic props are no longer a disqualifier. It also
+/// makes the painted markup strictly fresher than the build-time seed it
+/// supersedes, which could be stale for a collection that had gained rows.
+fn painted_inline(node: &TierBNode) -> bool {
+    node.data_deps.is_empty()
+}
+
 fn build_stream(
     route: RouteManifest,
     ctx: TierBRequestContext,
@@ -609,12 +743,74 @@ fn build_stream(
         // this is also one fewer registry hit per chunk.
         let csrf_token = app.csrf().token_for(page_session);
 
+        // The path a JS-less form submit returns to. `ctx.path` and not the
+        // route *pattern*: a form on `/room/42` must send its reader back to
+        // `/room/42`, not to `/room/[id]`.
+        let return_path: std::sync::Arc<str> = std::sync::Arc::from(ctx.path.as_str());
+
+        // Route boundary component names (`error.tsx` / `loading.tsx`), if any,
+        // and the island fill data — hoisted above the shell because the inline
+        // pass below runs *before* it and needs the same values the streamed
+        // pass does.
+        let error_component = route.error_component.clone();
+        let loading_component = route.loading_component.clone();
+
+        // Island fill data for this route, shared across the Tier-B futures. An
+        // island nested in an `async function Page()` renders (via its client
+        // reference stub) to the empty placeholder inside the page's HTML; this
+        // is the same marked SSR markup the shell fill uses, applied to the
+        // resolved chunk so async-page islands are byte-identical to Tier-A ones.
+        let island_fills: std::sync::Arc<Vec<(String, String)>> =
+            std::sync::Arc::new(hydration.map(|h| h.placeholders.clone()).unwrap_or_default());
+
+        // Shared with each Tier-B future so its resolved HTML goes through the
+        // same fill as the shell. Without this a `<form action="action:NAME">`
+        // inside an `async function Page()` reaches the browser with
+        // `value=""` and the submit arrives tokenless.
+        let csrf_token: std::sync::Arc<str> = std::sync::Arc::from(csrf_token.as_str());
+
+        let shared = TierBResolveCtx {
+            app: &app,
+            ctx: &ctx,
+            error_component,
+            loading_component,
+            island_fills,
+            csrf_token: csrf_token.clone(),
+            return_path: return_path.clone(),
+        };
+
+        // ── Pass 1 · the nodes that are painted into the shell ──
+        //
+        // Resolved concurrently and awaited before the first byte, so the served
+        // document carries the page's content as *markup* rather than as a
+        // script argument. Each node keeps its own `timeout_ms`, which is what
+        // bounds how long this can hold the response.
+        let (inline_nodes, streamed_nodes): (Vec<TierBNode>, Vec<TierBNode>) =
+            route.tier_b.iter().cloned().partition(painted_inline);
+
+        let mut painted: HashMap<String, InjectionChunk> = HashMap::new();
+        if !inline_nodes.is_empty() {
+            let mut inline_futures: FuturesUnordered<_> = inline_nodes
+                .into_iter()
+                .map(|node| {
+                    let id = node.placeholder_id.clone();
+                    let shared = &shared;
+                    async move { (id, resolve_tier_b_node(node, shared).await) }
+                })
+                .collect();
+            while let Some((id, chunk)) = inline_futures.next().await {
+                painted.insert(id, chunk);
+            }
+        }
+
         let mut shell = build_shell_chunk(
             &route,
             negotiated_transport,
             app.transport.webtransport_path.as_str(),
             &csrf_token,
+            &return_path,
             hydration,
+            &painted,
         );
 
         // Slice 3 — a route exporting `generateMetadata` carries a head marker
@@ -643,112 +839,18 @@ fn build_stream(
 
         yield Ok(Bytes::from(shell));
 
-        // Route boundary component names (`error.tsx` / `loading.tsx`), if any.
-        // Captured once and cloned into each island future so a throwing or
-        // slow Tier-B node can fall back to the route's declared boundary UI
-        // instead of a blank `data-albedo-error` stub.
-        let error_component = route.error_component.clone();
-        let loading_component = route.loading_component.clone();
-
-        // Island fill data for this route, shared across the Tier-B futures. An
-        // island nested in an `async function Page()` renders (via its client
-        // reference stub) to the empty placeholder inside the page's HTML; this
-        // is the same marked SSR markup the shell fill uses, applied to the
-        // resolved chunk so async-page islands are byte-identical to Tier-A ones.
-        let island_fills: std::sync::Arc<Vec<(String, String)>> =
-            std::sync::Arc::new(hydration.map(|h| h.placeholders.clone()).unwrap_or_default());
-
-        // Shared with each Tier-B future so its resolved HTML goes through the
-        // same fill as the shell. Without this a `<form action="action:NAME">`
-        // inside an `async function Page()` reaches the browser with
-        // `value=""` and the submit arrives tokenless.
-        let csrf_token: std::sync::Arc<str> = std::sync::Arc::from(csrf_token.as_str());
-
-        let mut tier_b_futures: FuturesUnordered<_> = route
-            .tier_b
-            .iter()
-            .cloned()
+        // ── Pass 2 · the nodes that stream ──
+        //
+        // Only the ones with declared external data reach here; the rest are
+        // already in the document above. A painted node ships **no** inject:
+        // `__albedo_inject` assigns `outerHTML`, so re-sending identical markup
+        // would replace live nodes for no reason — losing focus and selection,
+        // which is the property this framework's delta path exists to keep.
+        let mut tier_b_futures: FuturesUnordered<_> = streamed_nodes
+            .into_iter()
             .map(|node| {
-                let ctx = ctx.clone();
-                let app = app.clone();
-                let error_component = error_component.clone();
-                let loading_component = loading_component.clone();
-                let island_fills = island_fills.clone();
-                let csrf_token = csrf_token.clone();
-                async move {
-                    let render_result = timeout(
-                        Duration::from_millis(node.timeout_ms.max(1)),
-                        render_tier_b(
-                            &node,
-                            &ctx,
-                            app.services.registry.as_ref(),
-                            app.services.data_fetcher.as_ref(),
-                        ),
-                    )
-                    .await;
-
-                    // Every arm below that carries component-rendered markup
-                    // goes through the same fill as the shell — including the
-                    // boundaries, since an `error.tsx` may well render a retry
-                    // form. The two stub arms (`error` / `fallback`) build
-                    // their own markup from a constant and have nothing to fill.
-                    let fill = |html: String| {
-                        fill_server_placeholders(html, &island_fills, &csrf_token)
-                    };
-
-                    match render_result {
-                        Ok(Ok(html)) => InjectionChunk::success(&node, fill(html)),
-                        Ok(Err(err)) => {
-                            // Logged before anything is decided about the
-                            // response. Without this a throwing Tier-B node with
-                            // no `error.tsx` produced a blank placeholder and
-                            // **nothing anywhere** — the diagnostic chain the
-                            // error carries for exactly this purpose was built
-                            // and then dropped on the floor.
-                            warn!(
-                                target: "albedo.render",
-                                node = %node.placeholder_id,
-                                error = %err,
-                                "tier-B component failed to render"
-                            );
-                            // The component threw. Render the route's `error.tsx`
-                            // boundary and inject its HTML; only if there is no
-                            // boundary (or it too fails) do we fall back to the
-                            // blank error stub.
-                            // Reader-facing copy: the raw thrown message only,
-                            // never the wrapped diagnostic chain or a filesystem
-                            // path. The full `err` still reaches logs/overlay
-                            // (Display) on the boundary-render failure path below.
-                            let error_props = json!({
-                                "error": { "message": err.user_message() }
-                            });
-                            match render_route_boundary(
-                                app.as_ref(),
-                                error_component.as_deref(),
-                                &error_props,
-                            )
-                            .await
-                            {
-                                Some(html) => InjectionChunk::error_boundary(&node, fill(html)),
-                                None => InjectionChunk::error(&node, err),
-                            }
-                        }
-                        Err(_) => {
-                            // The component timed out. Prefer the route's
-                            // `loading.tsx` UI over the generic timeout div.
-                            match render_route_boundary(
-                                app.as_ref(),
-                                loading_component.as_deref(),
-                                &json!({}),
-                            )
-                            .await
-                            {
-                                Some(html) => InjectionChunk::fallback_with_html(&node, fill(html)),
-                                None => InjectionChunk::fallback(&node),
-                            }
-                        }
-                    }
-                }
+                let shared = &shared;
+                async move { resolve_tier_b_node(node, shared).await }
             })
             .collect();
 
@@ -795,7 +897,12 @@ fn build_shell_chunk(
     negotiated_transport: NegotiatedTransport,
     webtransport_path: &str,
     csrf_token: &str,
+    request_path: &str,
     hydration: Option<&crate::renderer_runtime::RouteHydration>,
+    // Tier-B nodes already resolved on this request, keyed by placeholder id.
+    // Empty on the WebTransport path, which ships opcode frames rather than
+    // injected markup and is JS-guaranteed by definition.
+    painted: &HashMap<String, InjectionChunk>,
 ) -> String {
     let mut shell = route.shell.doctype_and_head.clone();
     shell.push_str(&route.shell.body_open);
@@ -814,9 +921,19 @@ fn build_shell_chunk(
         );
     }
 
+    // Paint this request's own Tier-B renders into their placeholders. Done
+    // before `seed_tier_b_placeholders` so the fresh markup wins: the seed
+    // matches only an *empty* placeholder, so a painted node is already past it
+    // and the build-time HTML can never overwrite a per-request render.
+    shell = paint_tier_b_placeholders(shell, painted);
+
     // Seed before the fill pass, not after: a `<form action="action:…">` inside
     // the build-time HTML carries an unfilled CSRF placeholder, and
     // `fill_server_placeholders` below is the single stage that stamps it.
+    //
+    // This now covers only what pass 1 did not paint — a node that streams. Its
+    // build-time HTML is still better than an empty hole while the real chunk is
+    // in flight, on exactly the terms its own gate describes.
     shell = seed_tier_b_placeholders(shell, &route.tier_b);
 
     fill_server_placeholders(
@@ -825,6 +942,7 @@ fn build_shell_chunk(
             .map(|h| h.placeholders.as_slice())
             .unwrap_or_default(),
         csrf_token,
+        request_path,
     )
 }
 
@@ -847,11 +965,18 @@ fn fill_server_placeholders(
     html: String,
     islands: &[(String, String)],
     csrf_token: &str,
+    request_path: &str,
 ) -> String {
     let with_islands = replace_island_placeholders(html, islands);
     // Phase L · stamp the per-session token into every hidden CSRF input
     // the renderers emitted. No-op for any page without a form.
-    crate::render::csrf::substitute_csrf_token_in_html(&with_islands, csrf_token)
+    let with_csrf = crate::render::csrf::substitute_csrf_token_in_html(&with_islands, csrf_token);
+    // …and, in the same pass, the path a JS-less submit returns to. Fused with
+    // the CSRF fill rather than run as its own stage for the reason this
+    // function exists at all: a form that got one fill and not the other
+    // submits successfully and then lands the reader on `/`, which reads as the
+    // app losing their place rather than as a missing substitution.
+    crate::render::csrf::substitute_return_path_in_html(&with_csrf, request_path)
 }
 
 /// Replace each empty Tier-C island placeholder (`<div id="…"
@@ -893,6 +1018,35 @@ fn replace_island_placeholders(mut html: String, placeholders: &[(String, String
 /// server-streaming trade and it is strictly better than an empty element: the
 /// content is correct in shape, correct in structure, and replaced within the
 /// same response.
+/// Replace each resolved Tier-B placeholder with this request's own rendered
+/// markup, so the served document carries the page's content as HTML.
+///
+/// ## Why replace rather than fill
+///
+/// `__albedo_inject` assigns `el.outerHTML`, which replaces the placeholder
+/// element. Painting does the same thing at the same position, so the document a
+/// reader without JavaScript receives is **byte-identical to the one the
+/// injector would have produced**. Filling instead would leave a wrapper `<div>`
+/// that exists on one path and not the other, and every stylesheet, selector and
+/// delta anchor written against one would be reasoning about the other.
+///
+/// A node painted here ships no inject (see pass 2 in `build_stream`), so this
+/// is the only thing that writes it.
+fn paint_tier_b_placeholders(
+    mut html: String,
+    painted: &HashMap<String, InjectionChunk>,
+) -> String {
+    for (placeholder_id, chunk) in painted {
+        let empty = format!("<div id=\"{placeholder_id}\" data-albedo-tier=\"b\"></div>");
+        // `clone` because the map is borrowed and the chunk owns its markup;
+        // one clone per Tier-B node per request, against a render that just
+        // executed a component.
+        let markup = chunk.clone().into_painted_markup();
+        html = html.replace(&empty, &markup);
+    }
+    html
+}
+
 fn seed_tier_b_placeholders(mut html: String, nodes: &[TierBNode]) -> String {
     for node in nodes {
         if !node.dynamic_prop_keys.is_empty() || !node.data_deps.is_empty() {
@@ -971,7 +1125,20 @@ async fn stream_route_over_webtransport(
         NegotiatedTransport::WebTransport,
         app.transport.webtransport_path.as_str(),
         &app.csrf().token_for(page_session),
+        // The request's own path, so a form in this shell returns here. A page
+        // reached over WebTransport ran JavaScript by definition, so its forms
+        // will be intercepted and this value never read — it is stamped anyway
+        // because "this branch cannot need it" is how the CSRF input came to be
+        // missing on the Tier-B path, and the cost of being wrong is a reader
+        // silently landing on `/`.
+        ctx.path.as_str(),
         None,
+        // No painted nodes on this path. WebTransport delivers Tier-B as opcode
+        // frames on the patches lane, not as injected markup, so painting here
+        // would put the content in the document twice — and a page reached over
+        // WebTransport ran JavaScript to open the session, so the no-JS reader
+        // this painting exists for cannot be on this path at all.
+        &HashMap::new(),
     );
     shell.push_str(&route.shell.body_close);
     sessions
@@ -1503,11 +1670,16 @@ mod tests {
         );
     }
 
-    /// The gate. `/room/[id]` carries `dynamic_prop_keys: ["params"]`, and its
-    /// build-time render therefore saw no id — seeding it would paint one
-    /// entity's markup while the request is for another.
+    /// The gate on the **build-time** seed. `/room/[id]` carries
+    /// `dynamic_prop_keys: ["params"]`, and its build-time render therefore saw
+    /// no id — seeding it would paint one entity's markup while the request is
+    /// for another.
+    ///
+    /// 🔑 This is not a statement that such a node ships empty. It ships the
+    /// render this request produced, painted by `paint_tier_b_placeholders`
+    /// before this seed ever runs; the seed is the fallback for what streams.
     #[test]
-    fn a_request_dependent_node_is_left_empty() {
+    fn a_request_dependent_node_is_left_empty_by_the_build_time_seed() {
         let mut node = tier_b_node();
         node.data_deps.clear();
         node.dynamic_prop_keys = vec!["params".to_string()];
@@ -1530,6 +1702,103 @@ mod tests {
             shell,
             "a node with request-context data_deps must not be seeded"
         );
+    }
+
+    /// 🔑 **The painted form must be what the injector would have produced.**
+    /// `__albedo_inject` assigns `el.outerHTML`, replacing the placeholder — so
+    /// painting replaces it too. Filling instead would leave a wrapper `<div>`
+    /// present without JavaScript and absent with it, and every selector or
+    /// delta anchor written against one would be reasoning about the other.
+    #[test]
+    fn a_painted_node_replaces_the_placeholder_rather_than_filling_it() {
+        let node = tier_b_node();
+        let mut painted = HashMap::new();
+        painted.insert(
+            node.placeholder_id.clone(),
+            InjectionChunk::success(&node, "<section>live</section>".to_string()),
+        );
+
+        let html = paint_tier_b_placeholders(
+            "<body><div id=\"__b_feature\" data-albedo-tier=\"b\"></div></body>".to_string(),
+            &painted,
+        );
+
+        assert_eq!(html, "<body><section>live</section></body>");
+    }
+
+    /// The per-request render supersedes the build-time seed. Painting runs
+    /// first and consumes the empty placeholder, so the seed — which matches
+    /// only an empty one — can no longer reach it. That ordering is what stops a
+    /// stale build-time list from overwriting the rows this request just read.
+    #[test]
+    fn a_painted_node_cannot_be_overwritten_by_the_build_time_seed() {
+        let mut node = tier_b_node();
+        node.data_deps.clear();
+        node.initial_html = Some("<section>stale build</section>".to_string());
+
+        let mut painted = HashMap::new();
+        painted.insert(
+            node.placeholder_id.clone(),
+            InjectionChunk::success(&node, "<section>fresh request</section>".to_string()),
+        );
+
+        let shell = "<div id=\"__b_feature\" data-albedo-tier=\"b\"></div>".to_string();
+        let painted_html = paint_tier_b_placeholders(shell, &painted);
+        let after_seed = seed_tier_b_placeholders(painted_html, std::slice::from_ref(&node));
+
+        assert_eq!(after_seed, "<section>fresh request</section>");
+        assert!(!after_seed.contains("stale build"));
+    }
+
+    /// A node that threw with no `error.tsx` keeps its placeholder and is
+    /// marked, mirroring the injector's other branch (`setAttribute`, not
+    /// `outerHTML`). It must NOT be left bare, or the build-time seed would
+    /// then fill a failed component with markup that never rendered.
+    #[test]
+    fn a_failed_node_paints_a_marked_placeholder_the_seed_cannot_fill() {
+        let mut node = tier_b_node();
+        node.data_deps.clear();
+        node.initial_html = Some("<section>stale build</section>".to_string());
+
+        let mut painted = HashMap::new();
+        painted.insert(
+            node.placeholder_id.clone(),
+            InjectionChunk::error(
+                &node,
+                crate::render::tier_b::RenderError::MissingDynamicProp {
+                    key: "user".to_string(),
+                },
+            ),
+        );
+
+        let shell = "<div id=\"__b_feature\" data-albedo-tier=\"b\"></div>".to_string();
+        let painted_html = paint_tier_b_placeholders(shell, &painted);
+        assert!(painted_html.contains("data-albedo-error=\"error\""), "{painted_html}");
+
+        let after_seed = seed_tier_b_placeholders(painted_html, std::slice::from_ref(&node));
+        assert!(
+            !after_seed.contains("stale build"),
+            "a component that failed must not be papered over with build-time markup: {after_seed}"
+        );
+    }
+
+    /// The cut between the two passes: external data streams, everything else is
+    /// painted. A node reading only request props is painted precisely because
+    /// there is now a request to read it from.
+    #[test]
+    fn only_external_data_defers_a_node_to_the_stream() {
+        let mut request_props_only = tier_b_node();
+        request_props_only.data_deps.clear();
+        request_props_only.dynamic_prop_keys = vec!["user".to_string()];
+        assert!(painted_inline(&request_props_only));
+
+        let mut nothing_dynamic = tier_b_node();
+        nothing_dynamic.data_deps.clear();
+        nothing_dynamic.dynamic_prop_keys.clear();
+        assert!(painted_inline(&nothing_dynamic));
+
+        // The fixture carries `data_deps` by default.
+        assert!(!painted_inline(&tier_b_node()));
     }
 
     /// A build that produced no `initial_html` degrades to exactly the old
@@ -1680,7 +1949,7 @@ mod tests {
         use dom_render_compiler::transforms::form::CSRF_PLACEHOLDER_INPUT;
 
         let html = format!("<main><form data-albedo-action=\"sign\">{CSRF_PLACEHOLDER_INPUT}</form></main>");
-        let out = fill_server_placeholders(html, &[], "cafebabe");
+        let out = fill_server_placeholders(html, &[], "cafebabe", "/guestbook");
 
         assert!(
             out.contains("value=\"cafebabe\""),
@@ -1707,10 +1976,36 @@ mod tests {
             format!("<form data-albedo-action=\"sign\">{CSRF_PLACEHOLDER_INPUT}</form>"),
         )];
 
-        let out = fill_server_placeholders(html, &fills, "deadbeef");
+        let out = fill_server_placeholders(html, &fills, "deadbeef", "/guestbook");
         assert!(
             out.contains("value=\"deadbeef\""),
             "a form arriving via an island must still get a token: {out}"
+        );
+    }
+
+    /// The return-path fill rides the same pass, and it must reach the same
+    /// places — including inside an island, where the markup is precomputed at
+    /// boot and has no request of its own. A form that gets a token but no
+    /// return path submits successfully and drops the reader on `/`.
+    #[test]
+    fn fill_server_placeholders_stamps_the_return_path_beside_the_token() {
+        use dom_render_compiler::transforms::form::FORM_HIDDEN_INPUTS;
+
+        let html = "<main><div id=\"__c_1\" data-albedo-tier=\"c\"></div></main>".to_string();
+        let fills = vec![(
+            "__c_1".to_string(),
+            format!("<form data-albedo-action=\"sign\">{FORM_HIDDEN_INPUTS}</form>"),
+        )];
+
+        let out = fill_server_placeholders(html, &fills, "deadbeef", "/room/42?tab=chat");
+        assert!(out.contains("value=\"deadbeef\""), "{out}");
+        assert!(
+            out.contains("value=\"/room/42?tab=chat\""),
+            "the request's own path, not the route pattern: {out}"
+        );
+        assert!(
+            !out.contains("value=\"\""),
+            "neither hidden input may ship empty: {out}"
         );
     }
 

@@ -55,6 +55,14 @@ uuid             = { version = "1", features = ["v4"] }
 # for a tab id and short of what a bearer credential should carry.
 sha2             = { version = "0.10" }
 rand             = { version = "0.8" }
+# AUTH · P2 — passwords. The one input in this system that is low-entropy and
+# attacker-guessable, so it is the one that gets a deliberately slow hash.
+# Argon2id specifically: OWASP's first recommendation, and the only widely
+# available KDF that resists both GPU and side-channel attack (Argon2i resists
+# side channels, Argon2d resists GPUs, id is the hybrid). Version pinned rather
+# than floated because a minor bump that changes the default cost parameters
+# would silently change every password we write from that day on.
+argon2           = { version = "0.5" }
 
 # Serialization
 # SWC 0.37.x still relies on serde::__private, which changed in newer serde releases.
@@ -214,6 +222,7 @@ tracing-subscriber.workspace = true
 uuid.workspace               = true
 sha2.workspace               = true
 rand.workspace               = true
+argon2.workspace             = true
 base64.workspace             = true
 num_cpus.workspace           = true
 walkdir.workspace            = true

@@ -52,6 +52,7 @@ pub mod contract;
 pub mod dev;
 pub mod engine_pool;
 pub mod error;
+pub mod forms;
 pub mod handlers;
 pub mod inspector;
 pub mod lifecycle;

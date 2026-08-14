@@ -40,9 +40,10 @@ use crate::render::csrf::CsrfRegistry;
 use axum::body::Body;
 use axum::http::{header, Response, StatusCode};
 use bytes::Bytes;
-use dom_render_compiler::ir::action::decode_action_envelope;
+use dom_render_compiler::ir::action::{decode_action_envelope, ActionEnvelope};
 use dom_render_compiler::ir::opcode::OpcodeFrame;
 use dom_render_compiler::ir::wire::encode_frame;
+use dom_render_compiler::transforms::form::allocate_form_action_id;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
@@ -107,6 +108,112 @@ pub async fn run_action_request(
         }
     };
 
+    match dispatch_action(registry, csrf, form_actions, &ctx, &envelope, slots, overlay).await {
+        Ok(instructions) => frame_response(instructions),
+        Err(refusal) => refusal,
+    }
+}
+
+/// `POST /_albedo/action/{name}` — the same action, submitted by a browser that
+/// never ran our JavaScript.
+///
+/// ## Why this is not a second dispatcher
+///
+/// Everything below the decode is [`dispatch_action`], shared with the envelope
+/// path above. Only three things differ, and each is a property of the
+/// *transport* rather than of the action:
+///
+/// | | envelope path | this path |
+/// |---|---|---|
+/// | how the action is named | `action_id` inside the body | the URL segment |
+/// | how fields arrive | JSON the client serialized | `application/x-www-form-urlencoded` |
+/// | what comes back | an `OpcodeFrame` to apply in place | `303` to the page that submitted |
+///
+/// A handler cannot tell which one it is serving, which is the point: an action
+/// that behaves differently without JavaScript is the defect this whole seam
+/// exists to make impossible. `FormBody::to_action_payload` produces the same
+/// JSON shape `assets/albedo-link-forms.js` produces, so the payload bytes are
+/// the same bytes.
+///
+/// ## The response is negotiated, not assumed
+///
+/// A `fetch()` caller that asks for `application/octet-stream` gets the frame —
+/// so the JS path could migrate onto this URL without changing what it does with
+/// the answer. Everything else gets the redirect, because everything else is a
+/// browser. See [`crate::forms::negotiate`].
+pub async fn run_form_action_request(
+    registry: &ActionRegistry,
+    csrf: &CsrfRegistry,
+    form_actions: &FormActionIds,
+    ctx: RequestContext,
+    action_name: &str,
+    body: Bytes,
+    slots: SessionSlots,
+    overlay: Option<&crate::dev::SharedErrorRegistry>,
+) -> Response<Body> {
+    use crate::forms::{negotiate_accept, see_other, FormBody, Wants};
+
+    let content_type = ctx.headers.get("content-type").map(String::as_str);
+    let form = match FormBody::decode(content_type, body.as_ref()) {
+        Ok(form) => form,
+        Err(err) => {
+            warn!(action = %action_name, error = %err, "rejecting malformed form submit");
+            return error_response(StatusCode::BAD_REQUEST, err.to_string());
+        }
+    };
+
+    // Read before dispatch, because a refusal has to land somewhere too — a 403
+    // that renders as a bare error page is the no-JS equivalent of a silent
+    // failure.
+    let return_path = form.return_path();
+    let wants = negotiate_accept(ctx.headers.get("accept").map_or("", String::as_str));
+
+    // The action's identity comes from the request line. `allocate_form_action_id`
+    // is the same FNV-1a-32 the renderers stamped and the client hashes, so the
+    // id this yields is the id the registry is keyed by — there is no second
+    // naming scheme, just a second way to say the same name.
+    let envelope = ActionEnvelope {
+        action_id: allocate_form_action_id(action_name),
+        event_kind: SUBMIT_EVENT_KIND,
+        payload: form.to_action_payload(),
+    };
+
+    match dispatch_action(registry, csrf, form_actions, &ctx, &envelope, slots, overlay).await {
+        Ok(instructions) => match wants {
+            Wants::Frame => frame_response(instructions),
+            // The opcodes are deliberately dropped here, and that is not a loss:
+            // they describe an in-place mutation of a DOM this caller does not
+            // have. The browser re-requests the page, and the render it gets
+            // back is built from the state the action just committed — which is
+            // the same information by a different route, and the reason
+            // POST/Redirect/GET is the pattern rather than a fallback.
+            Wants::Redirect => see_other(&return_path),
+        },
+        Err(refusal) => refusal,
+    }
+}
+
+/// `ActionEventKind::Submit` — mirrored from
+/// `dom_render_compiler::ir::action::ActionEventKind` and from
+/// `assets/albedo-link-forms.js`'s `EVENT_KIND_SUBMIT`. A form submit is a form
+/// submit regardless of which transport carried it.
+const SUBMIT_EVENT_KIND: u8 = 2;
+
+/// The gate and the handler call, shared by both entry points.
+///
+/// Returns the handler's instructions, or the refusal response to send instead.
+/// Splitting it out this way is what keeps the CSRF rule *one* rule: when the
+/// no-JS path arrived it inherited the gate rather than growing its own, so
+/// there is no second place where a token could be treated as optional.
+async fn dispatch_action(
+    registry: &ActionRegistry,
+    csrf: &CsrfRegistry,
+    form_actions: &FormActionIds,
+    ctx: &RequestContext,
+    envelope: &ActionEnvelope,
+    slots: SessionSlots,
+    overlay: Option<&crate::dev::SharedErrorRegistry>,
+) -> Result<Vec<dom_render_compiler::ir::opcode::Instruction>, Response<Body>> {
     // Phase L · CSRF gate.
     //
     // Every action must present a valid per-session token. It arrives on
@@ -140,10 +247,10 @@ pub async fn run_action_request(
                     error = %err,
                     "CSRF validation failed",
                 );
-                return error_response(
+                return Err(error_response(
                     StatusCode::FORBIDDEN,
                     format!("CSRF validation failed: {err}"),
-                );
+                ));
             }
         }
         // Fail closed. No token on either channel is a forged cross-site
@@ -161,7 +268,7 @@ pub async fn run_action_request(
                 session = %slots.session_id(),
                 "{kind} submitted without a CSRF token; rejecting",
             );
-            return error_response(
+            return Err(error_response(
                 StatusCode::FORBIDDEN,
                 format!(
                     "CSRF validation failed: {kind} {} carried no token \
@@ -170,31 +277,31 @@ pub async fn run_action_request(
                     CSRF_HEADER,
                     crate::render::csrf::CSRF_FIELD_NAME,
                 ),
-            );
+            ));
         }
     }
 
     let handler = match registry.get(&envelope.action_id) {
         Some(handler) => handler.clone(),
         None => {
-            return error_response(
+            return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("no handler registered for action_id {}", envelope.action_id),
-            );
+            ));
         }
     };
 
-    let mut instructions = match handler.handle(&ctx, &envelope, slots.clone()).await {
+    let mut instructions = match handler.handle(ctx, envelope, slots.clone()).await {
         Ok(out) => out,
         Err(err) => {
             warn!(action_id = envelope.action_id, error = %err, "action handler failed");
             if let Some(reg) = overlay {
                 reg.report_action(format!("action {} failed: {err}", envelope.action_id));
             }
-            return error_response(
+            return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 err.to_string(),
-            );
+            ));
         }
     };
 
@@ -203,13 +310,20 @@ pub async fn run_action_request(
     // returns an empty vec, so the handler's explicit response still
     // ships even if the slot store is in a bad state.
     instructions.extend(slots.drain_pending());
+    Ok(instructions)
+}
 
-    // Action responses don't share frame_ids with the WT patches
-    // stream — each is a self-contained `OpcodeFrame` per the Phase-D
-    // wire amendment. The `frame_id` here is `0`: bakabox's
-    // `applyFrameBytes` doesn't currently key on frame_id for HTTP
-    // responses (no multi-message reassembly), so the value is
-    // bookkeeping only.
+/// Wire-encode a handler's instructions as the binary `OpcodeFrame` the client
+/// frame applier consumes.
+///
+/// Action responses don't share frame_ids with the WT patches stream — each is a
+/// self-contained `OpcodeFrame` per the Phase-D wire amendment. The `frame_id`
+/// here is `0`: bakabox's `applyFrameBytes` doesn't currently key on frame_id
+/// for HTTP responses (no multi-message reassembly), so the value is bookkeeping
+/// only.
+fn frame_response(
+    instructions: Vec<dom_render_compiler::ir::opcode::Instruction>,
+) -> Response<Body> {
     let frame = OpcodeFrame {
         frame_id: 0,
         component_id: None,
@@ -899,6 +1013,218 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── the no-JS path ───────────────────────────────────────────────
+    //
+    // Everything below submits the way a browser does: form-encoded body, no
+    // `x-albedo-csrf` header, no `Accept` for octet-stream. The gate is the same
+    // gate — these tests exist to prove that, not to describe a second one.
+
+    /// A request context shaped like a browser's form POST.
+    fn form_ctx(accept: Option<&str>) -> RequestContext {
+        let mut ctx = ctx();
+        ctx.headers.insert(
+            "content-type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        );
+        if let Some(accept) = accept {
+            ctx.headers.insert("accept".to_string(), accept.to_string());
+        }
+        ctx
+    }
+
+    fn echoing_registry(name: &str, sink: Arc<std::sync::Mutex<Vec<u8>>>) -> ActionRegistry {
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            move |_ctx: RequestContext, env: ActionEnvelope, _slots: SessionSlots| {
+                let sink = sink.clone();
+                async move {
+                    if let Ok(mut guard) = sink.lock() {
+                        guard.clone_from(&env.payload);
+                    }
+                    Ok(Vec::new())
+                }
+            },
+        );
+        registry.insert(allocate_form_action_id(name), handler);
+        registry
+    }
+
+    /// The headline: a form submitted by a browser that never ran our
+    /// JavaScript reaches the handler and the reader lands back on the page they
+    /// came from. Before this path existed the same submit was a `405`.
+    #[tokio::test]
+    async fn a_browser_form_submit_dispatches_and_redirects_to_the_submitting_page() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let token = csrf_registry.token_for(session);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let body = Bytes::from(format!(
+            "_csrf={token}&_albedo_return=%2Fguestbook&author=ada&message=hello"
+        ));
+        let response = run_form_action_request(
+            &echoing_registry("sign_guestbook", seen.clone()),
+            &csrf_registry,
+            &form_actions(&[allocate_form_action_id("sign_guestbook")]),
+            form_ctx(Some("text/html,*/*;q=0.8")),
+            "sign_guestbook",
+            body,
+            slots_for(session),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/guestbook"
+        );
+
+        // …and the handler saw the same payload shape the JS path sends, which
+        // is what makes "same action, either way" true rather than aspirational.
+        let payload = seen.lock().unwrap().clone();
+        let value: serde_json::Value = serde_json::from_slice(&payload).expect("json payload");
+        assert_eq!(value["author"], serde_json::json!("ada"));
+        assert_eq!(value["message"], serde_json::json!("hello"));
+    }
+
+    /// The gate is inherited, not re-implemented. A form-encoded submit with no
+    /// token must fail exactly as the envelope path does — the handler panics if
+    /// it runs, so this cannot pass vacuously.
+    #[tokio::test]
+    async fn a_browser_form_submit_without_a_token_is_rejected() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let _token = csrf_registry.token_for(session);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                panic!("handler must not run for a tokenless no-JS submit");
+            },
+        );
+        registry.insert(allocate_form_action_id("sign_guestbook"), handler);
+
+        let response = run_form_action_request(
+            &registry,
+            &csrf_registry,
+            &form_actions(&[allocate_form_action_id("sign_guestbook")]),
+            form_ctx(None),
+            "sign_guestbook",
+            Bytes::from_static(b"author=ada"),
+            slots_for(session),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// **The open-redirect test, end to end.** A submitted `_albedo_return`
+    /// pointing off-origin must not become a `Location`. For a login form this
+    /// is the credential-phishing chain, which is why it is asserted at the
+    /// handler and not only at the parser.
+    #[tokio::test]
+    async fn a_hostile_return_path_redirects_to_the_root_instead() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let token = csrf_registry.token_for(session);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let response = run_form_action_request(
+            &echoing_registry("save", seen),
+            &csrf_registry,
+            &form_actions(&[allocate_form_action_id("save")]),
+            form_ctx(None),
+            "save",
+            Bytes::from(format!(
+                "_csrf={token}&_albedo_return=%2F%2Fevil.example%2Fharvest"
+            )),
+            slots_for(session),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/");
+    }
+
+    /// The JS path could migrate onto this URL unchanged: ask for the frame and
+    /// the frame is what comes back.
+    #[tokio::test]
+    async fn a_caller_that_asks_for_a_frame_gets_one() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let token = csrf_registry.token_for(session);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let response = run_form_action_request(
+            &echoing_registry("save", seen),
+            &csrf_registry,
+            &no_form_actions(),
+            form_ctx(Some("application/octet-stream")),
+            "save",
+            Bytes::from(format!("_csrf={token}&x=1")),
+            slots_for(session),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream"),
+        );
+    }
+
+    /// A body this path cannot decode is a 400 before any handler lookup — the
+    /// content type is checked, never guessed at.
+    #[tokio::test]
+    async fn a_non_form_body_is_refused_with_400() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let mut ctx = ctx();
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+
+        let response = run_form_action_request(
+            &HashMap::new(),
+            &csrf_registry,
+            &no_form_actions(),
+            ctx,
+            "save",
+            Bytes::from_static(br#"{"x":1}"#),
+            slots_for(session),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An action nobody registered is a 404 on this path too — the URL naming an
+    /// action does not conjure one.
+    #[tokio::test]
+    async fn an_unregistered_action_name_is_404() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let token = csrf_registry.token_for(session);
+
+        let response = run_form_action_request(
+            &HashMap::new(),
+            &csrf_registry,
+            &no_form_actions(),
+            form_ctx(None),
+            "no_such_action",
+            Bytes::from(format!("_csrf={token}")),
+            slots_for(session),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

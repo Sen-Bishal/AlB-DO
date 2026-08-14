@@ -588,6 +588,7 @@ impl RenderCompiler {
                 component.is_interactive,
                 component.is_client_interactive,
                 component.state_escapes,
+                component.reads_principal,
                 component.is_above_fold,
                 weight_bytes,
                 tiering_inputs,
@@ -678,6 +679,11 @@ fn tier_reason_to_message(reason: TieringReason, tier: Tier) -> String {
             } else {
                 "size threshold - server-rendered, no component JS".to_string()
             }
+        }
+        // AUTH § 3. Always Tier B — the tier is not a preference here, it is the
+        // only one with a request in scope.
+        TieringReason::RequestScoped => {
+            "reads `user` - rendered per request, no component JS".to_string()
         }
     }
 }

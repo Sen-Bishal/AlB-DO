@@ -156,6 +156,18 @@ impl LiveRuntime {
         }
     }
 
+    /// The installed AUTH runtime, for the login flows that need to *write* a
+    /// session rather than read one.
+    ///
+    /// `None` before boot installs one — which the sign-in endpoints treat as
+    /// "this app has no auth", the same answer an app that declared no providers
+    /// gets. Fail closed by returning nothing rather than by constructing an
+    /// empty runtime here: a default-constructed one would carry a substrate
+    /// nobody chose.
+    fn auth(&self) -> Option<&Arc<crate::auth::AuthRuntime>> {
+        self.auth.get()
+    }
+
     /// Install the APERTURE read path. Idempotent; a second call is ignored, so
     /// a dev world swap cannot replace a warm cache with a cold one.
     ///
@@ -2513,6 +2525,142 @@ async fn dispatch_routed(
         }
     }
 
+    // AUTH · P2 — the first-party sign-in endpoints. Placed ahead of everything
+    // else under `/_albedo/` because they are the one surface an anonymous
+    // stranger is *supposed* to reach, and because the limiting they need is not
+    // the limiting the rest of this function applies.
+    if let Some(auth_route) = crate::handlers::auth_routes::match_auth_route(path.as_str()) {
+        use crate::handlers::auth_routes::{AuthRequest, AuthRoute};
+
+        if method != HttpMethod::Post {
+            // A credential never travels in a URL, so `GET` is not a slower way
+            // to do this — it is the mistake that puts a password in the access
+            // log, and it is refused rather than redirected.
+            return ResponsePayload::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "sign-in endpoints accept POST only".to_string(),
+            )
+            .with_header("allow", "POST")
+            .into_response();
+        }
+
+        let Some(auth) = state.live.auth() else {
+            return RuntimeError::RouteNotFound {
+                method: method.as_str().to_string(),
+                path,
+            }
+            .into_response();
+        };
+        let auth = auth.clone();
+        let identity = state.live.identity(request.headers()).await;
+        let caller = state.shutter.key(
+            &identity,
+            peer,
+            request.headers(),
+            OperationClass::Credential,
+        );
+
+        // Registration and logout are rationed here, before the body is read.
+        // **Login deliberately is not** — its limiter needs the account being
+        // attempted, which is inside the body, so `run_auth_route` charges it
+        // once the address is known. What bounds the pre-limit work is the read
+        // cap below: an unauthenticated flood costs at most one small buffer per
+        // request, and never the KDF, which is the expensive part.
+        if auth_route != AuthRoute::PasswordLogin {
+            let cost = match auth_route {
+                AuthRoute::PasswordRegister => Cost::flat(OperationClass::Credential),
+                _ => Cost::flat(OperationClass::Write),
+            };
+            if let Err(refusal) = ration(state, peer, request.headers(), &identity, cost, rationed)
+            {
+                return refusal;
+            }
+        }
+
+        let (parts, body) = request.into_parts();
+        let body = match to_bytes(body, crate::forms::MAX_FORM_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
+        };
+
+        // The **tab** session, not a login: a stranger arriving at the sign-in
+        // page has one, and the CSRF token on the form they were served is bound
+        // to it. Falling back to a fresh id means the token cannot validate,
+        // which is the correct failure — a form submitted with no tab session
+        // did not come from a page we rendered.
+        let session = crate::render::csrf::read_session_cookie(&parts.headers)
+            .unwrap_or_else(SessionId::random);
+
+        let response = crate::handlers::auth_routes::run_auth_route(
+            auth_route,
+            AuthRequest {
+                auth: auth.as_ref(),
+                csrf: world.csrf.as_ref(),
+                session,
+                identity: &identity,
+                headers: &parts.headers,
+                body,
+                shutter: state.shutter.as_ref(),
+                caller,
+            },
+        )
+        .await;
+
+        if state.request_timings {
+            crate::timing::print_request(method.as_str(), &path, started.elapsed());
+        }
+        return response;
+    }
+
+    // The no-JS form submit — `POST /_albedo/action/{name}`. Placed before the
+    // envelope branch because it is the more specific path, and matched on the
+    // segment rather than on a router pattern so the whole action surface stays
+    // visible in one place.
+    //
+    // 🔑 **The action is named by the request line**, so this branch knows what
+    // it is dispatching before it reads a byte of the body — which is what
+    // `AUTH.md` § "P2's shape" asks for and what the bincode envelope below can
+    // never offer.
+    if method == HttpMethod::Post {
+        if let Some(action_name) = form_action_segment(path.as_str()) {
+            let principal = state.live.identity(request.headers()).await;
+
+            // Priced exactly as the envelope path: same admission cost, same
+            // post-hoc fan-out surcharge. A cheaper no-JS path would be a
+            // limiter bypass wearing a progressive-enhancement costume.
+            let key = match ration(
+                state,
+                peer,
+                request.headers(),
+                &principal,
+                Cost::flat(OperationClass::Write),
+                rationed,
+            ) {
+                Ok(key) => key,
+                Err(refusal) => return refusal,
+            };
+
+            let (response, fan_out) = crate::shutter::metered(run_form_action_route(
+                &world,
+                state.dev_error_registry.as_ref(),
+                request,
+                action_name,
+                principal,
+            ))
+            .await;
+
+            if fan_out > 0 {
+                state
+                    .shutter
+                    .debit(&key, Cost::surcharge(OperationClass::Write, fan_out));
+            }
+            if state.request_timings {
+                crate::timing::print_request(method.as_str(), &path, started.elapsed());
+            }
+            return response;
+        }
+    }
+
     // Phase-G — bakabox → server action invocations land here. Only
     // POST is accepted; other methods fall through to the normal
     // router (which will surface 405 or 404 as appropriate).
@@ -2933,6 +3081,99 @@ async fn run_action_route(
     .await
 }
 
+/// The action name in `POST /_albedo/action/{name}`, or `None` for any other
+/// path.
+///
+/// Matched here rather than by a router pattern because the answer has to be
+/// *exactly* one segment: `/_albedo/action/a/b` is not an action called `a/b`,
+/// and neither is `/_albedo/action/` an action called nothing. Both fall through
+/// to the ordinary 404 rather than reaching the dispatcher with a name it would
+/// then have to re-validate.
+///
+/// The alphabet is `transforms::form::is_url_safe_action_name` — the same
+/// predicate the renderers used to decide whether to emit a URL at all — so a
+/// name this accepts is a name a form could have been built from. A request
+/// naming anything else did not come from a page we served.
+fn form_action_segment(path: &str) -> Option<String> {
+    use dom_render_compiler::transforms::form::{is_url_safe_action_name, ACTION_ENDPOINT_PREFIX};
+    let name = path.strip_prefix(ACTION_ENDPOINT_PREFIX)?;
+    if !is_url_safe_action_name(name) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// `POST /_albedo/action/{name}` — the browser's own form submit.
+///
+/// Structurally identical to [`run_action_route`] and deliberately so: same
+/// session resolution, same [`RequestContext`], same principal, same registry.
+/// The action is named by the URL instead of by the body, and the answer is a
+/// redirect instead of an opcode frame. Everything in between is the one
+/// dispatcher.
+///
+/// Kept as a sibling rather than a branch inside `run_action_route` because the
+/// two differ in their *first* step — one decodes a bincode envelope, one decodes
+/// a form — and a function that begins with "which kind of request is this" is
+/// where a gate ends up applying to one arm and not the other.
+async fn run_form_action_route(
+    world: &RenderWorld,
+    dev_error_registry: Option<&crate::dev::SharedErrorRegistry>,
+    request: Request<Body>,
+    action_name: String,
+    principal: crate::auth::Identity,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
+    };
+
+    let session_id = crate::render::csrf::read_session_cookie(&parts.headers)
+        .or_else(|| {
+            parts
+                .headers
+                .get(ACTION_SESSION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                .map(SessionId::new)
+        })
+        .unwrap_or_else(SessionId::random);
+
+    let query = parts.uri.query().map(str::to_string);
+    let ctx = RequestContext::new(
+        HttpMethod::Post,
+        parts.uri.path().to_string(),
+        query.as_deref(),
+        Default::default(),
+        &parts.headers,
+        body.clone(),
+    )
+    .with_principal(principal.principal().map(|who| who.id.clone()));
+
+    if let Some(who) = principal.principal() {
+        tracing::debug!(
+            target: "albedo.auth",
+            principal = %who.id,
+            provider = %who.provider,
+            action = %action_name,
+            "form action dispatched under a resolved principal"
+        );
+    }
+
+    let slots = SessionSlots::new(session_id, world.slot_store.clone());
+    crate::handlers::action::run_form_action_request(
+        world.action_handlers.as_ref(),
+        world.csrf.as_ref(),
+        world.form_action_ids.as_ref(),
+        ctx,
+        &action_name,
+        body,
+        slots,
+        dev_error_registry,
+    )
+    .await
+}
+
 /// Runs an API request: applies the route-level timeout, calls
 /// [`dispatch_api_route`], and converts the result into an axum
 /// response. Centralised so the dispatcher stays linear and so future
@@ -3290,6 +3531,30 @@ mod tests {
     use axum::body::to_bytes;
     use bytes::Bytes;
     use tower::ServiceExt;
+
+    /// The no-JS action route matches exactly one segment, and only a segment a
+    /// form could have been built from. Every rejection here would otherwise
+    /// reach the dispatcher as a "name" it would have to re-validate — and the
+    /// traversal cases are the reason `.` is outside the alphabet.
+    #[test]
+    fn the_form_action_route_matches_exactly_one_safe_segment() {
+        assert_eq!(
+            form_action_segment("/_albedo/action/sign_guestbook").as_deref(),
+            Some("sign_guestbook")
+        );
+        for path in [
+            "/_albedo/action",     // the envelope route, not this one
+            "/_albedo/action/",    // an action called nothing
+            "/_albedo/action/a/b", // not an action called `a/b`
+            "/_albedo/action/..",
+            "/_albedo/action/../../etc/passwd",
+            "/_albedo/action/a%2Fb",
+            "/_albedo/actions/x",
+            "/mine",
+        ] {
+            assert_eq!(form_action_segment(path), None, "`{path}` must not match");
+        }
+    }
 
     #[tokio::test]
     async fn test_dynamic_route_dispatches_and_reads_param() {

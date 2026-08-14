@@ -326,6 +326,51 @@ pub fn preset_for(name: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|preset| preset.name == name)
 }
 
+/// Longest in-app path this crate will accept anywhere — a declared login
+/// route, a submitted return path.
+pub const MAX_APP_PATH_BYTES: usize = 2048;
+
+/// Whether `raw` is a path on **this** app and nothing else.
+///
+/// ## One rule, two readers
+///
+/// Two places need this and they must not disagree: the `login` route declared
+/// below, which the route gate redirects a stranger to, and
+/// `albedo_server::forms::ReturnPath`, which decides where a form submit sends
+/// the browser afterwards. Both are "a URL we are about to put in a `Location`
+/// header", and the second one is **request-supplied** — so if the two spellings
+/// of the rule ever drifted, the looser one would be the one attackers found.
+///
+/// ## The two characters that do all the work
+///
+/// `//evil.example` and `/\evil.example` are paths by any naive check — they
+/// start with `/` — and both resolve in every browser as **protocol-relative
+/// URLs pointing at another host**. That is why the second byte is tested
+/// explicitly rather than the rule being written as "starts with `/`". For a
+/// sign-in flow this is not a generic open redirect: "authenticate, then get
+/// bounced somewhere else" is the credential-phishing chain, with the victim
+/// already primed to trust wherever they land.
+///
+/// Control characters and non-ASCII are refused because the value ends up in a
+/// header: a CR or LF is response splitting, and a raw non-ASCII byte is
+/// something the HTTP layer would have to re-encode or reject. A browser
+/// percent-encodes those anyway, so nothing legitimate is lost.
+#[must_use]
+pub fn is_rooted_app_path(raw: &str) -> bool {
+    if raw.is_empty() || raw.len() > MAX_APP_PATH_BYTES {
+        return false;
+    }
+    let mut bytes = raw.bytes();
+    if bytes.next() != Some(b'/') {
+        return false;
+    }
+    if matches!(bytes.next(), Some(b'/') | Some(b'\\')) {
+        return false;
+    }
+    !raw.bytes()
+        .any(|byte| byte.is_ascii_control() || !byte.is_ascii() || byte == b' ')
+}
+
 /// Session handling for the whole app.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SessionDecl {
@@ -424,6 +469,26 @@ pub struct AuthDeclaration {
     /// because the hosts it yields become the egress allowlist.
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderDecl>,
+
+    /// The app's own sign-in route, e.g. `"/sign-in"`.
+    ///
+    /// ## Why this is declared and not derived
+    ///
+    /// A route gate (`export const auth = "required"`) has to send a stranger
+    /// *somewhere*, and until this existed there was nowhere honest to send them
+    /// — so the gate answered `401`, which is accurate and useless. Now that P2
+    /// can build a sign-in page, the app can name it.
+    ///
+    /// It is not inferred from "the route with a login form on it": that would
+    /// make a security-adjacent redirect target change when somebody adds a
+    /// second form somewhere, which is the same defect route gating itself
+    /// refused to inherit.
+    ///
+    /// Absent is a legitimate choice — an app whose only gate is an API, or one
+    /// that would rather show `401` than a sign-in page. The gate falls back to
+    /// the refusal it gave before.
+    #[serde(default)]
+    pub login: Option<String>,
 }
 
 /// Why an `auth` block was refused.
@@ -475,6 +540,11 @@ pub enum AuthSchemaError {
         value: String,
         /// What was wrong.
         reason: String,
+    },
+    /// The declared `login` route is not a path on this app.
+    InvalidLoginPath {
+        /// The offending value.
+        value: String,
     },
     /// A `SecretDecl::Env` named a variable that is not set.
     MissingEnv {
@@ -538,6 +608,13 @@ impl std::fmt::Display for AuthSchemaError {
             Self::InvalidCookie { value, reason } => {
                 write!(f, "auth session `cookie` = `{value}`: {reason}")
             }
+            Self::InvalidLoginPath { value } => write!(
+                f,
+                "auth `login` = `{value}` is not a route on this app. It becomes a `Location` \
+                 header the moment a stranger reaches a gated page, so it must be a rooted path \
+                 like `/sign-in` — not an absolute URL, not protocol-relative (`//host`), and \
+                 with no spaces or control characters"
+            ),
             Self::MissingEnv {
                 provider,
                 field,
@@ -621,6 +698,9 @@ pub struct AuthRegistry {
     pub session_cookie: String,
     /// Providers, in declaration order.
     pub providers: Vec<ResolvedProvider>,
+    /// The app's sign-in route, validated. `None` means a gated route answers
+    /// `401` rather than redirecting.
+    pub login_path: Option<String>,
 }
 
 impl AuthRegistry {
@@ -634,6 +714,7 @@ impl AuthRegistry {
             session_ttl: DEFAULT_SESSION_TTL,
             session_cookie: DEFAULT_SESSION_COOKIE.to_string(),
             providers: Vec::new(),
+            login_path: None,
         }
     }
 
@@ -731,6 +812,13 @@ impl AuthDeclaration {
             session_ttl,
             session_cookie,
             providers,
+            // No declaration surface for this yet, and deliberately so: until P2
+            // builds a login route there is nowhere honest to send anyone, and a
+            // knob whose only correct value does not exist is a redirect to a
+            // 404 in every app that sets it. `handlers::auth_gate` carries the
+            // full reasoning; when P2 lands, this is where the declared route
+            // gets lowered.
+            login_path: None,
         })
     }
 }

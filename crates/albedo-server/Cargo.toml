@@ -68,6 +68,12 @@ tempfile.workspace = true
 # `dom-render-compiler`'s seam.
 rquickjs.workspace = true
 tower.workspace = true
+# AUTH P2 only: `tests/auth_password_http.rs` drives a *running* server rather
+# than `Router::oneshot`, because the FORGE substrate — and therefore the
+# `AuthRuntime` that resolves against it — is installed by `run_with_ready` and
+# not by `build()`. A test that never binds a listener sees no auth at all, so
+# it would prove the endpoints 404 and call that a pass.
+reqwest.workspace = true
 
 [[bin]]
 name = "albedo"

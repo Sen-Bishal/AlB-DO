@@ -171,6 +171,19 @@ fn corpora() -> Vec<Corpus> {
     out
 }
 
+/// Whether the module was parsed but carries no default export.
+///
+/// `true` only when the module is known and has none — an unknown module is not
+/// this function's business, and reporting it as "no default export" would hide
+/// a discovery bug behind a setup excuse.
+fn module_has_no_default_export(project: &CompiledProject, entry: &str) -> bool {
+    project
+        .project()
+        .modules()
+        .get(entry)
+        .is_some_and(|module| module.default_export.is_none())
+}
+
 fn quarantine_reason(corpus: &str, entry: &str, contract: Contract) -> Option<&'static str> {
     QUARANTINE
         .iter()
@@ -239,6 +252,30 @@ fn run_corpora(corpora: &[Corpus]) -> Run {
                         id,
                         Verdict::NotComparable {
                             reason: reason.to_string(),
+                        },
+                    );
+                    continue;
+                }
+
+                // A source tree is not a corpus of components. Most modules in
+                // a real application are utilities, hooks, types and constants,
+                // and the harness renders the *default export* — so asking one
+                // of those to render produces "has no default export", which is
+                // neither a defect nor a construct the evaluator declined.
+                //
+                // Checked here, from the parsed module, rather than by
+                // classifying the error after the fact: the gate's rule is that
+                // an evaluator error naming no construct is a defect, and that
+                // rule should keep its teeth. This never fires on the in-repo
+                // corpus, where every entry is a component by construction.
+                if module_has_no_default_export(&project, entry) {
+                    run.report.push(
+                        id,
+                        Verdict::NotComparable {
+                            reason: "module exports no default component — not a renderable \
+                                     entry. Components exported only by name are the single \
+                                     largest widening available to this corpus."
+                                .to_string(),
                         },
                     );
                     continue;
@@ -496,6 +533,28 @@ fn external_corpora_report_the_coverage_frontier() {
 
     let run = run_corpora(&corpora);
     eprintln!("\n{}", run.report.summary());
+
+    // The evaluator's frontier is the headline, but a case QuickJS could not
+    // render is not a parity result either — and on foreign code it is the
+    // *escape hatch's* own frontier, which nothing else measures. Bucketed by
+    // the leading line of the error so 48 cases read as a handful of causes
+    // rather than as a wall.
+    let mut qjs: std::collections::BTreeMap<String, usize> = Default::default();
+    for outcome in &run.report.outcomes {
+        if let Verdict::QuickJsFaulted { reason } = &outcome.verdict {
+            let head = reason.lines().next().unwrap_or(reason).trim();
+            *qjs.entry(head.chars().take(90).collect()).or_insert(0) += 1;
+        }
+    }
+    if !qjs.is_empty() {
+        eprintln!("QUICKJS FRONTIER (the escape hatch's own failures)");
+        let mut rows: Vec<_> = qjs.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (reason, count) in rows {
+            eprintln!("  {count:>4}  {reason}");
+        }
+        eprintln!();
+    }
 
     for outcome in run.report.failures() {
         eprintln!("{}\n", outcome.describe());

@@ -44,6 +44,7 @@ fn decide(source: &str) -> TieringDecision {
         c.is_interactive,
         c.is_client_interactive,
         c.state_escapes,
+        c.reads_principal,
         false,
         c.estimated_size as u64,
         inputs(),

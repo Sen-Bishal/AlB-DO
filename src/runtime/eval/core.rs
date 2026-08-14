@@ -6,8 +6,8 @@ use crate::transforms::events::HandlerBody;
 // *detected* name for the element being rendered, so the parser that
 // produces it needs a distinct name to stay readable.
 use crate::transforms::form::{
-    allocate_field_error_id, form_action_name as parse_form_action_sentinel,
-    CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR,
+    action_endpoint, allocate_field_error_id, form_action_name as parse_form_action_sentinel,
+    plain_form_needs_hidden_inputs, CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR, FORM_HIDDEN_INPUTS,
 };
 use crate::types::ComponentId;
 use anyhow::{anyhow, Result};
@@ -3761,12 +3761,28 @@ impl ComponentProject {
                 }
             });
             if let Some(action_name) = &detected {
-                // Drop the sentinel `action` attribute and replace it
-                // with `data-albedo-action` carrying the bare name.
-                // Slot count stays balanced (1 in, 1 out) so the
-                // rendered HTML still looks like a normal form
-                // element with one form-action hook attached.
+                // Replace the sentinel `action` with the endpoint the form
+                // actually posts to, and keep `data-albedo-action` beside it.
+                //
+                // Both, not either. The attribute is what the client
+                // interceptor keys on; the URL is what the browser uses when
+                // no interceptor ran. Emitting only the attribute — which is
+                // what this did until now — meant the served form had no
+                // `action` at all, so a JS-less submit went to the current
+                // page and got a 405. See `transforms::form::ACTION_ENDPOINT_PREFIX`.
                 attrs.retain(|(n, _)| n != "action");
+                if let Some(endpoint) = action_endpoint(action_name) {
+                    // 🔑 POST is forced, not defaulted. An action is a
+                    // mutation, and a `<form>` with no `method` submits GET —
+                    // which would put every field, password included, in the
+                    // URL bar, the history, the Referer and the access log.
+                    // An authored `method="get"` on an action form is a
+                    // mistake with no correct reading, so it is overwritten
+                    // rather than honoured.
+                    attrs.retain(|(n, _)| n != "method");
+                    attrs.push(("action".to_string(), Value::String(endpoint)));
+                    attrs.push(("method".to_string(), Value::String("post".to_string())));
+                }
                 attrs.push((
                     FORM_ACTION_ATTR.to_string(),
                     Value::String(action_name.clone()),
@@ -3888,17 +3904,37 @@ impl ComponentProject {
 
         phase_k_pop_element();
 
-        // Phase L · for form-action forms, inject the hidden CSRF input
-        // as the first child of the form body. The placeholder and the
-        // per-session fill that later replaces its `value` are both
-        // owned by `transforms::form` — the QuickJS shim emits this
-        // same constant, so Tier-A and Tier-B forms are identical here.
-        // Empty string for every non-form element so the format strings
-        // below stay branch-free.
-        let body_prefix: &'static str = if form_action_name.is_some() {
-            CSRF_PLACEHOLDER_INPUT
-        } else {
-            ""
+        // Phase L · for form-action forms, inject the two hidden inputs the
+        // server fills at request time as the first children of the form body:
+        // the CSRF token, and the path a JS-less submit returns to. Both
+        // placeholders and both fills are owned by `transforms::form` — the
+        // QuickJS shim emits these same constants, so Tier-A and Tier-B forms
+        // are identical here.
+        //
+        // The return input rides with the endpoint: if the action name could
+        // not become a URL there is no browser submit to return from, and a
+        // dead hidden field would just be markup nobody reads. Empty string for
+        // every non-form element so the format strings below stay branch-free.
+        // A plain same-origin POST form earns the same two inputs. That is what
+        // makes the first-party sign-in endpoints authorable at all — see
+        // `transforms::form::plain_form_needs_hidden_inputs` for why the rule is
+        // about where the form posts rather than about auth.
+        let body_prefix: &'static str = match &form_action_name {
+            Some(name) if action_endpoint(name).is_some() => FORM_HIDDEN_INPUTS,
+            Some(_) => CSRF_PLACEHOLDER_INPUT,
+            None if tag == "form" => {
+                let attr = |wanted: &str| {
+                    attrs.iter().find_map(|(name, value)| {
+                        (name == wanted).then(|| value.as_str()).flatten()
+                    })
+                };
+                if plain_form_needs_hidden_inputs(attr("action"), attr("method")) {
+                    FORM_HIDDEN_INPUTS
+                } else {
+                    ""
+                }
+            }
+            None => "",
         };
 
         // Phase L · sibling `data-albedo-error` span for every named
@@ -3973,6 +4009,53 @@ impl ComponentProject {
         self.render_local(module_spec, component, props)
     }
 
+    /// `style={{ … }}` lowered to CSS text **in source order**.
+    ///
+    /// A `Value::Object` here is a `serde_json::Map`, which is a `BTreeMap`
+    /// unless `preserve_order` is enabled — so an object literal loses its
+    /// authored order the instant it becomes a `Value`, and `{height,
+    /// backgroundColor, margin, flex}` comes back out alphabetized. CSS is
+    /// order-sensitive (`{ margin: 0, marginTop: 4 }` and its reverse are
+    /// different rules), and the QuickJS shim sees a real JS object, which
+    /// *does* keep insertion order. Lowering the literal here, while the AST is
+    /// still in hand, is what lets the two renderers agree byte-for-byte.
+    ///
+    /// `None` for anything that is not a plain object literal — a spread, a
+    /// variable, a computed key. Those fall through to the generic path and are
+    /// rendered by `render_attrs` from the map, in the map's own order. That
+    /// residual is the one case where the two renderers can still order
+    /// declarations differently, and it is only observable when a style object
+    /// sets two *conflicting* properties.
+    fn eval_style_object_literal(
+        &self,
+        module_spec: &str,
+        expr: &swc_ecma_ast::Expr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Option<String>> {
+        use swc_ecma_ast::*;
+        let Expr::Object(object) = expr else {
+            return Ok(None);
+        };
+        let mut entries: Vec<(String, Value)> = Vec::with_capacity(object.props.len());
+        for prop in &object.props {
+            let PropOrSpread::Prop(prop) = prop else {
+                return Ok(None);
+            };
+            let Prop::KeyValue(kv) = prop.as_ref() else {
+                return Ok(None);
+            };
+            let key = match &kv.key {
+                PropName::Ident(ident) => ident.sym.to_string(),
+                PropName::Str(string) => string.value.to_string(),
+                _ => return Ok(None),
+            };
+            entries.push((key, self.eval_expr(module_spec, &kv.value, env)?));
+        }
+        Ok(Some(crate::runtime::eval::component::style_object_to_css(
+            entries.iter().map(|(k, v)| (k.as_str(), v)),
+        )))
+    }
+
     fn read_attrs(
         &self,
         module_spec: &str,
@@ -3995,7 +4078,17 @@ impl ComponentProject {
                         None => Value::Bool(true),
                         Some(JSXAttrValue::Lit(lit)) => lit_to_value(lit),
                         Some(JSXAttrValue::JSXExprContainer(container)) => match &container.expr {
-                            JSXExpr::Expr(expr) => self.eval_expr(module_spec, expr, env)?,
+                            JSXExpr::Expr(expr) => {
+                                let lowered = if name == "style" {
+                                    self.eval_style_object_literal(module_spec, expr, env)?
+                                } else {
+                                    None
+                                };
+                                match lowered {
+                                    Some(css) => Value::String(css),
+                                    None => self.eval_expr(module_spec, expr, env)?,
+                                }
+                            }
                             JSXExpr::JSXEmptyExpr(_) => Value::Null,
                         },
                         _ => Value::Null,

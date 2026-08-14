@@ -111,6 +111,7 @@ impl ProjectScanner {
             component.is_interactive = parsed.is_interactive;
             component.is_client_interactive = parsed.is_client_interactive;
             component.state_escapes = parsed.state_escapes;
+            component.reads_principal = parsed.reads_principal;
             component.effect_profile = parsed.effect_profile;
             component.source_hash = parsed.source_hash;
             component.is_module_only = parsed.is_module_only;

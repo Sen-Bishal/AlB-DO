@@ -169,6 +169,21 @@ pub fn substitute_csrf_token_in_html(html: &str, token: &str) -> String {
     dom_render_compiler::transforms::form::fill_csrf_tokens(html, token)
 }
 
+/// Post-render return-path substitution — the CSRF fill's sibling.
+///
+/// Stamps the request's own path into every hidden `_albedo_return` input the
+/// renderers emitted, so a form submitted **without JavaScript** lands back on
+/// the page it came from instead of at `/`. Same delegate arrangement and same
+/// reason as [`substitute_csrf_token_in_html`]: `transforms::form` owns both the
+/// placeholder and the anchor.
+///
+/// The value is re-validated on the way back in by
+/// [`crate::forms::ReturnPath`] — what a server stamps and what a client submits
+/// are two different facts, and only the second one decides a redirect.
+pub fn substitute_return_path_in_html(html: &str, path: &str) -> String {
+    dom_render_compiler::transforms::form::fill_return_paths(html, path)
+}
+
 /// Reads the `__Host-albedo-session` cookie value from a request's header
 /// map and parses it into a [`SessionId`].
 ///
