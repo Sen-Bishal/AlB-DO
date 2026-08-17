@@ -24,7 +24,9 @@ classified into a **tier** based on what it actually does (`src/lib.rs` "Effect 
 
 If you understand *why a given component is A, B, or C*, you understand ALBEDO. The moat is in
 `src/analysis/` (classification) and `src/runtime/` (two different render engines for A vs B/C).
-See [design_tier_classification] in the project memory for the deep version.
+The classifier itself is [src/analysis/analyzer.rs](src/analysis/analyzer.rs), and the
+soundness argument under it is the escape analysis in the same directory — a component whose
+state escapes cannot be Tier A no matter what its hooks look like.
 
 ---
 
@@ -64,7 +66,7 @@ consumes. If you want to see the seam between "compiler" and "runtime," read tha
 
 Supporting dirs: [scaffold/](scaffold/) (what `albedo init` copies), [tests/](tests/) +
 [fuzz/](fuzz/) + [benches/](benches/) (correctness/robustness/perf), [examples/](examples/),
-[installer/](installer/), `graphify-out/` (the knowledge-graph cache — see CLAUDE.md).
+[installer/](installer/).
 
 ---
 
@@ -136,7 +138,7 @@ Tier-B/C with **QuickJS**, sharing a request-scoped memory arena.
 |------|----------|
 | [src/runtime/eval/core.rs](src/runtime/eval/core.rs) | The **pure-Rust JS evaluator** for Tier-A (`eval_body_stmts` etc.). Unsupported constructs fail *loudly* → punt to QuickJS. |
 | [src/runtime/quickjs_engine.rs](src/runtime/quickjs_engine.rs) · [engine.rs](src/runtime/engine.rs) | The **QuickJS engine** for Tier-B/C. |
-| [src/runtime/arena.rs](src/runtime/arena.rs) | Request-scoped bump arena (warmup only; per-request allocs go to the system allocator — see [project_quickjs_arena] memory). |
+| [src/runtime/arena.rs](src/runtime/arena.rs) | Request-scoped bump arena (warmup only; per-request allocs go to the system allocator). ⚠️ The O(1) bump-reset was **removed deliberately** — it allowed a cross-request use-after-free. Do not reintroduce it. |
 | [src/runtime/compiled.rs](src/runtime/compiled.rs) | `CompiledProject` + `invoke_action_*` — the per-request action invocation path. |
 | [src/runtime/renderer/manifest.rs](src/runtime/renderer/manifest.rs) | `render_route*` — turns a manifest route into HTML (the streaming SSR core). |
 | [src/runtime/slot_store.rs](src/runtime/slot_store.rs) · [broadcast.rs](src/runtime/broadcast.rs) · [session.rs](src/runtime/session.rs) | State: per-session slot values, broadcast topics, session ids. |
@@ -147,10 +149,51 @@ Tier-B/C with **QuickJS**, sharing a request-scoped memory arena.
 ### CLI
 | File | Controls |
 |------|----------|
-| [src/bin/albedo.rs](src/bin/albedo.rs) | **The `albedo` command.** `init`/`dev`/`serve`/`build`/`ship` dispatch, contract resolution, dev watch→rebuild→hot-swap. `dev` and `serve` both boot the *same* production pipeline (see [project_dev_serve_unification]). |
+| [src/bin/albedo.rs](src/bin/albedo.rs) | **The `albedo` command.** `init`/`dev`/`serve`/`build`/`ship` dispatch, contract resolution, dev watch→rebuild→hot-swap. `dev` and `serve` both boot the *same* production pipeline, deliberately — divergence between them was a recurring source of "works in dev" bugs. |
 | [src/bin/albedo/printer.rs](src/bin/albedo/printer.rs) | The "Halation" CLI styling + tier report. |
 | [src/bin/albedo/first_run.rs](src/bin/albedo/first_run.rs) | First-run experience. |
 | [src/bin/albedo-bench.rs](src/bin/albedo-bench.rs) · [dom-compiler.rs](src/bin/dom-compiler.rs) | Bench + raw-compiler bins. |
+
+### FORGE — the database
+Declared collections become tables, live topics, and generated types. Feature-gated as `forge`,
+but **on by default**: a build without it silently yields `null` topics at serve time.
+| File | Controls |
+|------|----------|
+| [src/forge/declare.rs](src/forge/declare.rs) | The declaration language — `FieldType` (`text`/`int`/`real`/`bool`/`timestamp`) and `FieldSpec { ty, nullable }`, the trailing `?`. What an app is allowed to say about its own schema. |
+| [src/forge/write.rs](src/forge/write.rs) | `append`/`update`/`remove`. ⚠️ `returned_record` splices a `RETURNING` row without re-querying — it and `skeleton::rows_to_json` are **two conversion sites that must agree**, or a value's type changes between the write and the next full read. |
+| [src/forge/drift.rs](src/forge/drift.rs) | `evolve_schema` — adds a new nullable column via `ALTER`, refuses every other change **by name**. The declared SQL type names (`BOOLEAN`/`TIMESTAMP`) survive in `PRAGMA table_info`, which is what makes a retype detectable. |
+| [src/forge/mod.rs](src/forge/mod.rs) | Collection handles, partition keys, and the projection into topic values. |
+
+### AUTH — identity as a key source
+| File | Controls |
+|------|----------|
+| [src/auth/principal.rs](src/auth/principal.rs) | `Principal` — one identity type regardless of which credential minted it. |
+| [src/auth/session.rs](src/auth/session.rs) · [store.rs](src/auth/store.rs) | Session cookies and the session store. |
+| [src/auth/password.rs](src/auth/password.rs) | First-party password credentials (argon2). |
+| [src/auth/declare.rs](src/auth/declare.rs) | Declared route policy and the gate that enforces it. |
+| [src/shutter/gcra.rs](src/shutter/gcra.rs) · [cost.rs](src/shutter/cost.rs) | GCRA rate limiting; the weight of a request is **derived**, not configured. Credential attempts are metered here. |
+
+🔑 **The invariant worth understanding before changing any of this:** identity reaches the read
+path as **data** (a partition key on a topic), not as `if` statements in handlers. That is what
+makes `messages.where({ owner: user.id })` row-level security which cannot be written wrong — the
+read and the policy are the same expression, and an author cannot spell the topic name directly.
+Every "policy authored apart from the read" footgun is structurally absent, and it stays absent
+only as long as **every** read path mints a topic.
+
+### APERTURE — the outside world
+| File | Controls |
+|------|----------|
+| [src/aperture/egress.rs](src/aperture/egress.rs) | The egress policy, enforced at the **resolver** level so it cannot be bypassed by DNS rebinding. ⚠️ An IP-literal URL once bypassed this entirely — that class of hole is what this file exists to close. |
+| [src/aperture/cache.rs](src/aperture/cache.rs) · [client.rs](src/aperture/client.rs) | Byte-budgeted LRU response store; cache lookup, single-flight coalescing, conditional revalidation. |
+| [src/aperture/transport.rs](src/aperture/transport.rs) | The `reqwest` implementation of the network seam. |
+
+⚠️ **Phase A0.** There is no JS surface: no global `fetch` is installed and nothing in a handler
+body can reach this module. Do not document outbound HTTP as a user-facing feature until A1/A2 land.
+
+### `albedo doctor`
+| File | Controls |
+|------|----------|
+| [src/doctor/matrix.rs](src/doctor/matrix.rs) | The reach matrix — what can reach what, and under which principal. **Derived from the tree, never a maintained list**; a hand-maintained capability table goes stale the first time someone forgets it. |
 
 ---
 
@@ -225,9 +268,23 @@ hydration silently.
 - **"How does a click reach the server?"** → [assets/albedo-link-forms.js](assets/albedo-link-forms.js) → [handlers/action.rs](crates/albedo-server/src/handlers/action.rs) → [src/runtime/compiled.rs](src/runtime/compiled.rs).
 - **"What does the CLI actually do?"** → [src/bin/albedo.rs](src/bin/albedo.rs) (`run_serve_command`, `run_live_dev_runtime`, `run_prod_build`).
 - **"What's the compiler↔runtime seam?"** → [src/manifest/schema.rs](src/manifest/schema.rs).
-- **Broad architecture** → `graphify-out/GRAPH_REPORT.md` and `graphify-out/wiki/index.md` (generated knowledge graph), or `ENDGAME.md` for the roadmap.
+- **"Where does the data live?"** → [src/forge/declare.rs](src/forge/declare.rs) → [src/forge/write.rs](src/forge/write.rs) → [src/runtime/broadcast.rs](src/runtime/broadcast.rs).
+- **"How is a read authorized?"** → [src/auth/principal.rs](src/auth/principal.rs) → [src/transforms/shared_slots.rs](src/transforms/shared_slots.rs) (a topic's partition key) → [src/auth/declare.rs](src/auth/declare.rs).
+- **Roadmap and current state** → [README.md](README.md) § *What isn't done* and § *Where it's headed*.
 
 ---
 
-*Generated as part of the codebase readiness sweep (see `STRATEGY.md` Decision 3). Known open
-items a reviewer should not be surprised by are called out inline with ⚠️.*
+## 9. A note on the design-document references
+
+Doc comments throughout the source cite files under `development-plan/` — `APERTURE.md`,
+`AUTH.md`, `PHOSPHOR.md`, `PRISM.md`, and others. **Those are internal working notes and are
+not published in this repository.** They are cited because that is honestly where a given
+invariant was argued out, and stripping the citations would make the comments claim less
+provenance than they have.
+
+Nothing in the code depends on them. This file and the source are the normative description;
+where a comment says *"invariant 2.7"*, the invariant it names is stated in the comment itself.
+
+---
+
+*Known open items a reviewer should not be surprised by are called out inline with ⚠️.*

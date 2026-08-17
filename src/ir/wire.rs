@@ -79,7 +79,7 @@ fn decode_config() -> impl bincode::config::Config {
 
 // ── Codec traits ─────────────────────────────────────────────────────
 //
-// PHASE 2 (B-emitter) �: emit through these traits
+// PHASE 2 (B-emitter): emit through these traits
 // (`frame.wire_encode()`), not through the free functions. Reason: when we
 // swap bincode for FlatBuffers later, only this file changes. The free
 // functions below stay as ergonomic wrappers but they are not the contract

@@ -662,8 +662,39 @@
     registerComponent: registerComponent,
   };
 
+  // Phase L · `<Link href>` in a client island.
+  //
+  // The server half of this lives in `quickjs_engine`'s runtime prelude, and
+  // both exist for the same reason: `<Link>` is rewritten to `<a
+  // data-albedo-link>` by the pure-Rust evaluator's JSX walker only.
+  // `transforms::link` is a metadata pass that does not touch the AST, so a
+  // compiled island — whose JSX lowers to `h(Link, …)` — has no `Link` binding
+  // at all and throws `Link is not defined` on its first render.
+  //
+  // Without this, fixing only the server side would give an island that
+  // server-renders correctly and then blows up the moment it hydrates, which
+  // is a worse failure than not mounting: the markup is already on screen.
+  //
+  // `data-albedo-link` is set last, matching the attribute order both
+  // renderers emit, so hydration adopts the server's DOM instead of replacing
+  // it. `albedo-link-forms.js` is what actually hooks the attribute to
+  // intercept the click.
+  function Link(props) {
+    var merged = {};
+    var source = props || {};
+    for (var key in source) {
+      if (Object.prototype.hasOwnProperty.call(source, key) && key !== 'children') {
+        merged[key] = source[key];
+      }
+    }
+    delete merged['data-albedo-link'];
+    merged['data-albedo-link'] = true;
+    return h('a', merged, source.children);
+  }
+
   global.__albedoClient = api;
   global.h = h;
+  global.Link = Link;
   global.Fragment = Fragment;
   global.useState = useState;
   global.useEffect = useEffect;

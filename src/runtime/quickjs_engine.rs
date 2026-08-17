@@ -8,8 +8,9 @@ use super::engine::{
 };
 use rquickjs::{promise::MaybePromise, Context, Function, Runtime};
 use serde::Deserialize;
+use crate::runtime::eval::component::fnv1a_32;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1213,9 +1214,14 @@ if (typeof globalThis.h !== 'function') {
       // `defaultValue`→`value`, `defaultChecked`→`checked` — so a pre-filled
       // `<input defaultValue={x}>` shows its value instead of shipping the
       // browser-inert lowercased `defaultvalue`.
+      // `htmlFor`→`for` is here for the same reason as `className`→`class`:
+      // JSX cannot spell `for`, so React-shaped code writes `htmlFor`, and
+      // shipping it verbatim yields the inert `htmlfor` — which disconnects a
+      // label from its control. MUST match the Rust `render_attrs` table.
       const attrName = key === 'className' ? 'class'
         : key === 'defaultValue' ? 'value'
         : key === 'defaultChecked' ? 'checked'
+        : key === 'htmlFor' ? 'for'
         : key;
       if (value === true) {
         attrs += ' ' + attrName;
@@ -1349,6 +1355,41 @@ if (typeof globalThis.h !== 'function') {
       }
     }
     return String(hash >>> 0);
+  };
+
+  // Phase L · `<Link href>` on the QuickJS render path.
+  //
+  // `<Link>` is a compile-time component: `eval::core` rewrites the TAG to `a`
+  // and pushes a bare `data-albedo-link` attribute. That rewrite lives in the
+  // pure-Rust evaluator's JSX walker, and `transforms::link` is explicitly a
+  // metadata-only pass that "does not rewrite the AST" — so nothing ever
+  // rewrote it for THIS engine. JSX lowers `<Link>` to `h(Link, …)`, `Link`
+  // was an undefined free identifier, and any component containing one threw
+  // `Link is not defined` the moment it rendered through QuickJS.
+  //
+  // Why that was invisible: a route renders through the pure-Rust evaluator,
+  // which handles `<Link>` fine. The QuickJS path is reached when an island is
+  // rendered STANDALONE from its module path — and that call site
+  // (`renderer_runtime::render_island_html`) catches the error, logs a
+  // `tracing::warn!` nobody sees, and leaves the placeholder empty. The island
+  // then has no `data-albedo-island` marker, so the interaction-triggered
+  // bootstrap can never find a node to hydrate and the component never mounts.
+  // A navigation bar with one `<Link>` in it disappeared from every page of a
+  // real site with a green build and a clean console.
+  //
+  // Defined as a function component so `h`'s existing `typeof type ===
+  // 'function'` branch invokes it. `data-albedo-link` is assigned LAST, after
+  // `children` is removed, so the emitted attribute order matches
+  // `eval::core` — which pushes it after the authored attrs. That parity is
+  // load-bearing: the row-delta path compares the two renderers' bytes, and a
+  // Tier-A `<Link>` and a Tier-C `<Link>` must agree exactly.
+  globalThis.Link = function(props) {
+    const merged = Object.assign({}, props || {});
+    const children = merged.children;
+    delete merged.children;
+    delete merged['data-albedo-link'];
+    merged['data-albedo-link'] = true;
+    return h('a', merged, children);
   };
 
   globalThis.h = h;
@@ -1559,7 +1600,7 @@ fn compile_legacy_expression_module(
 }
 
 fn compile_exporting_module(specifier: &str, source: &str) -> RuntimeResult<String> {
-    let lowered = lower_module_to_statements(specifier, source, rewrite_import_declaration)?;
+    let lowered = lower_module_to_statements(specifier, source, &rewrite_import_declaration)?;
     build_module_record_script(specifier, &lowered.statements, &lowered.export_assignments)
 }
 
@@ -1575,12 +1616,15 @@ struct LoweredModule {
     default_export_local: Option<String>,
 }
 
-type ImportRewriter = fn(swc_ecma_ast::ImportDecl, &str) -> RuntimeResult<Vec<String>>;
+/// A borrowed closure rather than a bare `fn` pointer, so a rewriter can CAPTURE
+/// state — specifically the project's module sources, which is what lets the
+/// client-island rewriter inline an imported data module instead of refusing it.
+type ImportRewriter<'a> = &'a dyn Fn(swc_ecma_ast::ImportDecl, &str) -> RuntimeResult<Vec<String>>;
 
 fn lower_module_to_statements(
     specifier: &str,
     source: &str,
-    rewrite_import: ImportRewriter,
+    rewrite_import: ImportRewriter<'_>,
 ) -> RuntimeResult<LoweredModule> {
     let module = parse_module(specifier, source)?;
     let mut statements = Vec::new();
@@ -1777,25 +1821,208 @@ fn lower_module_to_statements(
     })
 }
 
-/// Tier-C client island import policy: framework runtime imports bind to the
-/// globals the client runtime installs (mirroring the server-side
-/// [`rewrite_framework_runtime_import`]); anything else is rejected loudly,
-/// because npm packages and child-component modules are not yet client-bundled
-/// (the A3.2 vendor-chunk follow-up).
-fn rewrite_import_for_client(
+/// Resolve a relative import specifier against the module map.
+///
+/// Module keys are whatever the caller registered — absolute source paths in
+/// the CLI's case — so this joins the importer's directory and then tries the
+/// extensions a TypeScript project actually uses.
+fn resolve_relative_module(
+    importer: &str,
+    source: &str,
+    modules: &HashMap<String, String>,
+) -> Option<String> {
+    let dir = Path::new(importer).parent()?;
+    let joined = dir.join(source);
+    // Normalize `..` segments so `src/components/../config` becomes `src/config`.
+    let mut normalized = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    let base = normalized.to_string_lossy().replace('\\', "/");
+    let candidates = [
+        base.clone(),
+        format!("{base}.ts"),
+        format!("{base}.tsx"),
+        format!("{base}.js"),
+        format!("{base}.jsx"),
+        format!("{base}/index.ts"),
+        format!("{base}/index.tsx"),
+    ];
+    modules.keys().find(|key| {
+        let normalized_key = key.replace('\\', "/");
+        candidates.iter().any(|candidate| normalized_key == *candidate)
+    }).cloned()
+}
+
+/// Tier-C client island import policy.
+///
+/// Framework runtime imports bind to the globals the client runtime installs.
+/// A **relative project import** is inlined: the target module is lowered and
+/// embedded in the island's own bundle, so the island can read a shared data
+/// module the same way a Tier-A component can.
+///
+/// ── WHY THIS EXISTS ──────────────────────────────────────────────────
+/// This used to reject every non-framework import outright, and the rejection
+/// was swallowed at both call sites — so an island that referenced ANY imported
+/// binding, an array or even a bare string, was classified Tier C, reported as
+/// "ships a client island", and then never compiled. It rendered as an empty
+/// `<div data-albedo-tier="c">` with a green build.
+///
+/// The practical cost was that a shared `config.ts` could not be read from an
+/// island at all. Data had to be duplicated into every island that used it,
+/// which is the opposite of what a compiler that owns the whole graph should
+/// require.
+///
+/// ── HOW THE INLINING IS SCOPED ───────────────────────────────────────
+/// The target module is wrapped in its own IIFE and only the imported names are
+/// lifted out:
+///
+/// ```js
+/// const __albedo_import_0 = (function(){ …target statements…
+///   return { nav: nav }; })();
+/// const nav = __albedo_import_0.nav;
+/// ```
+///
+/// The IIFE is not decoration. Inlining the target's statements directly into
+/// the island scope would leak its PRIVATE top-level bindings — a `const
+/// suffix` in the data module would collide with an unrelated `suffix` in the
+/// island. Wrapping keeps the target's internals invisible and lifts exactly
+/// the imported bindings, which also makes aliasing (`import { a as b }`) a
+/// plain property read.
+fn rewrite_import_for_client_with_modules(
     import_decl: swc_ecma_ast::ImportDecl,
     specifier: &str,
+    modules: &HashMap<String, String>,
+    depth: u32,
 ) -> RuntimeResult<Vec<String>> {
+    // Import chains are inlined recursively; the cap stops a cycle from
+    // recursing until the stack dies. The manifest optimizer rejects true
+    // cycles earlier, so this is a backstop rather than the primary guard.
+    const MAX_INLINE_DEPTH: u32 = 8;
+
     let import_source = import_decl.src.value.to_string();
     if is_framework_runtime_import(import_source.as_str()) {
         return rewrite_framework_runtime_import(import_decl, specifier);
     }
+
+    if import_source.starts_with('.') && depth < MAX_INLINE_DEPTH {
+        if let Some(target_key) = resolve_relative_module(specifier, &import_source, modules) {
+            let target_source = modules
+                .get(&target_key)
+                .expect("resolve_relative_module returned a key from this map");
+            let transpiled =
+                transpile_module_source_for_quickjs(&target_key, target_source, None)?;
+            let nested = |decl: swc_ecma_ast::ImportDecl, spec: &str| {
+                rewrite_import_for_client_with_modules(decl, spec, modules, depth + 1)
+            };
+            let lowered = lower_module_to_statements(&target_key, transpiled.as_str(), &nested)?;
+
+            // Parse `export_assignments` back into the pairs the IIFE returns.
+            //
+            // ⚠️ TWO SHAPES, and missing one is silent. A named export is
+            // emitted through `js_string_literal` as
+            //   __albedo_exports["nav"] = nav;
+            // while `default` takes the dot form
+            //   __albedo_exports.default = __albedo_default_export__;
+            // Parsing only the dot form left `returns` empty for every data
+            // module, so the IIFE emitted `return {  };`, every imported
+            // binding was `undefined`, and the island threw on first render —
+            // which looks exactly like "islands still don't work" rather than
+            // like a parsing bug two layers down.
+            let mut returns = Vec::new();
+            for assignment in &lowered.export_assignments {
+                let Some(rest) = assignment.strip_prefix("__albedo_exports") else {
+                    continue;
+                };
+                let Some((key_part, local)) = rest.split_once(" = ") else {
+                    continue;
+                };
+                let key = key_part.trim();
+                let name = if let Some(bracketed) = key.strip_prefix('[') {
+                    // `["nav"]` → `nav`
+                    bracketed
+                        .trim_end_matches(']')
+                        .trim()
+                        .trim_matches(|c| c == '"' || c == '\'')
+                        .to_string()
+                } else {
+                    key.trim_start_matches('.').to_string()
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                returns.push((
+                    name,
+                    local.trim_end_matches(';').trim().to_string(),
+                ));
+            }
+            if returns.is_empty() {
+                return Err(RuntimeError::load(
+                    LoadErrorKind::UnsupportedSyntax,
+                    format!(
+                        "Tier-C client island '{specifier}' imports '{import_source}', but no \
+                         exports could be lifted from that module — the island would receive \
+                         `undefined` for every imported binding"
+                    ),
+                ));
+            }
+
+            let slot = format!(
+                "__albedo_import_{:x}",
+                fnv1a_32(format!("{specifier}:{import_source}").as_bytes())
+            );
+            let body = lowered.statements.join("\n");
+            let return_obj = returns
+                .iter()
+                .map(|(name, local)| format!("{name}: {local}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let mut out = vec![format!(
+                "const {slot} = (function(){{\n{body}\nreturn {{ {return_obj} }};\n}})();"
+            )];
+
+            // Bind each local name the island actually imported.
+            for spec in &import_decl.specifiers {
+                match spec {
+                    ImportSpecifier::Named(named) => {
+                        let exported = match &named.imported {
+                            Some(ModuleExportName::Ident(id)) => id.sym.to_string(),
+                            Some(ModuleExportName::Str(s)) => s.value.to_string(),
+                            None => named.local.sym.to_string(),
+                        };
+                        out.push(format!(
+                            "const {} = {slot}.{exported};",
+                            named.local.sym
+                        ));
+                    }
+                    ImportSpecifier::Default(default_spec) => {
+                        out.push(format!(
+                            "const {} = {slot}.default;",
+                            default_spec.local.sym
+                        ));
+                    }
+                    ImportSpecifier::Namespace(ns) => {
+                        out.push(format!("const {} = {slot};", ns.local.sym));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+    }
+
     Err(RuntimeError::load(
         LoadErrorKind::UnsupportedSyntax,
         format!(
             "Tier-C client island '{specifier}' imports '{import_source}', which is not yet \
-             bundled for the browser; only framework runtime imports (react/react-dom/albedo) \
-             resolve client-side today (npm + child-module client chunks are the A3.2 follow-up)"
+             bundled for the browser; framework runtime imports (react/react-dom/albedo) and \
+             relative project modules resolve client-side, but bare npm specifiers do not"
         ),
     ))
 }
@@ -1814,6 +2041,23 @@ pub fn compile_client_island_module(
     source: &str,
     component_id: u64,
 ) -> RuntimeResult<String> {
+    compile_client_island_module_with_modules(specifier, source, component_id, &HashMap::new())
+}
+
+/// [`compile_client_island_module`], with the project's module sources so a
+/// relative import can be inlined into the island bundle.
+///
+/// Callers that hold the module map should prefer this: without it an island
+/// referencing ANY imported binding fails to compile, and the caller's error
+/// handling decides whether that is loud or silent. The map is keyed however
+/// the caller registered its modules (absolute source paths, in the CLI's
+/// case); `resolve_relative_module` normalizes separators before matching.
+pub fn compile_client_island_module_with_modules(
+    specifier: &str,
+    source: &str,
+    component_id: u64,
+    modules: &HashMap<String, String>,
+) -> RuntimeResult<String> {
     let normalized = source.trim_start_matches('\u{feff}');
     // `None`: an island's markup is produced by the browser runtime, which has
     // no `__albedo_stable_id` — stamping here would be a ReferenceError on the
@@ -1830,7 +2074,12 @@ pub fn compile_client_island_module(
             default_export_local: Some("__albedo_default_export__".to_string()),
         }
     } else {
-        lower_module_to_statements(specifier, transpiled.as_str(), rewrite_import_for_client)?
+        {
+            let rewriter = |decl: swc_ecma_ast::ImportDecl, spec: &str| {
+                rewrite_import_for_client_with_modules(decl, spec, modules, 0)
+            };
+            lower_module_to_statements(specifier, transpiled.as_str(), &rewriter)?
+        }
     };
 
     let default_local = lowered.default_export_local.ok_or_else(|| {

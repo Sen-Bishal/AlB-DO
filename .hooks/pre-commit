@@ -1,0 +1,27 @@
+#!/bin/sh
+# AlBDO pre-commit hook.
+#
+# Install once after cloning:
+#
+#     git config core.hooksPath .hooks
+#     chmod +x .hooks/pre-commit     # Unix/macOS only
+#
+# Runs the two checks that CI runs first and that fail most often. It
+# deliberately does NOT run the test suite: the workspace takes minutes to
+# build and a pre-commit hook that slow gets bypassed with `--no-verify`,
+# which is worse than not having one. Tests are CI's job.
+#
+# Skip deliberately with `git commit --no-verify` when committing WIP.
+
+set -e
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --all -- --check
+
+echo "pre-commit: cargo clippy"
+# Matches `.github/workflows/ci.yml` exactly. If you change one, change both —
+# a hook that is stricter than CI blocks work for no reason, and one that is
+# looser lets a red build through while claiming it checked.
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "pre-commit: ok"

@@ -16,6 +16,10 @@ import { test } from 'node:test';
 
 import { Bakabox } from '../../assets/albedo-runtime.js';
 
+// `listSlots` maps a slot to an ARRAY of bound anchors: one topic may be
+// rendered in several places and every rendering stays live. These tests bind
+// a single anchor, so they read index 0.
+
 // ── DOM shim (single-element row parsing; same discipline as the sibling tests) ──
 
 class FakeElement {
@@ -152,7 +156,7 @@ test('reconcile reorders existing rows, preserving node identity', () => {
 
   // First reconcile adopts the SSR nodes; capture identities afterwards.
   reconcile(bakabox, 5, [row('a', 'alice'), row('b', 'bob'), row('c', 'carol')]);
-  const list = bakabox.listSlots.get(5);
+  const list = bakabox.listSlots.get(5)[0];
   const nodeA = list.rowsByKey.get('a');
   const nodeC = list.rowsByKey.get('c');
 
@@ -169,7 +173,7 @@ test('an unchanged reconcile is a no-op that preserves every node', () => {
   const anchor = mountList(bakabox, doc, 5, 1, [['a', 'alice'], ['b', 'bob']]);
 
   reconcile(bakabox, 5, [row('a', 'alice'), row('b', 'bob')]); // adopt
-  const before = bakabox.listSlots.get(5).rowsByKey;
+  const before = bakabox.listSlots.get(5)[0].rowsByKey;
   const [nodeA, nodeB] = [before.get('a'), before.get('b')];
 
   reconcile(bakabox, 5, [row('a', 'alice'), row('b', 'bob')]); // identical

@@ -22,6 +22,10 @@ import { test } from 'node:test';
 
 import { Bakabox } from '../../assets/albedo-runtime.js';
 
+// `listSlots` maps a slot to an ARRAY of bound anchors: one topic may be
+// rendered in several places and every rendering stays live. These tests bind
+// a single anchor, so they read index 0.
+
 // ── Minimal DOM shim ─────────────────────────────────────────────────
 //
 // Self-contained, like the sibling suites. Beyond `slot-delta-sink`'s shim
@@ -268,7 +272,7 @@ test('a stale rowsByKey entry for a detached node degrades instead of throwing',
   const doc = new FakeDocument();
   const bakabox = new Bakabox({ document: doc });
   const anchor = mountList(bakabox, doc, 5, 1, [['a', 'alice'], ['b', 'bob']]);
-  const bNode = bakabox.listSlots.get(5).rowsByKey.get('b');
+  const bNode = bakabox.listSlots.get(5)[0].rowsByKey.get('b');
   anchor.removeChild(bNode); // detached, but still mapped
 
   bakabox.applyInstruction(slotInsert(5, 'b', [['m', 'mid']]));
@@ -309,7 +313,7 @@ test('an existing key with changed markup is re-rendered at the new position', (
 test('an unbound slot is a no-op on an anchorless list, not a throw', () => {
   const doc = new FakeDocument();
   const bakabox = new Bakabox({ document: doc });
-  bakabox.listSlots.set(7, { anchor: null, rowsByKey: new Map() });
+  bakabox.listSlots.set(7, [{ anchor: null, rowsByKey: new Map() }]);
   assert.doesNotThrow(() => bakabox.applyInstruction(slotInsert(7, null, [['a', 'alice']])));
 });
 

@@ -4,7 +4,7 @@
 // never panic; any input either decodes to an `InternTable` or returns
 // `WireError::Decode`.
 //
-// PHASE 2 (B-emitter) �: same locking discipline as `decode_frame`
+// PHASE 2 (B-emitter): same locking discipline as `decode_frame`
 // — clean for ≥ 5 minutes locally before the first Phase-B caller.
 // — Bishal-albdo@may-2026
 

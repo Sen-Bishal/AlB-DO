@@ -114,10 +114,12 @@ test('scanListAnchors registers a shared-slot list under its topic slot, seeded 
   bakabox.scanListAnchors();
 
   const slot = topicSlotId('guestbook');
-  const list = bakabox.listSlots.get(slot);
-  assert.ok(list, 'anchor registered under the topic slot');
-  assert.equal(list.anchor, ul, 'the anchor is the <ul> element itself (no data-albedo-id needed)');
-  assert.deepStrictEqual([...list.rowsByKey.keys()], ['1', '2'], 'rowsByKey seeded from SSR keys');
+  // A slot holds an ARRAY of bound anchors — one topic may be rendered in more
+  // than one place on a page and every rendering has to stay live.
+  const lists = bakabox.listSlots.get(slot);
+  assert.ok(lists && lists.length === 1, 'one anchor registered under the topic slot');
+  assert.equal(lists[0].anchor, ul, 'the anchor is the <ul> element itself (no data-albedo-id needed)');
+  assert.deepStrictEqual([...lists[0].rowsByKey.keys()], ['1', '2'], 'rowsByKey seeded from SSR keys');
 });
 
 test('a SlotDelta on the topic slot reconciles the scanned list (the S4 path)', () => {
@@ -154,7 +156,74 @@ test('scanListAnchors is idempotent — a re-scan never resets applied rows', ()
   bakabox.scanListAnchors(); // re-scan (e.g. after another inject)
 
   assert.equal(serialize(ul), '<li key=1>ada</li><li key=2>alan</li>', 'rows survive the re-scan');
-  assert.equal(bakabox.listSlots.get(topicSlotId('guestbook')).rowsByKey.size, 2);
+  const lists = bakabox.listSlots.get(topicSlotId('guestbook'));
+  assert.equal(lists.length, 1, 're-scanning the SAME anchor must not stack a second binding');
+  assert.equal(lists[0].rowsByKey.size, 2);
+});
+
+// ── Regression · one topic rendered TWICE on a page ───────────────────
+//
+// `scanListAnchors` used to skip any anchor whose SLOT was already registered
+// (`if (this.listSlots.has(slotId)) continue`). `querySelectorAll` found every
+// anchor; the guard then threw away all but the first. So a page rendering one
+// collection in two places had one live list and one that was correct at SSR
+// and frozen forever after — only a reload brought them back into agreement,
+// because a reload re-reads the topic during SSR.
+//
+// It bit the ALB'DO site's own homepage, where the pane labelled "never
+// reloads" was the one that needed a reload.
+//
+// The scalar sibling `_registerSlotAnchor` never had the bug: it dedupes per
+// ELEMENT and pushes a site per binding. This is the same rule for lists.
+test('a topic rendered in two places registers BOTH, and one delta updates both', () => {
+  const doc = new FakeDocument();
+  const paneA = mountSharedList(doc, 'guestbook', [['1', 'ada']]);
+  const paneB = mountSharedList(doc, 'guestbook', [['1', 'ada']]);
+  const bakabox = new Bakabox({ document: doc });
+
+  bakabox.scanListAnchors();
+
+  const lists = bakabox.listSlots.get(topicSlotId('guestbook'));
+  assert.equal(lists.length, 2, 'both renderings of the topic are bound');
+  assert.equal(lists[0].anchor, paneA);
+  assert.equal(lists[1].anchor, paneB);
+
+  bakabox.applyInstruction({
+    op: 'SlotDelta',
+    slotId: topicSlotId('guestbook'),
+    changes: [{ weight: 1, key: '2', payload: enc(rowHtml('2', 'alan')) }],
+  });
+
+  const expected = '<li key=1>ada</li><li key=2>alan</li>';
+  assert.equal(serialize(paneA), expected, 'first rendering updated');
+  assert.equal(serialize(paneB), expected, 'second rendering updated WITHOUT a reload');
+
+  // Each rendering keeps its own node map — the panes hold different elements
+  // and sharing one `rowsByKey` would make the second pane's DOM unreachable.
+  assert.notEqual(lists[0].rowsByKey.get('2'), lists[1].rowsByKey.get('2'));
+});
+
+test('a re-scan after a second pane appears binds only the new anchor', () => {
+  const doc = new FakeDocument();
+  const paneA = mountSharedList(doc, 'guestbook', [['1', 'ada']]);
+  const bakabox = new Bakabox({ document: doc });
+  bakabox.scanListAnchors();
+
+  bakabox.applyInstruction({
+    op: 'SlotDelta',
+    slotId: topicSlotId('guestbook'),
+    changes: [{ weight: 1, key: '2', payload: enc(rowHtml('2', 'alan')) }],
+  });
+
+  // A Tier-B injection brings a second rendering in after boot.
+  const paneB = mountSharedList(doc, 'guestbook', [['1', 'ada'], ['2', 'alan']]);
+  bakabox.scanListAnchors();
+
+  const lists = bakabox.listSlots.get(topicSlotId('guestbook'));
+  assert.equal(lists.length, 2, 'the late anchor is adopted');
+  // The already-applied delta must not be replayed onto pane A a second time.
+  assert.equal(serialize(paneA), '<li key=1>ada</li><li key=2>alan</li>');
+  assert.equal(serialize(paneB), '<li key=1>ada</li><li key=2>alan</li>');
 });
 
 test('a SlotDelta arriving before the scan is buffered, then replayed on registration', () => {

@@ -269,7 +269,10 @@ pub(crate) fn build_canonical_components_and_edges_from_graph(
                 imports: Vec::new(),
             });
 
-        // the team -> Better error handling
+        // OPEN: the `if let Some(…)` silently does nothing when the entry is
+        // absent. It cannot be today — the `or_insert_with` directly above
+        // guarantees the key — but that guarantee is positional, not typed,
+        // and a later edit that moves either half breaks it without a word.
         if let Some(module) = modules_by_path.get_mut(&component.file_path) {
             let mut dependency_names = graph
                 .get_dependencies(&component.id)

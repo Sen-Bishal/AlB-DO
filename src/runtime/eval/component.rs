@@ -216,6 +216,17 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
             "className" => "class",
             "defaultValue" => "value",
             "defaultChecked" => "checked",
+            // `htmlFor`→`for`. JSX cannot use `for` (a reserved word), so React
+            // spells it `htmlFor` and every React-shaped codebase writes that —
+            // `albedo-env.d.ts` even declares it on `LabelAttributes`. Without
+            // this rename it shipped as the browser-inert `htmlfor`, which
+            // silently DISCONNECTS the label from its control: clicking the
+            // label does nothing and a screen reader announces an unlabelled
+            // input. Found because a CSS-only disclosure built on
+            // `<label htmlFor>` + `<input type="checkbox">` simply never
+            // opened; the same bug had already broken every form label on the
+            // page, where it is invisible until someone uses a screen reader.
+            "htmlFor" => "for",
             _ => name.as_str(),
         };
         // `style` takes an object in JSX and CSS text in HTML. Without this the

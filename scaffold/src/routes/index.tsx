@@ -74,7 +74,7 @@ export default function Home() {
         </a>
         <a
           className="act act-quiet"
-          href="https://albdo.dev"
+          href="https://github.com/Sen-Bishal/AlB-DO"
           rel="noreferrer"
         >
           Read the docs <span className="arrow">&rarr;</span>

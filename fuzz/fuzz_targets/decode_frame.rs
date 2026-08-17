@@ -4,7 +4,7 @@
 // panic; any input is either a successfully decoded `OpcodeFrame` or a
 // `WireError::Decode`.
 //
-// PHASE 2 (B-emitter) â€: do NOT register an emitter call site
+// PHASE 2 (B-emitter): do NOT register an emitter call site
 // against `decode_frame` until this target has run clean for at least 5
 // minutes locally. Once Phase B ships, every decoder fix is a wire break.
 // â€” Bishal-albdo@may-2026

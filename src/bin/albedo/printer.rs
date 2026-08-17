@@ -21,7 +21,7 @@ const TIER_LUMEN: [u8; 3] = [137, 179, 222];
 ///
 /// Every field here is measured from the build's own output, so a reader can
 /// check each one with `curl … | wc -c`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MeasuredBytes {
     /// Sum of the compiled client-island module bytes across Tier-C
     /// components — the real payload an island costs, straight from
@@ -33,6 +33,21 @@ pub struct MeasuredBytes {
     /// Framework client runtime emitted to `_albedo/` — the shared cost every
     /// live page pays regardless of how its components tiered.
     pub runtime_bytes: u64,
+    /// Tier-C components whose island FAILED to compile, as
+    /// `(component name, why)`.
+    ///
+    /// This exists because the failure used to be unobservable. Both call
+    /// sites wrote `if let Ok(iife) = compile_client_island_module(…)` and
+    /// dropped a `RuntimeError` that already carried an exact diagnostic — so
+    /// a component could be classified Tier C, printed as "ships a client
+    /// island", and then ship nothing at all. The build stayed green, the
+    /// placeholder rendered as an empty `<div data-albedo-tier="c">`, and the
+    /// only signal anywhere was the words "no island compiled" in the summary.
+    ///
+    /// A Tier-C component that produces no island is a BUILD FAILURE of the
+    /// same kind as a type error: the author asked for interactivity and did
+    /// not get it. Printing the reason is the minimum; see `print_tier_report`.
+    pub tier_c_failures: Vec<(String, String)>,
 }
 
 pub fn print_tier_report(report: &TierReport, root: &str, measured: &MeasuredBytes) {
@@ -130,6 +145,39 @@ pub fn print_tier_report(report: &TierReport, root: &str, measured: &MeasuredByt
         )
     };
     print_tier_summary(2, report.tier_c_count, total, "C", &tier_c_hint);
+
+    // An island that did not compile is not a footnote. The component was
+    // classified Tier C — the author wrote hooks and handlers and expects them
+    // to run — and what actually ships is an empty placeholder div. Silence
+    // here is how a whole navigation bar goes missing from every page of a
+    // site without one line of output saying so.
+    //
+    // The reason strings come straight from `compile_client_island_module`,
+    // which already names the exact cause (a missing default export, an import
+    // that is not client-bundled). They were being discarded, not missing.
+    if !measured.tier_c_failures.is_empty() {
+        println!();
+        println!(
+            "  {} {}",
+            style("▸", "1;33"),
+            style("islands that did not compile", "1")
+        );
+        for (name, reason) in &measured.tier_c_failures {
+            println!(
+                "  {} {}  {}",
+                style("!", "1;33"),
+                style_256(name, ACCENT, true),
+                style(reason, "2")
+            );
+        }
+        println!(
+            "    {}",
+            style(
+                "these components render as an empty placeholder and never hydrate.",
+                "2"
+            )
+        );
+    }
 
     // The shared cost. Leaving it out is what made the per-tier numbers
     // misleading even when they were right: a page can ship zero component

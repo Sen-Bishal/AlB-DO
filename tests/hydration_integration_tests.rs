@@ -647,3 +647,120 @@ globalThis.__button = button;
     // Zero network calls — the whole interaction was local.
     assert_eq!(value["network"], 0, "Tier-C interaction must not round-trip");
 }
+
+// ── Regression · `<Link>` inside a Tier-C island ─────────────────────────────
+//
+// `<Link>` is a compile-time component: the pure-Rust evaluator (`eval::core`)
+// rewrites the TAG to `a` and appends a bare `data-albedo-link` attribute.
+// `transforms::link` is explicitly a metadata-only pass that does not touch the
+// AST, so that rewrite existed on the evaluator path and NOWHERE ELSE.
+//
+// An island is different: it is rendered STANDALONE from its module path, which
+// runs it through QuickJS. There, JSX has been lowered to `h(Link, …)` and
+// `Link` was an undefined free identifier — so every island containing a single
+// `<Link>` threw `Link is not defined` on render.
+//
+// The damage was invisible, which is why this test exists. `render_island_html`
+// caught the throw, logged a `warn!` no default log level surfaces, and returned
+// `None`. The placeholder then shipped as an empty `<div data-albedo-tier="c">`
+// with no `data-albedo-island` marker, so the bootstrap had no node to hydrate
+// and the component never appeared at all — with a green build and a clean
+// browser console. A real site lost its entire navigation bar this way.
+//
+// Nothing in the suite caught it because every existing island fixture renders
+// from a hand-written plain-JS source. This one goes through `h(Link, …)`, which
+// is what the JSX pragma actually emits.
+const LINK_ISLAND_SSR: &str =
+    "(props) => h(Link, { href: '/features', className: 'nav-link' }, 'Features')";
+
+#[test]
+fn tier_c_island_containing_a_link_renders_instead_of_an_empty_placeholder() {
+    const ISLAND_ID: u64 = 91;
+
+    let mut renderer = create_renderer();
+
+    let manifest = RenderManifestV2 {
+        schema_version: "2.0".to_string(),
+        generated_at: "2026-08-14T00:00:00Z".to_string(),
+        components: vec![component(
+            ISLAND_ID,
+            "NavIsland",
+            "components/nav-island",
+            Tier::C,
+            HydrationMode::OnInteraction,
+            Vec::new(),
+        )],
+        parallel_batches: vec![vec![ISLAND_ID]],
+        critical_path: vec![ISLAND_ID],
+        vendor_chunks: Vec::new(),
+        ..RenderManifestV2::legacy_defaults()
+    };
+
+    let mut sources = std::collections::HashMap::new();
+    sources.insert(
+        "components/nav-island".to_string(),
+        LINK_ISLAND_SSR.to_string(),
+    );
+    renderer
+        .register_manifest_modules(&manifest, &sources)
+        .expect("manifest registration should succeed");
+
+    // Before the fix this call failed outright with "Link is not defined", so
+    // asserting on `expect` is itself half the regression.
+    let result = renderer
+        .render_route_with_manifest_hydration(
+            &RouteRenderRequest {
+                entry: "components/nav-island".to_string(),
+                props_json: "{}".to_string(),
+                module_order: Vec::new(),
+                hydration_payload: None,
+                host_json: None,
+            },
+            &manifest,
+        )
+        .expect("an island containing <Link> must render, not fail to a warning");
+
+    // `<Link>` must desugar to an anchor, not survive as a component tag.
+    assert!(
+        result.html.contains("<a "),
+        "<Link> must render as an anchor: got {:?}",
+        result.html
+    );
+    assert!(
+        !result.html.contains("<Link"),
+        "the Link tag must not reach the HTML: got {:?}",
+        result.html
+    );
+    assert!(
+        result.html.contains("href=\"/features\""),
+        "authored href must survive the rewrite: got {:?}",
+        result.html
+    );
+    assert!(
+        result.html.contains("Features"),
+        "children must render: got {:?}",
+        result.html
+    );
+
+    // The marker `albedo-link-forms.js` hooks to intercept the click. Emitted as
+    // a BARE attribute, matching `eval::core`, which pushes `Value::Bool(true)`.
+    assert!(
+        result.html.contains("data-albedo-link"),
+        "the client-side link hook must be stamped: got {:?}",
+        result.html
+    );
+    assert!(
+        !result.html.contains("data-albedo-link=\""),
+        "data-albedo-link is a bare attribute on the Rust path; a valued one \
+         would make Tier-A and Tier-C markup differ, and the row-delta path \
+         compares those bytes: got {:?}",
+        result.html
+    );
+
+    // The whole point: the placeholder is not empty, so the bootstrap has a node.
+    assert!(
+        result.html.contains(&format!("data-albedo-island=\"{}\"", ISLAND_ID)),
+        "island marker must be present or hydration can never find the node: got {:?}",
+        result.html
+    );
+}

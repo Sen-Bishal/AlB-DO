@@ -17,7 +17,9 @@ use dom_render_compiler::manifest::schema::{
     ComponentManifestEntry, HydrationMode, PrecompiledRuntimeModulesArtifact, RenderManifestV2,
 };
 use dom_render_compiler::runtime::engine::BootstrapPayload;
-use dom_render_compiler::runtime::quickjs_engine::{compile_client_island_module, QuickJsEngine};
+use dom_render_compiler::runtime::quickjs_engine::{
+    compile_client_island_module_with_modules, QuickJsEngine,
+};
 use dom_render_compiler::runtime::renderer::{
     inject_island_marker, RouteRenderRequest, ServerRenderer,
 };
@@ -266,6 +268,11 @@ impl RendererRuntime {
         }
 
         // Phase 2 — render + compile each island, assemble the per-route block.
+        //
+        // Snapshot the module sources once: an island that imports a relative
+        // project module has that module inlined into its bundle, so the
+        // compiler needs the whole map rather than just the island's own source.
+        let module_sources = self.renderer.module_registry().sources();
         let mut blocks = HashMap::new();
         for (path, islands) in routes {
             let mut placeholders = Vec::new();
@@ -279,14 +286,31 @@ impl RendererRuntime {
                         inject_island_marker(&html, island.component_id),
                     ));
                 }
-                if let Ok(iife) = compile_client_island_module(
+                // The error carries the exact cause and used to be dropped by
+                // `if let Ok(…)`. Without the script the island never
+                // registers, so the placeholder — which may well have
+                // server-rendered fine just above — sits there inert forever.
+                // That is indistinguishable from "the framework is broken"
+                // unless the reason is said out loud.
+                match compile_client_island_module_with_modules(
                     &island.module_path,
                     &island.source,
                     island.component_id,
+                    &module_sources,
                 ) {
-                    scripts.push_str("<script>");
-                    scripts.push_str(&escape_inline_script(&iife));
-                    scripts.push_str("</script>");
+                    Ok(iife) => {
+                        scripts.push_str("<script>");
+                        scripts.push_str(&escape_inline_script(&iife));
+                        scripts.push_str("</script>");
+                    }
+                    Err(err) => tracing::error!(
+                        target: "albedo.renderer",
+                        module_path = %island.module_path,
+                        component_id = island.component_id,
+                        error = %err,
+                        "island failed to compile for the client; it will render \
+                         but never hydrate"
+                    ),
                 }
                 plan_islands.push(HydrationIslandPlan {
                     component_id: island.component_id,
@@ -733,11 +757,18 @@ impl RendererRuntime {
         match self.renderer.render_route(&request) {
             Ok(result) => Some(result.html),
             Err(err) => {
-                tracing::warn!(
+                // `error!`, not `warn!`. An empty placeholder means the
+                // component is absent from the page — there is no degraded
+                // mode here, the thing simply is not there. It was a `warn`
+                // that no default log level surfaced, which is how a `<Link>`
+                // inside an island removed an entire navigation bar from a
+                // real site without one visible line of output.
+                tracing::error!(
                     target: "albedo.renderer",
                     module_path,
                     error = %err,
-                    "island SSR render failed; placeholder stays empty"
+                    "island SSR render failed; placeholder stays empty and the \
+                     component will not appear on the page"
                 );
                 None
             }

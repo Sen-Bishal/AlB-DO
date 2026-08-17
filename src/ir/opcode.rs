@@ -127,7 +127,7 @@ pub struct InternTable {
 /// [`Instruction::InitInternTable`] (single-shot, ships the full table) so
 /// the warm path stays a single byte of discriminant.
 //
-// PHASE 2 (B-emitter) �: the compiler's intern-table-diff pass
+// PHASE 2 (B-emitter): the compiler's intern-table-diff pass
 // emits these ops on the control stream when the JSX corpus grows new
 // tags/attrs/events between hot reloads. `Remove` is for evicting an id
 // the client must drop from its mirror; do not reuse it for "rename".
@@ -178,7 +178,7 @@ pub struct ReconcileRow {
 /// variants is allowed; **reordering existing ones is a wire break**. Any
 /// reorder requires a coordinated client/server upgrade.
 //
-// PHASE 2 (B-emitter) �: `src/runtime/emitter.rs` is the only
+// PHASE 2 (B-emitter): `src/runtime/emitter.rs` is the only
 // producer. Walk `IrColumns` lane slices via the existing `LaneColumnPass`
 // (`src/ir/columns.rs`), emit one `OpcodeFrame` per lane, hand the encoded
 // bytes to `WTStreamRouter` as `FramePayload::Binary`. Do NOT mix `SetText`
@@ -256,7 +256,7 @@ pub enum Instruction {
 
     // ── Alt D — reactive slot refs ─────────────────────────────────
     //
-    // PHASE 5 (E-hooks) �: these are the wire-level binding for
+    // PHASE 5 (E-hooks): these are the wire-level binding for
     // `useState` / `useEffect` server-side mirrors. Emitter produces a
     // `SetTextRef` / `SetAttrRef` once at create-time; subsequent updates
     // arrive as `SlotSet` carrying only the new value bytes against
@@ -375,7 +375,7 @@ pub enum Instruction {
 /// BEFORE invoking [`crate::ir::wire::decode_frame`]. Per-message decoding
 /// is unsupported; do not assume frame == STREAM message.
 //
-// PHASE 2 (B-emitter) �: `frame_id` MUST be allocated via the
+// PHASE 2 (B-emitter): `frame_id` MUST be allocated via the
 // per-stream sequence in `WebTransportMuxer::allocate_sequence` so a frame
 // split across STREAM messages stays attributable to the same logical
 // frame on reassembly. `component_id` is `None` for cross-component

@@ -159,10 +159,11 @@ impl DirtyBitmap {
         scratch.clear();
         self.drain(|idx| {
             if let Ok(as_u32) = u32::try_from(idx) {
-                scratch.push(as_u32); //  -> We need to figure out what the push-params
-                                      // are sending each pass. we can make the channels send a req
-                                      // and count them per microsecond interval, or if there's any
-                                      // better way find it.
+                // OPEN: the per-pass volume through here is unmeasured. Worth
+                // instrumenting before tuning `scratch`'s reserve strategy —
+                // counting drains per interval would say whether this is a
+                // steady trickle or bursty, and those want different sizing.
+                scratch.push(as_u32);
             }
         })
     }
@@ -226,7 +227,10 @@ pub fn hash_diff_into_bitmap_at(
 
     let mut i = 0usize;
     while i + 4 <= len {
-        // the team -> responsive? need to test it out after bakabox/sussybox impl.
+        // OPEN: this 4-lane step is unvalidated against the real reconcile
+        // workload — it was written before the bakabox conformance harness
+        // existed. Re-measure through that harness before assuming the SIMD
+        // width is the right one; a scalar loop may well win at small `len`.
         let old_v = u64x4::new([
             old.get(i).copied().unwrap_or(0),
             old.get(i + 1).copied().unwrap_or(0),

@@ -1,6 +1,7 @@
 # AlBDO starter
 
-A JSX/TSX app compiled and served by [AlBDO](https://albdo.dev) — a
+A JSX/TSX app compiled and served by
+[AlBDO](https://github.com/Sen-Bishal/AlB-DO) — a
 tiered DOM compiler written in Rust, with no Node.js on the runtime path.
 
 ## Getting started

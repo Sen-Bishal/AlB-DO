@@ -888,22 +888,44 @@ fn measure_client_bytes(
     module_sources: &HashMap<String, String>,
     out_dir: &Path,
 ) -> printer::MeasuredBytes {
-    use dom_render_compiler::runtime::quickjs_engine::compile_client_island_module;
+    use dom_render_compiler::runtime::quickjs_engine::compile_client_island_module_with_modules;
 
     let mut tier_c_island_bytes = 0u64;
     let mut tier_c_measured = 0usize;
+    // Why every failure is now recorded rather than skipped: this loop used to
+    // be `if let Ok(iife) = …`, which threw away a `RuntimeError` that names
+    // the exact cause. A Tier-C component that fails here ships an empty
+    // placeholder and never hydrates, so dropping the reason turned a
+    // diagnosable build error into a page that is quietly missing a component.
+    let mut tier_c_failures = Vec::new();
 
     for component in &manifest.components {
         if component.tier != Tier::C {
             continue;
         }
         let Some(source) = module_sources.get(&component.module_path) else {
+            // Also worth saying out loud: no source means nothing to compile,
+            // which is the same outcome for the reader.
+            tier_c_failures.push((
+                component.name.clone(),
+                format!(
+                    "no module source recorded for '{}'",
+                    component.module_path
+                ),
+            ));
             continue;
         };
-        if let Ok(iife) = compile_client_island_module(&component.module_path, source, component.id)
-        {
-            tier_c_island_bytes = tier_c_island_bytes.saturating_add(iife.len() as u64);
-            tier_c_measured += 1;
+        match compile_client_island_module_with_modules(
+            &component.module_path,
+            source,
+            component.id,
+            module_sources,
+        ) {
+            Ok(iife) => {
+                tier_c_island_bytes = tier_c_island_bytes.saturating_add(iife.len() as u64);
+                tier_c_measured += 1;
+            }
+            Err(err) => tier_c_failures.push((component.name.clone(), err.to_string())),
         }
     }
 
@@ -924,6 +946,7 @@ fn measure_client_bytes(
         tier_c_island_bytes,
         tier_c_measured,
         runtime_bytes,
+        tier_c_failures,
     }
 }
 
@@ -1276,7 +1299,11 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     print_foreign_layout_notice(&contract);
     print_kv("mode", "production (build + serve)");
     println!();
-    run_prod_build(&contract)?;
+    // The tier report is the dashboard's "tiers" panel — the same numbers the
+    // `dev` lane keeps. Dropping it here is what left `serve` showing
+    // "no build report yet" for the whole session: the build produced the
+    // classification and the only consumer never received it.
+    let tier_report = run_prod_build(&contract)?;
 
     // `resolve_dev_contract` already absorbed `--host` / `--port` from
     // `raw_args`. Pull the bind address back out for the banner.
@@ -1284,14 +1311,17 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     contract.server.host = serve_options.host.clone();
     contract.server.port = serve_options.port;
 
-    boot_and_run_production_server(&contract)
+    boot_and_run_production_server(&contract, Some(tier_report))
 }
 
 /// Phase P · Stream A — turn a built `ResolvedDevContract` into a
 /// running [`albedo_server::AlbedoServer`]. The Tokio runtime is
 /// spun up here (not at `main`) so the dev path stays sync and only
 /// pays the runtime cost on `albedo serve`.
-fn boot_and_run_production_server(contract: &ResolvedDevContract) -> Result<(), String> {
+fn boot_and_run_production_server(
+    contract: &ResolvedDevContract,
+    report: Option<TierReport>,
+) -> Result<(), String> {
     use albedo_server::{boot_production_server, ProductionServerOptions};
 
     let opts = ProductionServerOptions::from_contract(contract);
@@ -1313,7 +1343,7 @@ fn boot_and_run_production_server(contract: &ResolvedDevContract) -> Result<(), 
             tui::dev::Mode::Serve,
             url,
             contract.project_dir.display().to_string(),
-            None,
+            report,
             server,
             // `serve` has no `--open`; it is a production run, not an on-ramp.
             false,

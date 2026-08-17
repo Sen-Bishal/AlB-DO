@@ -35,6 +35,15 @@ thread_local! {
     /// able to address. Phase K's compiler can replace this with a
     /// content-hash strategy when HMR stability matters.
     static RENDER_ELEMENT_COUNTER: Cell<u32> = const { Cell::new(0) };
+
+    /// Recursion depth of `resolve_imported_value`.
+    ///
+    /// Resolving an imported constant re-enters `eval_expr`, which can hit
+    /// another imported identifier and re-enter the resolver. ES modules allow
+    /// import cycles, so without a bound `a.ts ⇄ b.ts` recurses until the stack
+    /// dies. Thread-local for the same reason as the element counter: renders
+    /// run concurrently on different threads and must not share this.
+    static IMPORT_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Bakabox reads anchors from `data-albedo-id` (DEFAULT_ANCHOR_ATTRIBUTE
@@ -2208,19 +2217,37 @@ impl ComponentProject {
             Expr::Ident(ident) => {
                 let name = ident.sym.to_string();
                 if let Some(value) = env.get(&name) {
-                    Ok(value.clone())
-                } else {
-                    // Static evaluator has no binding for this identifier.
-                    // Phase K wires reactive bindings; until then make the
-                    // miss findable in dev rather than letting it vanish.
-                    tracing::debug!(
-                        target: "albedo::eval",
-                        ident = %name,
-                        module = %module_spec,
-                        "unbound identifier in JSX expression — evaluating to null",
-                    );
-                    Ok(Value::Null)
+                    return Ok(value.clone());
                 }
+                // Not a local binding — it may be a VALUE imported from another
+                // module. `env` only ever holds this module's own constants and
+                // params (`seed_env_with_module_constants` says as much), and
+                // `module.imports` was consulted only when resolving a
+                // COMPONENT (`render_component_ref`). So `import { site } from
+                // "../config"` had nowhere to resolve and fell straight to the
+                // `Null` below — which renders as the empty string.
+                //
+                // The damage was invisible and total: `{site.tagline}` emitted
+                // `<h1 class="h1"></h1>`, and a route whose whole body mapped
+                // over an imported array rendered zero rows. Nothing warned,
+                // because a missing value and a legitimately-null one took the
+                // same path. It also made a shared `config.ts` impossible, so
+                // projects were pushed toward duplicating data per file.
+                if let Some(value) = self.resolve_imported_value(module_spec, &name) {
+                    return Ok(value);
+                }
+                // Still unresolved. An identifier the evaluator cannot bind is
+                // worth more than a `debug!`: it is about to render as nothing.
+                // Phase K wires reactive bindings, so this is not always a bug —
+                // hence `warn` rather than a hard error — but it must be
+                // findable without turning on trace logging.
+                tracing::warn!(
+                    target: "albedo::eval",
+                    ident = %name,
+                    module = %module_spec,
+                    "unbound identifier in JSX expression — rendering as empty",
+                );
+                Ok(Value::Null)
             }
             Expr::Member(member) => self.eval_member(module_spec, member, env),
             Expr::Paren(paren) => self.eval_expr(module_spec, &paren.expr, env),
@@ -4569,6 +4596,80 @@ impl ComponentProject {
             }
         }
         Ok(html)
+    }
+
+    /// Resolve `name` as a VALUE imported from another module.
+    ///
+    /// The data half of [`Self::render_component_ref`], which resolves the same
+    /// `imports` map for components. Both walk `import { X } from "./y"` to the
+    /// target module; this one evaluates a top-level constant there instead of
+    /// rendering a function.
+    ///
+    /// Returns `None` — never an error — when the name is not an import, the
+    /// source is not a relative path (framework specifiers like `react` and
+    /// `albedo` are bindings the runtime seeds, not project data), the target
+    /// module is not loaded, or the export is a function rather than a value.
+    /// A component imported and then referenced in an expression position is
+    /// the last of those, and it must keep falling through to the component
+    /// path rather than being answered here.
+    fn resolve_imported_value(&self, module_spec: &str, name: &str) -> Option<Value> {
+        // Cycle guard. `a.ts` importing from `b.ts` importing from `a.ts` is
+        // legal in ES modules, and evaluating a constant re-enters `eval_expr`,
+        // which re-enters here — so without a bound this recurses until the
+        // stack dies. A depth cap rather than a visited-set because the
+        // recursion runs through `eval_expr`, which owns no such state; the
+        // limit is generous next to any real import chain.
+        const MAX_IMPORT_DEPTH: u32 = 8;
+
+        let module = self.modules.get(module_spec)?;
+        let binding = module.imports.get(name)?;
+        // Only relative specifiers are project modules. `resolve_import`
+        // already refuses the rest, but returning early keeps the intent local.
+        if !binding.source.starts_with('.') {
+            return None;
+        }
+        let target = self.resolve_import(module_spec, &binding.source)?;
+        let target_module = self.modules.get(&target)?;
+
+        // `export default` maps through the module's recorded default local.
+        let local = if binding.export_name == "default" {
+            target_module.default_export.clone()?
+        } else {
+            binding.export_name.clone()
+        };
+
+        // A function export is a component; leave it to the component path.
+        if target_module.functions.contains_key(&local) {
+            return None;
+        }
+
+        let (_, init) = target_module
+            .module_constants
+            .iter()
+            .find(|(const_name, _)| const_name == &local)?
+            .clone();
+
+        let depth = IMPORT_DEPTH.with(|d| d.get());
+        if depth >= MAX_IMPORT_DEPTH {
+            tracing::warn!(
+                target: "albedo::eval",
+                ident = %name,
+                module = %module_spec,
+                "import chain exceeded the depth limit — possible import cycle",
+            );
+            return None;
+        }
+        IMPORT_DEPTH.with(|d| d.set(depth + 1));
+
+        // Evaluate in the TARGET module's scope, seeded with its own constants,
+        // so a constant built out of its neighbours resolves the same way it
+        // would if the value had been declared where it is used.
+        let mut target_env = HashMap::new();
+        self.seed_env_with_module_constants(&target, &mut target_env);
+        let value = self.eval_expr(&target, &init, &target_env).ok();
+
+        IMPORT_DEPTH.with(|d| d.set(depth));
+        value
     }
 
     fn resolve_import(&self, current_module: &str, source: &str) -> Option<String> {

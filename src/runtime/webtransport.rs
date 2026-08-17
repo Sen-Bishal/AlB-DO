@@ -416,7 +416,7 @@ impl WebTransportMuxer {
         Ok(output)
     }
 
-    // PHASE 2 (B-emitter) â€: this is `reassemble_binary_stream`'s
+    // PHASE 2 (B-emitter): this is `reassemble_binary_stream`'s
     // first real caller. The Phase-B emitter should hand binary opcode
     // frames to the patches stream (slot 2); the client decoder reads back
     // through this fn after collecting all `WebTransportFrame`s sharing a

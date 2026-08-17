@@ -1,45 +1,103 @@
 # AlB'DO
 
-A JSX/TSX render compiler and HTTP server, written in Rust. You write
-React-shaped components; AlB'DO compiles and serves them as one binary,
+A JSX/TSX render compiler, database, and HTTP server, written in Rust. You
+write React-shaped components; AlB'DO compiles and serves them as one binary,
 with no Node.js in the request path.
 
-It is a work in progress — a prototype I'm building in the open, not a
-finished framework. The pieces below work today; the APIs will still
-move.
+The compiler decides *per component* how much client JavaScript it needs —
+often none — and it does the same for your data: a collection you declare in
+config becomes a persisted table, a live subscription, and a typed `.d.ts`,
+without a server directory, an ORM, an API route, or any WebSocket code.
+
+It is a work in progress — a prototype built in the open, not a finished
+framework. Everything under "What works" below is implemented and exercised by
+the test suite; everything under "What isn't done" is honest about the gaps.
+The APIs will still move.
 
 ---
 
 ## What works right now
 
-- `.tsx`/`.jsx` components parsed with SWC and rendered to HTML.
-- File-based routing with nested `layout.tsx` composition.
-- `useState` / `useEffect` / `useRef` / `useMemo` islands that hydrate
-  in the browser.
-- Server `action()` handlers and SSR run under an embedded JS engine
-  (QuickJS), so real JS — loops, `try`, array methods — works, and a
-  broken construct fails loudly instead of rendering null.
-- npm dependencies bundled in-tree for SSR + actions (tested against
-  `zod` and `date-fns`).
-- Global CSS and CSS modules, `<title>`/meta, and a dev server with
-  hot reload over SSE.
-- A "binding mode" path: for many stateful components the compiler ships
-  a few hundred bytes of bindings instead of hydrating the whole
-  component, and a click updates the bound node locally with no network
-  round-trip.
+### Compiler and rendering
+
+- `.tsx`/`.jsx` parsed with SWC and rendered to HTML.
+- **Three-tier classification, decided at build time, with nothing to
+  configure.** Every component is analysed for what it actually does and
+  compiled accordingly (see [How rendering is decided](#how-rendering-is-decided)).
+- **Binding mode** — for many stateful components the compiler ships a few
+  hundred bytes of bindings instead of hydrating the whole component. A click
+  updates the bound node locally: no VDOM, no re-render, no network round-trip.
+- File-based routing, nested `layout.tsx` composition, and dynamic routes
+  (`/post/[id]`).
+- `error.tsx` / `loading.tsx` boundaries, and `async` server components.
+- Global CSS and CSS modules, `<title>` and meta tags.
+- `useState` / `useEffect` / `useRef` / `useMemo` / `useCallback` islands that
+  hydrate in the browser.
+- Server `action()` handlers and SSR run under an embedded JS engine (QuickJS),
+  so real JavaScript — loops, `try`, array methods — works, and a broken
+  construct fails loudly instead of rendering null.
+- npm dependencies bundled in-tree for SSR and actions (tested against `zod`
+  and `date-fns`).
+- A dev server with hot reload over SSE.
+
+### FORGE — the backend, on by default
+
+- Declare a collection in `albedo.config.ts` and it exists: table, seed rows,
+  and a live topic. No migration folder, no ORM, no API route.
+- Field types `text`, `int`, `real`, `bool`, `timestamp`, with a trailing `?`
+  for nullable. A `bool` round-trips as a `bool` — writing `true` and reading
+  it back does not hand you a `1`.
+- `append` / `update` / `remove` as server actions.
+- **Additive schema evolution.** Add a nullable field, restart, and the column
+  is added with existing rows intact. Anything else is refused by name rather
+  than applied halfway.
+- Typed `.albedo/forge.d.ts` generated from the declared schema.
+
+### Live data
+
+- `useSharedSlot` for scalars and lists — updates land **cross-tab with no
+  polling**, and the author writes no subscription code.
+- Keyed rows: a write re-renders the changed row and leaves the untouched DOM
+  nodes alone.
+- **Dynamic topics** — a route parameter can name a topic, so `/room/[id]`,
+  per-user data, and multi-tenancy work rather than being a compile error.
+- Route-scoped subscription: a client subscribes to the route it is on, not to
+  every topic in the app.
+
+### Auth
+
+- Session cookies, first-party password credentials (argon2), and CSRF
+  protection on same-origin POST forms.
+- Route gating by declared policy.
+- `user` reaches components as a prop, and identity is a legal **partition
+  key** — so `messages.where({ owner: user.id })` is row-level security that
+  cannot be authored apart from the read, because the read *is* the policy.
+- **The sign-in flow works with JavaScript disabled.**
+- GCRA rate limiting on credential attempts.
+
+---
 
 ## What isn't done
 
-- No production-ready guarantees. Expect rough edges and breaking
+- **No outbound `fetch()` from your code.** The HTTP client, egress policy,
+  response cache, and request coalescing all exist (`src/aperture/`), but phase
+  A0 deliberately installs no JS-visible `fetch` and nothing in a handler body
+  can reach it yet. Consequences: **no OAuth, no email, no payment provider,
+  no third-party API calls.**
+- **No file uploads.** Zero code in tree.
+- **No passkeys.** Password is the only first-party credential today.
+- **`forwardRef`, `createPortal`, and `useId` do not exist** — verified zero
+  occurrences in the tree. Most React component libraries (shadcn/ui included)
+  depend on at least one, so they will not work.
+- **`useContext` server-renders the context *default*, not the Provider
+  value.** A single SSR pass invokes `h` eagerly, so a nested Provider cannot
+  thread its value down; the client applies it on hydration. It does not
+  crash, but SSR output and post-hydration output differ.
+- No production-ready guarantees. Pre-1.0, expect rough edges and breaking
   changes.
-- Only the Windows binary is built today; other platforms compile but
-  aren't packaged yet.
-- Parts of the reactivity coverage (conditionals, keyed lists),
-  `useContext`, dynamic metadata, and the columnar wire format are
-  still in progress.
-- No published head-to-head benchmark against other frameworks. The
-  numbers below are AlB'DO measured on one machine; reproduce them and
-  compare against your own setup.
+- The columnar wire format is designed and encoded but has no emitter yet.
+- No published head-to-head benchmark against other frameworks. The numbers
+  below are AlB'DO measured on one machine.
 
 ---
 
@@ -47,29 +105,73 @@ move.
 
 ```sh
 albedo init my-app
-cd my-app
-albedo dev        # dev server + hot reload
-albedo build      # production build
-albedo serve      # build, then serve it
 ```
+
+```sh
+cd my-app && albedo dev
+```
+
+`albedo build` produces a production build; `albedo serve` builds and serves
+it; `albedo doctor` reports what the compiler decided and why.
 
 ---
 
 ## How rendering is decided
 
-The compiler reads each component's effects at build time and picks how
-much, if any, client JavaScript it needs. There's nothing to configure.
+The compiler reads each component's effects at build time and picks how much,
+if any, client JavaScript it needs.
 
 ```
 Tier A   no hooks, no async, no side effects   →  plain HTML, zero JS
-Tier B   event handlers, light interactivity   →  only that island ships JS
+Tier B   event handlers, light interactivity   →  bindings only (~250–400 B)
 Tier C   full hooks / async / side effects     →  full client hydration
 ```
 
-On top of that, the "binding mode" path can take a stateful component
-and ship just the state bindings — the server-rendered DOM stays put,
-and the handler runs in the browser against those bindings. No VDOM, no
-re-render, no request.
+The decision is a property of the code, not an annotation. Adding `useState`
+to a Tier A component moves it to B or C at the next build; removing it moves
+it back.
+
+## The pipeline
+
+```
+  COMPILE  ·  albedo build / dev
+  ────────────────────────────────────────────────────────────────────
+   src/**.tsx
+       │
+       ▼
+   scan ──► parse ──► analyse ──► transform ──► IR + wire encode
+  scanner.rs  parser.rs  analysis/   transforms/      ir/
+                            │
+                            └── the tier decision (A / B / C)
+                                and the escape analysis under it
+       │
+       ▼
+   RenderManifestV2  +  islands  +  forge schema  +  .d.ts codegen
+      manifest/          bundler/      forge/
+
+  SERVE  ·  albedo serve / dev
+  ────────────────────────────────────────────────────────────────────
+   request
+       │
+       ▼
+   route match ──► auth: session → Principal ──► policy gate
+    routing/            auth/                    auth/declare.rs
+       │
+       ▼
+   render ──┬── Tier A ──► pure-Rust evaluator      ──► HTML, no JS
+            └── Tier B/C ─► QuickJS engine          ──► HTML + island
+    runtime/                runtime/quickjs_engine.rs
+       │
+       │  a read mints a TOPIC; the topic is partitioned by the
+       │  principal, and that IS the authorization
+       ▼
+   FORGE (libsql) ──► topic value ──► delta ──► live clients
+     forge/                            broadcast/    PHOSPHOR lane
+```
+
+The load-bearing idea is in the last two boxes: **authorization is derived
+from the read, never authored beside it.** An author cannot spell a topic name
+directly, so there is no way to write a query whose policy disagrees with it.
 
 ---
 
@@ -78,8 +180,8 @@ re-render, no request.
 One 16-core machine, release build. Reproduce with the commands in
 [`benchmarks/parity/README.md`](./benchmarks/parity/README.md).
 
-**Request latency** — a `GET /` SSR shell (28.8 KB, the scaffold's
-starter page), served over the wire:
+**Request latency** — a `GET /` SSR shell (28.8 KB, the scaffold's starter
+page), served over the wire:
 
 | Connection model | Concurrency | TTFB p50 | TTFB p99 |
 |---|---|--:|--:|
@@ -88,14 +190,13 @@ starter page), served over the wire:
 | keep-alive, all cores | 16 | 0.23 ms | 0.53 ms |
 | new connection per request | 1 | 0.36 ms | 0.54 ms |
 
-Render and serve costs about **70 µs** over loopback when a connection
-is reused. A fresh TCP connect per request adds ~0.3 ms (that's OS
-cost, the same for anything). Per-request latency stays under a
-millisecond up to core saturation.
+Render and serve costs about **70 µs** over loopback when a connection is
+reused. A fresh TCP connect per request adds ~0.3 ms (OS cost, the same for
+anything). Per-request latency stays under a millisecond up to core saturation.
 
-**Action round-trip** — a `POST /_albedo/action` (decode the bincode
-envelope → run the handler → encode the opcode-frame response), measured
-over the wire against a real `broadcast()` action:
+**Action round-trip** — a `POST /_albedo/action` (decode the bincode envelope →
+run the handler → encode the opcode-frame response), measured over the wire
+against a real `broadcast()` action:
 
 | Connection model | Concurrency | TTFB p50 | TTFB p99 |
 |---|---|--:|--:|
@@ -103,19 +204,14 @@ over the wire against a real `broadcast()` action:
 | keep-alive, all cores | 16 | 0.45 ms | 1.34 ms |
 | new connection per request | 1 | 0.50 ms | 1.21 ms |
 
-A full server action costs ~**0.24 ms** uncontended — about 0.13 ms more
-than a GET shell on the same run, which is the dispatch + encode cost on
-the wire (the in-process slice is the ~13.6 µs below).
-
-**Cold process start** — spawn `albedo serve`, wait for the port, time
-the first-ever hit: **~0.5 s** to ready (project stitch + artifact load,
-one Rust process — no Node boot), then a **0.67 ms** first render that
-warms to 0.11 ms within a few requests.
+**Cold process start** — spawn `albedo serve`, wait for the port, time the
+first-ever hit: **~0.5 s** to ready (project stitch + artifact load, one Rust
+process — no Node boot), then a **0.67 ms** first render that warms to 0.11 ms
+within a few requests.
 
 **Build time** — `albedo build` is ~**434 ms** clean for the 5-component
-starter. The CLI build is from-scratch every run today (the incremental
-cache is dev-watch only; cross-process incremental is still ahead), so
-clean and re-run measure 1.0× — the baseline that work will improve on.
+starter. The CLI build is from-scratch every run today (the incremental cache
+is dev-watch only), so clean and re-run measure 1.0×.
 
 **In-process cost** (no socket, Criterion):
 
@@ -125,43 +221,77 @@ clean and re-run measure 1.0× — the baseline that work will improve on.
 | Static (Tier A) route — framework shell, no client JS | ~315 B |
 | One interactive island (handler wrapper + bindings) | ~250–400 B |
 
-(The 28.8 KB shell above is mostly the starter's own CSS; the framework
-itself adds the ~315 B.)
+(The 28.8 KB shell above is mostly the starter's own CSS; the framework itself
+adds the ~315 B.)
 
-These are loopback and micro-benchmarks, not a full load test. They say
-what AlB'DO's own overhead is — they don't simulate your network or
-your database.
+These are loopback and micro-benchmarks, not a load test. They say what
+AlB'DO's own overhead is — they don't simulate your network or your database.
 
 ---
 
 ## Where it's headed
 
-Roughly in order, while it's still under development:
+Roughly in order:
 
-1. **Wider reactivity** — conditionals and keyed lists in binding mode,
-   `useContext`, dynamic metadata.
-2. **A real app, ported** — take an existing React/Next app across to
-   AlB'DO and write up the friction honestly.
-3. **Distribution** — cross-platform binaries so `albedo` installs and
-   runs anywhere, not just Windows.
+1. **Outbound HTTP reaching userland** — wiring APERTURE's client to the read
+   path and to action bodies. This is what unblocks OAuth, email, and payments,
+   so it gates most of the rest.
+2. **Compatibility** — `forwardRef`, `createPortal`, `useId`, and a Provider
+   value that survives SSR, so existing component libraries work.
+3. **File uploads.**
+4. **A real app, ported** — take an existing React/Next app across and write up
+   the friction honestly.
 
 ---
 
-## Layout
+## Repository layout
 
 ```
 src/
-  effects.rs          effect analysis → tier decision
-  parser.rs           SWC JSX/TSX parser
-  manifest/           build manifest + shell composition
-  bundler/            classify → plan → rewrite → emit
-  runtime/            render kernel, scheduler, QuickJS engine
-  dev/serve_bench.rs  serve-time latency harness
+  scanner.rs        project scan
+  parser.rs         SWC JSX/TSX parser
+  effects.rs        effect analysis → tier decision
+  analysis/         classification, escape analysis
+  transforms/       JSX rewrites, shared slots, actions
+  ir/               canonical IR, opcode + wire format
+  manifest/         build manifest + shell composition
+  bundler/          classify → plan → rewrite → emit
+  runtime/          render kernel, QuickJS engine, broadcast
+  forge/            the database: declare, write, projection, drift
+  auth/             principal, session, password, policy
+  aperture/         outbound HTTP client, egress policy, cache
+  routing/          route matching, dynamic segments
+  doctor/           the reach matrix behind `albedo doctor`
+  shutter/          GCRA rate limiting
 crates/
-  albedo-server/      axum + tokio HTTP runtime, the `albedo` binary
-  albedo-node/        cross-platform bindings
+  albedo-server/    axum + tokio HTTP runtime, the `albedo` binary
+  albedo-node/      Node-API bridge (napi)
+scaffold/           what `albedo init` writes
+tests/              integration, conformance, and wire fixtures
+fuzz/               cargo-fuzz targets for the wire decoders
 ```
+
+## Documentation
+
+- [`legend.md`](./legend.md) — a reviewer's map: the core idea, the end-to-end
+  dataflow, and a file-by-file guide to what controls what. **Start here if you
+  are reading the source.**
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md) — branching, the checks CI runs, and
+  the pre-commit hook.
+- [`SECURITY.md`](./SECURITY.md) — what is in scope and how to report privately.
+
+Source files sometimes cite design documents under `development-plan/`. Those
+are internal working notes and are not published; the code and `legend.md` are
+the normative description.
 
 ---
 
-Built by [Sen-Bishal](https://github.com/Sen-Bishal) Paushali Banerjee
+## Credits
+
+Built by [Bishal Sen](https://github.com/Sen-Bishal) — compiler, runtime, and
+everything else in `src/`.
+**Paushali Banerjee** — COO and co-founder; operations, and the reason any of
+this reaches anyone.
+
+Copyright © 2026 Albedo Technologies Private Limited.
+Released under the [MIT License](./LICENSE.md).

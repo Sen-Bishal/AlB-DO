@@ -176,6 +176,21 @@ impl ModuleRegistry {
         self.modules.get(specifier)
     }
 
+    /// Every registered module's source, keyed by specifier.
+    ///
+    /// Added for client-island compilation, which inlines a relative project
+    /// import into the island bundle and therefore needs to look up modules
+    /// other than the one being compiled. The registry had only a
+    /// single-specifier accessor, so the serve path could not offer the island
+    /// compiler the same module map the CLI already had — and an island that
+    /// imported anything failed to compile there.
+    pub fn sources(&self) -> HashMap<String, String> {
+        self.modules
+            .iter()
+            .map(|(specifier, module)| (specifier.clone(), module.code.clone()))
+            .collect()
+    }
+
     fn resolve_topological_order(&self, entry: &str) -> RuntimeResult<Vec<String>> {
         if !self.modules.contains_key(entry) {
             return Err(crate::runtime::engine::RuntimeError::load(

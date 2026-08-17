@@ -1,6 +1,6 @@
 # Phase A â€” wire-format fuzz harness.
 #
-# PHASE 2 (B-emitter) â€: run `cargo fuzz run decode_frame -- -max_total_time=300`
+# PHASE 2 (B-emitter): run `cargo fuzz run decode_frame -- -max_total_time=300`
 # (and the same for `decode_intern_table`) BEFORE the first emitter call site
 # lands. Reason: once Phase B has a caller, every decoder hardening becomes a
 # wire break. Standalone `[workspace]` marker keeps this crate out of the

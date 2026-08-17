@@ -456,8 +456,19 @@ impl Dashboard {
                 .cmp(&tier_rank(right.tier))
                 .then_with(|| left.name.cmp(&right.name))
         });
+        // The panel does not scroll, so on any terminal short of the component
+        // count some names cannot be drawn. Truncating is fine; truncating
+        // *silently* is not — an 18-component project on a 30-row terminal
+        // showed 10 names and looked exactly like a 10-component project. The
+        // last available row is spent on the count instead of one more name, so
+        // the list never claims to be the whole list.
         let room = area.height.saturating_sub(7) as usize;
-        for component in components.iter().take(room) {
+        let shown = if components.len() > room {
+            room.saturating_sub(1)
+        } else {
+            components.len()
+        };
+        for component in components.iter().take(shown) {
             let rank = tier_rank(component.tier) as usize;
             lines.push(Line::from(vec![
                 Span::styled("▍", theme::tier(rank)),
@@ -465,6 +476,17 @@ impl Dashboard {
                 Span::styled(tier_label(component.tier), theme::tier(rank)),
                 Span::raw("  "),
                 Span::styled(component.name.clone(), theme::label()),
+            ]));
+        }
+
+        // `room == 0` leaves nowhere to put it — the panel is already down to
+        // its bars — so the marker is dropped rather than stealing the row a
+        // border needs.
+        let hidden = components.len() - shown;
+        if hidden > 0 && room > 0 {
+            lines.push(Line::from(vec![
+                Span::raw("     "),
+                Span::styled(format!("+{hidden} more"), theme::dim()),
             ]));
         }
 
@@ -776,6 +798,33 @@ mod tests {
         assert!(
             text.contains("client island"),
             "Tier C is the tier that ships code, and must say so: {text}"
+        );
+    }
+
+    /// A short terminal cannot draw every component, and the panel does not
+    /// scroll. What it must never do is truncate without saying so — a partial
+    /// list that looks complete misreports the project's tier mix, which is the
+    /// one thing this panel exists to report.
+    #[test]
+    fn a_truncated_component_list_says_how_many_it_dropped() {
+        // 22 rows leaves the tier panel room for one name out of three.
+        let text = screen(&dashboard(), 120, 22);
+        assert!(
+            text.contains("+2 more"),
+            "a cut list must admit the cut: {text}"
+        );
+        assert!(text.contains("Overview"), "{text}");
+        assert!(
+            !text.contains("Guestbook"),
+            "the marker costs a row — it does not sit on top of a full list: {text}"
+        );
+
+        // Tall enough for all three: nothing was dropped, so nothing is claimed.
+        let text = screen(&dashboard(), 120, 30);
+        assert!(text.contains("Guestbook"), "{text}");
+        assert!(
+            !text.contains("more"),
+            "no marker when the list is whole: {text}"
         );
     }
 

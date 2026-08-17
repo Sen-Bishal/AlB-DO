@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Node-API bridge for ALBEDO compiler analysis and manifest optimization.",
   "private": false,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "main": "index.js",
   "types": "index.d.ts",
   "exports": {

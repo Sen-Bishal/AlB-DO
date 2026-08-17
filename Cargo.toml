@@ -10,10 +10,10 @@ members = [
 version      = "0.1.0-alpha.1"
 edition      = "2021"
 rust-version = "1.77.0"
-authors      = ["Bishal Sen(bishalsenpersonal@gmail.com)", "Bishal Sen(bishalsenpersonal@gmail.com)", "AlBDO(support@albdo.dev)"]
+authors      = ["Bishal Sen <bishalsenpersonal@gmail.com>"]
 license      = "MIT"
 repository   = "https://github.com/Sen-Bishal/AlB-DO"
-homepage     = "https://albdo.dev"
+homepage     = "https://github.com/Sen-Bishal/AlB-DO"
 keywords     = ["jsx", "tsx", "compiler", "ssr", "runtime"]
 categories   = ["web-programming", "compilers", "development-tools"]
 

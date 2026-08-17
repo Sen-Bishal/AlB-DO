@@ -431,10 +431,16 @@ export class Bakabox {
     this.pendingSlotValues = new Map();
 
     /**
-     * Map<SlotId, { anchor: Element, rowsByKey: Map<RowKey, Element> }> —
-     * keyed-list bindings. A `SetListRef` marks an element as the anchor whose
-     * children are the rows of a list slot; `SlotDelta` reconciles those rows
-     * by `RowKey`. Distinct from `slots` (scalar text/attr/html sites).
+     * Map<SlotId, Array<{ anchor: Element, rowsByKey: Map<RowKey, Element> }>>
+     * — keyed-list bindings. A `SetListRef` marks an element as the anchor
+     * whose children are the rows of a list slot; `SlotDelta` reconciles those
+     * rows by `RowKey`. Distinct from `slots` (scalar text/attr/html sites).
+     *
+     * An ARRAY per slot, because one topic may be rendered in several places on
+     * a page and every one of them has to stay live. This held a single entry
+     * once; the extra renderings then updated at SSR and never again, so the
+     * page needed a reload to make them agree. `rowsByKey` is per anchor —
+     * the nodes are different elements in each rendering and cannot be shared.
      */
     this.listSlots = new Map();
     /**
@@ -808,7 +814,33 @@ export class Bakabox {
    * broadcast anchor (Tier-B `<ul>`) carries no `data-albedo-id`.
    */
   _registerListAnchor(slotId, anchor) {
-    this.listSlots.set(slotId, { anchor, rowsByKey: this._seedRowsByKey(anchor) });
+    // A topic may be rendered in MORE THAN ONE place on a page, so a slot holds
+    // a LIST of anchors rather than one.
+    //
+    // It used to hold exactly one (`listSlots.set(slotId, {…})`), and the boot
+    // scan skipped any anchor whose slot was already registered. The effect was
+    // that the second and later renderings of the same collection went live
+    // exactly once — at SSR — and then never moved again, while the first one
+    // updated normally. Only a reload brought them back into agreement, because
+    // a reload re-reads the topic during SSR.
+    //
+    // The scalar sibling `_registerSlotAnchor` never had this bug: it dedupes
+    // per ELEMENT and pushes a site per binding. This is the same rule for
+    // lists, and the per-element check below is what keeps a re-scan (after a
+    // Tier-B injection, say) from stacking a duplicate site for one `<ul>`.
+    const lists = this.listSlots.get(slotId) || [];
+    for (const existing of lists) {
+      if (existing.anchor === anchor) return;
+    }
+    lists.push({ anchor, rowsByKey: this._seedRowsByKey(anchor) });
+    this.listSlots.set(slotId, lists);
+
+    // Drain buffered ops on the FIRST anchor only. Every op handler now applies
+    // to every bound anchor, so draining again for a second anchor would
+    // re-apply the same ops to the first one. A later anchor does not need the
+    // replay anyway: `_seedRowsByKey` reads its own server-rendered rows, which
+    // already reflect everything that happened before it was rendered.
+    if (lists.length !== 1) return;
     const pending = this.pendingListOps.get(slotId);
     if (pending) {
       // Drop the buffer BEFORE replaying: each op now finds a bound anchor and
@@ -867,7 +899,12 @@ export class Bakabox {
       const topic = anchor.getAttribute('data-albedo-list-slot');
       if (topic === null || topic === undefined) continue;
       const slotId = topicSlotId(topic);
-      if (this.listSlots.has(slotId)) continue;
+      // No per-SLOT skip here. `querySelectorAll` already finds every anchor
+      // for the topic, and skipping on `listSlots.has(slotId)` threw away all
+      // but the first — which is precisely how a page that renders one
+      // collection twice ended up with one live list and one frozen one.
+      // Idempotency is enforced per ELEMENT inside `_registerListAnchor`, which
+      // is the property the re-scan actually needs.
       this._registerListAnchor(slotId, anchor);
     }
   }
@@ -928,8 +965,8 @@ export class Bakabox {
    * payload, never on summed weights, so an update never cancels to a no-op.
    */
   _opSlotDelta({ slotId, changes }) {
-    const list = this.listSlots.get(slotId);
-    if (!list) {
+    const lists = this.listSlots.get(slotId);
+    if (!lists || lists.length === 0) {
       // Re-tag the op explicitly rather than forwarding the caller's object:
       // this handler is reached both through `applyInstruction` (which carries
       // `op`) and by direct call from the local reactive driver (which does
@@ -937,6 +974,15 @@ export class Bakabox {
       this._bufferListOp(slotId, { op: 'SlotDelta', slotId, changes });
       return;
     }
+    // Every rendering of this topic gets the delta. The plan is recomputed per
+    // anchor rather than shared: `reconcileSlotDelta` keys on what THAT list
+    // already holds, and two renderings of one topic can legitimately be in
+    // different states (one may have been injected after the other).
+    for (const list of lists) this._applySlotDeltaToList(list, changes);
+  }
+
+  /** Apply one `SlotDelta` to a single bound anchor. See `_opSlotDelta`. */
+  _applySlotDeltaToList(list, changes) {
     const anchor = list.anchor;
     if (!anchor) return;
 
@@ -989,8 +1035,13 @@ export class Bakabox {
    * HTML on the node (`__albedoRowHtml`) so an unchanged row is left untouched.
    */
   _opReconcileList({ slotId, rows }) {
-    const list = this.listSlots.get(slotId);
-    if (!list) return;
+    const lists = this.listSlots.get(slotId);
+    if (!lists || lists.length === 0) return;
+    for (const list of lists) this._applyReconcileListToList(list, rows);
+  }
+
+  /** Bring one bound anchor to match `rows`. See `_opReconcileList`. */
+  _applyReconcileListToList(list, rows) {
     const anchor = list.anchor;
     if (!anchor) return;
     const rowsByKey = list.rowsByKey;
@@ -1049,11 +1100,20 @@ export class Bakabox {
    * it if its markup changed), which keeps a redelivered op idempotent.
    */
   _opSlotInsert({ slotId, before, rows }) {
-    const list = this.listSlots.get(slotId);
-    if (!list) {
+    const lists = this.listSlots.get(slotId);
+    if (!lists || lists.length === 0) {
       this._bufferListOp(slotId, { op: 'SlotInsert', slotId, before, rows });
       return;
     }
+    // The `before` marker is resolved per anchor, not once: each rendering has
+    // its own nodes, so the row named by `before` is a different element in
+    // each — and may be missing from one of them, which the tail fallback
+    // already handles correctly.
+    for (const list of lists) this._applySlotInsertToList(list, before, rows);
+  }
+
+  /** Insert `rows` at `before` in one bound anchor. See `_opSlotInsert`. */
+  _applySlotInsertToList(list, before, rows) {
     const anchor = list.anchor;
     if (!anchor) return;
     const rowsByKey = list.rowsByKey;

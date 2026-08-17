@@ -11,7 +11,6 @@ crates/albedo-server/Cargo.lock
 # Generated documentation
 /doc/
 /target/doc/
-.github/CODEOWNERS
 
 # Benchmark results
 /target/criterion/
@@ -240,36 +239,46 @@ nul
 *.exe
 !target/**/*.exe
 
-# Private brainstorming / planning docs — not tracked (see legend.md + README.md for public docs)
+# ── PRIVATE MATERIAL ─────────────────────────────────────────────────
+#
+# ONE RULE: anything not meant for the public — planning docs, strategy,
+# pitch decks, brand and GTM material, roadmaps, dev logs — lives under
+# `/development-plan/`, which is ignored wholesale. Nothing private sits
+# at the repo root.
+#
+# This replaced a list of ~15 per-file entries. That list was the problem
+# it looked like the solution to: every new private doc needed a new line,
+# and a doc that got one only after it was written had already been a
+# `git add -A` away from shipping. A directory cannot be forgotten.
+#
+# Public docs are README.md, legend.md, CONTRIBUTING.md, SECURITY.md,
+# CODE_OF_CONDUCT.md, LICENSE.md, and benchmarks/parity/README.md.
 /development-plan/
 
-# Personal — for us, not for the repo.
-/FORUS.md
-
-# Internal dev-team operating manual (graphify/Claude Code/Obsidian system) — not for OSS users.
-/DEVELOPMENT_DOCTRINE.md
-
-# Private brand / pitch / strategy material — company property, not for OSS users.
-/brief/
-/.deck-build/
-/gtm/
-/professionalization/
+# Knowledge-graph output for the internal dev tooling. Regenerated on
+# demand and machine-specific; not repo material.
 /graphify-out/
-/AlBDO_Pitch_Deck.pptx
 
-# Generated build output + stray artifacts (not sensitive, just not repo material).
+# Agent instructions for the internal dev tooling. Kept on disk because the
+# tooling reads it from the repo root, but untracked: it points at the
+# `graphify` CLI and at `/graphify-out/` above, neither of which a cloner has,
+# so shipping it publicly documents a workflow nobody outside can run.
+/CLAUDE.md
+
+# Generated build output + stray artifacts (not sensitive, just not repo
+# material). Root-level HTML dumps from the dev server and `curl` are
+# already covered by the `*.html` rule above, which carries deliberate
+# `!` exceptions for the fixture and inspector assets — do not add a
+# broader negation here or those exceptions stop meaning anything.
 /rustc-ice-*.txt
-/chat.html
-/home.html
-/response.html
 
-# Private brand / pitch / strategy PDFs — for us, not for the general public.
-# Listed explicitly (not a blanket *.pdf) so a future open-source PDF can be
-# tracked deliberately.
-/.deck-build/AlBDO_Pitch.pdf
-/AlBDO_Pitch_Deck.pdf
-/ALKMY_Brand_Identity_Brief.pdf
-/ALKMY_Manifesto.pdf
-/gtm/ALKMY_Pre-Reveal_Content_Calendar.pdf
-/ALBEDO_FORGE_Overview.pdf
-/PROJECT-ALBDO-FORGE.pdf
+# napi build output. `npm run build` regenerates the `.node` from source and
+# `npm pack` regenerates the tarball, so neither is repo material.
+#
+# These were tracked until 2026-08-17, and it mattered: a compiled `.node` is
+# a 4.6 MB blob that embeds the ABSOLUTE TOOLCHAIN PATHS of whichever machine
+# produced it. The tracked copy carried a contributor's home directory in
+# every panic string. A committed binary is not just stale weight — it
+# publishes wherever it was built.
+crates/albedo-node/*.node
+crates/albedo-node/*.tgz
