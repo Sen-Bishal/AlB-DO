@@ -41,10 +41,13 @@
 use crate::runtime::engine::stable_source_hash;
 use crate::runtime::quickjs_engine::{compile_npm_module_script, NpmModuleFormat};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{sync::Lrc, FileName, SourceMap};
-use swc_ecma_ast::{CallExpr, Callee, Expr, Lit, Module, ModuleDecl, ModuleItem, Program};
+use swc_ecma_ast::{
+    CallExpr, Callee, Decl, Expr, ExportSpecifier, Lit, Module, ModuleDecl, ModuleExportName,
+    ModuleItem, Pat, Program,
+};
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitWith};
 
@@ -751,6 +754,502 @@ fn esm_specifiers(module: &Module) -> Vec<String> {
     sources
 }
 
+// ── Tree shaking · the export graph ────────────────────────────────────
+//
+// The problem, concretely: `import { Check } from "lucide-react"` reaches an
+// entry that is `export * from './icons'`, whose `./icons/index.js` is 854 lines
+// of `export { default as Check } from './check'`. Walking the graph from the
+// entry — which is what the untargeted bundler does, correctly, for the server —
+// lowers all 854 icons to ship one. For a framework whose claim is minimal
+// JavaScript, that is not a size regression, it is the claim being false.
+//
+// 🔑 **The shape of the fix is demand-driven construction, not post-hoc
+// pruning.** Pruning after the walk means 854 files have already been read,
+// parsed and lowered; the cost is paid before the saving is computed. Starting
+// from *(entry, names the importer actually asked for)* and pulling only what
+// answers that demand does the work once.
+//
+// 🔑 **Re-export edges are all this needs, and that is why it is tractable.**
+// Resolving `Check` to `./icons/check.js` is a walk over `export … from`
+// declarations — no scope analysis, no binding resolution, no side-effect
+// inference inside a function body. The barrel *is* the index.
+//
+// ⚠️ **Deliberate boundary: no intra-file dead-code elimination.** Once a file is
+// reached, every byte of it ships. Removing an unused local inside a reached
+// module is a different discipline (full scope analysis) with a far worse
+// effort-to-saving ratio, and a minifier does it better. What this removes is
+// whole files, which is where the 854 lives.
+
+/// Where one exported name comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExportOrigin {
+    /// Defined in this file (`export const x`, `export default …`). Reaching it
+    /// makes the whole file live.
+    Local,
+    /// `export { a as b } from "./src"` — a direct name→file edge, and the case
+    /// that makes barrel pruning exact.
+    ReExport { source: String, imported: String },
+}
+
+/// What a module exports, and the `export *` sources it forwards to.
+#[derive(Debug, Default, Clone)]
+struct ExportMap {
+    /// Named exports this file resolves itself.
+    named: BTreeMap<String, ExportOrigin>,
+    /// `export * from "./x"` sources, in source order. A name not found in
+    /// `named` may be provided by one of these, and only reading them can say
+    /// which — so they are followed lazily, on a miss.
+    star: Vec<String>,
+    /// Every specifier this file imports for its own use. Demanded wholesale
+    /// once the file is live, because without intra-file DCE we cannot know
+    /// which import a used export actually needs.
+    imports: Vec<String>,
+}
+
+/// Read a module's export surface.
+///
+/// Only `ModuleDecl`s are inspected: this answers *"which file provides name
+/// N"*, and no expression can change that answer.
+fn export_map(module: &Module) -> ExportMap {
+    let mut map = ExportMap::default();
+
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(decl) = item else {
+            continue;
+        };
+        match decl {
+            ModuleDecl::Import(import) => map.imports.push(import.src.value.to_string()),
+            ModuleDecl::ExportAll(all) => map.star.push(all.src.value.to_string()),
+            ModuleDecl::ExportDefaultDecl(_) | ModuleDecl::ExportDefaultExpr(_) => {
+                map.named.insert("default".to_string(), ExportOrigin::Local);
+            }
+            ModuleDecl::ExportDecl(export_decl) => {
+                for name in declared_export_names(&export_decl.decl) {
+                    map.named.insert(name, ExportOrigin::Local);
+                }
+            }
+            ModuleDecl::ExportNamed(named) => {
+                // With a source this is a re-export edge; without one it is a
+                // local binding exported under a name.
+                let source = named.src.as_ref().map(|src| src.value.to_string());
+                if source.is_none() {
+                    // `export { a, b }` — the bindings are local, so the file is
+                    // its own provider and its imports are demanded with it.
+                    for specifier in &named.specifiers {
+                        if let ExportSpecifier::Named(entry) = specifier {
+                            let exported = entry
+                                .exported
+                                .as_ref()
+                                .map_or_else(|| export_name_text(&entry.orig), export_name_text);
+                            map.named.insert(exported, ExportOrigin::Local);
+                        }
+                    }
+                    continue;
+                }
+                let source = source.expect("checked above");
+                for specifier in &named.specifiers {
+                    match specifier {
+                        ExportSpecifier::Named(entry) => {
+                            let imported = export_name_text(&entry.orig);
+                            let exported = entry
+                                .exported
+                                .as_ref()
+                                .map_or_else(|| imported.clone(), export_name_text);
+                            map.named.insert(
+                                exported,
+                                ExportOrigin::ReExport {
+                                    source: source.clone(),
+                                    imported,
+                                },
+                            );
+                        }
+                        // `export * as ns from "./x"` — the namespace object
+                        // needs every export of the target, so the target is
+                        // pulled whole rather than by name.
+                        ExportSpecifier::Namespace(ns) => {
+                            map.named.insert(
+                                export_name_text(&ns.name),
+                                ExportOrigin::ReExport {
+                                    source: source.clone(),
+                                    imported: STAR_DEMAND.to_string(),
+                                },
+                            );
+                        }
+                        ExportSpecifier::Default(_) => {
+                            map.named.insert(
+                                "default".to_string(),
+                                ExportOrigin::ReExport {
+                                    source: source.clone(),
+                                    imported: "default".to_string(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    map
+}
+
+/// The sentinel demand meaning *every export of this module*.
+///
+/// Not a valid JavaScript identifier, so it can never collide with a real
+/// export name — which is what lets one `BTreeSet<String>` carry both
+/// "these names" and "all of them" without a second field to keep in sync.
+const STAR_DEMAND: &str = "*";
+
+/// The names bound by an `export <decl>`.
+fn declared_export_names(decl: &Decl) -> Vec<String> {
+    match decl {
+        Decl::Fn(fn_decl) => vec![fn_decl.ident.sym.to_string()],
+        Decl::Class(class_decl) => vec![class_decl.ident.sym.to_string()],
+        Decl::Var(var_decl) => var_decl
+            .decls
+            .iter()
+            .filter_map(|declarator| match &declarator.name {
+                Pat::Ident(binding) => Some(binding.id.sym.to_string()),
+                // A destructured export (`export const { a } = …`) binds names
+                // this does not enumerate. Returning none for it is safe in the
+                // direction that matters: the name simply will not be found by
+                // demand, and the caller falls back to taking the file whole.
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `ModuleExportName` as the string it denotes.
+fn export_name_text(name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::Ident(ident) => ident.sym.to_string(),
+        ModuleExportName::Str(str_name) => str_name.value.to_string(),
+    }
+}
+
+/// One demanded export, resolved past every barrel to the record that defines it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedExport {
+    /// Record key of the file that actually defines the binding.
+    pub record_key: String,
+    /// The name on that record. `default` for a default export; [`STAR_DEMAND`]
+    /// when the importer needs the whole namespace object.
+    pub export_name: String,
+}
+
+/// A tree-shaken bundle: only the files needed to answer a specific demand.
+#[derive(Debug, Clone)]
+pub struct ShakenNpmBundle {
+    pub specifier: String,
+    pub package_name: String,
+    pub package_version: String,
+    /// Demanded name → the record and property to bind it to. The importer
+    /// binds against this directly, so **no barrel is emitted at all**.
+    pub bindings: BTreeMap<String, ResolvedExport>,
+    pub artifacts: Vec<NpmArtifact>,
+    /// True when the package could not be shaken and was taken whole.
+    pub taken_whole: bool,
+}
+
+/// Bundle `specifier` carrying only what `demand` needs.
+///
+/// # Why this is a second entry point and not a parameter on the first
+///
+/// [`bundle_npm_dependency`] serves the **server**, which registers a package
+/// whole because it cannot know which export an action will reach. This serves
+/// the **browser**, where the demand set is exactly the island's import list and
+/// every unshaken byte is transferred to a user. Two different questions; making
+/// one function answer both with a flag would put the server's correctness at
+/// the mercy of a client-side optimisation.
+///
+/// # How a barrel disappears
+///
+/// A demanded name is resolved *through* re-export edges to the file that
+/// defines it, and the importer is bound to that file's record. So
+/// `import { Check } from "lucide-react"` emits a reference to
+/// `…/icons/check.js` and the 854-line barrel is never emitted — which is also
+/// why pruning the barrel's own body is unnecessary: nothing points at it.
+///
+/// # When shaking is declined
+///
+/// Only a package declaring `"sideEffects": false` is shaken. Without that
+/// declaration a file may matter for reasons no export graph can see (a polyfill
+/// installing itself, a registry populating on import), and dropping it would
+/// break the package silently at runtime — the worst failure this codebase has.
+/// Such a package is taken whole and says so via [`ShakenNpmBundle::taken_whole`].
+///
+/// # Errors
+/// The resolution errors of [`bundle_npm_dependency`], plus a loud failure when
+/// a demanded name is exported by nothing in the graph.
+pub fn bundle_npm_dependency_for_demand(
+    search_dir: &Path,
+    specifier: &str,
+    demand: &BTreeSet<String>,
+) -> Result<ShakenNpmBundle, NpmBundleError> {
+    let (entry_package, entry_path) = resolve_bare_entry(search_dir, specifier)?;
+
+    // A star demand cannot be narrowed, and an unshakeable package must not be.
+    let shakeable = package_declares_no_side_effects(&entry_package)
+        && !demand.iter().any(|name| name == STAR_DEMAND);
+    if !shakeable {
+        let whole = bundle_npm_dependency(search_dir, specifier)?;
+        let bindings = demand
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    ResolvedExport {
+                        record_key: whole.entry_key.clone(),
+                        export_name: name.clone(),
+                    },
+                )
+            })
+            .collect();
+        return Ok(ShakenNpmBundle {
+            specifier: whole.specifier,
+            package_name: whole.package_name,
+            package_version: whole.package_version,
+            bindings,
+            artifacts: whole.artifacts,
+            taken_whole: true,
+        });
+    }
+
+    let mut walk = DemandWalk::new(specifier);
+    let mut bindings = BTreeMap::new();
+    for name in demand {
+        let resolved = walk.resolve(&entry_package, &entry_path, name, 0)?;
+        bindings.insert(name.clone(), resolved);
+    }
+    // Every file reached by resolution is live; a live file needs its own
+    // imports whole, because without intra-file DCE we cannot tell which import
+    // the used export depends on.
+    walk.close_over_imports()?;
+
+    Ok(ShakenNpmBundle {
+        specifier: specifier.to_string(),
+        package_name: entry_package.name.clone(),
+        package_version: entry_package.version.clone(),
+        bindings,
+        artifacts: walk.into_artifacts()?,
+        taken_whole: false,
+    })
+}
+
+/// `"sideEffects": false` on the package's own manifest.
+///
+/// The array form (`"sideEffects": ["*.css"]`) is deliberately treated as *not*
+/// declared: it means "these files do have effects", and honouring it properly
+/// requires glob matching per file. Declining to shake is the safe reading of a
+/// declaration we do not fully implement.
+fn package_declares_no_side_effects(package: &ResolvedPackage) -> bool {
+    let manifest_path = package.dir.join("package.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    value.get("sideEffects") == Some(&serde_json::Value::Bool(false))
+}
+
+/// The demand-driven walk: resolution state plus the live file set.
+struct DemandWalk {
+    specifier: String,
+    /// Files that must be emitted, in insertion order.
+    live: Vec<(ResolvedPackage, PathBuf)>,
+    live_keys: BTreeSet<PathBuf>,
+    /// `(file, name)` pairs already resolved, so a re-export cycle terminates.
+    resolving: BTreeSet<(PathBuf, String)>,
+}
+
+impl DemandWalk {
+    fn new(specifier: &str) -> Self {
+        Self {
+            specifier: specifier.to_string(),
+            live: Vec::new(),
+            live_keys: BTreeSet::new(),
+            resolving: BTreeSet::new(),
+        }
+    }
+
+    fn mark_live(&mut self, package: &ResolvedPackage, path: &Path) {
+        if self.live_keys.insert(path.to_path_buf()) {
+            self.live.push((package.clone(), path.to_path_buf()));
+        }
+    }
+
+    /// Resolve one exported name to the record that defines it.
+    fn resolve(
+        &mut self,
+        package: &ResolvedPackage,
+        path: &Path,
+        name: &str,
+        depth: u32,
+    ) -> Result<ResolvedExport, NpmBundleError> {
+        // A barrel chain is short in practice (entry → index → leaf); the cap is
+        // a backstop against a pathological or cyclic graph, not a real limit.
+        const MAX_REEXPORT_DEPTH: u32 = 32;
+        if depth > MAX_REEXPORT_DEPTH {
+            return Err(NpmBundleError::Compile {
+                key: self.specifier.clone(),
+                path: path.to_path_buf(),
+                message: format!(
+                    "re-export chain for '{name}' exceeded {MAX_REEXPORT_DEPTH} hops"
+                ),
+            });
+        }
+
+        let source = std::fs::read_to_string(path).map_err(|err| NpmBundleError::Io {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+
+        // Only ESM has a static export graph. A CJS or JSON file is opaque to
+        // this analysis, so it is taken whole and the name is read off its
+        // record at runtime — correct, just unshaken.
+        if classify_format(path, &source) != NpmModuleFormat::Esm {
+            self.mark_live(package, path);
+            return Ok(ResolvedExport {
+                record_key: record_key(package, path),
+                export_name: name.to_string(),
+            });
+        }
+
+        if !self.resolving.insert((path.to_path_buf(), name.to_string())) {
+            // Already being resolved higher in this chain — a cycle. Bind to
+            // this file; the runtime linker's memoisation handles the rest.
+            self.mark_live(package, path);
+            return Ok(ResolvedExport {
+                record_key: record_key(package, path),
+                export_name: name.to_string(),
+            });
+        }
+
+        let module = parse_npm_module(path, &source).map_err(|message| NpmBundleError::Compile {
+            key: record_key(package, path),
+            path: path.to_path_buf(),
+            message,
+        })?;
+        let map = export_map(&module);
+
+        if let Some(origin) = map.named.get(name) {
+            return match origin.clone() {
+                ExportOrigin::Local => {
+                    self.mark_live(package, path);
+                    Ok(ResolvedExport {
+                        record_key: record_key(package, path),
+                        export_name: name.to_string(),
+                    })
+                }
+                ExportOrigin::ReExport {
+                    source: from,
+                    imported,
+                } => {
+                    let (next_package, next_path) = resolve_from_file(package, path, &from)?;
+                    if imported == STAR_DEMAND {
+                        // A namespace re-export needs the target whole.
+                        self.mark_live(&next_package, &next_path);
+                        return Ok(ResolvedExport {
+                            record_key: record_key(&next_package, &next_path),
+                            export_name: STAR_DEMAND.to_string(),
+                        });
+                    }
+                    self.resolve(&next_package, &next_path, &imported, depth + 1)
+                }
+            };
+        }
+
+        // Not named here — try each `export *` source in order, which is what
+        // makes `export * from './icons'` resolve without reading all 854.
+        for star_source in &map.star.clone() {
+            let (next_package, next_path) = resolve_from_file(package, path, star_source)?;
+            if let Ok(resolved) = self.resolve(&next_package, &next_path, name, depth + 1) {
+                return Ok(resolved);
+            }
+        }
+
+        Err(NpmBundleError::Compile {
+            key: record_key(package, path),
+            path: path.to_path_buf(),
+            message: format!(
+                "'{}' does not export '{name}' — nothing in its module graph provides that binding",
+                self.specifier
+            ),
+        })
+    }
+
+    /// A live file needs its own imports, and theirs, whole.
+    fn close_over_imports(&mut self) -> Result<(), NpmBundleError> {
+        let mut index = 0usize;
+        while index < self.live.len() {
+            let (package, path) = self.live[index].clone();
+            index += 1;
+
+            if self.live.len() > MAX_GRAPH_FILES {
+                return Err(NpmBundleError::GraphTooLarge {
+                    specifier: self.specifier.clone(),
+                });
+            }
+
+            let source = std::fs::read_to_string(&path).map_err(|err| NpmBundleError::Io {
+                path: path.clone(),
+                message: err.to_string(),
+            })?;
+            let format = classify_format(&path, &source);
+            for raw in collect_specifiers(&path, &source, format)? {
+                let (dep_package, dep_path) = resolve_from_file(&package, &path, &raw)?;
+                self.mark_live(&dep_package, &dep_path);
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower every live file to its registration artifact.
+    fn into_artifacts(self) -> Result<Vec<NpmArtifact>, NpmBundleError> {
+        let mut artifacts = Vec::with_capacity(self.live.len());
+        for (package, path) in &self.live {
+            let key = record_key(package, path);
+            let source = std::fs::read_to_string(path).map_err(|err| NpmBundleError::Io {
+                path: path.clone(),
+                message: err.to_string(),
+            })?;
+            let format = classify_format(path, &source);
+
+            let mut resolve_map: BTreeMap<String, String> = BTreeMap::new();
+            for raw in collect_specifiers(path, &source, format)? {
+                if resolve_map.contains_key(&raw) {
+                    continue;
+                }
+                let (dep_package, dep_path) = resolve_from_file(package, path, &raw)?;
+                resolve_map.insert(raw, record_key(&dep_package, &dep_path));
+            }
+
+            // The lowering takes a `HashMap`; the walk keeps a `BTreeMap` so the
+            // emitted resolve table is byte-stable across runs, which is what
+            // lets the client chunk be content-hashed and cached.
+            let resolve_map: HashMap<String, String> = resolve_map.into_iter().collect();
+            let script = compile_npm_module_script(&key, &source, format, &resolve_map).map_err(
+                |err| NpmBundleError::Compile {
+                    key: key.clone(),
+                    path: path.clone(),
+                    message: err.to_string(),
+                },
+            )?;
+            let source_hash = stable_source_hash(&source);
+            artifacts.push(NpmArtifact {
+                key,
+                script,
+                source_hash,
+            });
+        }
+        Ok(artifacts)
+    }
+}
+
 /// Collects string-literal `require("…")` call arguments anywhere in a CJS file.
 #[derive(Default)]
 struct RequireCollector {
@@ -1265,6 +1764,208 @@ mod tests {
 
         let err = bundle_npm_dependency(dir.path(), "loop").unwrap_err();
         assert!(matches!(err, NpmBundleError::FileNotFound { .. }));
+    }
+
+    // ── tree shaking ───────────────────────────────────────────────────
+    //
+    // The corpus tests in `tests/npm_tree_shaking.rs` measure the real
+    // packages; these pin the algorithm against fixtures so the rules hold
+    // without a `node_modules` on disk.
+
+    /// A package shaped like `lucide-react`: entry → star barrel → named
+    /// barrel → leaf, with `sideEffects: false`.
+    fn barrel_package(dir: &Path) -> PathBuf {
+        let pkg = dir.join("node_modules").join("barrel");
+        std::fs::create_dir_all(pkg.join("esm").join("icons")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "barrel", "version": "1.0.0", "module": "esm/index.js",
+                 "sideEffects": false }"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("esm").join("index.js"), "export * from './icons';").unwrap();
+        std::fs::write(
+            pkg.join("esm").join("icons").join("index.js"),
+            "export { default as Alpha } from './alpha';\n\
+             export { default as Beta } from './beta';\n\
+             export { default as Gamma } from './gamma';",
+        )
+        .unwrap();
+        for icon in ["alpha", "beta", "gamma"] {
+            std::fs::write(
+                pkg.join("esm").join("icons").join(format!("{icon}.js")),
+                format!(
+                    "import shared from '../shared';\nconst {icon} = shared('{icon}');\nexport default {icon};"
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            pkg.join("esm").join("shared.js"),
+            "export default function shared(n) { return n; }",
+        )
+        .unwrap();
+        pkg
+    }
+
+    fn demand(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// The headline rule: a demanded name is resolved *through* both barrels to
+    /// the file that defines it, and the barrels are never emitted — which is
+    /// also why their unused re-exports need no pruning, since nothing points
+    /// at them.
+    #[test]
+    fn a_demanded_name_resolves_past_every_barrel() {
+        let dir = tempfile::tempdir().unwrap();
+        barrel_package(dir.path());
+
+        let shaken =
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"])).unwrap();
+
+        assert!(!shaken.taken_whole);
+        let beta = shaken.bindings.get("Beta").expect("Beta resolved");
+        assert!(beta.record_key.ends_with("esm/icons/beta.js"), "{beta:?}");
+        assert_eq!(beta.export_name, "default");
+
+        let keys: Vec<&str> = shaken.artifacts.iter().map(|a| a.key.as_str()).collect();
+        assert!(
+            !keys.iter().any(|k| k.ends_with("index.js")),
+            "no barrel should be emitted: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k.ends_with("alpha.js") || k.ends_with("gamma.js")),
+            "unreached siblings must not ship: {keys:?}"
+        );
+        // The leaf and the helper its import demands, and nothing else.
+        assert_eq!(shaken.artifacts.len(), 2, "{keys:?}");
+    }
+
+    /// A live file's own imports come with it, because without intra-file DCE we
+    /// cannot know which import the used export depends on.
+    #[test]
+    fn a_live_file_pulls_its_own_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        barrel_package(dir.path());
+
+        let shaken =
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha"])).unwrap();
+        assert!(shaken
+            .artifacts
+            .iter()
+            .any(|a| a.key.ends_with("esm/shared.js")));
+    }
+
+    /// Two names share one graph — the helper is emitted once, not per name.
+    #[test]
+    fn two_demanded_names_share_their_common_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        barrel_package(dir.path());
+
+        let one =
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha"])).unwrap();
+        let two =
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha", "Beta"]))
+                .unwrap();
+
+        assert_eq!(one.artifacts.len(), 2);
+        assert_eq!(two.artifacts.len(), 3, "one extra leaf, one shared helper");
+    }
+
+    /// 🔒 Without `"sideEffects": false` the package is taken whole and says so.
+    /// A file can matter for reasons no export graph can see — a polyfill
+    /// installing itself, a registry populating on import — and dropping one
+    /// breaks the package at runtime, silently, which is the worst outcome
+    /// available.
+    #[test]
+    fn a_package_without_the_declaration_is_never_shaken() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = barrel_package(dir.path());
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "barrel", "version": "1.0.0", "module": "esm/index.js" }"#,
+        )
+        .unwrap();
+
+        let shaken =
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"])).unwrap();
+        assert!(shaken.taken_whole);
+        assert!(shaken.artifacts.len() > 3, "the whole package ships");
+        // The binding still resolves — through the entry record, as before.
+        assert!(shaken.bindings.contains_key("Beta"));
+    }
+
+    /// The array form of `sideEffects` names files that *do* have effects.
+    /// Honouring it needs glob matching per file; declining to shake is the
+    /// safe reading of a declaration we do not fully implement.
+    #[test]
+    fn the_array_form_of_side_effects_declines_shaking() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = barrel_package(dir.path());
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "barrel", "version": "1.0.0", "module": "esm/index.js",
+                 "sideEffects": ["*.css"] }"#,
+        )
+        .unwrap();
+
+        let shaken =
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"])).unwrap();
+        assert!(shaken.taken_whole);
+    }
+
+    /// A name nothing exports is a build error, not a chunk whose binding is
+    /// `undefined` when the island first renders.
+    #[test]
+    fn an_unexported_name_fails_at_build() {
+        let dir = tempfile::tempdir().unwrap();
+        barrel_package(dir.path());
+
+        let err = bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Delta"]))
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Delta"), "must name the binding: {message}");
+    }
+
+    /// A re-export cycle terminates instead of recursing until the stack dies.
+    #[test]
+    fn a_re_export_cycle_terminates() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules").join("loopy");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "loopy", "version": "1.0.0", "module": "a.js", "sideEffects": false }"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("a.js"), "export * from './b';").unwrap();
+        std::fs::write(pkg.join("b.js"), "export * from './a';").unwrap();
+
+        // Either a clean "not exported" error or a bound record — never a hang
+        // or a stack overflow.
+        let _ = bundle_npm_dependency_for_demand(dir.path(), "loopy", &demand(&["Whatever"]));
+    }
+
+    /// CommonJS has no static export graph, so a CJS entry is opaque to this
+    /// analysis: it is taken whole and the name read off its record at runtime.
+    #[test]
+    fn a_commonjs_entry_is_taken_whole_but_still_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules").join("cjspkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "cjspkg", "version": "1.0.0", "main": "index.js", "sideEffects": false }"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), "module.exports = { hello: 1 };").unwrap();
+
+        let shaken =
+            bundle_npm_dependency_for_demand(dir.path(), "cjspkg", &demand(&["hello"])).unwrap();
+        let hello = shaken.bindings.get("hello").expect("bound");
+        assert!(hello.record_key.ends_with("index.js"));
+        assert_eq!(hello.export_name, "hello");
     }
 
     #[test]
