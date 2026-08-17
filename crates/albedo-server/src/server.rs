@@ -1365,6 +1365,44 @@ impl AlbedoServerBuilder {
             // and without them the request path can't resolve a shared slot.
             let plan = runtime.build_tier_b_render_plan(self.reactive_project.as_deref());
 
+            // A2 · give every pool engine the project's npm bundles **before**
+            // anything renders on them.
+            //
+            // 🔑 The order is load-bearing: warm-up below renders real
+            // components, and a component module links its imports eagerly at
+            // load, so warming first would fail on precisely the components
+            // that import a package.
+            //
+            // Without this the pooled render path had no npm at all — the
+            // Tier-B registry, the row projector and the warm-up each load only
+            // the boot-precomputed *project* modules, and none of them goes
+            // through `CompiledProject`, which is where `preload_npm_bundles`
+            // lives. That is why actions could import a package and a
+            // per-request component could not.
+            if let Some(project) = self.reactive_project.as_deref() {
+                let artifacts: Vec<crate::engine_pool::NpmArtifactRegistration> = project
+                    .npm_bundles()
+                    .iter()
+                    .flat_map(|bundle| bundle.artifacts.iter())
+                    .map(|artifact| {
+                        (
+                            artifact.key.clone(),
+                            artifact.script.clone(),
+                            artifact.source_hash,
+                        )
+                    })
+                    .collect();
+                if !artifacts.is_empty() {
+                    let failed = pool.install_npm_bundles(&artifacts);
+                    tracing::info!(
+                        target: "albedo.renderer",
+                        artifacts = artifacts.len(),
+                        failed,
+                        "registered npm bundles on the render pool"
+                    );
+                }
+            }
+
             // Warm every pool engine's render path with the real Tier-B components
             // before the pool serves a request. The arena's O(1) reset is only safe
             // once a component's interned QuickJS state lives in the persistent

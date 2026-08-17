@@ -291,6 +291,111 @@ impl QuickJsEnginePool {
             *idle = workers;
         }
     }
+
+    /// A2 · register the project's npm bundles on **every** engine in the pool.
+    ///
+    /// # Why this lives on the pool and not on its callers
+    ///
+    /// 🔴 **Because four separate callers had the same bug and a fifth would
+    /// have inherited it.** Every consumer of these engines loads a
+    /// boot-precomputed list of *project* modules and renders — the Tier-B
+    /// registry's `call`, its `call_metadata`, the row projector, and
+    /// [`Self::warm_render_path`] itself — and **not one of them registered an
+    /// npm bundle**. The action path escaped only because it routes through
+    /// `CompiledProject::invoke_action_quickjs_pass`, which preloads them
+    /// itself. The result was that `import clsx from "clsx"` in any per-request
+    /// component threw `__ALBEDO_MODULE_MISSING__` and the component vanished
+    /// from the page under an HTTP 200.
+    ///
+    /// npm bundles are a property of the **project**, not of a component, so
+    /// the engine is the right owner. Installing here means a new pool consumer
+    /// cannot forget: the engine it is handed already has them.
+    ///
+    /// # Ordering
+    ///
+    /// Call this **before** [`Self::warm_render_path`]. Warm-up renders real
+    /// components, and a component module links its imports *eagerly at load*,
+    /// so a warm that runs first would fail on exactly the components this
+    /// exists to support.
+    ///
+    /// Registration is lazy on the JS side — each artifact installs a *factory*
+    /// and nothing executes until a module is actually imported — and
+    /// `load_precompiled_module` is memoised by `(specifier, source_hash)`, so
+    /// calling this again after a dev reload re-registers only what changed.
+    ///
+    /// Returns the number of artifacts that failed to register. A failure is not
+    /// fatal — a project can legitimately carry a package only a Tier-A path
+    /// uses — but it is never silent, because the component that imports it
+    /// would otherwise fail at render with the missing-module error this whole
+    /// change exists to remove.
+    pub fn install_npm_bundles(&self, artifacts: &[NpmArtifactRegistration]) -> usize {
+        if artifacts.is_empty() {
+            return 0;
+        }
+
+        let workers: Vec<Worker> = {
+            let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
+            std::mem::take(&mut *idle)
+        };
+
+        let mut dones = Vec::with_capacity(workers.len());
+        for worker in &workers {
+            let (done_tx, done_rx) = mpsc::channel::<usize>();
+            let artifacts = artifacts.to_vec();
+            let job: Job = Box::new(move |engine: &mut QuickJsEngine| {
+                let _ = done_tx.send(register_npm_artifacts(engine, &artifacts));
+            });
+            if worker.job_tx.send(job).is_ok() {
+                dones.push(done_rx);
+            }
+        }
+        // Every engine registers the same set, so the per-engine failure counts
+        // agree; take the max rather than the sum so the number reported is
+        // "how many artifacts are broken", not "how many times we noticed".
+        let mut failed = 0usize;
+        for done_rx in dones {
+            failed = failed.max(done_rx.recv().unwrap_or(0));
+        }
+
+        {
+            let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
+            *idle = workers;
+        }
+        failed
+    }
+}
+
+/// One npm artifact as the pool registers it: `(record key, registration
+/// script, source hash)`. The tuple mirrors `NpmArtifact`'s fields without
+/// making this crate depend on that type's shape.
+pub type NpmArtifactRegistration = (String, String, u64);
+
+/// Register every artifact on one engine, returning how many were refused.
+///
+/// Each failure is logged with the artifact's key: the alternative is a
+/// component that imports it failing later with `__ALBEDO_MODULE_MISSING__`,
+/// which names the *package* and gives no hint that its registration was the
+/// thing that went wrong.
+fn register_npm_artifacts(
+    engine: &mut QuickJsEngine,
+    artifacts: &[NpmArtifactRegistration],
+) -> usize {
+    use dom_render_compiler::runtime::engine::RuntimeEngine;
+
+    let mut failed = 0usize;
+    for (key, script, source_hash) in artifacts {
+        if let Err(err) = engine.load_precompiled_module(key, script, *source_hash) {
+            failed += 1;
+            tracing::warn!(
+                target: "albedo.renderer",
+                artifact = %key,
+                error = %err,
+                "npm artifact failed to register on a pool engine; components importing it \
+                 will not render"
+            );
+        }
+    }
+    failed
 }
 
 impl Drop for QuickJsEnginePool {
@@ -437,6 +542,117 @@ mod tests {
                 "pool handed out a cold engine — warm-on-construction broken"
             );
         }
+    }
+
+    // ── A2 · npm bundles reach the pooled engines ──────────────────────
+    //
+    // The bug: nothing that renders on a pooled engine ever registered an npm
+    // bundle. The Tier-B registry, its metadata path, the row projector and the
+    // render warm-up all load only the boot-precomputed *project* modules; the
+    // action path escaped because it routes through `CompiledProject`, which
+    // preloads them itself. So `import clsx from "clsx"` in a per-request
+    // component threw `__ALBEDO_MODULE_MISSING__` and the component silently
+    // vanished from an HTTP 200 page.
+
+    /// A factory + alias pair, in the shape the npm bundler emits.
+    fn fake_npm_artifacts() -> Vec<NpmArtifactRegistration> {
+        vec![
+            (
+                "npm:testpkg@1.0.0/index.js".to_string(),
+                r#"globalThis.__ALBEDO_NPM_FACTORIES["npm:testpkg@1.0.0/index.js"] = function(e) { e.default = 1; };"#
+                    .to_string(),
+                11,
+            ),
+            (
+                "testpkg".to_string(),
+                r#"globalThis.__ALBEDO_NPM_ALIASES["testpkg"] = "npm:testpkg@1.0.0/index.js";"#
+                    .to_string(),
+                22,
+            ),
+        ]
+    }
+
+    /// Throws unless the alias table knows `testpkg` — the exact lookup a
+    /// compiled component's `import` performs, so a pass here means an import
+    /// would resolve.
+    ///
+    /// 🪤 Shaped as a **module with an export and a single expression**, not as
+    /// an `if`/`throw` block: `load_module` lowers a body through the component
+    /// module compiler, which puts it in expression position, and a statement
+    /// there fails to parse for reasons that have nothing to do with what this
+    /// is testing. Indexing a missing table throws a `TypeError` on its own,
+    /// which is the assertion.
+    const ALIAS_PROBE: &str =
+        r#"export const alias = globalThis.__ALBEDO_NPM_ALIASES["testpkg"].length;"#;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn installed_npm_bundles_reach_every_pooled_engine() {
+        use dom_render_compiler::runtime::engine::RuntimeEngine;
+
+        let pool = QuickJsEnginePool::with_size(3);
+        let failed = pool.install_npm_bundles(&fake_npm_artifacts());
+        assert_eq!(failed, 0, "well-formed artifacts must register");
+
+        // More checkouts than engines, so every engine is exercised and reuse
+        // from the idle stack is covered too. `install_npm_bundles` reaches each
+        // engine exactly once, and this is what proves it.
+        for _ in 0..6 {
+            let outcome = pool
+                .with_engine(|engine| {
+                    engine
+                        .load_module("__probe__", ALIAS_PROBE)
+                        .map_err(|err| err.to_string())
+                })
+                .await
+                .expect("checkout succeeds");
+            assert!(
+                outcome.is_ok(),
+                "a pooled engine had no npm alias table — this is the bug that made \
+                 every per-request component's `import` fail: {outcome:?}"
+            );
+        }
+    }
+
+    /// The control. Without the install the identical probe must fail — a test
+    /// that passes on both sides proves nothing about the wiring.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn without_installation_a_pooled_engine_has_no_npm_aliases() {
+        use dom_render_compiler::runtime::engine::RuntimeEngine;
+
+        let pool = QuickJsEnginePool::with_size(1);
+        let resolved = pool
+            .with_engine(|engine| engine.load_module("__probe__", ALIAS_PROBE).is_ok())
+            .await
+            .expect("checkout succeeds");
+        assert!(
+            !resolved,
+            "a fresh pool must not already know the package — if this passes, the \
+             positive test above is not measuring the installation"
+        );
+    }
+
+    /// A broken artifact is counted and reported, never swallowed: the component
+    /// that imports it would otherwise fail later with a missing-module error
+    /// that names the package and not the cause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broken_artifact_is_counted_rather_than_silently_dropped() {
+        let pool = QuickJsEnginePool::with_size(2);
+        let failed = pool.install_npm_bundles(&[(
+            "npm:broken@1.0.0/index.js".to_string(),
+            "this is not ( valid javascript".to_string(),
+            33,
+        )]);
+        // One broken artifact, however many engines refused it.
+        assert_eq!(failed, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn installing_nothing_is_a_no_op() {
+        let pool = QuickJsEnginePool::with_size(1);
+        assert_eq!(pool.install_npm_bundles(&[]), 0);
+        // The pool is still serviceable afterwards — the early return must not
+        // leave the idle set drained.
+        assert!(pool.with_engine(|engine| engine.is_initialized()).await.unwrap());
     }
 
     /// Warm-on-construction reaches the arena layer: after construction, a

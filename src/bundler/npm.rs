@@ -345,9 +345,23 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+/// How many nested `package.json` redirections a directory probe will follow
+/// before giving up.
+///
+/// One is enough for every real package; the bound exists because a
+/// `package.json` whose `main` points back at its own directory would otherwise
+/// recurse forever, and that is a malformed package we should decline rather
+/// than hang on.
+const MAX_DIRECTORY_INDIRECTION: u8 = 4;
+
 /// Probe `base` the way Node resolves a path-ish specifier: exact file, then
-/// appended extensions, then directory index files.
+/// appended extensions, then **the directory's own `package.json`**, then
+/// directory index files.
 fn probe_file(base: &Path) -> Option<PathBuf> {
+    probe_file_inner(base, 0)
+}
+
+fn probe_file_inner(base: &Path, depth: u8) -> Option<PathBuf> {
     let base = &normalize_path(base);
     if base.is_file() {
         return Some(base.to_path_buf());
@@ -362,6 +376,18 @@ fn probe_file(base: &Path) -> Option<PathBuf> {
         }
     }
     if base.is_dir() {
+        // Node's LOAD_AS_DIRECTORY step 1, and it has to come **before** the
+        // index probe because a directory may legitimately carry both.
+        if depth < MAX_DIRECTORY_INDIRECTION {
+            if let Some(target) = directory_entry_target(base) {
+                if let Some(resolved) = probe_file_inner(&base.join(target), depth + 1) {
+                    return Some(resolved);
+                }
+                // A manifest that points nowhere falls through to the index
+                // probe rather than failing: the folder may still be resolvable
+                // the ordinary way, and a broken `main` should not veto that.
+            }
+        }
         for index in ["index.js", "index.mjs", "index.cjs", "index.json"] {
             let candidate = base.join(index);
             if candidate.is_file() {
@@ -372,15 +398,77 @@ fn probe_file(base: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The entry a directory's own `package.json` names, if it has one.
+///
+/// ## The shape this exists for
+///
+/// The pre-`exports` convention for publishing a secondary entry point: ship a
+/// directory containing **nothing but a `package.json`** that redirects into
+/// the real build output. `react-remove-scroll-bar/constants/package.json` is
+/// the case that found this — it holds only
+/// `"module": "../dist/es2015/constants.js"` — and **every Radix primitive
+/// depends on it**, so the whole shadcn layer failed to resolve while this
+/// probe looked for `constants.js` and `constants/index.js` and concluded the
+/// file did not exist.
+///
+/// 🪤 **It was invisible until the format classifier was fixed.** These packages
+/// were being lowered as CJS, so their `import` statements were never scanned,
+/// so this dependency was never resolved and never had the chance to fail —
+/// they "loaded" with an unwalked graph and threw later at evaluation instead.
+/// One bug was hiding the other.
+///
+/// 🔑 `module` before `main`, mirroring [`resolve_bare_entry`]: both fields name
+/// the same code and the former is the ESM build, which is the one this pipeline
+/// wants. Node reads only `main`, which is why Node reaches a different file
+/// here and why this is not a place to copy Node exactly.
+///
+/// The directory's `exports` map is deliberately **not** consulted: `exports`
+/// governs a *package* reached through `node_modules`, not a folder reached by
+/// path, and these redirect stubs predate it.
+fn directory_entry_target(dir: &Path) -> Option<String> {
+    let manifest_path = dir.join("package.json");
+    if !manifest_path.is_file() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&manifest_path).ok()?;
+    let manifest: PackageManifest = serde_json::from_str(&raw).ok()?;
+    manifest.module.or(manifest.main)
+}
+
 /// How a resolved file should be lowered.
-fn classify_format(path: &Path) -> NpmModuleFormat {
+///
+/// ## Why the source is consulted and Node's rule is not enough
+///
+/// 🔴 **Node's rule — extension, then the nearest `package.json` `"type"`,
+/// defaulting to CJS — is exactly what this used to implement, and it is wrong
+/// *here*, because this resolver does not resolve like Node.** Entry selection
+/// prefers the **`"module"` field** (`manifest.module.or(manifest.main)`), as
+/// every bundler does, and that field means ESM **by definition**. Node never
+/// reads it, so Node never has to reconcile the two. We do.
+///
+/// `clsx` is the minimal case and the one that found this: its manifest carries
+/// `"module": "dist/clsx.m.js"` and no `"type"`, so the resolver picks an ESM
+/// file whose extension is `.js` (the `.m` is part of the *basename*) and the
+/// old classifier called it CJS. The CJS lowering wraps source verbatim in a
+/// `function(module, exports, require, …)` IIFE — so `export function clsx(){}`
+/// landed inside a function body and QuickJS answered *"unsupported keyword:
+/// export"*. **The lowering was innocent; the label was wrong.**
+///
+/// 🔑 **Provenance alone would not have been enough.** Marking only the entry
+/// ESM fixes `clsx` and misses `date-fns`, whose `esm/index.js` entry relatively
+/// imports a whole tree of ESM `.js` files that no manifest describes. The
+/// format is a property of the *file*, so the file is what gets asked.
+///
+/// Node's answer is still taken first when it says ESM (an explicit
+/// `"type": "module"` is a declaration, not a guess); the content check only
+/// ever *promotes* a would-be CJS file, and only on evidence.
+fn classify_format(path: &Path, source: &str) -> NpmModuleFormat {
     match path.extension().and_then(|e| e.to_str()) {
         Some("mjs") => NpmModuleFormat::Esm,
         Some("cjs") => NpmModuleFormat::Cjs,
         Some("json") => NpmModuleFormat::Json,
         _ => {
-            // `.js` (or anything else): nearest package.json `"type"` decides,
-            // defaulting to CJS exactly like Node.
+            // `.js` (or anything else): nearest package.json `"type"` first.
             let mut dir = path.parent();
             while let Some(current) = dir {
                 let manifest_path = current.join("package.json");
@@ -389,17 +477,103 @@ fn classify_format(path: &Path) -> NpmModuleFormat {
                         .ok()
                         .and_then(|raw| serde_json::from_str::<PackageManifest>(&raw).ok())
                         .and_then(|manifest| manifest.module_type);
-                    return if module_type.as_deref() == Some("module") {
-                        NpmModuleFormat::Esm
-                    } else {
-                        NpmModuleFormat::Cjs
-                    };
+                    if module_type.as_deref() == Some("module") {
+                        return NpmModuleFormat::Esm;
+                    }
+                    break;
                 }
                 dir = current.parent();
             }
-            NpmModuleFormat::Cjs
+            if source_is_esm(source) {
+                NpmModuleFormat::Esm
+            } else {
+                NpmModuleFormat::Cjs
+            }
         }
     }
+}
+
+/// Does this source actually use module syntax?
+///
+/// Two stages, because the cheap one is wrong on its own and the correct one is
+/// too expensive to run over every file in a 1,771-file graph like
+/// `lucide-react`:
+///
+/// 1. A word-boundary scan for `import` / `export`. 🪤 **A plain substring test
+///    is useless here** — `exports.foo`, the single most common token in CJS,
+///    contains `export`. The boundary check is what keeps the parse off the
+///    overwhelming majority of CJS files.
+/// 2. A real parse for the files that survive it. Only a top-level
+///    `ModuleDecl` (or `import.meta`) is proof; a *dynamic* `import()` call is
+///    legal in CJS and must not promote the file, which is precisely the
+///    distinction a text scan cannot make and a parse makes for free.
+///
+/// An unparseable file is left as CJS: if it will not parse as a module it
+/// cannot be one, and the CJS path passes source through verbatim, so a file
+/// this cannot classify still has the better of the two chances.
+fn source_is_esm(source: &str) -> bool {
+    if !has_module_keyword(source) {
+        return false;
+    }
+
+    let source_map: Lrc<SourceMap> = Lrc::default();
+    let file = source_map.new_source_file(
+        FileName::Custom("classify".to_string()).into(),
+        source.to_string(),
+    );
+    let Ok(module) = Parser::new(
+        Syntax::Es(EsSyntax {
+            jsx: false,
+            decorators: true,
+            ..Default::default()
+        }),
+        StringInput::from(&*file),
+        None,
+    )
+    .parse_module() else {
+        return false;
+    };
+
+    if module
+        .body
+        .iter()
+        .any(|item| matches!(item, ModuleItem::ModuleDecl(_)))
+    {
+        return true;
+    }
+
+    // `import.meta` is an expression, not a `ModuleDecl`, so the check above
+    // misses it — and a file using it is unambiguously a module. This is the
+    // `import.meta only valid in module code` class of failure.
+    source.contains("import.meta")
+}
+
+/// `import` or `export` present as a whole word.
+///
+/// Deliberately not a regex: this runs once per file across every npm graph in
+/// the project, and the rule is small enough to say directly.
+fn has_module_keyword(source: &str) -> bool {
+    const KEYWORDS: [&str; 2] = ["import", "export"];
+    let bytes = source.as_bytes();
+    let is_ident_byte =
+        |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+
+    for keyword in KEYWORDS {
+        let mut from = 0usize;
+        while let Some(offset) = source[from..].find(keyword) {
+            let start = from + offset;
+            let end = start + keyword.len();
+            let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+            // `exports` / `imported` must not count; `export{`, `export ` and
+            // `export*` must.
+            let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
 }
 
 /// A package the walker has located on disk.
@@ -674,7 +848,7 @@ pub fn bundle_npm_dependency(
             path: path.clone(),
             message: err.to_string(),
         })?;
-        let format = classify_format(&path);
+        let format = classify_format(&path, &source);
 
         // Resolve every raw specifier this file references to a record key,
         // queueing newly-discovered files.
@@ -749,6 +923,81 @@ pub fn bundle_npm_dependencies(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+
+    // ── format classification ──────────────────────────────────────────
+    //
+    // The bug these pin: entry resolution prefers the `"module"` field, which
+    // is ESM by definition, while classification followed Node — extension,
+    // then `"type"`, default CJS. Node never reads `"module"`, so Node never
+    // has to reconcile them; this bundler does. An ESM file labelled CJS gets
+    // wrapped verbatim in a `function(module, exports, …)` IIFE, putting
+    // `export` inside a function body, and QuickJS answers *"unsupported
+    // keyword: export"*. It was ~46 of 79 evaluation failures across the
+    // measured corpus, and one such package in a project broke **every action
+    // in that project**, because `preload_npm_bundles` loads them all.
+
+    /// `clsx@1.2.1/dist/clsx.m.js`, byte for byte — the minimal real case, and
+    /// the one that found this. Note the extension is `.js`: the `.m` belongs
+    /// to the *basename*, so nothing about the path says ESM.
+    const CLSX_MINIFIED_ESM: &str = r#"function r(e){var t,f,n="";if("string"==typeof e)n+=e;return n}export function clsx(){return ""}export default clsx;"#;
+
+    #[test]
+    fn a_minified_esm_file_named_dot_js_is_detected_as_esm() {
+        assert!(
+            source_is_esm(CLSX_MINIFIED_ESM),
+            "`export` after a `}}` with no whitespace is still an export"
+        );
+    }
+
+    #[test]
+    fn a_cjs_file_using_exports_is_not_promoted() {
+        // 🪤 The reason the keyword scan is word-boundary and not a substring
+        // test: `exports` *contains* `export`, and it is the single most common
+        // token in CommonJS. A substring test would parse every CJS file and
+        // promote the ones whose parse happened to succeed.
+        assert!(!source_is_esm(
+            "exports.foo = 1; module.exports = { bar: 2 }; const imported = require('x');"
+        ));
+        assert!(!has_module_keyword("exports.a = 1; var imported = 2;"));
+    }
+
+    #[test]
+    fn a_dynamic_import_alone_does_not_make_a_file_a_module() {
+        // `import(...)` is legal in CommonJS. Only a top-level declaration (or
+        // `import.meta`) is proof, which is exactly what the parse — and not
+        // the text scan — can tell.
+        assert!(!source_is_esm(
+            "module.exports = async () => { const m = await import('node:fs'); return m; };"
+        ));
+    }
+
+    #[test]
+    fn import_meta_promotes_a_file_with_no_module_declarations() {
+        // An expression, not a `ModuleDecl`, so the declaration check misses it
+        // — this is the `import.meta only valid in module code` failure class.
+        assert!(source_is_esm("const url = import.meta.url; module.exports = url;"));
+    }
+
+    #[test]
+    fn every_export_form_the_corpus_produced_is_detected() {
+        for source in [
+            "export * from './a';",              // Unexpected token '*'
+            "export { a as b } from './a';",     // Unexpected token '{'
+            "export default function () {}",
+            "const e = 1; export { e };",
+            "import a from './a'; a();",
+        ] {
+            assert!(source_is_esm(source), "not detected as ESM: {source}");
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_module_syntax_stays_cjs() {
+        assert!(!source_is_esm("function a() { return 1; } a();"));
+        // Unparseable source is left CJS: if it will not parse as a module it
+        // cannot be one, and the CJS path passes source through verbatim.
+        assert!(!source_is_esm("export export export"));
+    }
 
     #[test]
     fn bare_specifier_detection() {
@@ -905,6 +1154,117 @@ mod tests {
         let alias = bundle.artifacts.last().unwrap();
         assert_eq!(alias.key, "tinylib");
         assert!(alias.script.contains("__ALBEDO_NPM_ALIASES"));
+    }
+
+    /// `react-remove-scroll-bar/constants`, reproduced exactly: a subpath that
+    /// is a **directory containing nothing but a redirecting `package.json`**.
+    ///
+    /// The pre-`exports` way to publish a secondary entry point, and every Radix
+    /// primitive depends on this one package — so while `probe_file` looked only
+    /// for `constants.js` and `constants/index.js`, the entire shadcn layer was
+    /// unresolvable.
+    #[test]
+    fn a_directory_subpath_resolves_through_its_own_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules").join("scroll-bar");
+        std::fs::create_dir_all(pkg.join("dist").join("es2015")).unwrap();
+        std::fs::create_dir_all(pkg.join("constants")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "scroll-bar", "version": "2.3.8", "module": "dist/es2015/index.js" }"#,
+        )
+        .unwrap();
+        // Nothing but the redirect — no `constants.js`, no `constants/index.js`.
+        // The `../` in the target is the shape that makes this a real path
+        // resolution and not a name lookup.
+        std::fs::write(
+            pkg.join("constants").join("package.json"),
+            r#"{ "private": true, "main": "../dist/es5/constants.js",
+                 "module": "../dist/es2015/constants.js" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("dist").join("es2015").join("constants.js"),
+            "export const zeroRightClassName = 'right-0';",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("dist").join("es2015").join("index.js"),
+            "export const noop = 1;",
+        )
+        .unwrap();
+
+        let bundle = bundle_npm_dependency(dir.path(), "scroll-bar/constants").unwrap();
+        assert_eq!(
+            bundle.entry_key, "npm:scroll-bar@2.3.8/dist/es2015/constants.js",
+            "the directory's own manifest must redirect the probe, and `module` \
+             must win over `main` the way `resolve_bare_entry` picks an entry"
+        );
+    }
+
+    /// The redirect is tried *before* the index probe, because a directory may
+    /// carry both and Node's LOAD_AS_DIRECTORY reads the manifest first.
+    #[test]
+    fn a_directory_manifest_wins_over_an_index_file_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules").join("both");
+        std::fs::create_dir_all(pkg.join("sub")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "both", "version": "1.0.0", "main": "sub/index.js" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("sub").join("package.json"),
+            r#"{ "main": "./real.js" }"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("sub").join("real.js"), "module.exports = 'real';").unwrap();
+        std::fs::write(pkg.join("sub").join("index.js"), "module.exports = 'index';").unwrap();
+
+        let bundle = bundle_npm_dependency(dir.path(), "both/sub").unwrap();
+        assert_eq!(bundle.entry_key, "npm:both@1.0.0/sub/real.js");
+    }
+
+    /// A manifest pointing at nothing must not veto the ordinary path — the
+    /// folder can still be resolvable the normal way.
+    #[test]
+    fn a_broken_directory_manifest_falls_through_to_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules").join("broken");
+        std::fs::create_dir_all(pkg.join("sub")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "broken", "version": "1.0.0", "main": "sub/index.js" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("sub").join("package.json"),
+            r#"{ "main": "./does-not-exist.js" }"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("sub").join("index.js"), "module.exports = 'index';").unwrap();
+
+        let bundle = bundle_npm_dependency(dir.path(), "broken/sub").unwrap();
+        assert_eq!(bundle.entry_key, "npm:broken@1.0.0/sub/index.js");
+    }
+
+    /// A manifest that redirects to its own directory would recurse forever.
+    /// The bound turns a malformed package into a refusal instead of a hang.
+    #[test]
+    fn a_self_referential_directory_manifest_terminates() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules").join("loop");
+        std::fs::create_dir_all(pkg.join("sub")).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{ "name": "loop", "version": "1.0.0", "main": "sub" }"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("sub").join("package.json"), r#"{ "main": "." }"#).unwrap();
+
+        let err = bundle_npm_dependency(dir.path(), "loop").unwrap_err();
+        assert!(matches!(err, NpmBundleError::FileNotFound { .. }));
     }
 
     #[test]
