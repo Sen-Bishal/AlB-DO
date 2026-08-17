@@ -62,6 +62,35 @@ pub type ActionRegistry = HashMap<u32, Arc<dyn ActionHandler>>;
 /// is served and cannot be influenced by one.
 pub type FormActionIds = std::collections::HashSet<u32>;
 
+/// AUTH § 8.1.3 · the set of `action_id`s declared in a route module whose
+/// `export const auth` is `"required"`, and therefore refused to an anonymous
+/// caller.
+///
+/// ## Why an action inherits its route's gate rather than declaring its own
+///
+/// Because that is where the author already said it. An action is not a
+/// free-floating endpoint here — it is exported from a route module, and the
+/// manifest records which route each `action_id` came from
+/// (`RouteManifest.action_ids`). So the gate is **derived from the declaration
+/// that already exists** rather than authored a second time, which is the same
+/// move § 4 makes for reads and avoids the failure a second declaration
+/// invites: a route marked `required` whose form still submits, because nobody
+/// remembered there were two places to say so.
+///
+/// ## The collision rule is restrictive, on purpose
+///
+/// An `action_id` is `FNV-1a-32(name)`, and duplicate names are refused only
+/// **within one module** — two different route files may both export `submit`
+/// and land on one id. When that id is declared on a gated route and a public
+/// one, this set contains it: the gate wins. The two failures are not
+/// symmetrical. Taking the permissive answer means a gate is silently defeated
+/// by an unrelated file that happens to reuse a name — the "security property
+/// that changes on an unrelated edit" shape § 8.1.3 rejects when it declined to
+/// *derive* the route default. Taking the restrictive one means a public form
+/// starts answering 401, which is loud, immediate, and in the same breath tells
+/// you two routes are sharing a handler.
+pub type GatedActionIds = std::collections::HashSet<u32>;
+
 /// Request header carrying the per-session CSRF token on every action
 /// POST. The client runtime reads the token from
 /// `globalThis.__ALBEDO_CSRF__` (published by the streaming shell) and
@@ -92,6 +121,7 @@ pub async fn run_action_request(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,
     form_actions: &FormActionIds,
+    gated_actions: &GatedActionIds,
     ctx: RequestContext,
     body: Bytes,
     slots: SessionSlots,
@@ -108,7 +138,18 @@ pub async fn run_action_request(
         }
     };
 
-    match dispatch_action(registry, csrf, form_actions, &ctx, &envelope, slots, overlay).await {
+    match dispatch_action(
+        registry,
+        csrf,
+        form_actions,
+        gated_actions,
+        &ctx,
+        &envelope,
+        slots,
+        overlay,
+    )
+    .await
+    {
         Ok(instructions) => frame_response(instructions),
         Err(refusal) => refusal,
     }
@@ -145,6 +186,7 @@ pub async fn run_form_action_request(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,
     form_actions: &FormActionIds,
+    gated_actions: &GatedActionIds,
     ctx: RequestContext,
     action_name: &str,
     body: Bytes,
@@ -178,7 +220,18 @@ pub async fn run_form_action_request(
         payload: form.to_action_payload(),
     };
 
-    match dispatch_action(registry, csrf, form_actions, &ctx, &envelope, slots, overlay).await {
+    match dispatch_action(
+        registry,
+        csrf,
+        form_actions,
+        gated_actions,
+        &ctx,
+        &envelope,
+        slots,
+        overlay,
+    )
+    .await
+    {
         Ok(instructions) => match wants {
             Wants::Frame => frame_response(instructions),
             // The opcodes are deliberately dropped here, and that is not a loss:
@@ -209,6 +262,7 @@ async fn dispatch_action(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,
     form_actions: &FormActionIds,
+    gated_actions: &GatedActionIds,
     ctx: &RequestContext,
     envelope: &ActionEnvelope,
     slots: SessionSlots,
@@ -279,6 +333,37 @@ async fn dispatch_action(
                 ),
             ));
         }
+    }
+
+    // AUTH § 8.1.3 · the declaring route's gate.
+    //
+    // Here rather than in the dispatcher for the reason the CSRF gate above is
+    // here: two entry points reach this function — the bincode envelope and the
+    // no-JS `POST /_albedo/action/{name}` — and only one of them knows what it
+    // is dispatching before it reads the body. A check placed upstream would
+    // therefore have to be written twice, and the second copy is where a rule
+    // goes to disagree with the first.
+    //
+    // 🔑 **The read gate does not imply this one, which is why it was missing.**
+    // F1 refuses an anonymous write to an *identity-partitioned* collection, so
+    // the case P1 created was covered. An action on a gated route that appends
+    // to a global collection is partitioned by nothing, has no owner to compare
+    // against, and was executed for anyone who could obtain a CSRF token from
+    // any public page on the same origin.
+    //
+    // After the CSRF check, deliberately: a request that is not genuine should
+    // be refused as forged whatever it was aiming at, and keeping this second
+    // preserves *the CSRF check always runs* as an unqualified sentence.
+    if gated_actions.contains(&envelope.action_id) && ctx.principal.is_none() {
+        warn!(
+            action_id = envelope.action_id,
+            "anonymous dispatch refused: this action is declared on a route with \
+             `auth = \"required\"`",
+        );
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "this action is only available to signed-in users".to_string(),
+        ));
     }
 
     let handler = match registry.get(&envelope.action_id) {
@@ -455,6 +540,18 @@ mod tests {
         FormActionIds::new()
     }
 
+    /// A project with no gated routes — what every test below this line
+    /// assumes, and what an app that never writes `export const auth`
+    /// produces. The gate's own tests build their set explicitly.
+    fn no_gated_actions() -> GatedActionIds {
+        GatedActionIds::new()
+    }
+
+    /// The `action_id`s of routes declared `auth = "required"`.
+    fn gated_actions(ids: &[u32]) -> GatedActionIds {
+        ids.iter().copied().collect()
+    }
+
     /// The dispatcher tests below don't exercise CSRF, but every action
     /// must now clear the gate, so they need a valid token. Mint one for
     /// a fresh session in `reg` and return a context presenting it in the
@@ -505,6 +602,7 @@ mod tests {
             &registry,
             &reg,
             &no_form_actions(),
+            &no_gated_actions(),
             ctx,
             body,
             slots,
@@ -536,6 +634,7 @@ mod tests {
             &registry,
             &csrf(),
             &no_form_actions(),
+            &no_gated_actions(),
             ctx(),
             Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]),
             slots(),
@@ -562,6 +661,7 @@ mod tests {
             &registry,
             &reg,
             &no_form_actions(),
+            &no_gated_actions(),
             ctx,
             body,
             slots,
@@ -595,6 +695,7 @@ mod tests {
             &registry,
             &reg,
             &no_form_actions(),
+            &no_gated_actions(),
             ctx,
             body,
             slots,
@@ -637,6 +738,7 @@ mod tests {
             &registry,
             &reg,
             &no_form_actions(),
+            &no_gated_actions(),
             ctx,
             body,
             view,
@@ -711,6 +813,7 @@ mod tests {
             &registry,
             &csrf_registry,
             &form_actions(&[99]),
+            &no_gated_actions(),
             ctx(),
             body,
             slots_for(session),
@@ -750,6 +853,7 @@ mod tests {
             &registry,
             &csrf_registry,
             &form_actions(&[99]),
+            &no_gated_actions(),
             ctx(),
             body,
             slots_for(session),
@@ -794,6 +898,7 @@ mod tests {
             &registry,
             &csrf_registry,
             &no_form_actions(),
+            &no_gated_actions(),
             ctx(),
             body,
             slots_for(session),
@@ -839,6 +944,7 @@ mod tests {
             &registry,
             &csrf_registry,
             &no_form_actions(),
+            &no_gated_actions(),
             ctx_with_csrf_header(&token),
             body,
             slots_for(session),
@@ -877,6 +983,7 @@ mod tests {
             &registry,
             &csrf_registry,
             &no_form_actions(),
+            &no_gated_actions(),
             ctx_with_csrf_header("00000000000000000000000000000000"),
             body,
             slots_for(session),
@@ -921,6 +1028,7 @@ mod tests {
             &registry,
             &csrf_registry,
             &form_actions(&[99]),
+            &no_gated_actions(),
             ctx_with_csrf_header(&token),
             body,
             slots_for(session),
@@ -966,6 +1074,7 @@ mod tests {
             &registry,
             &csrf_registry,
             &form_actions(&[99]),
+            &no_gated_actions(),
             ctx(),
             body,
             slots_for(session),
@@ -1006,6 +1115,7 @@ mod tests {
             &registry,
             &csrf_registry,
             &form_actions(&[99]),
+            &no_gated_actions(),
             ctx(),
             body,
             slots_for(session),
@@ -1068,6 +1178,7 @@ mod tests {
             &echoing_registry("sign_guestbook", seen.clone()),
             &csrf_registry,
             &form_actions(&[allocate_form_action_id("sign_guestbook")]),
+            &no_gated_actions(),
             form_ctx(Some("text/html,*/*;q=0.8")),
             "sign_guestbook",
             body,
@@ -1111,6 +1222,7 @@ mod tests {
             &registry,
             &csrf_registry,
             &form_actions(&[allocate_form_action_id("sign_guestbook")]),
+            &no_gated_actions(),
             form_ctx(None),
             "sign_guestbook",
             Bytes::from_static(b"author=ada"),
@@ -1136,6 +1248,7 @@ mod tests {
             &echoing_registry("save", seen),
             &csrf_registry,
             &form_actions(&[allocate_form_action_id("save")]),
+            &no_gated_actions(),
             form_ctx(None),
             "save",
             Bytes::from(format!(
@@ -1163,6 +1276,7 @@ mod tests {
             &echoing_registry("save", seen),
             &csrf_registry,
             &no_form_actions(),
+            &no_gated_actions(),
             form_ctx(Some("application/octet-stream")),
             "save",
             Bytes::from(format!("_csrf={token}&x=1")),
@@ -1195,6 +1309,7 @@ mod tests {
             &HashMap::new(),
             &csrf_registry,
             &no_form_actions(),
+            &no_gated_actions(),
             ctx,
             "save",
             Bytes::from_static(br#"{"x":1}"#),
@@ -1217,6 +1332,7 @@ mod tests {
             &HashMap::new(),
             &csrf_registry,
             &no_form_actions(),
+            &no_gated_actions(),
             form_ctx(None),
             "no_such_action",
             Bytes::from(format!("_csrf={token}")),
@@ -1225,6 +1341,163 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── AUTH § 8.1.3 · the route gate on the action path ─────────────
+    //
+    // The gap these close: `export const auth = "required"` was enforced at the
+    // page render and nowhere else, so the action the gated page declares ran
+    // for anyone holding a CSRF token from any public page on the origin.
+    //
+    // 🔑 Every refusal test below is paired with the *same* dispatch under a
+    // principal. A gate that refused unconditionally passes the refusal half and
+    // is indistinguishable from a correct one without the control — the lesson
+    // F1's browser proof paid for.
+
+    /// A principal, for a context that has one.
+    fn someone() -> dom_render_compiler::auth::PrincipalId {
+        dom_render_compiler::auth::PrincipalId::mint()
+    }
+
+    /// A bincode envelope naming one action and carrying nothing else — these
+    /// tests are about who may dispatch, not about what the payload says.
+    fn encode_envelope(action_id: u32) -> Vec<u8> {
+        encode_action_envelope(&ActionEnvelope {
+            action_id,
+            event_kind: 0,
+            payload: Vec::new(),
+        })
+        .expect("envelope encodes")
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_dispatch_of_a_gated_action_is_refused() {
+        let csrf_registry = CsrfRegistry::new();
+        let (ctx, slots) = authed(&csrf_registry);
+        let registry = echoing_registry("admin_write", Arc::new(std::sync::Mutex::new(Vec::new())));
+        let gated = allocate_form_action_id("admin_write");
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            &no_form_actions(),
+            &gated_actions(&[gated]),
+            ctx,
+            Bytes::from(encode_envelope(gated)),
+            slots,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an action declared on a route that requires a principal must not run without one"
+        );
+    }
+
+    /// The control. Same action, same gate, same token — a resolved principal.
+    #[tokio::test]
+    async fn the_same_gated_action_runs_for_a_resolved_principal() {
+        let csrf_registry = CsrfRegistry::new();
+        let (mut ctx, slots) = authed(&csrf_registry);
+        ctx.principal = Some(someone());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = echoing_registry("admin_write", seen.clone());
+        let gated = allocate_form_action_id("admin_write");
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            &no_form_actions(),
+            &gated_actions(&[gated]),
+            ctx,
+            Bytes::from(encode_envelope(gated)),
+            slots,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The gate is a property of the action, not of the transport. The no-JS
+    /// form path names its action in the URL instead of the body and must reach
+    /// the identical answer — a browser without JavaScript is not a way around
+    /// signing in.
+    #[tokio::test]
+    async fn the_no_js_form_path_refuses_a_gated_action_anonymously() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let token = csrf_registry.token_for(session);
+        let registry = echoing_registry("admin_write", Arc::new(std::sync::Mutex::new(Vec::new())));
+
+        let response = run_form_action_request(
+            &registry,
+            &csrf_registry,
+            &no_form_actions(),
+            &gated_actions(&[allocate_form_action_id("admin_write")]),
+            form_ctx(None),
+            "admin_write",
+            Bytes::from(format!("_csrf={token}")),
+            slots_for(session),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_no_js_form_path_runs_a_gated_action_for_a_principal() {
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let token = csrf_registry.token_for(session);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = echoing_registry("admin_write", seen);
+        let mut ctx = form_ctx(None);
+        ctx.principal = Some(someone());
+
+        let response = run_form_action_request(
+            &registry,
+            &csrf_registry,
+            &no_form_actions(),
+            &gated_actions(&[allocate_form_action_id("admin_write")]),
+            ctx,
+            "admin_write",
+            Bytes::from(format!("_csrf={token}")),
+            slots_for(session),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    /// The other direction, and the one that says this gate is narrow: an action
+    /// on an undeclared route is untouched. Most apps declare nothing, and for
+    /// them this set is empty and the check always misses.
+    #[tokio::test]
+    async fn an_ungated_action_still_dispatches_anonymously() {
+        let csrf_registry = CsrfRegistry::new();
+        let (ctx, slots) = authed(&csrf_registry);
+        let registry = echoing_registry("public_write", Arc::new(std::sync::Mutex::new(Vec::new())));
+        let id = allocate_form_action_id("public_write");
+
+        let response = run_action_request(
+            &registry,
+            &csrf_registry,
+            &no_form_actions(),
+            // A *different* action is gated — this one is not.
+            &gated_actions(&[allocate_form_action_id("admin_write")]),
+            ctx,
+            Bytes::from(encode_envelope(id)),
+            slots,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

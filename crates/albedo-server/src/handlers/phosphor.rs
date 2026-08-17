@@ -124,9 +124,22 @@ const HELLO_EVENT: &str = "hello";
 /// *sufficient* now. A partition is reachable only through a route that renders
 /// it (PRISM invariant 2), so this grants exactly the read the page GET already
 /// granted — and a page GET by an anonymous visitor resolves no identity-keyed
-/// topic, so neither does this. There is no separate policy check, because there
-/// is no separate question: an unauthorized read is one this function cannot
-/// produce a topic name for.
+/// topic, so neither does this.
+///
+/// 🔴 **That sentence used to end with *"there is no separate policy check,
+/// because there is no separate question"*, and it was wrong from the moment
+/// `export const auth` shipped.** It is true of derived authorization: an
+/// unauthorized *read* is one the resolver cannot produce a topic name for. It
+/// is false of a **declared** route gate, which refuses a page whose topics
+/// resolve perfectly well for everybody — § 8.1.3's motivating case is a
+/// dashboard over global data, where there is nothing to derive. For four days
+/// the page GET answered 401 and this function answered with the rows.
+///
+/// So there *is* a separate question, and the implementation answers it in the
+/// one place both live lanes pass through
+/// (`server::resolve_route_topics_detailed`) rather than here — same reason the
+/// render and subscribe paths share one topic resolver: two copies of an
+/// authorization rule are two rules.
 ///
 /// 🔑 **`principal`, not `SessionId`.** The two are different things and the
 /// distinction is load-bearing: a `SessionId` is a *tab* — minted for anyone who

@@ -6,7 +6,7 @@ use crate::contract::{
     RuntimeMiddleware,
 };
 use crate::error::RuntimeError;
-use crate::handlers::action::{run_action_request, ActionRegistry, FormActionIds};
+use crate::handlers::action::{run_action_request, ActionRegistry, FormActionIds, GatedActionIds};
 use crate::handlers::api::dispatch_api_route;
 use crate::handlers::public_assets::PublicAssets;
 use crate::handlers::{
@@ -667,6 +667,12 @@ struct RenderWorld {
     /// the dispatcher never has to ask a request whether it ought to be
     /// checked.
     form_action_ids: Arc<FormActionIds>,
+    /// AUTH § 8.1.3 — `action_id`s declared on a route whose `export const auth`
+    /// is `"required"`. Derived from the manifest at build (see
+    /// [`GatedActionIds`]), so the dispatcher answers *may this caller run this*
+    /// from a table fixed before any request arrived, exactly as the CSRF set
+    /// above is.
+    gated_action_ids: Arc<GatedActionIds>,
     layouts: Arc<HashMap<String, SharedLayoutHandler>>,
     middleware: Arc<HashMap<String, SharedMiddleware>>,
     auth_provider: SharedAuthProvider,
@@ -1539,6 +1545,34 @@ impl AlbedoServerBuilder {
             Arc::new(state)
         });
 
+        // AUTH § 8.1.3 · derive the gated-action set from the manifest, once.
+        //
+        // Read off `RouteManifest.action_ids` — the record of which route module
+        // each `action_id` was exported from — so an action's gate is the gate
+        // its author already wrote on the route, and there is no second place to
+        // declare (or forget) it.
+        //
+        // 🔑 Built here rather than in `with_compiled_project`, because the
+        // question is about a *route*, and routes live in the manifest. The
+        // compiled project knows which actions exist; only the manifest knows
+        // where each one was written.
+        //
+        // A project with no gated route produces an empty set and the check
+        // below is one hash lookup that always misses — which is the price of
+        // it being unconditional rather than something a request could skip.
+        let gated_action_ids: GatedActionIds = streaming_runtime
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .manifest
+                    .routes
+                    .values()
+                    .filter(|route| !route.auth.allows_anonymous())
+                    .flat_map(|route| route.action_ids.iter().map(|entry| entry.action_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let has_entry_routes = self
             .config
             .routes
@@ -1653,6 +1687,7 @@ impl AlbedoServerBuilder {
             // action dispatcher validates against.
             csrf: csrf_registry.clone(),
             form_action_ids: Arc::new(self.form_action_ids),
+            gated_action_ids: Arc::new(gated_action_ids),
             layouts: Arc::new(self.layouts),
             middleware: Arc::new(self.middleware),
             auth_provider: self.auth_provider,
@@ -3073,6 +3108,7 @@ async fn run_action_route(
         world.action_handlers.as_ref(),
         world.csrf.as_ref(),
         world.form_action_ids.as_ref(),
+        world.gated_action_ids.as_ref(),
         ctx,
         body,
         slots,
@@ -3165,6 +3201,7 @@ async fn run_form_action_route(
         world.action_handlers.as_ref(),
         world.csrf.as_ref(),
         world.form_action_ids.as_ref(),
+        world.gated_action_ids.as_ref(),
         ctx,
         &action_name,
         body,
@@ -3335,6 +3372,33 @@ fn resolve_route_topics_detailed(
     let Some(route) = streaming.manifest.routes.get(pattern.as_str()) else {
         return Some((Vec::new(), Vec::new(), Vec::new()));
     };
+
+    // AUTH § 8.1.3 · the route's declared gate, enforced on the live lanes.
+    //
+    // 🔑 **This is the second half of a check that shipped as one.** The gate
+    // was built at the page render and nowhere else, on the reasoning recorded
+    // at `RouteAuthority` — *a subscribe grants exactly the read the page GET
+    // already granted*. That held while the only way a page GET could refuse
+    // was resolving no topic. `export const auth` added a second way to refuse,
+    // and it is not expressible as an absent topic: a route over global data
+    // resolves the same public topics for everyone, so an anonymous lane was
+    // handed the rows of a page whose GET had just answered 401.
+    //
+    // This is F2's shape a second time. The line never changed; what it was
+    // reasoning about did.
+    //
+    // Placed **before** resolution rather than after, for the reason the render
+    // path gives at its own gate: a refusal must cost nothing, and warming a
+    // partition out of FORGE for a lane that may not have it is work done on
+    // behalf of a request already refused.
+    if !route.auth.allows_anonymous() && principal.is_none() {
+        debug!(
+            target: "albedo.auth",
+            route = %pattern,
+            "anonymous lane refused by the route's `auth = \"required\"`"
+        );
+        return None;
+    }
 
     // PRISM · the same resolver the render path calls, over the same matched
     // params. A spec whose param the route did not match, or whose key is

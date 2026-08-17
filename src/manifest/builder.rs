@@ -22,6 +22,7 @@ use crate::runtime::compiled::{
 use crate::runtime::eval::ComponentProject;
 use crate::runtime::session::SessionId;
 use crate::runtime::slot_store::{SessionSlotView, SlotStore};
+use crate::transforms::form::allocate_form_action_id;
 use crate::runtime::webtransport::{
     WTRenderMode, WTStreamRouter, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
     WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
@@ -224,11 +225,10 @@ impl<'a> ManifestBuilder<'a> {
             .map(|cp| cp.project.shared_slot_topics())
             .unwrap_or_default();
 
-        // Action IDs come from CompiledComponent.action_handlers,
-        // which is empty until Stream C ships. The lookup path is
-        // future-proofed here so Stream C doesn't need a second
-        // schema bump.
-        let action_ids = self.collect_route_action_ids();
+        // AUTH § 8.1.3 · which actions this route declares. Now a real
+        // attribution rather than a stub — the route's gate is enforced on the
+        // action path by looking each dispatched id up in here.
+        let action_ids = self.collect_route_action_ids(root_component);
 
         // Layout chain comes from discover_routes when `<root>/routes/`
         // exists. Empty otherwise.
@@ -418,13 +418,61 @@ impl<'a> ManifestBuilder<'a> {
         self.component_name_for_rel_path(rel.as_path())
     }
 
-    /// Collect TS-action handler names + their wire IDs for this
-    /// route. Empty until Stream C lands the `action()` extractor
-    /// (which adds `action_handlers` to `CompiledComponent`). Kept as
-    /// a method so the call site in `build_route_manifest` reads
-    /// uniformly even before Stream C wires real data here.
-    fn collect_route_action_ids(&self) -> Vec<RouteActionEntry> {
-        Vec::new()
+    /// Collect the TS-action handler names + wire IDs **this route's leaf
+    /// module declares**.
+    ///
+    /// ## This was a stub, and the stub was load-bearing
+    ///
+    /// It returned `Vec::new()` unconditionally with a comment promising Stream
+    /// C would fill it — so `RouteManifest.action_ids` was `[]` in every
+    /// manifest the compiler has ever emitted, and any consumer of it was
+    /// reading a field that could not be non-empty. AUTH § 8.1.3's action gate
+    /// is that consumer: it asks *which route declared this action* in order to
+    /// apply that route's `export const auth`. Against the stub the gate
+    /// compiled, tested green against a hand-written manifest, and refused
+    /// nothing in a real build.
+    ///
+    /// 🪤 **That is the reachability trap for the third time in this codebase** —
+    /// APERTURE's egress check that nothing routed to, P2's CSRF token no form
+    /// could obtain, and this. The common shape: the mechanism is correct and
+    /// the *input it judges* is unreachable, so every test that supplies the
+    /// input itself passes.
+    ///
+    /// ## Where the attribution comes from
+    ///
+    /// The same place [`Self::extract_route_auth`] reads its declaration: the
+    /// route leaf's parsed module. `action_declarations` is populated by the
+    /// `action()` extractor on every parse, so both halves of the rule — the
+    /// gate and the actions it governs — are read off one module, and a route
+    /// cannot acquire a gate that names actions from a different file.
+    ///
+    /// `action_id` is `FNV-1a-32(name)` via [`allocate_form_action_id`], the
+    /// same hash the renderers stamp into `data-albedo-action` and the form path
+    /// recomputes from the URL segment, so this introduces no second naming
+    /// scheme.
+    fn collect_route_action_ids(&self, root_component: ComponentId) -> Vec<RouteActionEntry> {
+        let Some(compiled) = self.compiled_render_project.as_ref() else {
+            return Vec::new();
+        };
+        let Some(component) = self.components.get(&root_component) else {
+            return Vec::new();
+        };
+        let Some(entry) = self.component_entry_for_project(component, compiled.root.as_path())
+        else {
+            return Vec::new();
+        };
+        let Some(module) = compiled.project.module(entry.as_str()) else {
+            return Vec::new();
+        };
+
+        module
+            .action_declarations
+            .iter()
+            .map(|declaration| RouteActionEntry {
+                action_id: allocate_form_action_id(&declaration.name),
+                name: declaration.name.clone(),
+            })
+            .collect()
     }
 
     /// Resolve the layout chain for `route` by looking up the route's
