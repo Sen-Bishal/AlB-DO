@@ -75,15 +75,30 @@ The APIs will still move.
 - **The sign-in flow works with JavaScript disabled.**
 - GCRA rate limiting on credential attempts.
 
+### Calling the outside world
+
+- **`await fetch(...)` works inside a handler or action body** — written as
+  plain JavaScript, exactly as any vendor's sample code spells it. The compiler
+  lowers the `await`; the server suspends the body, resolves the request, and
+  replays it against a journal that answers.
+- A declared `sources` block makes a remote endpoint a topic: it refreshes,
+  paints like any other slot, and generates types into `.albedo/sources.d.ts`.
+- An **egress policy enforced inside the DNS resolver**, so a declared allowlist
+  cannot be walked around by DNS rebinding, by an IP-literal URL, or by a
+  redirect (redirects are refused outright).
+- Response caching, single-flight coalescing, conditional requests, derived
+  idempotency keys, and a request deadline.
+
 ---
 
 ## What isn't done
 
-- **No outbound `fetch()` from your code.** The HTTP client, egress policy,
-  response cache, and request coalescing all exist (`src/aperture/`), but phase
-  A0 deliberately installs no JS-visible `fetch` and nothing in a handler body
-  can reach it yet. Consequences: **no OAuth, no email, no payment provider,
-  no third-party API calls.**
+- **Outbound `fetch()` works, but does not batch or survive a crash.** Three
+  independent GETs in one handler cost three round trips — request hoisting
+  isn't built. The journal is in-memory, so there is no crash recovery and no
+  retry policy for a call that fails halfway.
+- **No OAuth.** Password is the only first-party credential; the outbound half
+  it needs now exists, but the provider flows are not written.
 - **No file uploads.** Zero code in tree.
 - **No passkeys.** Password is the only first-party credential today.
 - **`forwardRef`, `createPortal`, and `useId` do not exist** — verified zero
@@ -233,13 +248,15 @@ AlB'DO's own overhead is — they don't simulate your network or your database.
 
 Roughly in order:
 
-1. **Outbound HTTP reaching userland** — wiring APERTURE's client to the read
-   path and to action bodies. This is what unblocks OAuth, email, and payments,
-   so it gates most of the rest.
-2. **Compatibility** — `forwardRef`, `createPortal`, `useId`, and a Provider
-   value that survives SSR, so existing component libraries work.
-3. **File uploads.**
-4. **A real app, ported** — take an existing React/Next app across and write up
+1. **Compatibility** — `forwardRef`, `createPortal`, `useId`, and a Provider
+   value that survives SSR, so existing component libraries work. This is the
+   largest gap between "it runs my code" and "it runs the code I already have."
+2. **Durability for outbound calls** — persisting the journal so a partially
+   completed call survives a restart, and hoisting independent requests so they
+   batch instead of serializing.
+3. **OAuth**, on top of the outbound path that now exists.
+4. **File uploads.**
+5. **A real app, ported** — take an existing React/Next app across and write up
    the friction honestly.
 
 ---

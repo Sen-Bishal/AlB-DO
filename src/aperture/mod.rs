@@ -3,19 +3,32 @@
 //! *A remote resource is a topic whose derivation is an HTTP GET; a remote
 //! write is a journal entry whose position is its idempotency key.*
 //!
-//! Design: `development-plan/APERTURE.md`. This module is **phase A0** of that
-//! plan: the outbound HTTP client, the shared response cache, request
-//! coalescing, conditional requests, and the egress policy.
+//! Design: `development-plan/APERTURE.md`.
 //!
-//! ## What A0 deliberately is not
+//! ## Phase status
 //!
-//! There is **no JS surface here**. `bridge.rs` is untouched, no global named
-//! `fetch` is installed, and nothing in this module is reachable from a handler
-//! body. Phase A1 wires the read path to `useSharedSlot`; phase A2 adds the
-//! journal and the suspend protocol that let an action body call outward.
+//! - **A0 · the client** ✅ — outbound HTTP, the shared response cache, request
+//!   coalescing, conditional requests, and the egress policy.
+//! - **A1 · the read path** ✅ — declared `sources`, `useSharedSlot(ops.status())`,
+//!   the refresh loop, and `.d.ts` codegen ([`typegen`]).
+//! - **A2 · the protocol and the server seam** ✅ — the journal, suspend/replay,
+//!   `await` lowering, and [`drive_workflow`] called from the action path. An
+//!   authored `await fetch(…)` inside a handler body runs to completion; see
+//!   `tests/aperture_workflow.rs` and the `hook_compile/fetching_handler`
+//!   fixture, which is deliberately verbatim copy-paste-shaped code.
+//! - **A2 · R1.3 hoisting** ❌ — there is no batching. Three independent GETs
+//!   cost 4 passes and 3 round trips.
+//! - **A3 · durable journal** ❌ — the journal is not persisted to FORGE, so
+//!   there is no crash recovery and no retry policy.
 //!
-//! Sequencing it this way is what makes the merge gates unambiguous: gates 3
-//! (conditional requests) and 6 (single-flight) run against this module with no
+//! ⚠️ **This header claimed "A0 only, no JS surface" long after A1 and A2 had
+//! landed**, and that stale sentence was copied into the public README as a
+//! statement that outbound fetch did not work. A phase list in a doc comment is
+//! a claim about the tree; when it goes stale it does not merely age, it
+//! actively misinforms. Update it in the same commit as the phase.
+//!
+//! Sequencing the phases this way is what made the merge gates unambiguous:
+//! gates 3 (conditional requests) and 6 (single-flight) run against A0 with no
 //! engine involved, so a failure is in the cache or the coalescer and nowhere
 //! else.
 //!
