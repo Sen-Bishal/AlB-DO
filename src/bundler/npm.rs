@@ -776,9 +776,25 @@ fn esm_specifiers(module: &Module) -> Vec<String> {
 //
 // ⚠️ **Deliberate boundary: no intra-file dead-code elimination.** Once a file is
 // reached, every byte of it ships. Removing an unused local inside a reached
-// module is a different discipline (full scope analysis) with a far worse
-// effort-to-saving ratio, and a minifier does it better. What this removes is
-// whole files, which is where the 854 lives.
+// module is a different discipline — full scope analysis — and the measurement
+// says it is not where the bytes are. Shaking `lucide-react` for one icon:
+//
+// ```text
+// whole 848 231 B → shaken 156 991 B, of which lucide's own code is 3 507 B
+// ```
+//
+// **97.8% of what survives is dependencies** — `react` (98 kB across three
+// files, 89 kB of it `react.development.js`), `prop-types` (34 kB), `react-is`
+// (13 kB), `object-assign` (3 kB). Those go away by *externalising* the client
+// runtime and by substituting `NODE_ENV`, not by pruning statements. Intra-file
+// DCE would be a scope-analysis pass fighting for a few hundred bytes of the
+// 3 507 while 153 kB sat beside it untouched.
+//
+// 🪤 **And this codebase has no minifier at all** — no `swc_ecma_minifier`, no
+// terser, and `CodegenConfig::default()` means `minify: false`, so client JS
+// ships pretty-printed. That is a larger and more general lever than DCE (it
+// applies to every island, not only npm), and it is deliberately not smuggled in
+// here. What this pass removes is whole files, which is where the 854 lives.
 
 /// Where one exported name comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]

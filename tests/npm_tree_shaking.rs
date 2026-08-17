@@ -54,11 +54,28 @@ fn one_lucide_icon_does_not_drag_in_the_whole_set() {
         whole.artifacts.len(),
         shaken.artifacts.len()
     );
-    // Printed, not just counted: a count that is smaller can still be wrong, and
-    // the only way to see the walk pulled nothing gratuitous is to read what it
-    // pulled.
+    // 🔑 **Bytes, not just files.** A file count is a proxy; what a user
+    // downloads is bytes, and reporting the proxy is how a saving gets
+    // overstated. Split by origin too — the package's own code versus what its
+    // dependencies drag in — because those have different fixes.
+    let bytes = |artifacts: &[dom_render_compiler::bundler::npm::NpmArtifact]| -> usize {
+        artifacts.iter().map(|a| a.script.len()).sum()
+    };
+    let own: Vec<_> = shaken
+        .artifacts
+        .iter()
+        .filter(|a| a.key.contains("lucide-react@"))
+        .cloned()
+        .collect();
+    eprintln!(
+        "    bytes: whole {} · shaken {} · of which lucide's own {} ({} files)",
+        bytes(&whole.artifacts),
+        bytes(&shaken.artifacts),
+        bytes(&own),
+        own.len()
+    );
     for artifact in &shaken.artifacts {
-        eprintln!("    · {}", artifact.key);
+        eprintln!("    · {:>8} B  {}", artifact.script.len(), artifact.key);
     }
 
     assert!(!shaken.taken_whole, "lucide-react declares sideEffects:false");
