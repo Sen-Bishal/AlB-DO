@@ -23,9 +23,23 @@ This repository is maintained with a release-first approach. Contributions are w
 
 ## Local Validation Before PR
 
-Run the following from repository root before opening a pull request. These are
-**exactly** the commands `.github/workflows/ci.yml` runs, in the same order — if
-they pass locally and fail in CI, that is a bug in this list, so please say so.
+Run the following from repository root before opening a pull request. These are the
+commands `.github/workflows/ci.yml` runs, in the same order.
+
+> ⚠️ **Known: `fmt` and `clippy` do not currently pass on a clean checkout, even
+> though CI reports green.** Verified 2026-08-17 — do not assume your change caused it.
+>
+> - **`fmt`** — `rustfmt.toml` uses three *unstable* options (`wrap_comments`,
+>   `normalize_comments`, `comment_width`). Their output shifts between nightly
+>   builds, so whether the tree is fmt-clean depends on which nightly you have.
+>   **Do not mass-reformat.** Format only files you actually edited:
+>   `rustfmt --config-path rustfmt.toml <file.rs>`. A global `cargo fmt` rewrites
+>   ~160 files and buries your diff.
+> - **`clippy`** — [`src/lib.rs`](./src/lib.rs) sets `#![warn(clippy::pedantic)]`,
+>   and CI passes `-D warnings`, which promotes every pedantic lint to an error
+>   (~3,674 of them). CI passes only because its cache makes the step a no-op.
+>
+> Both are tracked. Until they are resolved, treat `cargo test` as the real gate.
 
 ```bash
 cargo fmt --all -- --check
