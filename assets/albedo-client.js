@@ -547,42 +547,71 @@
 
   var SVG_NS = 'http://www.w3.org/2000/svg';
 
-  // Attributes whose SVG spelling is camelCase. `setAttribute` on an element in
-  // the SVG namespace is case-SENSITIVE, and the JSX author writes the SVG
-  // spelling, so the name must survive verbatim — but `updateDomProps` cannot
-  // tell `viewBox` from `onClick` without knowing where it is going, and the
-  // HTML side has always lowercased. This table is the boundary between the two.
+  // JSX prop → attribute name.
   //
-  // Kept to the attributes real SVG content uses (every icon set, every chart
-  // library) rather than the full SVG 1.1 surface, which is 200 entries of
-  // filter primitives nothing in this codebase has ever emitted.
-  var SVG_CAMEL_ATTRS = {
-    viewbox: 'viewBox',
-    preserveaspectratio: 'preserveAspectRatio',
-    strokewidth: 'stroke-width',
-    strokelinecap: 'stroke-linecap',
-    strokelinejoin: 'stroke-linejoin',
-    strokedasharray: 'stroke-dasharray',
-    strokedashoffset: 'stroke-dashoffset',
-    strokemiterlimit: 'stroke-miterlimit',
-    strokeopacity: 'stroke-opacity',
-    fillopacity: 'fill-opacity',
-    fillrule: 'fill-rule',
-    cliprule: 'clip-rule',
-    clippath: 'clip-path',
-    textanchor: 'text-anchor',
-    dominantbaseline: 'dominant-baseline',
-    fontfamily: 'font-family',
-    fontsize: 'font-size',
-    fontweight: 'font-weight',
-    letterspacing: 'letter-spacing',
-    markerend: 'marker-end',
-    markermid: 'marker-mid',
-    markerstart: 'marker-start',
-    stopcolor: 'stop-color',
-    stopopacity: 'stop-opacity',
-    vectoreffect: 'vector-effect',
+  // 🔑 **This table is checked against `runtime::jsx_attributes`'s by a
+  // Rust test** (`the_client_runtime_table_matches_this_one`). It cannot be
+  // generated — this file is hand-written JavaScript served to the browser —
+  // so drift is caught rather than prevented. It matters because hydration
+  // *adopts* the server's DOM: a client that spells one attribute differently
+  // does not produce a cosmetic difference, it produces a stray attribute on an
+  // adopted node, or a re-mount.
+  //
+  // Keyed on the exact prop name, with no SVG/HTML branch, because the mapping
+  // needs no context: `strokeWidth` is meaningless on a `<div>`. Attributes
+  // already spelled camelCase in SVG (`viewBox`, `preserveAspectRatio`) map to
+  // themselves and are deliberately absent — `setAttribute` on a namespaced
+  // element is case-preserving.
+  var JSX_ATTRIBUTE_RENAMES = {
+    className: 'class',
+    htmlFor: 'for',
+    defaultChecked: 'checked',
+    defaultValue: 'value',
+    alignmentBaseline: 'alignment-baseline',
+    baselineShift: 'baseline-shift',
+    clipPath: 'clip-path',
+    clipRule: 'clip-rule',
+    colorInterpolation: 'color-interpolation',
+    colorInterpolationFilters: 'color-interpolation-filters',
+    dominantBaseline: 'dominant-baseline',
+    fillOpacity: 'fill-opacity',
+    fillRule: 'fill-rule',
+    floodColor: 'flood-color',
+    floodOpacity: 'flood-opacity',
+    fontFamily: 'font-family',
+    fontSize: 'font-size',
+    fontSizeAdjust: 'font-size-adjust',
+    fontStretch: 'font-stretch',
+    fontStyle: 'font-style',
+    fontVariant: 'font-variant',
+    fontWeight: 'font-weight',
+    imageRendering: 'image-rendering',
+    letterSpacing: 'letter-spacing',
+    lightingColor: 'lighting-color',
+    markerEnd: 'marker-end',
+    markerMid: 'marker-mid',
+    markerStart: 'marker-start',
+    paintOrder: 'paint-order',
+    pointerEvents: 'pointer-events',
+    shapeRendering: 'shape-rendering',
+    stopColor: 'stop-color',
+    stopOpacity: 'stop-opacity',
+    strokeDasharray: 'stroke-dasharray',
+    strokeDashoffset: 'stroke-dashoffset',
+    strokeLinecap: 'stroke-linecap',
+    strokeLinejoin: 'stroke-linejoin',
+    strokeMiterlimit: 'stroke-miterlimit',
+    strokeOpacity: 'stroke-opacity',
+    strokeWidth: 'stroke-width',
+    textAnchor: 'text-anchor',
+    textDecoration: 'text-decoration',
+    textRendering: 'text-rendering',
+    unicodeBidi: 'unicode-bidi',
+    vectorEffect: 'vector-effect',
+    wordSpacing: 'word-spacing',
+    writingMode: 'writing-mode',
   };
+
 
   // 🔑 `document.createElement('svg')` produces an `HTMLUnknownElement`, not an
   // SVG element — it renders **nothing**, silently. Every icon package in npm
@@ -601,19 +630,9 @@
     return global.document.createElement(type);
   }
 
-  // The attribute name to write on `dom`, given the JSX prop name.
-  function attributeNameFor(dom, key) {
-    if (dom.namespaceURI === SVG_NS) {
-      var camel = SVG_CAMEL_ATTRS[key.toLowerCase()];
-      return camel || key;
-    }
-    if (key === 'className') {
-      return 'class';
-    }
-    if (key === 'htmlFor') {
-      return 'for';
-    }
-    return key;
+  // The attribute name to write, given the JSX prop name.
+  function attributeNameFor(key) {
+    return hasOwn(JSX_ATTRIBUTE_RENAMES, key) ? JSX_ATTRIBUTE_RENAMES[key] : key;
   }
 
   // A React-style `ref` on a host element: hand the ref the real DOM node.
@@ -660,13 +679,8 @@
       }
       return;
     }
-    // JSX prop → attribute name. For HTML this is the `className`/`htmlFor`
-    // rename that matches the server renderer, so hydration adopts the server's
-    // `class`/`for` rather than creating a stray attribute. For SVG it is the
-    // case-sensitive spelling (`viewBox`, `stroke-width`), which
-    // `setAttribute` will otherwise store verbatim-lowercased and the renderer
-    // will ignore.
-    key = attributeNameFor(dom, key);
+    // JSX prop → attribute name, from the table both server renderers read.
+    key = attributeNameFor(key);
     if (newValue === undefined || newValue === null || newValue === false) {
       dom.removeAttribute(key);
       return;
@@ -797,6 +811,14 @@
     merged['data-albedo-link'] = true;
     return h('a', merged, source.children);
   }
+
+  // The one export in the shared React host table (`runtime::react_host`) whose
+  // implementation cannot be shared: an "element" is a vnode here and an
+  // `AlbedoHtml` string wrapper on the server. `isValidElement` routes through
+  // this global so the table stays single-sourced.
+  global.__albedo_is_element = function (value) {
+    return value !== null && typeof value === 'object' && value.__vnode === true;
+  };
 
   global.__albedoClient = api;
   global.h = h;

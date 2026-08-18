@@ -21,6 +21,17 @@ use dom_render_compiler::runtime::slot_store::SlotStore;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
+use dom_render_compiler::bundler::npm::ShakeOptions;
+
+/// The option set the server actually bundles with (`bundle_project_npm_dependencies`).
+///
+/// ⚠️ Not `ShakeOptions::default()`. Since Tier C's `react` host landed, the
+/// server externalises a package's React import and folds `NODE_ENV`, so
+/// measuring with the empty option set would measure a configuration that no
+/// longer ships. Any coverage figure taken here supersedes an older one.
+fn server_options() -> ShakeOptions {
+    dom_render_compiler::bundler::client_npm::server_shake_options()
+}
 
 fn engine() -> QuickJsEngine {
     let mut engine = QuickJsEngine::new();
@@ -84,7 +95,7 @@ fn esm_package_with_reexport_chain_renders_through_component() {
         "#,
     );
 
-    let bundle = bundle_npm_dependency(dir.path(), "mathkit").expect("bundle mathkit");
+    let bundle = bundle_npm_dependency(dir.path(), "mathkit", &server_options()).expect("bundle mathkit");
     assert_eq!(bundle.package_name, "mathkit");
     assert_eq!(bundle.entry_key, "npm:mathkit@2.0.0/src/index.js");
 
@@ -144,7 +155,7 @@ fn cjs_dependency_interops_with_esm_entry() {
         "module.exports = function pad(s) { return '[' + s + ']'; };",
     );
 
-    let bundle = bundle_npm_dependency(dir.path(), "mixed").expect("bundle mixed");
+    let bundle = bundle_npm_dependency(dir.path(), "mixed", &server_options()).expect("bundle mixed");
     let mut engine = engine();
     load_bundle(&mut engine, &bundle);
 
@@ -184,7 +195,7 @@ fn json_module_exposes_default_and_named() {
     );
     write(&pkg.join("meta.json"), r#"{ "label": "cfg", "major": 3 }"#);
 
-    let bundle = bundle_npm_dependency(dir.path(), "jsonpkg").expect("bundle jsonpkg");
+    let bundle = bundle_npm_dependency(dir.path(), "jsonpkg", &server_options()).expect("bundle jsonpkg");
     let mut engine = engine();
     load_bundle(&mut engine, &bundle);
 
@@ -233,7 +244,7 @@ fn import_cycle_resolves_lazily() {
         "#,
     );
 
-    let bundle = bundle_npm_dependency(dir.path(), "cyclic").expect("bundle cyclic");
+    let bundle = bundle_npm_dependency(dir.path(), "cyclic", &server_options()).expect("bundle cyclic");
     let mut engine = engine();
     load_bundle(&mut engine, &bundle);
 
@@ -266,8 +277,8 @@ fn subpath_export_bundles_independently() {
     write(&pkg.join("root.js"), "export const where = \"root\";");
     write(&pkg.join("extra.js"), "export const where = \"extra\";");
 
-    let root = bundle_npm_dependency(dir.path(), "featured").expect("bundle root");
-    let extra = bundle_npm_dependency(dir.path(), "featured/extra").expect("bundle subpath");
+    let root = bundle_npm_dependency(dir.path(), "featured", &server_options()).expect("bundle root");
+    let extra = bundle_npm_dependency(dir.path(), "featured/extra", &server_options()).expect("bundle subpath");
     assert_eq!(root.entry_key, "npm:featured@1.0.0/root.js");
     assert_eq!(extra.entry_key, "npm:featured@1.0.0/extra.js");
 
@@ -317,7 +328,7 @@ fn transitive_package_dependency_resolves() {
     );
     write(&inner.join("index.js"), "export const core = \"pith\";");
 
-    let bundle = bundle_npm_dependency(dir.path(), "outer").expect("bundle outer");
+    let bundle = bundle_npm_dependency(dir.path(), "outer", &server_options()).expect("bundle outer");
     assert!(
         bundle
             .artifacts

@@ -21,6 +21,17 @@ use dom_render_compiler::runtime::slot_store::SlotStore;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
+use dom_render_compiler::bundler::npm::ShakeOptions;
+
+/// The option set the server actually bundles with (`bundle_project_npm_dependencies`).
+///
+/// ⚠️ Not `ShakeOptions::default()`. Since Tier C's `react` host landed, the
+/// server externalises a package's React import and folds `NODE_ENV`, so
+/// measuring with the empty option set would measure a configuration that no
+/// longer ships. Any coverage figure taken here supersedes an older one.
+fn server_options() -> ShakeOptions {
+    dom_render_compiler::bundler::client_npm::server_shake_options()
+}
 
 fn fixture_root() -> Option<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -60,7 +71,7 @@ fn load_bundle(engine: &mut QuickJsEngine, bundle: &NpmDependencyBundle) {
 fn zod_schema_validates_inside_component_render() {
     let Some(root) = fixture_root() else { return };
 
-    let bundle = bundle_npm_dependency(&root, "zod").expect("bundle zod");
+    let bundle = bundle_npm_dependency(&root, "zod", &server_options()).expect("bundle zod");
     assert_eq!(bundle.package_name, "zod");
     eprintln!(
         "zod {} bundled: {} artifacts, entry {}",
@@ -96,7 +107,7 @@ fn zod_schema_validates_inside_component_render() {
 fn zod_parse_failure_is_loud() {
     let Some(root) = fixture_root() else { return };
 
-    let bundle = bundle_npm_dependency(&root, "zod").expect("bundle zod");
+    let bundle = bundle_npm_dependency(&root, "zod", &server_options()).expect("bundle zod");
     let mut engine = engine();
     load_bundle(&mut engine, &bundle);
 
@@ -126,7 +137,7 @@ fn zod_parse_failure_is_loud() {
 fn date_fns_formats_through_root_import() {
     let Some(root) = fixture_root() else { return };
 
-    let bundle = bundle_npm_dependency(&root, "date-fns").expect("bundle date-fns");
+    let bundle = bundle_npm_dependency(&root, "date-fns", &server_options()).expect("bundle date-fns");
     eprintln!(
         "date-fns {} bundled: {} artifacts",
         bundle.package_version,
@@ -257,7 +268,7 @@ fn compiled_project_action_handler_validates_with_zod() {
 fn date_fns_subpath_import_resolves() {
     let Some(root) = fixture_root() else { return };
 
-    let bundle = bundle_npm_dependency(&root, "date-fns/addDays").expect("bundle subpath");
+    let bundle = bundle_npm_dependency(&root, "date-fns/addDays", &server_options()).expect("bundle subpath");
     eprintln!(
         "date-fns/addDays bundled: {} artifacts",
         bundle.artifacts.len()

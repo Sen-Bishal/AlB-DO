@@ -206,29 +206,14 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
         if is_reserved_jsx_prop(name) {
             continue;
         }
-        // JSX prop → HTML attribute rename. `className`→`class`, plus React's
-        // uncontrolled form-control props to their DOM attribute equivalents:
-        // `defaultValue`→`value`, `defaultChecked`→`checked`. Without the latter
-        // a pre-filled `<input defaultValue={x}>` ships the browser-inert
-        // `defaultvalue` and the field renders blank. The QuickJS `h` shim
-        // mirrors this exact mapping, so Tier-A and Tier-B emit the same markup.
-        let attr_name = match name.as_str() {
-            "className" => "class",
-            "defaultValue" => "value",
-            "defaultChecked" => "checked",
-            // `htmlFor`→`for`. JSX cannot use `for` (a reserved word), so React
-            // spells it `htmlFor` and every React-shaped codebase writes that —
-            // `albedo-env.d.ts` even declares it on `LabelAttributes`. Without
-            // this rename it shipped as the browser-inert `htmlfor`, which
-            // silently DISCONNECTS the label from its control: clicking the
-            // label does nothing and a screen reader announces an unlabelled
-            // input. Found because a CSS-only disclosure built on
-            // `<label htmlFor>` + `<input type="checkbox">` simply never
-            // opened; the same bug had already broken every form label on the
-            // page, where it is invisible until someone uses a screen reader.
-            "htmlFor" => "for",
-            _ => name.as_str(),
-        };
+        // JSX prop → HTML attribute rename, from the ONE table every renderer
+        // reads (`runtime::jsx_attributes`). It used to be a `match` here, a
+        // ternary chain in the QuickJS `h` shim, and a third pair of `if`s in
+        // `albedo-client.js` — three independent implementations of a rule that
+        // hydration requires to agree byte-for-byte. The SVG half was missing
+        // from all three, which is why `<svg strokeWidth="2">` has been shipping
+        // the browser-inert `strokewidth` since Tier A existed.
+        let attr_name = crate::runtime::jsx_attributes::jsx_attribute_name(name.as_str());
         // `style` takes an object in JSX and CSS text in HTML. Without this the
         // object fell through to `value_to_string`, which JSON-encodes it, and a
         // `<div style={{height:"1px"}}>` shipped a `style` attribute holding

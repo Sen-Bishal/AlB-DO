@@ -402,6 +402,14 @@ impl QuickJsEngine {
                         RuntimeError::init(format!("failed to install markup contract: {err}"))
                     })?;
 
+                ctx.eval::<(), _>(
+                    crate::runtime::jsx_attributes::build_jsx_attribute_table_script().as_str(),
+                )
+                .map_err(|err| {
+                    RuntimeError::init(format!(
+                        "failed to install the JSX attribute table: {err}"
+                    ))
+                })?;
                 ctx.eval::<(), _>(build_builtin_runtime_helpers_script())
                     .map_err(|err| {
                         RuntimeError::init(format!(
@@ -434,6 +442,21 @@ impl QuickJsEngine {
                             "failed to install npm module runtime helpers: {err}"
                         ))
                     })?;
+
+                // The React host records, from the SAME generator the browser
+                // runtime uses. A package's `import 'react'` resolves to
+                // `albedo:host/react` on both sides, so `forwardRef` returns the
+                // same kind of thing in SSR and in hydration — which is what
+                // stops a React component library rendering as the literal text
+                // `<[object Object]>` here while working perfectly in the
+                // browser. Must run AFTER the linker: it writes into
+                // `__ALBEDO_NPM_FACTORIES`.
+                ctx.eval::<(), _>(
+                    crate::runtime::react_host::build_host_module_records_script().as_str(),
+                )
+                .map_err(|err| {
+                    RuntimeError::init(format!("failed to install React host records: {err}"))
+                })?;
 
                 let render_script = build_render_function_script();
                 ctx.eval::<(), _>(render_script.as_str()).map_err(|err| {
@@ -1258,30 +1281,22 @@ if (typeof globalThis.h !== 'function') {
       return type(mergedProps);
     }
 
-    // A component type that is neither a function nor a tag name has exactly
-    // one real-world cause, and it must NOT fall through to the element branch
-    // below — which would interpolate the object into a tag name and emit the
-    // literal text `<[object Object]>` into the page.
+    // A component type that is neither a function nor a tag name must NOT fall
+    // through to the element branch below — that interpolates the object into a
+    // tag name and emits the literal text `<[object Object]>` into the page.
     //
-    // 🪤 **The cause: on the server, an npm package binds to the real `react`
-    // in `node_modules`; in the browser it binds to Albedo's host module.**
-    // `React.forwardRef(...)` and `React.memo(...)` return *objects*, not
-    // functions, so every React component library renders as garbage here while
-    // its Tier-C client chunk renders correctly. Externalising `react` on the
-    // server path the way `bundler::client_npm` does for the browser is the
-    // fix, and it is compatibility work (`TODO.md` item 9.2), not something to
-    // infer silently at render time.
-    //
-    // Loud, and named: an empty placeholder with a diagnostic is recoverable
-    // (the island still hydrates); visible corruption in the HTML is not.
+    // 🪤 This used to fire for every React component library, because a package
+    // bound to the real `react` in `node_modules` and `React.forwardRef` returns
+    // an *object*. That cause is gone — `runtime::react_host` binds a package's
+    // react to this runtime on both sides — and the guard stays for whatever
+    // finds the next way in. Visible corruption in someone's HTML is the one
+    // outcome worse than a named failure.
     if (typeof type !== 'string') {
       throw new Error(
         '[albedo] cannot server-render a component whose type is ' +
         (type === null ? 'null' : typeof type) +
-        '. This is almost always a React element object (React.forwardRef / React.memo) ' +
-        'from an npm package: on the server a package binds to the real react in ' +
-        'node_modules, while in the browser it binds to Albedo\'s host module. ' +
-        'Server-side rendering of a package\'s React component is TODO 9.2.'
+        '. A component must be a function or a tag name; an object here is ' +
+        'usually a foreign framework\'s element wrapper that Albedo does not model.'
       );
     }
 
@@ -1337,22 +1352,12 @@ if (typeof globalThis.h !== 'function') {
       if (typeof value === 'function') {
         continue;
       }
-      // JSX prop → HTML attribute rename, mirroring the pure-Rust renderer
-      // (`render_attrs`) so QuickJS-rendered islands match build-time Tier-A
-      // markup and apply CSS classes in the browser. React's uncontrolled
-      // form-control props map to their DOM attribute equivalents too —
-      // `defaultValue`→`value`, `defaultChecked`→`checked` — so a pre-filled
-      // `<input defaultValue={x}>` shows its value instead of shipping the
-      // browser-inert lowercased `defaultvalue`.
-      // `htmlFor`→`for` is here for the same reason as `className`→`class`:
-      // JSX cannot spell `for`, so React-shaped code writes `htmlFor`, and
-      // shipping it verbatim yields the inert `htmlfor` — which disconnects a
-      // label from its control. MUST match the Rust `render_attrs` table.
-      const attrName = key === 'className' ? 'class'
-        : key === 'defaultValue' ? 'value'
-        : key === 'defaultChecked' ? 'checked'
-        : key === 'htmlFor' ? 'for'
-        : key;
+      // One table, generated from `runtime::jsx_attributes` and installed by
+      // `build_jsx_attribute_table_script`. Not a ternary chain here and a
+      // `match` in the pure-Rust renderer: the two are required to agree
+      // byte-for-byte (see the void-element spelling below), and two hand-kept
+      // lists of the same rule is how they stop agreeing.
+      const attrName = globalThis.__albedo_attr_name(key);
       if (value === true) {
         attrs += ' ' + attrName;
         continue;
@@ -1523,6 +1528,15 @@ if (typeof globalThis.h !== 'function') {
   };
 
   globalThis.h = h;
+
+  // The one export in the shared React host table whose implementation cannot
+  // be shared: an "element" is an `AlbedoHtml` here and a vnode in the browser.
+  // Routing `isValidElement` through this global keeps the table itself
+  // single-sourced (`runtime::react_host`) and reduces the difference between
+  // the two runtimes to one named function.
+  globalThis.__albedo_is_element = function(value) {
+    return value instanceof AlbedoHtml;
+  };
 }
 
 // A1 · host-object bridge (render side). The framework hooks resolve here

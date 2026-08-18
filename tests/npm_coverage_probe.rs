@@ -36,6 +36,17 @@ use dom_render_compiler::bundler::npm::{
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use dom_render_compiler::bundler::npm::ShakeOptions;
+
+/// The option set the server actually bundles with (`bundle_project_npm_dependencies`).
+///
+/// ⚠️ Not `ShakeOptions::default()`. Since Tier C's `react` host landed, the
+/// server externalises a package's React import and folds `NODE_ENV`, so
+/// measuring with the empty option set would measure a configuration that no
+/// longer ships. Any coverage figure taken here supersedes an older one.
+fn server_options() -> ShakeOptions {
+    dom_render_compiler::bundler::client_npm::server_shake_options()
+}
 
 /// Which stage a specifier died at, split by **what the failure means about
 /// us** rather than by which error variant was raised.
@@ -233,7 +244,7 @@ fn evaluate_bundle(bundle: &NpmDependencyBundle) -> (EvalOutcome, String) {
 }
 
 fn probe_one(project: &str, dir: &Path, specifier: &str, sites: u32, run_eval: bool) -> Probe {
-    match bundle_npm_dependency(dir, specifier) {
+    match bundle_npm_dependency(dir, specifier, &server_options()) {
         Ok(bundle) => {
             let (eval, eval_detail) = if run_eval {
                 evaluate_bundle(&bundle)

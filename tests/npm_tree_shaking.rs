@@ -50,7 +50,7 @@ fn one_lucide_icon_does_not_drag_in_the_whole_set() {
         return;
     };
 
-    let whole = bundle_npm_dependency(&dir, "lucide-react").expect("bundles whole");
+    let whole = bundle_npm_dependency(&dir, "lucide-react", &ShakeOptions::default()).expect("bundles whole");
     let shaken = bundle_npm_dependency_for_demand(&dir, "lucide-react", &demand(&["Check"]), &ShakeOptions::default())
         .expect("bundles shaken");
 
@@ -148,7 +148,7 @@ fn one_date_fns_function_does_not_drag_in_the_library() {
         return;
     };
 
-    let whole = bundle_npm_dependency(&dir, "date-fns").expect("bundles whole");
+    let whole = bundle_npm_dependency(&dir, "date-fns", &ShakeOptions::default()).expect("bundles whole");
     let shaken = bundle_npm_dependency_for_demand(&dir, "date-fns", &demand(&["format"]), &ShakeOptions::default())
         .expect("bundles shaken");
 

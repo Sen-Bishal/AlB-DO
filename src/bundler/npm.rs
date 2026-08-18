@@ -1202,7 +1202,11 @@ pub fn bundle_npm_dependency_for_demand(
     let shakeable = package_declares_no_side_effects(&entry_package)
         && !demand.iter().any(|name| name == STAR_DEMAND);
     if !shakeable {
-        let whole = bundle_npm_dependency(search_dir, specifier)?;
+        // 🔑 The SAME options. An unshakeable package taken whole for the
+        // browser must still externalise and fold, or a single package without
+        // `"sideEffects": false` silently reintroduces the 157 kB this phase
+        // exists to remove.
+        let whole = bundle_npm_dependency(search_dir, specifier, options)?;
         let bindings = demand
             .iter()
             .map(|name| {
@@ -1671,6 +1675,7 @@ pub fn scan_bare_imports(source: &str) -> Vec<String> {
 pub fn bundle_npm_dependency(
     search_dir: &Path,
     specifier: &str,
+    options: &ShakeOptions,
 ) -> Result<NpmDependencyBundle, NpmBundleError> {
     let (entry_package, entry_path) = resolve_bare_entry(search_dir, specifier)?;
     let entry_key = record_key(&entry_package, &entry_path);
@@ -1690,18 +1695,45 @@ pub fn bundle_npm_dependency(
         }
 
         let key = record_key(&package, &path);
-        let source = std::fs::read_to_string(&path).map_err(|err| NpmBundleError::Io {
+        let raw_source = std::fs::read_to_string(&path).map_err(|err| NpmBundleError::Io {
             path: path.clone(),
             message: err.to_string(),
         })?;
-        let format = classify_format(&path, &source);
+        let format = classify_format(&path, &raw_source);
+        // The folded source is the ONLY source: the scan below and the lowering
+        // further down both read it, so they cannot disagree about which arm of
+        // a `NODE_ENV` fork exists. See `bundler::defines`.
+        let source = fold_defines(
+            &path.display().to_string(),
+            &raw_source,
+            format == NpmModuleFormat::Esm,
+            &options.defines,
+        )
+        .unwrap_or(raw_source);
 
         // Resolve every raw specifier this file references to a record key,
-        // queueing newly-discovered files.
+        // queueing newly-discovered files. A specifier the host provides is
+        // bound to the host's record and NOT queued — that is what keeps a
+        // package's `import 'react'` from pulling a second React into a runtime
+        // that cannot execute one.
         let mut resolve_map: BTreeMap<String, String> = BTreeMap::new();
         for raw in collect_specifiers(&path, &source, format)? {
             if resolve_map.contains_key(&raw) {
                 continue;
+            }
+            match options.externals.get(&raw) {
+                Some(ExternalTarget::Host { record_key, .. }) => {
+                    resolve_map.insert(raw.clone(), record_key.clone());
+                    continue;
+                }
+                Some(ExternalTarget::Refused { reason }) => {
+                    return Err(NpmBundleError::ExternalRefused {
+                        specifier: raw.clone(),
+                        importer: path.clone(),
+                        reason: reason.clone(),
+                    })
+                }
+                None => {}
             }
             let (dep_package, dep_path) = resolve_from_file(&package, &path, &raw)?;
             resolve_map.insert(raw.clone(), record_key(&dep_package, &dep_path));
@@ -1757,10 +1789,11 @@ pub fn bundle_npm_dependency(
 pub fn bundle_npm_dependencies(
     search_dir: &Path,
     specifiers: impl IntoIterator<Item = impl AsRef<str>>,
+    options: &ShakeOptions,
 ) -> Result<Vec<NpmDependencyBundle>, NpmBundleError> {
     let mut bundles = Vec::new();
     for specifier in specifiers {
-        bundles.push(bundle_npm_dependency(search_dir, specifier.as_ref())?);
+        bundles.push(bundle_npm_dependency(search_dir, specifier.as_ref(), options)?);
     }
     Ok(bundles)
 }
@@ -1987,7 +2020,7 @@ mod tests {
         )
         .unwrap();
 
-        let bundle = bundle_npm_dependency(dir.path(), "tinylib").unwrap();
+        let bundle = bundle_npm_dependency(dir.path(), "tinylib", &ShakeOptions::default()).unwrap();
         assert_eq!(bundle.package_name, "tinylib");
         assert_eq!(bundle.package_version, "1.2.3");
         assert_eq!(bundle.entry_key, "npm:tinylib@1.2.3/lib/index.js");
@@ -2040,7 +2073,7 @@ mod tests {
         )
         .unwrap();
 
-        let bundle = bundle_npm_dependency(dir.path(), "scroll-bar/constants").unwrap();
+        let bundle = bundle_npm_dependency(dir.path(), "scroll-bar/constants", &ShakeOptions::default()).unwrap();
         assert_eq!(
             bundle.entry_key, "npm:scroll-bar@2.3.8/dist/es2015/constants.js",
             "the directory's own manifest must redirect the probe, and `module` \
@@ -2068,7 +2101,7 @@ mod tests {
         std::fs::write(pkg.join("sub").join("real.js"), "module.exports = 'real';").unwrap();
         std::fs::write(pkg.join("sub").join("index.js"), "module.exports = 'index';").unwrap();
 
-        let bundle = bundle_npm_dependency(dir.path(), "both/sub").unwrap();
+        let bundle = bundle_npm_dependency(dir.path(), "both/sub", &ShakeOptions::default()).unwrap();
         assert_eq!(bundle.entry_key, "npm:both@1.0.0/sub/real.js");
     }
 
@@ -2091,7 +2124,7 @@ mod tests {
         .unwrap();
         std::fs::write(pkg.join("sub").join("index.js"), "module.exports = 'index';").unwrap();
 
-        let bundle = bundle_npm_dependency(dir.path(), "broken/sub").unwrap();
+        let bundle = bundle_npm_dependency(dir.path(), "broken/sub", &ShakeOptions::default()).unwrap();
         assert_eq!(bundle.entry_key, "npm:broken@1.0.0/sub/index.js");
     }
 
@@ -2109,7 +2142,7 @@ mod tests {
         .unwrap();
         std::fs::write(pkg.join("sub").join("package.json"), r#"{ "main": "." }"#).unwrap();
 
-        let err = bundle_npm_dependency(dir.path(), "loop").unwrap_err();
+        let err = bundle_npm_dependency(dir.path(), "loop", &ShakeOptions::default()).unwrap_err();
         assert!(matches!(err, NpmBundleError::FileNotFound { .. }));
     }
 
@@ -2318,7 +2351,7 @@ mod tests {
     #[test]
     fn missing_package_fails_loudly() {
         let dir = tempfile::tempdir().unwrap();
-        let err = bundle_npm_dependency(dir.path(), "ghost-package").unwrap_err();
+        let err = bundle_npm_dependency(dir.path(), "ghost-package", &ShakeOptions::default()).unwrap_err();
         assert!(matches!(err, NpmBundleError::PackageNotFound { .. }));
         assert!(err.to_string().contains("ghost-package"));
     }
@@ -2336,7 +2369,7 @@ mod tests {
         .unwrap();
         std::fs::write(pkg.join("index.js"), "export const x = 1;").unwrap();
 
-        let err = bundle_npm_dependency(dir.path(), "sealed/secret").unwrap_err();
+        let err = bundle_npm_dependency(dir.path(), "sealed/secret", &ShakeOptions::default()).unwrap_err();
         assert!(matches!(err, NpmBundleError::SubpathNotExported { .. }));
     }
 }

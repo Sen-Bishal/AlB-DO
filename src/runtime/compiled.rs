@@ -2749,9 +2749,13 @@ fn bundle_project_npm_dependencies(project: &ComponentProject) -> Vec<NpmDepende
         }
     }
 
+    // The SERVER option set: the same host modules the browser binds to, and
+    // no refusals. See `bundler::client_npm::server_shake_options` for why the
+    // two differ on refusals and must not differ on defines.
+    let options = crate::bundler::client_npm::server_shake_options();
     let mut bundles = Vec::new();
     for specifier in specifiers {
-        match bundle_npm_dependency(project.root(), &specifier) {
+        match bundle_npm_dependency(project.root(), &specifier, &options) {
             Ok(bundle) => {
                 tracing::debug!(
                     specifier = %bundle.specifier,
