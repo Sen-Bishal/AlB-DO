@@ -9,7 +9,7 @@ use super::engine::{
 use rquickjs::{promise::MaybePromise, Context, Ctx, Function, Runtime};
 use serde::Deserialize;
 use crate::runtime::eval::component::fnv1a_32;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,7 +19,8 @@ use swc_common::{
     GLOBALS,
 };
 use swc_ecma_ast::{
-    Decl, ExportSpecifier, ImportSpecifier, Module, ModuleDecl, ModuleExportName, ModuleItem, Pat,
+    Decl, ExportSpecifier, ImportDecl, ImportSpecifier, Module, ModuleDecl, ModuleExportName,
+    ModuleItem, Pat,
 };
 use swc_ecma_codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
@@ -766,22 +767,46 @@ fn describe_js_error(ctx: &Ctx<'_>, err: &rquickjs::Error) -> String {
 /// module records execute their import statements at *load* time, where the
 /// old render-function-local closure was out of scope — which is exactly why a
 /// project component importing another project module could not load before.
-fn build_npm_runtime_helpers_script() -> String {
+pub(crate) fn build_npm_runtime_helpers_script() -> String {
+    format!(
+        "{linker}{quickjs}",
+        linker = npm_record_linker_script(),
+        quickjs = build_quickjs_module_helpers_script()
+    )
+}
+
+/// The **portable** half of the npm runtime: the record table, the factory and
+/// alias tables, and the lazy memoising linker `__albedo_require_record`.
+///
+/// 🔑 **Shared verbatim with the browser** (see
+/// `bundler::client_npm::build_browser_npm_runtime_script`). Tier C ships npm
+/// packages to the client in exactly the server's record format, and the linker
+/// that reads that format has to agree byte-for-byte on both sides — a second
+/// hand-written copy in `assets/*.js` is the *"three paint-rule
+/// implementations"* shape this codebase has already paid for once. There is
+/// one implementation and two callers.
+///
+/// Nothing in here touches QuickJS, the filesystem, or any server capability:
+/// it is table lookups and one `Object.create`. The pieces that *are*
+/// server-specific — project-module resolution, the component-aware default
+/// unwrapping in `__albedo_require` — live in
+/// [`build_quickjs_module_helpers_script`] next door.
+///
+/// The record is published **before** the factory body runs, which is Node's
+/// CommonJS cycle discipline: an import cycle observes a partially-initialized
+/// record instead of recursing forever, so no topological sort is needed and
+/// load order is irrelevant.
+pub fn npm_record_linker_script() -> String {
     format!(
         r#"
 (function() {{
   if (typeof globalThis.__albedo_require_record === 'function') {{ return; }}
+  if (typeof globalThis.__ALBEDO_MODULES === 'undefined') {{
+    globalThis.__ALBEDO_MODULES = Object.create(null);
+  }}
   globalThis.__ALBEDO_NPM_FACTORIES = Object.create(null);
   globalThis.__ALBEDO_NPM_ALIASES = Object.create(null);
-  if (typeof globalThis.process === 'undefined') {{
-    globalThis.process = {{ env: {{ NODE_ENV: 'production' }} }};
-  }}
   const __albedo_has_own = Object.prototype.hasOwnProperty;
-  const __albedo_is_record = function(candidate) {{
-    return candidate !== null
-      && typeof candidate === 'object'
-      && candidate.{MODULE_RECORD_FLAG} === true;
-  }};
 
   globalThis.__albedo_is_npm_module = function(specifier) {{
     const spec = String(specifier);
@@ -805,6 +830,27 @@ fn build_npm_runtime_helpers_script() -> String {
     table[key] = record;
     try {{ factory(record); }} catch (err) {{ delete table[key]; throw err; }}
     return record;
+  }};
+}})();
+"#
+    )
+}
+
+/// The server-only half: `process`, the legacy `__albedo_require`, the import
+/// binding helpers and project-relative module resolution.
+fn build_quickjs_module_helpers_script() -> String {
+    format!(
+        r#"
+(function() {{
+  if (typeof globalThis.__albedo_require === 'function') {{ return; }}
+  if (typeof globalThis.process === 'undefined') {{
+    globalThis.process = {{ env: {{ NODE_ENV: 'production' }} }};
+  }}
+  const __albedo_has_own = Object.prototype.hasOwnProperty;
+  const __albedo_is_record = function(candidate) {{
+    return candidate !== null
+      && typeof candidate === 'object'
+      && candidate.{MODULE_RECORD_FLAG} === true;
   }};
 
   globalThis.__albedo_require = function(specifier) {{
@@ -1210,6 +1256,33 @@ if (typeof globalThis.h !== 'function') {
         mergedProps.children = flatChildren;
       }
       return type(mergedProps);
+    }
+
+    // A component type that is neither a function nor a tag name has exactly
+    // one real-world cause, and it must NOT fall through to the element branch
+    // below — which would interpolate the object into a tag name and emit the
+    // literal text `<[object Object]>` into the page.
+    //
+    // 🪤 **The cause: on the server, an npm package binds to the real `react`
+    // in `node_modules`; in the browser it binds to Albedo's host module.**
+    // `React.forwardRef(...)` and `React.memo(...)` return *objects*, not
+    // functions, so every React component library renders as garbage here while
+    // its Tier-C client chunk renders correctly. Externalising `react` on the
+    // server path the way `bundler::client_npm` does for the browser is the
+    // fix, and it is compatibility work (`TODO.md` item 9.2), not something to
+    // infer silently at render time.
+    //
+    // Loud, and named: an empty placeholder with a diagnostic is recoverable
+    // (the island still hydrates); visible corruption in the HTML is not.
+    if (typeof type !== 'string') {
+      throw new Error(
+        '[albedo] cannot server-render a component whose type is ' +
+        (type === null ? 'null' : typeof type) +
+        '. This is almost always a React element object (React.forwardRef / React.memo) ' +
+        'from an npm package: on the server a package binds to the real react in ' +
+        'node_modules, while in the browser it binds to Albedo\'s host module. ' +
+        'Server-side rendering of a package\'s React component is TODO 9.2.'
+      );
     }
 
     let attrs = '';
@@ -1917,6 +1990,55 @@ fn resolve_relative_module(
     }).cloned()
 }
 
+/// Where one name imported from an npm package lives in the client chunk.
+///
+/// Produced by `bundler::client_npm` and consumed by the island lowering, which
+/// is the whole reason it is a type and not two `String`s: the lowering must not
+/// be able to invent a record key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientNpmBinding {
+    /// The record key `__albedo_require_record` resolves.
+    pub record_key: String,
+    /// The property on that record, `default` for a default export, or `*` when
+    /// the importer needs the record itself.
+    pub export_name: String,
+}
+
+/// One island's npm bindings: specifier → imported name → where it lives.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientNpmBindings {
+    entries: BTreeMap<String, BTreeMap<String, ClientNpmBinding>>,
+}
+
+impl ClientNpmBindings {
+    /// Record where one imported name resolves.
+    pub fn insert(&mut self, specifier: &str, name: &str, binding: ClientNpmBinding) {
+        self.entries
+            .entry(specifier.to_string())
+            .or_default()
+            .insert(name.to_string(), binding);
+    }
+
+    /// Look one name up.
+    #[must_use]
+    pub fn get(&self, specifier: &str, name: &str) -> Option<&ClientNpmBinding> {
+        self.entries.get(specifier)?.get(name)
+    }
+
+    /// Any binding at all for this specifier — the signal that the package
+    /// resolved, as opposed to failing and leaving the island to refuse.
+    #[must_use]
+    pub fn contains_specifier(&self, specifier: &str) -> bool {
+        self.entries.contains_key(specifier)
+    }
+
+    /// `true` when this island imports no npm package.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// Tier-C client island import policy.
 ///
 /// Framework runtime imports bind to the globals the client runtime installs.
@@ -1956,6 +2078,7 @@ fn rewrite_import_for_client_with_modules(
     import_decl: swc_ecma_ast::ImportDecl,
     specifier: &str,
     modules: &HashMap<String, String>,
+    npm: &ClientNpmBindings,
     depth: u32,
 ) -> RuntimeResult<Vec<String>> {
     // Import chains are inlined recursively; the cap stops a cycle from
@@ -1976,7 +2099,7 @@ fn rewrite_import_for_client_with_modules(
             let transpiled =
                 transpile_module_source_for_quickjs(&target_key, target_source, None)?;
             let nested = |decl: swc_ecma_ast::ImportDecl, spec: &str| {
-                rewrite_import_for_client_with_modules(decl, spec, modules, depth + 1)
+                rewrite_import_for_client_with_modules(decl, spec, modules, npm, depth + 1)
             };
             let lowered = lower_module_to_statements(&target_key, transpiled.as_str(), &nested)?;
 
@@ -2074,14 +2197,100 @@ fn rewrite_import_for_client_with_modules(
         }
     }
 
+    // Tier C · Phase 2 — a bare npm specifier binds to the client chunk.
+    //
+    // 🔑 **Nothing is inlined here.** The package lives in a content-hashed
+    // `/_albedo/npm/<pkg>.<hash>.js` loaded before this script, and the island
+    // reads it through the same lazy record linker the server uses. That is why
+    // the depth cap above is irrelevant to package graphs and why two islands
+    // importing the same package cost one transfer, not two.
+    if npm.contains_specifier(import_source.as_str()) {
+        return bind_npm_import_for_client(&import_decl, specifier, import_source.as_str(), npm);
+    }
+
     Err(RuntimeError::load(
         LoadErrorKind::UnsupportedSyntax,
         format!(
-            "Tier-C client island '{specifier}' imports '{import_source}', which is not yet \
-             bundled for the browser; framework runtime imports (react/react-dom/albedo) and \
-             relative project modules resolve client-side, but bare npm specifiers do not"
+            "Tier-C client island '{specifier}' imports '{import_source}', which did not resolve \
+             for the browser; framework runtime imports (react/react-dom/albedo), relative \
+             project modules and bundled npm packages resolve client-side. If this is an npm \
+             package, the build log names why its client bundle failed."
         ),
     ))
+}
+
+/// Bind one npm import against the client chunk's record table.
+///
+/// Every specifier form lands on `__albedo_require_record(<key>)`, which is
+/// **memoised and lazy**: the factory for a file runs at most once, on first
+/// access, and the record is published before the body runs so an import cycle
+/// inside the package observes a partially-initialized record rather than
+/// recursing — Node's CommonJS discipline, unchanged from the server.
+///
+/// A demanded name that the bundler could not resolve is a **build error**, not
+/// an `undefined` binding discovered when the island first renders. The bundler
+/// already refuses at that point; this is the second gate, for the case where a
+/// binding table and an import list disagree.
+fn bind_npm_import_for_client(
+    import_decl: &ImportDecl,
+    specifier: &str,
+    import_source: &str,
+    npm: &ClientNpmBindings,
+) -> RuntimeResult<Vec<String>> {
+    let record_of = |name: &str| -> RuntimeResult<String> {
+        let binding = npm.get(import_source, name).ok_or_else(|| {
+            RuntimeError::load(
+                LoadErrorKind::ModuleMissing,
+                format!(
+                    "Tier-C client island '{specifier}' imports '{name}' from '{import_source}', \
+                     but the client bundle has no binding for it"
+                ),
+            )
+        })?;
+        let key = js_string_literal(&binding.record_key, specifier)?;
+        let record = format!("globalThis.__albedo_require_record({key})");
+        if binding.export_name == "*" {
+            return Ok(record);
+        }
+        let property = js_string_literal(&binding.export_name, specifier)?;
+        Ok(format!("{record}[{property}]"))
+    };
+
+    // `import "pkg"` — run the module for its effects. The bundler records this
+    // as a `*` demand (the package is taken whole), so the record is the module.
+    if import_decl.specifiers.is_empty() {
+        return Ok(vec![format!("{};", record_of("*")?)]);
+    }
+
+    let mut out = Vec::with_capacity(import_decl.specifiers.len());
+    for import_specifier in &import_decl.specifiers {
+        match import_specifier {
+            ImportSpecifier::Default(default_specifier) => {
+                let expression = record_of("default")?;
+                out.push(format!(
+                    "const {} = {expression};",
+                    default_specifier.local.sym
+                ));
+            }
+            ImportSpecifier::Namespace(namespace_specifier) => {
+                let expression = record_of("*")?;
+                out.push(format!(
+                    "const {} = {expression};",
+                    namespace_specifier.local.sym
+                ));
+            }
+            ImportSpecifier::Named(named) => {
+                let imported = match &named.imported {
+                    Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
+                    Some(ModuleExportName::Str(literal)) => literal.value.to_string(),
+                    None => named.local.sym.to_string(),
+                };
+                let expression = record_of(&imported)?;
+                out.push(format!("const {} = {expression};", named.local.sym));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A3.2 — lower one Tier-C island component to a **browser** script.
@@ -2115,6 +2324,30 @@ pub fn compile_client_island_module_with_modules(
     component_id: u64,
     modules: &HashMap<String, String>,
 ) -> RuntimeResult<String> {
+    compile_client_island_module_with_npm(
+        specifier,
+        source,
+        component_id,
+        modules,
+        &ClientNpmBindings::default(),
+    )
+}
+
+/// [`compile_client_island_module_with_modules`], plus the island's npm bindings.
+///
+/// Tier C · Phase 2. `npm` comes from `bundler::client_npm::build_client_npm_graph`
+/// and says, per bare specifier and per imported name, which record in the
+/// content-hashed client chunk the binding resolves to. Without it a bare
+/// specifier is refused, which is exactly the pre-Phase-2 behaviour — so every
+/// caller that has no chunk pipeline keeps working unchanged, and the ones that
+/// do get npm by passing one more argument.
+pub fn compile_client_island_module_with_npm(
+    specifier: &str,
+    source: &str,
+    component_id: u64,
+    modules: &HashMap<String, String>,
+    npm: &ClientNpmBindings,
+) -> RuntimeResult<String> {
     let normalized = source.trim_start_matches('\u{feff}');
     // `None`: an island's markup is produced by the browser runtime, which has
     // no `__albedo_stable_id` — stamping here would be a ReferenceError on the
@@ -2133,7 +2366,7 @@ pub fn compile_client_island_module_with_modules(
     } else {
         {
             let rewriter = |decl: swc_ecma_ast::ImportDecl, spec: &str| {
-                rewrite_import_for_client_with_modules(decl, spec, modules, 0)
+                rewrite_import_for_client_with_modules(decl, spec, modules, npm, 0)
             };
             lower_module_to_statements(specifier, transpiled.as_str(), &rewriter)?
         }

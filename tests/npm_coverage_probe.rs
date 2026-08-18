@@ -66,6 +66,15 @@ enum Outcome {
     Io,
     Compile,
     GraphTooLarge,
+    /// Tier C · Phase 2 — a *client* bundle reached a module the browser host
+    /// declines to provide, or a name it does not have.
+    ///
+    /// Unreachable through this probe, which measures the **server** bundler
+    /// (`ShakeOptions::default()`, no externals), and listed so that the day a
+    /// client-side coverage run is added the number lands in its own bucket
+    /// instead of being counted as a resolution failure. A refusal is a
+    /// capability answer, not a bug.
+    ClientHostRefused,
 }
 
 /// Node's built-in module set. A specifier equal to one of these, or carrying
@@ -100,6 +109,7 @@ impl Outcome {
             Outcome::Io => "io",
             Outcome::Compile => "compile",
             Outcome::GraphTooLarge => "graph-too-large",
+            Outcome::ClientHostRefused => "client-host-refused (client bundles only)",
         }
     }
 
@@ -122,6 +132,8 @@ impl Outcome {
             NpmBundleError::Io { .. } => Outcome::Io,
             NpmBundleError::Compile { .. } => Outcome::Compile,
             NpmBundleError::GraphTooLarge { .. } => Outcome::GraphTooLarge,
+            NpmBundleError::ExternalRefused { .. }
+            | NpmBundleError::ExternalExportMissing { .. } => Outcome::ClientHostRefused,
         }
     }
 }

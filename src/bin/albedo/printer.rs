@@ -48,6 +48,16 @@ pub struct MeasuredBytes {
     /// same kind as a type error: the author asked for interactivity and did
     /// not get it. Printing the reason is the minimum; see `print_tier_report`.
     pub tier_c_failures: Vec<(String, String)>,
+    /// Tier C · Phase 2 — the npm packages Tier-C islands pull into the browser,
+    /// as `(package, bytes)`, one entry per emitted content-hashed chunk.
+    ///
+    /// Counted separately from `tier_c_island_bytes` because it is a different
+    /// cost with a different fix: an island's own bytes shrink by writing less
+    /// component, and these shrink by importing less package (or by the host
+    /// providing it). Folding them into one number would hide which lever
+    /// applies — and hiding it is how 157 kB of transitive `react` sat inside a
+    /// "3.5 kB icon" for a whole phase.
+    pub npm_chunks: Vec<(String, u64)>,
 }
 
 pub fn print_tier_report(report: &TierReport, root: &str, measured: &MeasuredBytes) {
@@ -145,6 +155,45 @@ pub fn print_tier_report(report: &TierReport, root: &str, measured: &MeasuredByt
         )
     };
     print_tier_summary(2, report.tier_c_count, total, "C", &tier_c_hint);
+
+    // Tier C · Phase 2 — what npm costs, per package, so the number is
+    // actionable rather than a total to shrug at. Each chunk is content-hashed
+    // and shared across every route that needs it, so this is a whole-site cost
+    // paid once, not a per-page one.
+    if !measured.npm_chunks.is_empty() {
+        let total_npm: u64 = measured.npm_chunks.iter().map(|(_, bytes)| bytes).sum();
+        println!();
+        println!(
+            "  {} {}  {}",
+            style_256("▸", ACCENT, true),
+            style("npm in the browser", "1"),
+            style(
+                &format!(
+                    "— {:.1} kB across {} chunk{}",
+                    total_npm as f64 / 1024.0,
+                    measured.npm_chunks.len(),
+                    if measured.npm_chunks.len() == 1 { "" } else { "s" }
+                ),
+                "2"
+            )
+        );
+        let width = measured
+            .npm_chunks
+            .iter()
+            .map(|(package, _)| package.chars().count())
+            .max()
+            .unwrap_or(0)
+            + 2;
+        for (package, bytes) in &measured.npm_chunks {
+            let pad = width.saturating_sub(package.chars().count());
+            println!(
+                "    {}{}  {}",
+                style_256(package, ACCENT_SOFT, true),
+                " ".repeat(pad),
+                style(&format!("{:.1} kB", *bytes as f64 / 1024.0), "2")
+            );
+        }
+    }
 
     // An island that did not compile is not a footnote. The component was
     // classified Tier C — the author wrote hooks and handlers and expects them

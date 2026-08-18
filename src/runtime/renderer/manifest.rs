@@ -200,6 +200,34 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         Ok(())
     }
 
+    /// A2 · register one npm factory/alias artifact on this renderer's own
+    /// engine.
+    ///
+    /// 🪤 **The renderer has its own engine, and it is a *third* place npm has to
+    /// arrive.** `CompiledProject::preload_npm_bundles` serves the compiled
+    /// project and `QuickJsEnginePool::install_npm_bundles` serves the pooled
+    /// action/Tier-B engines; neither of them is the engine that
+    /// `RendererRuntime::render_island_html` uses to server-render a Tier-C
+    /// island. An island importing a package rendered *nothing* — an empty
+    /// placeholder and a blank area on the page without JS — while the client
+    /// chunk for the very same package loaded fine.
+    ///
+    /// This is the third instance of *"the mechanism is correct and the input
+    /// never reaches it"*, after the pooled engines (`d72bcfd`) and
+    /// `RouteManifest.action_ids`. The shape to watch for: a capability wired
+    /// per-engine, and a new engine added later.
+    ///
+    /// # Errors
+    /// Whatever the engine reports for a script it cannot evaluate.
+    pub fn register_npm_artifact(
+        &mut self,
+        key: &str,
+        script: &str,
+        source_hash: u64,
+    ) -> RuntimeResult<()> {
+        self.engine.load_precompiled_module(key, script, source_hash)
+    }
+
     pub fn module_registry(&self) -> &ModuleRegistry {
         &self.module_registry
     }

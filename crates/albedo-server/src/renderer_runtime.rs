@@ -17,8 +17,11 @@ use dom_render_compiler::manifest::schema::{
     ComponentManifestEntry, HydrationMode, PrecompiledRuntimeModulesArtifact, RenderManifestV2,
 };
 use dom_render_compiler::runtime::engine::BootstrapPayload;
+use dom_render_compiler::bundler::client_npm::{
+    build_client_npm_graph, ClientIsland, ClientNpmGraph, CLIENT_NPM_RUNTIME_URL,
+};
 use dom_render_compiler::runtime::quickjs_engine::{
-    compile_client_island_module_with_modules, QuickJsEngine,
+    compile_client_island_module_with_npm, ClientNpmBindings, QuickJsEngine,
 };
 use dom_render_compiler::runtime::renderer::{
     inject_island_marker, RouteRenderRequest, ServerRenderer,
@@ -33,6 +36,12 @@ pub const RUNTIME_MODULE_SOURCES_FILENAME: &str = "runtime-module-sources.json";
 pub struct RendererRuntime {
     manifest: RenderManifestV2,
     renderer: ServerRenderer<QuickJsEngine>,
+    /// Tier C · Phase 2 — the client npm chunks this build emitted, and the
+    /// per-island bindings that reach into them. Built once by
+    /// [`RendererRuntime::build_hydration_blocks`] on the boot thread; read-only
+    /// afterwards, which is what lets the concurrent request path serve a chunk
+    /// without touching QuickJS.
+    client_npm: ClientNpmGraph,
 }
 
 /// A3 · per-route client-hydration artifacts, precomputed once at boot. The
@@ -167,7 +176,11 @@ impl RendererRuntime {
             tracing::warn!(target: "albedo.renderer", error = %err, "engine warmup failed");
         }
 
-        Ok(Self { manifest, renderer })
+        Ok(Self {
+            manifest,
+            renderer,
+            client_npm: ClientNpmGraph::default(),
+        })
     }
 
     // `render_route_stream(entry_module, props_json)` used to live here: render
@@ -193,6 +206,40 @@ impl RendererRuntime {
         &self.manifest
     }
 
+    /// Register the project's npm bundles on the renderer's own engine, so a
+    /// Tier-C island that imports a package can be **server-rendered** — which
+    /// is what puts real markup in the placeholder before any JS runs.
+    ///
+    /// Returns how many artifacts were refused; each is logged with its key.
+    /// Must be called before [`Self::build_hydration_blocks`], which renders
+    /// every island.
+    pub fn install_npm_bundles(
+        &mut self,
+        artifacts: &[(String, String, u64)],
+    ) -> usize {
+        let mut failed = 0usize;
+        for (key, script, source_hash) in artifacts {
+            if let Err(err) = self.renderer.register_npm_artifact(key, script, *source_hash) {
+                failed += 1;
+                tracing::warn!(
+                    target: "albedo.renderer",
+                    artifact = %key,
+                    error = %err,
+                    "npm artifact failed to register on the island renderer; islands \
+                     importing it will not server-render"
+                );
+            }
+        }
+        failed
+    }
+
+    /// The client npm chunks this build emitted. Empty until
+    /// [`Self::build_hydration_blocks`] has run, and empty afterwards for a
+    /// project whose islands import no package.
+    pub fn client_npm(&self) -> &ClientNpmGraph {
+        &self.client_npm
+    }
+
     /// A3 · precompute the client-hydration block for every manifest route that
     /// carries a hydratable Tier-C island. Each island is SSR-rendered standalone
     /// (so the placeholder shows real markup the browser can adopt and the user
@@ -207,9 +254,22 @@ impl RendererRuntime {
     /// and a must-hydrate island emits exactly one block per node — the two maps
     /// are then unioned per-component by the caller, instead of one clobbering
     /// the whole route's block.
+    ///
+    /// ## Tier C · Phase 2
+    ///
+    /// `npm_root` is where the `node_modules` search starts for islands that
+    /// import a package. Passing `None` reproduces the pre-Phase-2 behaviour
+    /// exactly: no chunks are built and a bare specifier is refused at compile,
+    /// which is the right answer for a runtime that has no project on disk.
+    ///
+    /// 🔑 **The graph is built once, for every island in the build, before any
+    /// island is compiled.** Demand is unioned across islands so one package
+    /// yields one content-hashed chunk for the whole site, and the per-island
+    /// binding table the compile needs falls out of the same pass.
     pub fn build_hydration_blocks(
         &mut self,
         claimed: &HashMap<String, std::collections::HashSet<String>>,
+        npm_root: Option<&Path>,
     ) -> HashMap<String, RouteHydration> {
         struct IslandMeta {
             placeholder_id: String,
@@ -273,10 +333,72 @@ impl RendererRuntime {
         // project module has that module inlined into its bundle, so the
         // compiler needs the whole map rather than just the island's own source.
         let module_sources = self.renderer.module_registry().sources();
+
+        // Tier C · Phase 2 — resolve every island's npm demand up front, once
+        // for the whole build. Islands are deduplicated by module path: the same
+        // component mounted on three routes is one entry in the demand set and
+        // one entry in the binding table.
+        self.client_npm = match npm_root {
+            Some(root) => {
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                let sources: Vec<ClientIsland<'_>> = routes
+                    .iter()
+                    .flat_map(|(_, islands)| islands.iter())
+                    .filter(|island| seen.insert(island.module_path.as_str()))
+                    .map(|island| ClientIsland {
+                        module_path: island.module_path.as_str(),
+                        source: island.source.as_str(),
+                    })
+                    .collect();
+                build_client_npm_graph(root, &sources)
+            }
+            None => ClientNpmGraph::default(),
+        };
+        for failure in self.client_npm.failures() {
+            // Loud, and named. An island whose package does not resolve renders
+            // its server HTML and then never hydrates; without this line that is
+            // indistinguishable from "the framework is broken".
+            tracing::error!(
+                target: "albedo.renderer",
+                module_path = %failure.module_path,
+                specifier = %failure.specifier,
+                error = %failure.reason,
+                "client npm bundle failed; the island importing it will not hydrate"
+            );
+        }
+        if !self.client_npm.is_empty() {
+            for chunk in self.client_npm.chunks() {
+                tracing::info!(
+                    target: "albedo.renderer",
+                    package = %chunk.package,
+                    url = %chunk.url,
+                    bytes = chunk.bytes(),
+                    "client npm chunk"
+                );
+            }
+        }
+        let empty_npm_bindings = ClientNpmBindings::default();
+
         let mut blocks = HashMap::new();
         for (path, islands) in routes {
             let mut placeholders = Vec::new();
             let mut scripts = String::from("<script src=\"/_albedo/client.js\"></script>");
+            // The linker + host modules, then the package chunks, then the
+            // islands. Plain `<script src>` tags execute in document order, and
+            // that order is the dependency order: an island calls
+            // `__albedo_require_record`, which the runtime defines, against
+            // factories the chunks registered.
+            let chunk_urls = self
+                .client_npm
+                .chunk_urls_for(islands.iter().map(|island| island.module_path.as_str()));
+            if !chunk_urls.is_empty() {
+                scripts.push_str(&format!(
+                    "<script src=\"{CLIENT_NPM_RUNTIME_URL}\"></script>"
+                ));
+                for url in chunk_urls {
+                    scripts.push_str(&format!("<script src=\"{url}\"></script>"));
+                }
+            }
             let mut plan_islands = Vec::new();
 
             for island in &islands {
@@ -292,11 +414,14 @@ impl RendererRuntime {
                 // server-rendered fine just above — sits there inert forever.
                 // That is indistinguishable from "the framework is broken"
                 // unless the reason is said out loud.
-                match compile_client_island_module_with_modules(
+                match compile_client_island_module_with_npm(
                     &island.module_path,
                     &island.source,
                     island.component_id,
                     &module_sources,
+                    self.client_npm
+                        .bindings_for(&island.module_path)
+                        .unwrap_or(&empty_npm_bindings),
                 ) {
                     Ok(iife) => {
                         scripts.push_str("<script>");

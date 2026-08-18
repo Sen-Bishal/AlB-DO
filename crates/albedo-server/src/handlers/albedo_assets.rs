@@ -15,6 +15,7 @@
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, Response, StatusCode};
+use std::sync::OnceLock;
 
 const RUNTIME_JS: &str = include_str!("../../../../assets/albedo-runtime.js");
 const BINCODE_JS: &str = include_str!("../../../../assets/bincode.js");
@@ -27,6 +28,23 @@ const PHOSPHOR_JS: &str = include_str!("../../../../assets/phosphor.js");
 // A3 · the Tier-C client runtime (Preact-compatible VDOM + hooks). Installs the
 // `h`/`useState`/… globals and `__ALBEDO_HYDRATE_ISLAND` the bootstrap calls.
 const CLIENT_JS: &str = include_str!("../../../../assets/albedo-client.js");
+
+/// Tier C · Phase 2 — the browser-side npm runtime: the record linker (the
+/// **same** Rust-generated string the server's QuickJS prelude installs) plus
+/// the host modules that stand in for `react` and `react/jsx-runtime`, plus an
+/// inert frozen `process`.
+///
+/// Generated rather than `include_str!`'d, because it is derived from
+/// `bundler::client_npm::CLIENT_HOST_MODULES` — the one list that also decides
+/// which imports the bundler accepts. A hand-written copy in `assets/` would be
+/// a second place to forget.
+///
+/// Built once per process: the inputs are compile-time constants, so the string
+/// is identical for the life of the binary.
+fn npm_runtime_js() -> &'static str {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED.get_or_init(dom_render_compiler::bundler::client_npm::build_browser_npm_runtime_script)
+}
 
 /// Resolve `path` to one of the in-binary bakabox client assets.
 /// Returns `Some(body)` for the known framework-reserved URLs;
@@ -41,6 +59,7 @@ fn resolve_albedo_asset(path: &str) -> Option<&'static str> {
         "/_albedo/client.js" => Some(CLIENT_JS),
         "/_albedo/wt-bootstrap.js" => Some(WT_BOOTSTRAP_JS),
         "/_albedo/phosphor.js" => Some(PHOSPHOR_JS),
+        dom_render_compiler::bundler::client_npm::CLIENT_NPM_RUNTIME_URL => Some(npm_runtime_js()),
         _ => None,
     }
 }
@@ -68,6 +87,33 @@ pub fn dispatch_albedo_asset(path: &str) -> Option<Response<Body>> {
     Some(response)
 }
 
+/// Tier C · Phase 2 — serve one content-hashed client npm chunk.
+///
+/// `cache-control` is `immutable` with a one-year `max-age`, and it is the URL
+/// that earns it: the filename carries a hash of the exact bytes, so a chunk
+/// whose content changes gets a different URL and can never be served stale.
+/// That is precisely the property the fixed-URL assets above lack, which is why
+/// they are `no-cache` and this is not.
+pub fn dispatch_client_npm_chunk(
+    graph: &dom_render_compiler::bundler::client_npm::ClientNpmGraph,
+    path: &str,
+) -> Option<Response<Body>> {
+    let chunk = graph.chunk_by_url(path)?;
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/javascript; charset=utf-8"),
+        )
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        )
+        .body(Body::from(chunk.script.clone()))
+        .expect("npm chunk response builds");
+    Some(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +128,7 @@ mod tests {
             "/_albedo/client.js",
             "/_albedo/wt-bootstrap.js",
             "/_albedo/phosphor.js",
+            dom_render_compiler::bundler::client_npm::CLIENT_NPM_RUNTIME_URL,
         ] {
             let body = resolve_albedo_asset(path).unwrap_or_else(|| {
                 panic!("expected asset to resolve: {path}")

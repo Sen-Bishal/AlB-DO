@@ -38,6 +38,7 @@
 //! Anything unresolvable fails **loudly** with the file and specifier that
 //! caused it — never a silent fallthrough.
 
+use crate::bundler::defines::{fold_defines, Defines};
 use crate::runtime::engine::stable_source_hash;
 use crate::runtime::quickjs_engine::{compile_npm_module_script, NpmModuleFormat};
 use serde::Deserialize;
@@ -45,8 +46,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{sync::Lrc, FileName, SourceMap};
 use swc_ecma_ast::{
-    CallExpr, Callee, Decl, Expr, ExportSpecifier, Lit, Module, ModuleDecl, ModuleExportName,
-    ModuleItem, Pat, Program,
+    CallExpr, Callee, Decl, Expr, ExportSpecifier, ImportSpecifier, Lit, Module, ModuleDecl,
+    ModuleExportName, ModuleItem, Pat, Program,
 };
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitWith};
@@ -124,6 +125,32 @@ pub enum NpmBundleError {
     GraphTooLarge {
         /// The bare specifier whose graph blew the cap.
         specifier: String,
+    },
+    /// A package imported a specifier the client host declines to provide.
+    ///
+    /// 🔑 **Refused at build, never stubbed to throw at run time.** A stub that
+    /// throws moves a fact the compiler already knows into the user's browser,
+    /// where it arrives as a blank island instead of a build error.
+    #[error("'{specifier}' (imported from '{importer}') is not available to client code: {reason}")]
+    ExternalRefused {
+        /// The refused specifier as written.
+        specifier: String,
+        /// File that imported it.
+        importer: PathBuf,
+        /// Why the host declines it.
+        reason: String,
+    },
+    /// A package imported a *name* the host module does not provide.
+    #[error("'{specifier}' (imported from '{importer}') does not provide '{name}' in Albedo's client runtime — it provides: {provides}")]
+    ExternalExportMissing {
+        /// The host specifier.
+        specifier: String,
+        /// The name the importer asked for.
+        name: String,
+        /// File that imported it.
+        importer: PathBuf,
+        /// Comma-separated list of what the host does provide.
+        provides: String,
     },
 }
 
@@ -666,14 +693,39 @@ fn record_key(package: &ResolvedPackage, file: &Path) -> String {
     format!("npm:{}@{}/{}", package.name, package.version, relative)
 }
 
-/// Raw import/require specifiers found in one parsed file.
-fn collect_specifiers(
+/// One import edge out of a file: the specifier as written, plus the names the
+/// importer binds from it.
+///
+/// The names exist for one reason — checking an import against what a **host**
+/// external actually provides — and are empty for CJS, where a `require` gives
+/// no static name list at all.
+#[derive(Debug, Clone)]
+struct FileImport {
+    specifier: String,
+    /// Imported names; `default` for a default import, [`STAR_DEMAND`] for a
+    /// namespace import, empty for a side-effect-only import or any `require`.
+    names: Vec<String>,
+}
+
+/// Every import edge out of one file, in source order.
+#[derive(Debug, Clone, Default)]
+struct FileImports {
+    entries: Vec<FileImport>,
+}
+
+/// Raw import/require specifiers found in one parsed file, with the names each
+/// one binds.
+///
+/// 🔑 **One parse, one truth.** [`collect_specifiers`] is a projection of this,
+/// so the specifier walk and the host-export check can never see different
+/// import lists for the same file.
+fn collect_imports(
     path: &Path,
     source: &str,
     format: NpmModuleFormat,
-) -> Result<Vec<String>, NpmBundleError> {
+) -> Result<FileImports, NpmBundleError> {
     match format {
-        NpmModuleFormat::Json => Ok(Vec::new()),
+        NpmModuleFormat::Json => Ok(FileImports::default()),
         NpmModuleFormat::Esm => {
             let module =
                 parse_npm_module(path, source).map_err(|message| NpmBundleError::Compile {
@@ -681,7 +733,7 @@ fn collect_specifiers(
                     path: path.to_path_buf(),
                     message,
                 })?;
-            Ok(esm_specifiers(&module))
+            Ok(esm_imports(&module))
         }
         NpmModuleFormat::Cjs => {
             let program =
@@ -692,9 +744,31 @@ fn collect_specifiers(
                 })?;
             let mut collector = RequireCollector::default();
             program.visit_with(&mut collector);
-            Ok(collector.specifiers)
+            Ok(FileImports {
+                entries: collector
+                    .specifiers
+                    .into_iter()
+                    .map(|specifier| FileImport {
+                        specifier,
+                        names: Vec::new(),
+                    })
+                    .collect(),
+            })
         }
     }
+}
+
+/// Raw import/require specifiers found in one parsed file.
+fn collect_specifiers(
+    path: &Path,
+    source: &str,
+    format: NpmModuleFormat,
+) -> Result<Vec<String>, NpmBundleError> {
+    Ok(collect_imports(path, source, format)?
+        .entries
+        .into_iter()
+        .map(|entry| entry.specifier)
+        .collect())
 }
 
 /// Parse an npm ESM file (plain JS — no JSX/TS) into an swc module.
@@ -730,6 +804,54 @@ fn parse_npm_program(path: &Path, source: &str) -> Result<Program, String> {
     parser
         .parse_program()
         .map_err(|err| format!("parse error: {err:?}"))
+}
+
+/// Import edges of an ESM module, with the names each binds.
+///
+/// `export … from` and `export * from` are import edges too — they load the
+/// target — but the names they *re-export* are not names this file binds, so
+/// they carry an empty list rather than a name a host would be checked against.
+fn esm_imports(module: &Module) -> FileImports {
+    let mut entries = Vec::new();
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(decl) = item else {
+            continue;
+        };
+        match decl {
+            ModuleDecl::Import(import) => {
+                let names = import
+                    .specifiers
+                    .iter()
+                    .map(|specifier| match specifier {
+                        ImportSpecifier::Default(_) => "default".to_string(),
+                        ImportSpecifier::Namespace(_) => STAR_DEMAND.to_string(),
+                        ImportSpecifier::Named(named) => named
+                            .imported
+                            .as_ref()
+                            .map_or_else(|| named.local.sym.to_string(), export_name_text),
+                    })
+                    .collect();
+                entries.push(FileImport {
+                    specifier: import.src.value.to_string(),
+                    names,
+                });
+            }
+            ModuleDecl::ExportNamed(named) => {
+                if let Some(src) = named.src.as_ref() {
+                    entries.push(FileImport {
+                        specifier: src.value.to_string(),
+                        names: Vec::new(),
+                    });
+                }
+            }
+            ModuleDecl::ExportAll(all) => entries.push(FileImport {
+                specifier: all.src.value.to_string(),
+                names: Vec::new(),
+            }),
+            _ => {}
+        }
+    }
+    FileImports { entries }
 }
 
 /// Import sources reachable from an ESM module: `import … from`, bare
@@ -915,7 +1037,7 @@ fn export_map(module: &Module) -> ExportMap {
 /// Not a valid JavaScript identifier, so it can never collide with a real
 /// export name — which is what lets one `BTreeSet<String>` carry both
 /// "these names" and "all of them" without a second field to keep in sync.
-const STAR_DEMAND: &str = "*";
+pub const STAR_DEMAND: &str = "*";
 
 /// The names bound by an `export <decl>`.
 fn declared_export_names(decl: &Decl) -> Vec<String> {
@@ -970,6 +1092,61 @@ pub struct ShakenNpmBundle {
     pub taken_whole: bool,
 }
 
+/// What a bare specifier means to a **client** bundle when the host already
+/// provides it, or refuses to.
+///
+/// 🔑 **This is the lever that carries most of Phase 2's payload.** Shaking
+/// `lucide-react` for one icon left 156 991 B of which only 3 507 B was lucide's
+/// own code; the rest was `react` (98 kB), `prop-types`, `react-is` and
+/// `object-assign`, pulled in by the *package's* own `import … from 'react'`. A
+/// project's react import already binds to the client runtime's globals; a
+/// package's did not, so every React component library shipped a second React.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalTarget {
+    /// The host publishes this module itself. The walk stops here: no file is
+    /// read, nothing is emitted, and importers bind to `record_key`.
+    Host {
+        /// Record key the host registers the module under.
+        record_key: String,
+        /// Names the host's record actually provides. An ESM import naming
+        /// anything outside this set is a **build error** — the same discipline
+        /// as a demanded name nothing exports, and for the same reason: the
+        /// alternative is an `undefined` binding discovered at first render.
+        provides: BTreeSet<String>,
+    },
+    /// The host has no implementation, and stubbing one that throws would move
+    /// a build-time fact to run time. Fails the bundle, naming why.
+    Refused {
+        /// Human-facing reason, surfaced verbatim in the build error.
+        reason: String,
+    },
+}
+
+/// How a demand-driven bundle differs from the server's whole-package one.
+///
+/// [`Default`] is exactly the pre-externalisation behaviour — no externals, no
+/// defines — so the server path and every fixture test that wants the raw walk
+/// can ask for it by name.
+#[derive(Debug, Clone, Default)]
+pub struct ShakeOptions {
+    externals: BTreeMap<String, ExternalTarget>,
+    defines: Defines,
+}
+
+impl ShakeOptions {
+    /// Build an option set from an externals table and a define set.
+    #[must_use]
+    pub fn new(externals: BTreeMap<String, ExternalTarget>, defines: Defines) -> Self {
+        Self { externals, defines }
+    }
+
+    /// The externals table, for callers that need to emit matching host records.
+    #[must_use]
+    pub fn externals(&self) -> &BTreeMap<String, ExternalTarget> {
+        &self.externals
+    }
+}
+
 /// Bundle `specifier` carrying only what `demand` needs.
 ///
 /// # Why this is a second entry point and not a parameter on the first
@@ -989,6 +1166,14 @@ pub struct ShakenNpmBundle {
 /// `…/icons/check.js` and the 854-line barrel is never emitted — which is also
 /// why pruning the barrel's own body is unnecessary: nothing points at it.
 ///
+/// # What `options` adds
+///
+/// * **Externals** — a specifier the host already provides is never walked, so
+///   a package's `import 'react'` costs zero bytes instead of 98 kB.
+/// * **Defines** — `process.env.NODE_ENV` folds to `"production"` before the
+///   specifier scan, so a `NODE_ENV` fork contributes *one* arm to the graph
+///   rather than both. See [`crate::bundler::defines`].
+///
 /// # When shaking is declined
 ///
 /// Only a package declaring `"sideEffects": false` is shaken. Without that
@@ -996,14 +1181,20 @@ pub struct ShakenNpmBundle {
 /// installing itself, a registry populating on import), and dropping it would
 /// break the package silently at runtime — the worst failure this codebase has.
 /// Such a package is taken whole and says so via [`ShakenNpmBundle::taken_whole`].
+/// ⚠️ A whole-taken package still goes through the **server** bundler, so it is
+/// neither externalised nor define-folded: those are properties of the shaken
+/// walk, and pretending otherwise would emit a graph whose scan and lowering
+/// disagreed.
 ///
 /// # Errors
 /// The resolution errors of [`bundle_npm_dependency`], plus a loud failure when
-/// a demanded name is exported by nothing in the graph.
+/// a demanded name is exported by nothing in the graph, when a package imports a
+/// refused external, or when it imports a name the host external does not have.
 pub fn bundle_npm_dependency_for_demand(
     search_dir: &Path,
     specifier: &str,
     demand: &BTreeSet<String>,
+    options: &ShakeOptions,
 ) -> Result<ShakenNpmBundle, NpmBundleError> {
     let (entry_package, entry_path) = resolve_bare_entry(search_dir, specifier)?;
 
@@ -1034,7 +1225,7 @@ pub fn bundle_npm_dependency_for_demand(
         });
     }
 
-    let mut walk = DemandWalk::new(specifier);
+    let mut walk = DemandWalk::new(specifier, options);
     let mut bindings = BTreeMap::new();
     for name in demand {
         let resolved = walk.resolve(&entry_package, &entry_path, name, 0)?;
@@ -1072,29 +1263,132 @@ fn package_declares_no_side_effects(package: &ResolvedPackage) -> bool {
     value.get("sideEffects") == Some(&serde_json::Value::Bool(false))
 }
 
+/// Where one import edge lands.
+enum Edge {
+    /// A host-provided module. Nothing is read, nothing is emitted.
+    Host(String),
+    /// A real file inside some package.
+    File(ResolvedPackage, PathBuf),
+}
+
+/// One file, read, classified and define-folded exactly once.
+///
+/// 🔑 **The folded source is the only source.** The specifier walk and the
+/// lowering both read this string, so they cannot disagree about which arm of a
+/// `NODE_ENV` fork exists — the failure mode being a `require` that resolves
+/// against a record nothing registered.
+#[derive(Clone)]
+struct PreparedFile {
+    format: NpmModuleFormat,
+    source: std::sync::Arc<str>,
+    imports: std::sync::Arc<FileImports>,
+}
+
 /// The demand-driven walk: resolution state plus the live file set.
-struct DemandWalk {
+struct DemandWalk<'a> {
     specifier: String,
+    options: &'a ShakeOptions,
     /// Files that must be emitted, in insertion order.
     live: Vec<(ResolvedPackage, PathBuf)>,
     live_keys: BTreeSet<PathBuf>,
     /// `(file, name)` pairs already resolved, so a re-export cycle terminates.
     resolving: BTreeSet<(PathBuf, String)>,
+    /// Read-once cache. A file is touched up to three times (name resolution,
+    /// import closure, lowering) and a barrel once *per demanded name* — twenty
+    /// icons re-parsed lucide's 854-line index twenty times before this existed.
+    prepared: HashMap<PathBuf, PreparedFile>,
+    /// Export surfaces, cached for the same reason and on the same key.
+    export_maps: HashMap<PathBuf, std::sync::Arc<ExportMap>>,
 }
 
-impl DemandWalk {
-    fn new(specifier: &str) -> Self {
+impl<'a> DemandWalk<'a> {
+    fn new(specifier: &str, options: &'a ShakeOptions) -> Self {
         Self {
             specifier: specifier.to_string(),
+            options,
             live: Vec::new(),
             live_keys: BTreeSet::new(),
             resolving: BTreeSet::new(),
+            prepared: HashMap::new(),
+            export_maps: HashMap::new(),
         }
     }
 
     fn mark_live(&mut self, package: &ResolvedPackage, path: &Path) {
         if self.live_keys.insert(path.to_path_buf()) {
             self.live.push((package.clone(), path.to_path_buf()));
+        }
+    }
+
+    /// Read, classify and define-fold one file, memoised on its path.
+    fn prepare(&mut self, path: &Path) -> Result<PreparedFile, NpmBundleError> {
+        if let Some(hit) = self.prepared.get(path) {
+            return Ok(hit.clone());
+        }
+        let raw = std::fs::read_to_string(path).map_err(|err| NpmBundleError::Io {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+        // Classification reads the *original* text: define folding preserves
+        // every `import`/`export` declaration, so it cannot change the answer,
+        // and asking first means the fold knows which grammar to parse with.
+        let format = classify_format(path, &raw);
+        let source = fold_defines(
+            &path.display().to_string(),
+            &raw,
+            format == NpmModuleFormat::Esm,
+            &self.options.defines,
+        )
+        .unwrap_or(raw);
+        let imports = collect_imports(path, &source, format)?;
+        let prepared = PreparedFile {
+            format,
+            source: std::sync::Arc::from(source.as_str()),
+            imports: std::sync::Arc::new(imports),
+        };
+        self.prepared.insert(path.to_path_buf(), prepared.clone());
+        Ok(prepared)
+    }
+
+    /// The export surface of an ESM file, memoised.
+    fn export_map_of(
+        &mut self,
+        package: &ResolvedPackage,
+        path: &Path,
+        source: &str,
+    ) -> Result<std::sync::Arc<ExportMap>, NpmBundleError> {
+        if let Some(hit) = self.export_maps.get(path) {
+            return Ok(hit.clone());
+        }
+        let module = parse_npm_module(path, source).map_err(|message| NpmBundleError::Compile {
+            key: record_key(package, path),
+            path: path.to_path_buf(),
+            message,
+        })?;
+        let map = std::sync::Arc::new(export_map(&module));
+        self.export_maps.insert(path.to_path_buf(), map.clone());
+        Ok(map)
+    }
+
+    /// Resolve one raw specifier written inside a package file, consulting the
+    /// externals table first.
+    fn edge(
+        &self,
+        package: &ResolvedPackage,
+        path: &Path,
+        raw: &str,
+    ) -> Result<Edge, NpmBundleError> {
+        match self.options.externals.get(raw) {
+            Some(ExternalTarget::Host { record_key, .. }) => Ok(Edge::Host(record_key.clone())),
+            Some(ExternalTarget::Refused { reason }) => Err(NpmBundleError::ExternalRefused {
+                specifier: raw.to_string(),
+                importer: path.to_path_buf(),
+                reason: reason.clone(),
+            }),
+            None => {
+                let (dep_package, dep_path) = resolve_from_file(package, path, raw)?;
+                Ok(Edge::File(dep_package, dep_path))
+            }
         }
     }
 
@@ -1113,21 +1407,16 @@ impl DemandWalk {
             return Err(NpmBundleError::Compile {
                 key: self.specifier.clone(),
                 path: path.to_path_buf(),
-                message: format!(
-                    "re-export chain for '{name}' exceeded {MAX_REEXPORT_DEPTH} hops"
-                ),
+                message: format!("re-export chain for '{name}' exceeded {MAX_REEXPORT_DEPTH} hops"),
             });
         }
 
-        let source = std::fs::read_to_string(path).map_err(|err| NpmBundleError::Io {
-            path: path.to_path_buf(),
-            message: err.to_string(),
-        })?;
+        let prepared = self.prepare(path)?;
 
         // Only ESM has a static export graph. A CJS or JSON file is opaque to
         // this analysis, so it is taken whole and the name is read off its
         // record at runtime — correct, just unshaken.
-        if classify_format(path, &source) != NpmModuleFormat::Esm {
+        if prepared.format != NpmModuleFormat::Esm {
             self.mark_live(package, path);
             return Ok(ResolvedExport {
                 record_key: record_key(package, path),
@@ -1145,12 +1434,7 @@ impl DemandWalk {
             });
         }
 
-        let module = parse_npm_module(path, &source).map_err(|message| NpmBundleError::Compile {
-            key: record_key(package, path),
-            path: path.to_path_buf(),
-            message,
-        })?;
-        let map = export_map(&module);
+        let map = self.export_map_of(package, path, &prepared.source)?;
 
         if let Some(origin) = map.named.get(name) {
             return match origin.clone() {
@@ -1164,25 +1448,37 @@ impl DemandWalk {
                 ExportOrigin::ReExport {
                     source: from,
                     imported,
-                } => {
-                    let (next_package, next_path) = resolve_from_file(package, path, &from)?;
-                    if imported == STAR_DEMAND {
-                        // A namespace re-export needs the target whole.
-                        self.mark_live(&next_package, &next_path);
-                        return Ok(ResolvedExport {
-                            record_key: record_key(&next_package, &next_path),
-                            export_name: STAR_DEMAND.to_string(),
-                        });
+                } => match self.edge(package, path, &from)? {
+                    // A re-export that lands on the host binds straight to the
+                    // host's record — `export { forwardRef } from 'react'`.
+                    Edge::Host(host_key) => Ok(ResolvedExport {
+                        record_key: host_key,
+                        export_name: imported,
+                    }),
+                    Edge::File(next_package, next_path) => {
+                        if imported == STAR_DEMAND {
+                            // A namespace re-export needs the target whole.
+                            self.mark_live(&next_package, &next_path);
+                            return Ok(ResolvedExport {
+                                record_key: record_key(&next_package, &next_path),
+                                export_name: STAR_DEMAND.to_string(),
+                            });
+                        }
+                        self.resolve(&next_package, &next_path, &imported, depth + 1)
                     }
-                    self.resolve(&next_package, &next_path, &imported, depth + 1)
-                }
+                },
             };
         }
 
         // Not named here — try each `export *` source in order, which is what
         // makes `export * from './icons'` resolve without reading all 854.
         for star_source in &map.star.clone() {
-            let (next_package, next_path) = resolve_from_file(package, path, star_source)?;
+            // A host module has no readable export graph, so a name cannot be
+            // *found* through it; skip rather than guess.
+            let Ok(Edge::File(next_package, next_path)) = self.edge(package, path, star_source)
+            else {
+                continue;
+            };
             if let Ok(resolved) = self.resolve(&next_package, &next_path, name, depth + 1) {
                 return Ok(resolved);
             }
@@ -1211,51 +1507,86 @@ impl DemandWalk {
                 });
             }
 
-            let source = std::fs::read_to_string(&path).map_err(|err| NpmBundleError::Io {
-                path: path.clone(),
-                message: err.to_string(),
-            })?;
-            let format = classify_format(&path, &source);
-            for raw in collect_specifiers(&path, &source, format)? {
-                let (dep_package, dep_path) = resolve_from_file(&package, &path, &raw)?;
-                self.mark_live(&dep_package, &dep_path);
+            let prepared = self.prepare(&path)?;
+            for entry in &prepared.imports.entries {
+                match self.edge(&package, &path, &entry.specifier)? {
+                    Edge::Host(_) => self.check_host_import(&path, entry)?,
+                    Edge::File(dep_package, dep_path) => self.mark_live(&dep_package, &dep_path),
+                }
             }
         }
         Ok(())
     }
 
+    /// Every name a live file imports from a host module must be a name that
+    /// host actually provides.
+    ///
+    /// 🔑 **Checked here, at build, rather than left to produce `undefined` at
+    /// first render.** This is the same rule Phase 1 set for a demanded name
+    /// nothing exports, applied to the other end of the edge.
+    ///
+    /// ⚠️ **Boundary: a namespace import is unverifiable.** `import * as React
+    /// from 'react'` followed by `React.useSyncExternalStore(…)` is a member
+    /// access on an object, and answering it would need whole-file member
+    /// analysis rather than an import list. The same is true of CJS
+    /// `require('react').x`. Both pass, and a missing member surfaces as an
+    /// ordinary `undefined is not a function` at run time.
+    fn check_host_import(
+        &self,
+        path: &Path,
+        entry: &FileImport,
+    ) -> Result<(), NpmBundleError> {
+        let Some(ExternalTarget::Host { provides, .. }) =
+            self.options.externals.get(&entry.specifier)
+        else {
+            return Ok(());
+        };
+        for name in &entry.names {
+            if name == STAR_DEMAND || provides.contains(name) {
+                continue;
+            }
+            return Err(NpmBundleError::ExternalExportMissing {
+                specifier: entry.specifier.clone(),
+                name: name.clone(),
+                importer: path.to_path_buf(),
+                provides: provides.iter().cloned().collect::<Vec<_>>().join(", "),
+            });
+        }
+        Ok(())
+    }
+
     /// Lower every live file to its registration artifact.
-    fn into_artifacts(self) -> Result<Vec<NpmArtifact>, NpmBundleError> {
-        let mut artifacts = Vec::with_capacity(self.live.len());
-        for (package, path) in &self.live {
+    fn into_artifacts(mut self) -> Result<Vec<NpmArtifact>, NpmBundleError> {
+        let live = std::mem::take(&mut self.live);
+        let mut artifacts = Vec::with_capacity(live.len());
+        for (package, path) in &live {
             let key = record_key(package, path);
-            let source = std::fs::read_to_string(path).map_err(|err| NpmBundleError::Io {
-                path: path.clone(),
-                message: err.to_string(),
-            })?;
-            let format = classify_format(path, &source);
+            let prepared = self.prepare(path)?;
 
             let mut resolve_map: BTreeMap<String, String> = BTreeMap::new();
-            for raw in collect_specifiers(path, &source, format)? {
-                if resolve_map.contains_key(&raw) {
+            for entry in &prepared.imports.entries {
+                if resolve_map.contains_key(&entry.specifier) {
                     continue;
                 }
-                let (dep_package, dep_path) = resolve_from_file(package, path, &raw)?;
-                resolve_map.insert(raw, record_key(&dep_package, &dep_path));
+                let resolved = match self.edge(package, path, &entry.specifier)? {
+                    Edge::Host(host_key) => host_key,
+                    Edge::File(dep_package, dep_path) => record_key(&dep_package, &dep_path),
+                };
+                resolve_map.insert(entry.specifier.clone(), resolved);
             }
 
             // The lowering takes a `HashMap`; the walk keeps a `BTreeMap` so the
             // emitted resolve table is byte-stable across runs, which is what
             // lets the client chunk be content-hashed and cached.
             let resolve_map: HashMap<String, String> = resolve_map.into_iter().collect();
-            let script = compile_npm_module_script(&key, &source, format, &resolve_map).map_err(
-                |err| NpmBundleError::Compile {
-                    key: key.clone(),
-                    path: path.clone(),
-                    message: err.to_string(),
-                },
-            )?;
-            let source_hash = stable_source_hash(&source);
+            let script =
+                compile_npm_module_script(&key, &prepared.source, prepared.format, &resolve_map)
+                    .map_err(|err| NpmBundleError::Compile {
+                        key: key.clone(),
+                        path: path.clone(),
+                        message: err.to_string(),
+                    })?;
+            let source_hash = stable_source_hash(&prepared.source);
             artifacts.push(NpmArtifact {
                 key,
                 script,
@@ -1838,7 +2169,7 @@ mod tests {
         barrel_package(dir.path());
 
         let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"])).unwrap();
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"]), &ShakeOptions::default()).unwrap();
 
         assert!(!shaken.taken_whole);
         let beta = shaken.bindings.get("Beta").expect("Beta resolved");
@@ -1866,7 +2197,7 @@ mod tests {
         barrel_package(dir.path());
 
         let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha"])).unwrap();
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha"]), &ShakeOptions::default()).unwrap();
         assert!(shaken
             .artifacts
             .iter()
@@ -1880,9 +2211,9 @@ mod tests {
         barrel_package(dir.path());
 
         let one =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha"])).unwrap();
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha"]), &ShakeOptions::default()).unwrap();
         let two =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha", "Beta"]))
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha", "Beta"]), &ShakeOptions::default())
                 .unwrap();
 
         assert_eq!(one.artifacts.len(), 2);
@@ -1905,7 +2236,7 @@ mod tests {
         .unwrap();
 
         let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"])).unwrap();
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"]), &ShakeOptions::default()).unwrap();
         assert!(shaken.taken_whole);
         assert!(shaken.artifacts.len() > 3, "the whole package ships");
         // The binding still resolves — through the entry record, as before.
@@ -1927,7 +2258,7 @@ mod tests {
         .unwrap();
 
         let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"])).unwrap();
+            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"]), &ShakeOptions::default()).unwrap();
         assert!(shaken.taken_whole);
     }
 
@@ -1938,7 +2269,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         barrel_package(dir.path());
 
-        let err = bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Delta"]))
+        let err = bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Delta"]), &ShakeOptions::default())
             .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("Delta"), "must name the binding: {message}");
@@ -1960,7 +2291,7 @@ mod tests {
 
         // Either a clean "not exported" error or a bound record — never a hang
         // or a stack overflow.
-        let _ = bundle_npm_dependency_for_demand(dir.path(), "loopy", &demand(&["Whatever"]));
+        let _ = bundle_npm_dependency_for_demand(dir.path(), "loopy", &demand(&["Whatever"]), &ShakeOptions::default());
     }
 
     /// CommonJS has no static export graph, so a CJS entry is opaque to this
@@ -1978,7 +2309,7 @@ mod tests {
         std::fs::write(pkg.join("index.js"), "module.exports = { hello: 1 };").unwrap();
 
         let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "cjspkg", &demand(&["hello"])).unwrap();
+            bundle_npm_dependency_for_demand(dir.path(), "cjspkg", &demand(&["hello"]), &ShakeOptions::default()).unwrap();
         let hello = shaken.bindings.get("hello").expect("bound");
         assert!(hello.record_key.ends_with("index.js"));
         assert_eq!(hello.export_name, "hello");

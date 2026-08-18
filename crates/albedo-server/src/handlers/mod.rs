@@ -10,7 +10,7 @@ pub mod public_assets;
 pub mod streaming;
 
 pub use action::{run_action_request, ActionRegistry};
-pub use albedo_assets::dispatch_albedo_asset;
+pub use albedo_assets::{dispatch_albedo_asset, dispatch_client_npm_chunk};
 pub use api::dispatch_api_route;
 pub use dev::{
     dev_not_found, serve_error_stream, serve_hmr_apply_script, serve_hmr_stream,

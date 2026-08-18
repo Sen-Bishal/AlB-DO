@@ -319,7 +319,7 @@
       inst.dom = inst.renderedInstance.dom;
       return inst;
     }
-    var dom = global.document.createElement(vnode.type);
+    var dom = createHostElement(vnode.type, parentDom);
     updateDomProps(dom, null, vnode.props);
     var childInstances = [];
     for (var i = 0; i < vnode.children.length; i++) {
@@ -509,6 +509,11 @@
     if (instance.providerChild) {
       unmount(instance.providerChild);
     }
+    // A host element that received a ref hands back `null` on the way out, so
+    // a consumer never holds a node that has left the document.
+    if (instance.childInstances && instance.vnode && instance.vnode.props) {
+      attachRef(instance.vnode.props.ref, null);
+    }
     if (instance.childInstances) {
       for (var j = 0; j < instance.childInstances.length; j++) {
         unmount(instance.childInstances[j]);
@@ -540,7 +545,109 @@
     }
   }
 
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+
+  // Attributes whose SVG spelling is camelCase. `setAttribute` on an element in
+  // the SVG namespace is case-SENSITIVE, and the JSX author writes the SVG
+  // spelling, so the name must survive verbatim — but `updateDomProps` cannot
+  // tell `viewBox` from `onClick` without knowing where it is going, and the
+  // HTML side has always lowercased. This table is the boundary between the two.
+  //
+  // Kept to the attributes real SVG content uses (every icon set, every chart
+  // library) rather than the full SVG 1.1 surface, which is 200 entries of
+  // filter primitives nothing in this codebase has ever emitted.
+  var SVG_CAMEL_ATTRS = {
+    viewbox: 'viewBox',
+    preserveaspectratio: 'preserveAspectRatio',
+    strokewidth: 'stroke-width',
+    strokelinecap: 'stroke-linecap',
+    strokelinejoin: 'stroke-linejoin',
+    strokedasharray: 'stroke-dasharray',
+    strokedashoffset: 'stroke-dashoffset',
+    strokemiterlimit: 'stroke-miterlimit',
+    strokeopacity: 'stroke-opacity',
+    fillopacity: 'fill-opacity',
+    fillrule: 'fill-rule',
+    cliprule: 'clip-rule',
+    clippath: 'clip-path',
+    textanchor: 'text-anchor',
+    dominantbaseline: 'dominant-baseline',
+    fontfamily: 'font-family',
+    fontsize: 'font-size',
+    fontweight: 'font-weight',
+    letterspacing: 'letter-spacing',
+    markerend: 'marker-end',
+    markermid: 'marker-mid',
+    markerstart: 'marker-start',
+    stopcolor: 'stop-color',
+    stopopacity: 'stop-opacity',
+    vectoreffect: 'vector-effect',
+  };
+
+  // 🔑 `document.createElement('svg')` produces an `HTMLUnknownElement`, not an
+  // SVG element — it renders **nothing**, silently. Every icon package in npm
+  // is `createElement('svg', …)`, so without this the Tier-C npm path would
+  // deliver a chunk that loads, a component that mounts, and a blank square
+  // where the icon should be. The namespace is inherited from the parent (SVG
+  // has no closing marker in the vnode tree) and entered at the `<svg>` tag,
+  // matching how every VDOM does it.
+  function createHostElement(type, parentDom) {
+    var inSvg =
+      type === 'svg' ||
+      (parentDom && parentDom.namespaceURI === SVG_NS && type !== 'foreignObject');
+    if (inSvg) {
+      return global.document.createElementNS(SVG_NS, type);
+    }
+    return global.document.createElement(type);
+  }
+
+  // The attribute name to write on `dom`, given the JSX prop name.
+  function attributeNameFor(dom, key) {
+    if (dom.namespaceURI === SVG_NS) {
+      var camel = SVG_CAMEL_ATTRS[key.toLowerCase()];
+      return camel || key;
+    }
+    if (key === 'className') {
+      return 'class';
+    }
+    if (key === 'htmlFor') {
+      return 'for';
+    }
+    return key;
+  }
+
+  // A React-style `ref` on a host element: hand the ref the real DOM node.
+  //
+  // Both callable refs (`ref={node => ...}`) and object refs
+  // (`ref={useRef(null)}`) are supported, which is exactly the pair
+  // `forwardRef`/`useImperativeHandle` in the react host module
+  // (`bundler::client_npm`) produce and consume.
+  function attachRef(ref, value) {
+    if (typeof ref === 'function') {
+      try {
+        ref(value);
+      } catch (err) {
+        reportError(err);
+      }
+      return;
+    }
+    if (ref && typeof ref === 'object') {
+      ref.current = value;
+    }
+  }
+
   function applyProp(dom, key, oldValue, newValue) {
+    // 🔑 `ref` is a binding, not an attribute. Without this arm a forwarded
+    // ref reaches `setAttribute` and lands in the DOM as
+    // `ref="[object Object]"` while nothing ever receives the node — which is
+    // why externalising React's `forwardRef` is only honest with this half
+    // present. Detach-then-attach so a ref that moved between elements is
+    // cleared on the old one first.
+    if (key === 'ref') {
+      attachRef(oldValue, null);
+      attachRef(newValue, dom);
+      return;
+    }
     // Event handler prop `onX` → DOM listener. The lowercased remainder is the
     // event type (`onClick` → `click`), matching React's convention.
     if (key.length > 2 && key[0] === 'o' && key[1] === 'n' && key[2] >= 'A' && key[2] <= 'Z') {
@@ -553,14 +660,13 @@
       }
       return;
     }
-    // JSX prop → HTML attribute rename, matching the server renderer so
-    // hydration adopts the server's `class`/`for` rather than creating a stray
-    // `className`/`htmlFor` attribute.
-    if (key === 'className') {
-      key = 'class';
-    } else if (key === 'htmlFor') {
-      key = 'for';
-    }
+    // JSX prop → attribute name. For HTML this is the `className`/`htmlFor`
+    // rename that matches the server renderer, so hydration adopts the server's
+    // `class`/`for` rather than creating a stray attribute. For SVG it is the
+    // case-sensitive spelling (`viewBox`, `stroke-width`), which
+    // `setAttribute` will otherwise store verbatim-lowercased and the renderer
+    // will ignore.
+    key = attributeNameFor(dom, key);
     if (newValue === undefined || newValue === null || newValue === false) {
       dom.removeAttribute(key);
       return;

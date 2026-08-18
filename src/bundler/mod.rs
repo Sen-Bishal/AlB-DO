@@ -1,4 +1,6 @@
 pub mod classify;
+pub mod client_npm;
+pub mod defines;
 pub mod emit;
 pub mod npm;
 pub mod plan;

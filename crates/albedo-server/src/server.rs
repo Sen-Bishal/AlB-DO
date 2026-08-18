@@ -688,6 +688,10 @@ struct RenderWorld {
     /// (cheap when unused); userland reaches it via
     /// `AlbedoServer::broadcast()`.
     broadcast: Arc<BroadcastRegistry>,
+    /// Tier C · Phase 2 — the content-hashed npm chunks Tier-C islands load.
+    /// Lives on the world (not on the process) so a dev reload that changes an
+    /// island's imports swaps the chunk table with everything else it swaps.
+    npm_chunks: Arc<dom_render_compiler::bundler::client_npm::ClientNpmGraph>,
 }
 
 #[derive(Clone)]
@@ -1352,6 +1356,41 @@ impl AlbedoServerBuilder {
             ..SharedRenderServices::default()
         };
 
+        // A2 · the renderer's OWN engine needs the project's npm bundles too.
+        //
+        // 🪤 This is a third engine, and it was the one nobody wired. The pool
+        // install below covers actions and Tier-B; `CompiledProject` covers the
+        // compiled project. Neither is the engine `render_island_html` uses, so
+        // a Tier-C island importing a package server-rendered **nothing** — an
+        // empty placeholder — while its client chunk loaded perfectly. Tier C's
+        // Phase 2 is what made that reachable, and a package that only works
+        // once JavaScript runs is exactly the claim this framework denies.
+        if let (Some(runtime), Some(project)) =
+            (renderer.as_mut(), self.reactive_project.as_deref())
+        {
+            let artifacts: Vec<(String, String, u64)> = project
+                .npm_bundles()
+                .iter()
+                .flat_map(|bundle| bundle.artifacts.iter())
+                .map(|artifact| {
+                    (
+                        artifact.key.clone(),
+                        artifact.script.clone(),
+                        artifact.source_hash,
+                    )
+                })
+                .collect();
+            if !artifacts.is_empty() {
+                let failed = runtime.install_npm_bundles(&artifacts);
+                tracing::info!(
+                    target: "albedo.renderer",
+                    artifacts = artifacts.len(),
+                    failed,
+                    "registered npm bundles on the island renderer"
+                );
+            }
+        }
+
         // RSC · Tier-B server rendering. The default `registry` is a stub that
         // returns empty markup, so async server components (and every legit
         // Tier-B island) render nothing on `albedo serve`. When both a renderer
@@ -1540,9 +1579,18 @@ impl AlbedoServerBuilder {
                 .collect();
 
             // A3 · hydrate the islands the reactive pass did NOT claim.
+            // Tier C · Phase 2 — the npm search root. Taken from the compiled
+            // project rather than the dist directory, because that is the
+            // directory whose `node_modules` the build resolved against; a
+            // project with no compiled source has no npm to bundle and passes
+            // `None`, which is the pre-Phase-2 refusal.
+            let npm_root = self
+                .reactive_project
+                .as_deref()
+                .map(|project| project.project().root().to_path_buf());
             let hydration_blocks = renderer
                 .as_mut()
-                .map(|runtime| runtime.build_hydration_blocks(&claimed))
+                .map(|runtime| runtime.build_hydration_blocks(&claimed, npm_root.as_deref()))
                 .unwrap_or_default();
 
             // Fix #3 · merge per-component, not per-route, so a single route can
@@ -1733,6 +1781,15 @@ impl AlbedoServerBuilder {
             streaming_runtime,
             public_assets,
             broadcast,
+            // Built above by `build_hydration_blocks`; empty for a project whose
+            // islands import no package, in which case no page emits a chunk tag
+            // and the dispatch arm is one failed lookup.
+            npm_chunks: Arc::new(
+                renderer
+                    .as_ref()
+                    .map(|runtime| runtime.client_npm().clone())
+                    .unwrap_or_default(),
+            ),
         };
 
         let state = RuntimeState {
@@ -2802,6 +2859,29 @@ async fn dispatch_routed(
     // public-assets dispatch so a user's `public/runtime.js`
     // doesn't accidentally hijack the framework path.
     if matches!(method, HttpMethod::Get | HttpMethod::Head) {
+        // Tier C · Phase 2 — a content-hashed npm chunk. Checked with the other
+        // framework assets, and before `public/`, so nothing a user drops in
+        // their static directory can shadow a package the page depends on.
+        if let Some(response) = crate::handlers::albedo_assets::dispatch_client_npm_chunk(
+            world.npm_chunks.as_ref(),
+            path.as_str(),
+        ) {
+            if let Err(refusal) = ration(
+                state,
+                peer,
+                request.headers(),
+                &crate::auth::Identity::Anonymous,
+                Cost::flat(OperationClass::StaticRead),
+                rationed,
+            ) {
+                return refusal;
+            }
+            let mut response = response;
+            if method == HttpMethod::Head {
+                *response.body_mut() = Body::empty();
+            }
+            return response;
+        }
         if let Some(response) = crate::handlers::albedo_assets::dispatch_albedo_asset(path.as_str())
         {
             // Charged after the lookup rather than before it: the lookup is a

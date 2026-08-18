@@ -887,8 +887,33 @@ fn measure_client_bytes(
     manifest: &RenderManifestV2,
     module_sources: &HashMap<String, String>,
     out_dir: &Path,
+    project_root: &Path,
 ) -> printer::MeasuredBytes {
-    use dom_render_compiler::runtime::quickjs_engine::compile_client_island_module_with_modules;
+    use dom_render_compiler::bundler::client_npm::{build_client_npm_graph, ClientIsland};
+    use dom_render_compiler::runtime::quickjs_engine::{
+        compile_client_island_module_with_npm, ClientNpmBindings,
+    };
+
+    // Tier C · Phase 2 — the same graph the serve path builds, from the same
+    // function, so the measurement is the payload rather than a proxy for it.
+    // Building it here (rather than measuring islands without npm and adding a
+    // guess) is what keeps `albedo build`'s number equal to what a browser
+    // downloads.
+    let islands: Vec<ClientIsland<'_>> = manifest
+        .components
+        .iter()
+        .filter(|component| component.tier == Tier::C)
+        .filter_map(|component| {
+            module_sources
+                .get(&component.module_path)
+                .map(|source| ClientIsland {
+                    module_path: component.module_path.as_str(),
+                    source: source.as_str(),
+                })
+        })
+        .collect();
+    let npm_graph = build_client_npm_graph(project_root, &islands);
+    let empty_npm_bindings = ClientNpmBindings::default();
 
     let mut tier_c_island_bytes = 0u64;
     let mut tier_c_measured = 0usize;
@@ -915,11 +940,14 @@ fn measure_client_bytes(
             ));
             continue;
         };
-        match compile_client_island_module_with_modules(
+        match compile_client_island_module_with_npm(
             &component.module_path,
             source,
             component.id,
             module_sources,
+            npm_graph
+                .bindings_for(&component.module_path)
+                .unwrap_or(&empty_npm_bindings),
         ) {
             Ok(iife) => {
                 tier_c_island_bytes = tier_c_island_bytes.saturating_add(iife.len() as u64);
@@ -942,11 +970,27 @@ fn measure_client_bytes(
         .map(|meta| meta.len())
         .sum();
 
+    // A package that would not bundle is a Tier-C failure like any other: the
+    // island imports it, so the island will not hydrate. Reported through the
+    // same channel the compile failures use rather than a second list nobody
+    // reads.
+    for failure in npm_graph.failures() {
+        tier_c_failures.push((
+            failure.module_path.clone(),
+            format!("npm '{}': {}", failure.specifier, failure.reason),
+        ));
+    }
+
     printer::MeasuredBytes {
         tier_c_island_bytes,
         tier_c_measured,
         runtime_bytes,
         tier_c_failures,
+        npm_chunks: npm_graph
+            .chunks()
+            .iter()
+            .map(|chunk| (chunk.package.clone(), chunk.bytes() as u64))
+            .collect(),
     }
 }
 
@@ -2518,6 +2562,8 @@ fn run_prod_build_with_budget(
 
     let compile_start = Instant::now();
     let out_dir_for_closure = out_dir.clone();
+    // Tier C · Phase 2 — the `node_modules` search root for client bundles.
+    let project_root_for_closure = contract.project_dir.clone();
     let build_work = move || {
         let scanner = ProjectScanner::new();
         let compiler = scanner.build_compiler(components);
@@ -2550,7 +2596,12 @@ fn run_prod_build_with_budget(
                 &out_dir_for_closure,
             )
             .map_err(|err| format!("failed to emit production artifacts: {err}"))?;
-        let measured = measure_client_bytes(&manifest, &module_sources, &out_dir_for_closure);
+        let measured = measure_client_bytes(
+            &manifest,
+            &module_sources,
+            &out_dir_for_closure,
+            &project_root_for_closure,
+        );
         Ok::<_, String>((manifest, tier_report, report, missing_sources, measured))
     };
     let (mut manifest, tier_report, report, missing_sources, measured) = if quiet {
