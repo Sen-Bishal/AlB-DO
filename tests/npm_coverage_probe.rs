@@ -29,9 +29,28 @@
 //! imports it discovers in user source.
 //!
 //! Set `ALBEDO_NPM_COVERAGE_REPORT` to also write the markdown table to a file.
+//!
+//! ## Building the manifest
+//!
+//! 🪤 **Item 9.0 built its manifest and then lost it**, which is the whole reason
+//! that item existed a second time — and it happened again: the 79.6% run of
+//! 2026-08-17 cannot be reproduced because nothing in the repo can regenerate
+//! its denominator. So the generator lives here now:
+//!
+//! ```text
+//! ALBEDO_NPM_COVERAGE_SCAN=C:/Development/albedo-corpus \
+//! ALBEDO_NPM_COVERAGE_MANIFEST=C:/Development/albedo-corpus/manifest.json \
+//!   cargo test --test npm_coverage_probe -- --ignored generate --nocapture
+//! ```
+//!
+//! It scans every project directory under the given root with the compiler's
+//! **own** `scan_bare_imports`, so the denominator is *the specifiers real code
+//! writes* — the 9.0 definition — rather than `package.json` names, and it is
+//! produced by the same function the build uses rather than a lookalike.
 
 use dom_render_compiler::bundler::npm::{
-    bundle_npm_dependency, NpmBundleError, NpmDependencyBundle,
+    bundle_npm_dependency, is_bare_npm_specifier, scan_bare_imports, NpmBundleError,
+    NpmDependencyBundle,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -625,4 +644,122 @@ fn render_report(probes: &[Probe]) -> String {
     }
 
     out
+}
+
+
+/// Regenerate the projects manifest by scanning a corpus root.
+///
+/// Each immediate subdirectory that contains a `node_modules` is one project.
+/// Its sources are scanned with the compiler's own [`scan_bare_imports`], and
+/// each specifier is weighted by **the number of source files that write it** —
+/// the site-weighted denominator item 9.0 settled on, because failures cluster
+/// in rarely-imported specifiers and a flat count hides that.
+#[test]
+#[ignore = "regenerates the coverage manifest; run explicitly with ALBEDO_NPM_COVERAGE_SCAN set"]
+fn generate_npm_coverage_manifest() {
+    let Ok(root) = std::env::var("ALBEDO_NPM_COVERAGE_SCAN") else {
+        eprintln!("SKIP: set ALBEDO_NPM_COVERAGE_SCAN to a corpus root");
+        return;
+    };
+    let out_path = std::env::var("ALBEDO_NPM_COVERAGE_MANIFEST")
+        .unwrap_or_else(|_| format!("{root}/manifest.json"));
+
+    let mut projects: Vec<serde_json::Value> = Vec::new();
+    // A monorepo installs per workspace, not at its root — `bulletproof-react`
+    // keeps its tree at `apps/react-vite/node_modules`. Looking only one level
+    // deep silently dropped a whole project from the denominator, which is the
+    // kind of omission that moves a coverage number without anyone noticing.
+    let mut entries: Vec<PathBuf> = Vec::new();
+    collect_projects(Path::new(&root), 0, &mut entries);
+    entries.sort();
+
+    for dir in entries {
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let mut sites: BTreeMap<String, u32> = BTreeMap::new();
+        scan_sources(&dir, &dir, &mut sites);
+        eprintln!("{name}: {} distinct specifiers", sites.len());
+        projects.push(serde_json::json!({
+            "project": name,
+            "dir": dir.to_string_lossy().replace('\\', "/"),
+            "specifiers": sites,
+        }));
+    }
+
+    let json = serde_json::to_string_pretty(&projects).expect("manifest serializes");
+    std::fs::write(&out_path, json).unwrap_or_else(|err| panic!("write '{out_path}': {err}"));
+    eprintln!(
+        "wrote {} projects to {out_path}",
+        projects.len()
+    );
+}
+
+/// Every directory at or under `dir` that owns a `node_modules`, not descending
+/// into one once found (a workspace is one project, not one per package).
+fn collect_projects(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
+    const MAX_DEPTH: u8 = 3;
+    if dir.join("node_modules").is_dir() {
+        out.push(dir.to_path_buf());
+        return;
+    }
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() && !name.starts_with('.') && name != "node_modules" {
+            collect_projects(&path, depth + 1, out);
+        }
+    }
+}
+
+/// Walk a project's sources, counting how many files write each bare specifier.
+///
+/// `node_modules` and build output are skipped: the question is what *the
+/// project's own code* imports.
+fn scan_sources(root: &Path, dir: &Path, sites: &mut BTreeMap<String, u32>) {
+    const SKIP: [&str; 8] = [
+        "node_modules", ".git", "dist", "build", ".next", "out", "coverage", ".turbo",
+    ];
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            scan_sources(root, &path, sites);
+            continue;
+        }
+        let is_source = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("ts" | "tsx" | "js" | "jsx" | "mjs")
+        );
+        if !is_source || name.ends_with(".d.ts") {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut seen_in_file: Vec<String> = Vec::new();
+        for specifier in scan_bare_imports(&source) {
+            // The same filter `CompiledProject::wrap` applies before bundling:
+            // framework runtime imports bind to globals and never reach npm.
+            if !is_bare_npm_specifier(&specifier) || seen_in_file.contains(&specifier) {
+                continue;
+            }
+            seen_in_file.push(specifier.clone());
+            *sites.entry(specifier).or_insert(0) += 1;
+        }
+    }
 }
