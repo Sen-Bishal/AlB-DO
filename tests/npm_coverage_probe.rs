@@ -84,11 +84,18 @@ enum Outcome {
     PackageNotFound,
     /// A Node built-in (`util`, `fs`, `crypto`, …) reached the resolver.
     ///
-    /// This surfaces as `PackageNotFound` — the resolver has no concept of
-    /// built-ins, so it searches `node_modules` for `util` and reports it
-    /// missing. Separating it out is the whole reason this enum is not just
-    /// `Result`: lumped together, a **genuine capability gap reads as fixture
-    /// noise**. It is exactly what makes `react-dom/server` fail.
+    /// Separating it out is the whole reason this enum is not just `Result`:
+    /// lumped together, a **genuine capability gap reads as fixture noise**. It
+    /// is exactly what makes `react-dom/server` fail.
+    ///
+    /// 🔑 **The resolver now says this itself** (Tier C · Phase 3):
+    /// `NpmBundleError::NodeBuiltin`, derived from
+    /// `runtime::node_builtins`. This probe used to carry its own 42-name copy
+    /// of Node's module list and re-classify `PackageNotFound` behind the
+    /// resolver's back — a maintained list doing a derivation's job, and a
+    /// second place for the answer to drift. The bucket is unchanged, and so are
+    /// the 85.2% / 79.6% figures taken with it: the two lists agreed on every
+    /// bare name.
     NodeBuiltin,
     SubpathNotExported,
     FileNotFound,
@@ -105,26 +112,6 @@ enum Outcome {
     /// instead of being counted as a resolution failure. A refusal is a
     /// capability answer, not a bug.
     ClientHostRefused,
-}
-
-/// Node's built-in module set. A specifier equal to one of these, or carrying
-/// the `node:` prefix, is a runtime capability question, not a resolution one.
-///
-/// Kept as a packed table rather than rustfmt's one-per-line: it is a lookup
-/// set, and 42 lines of single words is harder to scan for "is `dgram` here?".
-#[rustfmt::skip]
-const NODE_BUILTINS: &[&str] = &[
-    "assert", "async_hooks", "buffer", "child_process", "cluster", "console", "constants",
-    "crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs", "http", "http2",
-    "https", "inspector", "module", "net", "os", "path", "perf_hooks", "process", "punycode",
-    "querystring", "readline", "repl", "stream", "string_decoder", "sys", "timers", "tls",
-    "trace_events", "tty", "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib",
-];
-
-fn is_node_builtin(package: &str) -> bool {
-    let bare = package.strip_prefix("node:").unwrap_or(package);
-    let root = bare.split('/').next().unwrap_or(bare);
-    NODE_BUILTINS.contains(&root)
 }
 
 impl Outcome {
@@ -152,9 +139,7 @@ impl Outcome {
 
     fn from_error(err: &NpmBundleError) -> Self {
         match err {
-            NpmBundleError::PackageNotFound { package, .. } if is_node_builtin(package) => {
-                Outcome::NodeBuiltin
-            }
+            NpmBundleError::NodeBuiltin { .. } => Outcome::NodeBuiltin,
             NpmBundleError::PackageNotFound { .. } => Outcome::PackageNotFound,
             NpmBundleError::SubpathNotExported { .. } => Outcome::SubpathNotExported,
             NpmBundleError::FileNotFound { .. } => Outcome::FileNotFound,

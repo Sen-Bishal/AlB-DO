@@ -40,6 +40,7 @@
 
 use crate::bundler::defines::{fold_defines, Defines};
 use crate::runtime::engine::stable_source_hash;
+use crate::runtime::node_builtins;
 use crate::runtime::quickjs_engine::{compile_npm_module_script, NpmModuleFormat};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -64,6 +65,24 @@ const EXPORT_CONDITIONS: [&str; 4] = ["import", "module", "default", "require"];
 /// exact file/specifier that broke, because these surface as build/dev errors.
 #[derive(Debug, thiserror::Error)]
 pub enum NpmBundleError {
+    /// The specifier names a **Node built-in**, not a package.
+    ///
+    /// 🔑 **Diagnosis, not a resolution failure.** The old message —
+    /// *"npm package 'crypto' not found in node_modules"* — sent a reader
+    /// hunting for a dependency they never had (`TODO.md` 9.5 names that
+    /// sentence). The reason comes from [`crate::runtime::node_builtins`] and
+    /// says which of the two futures the built-in has: a host capability that
+    /// will not be shimmed, or pure computation that is not shimmed *yet*.
+    ///
+    /// 🪤 Raised only **after** `node_modules` resolution has failed, because
+    /// `events`, `buffer`, `path` and friends are also real published packages.
+    #[error("{reason}")]
+    NodeBuiltin {
+        /// The specifier as written (`fs`, `node:fs/promises`).
+        specifier: String,
+        /// The full sentence, from the built-in table.
+        reason: String,
+    },
     /// The bare specifier's package directory was not found in any
     /// `node_modules` directory from the search root upward.
     #[error("npm package '{package}' not found in node_modules (searched upward from '{searched_from}')")]
@@ -620,8 +639,30 @@ fn resolve_bare_entry(
     search_dir: &Path,
     specifier: &str,
 ) -> Result<(ResolvedPackage, PathBuf), NpmBundleError> {
+    // A `node:` specifier cannot be a package — npm names have no colon — so it
+    // is refused on sight, without a `node_modules` probe.
+    if node_builtins::is_prefixed_specifier(specifier) {
+        if let Some(reason) = node_builtins::refusal(specifier) {
+            return Err(NpmBundleError::NodeBuiltin {
+                specifier: specifier.to_string(),
+                reason,
+            });
+        }
+    }
+
     let (package_name, subpath) = split_bare_specifier(specifier);
     let package_dir = find_package_dir(search_dir, &package_name).ok_or_else(|| {
+        // 🔑 Resolve first, diagnose second. A bare built-in *name* is not proof
+        // a built-in was meant: `events`/`buffer`/`path`/`process` are all
+        // published npm packages (the browserify shim layer), and one that is
+        // installed is what the importer meant. Only once nothing resolved is
+        // the name evidence of anything.
+        if let Some(reason) = node_builtins::refusal(specifier) {
+            return NpmBundleError::NodeBuiltin {
+                specifier: specifier.to_string(),
+                reason,
+            };
+        }
         NpmBundleError::PackageNotFound {
             package: package_name.clone(),
             searched_from: search_dir.to_path_buf(),
@@ -1147,6 +1188,35 @@ impl ShakeOptions {
     }
 }
 
+/// The externals table, consulted for a bundle's **entry** specifier.
+///
+/// 🪤 **This was missing, and the refusal table had a hole the size of its
+/// primary case.** `edge()` and the whole-package walk both check `externals`
+/// for specifiers written *inside* a package, but both entry points went
+/// straight to [`resolve_bare_entry`] — so `react-dom` refused when a package
+/// imported it and **resolved normally when an island imported it directly**.
+/// `is_bare_npm_specifier` hides the bare `react-dom` case (it is filtered out
+/// upstream), which is exactly why the hole survived: the one form that reaches
+/// here, `react-dom/client`, is the one nobody wrote a test for. Fourth instance
+/// of *"correct mechanism, unreachable input"*.
+///
+/// [`ExternalTarget::Host`] is deliberately **not** handled here. No host
+/// specifier can reach an entry today — `is_bare_npm_specifier` filters
+/// `react`, `react-dom` and `react/*` before the scan — and binding an entry to
+/// a host record is a feature (a bundle with no artifacts), not a check. If a
+/// host specifier ever does reach this point it falls through to
+/// `node_modules`, which is the pre-existing behaviour, not a new one.
+fn check_entry_external(specifier: &str, options: &ShakeOptions) -> Result<(), NpmBundleError> {
+    if let Some(ExternalTarget::Refused { reason }) = options.externals.get(specifier) {
+        return Err(NpmBundleError::ExternalRefused {
+            specifier: specifier.to_string(),
+            importer: PathBuf::from(format!("<entry of '{specifier}'>")),
+            reason: reason.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Bundle `specifier` carrying only what `demand` needs.
 ///
 /// # Why this is a second entry point and not a parameter on the first
@@ -1196,6 +1266,7 @@ pub fn bundle_npm_dependency_for_demand(
     demand: &BTreeSet<String>,
     options: &ShakeOptions,
 ) -> Result<ShakenNpmBundle, NpmBundleError> {
+    check_entry_external(specifier, options)?;
     let (entry_package, entry_path) = resolve_bare_entry(search_dir, specifier)?;
 
     // A star demand cannot be narrowed, and an unshakeable package must not be.
@@ -1677,6 +1748,7 @@ pub fn bundle_npm_dependency(
     specifier: &str,
     options: &ShakeOptions,
 ) -> Result<NpmDependencyBundle, NpmBundleError> {
+    check_entry_external(specifier, options)?;
     let (entry_package, entry_path) = resolve_bare_entry(search_dir, specifier)?;
     let entry_key = record_key(&entry_package, &entry_path);
 
@@ -2354,6 +2426,94 @@ mod tests {
         let err = bundle_npm_dependency(dir.path(), "ghost-package", &ShakeOptions::default()).unwrap_err();
         assert!(matches!(err, NpmBundleError::PackageNotFound { .. }));
         assert!(err.to_string().contains("ghost-package"));
+    }
+
+    #[test]
+    fn a_node_builtin_is_named_instead_of_reported_as_a_missing_package() {
+        let dir = tempfile::tempdir().unwrap();
+        for specifier in ["fs", "node:fs/promises", "child_process"] {
+            let err =
+                bundle_npm_dependency(dir.path(), specifier, &ShakeOptions::default()).unwrap_err();
+            assert!(
+                matches!(err, NpmBundleError::NodeBuiltin { .. }),
+                "{specifier} should be diagnosed as a built-in, got: {err}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("Node built-in"), "{message}");
+            assert!(
+                !message.contains("not found in node_modules"),
+                "the old message sent a reader hunting for a dependency they never had: {message}"
+            );
+        }
+
+        // The two futures are said differently, because they are different.
+        let host = bundle_npm_dependency(dir.path(), "net", &ShakeOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(host.contains("will not be shimmed"), "{host}");
+        let shimmable = bundle_npm_dependency(dir.path(), "path", &ShakeOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(shimmable.contains("no Node built-in shims yet"), "{shimmable}");
+    }
+
+    /// 🪤 **The falsifier for the whole refusal table.** `events`, `buffer`,
+    /// `path`, `process` and `url` are all published npm packages — the
+    /// browserify shim layer — and a project with one installed is importing
+    /// *that*, not Node's. If the table were consulted before resolution, every
+    /// build using one of them would break, and the thing the refusal would be
+    /// "protecting" the browser from is a polyfill.
+    #[test]
+    fn an_installed_package_under_a_builtin_name_still_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules").join("events");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"events","version":"3.3.0","main":"./index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), "module.exports = { EventEmitter: 1 };").unwrap();
+
+        let bundle = bundle_npm_dependency(dir.path(), "events", &ShakeOptions::default())
+            .expect("an installed package wins over the built-in name");
+        assert_eq!(bundle.package_name, "events");
+
+        // ...but the unambiguous form is still the built-in, because no npm
+        // package can be named with a colon.
+        let err = bundle_npm_dependency(dir.path(), "node:events", &ShakeOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, NpmBundleError::NodeBuiltin { .. }), "{err}");
+    }
+
+    /// 🪤 The refusal table only covered specifiers written *inside* a package:
+    /// both entry points went straight to `resolve_bare_entry`, so an island
+    /// importing a refused module directly bundled it. Reverting
+    /// `check_entry_external` fails this.
+    #[test]
+    fn a_refused_module_is_refused_at_the_entry_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("node_modules").join("react-dom");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"react-dom","version":"18.2.0","main":"./index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), "module.exports = { createPortal: 1 };").unwrap();
+
+        let options = crate::bundler::client_npm::client_shake_options();
+        let err = bundle_npm_dependency(dir.path(), "react-dom", &options).unwrap_err();
+        assert!(matches!(err, NpmBundleError::ExternalRefused { .. }), "{err}");
+        let err =
+            bundle_npm_dependency_for_demand(dir.path(), "react-dom", &demand(&["default"]), &options)
+                .unwrap_err();
+        assert!(matches!(err, NpmBundleError::ExternalRefused { .. }), "{err}");
+
+        // The server takes the same package whole, on purpose: loading is not
+        // rendering, and 79.6% npm coverage is the loading number.
+        bundle_npm_dependency(dir.path(), "react-dom", &crate::bundler::client_npm::server_shake_options())
+            .expect("the server must still load a react-dom-shaped package");
     }
 
     #[test]

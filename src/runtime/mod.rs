@@ -12,6 +12,7 @@ pub mod frame;
 pub mod highway;
 pub mod jsx_attributes;
 pub mod hot_set;
+pub mod node_builtins;
 pub mod pi_arch;
 pub mod pipeline;
 pub mod quickjs_engine;

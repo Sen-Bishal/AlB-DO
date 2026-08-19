@@ -252,6 +252,121 @@ fn a_package_reaching_for_react_dom_is_refused_at_build() {
     );
 }
 
+/// Tier C · Phase 3 — a Node built-in in client-reachable code is **named** at
+/// build, at both doors.
+///
+/// 🔑 The value is not that the import fails; it already failed. It is that the
+/// failure says what is true. The old sentence — *"npm package 'fs' not found
+/// in node_modules (searched upward from …)"* — sent a reader hunting for a
+/// dependency they never had, which is the defect `TODO.md` 9.5 names.
+#[test]
+fn a_node_builtin_is_named_at_both_doors() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+        import { readFileSync } from "fs";
+        export default function Widget() { return <div>{readFileSync("x")}</div>; }
+    "#;
+
+    // Door 1 — the bundler, whose reason lands in the build log.
+    let graph = build_client_npm_graph(dir.path(), &[island(source)]);
+    assert_eq!(graph.failures().len(), 1, "{:?}", graph.failures());
+    let reason = &graph.failures()[0].reason;
+    assert!(reason.contains("Node built-in"), "{reason}");
+    assert!(reason.contains("will not be shimmed"), "{reason}");
+    assert!(
+        !reason.contains("not found in node_modules"),
+        "the old message is the defect: {reason}"
+    );
+
+    // Door 2 — the island's own compile, which is the message a user sees
+    // first. Same table, so the two cannot drift.
+    let err = compile_client_island_module_with_npm(
+        "src/components/Toolbar.tsx",
+        source,
+        7,
+        &HashMap::new(),
+        &Default::default(),
+    )
+    .expect_err("a built-in must not compile into an island");
+    let message = err.to_string();
+    assert!(message.contains("Node built-in"), "{message}");
+    assert!(message.contains("'fs'"), "{message}");
+    assert!(
+        !message.contains("the build log names why"),
+        "the generic fall-through is the thing this replaces: {message}"
+    );
+}
+
+/// The two kinds of built-in have different futures and say so. A shimmable one
+/// is *"not yet"*; a host capability is *"not ever"* — which is `FLOOR.md`'s
+/// verdict (c) arriving as a compiler message.
+#[test]
+fn a_shimmable_builtin_and_a_host_capability_read_differently() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let pure = build_client_npm_graph(
+        dir.path(),
+        &[island(
+            r#"import { join } from "node:path";
+               export default function W() { return <div>{join("a")}</div>; }"#,
+        )],
+    );
+    assert_eq!(pure.failures().len(), 1, "{:?}", pure.failures());
+    assert!(
+        pure.failures()[0].reason.contains("no Node built-in shims yet"),
+        "{}",
+        pure.failures()[0].reason
+    );
+
+    let host = build_client_npm_graph(
+        dir.path(),
+        &[island(
+            r#"import { spawn } from "node:child_process";
+               export default function W() { return <div>{spawn}</div>; }"#,
+        )],
+    );
+    assert_eq!(host.failures().len(), 1, "{:?}", host.failures());
+    assert!(
+        host.failures()[0].reason.contains("will not be shimmed"),
+        "{}",
+        host.failures()[0].reason
+    );
+}
+
+/// 🪤 **The falsifier for the whole table.** `events`, `buffer`, `path` and
+/// `process` are also published npm packages — the browserify shim layer — and
+/// they are ordinary JavaScript that runs fine in a browser. A refusal keyed on
+/// the *name* rather than on a failed resolution would break every build using
+/// one, to protect the browser from a polyfill.
+#[test]
+fn an_installed_shim_package_under_a_builtin_name_still_reaches_the_browser() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("node_modules").join("events");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{ "name": "events", "version": "3.3.0", "module": "index.js",
+             "sideEffects": false }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("index.js"),
+        "export function EventEmitter() { this.handlers = {}; }",
+    )
+    .unwrap();
+
+    let graph = build_client_npm_graph(
+        dir.path(),
+        &[island(
+            r#"import { EventEmitter } from "events";
+               export default function W() { return <div>{String(EventEmitter)}</div>; }"#,
+        )],
+    );
+    assert!(graph.failures().is_empty(), "{:?}", graph.failures());
+    assert_eq!(graph.chunks().len(), 1);
+    assert!(graph.chunks()[0].script.contains("EventEmitter"));
+}
+
 /// Two islands importing the same package share one chunk, and a package
 /// reached from two others is emitted once for the whole build.
 #[test]

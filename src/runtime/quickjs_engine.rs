@@ -2222,6 +2222,21 @@ fn rewrite_import_for_client_with_modules(
         return bind_npm_import_for_client(&import_decl, specifier, import_source.as_str(), npm);
     }
 
+    // Tier C · Phase 3 — a Node built-in is named, not left to the generic
+    // "did not resolve" sentence.
+    //
+    // 🔑 **The same table the bundler consults** (`runtime::node_builtins`), so
+    // the two cannot drift. The bundler reaches it after `node_modules`
+    // resolution fails; this is the *other* door — an island whose import never
+    // produced a client binding — and it is the message a user sees first,
+    // because the bundler's own reason lands in the build log.
+    if let Some(reason) = crate::runtime::node_builtins::refusal(import_source.as_str()) {
+        return Err(RuntimeError::load(
+            LoadErrorKind::UnsupportedSyntax,
+            format!("Tier-C client island '{specifier}': {reason}"),
+        ));
+    }
+
     Err(RuntimeError::load(
         LoadErrorKind::UnsupportedSyntax,
         format!(
