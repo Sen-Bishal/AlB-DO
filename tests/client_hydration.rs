@@ -26,8 +26,25 @@ globalThis.queueMicrotask = function (fn) { fn(); };
 globalThis.console = { error: function () {} };
 globalThis.__effectLog = [];
 
+// `nextSibling`, live off the parent's `childNodes` rather than cached, so it
+// stays correct across appendChild/insertBefore/removeChild/replaceChild with
+// no bookkeeping at each call site — same as a real DOM node. Multi-child
+// Fragment hydration (`hydrateChildren` in albedo-client.js) walks this to
+// find where one vnode's DOM slice ends and the next begins.
+function withSiblingLink(node) {
+  Object.defineProperty(node, 'nextSibling', {
+    get: function () {
+      if (!node.parentNode) { return null; }
+      var siblings = node.parentNode.childNodes;
+      var i = siblings.indexOf(node);
+      return i >= 0 && i + 1 < siblings.length ? siblings[i + 1] : null;
+    },
+  });
+  return node;
+}
+
 function makeText(text) {
-  return { nodeType: 3, nodeValue: text, parentNode: null };
+  return withSiblingLink({ nodeType: 3, nodeValue: text, parentNode: null });
 }
 
 function makeElement(tag) {
@@ -81,7 +98,7 @@ function makeElement(tag) {
   Object.defineProperty(node, 'firstChild', {
     get: function () { return node.childNodes.length ? node.childNodes[0] : null; },
   });
-  return node;
+  return withSiblingLink(node);
 }
 
 globalThis.document = { createElement: makeElement, createTextNode: makeText };
@@ -603,6 +620,228 @@ fn h_folds_positional_children_into_props_for_component_vnodes() {
         value["noneHasChild"], false,
         "a childless component must not fabricate a props.children"
     );
+}
+
+// Regression: a top-level component whose render is a multi-child Fragment —
+// exactly `scaffold/src/components/Counter.tsx` (`<>` wrapping four
+// siblings) — must hydrate. `inject_island_marker`
+// (`src/runtime/renderer/manifest.rs`) stamps `data-albedo-island` onto the
+// FIRST tag of the island's own SSR string, because a Fragment's output has
+// no wrapper element; the other siblings are real DOM siblings of that first
+// tag, not its children. This scenario reproduces that shape exactly:
+// `root` (what `hydrateIsland` is handed) is the first of four sibling
+// elements, not a container.
+const MULTI_CHILD_FRAGMENT_ISLAND_SCENARIO: &str = r#"
+function Panel(props) {
+  var s = useState(0);
+  var n = s[0], set = s[1];
+  return h(
+    Fragment,
+    null,
+    h('p', null, 'eyebrow'),
+    h('h2', null, 'title'),
+    h('button', { onClick: function () { set(n + 1); } }, 'press'),
+    h('span', null, 'tally: ' + n)
+  );
+}
+
+var container = document.createElement('div');
+var p = document.createElement('p');
+p.appendChild(document.createTextNode('eyebrow'));
+var h2 = document.createElement('h2');
+h2.appendChild(document.createTextNode('title'));
+var button = document.createElement('button');
+button.appendChild(document.createTextNode('press'));
+var span = document.createElement('span');
+span.appendChild(document.createTextNode('tally: 0'));
+container.appendChild(p);
+container.appendChild(h2);
+container.appendChild(button);
+container.appendChild(span);
+
+// `root` is `p` — the first sibling, exactly what the marker injector stamps.
+__albedoClient.hydrateIsland(h(Panel, {}), p);
+
+var adoptedBeforeClick = [
+  container.childNodes[0] === p,
+  container.childNodes[1] === h2,
+  container.childNodes[2] === button,
+  container.childNodes[3] === span,
+];
+var tallyBeforeClick = span.firstChild.nodeValue;
+
+button.__dispatch('click');
+
+JSON.stringify({
+  childCount: container.childNodes.length,
+  adoptedBeforeClick: adoptedBeforeClick,
+  tallyBeforeClick: tallyBeforeClick,
+  tallyAfterClick: span.firstChild.nodeValue,
+  sameNodesAfterClick: container.childNodes[0] === p && container.childNodes[3] === span,
+});
+"#;
+
+#[test]
+fn multi_child_fragment_island_hydrates_and_updates() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(MULTI_CHILD_FRAGMENT_ISLAND_SCENARIO)
+            .expect("scenario should evaluate")
+    });
+
+    let value: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+
+    assert_eq!(value["childCount"], 4, "all four Fragment siblings must be present");
+    assert_eq!(
+        value["adoptedBeforeClick"],
+        serde_json::json!([true, true, true, true]),
+        "every sibling must be ADOPTED from the server markup, not recreated"
+    );
+    assert_eq!(value["tallyBeforeClick"], "tally: 0");
+    assert_eq!(value["tallyAfterClick"], "tally: 1", "state update must patch the fourth sibling");
+    assert_eq!(
+        value["sameNodesAfterClick"], true,
+        "the update must patch in place, not tear down and remount the group"
+    );
+}
+
+// Regression: the Fragment's own child COUNT changing (not just content)
+// across a re-render — tail growth and tail shrink through
+// `reconcileChildList`, exercised via a real click, not a hand call into
+// internals.
+const FRAGMENT_GROW_SHRINK_SCENARIO: &str = r#"
+function GrowShrink(props) {
+  var s = useState(2);
+  var n = s[0], set = s[1];
+  var kids = [h('button', { onClick: function () { set(n === 2 ? 4 : 2); } }, 'toggle')];
+  for (var i = 0; i < n; i++) {
+    kids.push(h('li', null, 'item' + i));
+  }
+  return h.apply(null, [Fragment, null].concat(kids));
+}
+
+var container = document.createElement('div');
+var button = document.createElement('button');
+button.appendChild(document.createTextNode('toggle'));
+var li0 = document.createElement('li'); li0.appendChild(document.createTextNode('item0'));
+var li1 = document.createElement('li'); li1.appendChild(document.createTextNode('item1'));
+container.appendChild(button);
+container.appendChild(li0);
+container.appendChild(li1);
+
+__albedoClient.hydrateIsland(h(GrowShrink, {}), button);
+
+var countAfterHydrate = container.childNodes.length;
+
+button.__dispatch('click'); // 2 -> 4: two new <li> must be appended
+
+var countAfterGrow = container.childNodes.length;
+var textsAfterGrow = [];
+for (var i = 1; i < container.childNodes.length; i++) {
+  textsAfterGrow.push(container.childNodes[i].firstChild.nodeValue);
+}
+
+button.__dispatch('click'); // 4 -> 2: the trailing two <li> must be removed
+
+JSON.stringify({
+  countAfterHydrate: countAfterHydrate,
+  countAfterGrow: countAfterGrow,
+  textsAfterGrow: textsAfterGrow,
+  countAfterShrink: container.childNodes.length,
+});
+"#;
+
+#[test]
+fn fragment_child_count_grows_and_shrinks_across_reconcile() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(FRAGMENT_GROW_SHRINK_SCENARIO)
+            .expect("scenario should evaluate")
+    });
+
+    let value: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+
+    assert_eq!(value["countAfterHydrate"], 3, "button + 2 items");
+    assert_eq!(value["countAfterGrow"], 5, "button + 4 items after growing");
+    assert_eq!(
+        value["textsAfterGrow"],
+        serde_json::json!(["item0", "item1", "item2", "item3"]),
+        "new items must append in order after the existing ones"
+    );
+    assert_eq!(value["countAfterShrink"], 3, "button + 2 items after shrinking back");
+}
+
+// Regression: a Fragment nested INSIDE a host element's children — one JSX
+// child slot expanding into two DOM nodes flanked by siblings on both
+// sides — must hydrate with every sibling correctly adopted, proving the
+// cursor walk (not a `childNodes[i]` index) is what host-element hydration
+// uses too.
+const NESTED_FRAGMENT_SCENARIO: &str = r#"
+function Nested(props) {
+  return h(
+    'div',
+    { id: 'wrap' },
+    h('span', null, 'lead'),
+    h(Fragment, null, h('i', null, 'a'), h('i', null, 'b')),
+    h('span', null, 'trail')
+  );
+}
+
+var container = document.createElement('div');
+var wrap = document.createElement('div');
+var lead = document.createElement('span'); lead.appendChild(document.createTextNode('lead'));
+var ia = document.createElement('i'); ia.appendChild(document.createTextNode('a'));
+var ib = document.createElement('i'); ib.appendChild(document.createTextNode('b'));
+var trail = document.createElement('span'); trail.appendChild(document.createTextNode('trail'));
+wrap.appendChild(lead);
+wrap.appendChild(ia);
+wrap.appendChild(ib);
+wrap.appendChild(trail);
+container.appendChild(wrap);
+
+__albedoClient.hydrate(h(Nested, {}), container);
+
+var tags = [];
+for (var i = 0; i < wrap.childNodes.length; i++) { tags.push(wrap.childNodes[i].tagName); }
+
+JSON.stringify({
+  tags: tags,
+  sameLead: wrap.childNodes[0] === lead,
+  sameIa: wrap.childNodes[1] === ia,
+  sameIb: wrap.childNodes[2] === ib,
+  sameTrail: wrap.childNodes[3] === trail,
+});
+"#;
+
+#[test]
+fn fragment_nested_inside_host_element_children_hydrates_all_siblings() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(NESTED_FRAGMENT_SCENARIO).expect("scenario should evaluate")
+    });
+
+    let value: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+
+    assert_eq!(value["tags"], serde_json::json!(["SPAN", "I", "I", "SPAN"]));
+    assert_eq!(value["sameLead"], true);
+    assert_eq!(value["sameIa"], true, "the fragment's first child must be adopted, not recreated");
+    assert_eq!(value["sameIb"], true, "the fragment's second child must be adopted, not recreated");
+    assert_eq!(value["sameTrail"], true, "the sibling after the fragment must line up correctly");
 }
 
 #[test]

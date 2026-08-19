@@ -309,6 +309,119 @@
     runEffects();
   }
 
+  // --- multi-node instance plumbing ------------------------------------------
+  //
+  // Every instance owns some number of real DOM nodes: exactly one for text,
+  // a host element, or a component (which just delegates to whatever its
+  // render returned) — but zero or many for a Fragment or a context Provider,
+  // which paint nothing of their own and are transparent groups of whatever
+  // their children produce. `instance.isGroup` marks the latter; its nodes
+  // live in its `childInstances`, exactly like a host element's, except there
+  // is no element of its own to hold them. These helpers are the only code
+  // that needs to know any of this — mount, hydrate, reconcile and unmount
+  // all treat "an instance" as "a thing with DOM nodes" without caring how
+  // many it has or where they came from.
+
+  function collectInstanceNodes(instance, out) {
+    if (!instance) {
+      return;
+    }
+    if (instance.isGroup) {
+      for (var i = 0; i < instance.childInstances.length; i++) {
+        collectInstanceNodes(instance.childInstances[i], out);
+      }
+      return;
+    }
+    if (instance.renderedInstance) {
+      collectInstanceNodes(instance.renderedInstance, out);
+      return;
+    }
+    if (instance.dom) {
+      out.push(instance.dom);
+    }
+  }
+
+  function firstInstanceNode(instance) {
+    var nodes = [];
+    collectInstanceNodes(instance, nodes);
+    return nodes.length ? nodes[0] : null;
+  }
+
+  // Insert every node `instance` owns into `parentDom`, in order, right
+  // before `beforeNode` — or at the end when `beforeNode` is null/undefined.
+  function insertInstance(parentDom, instance, beforeNode) {
+    var nodes = [];
+    collectInstanceNodes(instance, nodes);
+    for (var i = 0; i < nodes.length; i++) {
+      if (beforeNode) {
+        parentDom.insertBefore(nodes[i], beforeNode);
+      } else {
+        parentDom.appendChild(nodes[i]);
+      }
+    }
+  }
+
+  // Remove every node `instance` owns from wherever it currently lives.
+  function removeInstance(instance) {
+    var nodes = [];
+    collectInstanceNodes(instance, nodes);
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].parentNode) {
+        nodes[i].parentNode.removeChild(nodes[i]);
+      }
+    }
+  }
+
+  // Mount a flat vnode list into `container`, in order. Shared by a host
+  // element (container = the element itself) and a group (container = the
+  // surrounding real DOM parent, since a group owns no element of its own).
+  function mountChildren(vnodes, container) {
+    var instances = [];
+    for (var i = 0; i < vnodes.length; i++) {
+      var ci = instantiate(vnodes[i], container);
+      insertInstance(container, ci, null);
+      instances.push(ci);
+    }
+    return instances;
+  }
+
+  // Hydrate a flat vnode list against `container`'s existing DOM, starting at
+  // `startDom` and walking real siblings — not `childNodes[i]` — because one
+  // vnode can consume zero (an empty nested group), one (text/host/component)
+  // or many (a nested Fragment/Provider) DOM nodes before the next vnode's
+  // slice begins.
+  function hydrateChildren(vnodes, container, startDom) {
+    var instances = [];
+    var cursor = startDom;
+    for (var i = 0; i < vnodes.length; i++) {
+      var ci = hydrateInstance(cursor, vnodes[i], container);
+      instances.push(ci);
+      var consumed = [];
+      collectInstanceNodes(ci, consumed);
+      for (var j = 0; j < consumed.length; j++) {
+        cursor = cursor ? cursor.nextSibling : null;
+      }
+    }
+    return instances;
+  }
+
+  // Diff an old/new pair of flat child-instance/vnode lists against
+  // `container`. Index-aligned: matching indices reconcile in place, a
+  // shorter new list drops the tail, a longer one appends new instances at
+  // the end. Reordering existing children mid-list is not attempted — same
+  // documented scope as the rest of this reconciler.
+  function reconcileChildList(container, oldChildren, newVnodes) {
+    var count = Math.max(oldChildren.length, newVnodes.length);
+    var next = [];
+    for (var i = 0; i < count; i++) {
+      var child = reconcile(container, oldChildren[i] || null, newVnodes[i] || null);
+      if (child) {
+        next.push(child);
+      }
+    }
+    return next;
+  }
+
   // --- instantiate (mount path: create real DOM) ---------------------------
 
   function instantiate(vnode, parentDom) {
@@ -316,39 +429,31 @@
       return { vnode: vnode, dom: global.document.createTextNode(vnode.text) };
     }
     if (vnode.type === Fragment) {
-      // A fragment has no DOM of its own; for v1 it adopts its single child's
-      // node. Multi-child fragments at a reconcilable boundary are a known gap
-      // (no anchor node to diff against) — handled in a later slice.
-      var only = singleFragmentChild(vnode);
-      var childInst = instantiate(only, parentDom);
-      return { vnode: vnode, dom: childInst.dom, fragmentChild: childInst };
+      return {
+        vnode: vnode,
+        isGroup: true,
+        parentDom: parentDom,
+        childInstances: mountChildren(vnode.children, parentDom),
+      };
     }
     var ctxId = providerContextId(vnode.type);
     if (ctxId != null) {
-      var pinst = { vnode: vnode, isProvider: true, parentDom: parentDom, contextMap: currentContextMap };
+      var pinst = { vnode: vnode, isGroup: true, isProvider: true, parentDom: parentDom, contextMap: currentContextMap };
       var prevMap = currentContextMap;
       currentContextMap = childContextMap(prevMap, ctxId, pinst);
-      pinst.providerChild = instantiate(singleFragmentChild(vnode), parentDom);
+      pinst.childInstances = mountChildren(vnode.children, parentDom);
       currentContextMap = prevMap;
-      pinst.dom = pinst.providerChild.dom;
       return pinst;
     }
     if (isComponent(vnode.type)) {
       var inst = { vnode: vnode, component: vnode.type, hooks: [], parentDom: parentDom, contextMap: currentContextMap };
       var rendered = renderComponent(inst);
       inst.renderedInstance = instantiate(rendered, parentDom);
-      inst.dom = inst.renderedInstance.dom;
       return inst;
     }
     var dom = createHostElement(vnode.type, parentDom);
     updateDomProps(dom, null, vnode.props);
-    var childInstances = [];
-    for (var i = 0; i < vnode.children.length; i++) {
-      var ci = instantiate(vnode.children[i], dom);
-      dom.appendChild(ci.dom);
-      childInstances.push(ci);
-    }
-    return { vnode: vnode, dom: dom, childInstances: childInstances };
+    return { vnode: vnode, dom: dom, childInstances: mountChildren(vnode.children, dom) };
   }
 
   // --- hydrate (adopt server-rendered DOM, no re-paint) --------------------
@@ -364,25 +469,26 @@
       return mountReplace(vnode, parentDom, dom);
     }
     if (vnode.type === Fragment) {
-      var only = singleFragmentChild(vnode);
-      var childInst = hydrateInstance(dom, only, parentDom);
-      return { vnode: vnode, dom: childInst.dom, fragmentChild: childInst };
+      return {
+        vnode: vnode,
+        isGroup: true,
+        parentDom: parentDom,
+        childInstances: hydrateChildren(vnode.children, parentDom, dom),
+      };
     }
     var ctxId = providerContextId(vnode.type);
     if (ctxId != null) {
-      var pinst = { vnode: vnode, isProvider: true, parentDom: parentDom, contextMap: currentContextMap };
+      var pinst = { vnode: vnode, isGroup: true, isProvider: true, parentDom: parentDom, contextMap: currentContextMap };
       var prevMap = currentContextMap;
       currentContextMap = childContextMap(prevMap, ctxId, pinst);
-      pinst.providerChild = hydrateInstance(dom, singleFragmentChild(vnode), parentDom);
+      pinst.childInstances = hydrateChildren(vnode.children, parentDom, dom);
       currentContextMap = prevMap;
-      pinst.dom = pinst.providerChild.dom;
       return pinst;
     }
     if (isComponent(vnode.type)) {
       var inst = { vnode: vnode, component: vnode.type, hooks: [], parentDom: parentDom, contextMap: currentContextMap };
       var rendered = renderComponent(inst);
       inst.renderedInstance = hydrateInstance(dom, rendered, parentDom);
-      inst.dom = inst.renderedInstance.dom;
       return inst;
     }
     // Host element. If the server node doesn't line up with the expected tag,
@@ -391,21 +497,16 @@
       return mountReplace(vnode, parentDom, dom);
     }
     updateDomProps(dom, null, vnode.props);
-    var childInstances = [];
-    var domChildren = dom.childNodes;
-    for (var i = 0; i < vnode.children.length; i++) {
-      var childDom = domChildren ? domChildren[i] : null;
-      childInstances.push(hydrateInstance(childDom, vnode.children[i], dom));
-    }
-    return { vnode: vnode, dom: dom, childInstances: childInstances };
+    return { vnode: vnode, dom: dom, childInstances: hydrateChildren(vnode.children, dom, dom.firstChild) };
   }
 
   function mountReplace(vnode, parentDom, existingDom) {
     var inst = instantiate(vnode, parentDom);
     if (parentDom && existingDom && existingDom.parentNode === parentDom) {
-      parentDom.replaceChild(inst.dom, existingDom);
+      insertInstance(parentDom, inst, existingDom);
+      existingDom.parentNode.removeChild(existingDom);
     } else if (parentDom) {
-      parentDom.appendChild(inst.dom);
+      insertInstance(parentDom, inst, null);
     }
     return inst;
   }
@@ -415,20 +516,27 @@
   function reconcile(parentDom, instance, vnode) {
     if (instance == null) {
       var created = instantiate(vnode, parentDom);
-      parentDom.appendChild(created.dom);
+      insertInstance(parentDom, created, null);
       return created;
     }
     if (vnode == null) {
       unmount(instance);
-      if (instance.dom && instance.dom.parentNode) {
-        instance.dom.parentNode.removeChild(instance.dom);
-      }
+      removeInstance(instance);
       return null;
     }
     if (instance.vnode.type !== vnode.type) {
+      // Read the old instance's leading node BEFORE it's touched, so the
+      // replacement lands in the same slot even when either side owns zero
+      // or many nodes (a group). Known boundary: if the OLD instance is an
+      // empty group (no node to anchor on) this falls back to appending at
+      // the end of `parentDom`, which is only wrong if the empty group has
+      // real trailing siblings there — the same "no mid-list reordering"
+      // scope this reconciler already documents elsewhere.
+      var anchor = firstInstanceNode(instance);
       var replacement = instantiate(vnode, parentDom);
-      parentDom.replaceChild(replacement.dom, instance.dom);
+      insertInstance(parentDom, replacement, anchor);
       unmount(instance);
+      removeInstance(instance);
       return replacement;
     }
     if (vnode.type === TEXT) {
@@ -439,9 +547,9 @@
       return instance;
     }
     if (vnode.type === Fragment) {
-      instance.fragmentChild = reconcile(parentDom, instance.fragmentChild, singleFragmentChild(vnode));
-      instance.dom = instance.fragmentChild.dom;
+      instance.childInstances = reconcileChildList(parentDom, instance.childInstances || [], vnode.children);
       instance.vnode = vnode;
+      instance.parentDom = parentDom;
       return instance;
     }
     var rctxId = providerContextId(vnode.type);
@@ -454,9 +562,8 @@
       instance.parentDom = parentDom;
       var pPrevMap = currentContextMap;
       currentContextMap = childContextMap(instance.contextMap || pPrevMap, rctxId, instance);
-      instance.providerChild = reconcile(parentDom, instance.providerChild, singleFragmentChild(vnode));
+      instance.childInstances = reconcileChildList(parentDom, instance.childInstances || [], vnode.children);
       currentContextMap = pPrevMap;
-      instance.dom = instance.providerChild.dom;
       return instance;
     }
     if (isComponent(vnode.type)) {
@@ -470,27 +577,12 @@
       var rendered = renderComponent(instance);
       instance.renderedInstance = reconcile(parentDom, instance.renderedInstance, rendered);
       currentContextMap = cPrevMap;
-      instance.dom = instance.renderedInstance.dom;
       return instance;
     }
     updateDomProps(instance.dom, instance.vnode.props, vnode.props);
-    reconcileChildren(instance, vnode);
+    instance.childInstances = reconcileChildList(instance.dom, instance.childInstances || [], vnode.children);
     instance.vnode = vnode;
     return instance;
-  }
-
-  function reconcileChildren(instance, vnode) {
-    var oldChildren = instance.childInstances || [];
-    var newVnodes = vnode.children;
-    var count = Math.max(oldChildren.length, newVnodes.length);
-    var next = [];
-    for (var i = 0; i < count; i++) {
-      var child = reconcile(instance.dom, oldChildren[i] || null, newVnodes[i] || null);
-      if (child) {
-        next.push(child);
-      }
-    }
-    instance.childInstances = next;
   }
 
   // --- component invocation ------------------------------------------------
@@ -524,15 +616,10 @@
     if (instance.renderedInstance) {
       unmount(instance.renderedInstance);
     }
-    if (instance.fragmentChild) {
-      unmount(instance.fragmentChild);
-    }
-    if (instance.providerChild) {
-      unmount(instance.providerChild);
-    }
     // A host element that received a ref hands back `null` on the way out, so
-    // a consumer never holds a node that has left the document.
-    if (instance.childInstances && instance.vnode && instance.vnode.props) {
+    // a consumer never holds a node that has left the document. Not a group
+    // (Fragment/Provider): those never carry a `ref` prop that means anything.
+    if (instance.childInstances && !instance.isGroup && instance.vnode && instance.vnode.props) {
       attachRef(instance.vnode.props.ref, null);
     }
     if (instance.childInstances) {
@@ -722,13 +809,6 @@
   function tagMatches(dom, type) {
     var name = dom.tagName || dom.nodeName;
     return typeof name === 'string' && name.toLowerCase() === String(type).toLowerCase();
-  }
-
-  function singleFragmentChild(vnode) {
-    if (vnode.children.length === 1) {
-      return vnode.children[0];
-    }
-    throw new Error('[albedo-client] multi-child Fragment is not yet reconcilable on the client');
   }
 
   function reportError(err) {
