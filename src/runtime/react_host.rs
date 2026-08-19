@@ -183,11 +183,16 @@ const REACT_HOST: HostModule = HostModule {
 
 /// The automatic JSX runtime, which most modern packages are compiled against.
 ///
-/// 🔑 **`jsx` is where `props.children` becomes variadic children**, which is the
-/// shape `h` takes. A package compiled with the automatic runtime therefore
-/// renders its children correctly even though the classic
-/// `createElement(Component, props, child)` path does not (see
-/// [`REFUSED_MODULES`] on `Children`).
+/// 🔑 **`jsx` is where `props.children` becomes variadic children**, which is
+/// the shape `h` takes — `jsx(type, {..., children}, key)` pulls `children`
+/// back out of `props` and hands it to `h` positionally, same as the classic
+/// `createElement(type, props, ...children)` call shape does natively. Both
+/// paths converge on `h`, so both depend on `h` folding those positional
+/// children back into `props.children` for a component type — the shape a
+/// component actually reads. That fold lives once in each host's `h`
+/// (`quickjs_engine.rs` server-side, `assets/albedo-client.js` client-side)
+/// rather than here, so `jsx` and the classic path are two callers of the
+/// same fix, not two implementations of it.
 const JSX_RUNTIME_HOST: HostModule = HostModule {
     specifiers: &["react/jsx-runtime", "react/jsx-dev-runtime"],
     record_key: "albedo:host/react-jsx-runtime",

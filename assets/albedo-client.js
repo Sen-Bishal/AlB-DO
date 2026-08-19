@@ -92,12 +92,33 @@
     }
     var children = [];
     normalizeChildren(rest, children);
+    // `vnode.children` (above) is for the reconciler to walk when `type` is a
+    // host tag — it appends real DOM nodes from it and never looks at props.
+    // A *component* is invoked, not walked, and reads its children the React
+    // way: off `props.children`. This mirrors the SSR `h` in
+    // `quickjs_engine.rs`, which does the same merge for the same reason —
+    // without it, a component built through the classic `h(Component, props,
+    // child)` call shape, or through the automatic JSX runtime (which strips
+    // `children` out of `props` before it ever reaches here — see
+    // `react_host.rs`'s `__albedo_jsx`), sees `props.children === undefined`
+    // even though it was given children. `Link` below is a real instance of
+    // this: it forwards `props.children` and, without this merge, silently
+    // renders an empty anchor.
+    var finalProps = props || null;
+    if (isComponent(type)) {
+      finalProps = Object.assign({}, props || {});
+      if (children.length === 1) {
+        finalProps.children = children[0];
+      } else if (children.length > 1) {
+        finalProps.children = children;
+      }
+    }
     return {
       __vnode: true,
       type: type,
-      props: props || null,
+      props: finalProps,
       children: children,
-      key: props && props.key != null ? props.key : null,
+      key: finalProps && finalProps.key != null ? finalProps.key : null,
     };
   }
 
