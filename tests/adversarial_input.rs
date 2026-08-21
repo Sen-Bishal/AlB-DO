@@ -33,6 +33,14 @@
 //! cross-platform, and CI-runnable on every PR. The fuzz targets remain the
 //! deep, coverage-guided option for Linux/CI; this is the always-on gate.
 
+// AUDITED EXCEPTION to the workspace's `unsafe_code = "deny"`, test-binary scope.
+//
+// `GlobalAlloc` is an unsafe trait and its methods are unsafe by definition; the
+// counting allocator below is the instrument these tests measure with (peak live
+// bytes across a decode), so it cannot be written in safe Rust. It governs this test
+// binary only and never ships.
+#![allow(unsafe_code)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 

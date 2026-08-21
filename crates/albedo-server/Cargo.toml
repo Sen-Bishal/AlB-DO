@@ -78,3 +78,9 @@ reqwest.workspace = true
 [[bin]]
 name = "albedo"
 path = "../../src/bin/albedo.rs"
+
+# Opt this crate into `[workspace.lints]`. Without this table the workspace lint
+# configuration is inert — declared and never applied — which is how
+# `unsafe_code` sat "forbid" over a tree containing `unsafe`.
+[lints]
+workspace = true

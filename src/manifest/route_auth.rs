@@ -82,7 +82,6 @@ pub fn validate_route_auth(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::manifest::schema::RouteAuth;
 
     #[test]

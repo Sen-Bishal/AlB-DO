@@ -13,7 +13,7 @@
 //! The dispatcher is exercised directly (no HTTP layer) so the test
 //! stays fast and deterministic.
 
-use albedo_server::actions::{ActionHandler, SessionSlots};
+use albedo_server::actions::SessionSlots;
 use albedo_server::lifecycle::RequestContext;
 use albedo_server::render::form_action::{
     form_action_handler, form_action_id, FormDecodeError, FromFormPayload,

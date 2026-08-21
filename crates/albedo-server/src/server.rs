@@ -5035,8 +5035,6 @@ mod tests {
 
     #[tokio::test]
     async fn register_form_action_deserialises_json_payload_into_typed_struct() {
-        use crate::render::form_action::form_action_id;
-        use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
         use dom_render_compiler::ir::opcode::{Instruction, StableId};
         use dom_render_compiler::ir::wire::decode_frame;
         use serde::Deserialize;

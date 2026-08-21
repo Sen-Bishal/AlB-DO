@@ -52,6 +52,11 @@ const FIXTURE_GROUPS: &[&str] = &["hook_compile", "jsx_matrix", "render_quickjs"
 fn props_for(corpus: &str, entry: &str) -> Value {
     match (corpus, entry) {
         ("render_quickjs/list", _) => json!({ "items": ["alpha", "beta"] }),
+        // Markup-significant characters arriving from OUTSIDE the component.
+        // Escaping is only interesting on data the author did not write.
+        ("render_quickjs/escaped_props_text", _) => json!({
+            "bio": "<script>alert(1)</script> & \"quoted\" 'single'"
+        }),
         ("scaffold", "routes/room/[id].tsx") => json!({ "params": { "id": "lobby" } }),
         _ => json!({}),
     }

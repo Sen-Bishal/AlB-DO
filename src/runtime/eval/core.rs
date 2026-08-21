@@ -1,3 +1,11 @@
+// AUDITED EXCEPTION 2 of 2 to the workspace's `unsafe_code = "deny"`.
+//
+// The evaluator threads the active `CompiledProject` through a thread-local raw pointer
+// rather than a lifetime, because the render walk re-enters itself through QuickJS and no
+// borrow can span that boundary. Each deref below is guarded by the scope guard that set
+// the pointer, and carries its `// Safety:` argument.
+#![allow(unsafe_code)]
+
 use crate::ir::opcode::{Instruction, ProxyId, SlotId, StableId};
 use crate::runtime::compiled::{allocate_proxy_id, CompiledComponent, CompiledProject};
 use crate::runtime::slot_store::SessionSlotView;
@@ -20,9 +28,9 @@ use walkdir::WalkDir;
 use crate::runtime::eval::component::{
     arg_num, classnames_collect, date_value_ms, escape_html, fnv1a_32, fnv1a_hash,
     import_candidates, is_classnames_source, is_component_module, is_component_tag, is_truthy,
-    is_void_tag, json_int, json_num, lit_to_value, make_date_value, normalize_jsx_text,
-    normalize_slashes, normalize_specifier, prop_name_to_string, render_attrs, to_number,
-    value_to_string,
+    is_void_tag, json_int, json_num, lit_to_value, make_date_value, make_html_value,
+    normalize_jsx_text, normalize_slashes, normalize_specifier, prop_name_to_string,
+    push_expression_child, render_attrs, to_number, unwrap_html_markers, value_to_string,
 };
 
 thread_local! {
@@ -2203,12 +2211,17 @@ impl ComponentProject {
     ) -> Result<Value> {
         use swc_ecma_ast::*;
         match expr {
-            Expr::JSXElement(element) => Ok(Value::String(self.eval_jsx_element(
+            // Markup, not text. The distinction is the whole reason
+            // `make_html_value` exists: what comes back here is spliced into a
+            // page verbatim, while every OTHER value an expression can produce
+            // is data and must be escaped on the way in. Losing the difference
+            // is how `{props.bio}` shipped unescaped for as long as it did.
+            Expr::JSXElement(element) => Ok(make_html_value(self.eval_jsx_element(
                 module_spec,
                 element,
                 env,
             )?)),
-            Expr::JSXFragment(fragment) => Ok(Value::String(self.eval_jsx_fragment(
+            Expr::JSXFragment(fragment) => Ok(make_html_value(self.eval_jsx_fragment(
                 module_spec,
                 fragment,
                 env,
@@ -2900,7 +2913,13 @@ impl ComponentProject {
 
             // JSON.* — useful in display-time templates for debug surfaces.
             ("JSON", "stringify") => match evaluated.first() {
-                Some(value) => Value::String(serde_json::to_string(value).unwrap_or_default()),
+                // Unwrap first: a rendered-markup marker is an internal shape,
+                // and stringifying it would put the per-process tag on a page.
+                // What the author sees is what they saw before it existed — the
+                // markup as a plain string.
+                Some(value) => Value::String(
+                    serde_json::to_string(&unwrap_html_markers(value)).unwrap_or_default(),
+                ),
                 None => Value::Null,
             },
 
@@ -3006,15 +3025,20 @@ impl ComponentProject {
                         spread: None,
                     }) = args.first()
                     {
+                        // An ARRAY, not a joined string. `xs.map(x => <li/>)` is
+                        // the ordinary way to write a list, and flattening it to
+                        // text here erased the fact that each element was
+                        // markup — which then made `{xs.map(...)}` in a child
+                        // position indistinguishable from a user string, and so
+                        // escapable. `value_to_string` still concatenates an
+                        // array, so every consumer that wanted the joined text
+                        // gets the same bytes it did before.
                         let parts = items
                             .iter()
                             .enumerate()
-                            .map(|(i, item)| {
-                                self.eval_closure(module_spec, mapper, item, i, env)
-                                    .map(|v| value_to_string(&v))
-                            })
+                            .map(|(i, item)| self.eval_closure(module_spec, mapper, item, i, env))
                             .collect::<Result<Vec<_>>>()?;
-                        return Ok(Some(Value::String(parts.join(""))));
+                        return Ok(Some(Value::Array(parts)));
                     }
                     Ok(Some(Value::Null))
                 }
@@ -3644,7 +3668,7 @@ impl ComponentProject {
         fragment: &swc_ecma_ast::JSXFragment,
         env: &HashMap<String, Value>,
     ) -> Result<String> {
-        self.render_children(module_spec, &fragment.children, env, false)
+        self.render_children(module_spec, &fragment.children, env)
     }
 
     fn eval_jsx_element(
@@ -3719,7 +3743,10 @@ impl ComponentProject {
                         // closure cannot be serialised into a payload, and the
                         // island's own `onClick`s are compiled into its bundle.
                         if !name.starts_with("on") {
-                            props.insert(name, value);
+                            // Serialised into the page for the island to boot
+                            // from, so the internal markup marker is unwrapped
+                            // to the plain string it stands for.
+                            props.insert(name, unwrap_html_markers(&value));
                         }
                     }
                     push_island_props(&tag, Value::Object(props));
@@ -3922,7 +3949,7 @@ impl ComponentProject {
         }
 
         let attrs_html = render_attrs(&attrs);
-        let children_html = self.render_children(module_spec, &element.children, env, false)?;
+        let children_html = self.render_children(module_spec, &element.children, env)?;
         let void_tag = is_void_tag(&tag);
 
         if form_action_name.is_some() {
@@ -4152,14 +4179,14 @@ impl ComponentProject {
                     JSXExpr::JSXEmptyExpr(_) => {}
                 },
                 JSXElementChild::JSXElement(element) => {
-                    out.push(Value::String(self.eval_jsx_element(
+                    out.push(make_html_value(self.eval_jsx_element(
                         module_spec,
                         element,
                         env,
                     )?));
                 }
                 JSXElementChild::JSXFragment(fragment) => {
-                    out.push(Value::String(self.eval_jsx_fragment(
+                    out.push(make_html_value(self.eval_jsx_fragment(
                         module_spec,
                         fragment,
                         env,
@@ -4478,12 +4505,21 @@ impl ComponentProject {
         Ok(())
     }
 
+    /// Render a JSX child list to HTML.
+    ///
+    /// Expression children are escaped unless they are markup this renderer
+    /// produced; [`push_expression_child`] owns that rule and QuickJS's
+    /// `__albedo_push_children` is the same rule on the other side of the
+    /// language boundary. This used to take an `escape_expr_children: bool`
+    /// that both call sites passed `false`, so the escaping branch was
+    /// unreachable and every expression child shipped raw. There is no caller
+    /// for which raw is right — a fragment's children and an element's children
+    /// are the same children — so the flag is gone rather than flipped.
     fn render_children(
         &self,
         module_spec: &str,
         children: &[swc_ecma_ast::JSXElementChild],
         env: &HashMap<String, Value>,
-        escape_expr_children: bool,
     ) -> Result<String> {
         use swc_ecma_ast::*;
         let mut html = String::new();
@@ -4574,15 +4610,7 @@ impl ComponentProject {
                             }
                         }
                         let value = self.eval_expr(module_spec, expr, env)?;
-                        if matches!(value, Value::Null | Value::Bool(false)) {
-                            continue;
-                        }
-                        let text = value_to_string(&value);
-                        if escape_expr_children {
-                            html.push_str(&escape_html(&text));
-                        } else {
-                            html.push_str(&text);
-                        }
+                        push_expression_child(&value, &mut html);
                     }
                     JSXExpr::JSXEmptyExpr(_) => {}
                 },

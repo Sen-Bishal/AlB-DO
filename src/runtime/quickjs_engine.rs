@@ -4468,7 +4468,7 @@ mod tests {
         use super::QuickJsEngine;
         use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
-        use serde_json::{Map, Value};
+        use serde_json::Map;
 
         let mut engine = QuickJsEngine::new();
         engine

@@ -139,7 +139,15 @@ tower     = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["catch-panic", "compression-gzip"] }
 
 [workspace.lints.rust]
-unsafe_code      = "forbid"
+# `deny`, not `forbid`, and the difference is the whole point: `forbid` cannot be
+# locally relaxed, so under it the two real `unsafe` sites in this tree
+# (`src/runtime/arena.rs` — the arena allocator; `src/runtime/eval/core.rs` — the
+# thread-local raw-pointer derefs) could only exist by the lint never being
+# applied at all. That is exactly the state this table was in until the crates
+# below opted in: declared and inert. Under `deny` the exceptions are
+# `#![allow(unsafe_code)]` with a written justification, which makes them an
+# audited list of two rather than an unenforced slogan.
+unsafe_code      = "deny"
 missing_docs     = "warn"
 unused_imports   = "deny"
 dead_code        = "warn"
@@ -283,6 +291,12 @@ harness = false
 name              = "prism_partitions"
 harness           = false
 required-features = ["forge"]
+
+# Opt this crate into `[workspace.lints]`. Without this table the workspace lint
+# configuration is inert — declared and never applied — which is how
+# `unsafe_code` sat "forbid" over a tree containing `unsafe`.
+[lints]
+workspace = true
 
 [profile.release]
 opt-level     = 3

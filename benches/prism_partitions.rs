@@ -120,7 +120,11 @@ async fn median_append_us(
     for i in 0..n {
         let write = append(room, &format!("bench {i}"));
         let t = Instant::now();
-        apply_writes(db, broadcast, schema, std::slice::from_ref(&write), None)
+        // `None` twice: no row projector and no principal — this bench measures the
+        // write path's shape, not authorization. (The second argument arrived when
+        // `apply_writes` grew its `principal` parameter; this call site was not
+        // updated then, which is why the target stopped compiling.)
+        apply_writes(db, broadcast, schema, std::slice::from_ref(&write), None, None)
             .await
             .expect("write");
         samples.push(t.elapsed());

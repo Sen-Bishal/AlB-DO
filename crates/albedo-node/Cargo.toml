@@ -20,3 +20,9 @@ serde_json.workspace          = true
 
 [build-dependencies]
 napi-build = "2.1"
+
+# Opt this crate into `[workspace.lints]`. Without this table the workspace lint
+# configuration is inert — declared and never applied — which is how
+# `unsafe_code` sat "forbid" over a tree containing `unsafe`.
+[lints]
+workspace = true

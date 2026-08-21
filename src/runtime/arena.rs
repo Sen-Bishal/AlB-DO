@@ -35,6 +35,14 @@
 //! Single-threaded by construction: a QuickJS `Runtime` is not `Send`, and the engine
 //! drives allocation and the `begin_request`/`end_request` control points from that one
 //! thread. Counters use relaxed atomics purely so the handle stays `Send + Sync`.
+// AUDITED EXCEPTION 1 of 2 to the workspace's `unsafe_code = "deny"`.
+//
+// This module IS the allocator: it hands QuickJS a `JSMallocFunctions` table, so
+// `alloc`/`dealloc`/`realloc` and the raw header arithmetic below cannot be expressed
+// in safe Rust. Every `unsafe` block here carries a `// Safety:` argument naming the
+// invariant it relies on; `Region::bump`'s non-atomic read-modify-write is the one
+// whose safety still rests on a doc comment rather than a type (see § 4 of this file).
+#![allow(unsafe_code)]
 
 // An allocator is pointer arithmetic by nature: it stores region bases as integers,
 // reconstructs pointers from them, and offsets within blocks. These casts and the

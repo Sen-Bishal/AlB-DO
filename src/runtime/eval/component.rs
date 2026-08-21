@@ -153,11 +153,113 @@ pub fn is_component_tag(tag: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The key that tags an evaluator value as ALREADY-RENDERED MARKUP.
+///
+/// The evaluator's `Value` is `serde_json::Value` — a foreign type with no room
+/// for a new variant — so "this string is HTML, not text" rides the same way a
+/// `Date` does: a one-key object. QuickJS draws the same distinction with the
+/// `AlbedoHtml` wrapper in `quickjs_engine`'s `h()` shim, and the two renderers
+/// must agree on *which* children get escaped or they emit different bytes for
+/// the same component.
+///
+/// ## Why the key carries a per-process nonce
+///
+/// `AlbedoHtml` is unforgeable in JS: a value decoded from JSON is never
+/// `instanceof AlbedoHtml`. A fixed key like `__albedo_html__` would NOT be
+/// unforgeable here — props, FORGE rows and fetched JSON are all
+/// attacker-influenced `Value`s, and any one of them could carry that key and
+/// so be spliced into the page as raw markup. That would replace the escaping
+/// hole this marker exists to close with a narrower one, which is not a fix.
+/// A nonce chosen at process start cannot be written by anything that entered
+/// as data, so the marker means what it says: *this renderer produced it*.
+///
+/// It never reaches output — [`value_to_string`] unwraps it, and
+/// [`unwrap_html_markers`] is applied at the two boundaries that serialise a
+/// `Value` back out (island props, `JSON.stringify`) — so the nondeterminism
+/// stays inside one process's memory and out of every artifact.
+#[must_use]
+pub fn albedo_html_tag() -> &'static str {
+    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TAG.get_or_init(|| format!("__albedo_html_{:016x}__", rand::random::<u64>()))
+}
+
+/// Tag `html` as markup that is already safe to embed verbatim.
+#[must_use]
+pub fn make_html_value(html: String) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(albedo_html_tag().to_string(), Value::String(html));
+    Value::Object(map)
+}
+
+/// The markup inside an already-rendered value, or `None` for plain data.
+///
+/// Plain data is everything a component author can put in an expression child
+/// that is not the output of a render: strings, numbers, dates, objects, and
+/// anything that arrived as props. All of it must be escaped.
+#[must_use]
+pub fn as_rendered_html(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    object.get(albedo_html_tag())?.as_str()
+}
+
+/// Replace every markup marker in `value` with its bare string.
+///
+/// For the boundaries that serialise a `Value` back out of the renderer, where
+/// the marker's shape would otherwise leak into a payload. Restores exactly what
+/// those boundaries saw before the marker existed: a `String` of HTML.
+#[must_use]
+pub fn unwrap_html_markers(value: &Value) -> Value {
+    if let Some(html) = as_rendered_html(value) {
+        return Value::String(html.to_string());
+    }
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(unwrap_html_markers).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), unwrap_html_markers(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 pub fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Append one JSX expression child to `out`, escaping it unless it is markup
+/// this renderer produced.
+///
+/// The Rust half of QuickJS's `__albedo_push_children`, and it must stay the
+/// same rule: arrays flatten, `null`/`false` render nothing, an already-rendered
+/// value passes through verbatim, and **everything else is escaped**. Anything
+/// that reached here as data — props, a route param, a FORGE column, a fetched
+/// field — is in that last case.
+pub fn push_expression_child(value: &Value, out: &mut String) {
+    if let Some(html) = as_rendered_html(value) {
+        out.push_str(html);
+        return;
+    }
+    match value {
+        // `{null}`, `{undefined}` and `{cond && ...}` with a false `cond`
+        // render nothing. `true` is deliberately not in this set: JS prints it.
+        Value::Null | Value::Bool(false) => {}
+        // A mapped list is an array of children, each with its own nature —
+        // `xs.map(x => <li/>)` is markup, `xs.map(x => x.name)` is text — so the
+        // decision is made per element rather than for the array.
+        Value::Array(items) => {
+            for item in items {
+                push_expression_child(item, out);
+            }
+        }
+        other => out.push_str(&escape_html(&value_to_string(other))),
+    }
 }
 
 pub fn escape_attr(value: &str) -> String {
@@ -488,6 +590,12 @@ pub fn value_to_string(value: &Value) -> String {
         Value::String(string) => string.clone(),
         Value::Array(values) => values.iter().map(value_to_string).collect(),
         Value::Object(object) => {
+            // Already-rendered markup prints as itself. `value_to_string` is the
+            // one funnel every text-ish consumer goes through, so unwrapping
+            // here keeps the marker's shape from ever reaching a page.
+            if let Some(html) = as_rendered_html(value) {
+                return html.to_string();
+            }
             // Date objects (encoded as { __albedo_date__: ms }) print as the
             // ISO string, mirroring JS's `String(new Date())` shape closely
             // enough for templates that interpolate them directly. Anything
