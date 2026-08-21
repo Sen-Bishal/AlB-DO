@@ -254,6 +254,16 @@ tempfile.workspace  = true
 regex.workspace     = true
 criterion.workspace = true
 
+# For `tests/adversarial_corpus_sweep.rs`, which rewrites the corpus's string
+# literals and must agree with the compiler about what a string literal *is*.
+# A hand-rolled scanner would be a second spelling of that rule and would get
+# JSX wrong — `<span>say "hi"</span>` has no string literal in it at all. These
+# are already compiled for the library; sharing them adds no supply chain.
+swc_common.workspace     = true
+swc_ecma_ast.workspace   = true
+swc_ecma_parser.workspace = true
+swc_ecma_visit.workspace = true
+
 [[bench]]
 name    = "frame_tick"
 harness = false
