@@ -82,6 +82,69 @@ fn reset_element_counter() {
     RENDER_ELEMENT_COUNTER.with(|cell| cell.set(0));
 }
 
+thread_local! {
+    /// `useId`'s counter and scope. See the QuickJS prelude's `useId` for the
+    /// full argument; the short version is that the id is `(scope, n)` where
+    /// `scope` names the render's entry module and `n` counts `useId` calls in
+    /// component-invocation order. This half exists so the two SERVER renderers
+    /// agree — the conformance gate compares them byte-for-byte, and a `useId`
+    /// implemented in only one of them is a guaranteed `DIVERGE`.
+    static RENDER_ID_COUNTER: Cell<u32> = const { Cell::new(0) };
+    static RENDER_ID_SCOPE: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// The slug half of the id, byte-identical to the prelude's `__albedo_id_slug`.
+fn id_slug(entry: &str) -> String {
+    let mut slug = String::with_capacity(entry.len());
+    let mut last_dash = false;
+    for ch in entry.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "r".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn begin_id_scope(entry: &str) {
+    RENDER_ID_COUNTER.with(|cell| cell.set(0));
+    RENDER_ID_SCOPE.with(|cell| *cell.borrow_mut() = id_slug(entry));
+}
+
+fn next_use_id() -> String {
+    let n = RENDER_ID_COUNTER.with(|cell| {
+        let n = cell.get();
+        cell.set(n.wrapping_add(1));
+        n
+    });
+    let scope = RENDER_ID_SCOPE.with(|cell| cell.borrow().clone());
+    let scope = if scope.is_empty() { "r".to_string() } else { scope };
+    // `n.to_string(36)` on the JS side; base-36 by hand here so the two spell
+    // the same digits.
+    let mut digits = String::new();
+    let mut value = n;
+    loop {
+        let digit = u32::from(value % 36);
+        digits.insert(
+            0,
+            char::from_digit(digit, 36).expect("digit < 36 is representable"),
+        );
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    format!("albedo-{scope}-{digits}")
+}
+
 /// A derived text/attribute binding collected during a Phase K render: a JSX
 /// expression that reads ≥1 reactive slot but isn't a bare slot read
 /// (`{count * 2}`, `{open ? 'on' : 'off'}`, `className={busy ? 'b' : ''}`). The
@@ -1843,6 +1906,7 @@ impl ComponentProject {
         let entry = self
             .resolve_entry(entry)
             .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
+        begin_id_scope(&entry);
         self.render_export(&entry, "default", props)
     }
 
@@ -1881,6 +1945,7 @@ impl ComponentProject {
         let entry = self
             .resolve_entry(entry)
             .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
+        begin_id_scope(&entry);
 
         // Set up the Phase-K thread-local state. RAII guard restores
         // the previous (None) state even on panic so concurrent
@@ -1922,6 +1987,7 @@ impl ComponentProject {
         let entry = self
             .resolve_entry(entry)
             .ok_or_else(|| anyhow!("entry '{}' not found in '{}'", entry, self.root.display()))?;
+        begin_id_scope(&entry);
 
         let _slot_guard = PhaseKGuard::install(slots.clone());
         let _project_guard = install_phase_k_project(compiled);
@@ -2818,6 +2884,19 @@ impl ComponentProject {
                         _ => Value::Null,
                     };
                     return Ok(Value::Array(vec![initial, Value::Null]));
+                }
+
+                // useId shim — `TODO.md` 9.2. Must produce the SAME string the
+                // QuickJS prelude does or the conformance gate diverges on
+                // every component that calls it, which is every Radix
+                // primitive. Both halves are `(scope, n)`; see the prelude for
+                // why that pair is the one the client can also re-derive.
+                let is_react_use_id = fn_name == "useId"
+                    && import
+                        .map(|b| b.source == "react" && b.export_name == "useId")
+                        .unwrap_or(false);
+                if is_react_use_id {
+                    return Ok(Value::String(next_use_id()));
                 }
 
                 // useMemo shim — the value of `useMemo(() => EXPR, deps)` on a

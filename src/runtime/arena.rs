@@ -35,13 +35,28 @@
 //! Single-threaded by construction: a QuickJS `Runtime` is not `Send`, and the engine
 //! drives allocation and the `begin_request`/`end_request` control points from that one
 //! thread. Counters use relaxed atomics purely so the handle stays `Send + Sync`.
+//!
+//! That last paragraph used to be the *only* thing holding two of this module's
+//! invariants up, which is a poor place for an allocator's soundness to live. Both are
+//! now enforced rather than asserted:
+//!
+//! * `Region::bump` and the `realloc` top-of-region fast path are single atomic
+//!   read-modify-writes, so neither hands two callers the same address even if the
+//!   one-thread property stops holding.
+//! * [`ArenaControl::debug_assert_owning_thread`] pins the arena to the first thread
+//!   that allocates through it and fires on the second, so the property is *checked*
+//!   in every debug build rather than believed.
+//!
+//! Neither change fixes the intermittent `0xc0000005` recorded in
+//! `development-plan/ACCESS_VIOLATION.md` — that file's § 4 says plainly that these two
+//! hazards are not the observed crash. They are cheap, they are real, and they were
+//! found while looking for it.
 // AUDITED EXCEPTION 1 of 2 to the workspace's `unsafe_code = "deny"`.
 //
 // This module IS the allocator: it hands QuickJS a `JSMallocFunctions` table, so
 // `alloc`/`dealloc`/`realloc` and the raw header arithmetic below cannot be expressed
 // in safe Rust. Every `unsafe` block here carries a `// Safety:` argument naming the
-// invariant it relies on; `Region::bump`'s non-atomic read-modify-write is the one
-// whose safety still rests on a doc comment rather than a type (see § 4 of this file).
+// invariant it relies on.
 #![allow(unsafe_code)]
 
 // An allocator is pointer arithmetic by nature: it stores region bases as integers,
@@ -56,7 +71,8 @@ use rquickjs::allocator::Allocator;
 use std::alloc::{self, Layout};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::thread::ThreadId;
 
 /// QuickJS's largest scalar is a `u64`, so every block must be 8-byte aligned.
 const ALLOC_ALIGN: usize = std::mem::align_of::<u64>();
@@ -70,6 +86,24 @@ const DEFAULT_PERSISTENT_CAP: usize = 16 * 1024 * 1024;
 #[inline]
 fn round_up(size: usize) -> usize {
     (size + ALLOC_ALIGN - 1) & !(ALLOC_ALIGN - 1)
+}
+
+/// The usable size a request of `size` bytes actually gets — never zero.
+///
+/// A zero-usable block is the one input that breaks [`ArenaControl::is_persistent`],
+/// which classifies a pointer by testing it against the region's half-open range. A
+/// block whose usable size rounds to 0, allocated when the bump cursor sits at exactly
+/// `cap - HEADER_SIZE`, has a user pointer of `base + cap` — one past the end, so the
+/// range rejects it and `dealloc` hands arena-owned memory to `alloc::dealloc`.
+///
+/// Fixed at the source rather than by widening the range: an inclusive bound would
+/// claim any foreign pointer that happened to land immediately after the region, which
+/// trades a rare bug for a broader one. Refusing to hand out a zero-size block removes
+/// the input instead, and matches what a real allocator does with `malloc(0)` — a
+/// unique, freeable pointer.
+#[inline]
+fn usable_for(size: usize) -> usize {
+    round_up(size).max(ALLOC_ALIGN)
 }
 
 /// A fixed-capacity slab we bump-allocate within. The backing memory is committed once
@@ -103,16 +137,23 @@ impl Region {
 
     /// Bump `total` bytes off the front; returns the block's base address or `None` when
     /// the region is exhausted.
+    ///
+    /// One atomic read-modify-write, not a `load` followed by a `store`. The pair was
+    /// sound only while one arena was touched by exactly one thread — and that property
+    /// was enforced by a doc comment, so the day an engine became `Send` two callers
+    /// would have been handed the same address with nothing to say so. `fetch_update`
+    /// makes the invariant hold regardless, and `debug_assert_owning_thread` now checks
+    /// the property itself rather than asserting it in prose.
     #[inline]
     fn bump(&self, total: usize) -> Option<usize> {
-        let off = self.top.load(Relaxed);
-        let end = off.checked_add(total)?;
-        if end <= self.cap {
-            self.top.store(end, Relaxed);
-            Some(self.base + off)
-        } else {
-            None
-        }
+        let off = self
+            .top
+            .fetch_update(Relaxed, Relaxed, |off| {
+                let end = off.checked_add(total)?;
+                (end <= self.cap).then_some(end)
+            })
+            .ok()?;
+        Some(self.base + off)
     }
 }
 
@@ -148,6 +189,15 @@ pub struct ArenaControl {
     system_live_bytes: AtomicUsize,
     /// High-water mark of `system_live_bytes`.
     system_peak_bytes: AtomicUsize,
+    /// The thread that first allocated through this arena.
+    ///
+    /// The module header claims one arena is touched by exactly one thread for its whole
+    /// life — `QuickJsEngine` is `!Send`, and `engine_pool` gives each engine a dedicated
+    /// thread it talks to by channel. That claim is load-bearing (it is what made the old
+    /// non-atomic `bump` sound) and until now nothing checked it. Pinned lazily on first
+    /// allocation rather than at construction, because the arena is built by whoever
+    /// creates the engine and then used by the engine's own thread.
+    owner: OnceLock<ThreadId>,
 }
 
 /// A point-in-time view of arena usage, used by the guardrail tests and diagnostics.
@@ -177,7 +227,34 @@ impl ArenaControl {
             persistent_grew_in_request: AtomicUsize::new(0),
             system_live_bytes: AtomicUsize::new(0),
             system_peak_bytes: AtomicUsize::new(0),
+            owner: OnceLock::new(),
         })
+    }
+
+    /// Check the one-arena-one-thread property the header claims.
+    ///
+    /// Debug-only, and deliberately only on the three allocation callbacks — those are
+    /// where the property is load-bearing, because they write block headers and move a
+    /// bump cursor. `begin_request`/`end_request` touch one `AtomicBool` and are
+    /// genuinely thread-safe, so asserting there would be claiming more than the code
+    /// needs. `stats()` is a read-only observation the guardrail tests make from
+    /// wherever they happen to run, and asserting there would fail the harness rather
+    /// than the allocator.
+    #[inline]
+    fn debug_assert_owning_thread(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let current = std::thread::current().id();
+            let owner = *self.owner.get_or_init(|| current);
+            assert_eq!(
+                owner, current,
+                "arena reached from two threads ({owner:?} then {current:?}). The block \
+                 headers and the bump cursor assume one arena is touched by one thread \
+                 for its whole life — see this module's header. If an engine has \
+                 deliberately become shareable, that design change has to reach the \
+                 header comment and this assertion together."
+            );
+        }
     }
 
     pub fn with_default_caps() -> Arc<Self> {
@@ -246,8 +323,9 @@ impl ArenaControl {
     }
 
     fn alloc(&self, size: usize, zero: bool) -> *mut u8 {
+        self.debug_assert_owning_thread();
         self.alloc_calls.fetch_add(1, Relaxed);
-        let usable = round_up(size);
+        let usable = usable_for(size);
         if self.in_request.load(Relaxed) {
             // Request-time: hand QuickJS a system block it can free per-object. We must
             // NOT bump this into a resettable region — QuickJS interns long-lived
@@ -262,6 +340,7 @@ impl ArenaControl {
 
     /// SAFETY: `user` must be a live pointer previously returned by this arena.
     unsafe fn dealloc(&self, user: *mut u8) {
+        self.debug_assert_owning_thread();
         self.dealloc_calls.fetch_add(1, Relaxed);
         if self.is_persistent(user) {
             // Persistent block: reclaimed wholesale when the engine drops.
@@ -275,12 +354,13 @@ impl ArenaControl {
 
     /// SAFETY: `user` (if non-null) must be a live pointer previously returned by this arena.
     unsafe fn realloc(&self, user: *mut u8, new_size: usize) -> *mut u8 {
+        self.debug_assert_owning_thread();
         if user.is_null() {
             return self.alloc(new_size, false);
         }
         self.realloc_calls.fetch_add(1, Relaxed);
 
-        let new_usable = round_up(new_size);
+        let new_usable = usable_for(new_size);
         let old_usable = read_header(user);
 
         if !self.is_persistent(user) {
@@ -305,9 +385,17 @@ impl ArenaControl {
         let off = block_base - self.persistent.base;
         let old_total = HEADER_SIZE + old_usable;
         let new_total = HEADER_SIZE + new_usable;
-        if off + old_total == self.persistent.top.load(Relaxed) && off + new_total <= self.persistent.cap
+        // "Is this still the top block?" and "move the cursor" are one atomic operation,
+        // for the same reason `bump` is. Separately they were a test whose answer could
+        // stop being true before the store acted on it. A failed exchange means someone
+        // else moved the top, which is precisely the case the slow path below handles.
+        if off + new_total <= self.persistent.cap
+            && self
+                .persistent
+                .top
+                .compare_exchange(off + old_total, off + new_total, Relaxed, Relaxed)
+                .is_ok()
         {
-            self.persistent.top.store(off + new_total, Relaxed);
             (block_base as *mut usize).write(new_usable);
             return user;
         }
@@ -570,5 +658,110 @@ mod tests {
         unsafe { a.dealloc(shrunk) };
         assert_eq!(ctl.stats().system_live_bytes, 0);
         ctl.end_request();
+    }
+
+    // -----------------------------------------------------------------------
+    // The § 4 hazards, each with the falsifier for its fix
+    // -----------------------------------------------------------------------
+
+    /// A zero-size allocation at the very end of a region must not be misclassified.
+    ///
+    /// The hazard in one line: `is_persistent` tests the *user* pointer against a
+    /// half-open range, so a block with zero usable bytes whose header starts at
+    /// `cap - HEADER_SIZE` has a user pointer of exactly `base + cap` — outside the
+    /// range, so `dealloc` would hand arena memory to `alloc::dealloc`.
+    ///
+    /// A region of exactly `HEADER_SIZE` puts the cursor at that spot immediately, which
+    /// is what makes the hazard reachable in a test rather than only in principle.
+    /// Revert `usable_for`'s `.max(ALLOC_ALIGN)` and this fails: the bump succeeds,
+    /// `is_persistent` says false, and the block is freed by the wrong allocator.
+    #[test]
+    fn a_zero_size_allocation_is_never_classified_as_foreign_memory() {
+        let ctl = ArenaControl::new(HEADER_SIZE);
+        assert_eq!(ctl.persistent.cap, HEADER_SIZE);
+        assert_eq!(ctl.persistent.top.load(Relaxed), ctl.persistent.cap - HEADER_SIZE);
+
+        let p = alloc(&ctl, 0);
+        assert!(!p.is_null());
+
+        // Either it stayed inside the region or it spilled to the system allocator, but
+        // the classification has to agree with reality — and a user pointer one past the
+        // region's end is the one case where it would not.
+        assert_ne!(
+            p as usize,
+            ctl.persistent.base + ctl.persistent.cap,
+            "the user pointer landed exactly one past the region, which `is_persistent` \
+             reads as foreign memory"
+        );
+        assert!(
+            unsafe { ArenaAllocator::usable_size(p) } >= ALLOC_ALIGN,
+            "a zero-usable block is the input that breaks pointer classification"
+        );
+
+        // The real property: whatever it is, freeing it must route correctly.
+        let mut a = ArenaAllocator::new(ctl.clone());
+        unsafe { a.dealloc(p) };
+    }
+
+    /// Concurrent bumps must never hand out the same address.
+    ///
+    /// Exercises `Region` directly rather than through `ArenaControl`, because the arena
+    /// deliberately refuses to be used from two threads (see the ownership test below)
+    /// — the point here is that the cursor itself is now sound even if that higher-level
+    /// property ever stops holding.
+    ///
+    /// Revert `bump` to `load`/`store` and this fails: the interleaved read-modify-write
+    /// returns duplicate offsets.
+    #[test]
+    fn concurrent_bumps_never_return_the_same_address() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 512;
+        const BLOCK: usize = 16;
+
+        let region = Arc::new(Region::new(THREADS * PER_THREAD * BLOCK));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let region = Arc::clone(&region);
+                std::thread::spawn(move || {
+                    (0..PER_THREAD)
+                        .map(|_| region.bump(BLOCK).expect("region sized for every block"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let mut addresses: Vec<usize> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("bump must not panic"))
+            .collect();
+        let handed_out = addresses.len();
+        addresses.sort_unstable();
+        addresses.dedup();
+        assert_eq!(
+            addresses.len(),
+            handed_out,
+            "two callers were handed the same block — the bump cursor is not atomic"
+        );
+    }
+
+    /// The one-arena-one-thread claim in the module header is checked, not believed.
+    ///
+    /// The assertion is debug-only, so the test is too: in a release test build there is
+    /// nothing to observe and asserting otherwise would be testing the build profile.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn allocating_from_a_second_thread_is_caught() {
+        let ctl = ArenaControl::new(64 * 1024);
+        let _first = alloc(&ctl, 32);
+
+        let second = {
+            let ctl = Arc::clone(&ctl);
+            std::thread::spawn(move || alloc(&ctl, 32) as usize)
+        };
+        assert!(
+            second.join().is_err(),
+            "a second thread allocated through the arena without tripping the ownership \
+             assertion — the property the block headers rely on is unchecked again"
+        );
     }
 }

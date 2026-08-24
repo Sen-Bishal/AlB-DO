@@ -854,3 +854,356 @@ fn client_island_rejects_unbundled_imports_loudly() {
     let message = format!("{err}");
     assert!(message.contains("zod"), "error should name the offending import: {message}");
 }
+
+// ---------------------------------------------------------------------------
+// useId — TODO.md 9.2
+// ---------------------------------------------------------------------------
+
+/// The client's `useId` strings, produced by hydrating the same shape the
+/// `jsx_matrix/use_id` fixture renders on the server.
+///
+/// The component mirrors that fixture deliberately: a parent that calls `useId`
+/// and two children that each call it once. A flat component would pass while
+/// the ordering property — parent-first, depth-first, on both sides — went
+/// unexercised, and that ordering is the whole reason the two halves agree.
+const USE_ID_SCENARIO: &str = r#"
+var api = globalThis.__albedoClient;
+
+function Field() {
+  var id = api.useId();
+  return h('label', { htmlFor: id }, h('input', { id: id }));
+}
+
+function Component() {
+  var outer = api.useId();
+  return h('div', { id: outer, 'data-albedo-island': '9' },
+    h(Field, null),
+    h(Field, null));
+}
+api.registerComponent('9', Component);
+
+// The server-rendered DOM the island hydrates against.
+var body = document.createElement('div');
+var root = document.createElement('div');
+root.setAttribute('data-albedo-island', '9');
+for (var i = 0; i < 2; i++) {
+  var label = document.createElement('label');
+  label.appendChild(document.createElement('input'));
+  root.appendChild(label);
+}
+body.appendChild(root);
+globalThis.__domRoot = body;
+
+// `module_path` is what the server passed as its render `entry` — that string
+// IS the id scope on both sides.
+__ALBEDO_HYDRATE_ISLAND({ component_id: 9, module_path: 'Component.tsx', props: {} });
+
+var ids = [root.getAttribute('id')];
+for (var j = 0; j < root.childNodes.length; j++) {
+  var lbl = root.childNodes[j];
+  ids.push(lbl.getAttribute('for') || lbl.getAttribute('htmlFor'));
+  ids.push(lbl.childNodes[0].getAttribute('id'));
+}
+JSON.stringify({ ids: ids });
+"#;
+
+/// The client and the two server renderers must produce the SAME `useId`
+/// strings.
+///
+/// 🔑 **The expected values are read from the server's golden file, not
+/// re-typed here.** `useId`'s only contract is that the server's string and the
+/// client's string are identical; two hand-written lists could drift apart and
+/// still both "pass", which would assert nothing. The golden is
+/// `tests/fixtures/jsx_matrix/use_id/expected.html`, pinned by
+/// `jsx_expr_eval_matrix` and cross-checked between both server renderers by
+/// `renderer_conformance`.
+///
+/// A mismatch here is silent in production: the markup still renders, and the
+/// `aria-controls`/`aria-labelledby` wiring every Radix primitive builds out of
+/// this hook simply points at nothing.
+#[test]
+fn client_use_id_matches_the_server_golden() {
+    let golden = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/jsx_matrix/use_id/expected.html"),
+    )
+    .expect("the useId golden must exist");
+
+    // Every id the server wrote, in document order.
+    let mut expected: Vec<String> = Vec::new();
+    for (marker, _) in [("id=\"", 0), ("for=\"", 0)] {
+        let _ = marker;
+    }
+    let mut rest = golden.as_str();
+    while let Some(at) = rest.find(|c| c == 'i' || c == 'f') {
+        let tail = &rest[at..];
+        let value = tail
+            .strip_prefix("id=\"")
+            .or_else(|| tail.strip_prefix("for=\""));
+        match value {
+            Some(value) => {
+                let end = value.find('"').expect("attribute value must terminate");
+                expected.push(value[..end].to_string());
+                rest = &value[end..];
+            }
+            None => rest = &rest[at + 1..],
+        }
+    }
+    assert!(
+        expected.len() >= 5,
+        "the golden should carry the outer id plus a for/id pair per field, got {expected:?}"
+    );
+
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(USE_ID_SCENARIO)
+            .expect("useId scenario should evaluate")
+    });
+    let value: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+    let actual: Vec<String> = value["ids"]
+        .as_array()
+        .expect("ids array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+
+    assert_eq!(
+        actual, expected,
+        "client `useId` disagreed with the server golden — every aria attribute \
+         Radix builds from this hook would point at an element that does not exist"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// createPortal — TODO.md 9.3
+// ---------------------------------------------------------------------------
+
+/// A dialog-shaped island: a trigger in the island, its content portalled into
+/// a container elsewhere in the document — the shape every Radix overlay has.
+///
+/// The scenario deliberately toggles the portal OPEN and then CLOSED again,
+/// because the two halves fail differently. Mounting proves the content lands
+/// in the container; unmounting proves `removeInstance` looks for those nodes
+/// in the container rather than in the island, which is the one place the
+/// reconciler has to know a portal exists at all.
+const PORTAL_SCENARIO: &str = r#"
+var api = globalThis.__albedoClient;
+
+function Dialog() {
+  var s = useState(false);
+  var open = s[0], setOpen = s[1];
+  return h('div', { 'data-albedo-island': '11' },
+    h('button', { onClick: function () { setOpen(!open); } }, open ? 'close' : 'open'),
+    open ? api.createPortal(h('p', null, 'portal content'), globalThis.__portalHost) : null);
+}
+api.registerComponent('11', Dialog);
+
+// The server rendered the island WITHOUT portal content (there is none), so the
+// island's markup is the trigger alone.
+var body = document.createElement('div');
+var root = document.createElement('div');
+root.setAttribute('data-albedo-island', '11');
+var trigger = document.createElement('button');
+trigger.appendChild(document.createTextNode('open'));
+root.appendChild(trigger);
+body.appendChild(root);
+
+var portalHost = document.createElement('aside');
+body.appendChild(portalHost);
+globalThis.__portalHost = portalHost;
+globalThis.__domRoot = body;
+
+__ALBEDO_HYDRATE_ISLAND({ component_id: 11, module_path: 'Dialog.tsx', props: {} });
+
+function textOf(node) {
+  if (node.nodeType === 3) { return node.nodeValue; }
+  var out = '';
+  for (var i = 0; i < node.childNodes.length; i++) { out += textOf(node.childNodes[i]); }
+  return out;
+}
+
+var afterHydrate = { island: textOf(root), host: textOf(portalHost) };
+var sameTrigger = root.childNodes[0] === trigger;
+
+trigger.__dispatch('click');
+var afterOpen = { island: textOf(root), host: textOf(portalHost), hostKids: portalHost.childNodes.length };
+// The island itself must not have gained the portal's node.
+var islandKidsWhenOpen = root.childNodes.length;
+
+trigger.__dispatch('click');
+var afterClose = { island: textOf(root), host: textOf(portalHost), hostKids: portalHost.childNodes.length };
+
+JSON.stringify({
+  afterHydrate: afterHydrate,
+  sameTrigger: sameTrigger,
+  afterOpen: afterOpen,
+  islandKidsWhenOpen: islandKidsWhenOpen,
+  afterClose: afterClose,
+  network: globalThis.__net
+});
+"#;
+
+/// Portal content mounts into its container, never into the island, and is
+/// removed from the container on unmount.
+///
+/// 🔑 The `islandKidsWhenOpen` assertion is the one that matters. A portal that
+/// merely *rendered* would put its node in the island — which is the bug this
+/// whole design avoids by reporting zero nodes from `collectInstanceNodes`, so
+/// that every parent-side DOM operation skips it.
+#[test]
+fn create_portal_mounts_into_its_container_and_cleans_up() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(PORTAL_SCENARIO)
+            .expect("portal scenario should evaluate")
+    });
+    let v: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+
+    // Hydration adopts the server trigger and adds no portal content, because
+    // the server rendered none.
+    assert_eq!(v["afterHydrate"]["island"], "open");
+    assert_eq!(v["afterHydrate"]["host"], "");
+    assert_eq!(
+        v["sameTrigger"], true,
+        "the portal must not disturb hydration of its siblings"
+    );
+
+    // Opening mounts the content into the CONTAINER.
+    assert_eq!(v["afterOpen"]["host"], "portal content");
+    assert_eq!(v["afterOpen"]["hostKids"], 1);
+    assert_eq!(
+        v["afterOpen"]["island"], "close",
+        "the island shows only its own markup"
+    );
+    assert_eq!(
+        v["islandKidsWhenOpen"], 1,
+        "portal content must NOT be appended to the island — a portal owns no \
+         nodes in its parent"
+    );
+
+    // Closing removes it from the container, not from the island.
+    assert_eq!(v["afterClose"]["host"], "");
+    assert_eq!(v["afterClose"]["hostKids"], 0);
+    assert_eq!(v["afterClose"]["island"], "open");
+
+    assert_eq!(v["network"], 0, "a portal is a local DOM concern");
+}
+
+// ---------------------------------------------------------------------------
+// Components that render nothing
+// ---------------------------------------------------------------------------
+
+/// `if (!open) return null` — the most ordinary idiom in React, and the one
+/// that crashed the reconciler outright.
+///
+/// The scenario toggles a null-returning child in and out TWICE, because the
+/// transitions fail in different places: mounting from null needs `instantiate`
+/// to accept it, unmounting back to null needs the empty instance to own no
+/// nodes, and doing it again needs the reconcile path rather than the mount
+/// path. It also keeps a real sibling after the toggling child, so a bug that
+/// let the empty instance consume a DOM slot shows up as the sibling moving.
+const NULL_RENDER_SCENARIO: &str = r#"
+var api = globalThis.__albedoClient;
+
+function Maybe(props) {
+  if (!props.show) { return null; }
+  return h('em', null, 'here');
+}
+
+function Host() {
+  var s = useState(false);
+  var show = s[0], setShow = s[1];
+  return h('div', { 'data-albedo-island': '21' },
+    h('button', { onClick: function () { setShow(!show); } }, 'toggle'),
+    h(Maybe, { show: show }),
+    h('span', { className: 'tail' }, 'tail'));
+}
+api.registerComponent('21', Host);
+
+// Server markup: the null child rendered nothing, so button + tail only.
+var body = document.createElement('div');
+var root = document.createElement('div');
+root.setAttribute('data-albedo-island', '21');
+var button = document.createElement('button');
+button.appendChild(document.createTextNode('toggle'));
+root.appendChild(button);
+var tail = document.createElement('span');
+tail.setAttribute('class', 'tail');
+tail.appendChild(document.createTextNode('tail'));
+root.appendChild(tail);
+body.appendChild(root);
+globalThis.__domRoot = body;
+
+function shape() {
+  var out = [];
+  for (var i = 0; i < root.childNodes.length; i++) {
+    var n = root.childNodes[i];
+    out.push(n.nodeType === 3 ? '#' + n.nodeValue : n.tagName);
+  }
+  return out.join(',');
+}
+
+__ALBEDO_HYDRATE_ISLAND({ component_id: 21, module_path: 'Host.tsx', props: {} });
+var afterHydrate = shape();
+var tailAdopted = root.childNodes[root.childNodes.length - 1] === tail;
+
+button.__dispatch('click');
+var afterShow = shape();
+
+button.__dispatch('click');
+var afterHide = shape();
+
+button.__dispatch('click');
+var afterShowAgain = shape();
+
+JSON.stringify({
+  afterHydrate: afterHydrate,
+  tailAdopted: tailAdopted,
+  afterShow: afterShow,
+  afterHide: afterHide,
+  afterShowAgain: afterShowAgain,
+  tailStillSame: root.childNodes[root.childNodes.length - 1] === tail
+});
+"#;
+
+/// A component may render nothing, repeatedly, without disturbing its siblings.
+#[test]
+fn a_component_that_renders_null_mounts_hydrates_and_toggles() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(NULL_RENDER_SCENARIO)
+            .expect("null-render scenario should evaluate")
+    });
+    let v: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+
+    // Hydration: the null child adopts nothing and leaves the cursor alone, so
+    // `tail` is adopted rather than mistaken for the null child's node.
+    assert_eq!(v["afterHydrate"], "BUTTON,SPAN");
+    assert_eq!(
+        v["tailAdopted"], true,
+        "an empty instance must not consume a sibling's DOM slot"
+    );
+
+    // Showing inserts BETWEEN the button and the tail, not at the end.
+    assert_eq!(v["afterShow"], "BUTTON,EM,SPAN");
+    // Hiding removes only its own node.
+    assert_eq!(v["afterHide"], "BUTTON,SPAN");
+    // And again, this time through the reconcile path rather than the mount one.
+    assert_eq!(v["afterShowAgain"], "BUTTON,EM,SPAN");
+    assert_eq!(
+        v["tailStillSame"], true,
+        "the sibling must be patched in place across every toggle, not recreated"
+    );
+}

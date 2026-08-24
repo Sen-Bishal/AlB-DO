@@ -218,10 +218,24 @@ fn a_host_name_that_does_not_exist_is_a_build_error() {
     );
 }
 
-/// `react-dom` is refused with its reason rather than stubbed into a runtime
-/// throw, because a blank island is a worse answer than a failed build.
+/// Tier C · 9.3 — a package importing `createPortal` from `react-dom` BUILDS,
+/// and one importing `createRoot` is still refused by name.
+///
+/// This assertion is the inverse of the one it replaced, and the inversion is
+/// the point. `react-dom` used to be refused whole, on the premise that
+/// `createPortal` needed the SSR renderer and hydration to agree on where
+/// portal content lands in the markup. That premise was false — React's own
+/// server renderer *throws* on portals, so there has never been server markup
+/// to agree about — and the refusal was doing more work than the evidence
+/// supported.
+///
+/// 🔑 **The refusal did not disappear, it got sharper.** It moved from the
+/// package to the export: `REACT_DOM_HOST.exports` lists `createPortal` and
+/// nothing else, and the import check derives `provides` from that list, so
+/// `createRoot` now fails naming the export a package asked for rather than the
+/// package it asked it from.
 #[test]
-fn a_package_reaching_for_react_dom_is_refused_at_build() {
+fn react_dom_provides_create_portal_and_still_refuses_create_root() {
     let dir = tempfile::tempdir().unwrap();
     let pkg = dir.path().join("node_modules").join("portalish");
     std::fs::create_dir_all(&pkg).unwrap();
@@ -244,11 +258,41 @@ fn a_package_reaching_for_react_dom_is_refused_at_build() {
                export default function W() { return <div>{portal}</div>; }"#,
         )],
     );
-    assert_eq!(graph.failures().len(), 1);
     assert!(
-        graph.failures()[0].reason.contains("createPortal"),
-        "{}",
-        graph.failures()[0].reason
+        graph.failures().is_empty(),
+        "createPortal is implemented now; the build must not refuse it: {:?}",
+        graph.failures()
+    );
+
+    // The other half: a package reaching for the render lifecycle still fails,
+    // and the message names the export rather than the package.
+    let rootish = dir.path().join("node_modules").join("rootish");
+    std::fs::create_dir_all(&rootish).unwrap();
+    std::fs::write(
+        rootish.join("package.json"),
+        r#"{ "name": "rootish", "version": "1.0.0", "module": "index.js",
+             "sideEffects": false }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        rootish.join("index.js"),
+        "import { createRoot } from 'react-dom';
+export const root = createRoot;",
+    )
+    .unwrap();
+
+    let refused = build_client_npm_graph(
+        dir.path(),
+        &[island(
+            r#"import { root } from "rootish";
+               export default function W() { return <div>{root}</div>; }"#,
+        )],
+    );
+    assert_eq!(refused.failures().len(), 1, "{:?}", refused.failures());
+    assert!(
+        refused.failures()[0].reason.contains("createRoot"),
+        "the error must name the export the package asked for: {}",
+        refused.failures()[0].reason
     );
 }
 
@@ -463,4 +507,87 @@ fn the_browser_and_server_linkers_are_one_implementation() {
         browser.contains(linker.trim()),
         "the browser runtime must embed the shared linker verbatim"
     );
+}
+
+/// `React.Children` behaves as React does — the ONE implementation both
+/// runtimes share, exercised through the emitted records script.
+///
+/// Found by building a real Radix Dialog, not by reading React's exports:
+/// `DialogPortal` calls `React.Children.map(children, …)` on every render, so
+/// the entire shadcn overlay layer died on `Cannot read properties of undefined
+/// (reading 'map')` — with `createPortal` implemented and never reached.
+///
+/// 🔑 The empty-slot rules are the point, and they are deliberately
+/// inconsistent because React's are: `count` counts every slot including the
+/// empty ones, `toArray` drops them, and `map` invokes its callback for each
+/// slot while dropping `null` RESULTS. A tidier version would be a different
+/// function, and a package written against React is the only consumer.
+#[test]
+fn react_children_matches_reacts_empty_slot_rules() {
+    use dom_render_compiler::runtime::react_host::build_host_module_records_script;
+    use rquickjs::{Context, Runtime};
+
+    let runtime = Runtime::new().expect("quickjs runtime");
+    let context = Context::full(&runtime).expect("quickjs context");
+    let summary: String = context.with(|ctx| {
+        // The records script assumes the factory table exists, and `Children`
+        // is pure JS with no renderer dependency — so a bare table is enough.
+        ctx.eval::<(), _>(
+            "globalThis.__ALBEDO_NPM_FACTORIES = {}; globalThis.__ALBEDO_NPM_ALIASES = {};",
+        )
+            .expect("factory table");
+        if let Err(err) = ctx.eval::<(), _>(build_host_module_records_script().as_str()) {
+            let detail = ctx
+                .catch()
+                .as_exception()
+                .map_or_else(|| format!("{err}"), |e| format!("{e:?}"));
+            panic!("records script must evaluate: {detail}");
+        }
+        ctx.eval::<String, _>(
+            r#"
+            const C = globalThis.__albedo_Children;
+            const kids = ['a', null, 'b'];
+            JSON.stringify({
+              // Every slot, empty ones included.
+              count: C.count(kids),
+              // Empty slots dropped.
+              toArray: C.toArray(kids).length,
+              // Nested arrays flatten.
+              nested: C.count(['a', ['b', ['c']]]),
+              // The callback sees every slot, but a null RESULT is dropped — so
+              // the identity map over ['a', null, 'b'] yields TWO entries, not
+              // three. React does the same, and the asymmetry with `count` is
+              // the whole reason both are pinned here.
+              mapIdentity: C.map(kids, (child) => child).length,
+              mapSawSlots: (function () { let n = 0; C.forEach(kids, () => { n++; }); return n; })(),
+              // Indices are positional across the whole walk.
+              indices: C.map(kids, (_child, i) => String(i)).join(','),
+              // React returns the argument untouched when there is nothing.
+              mapOfNull: C.map(null, (x) => x),
+              countOfNull: C.count(null),
+              // `only` is an assertion, not a getter.
+              only: C.only(['solo']),
+              onlyThrows: (function () {
+                try { C.only(['a', 'b']); return false; } catch (_e) { return true; }
+              })(),
+            });
+            "#,
+        )
+        .expect("Children scenario")
+    });
+    let v: serde_json::Value = serde_json::from_str(&summary).expect("json");
+
+    assert_eq!(v["count"], 3, "count includes empty slots");
+    assert_eq!(v["toArray"], 2, "toArray drops them");
+    assert_eq!(v["nested"], 3, "nested arrays flatten");
+    assert_eq!(
+        v["mapIdentity"], 2,
+        "an identity map drops the empty slot's null result, as React does"
+    );
+    assert_eq!(v["mapSawSlots"], 3, "forEach visits every slot");
+    assert_eq!(v["indices"], "0,1,2", "the index walks all slots");
+    assert!(v["mapOfNull"].is_null(), "map(null) returns its argument");
+    assert_eq!(v["countOfNull"], 0);
+    assert_eq!(v["only"], "solo");
+    assert_eq!(v["onlyThrows"], true, "only() must reject two children");
 }

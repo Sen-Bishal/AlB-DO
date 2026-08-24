@@ -578,12 +578,25 @@ mod tests {
     }
 
     #[test]
-    fn react_dom_is_refused_rather_than_stubbed() {
+    fn react_dom_client_is_refused_rather_than_stubbed() {
         let options = client_shake_options();
-        let Some(ExternalTarget::Refused { reason }) = options.externals().get("react-dom") else {
-            panic!("react-dom must be refused");
+        // 9.3 narrowed this: bare `react-dom` is a host module now (it provides
+        // `createPortal`), while the entry points that own a render lifecycle
+        // stay refused. The property under test is unchanged — a capability the
+        // host lacks fails at BUILD, never as a throwing stub in a browser.
+        let Some(ExternalTarget::Refused { reason }) =
+            options.externals().get("react-dom/client")
+        else {
+            panic!("react-dom/client must be refused");
         };
-        assert!(reason.contains("createPortal"));
+        assert!(reason.contains("createRoot"));
+        assert!(
+            !matches!(
+                options.externals().get("react-dom"),
+                Some(ExternalTarget::Refused { .. })
+            ),
+            "bare react-dom must no longer be refused wholesale"
+        );
     }
 
     #[test]

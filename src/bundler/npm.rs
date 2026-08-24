@@ -2493,21 +2493,43 @@ mod tests {
     #[test]
     fn a_refused_module_is_refused_at_the_entry_too() {
         let dir = tempfile::tempdir().unwrap();
-        let pkg = dir.path().join("node_modules").join("react-dom");
+        // 9.3: the refusal moved from bare `react-dom` (now a host module for
+        // `createPortal`) to the entry points that own a render lifecycle. The
+        // property under test — a refusal fires at the ENTRY, not only for
+        // specifiers written inside a package — is what this pins, and it is
+        // the 4th "correct mechanism, unreachable input" bug's regression test.
+        let pkg = dir
+            .path()
+            .join("node_modules")
+            .join("react-dom")
+            .join("client");
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(
             pkg.join("package.json"),
+            r#"{"name":"react-dom/client","version":"18.2.0","main":"./index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), "module.exports = { createRoot: 1 };").unwrap();
+
+        // Bare `react-dom`, for the server half of this test below.
+        let bare = dir.path().join("node_modules").join("react-dom");
+        std::fs::write(
+            bare.join("package.json"),
             r#"{"name":"react-dom","version":"18.2.0","main":"./index.js"}"#,
         )
         .unwrap();
-        std::fs::write(pkg.join("index.js"), "module.exports = { createPortal: 1 };").unwrap();
+        std::fs::write(bare.join("index.js"), "module.exports = { createPortal: 1 };").unwrap();
 
         let options = crate::bundler::client_npm::client_shake_options();
-        let err = bundle_npm_dependency(dir.path(), "react-dom", &options).unwrap_err();
+        let err = bundle_npm_dependency(dir.path(), "react-dom/client", &options).unwrap_err();
         assert!(matches!(err, NpmBundleError::ExternalRefused { .. }), "{err}");
-        let err =
-            bundle_npm_dependency_for_demand(dir.path(), "react-dom", &demand(&["default"]), &options)
-                .unwrap_err();
+        let err = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "react-dom/client",
+            &demand(&["default"]),
+            &options,
+        )
+        .unwrap_err();
         assert!(matches!(err, NpmBundleError::ExternalRefused { .. }), "{err}");
 
         // The server takes the same package whole, on purpose: loading is not

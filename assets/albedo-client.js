@@ -129,8 +129,106 @@
   }
   h.Fragment = Fragment;
 
+  // `createPortal(children, container)` — TODO.md 9.3.
+  //
+  // A portal is a group (§ multi-node instance plumbing) with one difference
+  // that decides every other line: **it owns no nodes in its parent.** Its
+  // children live in `container`, somewhere else in the document entirely.
+  //
+  // 🔑 That single property is what makes it fit the existing machinery instead
+  // of fighting it. `collectInstanceNodes` returns nothing for a portal, so:
+  //   * `insertInstance` moves nothing — a parent re-order never drags portal
+  //     content back into the parent;
+  //   * `firstInstanceNode` skips it as an anchor, which is correct: it has no
+  //     position among its siblings;
+  //   * `hydrateChildren`'s cursor does not advance past it — correct, because
+  //     the server rendered nothing there (see below).
+  // Only `removeInstance` needs to know a portal exists, because its nodes must
+  // be removed from `container` rather than from the parent.
+  //
+  // ## Why there is nothing to hydrate
+  //
+  // React's own server renderer THROWS on a portal — *"Portals are not
+  // currently supported by the server renderer. Render them conditionally so
+  // that they only appear on the client render."* (verified in
+  // `react-dom/cjs/react-dom-server-legacy.browser.development.js`). So no
+  // React app has ever had server markup for portal content, Radix only renders
+  // `<Dialog.Portal>` when the dialog is open for exactly that reason, and
+  // Albedo's server renderers emit nothing rather than throwing — strictly more
+  // permissive, and it can never produce markup that disagrees with the client.
+  //
+  // Hydration therefore MOUNTS the portal fresh instead of adopting. There is
+  // no server DOM to adopt, and trying to would consume a sibling that belongs
+  // to the portal's neighbour.
+  function Portal(props) {
+    return props ? props.children : null;
+  }
+
+  function createPortal(children, container) {
+    var kids = [];
+    normalizeChildren([children], kids);
+    return {
+      __vnode: true,
+      type: Portal,
+      props: { container: container },
+      children: kids,
+      key: null,
+    };
+  }
+
+  // A component is allowed to render nothing — `if (!open) return null` is the
+  // most ordinary idiom in React, and Radix's `Presence` is exactly it. But a
+  // bare `null` has no `.type`, and `instantiate`/`hydrateInstance` read that
+  // field on their first line, so a null render crashed the reconciler outright.
+  //
+  // 🔑 Rather than scatter null checks, a null render becomes a real vnode with
+  // its own sentinel type — the same shape Fragment and Portal already use.
+  // Every downstream site then takes its normal path, and `Empty` behaves like
+  // a group with no children: it owns zero DOM nodes, so `collectInstanceNodes`
+  // reports nothing for it and the sibling/anchor/hydration-cursor logic skips
+  // it without knowing it exists.
+  function Empty() {
+    return null;
+  }
+
+  function emptyVnode() {
+    return { __vnode: true, type: Empty, props: null, children: [], key: null };
+  }
+
+  // What a component actually returned, as something the reconciler can walk.
+  //
+  // Mirrors `normalizeChildren`'s rules deliberately: a value is either markup,
+  // nothing, or text, and it should not matter whether it arrived as a child or
+  // as a component's return value. That also makes `return "hello"` work, which
+  // React allows and which previously reached `createHostElement(undefined)`.
+  function normalizeRender(rendered) {
+    if (rendered === null || rendered === undefined || typeof rendered === 'boolean') {
+      return emptyVnode();
+    }
+    if (typeof rendered === 'object' && rendered.__vnode) {
+      return rendered;
+    }
+    if (Array.isArray(rendered)) {
+      // An array return is a fragment in all but name.
+      var kids = [];
+      normalizeChildren(rendered, kids);
+      return { __vnode: true, type: Fragment, props: null, children: kids, key: null };
+    }
+    return { __vnode: true, type: TEXT, text: String(rendered), props: null, children: null };
+  }
+
   function isComponent(type) {
-    return typeof type === 'function' && type !== Fragment;
+    return typeof type === 'function'
+      && type !== Fragment
+      && type !== Portal
+      && type !== Empty;
+  }
+
+  // The DOM node a portal's children go into. `document.body` is React's
+  // default and the one Radix passes when a consumer gives no `container`.
+  function portalContainer(vnode) {
+    var declared = vnode.props ? vnode.props.container : null;
+    return declared || (global.document ? global.document.body : null);
   }
 
   // --- hooks ---------------------------------------------------------------
@@ -196,6 +294,47 @@
     // useCallback(fn, deps) is exactly useMemo(() => fn, deps); it consumes the
     // same single hook slot via the delegated useMemo call.
     return useMemo(function () { return callback; }, deps);
+  }
+
+  // useId — the client half of the pair documented in `quickjs_engine.rs`'s
+  // prelude. Same formula, same inputs: the island's module_path as the scope
+  // (identical to the string the server rendered under) and a counter over
+  // useId calls in component-invocation order, which is parent-first
+  // depth-first on both sides.
+  //
+  // It takes a hook SLOT rather than recomputing, because the counter only
+  // matches the server's on the FIRST pass. A re-render (any setState) walks
+  // the same components again, and a recomputed id would change under the DOM
+  // that already carries it — breaking exactly the aria wiring the hook exists
+  // to establish.
+  var idScope = 'r';
+  var idCounter = 0;
+
+  function idSlug(entry) {
+    var raw = entry === undefined || entry === null ? '' : String(entry);
+    var slug = '';
+    for (var i = 0; i < raw.length; i++) {
+      var ch = raw[i];
+      var ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+      slug += ok ? ch : '-';
+    }
+    slug = slug.replace(/-+/g, '-').replace(/^-|-$/g, '');
+    return slug.length > 0 ? slug : 'r';
+  }
+
+  function beginIdScope(entry) {
+    idCounter = 0;
+    idScope = idSlug(entry);
+  }
+
+  function useId() {
+    var fiber = currentFiber;
+    var index = hookIndex++;
+    var hooks = fiber.hooks;
+    if (hooks.length <= index) {
+      hooks[index] = { id: 'albedo-' + idScope + '-' + (idCounter++).toString(36) };
+    }
+    return hooks[index].id;
   }
 
   // createContext returns a context object whose `.Provider` is a sentinel
@@ -326,6 +465,13 @@
     if (!instance) {
       return;
     }
+    // A portal's nodes are in another container, so it contributes NOTHING to
+    // its parent's node list. Every caller of this function is asking "what
+    // does this instance occupy here?", and the answer for a portal is
+    // "nothing" — see `createPortal`.
+    if (instance.isPortal) {
+      return;
+    }
     if (instance.isGroup) {
       for (var i = 0; i < instance.childInstances.length; i++) {
         collectInstanceNodes(instance.childInstances[i], out);
@@ -364,7 +510,16 @@
   // Remove every node `instance` owns from wherever it currently lives.
   function removeInstance(instance) {
     var nodes = [];
-    collectInstanceNodes(instance, nodes);
+    if (instance && instance.isPortal) {
+      // Collect from the portal's CHILDREN, since the portal itself reports no
+      // nodes. Each node is removed via its own `parentNode`, so this lands in
+      // the portal's container rather than the parent.
+      for (var p = 0; p < (instance.childInstances || []).length; p++) {
+        collectInstanceNodes(instance.childInstances[p], nodes);
+      }
+    } else {
+      collectInstanceNodes(instance, nodes);
+    }
     for (var i = 0; i < nodes.length; i++) {
       if (nodes[i].parentNode) {
         nodes[i].parentNode.removeChild(nodes[i]);
@@ -414,7 +569,21 @@
     var count = Math.max(oldChildren.length, newVnodes.length);
     var next = [];
     for (var i = 0; i < count; i++) {
-      var child = reconcile(container, oldChildren[i] || null, newVnodes[i] || null);
+      // Where anything created at this slot must land: the first DOM node owned
+      // by a LATER old sibling, or the end of the container when there is none.
+      //
+      // 🔑 This is only consulted when the slot's own instance owns no nodes,
+      // and that case stopped being exotic when a component was allowed to
+      // render nothing. `reconcile` alone cannot compute it — an empty instance
+      // has no position of its own, so the answer lives with its siblings and
+      // has to be passed in. Without it, a `null` that becomes content appends
+      // at the END of its parent instead of reappearing where it belongs, which
+      // is the boundary `reconcile` used to document as known-wrong.
+      var anchor = null;
+      for (var j = i + 1; j < oldChildren.length && !anchor; j++) {
+        anchor = firstInstanceNode(oldChildren[j]);
+      }
+      var child = reconcile(container, oldChildren[i] || null, newVnodes[i] || null, anchor);
       if (child) {
         next.push(child);
       }
@@ -434,6 +603,20 @@
         isGroup: true,
         parentDom: parentDom,
         childInstances: mountChildren(vnode.children, parentDom),
+      };
+    }
+    if (vnode.type === Empty) {
+      return { vnode: vnode, isGroup: true, parentDom: parentDom, childInstances: [] };
+    }
+    if (vnode.type === Portal) {
+      var pcontainer = portalContainer(vnode);
+      return {
+        vnode: vnode,
+        isGroup: true,
+        isPortal: true,
+        parentDom: parentDom,
+        container: pcontainer,
+        childInstances: pcontainer ? mountChildren(vnode.children, pcontainer) : [],
       };
     }
     var ctxId = providerContextId(vnode.type);
@@ -476,6 +659,17 @@
         childInstances: hydrateChildren(vnode.children, parentDom, dom),
       };
     }
+    if (vnode.type === Empty) {
+      // Renders nothing, so it adopts nothing and leaves `dom` for the next
+      // sibling — the server rendered nothing here either.
+      return { vnode: vnode, isGroup: true, parentDom: parentDom, childInstances: [] };
+    }
+    if (vnode.type === Portal) {
+      // No server markup exists for a portal (see `createPortal`), so this is a
+      // MOUNT, not an adopt — and it deliberately ignores `dom`, which belongs
+      // to whatever sibling comes next.
+      return instantiate(vnode, parentDom);
+    }
     var ctxId = providerContextId(vnode.type);
     if (ctxId != null) {
       var pinst = { vnode: vnode, isGroup: true, isProvider: true, parentDom: parentDom, contextMap: currentContextMap };
@@ -513,10 +707,10 @@
 
   // --- reconcile (update path: diff instance tree vs new vnode) ------------
 
-  function reconcile(parentDom, instance, vnode) {
+  function reconcile(parentDom, instance, vnode, anchorHint) {
     if (instance == null) {
       var created = instantiate(vnode, parentDom);
-      insertInstance(parentDom, created, null);
+      insertInstance(parentDom, created, anchorHint || null);
       return created;
     }
     if (vnode == null) {
@@ -532,7 +726,9 @@
       // the end of `parentDom`, which is only wrong if the empty group has
       // real trailing siblings there — the same "no mid-list reordering"
       // scope this reconciler already documents elsewhere.
-      var anchor = firstInstanceNode(instance);
+      // The old instance's own leading node when it has one; otherwise the
+      // sibling anchor, which is the empty-instance case.
+      var anchor = firstInstanceNode(instance) || anchorHint || null;
       var replacement = instantiate(vnode, parentDom);
       insertInstance(parentDom, replacement, anchor);
       unmount(instance);
@@ -548,6 +744,29 @@
     }
     if (vnode.type === Fragment) {
       instance.childInstances = reconcileChildList(parentDom, instance.childInstances || [], vnode.children);
+      instance.vnode = vnode;
+      instance.parentDom = parentDom;
+      return instance;
+    }
+    if (vnode.type === Empty) {
+      instance.vnode = vnode;
+      instance.parentDom = parentDom;
+      return instance;
+    }
+    if (vnode.type === Portal) {
+      // Children diff against the CONTAINER, never `parentDom`. A container
+      // that changed identity between renders is a different destination, so
+      // the old content is torn down rather than migrated — React re-creates
+      // in that case too.
+      var nextContainer = portalContainer(vnode);
+      if (nextContainer !== instance.container) {
+        unmount(instance);
+        removeInstance(instance);
+        return instantiate(vnode, parentDom);
+      }
+      instance.childInstances = nextContainer
+        ? reconcileChildList(nextContainer, instance.childInstances || [], vnode.children)
+        : [];
       instance.vnode = vnode;
       instance.parentDom = parentDom;
       return instance;
@@ -575,7 +794,15 @@
       var cPrevMap = currentContextMap;
       currentContextMap = instance.contextMap || cPrevMap;
       var rendered = renderComponent(instance);
-      instance.renderedInstance = reconcile(parentDom, instance.renderedInstance, rendered);
+      // Forwarded: a component's rendered subtree sits in the COMPONENT's slot,
+      // so when that subtree goes from nothing to something it must land where
+      // the component is, not at the end of the parent.
+      instance.renderedInstance = reconcile(
+        parentDom,
+        instance.renderedInstance,
+        rendered,
+        anchorHint
+      );
       currentContextMap = cPrevMap;
       return instance;
     }
@@ -593,7 +820,10 @@
     currentFiber = instance;
     hookIndex = 0;
     try {
-      return instance.component(instance.vnode.props || {});
+      // Normalised HERE, at the single seam every component return passes
+      // through, so `instantiate`, `hydrateInstance` and `reconcile` never see
+      // a value that is not a vnode.
+      return normalizeRender(instance.component(instance.vnode.props || {}));
     } finally {
       currentFiber = prevFiber;
       hookIndex = prevIndex;
@@ -865,6 +1095,9 @@
     if (root.setAttribute) {
       root.setAttribute('data-albedo-hydrated', 'true');
     }
+    // Enter the same `useId` scope the server rendered this island under.
+    // `module_path` is the string it passed as `entry`.
+    beginIdScope(island.module_path || island.component_id);
     hydrateIsland(h(component, island.props || {}), root);
   }
 
@@ -874,6 +1107,10 @@
     useState: useState,
     useEffect: useEffect,
     useRef: useRef,
+    useId: useId,
+    createPortal: createPortal,
+    Portal: Portal,
+    Empty: Empty,
     useMemo: useMemo,
     useCallback: useCallback,
     useContext: useContext,
@@ -920,6 +1157,12 @@
   global.__albedo_is_element = function (value) {
     return value !== null && typeof value === 'object' && value.__vnode === true;
   };
+
+  // The second such export, and the same arrangement: `createPortal` builds a
+  // vnode here and returns empty markup on the server (there is no server
+  // rendering of portal content — see `createPortal` above). One table row in
+  // `runtime::react_host`, one global name, two implementations.
+  global.__albedo_createPortal = createPortal;
 
   global.__albedoClient = api;
   global.h = h;

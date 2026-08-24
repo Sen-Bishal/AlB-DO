@@ -42,6 +42,25 @@ pub struct RendererRuntime {
     /// afterwards, which is what lets the concurrent request path serve a chunk
     /// without touching QuickJS.
     client_npm: ClientNpmGraph,
+    /// Islands whose SSR render threw, collected during
+    /// [`RendererRuntime::build_hydration_blocks`] so the CLI can print them.
+    island_ssr_failures: Vec<IslandRenderFailure>,
+}
+
+/// One island that will not appear on the page, and why.
+///
+/// 🔑 **Not a warning — a statement of absence.** An empty placeholder carries
+/// no `data-albedo-island` marker, so the hydration bootstrap can never find a
+/// node to mount into: the component is missing from the served page and stays
+/// missing. There is no degraded mode to describe.
+#[derive(Debug, Clone)]
+pub struct IslandRenderFailure {
+    /// The island's module path, as the author wrote it on disk.
+    pub module_path: String,
+    /// The renderer's error, verbatim. Usually the component's own message —
+    /// "DialogTrigger must be used within Dialog" — which is the most useful
+    /// thing anyone can be told, and is lost entirely if this is summarised.
+    pub error: String,
 }
 
 /// A3 · per-route client-hydration artifacts, precomputed once at boot. The
@@ -180,6 +199,7 @@ impl RendererRuntime {
             manifest,
             renderer,
             client_npm: ClientNpmGraph::default(),
+            island_ssr_failures: Vec::new(),
         })
     }
 
@@ -861,6 +881,16 @@ impl RendererRuntime {
         );
     }
 
+    /// Islands that failed to server-render during
+    /// [`Self::build_hydration_blocks`], each of which is absent from its page.
+    ///
+    /// Drained rather than borrowed: the caller carries them out to the
+    /// `BootReport`, and a second read returning the same list would print them
+    /// twice on a dev reload.
+    pub fn take_island_ssr_failures(&mut self) -> Vec<IslandRenderFailure> {
+        std::mem::take(&mut self.island_ssr_failures)
+    }
+
     /// Render one island component to its SSR HTML from the props its parent
     /// passed it. Soft-fails to `None` so a single bad island can't sink the
     /// whole boot.
@@ -895,6 +925,18 @@ impl RendererRuntime {
                     "island SSR render failed; placeholder stays empty and the \
                      component will not appear on the page"
                 );
+                // ...and RECORDED, because the log alone reaches nobody.
+                // `install_tracing` in the CLI states the rule: a subscriber
+                // exists only when `RUST_LOG` is set, so "anything an author
+                // must see is not a log — it belongs in the CLI's own output."
+                // Upgrading `warn!` to `error!` after the `<Link>` incident
+                // changed the level on a channel nobody was listening to, which
+                // is why the identical failure was still silent when a Radix
+                // dialog hit it months later. The level was never the problem.
+                self.island_ssr_failures.push(IslandRenderFailure {
+                    module_path: module_path.to_string(),
+                    error: err.to_string(),
+                });
                 None
             }
         }

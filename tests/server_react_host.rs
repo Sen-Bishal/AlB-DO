@@ -21,7 +21,7 @@
 //! unit test of either half is self-consistent and would have caught none of it.
 
 use dom_render_compiler::bundler::client_npm::server_shake_options;
-use dom_render_compiler::bundler::npm::bundle_npm_dependency;
+use dom_render_compiler::bundler::npm::{bundle_npm_dependency, ExternalTarget};
 use dom_render_compiler::runtime::engine::{BootstrapPayload, RuntimeEngine};
 use dom_render_compiler::runtime::quickjs_engine::QuickJsEngine;
 use std::path::Path;
@@ -180,10 +180,19 @@ fn the_server_still_loads_a_package_that_imports_react_dom() {
     )
     .unwrap();
     // `react-dom` itself need not exist for the point: what matters is that the
-    // server option set carries no refusal that would stop a bundle.
+    // server option set carries no REFUSAL that would stop a bundle.
+    //
+    // 9.3 made this assertion say what it always meant. It used to check that
+    // the server had no entry for `react-dom` at all, which was a proxy for "no
+    // refusal" and stopped being one the moment `react-dom` became a host
+    // module providing `createPortal`. A proxy assertion fails on the day the
+    // thing it stood for is still true, which is the worst day for it to fail.
     let options = server_shake_options();
     assert!(
-        options.externals().get("react-dom").is_none(),
+        !matches!(
+            options.externals().get("react-dom"),
+            Some(ExternalTarget::Refused { .. })
+        ),
         "the server must not refuse react-dom; only client bundles do"
     );
     assert!(

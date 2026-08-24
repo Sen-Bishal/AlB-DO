@@ -617,6 +617,13 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
     if (typeof globalThis.__albedo_reset_element_counter === 'function') {{
       globalThis.__albedo_reset_element_counter();
     }}
+    // `useId` is scoped to THIS render and named by its entry — see
+    // `__albedo_begin_id_scope`. The client re-derives the same pair at
+    // hydration from the island descriptor's `module_path`, which is the same
+    // string as `entry` (`hydration/payload.rs` compares them directly).
+    if (typeof globalThis.__albedo_begin_id_scope === 'function') {{
+      globalThis.__albedo_begin_id_scope(entry);
+    }}
     const __albedo_record = globalThis.__ALBEDO_MODULES[entry];
     const __albedo_has_own = Object.prototype.hasOwnProperty;
     const __albedo_is_record = function(candidate) {{
@@ -1657,6 +1664,88 @@ if (typeof globalThis.useState !== 'function') {
     return (typeof factory === 'function') ? factory() : undefined;
   };
   globalThis.useCallback = function(fn) { return fn; };
+
+  // `useId` — TODO.md 9.2. Radix (and therefore all of shadcn) calls it on
+  // every primitive to wire `aria-controls`/`aria-labelledby`/`id` between a
+  // trigger and its content, so its ONE requirement is that the server's string
+  // and the client's string are the same. A mismatch does not warn here — it
+  // silently produces markup whose aria attributes point at nothing.
+  //
+  // ## The pair that has to agree
+  //
+  // `(scope, n)`: the entry module being rendered, and a counter over `useId`
+  // calls within that render.
+  //
+  // * **scope** — the server renders each island through its own
+  //   `__ALBEDO_RENDER_COMPONENT(entry, …)` call, and the client hydrates it
+  //   from a descriptor whose `module_path` is that same string
+  //   (`hydration/payload.rs` compares `island.module_path == plan.entry`
+  //   directly). Two islands on one page therefore cannot collide, which a bare
+  //   counter would allow.
+  // * **n** — components are invoked parent-first, depth-first on BOTH sides.
+  //   Here that falls out of JS argument evaluation (a component's body runs
+  //   before the `h(…)` calls for its children are made); on the client
+  //   `renderComponent` runs the body and reconciles children afterwards. This
+  //   is the same pre-order property `__albedo_stable_id` already relies on.
+  //
+  // 🪤 Note what is NOT relied on: the order the two renderers *assemble* their
+  // output. The server's `h` is eager and bottom-up, which is why `form_errors`
+  // is quarantined in the conformance gate. Invocation order and assembly order
+  // are different things, and only the first one is load-bearing here.
+  //
+  // The format is deliberately not React's `:r0:` — a leading colon is legal in
+  // an HTML id but needs escaping in a CSS selector, and this value reaches
+  // author code. `albedo-<scope>-<n>` is unique, selector-safe, and greppable.
+  let __albedo_id_counter = 0;
+  let __albedo_id_scope = 'r';
+  globalThis.__albedo_begin_id_scope = function(entry) {
+    __albedo_id_counter = 0;
+    __albedo_id_scope = globalThis.__albedo_id_slug(entry);
+  };
+  globalThis.__albedo_id_slug = function(entry) {
+    const raw = (entry === undefined || entry === null) ? '' : String(entry);
+    let slug = '';
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw[i];
+      const ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+      slug += ok ? ch : '-';
+    }
+    // Collapse runs and trim, so `routes/home.tsx` reads `routes-home-tsx`
+    // rather than `routes-home-tsx` with doubled separators from `./`.
+    slug = slug.replace(/-+/g, '-').replace(/^-|-$/g, '');
+    return slug.length > 0 ? slug : 'r';
+  };
+  globalThis.useId = function() {
+    const n = __albedo_id_counter++;
+    return 'albedo-' + __albedo_id_scope + '-' + n.toString(36);
+  };
+
+  // `createPortal(children, container)` — TODO.md 9.3, server half.
+  //
+  // Renders NOTHING, and that is React's semantics rather than a shortcut.
+  // React's own server renderer throws on a portal:
+  //
+  //   "Portals are not currently supported by the server renderer. Render them
+  //    conditionally so that they only appear on the client render."
+  //
+  // (`react-dom/cjs/react-dom-server-legacy.browser.development.js`). So there
+  // has never been server markup for portal content in any React app, and Radix
+  // renders `<Dialog.Portal>` only while the dialog is open for precisely that
+  // reason.
+  //
+  // Albedo emits an empty string instead of throwing. That is strictly more
+  // permissive — a component that portals unconditionally renders its non-portal
+  // markup here where React would fail the whole page — and it cannot produce
+  // markup the client then disagrees with, because there is none to disagree
+  // about. `assets/albedo-client.js` mounts the content on hydration.
+  //
+  // ⚠️ The consequence, said plainly: **portal content is not in the no-JS
+  // render.** A Tier-A/B page whose only copy of something lives behind a portal
+  // ships a page that does not contain it. That is React's behaviour too, but it
+  // is a real property of the output and not a detail.
+  globalThis.__albedo_createPortal = function() {
+    return new AlbedoHtml('');
+  };
 
   // Context. SSR `h` invokes components EAGERLY (children are already-rendered
   // HTML before a Provider runs), so a Provider cannot thread its value down to
@@ -3323,6 +3412,7 @@ fn rewrite_framework_runtime_import(
     const FRAMEWORK_NAMESPACE_OBJECT: &str = "{ useState: globalThis.useState, \
 useSharedSlot: globalThis.useSharedSlot, useEffect: globalThis.useEffect, \
 useLayoutEffect: globalThis.useLayoutEffect, useRef: globalThis.useRef, \
+useId: globalThis.useId, Children: globalThis.__albedo_Children, \
 useMemo: globalThis.useMemo, useCallback: globalThis.useCallback, \
 useContext: globalThis.useContext, createContext: globalThis.createContext, \
 action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";

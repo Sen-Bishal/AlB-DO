@@ -1552,6 +1552,9 @@ impl AlbedoServerBuilder {
         // (`!Send`) renderer is still single-threaded on the boot thread. The
         // resulting map is shared read-only into the streaming state so the
         // concurrent request path never touches the QuickJS engine.
+        // Declared out here so the island failures survive the block that
+        // computes them — they are boot output, not render output.
+        let mut island_ssr_failures: Vec<crate::renderer_runtime::IslandRenderFailure> = Vec::new();
         let route_hydration = Arc::new({
             // Step 3 (binding mode) · build the fine-grained reactive blocks
             // FIRST (immutable borrow). For routes whose Tier-C component is
@@ -1591,6 +1594,13 @@ impl AlbedoServerBuilder {
             let hydration_blocks = renderer
                 .as_mut()
                 .map(|runtime| runtime.build_hydration_blocks(&claimed, npm_root.as_deref()))
+                .unwrap_or_default();
+            // Carried out, not logged. An island that failed to SSR is absent
+            // from its page, and the author has to be told by the CLI rather
+            // than by a `tracing` subscriber that only exists under RUST_LOG.
+            island_ssr_failures = renderer
+                .as_mut()
+                .map(RendererRuntime::take_island_ssr_failures)
                 .unwrap_or_default();
 
             // Fix #3 · merge per-component, not per-route, so a single route can
@@ -1819,6 +1829,7 @@ impl AlbedoServerBuilder {
             config: self.config,
             state,
             auth_registry: self.auth_registry,
+            island_ssr_failures,
         })
     }
 }
@@ -1829,6 +1840,10 @@ pub struct AlbedoServer {
     /// AUTH · the lowered `auth` block, installed onto the live runtime by
     /// `run()` once the substrate it resolves against is open.
     auth_registry: Option<dom_render_compiler::auth::AuthRegistry>,
+    /// Islands that failed to server-render during `build()`, held until
+    /// `run_with_ready` can hand them to the [`BootReport`]. Boot decides them;
+    /// only the readiness callback can print them.
+    island_ssr_failures: Vec<crate::renderer_runtime::IslandRenderFailure>,
 }
 
 /// What a boot changed on the author's behalf, handed to the readiness callback.
@@ -1842,6 +1857,19 @@ pub struct BootReport {
     /// Columns added to existing FORGE tables to match an edited `forge` block.
     /// See [`evolve_schema`](dom_render_compiler::forge::evolve_schema).
     pub schema_additions: Vec<dom_render_compiler::forge::Addition>,
+    /// Islands whose SSR render threw. Each one is **missing from the page it
+    /// belongs to** — an empty placeholder carries no `data-albedo-island`
+    /// marker, so nothing ever hydrates into it.
+    ///
+    /// 🪤 This belongs here rather than in a log, and the distinction has cost
+    /// this project twice. `install_tracing` in the CLI says it plainly: a
+    /// subscriber exists only when `RUST_LOG` is set, so "a message on a
+    /// channel nobody is listening to is indistinguishable from no message at
+    /// all". A `<Link>` inside an island once removed an entire navigation bar
+    /// from a real site with a green build and a clean console; the fix at the
+    /// time raised `warn!` to `error!`, on the same unheard channel, and a
+    /// Radix dialog hit the identical silence months later.
+    pub island_ssr_failures: Vec<crate::renderer_runtime::IslandRenderFailure>,
 }
 
 impl BootReport {
@@ -1851,10 +1879,20 @@ impl BootReport {
     /// cannot drift into describing the same event three different ways.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
-        self.schema_additions
+        let mut out: Vec<String> = self
+            .schema_additions
             .iter()
             .map(|addition| format!("FORGE · {addition}"))
-            .collect()
+            .collect();
+        // Phrased as absence, because that is what happened. "failed to render"
+        // reads like a degraded page; the component is simply not on it.
+        out.extend(self.island_ssr_failures.iter().map(|failure| {
+            format!(
+                "ISLAND · {} is MISSING from every page that renders it. {}",
+                failure.module_path, failure.error
+            )
+        }));
+        out
     }
 }
 
@@ -1978,6 +2016,9 @@ impl AlbedoServer {
         F: FnOnce(&BootReport) + Send + 'static,
     {
         let mut report = BootReport::default();
+        // Decided at build time, surfaced here — this is the only path out to
+        // the author.
+        report.island_ssr_failures = self.island_ssr_failures.clone();
         // FORGE — open the durable substrate exactly once, before the listener
         // binds. This is the sole async boot seam (`build()` is synchronous),
         // and the handle lives on the persistent `RuntimeState` tier so a dev
@@ -5030,6 +5071,46 @@ mod tests {
                 Instruction::Navigate { url } if url == "/dashboard"
             ),
             "Phase-I Navigate must round-trip through the action response wire path"
+        );
+    }
+
+    /// A failed island SSR must reach the AUTHOR, not a log nobody subscribes to.
+    ///
+    /// 🪤 This project has paid for the distinction twice. `install_tracing`
+    /// only installs a subscriber when `RUST_LOG` is set, so a `tracing::error!`
+    /// on the island path is invisible on every ordinary run. A `<Link>` inside
+    /// an island once removed an entire navigation bar from a real site with a
+    /// green build and a clean console; the fix at the time raised `warn!` to
+    /// `error!` — the same unheard channel — and a Radix dialog hit the
+    /// identical silence months later. The level was never the problem.
+    ///
+    /// So the property under test is not "it is logged". It is that
+    /// [`BootReport::lines`] — the one path the CLI prints — carries it, names
+    /// the module, and repeats the renderer's own message verbatim.
+    #[test]
+    fn a_failed_island_render_reaches_the_boot_report() {
+        let report = BootReport {
+            island_ssr_failures: vec![crate::renderer_runtime::IslandRenderFailure {
+                module_path: "src/components/DialogDemo.tsx".to_string(),
+                error: "`DialogTrigger` must be used within `Dialog`".to_string(),
+            }],
+            ..BootReport::default()
+        };
+
+        let lines = report.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("src/components/DialogDemo.tsx"), "{line}");
+        // The component's OWN message is the useful half; summarising it away
+        // would leave an author knowing only that something failed.
+        assert!(line.contains("must be used within"), "{line}");
+        // Phrased as absence. "failed to render" reads like a degraded page;
+        // the component is simply not on it.
+        assert!(line.contains("MISSING"), "{line}");
+
+        assert!(
+            BootReport::default().lines().is_empty(),
+            "a clean boot must stay silent"
         );
     }
 

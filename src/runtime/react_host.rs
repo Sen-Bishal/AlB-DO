@@ -126,6 +126,95 @@ const REACT_HOST: HostModule = HostModule {
 
   function __albedo_createRef() { return { current: null }; }
 
+  // `React.Children` — the traversal helpers.
+  //
+  // Found by building a real Radix Dialog rather than by reading React's
+  // exports: `DialogPortal` calls `React.Children.map(children, …)` on every
+  // render, so the whole shadcn overlay layer died on `Cannot read properties
+  // of undefined (reading 'map')` — with `createPortal` implemented and never
+  // reached.
+  //
+  // 🔑 **One implementation serves both runtimes.** A "child" is a vnode in the
+  // browser and an `AlbedoHtml` (or a string) on the server, but nothing here
+  // inspects a child: the walk only flattens nested arrays and recognises the
+  // EMPTY slots, and `null`/`undefined`/`boolean` mean the same thing on both
+  // sides. So unlike `isValidElement` and `createPortal`, this needs no
+  // per-runtime global.
+  //
+  // The empty-slot rule is React's, including the parts that look inconsistent:
+  //   * `map`/`forEach` invoke the callback for EVERY slot, empty ones included
+  //     (React's `mapIntoArray` sets `invokeCallback` for an invalid child), and
+  //     a `null` RESULT is dropped from the output;
+  //   * `count` counts every slot, empty ones included — `count([a, null, b])`
+  //     is 3, while `toArray([a, null, b])` has length 2.
+  // Faithful rather than tidy, because a package written against React's
+  // behaviour is the only consumer.
+  function __albedo_child_is_empty(child) {
+    return child === null || child === undefined || typeof child === 'boolean';
+  }
+
+  function __albedo_children_each(children, visit) {
+    if (Array.isArray(children)) {
+      for (var i = 0; i < children.length; i++) {
+        __albedo_children_each(children[i], visit);
+      }
+      return;
+    }
+    visit(children);
+  }
+
+  var __albedo_Children = {
+    map: function(children, fn) {
+      // React returns the argument untouched when there is nothing to map,
+      // rather than an empty array.
+      if (children === null || children === undefined) { return children; }
+      var out = [];
+      var index = 0;
+      __albedo_children_each(children, function(child) {
+        var mapped = fn(child, index++);
+        if (mapped !== null && mapped !== undefined) { out.push(mapped); }
+      });
+      return out;
+    },
+    forEach: function(children, fn) {
+      if (children === null || children === undefined) { return; }
+      var index = 0;
+      __albedo_children_each(children, function(child) { fn(child, index++); });
+    },
+    count: function(children) {
+      if (children === null || children === undefined) { return 0; }
+      var n = 0;
+      __albedo_children_each(children, function() { n++; });
+      return n;
+    },
+    toArray: function(children) {
+      var out = [];
+      if (children === null || children === undefined) { return out; }
+      __albedo_children_each(children, function(child) {
+        if (!__albedo_child_is_empty(child)) { out.push(child); }
+      });
+      return out;
+    },
+    only: function(children) {
+      var found = [];
+      __albedo_children_each(children, function(child) {
+        if (!__albedo_child_is_empty(child)) { found.push(child); }
+      });
+      if (found.length !== 1) {
+        throw new Error('React.Children.only expected to receive a single React element child.');
+      }
+      return found[0];
+    }
+  };
+
+  // Published on the global as well as through the record, because there are
+  // two ways `React.Children` is reached and only one of them is this record.
+  // An npm package binds to the record; a user's own island writing `import
+  // React from "react"` is rewritten to a namespace object of `globalThis.*`
+  // shims (`quickjs_engine::rewrite_framework_runtime_import`), which cannot
+  // see this scope's `var`. One implementation, two doors.
+  globalThis.__albedo_Children = __albedo_Children;
+
   // `useReducer` on top of `useState`. The dispatch identity is stable because
   // `useState`'s setter is recreated per render but only ever closes over the
   // same hook cell; the reducer is read from a ref so a dispatch always applies
@@ -164,6 +253,7 @@ const REACT_HOST: HostModule = HostModule {
         ("forwardRef", "__albedo_forwardRef"),
         ("memo", "__albedo_memo"),
         ("createRef", "__albedo_createRef"),
+        ("Children", "__albedo_Children"),
         ("isValidElement", "globalThis.__albedo_is_element"),
         ("createContext", "globalThis.createContext"),
         ("useState", "globalThis.useState"),
@@ -172,6 +262,11 @@ const REACT_HOST: HostModule = HostModule {
         // after paint.
         ("useLayoutEffect", "globalThis.useEffect"),
         ("useRef", "globalThis.useRef"),
+        // `TODO.md` 9.2. Radix calls this on every primitive to wire
+        // `aria-controls`/`aria-labelledby`, so it is a shadcn prerequisite. The
+        // server/client agreement it depends on is documented at the
+        // implementation in `quickjs_engine.rs`'s prelude.
+        ("useId", "globalThis.useId"),
         ("useMemo", "globalThis.useMemo"),
         ("useCallback", "globalThis.useCallback"),
         ("useContext", "globalThis.useContext"),
@@ -227,15 +322,49 @@ const JSX_RUNTIME_HOST: HostModule = HostModule {
     default_is_namespace: true,
 };
 
+/// `react-dom`, narrowed to the one export Albedo actually implements.
+///
+/// `TODO.md` 9.3. Radix routes `Dialog`, `Popover`, `Tooltip`, `Select` and
+/// `DropdownMenu` content through `createPortal`, so the whole shadcn overlay
+/// layer sat behind this one name.
+///
+/// 🔑 **The `exports` list is the refusal.** The build-time import check derives
+/// its `provides` set from this table, so a package importing `createRoot`,
+/// `hydrateRoot`, `flushSync` or `render` still fails at build with the name it
+/// asked for — the loud error the blanket refusal used to give, now per-export
+/// rather than per-module. A half-right `flushSync` would be worse than
+/// refusing it: it turns a build error into a subtly wrong batch.
+///
+/// `createPortal` is the second export whose implementation cannot be shared
+/// between the two runtimes (`isValidElement` is the first), so it routes
+/// through a global each defines for itself — a vnode in
+/// `assets/albedo-client.js`, empty markup in the QuickJS prelude.
+const REACT_DOM_HOST: HostModule = HostModule {
+    specifiers: &["react-dom"],
+    record_key: "albedo:host/react-dom",
+    prelude: "",
+    exports: &[("createPortal", "globalThis.__albedo_createPortal")],
+    default_is_namespace: true,
+};
+
 /// Every module the browser host provides.
-pub const HOST_MODULES: &[HostModule] = &[REACT_HOST, JSX_RUNTIME_HOST];
+pub const HOST_MODULES: &[HostModule] = &[REACT_HOST, JSX_RUNTIME_HOST, REACT_DOM_HOST];
 
 /// Modules a client bundle refuses, with the reason a user sees.
 ///
-/// `react-dom` is the one that matters: `createPortal` needs the SSR renderer
-/// and hydration to agree on where portal content lands in the HTML, which is
-/// `TODO.md` item 9.3 and genuinely unbuilt. Shipping a stub that throws would
-/// turn a build error into a blank island.
+/// 🪤 **This list got shorter when 9.3 landed, and the reason is worth keeping.**
+/// It used to refuse `react-dom` whole, on the grounds that `createPortal`
+/// needed the SSR renderer and hydration to agree on where portal content lands
+/// in the HTML. That premise was wrong: React's own server renderer *throws* on
+/// portals, so there is no server markup to agree about, and the feature was
+/// never as large as the refusal implied. A refusal is a claim about what the
+/// host cannot do, and this one outlived its evidence.
+///
+/// What remains refused are the entry points that own a render lifecycle Albedo
+/// already owns (`createRoot`, `hydrateRoot`, `renderToString`). `react-dom`'s
+/// other named exports are refused by a sharper mechanism now: they are simply
+/// absent from [`REACT_DOM_HOST`]'s `exports`, so the import check names the
+/// export rather than the package.
 ///
 /// 🪤 **`react-is` was briefly on this list and should not have been.** It is
 /// ordinary JavaScript that reads `$$typeof` tags and works standalone, and
@@ -245,11 +374,11 @@ pub const HOST_MODULES: &[HostModule] = &[REACT_HOST, JSX_RUNTIME_HOST];
 /// capability the host genuinely lacks, not a package that looks React-shaped.**
 pub const REFUSED_MODULES: &[RefusedModule] = &[
     RefusedModule {
-        specifiers: &["react-dom", "react-dom/client", "react-dom/server"],
-        reason: "Albedo's client runtime is not react-dom — `createPortal` \
-                 (TODO 9.3), `flushSync` and `createRoot` have no implementation \
-                 here. A Tier-C island cannot use a package that reaches for \
-                 react-dom.",
+        specifiers: &["react-dom/client", "react-dom/server"],
+        reason: "Albedo's client runtime is not react-dom — `createRoot`, \
+                 `hydrateRoot` and `renderToString` own a render lifecycle \
+                 Albedo already owns. Bare `react-dom` IS available for \
+                 `createPortal`; these entry points are not.",
     },
 ];
 
@@ -368,11 +497,36 @@ mod tests {
     }
 
     #[test]
-    fn react_is_a_host_and_react_dom_is_only_refused() {
+    fn react_dom_provides_create_portal_and_refuses_the_render_lifecycle() {
         assert_eq!(host_record_key("react"), Some("albedo:host/react"));
-        assert_eq!(host_record_key("react-dom"), None);
-        assert!(REFUSED_MODULES
+        // 9.3: bare `react-dom` is now a host module, because `createPortal` is
+        // implemented. This assertion is the inverse of the one it replaced.
+        assert_eq!(host_record_key("react-dom"), Some("albedo:host/react-dom"));
+        assert!(!REFUSED_MODULES
             .iter()
             .any(|module| module.specifiers.contains(&"react-dom")));
+
+        // The narrowing must stay narrow. The entry points that own a render
+        // lifecycle are still refused by module...
+        for entry in ["react-dom/client", "react-dom/server"] {
+            assert!(
+                REFUSED_MODULES
+                    .iter()
+                    .any(|module| module.specifiers.contains(&entry)),
+                "{entry} must stay refused"
+            );
+        }
+
+        // ...and everything else react-dom exports is refused by ABSENCE from
+        // the table, which is the sharper mechanism: the import check derives
+        // `provides` from `exports`, so the error names the export. A
+        // `flushSync` that quietly appeared here would be a subtly wrong batch
+        // rather than a build error.
+        let react_dom = HOST_MODULES
+            .iter()
+            .find(|module| module.specifiers.contains(&"react-dom"))
+            .expect("react-dom is a host module");
+        let provided: Vec<&str> = react_dom.exports.iter().map(|(name, _)| *name).collect();
+        assert_eq!(provided, vec!["createPortal"]);
     }
 }
