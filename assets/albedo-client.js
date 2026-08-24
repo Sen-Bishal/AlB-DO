@@ -104,22 +104,84 @@
     // even though it was given children. `Link` below is a real instance of
     // this: it forwards `props.children` and, without this merge, silently
     // renders an empty anchor.
-    var finalProps = props || null;
-    if (isComponent(type)) {
-      finalProps = Object.assign({}, props || {});
-      if (children.length === 1) {
-        finalProps.children = children[0];
-      } else if (children.length > 1) {
-        finalProps.children = children;
-      }
+    //
+    // 🔑 **A host tag gets the same treatment, and for a different consumer.**
+    // The reconciler never needs `props.children` for a host tag — it walks
+    // `vnode.children`. *Packages* do. Radix's `Slot` reads
+    // `slottableElement.props.children` off whatever the author passed to
+    // `asChild` (usually a plain `<button>`), and its `getElementRef` calls
+    // `Object.getOwnPropertyDescriptor(element.props, 'ref')`, which throws on
+    // the `null` this used to produce. React folds children into props for
+    // every element type; so does this now. `updateDomProps` already skips
+    // `children` and `key`, so nothing reaches the DOM as an attribute.
+    //
+    // This is the host-tag half of the component-vnode fix above — one bug,
+    // found from opposite ends.
+    var finalProps = Object.assign({}, props || {});
+    if (children.length === 1) {
+      finalProps.children = children[0];
+    } else if (children.length > 1) {
+      finalProps.children = children;
     }
     return {
       __vnode: true,
       type: type,
       props: finalProps,
       children: children,
-      key: finalProps && finalProps.key != null ? finalProps.key : null,
+      key: finalProps.key != null ? finalProps.key : null,
     };
+  }
+
+  // `cloneElement` — `TODO.md` 9.2. The third export in the shared React host
+  // table (`runtime::react_host`) with two implementations, after
+  // `isValidElement` and `createPortal`.
+  //
+  // Here it is genuinely cheap, because a vnode is still a description: rebuild
+  // it through `h` so the clone's children normalization and props shaping are
+  // the *same* code a fresh render uses, rather than a second copy of those
+  // rules that can drift. The server's half has to work much harder — see
+  // `__albedo_clone_element` in `quickjs_engine.rs`.
+  //
+  // Prop precedence is React's: config over the element's own props, then
+  // variadic children over `config.children` over the element's own.
+  function cloneElement(element, config) {
+    var extra = [];
+    for (var i = 2; i < arguments.length; i++) {
+      extra.push(arguments[i]);
+    }
+    // Not a vnode, or a text node — which has no props to merge and whose
+    // `'#text'` type would be built as a literal `<#text>` tag by `h`.
+    if (element === null || typeof element !== 'object'
+        || element.__vnode !== true || element.type === TEXT) {
+      return element;
+    }
+
+    var merged = {};
+    var base = element.props || {};
+    var key;
+    for (key in base) {
+      if (hasOwn(base, key)) {
+        merged[key] = base[key];
+      }
+    }
+    if (config) {
+      for (key in config) {
+        if (hasOwn(config, key)) {
+          merged[key] = config[key];
+        }
+      }
+    }
+
+    // `h` re-folds children into props, so hand them to it positionally and
+    // let it do that once. `element.children` is the already-normalized array,
+    // which is what `h` would produce from the same input anyway.
+    var childArgs = extra;
+    if (childArgs.length === 0) {
+      childArgs = hasOwn(merged, 'children') ? [merged.children] : [element.children];
+    }
+    delete merged.children;
+
+    return h.apply(null, [element.type, merged].concat(childArgs));
   }
 
   // Fragment is a sentinel component type the reconciler special-cases to mean
@@ -950,6 +1012,49 @@
     writingMode: 'writing-mode',
   };
 
+  // 🔑 The attributes where a JSX boolean becomes the WORD, not a bare name.
+  //
+  // HTML has two unrelated kinds of attribute that both take `true` in JSX. A
+  // real boolean attribute (`disabled`, `checked`, `hidden`) signals by being
+  // *present* — its value is ignored, and `false` means remove it. An enumerated
+  // attribute signals by its *value*, and its value space is the two literal
+  // strings `"true"` and `"false"` — so a bare `aria-expanded` is the empty
+  // string, which is neither, and assistive technology reads it as not expanded.
+  // `false` is a value here too: `aria-hidden="false"` is what keeps an
+  // ancestor's `aria-hidden="true"` from being inherited over a subtree, and is
+  // not the same as saying nothing.
+  //
+  // The `aria-` prefix is a rule rather than a list of the sixty-odd ARIA
+  // booleans, so a new ARIA attribute cannot rot into inert markup. This table
+  // is only the non-`aria-` remainder — React's `BOOLEANISH_STRING` set. It is
+  // set-equal to `runtime::jsx_attributes::ENUMERATED_BOOLEAN_ATTRIBUTES` and a
+  // Rust test asserts that, for the same reason the rename table above has one:
+  // hydration ADOPTS the server's node, so a client that spells one attribute
+  // differently silently rewrites it on the way in.
+  //
+  // Keys are lowercase; lookups lowercase first. HTML attribute names are
+  // case-insensitive and `setAttribute` lowercases them on an HTML element, so
+  // `contentEditable` and `contenteditable` are one attribute.
+  var ENUMERATED_BOOLEAN_ATTRIBUTES = {
+    contenteditable: true,
+    draggable: true,
+    spellcheck: true,
+    autoreverse: true,
+    externalresourcesrequired: true,
+    focusable: true,
+    preservealpha: true,
+  };
+
+  var ARIA_PREFIX = 'aria-';
+
+  function isEnumeratedBooleanAttribute(name) {
+    var lower = String(name).toLowerCase();
+    return (
+      lower.slice(0, ARIA_PREFIX.length) === ARIA_PREFIX ||
+      hasOwn(ENUMERATED_BOOLEAN_ATTRIBUTES, lower)
+    );
+  }
+
 
   // 🔑 `document.createElement('svg')` produces an `HTMLUnknownElement`, not an
   // SVG element — it renders **nothing**, silently. Every icon package in npm
@@ -1019,6 +1124,15 @@
     }
     // JSX prop → attribute name, from the table both server renderers read.
     key = attributeNameFor(key);
+    // Booleans first, and BEFORE the removal branch: an enumerated attribute's
+    // `false` is a value it must carry (`aria-hidden="false"`), not a reason to
+    // remove it. The attribute name decides, from the same table both server
+    // renderers read — a divergence here would not fail loudly, it would rewrite
+    // the attribute on an adopted node the instant hydration applied props.
+    if (typeof newValue === 'boolean' && isEnumeratedBooleanAttribute(key)) {
+      dom.setAttribute(key, newValue ? 'true' : 'false');
+      return;
+    }
     if (newValue === undefined || newValue === null || newValue === false) {
       dom.removeAttribute(key);
       return;
@@ -1163,6 +1277,11 @@
   // rendering of portal content — see `createPortal` above). One table row in
   // `runtime::react_host`, one global name, two implementations.
   global.__albedo_createPortal = createPortal;
+
+  // The third, same arrangement. On the server an element is finished HTML, so
+  // cloning there is a re-render of one tag rather than a rebuild of a
+  // description; the two cannot share a body. One table row, one global name.
+  global.__albedo_clone_element = cloneElement;
 
   global.__albedoClient = api;
   global.h = h;

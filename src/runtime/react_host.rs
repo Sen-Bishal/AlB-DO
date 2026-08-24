@@ -21,13 +21,31 @@
 //! object), and the server's `h` stringified the object into a tag name — every
 //! React component library rendered as the literal text `<[object Object]>`.
 //!
-//! ## The one divergence, and how it stays a divergence of one
+//! ## The divergences, and how they stay named
 //!
-//! `isValidElement` is the only export whose implementation cannot be shared:
-//! the browser's element is a vnode (`value.__vnode === true`), the server's is
-//! an `AlbedoHtml`. It routes through `globalThis.__albedo_is_element`, which
-//! each runtime defines for itself — so the *table* stays single-sourced and the
-//! difference is one named global rather than two tables.
+//! Three exports cannot share a body, and all three for the same underlying
+//! reason: **the browser's element is a vnode (`value.__vnode === true`) and the
+//! server's is an `AlbedoHtml`** — finished HTML, because the QuickJS `h` is
+//! eager.
+//!
+//! | export | browser | server |
+//! |---|---|---|
+//! | `isValidElement` | `value.__vnode === true` | `instanceof AlbedoHtml` |
+//! | `createPortal` (`react-dom`) | builds a vnode | renders nothing |
+//! | `cloneElement` | rebuilds the vnode through `h` | **re-renders one host tag** |
+//!
+//! Each routes through a named global (`__albedo_is_element`,
+//! `__albedo_createPortal`, `__albedo_clone_element`) that each runtime defines
+//! for itself — so the *table* stays single-sourced and the difference is a
+//! named function rather than a second table.
+//!
+//! ⚠️ `cloneElement` is the one that is not merely a different spelling of the
+//! same idea. On an eager renderer an element's props are already bytes, so the
+//! server can only clone by having retained the call's arguments and re-running
+//! that one tag; the how, and what it deliberately cannot do, is documented at
+//! `quickjs_engine`'s `__albedo_element` and `__albedo_clone_element`. It is
+//! also the API that makes shadcn's `asChild` work, because Radix's `Slot` is
+//! built from it.
 //!
 //! ## Refusals are host-specific, deliberately
 //!
@@ -255,6 +273,12 @@ const REACT_HOST: HostModule = HostModule {
         ("createRef", "__albedo_createRef"),
         ("Children", "__albedo_Children"),
         ("isValidElement", "globalThis.__albedo_is_element"),
+        // `TODO.md` 9.2. Radix's `Slot` — the whole of `asChild`, and so the
+        // whole of shadcn's composition story — is four `cloneElement` calls
+        // and nothing else. Found by grepping what the *packages* call rather
+        // than what app code imports; see the module note on the divergences
+        // for why this one is the expensive half.
+        ("cloneElement", "globalThis.__albedo_clone_element"),
         ("createContext", "globalThis.createContext"),
         ("useState", "globalThis.useState"),
         ("useEffect", "globalThis.useEffect"),
@@ -494,6 +518,57 @@ mod tests {
             Some("globalThis.__albedo_is_element"),
             "an element is a vnode in one runtime and an AlbedoHtml in the other"
         );
+        assert_eq!(
+            lookup("cloneElement"),
+            Some("globalThis.__albedo_clone_element"),
+            "cloning rebuilds a vnode in one runtime and re-renders one tag in the other"
+        );
+    }
+
+    /// 🔑 **A name this table advertises must be one some runtime defines.**
+    ///
+    /// Every export is a *string* naming a global, so a row can reference a
+    /// function nobody wrote and nothing complains: the build-time import check
+    /// derives its `provides` set from this same list, so the package passes
+    /// the build, ships, and throws `undefined is not a function` in a user's
+    /// browser on first render. That is the exact shape this codebase has hit
+    /// five times — a correct mechanism reached by no input — and it is the
+    /// only half of the pair that cannot be generated, because
+    /// `assets/albedo-client.js` is hand-written JavaScript served to browsers.
+    ///
+    /// So it is checked instead. The QuickJS side is Rust in this crate and
+    /// fails loudly under test; the browser side would fail in production.
+    #[test]
+    fn every_global_the_table_names_is_defined_by_some_runtime() {
+        const CLIENT_RUNTIME: &str = include_str!("../../assets/albedo-client.js");
+
+        let mut haystack = String::from(CLIENT_RUNTIME);
+        for module in HOST_MODULES {
+            haystack.push_str(module.prelude);
+        }
+
+        for module in HOST_MODULES {
+            for (name, expression) in module.exports {
+                // `globalThis.h.Fragment` is owned by whoever defines `h`.
+                let identifier = expression
+                    .trim_start_matches("globalThis.")
+                    .split('.')
+                    .next()
+                    .expect("an export expression names something");
+                let defined = [
+                    format!("function {identifier}"),
+                    format!("var {identifier} ="),
+                    format!("const {identifier} ="),
+                    format!("{identifier} = "),
+                ]
+                .iter()
+                .any(|pattern| haystack.contains(pattern));
+                assert!(
+                    defined,
+                    "`{name}` is advertised as `{expression}`, but nothing in                      assets/albedo-client.js or any host prelude defines                      `{identifier}` — the browser would get `undefined`"
+                );
+            }
+        }
     }
 
     #[test]

@@ -45,6 +45,7 @@ fn decide(source: &str) -> TieringDecision {
         c.is_client_interactive,
         c.state_escapes,
         c.reads_principal,
+        dom_render_compiler::parser::imports_unresolvable_specifier(&c.import_sources),
         false,
         c.estimated_size as u64,
         inputs(),

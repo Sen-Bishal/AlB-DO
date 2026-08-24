@@ -135,18 +135,126 @@ pub fn jsx_attribute_name(name: &str) -> &str {
     name
 }
 
+/// How a **boolean-valued** JSX prop becomes an HTML attribute.
+///
+/// 🔑 **HTML has two unrelated kinds of attribute that both take `true` in
+/// JSX.** Conflating them is not a formatting difference — it changes what the
+/// attribute *means*:
+///
+/// | kind | `true` | `false` | example |
+/// |---|---|---|---|
+/// | boolean attribute | present, bare | **absent** | `disabled`, `checked`, `hidden` |
+/// | enumerated attribute | `="true"` | `="false"` | `aria-expanded`, `aria-hidden` |
+///
+/// For a real boolean attribute the *presence* of the name is the whole signal
+/// and the value is ignored, so `disabled="false"` is still disabled. For an
+/// enumerated attribute the value **is** the signal, and its value space is the
+/// two literal strings `"true"` and `"false"` — a bare `aria-expanded` is the
+/// empty string, which is in neither. Assistive technology reads that as *no
+/// value supplied*, i.e. not expanded.
+///
+/// ⚠️ **Both halves were wrong for aria before this existed.** All three
+/// renderers emitted `true` bare and *dropped* `false` entirely, so
+/// `aria-expanded={true}` shipped inert and `aria-hidden={false}` shipped
+/// nothing at all — and "not hidden" is a claim, not the absence of one: it is
+/// what stops an ancestor's `aria-hidden="true"` from being inherited over a
+/// subtree that must stay reachable. Radix wires **every** compound component's
+/// accessibility through this shape (`aria-expanded`, `aria-selected`,
+/// `aria-checked`, `aria-pressed`, `aria-hidden`), always as booleans, so the
+/// entire shadcn/UI layer server-rendered with dead aria state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BooleanAttributeForm {
+    /// A real HTML boolean attribute: emit the bare name for `true`, emit
+    /// nothing for `false`.
+    Bare,
+    /// An enumerated attribute: emit `="true"` / `="false"`. Never dropped.
+    Enumerated,
+}
+
+/// The enumerated-boolean attributes that are **not** matched by the `aria-`
+/// prefix rule in [`boolean_attribute_form`].
+///
+/// Compared ASCII-case-insensitively, so one entry covers both the JSX spelling
+/// and the HTML one (`contentEditable` and `contenteditable` are the same
+/// attribute; HTML attribute names are case-insensitive and `setAttribute`
+/// lowercases them on an HTML element).
+///
+/// ## Boundary
+///
+/// This is React's `BOOLEANISH_STRING` set and nothing more — the attributes
+/// where a JSX author writes a boolean and the HTML spec wants the *word*. It is
+/// deliberately not "every enumerated attribute in HTML": `translate` takes
+/// `yes`/`no` and `autocomplete` takes `on`/`off`, so a boolean there is a
+/// different mistake with a different fix, and neither is what a component
+/// library emits.
+///
+/// 🚫 **`data-*` is deliberately absent, and this is a knowing divergence from
+/// React**, which stringifies `data-foo={true}` to `data-foo="true"`. Two
+/// reasons: this codebase emits its own `data-albedo-link` marker *as a boolean
+/// prop* and `tests/hydration_integration_tests.rs` asserts it stays bare; and
+/// Radix's own convention for its `data-*` state markers is the bare form
+/// (`data-disabled`), which is what a `[data-disabled]` selector and
+/// `hasAttribute` both key on. Unlike aria, nothing reads a `data-*` attribute's
+/// value as a tri-state, so there is no defect here to fix — only a spelling to
+/// keep stable. The falsifier: an app that writes `data-x={true}` and reads
+/// `el.dataset.x` gets `""` where React would give it `"true"`.
+pub const ENUMERATED_BOOLEAN_ATTRIBUTES: &[&str] = &[
+    // ── HTML ────────────────────────────────────────────────────────────
+    "contenteditable",
+    "draggable",
+    "spellcheck",
+    // ── SVG ─────────────────────────────────────────────────────────────
+    "autoreverse",
+    "externalresourcesrequired",
+    "focusable",
+    "preservealpha",
+];
+
+/// The `aria-` prefix, matched case-insensitively. Every ARIA state and property
+/// that takes a boolean is enumerated, without exception, so the prefix is the
+/// rule rather than a list of the sixty-odd names — a list would rot the moment
+/// ARIA grows an attribute, and it would rot *silently*, into inert markup.
+const ARIA_PREFIX: &str = "aria-";
+
+/// Which of the two forms a boolean takes for `attribute_name`.
+///
+/// Takes the **already-renamed** attribute name — the output of
+/// [`jsx_attribute_name`], not the JSX prop — so a prop whose spelling changes
+/// on the way out is judged by what actually lands in the markup.
+#[must_use]
+pub fn boolean_attribute_form(attribute_name: &str) -> BooleanAttributeForm {
+    if attribute_name
+        .get(..ARIA_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ARIA_PREFIX))
+    {
+        return BooleanAttributeForm::Enumerated;
+    }
+    for enumerated in ENUMERATED_BOOLEAN_ATTRIBUTES {
+        if attribute_name.eq_ignore_ascii_case(enumerated) {
+            return BooleanAttributeForm::Enumerated;
+        }
+    }
+    BooleanAttributeForm::Bare
+}
+
 /// The QuickJS-side lookup, generated from [`JSX_ATTRIBUTE_RENAMES`].
 ///
 /// Installs `globalThis.__albedo_attr_name`, which the `h` shim's attribute loop
-/// calls. Generated rather than written into the prelude's raw string so the two
-/// server renderers cannot disagree — which is the whole contract the `h` shim's
-/// own comment states: *"the ` />` spelling is the pure-Rust renderer's, so the
-/// two agree byte-for-byte rather than merely parsing to the same tree."*
+/// calls, and `globalThis.__albedo_attr_bool_enumerated`, which it consults
+/// before spelling a boolean. Generated rather than written into the prelude's
+/// raw string so the two server renderers cannot disagree — which is the whole
+/// contract the `h` shim's own comment states: *"the ` />` spelling is the
+/// pure-Rust renderer's, so the two agree byte-for-byte rather than merely
+/// parsing to the same tree."*
 #[must_use]
 pub fn build_jsx_attribute_table_script() -> String {
     let mut entries = String::new();
     for (prop, attribute) in JSX_ATTRIBUTE_RENAMES {
         entries.push_str(&format!("  '{prop}': '{attribute}',\n"));
+    }
+    let mut enumerated = String::new();
+    for attribute in ENUMERATED_BOOLEAN_ATTRIBUTES {
+        enumerated.push_str(&format!("  '{attribute}': true,\n"));
     }
     format!(
         "(function() {{\n\
@@ -156,14 +264,21 @@ pub fn build_jsx_attribute_table_script() -> String {
          globalThis.__albedo_attr_name = function(name) {{\n\
          \x20 return own.call(table, name) ? table[name] : name;\n\
          }};\n\
-         }})();\n"
+         var enumeratedBooleans = {{\n{enumerated}}};\n\
+         globalThis.__albedo_attr_bool_enumerated = function(name) {{\n\
+         \x20 var lower = String(name).toLowerCase();\n\
+         \x20 return lower.slice(0, {aria_len}) === '{ARIA_PREFIX}'\n\
+         \x20   || own.call(enumeratedBooleans, lower);\n\
+         }};\n\
+         }})();\n",
+        aria_len = ARIA_PREFIX.len()
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn html_renames_are_preserved() {
@@ -203,6 +318,111 @@ mod tests {
             assert!(
                 seen.insert(prop, attribute).is_none(),
                 "duplicate entry for {prop}"
+            );
+        }
+    }
+
+    /// The defect this whole distinction exists for: `aria-expanded={true}` was
+    /// a bare attribute, which is the empty string, which is *not expanded*.
+    #[test]
+    fn aria_booleans_are_enumerated_not_bare() {
+        for name in [
+            "aria-expanded",
+            "aria-hidden",
+            "aria-selected",
+            "aria-checked",
+            "aria-pressed",
+            "aria-disabled",
+            // Case-insensitive: an author may write `ARIA-Expanded`, and HTML
+            // attribute names do not care.
+            "ARIA-Expanded",
+            // The prefix is a rule, not a list — an ARIA attribute nobody has
+            // enumerated here still lands on the right side.
+            "aria-some-future-state",
+        ] {
+            assert_eq!(
+                boolean_attribute_form(name),
+                BooleanAttributeForm::Enumerated,
+                "{name} must carry the literal word"
+            );
+        }
+    }
+
+    #[test]
+    fn real_html_boolean_attributes_stay_bare() {
+        // 🚫 The two `data-*` entries are knowingly bare, unlike React: this
+        // codebase emits `data-albedo-link` as a boolean prop and asserts it
+        // stays bare, and Radix's own `data-*` state markers are bare too.
+        for name in [
+            "disabled",
+            "checked",
+            "hidden",
+            "required",
+            "readonly",
+            "selected",
+            "multiple",
+            "open",
+            "inert",
+            "autofocus",
+            "class",
+            "id",
+            "style",
+            "stroke-width",
+            "data-albedo-link",
+            "data-state",
+        ] {
+            assert_eq!(
+                boolean_attribute_form(name),
+                BooleanAttributeForm::Bare,
+                "{name} signals by presence, so a value would be noise"
+            );
+        }
+    }
+
+    /// The non-`aria-` enumerated attributes, in both the JSX spelling and the
+    /// HTML one — `jsx_attribute_name` does not rename `contentEditable`, so the
+    /// camelCase form is what reaches the decision.
+    #[test]
+    fn booleanish_string_attributes_are_enumerated_in_either_case() {
+        for name in [
+            "contentEditable",
+            "contenteditable",
+            "draggable",
+            "spellCheck",
+            "spellcheck",
+            "focusable",
+            "preserveAlpha",
+        ] {
+            assert_eq!(
+                boolean_attribute_form(name),
+                BooleanAttributeForm::Enumerated,
+                "{name} takes the word `true`/`false`, not a bare name"
+            );
+        }
+    }
+
+    /// `get(..5)` on a short or multi-byte name must not panic — the prefix probe
+    /// runs on every attribute of every element the server renders.
+    #[test]
+    fn the_prefix_probe_survives_short_and_multibyte_names() {
+        for name in ["", "a", "ari", "aria", "日本語です", "aria", "é-x"] {
+            let _ = boolean_attribute_form(name);
+        }
+        assert_eq!(boolean_attribute_form("aria"), BooleanAttributeForm::Bare);
+    }
+
+    #[test]
+    fn the_enumerated_list_is_lowercase_and_free_of_the_aria_prefix() {
+        for attribute in ENUMERATED_BOOLEAN_ATTRIBUTES {
+            assert_eq!(
+                *attribute,
+                attribute.to_ascii_lowercase(),
+                "{attribute} must be listed lowercase — lookups lowercase first"
+            );
+            assert!(
+                !attribute.starts_with(ARIA_PREFIX),
+                "{attribute} is already covered by the prefix rule; listing it \
+                 twice is a line that can rot"
             );
         }
     }
@@ -260,6 +480,87 @@ mod tests {
              JSX_ATTRIBUTE_RENAMES — the client would emit different attribute \
              names than the server, and hydration would replace adopted DOM \
              instead of keeping it"
+        );
+    }
+
+    /// The same argument as above, for the same reason, about the other table.
+    ///
+    /// Drift here is worse than drift in the rename table, because it is
+    /// *invisible*: the client would keep the attribute name and only change its
+    /// value, so hydration adopts the node and then quietly rewrites the aria
+    /// state the server got right — or leaves the one it got wrong.
+    #[test]
+    fn the_client_runtime_enumerated_boolean_table_matches_this_one() {
+        let client = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/albedo-client.js"
+        ));
+        let start = client
+            .find("var ENUMERATED_BOOLEAN_ATTRIBUTES = {")
+            .expect("albedo-client.js must declare ENUMERATED_BOOLEAN_ATTRIBUTES");
+        let body = &client[start..];
+        let end = body.find("};").expect("the table must be closed");
+        let body = &body[..end];
+
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        for line in body.lines().skip(1) {
+            let line = line.trim().trim_end_matches(',');
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let Some((name, _)) = line.split_once(':') else {
+                continue;
+            };
+            found.insert(
+                name.trim()
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_ascii_lowercase(),
+            );
+        }
+
+        let expected: BTreeSet<String> = ENUMERATED_BOOLEAN_ATTRIBUTES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+
+        assert_eq!(
+            found, expected,
+            "assets/albedo-client.js's enumerated-boolean table has drifted from \
+             ENUMERATED_BOOLEAN_ATTRIBUTES — the client and the server would \
+             spell the same boolean prop differently on the same node"
+        );
+    }
+
+    /// The `aria-` half is code in all three renderers rather than data, so the
+    /// only thing that can be asserted from here is that the client still
+    /// *contains* the rule. Its behaviour is proven by running the real client
+    /// runtime (`tests/client_hydration.rs`).
+    #[test]
+    fn the_client_runtime_carries_the_aria_prefix_rule() {
+        let client = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/albedo-client.js"
+        ));
+        assert!(
+            client.contains(&format!("var ARIA_PREFIX = '{ARIA_PREFIX}'")),
+            "albedo-client.js must key the prefix rule on the same `{ARIA_PREFIX}` \
+             the server does"
+        );
+    }
+
+    #[test]
+    fn the_generated_script_carries_every_enumerated_boolean() {
+        let script = build_jsx_attribute_table_script();
+        for attribute in ENUMERATED_BOOLEAN_ATTRIBUTES {
+            assert!(
+                script.contains(&format!("'{attribute}': true")),
+                "{attribute} missing from the generated enumerated-boolean table"
+            );
+        }
+        assert!(
+            script.contains(&format!("=== '{ARIA_PREFIX}'")),
+            "the generated table must carry the aria prefix rule, not just the list"
         );
     }
 }

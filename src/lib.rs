@@ -589,6 +589,7 @@ impl RenderCompiler {
                 component.is_client_interactive,
                 component.state_escapes,
                 component.reads_principal,
+                component.imports_npm,
                 component.is_above_fold,
                 weight_bytes,
                 tiering_inputs,
@@ -684,6 +685,12 @@ fn tier_reason_to_message(reason: TieringReason, tier: Tier) -> String {
         // only one with a request in scope.
         TieringReason::RequestScoped => {
             "reads `user` - rendered per request, no component JS".to_string()
+        }
+        // Always Tier B, and for a reason worth naming in the dashboard: the
+        // author sees a component they wrote as pure static markup appear one
+        // tier down, and the import is why.
+        TieringReason::NpmDependency => {
+            "imports npm - server-rendered through QuickJS, no component JS".to_string()
         }
     }
 }

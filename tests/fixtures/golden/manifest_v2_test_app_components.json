@@ -187,6 +187,7 @@
     }
   },
   "schema_version": "2.0",
+  "static_render_failures": [],
   "vendor_chunks": [],
   "version": 2,
   "wt_streams": [

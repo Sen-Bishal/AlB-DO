@@ -1,3 +1,4 @@
+use crate::runtime::jsx_attributes;
 use serde_json::Value;
 use std::path::Path;
 
@@ -315,7 +316,7 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
         // hydration requires to agree byte-for-byte. The SVG half was missing
         // from all three, which is why `<svg strokeWidth="2">` has been shipping
         // the browser-inert `strokewidth` since Tier A existed.
-        let attr_name = crate::runtime::jsx_attributes::jsx_attribute_name(name.as_str());
+        let attr_name = jsx_attributes::jsx_attribute_name(name.as_str());
         // `style` takes an object in JSX and CSS text in HTML. Without this the
         // object fell through to `value_to_string`, which JSON-encodes it, and a
         // `<div style={{height:"1px"}}>` shipped a `style` attribute holding
@@ -332,8 +333,23 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
         }
         match value {
             Value::Null => {}
-            Value::Bool(false) => {}
-            Value::Bool(true) => out.push(attr_name.to_string()),
+            // 🔑 A boolean prop has TWO spellings in HTML and the attribute
+            // decides which — `disabled` is present-or-absent, `aria-expanded`
+            // is the literal word `"true"` or `"false"`. Emitting the bare form
+            // for an aria attribute ships the empty string, which assistive
+            // technology reads as *no value*, and dropping the `false` case ships
+            // nothing where `aria-hidden="false"` was the claim being made. The
+            // rule is in the one table every renderer reads, not restated here.
+            Value::Bool(flag) => match jsx_attributes::boolean_attribute_form(attr_name) {
+                jsx_attributes::BooleanAttributeForm::Bare => {
+                    if *flag {
+                        out.push(attr_name.to_string());
+                    }
+                }
+                jsx_attributes::BooleanAttributeForm::Enumerated => {
+                    out.push(format!("{attr_name}=\"{flag}\""));
+                }
+            },
             _ => {
                 let text = value_to_string(value);
                 if !text.is_empty() {
@@ -792,6 +808,46 @@ mod tests {
         assert_eq!(checked, "checked");
         let unchecked = render_attrs(&[("defaultChecked".to_string(), Value::Bool(false))]);
         assert_eq!(unchecked, "");
+    }
+
+    /// A boolean `aria-*` prop is an **enumerated** attribute, not a boolean one:
+    /// its value space is the two literal words. The bare form is the empty
+    /// string, which assistive technology reads as *not expanded*.
+    ///
+    /// Byte-level, at the renderer that decides the bytes, so a failure names the
+    /// spelling rather than a diff somewhere downstream. The whole-document
+    /// version of this — through real Radix — is
+    /// `tests/aria_boolean_attributes.rs`.
+    #[test]
+    fn render_attrs_spells_aria_booleans_as_words() {
+        let expanded = render_attrs(&[("aria-expanded".to_string(), Value::Bool(true))]);
+        assert_eq!(expanded, "aria-expanded=\"true\"");
+
+        // The half that is easy to miss: `false` is a value here, not a reason to
+        // drop the attribute. `aria-hidden="false"` is what stops an ancestor's
+        // `aria-hidden="true"` being inherited over a subtree.
+        let shown = render_attrs(&[("aria-hidden".to_string(), Value::Bool(false))]);
+        assert_eq!(shown, "aria-hidden=\"false\"");
+
+        // Side by side on one tag, from the same `true`: the aria attribute takes
+        // the word, the real HTML boolean attribute takes presence.
+        let both = render_attrs(&[
+            ("aria-pressed".to_string(), Value::Bool(true)),
+            ("disabled".to_string(), Value::Bool(true)),
+        ]);
+        assert_eq!(both, "aria-pressed=\"true\" disabled");
+
+        // The non-`aria-` enumerated set, and a renamed prop judged by the
+        // attribute it becomes rather than by its JSX spelling.
+        let booleanish = render_attrs(&[
+            ("contentEditable".to_string(), Value::Bool(false)),
+            ("draggable".to_string(), Value::Bool(true)),
+            ("defaultChecked".to_string(), Value::Bool(true)),
+        ]);
+        assert_eq!(
+            booleanish,
+            "contentEditable=\"false\" draggable=\"true\" checked"
+        );
     }
 
     /// A dot in the filename is not an extension. `Path::extension()` says

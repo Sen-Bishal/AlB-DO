@@ -55,6 +55,21 @@ pub struct Component {
     /// Defaults to `false` so existing manifests deserialize unchanged.
     #[serde(default)]
     pub reads_principal: bool,
+    /// **The pure-Rust evaluator cannot execute this component.** True when the
+    /// component's file imports a specifier the evaluator cannot resolve —
+    /// anything not relative, which in practice means npm. Derived from the AST
+    /// by `parser::imports_unresolvable_specifier`, not declared.
+    ///
+    /// Like [`Self::reads_principal`] this is a tier *impossibility* rather than
+    /// a preference: Tier-A markup is baked by `runtime::eval` walking the AST,
+    /// and that walk has no `node_modules`. A component baked that way does not
+    /// degrade — the render raises, and the error takes the whole Tier-A subtree
+    /// it was nested in with it. QuickJS has npm and renders it correctly, so
+    /// the component is served from a tier that reaches QuickJS.
+    ///
+    /// Defaults to `false` so existing manifests deserialize unchanged.
+    #[serde(default)]
+    pub imports_npm: bool,
     pub is_lcp_candidate: bool,
     pub effect_profile: EffectProfile,
     pub source_hash: u64,
@@ -82,6 +97,7 @@ impl Component {
             is_client_interactive: false,
             state_escapes: false,
             reads_principal: false,
+            imports_npm: false,
             is_lcp_candidate: false,
             effect_profile: EffectProfile::default(),
             source_hash: 0,

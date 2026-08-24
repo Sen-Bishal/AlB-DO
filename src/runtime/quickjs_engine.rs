@@ -1078,6 +1078,91 @@ if (typeof globalThis.h !== 'function') {
   function AlbedoHtml(str) { this.v = str; }
   AlbedoHtml.prototype.toString = function() { return this.v; };
 
+  // **Every** element is *readable*; only a host tag is *cloneable*.
+  //
+  // The distinction is not tidiness, it is a crash. Radix's `getElementRef`
+  // opens with `Object.getOwnPropertyDescriptor(element.props, 'ref')`, which
+  // throws `Cannot convert undefined or null to object` on an element with no
+  // `props` — so a Fragment-rooted child inside `asChild` died with a
+  // third-party TypeError before `cloneElement` was ever reached. A shared
+  // frozen default on the prototype makes the read safe without allocating a
+  // props object for every escaped text node. Nothing mutates an element's
+  // props (`mergeProps` and `__albedo_clone_element` both copy), so one
+  // instance is safe to share.
+  AlbedoHtml.prototype.props = Object.freeze({});
+
+  // `cloneElement` support — the reason an `AlbedoHtml` carries more than its
+  // string.
+  //
+  // ## The problem this solves
+  //
+  // This renderer is **eager**: `h` returns finished HTML, so by the time
+  // anything holds an "element" its props are already baked into the bytes and
+  // `cloneElement(el, moreProps)` has nothing to merge onto. Radix's `Slot` —
+  // which is what every `asChild` in shadcn/UI is built from — does exactly
+  // that, and it also *reads* `element.props` to merge the child's own props
+  // with the slot's (`getElementRef` even calls
+  // `Object.getOwnPropertyDescriptor(element.props, 'ref')`, which throws
+  // outright on an element with no `props`).
+  //
+  // 🔑 **The fix is to retain the call's arguments, not to make `h` lazy.**
+  // Evaluation order does not change: an element keeps its `type` and a
+  // React-shaped `props`, and cloning **re-renders that one tag** with merged
+  // props over the children it already rendered. Laziness is the other, larger
+  // change (it is also what SSR context propagation needs) and is deliberately
+  // not started here.
+  //
+  // ⚠️ Only **host tags** get these fields, and that is not a shortcut — it is
+  // what makes cloning safe. `h(Component, props)` invokes the component
+  // immediately and returns *its output*, so a "component element" here is
+  // already the host element at the root of that output. Cloning therefore
+  // never re-invokes a component, and so never re-runs its hooks — which would
+  // otherwise advance the `useId`/`useState` counters and break the
+  // server/client id agreement that Radix's aria wiring depends on.
+  //
+  // A Fragment, an empty render, a portal or a text node gets no `type`, and
+  // `__albedo_clone_element` passes those through unchanged: there is no single
+  // tag to merge props onto. Named in `cloneElement` rather than discovered.
+  const __albedo_element = function(html, type, props, flatChildren) {
+    const element = new AlbedoHtml(html);
+    element.type = type;
+    element.props = __albedo_react_props(props, flatChildren);
+    return element;
+  };
+
+  // React's own prop shape, which is *not* the shape this renderer's `h` uses
+  // for a host tag: React's `createElement` folds children into `props`, and
+  // packages read them from there. `Slot` does — `newChildren.push(
+  // slottableElement?.props?.children)` — so an element whose `props` lacked
+  // `children` would slot an `undefined` into the markup.
+  //
+  // The retained children are the **already-rendered** `AlbedoHtml` values, not
+  // the raw arguments. Re-rendering raw strings would escape them a second time
+  // (`&amp;` → `&amp;amp;`), which is the failure this codebase has already had
+  // once; an `AlbedoHtml` passes through `__albedo_push_children` verbatim.
+  function __albedo_react_props(props, flatChildren) {
+    const shaped = {};
+    if (props) {
+      for (const key in props) {
+        if (Object.prototype.hasOwnProperty.call(props, key)) {
+          shaped[key] = props[key];
+        }
+      }
+    }
+    // Authoritative, not additive: an inbound `children` prop (the automatic
+    // JSX runtime can carry one) is the RAW value, and re-rendering a raw
+    // string escapes it twice. The rendered children are the only ones a clone
+    // may re-emit, so they replace it — or delete it when there are none.
+    if (flatChildren.length === 1) {
+      shaped.children = flatChildren[0];
+    } else if (flatChildren.length > 1) {
+      shaped.children = flatChildren;
+    } else {
+      delete shaped.children;
+    }
+    return shaped;
+  }
+
   const __albedo_push_children = function(value, out) {
     if (Array.isArray(value)) {
       for (const item of value) {
@@ -1349,7 +1434,10 @@ if (typeof globalThis.h !== 'function') {
         continue;
       }
       const value = safeProps[key];
-      if (value === false || value === null || typeof value === 'undefined') {
+      // `false` is NOT skipped here any more — an enumerated attribute's `false`
+      // is a value it has to carry (`aria-hidden="false"`), and the attribute
+      // name is what decides, so the decision moved below the rename.
+      if (value === null || typeof value === 'undefined') {
         continue;
       }
       // Event handlers (`onClick={fn}`) and any other function-valued prop are
@@ -1365,8 +1453,19 @@ if (typeof globalThis.h !== 'function') {
       // byte-for-byte (see the void-element spelling below), and two hand-kept
       // lists of the same rule is how they stop agreeing.
       const attrName = globalThis.__albedo_attr_name(key);
-      if (value === true) {
-        attrs += ' ' + attrName;
+      // 🔑 Two spellings, and the attribute picks. A real boolean attribute is
+      // present-or-absent (`disabled`); an enumerated one carries the literal
+      // word (`aria-expanded="true"`), including for `false`, because a bare
+      // `aria-expanded` is the empty string and assistive technology reads that
+      // as *not expanded*. Radix routes every compound component's a11y through
+      // boolean aria props, so this branch is what makes `asChild` + `useId`
+      // amount to anything. Same table as the pure-Rust renderer.
+      if (typeof value === 'boolean') {
+        if (globalThis.__albedo_attr_bool_enumerated(attrName)) {
+          attrs += ' ' + attrName + '="' + (value ? 'true' : 'false') + '"';
+        } else if (value === true) {
+          attrs += ' ' + attrName;
+        }
         continue;
       }
       // `style` is an object in JSX and CSS text in HTML. Without this it fell
@@ -1430,9 +1529,12 @@ if (typeof globalThis.h !== 'function') {
     // it) is the pure-Rust renderer's, so the two agree byte-for-byte rather
     // than merely parsing to the same tree.
     if (inner === '' && __albedo_is_void_tag(String(type))) {
-      return new AlbedoHtml('<' + String(type) + attrs + ' />');
+      return __albedo_element(
+        '<' + String(type) + attrs + ' />', type, safeProps, flatChildren);
     }
-    return new AlbedoHtml('<' + String(type) + attrs + '>' + inner + '</' + String(type) + '>');
+    return __albedo_element(
+      '<' + String(type) + attrs + '>' + inner + '</' + String(type) + '>',
+      type, safeProps, flatChildren);
   };
 
   h.Fragment = function Fragment(fragmentProps) {
@@ -1441,7 +1543,14 @@ if (typeof globalThis.h !== 'function') {
     }
     const out = [];
     __albedo_push_children(fragmentProps.children, out);
-    return new AlbedoHtml(out.join(''));
+    // Readable but not cloneable: real `props`, deliberately no `type`. A
+    // Fragment has no single tag for merged props to land on — and dropping
+    // them is what React observably does here too (it warns in development and
+    // renders none of them), so `__albedo_clone_element` passing the element
+    // through is parity, not a shortcut.
+    const element = new AlbedoHtml(out.join(''));
+    element.props = __albedo_react_props(fragmentProps, out);
+    return element;
   };
 
   // Island-boundary primitive (server render context). A Tier-C island reached
@@ -1543,6 +1652,70 @@ if (typeof globalThis.h !== 'function') {
   // the two runtimes to one named function.
   globalThis.__albedo_is_element = function(value) {
     return value instanceof AlbedoHtml;
+  };
+
+  // `cloneElement` — `TODO.md` 9.2, and the third export whose implementation
+  // cannot be shared (after `isValidElement` and `createPortal`).
+  //
+  // Cloning is a **re-render of one host tag** with merged props over the
+  // children it already produced. See `__albedo_element` for why the element
+  // carries what it carries, and why this never re-invokes a component.
+  //
+  // ## Prop precedence is React's, including the parts that look odd
+  //
+  //   * the config wins over the element's own props, key by key;
+  //   * an explicit `undefined` in the config **is** copied (React only falls
+  //     back to `defaultProps`, which a function component does not have) —
+  //     harmless here because `h` skips `undefined`-valued props anyway;
+  //   * variadic children win over `config.children`, which wins over the
+  //     element's own. `cloneElement(el, undefined, kids)` — Radix's `Slot`
+  //     uses precisely that shape — therefore keeps every original prop and
+  //     replaces only the children.
+  //
+  // ## 🔴 The limit, stated here rather than found later
+  //
+  // A `Slottable` composition (`Slot`'s other two call sites) cannot work on
+  // this renderer at all, and not because of cloning: `isSlottable` tests
+  // `typeof child.type === 'function'`, and eagerness means a component's
+  // element is already its *output* — a host tag. So `isSlottable` is
+  // permanently false server-side and the `Slottable` branch is unreachable.
+  // The `asChild` path (this function's real consumer) does not go through it.
+  globalThis.__albedo_clone_element = function(element, config) {
+    const extraChildren = [];
+    for (let i = 2; i < arguments.length; i++) {
+      extraChildren.push(arguments[i]);
+    }
+
+    // Nothing to clone onto: not this renderer's element, or one with no host
+    // tag of its own (Fragment / empty render / portal / text).
+    if (!(element instanceof AlbedoHtml) || typeof element.type !== 'string') {
+      return element;
+    }
+
+    const merged = {};
+    const base = element.props || {};
+    for (const key in base) {
+      if (Object.prototype.hasOwnProperty.call(base, key)) {
+        merged[key] = base[key];
+      }
+    }
+    if (config) {
+      for (const key in config) {
+        if (Object.prototype.hasOwnProperty.call(config, key)) {
+          merged[key] = config[key];
+        }
+      }
+    }
+
+    let children = merged.children;
+    if (extraChildren.length === 1) {
+      children = extraChildren[0];
+    } else if (extraChildren.length > 1) {
+      children = extraChildren;
+    }
+    delete merged.children;
+
+    return h(element.type, merged, children);
   };
 }
 
@@ -3412,7 +3585,7 @@ fn rewrite_framework_runtime_import(
     const FRAMEWORK_NAMESPACE_OBJECT: &str = "{ useState: globalThis.useState, \
 useSharedSlot: globalThis.useSharedSlot, useEffect: globalThis.useEffect, \
 useLayoutEffect: globalThis.useLayoutEffect, useRef: globalThis.useRef, \
-useId: globalThis.useId, Children: globalThis.__albedo_Children, \
+useId: globalThis.useId, Children: globalThis.__albedo_Children, cloneElement: globalThis.__albedo_clone_element, isValidElement: globalThis.__albedo_is_element, \
 useMemo: globalThis.useMemo, useCallback: globalThis.useCallback, \
 useContext: globalThis.useContext, createContext: globalThis.createContext, \
 action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";

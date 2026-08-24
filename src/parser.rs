@@ -809,6 +809,69 @@ pub const PRINCIPAL_IDENT: &str = "user";
 /// and correct. A false negative is the defect this function exists to fix: the
 /// component is baked with no principal and its signed-in branch can never
 /// render. The cheap error is the one to make.
+/// **The pure-Rust evaluator cannot execute this component**, because it imports
+/// at least one module the evaluator cannot resolve.
+///
+/// Sits alongside `scan_reads_principal` because it is the same *kind* of fact:
+/// not a tier preference but a tier **impossibility**. Tier-A markup is produced
+/// by `runtime::eval` walking the AST, and that walk resolves only relative
+/// specifiers (see [`evaluator_can_resolve_specifier`]) — npm lives in
+/// `node_modules`, which `ProjectScanner` deliberately never ingests. A
+/// component whose JSX names an import from `"@radix-ui/react-slot"` therefore
+/// does not render *slightly wrong*: `render_component_ref` raises, and the
+/// error propagates to the top of the static render, taking every Tier-A
+/// ancestor's markup with it.
+///
+/// # `react` is exempt, and the exemption is load-bearing
+///
+/// `import React from "react"` is the classic-JSX pragma and appears at the top
+/// of a very large fraction of all `.jsx` ever written. The evaluator compiles
+/// JSX itself, so that binding is never referenced in value position and the
+/// import costs nothing — `render_component_ref` already carves `"react"` out
+/// for exactly this reason. Without the same carve-out here the rule is not a
+/// narrow npm guard, it **empties Tier A**: the `tests/fixtures/components`
+/// tree, which is ordinary classic JSX and nothing else, moved wholesale to
+/// Tier B and blew the default per-route Tier-B budget. That is how this
+/// exemption was found.
+///
+/// 🪤 **Residual, unchanged by this rule and stated so it is not mistaken for a
+/// regression.** A *value-position* React API in an otherwise-pure component —
+/// `React.createContext(…)`, `React.Children.map(…)` — still cannot resolve in
+/// the evaluator, and still renders as nothing rather than raising. That hole
+/// predates this function and behaves exactly as it did before; hooks are the
+/// only React import that already leaves Tier A, and they do it through
+/// `effects.hooks`.
+///
+/// # It is an over-approximation in the other direction, deliberately
+///
+/// `import_sources` is collected per *file*, not per component, and it does not
+/// record whether a binding is used in component position, in an expression, or
+/// at all. So a Tier-A component sharing a file with an npm import is pushed off
+/// Tier A even if its own JSX never touches it. That is the right direction to
+/// be wrong in: a component that did not need QuickJS renders identically
+/// through it, while the other error is a page that silently loses its markup.
+///
+/// Type-only imports are already excluded upstream by `visit_import_decl`, so
+/// `import type { Props } from "@radix-ui/react-slot"` does not trip this.
+#[must_use]
+pub fn imports_unresolvable_specifier(import_sources: &[String]) -> bool {
+    import_sources.iter().any(|source| {
+        !crate::runtime::eval::core::evaluator_can_resolve_specifier(source)
+            && !is_react_specifier(source)
+    })
+}
+
+/// `"react"` and its subpaths — the one bare specifier family the evaluator
+/// already treats as a no-op rather than a load.
+///
+/// Kept next to its only caller rather than inlined so the exemption is one
+/// named thing that can be found by grep, and so `react-dom`, `react-router` and
+/// friends are visibly **not** covered: the prefix test requires the next
+/// character to be `/`, or `react-dom` would slip through on `starts_with`.
+fn is_react_specifier(source: &str) -> bool {
+    source == "react" || source.starts_with("react/")
+}
+
 fn scan_reads_principal(stmts: &[Stmt], params: &[Pat]) -> bool {
     // A `user` destructured from props is a *parameter* binding, so it must not
     // be collected as a shadow — it is precisely the case we are looking for.

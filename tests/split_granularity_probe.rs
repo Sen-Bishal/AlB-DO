@@ -437,6 +437,7 @@ fn measure(corpus: &Corpus) -> Vec<Row> {
             component.is_client_interactive,
             component.state_escapes,
             component.reads_principal,
+            component.imports_npm,
             component.is_above_fold,
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             {

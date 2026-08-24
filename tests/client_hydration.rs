@@ -1207,3 +1207,289 @@ fn a_component_that_renders_null_mounts_hydrates_and_toggles() {
         "the sibling must be patched in place across every toggle, not recreated"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `cloneElement` — `TODO.md` 9.2, the browser half
+// ---------------------------------------------------------------------------
+//
+// Driven through a `Slot` shaped like Radix's, because `Slot` is what `asChild`
+// is and because it exercises the two things that must hold together: an
+// element has to be READABLE (`element.props`, including `children` — the half
+// this used to get wrong for host tags) before merged props can be CLONED back
+// onto it.
+//
+// `__albedo_Children` is deliberately not used here: it lives in the Rust-side
+// host prelude that reaches the browser as `/_albedo/npm-runtime.js`, not in
+// this file's runtime, and a test that stubbed it would be testing the stub.
+const SLOT_CLONE_SCENARIO: &str = r#"
+function mergeProps(slotProps, childProps) {
+  var overrideProps = Object.assign({}, childProps);
+  // `const` per iteration, as Radix has it — a function-scoped `var` here
+  // makes every composed handler close over the LAST prop's value.
+  for (const propName in childProps) {
+    const slotPropValue = slotProps[propName];
+    const childPropValue = childProps[propName];
+    if (/^on[A-Z]/.test(propName)) {
+      if (slotPropValue && childPropValue) {
+        overrideProps[propName] = function () {
+          childPropValue.apply(null, arguments);
+          slotPropValue.apply(null, arguments);
+        };
+      } else if (slotPropValue) {
+        overrideProps[propName] = slotPropValue;
+      }
+    } else if (propName === 'className') {
+      overrideProps[propName] = [slotPropValue, childPropValue].filter(Boolean).join(' ');
+    }
+  }
+  return Object.assign({}, slotProps, overrideProps);
+}
+
+globalThis.__order = [];
+globalThis.__reads = {};
+
+function Slot(props) {
+  var slotProps = {};
+  for (var key in props) {
+    if (key !== 'children') { slotProps[key] = props[key]; }
+  }
+  var child = props.children;
+
+  // Exactly Radix's `getElementRef` opening move — a TypeError on an element
+  // whose `props` is null, which is what a host-tag vnode used to have.
+  var descriptor = Object.getOwnPropertyDescriptor(child.props, 'ref');
+  globalThis.__reads.isElement = __albedo_is_element(child);
+  globalThis.__reads.readDescriptor = descriptor === undefined;
+  globalThis.__reads.childrenReadable = child.props.children !== undefined;
+
+  return __albedo_clone_element(child, mergeProps(slotProps, child.props));
+}
+
+function Trigger() {
+  return h(
+    Slot,
+    {
+      className: 'slot',
+      'data-state': 'open',
+      'aria-expanded': true,
+      onClick: function () { globalThis.__order.push('slot'); }
+    },
+    h(
+      'button',
+      {
+        className: 'mine',
+        type: 'button',
+        onClick: function () { globalThis.__order.push('child'); }
+      },
+      'Open'
+    )
+  );
+}
+
+// Server markup: the author's own bare `<button>`. Hydration must ADOPT it and
+// patch the merged props on.
+var container = document.createElement('div');
+var button = document.createElement('button');
+button.appendChild(document.createTextNode('Open'));
+container.appendChild(button);
+
+__albedoClient.hydrate(h(Trigger, {}), container);
+
+button.__dispatch('click');
+
+JSON.stringify({
+  reads: globalThis.__reads,
+  adopted: container.firstChild === button,
+  tag: container.firstChild.tagName,
+  className: button.getAttribute('class'),
+  state: button.getAttribute('data-state'),
+  expanded: button.getAttribute('aria-expanded'),
+  type: button.getAttribute('type'),
+  refAttr: button.getAttribute('ref'),
+  text: button.firstChild.nodeValue,
+  order: globalThis.__order,
+  network: globalThis.__net,
+});
+"#;
+
+#[test]
+fn slot_clones_merged_props_onto_the_child_and_composes_its_handlers() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        match ctx.eval::<String, _>(SLOT_CLONE_SCENARIO) {
+            Ok(v) => v,
+            Err(_) => {
+                let e = ctx.catch();
+                panic!("scenario threw: {e:?}");
+            }
+        }
+    });
+
+    let value: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+
+    // The reads that used to throw or come back empty.
+    assert_eq!(
+        value["reads"]["isElement"], true,
+        "a host-tag vnode must be a valid element"
+    );
+    assert_eq!(
+        value["reads"]["readDescriptor"], true,
+        "reading a property descriptor off element.props must not throw"
+    );
+    assert_eq!(
+        value["reads"]["childrenReadable"], true,
+        "a host tag's children must be reachable at props.children, as React puts them"
+    );
+
+    // The clone.
+    assert_eq!(value["adopted"], true, "hydration must adopt the server's button");
+    assert_eq!(value["tag"], "BUTTON", "the clone renders the child's tag");
+    assert_eq!(
+        value["className"], "slot mine",
+        "className is composed, slot then child"
+    );
+    assert_eq!(value["state"], "open", "a slot-only prop reaches the DOM");
+    // ⚠️ This line used to assert `""` — "a boolean prop lands as a bare
+    // attribute" — which was the defect written down as the expectation. `aria-*`
+    // are enumerated attributes: the empty string is neither `true` nor `false`,
+    // and assistive technology reads it as *not expanded*. See
+    // `hydration_keeps_the_servers_spelling_of_boolean_attributes` below.
+    assert_eq!(
+        value["expanded"], "true",
+        "a boolean `aria-*` prop lands as the literal word"
+    );
+    assert_eq!(value["type"], "button", "the child keeps its own props");
+    assert_eq!(value["refAttr"], serde_json::Value::Null, "a ref is never an attribute");
+    assert_eq!(value["text"], "Open", "and its children");
+
+    // Handler composition is the reason `asChild` is worth having at all.
+    assert_eq!(
+        value["order"],
+        serde_json::json!(["child", "slot"]),
+        "both handlers must run, child's first"
+    );
+    assert_eq!(value["network"], 0, "none of this touches the network");
+}
+
+// ---------------------------------------------------------------------------
+// Boolean props: the client must spell them exactly as the server did
+// ---------------------------------------------------------------------------
+
+// HTML has two unrelated kinds of attribute that both take `true` in JSX, and
+// `applyProp` used to treat them as one: bare for `true`, `removeAttribute` for
+// `false`. That is right for `disabled`/`hidden`, whose *presence* is the signal,
+// and wrong for `aria-*`, which are enumerated attributes whose value space is
+// the two literal strings `"true"` and `"false"`.
+//
+// 🔑 **The client half of this defect is the invisible one.** Hydration ADOPTS
+// the server's node, so a client that disagrees does not fail — it quietly
+// rewrites the attribute the instant it applies props. With the old rule, a
+// server-correct `aria-disabled="false"` was *deleted* on hydrate and a
+// server-correct `aria-expanded="true"` was replaced by the empty string. The
+// page was accessible until JavaScript loaded.
+//
+// The server markup below is what the two server renderers now emit for these
+// exact props (`tests/fixtures/render_quickjs/boolean_attributes` gates that they
+// agree with each other byte-for-byte), so this asserts the third copy against
+// them rather than against itself.
+const BOOLEAN_ATTR_SCENARIO: &str = r#"
+function Disclosure(props) {
+  var s = useState(true);
+  var open = s[0], set = s[1];
+  return h('button', {
+    type: 'button',
+    'aria-expanded': open,
+    'aria-disabled': false,
+    contentEditable: false,
+    disabled: false,
+    hidden: !open,
+    onClick: function () { set(!open); },
+  }, open ? 'shown' : 'gone');
+}
+
+var container = document.createElement('div');
+var button = document.createElement('button');
+// Exactly the server's output for those props: the enumerated ones carry the
+// word (including `false`), the real booleans are absent because they are false.
+// `contentEditable` keeps its authored case here only because the shim's
+// attribute map is case-sensitive; a real DOM lowercases it on an HTML element,
+// which is why one lowercase entry in the table covers both spellings.
+button.setAttribute('type', 'button');
+button.setAttribute('aria-expanded', 'true');
+button.setAttribute('aria-disabled', 'false');
+button.setAttribute('contentEditable', 'false');
+button.appendChild(document.createTextNode('shown'));
+container.appendChild(button);
+globalThis.__serverButton = button;
+
+__albedoClient.hydrate(h(Disclosure, {}), container);
+
+var afterHydrate = JSON.parse(JSON.stringify(button.attributes));
+var adopted = container.firstChild === globalThis.__serverButton;
+
+button.__dispatch('click');
+
+JSON.stringify({
+  adopted: adopted,
+  afterHydrate: afterHydrate,
+  afterToggle: JSON.parse(JSON.stringify(button.attributes)),
+  text: button.firstChild.nodeValue,
+  network: globalThis.__net,
+});
+"#;
+
+#[test]
+fn hydration_keeps_the_servers_spelling_of_boolean_attributes() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(BOOLEAN_ATTR_SCENARIO)
+            .expect("boolean attribute scenario should evaluate")
+    });
+
+    let value: serde_json::Value =
+        serde_json::from_str(&summary).expect("scenario summary should be JSON");
+
+    assert_eq!(value["adopted"], true, "the server <button> must be adopted");
+
+    // Nothing was rewritten and nothing was dropped: the client's spelling for
+    // these props IS the server's.
+    assert_eq!(
+        value["afterHydrate"],
+        serde_json::json!({
+            "type": "button",
+            "aria-expanded": "true",
+            "aria-disabled": "false",
+            "contentEditable": "false",
+        }),
+        "hydration must leave the server's boolean attributes exactly as found — \
+         an `aria-*` attribute rewritten to the empty string, or removed for \
+         being `false`, is inert aria state that the server got right"
+    );
+
+    // The update path obeys the same rule: `aria-expanded` goes to the WORD
+    // `false` rather than being removed, while `hidden` — a real boolean
+    // attribute — appears bare.
+    assert_eq!(
+        value["afterToggle"],
+        serde_json::json!({
+            "type": "button",
+            "aria-expanded": "false",
+            "aria-disabled": "false",
+            "contentEditable": "false",
+            "hidden": "",
+        }),
+        "a collapsed disclosure must SAY it is collapsed"
+    );
+
+    assert_eq!(value["text"], "gone");
+    assert_eq!(value["network"], 0);
+}

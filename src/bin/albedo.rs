@@ -2610,6 +2610,28 @@ fn run_prod_build_with_budget(
         with_spinner("compiling production bundle…", build_work)?
     };
 
+    // A Tier-A component that would not render is decided HERE, in the build,
+    // and for `albedo build` this is the last moment anyone is looking —
+    // somebody who builds and ships the output would otherwise learn about it
+    // from the missing section on the live page.
+    //
+    // Printed even under `quiet`, which suppresses progress, not findings: a
+    // hot reload that just deleted a component's markup is exactly the reload
+    // worth interrupting for.
+    //
+    // The one lane that stays silent here is the startup build behind `serve` /
+    // `dev` — `show_tiers` off AND `quiet` off is exactly that lane, and a
+    // server is about to boot and print the identical line out of its
+    // `BootReport`. Item 6.5's rule is one event, one wording, one line; the
+    // wording itself lives on `StaticRenderFailure::report_line` so the two
+    // lanes cannot drift.
+    let boot_report_will_print_this = !show_tiers && !quiet;
+    if !boot_report_will_print_this {
+        for failure in &manifest.static_render_failures {
+            print_warn(failure.report_line());
+        }
+    }
+
     // `albedo build` shows the tier breakdown — the "instrument for light" view
     // of what the app compiled to (luminance bars per tier). Suppressed for
     // serve / dev (re)builds so a hot reload stays a single line.

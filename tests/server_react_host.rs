@@ -57,10 +57,91 @@ fn write_icon_package(root: &Path) {
     .unwrap();
 }
 
+/// Radix's `Slot`, reduced to the parts that decide whether `asChild` works —
+/// and kept in Radix's own shape rather than paraphrased, because a paraphrase
+/// would test the paraphrase.
+///
+/// Every line here is load-bearing for a reason the eager server renderer used
+/// to break:
+///   * `getElementRef` calls `Object.getOwnPropertyDescriptor(element.props, …)`
+///     — a `TypeError` if an element has no `props` at all;
+///   * `mergeProps` reads the *child's* props to compose `className` and event
+///     handlers, so an element that forgot its props silently loses both;
+///   * `cloneElement` is how the merged result gets back onto the child.
+fn write_slot_package(root: &Path) {
+    let pkg = root.join("node_modules").join("slotish");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{ "name": "slotish", "version": "1.0.0", "module": "index.js",
+             "sideEffects": false }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("index.js"),
+        r#"
+import * as React from 'react';
+
+function getElementRef(element) {
+  var descriptor = Object.getOwnPropertyDescriptor(element.props, 'ref');
+  var getter = descriptor ? descriptor.get : undefined;
+  if (getter && 'isReactWarning' in getter && getter.isReactWarning) {
+    return element.ref;
+  }
+  return element.props.ref || element.ref;
+}
+
+function mergeProps(slotProps, childProps) {
+  const overrideProps = { ...childProps };
+  for (const propName in childProps) {
+    const slotPropValue = slotProps[propName];
+    const childPropValue = childProps[propName];
+    const isHandler = /^on[A-Z]/.test(propName);
+    if (isHandler) {
+      if (slotPropValue && childPropValue) {
+        overrideProps[propName] = (...args) => {
+          childPropValue(...args);
+          slotPropValue(...args);
+        };
+      } else if (slotPropValue) {
+        overrideProps[propName] = slotPropValue;
+      }
+    } else if (propName === 'style') {
+      overrideProps[propName] = { ...slotPropValue, ...childPropValue };
+    } else if (propName === 'className') {
+      overrideProps[propName] = [slotPropValue, childPropValue].filter(Boolean).join(' ');
+    }
+  }
+  return { ...slotProps, ...overrideProps };
+}
+
+export const Slot = React.forwardRef(function (props, forwardedRef) {
+  const { children, ...slotProps } = props;
+  if (React.Children.count(children) !== 1 || !React.isValidElement(children)) {
+    throw new Error('Slot expected a single element child.');
+  }
+  const mergedProps = mergeProps(slotProps, children.props ?? {});
+  mergedProps.ref = forwardedRef || getElementRef(children);
+  return React.cloneElement(children, mergedProps);
+});
+
+// `Slot`'s other call shape: props untouched, children replaced.
+export const Relabel = function (props) {
+  return React.cloneElement(props.children, undefined, props.label);
+};
+"#,
+    )
+    .unwrap();
+}
+
 /// Bundle the package for the server, register it on a fresh engine, load the
 /// component, render it.
 fn render_through_quickjs(root: &Path, component: &str) -> String {
-    let bundle = bundle_npm_dependency(root, "icons", &server_shake_options())
+    render_package_through_quickjs(root, "icons", component)
+}
+
+fn render_package_through_quickjs(root: &Path, package: &str, component: &str) -> String {
+    let bundle = bundle_npm_dependency(root, package, &server_shake_options())
         .expect("the package bundles for the server");
 
     let mut engine = QuickJsEngine::new();
@@ -198,5 +279,155 @@ fn the_server_still_loads_a_package_that_imports_react_dom() {
     assert!(
         bundle_npm_dependency(dir.path(), "portalish", &options).is_ok(),
         "an ordinary package must still bundle for the server"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `cloneElement` — `TODO.md` 9.2
+// ---------------------------------------------------------------------------
+//
+// These start from Radix's `Slot` rather than from `cloneElement` in isolation,
+// because `Slot` is the only consumer that matters and it exercises the whole
+// chain: an element must be *readable* (`element.props`) before it can be
+// cloned, and the clone must re-render the tag it came from. A unit test of
+// `cloneElement` alone would have passed against an element that carried no
+// props, which is precisely the state that broke `asChild`.
+
+const SLOT_COMPONENT: &str = r#"
+    import { Slot } from "slotish";
+    export default function Trigger() {
+        return (
+            <Slot className="slot" data-state="open" aria-expanded={true}>
+                <button className="mine" type="button">Open</button>
+            </Slot>
+        );
+    }
+"#;
+
+/// The headline: `asChild` puts the wrapper's props onto the author's own tag,
+/// server-side, with no JavaScript.
+#[test]
+fn a_slot_merges_its_props_onto_the_child_element() {
+    let dir = tempfile::tempdir().unwrap();
+    write_slot_package(dir.path());
+
+    let html = render_package_through_quickjs(dir.path(), "slotish", SLOT_COMPONENT);
+
+    assert!(
+        html.starts_with("<button"),
+        "the slot must render the CHILD's tag, not a wrapper: {html}"
+    );
+    assert!(
+        html.contains("data-state=\"open\""),
+        "a prop that exists only on the slot must reach the child's markup: {html}"
+    );
+    assert!(
+        html.contains("aria-expanded"),
+        "the aria wiring is the whole point of asChild: {html}"
+    );
+    assert!(
+        html.contains("class=\"slot mine\""),
+        "className must be COMPOSED, slot then child, not overwritten: {html}"
+    );
+    assert!(html.contains(">Open<"), "the child's own children survive: {html}");
+    assert!(!html.contains("ref="), "a merged ref is still not an attribute: {html}");
+}
+
+/// The other call shape Radix uses — `cloneElement(el, undefined, children)`.
+/// Props must survive untouched while children are replaced.
+#[test]
+fn cloning_with_no_config_keeps_every_prop_and_replaces_children() {
+    let dir = tempfile::tempdir().unwrap();
+    write_slot_package(dir.path());
+
+    let html = render_package_through_quickjs(
+        dir.path(),
+        "slotish",
+        r#"
+            import { Relabel } from "slotish";
+            export default function Trigger() {
+                return (
+                    <Relabel label="after">
+                        <button className="keep" type="button">before</button>
+                    </Relabel>
+                );
+            }
+        "#,
+    );
+
+    assert!(html.contains("class=\"keep\""), "props survive a childless clone: {html}");
+    assert!(html.contains("type=\"button\""), "all of them: {html}");
+    assert!(html.contains(">after<"), "children are replaced: {html}");
+    assert!(!html.contains("before"), "the originals are gone: {html}");
+}
+
+/// 🪤 **The trap this codebase has already fallen into once.** The children a
+/// clone re-renders are the *already-escaped* ones. Re-running the escape would
+/// turn `&` into `&amp;amp;` — invisible in a passing build and visible on the
+/// page.
+#[test]
+fn cloning_does_not_escape_the_children_a_second_time() {
+    let dir = tempfile::tempdir().unwrap();
+    write_slot_package(dir.path());
+
+    let html = render_package_through_quickjs(
+        dir.path(),
+        "slotish",
+        r#"
+            import { Slot } from "slotish";
+            export default function Trigger() {
+                const label = "Tom & <Jerry>";
+                return (
+                    <Slot className="slot">
+                        <button type="button">{label}</button>
+                    </Slot>
+                );
+            }
+        "#,
+    );
+
+    assert!(
+        html.contains("Tom &amp; &lt;Jerry&gt;"),
+        "the text must be escaped exactly once: {html}"
+    );
+    assert!(!html.contains("&amp;amp;"), "and not twice: {html}");
+    assert!(!html.contains("<Jerry>"), "nor zero times: {html}");
+}
+
+/// The documented limit, asserted so it stays a limit rather than becoming a
+/// crash. A component whose render is a Fragment has no single host tag, so its
+/// element carries no `type` and cloning returns it unchanged — the props are
+/// dropped, loudly here and in the prelude's comment, rather than silently
+/// producing `<undefined>`.
+#[test]
+fn cloning_a_fragment_rooted_element_passes_it_through_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    write_slot_package(dir.path());
+
+    let html = render_package_through_quickjs(
+        dir.path(),
+        "slotish",
+        r#"
+            import { Slot } from "slotish";
+            function Pair() {
+                return <><span>one</span><span>two</span></>;
+            }
+            export default function Trigger() {
+                return <Slot className="slot"><Pair /></Slot>;
+            }
+        "#,
+    );
+
+    // (`data-albedo-id` stamps mean the tags are matched on their text, not
+    // spelled out.)
+    assert!(html.contains(">one</span>"), "the element still renders: {html}");
+    assert!(html.contains(">two</span>"), "both halves: {html}");
+    assert!(
+        !html.contains("class=\"slot\""),
+        "and the slot's props are DROPPED, which is what React does here too: {html}"
+    );
+    assert!(
+        !html.contains("undefined"),
+        "an unclonable element must not become a bogus tag: {html}"
     );
 }

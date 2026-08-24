@@ -56,6 +56,7 @@ pub fn build_render_manifest_v2(
                 component.is_client_interactive,
                 component.state_escapes,
                 component.reads_principal,
+                component.imports_npm,
                 component.is_above_fold,
                 weight_bytes,
                 tiering_inputs_from_options(options),
@@ -139,6 +140,10 @@ pub fn build_render_manifest_v2(
         critical_path,
         vendor_chunks: Vec::new(),
         wt_streams,
+        // Drained last, after every route has been built — a component can be
+        // reached from more than one route, and the refusal is recorded on the
+        // attempt, so the list is only complete once the walk is.
+        static_render_failures: manifest_builder.take_static_render_failures(),
     }
 }
 

@@ -68,6 +68,13 @@ pub enum TieringReason {
     /// to boot time (a Tier-C island's props). Tier B is the only tier that has
     /// a request to read.
     RequestScoped,
+    /// The component imports npm, and **Tier A has no npm**. Tier-A markup is
+    /// baked by the pure-Rust evaluator walking the AST; that walk resolves only
+    /// relative specifiers, so a bare import raises and takes the whole Tier-A
+    /// subtree's markup with it. QuickJS has the npm graph and renders the same
+    /// component correctly, so the component is served from a tier that reaches
+    /// QuickJS. It ships no client JS for this reason alone.
+    NpmDependency,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,12 +117,20 @@ pub struct TieringInputs {
 ///   for a principal to come from, and a component baked that way renders its anonymous branch
 ///   forever. Like `state_escapes` this is a proof rather than a guess — the distinction
 ///   `TODO.md` P-c asks this signature to stop losing.
+/// - `imports_npm` — **the renderer that bakes Tier A cannot execute this component.** True when the
+///   component's file imports a specifier `runtime::eval` cannot resolve, read off the AST by
+///   `parser::imports_unresolvable_specifier`. The second tier *impossibility*, and the harsher of
+///   the two: `reads_principal` baked at Tier A renders the wrong branch, whereas this raises —
+///   `render_component_ref` returns `Err`, the error propagates to the top of the static render,
+///   and every ancestor's markup goes with it. QuickJS carries the npm graph and renders the same
+///   component correctly, which is what the tier below is for.
 pub fn decide_tier_and_hydration(
     effects: EffectProfile,
     has_event_handler: bool,
     client_interactive: bool,
     state_escapes: bool,
     reads_principal: bool,
+    imports_npm: bool,
     is_above_fold: bool,
     weight_bytes: u64,
     inputs: TieringInputs,
@@ -233,11 +248,44 @@ pub fn decide_tier_and_hydration(
     // signed-in branch is absent from the artifact rather than merely unreached.
     // Falling through leaves it Tier B, where `RequestContext::resolve("user")`
     // runs per request.
-    if weight_bytes <= inputs.tier_a_inline_max_bytes && !has_event_handler && !reads_principal {
+    if weight_bytes <= inputs.tier_a_inline_max_bytes
+        && !has_event_handler
+        && !reads_principal
+        && !imports_npm
+    {
         return TieringDecision {
             tier: Tier::A,
             hydration_mode: HydrationMode::None,
             reason: TieringReason::PureStaticEligible,
+        };
+    }
+
+    // 🔑 Checked here, ahead of every remaining rule, and it lands on **Tier B
+    // with no hydration** — not Tier C.
+    //
+    // The instinct is Tier C, because Tier C is where npm demonstrably works: an
+    // island renders through QuickJS at boot and a `useState` was all it took to
+    // make a broken Radix `Slot` render correctly. But Tier C is also the tier
+    // that *ships the component to the browser*, and this component asked for
+    // none of that — it has no hooks, no effects and no handlers. Promoting it
+    // would buy a correct render by shipping JS for a page that needs zero, and
+    // "how much JS did we not ship" is the whole product.
+    //
+    // Tier B reaches the same QuickJS renderer from the server, which is the
+    // only thing actually missing at Tier A. `HydrationMode::None` for the
+    // no-handler case follows the async-server-component rule right above:
+    // hydrating a component with nothing to drive re-invokes it in the browser
+    // and clobbers the server markup. A handler, if present, still needs its
+    // wiring — so that case keeps the normal Tier-B mode.
+    if imports_npm {
+        return TieringDecision {
+            tier: Tier::B,
+            hydration_mode: if has_event_handler {
+                inputs.tier_b_mode
+            } else {
+                HydrationMode::None
+            },
+            reason: TieringReason::NpmDependency,
         };
     }
 
@@ -291,7 +339,17 @@ mod tests {
     #[test]
     fn test_pure_small_component_is_tier_a() {
         let decision =
-            decide_tier_and_hydration(EffectProfile::pure(), false, false, false, false, false, 1024, inputs());
+            decide_tier_and_hydration(
+            EffectProfile::pure(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            1024,
+            inputs(),
+        );
         assert_eq!(decision.tier, Tier::A);
         assert_eq!(decision.hydration_mode, HydrationMode::None);
         assert_eq!(decision.reason, TieringReason::PureStaticEligible);
@@ -302,7 +360,17 @@ mod tests {
         // A pure component that nonetheless declares an `on*` handler must
         // hydrate to run the handler — it can never collapse to static Tier-A.
         let decision =
-            decide_tier_and_hydration(EffectProfile::pure(), true, false, false, false, false, 1024, inputs());
+            decide_tier_and_hydration(
+            EffectProfile::pure(),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            1024,
+            inputs(),
+        );
         assert_ne!(decision.tier, Tier::A);
     }
 
@@ -313,6 +381,7 @@ mod tests {
                 hooks: true,
                 ..EffectProfile::default()
             },
+            false,
             false,
             false,
             false,
@@ -335,6 +404,7 @@ mod tests {
             c.is_client_interactive,
             c.state_escapes,
             c.reads_principal,
+            crate::parser::imports_unresolvable_specifier(&c.import_sources),
             false,
             1024,
             inputs(),
@@ -400,6 +470,7 @@ mod tests {
             c.is_client_interactive,
             c.state_escapes,
             c.reads_principal,
+            crate::parser::imports_unresolvable_specifier(&c.import_sources),
             false,
             // Well past `tier_c_split_min_bytes`.
             256 * 1024,
@@ -514,6 +585,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             1024,
             inputs(),
         );
@@ -537,6 +609,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             1024,
             inputs(),
         );
@@ -550,6 +623,7 @@ mod tests {
                 side_effects: true,
                 ..EffectProfile::default()
             },
+            false,
             false,
             false,
             false,

@@ -4780,7 +4780,7 @@ impl ComponentProject {
     }
 
     fn resolve_import(&self, current_module: &str, source: &str) -> Option<String> {
-        if !source.starts_with('.') {
+        if !evaluator_can_resolve_specifier(source) {
             return None;
         }
 
@@ -4804,6 +4804,31 @@ impl ComponentProject {
         }
         None
     }
+}
+
+/// Whether the pure-Rust evaluator can resolve a module specifier at all.
+///
+/// **Only relative specifiers.** `ProjectScanner` never ingests a `node_modules`
+/// tree (`path_is_in_node_modules` keeps it out — npm belongs to
+/// `bundler::npm`), so a bare specifier names a module that is not in
+/// `self.modules` and never will be. It is not a lookup that happens to miss; it
+/// is a lookup that cannot hit.
+///
+/// 🔑 **This is the one place that rule is written down.** It is consulted twice
+/// and they must not drift: [`ComponentProject::resolve_import`] uses it to
+/// decide what it can load, and `parser::imports_unresolvable_specifier` uses it
+/// to decide that a component importing such a specifier can never be Tier A.
+/// If the evaluator ever learns to resolve bare specifiers, this function is
+/// what changes, and the tier decision follows for free.
+///
+/// `react` is deliberately **not** carved out here. `render_component_ref` does
+/// special-case a component imported from `"react"` (it renders as the empty
+/// string), but that is a component-position exemption, not a resolution — the
+/// module still cannot be loaded, and `import { createContext } from "react"`
+/// used in value position still has nowhere to resolve.
+#[must_use]
+pub fn evaluator_can_resolve_specifier(source: &str) -> bool {
+    source.starts_with('.')
 }
 
 /// Human-readable label for a statement the pure-Rust evaluator does not model,

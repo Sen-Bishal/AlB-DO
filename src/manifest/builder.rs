@@ -6,7 +6,7 @@ use super::metadata::{
 };
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, PartitionKeySource,
-    PartitionTopicSpec, RouteAuth, SourceTopicSpec,
+    PartitionTopicSpec, RouteAuth, SourceTopicSpec, StaticRenderFailure,
     RenderedNode, RouteActionEntry, RouteManifest, RouteMetadata, Tier, TierBNode, TierCNode,
     WTStreamSlot,
 };
@@ -29,6 +29,7 @@ use crate::runtime::webtransport::{
 };
 use crate::types::{Component, ComponentId};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,6 +99,14 @@ pub struct ManifestBuilder<'a> {
     /// placeholder. Empty unless the `forge` feature is on and a `forge.db`
     /// exists at the project root.
     forge_topic_seeds: Vec<(String, Vec<u8>)>,
+    /// Tier-A renders that failed, in the order they were attempted.
+    ///
+    /// `RefCell` because every render path on this builder takes `&self` and a
+    /// refusal is *output*, not a rendering decision — the alternative is
+    /// threading a `&mut Vec` through `traverse`, `render_static`,
+    /// `collect_tier_a_children` and `render_layout_html` purely to carry it.
+    /// The builder is never shared across threads.
+    static_render_failures: RefCell<Vec<StaticRenderFailure>>,
 }
 
 impl<'a> ManifestBuilder<'a> {
@@ -129,7 +138,33 @@ impl<'a> ManifestBuilder<'a> {
             compiled_render_project,
             discovered_routes,
             forge_topic_seeds,
+            static_render_failures: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Every Tier-A component this build could not render, each of which is
+    /// absent from the pages that name it.
+    ///
+    /// Drained rather than borrowed, matching
+    /// `RendererRuntime::take_island_ssr_failures`: the caller carries these out
+    /// to the manifest and on to the `BootReport`, and a second read returning
+    /// the same list would print them twice on a dev reload.
+    pub fn take_static_render_failures(&self) -> Vec<StaticRenderFailure> {
+        let drained = std::mem::take(&mut *self.static_render_failures.borrow_mut());
+        // Deduplicated on the way out. A shared component is re-rendered once
+        // per route that names it, so a single broken import would otherwise be
+        // reported as many times as it is used — which reads as many problems.
+        let mut seen = BTreeSet::new();
+        drained
+            .into_iter()
+            .filter(|failure| {
+                seen.insert((
+                    failure.component.clone(),
+                    failure.module_path.clone(),
+                    failure.error.clone(),
+                ))
+            })
+            .collect()
     }
 
     pub fn build_route_manifest(
@@ -981,7 +1016,17 @@ impl<'a> ManifestBuilder<'a> {
     /// rendering fails — caller's job to decide what to do with that.
     fn render_layout_html(&self, layout_name: &str) -> Option<String> {
         let component = self.components.values().find(|c| c.name == layout_name)?;
-        self.render_static_component_html(component)
+        match self.render_static_component_html(component) {
+            Ok(html) => Some(html),
+            // A layout that will not render takes every route beneath it with
+            // it, so it is recorded exactly like any other Tier-A refusal.
+            // `None` still means "no layout HTML" to the caller, as before; what
+            // changed is that the reason now leaves the building.
+            Err(error) => {
+                self.refuse_static_render(component, error);
+                None
+            }
+        }
     }
 
     /// Layout-island reachability — collect every Tier-C island reachable from a
@@ -1410,16 +1455,10 @@ impl<'a> ManifestBuilder<'a> {
             slugify(component.name.as_str()),
             component.id.as_u64()
         );
-        let html = self
-            .render_static_component_html(component)
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    target: "albedo.manifest.render",
-                    component = %component.name,
-                    "static render failed; falling back to text-stripped placeholder markup"
-                );
-                self.render_static_fallback_html(component)
-            });
+        let html = match self.render_static_component_html(component) {
+            Ok(html) => html,
+            Err(error) => self.refuse_static_render(component, error),
+        };
 
         RenderedNode {
             component_id: component.name.clone(),
@@ -1477,7 +1516,13 @@ impl<'a> ManifestBuilder<'a> {
         placeholders
     }
 
-    fn render_static_component_html(&self, component: &Component) -> Option<String> {
+    /// Render one Tier-A component to the HTML baked into the manifest.
+    ///
+    /// `Err` carries the reason verbatim, and every caller must do something
+    /// with it. It used to be `None`, which is why the reason was discarded at
+    /// every call site and the only thing left to fall back on was a scrape of
+    /// the component's own source text.
+    fn render_static_component_html(&self, component: &Component) -> Result<String, String> {
         let empty_props = Value::Object(Default::default());
 
         // Phase P · Stream E.3 — route the Tier-A static render
@@ -1486,82 +1531,113 @@ impl<'a> ManifestBuilder<'a> {
         // CSS-module registry installed by `render_entry_with_bindings`.
         // Falls back to the legacy static ComponentProject when no
         // compiled project is available (test fixtures, etc.).
+        // The first real error wins. A component that fails on the compiled
+        // path and is then merely *absent* from the Phase J project should
+        // report why it failed, not that a fallback could not find it.
+        let mut first_error: Option<String> = None;
+
         if let Some(compiled) = self.compiled_render_project.as_ref() {
-            let entry = self.component_entry_for_project(component, compiled.root.as_path())?;
-            let session = SessionId::random();
-            let slot_store = Arc::new(SlotStore::new());
-            let slots = SessionSlotView::new(session, slot_store);
-            let opts = RenderOptions {
-                hook_compile: false,
-            };
-            if let Ok(output) = render_entry_with_bindings(
-                &compiled.project,
-                entry.as_str(),
-                &empty_props,
-                &slots,
-                &opts,
-            ) {
-                let html = output.html;
-                if !html.trim().is_empty() {
-                    return Some(html);
-                }
-            }
-        }
-
-        let render_project = self.static_render_project.as_ref()?;
-        let entry = self.component_entry_for_project(component, render_project.root.as_path())?;
-        render_project
-            .project
-            .render_entry(entry.as_str(), &empty_props)
-            .ok()
-            .filter(|html| !html.trim().is_empty())
-    }
-
-    fn render_static_fallback_html(&self, component: &Component) -> String {
-        let content = self
-            .best_effort_static_content(component)
-            .unwrap_or_else(|| component.name.clone());
-        format!(
-            "<section data-albedo-static=\"{}\" data-component-id=\"{}\">{}</section>",
-            escape_html(component.name.as_str()),
-            component.id.as_u64(),
-            escape_html(content.as_str())
-        )
-    }
-
-    fn best_effort_static_content(&self, component: &Component) -> Option<String> {
-        let path = self.resolve_component_path(component.file_path.as_str())?;
-        let source = std::fs::read_to_string(path).ok()?;
-        let mut text = String::new();
-        let mut in_tag = false;
-        let mut saw_tag = false;
-
-        for ch in source.chars() {
-            match ch {
-                '<' => {
-                    in_tag = true;
-                    saw_tag = true;
-                }
-                '>' => {
-                    in_tag = false;
-                }
-                _ => {
-                    if saw_tag && !in_tag && !ch.is_control() {
-                        text.push(ch);
+            match self.component_entry_for_project(component, compiled.root.as_path()) {
+                Some(entry) => {
+                    let session = SessionId::random();
+                    let slot_store = Arc::new(SlotStore::new());
+                    let slots = SessionSlotView::new(session, slot_store);
+                    let opts = RenderOptions {
+                        hook_compile: false,
+                    };
+                    match render_entry_with_bindings(
+                        &compiled.project,
+                        entry.as_str(),
+                        &empty_props,
+                        &slots,
+                        &opts,
+                    ) {
+                        Ok(output) if !output.html.trim().is_empty() => return Ok(output.html),
+                        // Empty output is not a failure — a component may render
+                        // nothing. Fall through to the Phase J project, which is
+                        // what this path has always done.
+                        Ok(_) => {}
+                        Err(error) => first_error = Some(error.to_string()),
                     }
                 }
-            }
-            if text.len() >= 160 {
-                break;
+                None => {
+                    first_error = Some(format!(
+                        "'{}' is not under the compiled render root '{}'",
+                        component.file_path,
+                        compiled.root.display()
+                    ));
+                }
             }
         }
 
-        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if normalized.is_empty() {
-            None
-        } else {
-            Some(normalized)
+        let Some(render_project) = self.static_render_project.as_ref() else {
+            return Err(first_error
+                .unwrap_or_else(|| "no static render project was built".to_string()));
+        };
+        let Some(entry) = self.component_entry_for_project(component, render_project.root.as_path())
+        else {
+            return Err(first_error.unwrap_or_else(|| {
+                format!(
+                    "'{}' is not under the static render root '{}'",
+                    component.file_path,
+                    render_project.root.display()
+                )
+            }));
+        };
+        match render_project
+            .project
+            .render_entry(entry.as_str(), &empty_props)
+        {
+            // Empty is allowed here too, and is returned as-is: both paths ran
+            // without raising, so this component genuinely renders to nothing.
+            Ok(html) => Ok(html),
+            Err(error) => Err(first_error.unwrap_or_else(|| error.to_string())),
         }
+    }
+
+    /// A Tier-A render that failed, made **named and invisible** rather than
+    /// visible and wrong.
+    ///
+    /// 🪤 What stood here scraped the component's own `.tsx` off disk, kept
+    /// every character falling outside a `<`…`>` pair, and shipped the first 160
+    /// of them inside a `<section data-albedo-static>`. On a real route that
+    /// produced `<section ...>asChild );}</section>` — every tag gone, and the
+    /// closing `);}` of the source file rendered into the browser. There is no
+    /// reading of "strip everything between angle brackets" that recovers
+    /// markup, so it is deleted rather than repaired. The QuickJS `h` shim has
+    /// refused this class outright since it was written (`typeof type !==
+    /// 'string'` throws): visible corruption is the one outcome worse than a
+    /// named failure, and this path had no equivalent guard.
+    ///
+    /// What replaces it emits an HTML comment naming the component and nothing
+    /// else — no source text and no error text, because an evaluator error can
+    /// carry absolute paths and author strings and this string is served to
+    /// every visitor. The error travels to the `BootReport` instead, which is
+    /// read by the one person entitled to it.
+    fn refuse_static_render(&self, component: &Component, error: String) -> String {
+        // `error!`, not `warn!` — and recorded either way, because the level was
+        // never the problem. `install_tracing` in the CLI installs a subscriber
+        // only when `RUST_LOG` is set, so this line reaches nobody by default.
+        // The push below is what actually reaches the author.
+        tracing::error!(
+            target: "albedo.manifest.render",
+            component = %component.name,
+            module_path = %component.file_path,
+            error = %error,
+            "Tier-A static render failed; the component will not appear on any \
+             page that renders it"
+        );
+        self.static_render_failures
+            .borrow_mut()
+            .push(StaticRenderFailure {
+                component: component.name.clone(),
+                module_path: component.file_path.clone(),
+                error,
+            });
+        format!(
+            "<!-- albedo: {} did not render -->",
+            comment_safe(component.name.as_str())
+        )
     }
 
     fn component_entry_for_project(&self, component: &Component, root: &Path) -> Option<String> {
@@ -2077,6 +2153,30 @@ fn hoist_head_from_nodes(
         }
     }
     merged
+}
+
+/// A component name reduced to what is safe to place inside an HTML comment.
+///
+/// `escape_html` is the wrong tool here: entities are not decoded inside a
+/// comment, so escaping would leave the raw `&lt;` visible and — more to the
+/// point — would not stop `-->` from closing the comment early and spilling the
+/// rest into the document. Only `[A-Za-z0-9_-]` survives, and `--` cannot form
+/// because a run of dashes collapses to one.
+fn comment_safe(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else if ch == '-' && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "component".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn escape_html(value: &str) -> String {

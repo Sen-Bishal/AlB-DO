@@ -112,6 +112,8 @@ impl ProjectScanner {
             component.is_client_interactive = parsed.is_client_interactive;
             component.state_escapes = parsed.state_escapes;
             component.reads_principal = parsed.reads_principal;
+            component.imports_npm =
+                crate::parser::imports_unresolvable_specifier(&parsed.import_sources);
             component.effect_profile = parsed.effect_profile;
             component.source_hash = parsed.source_hash;
             component.is_module_only = parsed.is_module_only;

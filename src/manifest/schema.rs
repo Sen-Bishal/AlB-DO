@@ -49,6 +49,62 @@ pub struct WTStreamSlot {
     pub component_ids: Vec<u64>,
 }
 
+/// One Tier-A component the pure-Rust evaluator refused to render, and why.
+///
+/// 🔑 **A statement of absence, not a warning.** Tier-A markup is baked into the
+/// manifest at build time; when the bake fails there is no second attempt at
+/// request time, so the component — and every ancestor whose render it was
+/// nested inside — is simply not on the page.
+///
+/// 🪤 This type exists because the failure used to be *invisible and worse than
+/// absent*. `render_static` fell back to scraping the component's own source
+/// file for text between `<` and `>`, which emitted the tail of the file
+/// (`);}`) into the served HTML and dropped every tag. The QuickJS `h` shim
+/// already refuses that class of outcome outright — see its `typeof type !==
+/// 'string'` throw — on the grounds that visible corruption is the one result
+/// worse than a named failure. The Rust path had no such guard.
+///
+/// Carried in the manifest rather than a `tracing` event on purpose: the build
+/// and the serve are separate processes, and a log line only exists when
+/// `RUST_LOG` is set. See `BootReport::island_ssr_failures` for the same
+/// argument made about islands.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StaticRenderFailure {
+    /// The component the evaluator was asked to render, as the author named it.
+    pub component: String,
+    /// Its module path on disk.
+    pub module_path: String,
+    /// The evaluator's error, verbatim. Usually names the exact construct that
+    /// could not be resolved ("could not resolve import '@radix-ui/react-slot'
+    /// from '...'"), which is the most useful thing anyone can be told and is
+    /// lost entirely if summarised.
+    pub error: String,
+}
+
+impl StaticRenderFailure {
+    /// The one sentence anybody is ever shown about this failure.
+    ///
+    /// Lives here, on the data, because **three lanes report it**: `albedo
+    /// build` prints it as it happens, `albedo serve` prints it again out of
+    /// `BootReport::lines`, and the dev dashboard reads the same report. Item
+    /// 6.5 exists because three lanes once described one event three different
+    /// ways; a shared formatter is how that stays fixed.
+    ///
+    /// Phrased as absence rather than failure — "failed to render" reads like a
+    /// degraded page, and the page is not degraded, the component is not on it.
+    /// The ancestors are named out loud because that is the part nobody guesses:
+    /// a Tier-A render is one call over the whole subtree, so a failing leaf
+    /// takes its parents' markup with it.
+    #[must_use]
+    pub fn report_line(&self) -> String {
+        format!(
+            "STATIC · {} is MISSING from every page that renders it, along with the \
+             markup of any component that nests it ({}). {}",
+            self.component, self.module_path, self.error
+        )
+    }
+}
+
 /// The full manifest written to disk at build time and loaded at server startup.
 ///
 /// `schema_version` + legacy component fields are retained for backward compatibility
@@ -78,6 +134,15 @@ pub struct RenderManifestV2 {
     /// Empty when the build predates WT support or when no Tier B/C components exist.
     #[serde(default)]
     pub wt_streams: Vec<WTStreamSlot>,
+    /// Tier-A components whose build-time render failed. Each one is **missing
+    /// from every page that renders it**, along with any Tier-A ancestor that
+    /// tried to inline it — an evaluator error propagates to the top of the
+    /// static render, so a failing leaf takes its whole route's markup with it.
+    ///
+    /// Serialized so the failure survives the `albedo build` → `albedo serve`
+    /// process boundary and can be handed to the `BootReport` the CLI prints.
+    #[serde(default)]
+    pub static_render_failures: Vec<StaticRenderFailure>,
 }
 
 impl RenderManifestV2 {
@@ -97,6 +162,7 @@ impl RenderManifestV2 {
             critical_path: Vec::new(),
             vendor_chunks: Vec::new(),
             wt_streams: Vec::new(),
+            static_render_failures: Vec::new(),
         }
     }
 }

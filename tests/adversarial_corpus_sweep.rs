@@ -134,6 +134,14 @@ const NOT_EXERCISED: &[(&str, &str)] = &[
          question, not this one",
     ),
     (
+        "render_quickjs/boolean_attributes",
+        "boolean consts and JSX attribute values only. A boolean attribute's \
+         value is never author text — it is one of `true`/`false`/absent — so \
+         there is no channel here for a hostile string to arrive through. What \
+         the fixture pins is which of those three spellings each attribute gets, \
+         which is `jsx_attributes.rs`'s question, not this one",
+    ),
+    (
         "render_quickjs/form_errors",
         "every literal is a JSX attribute value, including the `action:NAME` \
          binding that makes it a form at all",

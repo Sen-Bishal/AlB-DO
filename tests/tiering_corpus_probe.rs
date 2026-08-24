@@ -88,7 +88,13 @@ impl Kind {
 
 const TIERS: [Tier; 3] = [Tier::A, Tier::B, Tier::C];
 
-const REASONS: [TieringReason; 7] = [
+// 🪤 A hand-maintained list, and `reason_index` panics with "known reason" on
+// anything absent from it. `RequestScoped` has been missing since AUTH § 3 added
+// it — the probe simply never met a component that reads `user`, so the gap was
+// invisible until a second reason arrived. Both are here now; a third addition
+// will break this the same way, and `reason_label`'s `match` below is the thing
+// that will make the compiler say so first.
+const REASONS: [TieringReason; 9] = [
     TieringReason::PureStaticEligible,
     TieringReason::ServerOwnedState,
     TieringReason::HookDrivenHydration,
@@ -96,6 +102,8 @@ const REASONS: [TieringReason; 7] = [
     TieringReason::IoBoundary,
     TieringReason::SideEffectBoundary,
     TieringReason::WeightBasedPromotion,
+    TieringReason::RequestScoped,
+    TieringReason::NpmDependency,
 ];
 
 fn tier_label(tier: Tier) -> &'static str {
@@ -116,6 +124,7 @@ fn reason_label(reason: TieringReason) -> &'static str {
         TieringReason::SideEffectBoundary => "SideEffectBoundary",
         TieringReason::WeightBasedPromotion => "WeightBasedPromotion",
         TieringReason::RequestScoped => "RequestScoped",
+        TieringReason::NpmDependency => "NpmDependency",
     }
 }
 
@@ -183,8 +192,8 @@ impl CorpusResult {
         counts
     }
 
-    fn reason_counts(&self) -> [usize; 7] {
-        let mut counts = [0usize; 7];
+    fn reason_counts(&self) -> [usize; REASONS.len()] {
+        let mut counts = [0usize; REASONS.len()];
         for row in &self.rows {
             counts[reason_index(row.reason)] += 1;
         }
@@ -192,8 +201,8 @@ impl CorpusResult {
     }
 
     /// `[tier][reason]`.
-    fn matrix(&self) -> [[usize; 7]; 3] {
-        let mut matrix = [[0usize; 7]; 3];
+    fn matrix(&self) -> [[usize; REASONS.len()]; TIERS.len()] {
+        let mut matrix = [[0usize; REASONS.len()]; TIERS.len()];
         for row in &self.rows {
             matrix[tier_index(row.tier)][reason_index(row.reason)] += 1;
         }
@@ -274,6 +283,7 @@ fn measure(name: &str, kind: Kind, dir: &Path) -> CorpusResult {
             component.is_client_interactive,
             component.state_escapes,
             component.reads_principal,
+            component.imports_npm,
             component.is_above_fold,
             weight,
             inputs,
@@ -435,7 +445,7 @@ fn measure_tier_distribution_across_corpora() {
 
         let total: usize = group.iter().map(|r| r.rows.len()).sum();
         let mut counts = [0usize; 3];
-        let mut reasons = [0usize; 7];
+        let mut reasons = [0usize; REASONS.len()];
         for result in &group {
             let c = result.tier_counts();
             let r = result.reason_counts();

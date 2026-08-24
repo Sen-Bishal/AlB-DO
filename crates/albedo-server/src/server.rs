@@ -1555,6 +1555,9 @@ impl AlbedoServerBuilder {
         // Declared out here so the island failures survive the block that
         // computes them — they are boot output, not render output.
         let mut island_ssr_failures: Vec<crate::renderer_runtime::IslandRenderFailure> = Vec::new();
+        let mut static_render_failures: Vec<
+            dom_render_compiler::manifest::schema::StaticRenderFailure,
+        > = Vec::new();
         let route_hydration = Arc::new({
             // Step 3 (binding mode) · build the fine-grained reactive blocks
             // FIRST (immutable borrow). For routes whose Tier-C component is
@@ -1601,6 +1604,14 @@ impl AlbedoServerBuilder {
             island_ssr_failures = renderer
                 .as_mut()
                 .map(RendererRuntime::take_island_ssr_failures)
+                .unwrap_or_default();
+            // Same argument, one tier up and one process earlier. A Tier-A
+            // render is baked at BUILD time, so its failures cannot be
+            // recomputed here — they ride in on the manifest, which is the only
+            // thing that survives `albedo build` → `albedo serve`.
+            static_render_failures = renderer
+                .as_ref()
+                .map(|runtime| runtime.manifest().static_render_failures.clone())
                 .unwrap_or_default();
 
             // Fix #3 · merge per-component, not per-route, so a single route can
@@ -1830,6 +1841,7 @@ impl AlbedoServerBuilder {
             state,
             auth_registry: self.auth_registry,
             island_ssr_failures,
+            static_render_failures,
         })
     }
 }
@@ -1844,6 +1856,10 @@ pub struct AlbedoServer {
     /// `run_with_ready` can hand them to the [`BootReport`]. Boot decides them;
     /// only the readiness callback can print them.
     island_ssr_failures: Vec<crate::renderer_runtime::IslandRenderFailure>,
+    /// Tier-A components whose build-time render failed, read off the manifest
+    /// in `build()` and held for the same reason: boot decides them, only the
+    /// readiness callback can print them.
+    static_render_failures: Vec<dom_render_compiler::manifest::schema::StaticRenderFailure>,
 }
 
 /// What a boot changed on the author's behalf, handed to the readiness callback.
@@ -1870,6 +1886,18 @@ pub struct BootReport {
     /// time raised `warn!` to `error!`, on the same unheard channel, and a
     /// Radix dialog hit the identical silence months later.
     pub island_ssr_failures: Vec<crate::renderer_runtime::IslandRenderFailure>,
+    /// Tier-A components whose **build-time** render failed. Each one is
+    /// missing from every page that renders it — and so is every Tier-A
+    /// ancestor whose markup it was nested inside, because the evaluator's
+    /// error propagates to the top of the static render.
+    ///
+    /// 🪤 Same lesson as `island_ssr_failures` above, learned separately and
+    /// more expensively. This path did not merely go quiet: it fell back to
+    /// scraping the component's own source file for the text between `<` and
+    /// `>`, which put `);}` — the tail of a route's `.tsx` — into the served
+    /// HTML with every tag stripped, under a green build and a clean console.
+    /// The scrape is gone; what is left is this list.
+    pub static_render_failures: Vec<dom_render_compiler::manifest::schema::StaticRenderFailure>,
 }
 
 impl BootReport {
@@ -1892,6 +1920,14 @@ impl BootReport {
                 failure.module_path, failure.error
             )
         }));
+        // Phrased by the failure itself, not here. `albedo build` prints the
+        // same event at the moment it happens, and item 6.5's whole point is
+        // that one event does not get three wordings.
+        out.extend(
+            self.static_render_failures
+                .iter()
+                .map(dom_render_compiler::manifest::schema::StaticRenderFailure::report_line),
+        );
         out
     }
 }
@@ -2019,6 +2055,7 @@ impl AlbedoServer {
         // Decided at build time, surfaced here — this is the only path out to
         // the author.
         report.island_ssr_failures = self.island_ssr_failures.clone();
+        report.static_render_failures = self.static_render_failures.clone();
         // FORGE — open the durable substrate exactly once, before the listener
         // binds. This is the sole async boot seam (`build()` is synchronous),
         // and the handle lives on the persistent `RuntimeState` tier so a dev
@@ -5112,6 +5149,48 @@ mod tests {
             BootReport::default().lines().is_empty(),
             "a clean boot must stay silent"
         );
+    }
+
+    /// The same property for the tier below, where the silence was worse.
+    ///
+    /// 🪤 A failed **Tier-A** render did not merely go unreported. The manifest
+    /// builder fell back to scraping the component's own `.tsx` for the text
+    /// between `<` and `>`, so a route rendered
+    /// `<section data-albedo-static="SlotRoute">asChild );}</section>` — every
+    /// tag stripped and the closing `);}` of the source file served to the
+    /// browser — under a green build and a clean console. The scrape is gone;
+    /// this asserts that what replaced it reaches the one path the CLI prints.
+    ///
+    /// The wording carries the part nobody guesses: a Tier-A render is a single
+    /// call over the whole subtree, so a failing leaf deletes its **ancestors'**
+    /// markup too. The page does not look degraded around the missing
+    /// component — the section it lived in is gone.
+    #[test]
+    fn a_failed_tier_a_render_reaches_the_boot_report() {
+        use dom_render_compiler::manifest::schema::StaticRenderFailure;
+
+        let report = BootReport {
+            static_render_failures: vec![StaticRenderFailure {
+                component: "SlotDemo".to_string(),
+                module_path: "src/components/SlotDemo.tsx".to_string(),
+                error: "could not resolve import '@radix-ui/react-slot' from \
+                        'components/SlotDemo.tsx'"
+                    .to_string(),
+            }],
+            ..BootReport::default()
+        };
+
+        let lines = report.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("SlotDemo"), "{line}");
+        assert!(line.contains("src/components/SlotDemo.tsx"), "{line}");
+        // The evaluator's own message names the exact specifier. Summarising it
+        // leaves an author knowing only that something did not render.
+        assert!(line.contains("@radix-ui/react-slot"), "{line}");
+        assert!(line.contains("MISSING"), "{line}");
+        // The ancestors are the surprise, so they are said out loud.
+        assert!(line.contains("nests it"), "{line}");
     }
 
     #[tokio::test]
