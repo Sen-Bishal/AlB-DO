@@ -624,6 +624,15 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
     if (typeof globalThis.__albedo_begin_id_scope === 'function') {{
       globalThis.__albedo_begin_id_scope(entry);
     }}
+    // The context stack is per-render too, and this reset is a SAFETY property
+    // rather than tidiness: `h` pops in a `finally`, but the QuickJS realm is
+    // shared across every request and principal (see
+    // `tests/quickjs_realm_isolation.rs`), so a value stranded by any path at
+    // all would be readable by the NEXT request's render. Cleared on the way in,
+    // where it cannot be skipped.
+    if (typeof globalThis.__albedo_reset_context === 'function') {{
+      globalThis.__albedo_reset_context();
+    }}
     const __albedo_record = globalThis.__ALBEDO_MODULES[entry];
     const __albedo_has_own = Object.prototype.hasOwnProperty;
     const __albedo_is_record = function(candidate) {{
@@ -1007,7 +1016,17 @@ fn build_form_contract_script() -> String {
 ///
 /// Both constants cross as *values* from Rust. There is one spelling of each
 /// and JS cannot disagree with it.
-fn build_markup_contract_script() -> String {
+/// The markup facts both renderers key on — void tags, the layout-children
+/// sentinel, and the unitless-style set — as one JS assignment.
+///
+/// 🔑 **Public because the BROWSER needs the same data.** The client runtime has
+/// to serialise a `style` object exactly as the server does, and the unitless
+/// set is the one part of that transform which is data rather than algorithm.
+/// Shipping it from here keeps a single spelling instead of a hand-copied list
+/// in `assets/albedo-client.js` — the "three paint-rule implementations" shape
+/// this codebase has already paid for.
+#[must_use]
+pub fn build_markup_contract_script() -> String {
     use crate::runtime::eval::component::HTML_VOID_ELEMENTS;
     use crate::runtime::eval::LAYOUT_CHILDREN_SENTINEL;
     // Infallible: `serde_json` cannot fail to encode `&str` / `&[&str]`.
@@ -1163,7 +1182,159 @@ if (typeof globalThis.h !== 'function') {
     return shaped;
   }
 
+  // A component's child, deferred. See `transforms::thunk_children` for why the
+  // deferral exists; this is the mark that makes it safe.
+  //
+  // 🪤 **Marked, never inferred.** `children` being a function is a real React
+  // idiom — render props, `<Ctx.Consumer>{v => …}</Ctx.Consumer>` — so forcing
+  // every function-valued child would invoke user callbacks with no arguments.
+  // Only what `__albedo_t` tagged is ever called.
+  // 🔑 **An object, not a bare closure, and memoised.** Two reasons, both found
+  // by measurement rather than design:
+  //
+  //  1. **Packages read a child's fields directly.** Radix's `getElementRef`
+  //     opens with `Object.getOwnPropertyDescriptor(element.props, 'ref')` on
+  //     the raw `props.children` — not through `React.Children` — and a
+  //     function has no `.props`, so every `asChild` died with *"Cannot convert
+  //     undefined or null to object"*. The `props`/`type` getters force on
+  //     access, which is both the value they want and the right moment to
+  //     compute it: the reader is already inside whatever Providers wrap it.
+  //  2. **Forcing twice would re-render the child**, advancing the `useId` and
+  //     `useState` counters a second time and desyncing the very ids this
+  //     release fixed. The memo makes a thunk force exactly once, however many
+  //     readers touch it.
+  globalThis.__albedo_t = function(fn) {
+    let memo;
+    let forced = false;
+    const thunk = {
+      __albedoThunk: true,
+      __albedoForce: function() {
+        if (!forced) {
+          memo = fn();
+          forced = true;
+        }
+        return memo;
+      }
+    };
+    const delegate = function(field) {
+      const value = thunk.__albedoForce();
+      return (value === null || typeof value === 'undefined') ? undefined : value[field];
+    };
+    Object.defineProperty(thunk, 'props', {
+      get: function() { return delegate('props'); },
+      configurable: true
+    });
+    Object.defineProperty(thunk, 'type', {
+      get: function() { return delegate('type'); },
+      configurable: true
+    });
+    thunk.toString = function() { return String(thunk.__albedoForce()); };
+    return thunk;
+  };
+  const __albedo_is_thunk = function(value) {
+    return value !== null
+      && typeof value === 'object'
+      && value.__albedoThunk === true;
+  };
+
+  // A **deferred element** — the package half of the same deferral
+  // `__albedo_t` provides for app code, and the thing that makes this renderer
+  // behave like React for compound components.
+  //
+  // 🔑 **It carries a real `type` and `props` without rendering.** That is the
+  // whole difference from an `__albedo_t` thunk, whose getters must force
+  // because an arbitrary expression has nothing to report until it runs. A
+  // deferred element can be *inspected* — `isValidElement`, `Children.only`,
+  // `cloneElement`, Radix's `getElementRef` — with no evaluation at all, which
+  // is exactly what React elements are for.
+  //
+  // Two consequences worth naming:
+  //
+  //   * **`Children.only` stops throwing on a portal.** Radix's Portal is
+  //     `container ? createPortal(…) : null` and has no container server-side,
+  //     so eager invocation handed `Presence` a literal `null` where React has
+  //     an unrendered element. Deferred, it is an element until forced — and it
+  //     renders to nothing, which is the correct no-JS outcome.
+  //   * **`cloneElement` no longer re-renders anything.** It merges props into a
+  //     new deferred element, so it cannot re-invoke a component or advance the
+  //     `useId`/`useState` counters.
+  //
+  // Memoised for the same reason `__albedo_t` is: forcing twice would render
+  // the subtree twice and desync every id in it.
+  globalThis.__albedo_lazy_element = function(type, props, children) {
+    let memo;
+    let forced = false;
+    const shaped = {};
+    if (props) {
+      for (const key in props) {
+        if (Object.prototype.hasOwnProperty.call(props, key)) {
+          shaped[key] = props[key];
+        }
+      }
+    }
+    if (typeof children !== 'undefined') {
+      shaped.children = children;
+    }
+    const element = {
+      __albedoThunk: true,
+      __albedoLazyElement: true,
+      type: type,
+      props: shaped,
+      __albedoForce: function() {
+        if (!forced) {
+          if (typeof children === 'undefined') {
+            memo = h(type, props);
+          } else if (Array.isArray(children)) {
+            memo = h.apply(null, [type, props].concat(children));
+          } else {
+            memo = h(type, props, children);
+          }
+          forced = true;
+        }
+        return memo;
+      }
+    };
+    element.toString = function() { return String(element.__albedoForce()); };
+    return element;
+  };
+
+  // What an API that **inspects** a child should see.
+  //
+  // A deferred element passes through untouched — it is already inspectable and
+  // forcing it would render it outside the Provider its consumer is about to
+  // wrap it in. An opaque app-code thunk has nothing to inspect, so it is
+  // forced. This distinction is the reason `React.Children` works without
+  // flattening the laziness it depends on.
+  globalThis.__albedo_child_view = function(value) {
+    while (__albedo_is_thunk(value) && value.__albedoLazyElement !== true) {
+      value = value.__albedoForce();
+    }
+    return value;
+  };
+
+  // Shallow force, for the APIs that **inspect** a child rather than embed it —
+  // `React.Children.*` (via `react_host`'s `__albedo_children_each`),
+  // `isValidElement`, `cloneElement`. Those must see the child, not the closure.
+  //
+  // Looped rather than recursive because a thunk may return another thunk; an
+  // array is left alone, since every caller already walks arrays and will force
+  // each element on the way past.
+  globalThis.__albedo_force_thunk = function(value) {
+    while (__albedo_is_thunk(value)) {
+      value = value.__albedoForce();
+    }
+    return value;
+  };
+
   const __albedo_push_children = function(value, out) {
+    // Forced HERE rather than at the `h(…)` call that received it: this is the
+    // point where a child is actually embedded, which is after the parent
+    // component's body has run and inside whatever context Providers are on the
+    // stack right now. That timing IS the fix.
+    if (__albedo_is_thunk(value)) {
+      __albedo_push_children(value.__albedoForce(), out);
+      return;
+    }
     if (Array.isArray(value)) {
       for (const item of value) {
         __albedo_push_children(item, out);
@@ -1180,6 +1351,57 @@ if (typeof globalThis.h !== 'function') {
     }
     // Plain user value (string, number, …) — escape before embedding in HTML.
     out.push(new AlbedoHtml(__albedo_escape_text(String(value))));
+  };
+
+  // Force a possibly-deferred value all the way down to one embeddable
+  // `AlbedoHtml`.
+  //
+  // A single child is returned VERBATIM rather than re-wrapped, which keeps the
+  // `type` + `props` an `__albedo_element` carries — the fields `cloneElement`
+  // and Radix's `getElementRef` read. Re-wrapping would silently turn every
+  // Provider-wrapped host element back into an un-cloneable one.
+  const __albedo_force_children = function(value) {
+    const out = [];
+    __albedo_push_children(value, out);
+    if (out.length === 1) {
+      return out[0];
+    }
+    return new AlbedoHtml(out.join(''));
+  };
+
+  // Context values currently in scope, keyed by context id, innermost last.
+  //
+  // A stack rather than a single value because Providers nest and siblings must
+  // not see each other's: `h` pushes before forcing a Provider's children and
+  // pops in a `finally`, so the entry is live for exactly the subtree that is
+  // lexically inside it. Reset per render — see `__albedo_reset_context`, which
+  // the render entry point calls alongside the id counter, so a throw mid-render
+  // cannot leak a value into the next request in this shared realm.
+  const __albedo_context_values = Object.create(null);
+  globalThis.__albedo_reset_context = function() {
+    for (const key in __albedo_context_values) {
+      delete __albedo_context_values[key];
+    }
+  };
+  const __albedo_context_push = function(id, value) {
+    const key = String(id);
+    if (!__albedo_context_values[key]) {
+      __albedo_context_values[key] = [];
+    }
+    __albedo_context_values[key].push(value);
+  };
+  const __albedo_context_pop = function(id) {
+    const stack = __albedo_context_values[String(id)];
+    if (stack && stack.length > 0) {
+      stack.pop();
+    }
+  };
+  globalThis.__albedo_context_current = function(id) {
+    const stack = __albedo_context_values[String(id)];
+    if (stack && stack.length > 0) {
+      return { found: true, value: stack[stack.length - 1] };
+    }
+    return { found: false };
   };
 
   // Framework-level props that are never HTML attributes: `key` (React's
@@ -1354,9 +1576,6 @@ if (typeof globalThis.h !== 'function') {
   };
 
   const h = function(type, props, ...children) {
-    const flatChildren = [];
-    __albedo_push_children(children, flatChildren);
-
     if (type === 'children') {
       // A content sink, not a wrapper: attrs and children are ignored, matching
       // the pure-Rust intrinsic.
@@ -1364,14 +1583,40 @@ if (typeof globalThis.h !== 'function') {
     }
 
     if (typeof type === 'function') {
+      // 🔑 **Children are NOT flattened here.** Flattening forces every thunk,
+      // which would run the children before this component's body — the exact
+      // ordering `transforms::thunk_children` exists to remove. They are handed
+      // over deferred and forced wherever the component actually embeds them.
       const mergedProps = Object.assign({}, props || {});
-      if (flatChildren.length === 1) {
-        mergedProps.children = flatChildren[0];
-      } else if (flatChildren.length > 1) {
-        mergedProps.children = flatChildren;
+      if (children.length === 1) {
+        mergedProps.children = children[0];
+      } else if (children.length > 1) {
+        mergedProps.children = children;
+      }
+
+      // A context Provider brackets the forcing of its own children, which is
+      // the whole of SSR context propagation. The push must happen before the
+      // children are forced and the pop after — so the value is live for
+      // exactly the subtree inside it, and a throw from a consumer still
+      // unwinds the stack.
+      //
+      // The result is forced HERE rather than left to the caller because by the
+      // time the caller embeds it this Provider has already popped, and a
+      // pass-through Provider returns its children untouched.
+      const contextId = type.__albedoContextId;
+      if (contextId) {
+        __albedo_context_push(contextId, (props || {}).value);
+        try {
+          return __albedo_force_children(type(mergedProps));
+        } finally {
+          __albedo_context_pop(contextId);
+        }
       }
       return type(mergedProps);
     }
+
+    const flatChildren = [];
+    __albedo_push_children(children, flatChildren);
 
     // A component type that is neither a function nor a tag name must NOT fall
     // through to the element branch below — that interpolates the object into a
@@ -1651,7 +1896,13 @@ if (typeof globalThis.h !== 'function') {
   // single-sourced (`runtime::react_host`) and reduces the difference between
   // the two runtimes to one named function.
   globalThis.__albedo_is_element = function(value) {
-    return value instanceof AlbedoHtml;
+    // A deferred element is an element — answered WITHOUT forcing, which is the
+    // point of it. Radix gates its `cloneElement` calls on this, so forcing here
+    // would render the child before the caller wraps it.
+    if (value !== null && typeof value === 'object' && value.__albedoLazyElement === true) {
+      return true;
+    }
+    return globalThis.__albedo_force_thunk(value) instanceof AlbedoHtml;
   };
 
   // `cloneElement` — `TODO.md` 9.2, and the third export whose implementation
@@ -1681,10 +1932,38 @@ if (typeof globalThis.h !== 'function') {
   // permanently false server-side and the `Slottable` branch is unreachable.
   // The `asChild` path (this function's real consumer) does not go through it.
   globalThis.__albedo_clone_element = function(element, config) {
+    // `Slot` reaches here holding `props.children`, which the server defers.
+    // Forced before the `instanceof` below, or every clone of a deferred child
+    // would fall through the "nothing to clone onto" guard and silently return
+    // the closure — `asChild` would drop the merged props it exists to apply.
     const extraChildren = [];
     for (let i = 2; i < arguments.length; i++) {
       extraChildren.push(arguments[i]);
     }
+
+    // A deferred element clones the way React's does: merge props, keep the
+    // type, render nothing. This is strictly better than the eager path below —
+    // no re-render, so no risk of re-invoking a component or advancing the
+    // `useId` counters — and it is what `Slot`'s `asChild` actually wants.
+    if (element !== null && typeof element === 'object' && element.__albedoLazyElement === true) {
+      const mergedProps = Object.assign({}, element.props, config || {});
+      let mergedChildren;
+      if (extraChildren.length === 1) {
+        mergedChildren = extraChildren[0];
+      } else if (extraChildren.length > 1) {
+        mergedChildren = extraChildren;
+      } else if (config && Object.prototype.hasOwnProperty.call(config, 'children')) {
+        mergedChildren = config.children;
+      } else {
+        mergedChildren = element.props.children;
+      }
+      delete mergedProps.children;
+      return globalThis.__albedo_lazy_element(element.type, mergedProps, mergedChildren);
+    }
+
+    // `Slot` also reaches here holding an app-code `props.children`, which is
+    // opaque and must be forced before the `instanceof` below can classify it.
+    element = globalThis.__albedo_force_thunk(element);
 
     // Nothing to clone onto: not this renderer's element, or one with no host
     // tag of its own (Fragment / empty render / portal / text).
@@ -1920,13 +2199,23 @@ if (typeof globalThis.useState !== 'function') {
     return new AlbedoHtml('');
   };
 
-  // Context. SSR `h` invokes components EAGERLY (children are already-rendered
-  // HTML before a Provider runs), so a Provider cannot thread its value down to
-  // nested consumers in this single pass — that propagation is applied by the
-  // client runtime on hydration. Here `useContext` returns a renderer-seeded
-  // value (`host.context[id]`) when present, else the context default, so a
-  // component using context LOADS and RENDERS without crashing. The Provider is
-  // a transparent pass-through that renders its children.
+  // Context. A Provider's value now reaches nested consumers **in this pass**.
+  //
+  // 🔑 The blocker was never `h` being eager — it was that JS evaluates call
+  // arguments before the call, so children finished rendering before their
+  // Provider ran. `transforms::thunk_children` defers a component's children,
+  // and `h` brackets a Provider's forcing with a push/pop, so a consumer forced
+  // inside that subtree reads the value that is live at that moment.
+  //
+  // ⚠️ This did not merely produce wrong values before — real Radix **threw**
+  // (`` `DialogTrigger` must be used within `Dialog` ``), because
+  // `createContextScope` raises on a missing context rather than falling back.
+  // The island SSR then failed, no `data-albedo-island` marker was emitted, and
+  // the component was absent from the page rather than merely mis-rendered.
+  //
+  // Resolution order: the live Provider stack, then a renderer-seeded value
+  // (`host.context[id]`), then the context default — so a consumer outside any
+  // Provider still renders instead of crashing.
   globalThis.__albedo_context_seq = 0;
   globalThis.createContext = function(defaultValue) {
     const id = ++globalThis.__albedo_context_seq;
@@ -1937,11 +2226,16 @@ if (typeof globalThis.useState !== 'function') {
     return { __albedoContext: true, _id: id, _defaultValue: defaultValue, Provider: Provider };
   };
   globalThis.useContext = function(context) {
+    if (!context) { return undefined; }
+    const live = globalThis.__albedo_context_current(context._id);
+    if (live.found) {
+      return live.value;
+    }
     const host = globalThis.__ALBEDO_HOST;
-    if (host && host.context && context && __albedo_has_own.call(host.context, String(context._id))) {
+    if (host && host.context && __albedo_has_own.call(host.context, String(context._id))) {
       return host.context[String(context._id)];
     }
-    return context ? context._defaultValue : undefined;
+    return context._defaultValue;
   };
 
   // `export const X = action(fn)` runs `action(fn)` at module load. Keep it a
@@ -1986,7 +2280,12 @@ pub(crate) fn compile_module_script_for_quickjs_with_spec(
     }
 
     let transpiled =
-        transpile_module_source_for_quickjs(specifier, normalized, stamp_module_spec)?;
+        transpile_module_source_for_quickjs(
+            specifier,
+            normalized,
+            stamp_module_spec,
+            TranspileTarget::Server,
+        )?;
 
     if !transpiled.contains("export") && !transpiled.contains("import") {
         return compile_legacy_expression_module(specifier, transpiled.as_str());
@@ -2373,7 +2672,12 @@ fn rewrite_import_for_client_with_modules(
                 .get(&target_key)
                 .expect("resolve_relative_module returned a key from this map");
             let transpiled =
-                transpile_module_source_for_quickjs(&target_key, target_source, None)?;
+                transpile_module_source_for_quickjs(
+                    &target_key,
+                    target_source,
+                    None,
+                    TranspileTarget::ClientIsland,
+                )?;
             let nested = |decl: swc_ecma_ast::ImportDecl, spec: &str| {
                 rewrite_import_for_client_with_modules(decl, spec, modules, npm, depth + 1)
             };
@@ -2643,7 +2947,12 @@ pub fn compile_client_island_module_with_npm(
     // `None`: an island's markup is produced by the browser runtime, which has
     // no `__albedo_stable_id` — stamping here would be a ReferenceError on the
     // island's first render.
-    let transpiled = transpile_module_source_for_quickjs(specifier, normalized, None)?;
+    let transpiled = transpile_module_source_for_quickjs(
+        specifier,
+        normalized,
+        None,
+        TranspileTarget::ClientIsland,
+    )?;
 
     let lowered = if !transpiled.contains("export") && !transpiled.contains("import") {
         // A bare expression module (`(props) => …`) — the expression itself is
@@ -3088,10 +3397,30 @@ fn build_npm_factory_script(
     Ok(script)
 }
 
+/// Which runtime will execute the transpiled output.
+///
+/// 🪤 **This exists because `stamp_module_spec: None` was doing the job and was
+/// not up to it.** It happens to be `None` for a client island, but it is also
+/// `None` for a server module that simply has no anchor spec — so "no spec"
+/// never meant "browser", and a pass gated on it would fire in the wrong place.
+/// `thunk_children` emits a call to `__albedo_t`, which exists only in the
+/// QuickJS prelude; shipped to the browser it is a `ReferenceError` that takes
+/// the whole island down. Named, so the next host-specific pass has somewhere
+/// obvious to ask.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TranspileTarget {
+    /// The QuickJS server renderer, whose `h` is eager.
+    Server,
+    /// A Tier-C island, executed by `assets/albedo-client.js`, whose `h`
+    /// already builds vnodes lazily and needs no deferral.
+    ClientIsland,
+}
+
 fn transpile_module_source_for_quickjs(
     specifier: &str,
     source: &str,
     stamp_module_spec: Option<&str>,
+    target: TranspileTarget,
 ) -> RuntimeResult<String> {
     let globals = Globals::new();
     GLOBALS.set(&globals, || {
@@ -3151,6 +3480,24 @@ fn transpile_module_source_for_quickjs(
             top_level_mark,
             unresolved_mark,
         ));
+
+        // AFTER lowering, deliberately: this pass matches on the emitted
+        // `h(type, props, …children)` calls, where a host tag is a string
+        // literal and a component is not. That distinction does not exist in
+        // JSX syntax, and it is the whole basis for leaving host tags alone.
+        //
+        // Defers each component's children so the component's own body runs
+        // first — the ordering React and the client reconciler both have, and
+        // the one SSR context propagation requires. See `transforms::thunk_children`.
+        //
+        // ⚠️ SERVER ONLY. The emitted `__albedo_t` lives in the QuickJS prelude;
+        // in the browser it is an undefined identifier. The client also does not
+        // need it — its `h` returns vnodes and its reconciler already descends
+        // parent-first, which is the property this pass buys back for an eager
+        // renderer.
+        if target == TranspileTarget::Server {
+            crate::transforms::thunk_children::thunk_component_children(&mut module);
+        }
 
         emit_module_source(specifier, &module, source_map)
     })
@@ -5209,13 +5556,21 @@ mod tests {
         assert_eq!(out.html, "<span>10:function</span>");
     }
 
-    // `useContext` loads and renders on the server. Eager `h` invocation means a
-    // nested Provider can't thread its value down in a single SSR pass (the
-    // client applies that on hydration), so a consumer resolves the context
-    // DEFAULT here — but it must not crash, and `createContext`/`useContext`
-    // must resolve as `react` imports.
+    // `useContext` resolves a Provider's value **in the server pass**.
+    //
+    // 🔑 This test asserted the opposite until 2026-08-24 — that a consumer
+    // nested inside `<Provider value="dark">` rendered `"light"`, the context
+    // default, with a comment explaining that eager `h` made propagation
+    // impossible in one pass. It was wrong about the cause: the defeater was
+    // that JS evaluates call ARGUMENTS before the call, so children finished
+    // before their Provider ran. `transforms::thunk_children` defers a
+    // component's children and `h` brackets a Provider's forcing with a
+    // push/pop, so the value is live for exactly its subtree.
+    //
+    // Renamed with the behaviour, deliberately: a test whose name still said
+    // `renders_default` would keep advertising the bug as the contract.
     #[test]
-    fn use_context_renders_default_without_crashing() {
+    fn use_context_resolves_a_providers_value_in_one_server_pass() {
         use super::QuickJsEngine;
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
@@ -5240,9 +5595,9 @@ mod tests {
         let out = engine
             .render_component("routes/app.tsx", "{}")
             .expect("renders");
-        // Consumer reads the createContext default ("light") server-side; the
-        // Provider value ("dark") is applied client-side on hydration.
-        assert_eq!(out.html, "<span>light</span>");
+        // The Provider's value, resolved server-side with no hydration
+        // involved. `"light"` here would mean the propagation regressed.
+        assert_eq!(out.html, "<span>dark</span>");
     }
 
     // Island client-reference boundary. A Tier-C island reached from a

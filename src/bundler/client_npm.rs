@@ -154,6 +154,11 @@ pub fn build_browser_npm_runtime_script() -> String {
         node_env = crate::bundler::defines::NODE_ENV_VALUE
     ));
 
+    // The markup contract the client's `style` serialiser reads, from the same
+    // builder the QuickJS prelude uses — see `build_markup_contract_script`.
+    out.push_str(&crate::runtime::quickjs_engine::build_markup_contract_script());
+    out.push('\n');
+
     out.push_str(&build_host_module_records_script());
     out
 }

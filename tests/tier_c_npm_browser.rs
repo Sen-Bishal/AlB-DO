@@ -591,3 +591,73 @@ fn react_children_matches_reacts_empty_slot_rules() {
     assert_eq!(v["only"], "solo");
     assert_eq!(v["onlyThrows"], true, "only() must reject two children");
 }
+
+/// 🔑 **Every global the host table promises a package must actually exist in
+/// the browser runtime.** Derived from the emitted records script, never from a
+/// list maintained beside it — the `albedo doctor` rule.
+///
+/// 🪤 **`useId` was missing here and failed SILENTLY.** The table maps
+/// `useId -> globalThis.useId`; `assets/albedo-client.js` defined every other
+/// hook on `global` and not that one. A package got `undefined` and fell back to
+/// its own counter, so Radix emitted `radix-0` in the browser against the
+/// server's `radix-albedo-<module>-0` and every `aria-controls` /
+/// `aria-labelledby` / tab-panel id was rewritten the moment hydration ran.
+///
+/// It survived a passing `useId` parity test because that test called
+/// `__albedoClient.useId()` — the APP-level entry — and never the path a
+/// PACKAGE takes. Same lesson as the host-table undercount: measure what
+/// packages CALL.
+#[test]
+fn every_global_the_host_table_promises_exists_in_the_browser_runtime() {
+    use rquickjs::{Context, Runtime};
+    use std::collections::BTreeSet;
+
+    // Derived from `HOST_MODULES` itself — the table that makes the promise —
+    // rather than from a list beside it. Only the export TARGETS count: a
+    // `globalThis.…` mentioned inside a prelude is that prelude's own business,
+    // and `__albedo_lazy_element` / `__albedo_child_view` are deliberately
+    // server-only.
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for module in dom_render_compiler::runtime::react_host::HOST_MODULES {
+        for (_, target) in module.exports {
+            if target.starts_with("globalThis.") {
+                // The whole expression, not the leading identifier: a target may
+                // be a PATH (`globalThis.h.Fragment`), which a bracket lookup
+                // cannot resolve.
+                names.insert((*target).to_string());
+            }
+        }
+    }
+    assert!(
+        names.contains("globalThis.useId"),
+        "the extraction itself broke — `useId` is mapped by the table"
+    );
+
+    let client_runtime = include_str!("../assets/albedo-client.js");
+    let runtime = Runtime::new().expect("quickjs runtime");
+    let context = Context::full(&runtime).expect("quickjs context");
+    let missing: Vec<String> = context.with(|ctx| {
+        // The client runtime only needs to *define* its globals here; nothing is
+        // rendered, so a document is not required.
+        ctx.eval::<(), _>("globalThis.document = { createElement: function(){ return {}; } };")
+            .expect("stub document");
+        ctx.eval::<(), _>(client_runtime)
+            .expect("client runtime should evaluate");
+        names
+            .iter()
+            .filter(|name| {
+                let probe = format!("typeof {name}");
+                let kind: String = ctx.eval(probe.as_str()).unwrap_or_else(|_| "error".into());
+                kind == "undefined"
+            })
+            .cloned()
+            .collect()
+    });
+
+    assert!(
+        missing.is_empty(),
+        "the host table promises these to every npm package, and the browser \
+         runtime does not define them: {missing:?} — a package gets `undefined` \
+         and silently falls back, which is a hydration mismatch rather than an error"
+    );
+}

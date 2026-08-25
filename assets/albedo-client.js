@@ -81,9 +81,37 @@
         out.push(child);
         continue;
       }
-      out.push({ __vnode: true, type: TEXT, text: String(child), props: null, children: null });
+      // 🪤 A FUNCTION child is a render prop, not text.
+      // `<Presence>{({present}) => …}</Presence>` is how Radix drives every
+      // mount/unmount animation, and stringifying it emitted the function's
+      // SOURCE as a text node — after which `typeof children === 'function'`
+      // was false inside the package, it took the `Children.only` branch
+      // instead, and the whole subtree (a `Collapsible`'s content, an
+      // `Accordion`'s panel) silently failed to render in the browser while the
+      // server rendered it fine.
+      //
+      // Dropped from `vnode.children` rather than pushed: the reconciler walks
+      // that list to build DOM and a function is not renderable. It survives on
+      // `props.children`, which is where a component reads it and the only place
+      // React itself puts it.
+      if (typeof child === 'function') { continue; }
+      out.push({ __vnode: true, type: TEXT, text: String(child), props: EMPTY_PROPS, children: null });
     }
   }
+
+  // Shared, frozen, and the client half of `AlbedoHtml.prototype.props`.
+  //
+  // 🪤 A vnode with no props of its own (text, `Empty`, `Fragment`) carried
+  // `props: null`, and Radix's `getElementRef` opens with
+  // `Object.getOwnPropertyDescriptor(element.props, 'ref')` — which throws
+  // `Cannot convert undefined or null to object` on exactly those. The server
+  // fixed this for its own element type; the client kept the hole, and it
+  // surfaced the moment a real Radix `Collapsible` (whose trigger has a plain
+  // text child) was rendered through the client runtime.
+  //
+  // One frozen instance rather than a fresh object per vnode: nothing mutates a
+  // vnode's props, and text nodes are the most numerous thing here.
+  var EMPTY_PROPS = Object.freeze({});
 
   function h(type, props) {
     var rest = [];
@@ -118,10 +146,22 @@
     // This is the host-tag half of the component-vnode fix above — one bug,
     // found from opposite ends.
     var finalProps = Object.assign({}, props || {});
-    if (children.length === 1) {
-      finalProps.children = children[0];
-    } else if (children.length > 1) {
-      finalProps.children = children;
+    // `props.children` is folded from the RAW arguments, not the normalised
+    // vnode list, so a render-prop function reaches the component intact. The
+    // normalised list stays as `vnode.children` for the reconciler to walk.
+    // React draws the same distinction: `props.children` is what you passed,
+    // the child list is what gets mounted.
+    var propsKids = [];
+    for (var r = 0; r < rest.length; r++) {
+      var raw = rest[r];
+      if (raw === null || raw === undefined || raw === false || raw === true) { continue; }
+      if (Array.isArray(raw)) { normalizeChildren([raw], propsKids); continue; }
+      propsKids.push(raw);
+    }
+    if (propsKids.length === 1) {
+      finalProps.children = propsKids[0];
+    } else if (propsKids.length > 1) {
+      finalProps.children = propsKids;
     }
     return {
       __vnode: true,
@@ -254,7 +294,7 @@
   }
 
   function emptyVnode() {
-    return { __vnode: true, type: Empty, props: null, children: [], key: null };
+    return { __vnode: true, type: Empty, props: EMPTY_PROPS, children: [], key: null };
   }
 
   // What a component actually returned, as something the reconciler can walk.
@@ -274,9 +314,9 @@
       // An array return is a fragment in all but name.
       var kids = [];
       normalizeChildren(rendered, kids);
-      return { __vnode: true, type: Fragment, props: null, children: kids, key: null };
+      return { __vnode: true, type: Fragment, props: EMPTY_PROPS, children: kids, key: null };
     }
-    return { __vnode: true, type: TEXT, text: String(rendered), props: null, children: null };
+    return { __vnode: true, type: TEXT, text: String(rendered), props: EMPTY_PROPS, children: null };
   }
 
   function isComponent(type) {
@@ -1098,6 +1138,62 @@
     }
   }
 
+  // React's `style` rule, the client half of `quickjs_engine`'s
+  // `__albedo_style_to_css`.
+  //
+  // 🪤 The client had NO style handling at all: `style={{…}}` fell through to
+  // `String(newValue)` and set `style="[object Object]"` on hydrate, wiping the
+  // CSS the server had written. The server had already been fixed for exactly
+  // this — the third instance in this codebase of a markup rule living in one
+  // renderer and not the other, after the prop→attribute renames and the
+  // boolean-attribute forms.
+  //
+  // The unitless SET is data and crosses from Rust on
+  // `__ALBEDO_MARKUP_CONTRACT` (shipped into the browser runtime by
+  // `bundler::client_npm`), so there is one spelling of it. The transform is
+  // algorithm, duplicated the same way the escaping is.
+  function isUnitlessStyle(property) {
+    var contract = global.__ALBEDO_MARKUP_CONTRACT;
+    if (!contract || !contract.styleUnitless) { return false; }
+    return contract.styleUnitless.indexOf(property) !== -1;
+  }
+
+  function hyphenateStyleName(name) {
+    var out = '';
+    for (var i = 0; i < name.length; i++) {
+      var ch = name.charAt(i);
+      if (ch >= 'A' && ch <= 'Z') { out += '-' + ch.toLowerCase(); } else { out += ch; }
+    }
+    // `msTransform` hyphenates to `ms-transform`, but CSS wants `-ms-transform`.
+    return out.indexOf('ms-') === 0 ? '-' + out : out;
+  }
+
+  function styleToCss(style) {
+    var out = '';
+    // `for…in` walks string keys in insertion order — the authored order of the
+    // object literal, which is the order the server emits too.
+    for (var name in style) {
+      if (!hasOwn(style, name)) { continue; }
+      var value = style[name];
+      var rendered;
+      if (value === null || value === undefined || typeof value === 'boolean') {
+        continue;
+      } else if (typeof value === 'number') {
+        rendered = String(value);
+        if (value !== 0 && name.indexOf('--') !== 0 && !isUnitlessStyle(name)) {
+          rendered += 'px';
+        }
+      } else {
+        rendered = String(value).trim();
+        if (rendered === '') { continue; }
+      }
+      var property = name.indexOf('--') === 0 ? name : hyphenateStyleName(name);
+      if (out !== '') { out += ';'; }
+      out += property + ':' + rendered;
+    }
+    return out;
+  }
+
   function applyProp(dom, key, oldValue, newValue) {
     // 🔑 `ref` is a binding, not an attribute. Without this arm a forwarded
     // ref reaches `setAttribute` and lands in the DOM as
@@ -1120,6 +1216,13 @@
       if (typeof newValue === 'function') {
         dom.addEventListener(eventType, newValue);
       }
+      return;
+    }
+    // `style` is an object in JSX and CSS text in HTML — serialised, never
+    // stringified. Before `attributeNameFor`, which does not rename it.
+    if (key === 'style' && newValue !== null && typeof newValue === 'object') {
+      var css = styleToCss(newValue);
+      if (css === '') { dom.removeAttribute('style'); } else { dom.setAttribute('style', css); }
       return;
     }
     // JSX prop → attribute name, from the table both server renderers read.
@@ -1292,6 +1395,17 @@
   global.useRef = useRef;
   global.useMemo = useMemo;
   global.useCallback = useCallback;
+  // 🪤 `useId` was MISSING here while every other hook was present, and it
+  // failed SILENTLY rather than throwing. `react_host`'s table maps
+  // `useId -> globalThis.useId`, so a package got `undefined` and fell back to
+  // its own counter: Radix produced `radix-0` in the browser against the
+  // server's `radix-albedo-<module>-0`, so every `aria-controls` /
+  // `aria-labelledby` / tab-panel id was rewritten on hydrate.
+  //
+  // It survived because the parity test called `__albedoClient.useId()` — the
+  // APP-level API — and never the path a PACKAGE takes. Same failure shape as
+  // the host-table undercount: measure what packages CALL, not what apps import.
+  global.useId = useId;
   global.useContext = useContext;
   global.createContext = createContext;
   global.__ALBEDO_HYDRATE_ISLAND = hydrateIslandDescriptor;

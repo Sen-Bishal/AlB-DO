@@ -172,6 +172,26 @@ const REACT_HOST: HostModule = HostModule {
   }
 
   function __albedo_children_each(children, visit) {
+    // The server defers a component's children (see
+    // `transforms::thunk_children`), so a package inspecting `props.children`
+    // would otherwise be handed the closure instead of the child. Forcing here
+    // is enough for ALL of `React.Children`, because every method funnels
+    // through this one walk.
+    //
+    // Guarded on the hook's existence rather than on a platform test: the
+    // client runtime has no thunks and does not define it, so this whole branch
+    // is inert there and the two runtimes keep one implementation.
+    //
+    // ⚠️ `__albedo_child_view`, NOT `__albedo_force_thunk`: a **deferred
+    // element** must be handed to the caller UNFORCED. It already carries a real
+    // `type` and `props`, which is everything `Children.map`/`only` and their
+    // callers inspect, and forcing it here would render it outside whatever
+    // Provider the caller is about to wrap it in — reintroducing the bug one
+    // level up. Only an opaque app-code thunk, which has nothing to inspect, is
+    // forced.
+    if (typeof globalThis.__albedo_child_view === 'function') {
+      children = globalThis.__albedo_child_view(children);
+    }
     if (Array.isArray(children)) {
       for (var i = 0; i < children.length; i++) {
         __albedo_children_each(children[i], visit);
@@ -233,6 +253,31 @@ const REACT_HOST: HostModule = HostModule {
   // see this scope's `var`. One implementation, two doors.
   globalThis.__albedo_Children = __albedo_Children;
 
+  // `React.createElement` — the CLASSIC runtime's element constructor, and the
+  // other half of the deferral `__albedo_jsx` performs for the automatic one.
+  //
+  // 🪤 **Not every package ships automatic JSX.** `@radix-ui/react-select` in the
+  // corpus is compiled to
+  // `createElement(Root, popperScope, createElement(SelectProvider, {…}, …))` —
+  // classic — so it kept rendering its children while building the outer
+  // Provider's arguments and threw `` `SelectTrigger` must be used within
+  // `Select` `` long after every `jsx`-compiled primitive worked. Mapping
+  // `createElement` straight to `h` was the hole.
+  //
+  // Deliberately NOT achieved by making `globalThis.h` itself lazy: `h` is also
+  // the pragma app JSX lowers to, where `transforms::thunk_children` already
+  // handles ordering, and changing `h` would move every existing golden.
+  function __albedo_createElement(type, props) {
+    var children = Array.prototype.slice.call(arguments, 2);
+    if (typeof globalThis.__albedo_lazy_element === 'function') {
+      var kids;
+      if (children.length === 1) { kids = children[0]; }
+      else if (children.length > 1) { kids = children; }
+      return globalThis.__albedo_lazy_element(type, props || {}, kids);
+    }
+    return globalThis.h.apply(null, [type, props].concat(children));
+  }
+
   // `useReducer` on top of `useState`. The dispatch identity is stable because
   // `useState`'s setter is recreated per render but only ever closes over the
   // same hook cell; the reducer is read from a ref so a dispatch always applies
@@ -266,7 +311,7 @@ const REACT_HOST: HostModule = HostModule {
   }
 "#,
     exports: &[
-        ("createElement", "globalThis.h"),
+        ("createElement", "__albedo_createElement"),
         ("Fragment", "globalThis.h.Fragment"),
         ("forwardRef", "__albedo_forwardRef"),
         ("memo", "__albedo_memo"),
@@ -328,6 +373,26 @@ const JSX_RUNTIME_HOST: HostModule = HostModule {
       }
     }
     if (key !== undefined && key !== null) { props.key = key; }
+    // 🔑 **On the server this returns a DEFERRED element, not markup.**
+    //
+    // A package builds its props object before calling `jsx`, so
+    // `jsx(Provider, { children: jsx(Inner, …) })` evaluates `Inner` FIRST —
+    // the same argument-order defeat that `transforms::thunk_children` removes
+    // for app code, but located inside pre-compiled package source no transform
+    // can reach. Radix nests providers exactly this way
+    // (`jsx(AccordionImplProvider, { children: jsx(Collection.Slot, { children:
+    // jsx(Primitive.div, { ...appProps }) }) })`), so every compound primitive
+    // rendered its children before its own Provider pushed.
+    //
+    // Deferring here makes nothing render until something needs the bytes, and
+    // the force descends THROUGH the Provider — which is the ordering React has.
+    //
+    // Guarded on the hook's existence rather than a platform test: the client
+    // runtime's `h` already builds vnodes lazily and defines no such hook, so it
+    // keeps the eager path below and the two runtimes share one `jsx`.
+    if (typeof globalThis.__albedo_lazy_element === 'function') {
+      return globalThis.__albedo_lazy_element(type, props, children);
+    }
     if (children === undefined) { return globalThis.h(type, props); }
     if (Array.isArray(children)) {
       return globalThis.h.apply(null, [type, props].concat(children));

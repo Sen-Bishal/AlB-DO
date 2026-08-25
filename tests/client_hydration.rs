@@ -1493,3 +1493,564 @@ fn hydration_keeps_the_servers_spelling_of_boolean_attributes() {
     assert_eq!(value["text"], "gone");
     assert_eq!(value["network"], 0);
 }
+
+// ---------------------------------------------------------------------------
+// EXPERIMENT · useId order when children are PASSED IN rather than created
+// ---------------------------------------------------------------------------
+
+/// The client scenario for [`use_id_agrees_when_children_are_passed_in`].
+///
+/// Same tree as `USE_ID_PASSED_TSX`, written against the client's `h`. The
+/// client's `h` is LAZY — `h(Inner, null)` builds a vnode, it does not invoke
+/// `Inner` — so the bodies run parent-first as the reconciler descends.
+const USE_ID_PASSED_SCENARIO: &str = r#"
+var api = globalThis.__albedoClient;
+
+function Inner() {
+  var id = api.useId();
+  return h('span', { id: id });
+}
+
+function Wrapper(props) {
+  var id = api.useId();
+  return h('div', { id: id }, props.children);
+}
+
+function Component() {
+  var outer = api.useId();
+  return h('section', { id: outer, 'data-albedo-island': '11' },
+    h(Wrapper, null, h(Inner, null)));
+}
+api.registerComponent('11', Component);
+
+var body = document.createElement('div');
+var root = document.createElement('section');
+root.setAttribute('data-albedo-island', '11');
+var mid = document.createElement('div');
+mid.appendChild(document.createElement('span'));
+root.appendChild(mid);
+body.appendChild(root);
+globalThis.__domRoot = body;
+
+__ALBEDO_HYDRATE_ISLAND({ component_id: 11, module_path: 'Component.tsx', props: {} });
+
+var ids = [
+  root.getAttribute('id'),
+  root.childNodes[0].getAttribute('id'),
+  root.childNodes[0].childNodes[0].getAttribute('id')
+];
+JSON.stringify({ ids: ids });
+"#;
+
+/// The same tree for the server: a component that receives its children as
+/// `props.children` rather than building them itself.
+const USE_ID_PASSED_TSX: &str = r#"
+import { useId } from "react";
+
+function Inner() {
+  const id = useId();
+  return <span id={id} />;
+}
+
+function Wrapper(props) {
+  const id = useId();
+  return <div id={id}>{props.children}</div>;
+}
+
+export default function Component() {
+  const outer = useId();
+  return (
+    <section id={outer}>
+      <Wrapper><Inner /></Wrapper>
+    </section>
+  );
+}
+"#;
+
+/// Every `id="..."` value, in document order.
+fn ids_in_document_order(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    // ` id="` with the leading space: `data-albedo-id="` ends in `-id="`, so an
+    // unanchored `id="` would collect the anchor ids too and drown the signal.
+    while let Some(at) = rest.find(" id=\"") {
+        let value = &rest[at + 5..];
+        let end = value.find('"').expect("attribute value must terminate");
+        out.push(value[..end].to_string());
+        rest = &value[end..];
+    }
+    out
+}
+
+/// 🔴 **The untested half of `useId`'s ordering contract.**
+///
+/// `client_use_id_matches_the_server_golden` nests components, but every child
+/// there is one the parent *creates* in its own JSX. For that shape the server
+/// really is parent-first: the parent's body runs, and only then does it
+/// evaluate the `h(…)` calls for its children.
+///
+/// This is the other shape — `<Wrapper><Inner /></Wrapper>`, where the child is
+/// evaluated at the CALL SITE and handed in as `props.children`. It lowers to
+/// `h(Wrapper, null, h(Inner))`, and JS evaluates arguments before the call, so
+/// on the server `Inner` runs BEFORE `Wrapper`. The client's `h` is lazy, so it
+/// runs `Wrapper` before `Inner`. Opposite orders, same counter.
+///
+/// This is the shape every context library composes with, so if it diverges it
+/// diverges under all of Radix.
+///
+/// 🟢 **Was a live defect; FIXED 2026-08-24 by `transforms::thunk_children`.**
+/// It measured server `[outer=0, Wrapper=2, Inner=1]` against client
+/// `[outer=0, Wrapper=1, Inner=2]` — transposed, so the client silently
+/// rewrote every id the server had baked in. Deferring a component's children
+/// makes the server invoke parent-first like the client, and the two agree.
+///
+/// ⚠️ The claim it falsifies is written down in two places — `quickjs_engine`'s
+/// `useId` prelude comment and `TODO.md` § 9.2 — both of which say components
+/// are invoked "parent-first, depth-first on BOTH sides". That holds only for
+/// children a component CREATES. For children PASSED IN it is exactly backwards
+/// on the server.
+#[test]
+fn use_id_agrees_when_children_are_passed_in() {
+    use dom_render_compiler::runtime::engine::{BootstrapPayload, RuntimeEngine};
+    use dom_render_compiler::runtime::quickjs_engine::QuickJsEngine;
+
+    let mut engine = QuickJsEngine::new();
+    engine.init(&BootstrapPayload::default()).expect("init");
+    engine
+        .load_module_with_spec("Component.tsx", USE_ID_PASSED_TSX, Some("Component.tsx"))
+        .expect("component loads");
+    let server_html = engine
+        .render_component_with_host("Component.tsx", "{}", "")
+        .expect("renders")
+        .html;
+    let server_ids = ids_in_document_order(&server_html);
+
+    let runtime = Runtime::new().expect("runtime");
+    let context = Context::full(&runtime).expect("context");
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("dom shim");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime");
+        ctx.eval::<String, _>(USE_ID_PASSED_SCENARIO)
+            .expect("scenario")
+    });
+    let value: serde_json::Value = serde_json::from_str(&summary).expect("json");
+    let client_ids: Vec<String> = value["ids"]
+        .as_array()
+        .expect("ids")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+
+    println!("SERVER HTML : {server_html}");
+    println!("SERVER ids  : {server_ids:?}");
+    println!("CLIENT ids  : {client_ids:?}");
+
+    assert_eq!(
+        server_ids, client_ids,
+        "server and client disagree on `useId` when children are passed in — \
+         every aria attribute Radix builds from this hook points at nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SERVER ↔ CLIENT parity for real npm components
+// ---------------------------------------------------------------------------
+
+/// Walk the shim DOM into the same normalised form `normalise_server_html`
+/// produces from the server's bytes: one record per element, attributes sorted.
+///
+/// Attribute ORDER is deliberately discarded. The two renderers assemble props
+/// in different orders and the DOM does not model order at all, so comparing
+/// bytes would fail on a difference no browser can observe. What must agree is
+/// the tree shape, the attribute NAMES, and their VALUES — which is exactly
+/// what hydration adopts against.
+const DOM_SERIALIZER: &str = r#"
+globalThis.__albedo_serialize = function(node) {
+  var out = [];
+  (function walk(n) {
+    if (!n) { return; }
+    if (n.nodeType === 3) { return; }
+    if (n.nodeType === 1) {
+      var keys = [];
+      for (var k in n.attributes) {
+        if (!Object.prototype.hasOwnProperty.call(n.attributes, k)) { continue; }
+        // Framework bookkeeping, not rendered output. Survives on the root when
+        // hydration ADOPTS it and vanishes when the tag differs and hydration
+        // replaces it — so leaving it in would make the comparison depend on
+        // which of those happened.
+        // ...and `data-albedo-hydrated`, which the client stamps on a node it
+        // ADOPTED. Its presence is a function of whether the tag matched (adopt)
+        // or differed (replace), so comparing it would test the harness rather
+        // than the markup. `data-albedo-key`/`data-albedo-id` are NOT skipped —
+        // the server really emits those.
+        if (k === 'data-albedo-island' || k === 'data-albedo-hydrated') { continue; }
+        keys.push(k);
+      }
+      keys.sort();
+      var parts = [];
+      for (var i = 0; i < keys.length; i++) {
+        parts.push(keys[i] + '=' + n.attributes[keys[i]]);
+      }
+      out.push(n.tagName.toLowerCase() + '[' + parts.join(',') + ']');
+      for (var j = 0; j < n.childNodes.length; j++) { walk(n.childNodes[j]); }
+    }
+  })(node);
+  return out;
+};
+"#;
+
+/// Every element in the server's markup as `tag[name=value,…]`, attributes
+/// sorted — the byte-side twin of `DOM_SERIALIZER`.
+fn normalise_server_html(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes: Vec<char> = html.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != '<' {
+            i += 1;
+            continue;
+        }
+        // Closing tag or comment — not an element start.
+        if i + 1 < bytes.len() && (bytes[i + 1] == '/' || bytes[i + 1] == '!') {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut inside = String::new();
+        let mut in_quote = false;
+        while j < bytes.len() {
+            let ch = bytes[j];
+            if ch == '"' {
+                in_quote = !in_quote;
+            }
+            if ch == '>' && !in_quote {
+                break;
+            }
+            inside.push(ch);
+            j += 1;
+        }
+        let inside = inside.trim_end_matches('/').to_string();
+        let mut name_end = 0;
+        for (idx, ch) in inside.char_indices() {
+            if ch.is_whitespace() {
+                break;
+            }
+            name_end = idx + ch.len_utf8();
+        }
+        let tag = inside[..name_end].to_ascii_lowercase();
+        let mut attrs: Vec<String> = Vec::new();
+        let rest = &inside[name_end..];
+        let chars: Vec<char> = rest.chars().collect();
+        let mut k = 0;
+        while k < chars.len() {
+            while k < chars.len() && chars[k].is_whitespace() {
+                k += 1;
+            }
+            let mut key = String::new();
+            while k < chars.len() && !chars[k].is_whitespace() && chars[k] != '=' {
+                key.push(chars[k]);
+                k += 1;
+            }
+            if key.is_empty() {
+                break;
+            }
+            let mut value = String::new();
+            if k < chars.len() && chars[k] == '=' {
+                k += 1;
+                if k < chars.len() && chars[k] == '"' {
+                    k += 1;
+                    while k < chars.len() && chars[k] != '"' {
+                        value.push(chars[k]);
+                        k += 1;
+                    }
+                    k += 1;
+                }
+            }
+            attrs.push(format!("{key}={value}"));
+        }
+        attrs.sort();
+        out.push(format!("{tag}[{}]", attrs.join(",")));
+        i = j + 1;
+    }
+    out
+}
+
+/// Render one island through the **client** runtime and return the normalised
+/// DOM, or `None` when the corpus this needs is not installed.
+///
+/// Mounts rather than hydrates: the container starts empty, and the reconciler
+/// falls back to a clean mount when there is nothing to adopt. What the
+/// comparison then proves is that the client would BUILD the same tree the
+/// server wrote — which is the precondition for hydration adopting it instead
+/// of replacing it.
+fn client_render(package: &str, source: &str) -> Option<Vec<String>> {
+    use dom_render_compiler::bundler::client_npm::{
+        build_browser_npm_runtime_script, build_client_npm_graph, ClientIsland,
+    };
+    use dom_render_compiler::runtime::quickjs_engine::compile_client_island_module_with_npm;
+    use std::collections::HashMap;
+
+    let root = std::path::Path::new("C:/Development/albedo-corpus/shadcn-taxonomy");
+    if !root.join("node_modules").join(package).is_dir() {
+        return None;
+    }
+    let module_path = "Component.tsx";
+    let island = ClientIsland {
+        module_path,
+        source,
+    };
+    let graph = build_client_npm_graph(root, std::slice::from_ref(&island));
+    assert!(
+        graph.failures().is_empty(),
+        "client npm graph failed for {package}: {:?}",
+        graph.failures()
+    );
+    let bindings = graph
+        .bindings_for(module_path)
+        .unwrap_or_else(|| panic!("no client bindings for {package}"));
+    let island_script =
+        compile_client_island_module_with_npm(module_path, source, 77, &HashMap::new(), bindings)
+            .unwrap_or_else(|err| panic!("island failed to compile for {package}: {err}"));
+
+    let runtime = Runtime::new().expect("quickjs runtime");
+    let context = Context::full(&runtime).expect("quickjs context");
+    let json: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("dom shim");
+        ctx.eval::<(), _>(DOM_SERIALIZER).expect("serializer");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime");
+        ctx.eval::<(), _>(build_browser_npm_runtime_script().as_str())
+            .expect("browser npm runtime");
+        for chunk in graph.chunks() {
+            ctx.eval::<(), _>(chunk.script.as_str())
+                .unwrap_or_else(|err| panic!("chunk {} failed: {err}", chunk.url));
+        }
+        ctx.eval::<(), _>(island_script.as_str())
+            .expect("island module");
+        ctx.eval::<String, _>(
+            r#"
+            (function() {
+              try {
+                var body = document.createElement('div');
+                var root = document.createElement('div');
+                root.setAttribute('data-albedo-island', '77');
+                body.appendChild(root);
+                globalThis.__domRoot = body;
+                __ALBEDO_HYDRATE_ISLAND({ component_id: 77, module_path: 'Component.tsx', props: {} });
+                // `body`, not `root`: `hydrateIsland` treats the marker element
+                // AS the component's root node, so when the component's tag
+                // differs the root is REPLACED inside its parent. Serializing
+                // the parent captures the result either way, and multi-root
+                // output (a checkbox is a button PLUS a hidden input) lands as
+                // siblings there too.
+                return JSON.stringify({ ok: true, dom: globalThis.__albedo_serialize(body).slice(1) });
+              } catch (err) {
+                return JSON.stringify({ ok: false,
+                  error: (err && err.message) ? err.message : String(err),
+                  stack: (err && err.stack) ? String(err.stack) : '' });
+              }
+            })();
+            "#,
+        )
+        .expect("client render scenario")
+    });
+    let value: serde_json::Value =
+        serde_json::from_str(&json).expect("client scenario should return JSON");
+    assert!(
+        value["ok"].as_bool().unwrap_or(false),
+        "client render threw for {package}: {}
+{}",
+        value["error"].as_str().unwrap_or("?"),
+        value["stack"].as_str().unwrap_or("")
+    );
+    Some(
+        value["dom"]
+            .as_array()
+            .expect("dom array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect(),
+    )
+}
+
+/// Render the same source through the **server** and return the normalised
+/// markup.
+fn server_render(package: &str, source: &str) -> Option<Vec<String>> {
+    use dom_render_compiler::bundler::client_npm::server_shake_options;
+    use dom_render_compiler::bundler::npm::bundle_npm_dependency;
+    use dom_render_compiler::runtime::engine::{BootstrapPayload, RuntimeEngine};
+    use dom_render_compiler::runtime::quickjs_engine::QuickJsEngine;
+
+    let root = std::path::Path::new("C:/Development/albedo-corpus/shadcn-taxonomy");
+    if !root.join("node_modules").join(package).is_dir() {
+        return None;
+    }
+    let bundle = bundle_npm_dependency(root, package, &server_shake_options())
+        .unwrap_or_else(|err| panic!("server bundle failed for {package}: {err}"));
+    let mut engine = QuickJsEngine::new();
+    engine.init(&BootstrapPayload::default()).expect("init");
+    for artifact in &bundle.artifacts {
+        engine
+            .load_precompiled_module(&artifact.key, &artifact.script, artifact.source_hash)
+            .unwrap_or_else(|err| panic!("artifact {} failed: {err}", artifact.key));
+    }
+    engine
+        .load_module_with_spec("Component.tsx", source, None)
+        .expect("component loads");
+    let html = engine
+        .render_component_with_host("Component.tsx", "{}", "")
+        .unwrap_or_else(|err| panic!("server render failed for {package}: {err}"))
+        .html;
+    Some(normalise_server_html(&html))
+}
+
+/// 🔑 **The parity that hydration depends on.** The server bakes Radix's markup
+/// at build time and the client rebuilds it in the browser; if the two trees
+/// disagree, hydration replaces nodes instead of adopting them and every
+/// `useId`-derived aria attribute the server wrote is rewritten under the user.
+///
+/// Both sides run the SAME package source — the server through
+/// `bundle_npm_dependency` + QuickJS, the client through `build_client_npm_graph`
+/// + `assets/albedo-client.js` — so this exercises two independent bundlers and
+/// two independent renderers against one library.
+///
+/// `#[ignore]`d because it reads an external corpus at
+/// `C:/Development/albedo-corpus`, the same reason `npm_coverage_probe` is.
+/// Run with `cargo test --test client_hydration -- --ignored --nocapture`.
+#[ignore = "reads the external corpus at C:/Development/albedo-corpus"]
+#[test]
+fn the_client_rebuilds_the_servers_radix_markup() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "label",
+            "@radix-ui/react-label",
+            r#"import * as L from "@radix-ui/react-label";
+               export default function C(){ return <L.Root htmlFor="email">Email</L.Root>; }"#,
+        ),
+        (
+            "separator",
+            "@radix-ui/react-separator",
+            r#"import * as S from "@radix-ui/react-separator";
+               export default function C(){ return <S.Root />; }"#,
+        ),
+        (
+            "toggle",
+            "@radix-ui/react-toggle",
+            r#"import * as T from "@radix-ui/react-toggle";
+               export default function C(){ return <T.Root>Bold</T.Root>; }"#,
+        ),
+        (
+            "progress",
+            "@radix-ui/react-progress",
+            r#"import * as P from "@radix-ui/react-progress";
+               export default function C(){ return <P.Root value={40}><P.Indicator /></P.Root>; }"#,
+        ),
+        (
+            "collapsible",
+            "@radix-ui/react-collapsible",
+            r#"import * as C2 from "@radix-ui/react-collapsible";
+               export default function C(){ return (<C2.Root defaultOpen>
+                 <C2.Trigger>Toggle</C2.Trigger><C2.Content>Body</C2.Content></C2.Root>); }"#,
+        ),
+        (
+            "accordion",
+            "@radix-ui/react-accordion",
+            r#"import * as A from "@radix-ui/react-accordion";
+               export default function C(){ return (<A.Root type="single" defaultValue="a"><A.Item value="a">
+                 <A.Header><A.Trigger>Question</A.Trigger></A.Header><A.Content>Answer</A.Content>
+               </A.Item></A.Root>); }"#,
+        ),
+    ];
+
+    let mut skipped = true;
+    let mut mismatches: Vec<String> = Vec::new();
+    for (label, package, source) in cases {
+        let (Some(server), Some(client)) = (server_render(package, source), client_render(package, source))
+        else {
+            continue;
+        };
+        skipped = false;
+        if server == client {
+            println!("[{label}] MATCH ({} elements)", server.len());
+        } else {
+            println!("[{label}] MISMATCH\n  server: {server:#?}\n  client: {client:#?}");
+            mismatches.push((*label).to_string());
+        }
+    }
+
+    if skipped {
+        println!("SKIPPED — corpus not installed");
+        return;
+    }
+    assert!(
+        mismatches.is_empty(),
+        "server and client built different trees for: {mismatches:?} — hydration \
+         would replace these nodes instead of adopting them"
+    );
+}
+
+/// 🟡 **`Tabs` is the one primitive whose trees still differ — pinned, not
+/// tolerated.**
+///
+/// Exactly two attributes disagree, both driven by effects rather than by the
+/// first render:
+///
+/// * `tabIndex` on the tablist — `RovingFocusGroup` computes it from focus
+///   state in an effect, so the server writes `-1` and the client settles on
+///   `0`.
+/// * `hidden` on the active tabpanel — the server emits it and the client does
+///   not, which means the two disagree about `Presence`'s INITIAL `present`.
+///   React initialises that state to `present ? 'mounted' : 'unmounted'`, so
+///   the server marking a *selected* panel hidden looks like OUR bug, not a
+///   settling difference. **Unresolved.**
+///
+/// Asserted as an exact set so any further drift fails: this pins the size of
+/// the gap rather than waving it through.
+#[ignore = "reads the external corpus at C:/Development/albedo-corpus"]
+#[test]
+fn tabs_differs_from_the_client_in_exactly_two_effect_driven_attributes() {
+    const TABS: &str = r#"import * as T from "@radix-ui/react-tabs";
+        export default function C(){ return (<T.Root defaultValue="a">
+          <T.List><T.Trigger value="a">One</T.Trigger><T.Trigger value="b">Two</T.Trigger></T.List>
+          <T.Content value="a">Panel A</T.Content></T.Root>); }"#;
+
+    let (Some(server), Some(client)) = (
+        server_render("@radix-ui/react-tabs", TABS),
+        client_render("@radix-ui/react-tabs", TABS),
+    ) else {
+        println!("SKIPPED — corpus not installed");
+        return;
+    };
+
+    assert_eq!(
+        server.len(),
+        client.len(),
+        "the two renderers built different SHAPES, which is more than the known          attribute gap
+server: {server:#?}
+client: {client:#?}"
+    );
+
+    let mut differing: Vec<String> = Vec::new();
+    for (s, c) in server.iter().zip(client.iter()) {
+        if s == c {
+            continue;
+        }
+        let server_attrs: std::collections::BTreeSet<&str> =
+            s.trim_end_matches(']').split('[').nth(1).unwrap_or("").split(',').collect();
+        let client_attrs: std::collections::BTreeSet<&str> =
+            c.trim_end_matches(']').split('[').nth(1).unwrap_or("").split(',').collect();
+        for attr in server_attrs.symmetric_difference(&client_attrs) {
+            differing.push((*attr).to_string());
+        }
+    }
+    differing.sort();
+
+    assert_eq!(
+        differing,
+        vec![
+            "hidden=".to_string(),
+            "tabIndex=-1".to_string(),
+            "tabIndex=0".to_string(),
+        ],
+        "the Tabs gap changed. If it SHRANK, delete this test and put Tabs back          in the strict parity list; if it GREW, something regressed."
+    );
+}

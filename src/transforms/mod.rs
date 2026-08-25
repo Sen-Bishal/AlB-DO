@@ -29,6 +29,7 @@ pub mod link;
 pub mod shared_slot_lists;
 pub mod shared_slots;
 pub mod stable_ids;
+pub mod thunk_children;
 pub mod workflow;
 
 pub use actions::{extract_action_declarations, ActionDeclaration, ActionExtractError};
