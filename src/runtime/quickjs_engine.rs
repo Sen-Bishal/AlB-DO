@@ -79,6 +79,10 @@ pub struct QuickJsEngine {
     force_persistent: bool,
     loaded_module_hashes: HashMap<String, u64>,
     bootstrap: Option<BootstrapPayload>,
+    /// The bootstrap kept for [`Self::reset_realm`], which must reinstall the
+    /// prelude into a brand-new context. `bootstrap` is *taken* by
+    /// `ensure_initialized`, so it cannot be reused.
+    bootstrap_retained: Option<BootstrapPayload>,
     initialized: bool,
 }
 
@@ -92,8 +96,71 @@ impl QuickJsEngine {
             force_persistent: false,
             loaded_module_hashes: HashMap::new(),
             bootstrap: None,
+            bootstrap_retained: None,
             initialized: false,
         }
+    }
+
+    /// **Discard this engine's JS realm and build a fresh one on the SAME
+    /// runtime.** Experimental — the mechanism TODO 10.0's confinement half
+    /// would be built on, and the instrument that prices it.
+    ///
+    /// 🔑 A `Context` owns the intrinsics (`Object.prototype`, `JSON`, …) and the
+    /// globals, which is the entire mutable surface a third-party package can
+    /// poison. The `Runtime` owns the allocator, the atom table and the shape
+    /// table — the expensive warm state. Dropping only the context therefore
+    /// throws away exactly the attack surface and keeps exactly the investment.
+    ///
+    /// ⚠️ TODO 10.0 rejects "a realm per request" as killing the warm arena.
+    /// That reads the ownership backwards: the arena is attached to the runtime,
+    /// which this does not touch. Whether it is *affordable* is a separate
+    /// question, and a measured one — see `tests/realm_reset_cost.rs`.
+    ///
+    /// Every module must be re-registered afterwards: module records live in the
+    /// context that evaluated them, so `loaded_module_hashes` is cleared too.
+    pub fn reset_realm(&mut self) -> RuntimeResult<()> {
+        self.rebuild_realm(|_| Ok(()))
+    }
+
+    /// Discard the realm **and re-register modules inside the same arena
+    /// bracket** — the only correct way to do it.
+    ///
+    /// 🔴 **Measured, twice, because the obvious version leaks (SANDGATE G1).**
+    /// `ArenaControl::in_request` is a ROUTING flag, not a region reset: outside
+    /// a request, allocations land in the persistent bump, which is never freed
+    /// while the engine lives (16 MB cap).
+    ///
+    /// | version | persistent growth | region exhausted after |
+    /// |---|---|---|
+    /// | no bracket | 366 KB / rebuild | ~45 rebuilds |
+    /// | bracket around the context only | 16.7 KB / rebuild | ~980 rebuilds |
+    /// | bracket around context **+ modules** | ~0.7 KB / rebuild | — |
+    ///
+    /// The middle row is the trap: it looks like a fix and is still a leak, just
+    /// a slower one. `load_module_with_spec` does not bracket — correctly, since
+    /// boot-time modules SHOULD be persistent — so a *re*-registration after a
+    /// reset must be bracketed by the caller. Taking the registration as a
+    /// closure is what makes that unforgettable rather than a comment somebody
+    /// has to obey.
+    ///
+    /// Module records live in the context that evaluated them, so everything the
+    /// engine had must be registered again inside `register`.
+    pub fn rebuild_realm<F>(&mut self, register: F) -> RuntimeResult<()>
+    where
+        F: FnOnce(&mut Self) -> RuntimeResult<()>,
+    {
+        let arena = Arc::clone(&self.arena);
+        arena.begin_request();
+        let outcome = (|| -> RuntimeResult<()> {
+            self.context = None;
+            self.loaded_module_hashes.clear();
+            self.initialized = false;
+            self.bootstrap = self.bootstrap_retained.clone();
+            self.ensure_initialized()?;
+            register(self)
+        })();
+        arena.end_request();
+        outcome
     }
 
     /// Snapshot of the request-scoped bump arena that backs the QuickJS runtime.
@@ -541,6 +608,7 @@ impl RuntimeEngine for QuickJsEngine {
             return Ok(());
         }
         self.bootstrap = Some(bootstrap.clone());
+        self.bootstrap_retained = Some(bootstrap.clone());
         self.ensure_initialized()
     }
 
