@@ -236,6 +236,11 @@ struct RawEffect {
     /// makes it `Value::Null` there rather than a decode error.
     #[serde(default)]
     value: Value,
+    /// SANDGATE-B · the module whose factory body was running when this effect
+    /// was recorded, or `None` for the ordinary case (the application's own
+    /// handler). Stamped from the sealed provenance stack.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 /// Raw shape of one staged request, as the `fetch` builtin pushes it.
@@ -271,6 +276,13 @@ struct HandlerEnvelope {
     /// ignore it. Optional so pre-P6 envelopes (no `result` key) still decode.
     result: Option<String>,
     error: Option<String>,
+    /// SANDGATE-B · the realm's own answer to *"is anything hooked into
+    /// serialisation right now?"*, read through the sealed holder a package
+    /// cannot replace. `None` on an envelope from a pre-SANDGATE prelude;
+    /// `Some(reason)` means the run is refused. See
+    /// [`crate::runtime::confinement::integrity_probe_expression`].
+    #[serde(default)]
+    integrity: Option<String>,
 }
 
 /// What a handler body produced: its side-effects (setter/broadcast calls) and,
@@ -330,6 +342,11 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     script.push_str(
         "const __albedo_is_suspend=function(e){return e===__ALBEDO_SUSPEND||(e!==null&&typeof e==='object'&&e.__albedo_suspend===true);};\n",
     );
+    // SANDGATE-B · the sealed holder is bound OUTSIDE the try for the same
+    // reason `__albedo_suspended` is: the catch block encodes its envelope
+    // through it, and a `const` declared inside the try is not in scope there —
+    // which would turn every handler that throws into an opaque ReferenceError.
+    script.push_str("const __albedo_S=globalThis.__albedo_sealed;\n");
     script.push_str("const __albedo_journal=");
     match inv.journal {
         Some(journal) => script.push_str(&js_literal(journal)?),
@@ -338,7 +355,39 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     script.push_str(";\n");
 
     script.push_str("try{\n");
-    script.push_str("const __albedo_effects=[];\n");
+    // SANDGATE-B · the effect channel is assembled through the SEALED holder,
+    // never through the realm's own `JSON` or `Array.prototype`.
+    //
+    // 🔴 The attack this replaces: a package patches `JSON.stringify`, and the
+    // epilogue below used to hand it the whole effect array to encode. The
+    // patched function returned text for an array it had appended a
+    // `forge_append` to, and the server executed it. Confinement does not close
+    // that — the victim route re-imports the package, so the patch is
+    // re-applied *before* the handler it attacks (gate 2, row 3).
+    //
+    // Three properties make the list unforgeable, and all three are needed:
+    //  1. every effect is a NULL-PROTOTYPE record, so encoding one cannot pick
+    //     up an inherited `toJSON`;
+    //  2. each is encoded at push time through the PRISTINE `stringify`
+    //     captured before any package ran;
+    //  3. the list is assembled by STRING CONCATENATION over those encoded
+    //     entries, so no array — and therefore no `Array.prototype` hook and no
+    //     second `stringify` call on an object — is on the path at all.
+    script.push_str("const __albedo_effect_json=__albedo_S.record();\n");
+    script.push_str("let __albedo_effect_n=0;\n");
+    // `origin` is the sealed provenance stack's current frame: the npm linker
+    // pushes a module key around a factory body, so an effect recorded while
+    // third-party top-level code runs is attributable. For an ordinary handler
+    // it is `null`, which is the honest answer.
+    script.push_str(
+        "const __albedo_emit=function(rec){rec.origin=__albedo_S.currentOrigin();__albedo_effect_json[__albedo_effect_n]=__albedo_S.stringify(rec);__albedo_effect_n=__albedo_effect_n+1;};\n",
+    );
+    script.push_str(
+        "const __albedo_rec=function(kind){var r=__albedo_S.record();r.kind=kind;return r;};\n",
+    );
+    script.push_str(
+        "const __albedo_effects_json=function(){var s='[';for(var i=0;i<__albedo_effect_n;i++){if(i>0){s+=',';}s+=__albedo_effect_json[i];}return s+']';};\n",
+    );
 
     // Pre-write snapshot of topic values, so updater-form `broadcast(topic, fn)`
     // can read the current value. Always defined (at least `{}`) since the
@@ -385,7 +434,7 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     // The setter helpers push raw values; the outer JSON.stringify of the whole
     // array encodes them once.
     script.push_str(
-        "const broadcast=function(topic,value){var __t=String(topic);var __v;if(typeof value==='function'){var __cur=Object.prototype.hasOwnProperty.call(__albedo_topic_current,__t)?__albedo_topic_current[__t]:null;__v=value(__cur);}else{__v=value;}if(__v===undefined)__v=null;__albedo_topic_current[__t]=__v;__albedo_effects.push({kind:'broadcast',topic:__t,value:__v});};\n",
+        "const broadcast=function(topic,value){var __t=String(topic);var __v;if(typeof value==='function'){var __cur=Object.prototype.hasOwnProperty.call(__albedo_topic_current,__t)?__albedo_topic_current[__t]:null;__v=value(__cur);}else{__v=value;}if(__v===undefined)__v=null;__albedo_topic_current[__t]=__v;var __r=__albedo_rec('broadcast');__r.topic=__t;__r.value=__v;__albedo_emit(__r);};\n",
     );
 
     // FORGE · `append(collection, record)` — the durable write builtin, defined
@@ -404,7 +453,7 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     // fields: the collection IS the topic (a persistent collection is a topic
     // materialised from the substrate), and the record is the value.
     script.push_str(
-        "const append=function(collection,record){if(record===null||typeof record!=='object'||Array.isArray(record)){throw new TypeError('append(collection, record): record must be an object');}__albedo_effects.push({kind:'forge_append',topic:String(collection),value:record});return null;};\n",
+        "const append=function(collection,record){if(record===null||typeof record!=='object'||Array.isArray(record)){throw new TypeError('append(collection, record): record must be an object');}var __r=__albedo_rec('forge_append');__r.topic=String(collection);__r.value=record;__albedo_emit(__r);return null;};\n",
     );
     // `update(collection, key, fields)` and `remove(collection, key)` — the
     // other two durable mutations, same effect-recording discipline as append.
@@ -421,10 +470,10 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
         "const __albedo_forge_key=function(name,key){if(key===null||typeof key==='object'){throw new TypeError(name+'(collection, key): key must be a string, number, or boolean');}return key;};\n",
     );
     script.push_str(
-        "const update=function(collection,key,fields){if(fields===null||typeof fields!=='object'||Array.isArray(fields)){throw new TypeError('update(collection, key, fields): fields must be an object');}__albedo_effects.push({kind:'forge_update',topic:String(collection),key:__albedo_forge_key('update',key),value:fields});return null;};\n",
+        "const update=function(collection,key,fields){if(fields===null||typeof fields!=='object'||Array.isArray(fields)){throw new TypeError('update(collection, key, fields): fields must be an object');}var __r=__albedo_rec('forge_update');__r.topic=String(collection);__r.key=__albedo_forge_key('update',key);__r.value=fields;__albedo_emit(__r);return null;};\n",
     );
     script.push_str(
-        "const remove=function(collection,key){__albedo_effects.push({kind:'forge_delete',topic:String(collection),key:__albedo_forge_key('remove',key)});return null;};\n",
+        "const remove=function(collection,key){var __r=__albedo_rec('forge_delete');__r.topic=String(collection);__r.key=__albedo_forge_key('remove',key);__albedo_emit(__r);return null;};\n",
     );
 
     // ── APERTURE A2 · the suspend protocol ───────────────────────────────
@@ -521,7 +570,7 @@ throw __ALBEDO_SUSPEND;\
             )));
         }
         script.push_str(&format!(
-            "const {name}=function(v){{__albedo_effects.push({{kind:'slot',slot_id:{},value:(v===undefined?null:v)}});}};\n",
+            "const {name}=function(v){{var __r=__albedo_rec('slot');__r.slot_id={};__r.value=(v===undefined?null:v);__albedo_emit(__r);}};\n",
             slot_id.0
         ));
     }
@@ -580,13 +629,30 @@ throw __ALBEDO_SUSPEND;\
     // a swallowed sentinel degrades to *suspend anyway*, never to *commit the
     // effects of a body that never got its data*.
     script.push_str(
-        "if(__albedo_suspended){return JSON.stringify({ok:false,suspend:JSON.stringify(__albedo_pending),journal_len:__albedo_journal.length});}\n",
+        "if(__albedo_suspended){return '{\"ok\":false,\"suspend\":'+__albedo_S.stringify(__albedo_S.stringify(__albedo_pending))+',\"journal_len\":'+__albedo_S.stringify(__albedo_journal.length|0)+'}';}\n",
     );
     script.push_str(
-        "return JSON.stringify({ok:true,value:JSON.stringify(__albedo_effects),result:JSON.stringify(__albedo_result===undefined?null:__albedo_result)});\n",
+        // 🔑 The envelope itself is CONCATENATED, not `stringify`d from an
+        // object literal. An object handed to `stringify` consults `toJSON`
+        // through its prototype chain, so a realm carrying
+        // `Object.prototype.toJSON` could have rewritten the whole envelope —
+        // including any integrity field inside it, which would have made the
+        // check below report on itself. Only primitives are encoded here, and
+        // `stringify` skips `toJSON` for primitives.
+        "var __albedo_result_json=__albedo_S.stringify(__albedo_result===undefined?null:__albedo_result);\n",
     );
     script.push_str(
-        "}catch(err){if(__albedo_suspended||__albedo_is_suspend(err)){return JSON.stringify({ok:false,suspend:JSON.stringify(__albedo_pending),journal_len:__albedo_journal.length});}const message=(err&&typeof err.message==='string')?err.message:String(err);return JSON.stringify({ok:false,error:message});}\n",
+        "if(typeof __albedo_result_json!=='string'){__albedo_result_json='null';}\n",
+    );
+    script.push_str(&format!(
+        "var __albedo_integrity={probe};\n",
+        probe = crate::runtime::confinement::integrity_probe_expression()
+    ));
+    script.push_str(
+        "return '{\"ok\":true,\"value\":'+__albedo_S.stringify(__albedo_effects_json())+',\"result\":'+__albedo_S.stringify(__albedo_result_json)+',\"integrity\":'+__albedo_S.stringify(__albedo_integrity)+'}';\n",
+    );
+    script.push_str(
+        "}catch(err){if(__albedo_suspended||__albedo_is_suspend(err)){return '{\"ok\":false,\"suspend\":'+__albedo_S.stringify(__albedo_S.stringify(__albedo_pending))+',\"journal_len\":'+__albedo_S.stringify(__albedo_journal.length|0)+'}';}const message=(err&&typeof err.message==='string')?err.message:String(err);return '{\"ok\":false,\"error\":'+__albedo_S.stringify(message)+'}';}\n",
     );
     script.push_str("})()");
     Ok(script)
@@ -642,6 +708,26 @@ pub(crate) fn decode_handler_run(
         )));
     }
 
+    // SANDGATE-B · refuse the run if the realm is carrying a serialisation hook.
+    //
+    // The effect list itself is unforgeable (null-prototype records, pristine
+    // `stringify`, concatenated assembly), but an effect's *payload* is
+    // application data serialised as an object, and `Object.prototype.toJSON`
+    // would still let a package rewrite it. Rather than defend a value the
+    // application legitimately owns, refuse the whole pass: no application
+    // plants `toJSON` on `Object.prototype`, so this is an attack signature and
+    // not a compatibility hazard.
+    //
+    // 🔑 This check is only worth anything because the envelope carrying it is
+    // built by string concatenation. Had it been an object handed to
+    // `stringify`, the same hook it reports would have been able to rewrite the
+    // report.
+    if let Some(reason) = envelope.integrity.as_deref().filter(|r| !r.is_empty()) {
+        return Err(RuntimeError::render(format!(
+            "handler '{entry}' refused: the JS realm has '{reason}' installed, which can rewrite              serialised effect payloads. This is realm poisoning — see SANDGATE-B."
+        )));
+    }
+
     // The result lane is best-effort: a missing key (pre-P6 envelope) or a
     // decode hiccup degrades to `None` rather than failing an otherwise-good
     // dispatch — the effects still ship.
@@ -670,6 +756,27 @@ pub(crate) fn decode_handler_run(
 }
 
 fn lower_effect(entry: &str, raw: RawEffect) -> RuntimeResult<HandlerEffect> {
+    // SANDGATE-B · provenance, enforced rather than merely recorded.
+    //
+    // The sealed provenance stack carries a frame only while an npm module's
+    // **factory body** is executing — the one window in which third-party code
+    // runs with the linker on the stack. A handler body runs with that stack
+    // empty, so every legitimate effect arrives with `origin: null`.
+    //
+    // 🔑 This is a **tripwire, not the defence**. Gate 4 showed the effect
+    // builtins were never reachable from package code to begin with
+    // (`append`/`update`/`remove` are `const`s inside the per-request handler
+    // IIFE, not globals), so this should never fire. That is precisely why it
+    // is worth having: if it ever does, either a builtin leaked onto
+    // `globalThis` or a package found a path back into one, and both are
+    // findings that would otherwise surface as a mysterious write.
+    if let Some(origin) = raw.origin.as_deref().filter(|o| !o.is_empty()) {
+        return Err(RuntimeError::render(format!(
+            "handler '{entry}' produced a '{}' effect while the module '{origin}' was              executing. Effects may only be recorded by application code; a package              reached an effect builtin. See SANDGATE-B.",
+            raw.kind
+        )));
+    }
+
     let value = serde_json::to_vec(&raw.value).map_err(|err| {
         RuntimeError::render(format!(
             "failed to encode handler effect value for '{entry}': {err}"
@@ -820,7 +927,7 @@ mod tests {
         let script = build_handler_script(&inv).unwrap();
         assert!(script.contains("let count=41;"));
         assert!(script.contains("const setCount=function(v)"));
-        assert!(script.contains("slot_id:7"));
+        assert!(script.contains("__r.slot_id=7;"));
         assert!(script.contains("(setCount(count + 1));"));
         assert!(script.contains("const event=null;"));
     }
@@ -921,6 +1028,57 @@ mod tests {
         }
     }
 
+    /// SANDGATE-B · an effect stamped with a module origin is refused.
+    ///
+    /// Constructed at the envelope rather than through a package, because gate
+    /// 4 established that a package *cannot* reach an effect builtin — so the
+    /// only way to exercise the tripwire is to forge the condition it watches
+    /// for. That is the right shape for a tripwire test: it proves the alarm
+    /// works without needing the fire.
+    #[test]
+    fn an_effect_recorded_while_a_package_was_executing_is_refused() {
+        let effects_json = serde_json::to_string(&serde_json::json!([
+            { "kind": "forge_append", "topic": "albedo_users",
+              "value": { "role": "admin" }, "origin": "npm:evil@1.0.0/index.js" }
+        ]))
+        .unwrap();
+        let envelope = serde_json::json!({ "ok": true, "value": effects_json }).to_string();
+
+        let err = decode_completed("routes/x", &envelope).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("npm:evil@1.0.0/index.js"),
+            "the refusal must name the module it caught. Got: {message}"
+        );
+        assert!(message.contains("SANDGATE-B"), "Got: {message}");
+    }
+
+    /// The ordinary case must not trip it: a handler body runs with the
+    /// provenance stack empty, so `origin` is absent and every effect lands.
+    #[test]
+    fn an_effect_with_no_origin_is_the_ordinary_case_and_is_accepted() {
+        let effects_json = serde_json::to_string(&serde_json::json!([
+            { "kind": "broadcast", "topic": "t", "value": 1, "origin": null }
+        ]))
+        .unwrap();
+        let envelope = serde_json::json!({ "ok": true, "value": effects_json }).to_string();
+        let outcome = decode_completed("routes/x", &envelope).expect("accepted");
+        assert_eq!(outcome.effects.len(), 1);
+    }
+
+    /// SANDGATE-B · a realm reporting a serialisation hook refuses the pass.
+    #[test]
+    fn an_integrity_violation_refuses_the_whole_pass() {
+        let envelope = serde_json::json!({
+            "ok": true, "value": "[]", "integrity": "Object.prototype.toJSON"
+        })
+        .to_string();
+        let err = decode_completed("routes/x", &envelope).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
+        assert!(message.contains("SANDGATE-B"), "Got: {message}");
+    }
+
     #[test]
     fn decode_surfaces_a_thrown_error_loudly() {
         let envelope = serde_json::json!({ "ok": false, "error": "boom" }).to_string();
@@ -976,7 +1134,7 @@ mod tests {
         })
         .unwrap();
         assert!(script.contains("const append=function(collection,record)"));
-        assert!(script.contains("kind:'forge_append'"));
+        assert!(script.contains("__albedo_rec('forge_append')"));
         assert!(script.contains("const form="));
     }
 
@@ -999,9 +1157,9 @@ mod tests {
         })
         .unwrap();
         assert!(script.contains("const update=function(collection,key,fields)"));
-        assert!(script.contains("kind:'forge_update'"));
+        assert!(script.contains("__albedo_rec('forge_update')"));
         assert!(script.contains("const remove=function(collection,key)"));
-        assert!(script.contains("kind:'forge_delete'"));
+        assert!(script.contains("__albedo_rec('forge_delete')"));
         assert!(
             !script.contains("const delete="),
             "delete is reserved; must be remove"

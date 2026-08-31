@@ -3,6 +3,7 @@ pub mod arena;
 pub mod bridge;
 pub mod broadcast;
 pub mod compiled;
+pub mod confinement;
 pub mod dirty_bitmap;
 pub mod emitter;
 pub mod engine;

@@ -95,6 +95,16 @@ const UNSAFE_EXCEPTIONS: &[(&str, &str)] = &[
         "GlobalAlloc is an unsafe trait; the counting allocator is this suite's instrument \
          and governs the test binary only",
     ),
+    (
+        "src/runtime/confinement.rs",
+        "SANDGATE-A replays npm registrations from bytecode at every request boundary, and          Module::load is the only route to JS_ReadObject; every byte it loads was produced          by Module::write on this process's own Runtime, is keyed by the content hash of          the script it came from, and is NEVER persisted to disk — an on-disk cache would          be a new integrity boundary inside the realm confinement exists to protect",
+    ),
+    (
+        "tests/sandgate_gate3_bytecode.rs",
+        "Module::load is the only route to JS_ReadObject, and pricing the bytecode path \
+         against today's parse is the entire question gate 3.1 asks; the bytes are produced \
+         by Module::write in the same process moments earlier and never leave the test binary",
+    ),
 ];
 
 #[test]

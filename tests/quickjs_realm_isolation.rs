@@ -1,19 +1,40 @@
-//! 🔴 **These tests assert a leak that is OPEN.** They document, executably,
-//! what an npm package can do to the server's shared QuickJS realm.
+//! 🔴 **These tests assert what an npm package can do to a QuickJS realm it
+//! shares.** They document the leak executably, because the finding is easy to
+//! state, easy to disbelieve, and expensive to re-derive.
 //!
 //! **If one of these starts failing, the leak was closed — invert the assertion
-//! rather than deleting the test.** They exist because the finding is easy to
-//! state and easy to disbelieve, and re-deriving it from scratch costs an hour.
+//! rather than deleting the test.**
 //!
-//! ## The setup that makes it reachable
+//! ## ⚠️ SUPERSEDED IN PART — read this before citing the file
+//!
+//! Every assertion below still holds **within one request**, which is what they
+//! measure: a bare `QuickJsEngine` driven straight, with no boundary crossed.
+//! Two things they say *about production* no longer do.
+//!
+//! 1. **"The realm spans every request and every principal."** No longer true.
+//!    `QuickJsEnginePool::with_engine` now confines the realm after any checkout
+//!    on an engine that has npm registered — `QuickJsEngine::confine` discards
+//!    the context and replays the registration ledger
+//!    (`runtime::confinement`). Pinned by
+//!    `engine_pool::tests::a_pooled_engine_does_not_carry_realm_state_between_checkouts`
+//!    and `tests/sandgate_gate5.rs`.
+//!
+//! 2. **"The effect stream is unauthenticated."** No longer true either, and by
+//!    a different mechanism — see the note on claim 2 below. `tests/sandgate_gate4.rs`.
+//!
+//! What confinement does **not** change, and what these tests remain the record
+//! of: the realm is not frozen, `globalThis` is reachable, and a package's code
+//! re-runs on import every request. Confinement erases accumulated **data**, not
+//! **code**. See `tests/sandgate_gate2.rs`.
+//!
+//! ## The setup that made it reachable
 //!
 //! Pooled engines (`crates/albedo-server/src/engine_pool.rs`) are created once,
-//! warmed, and **reused for every request for the process's life** — the arena
-//! discipline requires it (`ARENA_WARMUP_RENDERS`). `install_npm_bundles`
-//! registers the project's packages on **every** engine in that pool, and the
-//! same engines serve Tier-B renders *and* QuickJS actions. So one JS realm
-//! spans every request and every principal, and third-party package code lives
-//! in it.
+//! warmed, and reused for the process's life — the arena discipline requires it
+//! (`ARENA_WARMUP_RENDERS`). `install_npm_bundles` registers the project's
+//! packages on **every** engine in that pool, and the same engines serve Tier-B
+//! renders *and* QuickJS actions. Before confinement, one JS realm therefore
+//! spanned every request and every principal.
 //!
 //! ## What that falsifies
 //!
@@ -31,7 +52,20 @@
 //!    dispatches on `kind` alone. An effect carries **no provenance**, so a
 //!    forged one is indistinguishable from one the `append` shim pushed.
 //!    Enforcement-at-the-effect is sound only if the effect stream's *integrity*
-//!    is, and it is not.
+//!    is, and it was not.
+//!
+//!    ✅ **CLOSED 2026-08-30 (SANDGATE-B).** The effect list no longer passes
+//!    through the realm's `JSON` or through an array at all: each effect is a
+//!    null-prototype record encoded at push time with an intrinsic captured
+//!    before any package could run, and the list is assembled by string
+//!    concatenation. `Object.prototype.toJSON` — the one hook that could still
+//!    rewrite a *payload* — refuses the pass outright. `tests/sandgate_gate4.rs`.
+//!
+//!    🔑 And the finding underneath it: the effect builtins were never
+//!    *callable* from package code, because `append`/`update`/`remove` are
+//!    `const`s inside the per-request handler IIFE rather than globals. Every
+//!    real forging path went through **serialisation**, which is why the fix is
+//!    an integrity fix and not a capability check.
 //!
 //! ⚖️ **Not worse than the incumbent.** A malicious package in Next.js gets
 //! `fs`/`net`/`child_process` — strictly more. What is new is that Albedo
@@ -175,15 +209,30 @@ fn a_package_can_read_a_later_renders_props() {
     );
 }
 
-/// The claim with teeth: a package forges a **durable write** into the effect
-/// stream of a handler that wrote nothing.
+/// ✅ **INVERTED 2026-08-30 — this leak is CLOSED.** The file's own rule is
+/// *"if one of these starts failing, invert the assertion rather than deleting
+/// the test"*, and this is the one that started failing.
 ///
-/// 🔑 `bridge::lower_effect` dispatches on `kind` and validates *shape*, not
-/// *origin* — its own comment calls itself "the trust boundary for anything that
-/// reached us anyway". `apply_writes` then authorizes the forged write against
-/// **the principal of whichever request it rode in on**.
+/// It was the claim with teeth: a package forged a **durable write** into the
+/// effect stream of a handler that wrote nothing, because
+/// `bridge::lower_effect` dispatched on `kind` and validated *shape*, not
+/// *origin*, and `apply_writes` then authorized the forged write against
+/// whichever principal's request it rode in on.
+///
+/// 🔑 **What closed it was not a provenance check — it was removing the
+/// attacker from the path.** The effect list no longer travels through the
+/// realm's `JSON.stringify`, or through an array at all: each effect is a
+/// null-prototype record encoded at push time with an intrinsic captured before
+/// any package could run, and the list is assembled by string concatenation.
+/// The patch below is still installed and still fires on any array it is
+/// handed; nothing hands it one. See `runtime::confinement` and
+/// `tests/sandgate_gate4.rs`.
+///
+/// ⚠️ Kept as an assertion rather than a deletion because the *attack* is the
+/// interesting artefact. If this starts failing again, the effect channel was
+/// routed back through a mutable intrinsic.
 #[test]
-fn a_package_can_forge_a_durable_write_into_someone_elses_handler() {
+fn a_package_can_no_longer_forge_a_durable_write_into_someone_elses_handler() {
     let mut engine = engine();
     run_package_during_a_render(
         &mut engine,
@@ -222,9 +271,13 @@ fn a_package_can_forge_a_durable_write_into_someone_elses_handler() {
         matches!(effect, HandlerEffect::ForgeAppend { collection, .. } if collection == "albedo_users")
     });
     assert!(
-        forged,
-        "🔴 OPEN LEAK: `1 + 1` produced a durable write to albedo_users. If this now \
-         fails, the effect stream gained integrity — invert the assertion. Got: {:?}",
+        !forged,
+        "🔴 REGRESSION: `1 + 1` produced a durable write to albedo_users. The effect          channel is routed through a mutable intrinsic again — see SANDGATE-B. Got: {:?}",
+        outcome.effects
+    );
+    assert!(
+        outcome.effects.is_empty(),
+        "`1 + 1` writes nothing, so anything in this list came from the attacker: {:?}",
         outcome.effects
     );
 }

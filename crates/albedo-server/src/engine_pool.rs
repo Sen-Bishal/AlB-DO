@@ -47,6 +47,7 @@ use dom_render_compiler::ir::opcode::SlotId;
 use dom_render_compiler::runtime::quickjs_engine::QuickJsEngine;
 use dom_render_compiler::runtime::HandlerInvocation;
 use serde_json::Map;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -124,6 +125,14 @@ pub struct QuickJsEnginePool {
     joins: Mutex<Vec<JoinHandle<()>>>,
     /// Number of engines/threads the pool owns.
     size: usize,
+    /// SANDGATE-A · confine an engine's realm after every checkout on which
+    /// third-party code could have run. Off via `ALBEDO_SANDGATE=0`.
+    confine_after_use: bool,
+    /// How many checkouts have been followed by a realm rebuild.
+    confinements: Arc<AtomicU64>,
+    /// How many of those rebuilds failed. Non-zero means an engine in this pool
+    /// is under-populated and will fail the next render loudly.
+    confinement_failures: Arc<AtomicU64>,
 }
 
 impl QuickJsEnginePool {
@@ -168,7 +177,31 @@ impl QuickJsEnginePool {
             permits: Arc::new(Semaphore::new(size)),
             joins: Mutex::new(joins),
             size,
+            confine_after_use: std::env::var("ALBEDO_SANDGATE")
+                .map(|value| value != "0")
+                .unwrap_or(true),
+            confinements: Arc::new(AtomicU64::new(0)),
+            confinement_failures: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// SANDGATE-A · `(confinements, failures)` this pool has performed.
+    ///
+    /// Exposed because "we rebuild the realm every request" is a claim, and a
+    /// pool serving an app with no npm at all correctly reports zero. A reader
+    /// who cannot tell those apart cannot tell whether confinement is on.
+    #[must_use]
+    pub fn confinement_counts(&self) -> (u64, u64) {
+        (
+            self.confinements.load(Ordering::Relaxed),
+            self.confinement_failures.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Whether this pool confines realms between checkouts.
+    #[must_use]
+    pub fn confines(&self) -> bool {
+        self.confine_after_use
     }
 
     /// Builds a pool sized to the available parallelism (falling back to 1).
@@ -221,9 +254,51 @@ impl QuickJsEnginePool {
         };
 
         let (result_tx, result_rx) = oneshot::channel::<R>();
+        let confine = self.confine_after_use;
+        let confinements = Arc::clone(&self.confinements);
+        let failures = Arc::clone(&self.confinement_failures);
         let job: Job = Box::new(move |engine: &mut QuickJsEngine| {
             // If the receiver was dropped (caller cancelled), discard quietly.
             let _ = result_tx.send(f(engine));
+
+            // ── SANDGATE-A · the request boundary ─────────────────────────
+            //
+            // 🔑 **After the result is sent, not before it.** The caller's
+            // future resolves on the line above, so the response leaves while
+            // this thread rebuilds. The next job for this engine simply queues
+            // on its channel — which is the "rebuild it in the background
+            // before it is handed out again" design from `SANDGATE.md` § 3,
+            // without a second pool to own the dirty engines.
+            //
+            // The dirty bit has two halves and both are needed.
+            // `holds_third_party_code` is tracked in Rust and says npm is
+            // *registered*; `third_party_code_ran` asks the realm whether a
+            // package factory actually *executed*. Asking the suspect is
+            // normally the wrong move, and it is safe here only because the
+            // sealed holder exposes a one-way latch — a package can force extra
+            // rebuilds and cannot suppress one. Fails closed.
+            //
+            // 📏 Registration is not execution: a project that depends on Radix
+            // but serves a route importing nothing has an untouched realm, and
+            // confining it costs the full 1.06 ms replay to protect against
+            // nothing.
+            if confine && engine.third_party_code_ran() {
+                confinements.fetch_add(1, Ordering::Relaxed);
+                if let Err(err) = engine.confine() {
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    // Loud, and not swallowed: this engine's realm is now
+                    // missing modules, so the next render on it fails with a
+                    // missing-module error that names a package rather than
+                    // this. `project_silent_island_death` is the precedent —
+                    // a failure nobody can hear is a failure that gets
+                    // rediscovered from the symptom.
+                    tracing::error!(
+                        target: "albedo.sandgate",
+                        error = %err,
+                        "SANDGATE confinement failed; this engine's realm is                          incompletely populated and the next render on it will fail"
+                    );
+                }
+            }
         });
 
         // Ship the job. Send failing means the worker thread is gone.
@@ -644,6 +719,132 @@ mod tests {
         )]);
         // One broken artifact, however many engines refused it.
         assert_eq!(failed, 1);
+    }
+
+    // ── SANDGATE-A · confinement at the checkout boundary ──────────────────
+
+    use dom_render_compiler::runtime::engine::RuntimeEngine as _;
+
+    /// A one-file npm artifact that poisons the realm and remembers it did.
+    /// The registration script is what `install_npm_bundles` takes: a factory
+    /// installed into `__ALBEDO_NPM_FACTORIES`, run only when something
+    /// requires it.
+    const POISON_ARTIFACT: &str = r#"
+globalThis.__ALBEDO_NPM_FACTORIES['npm:poison@1.0.0/index.js'] = function (exports) {
+  globalThis.__poison_marker = (globalThis.__poison_marker || 0) + 1;
+  exports.tag = 'poison';
+};
+globalThis.__ALBEDO_NPM_ALIASES['poison'] = 'npm:poison@1.0.0/index.js';
+"#;
+
+    /// 🔑 **The property SANDGATE-A ships**, and the one every earlier gate
+    /// stopped short of: state left on a pooled engine by one checkout is gone
+    /// by the next.
+    ///
+    /// Before this, `with_engine` returned the worker to the idle stack
+    /// untouched — which is exactly what `tests/quickjs_realm_isolation.rs`
+    /// documented about production, and why gate 2 could not invert those
+    /// tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pooled_engine_does_not_carry_realm_state_between_checkouts() {
+        let pool = QuickJsEnginePool::with_size(1);
+        assert!(
+            pool.confines(),
+            "confinement is off by default — the rest of this test is vacuous"
+        );
+        assert_eq!(
+            pool.install_npm_bundles(&[(
+                "npm:poison@1.0.0/index.js".to_string(),
+                POISON_ARTIFACT.to_string(),
+                7,
+            )]),
+            0
+        );
+
+        // Checkout 1 · poison the realm directly (the factory body is what a
+        // required package would run).
+        let marked = pool
+            .with_engine(|engine| {
+                engine
+                    .load_module("routes/attacker.tsx", ATTACKER_ROUTE)
+                    .and_then(|()| engine.render_component("routes/attacker.tsx", "{}"))
+                    .map(|out| out.html)
+                    .unwrap_or_default()
+            })
+            .await
+            .expect("checkout 1");
+        assert!(
+            marked.contains('1'),
+            "CONTROL — the package must actually have run in checkout 1. Got: {marked}"
+        );
+
+        // Checkout 2 · the marker must be gone. If the realm were reused it
+        // would read 2, because the route re-imports the package and the
+        // factory increments.
+        let after = pool
+            .with_engine(|engine| {
+                engine
+                    .render_component("routes/attacker.tsx", "{}")
+                    .map(|out| out.html)
+                    .unwrap_or_default()
+            })
+            .await
+            .expect("checkout 2");
+        assert!(
+            after.contains('1'),
+            "🔴 SANDGATE-A IS NOT WIRED: the realm survived the checkout boundary, so              the poison counter kept climbing. Got: {after}"
+        );
+
+        // The counter is eventually consistent, and reading it straight after a
+        // checkout is a race: confinement runs AFTER the result is sent — that
+        // is the point, so the response does not wait on it — which means
+        // `with_engine` can return before the rebuild it triggered has
+        // incremented anything.
+        //
+        // A third checkout is the synchronisation, not a sleep: the worker's
+        // job channel is FIFO, so this job cannot start until the pending
+        // rebuild has finished.
+        pool.with_engine(|engine| engine.is_initialized())
+            .await
+            .expect("checkout 3 - flushes the pending confinement");
+
+        let (confinements, failures) = pool.confinement_counts();
+        assert!(
+            confinements >= 2,
+            "the pool reported {confinements} confinements for 3 checkouts on a dirty              engine — the dirty bit is not latching"
+        );
+        assert_eq!(failures, 0, "a confinement failed; the engine is under-populated");
+    }
+
+    const ATTACKER_ROUTE: &str = r#"import { tag } from "poison";
+export default function A() { return <b data-tag={tag}>{String(globalThis.__poison_marker)}</b>; }"#;
+
+    /// An app with no npm must not pay for confinement. The dirty bit is what
+    /// keeps the cost proportional to the risk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pool_serving_no_npm_never_confines() {
+        let pool = QuickJsEnginePool::with_size(1);
+        for _ in 0..3 {
+            pool.with_engine(|engine| {
+                let _ = engine.load_module(
+                    "routes/plain.tsx",
+                    "export default function P() { return <b>hi</b>; }",
+                );
+                let _ = engine.render_component("routes/plain.tsx", "{}");
+            })
+            .await
+            .expect("checkout");
+        }
+        // Flush, for the reason given in the test above: a zero read too early
+        // is indistinguishable from a zero that is correct.
+        pool.with_engine(|engine| engine.is_initialized())
+            .await
+            .expect("flush");
+        assert_eq!(
+            pool.confinement_counts(),
+            (0, 0),
+            "🔴 a project with no npm dependency is paying for a realm rebuild on              every request and getting nothing for it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

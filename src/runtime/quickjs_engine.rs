@@ -1,4 +1,5 @@
 use super::arena::{ArenaAllocator, ArenaControl, ArenaStats};
+use super::confinement::{BytecodeCache, ModuleLedger, Origin, PreludeFragment, ReplayOutcome};
 use super::bridge::{
     build_handler_script, decode_handler_run, HandlerInvocation, HandlerOutcome, HandlerRun,
 };
@@ -78,12 +79,36 @@ pub struct QuickJsEngine {
     /// must survive in the persistent region. See [`ARENA_WARMUP_RENDERS`].
     force_persistent: bool,
     loaded_module_hashes: HashMap<String, u64>,
-    bootstrap: Option<BootstrapPayload>,
+    bootstrap: Option<Rc<BootstrapPayload>>,
     /// The bootstrap kept for [`Self::reset_realm`], which must reinstall the
     /// prelude into a brand-new context. `bootstrap` is *taken* by
     /// `ensure_initialized`, so it cannot be reused.
-    bootstrap_retained: Option<BootstrapPayload>,
+    ///
+    /// 📏 **`Rc`, not a clone.** SANDGATE-A rebuilds the realm at every request
+    /// boundary, and each rebuild re-arms this. As an owned `BootstrapPayload`
+    /// that was a deep copy of the DOM shim, the runtime helpers and **every
+    /// preloaded library's source** — hundreds of KB of `memcpy` per request,
+    /// paid to hand the data straight back to a reader that only borrows it.
+    /// Sharing it makes a rebuild's cost a refcount bump.
+    bootstrap_retained: Option<Rc<BootstrapPayload>>,
     initialized: bool,
+    /// SANDGATE-A · every registration this engine has performed, in order, so
+    /// [`Self::confine`] can reconstitute a realm the caller never has to
+    /// describe. See [`crate::runtime::confinement`].
+    ledger: ModuleLedger,
+    /// Compiled bytecode for replayed registrations. In-memory only — see the
+    /// audit note in [`crate::runtime::confinement`].
+    bytecode: BytecodeCache,
+    /// Suppresses ledger recording while `ensure_initialized` installs the
+    /// bootstrap's preloaded libraries.
+    ///
+    /// 🔑 **The ledger must hold exactly what a rebuild does NOT redo by
+    /// itself.** `ensure_initialized` re-installs every preloaded library on
+    /// every rebuild, from the retained bootstrap. Recording them too would
+    /// make each confinement evaluate them twice — once from the bootstrap and
+    /// once from the replay — which is not incorrect, just silently double the
+    /// work, growing with the size of the preload set.
+    suspend_ledger: bool,
 }
 
 impl QuickJsEngine {
@@ -98,6 +123,9 @@ impl QuickJsEngine {
             bootstrap: None,
             bootstrap_retained: None,
             initialized: false,
+            ledger: ModuleLedger::new(),
+            bytecode: BytecodeCache::from_env(),
+            suspend_ledger: false,
         }
     }
 
@@ -152,12 +180,35 @@ impl QuickJsEngine {
         let arena = Arc::clone(&self.arena);
         arena.begin_request();
         let outcome = (|| -> RuntimeResult<()> {
-            self.context = None;
-            self.loaded_module_hashes.clear();
+            // 🔑 **Build, then swap — never drop, then build.**
+            //
+            // The first version dropped the context up front, so a replay that
+            // failed halfway left the engine *initialised and empty*: every
+            // later render on it fails with a missing-module error naming a
+            // package, and a pooled engine in that state serves 500s for the
+            // life of the process. The two contexts share the runtime, so
+            // holding the old one open while the new one is built costs one
+            // extra context for the duration of a rebuild and makes the whole
+            // operation all-or-nothing.
+            let previous_context = self.context.take();
+            let previous_hashes = std::mem::take(&mut self.loaded_module_hashes);
             self.initialized = false;
-            self.bootstrap = self.bootstrap_retained.clone();
-            self.ensure_initialized()?;
-            register(self)
+            self.bootstrap = self.bootstrap_retained.as_ref().map(Rc::clone);
+
+            match self.ensure_initialized().and_then(|()| register(self)) {
+                Ok(()) => {
+                    // Dropped INSIDE the arena bracket, like everything else a
+                    // rebuild touches — see the growth table above.
+                    drop(previous_context);
+                    Ok(())
+                }
+                Err(err) => {
+                    self.context = previous_context;
+                    self.loaded_module_hashes = previous_hashes;
+                    self.initialized = self.context.is_some();
+                    Err(err)
+                }
+            }
         })();
         arena.end_request();
         outcome
@@ -444,98 +495,46 @@ impl QuickJsEngine {
             self.context = Some(Context::full(runtime).expect("QuickJS context creation failed"));
         }
 
-        let bootstrap = self.bootstrap.take().unwrap_or_default();
+        let bootstrap = self
+            .bootstrap
+            .take()
+            .unwrap_or_else(|| Rc::new(BootstrapPayload::default()));
 
+        // 📏 **The prelude is the dominant cost of a request boundary**, and it
+        // is only visible once confinement ships: 1.63 ms of a 2.27 ms confined
+        // Radix request, against 0.64 ms for replaying all 55 npm artifacts
+        // (`tests/sandgate_confine_cost.rs`). Gate 3.1 predicted this — "the
+        // dominant term moves to B, the prelude rebuild" — and it is the reason
+        // the fragments are built once and evaluated through the same bytecode
+        // cache the module replay uses.
+        let fragments = prelude_fragments(&bootstrap);
+        let bytecode = &mut self.bytecode;
         self.context
             .as_ref()
             .unwrap()
             .with(|ctx| -> RuntimeResult<()> {
-                // Phase L · install the form-action contract before the
-                // helpers that read it. `h()` only dereferences it at render
-                // time, so strict ordering isn't load-bearing — but an engine
-                // whose shim could observe a half-installed contract would
-                // silently render forms without a CSRF input, so the order is
-                // pinned rather than left to chance.
-                ctx.eval::<(), _>(build_form_contract_script())
-                    .map_err(|err| {
-                        RuntimeError::init(format!("failed to install form contract: {err}"))
-                    })?;
-
-                // Installed alongside the form contract and for the same
-                // reason: `h()` must not carry its own copy of a markup rule
-                // the pure-Rust renderer also holds.
-                ctx.eval::<(), _>(build_markup_contract_script())
-                    .map_err(|err| {
-                        RuntimeError::init(format!("failed to install markup contract: {err}"))
-                    })?;
-
-                ctx.eval::<(), _>(
-                    crate::runtime::jsx_attributes::build_jsx_attribute_table_script().as_str(),
-                )
-                .map_err(|err| {
-                    RuntimeError::init(format!(
-                        "failed to install the JSX attribute table: {err}"
-                    ))
-                })?;
-                ctx.eval::<(), _>(build_builtin_runtime_helpers_script())
-                    .map_err(|err| {
-                        RuntimeError::init(format!(
-                            "failed to install built-in runtime helpers: {err}"
-                        ))
-                    })?;
-
-                if !bootstrap.dom_shim_js.trim().is_empty() {
-                    ctx.eval::<(), _>(bootstrap.dom_shim_js.as_str())
+                for fragment in fragments.iter() {
+                    crate::runtime::confinement::eval_prelude_fragment(&ctx, fragment, bytecode)
                         .map_err(|err| {
-                            RuntimeError::init(format!("failed to evaluate DOM shim: {err}"))
+                            RuntimeError::init(format!(
+                                "failed to install {}: {}",
+                                fragment.name,
+                                describe_js_error(&ctx, &err)
+                            ))
                         })?;
                 }
-
-                if !bootstrap.runtime_helpers_js.trim().is_empty() {
-                    ctx.eval::<(), _>(bootstrap.runtime_helpers_js.as_str())
-                        .map_err(|err| {
-                            RuntimeError::init(format!("failed to evaluate runtime helpers: {err}"))
-                        })?;
-                }
-
-                ctx.eval::<(), _>("globalThis.__ALBEDO_MODULES = Object.create(null);")
-                    .map_err(|err| {
-                        RuntimeError::init(format!("failed to initialize module table: {err}"))
-                    })?;
-
-                ctx.eval::<(), _>(build_npm_runtime_helpers_script().as_str())
-                    .map_err(|err| {
-                        RuntimeError::init(format!(
-                            "failed to install npm module runtime helpers: {err}"
-                        ))
-                    })?;
-
-                // The React host records, from the SAME generator the browser
-                // runtime uses. A package's `import 'react'` resolves to
-                // `albedo:host/react` on both sides, so `forwardRef` returns the
-                // same kind of thing in SSR and in hydration — which is what
-                // stops a React component library rendering as the literal text
-                // `<[object Object]>` here while working perfectly in the
-                // browser. Must run AFTER the linker: it writes into
-                // `__ALBEDO_NPM_FACTORIES`.
-                ctx.eval::<(), _>(
-                    crate::runtime::react_host::build_host_module_records_script().as_str(),
-                )
-                .map_err(|err| {
-                    RuntimeError::init(format!("failed to install React host records: {err}"))
-                })?;
-
-                let render_script = build_render_function_script();
-                ctx.eval::<(), _>(render_script.as_str()).map_err(|err| {
-                    RuntimeError::init(format!("failed to install reusable render function: {err}"))
-                })?;
-
                 Ok(())
             })?;
 
-        for preload in &bootstrap.preloaded_libraries {
-            self.load_module(&preload.specifier, &preload.code)?;
-        }
+        self.suspend_ledger = true;
+        let preloads = (|engine: &mut Self| -> RuntimeResult<()> {
+            for preload in &bootstrap.preloaded_libraries {
+                engine.load_module(&preload.specifier, &preload.code)?;
+            }
+            Ok(())
+        })(self);
+        self.suspend_ledger = false;
+        preloads?;
 
         self.initialized = true;
         Ok(())
@@ -598,7 +597,169 @@ impl QuickJsEngine {
 
         self.loaded_module_hashes
             .insert(specifier.to_string(), code_hash);
+        if !self.suspend_ledger {
+            self.ledger
+                .record(specifier, &script, code_hash, Origin::Project);
+        }
         Ok(())
+    }
+
+    /// **SANDGATE-A · discard this realm and rebuild it from the ledger.**
+    ///
+    /// This is the request-boundary operation. Everything the engine had
+    /// registered comes back — npm factories through cached bytecode, project
+    /// modules as the scripts they were first evaluated as — and everything the
+    /// realm *accumulated* does not: patched intrinsics, wrapped host globals,
+    /// stashed props, module-level `Map`s.
+    ///
+    /// 🔑 **What this does and does not buy** (SANDGATE gate 2, 5/5): it erases
+    /// an attacker's accumulated **data**, and nothing about their **code**. A
+    /// package is installed because something imports it, so the next request's
+    /// route pulls it back in and its body re-runs — before the handler it
+    /// attacks. Confinement is a temporal bound, not a sandbox. The forging half
+    /// is closed by SANDGATE-B (`__albedo_sealed`, and effect provenance), not
+    /// by this.
+    ///
+    /// Cheap enough to run per request: gate 3.1 puts a confined Radix request
+    /// at ≈2.7 ms against 2.0 ms with no npm at all.
+    ///
+    /// # Errors
+    /// Propagates a rebuild or replay failure. An engine whose replay failed is
+    /// left initialised but **incompletely populated**, which is why the caller
+    /// (the pool) treats the error as fatal to that worker rather than serving
+    /// the next request on it.
+    pub fn confine(&mut self) -> RuntimeResult<()> {
+        let mut outcome = ReplayOutcome::default();
+        // The ledger is moved out for the duration so the replay can borrow the
+        // engine mutably; nothing may re-record during a replay, and taking it
+        // makes that structural rather than a rule.
+        let ledger = std::mem::take(&mut self.ledger);
+        // 📏 Taken, not rebuilt. `rebuild_realm` clears this map because a
+        // generic caller may register a different world; a confinement replays
+        // exactly the world that was there, so the map it had is the map it
+        // ends with. Deriving it from the ledger instead allocated a fresh
+        // `String` per module on every request.
+        let hashes = std::mem::take(&mut self.loaded_module_hashes);
+        let result = self.rebuild_realm(|engine| {
+            outcome = engine.replay_ledger(&ledger)?;
+            Ok(())
+        });
+        self.ledger = ledger;
+        // Restored on BOTH paths: on success the replay re-registered exactly
+        // this set, and on failure `rebuild_realm` rolled the old realm back,
+        // where the same set is still loaded. Leaving it empty after a rollback
+        // would silently re-evaluate every module on next use.
+        self.loaded_module_hashes = hashes;
+        if result.is_ok() {
+            self.ledger.note_confinement(outcome);
+        }
+        result
+    }
+
+    /// Re-evaluate every recorded registration into the current (fresh) realm.
+    fn replay_ledger(&mut self, ledger: &ModuleLedger) -> RuntimeResult<ReplayOutcome> {
+        let mut outcome = ReplayOutcome::default();
+        if ledger.is_empty() {
+            return Ok(outcome);
+        }
+        let context = self
+            .context
+            .as_ref()
+            .ok_or_else(|| RuntimeError::init("realm replay ran without a context".to_string()))?;
+        let bytecode = &mut self.bytecode;
+        context.with(|ctx| -> RuntimeResult<()> {
+            for entry in ledger.entries() {
+                let from_bytecode = crate::runtime::confinement::replay_entry(&ctx, entry, bytecode)
+                    .map_err(|err| {
+                        RuntimeError::load(
+                            LoadErrorKind::EngineFailure,
+                            format!(
+                                "SANDGATE replay failed to re-register '{}': {}",
+                                entry.specifier,
+                                describe_js_error(&ctx, &err)
+                            ),
+                        )
+                    })?;
+                outcome.replayed += 1;
+                if from_bytecode {
+                    outcome.bytecode_hits += 1;
+                } else {
+                    outcome.source_replays += 1;
+                }
+            }
+            Ok(())
+        })?;
+        outcome.total_refusals = self.bytecode.refusals() as u64;
+        Ok(outcome)
+    }
+
+    /// True once any npm artifact has been registered on this engine — the
+    /// **static half** of the dirty bit. Tracked in Rust, never in the realm:
+    /// see [`ModuleLedger::holds_third_party`].
+    #[must_use]
+    pub fn holds_third_party_code(&self) -> bool {
+        self.ledger.holds_third_party()
+    }
+
+    /// **Does this realm need confining right now?**
+    ///
+    /// Registration is not execution. An npm artifact installs a lazy factory
+    /// and nothing runs until something imports it, so a project that depends
+    /// on Radix but serves a route that imports nothing has a realm no package
+    /// has touched — and confining it costs the full replay to protect against
+    /// nothing. Measured: 1.06 ms for the Radix corpus, on every request.
+    ///
+    /// The second half of the bit therefore comes from the realm, which is
+    /// normally the wrong place to ask. It is safe here for one specific
+    /// reason: [`crate::runtime::confinement::build_sealed_intrinsics_script`]
+    /// exposes only a **setter**. A package can latch it (and pay for an extra
+    /// rebuild) and has no way to clear it, so the worst a hostile package can
+    /// do with it is make the server safer and slower.
+    ///
+    /// Fails **closed**: an unreadable realm is a realm we confine.
+    #[must_use]
+    pub fn third_party_code_ran(&self) -> bool {
+        if !self.ledger.holds_third_party() {
+            return false;
+        }
+        let Some(context) = self.context.as_ref() else {
+            return true;
+        };
+        context.with(|ctx| {
+            ctx.eval::<bool, _>(
+                "typeof globalThis.__albedo_sealed === 'object' \
+                 && globalThis.__albedo_sealed !== null \
+                 && globalThis.__albedo_sealed.thirdPartyRan() === true",
+            )
+            .unwrap_or(true)
+        })
+    }
+
+    /// Counters describing what confinement has actually done here.
+    #[must_use]
+    pub fn confinement_stats(&self) -> crate::runtime::confinement::ConfinementStats {
+        self.ledger.stats()
+    }
+
+    /// Number of registrations the replay ledger holds.
+    #[must_use]
+    pub fn ledger_len(&self) -> usize {
+        self.ledger.len()
+    }
+
+    /// Bytes retained for confinement: replay scripts plus compiled bytecode.
+    #[must_use]
+    pub fn confinement_resident_bytes(&self) -> (usize, usize) {
+        (self.ledger.resident_bytes(), self.bytecode.resident_bytes())
+    }
+
+    /// Drop the replay ledger and every compiled artifact.
+    ///
+    /// For a dev reload that swapped the project out from under the engine:
+    /// replaying the previous world would resurrect modules that no longer
+    /// exist, which is worse than a cold realm.
+    pub fn forget_ledger(&mut self) {
+        self.ledger.clear();
     }
 }
 
@@ -607,8 +768,9 @@ impl RuntimeEngine for QuickJsEngine {
         if self.initialized {
             return Ok(());
         }
-        self.bootstrap = Some(bootstrap.clone());
-        self.bootstrap_retained = Some(bootstrap.clone());
+        let shared = Rc::new(bootstrap.clone());
+        self.bootstrap = Some(Rc::clone(&shared));
+        self.bootstrap_retained = Some(shared);
         self.ensure_initialized()
     }
 
@@ -642,6 +804,10 @@ impl RuntimeEngine for QuickJsEngine {
 
         self.loaded_module_hashes
             .insert(specifier.to_string(), source_hash);
+        if !self.suspend_ledger {
+            self.ledger
+                .record(specifier, compiled_script, source_hash, Origin::ThirdParty);
+        }
         Ok(())
     }
 
@@ -668,9 +834,134 @@ impl RuntimeEngine for QuickJsEngine {
     }
 }
 
+/// The realm prelude, in install order, as `(name, source)` pairs.
+///
+/// # Why this is a list and not ten `ctx.eval` calls
+///
+/// It was ten calls, and each one rebuilt its `format!`ed source from scratch —
+/// on every realm rebuild, which SANDGATE-A now performs at every request
+/// boundary. Naming the fragments turns the whole prelude into data that can be
+/// built once per process, cached as bytecode, and replayed.
+///
+/// # Order is load-bearing, in three places
+///
+/// 1. **The sealed intrinsics are first.** They capture what the trust boundary
+///    serialises through, and a capture taken after any other fragment captures
+///    whatever that fragment left behind.
+/// 2. **The form contract precedes the helpers that read it.** `h()` only
+///    dereferences it at render time, so this is not strictly required — but an
+///    engine that could observe a half-installed contract renders forms with no
+///    CSRF input and says nothing, so the order is pinned rather than left to
+///    chance.
+/// 3. **The React host records run after the npm linker**, because they write
+///    into `__ALBEDO_NPM_FACTORIES`. A package's `import 'react'` resolves to
+///    `albedo:host/react` on both the server and the browser, which is what
+///    stops a React component library rendering as the literal text
+///    `<[object Object]>` server-side while working perfectly in the browser.
+///
+/// The bootstrap-supplied fragments (the DOM shim, the runtime helpers) vary
+/// per project, so the returned list is cached per bootstrap identity rather
+/// than in a `static`.
+fn build_prelude_fragments(bootstrap: &BootstrapPayload) -> Vec<PreludeFragment> {
+    let mut fragments = vec![
+        PreludeFragment::new(
+            "the sealed intrinsics",
+            crate::runtime::confinement::build_sealed_intrinsics_script(),
+        ),
+        PreludeFragment::new("the form contract", build_form_contract_script().to_string()),
+        PreludeFragment::new(
+            "the markup contract",
+            build_markup_contract_script().to_string(),
+        ),
+        PreludeFragment::new(
+            "the JSX attribute table",
+            crate::runtime::jsx_attributes::build_jsx_attribute_table_script(),
+        ),
+        PreludeFragment::new(
+            "built-in runtime helpers",
+            build_builtin_runtime_helpers_script().to_string(),
+        ),
+    ];
+    if !bootstrap.dom_shim_js.trim().is_empty() {
+        fragments.push(PreludeFragment::new(
+            "the DOM shim",
+            bootstrap.dom_shim_js.clone(),
+        ));
+    }
+    if !bootstrap.runtime_helpers_js.trim().is_empty() {
+        fragments.push(PreludeFragment::new(
+            "the project runtime helpers",
+            bootstrap.runtime_helpers_js.clone(),
+        ));
+    }
+    fragments.push(PreludeFragment::new(
+        "the module table",
+        "globalThis.__ALBEDO_MODULES = Object.create(null);".to_string(),
+    ));
+    fragments.push(PreludeFragment::new(
+        "the npm module runtime helpers",
+        build_npm_runtime_helpers_script(),
+    ));
+    fragments.push(PreludeFragment::new(
+        "the React host records",
+        crate::runtime::react_host::build_host_module_records_script(),
+    ));
+    fragments.push(PreludeFragment::new(
+        "the reusable render function",
+        build_render_function_script(),
+    ));
+    fragments
+}
+
+/// Process-wide cache of the prelude for the **default** bootstrap, which is
+/// what every engine in a pool shares. A project-specific bootstrap (a DOM shim
+/// or runtime helpers) misses this and builds its own list; the bytecode cache
+/// downstream is per engine either way.
+fn prelude_fragments(bootstrap: &BootstrapPayload) -> Rc<Vec<PreludeFragment>> {
+    thread_local! {
+        static DEFAULT_PRELUDE: std::cell::RefCell<Option<Rc<Vec<PreludeFragment>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let is_default =
+        bootstrap.dom_shim_js.trim().is_empty() && bootstrap.runtime_helpers_js.trim().is_empty();
+    if !is_default {
+        return Rc::new(build_prelude_fragments(bootstrap));
+    }
+    DEFAULT_PRELUDE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        Rc::clone(slot.get_or_insert_with(|| Rc::new(build_prelude_fragments(bootstrap))))
+    })
+}
+
 fn build_render_function_script() -> String {
     format!(
         r#"
+// SANDGATE-B · envelope builders.
+//
+// 🔴 Found by gate 4, not by reasoning: a package that plants
+// `Object.prototype.toJSON` rewrites *any object* handed to `JSON.stringify` —
+// and the render envelope's `value` is the page's HTML. The handler channel was
+// sealed first and this one was missed, which is the same "one renderer got the
+// rule" shape this codebase has paid for three times already.
+//
+// The envelope is CONCATENATED and only ever encodes primitives (a string, a
+// message), because `stringify` skips `toJSON` for primitives but not for
+// objects. `__albedo_envelope_ok_json` is the one case that must encode an
+// arbitrary value — route metadata — and it is a plain data object the route
+// authored, so the residual there is the same payload-level one the handler
+// path documents.
+globalThis.__albedo_envelope_ok = function(text) {{
+  return '{{"ok":true,"value":' + globalThis.__albedo_sealed.stringify(String(text)) + '}}';
+}};
+globalThis.__albedo_envelope_ok_json = function(value) {{
+  var encoded = globalThis.__albedo_sealed.stringify(value);
+  if (typeof encoded !== 'string') {{ encoded = 'null'; }}
+  return '{{"ok":true,"value":' + encoded + '}}';
+}};
+globalThis.__albedo_envelope_err = function(message) {{
+  return '{{"ok":false,"error":' + globalThis.__albedo_sealed.stringify(String(message)) + '}}';
+}};
+
 globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
   try {{
     // A1 · install the per-render host seed (slot-backed useState values,
@@ -736,20 +1027,20 @@ globalThis.__ALBEDO_RENDER_COMPONENT = function(entry, propsJson, hostJson) {{
         && typeof __albedo_value.then === 'function') {{
       return __albedo_value.then(
         function(__albedo_resolved) {{
-          return JSON.stringify({{ ok: true, value: String(__albedo_resolved) }});
+          return __albedo_envelope_ok(String(__albedo_resolved));
         }},
         function(__albedo_err) {{
           const __albedo_msg = (__albedo_err && typeof __albedo_err.message === 'string')
             ? __albedo_err.message
             : String(__albedo_err);
-          return JSON.stringify({{ ok: false, error: __albedo_msg }});
+          return __albedo_envelope_err(__albedo_msg);
         }}
       );
     }}
-    return JSON.stringify({{ ok: true, value: String(__albedo_value) }});
+    return __albedo_envelope_ok(String(__albedo_value));
   }} catch (err) {{
     const message = (err && typeof err.message === 'string') ? err.message : String(err);
-    return JSON.stringify({{ ok: false, error: message }});
+    return __albedo_envelope_err(message);
   }} finally {{
     // Never let one render's host seed leak into the next render on this engine.
     globalThis.__ALBEDO_HOST = null;
@@ -773,7 +1064,7 @@ globalThis.__ALBEDO_EVAL_METADATA = function(entry, propsJson) {{
       ? __albedo_record.generateMetadata
       : undefined;
     if (typeof __albedo_fn !== 'function') {{
-      return JSON.stringify({{ ok: true, value: null }});
+      return '{{"ok":true,"value":null}}';
     }}
     const __albedo_props = JSON.parse(propsJson);
     const __albedo_value = __albedo_fn(__albedo_props);
@@ -782,20 +1073,20 @@ globalThis.__ALBEDO_EVAL_METADATA = function(entry, propsJson) {{
         && typeof __albedo_value.then === 'function') {{
       return __albedo_value.then(
         function(__albedo_resolved) {{
-          return JSON.stringify({{ ok: true, value: (__albedo_resolved === undefined ? null : __albedo_resolved) }});
+          return __albedo_envelope_ok_json(__albedo_resolved === undefined ? null : __albedo_resolved);
         }},
         function(__albedo_err) {{
           const __albedo_msg = (__albedo_err && typeof __albedo_err.message === 'string')
             ? __albedo_err.message
             : String(__albedo_err);
-          return JSON.stringify({{ ok: false, error: __albedo_msg }});
+          return __albedo_envelope_err(__albedo_msg);
         }}
       );
     }}
-    return JSON.stringify({{ ok: true, value: (__albedo_value === undefined ? null : __albedo_value) }});
+    return __albedo_envelope_ok_json(__albedo_value === undefined ? null : __albedo_value);
   }} catch (err) {{
     const message = (err && typeof err.message === 'string') ? err.message : String(err);
-    return JSON.stringify({{ ok: false, error: message }});
+    return __albedo_envelope_err(message);
   }}
 }};
 "#
@@ -935,7 +1226,25 @@ pub fn npm_record_linker_script() -> String {
     const record = Object.create(null);
     Object.defineProperty(record, '{MODULE_RECORD_FLAG}', {{ value: true, enumerable: false }});
     table[key] = record;
-    try {{ factory(record); }} catch (err) {{ delete table[key]; throw err; }}
+    // SANDGATE-B · provenance. This is the ONE place a package's own code
+    // starts running, so it is the only place an effect could be attributed
+    // to a module without a stack walk. Guarded because this linker ships
+    // verbatim to the browser, which has no sealed holder and no effect
+    // channel.
+    const __albedo_prov = globalThis.__albedo_sealed;
+    if (__albedo_prov) {{
+      __albedo_prov.enterModule(key);
+      // 🔑 Host records are OUR code wearing the npm record format
+      // (`albedo:host/react` and friends), so marking on them would latch on
+      // essentially every render and make the flag useless. The prefix is the
+      // whole distinction between "a package ran" and "our React shim ran".
+      if (key.lastIndexOf('albedo:host/', 0) !== 0) {{
+        __albedo_prov.markThirdPartyRan();
+      }}
+    }}
+    try {{ factory(record); }}
+    catch (err) {{ delete table[key]; throw err; }}
+    finally {{ if (__albedo_prov) {{ __albedo_prov.exitModule(); }} }}
     return record;
   }};
 }})();
@@ -4144,6 +4453,100 @@ fn extract_marker_payload(message: &str, marker: &str) -> Option<String> {
         None
     } else {
         Some(value)
+    }
+}
+
+#[cfg(test)]
+mod prelude_equivalence {
+    use super::*;
+    use crate::runtime::confinement::{eval_prelude_fragment, BytecodeCache};
+
+    /// 🔑 **The check that licenses running the prelude as bytecode.**
+    ///
+    /// `Module::declare` forces `JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_STRICT`, so
+    /// a fragment that installs cleanly as a *script* can behave differently as
+    /// a *module*. One hazard is real and easy to introduce by accident: a
+    /// top-level `const`/`let` in a script creates a **global lexical binding**
+    /// that later fragments can read, while in module source the same
+    /// declaration is module-local and invisible. A fragment that grew such a
+    /// dependency would throw `ReferenceError` here and nowhere else — the
+    /// engine would come up with a half-installed realm.
+    ///
+    /// Gate 3.1's lesson, applied: *assert the equivalence before believing the
+    /// speedup*. The measurement that motivates this
+    /// (`tests/sandgate_confine_cost.rs`) puts the prelude at 72% of a confined
+    /// request, which is worth exactly one test.
+    #[test]
+    fn every_prelude_fragment_behaves_the_same_as_script_and_as_module() {
+        let fragments = build_prelude_fragments(&BootstrapPayload::default());
+        assert!(
+            fragments.len() >= 8,
+            "the prelude shrank to {} fragments — this test is now measuring less              than it thinks",
+            fragments.len()
+        );
+        let runtime = Runtime::new().expect("runtime");
+
+        // Both paths must install without error AND leave the same own-property
+        // surface on the realm.
+        let surface = |bytecode: bool| -> Vec<String> {
+            let context = Context::full(&runtime).expect("context");
+            let mut cache = BytecodeCache::from_env();
+            context.with(|ctx| {
+                for fragment in &fragments {
+                    let outcome = if bytecode {
+                        eval_prelude_fragment(&ctx, fragment, &mut cache)
+                    } else {
+                        ctx.eval::<(), _>(fragment.source.as_str())
+                    };
+                    outcome.unwrap_or_else(|err| {
+                        panic!(
+                            "'{}' failed to install as {}: {}",
+                            fragment.name,
+                            if bytecode { "a module" } else { "a script" },
+                            describe_js_error(&ctx, &err)
+                        )
+                    });
+                }
+                let mut names: Vec<String> = ctx
+                    .eval("Object.getOwnPropertyNames(globalThis)")
+                    .expect("global surface readable");
+                names.sort();
+                names
+            })
+        };
+
+        let as_script = surface(false);
+        let as_module = surface(true);
+        assert_eq!(
+            as_script, as_module,
+            "the two paths leave different globals on the realm"
+        );
+
+        // And the globals actually work: a surface comparison would pass for two
+        // realms whose `h` differed in every respect except existing.
+        let probe = |bytecode: bool| -> String {
+            let context = Context::full(&runtime).expect("context");
+            let mut cache = BytecodeCache::from_env();
+            context.with(|ctx| {
+                for fragment in &fragments {
+                    if bytecode {
+                        eval_prelude_fragment(&ctx, fragment, &mut cache).expect(fragment.name);
+                    } else {
+                        ctx.eval::<(), _>(fragment.source.as_str())
+                            .expect(fragment.name);
+                    }
+                }
+                ctx.eval::<String, _>(
+                    "String(h('a', { href: '/x', className: 'c' }, 'hi')) + '|'                      + typeof globalThis.__albedo_require_record + '|'                      + typeof globalThis.__ALBEDO_RENDER_COMPONENT + '|'                      + String(globalThis.__albedo_sealed.integrity()) + '|'                      + Object.keys(globalThis.__ALBEDO_NPM_FACTORIES).length",
+                )
+                .expect("probe evaluates")
+            })
+        };
+        assert_eq!(
+            probe(false),
+            probe(true),
+            "the realms are functionally different despite the same global names"
+        );
     }
 }
 
