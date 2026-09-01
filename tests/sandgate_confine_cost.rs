@@ -272,6 +272,52 @@ fn a_confined_request_costs_what_gate_3_1_projected() {
          packages its route reaches instead of every package the project has.\n"
     );
 
+    // ── phase 4 · the collector, relaxed for the WHOLE engine ─────────────
+    //
+    // 🔴 Kept as the control for the refutation it produced. Raising the
+    // threshold and leaving it raised helps the rebuild and wrecks the render,
+    // because the `Context` is discarded per request but the **heap belongs to
+    // the `Runtime`** and survives — so render garbage accumulates in it. The
+    // shipped version raises it only for the duration of a rebuild
+    // (`REBUILD_GC_THRESHOLD`), which is what the numbers below are measured
+    // against.
+    let mut relaxed = engine();
+    for artifact in &bundle.artifacts {
+        relaxed
+            .load_precompiled_module(&artifact.key, &artifact.script, artifact.source_hash)
+            .expect("artifact registers");
+    }
+    relaxed
+        .load_module("routes/p.tsx", ROUTE_WITH_NPM)
+        .expect("route");
+    relaxed.set_gc_threshold(64 * 1024 * 1024);
+    for _ in 0..16 {
+        relaxed.confine().expect("confine");
+        relaxed.render_component("routes/p.tsx", props).expect("render");
+    }
+    let (relaxed_confine, _) = time(REPS, || relaxed.confine().expect("confine"));
+    let (relaxed_render, _) = time(REPS, || {
+        relaxed.render_component("routes/p.tsx", props).expect("render");
+    });
+
+    println!(
+        "
+  GC · shipped (suspended for the rebuild only) : confine {npm_confine_mean:.3} ms ·          render {npm_render_mean:.3} ms · request {:.3} ms",
+        npm_render_mean + npm_confine_mean
+    );
+    println!(
+        "     · relaxed for the WHOLE engine (REFUTED)    : confine {relaxed_confine:.3} ms ·          render {relaxed_render:.3} ms · request {:.3} ms",
+        relaxed_render + relaxed_confine
+    );
+    println!(
+        "     ⇒ leaving it relaxed costs {:+.1}% on the render and {:+.1}% on the request.
+",
+        (relaxed_render - npm_render_mean) / npm_render_mean * 100.0,
+        ((relaxed_render + relaxed_confine) - (npm_render_mean + npm_confine_mean))
+            / (npm_render_mean + npm_confine_mean)
+            * 100.0
+    );
+
     // ── the gate ──────────────────────────────────────────────────────────
     //
     // 🪤 **This assertion started life as "the prelude must dominate the module

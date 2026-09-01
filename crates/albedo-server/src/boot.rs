@@ -270,6 +270,24 @@ fn boot_inner(
     };
     let forge_schema = forge_schema.with_identity_partitions(&identity_partitions);
 
+    // ── every build-time-checkable defect, in one call ────────────────────
+    //
+    // 🔑 These were four inline blocks here, which meant `albedo build` — the
+    // thing CI runs — passed apps that `albedo serve` refused, and a broken
+    // build failed at container start instead of in the pipeline that made it.
+    // They live in `dom_render_compiler::preflight` now and are called from
+    // both, because two spellings of a rule disagree on exactly the inputs that
+    // matter.
+    //
+    // Each one closes a failure that was silent: HTTP 200 with something
+    // missing and nothing said anywhere. See that module for the table.
+    let served: Vec<String> = renderer.manifest().routes.keys().cloned().collect();
+    if let Err(report) =
+        dom_render_compiler::preflight::check(&compiled, &forge_schema, &served)
+    {
+        return Err(RuntimeError::ServerStartup(report));
+    }
+
     // AUTH § 4 · the third meeting of a declaration and the code that has to
     // satisfy it. A route's `export const auth` and the `auth` block are each
     // well-formed alone; only together do they say whether the gate can ever be

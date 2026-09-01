@@ -305,6 +305,19 @@ impl StaticSliceConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevCliOptions {
     pub root_override: Option<PathBuf>,
+    /// The **project** directory — where `albedo.config.*` is looked for and
+    /// where the source layout is detected. This is what the positional `[dir]`
+    /// on `albedo dev|build|ship|doctor` means.
+    ///
+    /// 🔴 It used to set [`Self::root_override`] instead, which is a different
+    /// directory: the *source root* (`src/`), resolved relative to the project.
+    /// The two coincide only for a flat layout, so on the scaffold the CLI
+    /// generates, `albedo build .` set the root to the project directory,
+    /// suppressed layout detection (a declared root is authoritative), and
+    /// failed with "entry module 'routes/index.tsx' does not exist under root".
+    /// `albedo build ../other-app` was worse: it read the config from the
+    /// *current* directory and looked for sources in the other one.
+    pub project_dir_override: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub entry_override: Option<String>,
     pub host_override: Option<String>,
@@ -320,6 +333,7 @@ impl Default for DevCliOptions {
     fn default() -> Self {
         Self {
             root_override: None,
+            project_dir_override: None,
             config_path: None,
             entry_override: None,
             host_override: None,
@@ -391,7 +405,7 @@ pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> 
 
     if let Some(first) = raw_args.first() {
         if !first.starts_with('-') {
-            options.root_override = Some(PathBuf::from(first));
+            options.project_dir_override = Some(PathBuf::from(first));
             idx = 1;
         }
     }
@@ -399,6 +413,13 @@ pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> 
     while idx < raw_args.len() {
         let arg = &raw_args[idx];
         match arg.as_str() {
+            "--root" => {
+                idx += 1;
+                let value = raw_args
+                    .get(idx)
+                    .ok_or_else(|| "missing value after --root".to_string())?;
+                options.root_override = Some(PathBuf::from(value));
+            }
             "--config" => {
                 idx += 1;
                 let value = raw_args
@@ -467,6 +488,16 @@ pub fn resolve_dev_contract(
     cwd: &Path,
 ) -> Result<ResolvedDevContract, String> {
     let cli = parse_dev_cli_args(raw_args)?;
+    // The positional `[dir]` selects the project *before* anything is read, so
+    // the config, the layout detection and the output directory all agree on
+    // which project this is. Resolving it here rather than threading it
+    // downstream is what keeps them from disagreeing.
+    let cwd = match &cli.project_dir_override {
+        Some(dir) if dir.is_absolute() => dir.clone(),
+        Some(dir) => cwd.join(dir),
+        None => cwd.to_path_buf(),
+    };
+    let cwd = cwd.as_path();
     let loaded = load_dev_config(cwd, cli.config_path.as_deref())?;
     let mut config = loaded.config;
     config.validate()?;
@@ -1315,8 +1346,12 @@ mod tests {
         ];
         let options = parse_dev_cli_args(&args).unwrap();
         assert_eq!(
-            options.root_override,
+            options.project_dir_override,
             Some(PathBuf::from("test-app/src/components"))
+        );
+        assert_eq!(
+            options.root_override, None,
+            "the positional argument is the PROJECT directory; the source root is `--root`"
         );
         assert_eq!(options.entry_override.as_deref(), Some("App.tsx"));
         assert_eq!(options.host_override.as_deref(), Some("127.0.0.1"));
@@ -1326,6 +1361,62 @@ mod tests {
         assert!(options.strict);
         assert!(options.verbose);
         assert!(options.print_contract);
+    }
+
+    #[test]
+    fn the_source_root_is_still_overridable_but_by_its_own_flag() {
+        let options = parse_dev_cli_args(&["--root".to_string(), "app".to_string()]).unwrap();
+        assert_eq!(options.root_override, Some(PathBuf::from("app")));
+        assert_eq!(options.project_dir_override, None);
+    }
+
+    /// 🔴 Regression: `albedo build .` failed on the scaffold the CLI itself
+    /// generates.
+    ///
+    /// The positional `[dir]` was wired to the **source root**, not the project
+    /// directory. On a `src/`-layout project that meant `.` declared the root to
+    /// be the project directory — and a declared root is authoritative, so
+    /// layout detection was suppressed and the entry `routes/index.tsx` was
+    /// looked for at the top level, where it is not.
+    ///
+    /// Four commands advertise `[dir]` (`dev`, `build`, `ship`, `doctor`) and
+    /// none of them worked with an argument.
+    #[test]
+    fn a_dot_project_directory_resolves_the_same_as_no_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        std::fs::create_dir_all(project.join("src").join("routes")).unwrap();
+        std::fs::write(
+            project.join("src").join("routes").join("index.tsx"),
+            "export default function Index() { return <b>hi</b>; }",
+        )
+        .unwrap();
+
+        let bare = resolve_dev_contract(&[], project).expect("no argument resolves");
+        let dot = resolve_dev_contract(&[".".to_string()], project).expect("`.` resolves");
+        assert_eq!(bare.root, dot.root, "`.` must not move the source root");
+        assert_eq!(bare.entry, dot.entry);
+    }
+
+    /// The other half of the same bug, and the worse one: naming a sibling
+    /// project read the config from the *current* directory while looking for
+    /// sources in the other, so it could not work for any real project.
+    #[test]
+    fn naming_a_sibling_project_resolves_that_projects_own_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("strangerapp");
+        std::fs::create_dir_all(project.join("src").join("routes")).unwrap();
+        std::fs::write(
+            project.join("src").join("routes").join("index.tsx"),
+            "export default function Index() { return <b>hi</b>; }",
+        )
+        .unwrap();
+
+        let from_parent = resolve_dev_contract(&["strangerapp".to_string()], temp.path())
+            .expect("a named sibling project resolves");
+        let from_inside = resolve_dev_contract(&[], &project).expect("resolves from inside");
+        assert_eq!(from_parent.root, from_inside.root);
+        assert_eq!(from_parent.entry, from_inside.entry);
     }
 
     #[test]

@@ -73,6 +73,7 @@ pub mod ir;
 pub mod manifest;
 pub mod parser;
 pub mod routing;
+pub mod preflight;
 pub mod runtime;
 pub mod scanner;
 pub mod shutter;

@@ -119,10 +119,46 @@ pub const RETURN_PLACEHOLDER_INPUT: &str =
 /// `emitted_placeholder_contains_the_fill_anchor`.
 const RETURN_EMPTY_VALUE_ANCHOR: &str = r#"value="" data-albedo-return"#;
 
-/// Both hidden inputs, in the order a renderer emits them.
+/// APERTURE A3 · the field carrying this render's **intent token**.
+pub const INTENT_FIELD_NAME: &str = "_albedo_intent";
+
+/// Marker attribute identifying an intent input the server still has to fill.
+pub const INTENT_MARKER_ATTR: &str = "data-albedo-intent";
+
+/// The hidden intent input every renderer emits beside the CSRF one.
 ///
-/// A `concat!` and therefore a restatement of the two constants above, which is
-/// the drift this module exists to prevent — so `the_fused_prefix_is_exactly_its_two_parts`
+/// # What the token means, and why it is per *render*
+///
+/// It answers the one question no server can answer for itself: **is this
+/// submit the same intention as the last one, or a new one?** Two deliberate
+/// clicks and one retry produce byte-identical requests, so the distinction has
+/// to come from the client — which is why every API that offers idempotency
+/// (Stripe's included) takes the key from the caller.
+///
+/// Per render is exactly the right granularity, and it falls out for free:
+///
+/// * a no-JS resubmit (`F5` → *resend?*) replays this same hidden field, so the
+///   workflow **resumes** rather than starting a second one;
+/// * a second deliberate submit arrives from a fresh page render with a fresh
+///   token, so it is correctly a **new** intention;
+/// * the client runtime reuses it across its own network retries.
+///
+/// The author writes nothing. That is the difference between this and every
+/// idempotency-key API a person has had to hold in their head.
+///
+/// Empty for the same reason the CSRF placeholder is — Tier-A markup is baked
+/// at build time and island markup is precomputed once at boot, so the renderer
+/// has no request to mint against. [`fill_intent_tokens`] fills it.
+pub const INTENT_PLACEHOLDER_INPUT: &str =
+    r#"<input type="hidden" name="_albedo_intent" value="" data-albedo-intent />"#;
+
+/// The exact `value=""` + marker sequence [`fill_intent_tokens`] rewrites.
+const INTENT_EMPTY_VALUE_ANCHOR: &str = r#"value="" data-albedo-intent"#;
+
+/// Every hidden input, in the order a renderer emits them.
+///
+/// A `concat!` and therefore a restatement of the constants above, which is
+/// the drift this module exists to prevent — so `the_fused_prefix_is_exactly_its_parts`
 /// fails the build the moment it stops being their concatenation. Const string
 /// concatenation of two `const`s is not expressible in stable Rust without a
 /// macro crate, and a test that cannot pass silently is cheaper than the
@@ -130,6 +166,7 @@ const RETURN_EMPTY_VALUE_ANCHOR: &str = r#"value="" data-albedo-return"#;
 pub const FORM_HIDDEN_INPUTS: &str = concat!(
     r#"<input type="hidden" name="_csrf" value="" data-albedo-csrf />"#,
     r#"<input type="hidden" name="_albedo_return" value="" data-albedo-return />"#,
+    r#"<input type="hidden" name="_albedo_intent" value="" data-albedo-intent />"#,
 );
 
 /// Marker attribute identifying a CSRF input the server still has to
@@ -218,6 +255,15 @@ pub fn plain_form_needs_hidden_inputs(action: Option<&str>, method: Option<&str>
 /// HTML parser would be pure cost. Returns the input unchanged when no
 /// marker is present — the common case (any page without a form).
 #[must_use]
+pub fn fill_intent_tokens(html: &str, token: &str) -> String {
+    if !html.contains(INTENT_EMPTY_VALUE_ANCHOR) {
+        return html.to_string();
+    }
+    let filled = format!("value=\"{token}\" {INTENT_MARKER_ATTR}");
+    html.replace(INTENT_EMPTY_VALUE_ANCHOR, &filled)
+}
+
+/// Stamp the session's CSRF token into every placeholder.
 pub fn fill_csrf_tokens(html: &str, token: &str) -> String {
     if !html.contains(CSRF_EMPTY_VALUE_ANCHOR) {
         return html.to_string();
@@ -798,28 +844,42 @@ mod contract_tests {
         assert!(!plain_form_needs_hidden_inputs(Some("/search"), None));
     }
 
-    /// [`FORM_HIDDEN_INPUTS`] restates the two placeholder literals because
-    /// stable Rust cannot concatenate two `const`s. This is the check that makes
-    /// the restatement safe: edit either placeholder without editing the fused
-    /// constant and the build stops here rather than shipping a form whose
-    /// hidden inputs no fill can see.
+    /// [`FORM_HIDDEN_INPUTS`] restates the placeholder literals because stable
+    /// Rust cannot concatenate `const`s. This is the check that makes the
+    /// restatement safe: edit any placeholder without editing the fused constant
+    /// and the build stops here rather than shipping a form whose hidden inputs
+    /// no fill can see.
+    ///
+    /// ✅ It did exactly that when APERTURE A3 added `_albedo_intent` — which is
+    /// the whole reason to keep a test whose only job is to restate a `concat!`.
     #[test]
-    fn the_fused_prefix_is_exactly_its_two_parts() {
+    fn the_fused_prefix_is_exactly_its_parts() {
         assert_eq!(
             FORM_HIDDEN_INPUTS,
-            format!("{CSRF_PLACEHOLDER_INPUT}{RETURN_PLACEHOLDER_INPUT}")
+            format!(
+                "{CSRF_PLACEHOLDER_INPUT}{RETURN_PLACEHOLDER_INPUT}{INTENT_PLACEHOLDER_INPUT}"
+            )
         );
     }
 
-    /// The two fills run over the same HTML in the same pass, so neither may
-    /// match the other's anchor. They differ only in their marker attribute,
-    /// which is exactly the kind of near-collision worth pinning.
+    /// The fills run over the same HTML in the same pass, so none may match
+    /// another's anchor. They differ only in their marker attribute, which is
+    /// exactly the kind of near-collision worth pinning — and the reason the
+    /// final assertion is *"nothing stayed empty"* rather than three positive
+    /// checks: a fill that quietly matched a sibling's anchor would satisfy its
+    /// own check and leave the sibling blank.
     #[test]
-    fn the_two_placeholder_fills_do_not_match_each_others_anchors() {
-        let both = format!("<form>{CSRF_PLACEHOLDER_INPUT}{RETURN_PLACEHOLDER_INPUT}</form>");
-        let filled = fill_return_paths(&fill_csrf_tokens(&both, "tok"), "/mine");
+    fn the_placeholder_fills_do_not_match_each_others_anchors() {
+        let all = format!(
+            "<form>{CSRF_PLACEHOLDER_INPUT}{RETURN_PLACEHOLDER_INPUT}{INTENT_PLACEHOLDER_INPUT}</form>"
+        );
+        let filled = fill_intent_tokens(
+            &fill_return_paths(&fill_csrf_tokens(&all, "tok"), "/mine"),
+            "i-1",
+        );
         assert!(filled.contains(&format!("name=\"{CSRF_FIELD_NAME}\" value=\"tok\"")));
         assert!(filled.contains(&format!("name=\"{RETURN_FIELD_NAME}\" value=\"/mine\"")));
+        assert!(filled.contains(&format!("name=\"{INTENT_FIELD_NAME}\" value=\"i-1\"")));
         assert!(!filled.contains("value=\"\""), "nothing may stay empty: {filled}");
     }
 

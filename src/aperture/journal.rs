@@ -98,6 +98,22 @@ pub enum JournalError {
     OutOfOrder { expected: u32, got: u32 },
     /// The step cap was reached.
     StepCap { cap: usize },
+    /// A settle was aimed at a step that already has an answer.
+    AlreadySettled {
+        /// Which step.
+        index: u32,
+    },
+    /// A replay asked for a different request at an index the log already
+    /// describes. § 10 requires divergence to be loud rather than silently
+    /// re-keyed.
+    Diverged {
+        /// Which step.
+        index: u32,
+        /// The digest the log holds.
+        recorded: String,
+        /// The digest the replay produced.
+        replayed: String,
+    },
 }
 
 impl std::fmt::Display for JournalError {
@@ -111,6 +127,22 @@ impl std::fmt::Display for JournalError {
             JournalError::StepCap { cap } => write!(
                 f,
                 "aperture: workflow exceeded its step cap of {cap} outbound calls"
+            ),
+            JournalError::AlreadySettled { index } => write!(
+                f,
+                "aperture: journal step {index} already has an outcome; overwriting it would \
+                 change an answer the body has already been given"
+            ),
+            JournalError::Diverged {
+                index,
+                recorded,
+                replayed,
+            } => write!(
+                f,
+                "aperture: replay diverged at journal step {index} — the log records request \
+                 `{recorded}` and this pass asked for `{replayed}`. The step index is the \
+                 idempotency key, so answering the second with the first's key would make two \
+                 different calls one intention"
             ),
         }
     }
@@ -211,6 +243,67 @@ impl Journal {
             outcome,
         });
         Ok(())
+    }
+
+    /// Record the outcome of a step the log **already holds** as
+    /// [`StepOutcome::Unknown`].
+    ///
+    /// # 🔴 Why this exists — the bug A3 shipped without it
+    ///
+    /// [`Self::append`] is strictly append-only: `index` must equal `len()`. A
+    /// **resumed** workflow breaks that. Its log comes back from disk carrying
+    /// the in-flight step as an `Unknown` row — which is the whole point, since
+    /// a gap there would re-key every later request — so the log is already
+    /// `n + 1` long when the body re-stages step `n`. `append` then refuses it
+    /// with `OutOfOrder { expected: n+1, got: n }`, and the one case
+    /// `StepOutcome::Unknown` was invented for fails.
+    ///
+    /// 🪤 The test written for that case passed anyway, because it seeded a
+    /// *fresh* journal instead of the resumed one — proving the idempotency key
+    /// was right while never touching the path that could not reach it.
+    ///
+    /// # Errors
+    /// [`JournalError::OutOfOrder`] for an index the log does not hold, and
+    /// [`JournalError::AlreadySettled`] for one that is not `Unknown` — a
+    /// settled step is an answer the body has already been given, and rewriting
+    /// it would change history under a replay that has read it.
+    /// [`JournalError::Diverged`] when the replay asks for a different request
+    /// at the same index, which § 10 requires to be loud.
+    pub fn settle(
+        &mut self,
+        index: u32,
+        request_digest: &str,
+        outcome: StepOutcome,
+    ) -> Result<(), JournalError> {
+        let position = usize::try_from(index).unwrap_or(usize::MAX);
+        let Some(step) = self.steps.get_mut(position) else {
+            return Err(JournalError::OutOfOrder {
+                expected: u32::try_from(self.steps.len()).unwrap_or(u32::MAX),
+                got: index,
+            });
+        };
+        if step.request_digest != request_digest {
+            return Err(JournalError::Diverged {
+                index,
+                recorded: step.request_digest.clone(),
+                replayed: request_digest.to_string(),
+            });
+        }
+        if !matches!(step.outcome, StepOutcome::Unknown) {
+            return Err(JournalError::AlreadySettled { index });
+        }
+        step.outcome = outcome;
+        Ok(())
+    }
+
+    /// Whether `index` is a step the log already holds.
+    ///
+    /// The one question [`Self::append`] and [`Self::settle`] divide on, asked
+    /// where the caller stands rather than by catching an error from the wrong
+    /// one.
+    #[must_use]
+    pub fn holds(&self, index: u32) -> bool {
+        usize::try_from(index).is_ok_and(|position| position < self.steps.len())
     }
 
     /// The idempotency key for a step: **the journal position is the key**
@@ -351,5 +444,78 @@ mod tests {
         assert_eq!(seeded[0]["ok"], false);
         assert_eq!(seeded[0]["e"], "boom");
         assert!(seeded[0].get("v").is_none());
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    fn unknown_at(index: u32, digest: &str) -> Journal {
+        let mut journal = Journal::new("w", "b");
+        journal
+            .append(index, StepKind::Fetch, digest, StepOutcome::Unknown)
+            .expect("append");
+        journal
+    }
+
+    /// The path a resumed workflow takes: the log holds the in-flight step, and
+    /// the retry fills it in rather than appending beside it.
+    #[test]
+    fn a_retry_settles_the_step_the_log_already_holds() {
+        let mut journal = unknown_at(0, "d0");
+        assert!(journal.holds(0));
+        journal
+            .settle(0, "d0", StepOutcome::Completed(json!("answer")))
+            .expect("settles");
+        assert_eq!(journal.len(), 1, "settling must not grow the log");
+        assert_eq!(journal.steps()[0].outcome, StepOutcome::Completed(json!("answer")));
+    }
+
+    /// A settled step is an answer the body has already been given. Rewriting it
+    /// would change history under a replay that has read it — the same rule the
+    /// durable ledger enforces with `WHERE state = 'unknown'`.
+    #[test]
+    fn settling_a_settled_step_is_refused() {
+        let mut journal = unknown_at(0, "d0");
+        journal
+            .settle(0, "d0", StepOutcome::Completed(json!("first")))
+            .expect("settles");
+        assert_eq!(
+            journal.settle(0, "d0", StepOutcome::Completed(json!("second"))),
+            Err(JournalError::AlreadySettled { index: 0 })
+        );
+    }
+
+    /// 🔑 § 10 requires divergence to be loud. The step index **is** the
+    /// idempotency key, so answering a different request under it would make
+    /// two intentions one.
+    #[test]
+    fn a_replay_asking_for_a_different_request_at_the_same_index_is_refused() {
+        let mut journal = unknown_at(0, "d0");
+        let err = journal
+            .settle(0, "SOMETHING-ELSE", StepOutcome::Completed(json!("x")))
+            .expect_err("divergence must be refused");
+        assert_eq!(
+            err,
+            JournalError::Diverged {
+                index: 0,
+                recorded: "d0".to_string(),
+                replayed: "SOMETHING-ELSE".to_string(),
+            }
+        );
+        assert!(err.to_string().contains("idempotency key"), "{err}");
+    }
+
+    /// Settling past the end is the caller asking the wrong question — `holds`
+    /// is how it decides, and this is what happens if it does not.
+    #[test]
+    fn settling_an_index_the_log_does_not_hold_is_out_of_order() {
+        let mut journal = unknown_at(0, "d0");
+        assert!(!journal.holds(1));
+        assert_eq!(
+            journal.settle(1, "d1", StepOutcome::Completed(json!("x"))),
+            Err(JournalError::OutOfOrder { expected: 1, got: 1 })
+        );
     }
 }

@@ -27,6 +27,7 @@
 //! ask for its appends to stand on their own.
 
 use crate::aperture::cache::CacheScope;
+use crate::aperture::ledger::JournalLedger;
 use crate::aperture::client::{ApertureClient, ApertureError, ApertureRequest};
 use crate::aperture::journal::{Journal, JournalError, StepKind, StepOutcome, DEFAULT_PASS_CAP};
 use crate::ir::opcode::Instruction;
@@ -52,6 +53,35 @@ pub const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 /// a future. That asymmetry is why 30 s is affordable here and would not be
 /// under a blocking host function.
 pub const DEFAULT_WORKFLOW_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Milliseconds since the epoch, for the ledger's `started_at` / `settled_at`.
+///
+/// Taken here rather than inside the ledger so the ledger's own tests can pin
+/// time and this module stays the only place that reads a clock.
+#[must_use]
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Where a workflow's log is written down, if anywhere.
+///
+/// `None` is A2's behaviour exactly — an in-memory log good for one dispatch —
+/// and is what a server with no substrate gets. The option is not a feature
+/// flag: a project with `forge` disabled has nowhere to put this, and refusing
+/// to run outbound calls at all would be a worse answer than running them the
+/// way they already ran.
+pub struct Durability<'a> {
+    /// The store.
+    pub ledger: &'a JournalLedger<'a>,
+    /// The workflow whose steps are being recorded.
+    pub workflow_id: &'a str,
+    /// The build the workflow started under, carried onto every row so a resume
+    /// under different code is detectable (§ 11 R8).
+    pub build_id: &'a str,
+}
 
 /// The caps one dispatch runs under.
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +137,17 @@ pub enum WorkflowError {
         /// Which pass.
         pass: usize,
     },
+    /// A3 · the workflow log could not be written.
+    ///
+    /// 🔑 Deliberately fatal. The alternative — issue the call and carry on —
+    /// produces exactly the unrecorded side effect durability exists to
+    /// prevent, and it produces it silently.
+    Durability {
+        /// What the ledger was being asked to do.
+        what: &'static str,
+        /// The substrate's own words.
+        detail: String,
+    },
     /// A pass was seeded with a journal that is not the one being grown.
     JournalDesync {
         /// What the body reported reading.
@@ -147,6 +188,10 @@ impl std::fmt::Display for WorkflowError {
                 f,
                 "aperture: the body read back {seeded} journal step(s) but the driver holds \
                  {held}; the pass was seeded from a different log"
+            ),
+            Self::Durability { what, detail } => write!(
+                f,
+                "aperture: could not {what} in the durable workflow log ({detail}); the call was                  refused rather than made without a record of it, because an unrecorded call is                  one a retry cannot recognise as already made"
             ),
             Self::Pass(message) => write!(f, "{message}"),
         }
@@ -301,11 +346,49 @@ pub async fn resolve_pending(
     client: &ApertureClient,
     journal: &mut Journal,
     pending: &[PendingRequest],
+    durability: Option<&Durability<'_>>,
 ) -> Result<(), WorkflowError> {
     let requests: Vec<ApertureRequest> = pending
         .iter()
         .map(|staged| wire_request(staged, journal))
         .collect();
+
+    // ── A3 · the bracket ─────────────────────────────────────────────────
+    //
+    // 🔑 **Every step is recorded as `Unknown` before ANY request leaves.**
+    // Writing the outcome afterwards — the obvious reading of "persist the
+    // journal" — leaves a crash between send and response with no record that
+    // the call was ever made. The retry then replays from a shorter log,
+    // re-derives a *different* step index, and issues the same call under a
+    // different idempotency key: a second intention, arrived at by adding
+    // durability. See `ledger.rs`.
+    //
+    // All begins before any send, not one begin per send, because the sends are
+    // concurrent below and a per-send interleaving would leave the same hole
+    // for whichever request won the race.
+    if let Some(durable) = durability {
+        let started = now_ms();
+        for staged in pending {
+            durable
+                .ledger
+                .begin_step(
+                    durable.workflow_id,
+                    durable.build_id,
+                    staged.step,
+                    StepKind::Fetch,
+                    &staged.digest,
+                    started,
+                )
+                .await
+                // 🔑 Fails CLOSED. If the intent cannot be written down, issuing
+                // the request anyway produces exactly the unrecorded side effect
+                // this whole module exists to prevent.
+                .map_err(|err| WorkflowError::Durability {
+                    what: "record the intent to call",
+                    detail: err.to_string(),
+                })?;
+        }
+    }
 
     let outcomes = futures_util::future::join_all(
         requests
@@ -316,7 +399,30 @@ pub async fn resolve_pending(
     .await;
 
     for (staged, outcome) in pending.iter().zip(outcomes) {
-        journal.append(staged.step, StepKind::Fetch, &staged.digest, outcome)?;
+        if let Some(durable) = durability {
+            durable
+                .ledger
+                .settle_step(durable.workflow_id, staged.step, &outcome, now_ms())
+                .await
+                // Also closed, and for a subtler reason: an unsettled row is
+                // indistinguishable from a crash, so continuing here would hand
+                // the body an answer the log does not have. The next attempt
+                // would re-issue a call this one already completed.
+                .map_err(|err| WorkflowError::Durability {
+                    what: "record the outcome of a call",
+                    detail: err.to_string(),
+                })?;
+        }
+        // 🔴 A resumed workflow's log ALREADY holds this index, as the
+        // `Unknown` row the crash left. Appending would be refused
+        // (`OutOfOrder`), which would break the exact case `Unknown` exists for
+        // — see `Journal::settle`. The question is asked here rather than by
+        // catching the wrong call's error.
+        if journal.holds(staged.step) {
+            journal.settle(staged.step, &staged.digest, outcome)?;
+        } else {
+            journal.append(staged.step, StepKind::Fetch, &staged.digest, outcome)?;
+        }
     }
     Ok(())
 }
@@ -345,6 +451,7 @@ pub async fn drive_workflow<T, F, Fut>(
     journal: &mut Journal,
     limits: &WorkflowLimits,
     build_id: &str,
+    durability: Option<&Durability<'_>>,
     mut pass: F,
 ) -> Result<(Vec<Instruction>, T), WorkflowError>
 where
@@ -403,7 +510,7 @@ where
             });
         }
 
-        resolve_pending(client, journal, &pending).await?;
+        resolve_pending(client, journal, &pending, durability).await?;
     }
 }
 
@@ -452,7 +559,7 @@ mod tests {
         let client = client(transport);
         let mut journal = Journal::new("w", "b");
 
-        resolve_pending(&client, &mut journal, &[staged(0, "GET", "https://api.test/s")])
+        resolve_pending(&client, &mut journal, &[staged(0, "GET", "https://api.test/s")], None)
             .await
             .expect("resolves");
 
@@ -481,6 +588,7 @@ mod tests {
                 staged(0, "POST", "https://api.test/charges"),
                 staged(1, "GET", "https://api.test/me"),
             ],
+            None,
         )
         .await
         .expect("resolves");
@@ -516,7 +624,7 @@ mod tests {
             .headers
             .push(("idempotency-key".to_string(), "mine".to_string()));
 
-        resolve_pending(&client, &mut journal, &[request])
+        resolve_pending(&client, &mut journal, &[request], None)
             .await
             .expect("resolves");
 
@@ -545,7 +653,7 @@ mod tests {
         let client = client(transport);
         let mut journal = Journal::new("w", "b");
 
-        resolve_pending(&client, &mut journal, &[staged(0, "GET", "https://api.test/s")])
+        resolve_pending(&client, &mut journal, &[staged(0, "GET", "https://api.test/s")], None)
             .await
             .expect("resolves");
 
@@ -567,7 +675,7 @@ mod tests {
         );
         let mut journal = Journal::new("w", "b");
 
-        resolve_pending(&client, &mut journal, &[staged(0, "GET", "ftp://api.test/s")])
+        resolve_pending(&client, &mut journal, &[staged(0, "GET", "ftp://api.test/s")], None)
             .await
             .expect("the step resolves — as a failure");
 
@@ -590,6 +698,7 @@ mod tests {
             &mut journal,
             &WorkflowLimits::default(),
             "b",
+            None,
             |seeded| {
                 seeded_lengths.push(seeded.len());
                 async move {
@@ -626,7 +735,7 @@ mod tests {
             ..WorkflowLimits::default()
         };
 
-        let result = drive_workflow(&client, &mut journal, &limits, "b", |seeded| {
+        let result = drive_workflow(&client, &mut journal, &limits, "b", None, |seeded| {
             let step = u32::try_from(seeded.len()).unwrap();
             async move {
                 Ok::<_, WorkflowError>((
@@ -656,7 +765,7 @@ mod tests {
             ..WorkflowLimits::default()
         };
 
-        let result = drive_workflow(&client, &mut journal, &limits, "b", |_| async {
+        let result = drive_workflow(&client, &mut journal, &limits, "b", None, |_| async {
             Ok::<_, WorkflowError>((
                 ActionPass::Suspended {
                     pending: vec![staged(0, "GET", "https://api.test/s")],
@@ -687,6 +796,7 @@ mod tests {
             &mut journal,
             &WorkflowLimits::default(),
             "build-new",
+            None,
             |_| async { panic!("the body must not run") },
         )
         .await;
@@ -711,6 +821,7 @@ mod tests {
             &mut journal,
             &WorkflowLimits::default(),
             "b",
+            None,
             |_| async {
                 Ok::<_, WorkflowError>((
                     ActionPass::Suspended {
@@ -724,5 +835,217 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap_err(), WorkflowError::NoProgress { pass: 1 });
+    }
+}
+
+/// APERTURE · A3 — the durability tests.
+///
+/// Kept apart from the module's other tests because every one of them needs a
+/// real substrate, and because they assert a property none of the others can:
+/// what survives a process that stopped.
+#[cfg(all(test, feature = "forge"))]
+mod durability_tests {
+    use super::*;
+    use crate::aperture::client::{CountingTransport, WireResponse};
+    use crate::aperture::egress::{EgressMode, EgressPolicy};
+    use crate::aperture::ledger::JournalLedger;
+    use crate::aperture::{ResponseCache, Transport, DEFAULT_RESPONSE_BUDGET};
+    use crate::forge::libsql::LibSqlSubstrate;
+    use std::sync::Arc;
+
+    fn client(transport: Arc<dyn Transport>) -> ApertureClient {
+        ApertureClient::new(
+            transport,
+            Arc::new(ResponseCache::new(DEFAULT_RESPONSE_BUDGET)),
+            Arc::new(EgressPolicy::new(EgressMode::Dev)),
+        )
+    }
+
+    fn ok_json(body: &str) -> WireResponse {
+        WireResponse {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            etag: None,
+            last_modified: None,
+            content_type: Some("application/json".to_string()),
+        }
+    }
+
+    fn staged(step: u32, url: &str) -> PendingRequest {
+        PendingRequest {
+            step,
+            method: "POST".to_string(),
+            url: url.to_string(),
+            body: None,
+            headers: Vec::new(),
+            digest: format!("d{step}"),
+        }
+    }
+
+    /// 🔑 **The property A3 exists for, end to end.**
+    ///
+    /// A workflow charges a card, and the process dies before the body finishes.
+    /// The retry must **not** charge it again — and the mechanism that prevents
+    /// that is not a check, it is the log: the completed step is answered from
+    /// disk, so the call is never re-issued at all.
+    #[tokio::test]
+    async fn a_completed_call_is_not_reissued_after_the_process_restarts() {
+        let substrate = LibSqlSubstrate::open_ephemeral().await.expect("db");
+        let ledger = JournalLedger::new(&substrate);
+        ledger.migrate().await.expect("migrate");
+
+        let transport = Arc::new(CountingTransport::always(ok_json(r#"{"charged":true}"#)));
+        let client = client(transport.clone());
+
+        // ── the process that died ────────────────────────────────────────
+        let mut journal = Journal::new("w_stable", "b");
+        let durability = Durability {
+            ledger: &ledger,
+            workflow_id: "w_stable",
+            build_id: "b",
+        };
+        resolve_pending(
+            &client,
+            &mut journal,
+            &[staged(0, "https://api.test/charges")],
+            Some(&durability),
+        )
+        .await
+        .expect("first attempt resolves");
+        assert_eq!(transport.requests().len(), 1, "the card was charged once");
+
+        // …and here the process is killed. `journal` is gone with it; only the
+        // substrate survives. Dropping it is the whole simulation.
+        drop(journal);
+
+        // ── the retry, in a new process ──────────────────────────────────
+        //
+        // The workflow id is stable (that is what `server::workflow_identity`
+        // buys), so the log is findable.
+        let resumed = ledger
+            .load("w_stable")
+            .await
+            .expect("load")
+            .expect("the log survived the process");
+        assert_eq!(resumed.len(), 1);
+        // 🪤 The stored outcome is the whole response envelope — status, url,
+        // headers, body — not the parsed body. My first assertion here expected
+        // the body, and the round trip proving otherwise is worth keeping: what
+        // must survive a restart is exactly what the body reads on a live pass,
+        // and anything less would make a resumed run diverge from a fresh one.
+        let StepOutcome::Completed(answer) = &resumed.steps()[0].outcome else {
+            panic!("the step must come back completed: {:?}", resumed.steps()[0]);
+        };
+        assert_eq!(answer["status"], 200);
+        assert_eq!(answer["url"], "https://api.test/charges");
+        assert_eq!(
+            answer["body"], r#"{"charged":true}"#,
+            "the answer the body will be handed instead of a second charge"
+        );
+
+        // A replay reaching step 0 reads it from the journal and never stages a
+        // request for it, so nothing new goes out.
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "🔴 the card was charged twice — the retry re-issued a completed call"
+        );
+    }
+
+    /// The other half: a call whose outcome was never recorded **is** re-issued,
+    /// and under the **same** key, so the upstream can recognise the retry.
+    #[tokio::test]
+    async fn an_in_flight_call_is_reissued_under_the_same_idempotency_key() {
+        let substrate = LibSqlSubstrate::open_ephemeral().await.expect("db");
+        let ledger = JournalLedger::new(&substrate);
+        ledger.migrate().await.expect("migrate");
+
+        // The process died inside the bracket: intent written, outcome not.
+        ledger
+            .begin_step("w_stable", "b", 0, StepKind::Fetch, "d0", 1_000)
+            .await
+            .expect("begin");
+
+        let resumed = ledger
+            .load("w_stable")
+            .await
+            .expect("load")
+            .expect("the in-flight step is a row, not a gap");
+        assert_eq!(resumed.steps()[0].outcome, StepOutcome::Unknown);
+
+        let transport = Arc::new(CountingTransport::always(ok_json("{}")));
+        let client = client(transport.clone());
+        // 🪤 **This line is the bug the first version of this test hid.** It
+        // seeded a FRESH journal, which proved the key was right while never
+        // touching the path that could not reach it: a resumed log already
+        // holds the in-flight index, so `append` refuses it with `OutOfOrder`
+        // and the one case `Unknown` exists for fails. Resume from the log.
+        let mut journal = resumed;
+        let durability = Durability {
+            ledger: &ledger,
+            workflow_id: "w_stable",
+            build_id: "b",
+        };
+        resolve_pending(
+            &client,
+            &mut journal,
+            &[staged(0, "https://api.test/charges")],
+            Some(&durability),
+        )
+        .await
+        .expect("a resumed in-flight step must retry, not be refused as out of order");
+        assert_eq!(journal.len(), 1, "the retry settles the row it found");
+        assert!(
+            matches!(journal.steps()[0].outcome, StepOutcome::Completed(_)),
+            "and the row is now settled: {:?}",
+            journal.steps()[0].outcome
+        );
+
+        let sent = transport.requests();
+        assert_eq!(sent.len(), 1, "the indeterminate call is retried");
+        let key = sent[0]
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(IDEMPOTENCY_KEY_HEADER))
+            .map(|(_, value)| value.clone())
+            .expect("a derived key rides along");
+        assert_eq!(
+            key, "w_stable:0",
+            "the retry must carry the ORIGINAL key, or the upstream sees a second intention"
+        );
+    }
+
+    /// 🔑 Fail closed. If the intent cannot be written down, the call must not
+    /// go out — an unrecorded call is exactly what durability exists to prevent,
+    /// and making it anyway would be the failure mode wearing the fix's name.
+    #[tokio::test]
+    async fn a_ledger_that_cannot_record_refuses_the_call_rather_than_making_it() {
+        // A substrate with no table: every write fails.
+        let substrate = LibSqlSubstrate::open_ephemeral().await.expect("db");
+        let ledger = JournalLedger::new(&substrate);
+        // …deliberately NOT migrated.
+
+        let transport = Arc::new(CountingTransport::always(ok_json("{}")));
+        let client = client(transport.clone());
+        let mut journal = Journal::new("w", "b");
+        let durability = Durability {
+            ledger: &ledger,
+            workflow_id: "w",
+            build_id: "b",
+        };
+        let result = resolve_pending(
+            &client,
+            &mut journal,
+            &[staged(0, "https://api.test/charges")],
+            Some(&durability),
+        )
+        .await;
+
+        assert!(matches!(result, Err(WorkflowError::Durability { .. })));
+        assert!(
+            transport.requests().is_empty(),
+            "🔴 the call went out with no record of it — fail-closed is not closed"
+        );
     }
 }

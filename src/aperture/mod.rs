@@ -65,6 +65,7 @@ pub mod client;
 pub mod declare;
 pub mod egress;
 pub mod journal;
+pub mod ledger;
 pub mod reader;
 pub mod refresh;
 pub mod transport;
@@ -76,6 +77,9 @@ pub use declare::{
     source_topic_name, AuthDecl, AuthScope, PathSegment, ResolvedSource, RouteDecl, SourceDecl,
     SourceRegistry, SourceRoute, SourceSchemaError, DEFAULT_REFRESH,
 };
+pub use ledger::{
+    JournalLedger, DEFAULT_RETENTION, DEFAULT_SWEEP_INTERVAL, WORKFLOW_STEPS_TABLE,
+};
 pub use journal::{
     Journal, JournalError, Step, StepKind, StepOutcome, DEFAULT_PASS_CAP, DEFAULT_STEP_CAP,
 };
@@ -84,6 +88,7 @@ pub use refresh::{
     refresh_topic, RefreshLoop, RefreshOutcome, RefreshReport, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TICK,
 };
 pub use typegen::emit_sources_dts;
+pub use workflow::{now_ms, Durability};
 pub use workflow::{
     drive_workflow, resolve_pending, WorkflowError, WorkflowLimits, DEFAULT_WORKFLOW_DEADLINE,
     IDEMPOTENCY_KEY_HEADER,

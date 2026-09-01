@@ -186,11 +186,112 @@ fn identity_partitioned(bindings: &[PartitionBinding]) -> BTreeSet<String> {
 
 /// `" (declared: a, b)"`, or empty when the schema has none — the cause is
 /// almost always a typo, and the fix is usually visible in the list.
+/// One `useSharedSlot("literal")` found in the app.
+///
+/// The partition sibling above is [`PartitionBinding`]; this is the plain form,
+/// where the author names a topic as a string instead of naming a collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralTopicRead {
+    /// Where it was written, for the error message.
+    pub module_spec: String,
+    pub function_name: String,
+    /// The local name the read is assigned to.
+    pub binding_name: String,
+    /// The topic string as written.
+    pub topic: String,
+}
+
+impl LiteralTopicRead {
+    fn site(&self) -> String {
+        format!(
+            "{}::{} (`{}`)",
+            self.module_spec, self.function_name, self.binding_name
+        )
+    }
+}
+
+/// Every topic the project can ever **write**, when that set is knowable.
+///
+/// `None` means a handler broadcasts to a computed topic, so the set is open
+/// and nothing can be judged unreachable. See
+/// [`validate_literal_topic_reads`].
+#[derive(Debug, Clone, Default)]
+pub struct WritableTopics {
+    /// Literal topics some action broadcasts to.
+    pub broadcast: BTreeSet<String>,
+    /// False when any handler's broadcast target could not be resolved to a
+    /// literal, which makes the whole set a lower bound rather than the truth.
+    pub exhaustive: bool,
+}
+
+/// Check every literal `useSharedSlot("…")` against what the project can write.
+///
+/// # The silent failure this closes
+///
+/// A mistyped topic — `useSharedSlot("guestbok")` — compiled, booted, and served
+/// **HTTP 200 with the list simply absent**. No build error, no boot warning,
+/// nothing in the log. It is the same failure the partition checks above exist
+/// to prevent, reached by the one road they do not cover, and it is the mistake
+/// a person is most likely to make: a string typed twice, in two files.
+///
+/// # Why the writable set has to be exhaustive to judge anything
+///
+/// A topic is legitimate if a collection materialises it **or** an action
+/// broadcasts to it. A handler that broadcasts to a computed topic
+/// (`broadcast(name, v)`) makes the second half unknowable, and a read this
+/// function cannot account for might be that handler's. So an inexhaustive set
+/// disables the check rather than guessing: **the cost of a false negative is a
+/// missing error; the cost of a false positive is a build that refuses correct
+/// code.**
+///
+/// # Errors
+/// One message per unaccounted read, all collected — a typo'd topic usually
+/// appears in more than one component.
+pub fn validate_literal_topic_reads(
+    reads: &[LiteralTopicRead],
+    schema: &ForgeSchema,
+    writable: &WritableTopics,
+) -> Result<(), Vec<String>> {
+    if !writable.exhaustive {
+        return Ok(());
+    }
+    let problems: Vec<String> = reads
+        .iter()
+        .filter(|read| {
+            schema.slot_for_topic(&read.topic).is_none()
+                && !writable.broadcast.contains(&read.topic)
+        })
+        .map(|read| {
+            format!(
+                "{}: nothing ever writes to topic `{}`, so this read renders empty forever. \
+                 Declare a collection with that name in the `forge` block, or `broadcast(\"{}\", …)` \
+                 from an action{}",
+                read.site(),
+                read.topic,
+                read.topic,
+                declared_list(schema)
+            )
+        })
+        .collect();
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
+}
+
 fn declared_list(schema: &ForgeSchema) -> String {
+    // 🔴 The auth block's tables are in the schema and are **not** things an
+    // author may declare or read — `albedo_` is a reserved prefix, refused at
+    // boot. Listing them under "declared:" invited the reader to try
+    // `useSharedSlot("albedo_users")`, which is the one suggestion this message
+    // must never make.
     let names: Vec<&str> = schema
         .collections()
         .iter()
         .map(|c| c.topic.as_str())
+        .filter(|topic| !crate::auth::schema::is_reserved(topic))
         .collect();
     if names.is_empty() {
         String::new()
@@ -237,6 +338,89 @@ mod tests {
             column: column.to_string(),
             key,
         }
+    }
+
+    fn literal_read(topic: &str) -> LiteralTopicRead {
+        LiteralTopicRead {
+            module_spec: "routes/guestbook.tsx".to_string(),
+            function_name: "Guestbook".to_string(),
+            binding_name: "entries".to_string(),
+            topic: topic.to_string(),
+        }
+    }
+
+    fn writable(topics: &[&str], exhaustive: bool) -> WritableTopics {
+        WritableTopics {
+            broadcast: topics.iter().map(|t| (*t).to_string()).collect(),
+            exhaustive,
+        }
+    }
+
+    /// 🔴 The regression this check exists for: `useSharedSlot("guestbok")`
+    /// compiled, booted, and served HTTP 200 with the list absent.
+    #[test]
+    fn a_topic_nothing_writes_is_refused_and_the_message_names_the_site() {
+        let schema = schema(&[("guestbook", &[("author", FieldType::Text)], None)]);
+        let problems = validate_literal_topic_reads(
+            &[literal_read("guestbok")],
+            &schema,
+            &writable(&[], true),
+        )
+        .expect_err("an unwritable topic must be refused");
+        assert_eq!(problems.len(), 1);
+        let message = &problems[0];
+        for expected in ["routes/guestbook.tsx", "Guestbook", "entries", "guestbok"] {
+            assert!(message.contains(expected), "message misses {expected}: {message}");
+        }
+        assert!(
+            message.contains("guestbook"),
+            "the message must list what IS declared, or the fix is a guess: {message}"
+        );
+    }
+
+    #[test]
+    fn a_topic_backed_by_a_collection_or_by_a_broadcast_is_accepted() {
+        let schema = schema(&[("guestbook", &[("author", FieldType::Text)], None)]);
+        validate_literal_topic_reads(&[literal_read("guestbook")], &schema, &writable(&[], true))
+            .expect("a declared collection materialises its topic");
+        validate_literal_topic_reads(
+            &[literal_read("ticker")],
+            &schema,
+            &writable(&["ticker"], true),
+        )
+        .expect("an action broadcasting to it is the other legitimate writer");
+    }
+
+    /// 🔑 The property that keeps this check from refusing correct code: one
+    /// handler broadcasting to a computed topic makes the writable set a lower
+    /// bound, and a lower bound cannot prove anything unreachable.
+    #[test]
+    fn an_inexhaustive_writable_set_disables_the_check_entirely() {
+        let schema = schema(&[("guestbook", &[("author", FieldType::Text)], None)]);
+        validate_literal_topic_reads(
+            &[literal_read("anything-at-all")],
+            &schema,
+            &writable(&[], false),
+        )
+        .expect("an open writable set must not accuse");
+    }
+
+    /// The auth block's tables are in the schema and are refused to authors, so
+    /// suggesting them is the one suggestion this message must not make.
+    #[test]
+    fn the_declared_list_never_advertises_a_reserved_collection() {
+        // The auth tables cannot be *declared* — `from_declarations` refuses the
+        // reserved prefix, which is how this test first failed. They enter the
+        // schema through `auth::schema::augment`, which is the path a real boot
+        // takes and therefore the one worth testing.
+        let schema = schema(&[("guestbook", &[("author", FieldType::Text)], None)]);
+        let schema = crate::auth::schema::augment(&schema).expect("auth tables augment");
+        let listed = declared_list(&schema);
+        assert!(listed.contains("guestbook"));
+        assert!(
+            !listed.contains("albedo_users"),
+            "reserved tables must not be offered as something to read: {listed}"
+        );
     }
 
     fn binding(collection: &str, column: &str) -> PartitionBinding {

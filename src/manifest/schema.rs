@@ -68,8 +68,32 @@ pub struct WTStreamSlot {
 /// and the serve are separate processes, and a log line only exists when
 /// `RUST_LOG` is set. See `BootReport::island_ssr_failures` for the same
 /// argument made about islands.
+/// Which kind of render failure a [`StaticRenderFailure`] describes.
+///
+/// One channel, three sentences. Item 6.5's rule is *one event, one wording,
+/// one line* — and a layout that did not render is not a component that went
+/// missing, so it must not borrow that component's sentence.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RenderFailureKind {
+    /// A Tier-A component the evaluator could not render. The default, so every
+    /// manifest written before this field existed keeps its meaning.
+    #[default]
+    StaticRender,
+    /// A layout in a route's chain that could not be found or rendered. The
+    /// route ships **without that layout**, which is a different event from a
+    /// component going missing and needs a different sentence.
+    LayoutMissing,
+    /// A layout that rendered but contains no `<children />`, so the route's own
+    /// content is appended after it instead of nested inside it.
+    LayoutWithoutChildren,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StaticRenderFailure {
+    /// What kind of failure this is — the sentence in [`Self::report_line`]
+    /// branches on it.
+    #[serde(default)]
+    pub kind: RenderFailureKind,
     /// The component the evaluator was asked to render, as the author named it.
     pub component: String,
     /// Its module path on disk.
@@ -97,11 +121,26 @@ impl StaticRenderFailure {
     /// takes its parents' markup with it.
     #[must_use]
     pub fn report_line(&self) -> String {
-        format!(
-            "STATIC · {} is MISSING from every page that renders it, along with the \
-             markup of any component that nests it ({}). {}",
-            self.component, self.module_path, self.error
-        )
+        match self.kind {
+            RenderFailureKind::StaticRender => format!(
+                "STATIC · {} is MISSING from every page that renders it, along with the \
+                 markup of any component that nests it ({}). {}",
+                self.component, self.module_path, self.error
+            ),
+            // 🔴 These two were `tracing::warn!` and nothing else, which is the
+            // channel this very file documents as reaching nobody by default.
+            // The events are real and visible on the page; only the diagnosis
+            // was missing.
+            RenderFailureKind::LayoutMissing => format!(
+                "LAYOUT · {} did not render, so every route under it ships WITHOUT it. {}",
+                self.component, self.error
+            ),
+            RenderFailureKind::LayoutWithoutChildren => format!(
+                "LAYOUT · {} has no `<children />`, so the route's own content is appended \
+                 after the layout instead of nested inside it. {}",
+                self.component, self.error
+            ),
+        }
     }
 }
 

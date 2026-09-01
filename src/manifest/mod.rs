@@ -232,7 +232,13 @@ fn entry_components_for_routes(
     route_map.into_iter().collect()
 }
 
-fn route_path_from_component(file_path: &str) -> Option<String> {
+/// The route a source file serves, or `None` when it is not a route.
+///
+/// `pub(crate)` so the boot-time "this route can never render" check uses the
+/// **same** rule the manifest builder used to create the route in the first
+/// place. Two spellings of this rule would disagree on exactly the files that
+/// matter — `layout.tsx`, `index.tsx`, nested segments.
+pub(crate) fn route_path_from_component(file_path: &str) -> Option<String> {
     let normalized = file_path.replace('\\', "/");
     let route_hint = normalized
         .split_once("/routes/")

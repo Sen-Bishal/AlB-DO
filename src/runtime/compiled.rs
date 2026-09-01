@@ -337,6 +337,9 @@ pub struct CompiledProject {
     /// the engine throws a loud `MODULE_MISSING` naming the specifier the
     /// first time something actually imports it.
     npm_bundles: Vec<NpmDependencyBundle>,
+    /// Bare specifiers that could not be resolved to a package, with the
+    /// resolver's reason. See [`Self::unresolved_npm_imports`].
+    unresolved_npm_imports: Vec<(String, String)>,
     /// P6 · form-action field manifest: `action_id → (action_name, declared
     /// field names)`. Built once at wrap time from every
     /// `<form action="action:NAME">`'s compile-time field set. The QuickJS
@@ -555,7 +558,7 @@ impl CompiledProject {
         // scans the retained sources (catches namespace and side-effect
         // imports the eval-side `ParsedModule.imports` map doesn't record);
         // specifiers that name an existing project module are skipped.
-        let npm_bundles = bundle_project_npm_dependencies(&project);
+        let (npm_bundles, unresolved_npm_imports) = bundle_project_npm_dependencies(&project);
 
         // P6 · index each `<form action="action:NAME">`'s declared field set by
         // its wire `action_id`, so action dispatch can reconcile a handler's
@@ -590,6 +593,7 @@ impl CompiledProject {
             action_declarations,
             css_modules,
             npm_bundles,
+            unresolved_npm_imports,
             action_form_fields,
             list_repeated_actions,
         })
@@ -621,6 +625,25 @@ impl CompiledProject {
     #[must_use]
     pub fn npm_bundles(&self) -> &[NpmDependencyBundle] {
         &self.npm_bundles
+    }
+
+    /// Bare imports that resolved to no package, as `(specifier, reason)`.
+    ///
+    /// # The silent failure
+    ///
+    /// `import clsx from "clsx"` with no `node_modules` built clean, booted
+    /// clean, and served **HTTP 200 with the route's content absent** — the
+    /// single likeliest mistake in the set, since forgetting `npm i` is not
+    /// even a typo.
+    ///
+    /// 🔑 The resolver had always produced a good message
+    /// (*"npm package 'clsx' not found in node_modules (searched upward from
+    /// …)"*). It went to `tracing::warn!`, which has no subscriber unless
+    /// `RUST_LOG` is set — so the diagnosis existed and could not be read. Third
+    /// instance of that shape after `project_silent_island_death`.
+    #[must_use]
+    pub fn unresolved_npm_imports(&self) -> &[(String, String)] {
+        &self.unresolved_npm_imports
     }
 
     /// A2 · load every npm artifact into `engine`. Idempotent and cheap
@@ -1399,6 +1422,174 @@ impl CompiledProject {
             ))
         });
         out
+    }
+
+    /// `<form action="action:NAME">` elements naming an action nobody declared.
+    ///
+    /// # The silent failure
+    ///
+    /// The page renders. The form renders. The submit is a dead end — at click
+    /// time, in production, on a build that reported nothing. Renaming an
+    /// action and missing one of its forms is the ordinary way to get here.
+    ///
+    /// # Why this needed no new machinery
+    ///
+    /// 🔑 Both halves were already extracted and had simply never been compared:
+    /// `transforms::form` walks the JSX and records `FormExtract::action_name`,
+    /// and `transforms::actions` records every `export const NAME = action(…)`.
+    /// The names converge on one `action_id` by construction (the same
+    /// FNV-1a-32 on both sides — see [`ActionDeclaration::name`]), which is
+    /// exactly why a mismatch is invisible at runtime: the form posts a
+    /// perfectly well-formed id for an action that does not exist.
+    ///
+    /// The declared set is **project-wide** because the lookup is: an action is
+    /// resolved by id, not by the module the form lives in.
+    ///
+    /// Returns `(site, action_name)` pairs, sorted.
+    #[must_use]
+    pub fn forms_naming_unknown_actions(&self) -> Vec<(String, String)> {
+        let declared: std::collections::HashSet<&str> = self
+            .action_declarations_iter()
+            .map(|(_, decl)| decl.name.as_str())
+            .collect();
+
+        let mut unknown: Vec<(String, String)> = self
+            .components
+            .values()
+            .flat_map(|component| {
+                component.forms.iter().map(move |form| {
+                    (
+                        format!(
+                            "{}::{}",
+                            component.module_spec, component.function_name
+                        ),
+                        form.action_name.clone(),
+                    )
+                })
+            })
+            .filter(|(_, name)| !declared.contains(name.as_str()))
+            .collect();
+        unknown.sort();
+        unknown.dedup();
+        unknown
+    }
+
+    /// Every action name this project declares, sorted — used to make the
+    /// refusal above actionable rather than a bare "no".
+    #[must_use]
+    pub fn declared_action_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .action_declarations_iter()
+            .map(|(_, decl)| decl.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Routes the manifest serves whose source module has **no `export
+    /// default`** — so the render can never resolve a component for them.
+    ///
+    /// # The silent failure
+    ///
+    /// Deleting `export default` from a route file built clean, booted clean,
+    /// and served **HTTP 200 containing only the layout**. The route's own
+    /// markup was simply absent, with nothing said anywhere.
+    ///
+    /// # Why it is keyed on what the manifest SERVES
+    ///
+    /// 🪤 The obvious version — "any module under `routes/` needs a default
+    /// export" — is wrong twice over, and the first attempt at this check made
+    /// both mistakes:
+    ///
+    /// * `resolve_entry_component(route_path)` returns `None` for **every**
+    ///   route (it takes a module spec, not a URL path), so a check built on it
+    ///   fails the scaffold the CLI itself generates.
+    /// * a helper module under `routes/` — `routes/_util.ts` with named exports
+    ///   only — maps to a route path but is never served, and flagging it would
+    ///   refuse correct code.
+    ///
+    /// Intersecting with the served set removes both: a path the manifest
+    /// serves, whose source module has no default export, is broken with no
+    /// remaining interpretation.
+    ///
+    /// Returns `(route, module_spec)` pairs, sorted, so a boot error reads the
+    /// same twice in a row.
+    #[must_use]
+    pub fn routes_without_default_export(&self, served: &[String]) -> Vec<(String, String)> {
+        let mut broken: Vec<(String, String)> = self
+            .project
+            .modules()
+            .iter()
+            .filter(|(_, module)| module.default_export.is_none())
+            .filter_map(|(spec, _)| {
+                let route = crate::manifest::route_path_from_component(spec)?;
+                served.iter().any(|s| *s == route).then_some((route, spec.clone()))
+            })
+            .collect();
+        broken.sort();
+        broken
+    }
+
+    /// Every literal `useSharedSlot("…")` in the project, with its site.
+    ///
+    /// The plain-topic counterpart to [`Self::partition_bindings`], and it
+    /// exists for the same reason: the extractor records what was written and
+    /// has no schema to check it against, so the two have to meet somewhere.
+    /// See [`crate::forge::validate_literal_topic_reads`].
+    ///
+    /// Sorted, so a build error lists the same sites in the same order twice in
+    /// a row.
+    #[must_use]
+    pub fn literal_topic_reads(&self) -> Vec<crate::forge::LiteralTopicRead> {
+        let mut out: Vec<crate::forge::LiteralTopicRead> = self
+            .components
+            .values()
+            .flat_map(|component| {
+                component.shared_slots.iter().filter_map(move |binding| {
+                    binding
+                        .static_topic()
+                        .map(|topic| crate::forge::LiteralTopicRead {
+                            module_spec: component.module_spec.clone(),
+                            function_name: component.function_name.clone(),
+                            binding_name: binding.binding_name.clone(),
+                            topic: topic.to_string(),
+                        })
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            (&a.module_spec, &a.function_name, &a.binding_name).cmp(&(
+                &b.module_spec,
+                &b.function_name,
+                &b.binding_name,
+            ))
+        });
+        out
+    }
+
+    /// The topics this project's actions can broadcast to.
+    ///
+    /// 🔑 `exhaustive` is the load-bearing field. `broadcast_reads_in_body`
+    /// already distinguishes *"this body names these literals"* from *"this body
+    /// uses `broadcast` in a way I cannot resolve"*, and the second answer makes
+    /// the whole set a lower bound. A caller that treats a lower bound as the
+    /// truth turns one dynamic `broadcast` anywhere into a build error on
+    /// correct code somewhere else.
+    #[must_use]
+    pub fn writable_topics(&self) -> crate::forge::WritableTopics {
+        let mut writable = crate::forge::WritableTopics {
+            broadcast: std::collections::BTreeSet::new(),
+            exhaustive: true,
+        };
+        for handler in self.handlers.values() {
+            match broadcast_reads_in_body(&handler.body) {
+                BroadcastReads::None => {}
+                BroadcastReads::Literal(topics) => writable.broadcast.extend(topics),
+                BroadcastReads::Unknown => writable.exhaustive = false,
+            }
+        }
+        writable
     }
 
     /// Phase O.2 · all `useSharedSlot` bindings for one component
@@ -2735,7 +2926,9 @@ pub(crate) fn is_compiled_stmt_root(_stmt: &Stmt) -> bool {
 /// fails to resolve or bundle logs a warning and is skipped — the engine
 /// throws a loud `MODULE_MISSING` naming it if a render/handler actually
 /// imports it, which is the established loud-error surface.
-fn bundle_project_npm_dependencies(project: &ComponentProject) -> Vec<NpmDependencyBundle> {
+fn bundle_project_npm_dependencies(
+    project: &ComponentProject,
+) -> (Vec<NpmDependencyBundle>, Vec<(String, String)>) {
     let mut specifiers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for module_spec in project.modules().keys() {
         let Some(source) = project.module_source(module_spec) else {
@@ -2754,6 +2947,7 @@ fn bundle_project_npm_dependencies(project: &ComponentProject) -> Vec<NpmDepende
     // two differ on refusals and must not differ on defines.
     let options = crate::bundler::client_npm::server_shake_options();
     let mut bundles = Vec::new();
+    let mut unresolved: Vec<(String, String)> = Vec::new();
     for specifier in specifiers {
         match bundle_npm_dependency(project.root(), &specifier, &options) {
             Ok(bundle) => {
@@ -2767,15 +2961,28 @@ fn bundle_project_npm_dependencies(project: &ComponentProject) -> Vec<NpmDepende
                 bundles.push(bundle);
             }
             Err(err) => {
+                // 🔴 This used to be the end of the story, and the story was
+                // wrong twice. `tracing::warn!` reaches nobody without
+                // `RUST_LOG` — the exact finding of `project_silent_island_death`
+                // — and the claim it made was false: an import of a package that
+                // did not bundle does **not** fail loudly at render. It renders
+                // nothing, under HTTP 200, with the route's content simply
+                // absent. Measured on the scaffold with a real `clsx` call and
+                // no `node_modules`.
+                //
+                // The failure is returned now so boot can refuse. The `warn!`
+                // stays for anyone who *is* watching logs.
                 tracing::warn!(
                     specifier = %specifier,
                     error = %err,
-                    "npm dependency did not bundle; imports of it will fail loudly at render"
+                    "npm dependency did not bundle"
                 );
+                unresolved.push((specifier, err.to_string()));
             }
         }
     }
-    bundles
+    unresolved.sort();
+    (bundles, unresolved)
 }
 
 fn build_css_module_registry(project: &ComponentProject) -> CssModuleRegistry {

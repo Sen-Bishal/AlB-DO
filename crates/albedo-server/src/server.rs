@@ -451,22 +451,82 @@ impl ActionHandler for CompiledProjectActionAdapter {
                 )));
             };
 
-            // The workflow id is half of every derived idempotency key
-            // (§ 5.3, `{workflow}:{step}`), so it is minted per dispatch and
-            // never reused. Two clicks are two intentions and must not
-            // deduplicate against each other; a *retry inside one* dispatch
-            // reuses the key, which is the case the header exists for.
-            let workflow_id = format!("w_{}", uuid::Uuid::new_v4().simple());
-            let mut journal = dom_render_compiler::aperture::Journal::new(
-                workflow_id,
-                self.build_id.as_ref(),
-            );
+            // A3 · the workflow's identity, and whether it can be resumed.
+            //
+            // 🔑 **A random id per dispatch makes a persisted log unreachable.**
+            // That is why A3 is not "write the journal down": a uuid minted here
+            // is gone with the process, so a retry after a crash mints a new one,
+            // finds nothing, and re-issues every completed call under fresh keys.
+            // Persistence without stable identity buys a log nobody can ever
+            // find again.
+            let identity = workflow_identity(self.action_id, ctx.principal.as_ref(), envelope);
+
+            let substrate = self.live.forge_substrate.get().cloned();
+            let ledger = substrate
+                .as_ref()
+                .map(|s| dom_render_compiler::aperture::JournalLedger::new(s.as_ref()));
+
+            // A3 · the submit that already happened.
+            //
+            // 🔑 Resuming the *steps* stops a completed upstream call from being
+            // re-issued. It does not stop the body's own effects — a FORGE
+            // append — from being applied a second time, because a replayed body
+            // runs its writes again. So a workflow that finished answers from
+            // the log instead of running at all, which is what turns "no
+            // duplicate charge" into "no duplicate submit".
+            //
+            // Only for a resumable identity: an id this process invented cannot
+            // have finished in an earlier one.
+            if identity.resumable {
+                if let Some(ledger) = &ledger {
+                    if let Ok(Some(bytes)) =
+                        ledger.completed(&identity.id, self.build_id.as_ref()).await
+                    {
+                        use dom_render_compiler::ir::wire::WireDecode;
+                        if let Ok((instructions, _)) =
+                            Vec::<dom_render_compiler::ir::opcode::Instruction>::wire_decode(&bytes)
+                        {
+                            tracing::debug!(
+                                target: "albedo.aperture.ledger",
+                                workflow = %identity.id,
+                                "answering a repeated submit from the recorded result"
+                            );
+                            return Ok(instructions);
+                        }
+                    }
+                }
+            }
+
+            // Resume: a retry of the same intention picks the log back up rather
+            // than starting a second one. A log that will not load is not fatal —
+            // starting over is safe precisely because every step it replays
+            // carries its own idempotency key, so the upstream deduplicates what
+            // this server cannot remember.
+            let resumed = match (&ledger, identity.resumable) {
+                (Some(ledger), true) => ledger.load(&identity.id).await.ok().flatten(),
+                _ => None,
+            };
+            let mut journal = resumed.unwrap_or_else(|| {
+                dom_render_compiler::aperture::Journal::new(
+                    identity.id.clone(),
+                    self.build_id.as_ref(),
+                )
+            });
+
+            let durability = ledger.as_ref().map(|ledger| {
+                dom_render_compiler::aperture::Durability {
+                    ledger,
+                    workflow_id: &identity.id,
+                    build_id: self.build_id.as_ref(),
+                }
+            });
 
             let (instructions, writes) = dom_render_compiler::aperture::drive_workflow(
                 client.as_ref(),
                 &mut journal,
                 &dom_render_compiler::aperture::WorkflowLimits::default(),
                 self.build_id.as_ref(),
+                durability.as_ref(),
                 |seeded| {
                     // Cloned per pass, outside the async block, so the future
                     // owns everything and borrows neither `self` nor the pool.
@@ -557,6 +617,42 @@ impl ActionHandler for CompiledProjectActionAdapter {
                 // is the only layer that knows who to charge for it. See
                 // `shutter::note_fan_out`.
                 crate::shutter::note_fan_out(fan_out.subscribers);
+            }
+
+            // …and only now is the workflow finished.
+            //
+            // 🔑 **After the writes, never before.** The two are not in one
+            // transaction, so one is second, and which one decides what a crash
+            // between them costs: result-first loses the writes *silently*,
+            // writes-first duplicates them *visibly*. Duplication is recoverable
+            // and is also exactly what happens today with no result table at
+            // all, so this ordering cannot regress anything. See
+            // `JournalLedger::complete`.
+            if identity.resumable {
+                if let Some(ledger) = &ledger {
+                    use dom_render_compiler::ir::wire::WireEncode;
+                    if let Ok(bytes) = instructions.wire_encode() {
+                        // A failure here costs a repeated submit's protection,
+                        // not the submit — the effects are already durable.
+                        if let Err(err) = ledger
+                            .complete(
+                                &identity.id,
+                                self.build_id.as_ref(),
+                                &bytes,
+                                dom_render_compiler::aperture::now_ms(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "albedo.aperture.ledger",
+                                workflow = %identity.id,
+                                error = %err,
+                                "could not record the workflow result; a repeated submit \
+                                 would run again"
+                            );
+                        }
+                    }
+                }
             }
 
             return Ok(instructions);
@@ -2107,6 +2203,64 @@ impl AlbedoServer {
             .map_err(|err| {
                 RuntimeError::ServerStartup(format!("FORGE: topic hydration failed: {err}"))
             })?;
+
+            // A3 · the workflow log's own table. Created here rather than
+            // lazily on first use so a dispatch never pays a DDL round trip,
+            // and so a substrate that cannot host it fails the boot rather than
+            // the first outbound call.
+            dom_render_compiler::aperture::JournalLedger::new(substrate.as_ref())
+                .migrate()
+                .await
+                .map_err(|err| {
+                    RuntimeError::ServerStartup(format!(
+                        "APERTURE: workflow log migration failed: {err}"
+                    ))
+                })?;
+
+            // …and the sweep that keeps it from growing forever.
+            //
+            // 🔑 A `sweep()` nobody calls is the bug this codebase keeps paying
+            // for: a correct mechanism with no consumer. The table is
+            // append-only by construction, so without this it is the same
+            // unbounded-growth failure `DEFAULT_STEP_CAP` guards *inside* one
+            // workflow, one level up and with no ceiling at all.
+            //
+            // Spawned here because this is async context — `boot_production_server`
+            // itself runs outside the runtime, so a `tokio::spawn` there would
+            // panic rather than schedule anything.
+            {
+                use dom_render_compiler::aperture::{
+                    JournalLedger, DEFAULT_RETENTION, DEFAULT_SWEEP_INTERVAL,
+                };
+                let swept = Arc::clone(&substrate);
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(DEFAULT_SWEEP_INTERVAL);
+                    // The first tick fires immediately, which is what clears
+                    // whatever the previous process left behind.
+                    loop {
+                        ticker.tick().await;
+                        let cutoff = dom_render_compiler::aperture::now_ms()
+                            .saturating_sub(
+                                i64::try_from(DEFAULT_RETENTION.as_millis()).unwrap_or(i64::MAX),
+                            );
+                        match JournalLedger::new(swept.as_ref()).sweep(cutoff).await {
+                            Ok(0) => {}
+                            Ok(rows) => tracing::debug!(
+                                target: "albedo.aperture.ledger",
+                                rows,
+                                "swept expired workflow steps"
+                            ),
+                            // A failed sweep is a growing table, not a broken
+                            // request path — worth saying, not worth stopping for.
+                            Err(err) => tracing::warn!(
+                                target: "albedo.aperture.ledger",
+                                error = %err,
+                                "workflow log sweep failed; the table will keep growing"
+                            ),
+                        }
+                    }
+                });
+            }
 
             // Fill the cell every action adapter is already holding a clone of.
             // Before the listener binds, so no request can race an empty cell —
@@ -5171,6 +5325,7 @@ mod tests {
 
         let report = BootReport {
             static_render_failures: vec![StaticRenderFailure {
+                kind: dom_render_compiler::manifest::schema::RenderFailureKind::StaticRender,
                 component: "SlotDemo".to_string(),
                 module_path: "src/components/SlotDemo.tsx".to_string(),
                 error: "could not resolve import '@radix-ui/react-slot' from \
@@ -5432,5 +5587,203 @@ mod tests {
             Err(other) => panic!("expected HandlerNotFound, got {other:?}"),
             Ok(_) => panic!("build must reject a route with no registered handler"),
         }
+    }
+}
+
+/// APERTURE A3 · the durable identity of one workflow, and whether a retry may
+/// pick it up.
+///
+/// See [`workflow_identity`] for why the second field exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowIdentity {
+    /// The id every derived idempotency key is built from (`{workflow}:{step}`).
+    pub id: String,
+    /// Whether a persisted log under this id may be resumed. False for an id
+    /// this process invented, which nothing else can ever name.
+    pub resumable: bool,
+}
+
+/// The form field carrying the client's intent token.
+///
+/// Reserved-prefixed like `_csrf` and `_albedo_return`, and stamped by the same
+/// machinery — see `transforms::form`.
+pub(crate) const INTENT_FIELD: &str = "_albedo_intent";
+
+/// Derive a workflow's durable identity from the request.
+///
+/// # Why this cannot be derived from the payload alone
+///
+/// A retry must be recognised as the same intention; two deliberate clicks must
+/// not be. Those two requests are **byte-identical** — same action, same fields
+/// — so nothing in the envelope distinguishes them. Only the client knows which
+/// it is sending, which is why every serious API that offers idempotency
+/// (Stripe's among them) takes the key from the caller rather than computing it.
+///
+/// So the token comes from the client, and albedo mints it without the author
+/// doing anything: the renderer stamps `_albedo_intent` into an action form the
+/// way it already stamps `_csrf`, and the client runtime reuses it across its
+/// own network retries. A no-JS resubmit (`F5` → *resend?*) replays the same
+/// hidden field and resumes; a second deliberate submit comes from a fresh page
+/// render with a fresh token and starts its own workflow. Both are correct, and
+/// neither asked the author for anything.
+///
+/// # 🔑 Why the principal is in the id
+///
+/// The token is **client-supplied**, and the id it produces indexes a store of
+/// *upstream response values*. Without scoping, a caller who guessed or
+/// observed another user's token could resume their workflow and be handed
+/// their responses on replay. Composing the id from `(action, principal,
+/// intent)` — as separate hashed segments rather than one hash over the
+/// concatenation — means a cross-principal collision needs two independent
+/// collisions rather than one.
+///
+/// Anonymous requests share the `anon` segment, which is correct: they share a
+/// principal in the only sense the server has.
+pub(crate) fn workflow_identity(
+    action_id: u32,
+    principal: Option<&dom_render_compiler::auth::PrincipalId>,
+    envelope: &dom_render_compiler::ir::action::ActionEnvelope,
+) -> WorkflowIdentity {
+    use dom_render_compiler::runtime::engine::stable_source_hash;
+
+    let intent = serde_json::from_slice::<serde_json::Value>(&envelope.payload)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get(INTENT_FIELD)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|token| !token.trim().is_empty());
+
+    match intent {
+        Some(token) => {
+            let who = principal.map_or_else(|| "anon".to_string(), ToString::to_string);
+            WorkflowIdentity {
+                id: format!(
+                    "w_{action_id:08x}_{:016x}_{:016x}",
+                    stable_source_hash(&who),
+                    stable_source_hash(&token)
+                ),
+                resumable: true,
+            }
+        }
+        // No token: today's behaviour exactly. A uuid is not resumable and must
+        // not be — an id this process invented is one no retry can name, so
+        // treating it as resumable would only ever produce a false miss.
+        None => WorkflowIdentity {
+            id: format!("w_{}", uuid::Uuid::new_v4().simple()),
+            resumable: false,
+        },
+    }
+}
+
+/// APERTURE A3 · the identity that makes a persisted log findable.
+#[cfg(test)]
+mod workflow_identity_tests {
+    use super::{workflow_identity, INTENT_FIELD};
+    use dom_render_compiler::auth::PrincipalId;
+    use dom_render_compiler::ir::action::ActionEnvelope;
+
+    fn envelope(payload: serde_json::Value) -> ActionEnvelope {
+        ActionEnvelope {
+            action_id: 7,
+            event_kind: 3,
+            payload: serde_json::to_vec(&payload).expect("payload"),
+        }
+    }
+
+    fn principal(raw: &str) -> PrincipalId {
+        PrincipalId::parse(raw).expect("a valid principal")
+    }
+
+    /// The whole point: the same intention resolves to the same log.
+    #[test]
+    fn the_same_intent_token_names_the_same_workflow() {
+        let user = principal("u_alice");
+        let first = workflow_identity(7, Some(&user), &envelope(serde_json::json!({INTENT_FIELD: "t1"})));
+        let again = workflow_identity(7, Some(&user), &envelope(serde_json::json!({INTENT_FIELD: "t1"})));
+        assert_eq!(first.id, again.id);
+        assert!(first.resumable);
+    }
+
+    /// And two intentions do not. A second deliberate submit arrives from a
+    /// fresh render with a fresh token, and must start its own workflow rather
+    /// than dedupe against the first.
+    #[test]
+    fn two_intent_tokens_name_two_workflows() {
+        let user = principal("u_alice");
+        let first = workflow_identity(7, Some(&user), &envelope(serde_json::json!({INTENT_FIELD: "t1"})));
+        let second = workflow_identity(7, Some(&user), &envelope(serde_json::json!({INTENT_FIELD: "t2"})));
+        assert_ne!(first.id, second.id);
+    }
+
+    /// 🔑 **The security property.** The token is client-supplied and the id it
+    /// produces indexes a store of upstream *response values*. Without the
+    /// principal in the id, a caller who guessed or observed another user's
+    /// token could resume their workflow and be handed their responses.
+    #[test]
+    fn the_same_token_from_two_principals_names_two_workflows() {
+        let payload = envelope(serde_json::json!({INTENT_FIELD: "stolen"}));
+        let alice = principal("u_alice");
+        let bob = principal("u_bob");
+        assert_ne!(
+            workflow_identity(7, Some(&alice), &payload).id,
+            workflow_identity(7, Some(&bob), &payload).id,
+            "🔴 one caller could resume another's workflow and read their responses"
+        );
+        assert_ne!(
+            workflow_identity(7, Some(&alice), &payload).id,
+            workflow_identity(7, None, &payload).id,
+            "and anonymous is its own principal, not everyone's"
+        );
+    }
+
+    /// Two different actions are two different workflows even under one token —
+    /// a page's forms share a render and could share a stamp.
+    #[test]
+    fn two_actions_name_two_workflows_under_one_token() {
+        let user = principal("u_alice");
+        let payload = envelope(serde_json::json!({INTENT_FIELD: "t1"}));
+        assert_ne!(
+            workflow_identity(7, Some(&user), &payload).id,
+            workflow_identity(8, Some(&user), &payload).id
+        );
+    }
+
+    /// No token: today's behaviour exactly, and **not resumable**. An id this
+    /// process invented is one no retry can name, so marking it resumable would
+    /// only ever produce a wasted lookup.
+    #[test]
+    fn a_request_with_no_token_gets_a_fresh_unresumable_id() {
+        let first = workflow_identity(7, None, &envelope(serde_json::json!({"author": "ada"})));
+        let second = workflow_identity(7, None, &envelope(serde_json::json!({"author": "ada"})));
+        assert_ne!(first.id, second.id, "two clicks must not dedupe by accident");
+        assert!(!first.resumable);
+    }
+
+    /// A blank or whitespace token is no token. Treating `""` as an identity
+    /// would collapse every such request in the process onto one log.
+    #[test]
+    fn a_blank_token_is_treated_as_absent() {
+        for blank in ["", "   "] {
+            let identity =
+                workflow_identity(7, None, &envelope(serde_json::json!({INTENT_FIELD: blank})));
+            assert!(
+                !identity.resumable,
+                "a blank token must not name a shared workflow"
+            );
+        }
+    }
+
+    /// A non-JSON payload (a click carries none) must not panic or resume.
+    #[test]
+    fn a_payload_that_is_not_json_falls_back_cleanly() {
+        let click = ActionEnvelope {
+            action_id: 7,
+            event_kind: 0,
+            payload: Vec::new(),
+        };
+        assert!(!workflow_identity(7, None, &click).resumable);
     }
 }

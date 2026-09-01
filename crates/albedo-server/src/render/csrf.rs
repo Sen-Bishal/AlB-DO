@@ -184,6 +184,27 @@ pub fn substitute_return_path_in_html(html: &str, path: &str) -> String {
     dom_render_compiler::transforms::form::fill_return_paths(html, path)
 }
 
+/// APERTURE A3 · post-render intent substitution — the third sibling.
+///
+/// Stamps a fresh token into every hidden `_albedo_intent` input, which is what
+/// lets the server tell **a retry** from **a second intention**. Two deliberate
+/// clicks and one retry are byte-identical requests, so that distinction can
+/// only come from the client; per *render* is the granularity that makes it
+/// come for free, with the author writing nothing:
+///
+/// * `F5` → *resend?* replays this same field, so the workflow **resumes**;
+/// * a second deliberate submit comes from a fresh render with a fresh token,
+///   so it correctly starts its own.
+///
+/// The value is never trusted as an identity — it is hashed together with the
+/// action and the **principal** before it names anything
+/// (`server::workflow_identity`), because a client-supplied key that indexed a
+/// store of upstream responses would otherwise let one caller resume another's
+/// workflow.
+pub fn substitute_intent_token_in_html(html: &str, token: &str) -> String {
+    dom_render_compiler::transforms::form::fill_intent_tokens(html, token)
+}
+
 /// Reads the `__Host-albedo-session` cookie value from a request's header
 /// map and parses it into a [`SessionId`].
 ///

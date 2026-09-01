@@ -65,7 +65,10 @@ pub use delta::{
 pub use reserve::{
     IdempotencyConflict, ReleaseOutcome, ReserveError, ReserveOutcome, ReserveRequest, Reservations,
 };
-pub use bindings::{validate_partition_bindings, PartitionBinding};
+pub use bindings::{
+    validate_literal_topic_reads, validate_partition_bindings, LiteralTopicRead,
+    PartitionBinding, WritableTopics,
+};
 pub use declare::{CollectionDecl, FieldType};
 pub use drift::{evolve_schema, Addition, Change, CollectionDrift, SchemaDrift, VerifyError};
 pub use typegen::emit_forge_dts;

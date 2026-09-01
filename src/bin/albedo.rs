@@ -722,7 +722,31 @@ fn print_doctor_report(
     }
 
     // The honest half. A report that lists only what it can answer reads as a
-    // clean bill of health, and this one is not entitled to give one yet.
+    // clean bill of health.
+    //
+    // 🔴 This section used to close with an unconditional *"no read can be keyed
+    // by the signed-in user until AUTH item 5's P1 lands"*. P1 landed —
+    // `ReachKey::Principal` is reachable and `user.id` lowers to
+    // `PartitionKeySource::Identity` — so the tool was reporting its own
+    // capabilities as of a date rather than the project in front of it. A
+    // trust-polish surface that is wrong about the framework is worse than one
+    // that says less.
+    //
+    // What replaces it is a fact about **this project**: whether any read is
+    // keyed by the principal. In a scaffold with no auth-keyed reads that is
+    // still worth saying — it is the difference between "absent because nothing
+    // asked" and "absent because it cannot be expressed".
+    let has_principal_read = matrix
+        .routes
+        .iter()
+        .flat_map(|row| row.reads.iter())
+        .any(|read| matches!(read.key, dom_render_compiler::doctor::ReachKey::Principal));
+    if unattributed.is_empty() && has_principal_read {
+        // Nothing unanswerable: say nothing rather than print an empty heading.
+        println!();
+        return;
+    }
+
     print_section("not yet answerable");
     if !unattributed.is_empty() {
         print_warn(format!(
@@ -749,20 +773,26 @@ fn print_doctor_report(
         );
         println!();
     }
-    println!(
-        "    {}",
-        style(
-            "no read can be keyed by the signed-in user until AUTH item 5's P1 lands, so every",
-            "2"
-        )
-    );
-    println!(
-        "    {}",
-        style(
-            "`← user.id` row above is absent by construction rather than by omission.",
-            "2"
-        )
-    );
+    if !has_principal_read {
+        println!(
+            "    {}",
+            style(
+                "no read in this project is keyed by the signed-in user. `← user.id` is",
+                "2"
+            )
+        );
+        println!(
+            "    {}",
+            style(
+                "expressible — nothing here asks for it, so every row above is reachable",
+                "2"
+            )
+        );
+        println!(
+            "    {}",
+            style("by anyone who can reach the route.", "2")
+        );
+    }
     println!();
 }
 
@@ -1370,10 +1400,21 @@ fn boot_and_run_production_server(
 
     let opts = ProductionServerOptions::from_contract(contract);
     let server = boot_production_server(&opts).map_err(|err| {
-        format!(
-            "failed to boot production server: {err}\n\
-             hint: did you run `albedo build` first?"
-        )
+        // 🔴 The hint used to be unconditional. `albedo serve` builds first, so
+        // by the time this runs the build has already succeeded — and every
+        // config or code error (a bad `partition_by`, a topic nothing writes)
+        // arrived carrying the advice to do the one thing that had just worked.
+        // A wrong hint on a correct diagnosis costs more than no hint.
+        let built = opts.dist_dir.join("bundle-plan.json").is_file();
+        if built {
+            format!("failed to boot production server: {err}")
+        } else {
+            format!(
+                "failed to boot production server: {err}\n\
+                 hint: no build output at {} — run `albedo build` first",
+                opts.dist_dir.display()
+            )
+        }
     })?;
 
     let url = format!("http://{}:{}", contract.server.host, contract.server.port);
@@ -2625,6 +2666,56 @@ fn run_prod_build_with_budget(
     // `BootReport`. Item 6.5's rule is one event, one wording, one line; the
     // wording itself lives on `StaticRenderFailure::report_line` so the two
     // lanes cannot drift.
+    // ── preflight, for the lane where nothing else will run it ────────────
+    //
+    // 🔴 Every check in `preflight` was written at **boot**, which meant
+    // `albedo build` — the thing CI runs — passed apps that `albedo serve`
+    // refuses. A broken build shipped and failed at container start instead of
+    // in the pipeline that produced it.
+    //
+    // Gated on `show_tiers`, which is exactly the standalone `albedo build`
+    // lane: the startup build behind `serve` / `dev` is followed immediately by
+    // a boot that runs the same checks against the same facts, and paying for a
+    // second source-tree parse there would slow every hot reload to catch
+    // nothing new. Same reasoning as `boot_report_will_print_this` below.
+    if show_tiers {
+        let served: Vec<String> = manifest.routes.keys().cloned().collect();
+        match dom_render_compiler::runtime::CompiledProject::load_from_dir(&contract.root) {
+            Ok(compiled) => {
+                // The auth tables are deliberately not augmented in here. The
+                // only thing the schema contributes is *"is this a declared
+                // collection"*, and `albedo_*` is never a legitimate topic — so
+                // their absence cannot produce a false accusation, which is the
+                // failure direction that matters.
+                let schema = if contract.forge.is_empty() {
+                    dom_render_compiler::forge::ForgeSchema::guestbook_default()
+                } else {
+                    match dom_render_compiler::forge::ForgeSchema::from_declarations(
+                        &contract.forge,
+                    ) {
+                        Ok(schema) => schema,
+                        // 🔴 First written as "boot makes a better diagnosis,
+                        // so say nothing here" — which is exactly wrong for the
+                        // lane this branch is in. `albedo build` is what CI
+                        // runs, and boot never happens there, so deferring meant
+                        // a malformed `forge` block sailed through the pipeline
+                        // and failed at container start. The message is boot's,
+                        // word for word, so the two lanes cannot drift.
+                        Err(err) => {
+                            return Err(format!(
+                                "invalid `forge` block in albedo.config: {err}"
+                            ));
+                        }
+                    }
+                };
+                dom_render_compiler::preflight::check(&compiled, &schema, &served)?;
+            }
+            // The source tree failing to load is its own error with its own
+            // message, produced on the path that actually needs the tree.
+            Err(_) => {}
+        }
+    }
+
     let boot_report_will_print_this = !show_tiers && !quiet;
     if !boot_report_will_print_this {
         for failure in &manifest.static_render_failures {

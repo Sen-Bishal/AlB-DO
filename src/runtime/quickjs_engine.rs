@@ -28,6 +28,17 @@ use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_transforms_base::resolver;
 
 const MAX_MODULE_SIZE: usize = 10 * 1024 * 1024; // 10 MB limit
+
+/// QuickJS's own default GC threshold, restored after every rebuild.
+///
+/// Named rather than re-derived so the restore cannot drift from what the
+/// runtime started with.
+const DEFAULT_GC_THRESHOLD: usize = 256 * 1024;
+
+/// The threshold in force **during a realm rebuild**, high enough that the
+/// collector does not run inside one. A confined Radix request's whole live set
+/// measured ~250 KB (SANDGATE gate 5), so this is two orders above it.
+const REBUILD_GC_THRESHOLD: usize = 64 * 1024 * 1024;
 use swc_ecma_transforms_react::{jsx, Options as JsxOptions, Runtime as JsxRuntime};
 use swc_ecma_transforms_typescript::strip_type;
 use swc_ecma_visit::VisitMutWith;
@@ -99,6 +110,9 @@ pub struct QuickJsEngine {
     /// Compiled bytecode for replayed registrations. In-memory only — see the
     /// audit note in [`crate::runtime::confinement`].
     bytecode: BytecodeCache,
+    /// The collector threshold restored after a rebuild — see
+    /// [`Self::set_gc_threshold`] and `REBUILD_GC_THRESHOLD`.
+    gc_threshold: usize,
     /// Suppresses ledger recording while `ensure_initialized` installs the
     /// bootstrap's preloaded libraries.
     ///
@@ -126,6 +140,7 @@ impl QuickJsEngine {
             ledger: ModuleLedger::new(),
             bytecode: BytecodeCache::from_env(),
             suspend_ledger: false,
+            gc_threshold: DEFAULT_GC_THRESHOLD,
         }
     }
 
@@ -179,6 +194,24 @@ impl QuickJsEngine {
     {
         let arena = Arc::clone(&self.arena);
         arena.begin_request();
+
+        // 📏 **Suspend the collector for the rebuild only.** A GC here walks the
+        // whole prelude and every re-registered module — freshly allocated, all
+        // still live — and frees nothing. Measured at **−14.7%** on a confined
+        // Radix rebuild (1.486 → 1.267 ms).
+        //
+        // 🔴 And *only* for the rebuild. Leaving it relaxed made renders **777%
+        // slower** and the request worse overall, because the premise it was
+        // raised on is false: the `Context` is discarded, but the **heap belongs
+        // to the `Runtime`** and survives every rebuild, so render garbage
+        // accumulates in it. That is the mirror image of the ownership mistake
+        // SANDGATE's own notes corrected once already — the arena, atom and
+        // shape tables are the runtime's; intrinsics and globals are the
+        // context's. Restored below, in the same bracket as the arena.
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.set_gc_threshold(REBUILD_GC_THRESHOLD);
+        }
+
         let outcome = (|| -> RuntimeResult<()> {
             // 🔑 **Build, then swap — never drop, then build.**
             //
@@ -210,8 +243,37 @@ impl QuickJsEngine {
                 }
             }
         })();
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.set_gc_threshold(self.gc_threshold);
+        }
         arena.end_request();
         outcome
+    }
+
+    /// Raise the runtime's GC threshold — the live-bytes mark at which QuickJS
+    /// stops and collects.
+    ///
+    /// # Why an embedder would, and why albedo especially
+    ///
+    /// A collection walks everything reachable. During a realm rebuild that is
+    /// the entire prelude plus every re-registered module — all of it freshly
+    /// allocated and all of it still live — so the collector marks the whole
+    /// graph and frees nothing. Ordinary embedders accept that as the price of
+    /// bounded memory.
+    ///
+    /// 🔑 **Albedo can say something stronger: under SANDGATE the context is
+    /// discarded at the end of the request anyway.** Garbage collected inside a
+    /// realm that is about to be dropped wholesale is work with no consumer —
+    /// the drop reclaims it either way. Memory stays bounded by the arena's own
+    /// caps and by the rebuild, not by the collector.
+    ///
+    /// Takes effect for the current runtime and survives `rebuild_realm`, which
+    /// keeps the `Runtime` and replaces only the `Context`.
+    pub fn set_gc_threshold(&mut self, bytes: usize) {
+        self.gc_threshold = bytes;
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.set_gc_threshold(bytes);
+        }
     }
 
     /// Snapshot of the request-scoped bump arena that backs the QuickJS runtime.
@@ -2512,10 +2574,36 @@ if (typeof globalThis.useState !== 'function') {
   //   directly). Two islands on one page therefore cannot collide, which a bare
   //   counter would allow.
   // * **n** — components are invoked parent-first, depth-first on BOTH sides.
-  //   Here that falls out of JS argument evaluation (a component's body runs
-  //   before the `h(…)` calls for its children are made); on the client
-  //   `renderComponent` runs the body and reconciles children afterwards. This
-  //   is the same pre-order property `__albedo_stable_id` already relies on.
+  //   On the client that is native: `renderComponent` runs the body and
+  //   reconciles children afterwards.
+  //
+  //   🔴 **On the server it is bought, not free — and this comment claimed the
+  //   opposite until 2026-08-24.** It read "that falls out of JS argument
+  //   evaluation (a component's body runs before the `h(…)` calls for its
+  //   children are made)". That is exactly backwards for children a component
+  //   is *passed*: `<Wrapper><Inner/></Wrapper>` lowers to
+  //   `h(Wrapper, null, h(Inner))` and JS evaluates arguments **before** the
+  //   call, so `Inner`'s body ran FIRST. Measured, server vs client:
+  //   `[outer=0, Wrapper=2, Inner=1]` vs `[outer=0, Wrapper=1, Inner=2]` —
+  //   transposed, so the client silently rewrote every id the server had baked
+  //   into the markup. `transforms::thunk_children` buys the order back by
+  //   deferring each child argument of a *component* call, forcing it after the
+  //   parent's body has run. **The property is one a transform maintains; if
+  //   that pass is removed, this counter desyncs.**
+  //
+  //   ⚠️ **`__albedo_stable_id` is NOT the same property, and borrowing its
+  //   justification is what made the claim above look sound.** That stamp is
+  //   injected as a JSX **attribute**, so it sits in the parent's props object —
+  //   which genuinely *is* built before any child's `h(…)` runs. A call in props
+  //   position gets pre-order from argument evaluation; a call in **body**
+  //   position, which is what `useId` is, gets the reverse. Two different
+  //   mechanisms that happen to agree on the answer.
+  //
+  //   Pinned by `use_id_agrees_when_children_are_passed_in`
+  //   (`tests/client_hydration.rs`) — written against the passed-in shape
+  //   precisely because the `jsx_matrix/use_id` golden only ever covered
+  //   children a component *creates*, and so passed while asserting nothing
+  //   about the case Radix actually uses.
   //
   // 🪤 Note what is NOT relied on: the order the two renderers *assemble* their
   // output. The server's `h` is eager and bottom-up, which is why `form_errors`
@@ -6267,10 +6355,14 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
             "{}",
         );
 
-        // Both fills, because the server runs both in one pass. Asserting only
-        // the CSRF one would let a shim that emits an unfillable return input
-        // pass — the same shape of miss this test was written for.
-        let served = fill_return_paths(&fill_csrf_tokens(&html, "0123456789abcdef"), "/sign2");
+        // EVERY fill, because the server runs them all in one pass. Asserting
+        // only the CSRF one would let a shim that emits an unfillable sibling
+        // pass — the same shape of miss this test was written for, and the miss
+        // it actually caught when APERTURE A3 added `_albedo_intent`.
+        let served = crate::transforms::form::fill_intent_tokens(
+            &fill_return_paths(&fill_csrf_tokens(&html, "0123456789abcdef"), "/sign2"),
+            "i-1",
+        );
         assert!(
             served.contains("value=\"0123456789abcdef\""),
             "the server fill must find the shim's placeholder: {served}",
@@ -6278,6 +6370,10 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
         assert!(
             served.contains("value=\"/sign2\""),
             "the return path must be fillable too: {served}",
+        );
+        assert!(
+            served.contains("value=\"i-1\""),
+            "the intent token must be fillable too: {served}",
         );
         assert!(
             !served.contains("value=\"\""),

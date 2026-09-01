@@ -197,8 +197,38 @@
   // envelope, POST it, then hand the response bytes back to the
   // bakabox frame applier so any returned `SetText` / `Navigate` /
   // `SlotSet` opcodes land in the DOM.
+  // APERTURE A3 · a fresh intent token per SUBMIT, not per render.
+  //
+  // The renderer stamps one `_albedo_intent` per page render, which is exactly
+  // right for the no-JS path — there, every submit IS a fresh render, and an
+  // `F5` resend replays the same token so the workflow resumes instead of
+  // running twice.
+  //
+  // 🔴 With JavaScript there is no reload, so the stamped value would be shared
+  // by every submit until the next render — including by the SAME action on
+  // different rows. Deleting row 1 and then row 2 would send one workflow id
+  // twice, and the second delete would be answered from the first's recorded
+  // result: the row simply would not go. Found by reading the served markup and
+  // noticing both forms on the page carried one token.
+  //
+  // So the client mints its own per submit. On a retry of that same submit it
+  // would reuse it — which is the case the whole mechanism exists for — and the
+  // stamped value stays the no-JS path's business.
+  function mintIntentToken() {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+      return globalThis.crypto.randomUUID().replace(/-/g, '');
+    }
+    // No `crypto` (an old browser, or an insecure origin): a token that only
+    // has to be unique within one tab's lifetime.
+    return (
+      'f' +
+      Date.now().toString(16) +
+      Math.random().toString(16).slice(2, 10)
+    );
+  }
+
   function submitAlbedoForm(form, actionName) {
-    const payload = serializeFormToJson(form);
+    const payload = serializeFormToJson(form, mintIntentToken());
     const actionId = resolveActionId(actionName);
 
     // `encodeActionEnvelope` (bincode.js) reads camelCase `actionId` /
@@ -274,8 +304,9 @@
   // serialized as UTF-8 bytes. Multi-select and same-name checkbox
   // groups collapse into arrays. File inputs are skipped — they need
   // a multipart path that this Stage 1 envelope can't carry yet.
-  function serializeFormToJson(form) {
+  function serializeFormToJson(form, intentToken) {
     const out = Object.create(null);
+
     const elements = form.elements;
     for (let i = 0; i < elements.length; i++) {
       const el = elements[i];
@@ -315,6 +346,12 @@
       }
       appendField(out, name, el.value);
     }
+    // 🪤 AFTER the loop, not before it. The form carries a hidden
+    // `_albedo_intent` input — that is how the no-JS path gets one — so writing
+    // the mint first would have it overwritten by the very value it exists to
+    // replace, and every submit on a page would share one token again. The
+    // first draft of this did exactly that, with a comment claiming otherwise.
+    if (intentToken) out['_albedo_intent'] = intentToken;
     const json = JSON.stringify(out);
     return new TextEncoder().encode(json);
   }

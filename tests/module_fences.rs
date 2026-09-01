@@ -179,6 +179,10 @@ const SERVER_MAY_REACH: &[(&str, &str)] = &[
     ("shutter", "the streaming/suspension machinery"),
     ("hydration", "tier and hydration types travelling on the manifest"),
     ("types", "shared identifier newtypes"),
+    (
+        "preflight",
+        "the build-time-checkable defects, so boot and `albedo build` run ONE          implementation of them rather than two that drift",
+    ),
     ("dev_contract", "the dev-server contract type, shared by construction"),
     // Compile-time modules, admitted only as SHARED VOCABULARY — the same "one
     // spelling, in Rust" rule that removed the JS shim's private copies of markup

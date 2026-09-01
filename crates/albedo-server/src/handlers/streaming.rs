@@ -976,7 +976,19 @@ fn fill_server_placeholders(
     // function exists at all: a form that got one fill and not the other
     // submits successfully and then lands the reader on `/`, which reads as the
     // app losing their place rather than as a missing substitution.
-    crate::render::csrf::substitute_return_path_in_html(&with_csrf, request_path)
+    let with_return =
+        crate::render::csrf::substitute_return_path_in_html(&with_csrf, request_path);
+    // …and the intent token, fused for the same reason: a form that reached the
+    // browser with an empty one still submits, and still works — it simply
+    // cannot be resumed after a crash, which is the failure that looks like
+    // nothing until the day it is a double charge.
+    //
+    // Fresh per render, which is the whole semantic: see
+    // `substitute_intent_token_in_html`.
+    crate::render::csrf::substitute_intent_token_in_html(
+        &with_return,
+        &uuid::Uuid::new_v4().simple().to_string(),
+    )
 }
 
 /// Replace each empty Tier-C island placeholder (`<div id="…"

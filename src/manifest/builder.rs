@@ -982,12 +982,34 @@ impl<'a> ManifestBuilder<'a> {
         let mut accumulated = leaf_html;
         for layout_name in layout_chain.iter().rev() {
             let Some(layout_html) = self.render_layout_html(layout_name) else {
+                // 🔴 `tracing::warn!` was the ONLY report of this, and this file
+                // already documents why that reaches nobody: the build and the
+                // serve are separate processes, and a log line exists only when
+                // `RUST_LOG` is set. The route ships without one of its layouts
+                // — visible on the page, undiagnosable from it.
                 tracing::warn!(
                     target: "albedo.manifest.layout",
                     layout = %layout_name,
-                    "layout component not found or failed to render; \
-                     route shipped without this layout in the chain"
+                    "layout component not found or failed to render"
                 );
+                // 🔑 Only when the Tier-A path has not already reported this
+                // component. A layout whose own render failed produces a
+                // `STATIC · … is MISSING` line there, and adding the consequence
+                // beside it is two lines for one root cause — exactly what item
+                // 6.5's *one event, one wording, one line* rule exists to stop.
+                // This line is for the case that path cannot see: a layout the
+                // chain names and the registry does not have.
+                let mut failures = self.static_render_failures.borrow_mut();
+                if !failures.iter().any(|f| f.component == *layout_name) {
+                    failures.push(StaticRenderFailure {
+                        kind: crate::manifest::schema::RenderFailureKind::LayoutMissing,
+                        component: layout_name.clone(),
+                        module_path: String::new(),
+                        error: "The layout chain names it, but no component by that \
+                                name is registered."
+                            .to_string(),
+                    });
+                }
                 continue;
             };
             if !layout_html.contains(LAYOUT_CHILDREN_SENTINEL) {
@@ -995,14 +1017,25 @@ impl<'a> ManifestBuilder<'a> {
                 // pre-E.1 shape rather than dropping the route's
                 // content on the floor. The layout's rendered HTML
                 // wins; the inner content is appended so it's still
-                // observable in the shell. Surface a tracing warn so
-                // the build log flags the misconfiguration.
+                // observable in the shell.
+                //
+                // 🔴 Same correction as above: the `tracing::warn!` was the only
+                // report, so the degradation was invisible to the author whose
+                // layout caused it.
                 tracing::warn!(
                     target: "albedo.manifest.layout",
                     layout = %layout_name,
-                    "layout component has no <children /> intrinsic; \
-                     appending inner content rather than substituting"
+                    "layout component has no <children /> intrinsic"
                 );
+                self.static_render_failures
+                    .borrow_mut()
+                    .push(StaticRenderFailure {
+                        kind: crate::manifest::schema::RenderFailureKind::LayoutWithoutChildren,
+                        component: layout_name.clone(),
+                        module_path: String::new(),
+                        error: "Add `<children />` where the route's content belongs."
+                            .to_string(),
+                    });
                 accumulated = format!("{}{}", layout_html, accumulated);
                 continue;
             }
@@ -1630,6 +1663,7 @@ impl<'a> ManifestBuilder<'a> {
         self.static_render_failures
             .borrow_mut()
             .push(StaticRenderFailure {
+                kind: crate::manifest::schema::RenderFailureKind::StaticRender,
                 component: component.name.clone(),
                 module_path: component.file_path.clone(),
                 error,
