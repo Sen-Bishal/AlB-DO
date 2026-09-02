@@ -1695,12 +1695,139 @@ impl Visit for RequireCollector {
     }
 }
 
-/// Scan a project TSX/TS/JSX source for the **bare npm specifiers** it
-/// imports (or re-exports from). Used at `CompiledProject::wrap` time to
-/// discover which packages need bundling. Parse failures return an empty
-/// list — discovery must never fail a build the component parser accepted.
+/// How a module was asked for, when the ask is invisible to the static scan.
+///
+/// The two forms are **not** interchangeable, and treating them alike is the
+/// trap this type exists to prevent — see [`scan_deferred_loads`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoadForm {
+    /// `require("x")` — CommonJS.
+    Require,
+    /// `import("x")` — a dynamic ESM import.
+    DynamicImport,
+}
+
+/// One module-loading call that [`scan_bare_imports`] cannot see.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeferredLoad {
+    /// How it was written.
+    pub form: LoadForm,
+    /// The string literal it names.
+    pub specifier: String,
+}
+
+/// Collects `require("…")` and `import("…")` with **string-literal** arguments.
+///
+/// A computed argument (`require(name)`, `import(\`./${x}\`)`) is deliberately
+/// not collected: there is no specifier to report, and inventing one would name
+/// a module the author never wrote.
+#[derive(Default)]
+struct DeferredLoadCollector {
+    loads: Vec<DeferredLoad>,
+}
+
+impl DeferredLoadCollector {
+    fn literal_arg(call: &CallExpr) -> Option<String> {
+        if call.args.len() != 1 {
+            return None;
+        }
+        match call.args.first().map(|arg| arg.expr.as_ref()) {
+            Some(Expr::Lit(Lit::Str(specifier))) => Some(specifier.value.to_string()),
+            _ => None,
+        }
+    }
+}
+
+impl Visit for DeferredLoadCollector {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        match &call.callee {
+            // `import("x")` — the callee is a distinct AST node, not an ident,
+            // which is exactly why an ident-keyed scan never saw it.
+            Callee::Import(_) => {
+                if let Some(specifier) = Self::literal_arg(call) {
+                    self.loads.push(DeferredLoad {
+                        form: LoadForm::DynamicImport,
+                        specifier,
+                    });
+                }
+            }
+            Callee::Expr(callee) => {
+                if let Expr::Ident(ident) = callee.as_ref() {
+                    if ident.sym.as_ref() == "require" {
+                        if let Some(specifier) = Self::literal_arg(call) {
+                            self.loads.push(DeferredLoad {
+                                form: LoadForm::Require,
+                                specifier,
+                            });
+                        }
+                    }
+                }
+            }
+            Callee::Super(_) => {}
+        }
+        call.visit_children_with(self);
+    }
+}
+
+/// Scan a project TSX/TS/JSX source for the module loads a **static** specifier
+/// scan cannot see: `require("…")` and dynamic `import("…")`.
+///
+/// # Why this exists — the hole it closes
+///
+/// [`scan_bare_imports`] reads `ModuleDecl`s, so it sees `import x from "y"` and
+/// nothing else. Everything it does not see is never resolved, never bundled and
+/// never refused, so the call **ships verbatim into the client chunk** and
+/// becomes a throw in a user's browser instead of an error in the build. That is
+/// precisely the failure the client capability boundary exists to prevent, and
+/// it has been open since Tier C Phase 2.
+///
+/// 🔑 **This is not a Node-built-ins problem.** `import("lucide-react")` inside a
+/// component ships just as unresolvable as `import("node:fs")` does; the
+/// built-ins are only the most alarming instance. What is broken is the *scan*.
+///
+/// # What the caller must not do with the result
+///
+/// 🪤 **Do not refuse every dynamic import.** `if (isNode) await import("fs")` is
+/// a standard isomorphic-package shape whose branch never runs in a browser, and
+/// refusing it would break packages that work today. Measured against
+/// `C:/Development/albedo-corpus` (2026-09-02): literal dynamic imports appear
+/// across the build-time tooling layer — `@swc`, `@eslint`, `@tailwindcss`,
+/// `contentlayer`, `chokidar`, `cosmiconfig`, `enhanced-resolve` and others —
+/// and in **zero** of the browser-shipped UI packages checked (`@radix-ui/*`,
+/// `lucide-react`, `clsx`). So the form is common in the ecosystem and absent
+/// from the client surface, which is the argument for reporting it rather than
+/// refusing it.
+///
+/// The one form that carries no ambiguity is [`LoadForm::Require`] **in project
+/// source**: `require` is a parameter of the CJS factory wrapper
+/// (`function(module, exports, require, …)`), never a global. Neither the
+/// QuickJS prelude nor `assets/albedo-client.js` defines one, so a `require` an
+/// author writes is a `ReferenceError` on the server render path *and* in the
+/// browser. There is no configuration in which it works.
+///
+/// Parse failures return an empty list, for the same reason
+/// [`scan_bare_imports`] does: discovery must never fail a build the component
+/// parser accepted.
 #[must_use]
-pub fn scan_bare_imports(source: &str) -> Vec<String> {
+pub fn scan_deferred_loads(source: &str) -> Vec<DeferredLoad> {
+    let Some(module) = parse_project_module(source) else {
+        return Vec::new();
+    };
+    let mut collector = DeferredLoadCollector::default();
+    module.visit_with(&mut collector);
+
+    let mut seen = HashSet::new();
+    collector
+        .loads
+        .into_iter()
+        .filter(|load| seen.insert((load.form, load.specifier.clone())))
+        .collect()
+}
+
+/// Parse project source as TSX, falling back to JSX. Shared by
+/// [`scan_bare_imports`] and [`scan_deferred_loads`] so the two cannot disagree
+/// about what a project file *is*.
+fn parse_project_module(source: &str) -> Option<Module> {
     let parse = |syntax: Syntax| -> Option<Module> {
         let source_map: Lrc<SourceMap> = Lrc::default();
         let file = source_map.new_source_file(
@@ -1712,7 +1839,7 @@ pub fn scan_bare_imports(source: &str) -> Vec<String> {
             .ok()
     };
 
-    let module = parse(Syntax::Typescript(TsSyntax {
+    parse(Syntax::Typescript(TsSyntax {
         tsx: true,
         decorators: true,
         ..Default::default()
@@ -1723,9 +1850,16 @@ pub fn scan_bare_imports(source: &str) -> Vec<String> {
             decorators: true,
             ..Default::default()
         }))
-    });
+    })
+}
 
-    let Some(module) = module else {
+/// Scan a project TSX/TS/JSX source for the **bare npm specifiers** it
+/// imports (or re-exports from). Used at `CompiledProject::wrap` time to
+/// discover which packages need bundling. Parse failures return an empty
+/// list — discovery must never fail a build the component parser accepted.
+#[must_use]
+pub fn scan_bare_imports(source: &str) -> Vec<String> {
+    let Some(module) = parse_project_module(source) else {
         return Vec::new();
     };
 
@@ -1927,6 +2061,130 @@ mod tests {
         // An expression, not a `ModuleDecl`, so the declaration check misses it
         // — this is the `import.meta only valid in module code` failure class.
         assert!(source_is_esm("const url = import.meta.url; module.exports = url;"));
+    }
+
+    // ── The deferred-load scan · Tier C Phase 3's residual ────────────────
+
+    /// 🔑 **The whole bug in one assertion.** These four forms are what a real
+    /// component can write, and the static scan sees exactly one of them. The
+    /// other three used to reach the browser unexamined.
+    #[test]
+    fn the_static_scan_is_blind_to_exactly_the_forms_this_scan_catches() {
+        const SOURCE: &str = r#"
+            import { clsx } from "clsx";
+            export default async function C() {
+              const fs = require("node:fs");
+              const icons = await import("lucide-react");
+              const dyn = await import("./local.js");
+              return null;
+            }
+        "#;
+
+        // What the static scan sees: the one `ModuleDecl`, and nothing else.
+        assert_eq!(scan_bare_imports(SOURCE), vec!["clsx".to_string()]);
+
+        // What this scan sees: the three it cannot.
+        let mut loads = scan_deferred_loads(SOURCE);
+        loads.sort();
+        assert_eq!(
+            loads,
+            vec![
+                DeferredLoad {
+                    form: LoadForm::Require,
+                    specifier: "node:fs".to_string()
+                },
+                DeferredLoad {
+                    form: LoadForm::DynamicImport,
+                    specifier: "./local.js".to_string()
+                },
+                DeferredLoad {
+                    form: LoadForm::DynamicImport,
+                    specifier: "lucide-react".to_string()
+                },
+            ]
+        );
+    }
+
+    /// A computed specifier names no module, so there is nothing to report and
+    /// nothing to refuse. Reporting the *variable* would name a module the
+    /// author never wrote.
+    #[test]
+    fn a_computed_specifier_is_not_collected() {
+        assert!(scan_deferred_loads(
+            "const name = 'fs'; export const load = () => require(name);"
+        )
+        .is_empty());
+        assert!(
+            scan_deferred_loads("export const load = (p) => import(`./pages/${p}.js`);").is_empty()
+        );
+    }
+
+    /// 🪤 `require` is only special as a **call**. A property, a local binding
+    /// or a string mentioning it must not be mistaken for one, or the check
+    /// refuses code that works.
+    #[test]
+    fn only_a_require_call_counts() {
+        assert!(scan_deferred_loads(
+            r#"
+            export const config = { require: "not a call" };
+            export function f(deps) { return deps.require("fs"); }
+            export const label = 'require("fs")';
+            "#
+        )
+        .is_empty());
+    }
+
+    /// The scan runs over project source, which is TSX. A file the component
+    /// parser accepts must not be silently skipped here.
+    #[test]
+    fn tsx_with_types_and_jsx_still_scans() {
+        let loads = scan_deferred_loads(
+            r#"
+            type Props = { label: string };
+            export default function C({ label }: Props) {
+              const mod = require("node:crypto");
+              return <div className="x">{label}</div>;
+            }
+            "#,
+        );
+        assert_eq!(
+            loads,
+            vec![DeferredLoad {
+                form: LoadForm::Require,
+                specifier: "node:crypto".to_string()
+            }]
+        );
+    }
+
+    /// Nested and repeated calls are found once each — the scan walks the whole
+    /// tree, not just the top level, and a caller printing one line per site
+    /// should not print the same specifier twice.
+    #[test]
+    fn nested_calls_are_found_and_deduplicated() {
+        let loads = scan_deferred_loads(
+            r#"
+            export default function C() {
+              if (a) { try { require("fs"); } catch { require("fs"); } }
+              return () => () => import("node:net");
+            }
+            "#,
+        );
+        assert_eq!(loads.len(), 2, "expected one entry per (form, specifier)");
+        assert!(loads.contains(&DeferredLoad {
+            form: LoadForm::Require,
+            specifier: "fs".to_string()
+        }));
+        assert!(loads.contains(&DeferredLoad {
+            form: LoadForm::DynamicImport,
+            specifier: "node:net".to_string()
+        }));
+    }
+
+    /// Unparseable source returns nothing rather than failing the build, the
+    /// same contract `scan_bare_imports` keeps.
+    #[test]
+    fn unparseable_source_yields_no_loads() {
+        assert!(scan_deferred_loads("export default function ( {{{").is_empty());
     }
 
     #[test]

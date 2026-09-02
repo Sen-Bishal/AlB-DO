@@ -10,7 +10,10 @@
 //! pre-extracted metadata**, not source-to-source codegen. Same wire
 //! opcodes; reuses the Phase-J evaluator end-to-end.
 
-use crate::bundler::npm::{bundle_npm_dependency, scan_bare_imports, NpmDependencyBundle};
+use crate::bundler::npm::{
+    bundle_npm_dependency, scan_bare_imports, scan_deferred_loads, DeferredLoad,
+    NpmDependencyBundle,
+};
 use crate::ir::action::ActionEnvelope;
 use crate::ir::opcode::{Instruction, InternTableKind, SlotId};
 use crate::runtime::bridge::{HandlerEffect, HandlerInvocation, HandlerRun, PendingRequest};
@@ -340,6 +343,12 @@ pub struct CompiledProject {
     /// Bare specifiers that could not be resolved to a package, with the
     /// resolver's reason. See [`Self::unresolved_npm_imports`].
     unresolved_npm_imports: Vec<(String, String)>,
+    /// 9.7 Phase 3 · `require("…")` and dynamic `import("…")` written in project
+    /// source, per module. Invisible to the specifier scan above — which reads
+    /// `ModuleDecl`s only — so before this existed they were never resolved,
+    /// never bundled and never refused, and shipped verbatim into the client
+    /// chunk. See [`Self::deferred_module_loads`].
+    deferred_module_loads: Vec<(String, DeferredLoad)>,
     /// P6 · form-action field manifest: `action_id → (action_name, declared
     /// field names)`. Built once at wrap time from every
     /// `<form action="action:NAME">`'s compile-time field set. The QuickJS
@@ -559,6 +568,7 @@ impl CompiledProject {
         // imports the eval-side `ParsedModule.imports` map doesn't record);
         // specifiers that name an existing project module are skipped.
         let (npm_bundles, unresolved_npm_imports) = bundle_project_npm_dependencies(&project);
+        let deferred_module_loads = scan_deferred_module_loads(&project);
 
         // P6 · index each `<form action="action:NAME">`'s declared field set by
         // its wire `action_id`, so action dispatch can reconcile a handler's
@@ -594,6 +604,7 @@ impl CompiledProject {
             css_modules,
             npm_bundles,
             unresolved_npm_imports,
+            deferred_module_loads,
             action_form_fields,
             list_repeated_actions,
         })
@@ -644,6 +655,18 @@ impl CompiledProject {
     #[must_use]
     pub fn unresolved_npm_imports(&self) -> &[(String, String)] {
         &self.unresolved_npm_imports
+    }
+
+    /// `require("…")` and dynamic `import("…")` calls written in project source,
+    /// paired with the module they were written in.
+    ///
+    /// The specifier scan that drives bundling reads `ModuleDecl`s, so it never
+    /// saw these; the calls reached the client chunk as source text and became a
+    /// throw in the browser. Consumed by
+    /// [`crate::preflight::deferred_module_loads`].
+    #[must_use]
+    pub fn deferred_module_loads(&self) -> &[(String, DeferredLoad)] {
+        &self.deferred_module_loads
     }
 
     /// A2 · load every npm artifact into `engine`. Idempotent and cheap
@@ -2983,6 +3006,26 @@ fn bundle_project_npm_dependencies(
     }
     unresolved.sort();
     (bundles, unresolved)
+}
+
+/// Collect every `require("…")` / dynamic `import("…")` in project source.
+///
+/// Deliberately walks the **same module set** `bundle_project_npm_dependencies`
+/// does, off the same retained sources, so a file that is scanned for static
+/// specifiers is scanned for these too. A module the specifier scan skips would
+/// otherwise be a hole in the check written to close a hole.
+fn scan_deferred_module_loads(project: &ComponentProject) -> Vec<(String, DeferredLoad)> {
+    let mut found = Vec::new();
+    for module_spec in project.modules().keys() {
+        let Some(source) = project.module_source(module_spec) else {
+            continue;
+        };
+        for load in scan_deferred_loads(source) {
+            found.push((module_spec.clone(), load));
+        }
+    }
+    found.sort();
+    found
 }
 
 fn build_css_module_registry(project: &ComponentProject) -> CssModuleRegistry {

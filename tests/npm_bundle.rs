@@ -497,3 +497,107 @@ fn project_child_component_import_now_links() {
         .expect("renders");
     assert_eq!(out.html, "<div>before <em>mid</em> after</div>");
 }
+
+// ── 9.7 Phase 3 · the specifier scan's blind spot ─────────────────────────
+//
+// The static scan reads `ModuleDecl`s, so `require("…")` and dynamic
+// `import("…")` were never resolved, never bundled and never refused: the call
+// shipped verbatim into the client chunk and became a throw in a user's
+// browser instead of an error in the build.
+//
+// 🔑 These start from `CompiledProject::load_from_dir` — the production path —
+// rather than from a hand-built fact list, because the bug being fixed is
+// precisely a fact the compiler holds with no consumer. A test that asserts on
+// a fact it constructed itself cannot tell whether the compiler produces it.
+
+/// The refusal half: a `require` in project source fails the build, and the
+/// message names the module and the call.
+#[test]
+fn a_require_in_project_source_fails_preflight_naming_the_site() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        &dir.path().join("Component.tsx"),
+        r#"
+            export default function Reader() {
+              const fs = require("node:fs");
+              return <pre>{fs.readFileSync("/etc/passwd")}</pre>;
+            }
+        "#,
+    );
+
+    let project = CompiledProject::load_from_dir(dir.path()).expect("project compiles");
+
+    // The compiler now holds the fact ...
+    let loads = project.deferred_module_loads();
+    assert_eq!(loads.len(), 1, "the scan sees the require: {loads:?}");
+    assert_eq!(loads[0].1.specifier, "node:fs");
+
+    // ... and a consumer acts on it.
+    let failure = dom_render_compiler::preflight::deferred_module_loads(&project)
+        .expect("`require` in project source must fail the build");
+    assert!(
+        failure.heading.contains("`require(…)` is not available"),
+        "heading names the form: {}",
+        failure.heading
+    );
+    assert_eq!(failure.problems.len(), 1);
+    assert!(
+        failure.problems[0].contains("Component.tsx") && failure.problems[0].contains("node:fs"),
+        "the line names the module and the specifier: {}",
+        failure.problems[0]
+    );
+}
+
+/// 🪤 **The asymmetry, pinned.** A dynamic `import` is *seen* by the scan and
+/// deliberately **not** refused: `if (isNode) await import("fs")` is a standard
+/// isomorphic shape whose branch never runs in a browser, and refusing it would
+/// break packages that work today. If someone later "tidies" the check by
+/// treating both forms alike, this fires.
+#[test]
+fn a_dynamic_import_is_seen_but_deliberately_not_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        &dir.path().join("Component.tsx"),
+        r#"
+            export default function Loader() {
+              const load = async () => await import("node:fs");
+              return <button onClick={load}>go</button>;
+            }
+        "#,
+    );
+
+    let project = CompiledProject::load_from_dir(dir.path()).expect("project compiles");
+
+    let loads = project.deferred_module_loads();
+    assert_eq!(loads.len(), 1, "the scan sees it: {loads:?}");
+    assert_eq!(loads[0].1.specifier, "node:fs");
+
+    assert!(
+        dom_render_compiler::preflight::deferred_module_loads(&project).is_none(),
+        "a dynamic import must NOT fail the build — see the check's own doc comment"
+    );
+}
+
+/// The falsifier for both: an ordinary component produces no finding, so the
+/// checks above are reacting to the call and not to compiling at all.
+#[test]
+fn a_component_with_no_deferred_loads_produces_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write(
+        &dir.path().join("Component.tsx"),
+        r#"
+            export default function Plain() {
+              const label = "require(\"node:fs\")";
+              return <span>{label}</span>;
+            }
+        "#,
+    );
+
+    let project = CompiledProject::load_from_dir(dir.path()).expect("project compiles");
+    assert!(
+        project.deferred_module_loads().is_empty(),
+        "a string mentioning require is not a call: {:?}",
+        project.deferred_module_loads()
+    );
+    assert!(dom_render_compiler::preflight::deferred_module_loads(&project).is_none());
+}

@@ -26,7 +26,9 @@
 //! | [`route_default_exports`] | a route with no `export default` served only the layout |
 //! | [`form_actions`] | a `<form action="action:…">` naming nothing was a dead end at click time |
 //! | [`npm_imports`] | an uninstalled package dropped the route's content |
+//! | [`deferred_module_loads`] | a `require("…")` shipped verbatim and threw in the browser |
 
+use crate::bundler::npm::LoadForm;
 use crate::forge::skeleton::ForgeSchema;
 use crate::runtime::compiled::CompiledProject;
 
@@ -115,6 +117,46 @@ pub fn npm_imports(compiled: &CompiledProject) -> Option<Failure> {
     })
 }
 
+/// A `require("…")` written in project source.
+///
+/// # Why this one is refused outright
+///
+/// `require` is a **parameter of the CJS factory wrapper**
+/// (`function(module, exports, require, …)`) that `bundler::npm` emits around a
+/// package's own files — never a global. Neither the QuickJS prelude nor
+/// `assets/albedo-client.js` defines one, so a `require` an author writes in
+/// project source is a `ReferenceError` on the server render path *and* in the
+/// browser. There is no configuration in which it works, and no specifier that
+/// rescues it — which is what separates it from a dynamic `import`.
+///
+/// 🔑 **The refusal is about the form, not the specifier.** `require("./util")`
+/// is exactly as broken as `require("node:fs")`; naming built-ins here would
+/// refuse the alarming half of a class that is entirely broken.
+///
+/// ⚖️ **Dynamic `import("…")` is deliberately NOT refused.**
+/// `if (isNode) await import("fs")` is a standard isomorphic shape whose branch
+/// never runs in a browser, and refusing it would break packages that work
+/// today. It still ships unresolvable and still deserves a report; that report
+/// needs a channel of its own rather than borrowing this one's severity, and is
+/// tracked as the second half of `TODO.md` 9.7 Phase 3.
+#[must_use]
+pub fn deferred_module_loads(compiled: &CompiledProject) -> Option<Failure> {
+    let requires: Vec<String> = compiled
+        .deferred_module_loads()
+        .iter()
+        .filter(|(_, load)| load.form == LoadForm::Require)
+        .map(|(module, load)| format!("{module}: `require(\"{}\")`", load.specifier))
+        .collect();
+
+    (!requires.is_empty()).then(|| Failure {
+        heading: "`require(…)` is not available in project source — it is a CommonJS call, and \
+                  neither the server renderer nor the browser defines one, so this throws a \
+                  `ReferenceError` wherever the component runs. Use a static `import` instead"
+            .to_string(),
+        problems: requires,
+    })
+}
+
 /// Run every check and collect what failed.
 ///
 /// All of them, not the first: a `forge` block edited without its readers
@@ -124,6 +166,7 @@ pub fn npm_imports(compiled: &CompiledProject) -> Option<Failure> {
 pub fn run(compiled: &CompiledProject, schema: &ForgeSchema, served: &[String]) -> Vec<Failure> {
     [
         npm_imports(compiled),
+        deferred_module_loads(compiled),
         route_default_exports(compiled, served),
         form_actions(compiled),
         literal_topics(compiled, schema),
