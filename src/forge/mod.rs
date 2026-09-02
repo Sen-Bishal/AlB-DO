@@ -66,7 +66,8 @@ pub use reserve::{
     IdempotencyConflict, ReleaseOutcome, ReserveError, ReserveOutcome, ReserveRequest, Reservations,
 };
 pub use bindings::{
-    validate_literal_topic_reads, validate_partition_bindings, LiteralTopicRead,
+    validate_literal_topic_reads, validate_partition_bindings,
+    validate_partitioned_whole_reads, LiteralTopicRead,
     PartitionBinding, WritableTopics,
 };
 pub use declare::{CollectionDecl, FieldType};

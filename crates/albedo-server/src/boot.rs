@@ -175,7 +175,15 @@ fn boot_inner(
         })
         .collect();
 
-    let compiled = CompiledProject::load_from_dir(&opts.source_root).map_err(|err| {
+    // npm bundles come from the build output when it left usable ones there, so
+    // serving does not need `node_modules` — see `bundler::npm_prebuilt`. It
+    // falls back to bundling when the file is absent or does not match this
+    // source tree, which is what dev and a from-source boot rely on.
+    let compiled = CompiledProject::load_from_dir_with_prebuilt_npm(
+        &opts.source_root,
+        &opts.dist_dir,
+    )
+    .map_err(|err| {
         RuntimeError::ServerStartup(format!(
             "failed to load source tree at '{}': {err}",
             opts.source_root.display()

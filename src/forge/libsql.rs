@@ -42,6 +42,88 @@ use crate::forge::value::{Result, Row, Rows, SqlValue, SubstrateError};
 /// the in-process queue is not the only writer and that is worth knowing loudly.
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
+/// The database handle and its two connections, held so they can be torn down
+/// in a defined order.
+///
+/// # What this does and does not fix
+///
+/// ✅ **Fixed and measured: the ephemeral temp-directory leak.** `Drop` used to
+/// delete the directory *before* the connections closed, and on Windows the
+/// database file is still locked while they are open, so the delete failed
+/// silently — the code called itself "best-effort" and `open_ephemeral` grew a
+/// wall-clock component in its directory name to survive the leak. **31 510
+/// leaked `forge-*` directories had accumulated on the dev rig.** Closing first
+/// makes the delete succeed: measured 2026-09-02, 30 substrates opened and
+/// dropped, directory count delta **0**.
+///
+/// 🔴 **NOT fixed: the `0xc0000005 STATUS_ACCESS_VIOLATION`.** See
+/// `tests/forge_teardown_race.rs` for the measurements. Two plausible fixes were
+/// built and both were **refuted by their own measurement**: a process-wide
+/// teardown mutex (9/30 crashes with it, i.e. no effect) and a dedicated
+/// teardown thread with the handles shipped to it (20/40). They are not in the
+/// tree, because an unproven mechanism left in place is indistinguishable from a
+/// fix to the next reader.
+///
+/// 🔑 **What is now known about the real variable**, and it is not what the
+/// earlier diagnosis recorded: the crash needs **many substrates open at the
+/// same time**, and then a teardown. It does *not* need the teardowns to
+/// overlap — 30 substrates dropped strictly one at a time on a single dedicated
+/// OS thread still crash 28/40 — and it does not care which thread drops them.
+/// Interleaving open/drop so only one is ever live is clean at 0/40 in every
+/// configuration tried.
+///
+/// ⚠️ **Production keeps one substrate per process**, which is why this has only
+/// ever been seen in test binaries. That is a reason it stays open, not a reason
+/// it is harmless: the crash aborts the process, so `cargo test` dies at that
+/// binary and every binary after it never runs, while the truncated log ends in
+/// `ok`.
+struct Connections {
+    /// Reads only. WAL readers never block the writer, never block each other,
+    /// and never take the write lock.
+    reader: Option<Connection>,
+    /// The one writer. Every write and transaction holds this mutex for its
+    /// duration, which is what makes "one writer at a time" true *before*
+    /// SQLite has to enforce it.
+    writer: Option<Arc<Mutex<Connection>>>,
+    /// The database the connections were opened from.
+    ///
+    /// ⚠️ **Retained on principle, not on evidence.** `open_local` used to let
+    /// this drop at the end of construction while returning connections that
+    /// outlived it; a parent handle outliving its children is the defensible
+    /// ordering regardless. It was *also* tried as a fix for the access
+    /// violation and made no measurable difference (5/30), so do not read it as
+    /// one.
+    db: Option<Database>,
+}
+
+impl Connections {
+    /// Close the connections, then the database, then delete the ephemeral
+    /// directory — in that order, which is the whole point.
+    ///
+    /// Idempotent, so [`LibSqlSubstrate::drop`] can call it explicitly and the
+    /// implicit field drop afterwards finds nothing to do.
+    fn close(&mut self, ephemeral_dir: Option<PathBuf>) {
+        // Writer first: it is the one a transaction may still hold a clone of.
+        drop(self.writer.take());
+        drop(self.reader.take());
+        // The database outlives its connections, so it goes after them.
+        drop(self.db.take());
+
+        if let Some(dir) = ephemeral_dir {
+            // Now that every handle is closed this can actually succeed. Still
+            // ignored: a leaked temp dir is untidy, not incorrect, and a panic
+            // in `drop` would be far worse than a stray file.
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+impl Drop for Connections {
+    fn drop(&mut self) {
+        self.close(None);
+    }
+}
+
 /// A libSQL database presented through the neutral [`DataSubstrate`] surface.
 ///
 /// ## The connection strategy, and why it is this one
@@ -67,13 +149,13 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 /// connection per transaction, which was correct but meant thousands of
 /// open/close cycles under load; two long-lived connections have none.
 pub struct LibSqlSubstrate {
-    /// Reads only. WAL readers never block the writer, never block each other,
-    /// and never take the write lock.
-    reader: Connection,
-    /// The one writer. Every write and transaction holds this mutex for its
-    /// duration, which is what makes "one writer at a time" true *before*
-    /// SQLite has to enforce it.
-    writer: Arc<Mutex<Connection>>,
+    /// The connections, torn down under [`TEARDOWN`].
+    ///
+    /// Declared **before** `db` on purpose: struct fields drop in
+    /// declaration order, so the connections go first and the database
+    /// they belong to goes after them.
+    conns: Connections,
+
     /// Directory to delete on drop — set only by
     /// [`open_ephemeral`](Self::open_ephemeral).
     ephemeral_dir: Option<PathBuf>,
@@ -108,10 +190,35 @@ impl LibSqlSubstrate {
         let reader = connect(&db).await?;
 
         Ok(Self {
-            reader,
-            writer: Arc::new(Mutex::new(writer)),
+            conns: Connections {
+                reader: Some(reader),
+                writer: Some(Arc::new(Mutex::new(writer))),
+                db: Some(db),
+            },
             ephemeral_dir: None,
         })
+    }
+
+    /// The read connection.
+    ///
+    /// `expect` cannot fire: the `Option` is `None` only after
+    /// [`Connections::close`], which runs during drop, after which `self` is
+    /// unreachable.
+    fn reader(&self) -> &Connection {
+        self.conns
+            .reader
+            .as_ref()
+            .expect("substrate used after teardown")
+    }
+
+    /// The writer mutex.
+    ///
+    /// See [`Self::reader`] for why the `expect` is unreachable.
+    fn writer(&self) -> &Arc<Mutex<Connection>> {
+        self.conns
+            .writer
+            .as_ref()
+            .expect("substrate used after teardown")
     }
 
     /// Open a throwaway database in a temporary directory, deleted when this
@@ -165,11 +272,11 @@ impl LibSqlSubstrate {
 
 impl Drop for LibSqlSubstrate {
     fn drop(&mut self) {
-        if let Some(dir) = self.ephemeral_dir.take() {
-            // Best-effort: a leaked temp dir is untidy, not incorrect, and a
-            // panic in `drop` would be far worse than a stray file.
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        // Ordering is the fix here: on Windows the database file stays locked
+        // while the connections are open, so deleting the directory first (what
+        // this used to do) silently failed and leaked it. `close` closes every
+        // handle and *then* deletes.
+        self.conns.close(self.ephemeral_dir.take());
     }
 }
 
@@ -262,7 +369,7 @@ async fn run_execute(conn: &Connection, sql: &str, params: &[SqlValue]) -> Resul
 #[async_trait]
 impl DataSubstrate for LibSqlSubstrate {
     async fn migrate(&self, ddl: &str) -> Result<()> {
-        let writer = self.writer.lock().await;
+        let writer = self.writer().lock().await;
         writer
             .execute_batch(ddl)
             .await
@@ -272,13 +379,13 @@ impl DataSubstrate for LibSqlSubstrate {
 
     /// Reads go to the reader connection: no lock, no queue, fully parallel.
     async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Rows> {
-        run_query(&self.reader, sql, params).await
+        run_query(self.reader(), sql, params).await
     }
 
     /// Writes queue on the in-process mutex rather than on SQLite's busy
     /// handler — microseconds and fair, instead of milliseconds of backoff.
     async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
-        let writer = self.writer.lock().await;
+        let writer = self.writer().lock().await;
         run_execute(&writer, sql, params).await
     }
 
@@ -305,7 +412,7 @@ impl DataSubstrate for LibSqlSubstrate {
     // early would put two transactions on one connection — the bug this fixes.
     #[allow(clippy::significant_drop_tightening)]
     async fn begin(&self) -> Result<Box<dyn Transaction>> {
-        let writer = Arc::clone(&self.writer).lock_owned().await;
+        let writer = Arc::clone(self.writer()).lock_owned().await;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await

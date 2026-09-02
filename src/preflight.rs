@@ -27,6 +27,7 @@
 //! | [`form_actions`] | a `<form action="action:…">` naming nothing was a dead end at click time |
 //! | [`npm_imports`] | an uninstalled package dropped the route's content |
 //! | [`deferred_module_loads`] | a `require("…")` shipped verbatim and threw in the browser |
+//! | [`partitioned_whole_reads`] | a whole read of a partitioned collection dropped the component |
 
 use crate::bundler::npm::LoadForm;
 use crate::forge::skeleton::ForgeSchema;
@@ -157,6 +158,24 @@ pub fn deferred_module_loads(compiled: &CompiledProject) -> Option<Failure> {
     })
 }
 
+/// A `useSharedSlot(collection)` on a collection that declares `partition_by`.
+///
+/// Built clean, booted clean, and served **HTTP 200 with the reading
+/// component's markup missing** — the sixth instance of this shape, and the
+/// first found by building a real app rather than by mutating the scaffold.
+/// The diagnosis and the reason it is a refusal rather than a feature live on
+/// [`crate::forge::validate_partitioned_whole_reads`].
+#[must_use]
+pub fn partitioned_whole_reads(compiled: &CompiledProject, schema: &ForgeSchema) -> Option<Failure> {
+    crate::forge::validate_partitioned_whole_reads(&compiled.literal_topic_reads(), schema)
+        .err()
+        .map(|problems| Failure {
+            heading: "a partitioned collection has no whole-collection value, so this read renders nothing"
+                .to_string(),
+            problems,
+        })
+}
+
 /// Run every check and collect what failed.
 ///
 /// All of them, not the first: a `forge` block edited without its readers
@@ -167,6 +186,7 @@ pub fn run(compiled: &CompiledProject, schema: &ForgeSchema, served: &[String]) 
     [
         npm_imports(compiled),
         deferred_module_loads(compiled),
+        partitioned_whole_reads(compiled, schema),
         route_default_exports(compiled, served),
         form_actions(compiled),
         literal_topics(compiled, schema),

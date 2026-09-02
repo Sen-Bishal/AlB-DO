@@ -175,7 +175,7 @@ pub enum NpmBundleError {
 
 /// One QuickJS-loadable artifact: a factory-registration script (or an alias
 /// script) plus the source hash used for idempotent reloads.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NpmArtifact {
     /// Record key (`npm:<pkg>@<version>/<relpath>`) or, for alias artifacts,
     /// the bare specifier the alias is for.
@@ -188,7 +188,7 @@ pub struct NpmArtifact {
 }
 
 /// The bundled, loadable form of one bare npm specifier.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NpmDependencyBundle {
     /// The bare specifier as requested (`zod`, `date-fns/addDays`).
     pub specifier: String,

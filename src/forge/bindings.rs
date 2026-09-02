@@ -281,6 +281,66 @@ pub fn validate_literal_topic_reads(
     }
 }
 
+/// A whole-collection read of a collection that declares `partition_by`.
+///
+/// # The silent failure this closes
+///
+/// `useSharedSlot(comments)` where `comments` declares
+/// `partition_by: "post_id"` builds clean, boots clean, and serves **HTTP 200
+/// with the reading component's markup missing** — measured 2026-09-02 on a real
+/// app, with nothing logged at `RUST_LOG=debug`. The two shapes differ only in
+/// how loudly they lose:
+///
+/// | written | served |
+/// |---|---|
+/// | `collection.length` | an empty reactive `<span>`, no server value |
+/// | `collection.filter(…)` | **the whole component's markup is dropped** |
+///
+/// The same code against an unpartitioned collection renders correctly, which is
+/// what identifies the partition as the variable rather than the method call.
+///
+/// 🔑 **Refused rather than supported, and that is a design decision.** A
+/// partitioned collection is *n* independent live channels; a whole-collection
+/// topic over it would fan every write out to every subscriber, which is the
+/// exact cost `partition_by` exists to remove — and it would cross every
+/// partition boundary at once, which for a per-tenant or per-user column is an
+/// authorization surface rather than a convenience. A read that cannot be served
+/// correctly and should not be served cheaply is one to name, not to grant.
+///
+/// This follows `forge::drift`'s rule for the same class of problem: *a loud
+/// refusal was already a complete fix for the failure mode — silence is the
+/// defect, not the absence of the feature.*
+///
+/// # Errors
+/// One line per offending read, naming the collection, its partition column,
+/// and the `.where(…)` remedy.
+pub fn validate_partitioned_whole_reads(
+    reads: &[LiteralTopicRead],
+    schema: &ForgeSchema,
+) -> Result<(), Vec<String>> {
+    let problems: Vec<String> = reads
+        .iter()
+        .filter_map(|read| {
+            let collection = schema.slot_for_topic(&read.topic)?;
+            let column = collection.partition_by.as_ref()?;
+            Some(format!(
+                "{}: `{}` declares `partition_by: \"{}\"`, so it has no whole-collection value and this read renders nothing. Read one partition with `{}.where({{ {}: … }})`",
+                read.site(),
+                read.topic,
+                column,
+                read.topic,
+                column
+            ))
+        })
+        .collect();
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
+}
+
 fn declared_list(schema: &ForgeSchema) -> String {
     // 🔴 The auth block's tables are in the schema and are **not** things an
     // author may declare or read — `albedo_` is a reserved prefix, refused at
@@ -587,5 +647,73 @@ mod tests {
             identity.iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["todos"]
         );
+    }
+
+    // ── partitioned whole-collection reads ────────────────────────────
+
+    fn read(topic: &str, binding: &str) -> LiteralTopicRead {
+        LiteralTopicRead {
+            module_spec: "routes/posts/index.tsx".to_string(),
+            function_name: "Posts".to_string(),
+            binding_name: binding.to_string(),
+            topic: topic.to_string(),
+        }
+    }
+
+    /// The defect, as measured on a real app: this read builds clean, boots
+    /// clean, and serves HTTP 200 with the component's markup missing.
+    #[test]
+    fn a_whole_read_of_a_partitioned_collection_is_refused() {
+        let schema = schema(&[(
+            "comments",
+            &[("post_id", FieldType::Int), ("body", FieldType::Text)],
+            Some("post_id"),
+        )]);
+        let problems = validate_partitioned_whole_reads(&[read("comments", "allComments")], &schema)
+            .expect_err("a partitioned collection has no whole-collection value");
+        assert_eq!(problems.len(), 1);
+        let problem = &problems[0];
+        // The message has to carry all four facts, or it cannot be acted on.
+        for needle in [
+            "routes/posts/index.tsx",
+            "allComments",
+            "comments",
+            "post_id",
+            "comments.where({ post_id",
+        ] {
+            assert!(
+                problem.contains(needle),
+                "message must name {needle:?}: {problem}"
+            );
+        }
+    }
+
+    /// 🪤 The false positive that would matter most: the scaffold's own
+    /// `room/[id].tsx` reads a partitioned collection through `.where(…)`, which
+    /// is a *partition binding*, not a literal topic read — it must never reach
+    /// this check. Guarded here because refusing correct code is worse than the
+    /// silence this replaces.
+    #[test]
+    fn an_unpartitioned_collection_is_not_refused() {
+        let schema = schema(&[
+            ("guestbook", &[("message", FieldType::Text)], None),
+            ("posts", &[("title", FieldType::Text)], None),
+        ]);
+        validate_partitioned_whole_reads(
+            &[read("guestbook", "entries"), read("posts", "all")],
+            &schema,
+        )
+        .expect("an unpartitioned collection reads whole");
+    }
+
+    /// A topic that resolves to no collection is the *other* check's business
+    /// (`validate_literal_topic_reads`). This one must stay silent about it
+    /// rather than emit a second, differently-worded complaint about one
+    /// mistake — item 6.5's rule.
+    #[test]
+    fn an_unknown_topic_is_left_to_the_check_that_owns_it() {
+        let schema = schema(&[("posts", &[("title", FieldType::Text)], None)]);
+        validate_partitioned_whole_reads(&[read("typo", "rows")], &schema)
+            .expect("unknown topics are not this check's problem");
     }
 }

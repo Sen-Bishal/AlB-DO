@@ -10,6 +10,7 @@
 //! pre-extracted metadata**, not source-to-source codegen. Same wire
 //! opcodes; reuses the Phase-J evaluator end-to-end.
 
+use crate::bundler::npm_prebuilt::PrebuiltNpmBundles;
 use crate::bundler::npm::{
     bundle_npm_dependency, scan_bare_imports, scan_deferred_loads, DeferredLoad,
     NpmDependencyBundle,
@@ -378,9 +379,39 @@ impl CompiledProject {
         Self::wrap(project)
     }
 
+    /// Load a project, taking its npm bundles from `dist_dir` when the build
+    /// left usable ones there.
+    ///
+    /// This is the boot path. [`load_from_dir`](Self::load_from_dir) keeps
+    /// bundling from `node_modules`, which is what dev and the build itself
+    /// want — they have the tree and need it fresh.
+    ///
+    /// # Errors
+    /// As [`load_from_dir`](Self::load_from_dir).
+    pub fn load_from_dir_with_prebuilt_npm(
+        root: impl AsRef<Path>,
+        dist_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let project = ComponentProject::load_from_dir(&root)?;
+        Self::wrap_with_prebuilt_npm(project, PrebuiltNpmBundles::load(dist_dir.as_ref()))
+    }
+
     /// Wrap an already-loaded [`ComponentProject`] in the Phase-K
     /// facade. Re-extracts metadata from every component.
     pub fn wrap(project: ComponentProject) -> Result<Self> {
+        Self::wrap_with_prebuilt_npm(project, None)
+    }
+
+    /// [`wrap`](Self::wrap), optionally taking npm bundles the build wrote
+    /// instead of reading `node_modules`.
+    ///
+    /// # Errors
+    /// As [`wrap`](Self::wrap).
+    pub fn wrap_with_prebuilt_npm(
+        project: ComponentProject,
+        prebuilt: Option<PrebuiltNpmBundles>,
+    ) -> Result<Self> {
         let mut components = HashMap::new();
         let mut handlers = HashMap::new();
 
@@ -567,7 +598,7 @@ impl CompiledProject {
         // scans the retained sources (catches namespace and side-effect
         // imports the eval-side `ParsedModule.imports` map doesn't record);
         // specifiers that name an existing project module are skipped.
-        let (npm_bundles, unresolved_npm_imports) = bundle_project_npm_dependencies(&project);
+        let (npm_bundles, unresolved_npm_imports) = resolve_project_npm(&project, prebuilt.as_ref());
         let deferred_module_loads = scan_deferred_module_loads(&project);
 
         // P6 · index each `<form action="action:NAME">`'s declared field set by
@@ -2949,9 +2980,12 @@ pub(crate) fn is_compiled_stmt_root(_stmt: &Stmt) -> bool {
 /// fails to resolve or bundle logs a warning and is skipped — the engine
 /// throws a loud `MODULE_MISSING` naming it if a render/handler actually
 /// imports it, which is the established loud-error surface.
-fn bundle_project_npm_dependencies(
-    project: &ComponentProject,
-) -> (Vec<NpmDependencyBundle>, Vec<(String, String)>) {
+/// Every bare npm specifier this project imports.
+///
+/// Split out so a prebuilt bundle file can be validated against the source
+/// tree **before** anything touches `node_modules` — which is the whole point
+/// of having one, since it exists to be used where `node_modules` is absent.
+fn project_npm_specifiers(project: &ComponentProject) -> std::collections::BTreeSet<String> {
     let mut specifiers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for module_spec in project.modules().keys() {
         let Some(source) = project.module_source(module_spec) else {
@@ -2964,6 +2998,13 @@ fn bundle_project_npm_dependencies(
             specifiers.insert(specifier);
         }
     }
+    specifiers
+}
+
+fn bundle_project_npm_dependencies(
+    project: &ComponentProject,
+) -> (Vec<NpmDependencyBundle>, Vec<(String, String)>) {
+    let specifiers = project_npm_specifiers(project);
 
     // The SERVER option set: the same host modules the browser binds to, and
     // no refusals. See `bundler::client_npm::server_shake_options` for why the
@@ -3026,6 +3067,42 @@ fn scan_deferred_module_loads(project: &ComponentProject) -> Vec<(String, Deferr
     }
     found.sort();
     found
+}
+
+/// npm bundles for this project, preferring ones the build already wrote.
+///
+/// # Why this exists
+///
+/// Bundling reads `node_modules`. Boot used to do it unconditionally, so the
+/// dependency tree had to be present wherever the app was *served*, not merely
+/// wherever it was *built* — 58 MB / 6 526 files for a five-dependency app, to
+/// re-derive 1.3 MB the build already had. See [`PrebuiltNpmBundles`].
+///
+/// 🔑 **The prebuilt file is used only when it covers exactly what this source
+/// tree imports.** Anything else falls back to bundling: a file that predates a
+/// new import would render the component using it as nothing, which is the
+/// silent-failure shape this tree keeps paying for. The fallback is safe
+/// because a machine that can bundle has `node_modules` by definition.
+fn resolve_project_npm(
+    project: &ComponentProject,
+    prebuilt: Option<&PrebuiltNpmBundles>,
+) -> (Vec<NpmDependencyBundle>, Vec<(String, String)>) {
+    if let Some(prebuilt) = prebuilt {
+        let wanted: Vec<String> = project_npm_specifiers(project).into_iter().collect();
+        if prebuilt.covers(&wanted) {
+            tracing::debug!(
+                target: "albedo.npm",
+                specifiers = wanted.len(),
+                "serving npm bundles the build wrote; node_modules not consulted"
+            );
+            return (prebuilt.bundles.clone(), Vec::new());
+        }
+        tracing::debug!(
+            target: "albedo.npm",
+            "prebuilt npm bundles do not match this source tree; re-bundling"
+        );
+    }
+    bundle_project_npm_dependencies(project)
 }
 
 fn build_css_module_registry(project: &ComponentProject) -> CssModuleRegistry {

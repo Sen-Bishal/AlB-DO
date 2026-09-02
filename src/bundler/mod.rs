@@ -3,6 +3,7 @@ pub mod client_npm;
 pub mod defines;
 pub mod emit;
 pub mod npm;
+pub mod npm_prebuilt;
 pub mod plan;
 pub mod precompiled;
 pub mod rewrite;

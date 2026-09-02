@@ -808,17 +808,34 @@ impl AuthDeclaration {
             providers.push(decl.lower(name)?);
         }
 
+        let login_path = match self.login.as_deref() {
+            Some(raw) if !is_rooted_app_path(raw) => {
+                return Err(AuthSchemaError::InvalidLoginPath {
+                    value: raw.to_string(),
+                })
+            }
+            Some(raw) => Some(raw.to_string()),
+            None => None,
+        };
+
         Ok(AuthRegistry {
             session_ttl,
             session_cookie,
             providers,
-            // No declaration surface for this yet, and deliberately so: until P2
-            // builds a login route there is nowhere honest to send anyone, and a
-            // knob whose only correct value does not exist is a redirect to a
-            // 404 in every app that sets it. `handlers::auth_gate` carries the
-            // full reasoning; when P2 lands, this is where the declared route
-            // gets lowered.
-            login_path: None,
+            // 🔴 This read `login_path: None` with a note saying "when P2 lands,
+            // this is where the declared route gets lowered". P2 landed; the note
+            // did not. `login` was declared, documented and **validated** while
+            // being dropped on the floor here, so the route gate could only ever
+            // see `None` and every gated page was a 401 dead end — including in
+            // the scaffold, whose own config comment promises a stranger is
+            // "sent to `login` below". Found 2026-09-02 by building a real app.
+            //
+            // 🔑 Validated with [`is_rooted_app_path`], the same rule
+            // `forms::ReturnPath` applies to a request-supplied return path.
+            // The declared value is author-supplied rather than attacker-supplied,
+            // but it becomes a `Location` header either way, and one rule with two
+            // spellings is how the looser spelling gets found.
+            login_path,
         })
     }
 }
@@ -1470,5 +1487,58 @@ mod tests {
             .collect();
         assert_eq!(names, ["github", "google", "passkey"], "BTreeMap order");
         assert_eq!(first, second);
+    }
+
+    /// The declared `login` route must survive lowering. It was declared,
+    /// documented and validated while `lower` hardcoded `None`, so the route
+    /// gate could only ever see "no login route" and every gated page was a 401
+    /// dead end — in the scaffold too, whose config comment promises otherwise.
+    #[test]
+    fn a_declared_login_route_reaches_the_registry() {
+        let block = decl(serde_json::json!({
+            "providers": { "password": {} },
+            "login": "/sign-in"
+        }));
+        assert_eq!(
+            block.lower().expect("lowers").login_path.as_deref(),
+            Some("/sign-in")
+        );
+    }
+
+    /// Absent is a legitimate choice — an app whose only gate is an API — and
+    /// its fallback is the 401 the gate always gave.
+    #[test]
+    fn no_declared_login_route_lowers_to_none() {
+        let block = decl(serde_json::json!({ "providers": { "password": {} } }));
+        assert!(block.lower().expect("lowers").login_path.is_none());
+    }
+
+    /// 🔑 The declared route becomes a `Location` header, so it is held to the
+    /// same rule as a request-supplied return path. Each of these is a real
+    /// bypass shape, and "authenticate, then get bounced somewhere else" is the
+    /// credential-phishing chain with the victim already primed to trust the
+    /// destination.
+    #[test]
+    fn a_login_route_that_is_not_a_rooted_app_path_is_refused() {
+        for hostile in [
+            "https://evil.example/login",
+            "//evil.example/login",
+            "/\\evil.example/login",
+            "sign-in",
+            "/sign in",
+            "",
+        ] {
+            let block = decl(serde_json::json!({
+                "providers": { "password": {} },
+                "login": hostile
+            }));
+            assert!(
+                matches!(
+                    block.lower(),
+                    Err(AuthSchemaError::InvalidLoginPath { .. })
+                ),
+                "{hostile:?} must not lower into a Location header"
+            );
+        }
     }
 }

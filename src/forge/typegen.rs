@@ -79,8 +79,19 @@ pub fn emit_forge_dts(declarations: &BTreeMap<String, CollectionDecl>) -> String
          \x20 /**\n\
          \x20  * A declared FORGE collection.\n\
          \x20  *\n\
-         \x20  * Read the whole collection with `useSharedSlot(collection)`, or one\n\
-         \x20  * partition with `useSharedSlot(collection.where({ col: params.id }))`.\n\
+         \x20  * An UNPARTITIONED collection is read whole:\n\
+         \x20  *   `useSharedSlot(collection)`\n\
+         \x20  *\n\
+         \x20  * A PARTITIONED one is read one partition at a time:\n\
+         \x20  *   `useSharedSlot(collection.where({ col: params.id }))`\n\
+         \x20  *\n\
+         \x20  * and has no whole-collection value at all — reading it whole is\n\
+         \x20  * refused at `albedo build`, because it would fan every write out to\n\
+         \x20  * every subscriber (the cost `partition_by` exists to remove) and\n\
+         \x20  * cross every partition at once. Before 2026-09-02 this comment said\n\
+         \x20  * the opposite, and the read it advertised served HTTP 200 with the\n\
+         \x20  * reading component missing.\n\
+         \x20  *\n\
          \x20  * `PartitionCol` is `never` when the collection declares no\n\
          \x20  * `partition_by`, which is what makes `.where` uncallable on it.\n\
          \x20  */\n\

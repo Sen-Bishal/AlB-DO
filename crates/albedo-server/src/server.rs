@@ -3276,7 +3276,20 @@ async fn dispatch_routed(
                 if state.request_timings {
                     crate::timing::print_request(method.as_str(), &path, started.elapsed());
                 }
-                return crate::handlers::auth_gate::refuse_anonymous(&route_pattern);
+                // AUTH · the declared `auth.login` route, finally read. It rides
+                // on the lowered registry, so an app that declared none gets
+                // `None` here and the 401 it always got.
+                let login_path = state
+                    .live
+                    .auth()
+                    .and_then(|auth| auth.registry().login_path.as_deref());
+                let navigating =
+                    crate::handlers::auth_gate::is_document_navigation(request.headers());
+                return crate::handlers::auth_gate::refuse_anonymous(
+                    &route_pattern,
+                    login_path,
+                    navigating,
+                );
             }
             // AUTH · the render path's identity — the third of the three
             // (render, action, subscribe) `AUTH.md` § 5 says resolve through one

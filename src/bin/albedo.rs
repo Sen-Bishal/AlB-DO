@@ -1227,17 +1227,52 @@ fn configure_ship_fly(contract: &ResolvedDevContract) -> Result<(), String> {
 /// ship-target tests can assert key lines without depending on file
 /// I/O.
 fn build_docker_template() -> String {
-    r#"# Phase N · multi-stage build emitted by `albedo ship --target docker`.
-# Stage 1 compiles userland against the prebuilt `albedo` binary; stage
-# 2 ships the resulting `.albedo/dist` artefacts under a slim runtime.
-# Configurable at run time via ALBEDO_SERVER_PORT / ALBEDO_SERVER_HOST.
+    r#"# Emitted by `albedo ship --target docker`.
+#
+# Stage 1 installs npm dependencies, stage 2 compiles and builds the app,
+# stage 3 RUNS THE APP.
+#
+# --- corrected 2026-09-02 -----------------------------------------------
+# This template used to copy only `.albedo/dist` + `public` and run
+# `albedo serve --dir dist`, which is the STATIC FILE SERVER. The container
+# served markup and nothing else: no FORGE, no actions, no per-request
+# render, no auth -- for a framework whose claim is that the compiler emits
+# your backend. The runtime stage also carried no source tree, so
+# project-mode `serve` could not have worked there even with the CMD fixed,
+# and `.dockerignore` excluded `node_modules`, so any app with an npm
+# dependency failed in the builder too. Three faults, one cause: the target
+# was written for a static-site model and never revisited when the framework
+# grew a backend and npm support.
+#
+# What `albedo serve` needs at runtime, established by running it rather than
+# by reading the code:
+#
+#   src/  +  albedo.config.*  +  node_modules/  +  public/
+#
+# `.albedo/dist` is deliberately NOT copied: `albedo serve` builds before it
+# serves, so a copied dist would be rebuilt and discarded.
+# ------------------------------------------------------------------------
+
+FROM node:22-bookworm AS deps
+WORKDIR /workspace
+# `albedo build` resolves bare specifiers out of `node_modules`, so they are
+# installed here rather than copied from the host: a lockfile install is
+# reproducible, and the host's tree may be built for another platform.
+COPY package.json package-lock.json* ./
+RUN if [ -f package-lock.json ]; then npm ci; \
+    elif [ -f package.json ]; then npm install; \
+    else mkdir -p node_modules; fi
 
 FROM rust:1-bookworm AS builder
 WORKDIR /workspace
 COPY . .
+COPY --from=deps /workspace/node_modules ./node_modules
 RUN if [ ! -f ./target/release/albedo ]; then \
       cargo build --release --bin albedo; \
     fi
+# Fail HERE, not at container start. `albedo build` refuses the defects that
+# would otherwise serve HTTP 200 with something missing -- an unresolvable
+# import, a topic nothing writes, a route with no default export.
 RUN ./target/release/albedo build .
 
 FROM debian:bookworm-slim AS runtime
@@ -1246,18 +1281,38 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /workspace/target/release/albedo /usr/local/bin/albedo
-COPY --from=builder /workspace/.albedo/dist /app/dist
+COPY --from=builder /workspace/src /app/src
+COPY --from=builder /workspace/albedo.config.* /app/
 COPY --from=builder /workspace/public /app/public
+# The server npm bundles the build lowered. This is what `node_modules` was
+# being shipped for: 1.3 MB of ready-to-run artifacts instead of 58 MB / 6 526
+# files of package tree, for a five-dependency app. Boot loads these and never
+# reads `node_modules`; if they are missing or do not match `src/`, it refuses
+# to start rather than serving a component as nothing.
+COPY --from=builder /workspace/.albedo/dist/npm-server-bundles.json /app/.albedo/dist/
 
 ENV ALBEDO_SERVER_HOST=0.0.0.0
 ENV ALBEDO_SERVER_PORT=3000
 EXPOSE 3000
 
+# NOTE -- FORGE's database is `forge.db` in the working directory, and that
+# path is not configurable today. A container without a mount for it starts
+# empty on every restart, which for an app with real data is data loss rather
+# than a fresh start. Persist it with a bind mount:
+#
+#   docker run -v "$PWD/forge.db:/app/forge.db" <image>
+#
+# Making the path configurable is the real fix and is not one this template
+# can make on its own.
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- "http://127.0.0.1:${ALBEDO_SERVER_PORT}/" >/dev/null 2>&1 || exit 1
 
-CMD ["sh", "-c", "albedo serve --dir dist --host ${ALBEDO_SERVER_HOST} --port ${ALBEDO_SERVER_PORT}"]
+# The app, not a folder of files. `--dir` here is what shipped the static
+# server; `albedo files <dir>` is the command for that, deliberately.
+CMD ["sh", "-c", "albedo serve --host ${ALBEDO_SERVER_HOST} --port ${ALBEDO_SERVER_PORT}"]
 "#
+
     .to_string()
 }
 
@@ -1323,12 +1378,27 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    // Phase P · post-P — only fall through to the static-file
-    // back-compat path when the user explicitly asks for a directory.
-    // Walk the args treating `--host`/`--port`/`--dir` values as
-    // bound to their flag so a port number like `3139` doesn't get
-    // mistaken for a positional dir arg.
-    let user_passed_dir = {
+    // 🔴 A bare positional used to land here too, and it silently changed
+    // what this command IS: `albedo build .` compiled the project, then
+    // `albedo serve .` served the project directory as **static files**, so
+    // every route 404'd — including the scaffold's own. Found 2026-09-02 by
+    // building a real app and pointing a browser at it.
+    //
+    // 🔑 The positional now selects the PROJECT, which is what it already
+    // means on `dev`, `build`, `ship` and `doctor` — the on-ramp audit fixed it
+    // there and left `serve`, the most-used of the five, meaning the opposite.
+    // One spelling, one meaning, across every command that takes it.
+    //
+    // Nothing is lost: `albedo files <dir>` is a first-class advertised command
+    // ("serve static files from a folder") and is exactly what the old
+    // behaviour was. `--dir` is kept as the explicit opt-in because it is
+    // load-bearing — `albedo ship --target docker` emits a `CMD` that uses it —
+    // and because nobody types `--dir` by accident, whereas `.` is typed
+    // constantly.
+    //
+    // The walk still binds `--host`/`--port` values to their flag so a port
+    // like `3139` is never read as anything else.
+    let explicit_files_dir = {
         let mut explicit_dir = false;
         let mut idx = 0;
         while idx < raw_args.len() {
@@ -1342,20 +1412,15 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
                     idx += 2; // skip the flag's value
                     continue;
                 }
-                _ if !arg.starts_with('-') => {
-                    explicit_dir = true;
-                    break;
-                }
                 _ => {}
             }
             idx += 1;
         }
         explicit_dir
     };
-    if user_passed_dir {
-        // Back-compat: `albedo serve <dir>` and `--dir <dir>` keep their
-        // pre-Phase-J semantics — serve the directory directly. Equivalent
-        // to `albedo files <dir>`, kept so existing scripts don't break.
+    if explicit_files_dir {
+        // `--dir <dir>` is the explicit "serve this folder as files" request,
+        // identical to `albedo files <dir>`.
         return run_files_command(raw_args);
     }
 
@@ -2708,11 +2773,72 @@ fn run_prod_build_with_budget(
                         }
                     }
                 };
+                // AUTH · the `auth` block is lowered at boot and, until
+                // 2026-09-02, nowhere else — so a declared `login` that is not a
+                // rooted path (an absolute URL, `//host`, a control character)
+                // passed `albedo build` and failed at container start. The
+                // `forge` arm above already learned this lesson for its own
+                // block; this is the same lane and the same argument.
+                //
+                // 🔑 The message is boot's, word for word (`boot.rs`), so the
+                // two lanes cannot describe one failure two ways.
+                if let Err(err) = contract.auth.lower() {
+                    return Err(format!("invalid `auth` block in albedo.config: {err}"));
+                }
+
                 dom_render_compiler::preflight::check(&compiled, &schema, &served)?;
+                // Write the server npm bundles beside the rest of the build
+                // output. They were just built in memory to run the checks
+                // above and were then thrown away, so serving the app required
+                // `node_modules` wherever it ran — 58 MB / 6 526 files for a
+                // five-dependency app, to re-derive 409 KB the build already
+                // had. See `bundler::npm_prebuilt`.
+                //
+                // A failure here is reported and not fatal: the file is an
+                // optimisation, and boot falls back to bundling from
+                // `node_modules` exactly as before.
+                let prebuilt = dom_render_compiler::bundler::npm_prebuilt::PrebuiltNpmBundles::new(
+                    compiled.npm_bundles().to_vec(),
+                );
+                match prebuilt.to_json() {
+                    Ok(json) => {
+                        let path = out_dir.join(
+                            dom_render_compiler::bundler::npm_prebuilt::NPM_SERVER_BUNDLES_FILENAME,
+                        );
+                        if let Err(err) = std::fs::write(&path, json) {
+                            print_warn(format!(
+                                "could not write {}: {err} — the app will still serve, but it \
+                                 will need node_modules wherever it runs",
+                                path.display()
+                            ));
+                        }
+                    }
+                    Err(err) => print_warn(format!("could not encode npm bundles: {err}")),
+                }
             }
-            // The source tree failing to load is its own error with its own
-            // message, produced on the path that actually needs the tree.
-            Err(_) => {}
+            // 🔴 This arm was `Err(_) => {}`, and swallowing it made
+            // `albedo build` exit 0 on a project `albedo serve` refuses to
+            // start — the exact defect `preflight` exists to prevent, one
+            // branch away from the sibling above that already carries the
+            // correction for it. Found 2026-09-02 by building a real app: a
+            // `useSharedSlot` whose topic is not derivable fails HERE, the
+            // build reported success, and boot then refused the artifact CI
+            // had just green-lit.
+            //
+            // The old comment said this failure "is its own error with its own
+            // message, produced on the path that actually needs the tree". The
+            // build needs the tree too: it is the lane that decides whether the
+            // artifact ships.
+            //
+            // 🔑 The message is boot's, word for word (`boot.rs`'s
+            // `ServerStartup`), so the two lanes cannot drift into describing
+            // one failure two ways.
+            Err(err) => {
+                return Err(format!(
+                    "failed to load source tree at '{}': {err}",
+                    contract.root.display()
+                ));
+            }
         }
     }
 
@@ -3661,7 +3787,7 @@ fn print_serve_help() {
     println!(
         "  {}  {}",
         style("usage", "2"),
-        style("albedo serve [--host <IP>] [--port <PORT>]", "1")
+        style("albedo serve [dir] [--host <IP>] [--port <PORT>]", "1")
     );
     println!();
     println!(
@@ -4072,7 +4198,28 @@ mod tests {
         assert!(dockerfile.contains("ALBEDO_SERVER_PORT=3000"));
         assert!(dockerfile.contains("HEALTHCHECK"));
         assert!(dockerfile.contains("EXPOSE 3000"));
-        assert!(dockerfile.contains("COPY --from=builder /workspace/.albedo/dist"));
+
+        // 🔴 This used to assert `COPY --from=builder /workspace/.albedo/dist`,
+        // which **pinned the defect**: shipping the build output and nothing
+        // else is exactly what made the container a static file server. The
+        // test passed for as long as the bug existed, which is the whole
+        // problem with asserting the shape a template happens to have rather
+        // than the thing it has to achieve.
+        //
+        // `dist` is now deliberately absent — `albedo serve` rebuilds before it
+        // serves, so copying it would ship bytes that are immediately discarded.
+        // `dist` itself is still not shipped -- `albedo serve` rebuilds it --
+        // but the npm bundles inside it are, because that rebuild cannot
+        // regenerate them without `node_modules`, which is what they replace.
+        assert!(
+            !dockerfile.contains("COPY --from=builder /workspace/.albedo/dist /"),
+            "the runtime stage should not ship a whole dist that serve rebuilds"
+        );
+        assert!(
+            !dockerfile.contains("/workspace/node_modules /app/node_modules"),
+            "the runtime image must not carry node_modules: the build lowered the \
+             bundles so that it would not have to"
+        );
     }
 
     #[test]
@@ -4160,5 +4307,161 @@ mod tests {
         let root = PathBuf::from("C:/work/demo/src/components");
         let inferred = infer_project_dir_from_root(&root).unwrap();
         assert_eq!(inferred, PathBuf::from("C:/work/demo"));
+    }
+
+    /// 🔴 **`albedo build` must fail on a project `albedo serve` would refuse.**
+    ///
+    /// The preflight block in `run_build_command` loads the source tree so it
+    /// can run the checks. That load is also the only place several defects are
+    /// detected at all — a `useSharedSlot` whose topic is not derivable fails
+    /// there and nowhere else. The arm was written `Err(_) => {}`, so the build
+    /// reported success and boot then refused the artifact CI had green-lit:
+    /// the exact defect `preflight` exists to prevent, one branch away from the
+    /// sibling that already carries the correction for it.
+    ///
+    /// Derived from this file's own source rather than asserted about behaviour,
+    /// for the same reason `preflight`'s fence is: the failure mode is a branch
+    /// that silently does nothing, which no behavioural test of the success path
+    /// can see.
+    #[test]
+    fn the_build_lane_never_swallows_a_source_tree_load_failure() {
+        let source = include_str!("albedo.rs");
+        let block = source
+            .split_once("match dom_render_compiler::runtime::CompiledProject::load_from_dir")
+            .expect("the build's preflight block is here")
+            .1;
+        // Up to the end of that `match`, which is the arm list we care about.
+        let block = block
+            .split_once("
+    }")
+            .expect("the match has an end")
+            .0;
+
+        // Comment lines are skipped: the arm below documents the bug by
+        // quoting it, and a naive `contains` reads its own prose as the
+        // defect. Fired exactly that way when first written.
+        let swallows = block
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .any(|line| line.starts_with("Err(_)") && line.contains("{}"));
+
+        assert!(
+            !swallows,
+            "the build's `CompiledProject::load_from_dir` failure is being swallowed, so              `albedo build` will exit 0 on a project `albedo serve` cannot start"
+        );
+        assert!(
+            block.contains("failed to load source tree at"),
+            "the build must report the load failure using boot's wording, word for word, so              the two lanes cannot describe one failure two ways"
+        );
+    }
+
+    /// 🔴 **`albedo serve .` must run the app, not serve the folder.**
+    ///
+    /// A bare positional used to route to the static-file server, so the
+    /// sequence every newcomer types —
+    ///
+    /// ```text
+    /// albedo build .   # compiles the project
+    /// albedo serve .   # served the DIRECTORY: every route 404, including the
+    ///                  # scaffold's own
+    /// ```
+    ///
+    /// — produced a dead site with no diagnostic. The positional means *the
+    /// project* on `dev`, `build`, `ship` and `doctor`; `serve` was the fifth
+    /// and most-used, and meant the opposite.
+    ///
+    /// Derived from this file's own source, like the other CLI fences here,
+    /// because the failure is a branch that silently reroutes the command
+    /// rather than one that errors.
+    #[test]
+    fn a_bare_positional_on_serve_selects_the_project_not_a_files_root() {
+        let source = include_str!("albedo.rs");
+        let body = source
+            .split_once("fn run_serve_command(")
+            .expect("serve command is here")
+            .1;
+        let body = body
+            .split_once("let cwd = std::env::current_dir()")
+            .expect("serve reaches the project path")
+            .0;
+
+        let code: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect();
+
+        // The arm that made any non-flag argument mean "serve this folder".
+        assert!(
+            !code.iter().any(|line| line.contains("!arg.starts_with('-')")),
+            "a bare positional is being treated as a files root again, so              `albedo serve .` will serve the directory instead of the app"
+        );
+        // `--dir` stays the explicit opt-in: the emitted Dockerfile's CMD uses it.
+        assert!(
+            code.iter().any(|line| line.contains("\"--dir\"")),
+            "`--dir` must stay the explicit files opt-in — the Dockerfile              `albedo ship --target docker` emits depends on it"
+        );
+    }
+
+    /// 🔴 **The docker target must ship the APP, not a folder of files.**
+    ///
+    /// The emitted Dockerfile used to copy only `.albedo/dist` + `public` and
+    /// run `albedo serve --dir dist` — the static file server. The container had
+    /// no FORGE, no actions, no per-request render and no auth, and carried no
+    /// source tree, so project-mode serve could not have run there either.
+    ///
+    /// The runtime contents asserted here are the ones verified by running
+    /// `albedo serve` against a directory containing exactly them:
+    /// `src/` + `albedo.config.*` + `node_modules/` + `public/`.
+    #[test]
+    fn the_emitted_dockerfile_runs_the_app_and_not_a_files_root() {
+        let dockerfile = build_docker_template();
+
+        let cmd = dockerfile
+            .lines()
+            .find(|line| line.starts_with("CMD "))
+            .expect("the template has a CMD");
+        assert!(
+            !cmd.contains("--dir"),
+            "the container is running the static file server: {cmd}"
+        );
+        assert!(
+            cmd.contains("albedo serve"),
+            "the container must run the app: {cmd}"
+        );
+
+        // Everything `albedo serve` needs at runtime, or it cannot boot.
+        for needed in [
+            "/workspace/src /app/src",
+            "/workspace/albedo.config.",
+            "/workspace/.albedo/dist/npm-server-bundles.json",
+        ] {
+            assert!(
+                dockerfile.contains(needed),
+                "the runtime stage must copy {needed:?}, or `albedo serve` has                  nothing to serve"
+            );
+        }
+    }
+
+    /// 🪤 `node_modules` stays out of the build context on purpose — the host's
+    /// tree may be built for another platform — so the image has to install it.
+    /// Without that, `albedo build` in the builder cannot resolve a single bare
+    /// specifier and every app with an npm dependency fails.
+    #[test]
+    fn the_docker_target_installs_npm_dependencies() {
+        assert!(
+            build_dockerignore_template().contains("node_modules"),
+            "the host's node_modules must stay out of the build context"
+        );
+        let dockerfile = build_docker_template();
+        assert!(
+            dockerfile.contains("npm ci") && dockerfile.contains("npm install"),
+            "the image must install npm dependencies itself"
+        );
+        assert!(
+            dockerfile.contains("COPY --from=deps /workspace/node_modules"),
+            "the builder needs the installed tree to resolve bare specifiers"
+        );
     }
 }
