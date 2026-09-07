@@ -24,6 +24,7 @@ fn make_server() -> albedo_server::server::AlbedoServer {
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     })
     .build()
     .expect("server build")

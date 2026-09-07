@@ -419,6 +419,7 @@ fn showcase_config() -> AppConfig {
             // path — the dispatcher picks the right registry by handler_id.
             route("api.ping", HttpMethod::Get, "/api/ping", "api.ping"),
         ],
+        forge: Default::default(),
     }
 }
 

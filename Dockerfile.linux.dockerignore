@@ -1,0 +1,17 @@
+# Build context for `Dockerfile.linux`.
+#
+# 🪤 `assets/` and `scaffold/` are `include_str!`'d into the binary — excluding
+# either breaks the build with a missing-file error at compile time, not at
+# runtime. They stay.
+target
+.git
+node_modules
+graphify-out
+development-plan
+*.pdf
+*.docx
+forge.db
+forge.db-*
+*.albedo-bin
+*.albedo-bin.exe
+.albedo-app-*

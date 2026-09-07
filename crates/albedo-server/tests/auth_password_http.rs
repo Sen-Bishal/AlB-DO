@@ -253,7 +253,8 @@ async fn a_stranger_signs_up_signs_in_and_signs_out_over_http() {
     fs::write(&page, SIGN_IN_TSX).expect("write SignIn.tsx");
     fs::write(
         dist_dir.join("render-manifest.v2.json"),
-        build_manifest_json(&page),
+        // Project-relative, as the compiler now emits and the gate requires.
+        build_manifest_json(Path::new("src/SignIn.tsx")),
     )
     .expect("write manifest");
     fs::write(
@@ -294,6 +295,7 @@ async fn a_stranger_signs_up_signs_in_and_signs_out_over_http() {
             providers,
             ..Default::default()
         },
+        tls: Default::default(),
     };
 
     let server = boot_production_server(&opts).expect("server boots with a password provider");

@@ -11,6 +11,7 @@ pub mod eval;
 pub mod form_result;
 pub mod frame;
 pub mod highway;
+pub mod implied_default;
 pub mod jsx_attributes;
 pub mod hot_set;
 pub mod node_builtins;

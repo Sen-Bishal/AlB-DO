@@ -1569,16 +1569,26 @@ impl CompiledProject {
     ///
     /// Returns `(route, module_spec)` pairs, sorted, so a boot error reads the
     /// same twice in a row.
+    /// 🔑 **9.1a — `default_export` is now filled from a single named export**
+    /// (see [`crate::runtime::implied_default`]), so a module written the way
+    /// 62.3% of real React files are written no longer reaches this list at
+    /// all. What survives is the case that must stay an error: **zero exported
+    /// components, or two or more.** The third tuple field carries the ones
+    /// found, so the refusal can name them instead of claiming a file that
+    /// exports two components has no component in it.
     #[must_use]
-    pub fn routes_without_default_export(&self, served: &[String]) -> Vec<(String, String)> {
-        let mut broken: Vec<(String, String)> = self
+    pub fn routes_without_default_export(&self, served: &[String]) -> Vec<(String, String, Vec<String>)> {
+        let mut broken: Vec<(String, String, Vec<String>)> = self
             .project
             .modules()
             .iter()
             .filter(|(_, module)| module.default_export.is_none())
-            .filter_map(|(spec, _)| {
+            .filter_map(|(spec, module)| {
                 let route = crate::manifest::route_path_from_component(spec)?;
-                served.iter().any(|s| *s == route).then_some((route, spec.clone()))
+                served
+                    .iter()
+                    .any(|s| *s == route)
+                    .then(|| (route, spec.clone(), module.component_exports.clone()))
             })
             .collect();
         broken.sort();

@@ -28,9 +28,11 @@
 //! | [`npm_imports`] | an uninstalled package dropped the route's content |
 //! | [`deferred_module_loads`] | a `require("…")` shipped verbatim and threw in the browser |
 //! | [`partitioned_whole_reads`] | a whole read of a partitioned collection dropped the component |
+//! | [`portable_module_paths`] | every artifact keyed on this machine's own paths, so a build served nowhere else |
 
 use crate::bundler::npm::LoadForm;
 use crate::forge::skeleton::ForgeSchema;
+use crate::manifest::schema::RenderManifestV2;
 use crate::runtime::compiled::CompiledProject;
 
 /// One problem, ready to print under a heading.
@@ -68,16 +70,32 @@ pub fn literal_topics(compiled: &CompiledProject, schema: &ForgeSchema) -> Optio
     })
 }
 
-/// A served route whose source module has no `export default`.
+/// A served route whose source module has no component this can render.
+///
+/// 🔑 **9.1a narrowed what this refuses.** A single named export
+/// (`export function Home`) is now bound as the default, so this fires only on
+/// the two cases that have no unambiguous answer: **no exported component at
+/// all**, or **more than one**. The message has to say which, because "no
+/// `export default`" is actively misleading about a file that exports two
+/// components — the author's problem there is choosing, not adding.
 #[must_use]
 pub fn route_default_exports(compiled: &CompiledProject, served: &[String]) -> Option<Failure> {
     let broken = compiled.routes_without_default_export(served);
     (!broken.is_empty()).then(|| Failure {
-        heading: "these routes have no `export default`, so they would serve an empty page"
+        heading: "these routes have no component to render, so they would serve an empty page"
             .to_string(),
         problems: broken
             .iter()
-            .map(|(route, spec)| format!("{route}  ({spec})"))
+            .map(|(route, spec, components)| match components.as_slice() {
+                [] => format!(
+                    "{route}  ({spec}) — no `export default` and no exported component"
+                ),
+                many => format!(
+                    "{route}  ({spec}) — {} exported components ({}); mark one `export default`",
+                    many.len(),
+                    many.join(", ")
+                ),
+            })
             .collect(),
     })
 }
@@ -176,14 +194,63 @@ pub fn partitioned_whole_reads(compiled: &CompiledProject, schema: &ForgeSchema)
         })
 }
 
+/// A `module_path` in the emitted manifest that still names this machine.
+///
+/// The manifest keys every component on `module_path`, and so do the
+/// precompiled-modules, static-slice and bundle artifacts that join to it. An
+/// absolute one — a drive letter followed by both separators mixed into one
+/// string is what the build actually wrote — pins the whole artifact set to
+/// the box that produced it: nothing resolves anywhere else, which is the
+/// single largest thing standing between `albedo build` and `albedo ship --binary`.
+///
+/// 🔑 This is the gate, not the fix. The fix is
+/// [`crate::manifest::portable_path::portable_module_path`] at the one site
+/// that mints the identity; this check exists because *any future producer*
+/// can reintroduce an absolute path, and the failure is invisible until
+/// someone deploys. A check derived from the artifact catches a producer this
+/// module has never heard of.
+#[must_use]
+pub fn portable_module_paths(manifest: Option<&RenderManifestV2>) -> Option<Failure> {
+    let problems: Vec<String> = manifest?
+        .components
+        .iter()
+        .filter(|component| {
+            let path = std::path::Path::new(component.module_path.as_str());
+            // A backslash is checked separately from `is_absolute`: a *relative*
+            // `src\components\App.jsx` is portable nowhere either, because
+            // `Path` on Linux reads the whole thing as one filename.
+            path.is_absolute() || component.module_path.contains('\\')
+        })
+        .map(|component| {
+            format!(
+                "{} is recorded as `{}` — an artifact carrying this cannot be \
+                 served from any other directory or machine",
+                component.name, component.module_path
+            )
+        })
+        .collect();
+
+    (!problems.is_empty()).then(|| Failure {
+        heading: "a component's module path names this build machine, so the artifact is not portable"
+            .to_string(),
+        problems,
+    })
+}
+
 /// Run every check and collect what failed.
 ///
 /// All of them, not the first: a `forge` block edited without its readers
 /// usually breaks more than one thing, and fixing them one boot at a time is
 /// the kind of small cruelty that makes a tool feel hostile.
 #[must_use]
-pub fn run(compiled: &CompiledProject, schema: &ForgeSchema, served: &[String]) -> Vec<Failure> {
+pub fn run(
+    compiled: &CompiledProject,
+    schema: &ForgeSchema,
+    served: &[String],
+    manifest: Option<&RenderManifestV2>,
+) -> Vec<Failure> {
     [
+        portable_module_paths(manifest),
         npm_imports(compiled),
         deferred_module_loads(compiled),
         partitioned_whole_reads(compiled, schema),
@@ -204,8 +271,9 @@ pub fn check(
     compiled: &CompiledProject,
     schema: &ForgeSchema,
     served: &[String],
+    manifest: Option<&RenderManifestV2>,
 ) -> Result<(), String> {
-    let failures = run(compiled, schema, served);
+    let failures = run(compiled, schema, served, manifest);
     if failures.is_empty() {
         return Ok(());
     }
@@ -218,6 +286,49 @@ pub fn check(
 
 #[cfg(test)]
 mod tests {
+    use super::portable_module_paths;
+    use crate::types::{Component, ComponentId};
+    use crate::RenderCompiler;
+
+    /// Build a manifest the way the real pipeline does, with and without the
+    /// project root — the two cases differ by exactly the wiring under test,
+    /// so neither is a hand-built fixture that could agree with a broken check.
+    fn manifest_with_root(root: Option<&str>) -> crate::manifest::schema::RenderManifestV2 {
+        let mut compiler = RenderCompiler::new();
+        let mut component = Component::new(ComponentId::new(0), "Counter".to_string());
+        component.file_path = "B:/proj/src/Counter.tsx".to_string();
+        component.weight = 1024.0;
+        compiler.add_component(component);
+        if let Some(root) = root {
+            compiler.set_project_root(root);
+        }
+        compiler
+            .optimize_manifest_v2()
+            .expect("the fixture graph optimizes")
+    }
+
+    /// The gate fires on the artifact the build used to write. Without this the
+    /// only symptom is a deploy that 500s on another box.
+    #[test]
+    fn a_manifest_keyed_on_host_paths_is_refused() {
+        let failure = portable_module_paths(Some(&manifest_with_root(None)))
+            .expect("an absolute module path must be refused");
+        assert!(
+            failure.problems.iter().any(|p| p.contains("B:/proj")),
+            "the refusal must name the offending path: {:?}",
+            failure.problems
+        );
+    }
+
+    /// …and stays quiet once the build declares its root, or every build fails.
+    #[test]
+    fn a_manifest_keyed_on_project_relative_paths_passes() {
+        assert_eq!(
+            portable_module_paths(Some(&manifest_with_root(Some("B:/proj")))),
+            None
+        );
+    }
+
     /// 🔑 **A check that exists and is never called is this session's bug, in
     /// this file.**
     ///

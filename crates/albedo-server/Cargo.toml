@@ -41,6 +41,12 @@ url.workspace                  = true
 uuid.workspace                 = true
 quinn.workspace                = true
 rustls-pemfile.workspace       = true
+rustls.workspace               = true
+tokio-rustls.workspace         = true
+rustls-acme.workspace          = true
+hyper.workspace                = true
+hyper-util.workspace           = true
+tower.workspace                = true
 rustls-pki-types.workspace     = true
 tower-http.workspace           = true
 xxhash-rust.workspace          = true
@@ -62,6 +68,15 @@ ratatui = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# 13.1 only: `tokio::test(start_paused)` needs `test-util`. The drain
+# deadline is a timer, and a test that really slept 5 s to prove a 5 s timeout
+# would be the slowest test in the suite for the weakest reason. The paused
+# clock makes it exact and instant.
+tokio = { workspace = true, features = ["test-util"] }
+# 13.4 only: the fly.toml test PARSES the emitted file rather than string
+# matching it, because `kill_signal` written under a table header is valid
+# TOML that Fly silently ignores -- a defect no `contains()` can see.
+toml.workspace = true
 # APERTURE gate 5c only: the context-pool gate builds runtimes and contexts
 # directly, because the question it settles is what the pool should be made OF.
 # Nothing in the crate's own code links rquickjs — the engine stays behind

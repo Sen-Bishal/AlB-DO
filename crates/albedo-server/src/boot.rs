@@ -17,7 +17,7 @@
 //!   `initial_opcode_frame` now resolves to a live `ActionHandler` via the registered
 //!   `CompiledProject`.
 
-use crate::config::{AppConfig, RouteSpec, ServerConfig};
+use crate::config::{AppConfig, ForgeConfig, RouteSpec, ServerConfig};
 use crate::error::RuntimeError;
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::HttpMethod;
@@ -75,6 +75,12 @@ pub struct ProductionServerOptions {
     /// `sources` are: lowering needs the real environment, and a bad `auth`
     /// block should stop the boot here with the offending provider named.
     pub auth: dom_render_compiler::auth::AuthDeclaration,
+    /// TLS + ACME, already resolved from flags and environment by the CLI.
+    ///
+    /// Carried rather than read from the environment here, so the flag surface
+    /// is what decides and this module has one input instead of two that could
+    /// disagree.
+    pub tls: crate::tls::TlsSettings,
 }
 
 impl ProductionServerOptions {
@@ -95,6 +101,9 @@ impl ProductionServerOptions {
             forge: contract.forge.clone(),
             sources: contract.sources.clone(),
             auth: contract.auth.clone(),
+            // The environment is the fallback; a caller with flags overwrites
+            // this before booting.
+            tls: crate::tls::TlsSettings::from_env(),
         }
     }
 }
@@ -138,6 +147,49 @@ pub(crate) fn boot_production_server_reusing(
     live: LiveRuntime,
 ) -> Result<AlbedoServer, RuntimeError> {
     boot_inner(opts, Some(live))
+}
+
+/// Re-root any relative TLS path onto the project directory.
+///
+/// A path from the environment is as likely to be written relative to the app
+/// (`certs/site.pem`) as absolute, and resolving it against the shell would
+/// make `albedo serve <dir>` fail from anywhere but inside the project.
+fn absolutise_tls(
+    settings: crate::tls::TlsSettings,
+    project_dir: &std::path::Path,
+) -> crate::tls::TlsSettings {
+    let rebase = |value: Option<String>| {
+        value.map(|raw| {
+            let path = PathBuf::from(raw.trim());
+            if path.is_absolute() || path.as_os_str().is_empty() {
+                path.display().to_string()
+            } else {
+                project_dir.join(path).display().to_string()
+            }
+        })
+    };
+    // 🔴 The ACME cache must be pinned to the project even when nobody named
+    // it. This boot path carries no renderer config, so the server's own
+    // fallback would resolve the default against the **process working
+    // directory** — and a restart from elsewhere would find no account, re-issue
+    // from scratch, and walk into Let's Encrypt's 5-duplicates-per-week limit.
+    // That is a lockout measured in days, from a path that merely looked
+    // harmless. Same class as `forge.db`, worse consequence.
+    let acme_cache = rebase(settings.acme_cache).or_else(|| {
+        Some(
+            project_dir
+                .join(crate::tls::DEFAULT_ACME_CACHE_DIR)
+                .display()
+                .to_string(),
+        )
+    });
+
+    crate::tls::TlsSettings {
+        cert_path: rebase(settings.cert_path),
+        key_path: rebase(settings.key_path),
+        acme_cache,
+        ..settings
+    }
 }
 
 fn boot_inner(
@@ -194,11 +246,41 @@ fn boot_inner(
         server: ServerConfig {
             host: opts.host.clone(),
             port: opts.port,
+            // Where the certificate is — if there is one — is a property of the
+            // deployment, so it comes from the environment rather than from the
+            // committed config. `TlsSettings::default()` is plain HTTP, which
+            // is what every deployment did before this existed.
+            //
+            // Absolutised here for the same reason `forge.db` is: this boot
+            // path carries no renderer config, so the server could not derive
+            // the project from an artifacts directory and a relative path
+            // would fall back to the process CWD.
+            tls: absolutise_tls(opts.tls.clone(), &opts.project_dir),
             ..ServerConfig::default()
         },
         renderer: None,
         layouts: Vec::new(),
         routes,
+        // This boot path compiles from source and holds no renderer config, so
+        // the server could not derive the project from an artifacts directory.
+        // Resolve here, where `source_root` is known, and hand the server the
+        // finished absolute path — otherwise the default falls back to a
+        // CWD-relative `forge.db`, which is the bug being fixed.
+        forge: ForgeConfig {
+            db_path: Some(
+                crate::forge_db_path::resolve_forge_db_path(
+                    None,
+                    crate::forge_db_path::forge_db_env().as_deref(),
+                    // `dist_dir`, not `source_root`: the resolver climbs two
+                    // levels to reach the project from `<project>/.albedo/dist`,
+                    // and `source_root` is `<project>/src` — climbing from
+                    // there would put the database inside `src/`.
+                    &opts.dist_dir,
+                )
+                .display()
+                .to_string(),
+            ),
+        },
     };
 
     // A1 · run compiled action bodies through the QuickJS executor in
@@ -290,9 +372,12 @@ fn boot_inner(
     // Each one closes a failure that was silent: HTTP 200 with something
     // missing and nothing said anywhere. See that module for the table.
     let served: Vec<String> = renderer.manifest().routes.keys().cloned().collect();
-    if let Err(report) =
-        dom_render_compiler::preflight::check(&compiled, &forge_schema, &served)
-    {
+    if let Err(report) = dom_render_compiler::preflight::check(
+        &compiled,
+        &forge_schema,
+        &served,
+        Some(renderer.manifest()),
+    ) {
         return Err(RuntimeError::ServerStartup(report));
     }
 
@@ -467,4 +552,54 @@ fn boot_inner(
     // templates — same source as the dev path's `dev_static_asset`.
 
     builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::absolutise_tls;
+    use crate::tls::{TlsSettings, DEFAULT_ACME_CACHE_DIR};
+    use std::path::{Path, PathBuf};
+
+    /// 🔴 The third appearance of one bug: a persistence path that defaults to
+    /// the **process working directory**. `forge.db` did it, module sources did
+    /// it, and here the consequence is the worst of the three — losing the ACME
+    /// account means re-issuing, and Let's Encrypt allows 5 duplicate
+    /// certificates per week, so a restart from the wrong directory is a
+    /// lockout measured in days.
+    #[test]
+    fn the_acme_cache_defaults_into_the_project_not_the_shell() {
+        let resolved = absolutise_tls(TlsSettings::default(), Path::new("/srv/app"));
+        assert_eq!(
+            resolved.acme_cache.as_deref().map(PathBuf::from),
+            Some(PathBuf::from("/srv/app").join(DEFAULT_ACME_CACHE_DIR)),
+            "an unset cache must still be pinned to the project"
+        );
+    }
+
+    /// A relative override belongs to the project too — the shell's location is
+    /// not a property of the deployment.
+    #[test]
+    fn a_relative_cache_override_is_rooted_at_the_project() {
+        let settings = TlsSettings {
+            acme_cache: Some("certs/acme".into()),
+            ..TlsSettings::default()
+        };
+        let resolved = absolutise_tls(settings, Path::new("/srv/app"));
+        assert_eq!(
+            resolved.acme_cache.as_deref().map(PathBuf::from),
+            Some(PathBuf::from("/srv/app").join("certs/acme"))
+        );
+    }
+
+    /// An absolute path is the operator naming a mounted volume, and is used
+    /// exactly as given.
+    #[test]
+    fn an_absolute_cache_override_is_left_alone() {
+        let settings = TlsSettings {
+            acme_cache: Some("/data/acme".into()),
+            ..TlsSettings::default()
+        };
+        let resolved = absolutise_tls(settings, Path::new("/srv/app"));
+        assert_eq!(resolved.acme_cache.as_deref(), Some("/data/acme"));
+    }
 }

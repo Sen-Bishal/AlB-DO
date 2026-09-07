@@ -282,3 +282,7 @@ nul
 # publishes wherever it was built.
 crates/albedo-node/*.node
 crates/albedo-node/*.tgz
+
+# Output of `docker build -f Dockerfile.linux --target export` — the
+# linux/amd64 runtime `ship --target docker` needs. Build output, never committed.
+dist-linux/

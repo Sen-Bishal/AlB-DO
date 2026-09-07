@@ -115,7 +115,28 @@ impl<'a> ManifestBuilder<'a> {
         metadata: HashMap<ComponentId, ComponentTierMetadata>,
         tier_b_timeout_ms: u64,
     ) -> Self {
-        let working_dir = std::env::current_dir().ok();
+        Self::new_in(graph, metadata, tier_b_timeout_ms, None)
+    }
+
+    /// [`Self::new`] with the project root stated instead of assumed.
+    ///
+    /// 🪤 `working_dir` was unconditionally `std::env::current_dir()`, so every
+    /// path this builder resolves — the routes directory, each component's
+    /// source, and `forge.db` for the shared-slot seeds — was resolved against
+    /// **the shell**, not the project. `albedo serve <dir>` from elsewhere
+    /// therefore read no seeds and *created a second, empty `forge.db` beside
+    /// the shell*, because `open_local` creates what is missing. The build
+    /// looked fine and the app served with no data.
+    ///
+    /// The CWD remains the fallback: it is right for the common case of running
+    /// inside the project, and every existing caller depends on it.
+    pub fn new_in(
+        graph: &'a ComponentGraph,
+        metadata: HashMap<ComponentId, ComponentTierMetadata>,
+        tier_b_timeout_ms: u64,
+        project_root: Option<PathBuf>,
+    ) -> Self {
+        let working_dir = project_root.or_else(|| std::env::current_dir().ok());
         let components = graph
             .components()
             .into_iter()

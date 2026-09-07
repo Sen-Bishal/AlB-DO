@@ -2797,6 +2797,8 @@ fn lower_module_to_statements(
     rewrite_import: ImportRewriter<'_>,
 ) -> RuntimeResult<LoweredModule> {
     let module = parse_module(specifier, source)?;
+    // 9.1a · computed before the walk below consumes `module.body`.
+    let component_exports = crate::runtime::implied_default::exported_component_names(&module.body);
     let mut statements = Vec::new();
     let mut export_assignments = Vec::new();
     let mut default_export_local: Option<String> = None;
@@ -2981,6 +2983,23 @@ fn lower_module_to_statements(
                 default_export_local = Some(rest.trim_end_matches(';').to_string());
                 break;
             }
+        }
+    }
+
+    // 9.1a · the named-export slice. A module with no default and exactly one
+    // exported component takes that component as its default.
+    //
+    // 🔑 **The rule comes from `implied_default`, not from a second copy of it
+    // here.** The Tier-A evaluator makes the same decision in
+    // `eval::expr::parse_module`, and `preflight` reads *that* one to decide
+    // whether to refuse the build. If the two ever disagreed the failure would
+    // be silent in the worst direction: the build passes, then this record has
+    // no `.default` and the route serves nothing.
+    if default_export_local.is_none() {
+        if let Some(name) = crate::runtime::implied_default::implied_default(&component_exports) {
+            let export_key = js_string_literal("default", specifier)?;
+            export_assignments.push(format!("__albedo_exports[{export_key}] = {name};"));
+            default_export_local = Some(name);
         }
     }
 
@@ -4662,6 +4681,85 @@ mod tests {
         assert!(compiled.contains(r#"const { a, b: c } = __albedo_import_named("pkg/named");"#));
         assert!(compiled.contains(r#"const ns = __albedo_import_namespace("pkg/ns");"#));
         assert!(compiled.contains(r#"__albedo_import_namespace("pkg/side-effect");"#));
+    }
+
+    /// 🔑 **Item 9.1a · the agreement test, and it is the point of the item.**
+    ///
+    /// Two independent lowerings decide what a module's default export is, and
+    /// both run on the serve path: this one (QuickJS — what `albedo serve`
+    /// actually invokes) and `eval::expr::parse_module` (Tier-A — what
+    /// `preflight::route_default_exports` reads to decide whether to refuse the
+    /// build).
+    ///
+    /// 🪤 **A disagreement is silent in the worst direction.** If Tier-A binds
+    /// the named export and QuickJS does not, preflight passes the build and
+    /// then the route serves an empty page — the exact class of defect the
+    /// preflight refusal exists to prevent. Asserting them together in one test
+    /// is what keeps the two honest; asserting them apart would let either
+    /// drift green.
+    #[test]
+    fn a_single_named_export_is_the_default_in_both_lowerings() {
+        let source = "export function Home() { return <main>hi</main>; }";
+
+        let compiled = compile_module_script_for_quickjs("routes/index.tsx", source).unwrap();
+        assert!(
+            compiled.contains(r#"__albedo_exports["default"] = Home;"#),
+            "QuickJS lowering did not bind the named export as default:\n{compiled}"
+        );
+
+        let parsed = crate::runtime::eval::expr::parse_module(
+            source,
+            std::path::Path::new("routes/index.tsx"),
+        )
+        .expect("Tier-A parses");
+        assert_eq!(
+            parsed.default_export.as_deref(),
+            Some("Home"),
+            "Tier-A did not bind the named export as default"
+        );
+    }
+
+    /// The other half of the rule: ambiguity stays an error in both lanes.
+    /// Guessing which of two exported components is "the page" would be a
+    /// silent wrong answer, which is worse than the refusal it replaced.
+    #[test]
+    fn two_named_exports_stay_ambiguous_in_both_lowerings() {
+        let source = "export function Home() { return <main/>; }\n\
+                      export function Sidebar() { return <aside/>; }";
+
+        let compiled = compile_module_script_for_quickjs("routes/index.tsx", source).unwrap();
+        assert!(
+            !compiled.contains(r#"__albedo_exports["default"]"#),
+            "QuickJS guessed a default between two exported components:\n{compiled}"
+        );
+
+        let parsed = crate::runtime::eval::expr::parse_module(
+            source,
+            std::path::Path::new("routes/index.tsx"),
+        )
+        .expect("Tier-A parses");
+        assert_eq!(parsed.default_export, None);
+        assert_eq!(
+            parsed.component_exports,
+            vec!["Home".to_string(), "Sidebar".to_string()],
+            "the refusal needs both names to report them"
+        );
+    }
+
+    /// 🪤 An explicit `export default` must still win. The implied-default rule
+    /// is a fallback, and a module with both a default and one other exported
+    /// component is not ambiguous — it said which one it meant.
+    #[test]
+    fn an_explicit_default_wins_over_a_named_component() {
+        let source = "export function Sidebar() { return <aside/>; }\n\
+                      export default function Home() { return <main/>; }";
+
+        let parsed = crate::runtime::eval::expr::parse_module(
+            source,
+            std::path::Path::new("routes/index.tsx"),
+        )
+        .expect("Tier-A parses");
+        assert_eq!(parsed.default_export.as_deref(), Some("Home"));
     }
 
     #[test]

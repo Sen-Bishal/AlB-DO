@@ -53,6 +53,7 @@ fn build_server() -> albedo_server::server::AlbedoServer {
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     };
 
     AlbedoServerBuilder::new(config)
@@ -270,6 +271,7 @@ async fn click_action_is_gated_and_dispatches_only_with_a_token() {
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     };
     let server = AlbedoServerBuilder::new(config)
         .register_action(
@@ -332,6 +334,7 @@ async fn cookie_session_round_trips_into_action_handler() {
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     };
     let observed_for_handler = observed.clone();
     let server = AlbedoServerBuilder::new(config)

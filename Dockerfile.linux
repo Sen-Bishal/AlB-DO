@@ -1,0 +1,53 @@
+# Build a linux/amd64 `albedo` from this repository.
+#
+# # Why this file exists
+#
+# `albedo ship --target binary` appends a project to **the running executable**,
+# so the one-file output is always for the platform that produced it. A Windows
+# or macOS dev box therefore cannot produce the Linux runtime that
+# `albedo ship --target docker` needs to put inside an image — and cross
+# compiling does not help: `ring`'s build script needs a cross C toolchain and
+# fails before any of our code is reached.
+#
+# Building in a Linux container is the way around both.
+#
+# # Use
+#
+#   docker build -f Dockerfile.linux --target export \
+#     --output type=local,dest=./dist-linux .
+#
+# That writes `./dist-linux/albedo`. Copy it into a project as
+# `albedo-linux-amd64` and `albedo ship --target docker` will use it:
+#
+#   cp dist-linux/albedo /path/to/app/albedo-linux-amd64
+#
+# 🪤 `--bin albedo` alone fails with `no bin target named albedo in default-run
+# packages`. The binary belongs to the `albedo-server` package (its `[[bin]]`
+# points at `../../src/bin/albedo.rs`), so the package selector is required.
+#
+# 🔴 **Re-run this whenever albedo itself changes.** The image embeds a *pinned*
+# runtime: `docker build` on an app cannot see that albedo moved, so the
+# container keeps running the old one and the symptom is whatever the old one
+# did. `ship --target docker` warns when the staged runtime is a different
+# version, but during development of albedo the version does not change while
+# the code does — so that warning cannot catch every drift, and this note has to.
+
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+
+# `ring` and some swc crates want a C/C++ toolchain and cmake.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake clang \
+    && rm -rf /var/lib/apt/lists/*
+
+# Resolve the pinned toolchain before the source lands, so a source-only change
+# does not re-download nightly.
+COPY rust-toolchain.toml ./
+RUN rustup show
+
+COPY . .
+RUN cargo build --release -p albedo-server --bin albedo
+
+# `--target export` + `--output type=local` writes just the binary to the host.
+FROM scratch AS export
+COPY --from=builder /src/target/release/albedo /albedo

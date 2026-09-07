@@ -108,6 +108,7 @@ async fn compiled_counter_dispatch_increments_slot_through_http_action_route() {
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     };
     let server = AlbedoServerBuilder::new(config)
         .register_compiled_project(project.clone())
@@ -228,6 +229,7 @@ async fn compiled_counter_persists_across_two_action_invocations() {
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     };
     let server = AlbedoServerBuilder::new(config)
         .register_compiled_project(project.clone())
@@ -341,6 +343,7 @@ async fn compiled_counter_dispatch_via_quickjs_pool_matches_pure_rust_wire() {
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     };
     // The one line under test: enable the pool BEFORE registering the project
     // so the adapter captures the pool and routes through QuickJS.

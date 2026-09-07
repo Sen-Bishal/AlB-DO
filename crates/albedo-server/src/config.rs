@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub layouts: Vec<LayoutSpec>,
     #[serde(default)]
     pub routes: Vec<RouteSpec>,
+    #[serde(default)]
+    pub forge: ForgeConfig,
 }
 
 impl Default for AppConfig {
@@ -27,8 +29,24 @@ impl Default for AppConfig {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: ForgeConfig::default(),
         }
     }
+}
+
+/// Where the durable substrate lives.
+///
+/// Its own block rather than a loose field because the deployment questions
+/// that follow — replica URL, sync interval, backup target — belong beside it,
+/// and moving a field into a block later is a breaking config change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeConfig {
+    /// Path to the database file. Relative paths resolve against the project,
+    /// **not** the process working directory; see
+    /// [`crate::forge_db_path::resolve_forge_db_path`] for the precedence and
+    /// for why the old CWD-relative default silently lost data.
+    #[serde(default)]
+    pub db_path: Option<String>,
 }
 
 impl AppConfig {
@@ -160,6 +178,10 @@ pub struct ServerConfig {
     pub shutdown_timeout_ms: u64,
     #[serde(default)]
     pub webtransport: WebTransportConfig,
+    /// In-process HTTPS. Empty means plain HTTP, which is what every
+    /// deployment did before this existed. See [`crate::tls`].
+    #[serde(default)]
+    pub tls: crate::tls::TlsSettings,
 }
 
 impl Default for ServerConfig {
@@ -170,6 +192,7 @@ impl Default for ServerConfig {
             request_timeout_ms: default_request_timeout_ms(),
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
             webtransport: WebTransportConfig::default(),
+            tls: crate::tls::TlsSettings::default(),
         }
     }
 }
@@ -498,6 +521,7 @@ mod tests {
                     auth: None,
                 },
             ],
+            forge: Default::default(),
         };
 
         let err = config.validate().unwrap_err();
@@ -522,6 +546,7 @@ mod tests {
                 },
             ],
             routes: Vec::new(),
+            forge: Default::default(),
         };
 
         let err = config.validate().unwrap_err();

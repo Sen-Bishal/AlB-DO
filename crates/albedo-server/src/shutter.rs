@@ -38,7 +38,121 @@ use std::sync::Arc;
 /// Addresses whose `X-Forwarded-For` we believe.
 #[derive(Debug, Clone, Default)]
 pub struct TrustedProxies {
-    entries: Vec<IpAddr>,
+    entries: Vec<TrustedRange>,
+}
+
+/// One trusted hop: a single address, or a network in CIDR form.
+///
+/// A bare address is simply a full-length prefix, so there is one comparison
+/// path rather than two that could disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedRange {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl TrustedRange {
+    /// The full-length prefix for one exact address.
+    #[must_use]
+    pub const fn exact(addr: IpAddr) -> Self {
+        let prefix = if addr.is_ipv4() { 32 } else { 128 };
+        Self {
+            network: addr,
+            prefix,
+        }
+    }
+
+    /// Parse `10.0.0.0/8`, `2001:db8::/32`, or a bare `192.168.1.1`.
+    fn parse(text: &str) -> Result<Self, String> {
+        let Some((addr_text, prefix_text)) = text.split_once('/') else {
+            return text
+                .parse::<IpAddr>()
+                .map(Self::exact)
+                .map_err(|_| String::new());
+        };
+
+        let network: IpAddr = addr_text.trim().parse().map_err(|_| String::new())?;
+        let max = if network.is_ipv4() { 32 } else { 128 };
+        let prefix: u8 = prefix_text.trim().parse().map_err(|_| String::new())?;
+        if prefix > max {
+            return Err(format!(
+                "a /{prefix} prefix, but an IPv{} address has only {max} bits",
+                if network.is_ipv4() { 4 } else { 6 }
+            ));
+        }
+        Ok(Self { network, prefix })
+    }
+
+    /// Does `candidate` fall inside this network?
+    fn contains(self, candidate: IpAddr) -> bool {
+        match (self.network, candidate) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                prefix_matches(&net.octets(), &ip.octets(), self.prefix)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                prefix_matches(&net.octets(), &ip.octets(), self.prefix)
+            }
+            // 🪤 A v4 peer reaching a **dual-stack** listener is presented as
+            // `::ffff:a.b.c.d`. Comparing that against a v4 entry byte-wise
+            // never matches, so a correct `ALBEDO_TRUSTED_PROXIES=10.0.0.1`
+            // would silently trust nothing — no error, and the only symptom is
+            // everyone sharing one bucket under load. Unmap first.
+            (IpAddr::V4(_), IpAddr::V6(ip)) => ip
+                .to_ipv4_mapped()
+                .is_some_and(|unmapped| self.contains(IpAddr::V4(unmapped))),
+            (IpAddr::V6(_), IpAddr::V4(_)) => false,
+        }
+    }
+}
+
+/// Compare the leading `prefix` bits of two equal-length byte arrays.
+///
+/// Bits, not bytes: `/12` has to split 172.16 from 172.32, and a byte-wise
+/// comparison would either trust all of 172.0.0.0/8 or none of it.
+fn prefix_matches(network: &[u8], candidate: &[u8], prefix: u8) -> bool {
+    let whole_bytes = usize::from(prefix / 8);
+    let leftover_bits = prefix % 8;
+
+    if network.get(..whole_bytes) != candidate.get(..whole_bytes) {
+        return false;
+    }
+    if leftover_bits == 0 {
+        return true;
+    }
+    let mask = 0xFFu8 << (8 - leftover_bits);
+    match (network.get(whole_bytes), candidate.get(whole_bytes)) {
+        (Some(left), Some(right)) => (left & mask) == (right & mask),
+        _ => true,
+    }
+}
+
+/// One `X-Forwarded-For` entry, which may carry a port or be bracketed IPv6.
+///
+/// 🪤 A bare `parse::<IpAddr>()` drops `198.51.100.7:51234` — a form several
+/// balancers emit. A dropped entry does not fail loudly; it shifts the
+/// right-to-left walk by one hop, so the bucket is charged to whatever sits
+/// further left, or to the proxy itself.
+fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
+    if entry.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = entry.parse::<IpAddr>() {
+        return Some(addr);
+    }
+    // `[2001:db8::1]:443`
+    if let Some(rest) = entry.strip_prefix('[') {
+        if let Some((inner, _)) = rest.split_once(']') {
+            return inner.parse::<IpAddr>().ok();
+        }
+    }
+    // `198.51.100.7:51234`. Only meaningful for v4 — a bare v6 address is full
+    // of colons of its own and was handled by the direct parse above.
+    if let Some((host, _)) = entry.rsplit_once(':') {
+        if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+            return Some(IpAddr::V4(addr));
+        }
+    }
+    None
 }
 
 impl TrustedProxies {
@@ -54,11 +168,19 @@ impl TrustedProxies {
     /// Trust these addresses to have appended an honest `X-Forwarded-For`.
     #[must_use]
     pub fn new(entries: Vec<IpAddr>) -> Self {
+        Self {
+            entries: entries.into_iter().map(TrustedRange::exact).collect(),
+        }
+    }
+
+    /// Trust these networks. [`Self::new`] is this with full-length prefixes.
+    #[must_use]
+    pub fn from_ranges(entries: Vec<TrustedRange>) -> Self {
         Self { entries }
     }
 
     fn trusts(&self, addr: IpAddr) -> bool {
-        self.entries.contains(&addr)
+        self.entries.iter().any(|range| range.contains(addr))
     }
 
     /// How many addresses are trusted.
@@ -95,7 +217,7 @@ impl TrustedProxies {
         // The first entry that is not itself a trusted hop is the real client.
         forwarded
             .rsplit(',')
-            .filter_map(|entry| entry.trim().parse::<IpAddr>().ok())
+            .filter_map(|entry| parse_forwarded_entry(entry.trim()))
             .find(|addr| !self.trusts(*addr))
             .unwrap_or(peer)
     }
@@ -231,17 +353,26 @@ fn parse_trusted_proxies(raw: &str) -> Result<TrustedProxies, String> {
         if field.is_empty() {
             continue;
         }
-        let addr: IpAddr = field.parse().map_err(|_| {
+        let range = TrustedRange::parse(field).map_err(|detail| {
+            // An empty `detail` means "did not parse at all"; a non-empty one
+            // names the specific thing that was wrong, which is worth saying
+            // because `/99` is a plausible typo whose silent clamp would trust
+            // a far wider network than the operator wrote.
+            let because = if detail.is_empty() {
+                "which is not an IP address or CIDR range".to_string()
+            } else {
+                format!("which has {detail}")
+            };
             format!(
-                "{TRUSTED_PROXIES_ENV} contains '{field}', which is not an IP address. It takes a \
-                 comma-separated list of the addresses of the load balancers in front of this \
-                 process — the ones whose X-Forwarded-For may be believed. Leave it unset when \
-                 nothing is in front."
+                "{TRUSTED_PROXIES_ENV} contains '{field}', {because}. It takes a comma-separated \
+                 list of the load balancers in front of this process — addresses or CIDR ranges \
+                 such as `10.0.0.0/8` — the ones whose X-Forwarded-For may be believed. Leave it \
+                 unset when nothing is in front."
             )
         })?;
-        entries.push(addr);
+        entries.push(range);
     }
-    Ok(TrustedProxies::new(entries))
+    Ok(TrustedProxies::from_ranges(entries))
 }
 
 tokio::task_local! {
@@ -521,6 +652,86 @@ mod tests {
         let parsed = parse_trusted_proxies(" 10.0.0.1 , 10.0.0.2 ,").unwrap();
         assert_eq!(parsed.len(), 2, "whitespace and a trailing comma are fine");
         assert!(parse_trusted_proxies("").unwrap().is_empty());
+    }
+
+    /// 🪤 A balancer in a container network does not have a *fixed* address —
+    /// it has one out of a subnet. Without a range to name, an operator would
+    /// have to enumerate every address the proxy might get, which nobody can
+    /// do, so they configure nothing and every visitor shares one bucket. The
+    /// feature is unusable on Docker/k8s without this.
+    #[test]
+    fn a_proxy_range_in_cidr_form_is_trusted() {
+        let proxies = parse_trusted_proxies("10.0.0.0/8").expect("a CIDR range is a proxy list");
+        let balancer: IpAddr = "10.42.7.3".parse().unwrap();
+        assert_eq!(
+            proxies.client_addr(balancer, &headers_with_xff("198.51.100.7")),
+            "198.51.100.7".parse::<IpAddr>().unwrap(),
+            "an address inside the trusted range must be believed"
+        );
+
+        let outsider: IpAddr = "11.0.0.1".parse().unwrap();
+        assert_eq!(
+            proxies.client_addr(outsider, &headers_with_xff("198.51.100.7")),
+            outsider,
+            "an address outside the range must not be"
+        );
+    }
+
+    /// 🪤 A v4 peer reaching a dual-stack listener is presented as
+    /// `::ffff:10.0.0.1`. An exact-match list holding `10.0.0.1` does not
+    /// contain that, so the balancer is **silently not trusted** and the whole
+    /// feature does nothing — with no error anywhere, on a correct config.
+    #[test]
+    fn a_v4_peer_on_a_dual_stack_listener_matches_its_v4_entry() {
+        let proxies = parse_trusted_proxies("10.0.0.1").unwrap();
+        let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        assert_eq!(
+            proxies.client_addr(mapped, &headers_with_xff("198.51.100.7")),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// 🪤 Some balancers append `addr:port`. That entry fails a bare `IpAddr`
+    /// parse and is dropped, so the right-to-left walk steps over the real
+    /// client and charges whatever sits further left — or falls back to the
+    /// proxy, putting everyone in one bucket again.
+    #[test]
+    fn a_forwarded_entry_carrying_a_port_is_understood() {
+        let proxies = parse_trusted_proxies("10.0.0.0/8").unwrap();
+        let balancer: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            proxies.client_addr(balancer, &headers_with_xff("198.51.100.7:51234")),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            proxies.client_addr(balancer, &headers_with_xff("[2001:db8::5]:443")),
+            "2001:db8::5".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// A prefix that does not land on a byte boundary must mask **bits**.
+    /// `/12` covers 172.16 through 172.31 and nothing either side.
+    #[test]
+    fn a_prefix_inside_a_byte_masks_bits_not_bytes() {
+        let proxies = parse_trusted_proxies("172.16.0.0/12").unwrap();
+        let inside: IpAddr = "172.31.255.254".parse().unwrap();
+        let outside: IpAddr = "172.32.0.1".parse().unwrap();
+        assert_eq!(
+            proxies.client_addr(inside, &headers_with_xff("198.51.100.7")),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            proxies.client_addr(outside, &headers_with_xff("198.51.100.7")),
+            outside
+        );
+    }
+
+    /// A prefix wider than the address has bits is a typo that would trust
+    /// far more than intended. Name it rather than clamping it.
+    #[test]
+    fn an_impossible_prefix_length_is_refused_by_name() {
+        let err = parse_trusted_proxies("10.0.0.0/99").unwrap_err();
+        assert!(err.contains("/99"), "{err}");
     }
 
     /// A request with no peer address must still be rationed. That is the

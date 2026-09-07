@@ -148,6 +148,16 @@ fn install_tracing() {
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
+    // 🔑 **A shipped binary is not a CLI.** If this executable carries an
+    // appended project, it exists to serve that project and nothing else — the
+    // person running it copied one file to a box, and `init`/`build`/`ship`
+    // are meaningless there. Checked before anything else so no other command
+    // can shadow it, and before the first-run greeting so a server does not
+    // print a welcome banner.
+    if let Some(shipped) = shipped_project()? {
+        return run_shipped_app(shipped, &args[1..]);
+    }
+
     // First-run greeting — one-time welcome on a fresh install, then a no-op
     // (single Path::exists check). It never dispatches a command itself, so
     // whatever the user typed still reaches the match below.
@@ -269,6 +279,8 @@ enum ShipTarget {
     Docker,
     Fly,
     Static,
+    /// One file: this runtime with the project appended to it.
+    Binary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +294,10 @@ struct ServeOptions {
     dir: PathBuf,
     host: String,
     port: u16,
+    /// TLS, as flags. Seeded from the environment so a container that sets
+    /// `ALBEDO_TLS_CERT` needs no flags, and overwritten by anything typed —
+    /// the flag is the documented surface, the variable is the fallback.
+    tls: albedo_server::tls::TlsSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -809,7 +825,9 @@ fn build_manifest_for_budget(contract: &ResolvedDevContract) -> Result<RenderMan
         ));
     }
     let scanner = ProjectScanner::new();
-    let compiler = scanner.build_compiler(components);
+    let compiler = scanner
+        .build_compiler(components)
+        .with_project_root(contract.project_dir.clone());
     compiler
         .optimize_manifest_v2()
         .map_err(|err| format!("failed to optimize manifest: {err}"))
@@ -1057,6 +1075,73 @@ fn merge_budget_reports(primary: &BudgetReport, secondary: Option<&BudgetReport>
     }
 }
 
+/// The project this executable carries, if it carries one.
+///
+/// `Ok(None)` is the ordinary `albedo` CLI and by far the common case. An
+/// error means a payload is present but damaged, which must be said rather
+/// than degraded into "no project here" — see `bundle_payload::read_index`.
+fn shipped_project() -> Result<Option<(PathBuf, albedo_server::bundle_payload::PayloadIndex)>, String>
+{
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        // Not being able to find our own path is not a reason to refuse to run
+        // as a CLI; it only means we cannot be a shipped app.
+        Err(_) => return Ok(None),
+    };
+    let mut file = match std::fs::File::open(&exe) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    let Some(index) = albedo_server::bundle_payload::read_index(&mut file)? else {
+        return Ok(None);
+    };
+    Ok(Some((exe, index)))
+}
+
+/// Serve the project appended to this executable.
+///
+/// Unpacks beside the binary on first run, then delegates to the ordinary
+/// serve path — the same code every other deployment uses, so a shipped app
+/// cannot drift into being a second, less-tested server.
+fn run_shipped_app(
+    (exe, index): (PathBuf, albedo_server::bundle_payload::PayloadIndex),
+    user_args: &[String],
+) -> Result<(), String> {
+    let mut file = std::fs::File::open(&exe)
+        .map_err(|err| format!("failed to open this executable to read its payload: {err}"))?;
+    let project =
+        albedo_server::bundle_payload::prepare_unpacked_project(&mut file, &index, &exe)?;
+
+    // 🔑 **The database belongs beside the executable, not inside the unpacked
+    // project.** The unpack directory is keyed by build id, so shipping a new
+    // build makes a new directory — a database inside it would be silently
+    // left behind with every deploy, which is data loss that looks like a
+    // successful release. Only a default: an operator who set the variable, or
+    // mounted a volume, has already said where it goes.
+    if std::env::var(albedo_server::forge_db_path::FORGE_DB_ENV).is_err() {
+        let beside = exe
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(albedo_server::forge_db_path::DEFAULT_FORGE_DB_FILENAME);
+        std::env::set_var(
+            albedo_server::forge_db_path::FORGE_DB_ENV,
+            beside.as_os_str(),
+        );
+    }
+
+    // The positional project directory is ours to decide; everything else the
+    // operator typed (`--host`, `--port`) still applies.
+    let mut forwarded: Vec<String> = vec![project.display().to_string()];
+    forwarded.extend(
+        user_args
+            .iter()
+            .filter(|arg| !matches!(arg.as_str(), "serve" | "run"))
+            .cloned(),
+    );
+
+    run_serve_command(&forwarded)
+}
+
 fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
     if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_ship_help();
@@ -1080,6 +1165,7 @@ fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
         ShipTarget::Vercel => configure_ship_vercel(&contract),
         ShipTarget::Docker => configure_ship_docker(&contract),
         ShipTarget::Fly => configure_ship_fly(&contract),
+        ShipTarget::Binary => configure_ship_binary(&contract),
         ShipTarget::Static => {
             print_section("static");
             print_ok("static export ready");
@@ -1090,6 +1176,119 @@ fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// `albedo ship --target binary` — write one file that is runtime plus app.
+///
+/// The output is this executable, byte for byte, with the project appended.
+/// It needs no Rust toolchain on the machine that produces it and no source
+/// tree on the machine that runs it: copy the file, run it, the site is up.
+fn configure_ship_binary(contract: &ResolvedDevContract) -> Result<(), String> {
+    use albedo_server::bundle_payload;
+
+    print_section("binary");
+
+    let exe = std::env::current_exe()
+        .map_err(|err| format!("failed to locate the albedo runtime: {err}"))?;
+
+    // The build ran a moment ago in `run_ship_command`, so the manifest is on
+    // disk and current. Its build id names the payload, which is what lets the
+    // runtime tell one shipped build from another.
+    let manifest_path = contract
+        .project_dir
+        .join(".albedo")
+        .join("dist")
+        .join("render-manifest.v2.json");
+    let build_id = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("build_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            format!(
+                "no build id in '{}' — run `albedo build` first",
+                manifest_path.display()
+            )
+        })?;
+
+    let files = bundle_payload::collect_project_files(&contract.project_dir)?;
+    if files.is_empty() {
+        return Err(format!(
+            "nothing to ship from '{}'",
+            contract.project_dir.display()
+        ));
+    }
+
+    let name = contract
+        .project_dir
+        .file_name()
+        .map_or_else(|| "app".to_string(), |name| name.to_string_lossy().to_string());
+    let extension = if cfg!(windows) { ".exe" } else { "" };
+    let output = contract
+        .project_dir
+        .join(format!("{name}.albedo-bin{extension}"));
+
+    // Written to a temporary sibling and renamed, so an interrupted ship never
+    // leaves a half-written file that looks runnable.
+    let staging = output.with_extension("partial");
+    {
+        let mut host = std::fs::File::open(&exe)
+            .map_err(|err| format!("failed to read the albedo runtime: {err}"))?;
+        let mut out = std::fs::File::create(&staging)
+            .map_err(|err| format!("failed to create '{}': {err}", staging.display()))?;
+        bundle_payload::write_payload(&mut out, &mut host, &build_id, &files)?;
+    }
+    std::fs::rename(&staging, &output)
+        .map_err(|err| format!("failed to finish '{}': {err}", output.display()))?;
+
+    // On Unix the copy has to be executable; `create` gives 0644.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&output)
+            .map_err(|err| format!("failed to stat '{}': {err}", output.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&output, perms)
+            .map_err(|err| format!("failed to make '{}' executable: {err}", output.display()))?;
+    }
+
+    let runtime_bytes = std::fs::metadata(&exe).map(|meta| meta.len()).unwrap_or(0);
+    let total = std::fs::metadata(&output)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+
+    print_ok("one file, runtime and app");
+    print_kv("output", output.display());
+    print_kv("files", files.len());
+    print_kv(
+        "size",
+        format!(
+            "{:.1} MB ({:.1} MB runtime + {:.1} MB app)",
+            total as f64 / 1_048_576.0,
+            runtime_bytes as f64 / 1_048_576.0,
+            total.saturating_sub(runtime_bytes) as f64 / 1_048_576.0
+        ),
+    );
+    print_kv("build", build_id.as_str());
+    println!();
+    println!(
+        "    {}",
+        style("copy it to any box and run it — no Node, no source tree, no node_modules.", "2")
+    );
+    println!(
+        "    {}",
+        style(
+            "it unpacks beside itself on first run; forge.db is created next to the binary.",
+            "2"
+        )
+    );
+
+    Ok(())
 }
 
 fn parse_ship_args(raw_args: &[String]) -> Result<ShipOptions, String> {
@@ -1128,8 +1327,9 @@ fn parse_ship_target(raw: &str) -> Result<ShipTarget, String> {
         "2" | "docker" => Ok(ShipTarget::Docker),
         "3" | "fly" | "flyio" | "fly.io" => Ok(ShipTarget::Fly),
         "4" | "static" => Ok(ShipTarget::Static),
+        "5" | "binary" | "bin" | "single" => Ok(ShipTarget::Binary),
         other => Err(format!(
-            "unknown ship target '{other}'. Supported targets: docker, fly, static."
+            "unknown ship target '{other}'. Supported targets: binary, docker, fly, static."
         )),
     }
 }
@@ -1137,9 +1337,14 @@ fn parse_ship_target(raw: &str) -> Result<ShipTarget, String> {
 fn prompt_ship_target() -> Result<ShipTarget, String> {
     print_section("pick a target");
     println!(
+        "    {} binary     {}",
+        style_256("5", ACCENT_SOFT, true),
+        style("one file: this runtime + your app (recommended)", "2")
+    );
+    println!(
         "    {} docker     {}",
         style_256("2", ACCENT_SOFT, true),
-        style("multi-stage binary image (recommended)", "2")
+        style("multi-stage binary image", "2")
     );
     println!(
         "    {} fly        {}",
@@ -1181,7 +1386,124 @@ fn configure_ship_vercel(_contract: &ResolvedDevContract) -> Result<(), String> 
 /// app via `albedo build`; stage 2 ships the binary + `.albedo/dist`
 /// on a slim Debian runtime. Port is configurable via
 /// `ALBEDO_SERVER_PORT` at run time; defaults to 3000.
+/// The linux/amd64 `albedo` the image needs, by convention, in the project.
+const LINUX_RUNTIME_FILENAME: &str = "albedo-linux-amd64";
+
+/// Does this file start with the ELF magic?
+///
+/// Cheaper and more honest than trusting a filename: the whole failure this
+/// guards against is a Windows `albedo.exe` sitting where a Linux one is
+/// expected, which a name check would happily accept.
+fn is_linux_elf(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && magic == [0x7f, b'E', b'L', b'F']
+}
+
+/// Find the linux/amd64 runtime the image will carry, or say why we cannot.
+///
+/// 🔴 **Found 2026-09-06 by running `docker build` for the first time.** The
+/// builder stage ran `cargo build --release --bin albedo` against the build
+/// context — but the context is **the user's app**, which has no `Cargo.toml`
+/// and no Rust source. It failed in 0.17 s with
+/// `could not find Cargo.toml in /workspace`. That line was in the template
+/// before item 13.4 touched it too, so **`ship --target docker` had never
+/// produced a working image in any version.** It read plausibly because it was
+/// written as if the context were the ALBEDO repo.
+///
+/// 🔑 **The image does not need a Rust toolchain — it needs one Linux
+/// executable.** `ship --target binary` appends the project to the *running*
+/// executable, so given a linux/amd64 `albedo` inside the image, the builder
+/// stage is `debian-slim` and does no compiling at all. That is what item 13.4
+/// actually wanted; the missing piece was never the template, it was the
+/// binary.
+///
+/// 🪤 **Refusing here is deliberate, and follows `--target vercel`.** Writing a
+/// Dockerfile that cannot build is worse than writing none: the user finds out
+/// several minutes into `docker build`, after an npm install, with a Rust error
+/// that points at nothing they own.
+fn resolve_linux_runtime(project_dir: &Path) -> Result<PathBuf, String> {
+    let supplied = project_dir.join(LINUX_RUNTIME_FILENAME);
+    if supplied.exists() {
+        return if is_linux_elf(&supplied) {
+            Ok(supplied)
+        } else {
+            Err(format!(
+                "'{}' is not a linux/amd64 executable (no ELF header). The image runs Linux, \
+                 so a Windows or macOS `albedo` cannot be the runtime inside it.",
+                supplied.display()
+            ))
+        };
+    }
+
+    // Shipping *from* Linux: the running executable is already the right thing.
+    let exe = std::env::current_exe()
+        .map_err(|err| format!("failed to locate the albedo runtime: {err}"))?;
+    if is_linux_elf(&exe) {
+        std::fs::copy(&exe, &supplied).map_err(|err| {
+            format!("failed to stage '{}': {err}", supplied.display())
+        })?;
+        return Ok(supplied);
+    }
+
+    Err(format!(
+        "`ship --target docker` needs a linux/amd64 `albedo` to put inside the image, and this \
+         one is not Linux.\n\n    \
+         `ship --target binary` appends your app to the *running* executable, so a Windows or \
+         macOS build cannot produce a Linux container runtime — and the image itself does not \
+         build one, because your project has no Rust source in it.\n\n    \
+         Put a linux/amd64 `albedo` at `{}` and run this again. Any of these produce one:\n      \
+         · in the albedo repo: `docker build -f Dockerfile.linux --target export \
+--output type=local,dest=./dist-linux .`\n      \
+         · `cargo build --release -p albedo-server --bin albedo` on a Linux box or in WSL\n      \
+         · a published linux/amd64 release binary, once one exists\n\n    \
+         Until then `ship --target binary` on a Linux host is the working path.",
+        supplied.display()
+    ))
+}
+
+/// Warn when the staged Linux runtime is a different albedo than this one.
+///
+/// 🔴 **Walked into this within minutes of building the mechanism.** The image
+/// embeds a *pinned* runtime, so a change to albedo is invisible to
+/// `docker build` until `albedo-linux-amd64` is re-staged — the container goes
+/// on running old code, and the symptom is whatever that old code did. Here it
+/// was a boot refusal that had already been fixed.
+///
+/// 🪤 **Checked by version string, not by mtime.** `cp` does not preserve mtime,
+/// so a freshly copied stale runtime looks new — the heuristic would be wrong in
+/// exactly the situation it exists for. Searching for this build's version is
+/// exact: a runtime of another version cannot contain the string.
+///
+/// A warning, not a refusal: during development of albedo itself the version is
+/// unchanged while the code moves, so this cannot see every drift, and a check
+/// that is silent half the time must not be allowed to block a build.
+fn warn_if_staged_runtime_is_a_different_version(runtime: &Path) {
+    let Ok(bytes) = std::fs::read(runtime) else {
+        return;
+    };
+    let version = env!("CARGO_PKG_VERSION").as_bytes();
+    let matches = bytes
+        .windows(version.len())
+        .any(|window| window == version);
+    if !matches {
+        print_warn(format!(
+            "'{}' does not look like albedo {} — the image would run a different runtime than \
+             this one. Re-stage it (see Dockerfile.linux in the albedo repo) unless you meant to \
+             pin an older build.",
+            runtime.display(),
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+}
+
 fn configure_ship_docker(contract: &ResolvedDevContract) -> Result<(), String> {
+    // Refuse BEFORE writing anything. A Dockerfile on disk that cannot build is
+    // a worse outcome than no Dockerfile.
+    let runtime = resolve_linux_runtime(&contract.project_dir)?;
+    warn_if_staged_runtime_is_a_different_version(&runtime);
     let dockerfile = build_docker_template();
     let dockerignore = build_dockerignore_template();
     let dockerfile_path = contract.project_dir.join("Dockerfile");
@@ -1194,13 +1516,46 @@ fn configure_ship_docker(contract: &ResolvedDevContract) -> Result<(), String> {
     print_ok("Dockerfile + .dockerignore written");
     print_kv("dockerfile", dockerfile_path.display());
     print_kv("ignore", dockerignore_path.display());
+    print_kv("runtime", runtime.display());
     print_kv(
         "build",
         style_256("docker build -t albedo-app .", ACCENT_SOFT, true),
     );
+    // 🔑 The printed command must WORK. It did not: for any app with auth —
+    // which the scaffold has — `docker run -p 3000:3000 albedo-app` exits 1 at
+    // boot, because a container binds 0.0.0.0 and that is what the plain-HTTP
+    // auth refusal stops. Found 2026-09-06 by running the line we print.
     print_kv(
         "run",
-        style_256("docker run -p 3000:3000 albedo-app", ACCENT_SOFT, true),
+        style_256(
+            "docker run -p 3000:3000 -v albedo-data:/data \\\n           \
+             -e ALBEDO_PUBLIC_ORIGIN=http://localhost:3000 albedo-app",
+            ACCENT_SOFT,
+            true,
+        ),
+    );
+    // 🔴 Found 2026-09-06 by running the printed command: for any app with auth
+    // configured — which the scaffold has — that `run` line **refuses to boot**.
+    // A container must bind 0.0.0.0, and binding 0.0.0.0 over plain HTTP with
+    // auth configured is exactly what `tls::refuse_plain_http_auth` exists to
+    // stop, because `__Host-` cookies are never stored over HTTP and signing in
+    // would silently do nothing. The refusal is correct; printing a command
+    // that trips it is not.
+    println!();
+    println!(
+        "    {}",
+        style(
+            "in production, say how users really reach you — an app with auth needs it:",
+            "2"
+        )
+    );
+    println!(
+        "      {}",
+        style_256(
+            "-e ALBEDO_PUBLIC_ORIGIN=https://app.example.com",
+            ACCENT_SOFT,
+            true
+        )
     );
     Ok(())
 }
@@ -1229,8 +1584,10 @@ fn configure_ship_fly(contract: &ResolvedDevContract) -> Result<(), String> {
 fn build_docker_template() -> String {
     r#"# Emitted by `albedo ship --target docker`.
 #
-# Stage 1 installs npm dependencies, stage 2 compiles and builds the app,
-# stage 3 RUNS THE APP.
+# Stage 1 installs npm dependencies, stage 2 builds THE ONE FILE, and the
+# runtime stage is a slim base with that one file in it. Nothing here compiles
+# Rust: `albedo-linux-amd64`, written beside this file by
+# `albedo ship --target docker`, is the runtime the builder uses.
 #
 # --- corrected 2026-09-02 -----------------------------------------------
 # This template used to copy only `.albedo/dist` + `public` and run
@@ -1244,13 +1601,27 @@ fn build_docker_template() -> String {
 # was written for a static-site model and never revisited when the framework
 # grew a backend and npm support.
 #
-# What `albedo serve` needs at runtime, established by running it rather than
-# by reading the code:
+# --- corrected 2026-09-06 (item 13.4) ------------------------------------
+# The fix above left this target contradicting `ship --target binary`. That
+# target's whole claim is "one file -- copy it to any box and run it"; this
+# one still assembled a runtime stage by hand out of four COPY lines
+# (`src/`, `albedo.config.*`, `public/`, `npm-server-bundles.json`), which is
+# the same list `bundle_payload::should_ship` already computes. Two
+# definitions of "what a deployment consists of", drifting independently --
+# and the Dockerfile's copy had already drifted once, which is why the block
+# above exists.
 #
-#   src/  +  albedo.config.*  +  node_modules/  +  public/
+# There is now ONE definition. The builder runs `ship --target binary`, and
+# the runtime stage copies its output. Anything `should_ship` starts or stops
+# including follows this image automatically.
 #
-# `.albedo/dist` is deliberately NOT copied: `albedo serve` builds before it
-# serves, so a copied dist would be rebuilt and discarded.
+# 🪤 The builder stage cannot be removed. `ship --target binary` appends the
+# project to *the running executable*, so the file it produces is for the
+# host that produced it -- a Windows or macOS dev box cannot emit a Linux
+# ELF this way. Compiling inside the image is what makes the output
+# linux/amd64 regardless of where `albedo ship` was typed. Use
+# `--platform=$BUILDPLATFORM` and a cross toolchain only if you need the
+# builder to run natively on an arm64 machine.
 # ------------------------------------------------------------------------
 
 FROM node:22-bookworm AS deps
@@ -1263,54 +1634,106 @@ RUN if [ -f package-lock.json ]; then npm ci; \
     elif [ -f package.json ]; then npm install; \
     else mkdir -p node_modules; fi
 
-FROM rust:1-bookworm AS builder
+# --- corrected 2026-09-06, second pass (13.4c) ---------------------------
+# This stage was `FROM rust:1-bookworm` and ran `cargo build --release --bin
+# albedo`. It could never have worked: the build context is YOUR APP, which has
+# no `Cargo.toml` and no Rust source, so it failed in 0.17 s with
+# `could not find Cargo.toml in /workspace`. The line predates the 13.4 rewrite,
+# so this target had never built an image in any version -- it was written as
+# though the context were the ALBEDO repo.
+#
+# 🔑 The image never needed a Rust toolchain. It needs ONE Linux executable.
+# `albedo ship --target binary` appends your project to the *running* albedo, so
+# with a linux/amd64 albedo in the image this stage is a slim base that compiles
+# nothing. `albedo ship --target docker` puts that binary next to this file.
+# ------------------------------------------------------------------------
+FROM debian:bookworm-slim AS builder
 WORKDIR /workspace
+COPY albedo-linux-amd64 /usr/local/bin/albedo
+RUN chmod +x /usr/local/bin/albedo
 COPY . .
 COPY --from=deps /workspace/node_modules ./node_modules
-RUN if [ ! -f ./target/release/albedo ]; then \
-      cargo build --release --bin albedo; \
-    fi
-# Fail HERE, not at container start. `albedo build` refuses the defects that
-# would otherwise serve HTTP 200 with something missing -- an unresolvable
-# import, a topic nothing writes, a route with no default export.
-RUN ./target/release/albedo build .
+# Fail HERE, not at container start. `ship` runs the same production build
+# `albedo build` does, so preflight still refuses the defects that would
+# otherwise serve HTTP 200 with something missing -- an unresolvable import,
+# a topic nothing writes, a route with no component to render.
+#
+# The output is named for the project directory, so it is moved to a fixed
+# path rather than guessed at in the COPY below.
+RUN albedo ship --target binary \
+    && mkdir -p /out \
+    && mv /workspace/*.albedo-bin /out/albedo-app \
+    && chmod +x /out/albedo-app
 
 FROM debian:bookworm-slim AS runtime
+# ca-certificates for outbound TLS (APERTURE fetches, ACME); wget for the
+# healthcheck below. Nothing else -- no Node, no source tree, no toolchain.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=builder /workspace/target/release/albedo /usr/local/bin/albedo
-COPY --from=builder /workspace/src /app/src
-COPY --from=builder /workspace/albedo.config.* /app/
-COPY --from=builder /workspace/public /app/public
-# The server npm bundles the build lowered. This is what `node_modules` was
-# being shipped for: 1.3 MB of ready-to-run artifacts instead of 58 MB / 6 526
-# files of package tree, for a five-dependency app. Boot loads these and never
-# reads `node_modules`; if they are missing or do not match `src/`, it refuses
-# to start rather than serving a component as nothing.
-COPY --from=builder /workspace/.albedo/dist/npm-server-bundles.json /app/.albedo/dist/
+COPY --from=builder /out/albedo-app /app/albedo-app
 
 ENV ALBEDO_SERVER_HOST=0.0.0.0
 ENV ALBEDO_SERVER_PORT=3000
 EXPOSE 3000
 
-# NOTE -- FORGE's database is `forge.db` in the working directory, and that
-# path is not configurable today. A container without a mount for it starts
-# empty on every restart, which for an app with real data is data loss rather
-# than a fresh start. Persist it with a bind mount:
+# FORGE's database, named explicitly rather than left to the default.
 #
-#   docker run -v "$PWD/forge.db:/app/forge.db" <image>
+# 🪤 A shipped binary defaults its database to a path BESIDE ITSELF, and
+# unpacks its project into a directory keyed by build id. Left implicit, the
+# database would land in `/app` next to a per-build unpack directory, inside
+# the container's writable layer -- so `docker run` twice is two empty
+# databases, which for an app with real data is data loss that looks like a
+# successful release. `VOLUME` makes docker create a real volume even when
+# the operator forgets `-v`; name it to keep it across `docker rm`:
 #
-# Making the path configurable is the real fix and is not one this template
-# can make on its own.
+#   docker run -v albedo-data:/data -p 3000:3000 <image>
+ENV ALBEDO_FORGE_DB=/data/forge.db
+VOLUME /data
+
+# 🪤 `shutdown_timeout_ms` bounds the drain that `docker stop` starts. Docker
+# sends SIGTERM and then SIGKILLs after its own grace period (10s default),
+# so keep this under `docker stop -t`.
+# 📏 Measured 2026-09-06: `docker stop` returns in 0s with exit code 0 — the
+# process handles SIGTERM and drains, rather than being killed at the 10s mark.
+ENV ALBEDO_SHUTDOWN_TIMEOUT_MS=5000
+
+# 🔴 ALBEDO_PUBLIC_ORIGIN — an app with auth will not boot without it.
+#
+# A container has to bind 0.0.0.0, and binding 0.0.0.0 over plain HTTP with auth
+# configured is refused on purpose: session cookies carry the `__Host-` prefix,
+# browsers will not store those over HTTP, and signing in would silently do
+# nothing forever with no error anywhere.
+#
+# 🔑 Inside a container the bind address cannot answer that question. `-p
+# 127.0.0.1:3000:3000`, an ingress terminating TLS, and a port open to the
+# internet all look identical from in here. So say how users actually reach you:
+#
+#   local testing:   -e ALBEDO_PUBLIC_ORIGIN=http://localhost:3000
+#   production:      -e ALBEDO_PUBLIC_ORIGIN=https://app.example.com
+#
+# Deliberately NOT defaulted in this image. A default would be a lie the moment
+# the image is deployed anywhere real, and it would disarm the one check that
+# catches a login which silently never works.
+#
+# Serving HTTPS from the container itself is the alternative:
+#   -v /certs:/certs -e ALBEDO_TLS_CERT=/certs/fullchain.pem \
+#                    -e ALBEDO_TLS_KEY=/certs/key.pem
+#
+# 🪤 ALBEDO_TRUSTED_PROXIES also satisfies the check, but do not reach for it to
+# silence this. It decides whose `X-Forwarded-For` the rate limiter believes —
+# a security setting, not a checkbox.
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- "http://127.0.0.1:${ALBEDO_SERVER_PORT}/" >/dev/null 2>&1 || exit 1
 
-# The app, not a folder of files. `--dir` here is what shipped the static
-# server; `albedo files <dir>` is the command for that, deliberately.
-CMD ["sh", "-c", "albedo serve --host ${ALBEDO_SERVER_HOST} --port ${ALBEDO_SERVER_PORT}"]
+# 🔑 The shipped binary is NOT a CLI -- it carries a payload, so it serves
+# that payload and ignores subcommands (`src/bin/albedo.rs`, `run_shipped_app`).
+# `--host`/`--port` still apply. Exec form via `sh -c` so the ENV above is
+# expanded, and `exec` so the binary is PID 1 and receives SIGTERM directly
+# rather than through a shell that would not forward it.
+CMD ["sh", "-c", "exec /app/albedo-app --host ${ALBEDO_SERVER_HOST} --port ${ALBEDO_SERVER_PORT}"]
 "#
 
     .to_string()
@@ -1324,6 +1747,17 @@ target/debug
 target/doc
 target/package
 target/tmp
+# A previously shipped binary is the runtime plus a whole copy of the app.
+# Sending it into the build context would upload it and then have the builder
+# overwrite it -- `bundle_payload::should_ship` already excludes both of these
+# from the payload for the same reason.
+*.albedo-bin
+*.albedo-bin.exe
+.albedo-app-*
+# The database and its WAL/SHM sidecars. A shipped WAL is a torn half
+# transaction, and the container mounts its own volume anyway.
+forge.db
+forge.db-*
 **/*.log
 **/.DS_Store
 **/Thumbs.db
@@ -1341,12 +1775,38 @@ fn build_fly_toml_template(app_name: &str) -> String {
 app = "{app_name}"
 primary_region = "iad"
 
+# 🔑 `auto_stop_machines` below means the platform stops this machine on every
+# idle cycle, not just on deploy — so the stop signal is on the hot path, and a
+# machine that dies instantly cuts whatever requests were in flight. Stated
+# explicitly rather than left to the platform default. `kill_timeout` is the
+# outer bound on ALBEDO_SHUTDOWN_TIMEOUT_MS below: Fly SIGKILLs after it, so
+# the drain has to finish first.
+#
+# 🪤 These are TOP-LEVEL keys and must stay above the first `[table]` header —
+# a bare key after `[mounts]` is `mounts.kill_signal`, which Fly does not read.
+kill_signal = "SIGTERM"
+kill_timeout = "10s"
+
 [build]
   dockerfile = "Dockerfile"
 
 [env]
   ALBEDO_SERVER_HOST = "0.0.0.0"
   ALBEDO_SERVER_PORT = "3000"
+  ALBEDO_FORGE_DB = "/data/forge.db"
+  ALBEDO_SHUTDOWN_TIMEOUT_MS = "5000"
+  # 🔑 Unlike a bare container, Fly's topology is KNOWN: `force_https` below
+  # means the edge terminates TLS and every app gets `<app>.fly.dev`. So the
+  # origin browsers use is not a guess here, and an app with auth boots without
+  # the operator having to work it out. Change this when you attach a custom
+  # domain — it is what decides whether the `__Host-` session cookie is stored.
+  ALBEDO_PUBLIC_ORIGIN = "https://{app_name}.fly.dev"
+
+# 🪤 Without this the database lives in the machine's ephemeral filesystem and
+# every deploy starts empty. `fly volumes create albedo_data --size 1` first.
+[mounts]
+  source = "albedo_data"
+  destination = "/data"
 
 [http_service]
   internal_port = 3000
@@ -1408,7 +1868,12 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
                     explicit_dir = true;
                     break;
                 }
-                "--host" | "--port" => {
+                // 🪤 Every value-taking flag must be skipped *with its value*
+                // here. Miss one and `--domain app.example.com` leaves
+                // `app.example.com` looking like a bare positional, which this
+                // walk would read as a directory to serve as static files.
+                "--host" | "--port" | "--tls-cert" | "--tls-key" | "--domain"
+                | "--acme-contact" | "--acme-cache" => {
                     idx += 2; // skip the flag's value
                     continue;
                 }
@@ -1450,7 +1915,7 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     contract.server.host = serve_options.host.clone();
     contract.server.port = serve_options.port;
 
-    boot_and_run_production_server(&contract, Some(tier_report))
+    boot_and_run_production_server(&contract, Some(tier_report), serve_options.tls)
 }
 
 /// Phase P · Stream A — turn a built `ResolvedDevContract` into a
@@ -1460,10 +1925,12 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
 fn boot_and_run_production_server(
     contract: &ResolvedDevContract,
     report: Option<TierReport>,
+    tls: albedo_server::tls::TlsSettings,
 ) -> Result<(), String> {
     use albedo_server::{boot_production_server, ProductionServerOptions};
 
-    let opts = ProductionServerOptions::from_contract(contract);
+    let mut opts = ProductionServerOptions::from_contract(contract);
+    opts.tls = tls;
     let server = boot_production_server(&opts).map_err(|err| {
         // 🔴 The hint used to be unconditional. `albedo serve` builds first, so
         // by the time this runs the build has already succeeded — and every
@@ -1610,6 +2077,7 @@ fn parse_serve_args(raw_args: &[String]) -> Result<ServeOptions, String> {
     let mut port = 3000u16;
     let mut idx = 0usize;
     let mut dir_set = false;
+    let mut tls = albedo_server::tls::TlsSettings::from_env();
 
     while idx < raw_args.len() {
         let arg = &raw_args[idx];
@@ -1644,6 +2112,55 @@ fn parse_serve_args(raw_args: &[String]) -> Result<ServeOptions, String> {
                     return Err("--port must be > 0".to_string());
                 }
             }
+            "--tls-cert" => {
+                idx += 1;
+                tls.cert_path = Some(
+                    raw_args
+                        .get(idx)
+                        .ok_or_else(|| "missing value after --tls-cert".to_string())?
+                        .clone(),
+                );
+            }
+            "--tls-key" => {
+                idx += 1;
+                tls.key_path = Some(
+                    raw_args
+                        .get(idx)
+                        .ok_or_else(|| "missing value after --tls-key".to_string())?
+                        .clone(),
+                );
+            }
+            // Repeatable, and comma-separated, because one certificate
+            // routinely covers an apex and its `www`.
+            "--domain" => {
+                idx += 1;
+                let value = raw_args
+                    .get(idx)
+                    .ok_or_else(|| "missing value after --domain".to_string())?;
+                tls.domains
+                    .extend(albedo_server::tls::split_domains(value));
+            }
+            "--acme-contact" => {
+                idx += 1;
+                tls.acme_contact = Some(
+                    raw_args
+                        .get(idx)
+                        .ok_or_else(|| "missing value after --acme-contact".to_string())?
+                        .clone(),
+                );
+            }
+            "--acme-cache" => {
+                idx += 1;
+                tls.acme_cache = Some(
+                    raw_args
+                        .get(idx)
+                        .ok_or_else(|| "missing value after --acme-cache".to_string())?
+                        .clone(),
+                );
+            }
+            "--acme-staging" => {
+                tls.acme_staging = true;
+            }
             _ if !arg.starts_with('-') && !dir_set => {
                 dir = PathBuf::from(arg);
                 dir_set = true;
@@ -1655,7 +2172,12 @@ fn parse_serve_args(raw_args: &[String]) -> Result<ServeOptions, String> {
         idx += 1;
     }
 
-    Ok(ServeOptions { dir, host, port })
+    Ok(ServeOptions {
+        dir,
+        host,
+        port,
+        tls,
+    })
 }
 
 fn handle_static_connection(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
@@ -2672,7 +3194,11 @@ fn run_prod_build_with_budget(
     let project_root_for_closure = contract.project_dir.clone();
     let build_work = move || {
         let scanner = ProjectScanner::new();
-        let compiler = scanner.build_compiler(components);
+        // Artifacts are written below, so every `module_path` they key on has
+        // to be expressed relative to the project rather than to this machine.
+        let compiler = scanner
+            .build_compiler(components)
+            .with_project_root(contract.project_dir.clone());
         let (manifest, tier_report) = compiler
             .optimize_manifest_v2_with_tier_report()
             .map_err(|err| format!("failed to optimize manifest: {err}"))?;
@@ -2786,7 +3312,12 @@ fn run_prod_build_with_budget(
                     return Err(format!("invalid `auth` block in albedo.config: {err}"));
                 }
 
-                dom_render_compiler::preflight::check(&compiled, &schema, &served)?;
+                dom_render_compiler::preflight::check(
+                    &compiled,
+                    &schema,
+                    &served,
+                    Some(&manifest),
+                )?;
                 // Write the server npm bundles beside the rest of the build
                 // output. They were just built in memory to run the checks
                 // above and were then thrown away, so serving the app required
@@ -3732,7 +4263,7 @@ fn print_ship_help() {
         style("usage", "2"),
         style("albedo ship [dir] [--target <name>] [--no-budget]", "1")
     );
-    print_option("--target <name>", "docker | fly | static");
+    print_option("--target <name>", "binary | docker | fly | static");
     print_option("--config <FILE>", "explicit albedo config");
     print_option("--entry <FILE>", "override entry module");
     print_option("--no-budget", "skip the tier-budget gate");
@@ -3814,6 +4345,12 @@ fn print_serve_help() {
     );
     println!();
     print_option("--host <IP>", "bind host (default: 127.0.0.1)");
+    print_option("--domain <NAME>", "serve HTTPS with an automatic Let's Encrypt certificate");
+    print_option("--acme-contact <EMAIL>", "optional ACME account contact");
+    print_option("--acme-cache <DIR>", "where certificates persist (default: .albedo-acme)");
+    print_option("--acme-staging", "use the Let's Encrypt staging CA while rehearsing");
+    print_option("--tls-cert <FILE>", "serve HTTPS with a certificate you already have");
+    print_option("--tls-key <FILE>", "the PEM key for --tls-cert");
     print_option("--port <PORT>", "bind port (default: 3000)");
     print_option(
         "<dir> | --dir <DIR>",
@@ -4192,7 +4729,7 @@ mod tests {
     #[test]
     fn test_docker_template_is_multi_stage_with_runtime_env() {
         let dockerfile = build_docker_template();
-        assert!(dockerfile.contains("FROM rust:1-bookworm AS builder"));
+        assert!(dockerfile.contains("FROM debian:bookworm-slim AS builder"));
         assert!(dockerfile.contains("FROM debian:bookworm-slim AS runtime"));
         assert!(dockerfile.contains("ALBEDO_SERVER_HOST=0.0.0.0"));
         assert!(dockerfile.contains("ALBEDO_SERVER_PORT=3000"));
@@ -4411,9 +4948,17 @@ mod tests {
     /// no FORGE, no actions, no per-request render and no auth, and carried no
     /// source tree, so project-mode serve could not have run there either.
     ///
-    /// The runtime contents asserted here are the ones verified by running
-    /// `albedo serve` against a directory containing exactly them:
-    /// `src/` + `albedo.config.*` + `node_modules/` + `public/`.
+    /// 🔑 **Item 13.4, 2026-09-06.** This test used to enumerate the four COPY
+    /// lines the runtime stage happened to have — `src/`, `albedo.config.*`,
+    /// `npm-server-bundles.json` — which is precisely the failure its sibling
+    /// `test_docker_template_is_multi_stage_with_runtime_env` documents:
+    /// *asserting the shape a template happens to have rather than the thing it
+    /// has to achieve.* That list was a second, hand-maintained definition of
+    /// "what a deployment consists of", and it had already drifted once.
+    ///
+    /// `bundle_payload::should_ship` is the one definition now. What this test
+    /// asserts is the property that makes that true: the runtime stage receives
+    /// **the shipped artifact**, not a hand-assembled copy of the project.
     #[test]
     fn the_emitted_dockerfile_runs_the_app_and_not_a_files_root() {
         let dockerfile = build_docker_template();
@@ -4422,26 +4967,167 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("CMD "))
             .expect("the template has a CMD");
+        // The original defect, still the most important line in this file.
         assert!(
             !cmd.contains("--dir"),
             "the container is running the static file server: {cmd}"
         );
         assert!(
-            cmd.contains("albedo serve"),
-            "the container must run the app: {cmd}"
+            cmd.contains("/app/albedo-app"),
+            "the container must run the shipped app: {cmd}"
+        );
+        // 🪤 Without `exec`, `sh` is PID 1 and never forwards SIGTERM — which
+        // would defeat the graceful-shutdown handler (13.1) inside a container
+        // and put us straight back to "every deploy cuts live requests".
+        assert!(
+            cmd.contains("exec "),
+            "the app must be PID 1 or it never receives SIGTERM: {cmd}"
         );
 
-        // Everything `albedo serve` needs at runtime, or it cannot boot.
-        for needed in [
-            "/workspace/src /app/src",
-            "/workspace/albedo.config.",
-            "/workspace/.albedo/dist/npm-server-bundles.json",
+        // One definition of a deployment: the builder ships, the runtime copies.
+        assert!(
+            dockerfile.contains("ship --target binary"),
+            "the builder must produce the same artifact `--target binary` does"
+        );
+        assert!(
+            dockerfile.contains("COPY --from=builder /out/albedo-app"),
+            "the runtime stage must receive the shipped artifact"
+        );
+
+        // The drift this closed: any COPY that re-assembles the project by hand
+        // is a second answer to a question `should_ship` already answers.
+        for hand_assembled in [
+            "COPY --from=builder /workspace/src",
+            "COPY --from=builder /workspace/albedo.config.",
+            "COPY --from=builder /workspace/public",
+            "COPY --from=builder /workspace/.albedo",
         ] {
             assert!(
-                dockerfile.contains(needed),
-                "the runtime stage must copy {needed:?}, or `albedo serve` has                  nothing to serve"
+                !dockerfile.contains(hand_assembled),
+                "{hand_assembled:?} re-derives the payload the ship target already \
+                 computes — that is how this template drifted the first time"
             );
         }
+
+        // 🪤 A shipped binary defaults its database beside itself and unpacks
+        // per build id, so an unmounted `/app` means every deploy starts empty.
+        assert!(
+            dockerfile.contains("ALBEDO_FORGE_DB=/data/forge.db")
+                && dockerfile.contains("VOLUME /data"),
+            "the database must be on a volume, not in the container's writable layer"
+        );
+    }
+
+    /// 🪤 The fly target inherits the Dockerfile, so it inherits the stop
+    /// signal — and `auto_stop_machines` puts that signal on the *idle* path,
+    /// not just the deploy path. A machine that dies instantly cuts in-flight
+    /// requests every time it scales to zero.
+    /// 🪤 **Parsed, not string-matched.** `kill_signal` written after the
+    /// `[mounts]` header is `mounts.kill_signal` — valid TOML, silently
+    /// ignored by Fly, and indistinguishable from the correct file by any
+    /// `contains()` assertion. Caught by emitting the file and reading it,
+    /// which is the same method that found every other defect in this target.
+    #[test]
+    fn the_fly_target_states_the_stop_signal_and_persists_the_database() {
+        let raw = build_fly_toml_template("demo-app");
+        let parsed: toml::Value = toml::from_str(&raw).expect("the emitted fly.toml must parse");
+        let table = parsed.as_table().expect("fly.toml is a table");
+
+        assert_eq!(
+            table.get("kill_signal").and_then(toml::Value::as_str),
+            Some("SIGTERM"),
+            "kill_signal must be a TOP-LEVEL key — nested under a table Fly never reads it"
+        );
+        assert!(
+            table.contains_key("kill_timeout"),
+            "kill_timeout must be top-level too, and bounds the drain"
+        );
+
+        let mounts = table
+            .get("mounts")
+            .and_then(toml::Value::as_table)
+            .expect("a machine without a volume loses its database on every deploy");
+        assert_eq!(
+            mounts.get("destination").and_then(toml::Value::as_str),
+            Some("/data")
+        );
+
+        let env = table
+            .get("env")
+            .and_then(toml::Value::as_table)
+            .expect("fly.toml has an [env] table");
+        assert_eq!(
+            env.get("ALBEDO_FORGE_DB").and_then(toml::Value::as_str),
+            Some("/data/forge.db"),
+            "the mount is useless unless FORGE is pointed at it"
+        );
+    }
+
+    /// 🔴 **13.4c — the defect `docker build` found on its first ever run.**
+    ///
+    /// The builder stage was `FROM rust:1-bookworm` running
+    /// `cargo build --release --bin albedo`. The build context is **the user's
+    /// app**, which has no `Cargo.toml`, so it failed in 0.17 s with
+    /// `could not find Cargo.toml in /workspace`. That line predates the 13.4
+    /// rewrite too — **this target had never built an image in any version.**
+    ///
+    /// 🔑 Every previous test here asserted things *about* the template and all
+    /// of them passed, because none of them could run `docker build`. The
+    /// assertion that would have caught it is the crude one below: **the image
+    /// must not try to compile Rust**, because the source is not there.
+    #[test]
+    fn the_image_never_compiles_rust_because_the_source_is_not_in_the_context() {
+        let dockerfile = build_docker_template();
+        // 🪤 Directives only. The template *documents* the old `cargo build`
+        // line so the mistake is not repeated, and a whole-file `contains`
+        // matches that prose — this assertion failed on its own comment the
+        // first time it ran.
+        let directives: String = dockerfile
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !directives.contains("cargo build"),
+            "the build context is the user's app — there is no Cargo.toml in it, so any \
+             `cargo build` here fails in under a second and always has"
+        );
+        assert!(
+            !directives.contains("FROM rust:"),
+            "a Rust toolchain in the image is the symptom of that mistake"
+        );
+        assert!(
+            directives.contains(&format!("COPY {LINUX_RUNTIME_FILENAME} /usr/local/bin/albedo")),
+            "the image needs one Linux executable, staged by `ship --target docker`"
+        );
+    }
+
+    /// 🪤 The runtime must not end up inside the payload it carries. The
+    /// builder does `COPY . .`, so without an exclusion the ~25 MB Linux albedo
+    /// is embedded in every shipped app — a whole albedo inside every albedo.
+    #[test]
+    fn the_staged_linux_runtime_is_not_shipped_inside_the_payload() {
+        assert!(
+            !albedo_server::bundle_payload::should_ship(LINUX_RUNTIME_FILENAME),
+            "`{LINUX_RUNTIME_FILENAME}` must be excluded from the payload"
+        );
+    }
+
+    /// A Windows `albedo.exe` under the Linux runtime's name must be caught by
+    /// its **contents**, not its name — that is the whole failure mode.
+    #[test]
+    fn a_non_elf_file_is_not_accepted_as_the_linux_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let planted = temp.path().join(LINUX_RUNTIME_FILENAME);
+        std::fs::write(&planted, b"MZ\x90\x00 not an ELF").unwrap();
+
+        assert!(!is_linux_elf(&planted));
+        let err = resolve_linux_runtime(temp.path()).expect_err("must refuse");
+        assert!(
+            err.contains("not a linux/amd64 executable"),
+            "refusal should name the real problem: {err}"
+        );
     }
 
     /// 🪤 `node_modules` stays out of the build context on purpose — the host's

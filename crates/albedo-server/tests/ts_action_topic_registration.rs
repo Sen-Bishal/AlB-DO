@@ -41,6 +41,7 @@ fn empty_config() -> AppConfig {
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     }
 }
 

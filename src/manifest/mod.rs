@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod metadata;
+pub mod portable_path;
 pub mod schema;
 
 mod route_auth;
@@ -20,6 +21,15 @@ pub struct ManifestOptions {
     pub tier_b_mode: HydrationMode,
     pub tier_c_mode: HydrationMode,
     pub tier_b_timeout_ms: u64,
+    /// The project root every `module_path` in the emitted manifest is
+    /// expressed relative to.
+    ///
+    /// `None` keeps the host path — which is only correct for in-memory use
+    /// (dev, tests) where the manifest is never written to disk and re-read on
+    /// another machine. Every path that *emits* a manifest sets this; the
+    /// preflight gate refuses an artifact whose paths stayed absolute, so a
+    /// caller that forgets fails at `albedo build` rather than at deploy.
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 impl Default for ManifestOptions {
@@ -30,6 +40,7 @@ impl Default for ManifestOptions {
             tier_b_mode: HydrationMode::OnIdle,
             tier_c_mode: HydrationMode::OnVisible,
             tier_b_timeout_ms: 2000,
+            project_root: None,
         }
     }
 }
@@ -80,7 +91,20 @@ pub fn build_render_manifest_v2(
             ComponentManifestEntry {
                 id: component.id.as_u64(),
                 name: component.name.clone(),
-                module_path: component.file_path.clone(),
+                // The one place a host path becomes an artifact identity. Every
+                // other consumer — the source map the build keys by this, the
+                // precompiled-modules join, the island lookup — inherits the
+                // spelling chosen here, which is why it is chosen once.
+                //
+                // Falling back to the host path when it cannot be relativised
+                // keeps in-memory callers (dev, tests, no root) working
+                // unchanged; the preflight gate is what stops such a path from
+                // reaching an artifact.
+                module_path: portable_path::portable_module_path(
+                    component.file_path.as_str(),
+                    options.project_root.as_deref(),
+                )
+                .unwrap_or_else(|| component.file_path.clone()),
                 tier: decision.tier,
                 weight_bytes,
                 priority: compute_priority(component, &critical_index, &batch_index),
@@ -109,7 +133,12 @@ pub fn build_render_manifest_v2(
         .map(|id| id.as_u64())
         .collect::<Vec<u64>>();
 
-    let manifest_builder = ManifestBuilder::new(graph, tier_metadata, options.tier_b_timeout_ms);
+    let manifest_builder = ManifestBuilder::new_in(
+        graph,
+        tier_metadata,
+        options.tier_b_timeout_ms,
+        options.project_root.clone(),
+    );
     let assets = manifest_builder.build_assets_manifest();
     let build_id = manifest_builder.build_build_id();
     let wt_streams = manifest_builder.build_wt_stream_slots();
@@ -812,5 +841,70 @@ mod tests {
             route.shell.doctype_and_head
         );
         assert!(route.metadata.is_empty());
+    }
+
+    /// The defect that blocks `albedo ship --binary`: the manifest keyed its
+    /// components on the build machine's own path, so an artifact built here
+    /// named a directory no other box has. What landed in `.albedo/dist` was
+    /// literally `B:\beta-two\test-app/src/components\App.jsx`.
+    #[test]
+    fn the_manifest_records_a_project_relative_module_path() {
+        let mut compiler = RenderCompiler::new();
+        let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
+        counter.file_path = "B:/proj/src/components/Counter.tsx".to_string();
+        counter.weight = 2048.0;
+        compiler.add_component(counter);
+
+        let result = compiler.optimize().unwrap();
+        let options = ManifestOptions {
+            project_root: Some(std::path::PathBuf::from("B:/proj")),
+            ..ManifestOptions::default()
+        };
+        let manifest = build_render_manifest_v2(compiler.graph(), &result, &options);
+
+        let entry = manifest
+            .components
+            .iter()
+            .find(|component| component.name == "Counter")
+            .expect("the component is in the manifest");
+        assert_eq!(entry.module_path, "src/components/Counter.tsx");
+    }
+
+    /// The join the precompiled-modules artifact depends on:
+    /// `module_sources.get(&component.module_path)`. If the manifest moved to a
+    /// relative spelling and the source map kept the absolute one, every
+    /// component would be recorded `skipped: "missing_source"` and the app
+    /// would silently fall back to interpreting sources — a 200 with the slow
+    /// path, which is exactly how this class of bug hides.
+    #[test]
+    fn a_module_path_is_the_key_a_source_map_can_be_built_from() {
+        let mut compiler = RenderCompiler::new();
+        let mut counter = Component::new(ComponentId::new(0), "Counter".to_string());
+        counter.file_path = "B:/proj/src/Counter.tsx".to_string();
+        counter.weight = 1024.0;
+        compiler.add_component(counter);
+
+        let result = compiler.optimize().unwrap();
+        let root = std::path::PathBuf::from("B:/proj");
+        let options = ManifestOptions {
+            project_root: Some(root.clone()),
+            ..ManifestOptions::default()
+        };
+        let manifest = build_render_manifest_v2(compiler.graph(), &result, &options);
+
+        // 🪤 Resolving against the *build* root passes either way: an absolute
+        // path resolves to itself, which is the same string. The property that
+        // actually separates portable from not is resolving against a root the
+        // build never saw.
+        let served_from = std::path::PathBuf::from("/srv/app");
+        for component in &manifest.components {
+            let resolved =
+                portable_path::resolve_portable_module_path(&component.module_path, &served_from);
+            assert_eq!(
+                resolved,
+                served_from.join("src/Counter.tsx"),
+                "the manifest key must resolve under whatever root serves it, not the one that built it"
+            );
+        }
     }
 }

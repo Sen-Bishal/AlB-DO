@@ -68,10 +68,14 @@ impl Fixture {
         fs::write(&hello_path, HELLO_TSX).expect("write Hello.tsx");
         fs::write(&counter_path, COUNTER_TSX).expect("write Counter.tsx");
 
-        // Manifest references Hello via its absolute path so
-        // `RendererRuntime::from_artifacts_dir`'s module-source loader
-        // resolves it without depending on the test's cwd.
-        let manifest_json = build_minimal_manifest_json(&hello_path);
+        // Manifest references Hello the way the compiler now emits it:
+        // **project-relative**. It used to hold the absolute path, because the
+        // module-source loader read `module_path` verbatim and would otherwise
+        // have depended on the test's cwd. That loader resolves against the
+        // project root derived from the artifacts directory now, so the
+        // absolute form is neither needed nor producible — `albedo build`
+        // refuses to emit one, and so does boot.
+        let manifest_json = build_minimal_manifest_json(Path::new("src/Hello.tsx"));
         fs::write(
             dist_dir.join("render-manifest.v2.json"),
             manifest_json,
@@ -110,6 +114,7 @@ impl Fixture {
             // No `auth` block either — every request resolves as anonymous,
             // and none of AUTH's tables are emitted.
             auth: Default::default(),
+            tls: Default::default(),
         }
     }
 }
@@ -237,6 +242,7 @@ fn boot_production_server_fails_loud_when_dist_dir_missing() {
         forge: Default::default(),
         sources: Default::default(),
         auth: Default::default(),
+        tls: Default::default(),
     };
 
     let err = match boot_production_server(&opts) {

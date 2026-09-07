@@ -121,6 +121,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub struct RenderCompiler {
     graph: ComponentGraph,
     cache: Option<IncrementalCache>,
+    project_root: Option<PathBuf>,
 }
 
 impl RenderCompiler {
@@ -129,6 +130,34 @@ impl RenderCompiler {
         Self {
             graph: ComponentGraph::new(),
             cache: None,
+            project_root: None,
+        }
+    }
+
+    /// Declares the directory every emitted `module_path` is relative to.
+    ///
+    /// Without it a manifest keys its components on this machine's own paths,
+    /// so the artifact only resolves on the box that produced it — the thing
+    /// that blocks shipping a build anywhere else. Callers that only hold the
+    /// manifest in memory (dev, tests) can leave it unset; anything that
+    /// *writes* artifacts must set it, and `preflight` refuses a build whose
+    /// paths stayed absolute rather than letting one reach a deploy.
+    pub fn set_project_root(&mut self, root: impl Into<PathBuf>) {
+        self.project_root = Some(root.into());
+    }
+
+    /// Chaining form of [`Self::set_project_root`].
+    #[must_use]
+    pub fn with_project_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.set_project_root(root);
+        self
+    }
+
+    /// The manifest options this compiler emits with, root included.
+    fn manifest_options(&self) -> manifest::ManifestOptions {
+        manifest::ManifestOptions {
+            project_root: self.project_root.clone(),
+            ..manifest::ManifestOptions::default()
         }
     }
 
@@ -146,6 +175,7 @@ impl RenderCompiler {
         Self {
             graph: ComponentGraph::new(),
             cache: Some(cache),
+            project_root: None,
         }
     }
 
@@ -268,11 +298,7 @@ impl RenderCompiler {
         &self,
         result: &OptimizationResult,
     ) -> manifest::schema::RenderManifestV2 {
-        manifest::build_render_manifest_v2(
-            &self.graph,
-            result,
-            &manifest::ManifestOptions::default(),
-        )
+        manifest::build_render_manifest_v2(&self.graph, result, &self.manifest_options())
     }
 
     /// Runs the full pipeline and returns a [`manifest::schema::RenderManifestV2`].
@@ -291,7 +317,7 @@ impl RenderCompiler {
         &self,
     ) -> Result<(manifest::schema::RenderManifestV2, TierReport)> {
         let result = self.optimize()?;
-        let options = manifest::ManifestOptions::default();
+        let options = self.manifest_options();
         let manifest = manifest::build_render_manifest_v2(&self.graph, &result, &options);
         let tier_report = self.build_tier_report(&options);
         Ok((manifest, tier_report))

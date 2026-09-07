@@ -33,6 +33,13 @@ pub struct ParsedModule {
     pub imports: HashMap<String, ImportBinding>,
     pub functions: HashMap<String, ComponentFunction>,
     pub default_export: Option<String>,
+    /// 9.1a · every exported component-shaped binding, in source order.
+    ///
+    /// Kept even after [`Self::default_export`] has been filled from it,
+    /// because the **refusal** needs it: a module with two exported components
+    /// has no implied default, and the build error has to name them rather
+    /// than say "no `export default`" about a file that exports two.
+    pub component_exports: Vec<String>,
     /// Stage 3 — top-level `const/let/var X = expr` declarations whose
     /// init isn't a function. Order preserved (Vec, not HashMap) so a
     /// forward-referenced const sees prior ones during sequential eval.
@@ -51,10 +58,14 @@ pub struct ParsedModule {
 
 pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
     let module = parse_source(source, file_path)?;
+    // 9.1a · computed here because the walk below consumes `module.body`.
+    let component_exports =
+        crate::runtime::implied_default::exported_component_names(&module.body);
     let mut parsed = ParsedModule {
         imports: HashMap::new(),
         functions: HashMap::new(),
         default_export: None,
+        component_exports,
         module_constants: Vec::new(),
         action_declarations: Vec::new(),
     };
@@ -170,6 +181,21 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
                 _ => {}
             },
         }
+    }
+
+    // 9.1a · a module with no `export default` and exactly one exported
+    // component takes that component as its default.
+    //
+    // 🪤 Guarded on `functions` containing the name. A candidate that never
+    // became a `ComponentFunction` (unsupported syntax in its body) would
+    // otherwise turn the clear build-time refusal into an obscure
+    // "function missing in module" at render time — trading a good error for
+    // a bad one further from the cause.
+    if parsed.default_export.is_none() {
+        parsed.default_export = crate::runtime::implied_default::implied_default(
+            &parsed.component_exports,
+        )
+        .filter(|name| parsed.functions.contains_key(name));
     }
 
     // Phase P · Stream C.1 — run the action extractor over the

@@ -491,9 +491,9 @@ pub struct PositionedInsert {
 /// so this classifier finds the transitions that opcode can reproduce exactly:
 ///
 /// 1. **Nothing retracted** — every previous key survives.
-/// 2. **Nothing updated** — every surviving key carries a byte-identical record. An edit is a `−`/`+`
-///    pair; `SlotInsert` upserts but retracts nothing, so a transition containing one is not this
-///    shape.
+/// 2. **Nothing updated** — every surviving key carries a byte-identical record. An edit is a
+///    `−`/`+` pair; `SlotInsert` upserts but retracts nothing, so a transition containing one is
+///    not this shape.
 /// 3. **Survivors keep their relative order** — the op moves no existing row.
 /// 4. **The inserted keys form a single contiguous run** — one op names one anchor. Two runs at
 ///    different positions would need two ops, and splitting them here would let a partial apply
@@ -770,7 +770,11 @@ mod tests {
             "id",
         ));
         // The empty-to-populated first write is all tail inserts.
-        assert!(is_tail_append(&rows(&[]), &rows(&[(1, "ada"), (2, "alan")]), "id"));
+        assert!(is_tail_append(
+            &rows(&[]),
+            &rows(&[(1, "ada"), (2, "alan")]),
+            "id"
+        ));
     }
 
     #[test]
@@ -833,7 +837,8 @@ mod tests {
     /// other, so nothing row-shaped ships.
     #[test]
     fn an_insertion_missing_from_the_render_suppresses_the_whole_delta() {
-        let changes = diff_records(&rows(&[]), &rows(&[(3, "grace"), (4, "hopper")]), "id").unwrap();
+        let changes =
+            diff_records(&rows(&[]), &rows(&[(3, "grace"), (4, "hopper")]), "id").unwrap();
         assert!(
             project_changes(&changes, &rendered(&[(3, "grace")])).is_none(),
             "a partial delta would disagree with the snapshot shipped beside it"
@@ -845,8 +850,12 @@ mod tests {
     /// the sink ignores for removals.
     #[test]
     fn a_retraction_projects_without_markup_it_could_never_have() {
-        let changes =
-            diff_records(&rows(&[(1, "ada"), (2, "alan")]), &rows(&[(1, "ada")]), "id").unwrap();
+        let changes = diff_records(
+            &rows(&[(1, "ada"), (2, "alan")]),
+            &rows(&[(1, "ada")]),
+            "id",
+        )
+        .unwrap();
         let projected = project_changes(&changes, &rendered(&[(1, "ada")])).unwrap();
 
         assert_eq!(projected.len(), 1);
@@ -1264,6 +1273,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(project_inserted_rows(&insert, &rendered(&[(2, "alan")])), None);
+        assert_eq!(
+            project_inserted_rows(&insert, &rendered(&[(2, "alan")])),
+            None
+        );
     }
 }

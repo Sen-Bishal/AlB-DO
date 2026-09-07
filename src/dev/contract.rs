@@ -458,6 +458,19 @@ pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> 
                 }
                 options.port_override = Some(port);
             }
+            // TLS + ACME belong to `serve`, not to the dev contract, but this
+            // parser sees the same raw argv and refuses anything it does not
+            // recognise. Consumed with their values so `albedo serve --domain
+            // app.example.com` does not die here as an "unknown dev option" —
+            // and, worse, so the value is never left looking like a positional.
+            "--tls-cert" | "--tls-key" | "--domain" | "--acme-contact" | "--acme-cache" => {
+                idx += 2;
+                continue;
+            }
+            "--acme-staging" => {
+                idx += 1;
+                continue;
+            }
             "--no-hmr" => {
                 options.no_hmr = true;
             }

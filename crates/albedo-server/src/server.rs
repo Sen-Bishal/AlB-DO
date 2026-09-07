@@ -2161,10 +2161,31 @@ impl AlbedoServer {
         {
             use dom_render_compiler::forge::{self, LibSqlSubstrate};
 
-            let opened = LibSqlSubstrate::open_local("forge.db")
+            // 🪤 This was the bare name `forge.db`, resolved against the
+            // *process* working directory. `open_local` creates a missing
+            // file, so serving from anywhere else — `albedo serve <dir>`, or a
+            // container with a different WORKDIR — opened a brand new empty
+            // database and booted clean with none of the app's data, and a
+            // restart lost every row written into the image. The path is now
+            // derived from the artifacts this server is already reading, and
+            // overridable by config or `ALBEDO_FORGE_DB` for a mounted volume.
+            let artifacts_dir = self.config.renderer.as_ref().map_or_else(
+                || std::path::PathBuf::from(".albedo/dist"),
+                |renderer| std::path::PathBuf::from(renderer.artifacts_dir.as_str()),
+            );
+            let db_path = crate::forge_db_path::resolve_forge_db_path(
+                self.config.forge.db_path.as_deref(),
+                crate::forge_db_path::forge_db_env().as_deref(),
+                &artifacts_dir,
+            );
+
+            let opened = LibSqlSubstrate::open_local(&db_path)
                 .await
                 .map_err(|err| {
-                    RuntimeError::ServerStartup(format!("FORGE: failed to open forge.db: {err}"))
+                    RuntimeError::ServerStartup(format!(
+                        "FORGE: failed to open {}: {err}",
+                        db_path.display()
+                    ))
                 })?;
             let substrate: Arc<dyn forge::DataSubstrate> = Arc::new(opened);
 
@@ -2309,11 +2330,87 @@ impl AlbedoServer {
             }
         }
 
+        // TLS · decided before the listener binds, so a half-written `tls`
+        // block or an unreadable certificate fails the boot rather than
+        // quietly serving the site on the wrong scheme.
+        let project_root = self.config.renderer.as_ref().map_or_else(
+            || std::path::PathBuf::from("."),
+            |renderer| {
+                std::path::Path::new(renderer.artifacts_dir.as_str())
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
+            },
+        );
+        let tls_mode = crate::tls::resolve(&self.config.server.tls, &project_root)
+            .map_err(RuntimeError::ServerStartup)?;
+
+        // AUTH × TLS · the refusal that exists because the alternative is a
+        // login that silently never works. See `tls::insecure_auth_refusal`.
+        let has_auth_providers = self
+            .auth_registry
+            .as_ref()
+            .is_some_and(|registry| !registry.is_empty());
+        // Read here rather than inside the refusal, so the decision stays a
+        // pure function of its arguments — the same split `TlsSettings::from_env`
+        // exists for, and the reason these rules are testable without mutating
+        // process-global state.
+        let public_origin = std::env::var(crate::tls::PUBLIC_ORIGIN_ENV).ok();
+        if let Some(refusal) = crate::tls::insecure_auth_refusal(
+            &tls_mode,
+            has_auth_providers,
+            self.state.shutter.trusted_proxies() > 0,
+            self.config.server.host.as_str(),
+            public_origin.as_deref(),
+        ) {
+            return Err(RuntimeError::ServerStartup(refusal));
+        }
+
+        let mut acme_driver = None;
+        let tls_server_config = match &tls_mode {
+            crate::tls::TlsMode::Disabled => None,
+            crate::tls::TlsMode::Files { cert, key } => Some(
+                crate::tls::server_config_from_files(cert, key)
+                    .map_err(RuntimeError::ServerStartup)?,
+            ),
+            crate::tls::TlsMode::Acme {
+                domains,
+                contact,
+                cache,
+                staging,
+            } => {
+                let (config, driver) = crate::tls::acme_config(
+                    domains,
+                    contact.as_deref(),
+                    cache,
+                    *staging,
+                )
+                .map_err(RuntimeError::ServerStartup)?;
+                info!(
+                    target: "albedo.tls.acme",
+                    domains = %domains.join(", "),
+                    staging = *staging,
+                    cache = %cache.display(),
+                    "ACME enabled; the certificate is obtained during the first TLS handshake"
+                );
+                // Kept until the listener is bound: TLS-ALPN-01 is answered on
+                // the HTTPS port, so driving issuance before there is a socket
+                // to answer on would spend a failed-validation attempt.
+                acme_driver = Some(driver);
+                Some(config)
+            }
+        };
+
         let addr = self.config.server.socket_addr()?;
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|err| RuntimeError::ServerStartup(err.to_string()))?;
-        info!("ALBEDO server listening on {}", addr);
+        let scheme = if tls_mode.is_enabled() {
+            "https"
+        } else {
+            "http"
+        };
+        info!("ALBEDO server listening on {scheme}://{addr}");
         // SHUTTER · the trust question, answered out loud. Zero trusted proxies
         // behind a load balancer is a misconfiguration whose only symptom is
         // over-strict limiting — the whole internet arriving as one address —
@@ -2383,10 +2480,15 @@ impl AlbedoServer {
         let graceful_shutdown = {
             let shutdown_tx = shutdown_tx.clone();
             async move {
-                shutdown_signal(shutdown_timeout).await;
+                shutdown_signal().await;
                 let _ = shutdown_tx.send(true);
             }
         };
+
+        // The other half of the signal fix: a bound on the drain itself. The
+        // clock starts when `graceful_shutdown` above flips the watch, so this
+        // is idle for the entire life of a healthy server.
+        let drain_deadline = drain_deadline(shutdown_rx.clone(), shutdown_timeout);
 
         // Everything that can fail a boot has now succeeded: the substrate is
         // open and agrees with the schema, the TCP listener is bound, and the
@@ -2399,15 +2501,43 @@ impl AlbedoServer {
         // the process shares one bucket — see `shutter::UNATTRIBUTED`, which is
         // the deliberate answer for an embedder that mounts `router()` itself,
         // not something the serve path should ever rely on.
-        let http_result = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(graceful_shutdown)
-            .await
-            .map_err(|err| RuntimeError::ServerRuntime(err.to_string()));
+        // Now that the listener is bound, TLS-ALPN-01 is answerable — start
+        // driving issuance and renewal. Aborted when serving ends so the task
+        // cannot outlive the server it was obtaining certificates for.
+        let acme_task = acme_driver.map(|driver| tokio::spawn(driver.run()));
+
+        let http_result = match tls_server_config {
+            None => {
+                let serve = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(graceful_shutdown);
+                // `axum::serve` drains without a bound of its own, so the
+                // deadline has to be raced against it from out here.
+                tokio::select! {
+                    result = serve => {
+                        result.map_err(|err| RuntimeError::ServerRuntime(err.to_string()))
+                    }
+                    () = drain_deadline => {
+                        warn!(
+                            timeout_ms = shutdown_timeout.as_millis(),
+                            "graceful shutdown exceeded shutdown_timeout_ms; closing remaining connections"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+            Some(tls) => {
+                serve_https(listener, router, tls, graceful_shutdown, shutdown_timeout).await
+            }
+        };
 
         let _ = shutdown_tx.send(true);
+
+        if let Some(task) = acme_task {
+            task.abort();
+        }
 
         if let Some(task) = webtransport_task {
             match task.await {
@@ -2522,6 +2652,108 @@ fn compression_layer() -> CompressionLayer<And<DefaultPredicate, NotForContentTy
         .compress_when(DefaultPredicate::new().and(NotForContentType::const_new(
             "text/event-stream",
         )))
+}
+
+/// Serve the router over TLS.
+///
+/// This is `axum::serve`'s loop with a `TlsAcceptor` in front, written out
+/// rather than borrowed because axum does not ship a TLS entry point. Two
+/// things it must not lose, both of which are silent if dropped:
+///
+/// * **`ConnectInfo`** — SHUTTER keys its rate-limit buckets on the peer, and
+///   without this every request in the process shares `UNATTRIBUTED`. The plain
+///   path gets it from `into_make_service_with_connect_info`; here it is
+///   inserted per connection by hand.
+/// * **graceful shutdown** — in-flight requests finish instead of being cut,
+///   which for a streaming response is the difference between a complete page
+///   and a truncated one.
+///
+/// 🪤 A failed handshake is logged at `debug` and the connection dropped, never
+/// propagated: every port scanner and every plain-HTTP request to the HTTPS
+/// port produces one, and treating those as server errors would end the accept
+/// loop for the whole process.
+async fn serve_https(
+    listener: TcpListener,
+    router: axum::Router,
+    tls: std::sync::Arc<rustls::ServerConfig>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    drain_timeout: Duration,
+) -> Result<(), RuntimeError> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use hyper_util::server::graceful::GracefulShutdown;
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let graceful = GracefulShutdown::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(err) => {
+                    // An accept error is per-connection (a client that hung up
+                    // between SYN and accept, or a transient fd exhaustion);
+                    // ending the loop would take the server down with it.
+                    warn!(error = %err, "TLS listener failed to accept a connection");
+                    continue;
+                }
+            },
+            () = &mut shutdown => break,
+        };
+
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        let watcher = graceful.watcher();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    debug!(peer = %peer, error = %err, "TLS handshake failed");
+                    return;
+                }
+            };
+
+            let service = hyper::service::service_fn(
+                move |mut request: Request<hyper::body::Incoming>| {
+                // The plain path's `into_make_service_with_connect_info`
+                // equivalent. Without it SHUTTER cannot tell two clients apart.
+                    request
+                        .extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    let mut router = router.clone();
+                    async move { tower::Service::call(&mut router, request).await }
+                },
+            );
+
+            // The builder has to outlive the connection future it produces, so
+            // it gets its own binding rather than being a temporary in the
+            // same expression.
+            let builder = ConnBuilder::new(TokioExecutor::new());
+            let connection =
+                builder.serve_connection_with_upgrades(TokioIo::new(tls_stream), service);
+
+            if let Err(err) = watcher.watch(connection.into_owned()).await {
+                debug!(peer = %peer, error = %err, "TLS connection ended with an error");
+            }
+        });
+    }
+
+    // A TLS connection that will not finish must not hold the process open
+    // forever — the streaming responses this path exists to protect are exactly
+    // the ones that can hang. `shutdown_timeout_ms` is the operator's stated
+    // bound on that, and this is where it is honoured.
+    if tokio::time::timeout(drain_timeout, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_ms = drain_timeout.as_millis(),
+            "TLS graceful shutdown exceeded shutdown_timeout_ms; closing remaining connections"
+        );
+    }
+    Ok(())
 }
 
 async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> Response {
@@ -3945,8 +4177,85 @@ fn response_is_html(response: &ResponsePayload) -> bool {
         .unwrap_or(false)
 }
 
-async fn shutdown_signal(_timeout: Duration) {
-    let _ = tokio::signal::ctrl_c().await;
+/// Resolves when the process is asked to stop.
+///
+/// 🔴 **This used to be `ctrl_c()` alone, which is SIGINT only.** Every Linux
+/// process manager that stops a service sends **SIGTERM** — `systemctl
+/// stop|restart`, `docker stop`, Fly's machine stop, every Kubernetes pod
+/// eviction — so the OS default applied and the process died instantly,
+/// skipping the graceful-shutdown machinery below it entirely. That machinery
+/// was already well built (in-flight requests drain, streaming responses
+/// complete rather than truncate); it was wired to the one signal nothing in
+/// production sends. **Consequence: every deploy cut live requests.**
+/// Found 2026-09-05 by reading the deploy path rather than the code — there
+/// were zero occurrences of `SignalKind` in the repository.
+///
+/// 🪤 A handler that fails to install must **never** resolve: returning early
+/// would make this future ready immediately and shut the server down at boot.
+/// Both arms park on `pending()` instead, so a process that cannot hear one
+/// signal still hears the other.
+async fn shutdown_signal() {
+    let interrupt = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(error = %err, "could not install the SIGINT handler; Ctrl-C will not drain");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                if sigterm.recv().await.is_none() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "could not install the SIGTERM handler; deploys will cut live requests");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    // Windows has no SIGTERM. `ctrl_c()` there already covers both the console
+    // signal and the service-stop path, so this arm simply never fires.
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = interrupt => info!(signal = "SIGINT", "shutdown requested; draining in-flight requests"),
+        () = terminate => info!(signal = "SIGTERM", "shutdown requested; draining in-flight requests"),
+    }
+}
+
+/// Resolves `shutdown_timeout_ms` after the shutdown signal fires — never
+/// before it.
+///
+/// 🪤 **`shutdown_timeout_ms` was dead on arrival.** It is read from the
+/// environment, validated `must be > 0`, defaulted to 5 000 ms, and threaded
+/// all the way into `shutdown_signal`, whose parameter was named `_timeout`
+/// and never read. A hung streaming connection could block shutdown forever
+/// while a config field advertised a bound. Same shape as the five defects in
+/// `77fcc87`: **a fact fully computed, and nothing consuming it.**
+///
+/// This is the consumer. Racing it against the serve future is what turns the
+/// config value into an actual deadline: the drain gets `timeout` to finish,
+/// then the server returns regardless.
+async fn drain_deadline(mut shutdown_rx: watch::Receiver<bool>, timeout: Duration) {
+    loop {
+        // Scoped so the `Ref` is dropped before the await below it.
+        let fired = *shutdown_rx.borrow();
+        if fired {
+            break;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            // The sender is gone, so the signal can never arrive. Parking is
+            // correct: firing here would cap the lifetime of a healthy server.
+            std::future::pending::<()>().await;
+        }
+    }
+    tokio::time::sleep(timeout).await;
 }
 
 #[cfg(test)]
@@ -3958,6 +4267,71 @@ mod tests {
     use axum::body::to_bytes;
     use bytes::Bytes;
     use tower::ServiceExt;
+
+    /// 🔴 **`shutdown_timeout_ms` was read, validated, defaulted and threaded
+    /// into a parameter named `_timeout` that was never used.** These three
+    /// tests are the consumer's regression guard — the defect they pin is not
+    /// "shutdown is wrong" but "a fully computed fact reaches nothing", which
+    /// is this project's signature shape and passes every type check.
+    ///
+    /// Signals themselves cannot be tested here: this rig is Windows and
+    /// delivers no SIGTERM. What *is* testable is the half that consumes the
+    /// config, and it is the half that was dead.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_deadline_consumes_shutdown_timeout_ms() {
+        let (tx, rx) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        tx.send(true).expect("receiver is alive");
+
+        drain_deadline(rx, Duration::from_millis(5_000)).await;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(5_000),
+            "the deadline resolved in {:?}, so shutdown_timeout_ms is not being read",
+            started.elapsed()
+        );
+    }
+
+    /// 🪤 The failure mode that matters more than a late drain: an early one.
+    /// If this future resolved before the signal, the `select!` in `serve`
+    /// would end a **healthy** server after `shutdown_timeout_ms` — five
+    /// seconds after boot, by default.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_deadline_never_fires_before_the_shutdown_signal() {
+        let (_tx, rx) = watch::channel(false);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3_600),
+            drain_deadline(rx, Duration::from_millis(5_000)),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the deadline fired without a shutdown signal — this would cap the \
+             lifetime of every healthy server at shutdown_timeout_ms"
+        );
+    }
+
+    /// The same guarantee on the other branch: a dropped sender means the
+    /// signal can never arrive, so parking is correct and firing is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_shutdown_sender_does_not_trigger_the_deadline() {
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3_600),
+            drain_deadline(rx, Duration::from_millis(5_000)),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a dropped sender resolved the deadline; the shutdown path must park, \
+             not fire"
+        );
+    }
 
     /// The no-JS action route matches exactly one segment, and only a segment a
     /// form could have been built from. Every rejection here would otherwise
@@ -3999,6 +4373,7 @@ mod tests {
                 middleware: Vec::new(),
                 auth: None,
             }],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4046,6 +4421,7 @@ mod tests {
                 middleware: Vec::new(),
                 auth: None,
             }],
+            forge: Default::default(),
         };
         AlbedoServerBuilder::new(config)
             .register_handler("ping", |_ctx: RequestContext| async move {
@@ -4201,6 +4577,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
         let server = AlbedoServerBuilder::new(config)
             .with_dev_mode(false)
@@ -4267,6 +4644,7 @@ mod tests {
                 middleware: Vec::new(),
                 auth: None,
             }],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4327,6 +4705,7 @@ mod tests {
                 middleware: Vec::new(),
                 auth: Some(AuthPolicy::Required),
             }],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4379,6 +4758,7 @@ mod tests {
                 middleware: Vec::new(),
                 auth: None,
             }],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4438,6 +4818,7 @@ mod tests {
                 middleware: Vec::new(),
                 auth: None,
             }],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4502,6 +4883,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: vec![api_route(HttpMethod::Post, "/api/echo", "echo", None)],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4545,6 +4927,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: vec![api_route(HttpMethod::Get, "/api/status", "status", None)],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4592,6 +4975,7 @@ mod tests {
                 "private",
                 Some(AuthPolicy::Required),
             )],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4642,6 +5026,7 @@ mod tests {
                 "admin",
                 Some(AuthPolicy::Role("admin".to_string())),
             )],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4677,6 +5062,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: vec![api_route(HttpMethod::Get, "/api/users", "users.list", None)],
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4743,6 +5129,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
         let server = AlbedoServerBuilder::new(config)
             .register_action(QUIET, |_ctx, envelope: ActionEnvelope, _slots| async move {
@@ -4820,6 +5207,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
 
         let server = AlbedoServerBuilder::new(config)
@@ -4888,6 +5276,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
         let server = AlbedoServerBuilder::new(config).build().unwrap();
 
@@ -4932,6 +5321,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
         let server = AlbedoServerBuilder::new(config)
             .register_action(
@@ -5013,6 +5403,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
 
         // action_id 1 — writer: stores the payload bytes into slot 7.
@@ -5129,6 +5520,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
         let server = AlbedoServerBuilder::new(config)
             .register_action(
@@ -5228,6 +5620,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
         let server = AlbedoServerBuilder::new(config)
             .register_action(
@@ -5384,6 +5777,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
         let server = AlbedoServerBuilder::new(config)
             .register_form_action::<LoginForm, _, _>(
@@ -5508,6 +5902,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
         let server = AlbedoServerBuilder::new(config)
             .register_form_action::<Required, _, _>(
@@ -5550,6 +5945,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: Vec::new(),
+            forge: Default::default(),
         };
         let server = AlbedoServerBuilder::new(config)
             .register_form_action::<serde_json::Value, _, _>(
@@ -5589,6 +5985,7 @@ mod tests {
             renderer: None,
             layouts: Vec::new(),
             routes: vec![api_route(HttpMethod::Get, "/api/missing", "missing", None)],
+            forge: Default::default(),
         };
 
         // No api_handler registered for "missing" — build must reject.

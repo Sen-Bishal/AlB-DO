@@ -288,7 +288,8 @@ async fn a_gated_route_refuses_the_live_lane_and_its_action_to_a_stranger() {
     fs::write(&page, PUBLIC_TSX).expect("write Home.tsx");
     fs::write(
         dist_dir.join("render-manifest.v2.json"),
-        build_manifest_json(&page),
+        // Project-relative, as the compiler now emits and the gate requires.
+        build_manifest_json(Path::new("src/Home.tsx")),
     )
     .expect("write manifest");
     fs::write(
@@ -323,6 +324,7 @@ async fn a_gated_route_refuses_the_live_lane_and_its_action_to_a_stranger() {
             providers,
             ..Default::default()
         },
+        tls: Default::default(),
     };
 
     let server = boot_production_server(&opts).expect("server boots");

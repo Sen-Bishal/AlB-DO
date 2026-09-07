@@ -20,6 +20,7 @@ fn build_server(public_dir: &std::path::Path) -> albedo_server::server::AlbedoSe
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     };
     AlbedoServerBuilder::new(config)
         .with_public_dir(public_dir)
@@ -144,6 +145,7 @@ async fn dev_mode_picks_no_store_cache_header_by_default() {
         renderer: None,
         layouts: Vec::new(),
         routes: Vec::new(),
+        forge: Default::default(),
     };
     let server = AlbedoServerBuilder::new(config)
         .with_public_dir(&public)

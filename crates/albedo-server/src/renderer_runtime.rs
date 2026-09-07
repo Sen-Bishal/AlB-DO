@@ -13,6 +13,7 @@ use dom_render_compiler::hydration::plan::{
 use dom_render_compiler::hydration::script::{
     build_bootstrap_script_tag, build_payload_script_tag,
 };
+use dom_render_compiler::manifest::portable_path::resolve_portable_module_path;
 use dom_render_compiler::manifest::schema::{
     ComponentManifestEntry, HydrationMode, PrecompiledRuntimeModulesArtifact, RenderManifestV2,
 };
@@ -969,14 +970,23 @@ fn load_module_sources(
         return Ok(modules);
     }
 
+    // `module_path` is project-relative now, so reading it as-is would resolve
+    // against the **process** working directory — which is the project only
+    // when the server happens to have been started from inside it.
+    // `albedo serve <dir>` from anywhere else read a path that does not exist
+    // and refused to boot. The root the artifacts came from is the only
+    // directory the manifest's identities are meaningful against.
+    let project_root = project_root_for_artifacts(artifacts_dir);
+
     let mut module_sources = HashMap::new();
     for component in &manifest.components {
         if module_sources.contains_key(&component.module_path) {
             continue;
         }
-        let source = std::fs::read_to_string(component.module_path.as_str()).map_err(|err| {
+        let resolved = resolve_portable_module_path(&component.module_path, &project_root);
+        let source = std::fs::read_to_string(&resolved).map_err(|err| {
             RuntimeError::RendererArtifactIo {
-                path: component.module_path.clone(),
+                path: resolved.display().to_string(),
                 message: err.to_string(),
             }
         })?;
@@ -984,6 +994,19 @@ fn load_module_sources(
     }
 
     Ok(module_sources)
+}
+
+/// The project directory a `<project>/.albedo/dist` artifacts directory belongs to.
+///
+/// Two components up, because that layout is fixed by the build. Falls back to
+/// the artifacts directory itself if it is shallower than that — a caller
+/// pointing somewhere unexpected then gets a wrong-but-bounded path and a
+/// named IO error, rather than a panic on `parent()`.
+fn project_root_for_artifacts(artifacts_dir: &Path) -> PathBuf {
+    artifacts_dir
+        .parent()
+        .and_then(Path::parent)
+        .map_or_else(|| artifacts_dir.to_path_buf(), Path::to_path_buf)
 }
 
 fn assert_optional_artifact_present(_path: &Path) {

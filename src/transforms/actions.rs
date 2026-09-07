@@ -510,6 +510,7 @@ mod tests {
             imports: HashMap::new(),
             functions: HashMap::new(),
             default_export: None,
+            component_exports: Vec::new(),
             module_constants: Vec::new(),
             action_declarations: Vec::new(),
         };
