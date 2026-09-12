@@ -144,6 +144,13 @@ napi-derive = { version = "2.16" }
 # Testing / benchmarks
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile  = { version = "3" }
+# 15.1 · uploads — the multipart parser. `multer` rather than a hand-rolled one:
+# multipart is a format with a long history of parser bugs, item 15's own rule
+# for a table-stakes surface is *wrap, do not innovate*, and this is the crate
+# axum's own `Multipart` extractor is built on. Used directly rather than
+# through that extractor because the action dispatch is a manual handler with
+# the body already in hand, and `multer` takes any byte stream plus a boundary.
+multer    = { version = "3" }
 regex     = { version = "1" }
 tower     = { version = "0.5", features = ["util"] }
 # `compression-gzip` is a *runtime* feature, not a test one: without it the

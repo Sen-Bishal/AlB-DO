@@ -58,6 +58,15 @@ pub struct DevConfig {
     /// hosts it yields become the egress allowlist.
     #[serde(default)]
     pub sources: BTreeMap<String, crate::aperture::SourceDecl>,
+    /// UPLOADS · declared buckets — the `uploads` block.
+    ///
+    /// The fourth sibling of `forge`, `sources` and `auth`, carried the same
+    /// way. Empty means the app accepts no files at all, which is a *bound*
+    /// rather than an omission: see [`crate::upload::declare`] for why
+    /// "undeclared" must not read as "unlimited".
+    #[serde(default)]
+    pub uploads: BTreeMap<String, crate::upload::UploadDecl>,
+
     /// AUTH · where principals come from — the `auth` block.
     ///
     /// The third sibling of `forge` and `sources`, and carried the same way. An
@@ -81,6 +90,7 @@ impl Default for DevConfig {
             routes: HashMap::new(),
             forge: BTreeMap::new(),
             sources: BTreeMap::new(),
+            uploads: BTreeMap::new(),
             auth: crate::auth::AuthDeclaration::default(),
         }
     }
@@ -397,6 +407,10 @@ pub struct ResolvedDevContract {
     /// [`DevConfig::auth`]. Empty `providers` means every request is anonymous.
     #[serde(default)]
     pub auth: crate::auth::AuthDeclaration,
+
+    /// [`DevConfig::uploads`]. Empty means the app accepts no files.
+    #[serde(default)]
+    pub uploads: BTreeMap<String, crate::upload::UploadDecl>,
 }
 
 pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> {
@@ -708,6 +722,7 @@ pub fn resolve_dev_contract(
         forge: config.forge,
         sources: config.sources,
         auth: config.auth,
+        uploads: config.uploads,
     })
 }
 

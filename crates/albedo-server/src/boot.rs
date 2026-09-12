@@ -75,6 +75,10 @@ pub struct ProductionServerOptions {
     /// `sources` are: lowering needs the real environment, and a bad `auth`
     /// block should stop the boot here with the offending provider named.
     pub auth: dom_render_compiler::auth::AuthDeclaration,
+    /// UPLOADS · the app's declared buckets, from the config's `uploads` block.
+    ///
+    /// Empty means the app accepts no files — a bound, not an omission.
+    pub uploads: BTreeMap<String, dom_render_compiler::upload::UploadDecl>,
     /// TLS + ACME, already resolved from flags and environment by the CLI.
     ///
     /// Carried rather than read from the environment here, so the flag surface
@@ -101,6 +105,7 @@ impl ProductionServerOptions {
             forge: contract.forge.clone(),
             sources: contract.sources.clone(),
             auth: contract.auth.clone(),
+            uploads: contract.uploads.clone(),
             // The environment is the fallback; a caller with flags overwrites
             // this before booting.
             tls: crate::tls::TlsSettings::from_env(),
@@ -333,6 +338,24 @@ fn boot_inner(
         })?
     };
 
+    // UPLOADS · 15.1 — lower the `uploads` block and let it contribute its one
+    // table, for the same reason the auth tables ride the ordinary schema: an
+    // upload record is a row, so it is readable, deletable and live like every
+    // other row, with no second mechanism to maintain.
+    let upload_registry = dom_render_compiler::upload::UploadRegistry::from_declarations(
+        &opts.uploads,
+    )
+    .map_err(|err| {
+        RuntimeError::ServerStartup(format!("invalid `uploads` block in albedo.config: {err}"))
+    })?;
+    let forge_schema = if upload_registry.is_empty() {
+        forge_schema
+    } else {
+        dom_render_compiler::upload::store::augment(&forge_schema).map_err(|err| {
+            RuntimeError::ServerStartup(format!("the uploads table cannot join the schema: {err}"))
+        })?
+    };
+
     // PRISM · the schema and the components finally meet. Everything up to here
     // validated one side in isolation: the extractor recorded what a component
     // wrote with no schema to check it against, and the schema knows nothing
@@ -406,7 +429,25 @@ fn boot_inner(
     // Lowered with the **real** environment, unlike `DevConfig::validate`'s
     // structural pass: a `bearerEnv` naming an unset variable is fatal here and
     // merely unknowable on a build machine.
-    let source_reader = if opts.sources.is_empty() {
+    //
+    // AUTH · 15.4 — `sources` is not the only block that names a host. An `auth`
+    // block's providers are reached over this same client, so its hosts belong
+    // in the same allowlist and this arm has to run for an app that declared
+    // providers and no `sources`.
+    //
+    // ⚠️ **This is not what made OAuth unreachable** — that was simply the
+    // absence of the routes. Taking the `None` arm here does not leave the app
+    // without a client: `server.rs` builds a fallback one when nothing else
+    // installed it, and a public provider is never refused anyway, because the
+    // allowlist exempts address classes rather than permitting hosts. Both
+    // halves of that were checked by removing this change and watching a real
+    // token exchange against github.com succeed without it.
+    //
+    // What it buys is the private case: a self-hosted IdP on a loopback or
+    // RFC1918 address is denied by `check_address` unless its host is declared,
+    // and the `auth` block is where an author declares it.
+    let auth_egress_hosts = auth_registry.egress_hosts();
+    let source_reader = if opts.sources.is_empty() && auth_egress_hosts.is_empty() {
         None
     } else {
         let reader = dom_render_compiler::aperture::SourceReader::from_declarations(
@@ -417,6 +458,7 @@ fn boot_inner(
                 dom_render_compiler::aperture::EgressMode::Serve
             },
             |name| std::env::var(name).ok(),
+            &auth_egress_hosts,
         )
         .map_err(|err| {
             RuntimeError::ServerStartup(format!("invalid `sources` block in albedo.config: {err}"))
@@ -531,6 +573,11 @@ fn boot_inner(
     // AUTH · same placement, same reason: after `with_live_runtime`, so a dev
     // reload carries the identity path onto the runtime it is actually reusing.
     builder = builder.with_auth_registry(auth_registry);
+    // UPLOADS · the project root travels with the registry because every stored
+    // path is built from it. Absolutised upstream for the same reason
+    // `forge.db` is: a shipped binary must not write its uploads wherever it
+    // happened to be launched from.
+    builder = builder.with_uploads(upload_registry, opts.project_dir.clone());
 
     let mut builder = builder.register_compiled_project(Arc::new(compiled));
 

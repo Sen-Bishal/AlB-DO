@@ -4799,6 +4799,7 @@ mod tests {
             forge: Default::default(),
             sources: Default::default(),
             auth: Default::default(),
+            uploads: Default::default(),
         };
         let err = configure_ship_vercel(&contract).unwrap_err();
         assert!(err.contains("vercel is not a supported"));

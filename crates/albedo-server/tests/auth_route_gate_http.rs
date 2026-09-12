@@ -320,6 +320,7 @@ async fn a_gated_route_refuses_the_live_lane_and_its_action_to_a_stranger() {
         dev_mode: false,
         forge: Default::default(),
         sources: Default::default(),
+        uploads: Default::default(),
         auth: AuthDeclaration {
             providers,
             ..Default::default()

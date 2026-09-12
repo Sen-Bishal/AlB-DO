@@ -22,6 +22,7 @@
 //! | [`principal`] | [`Principal`], [`PrincipalId`] — the one shape every provider lands on |
 //! | [`declare`] | the `auth` block: providers, presets, validation, egress derivation |
 //! | [`schema`] | the four tables, emitted through FORGE rather than adapted to it |
+//! | [`oauth`] | the authorization-code flow — the consumer [`declare`] never had |
 //!
 //! ## Why the id is ours, and what it settled
 //!
@@ -45,6 +46,7 @@
 //! it is last and why it is explicit.
 
 pub mod declare;
+pub mod oauth;
 pub mod password;
 pub mod principal;
 pub mod schema;
@@ -59,6 +61,9 @@ pub use declare::{
 pub use password::{
     absorb_timing, hash_password, normalize_email, verify_password, PasswordError,
     MAX_PASSWORD_BYTES, MIN_PASSWORD_BYTES,
+};
+pub use oauth::{
+    FlowStart, OAuthEndpoints, OAuthError, OutboundRequest, TokenResponse, FLOW_TTL_SECONDS,
 };
 pub use principal::{Principal, PrincipalId, PrincipalIdError, PRINCIPAL_ID_PREFIX};
 pub use session::{

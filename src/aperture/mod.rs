@@ -83,7 +83,7 @@ pub use ledger::{
 pub use journal::{
     Journal, JournalError, Step, StepKind, StepOutcome, DEFAULT_PASS_CAP, DEFAULT_STEP_CAP,
 };
-pub use reader::{SourceRead, SourceReadError, SourceReader};
+pub use reader::{SourceRead, SourceReadError, SourceReader, NO_EXTRA_HOSTS};
 pub use refresh::{
     refresh_topic, RefreshLoop, RefreshOutcome, RefreshReport, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TICK,
 };

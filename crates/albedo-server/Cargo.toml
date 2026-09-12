@@ -66,6 +66,13 @@ notify  = { workspace = true }
 walkdir = { workspace = true }
 ratatui = { workspace = true }
 
+# 15.1 · uploads — the multipart parser, the content-address hash, and the
+# temp-file name. `sha2` and `rand` are already the crates AUTH mints session
+# tokens with, so an upload id and a session token come from the same two.
+multer.workspace = true
+sha2.workspace   = true
+rand.workspace   = true
+
 [dev-dependencies]
 tempfile.workspace = true
 # 13.1 only: `tokio::test(start_paused)` needs `test-util`. The drain

@@ -18,6 +18,33 @@
 //! the same shape as PRISM's: the safe thing and the ergonomic thing are the
 //! same thing.
 //!
+//! ## Why the constructors take hosts a `sources` block does not name
+//!
+//! `sources` is not the only declaration that names a host. An `auth` block's
+//! providers do too — `AuthRegistry::egress_hosts` derives them by exactly this
+//! rule — and an OAuth token exchange rides this same client. That set was
+//! derived and read by nobody until it was threaded in here.
+//!
+//! ⚠️ **Be precise about what that cost, because the obvious reading is wrong.**
+//! The allowlist is an *exemption from address-class denies*, not a permit list
+//! for public hosts: [`EgressPolicy::check_url`] passes any named host, and
+//! `check_address` only refuses loopback, private and link-local addresses. So
+//! a public provider — every preset, GitHub and Google included — was always
+//! reachable, and an unconsumed allowlist did **not** break signing in with
+//! one. *(Measured against the real github.com, not reasoned about: with this
+//! set removed, the token exchange still completed.)*
+//!
+//! What it did cost is narrower and real: a provider on a **private or loopback
+//! address** — a self-hosted Keycloak on `10.0.0.5`, an internal OIDC issuer —
+//! is refused by `check_address`, and declaring it in the `auth` block did not
+//! exempt it. That is the gap this closes.
+//!
+//! `extra_hosts` is therefore a *required* argument rather than a builder
+//! method: a caller that has a second declaration must say so, and a caller that
+//! has none writes the empty iterator and has stated that too. A forgettable
+//! `.with_extra_hosts()` would have reproduced the original bug the first time
+//! a third host-naming declaration appeared.
+//!
 //! ## Why the body must be JSON
 //!
 //! A topic's value **is** its JSON encoding — `bridge.rs:244` relies on exactly
@@ -35,6 +62,13 @@ use crate::aperture::transport::ReqwestTransport;
 use crate::aperture::{ResponseCache, Transport, DEFAULT_RESPONSE_BUDGET};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// "This app has no host-naming declaration other than `sources`."
+///
+/// Spelled as a named constant rather than `[]` so the call site reads as a
+/// claim about the app rather than as a parameter nobody bothered to fill in —
+/// the two are indistinguishable at a glance, and only one of them is correct.
+pub const NO_EXTRA_HOSTS: [&str; 0] = [];
 
 /// A successful read of a declared source.
 #[derive(Debug, Clone)]
@@ -136,23 +170,31 @@ impl SourceReader {
     /// This is the one constructor boot should call, because it is the one that
     /// cannot forget to pass the declared hosts to the policy.
     ///
+    /// `extra_hosts` carries the hosts named by declarations that are not
+    /// `sources` — today that is the `auth` block's providers, via
+    /// `AuthRegistry::egress_hosts`. See this module's docs for why it is a
+    /// parameter and not a builder method.
+    ///
     /// # Errors
     /// [`SourceSchemaError`] from lowering, or a transport construction failure
     /// surfaced as [`SourceSchemaError::InvalidBase`] on a synthetic source
     /// name — a TLS backend that will not initialise is not a per-source
     /// problem, but it must not be silently swallowed either.
-    pub fn from_declarations<F>(
+    pub fn from_declarations<F, I, S>(
         declarations: &BTreeMap<String, SourceDecl>,
         mode: EgressMode,
         env: F,
+        extra_hosts: I,
     ) -> Result<Self, SourceSchemaError>
     where
         F: Fn(&str) -> Option<String>,
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
     {
         let registry = SourceRegistry::from_declarations(declarations, env)?;
         let policy = Arc::new(EgressPolicy::with_declared_hosts(
             mode,
-            registry.declared_hosts(),
+            declared_and_extra(&registry, extra_hosts),
         ));
         let transport = ReqwestTransport::new(Arc::clone(&policy)).map_err(|err| {
             SourceSchemaError::InvalidBase {
@@ -170,21 +212,29 @@ impl SourceReader {
 
     /// Build with an explicit transport. The seam the A1 tests use.
     ///
+    /// Takes `extra_hosts` for the same reason [`Self::from_declarations`] does,
+    /// and deliberately does **not** default it away: a test that exercises the
+    /// OAuth exchange over a fake transport must build the same allowlist the
+    /// real path builds, or it proves nothing about the real path.
+    ///
     /// # Errors
     /// [`SourceSchemaError`] from lowering.
-    pub fn with_transport<F>(
+    pub fn with_transport<F, I, S>(
         declarations: &BTreeMap<String, SourceDecl>,
         mode: EgressMode,
         env: F,
         transport: Arc<dyn Transport>,
+        extra_hosts: I,
     ) -> Result<Self, SourceSchemaError>
     where
         F: Fn(&str) -> Option<String>,
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
     {
         let registry = SourceRegistry::from_declarations(declarations, env)?;
         let policy = Arc::new(EgressPolicy::with_declared_hosts(
             mode,
-            registry.declared_hosts(),
+            declared_and_extra(&registry, extra_hosts),
         ));
         let client = ApertureClient::new(
             transport,
@@ -269,6 +319,27 @@ impl SourceReader {
     }
 }
 
+/// The egress allowlist: every host the `sources` block declared, plus every
+/// host some other declaration did.
+///
+/// One function so the union is computed identically for both constructors.
+/// The set is the *union* and never an intersection or an override, because
+/// each input is a separate statement of intent by the author and neither one
+/// is entitled to revoke the other.
+fn declared_and_extra<I, S>(registry: &SourceRegistry, extra: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    // `BTreeSet` rather than `Vec` so a host named by both a source and a
+    // provider appears once, and so the allowlist is byte-identical on every
+    // build — the same reason `AuthRegistry::egress_hosts` uses one.
+    let mut hosts: std::collections::BTreeSet<String> =
+        registry.declared_hosts().into_iter().collect();
+    hosts.extend(extra.into_iter().map(|host| host.as_ref().to_string()));
+    hosts.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,8 +381,105 @@ mod tests {
     }
 
     fn reader(transport: Arc<dyn Transport>) -> SourceReader {
-        SourceReader::with_transport(&github_block(), EgressMode::Dev, |_| None, transport)
+        SourceReader::with_transport(
+            &github_block(),
+            EgressMode::Dev,
+            |_| None,
+            transport,
+            NO_EXTRA_HOSTS,
+        )
             .expect("lowers")
+    }
+
+    /// The union, not the intersection and not an override.
+    ///
+    /// The bug this pins: an `auth` block's hosts were derived
+    /// (`AuthRegistry::egress_hosts`, tested there) and then read by nobody, so
+    /// the policy this client enforces was built from `sources` alone. An OAuth
+    /// token exchange was refused before a packet left the process — by the
+    /// security mechanism working correctly on an incomplete input, which is the
+    /// hardest kind of wrong to see.
+    #[test]
+    fn the_allowlist_is_the_union_of_sources_and_the_other_declarations() {
+        let transport = Arc::new(CountingTransport::always(json("{}", "\"v1\"")));
+        let reader = SourceReader::with_transport(
+            &github_block(),
+            EgressMode::Serve,
+            |_| None,
+            transport as Arc<dyn Transport>,
+            ["github.com", "accounts.google.com"],
+        )
+        .expect("lowers");
+
+        let policy = reader.client().policy();
+        assert!(
+            policy.is_declared("api.github.com"),
+            "the `sources` host must survive the union"
+        );
+        assert!(
+            policy.is_declared("github.com"),
+            "an auth provider's host must reach the allowlist — this is 15.4's blocker"
+        );
+        assert!(
+            policy.is_declared("accounts.google.com"),
+            "every extra host, not just the first"
+        );
+        assert!(
+            !policy.is_declared("evil.example"),
+            "the union must not become an allow-all"
+        );
+    }
+
+    /// **What the union is actually worth** — narrowed after the first claim was
+    /// falsified against the real github.com.
+    ///
+    /// The allowlist exempts address classes; it does not permit hosts. So a
+    /// public provider is reachable either way, and the only thing an
+    /// unconsumed `egress_hosts()` cost is a provider on a private or loopback
+    /// address: a self-hosted Keycloak, an internal OIDC issuer. This asserts
+    /// the consequence rather than the set membership, because the set
+    /// membership is what read as a much bigger fix than it is.
+    #[test]
+    fn a_provider_on_a_private_address_is_reachable_only_because_it_was_declared() {
+        let private: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+
+        let undeclared = EgressPolicy::with_declared_hosts(EgressMode::Serve, NO_EXTRA_HOSTS);
+        assert!(
+            undeclared.check_address("id.internal", private).is_err(),
+            "an RFC1918 address is refused when nothing declared its host"
+        );
+
+        let declared = EgressPolicy::with_declared_hosts(EgressMode::Serve, ["id.internal"]);
+        assert!(
+            declared.check_address("id.internal", private).is_ok(),
+            "declaring it in the `auth` block is what exempts it"
+        );
+
+        // And the thing that is NOT true, stated so it cannot be re-assumed:
+        // a public host passes with an empty allowlist.
+        assert!(
+            undeclared
+                .check_url(&url::Url::parse("https://github.com/login/oauth/access_token").unwrap())
+                .is_ok(),
+            "a named public host is never denied — measured against the real              github.com, which answered a token exchange with this policy"
+        );
+    }
+
+    /// An app with providers and no `sources` at all is the *common* OAuth
+    /// shape, so this arm has to build a reader.
+    #[test]
+    fn a_declaration_with_no_sources_still_produces_an_allowlist() {
+        let transport = Arc::new(CountingTransport::always(json("{}", "\"v1\"")));
+        let reader = SourceReader::with_transport(
+            &BTreeMap::new(),
+            EgressMode::Serve,
+            |_| None,
+            transport as Arc<dyn Transport>,
+            ["github.com"],
+        )
+        .expect("lowers");
+
+        assert!(reader.client().policy().is_declared("github.com"));
     }
 
     fn bound<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<&'a str> + 'a {
@@ -496,7 +664,13 @@ mod tests {
 
         let transport = Arc::new(CountingTransport::always(json(r#"{"n":1}"#, "\"v1\"")));
         let reader =
-            SourceReader::with_transport(&block, EgressMode::Dev, |_| None, transport.clone())
+            SourceReader::with_transport(
+                &block,
+                EgressMode::Dev,
+                |_| None,
+                transport.clone(),
+                NO_EXTRA_HOSTS,
+            )
                 .expect("lowers");
 
         let resolved = reader

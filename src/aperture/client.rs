@@ -312,6 +312,18 @@ impl ApertureClient {
         &self.cache
     }
 
+    /// The egress policy every request on this client is checked against.
+    ///
+    /// Exposed so a caller that is *about* to send can tell "this host was
+    /// never declared" apart from "this host refused us", and say so in an
+    /// error a person can act on. Read-only by construction: the policy is
+    /// behind an `Arc` and has no interior mutability, so nothing reached
+    /// through here can widen the allowlist at runtime.
+    #[must_use]
+    pub fn policy(&self) -> &Arc<EgressPolicy> {
+        &self.policy
+    }
+
     /// Fetch `request`, using and maintaining the shared cache.
     ///
     /// # Errors

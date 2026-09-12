@@ -291,6 +291,7 @@ async fn a_stranger_signs_up_signs_in_and_signs_out_over_http() {
         // without a substrate is a startup error by design.
         forge: Default::default(),
         sources: Default::default(),
+        uploads: Default::default(),
         auth: AuthDeclaration {
             providers,
             ..Default::default()

@@ -342,6 +342,7 @@ mod tests {
     use crate::aperture::declare::{RouteDecl, SourceDecl};
     use crate::aperture::egress::EgressMode;
     use crate::aperture::Transport;
+    use crate::aperture::NO_EXTRA_HOSTS;
     use crate::runtime::session::SessionId;
     use std::collections::BTreeMap;
     use tokio::sync::mpsc;
@@ -394,7 +395,13 @@ mod tests {
 
     fn reader(refresh: &str, transport: Arc<dyn Transport>) -> Arc<SourceReader> {
         Arc::new(
-            SourceReader::with_transport(&block(refresh), EgressMode::Dev, |_| None, transport)
+            SourceReader::with_transport(
+                &block(refresh),
+                EgressMode::Dev,
+                |_| None,
+                transport,
+                NO_EXTRA_HOSTS,
+            )
                 .expect("lowers"),
         )
     }

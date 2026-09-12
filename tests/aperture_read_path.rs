@@ -121,6 +121,7 @@ async fn a_declared_source_read_survives_every_stage() {
         EgressMode::Dev,
         |_| None,
         transport.clone() as Arc<dyn Transport>,
+        dom_render_compiler::aperture::NO_EXTRA_HOSTS,
     )
     .expect("lowers");
 
@@ -219,6 +220,7 @@ async fn two_spellings_of_one_resource_are_one_topic_and_one_request() {
         EgressMode::Dev,
         |_| None,
         transport.clone() as Arc<dyn Transport>,
+        dom_render_compiler::aperture::NO_EXTRA_HOSTS,
     )
     .expect("lowers");
 

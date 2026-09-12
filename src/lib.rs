@@ -79,6 +79,7 @@ pub mod scanner;
 pub mod shutter;
 pub mod transforms;
 pub mod types;
+pub mod upload;
 
 pub use analysis::adaptive;
 pub use analysis::analyzer;

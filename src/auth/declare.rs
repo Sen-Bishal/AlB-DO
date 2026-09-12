@@ -196,6 +196,20 @@ pub struct Preset {
     pub jwks_template: Option<&'static str>,
     /// For [`ProviderKind::Delegated`]: issuer template, `{domain}` substituted.
     pub issuer_template: Option<&'static str>,
+    /// `principal field → claim name`, for a provider whose profile document is
+    /// not OIDC-shaped.
+    ///
+    /// The default claim map is the OIDC standard set (`sub`/`email`/`name`/
+    /// `picture`), which is right for every [`ProviderKind::Oidc`] preset and
+    /// wrong for every [`ProviderKind::OAuth`] one: GitHub, GitLab and Discord
+    /// all key their profile on `id` and none of them returns `sub`. Naming the
+    /// endpoints without naming the shape left `subject` unresolvable on all
+    /// three, which is the whole login.
+    ///
+    /// An empty claim name means **this provider does not supply that field** —
+    /// see Discord's `image` below for the case that forced the distinction.
+    /// The author's own `claimMap` still overrides this.
+    pub claims: &'static [(&'static str, &'static str)],
 }
 
 impl Preset {
@@ -209,14 +223,23 @@ impl Preset {
             userinfo_url: None,
             jwks_template: None,
             issuer_template: None,
+            claims: &[],
         }
     }
 
+    /// A plain OAuth 2.0 preset.
+    ///
+    /// `claims` is not optional here, unlike on the OIDC constructor: an OAuth
+    /// 2.0 server has no standard profile document, so a preset that names its
+    /// endpoints and stays silent about its shape has described half of a
+    /// login. Making the argument mandatory is what stops the next preset from
+    /// shipping with the same hole.
     const fn oauth(
         name: &'static str,
         authorize_url: &'static str,
         token_url: &'static str,
         userinfo_url: &'static str,
+        claims: &'static [(&'static str, &'static str)],
     ) -> Self {
         Self {
             name,
@@ -227,6 +250,7 @@ impl Preset {
             userinfo_url: Some(userinfo_url),
             jwks_template: None,
             issuer_template: None,
+            claims,
         }
     }
 
@@ -244,6 +268,7 @@ impl Preset {
             userinfo_url: None,
             jwks_template: Some(jwks_template),
             issuer_template: Some(issuer_template),
+            claims: &[],
         }
     }
 
@@ -257,6 +282,7 @@ impl Preset {
             userinfo_url: None,
             jwks_template: None,
             issuer_template: None,
+            claims: &[],
         }
     }
 }
@@ -279,23 +305,56 @@ pub const PRESETS: &[Preset] = &[
     Preset::oidc("apple", "https://appleid.apple.com"),
     Preset::oidc("twitch", "https://id.twitch.tv/oauth2"),
     // ── plain OAuth 2.0: no discovery document, so the endpoints are named ──
+    // Each of these three keys its profile on `id`, and none returns `sub`.
+    // The claim map is therefore part of the preset, not a detail the app
+    // author is expected to discover from a failed login.
     Preset::oauth(
         "github",
         "https://github.com/login/oauth/authorize",
         "https://github.com/login/oauth/access_token",
         "https://api.github.com/user",
+        // `/user`'s `email` is null unless the account made it public, even
+        // with the `user:email` scope — the address then lives behind
+        // `/user/emails`. Mapped anyway: an absent email is an ordinary
+        // outcome (`albedo_users.email` is nullable and deliberately not
+        // unique), and a wrong one would not be.
+        &[
+            ("subject", "id"),
+            ("email", "email"),
+            ("name", "name"),
+            ("image", "avatar_url"),
+        ],
     ),
     Preset::oauth(
         "gitlab",
         "https://gitlab.com/oauth/authorize",
         "https://gitlab.com/oauth/token",
         "https://gitlab.com/api/v4/user",
+        &[
+            ("subject", "id"),
+            ("email", "email"),
+            ("name", "name"),
+            ("image", "avatar_url"),
+        ],
     ),
     Preset::oauth(
         "discord",
         "https://discord.com/oauth2/authorize",
         "https://discord.com/api/oauth2/token",
         "https://discord.com/api/users/@me",
+        // `image` is deliberately empty. Discord's `avatar` is a hash, not a
+        // URL: the image lives at
+        // `cdn.discordapp.com/avatars/{id}/{avatar}.png`, which is a
+        // *composition* of two claims and not something a field → claim map
+        // can express. Storing the hash in `albedo_users.image` would put a
+        // string that renders as a broken image into the column, so the field
+        // is absent instead of wrong.
+        &[
+            ("subject", "id"),
+            ("email", "email"),
+            ("name", "global_name"),
+            ("image", ""),
+        ],
     ),
     // ── delegated: they issue the token, we verify it ──
     Preset::delegated(
@@ -868,7 +927,7 @@ impl ProviderDecl {
 
         let endpoints = self.endpoints_for(name, kind, preset)?;
         let scopes = self.scopes_for(kind, preset);
-        let claim_map = self.claim_map_with_defaults();
+        let claim_map = self.claim_map_with_defaults(preset);
 
         Ok(ResolvedProvider {
             name: name.to_string(),
@@ -1044,12 +1103,26 @@ impl ProviderDecl {
         }
     }
 
-    /// OIDC standard claim names, overridden by anything the author declared.
+    /// OIDC standard claim names, then the preset's own shape, then whatever
+    /// the author declared.
     ///
-    /// Defaults rather than requirements: an OIDC provider uses these, and a
-    /// bespoke issuer that does not can say so without us having to know about
-    /// it in advance.
-    fn claim_map_with_defaults(&self) -> BTreeMap<String, String> {
+    /// Three layers, each narrower and each allowed to overwrite the one before
+    /// it, because each is a stronger statement about this specific provider:
+    ///
+    /// 1. **OIDC standard.** Right for every compliant issuer, and the only
+    ///    sensible answer for a provider we have never heard of.
+    /// 2. **The preset.** What *this* provider actually returns. Only a plain
+    ///    OAuth 2.0 preset carries one — an OIDC preset's document is the OIDC
+    ///    document by definition, so [`Preset::claims`] is empty there and this
+    ///    layer is a no-op.
+    /// 3. **The author.** They are looking at the provider's response and we
+    ///    are not, so they win.
+    ///
+    /// A preset claim of `""` **removes** the field rather than mapping it to
+    /// the empty claim name: it is how a preset says *this provider has no
+    /// usable value for this*, which is not the same as leaving the OIDC
+    /// default in place and reading a claim the response will never contain.
+    fn claim_map_with_defaults(&self, preset: Option<&Preset>) -> BTreeMap<String, String> {
         let mut map: BTreeMap<String, String> = [
             ("subject", "sub"),
             ("email", "email"),
@@ -1059,6 +1132,13 @@ impl ProviderDecl {
         .into_iter()
         .map(|(field, claim)| (field.to_string(), claim.to_string()))
         .collect();
+        for (field, claim) in preset.map(|preset| preset.claims).unwrap_or(&[]) {
+            if claim.is_empty() {
+                map.remove(*field);
+            } else {
+                map.insert((*field).to_string(), (*claim).to_string());
+            }
+        }
         for (field, claim) in &self.claim_map {
             map.insert(field.clone(), claim.clone());
         }
@@ -1384,6 +1464,87 @@ mod tests {
         assert_eq!(map.get("subject").map(String::as_str), Some("sub"));
         assert_eq!(map.get("email").map(String::as_str), Some("mail"));
         assert_eq!(map.get("image").map(String::as_str), Some("picture"));
+    }
+
+    /// The defect this pins: the OAuth presets named three endpoints each and
+    /// said nothing about the profile shape, so `subject` fell through to the
+    /// OIDC default `sub` — a claim none of these three servers returns. Every
+    /// one of them would have failed at the last step of a login that had
+    /// already redirected, exchanged a code and read a profile.
+    #[test]
+    fn a_plain_oauth_preset_carries_the_shape_its_server_actually_returns() {
+        for (provider, subject_claim, name_claim) in [
+            ("github", "id", "name"),
+            ("gitlab", "id", "name"),
+            ("discord", "id", "global_name"),
+        ] {
+            let registry = decl(serde_json::json!({
+                "providers": { provider: { "clientId": { "value": "cid" },
+                                           "clientSecret": { "value": "sec" } } }
+            }))
+            .lower()
+            .expect("lowers");
+            let map = &registry.provider(provider).unwrap().claim_map;
+            assert_eq!(
+                map.get("subject").map(String::as_str),
+                Some(subject_claim),
+                "{provider} keys its profile on `{subject_claim}`, not `sub`"
+            );
+            assert_eq!(map.get("name").map(String::as_str), Some(name_claim));
+        }
+    }
+
+    /// An OIDC preset's document *is* the OIDC document, so the preset layer
+    /// must not touch it.
+    #[test]
+    fn an_oidc_preset_keeps_the_standard_claim_names() {
+        let registry = decl(serde_json::json!({
+            "providers": { "google": { "clientId": { "value": "cid" },
+                                       "clientSecret": { "value": "sec" } } }
+        }))
+        .lower()
+        .expect("lowers");
+        let map = &registry.provider("google").unwrap().claim_map;
+        assert_eq!(map.get("subject").map(String::as_str), Some("sub"));
+        assert_eq!(map.get("image").map(String::as_str), Some("picture"));
+    }
+
+    /// Discord's `avatar` is a hash, not a URL. An absent field is the correct
+    /// answer; the OIDC default left in place would have read `picture` and the
+    /// naive fix would have stored a hash in a column rendered as `<img src>`.
+    #[test]
+    fn a_preset_can_remove_a_field_the_provider_does_not_supply() {
+        let registry = decl(serde_json::json!({
+            "providers": { "discord": { "clientId": { "value": "cid" },
+                                        "clientSecret": { "value": "sec" } } }
+        }))
+        .lower()
+        .expect("lowers");
+        let map = &registry.provider("discord").unwrap().claim_map;
+        assert!(
+            !map.contains_key("image"),
+            "an empty preset claim removes the field rather than mapping it: {map:?}"
+        );
+    }
+
+    /// Layer 3 still wins. An author reading the provider's actual response
+    /// outranks both our default and our preset.
+    #[test]
+    fn the_author_overrides_a_preset_claim() {
+        let registry = decl(serde_json::json!({
+            "providers": { "github": { "clientId": { "value": "cid" },
+                                       "clientSecret": { "value": "sec" },
+                                       "claimMap": { "name": "login" } } }
+        }))
+        .lower()
+        .expect("lowers");
+        let map = &registry.provider("github").unwrap().claim_map;
+        assert_eq!(map.get("name").map(String::as_str), Some("login"));
+        assert_eq!(
+            map.get("subject").map(String::as_str),
+            Some("id"),
+            "overriding one field must not discard the rest of the preset"
+        );
     }
 
     #[test]

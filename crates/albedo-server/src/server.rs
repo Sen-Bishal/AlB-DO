@@ -23,7 +23,7 @@ use crate::routing::{CompiledRouter, HttpMethod, RouteMatch, RouteTarget};
 use crate::webtransport::{WebTransportRuntime, WebTransportSessionRegistry};
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
@@ -115,6 +115,30 @@ pub(crate) struct LiveRuntime {
     /// installs one; an app that declared no providers installs one anyway, and
     /// it resolves everybody as anonymous without spending a query.
     auth: Arc<std::sync::OnceLock<Arc<crate::auth::AuthRuntime>>>,
+    /// AUTH · 15.4 — the OIDC discovery cache.
+    ///
+    /// Live state for the same reason `aperture_client` is: what it holds is a
+    /// deployment constant fetched over the network, and re-minting it on every
+    /// dev file save would put a round trip to the issuer in front of the first
+    /// sign-in after every keystroke.
+    oauth: Arc<crate::handlers::oauth_routes::OAuthRuntime>,
+    /// UPLOADS · 15.1 — the declared buckets and the directory their bytes live
+    /// in.
+    ///
+    /// Held here rather than on the world because both halves are app-static
+    /// and a dev hot reload must not swap them: the project root is fixed for
+    /// the life of the process, and re-lowering the registry on every file save
+    /// would change the bound an in-flight upload is being measured against.
+    uploads: Arc<std::sync::OnceLock<Arc<UploadRuntime>>>,
+}
+
+/// What the request path needs to accept a file.
+#[derive(Debug)]
+pub struct UploadRuntime {
+    /// The lowered `uploads` block.
+    pub registry: dom_render_compiler::upload::UploadRegistry,
+    /// Project root. Bytes land under `<project_dir>/uploads/`.
+    pub project_dir: std::path::PathBuf,
 }
 
 impl LiveRuntime {
@@ -130,6 +154,8 @@ impl LiveRuntime {
             source_reader: Arc::new(std::sync::OnceLock::new()),
             aperture_client: Arc::new(std::sync::OnceLock::new()),
             auth: Arc::new(std::sync::OnceLock::new()),
+            oauth: Arc::new(crate::handlers::oauth_routes::OAuthRuntime::default()),
+            uploads: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -193,6 +219,22 @@ impl LiveRuntime {
     /// The workflow client, if one has been installed.
     fn aperture_client(&self) -> Option<&Arc<dom_render_compiler::aperture::ApertureClient>> {
         self.aperture_client.get()
+    }
+
+    /// The OIDC discovery cache.
+    fn oauth(&self) -> &crate::handlers::oauth_routes::OAuthRuntime {
+        &self.oauth
+    }
+
+    /// The declared upload buckets, once boot has installed them.
+    fn uploads(&self) -> Option<&Arc<UploadRuntime>> {
+        self.uploads.get()
+    }
+
+    /// Install the upload runtime. Idempotent, on the same terms as the
+    /// APERTURE reader.
+    fn install_uploads(&self, uploads: Arc<UploadRuntime>) {
+        let _ = self.uploads.set(uploads);
     }
 
     /// The installed APERTURE read path, if the app declared any sources.
@@ -1052,6 +1094,25 @@ impl AlbedoServerBuilder {
         registry: dom_render_compiler::auth::AuthRegistry,
     ) -> Self {
         self.auth_registry = Some(registry);
+        self
+    }
+
+    /// UPLOADS · 15.1 — install the declared buckets and the project root.
+    ///
+    /// Lowered in `boot.rs` for the same reason the `auth` block is: a bad
+    /// `uploads` block must fail the *boot* naming the offending bucket, not
+    /// produce a server that refuses every file at request time for a reason
+    /// nobody can see.
+    #[must_use]
+    pub(crate) fn with_uploads(
+        self,
+        registry: dom_render_compiler::upload::UploadRegistry,
+        project_dir: std::path::PathBuf,
+    ) -> Self {
+        self.live.install_uploads(Arc::new(UploadRuntime {
+            registry,
+            project_dir,
+        }));
         self
     }
 
@@ -2797,6 +2858,52 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
 /// `identity` is passed rather than resolved because the branches differ on
 /// purpose: the render, action and subscribe paths have already paid for an
 /// identity lookup and should ration the *actor*, while a static asset has not
+/// The origin browsers reach this app on, for an OAuth `redirect_uri`.
+///
+/// **A declared origin wins**, on the same reasoning as
+/// [`crate::tls::insecure_auth_refusal`]: every other branch here *infers* the
+/// browser's view from the connection, and this one is told it. An app with
+/// auth providers behind a proxy or in a container has no other way to know —
+/// the bind address is meaningless in both, which is the scar
+/// `ALBEDO_PUBLIC_ORIGIN` already exists from.
+///
+/// The `Host` fallback is deliberate and safe here specifically because the
+/// redirect URI is compared byte-for-byte by the authorization server against
+/// the one registered with the client: a forged `Host` produces a URI the
+/// provider refuses, not a code delivered somewhere else. It would **not** be
+/// safe for anything the app itself trusts, and is used for nothing else.
+fn public_origin_for(state: &RuntimeState, headers: &HeaderMap) -> String {
+    if let Ok(origin) = std::env::var(crate::tls::PUBLIC_ORIGIN_ENV) {
+        let origin = origin.trim();
+        if !origin.is_empty() {
+            return origin.to_string();
+        }
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost");
+    // `X-Forwarded-Proto` is believed only from a declared proxy — the same
+    // rule SHUTTER already applies to a forwarded address, and for the same
+    // reason: an undeclared hop is an untrusted one.
+    let forwarded = (state.shutter.trusted_proxies() > 0)
+        .then(|| {
+            headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok())
+        })
+        .flatten();
+    let scheme = match forwarded {
+        Some(proto) if proto.eq_ignore_ascii_case("https") => "https",
+        Some(_) => "http",
+        // No declared proxy: loopback is the local dev case and everything else
+        // had to have passed the boot refusal, which means TLS.
+        None if host.starts_with("localhost") || host.starts_with("127.0.0.1") => "http",
+        None => "https",
+    };
+    format!("{scheme}://{host}")
+}
+
 /// and must not — an indexed session query per image on the page is a real cost
 /// for an answer that branch never reads. An asset therefore rations by address,
 /// which is the correct subject for an unauthenticated byte stream anyway.
@@ -3119,6 +3226,112 @@ async fn dispatch_routed(
         }
     }
 
+    // UPLOADS · 15.1 — stored bytes back out. A `GET`, no session required by
+    // default, and deliberately *not* guarded here: the id is a content hash,
+    // which is derived from bytes the holder already has and is therefore not a
+    // capability. An app with private files has to gate this the way it gates a
+    // FORGE row, and `uploads::store`'s docs say so rather than leaving the
+    // opposite assumption to be made quietly.
+    if let Some(upload_id) = crate::uploads::serve_id(path.as_str()) {
+        if method != HttpMethod::Get && method != HttpMethod::Head {
+            return ResponsePayload::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "uploads are read-only over HTTP".to_string(),
+            )
+            .with_header("allow", "GET, HEAD")
+            .into_response();
+        }
+        let (Some(uploads), Some(substrate)) =
+            (state.live.uploads(), state.live.forge_substrate.get())
+        else {
+            return RuntimeError::RouteNotFound {
+                method: method.as_str().to_string(),
+                path,
+            }
+            .into_response();
+        };
+        // Rationed as a read, by address — the same class and the same reason
+        // as a static asset: an unauthenticated byte stream's correct subject
+        // is the address, not a session nobody presented.
+        if let Err(refusal) = ration(
+            state,
+            peer,
+            request.headers(),
+            &crate::auth::Identity::Anonymous,
+            Cost::flat(OperationClass::Read),
+            rationed,
+        ) {
+            return refusal;
+        }
+        return crate::uploads::serve(substrate.as_ref(), &uploads.project_dir, upload_id).await;
+    }
+
+    // AUTH · 15.4 — the OAuth legs. Ahead of the password endpoints because
+    // those refuse anything that is not a `POST`, and both of these must be
+    // `GET`: one is a link a person clicks and the other is a top-level
+    // navigation the authorization server performs. A redirect cannot be a
+    // `POST`, so sharing that dispatch would have made the flow unreachable.
+    if let Some((leg, provider_name)) =
+        crate::handlers::oauth_routes::match_oauth_route(path.as_str())
+    {
+        use crate::handlers::oauth_routes::OAuthRequest;
+
+        if method != HttpMethod::Get {
+            return ResponsePayload::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "oauth sign-in endpoints accept GET only".to_string(),
+            )
+            .with_header("allow", "GET")
+            .into_response();
+        }
+
+        let Some(auth) = state.live.auth() else {
+            return RuntimeError::RouteNotFound {
+                method: method.as_str().to_string(),
+                path,
+            }
+            .into_response();
+        };
+        let auth = auth.clone();
+        let identity = state.live.identity(request.headers()).await;
+
+        // Both legs are credential operations: `start` mints a flow and
+        // `callback` opens a session, and an unlimited `callback` is an
+        // unlimited token exchange against somebody else's authorization
+        // server. Charged before either does any work, unlike password login —
+        // there is no account name inside a URL to bucket by, so the caller's
+        // own bucket is the whole answer.
+        if let Err(refusal) = ration(
+            state,
+            peer,
+            request.headers(),
+            &identity,
+            Cost::flat(OperationClass::Credential),
+            rationed,
+        ) {
+            return refusal;
+        }
+
+        let origin = public_origin_for(state, request.headers());
+        let query = request.uri().query().unwrap_or_default().to_string();
+        let headers = request.headers().clone();
+
+        return crate::handlers::oauth_routes::run_oauth_route(
+            leg,
+            provider_name,
+            OAuthRequest {
+                auth: auth.as_ref(),
+                oauth: state.live.oauth(),
+                aperture: state.live.aperture_client(),
+                identity: &identity,
+                query: &query,
+                origin: &origin,
+                headers: &headers,
+            },
+        )
+        .await;
+    }
+
     // AUTH · P2 — the first-party sign-in endpoints. Placed ahead of everything
     // else under `/_albedo/` because they are the one surface an anonymous
     // stranger is *supposed* to reach, and because the limiting they need is not
@@ -3240,6 +3453,8 @@ async fn dispatch_routed(
                 request,
                 action_name,
                 principal,
+                state.live.uploads(),
+                state.live.forge_substrate.get().cloned(),
             ))
             .await;
 
@@ -3752,11 +3967,72 @@ async fn run_form_action_route(
     request: Request<Body>,
     action_name: String,
     principal: crate::auth::Identity,
+    uploads: Option<&Arc<UploadRuntime>>,
+    substrate: Option<Arc<dyn dom_render_compiler::forge::DataSubstrate>>,
 ) -> Response {
-    let (parts, body) = request.into_parts();
-    let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
+    let (mut parts, body) = request.into_parts();
+
+    // UPLOADS · 15.1 — the multipart pre-stage.
+    //
+    // 🔑 **This normalises rather than forks.** A multipart body's file parts
+    // stream to disk and every field comes back as a small string — a file
+    // field's value being its id — so what continues down this function is an
+    // ordinary urlencoded body. CSRF, the return path, the action lookup and
+    // the gate below are therefore the *same* code on both paths, rather than a
+    // second implementation that has to be kept in step with the first. The
+    // `Content-Type` header is rewritten to match, because a header that still
+    // says `multipart` describes a body that no longer exists.
+    let body = match crate::uploads::boundary_of(
+        parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        Some(boundary) => {
+            let Some(uploads) = uploads else {
+                return crate::uploads::refusal(&crate::uploads::UploadError::NoBucketsDeclared);
+            };
+            let stream = futures_util::TryStreamExt::map_err(
+                body.into_data_stream(),
+                std::io::Error::other,
+            );
+            let form = match crate::uploads::decode_multipart(
+                stream,
+                &boundary,
+                &crate::uploads::UploadContext {
+                    registry: &uploads.registry,
+                    project_dir: &uploads.project_dir,
+                    principal: principal.principal().map(|who| who.id.to_string()),
+                },
+            )
+            .await
+            {
+                Ok(form) => form,
+                Err(err) => return crate::uploads::refusal(&err),
+            };
+
+            // The bytes are already on disk; the row is what makes them
+            // findable. Recorded before the action runs so an action body that
+            // reads the uploads table sees its own upload.
+            if let Some(substrate) = substrate.as_ref() {
+                crate::uploads::record_all(
+                    substrate.as_ref(),
+                    &form,
+                    crate::auth::now_ms(),
+                )
+                .await;
+            }
+
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static(crate::forms::FORM_CONTENT_TYPE),
+            );
+            bytes::Bytes::from(crate::uploads::to_urlencoded(&form))
+        }
+        None => match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
+        },
     };
 
     let session_id = crate::render::csrf::read_session_cookie(&parts.headers)

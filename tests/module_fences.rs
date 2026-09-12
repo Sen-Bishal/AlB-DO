@@ -175,6 +175,13 @@ const SERVER_MAY_REACH: &[(&str, &str)] = &[
     ("runtime", "the evaluator and engine the server drives per request"),
     ("forge", "the data substrate; the server is its only caller in production"),
     ("auth", "session and principal types shared with the request path"),
+    // Shared vocabulary by the fence's own test: the id alphabet and the
+    // fan-out path layout must be computed **identically** on both sides, or a
+    // file written by the request path is unfindable by the serve path. The
+    // declaration types travel with them because the bound they carry has to be
+    // in hand before the request path reads a byte. No compile-time machinery
+    // crosses — `upload` has no parser, no analysis and no build step.
+    ("upload", "the upload id alphabet, the on-disk layout, and the declared bounds"),
     ("aperture", "the outbound HTTP client the server stages suspensions through"),
     ("shutter", "the streaming/suspension machinery"),
     ("hydration", "tier and hydration types travelling on the manifest"),

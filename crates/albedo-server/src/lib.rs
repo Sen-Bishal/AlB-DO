@@ -63,6 +63,7 @@ pub mod renderer_runtime;
 pub mod routing;
 pub mod server;
 pub mod shutter;
+pub mod uploads;
 pub mod timing;
 pub mod tls;
 pub mod topics;

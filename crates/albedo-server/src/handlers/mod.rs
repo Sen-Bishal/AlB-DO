@@ -4,6 +4,7 @@ pub mod api;
 pub mod auth_gate;
 pub mod auth_routes;
 pub mod dev;
+pub mod oauth_routes;
 pub mod patches;
 pub mod phosphor;
 pub mod public_assets;
