@@ -1781,6 +1781,16 @@ impl ComponentProject {
         self.sources.get(&spec).map(String::as_str)
     }
 
+    /// Resolve a relative import written in `current_module` to the spec it
+    /// names, with the same extension and `index` candidates the evaluator uses.
+    ///
+    /// Exposed so a module graph built outside the evaluator (the middleware
+    /// entry, which no component imports) cannot resolve a path differently
+    /// from the evaluator that loaded the project.
+    pub fn resolve_project_import(&self, current_module: &str, source: &str) -> Option<String> {
+        self.resolve_import(current_module, source)
+    }
+
     /// Resolve a render `entry` to its `(module_spec, default_export_fn)`.
     /// Mirrors the resolution [`Self::render_entry`] does internally, exposed
     /// for the A1 host-object render bridge which needs the concrete module

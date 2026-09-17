@@ -68,19 +68,50 @@ impl AppConfig {
     }
 
     pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), RuntimeError> {
-        if let Ok(host) = std::env::var(format!("{prefix}SERVER_HOST")) {
+        let lookup = |key: &str| std::env::var(key).ok();
+        self.apply_bind_env_overrides_from(prefix, lookup)?;
+        self.apply_tuning_env_overrides_from(prefix, lookup)
+    }
+
+    /// `{prefix}SERVER_HOST` and `{prefix}SERVER_PORT`, read through `lookup`.
+    ///
+    /// Separate from [`Self::apply_tuning_env_overrides_from`] because these two
+    /// have CLI flags and the rest do not: a caller that also takes `--host` and
+    /// `--port` must layer the environment *under* them, and cannot do that by
+    /// calling one function that sets everything.
+    pub fn apply_bind_env_overrides_from(
+        &mut self,
+        prefix: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(host) = lookup(&format!("{prefix}SERVER_HOST")) {
             self.server.host = host;
         }
 
-        if let Ok(port) = std::env::var(format!("{prefix}SERVER_PORT")) {
+        if let Some(port) = lookup(&format!("{prefix}SERVER_PORT")) {
             self.server.port = port.parse::<u16>().map_err(|err| {
                 RuntimeError::InvalidConfig(format!(
                     "failed to parse {prefix}SERVER_PORT value '{port}': {err}"
                 ))
             })?;
         }
+        Ok(())
+    }
 
-        if let Ok(timeout_ms) = std::env::var(format!("{prefix}REQUEST_TIMEOUT_MS")) {
+    /// Everything the environment can set that has no CLI flag — the request
+    /// and shutdown timeouts and the WebTransport settings — read through
+    /// `lookup`.
+    ///
+    /// 🔴 **This used to run only from the JSON config-file loader.** `albedo
+    /// serve` builds its `AppConfig` as a literal, so on the one path anyone
+    /// deploys `ALBEDO_REQUEST_TIMEOUT_MS` and `ALBEDO_SHUTDOWN_TIMEOUT_MS` did
+    /// nothing — including in a systemd unit, where they are the only knob.
+    pub fn apply_tuning_env_overrides_from(
+        &mut self,
+        prefix: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), RuntimeError> {
+        if let Some(timeout_ms) = lookup(&format!("{prefix}REQUEST_TIMEOUT_MS")) {
             self.server.request_timeout_ms = timeout_ms.parse::<u64>().map_err(|err| {
                 RuntimeError::InvalidConfig(format!(
                     "failed to parse {prefix}REQUEST_TIMEOUT_MS value '{timeout_ms}': {err}"
@@ -88,7 +119,7 @@ impl AppConfig {
             })?;
         }
 
-        if let Ok(timeout_ms) = std::env::var(format!("{prefix}SHUTDOWN_TIMEOUT_MS")) {
+        if let Some(timeout_ms) = lookup(&format!("{prefix}SHUTDOWN_TIMEOUT_MS")) {
             self.server.shutdown_timeout_ms = timeout_ms.parse::<u64>().map_err(|err| {
                 RuntimeError::InvalidConfig(format!(
                     "failed to parse {prefix}SHUTDOWN_TIMEOUT_MS value '{timeout_ms}': {err}"
@@ -96,22 +127,34 @@ impl AppConfig {
             })?;
         }
 
-        if let Ok(enabled) = std::env::var(format!("{prefix}WEBTRANSPORT_ENABLED")) {
+        // Empty unsets, so a template can carry `ALBEDO_METRICS_ADDR=` as an
+        // off switch without it failing to parse.
+        if let Some(addr) = lookup(&format!("{prefix}METRICS_ADDR")) {
+            let addr = addr.trim();
+            if !addr.is_empty() && addr.parse::<SocketAddr>().is_err() {
+                return Err(RuntimeError::InvalidConfig(format!(
+                    "failed to parse {prefix}METRICS_ADDR value '{addr}': expected ip:port, e.g. 127.0.0.1:9464"
+                )));
+            }
+            self.server.metrics_addr = (!addr.is_empty()).then(|| addr.to_string());
+        }
+
+        if let Some(enabled) = lookup(&format!("{prefix}WEBTRANSPORT_ENABLED")) {
             self.server.webtransport.enabled = parse_bool_env(
                 format!("{prefix}WEBTRANSPORT_ENABLED").as_str(),
                 enabled.as_str(),
             )?;
         }
 
-        if let Ok(cert_path) = std::env::var(format!("{prefix}WEBTRANSPORT_CERT_PATH")) {
+        if let Some(cert_path) = lookup(&format!("{prefix}WEBTRANSPORT_CERT_PATH")) {
             self.server.webtransport.cert_path = Some(cert_path);
         }
 
-        if let Ok(key_path) = std::env::var(format!("{prefix}WEBTRANSPORT_KEY_PATH")) {
+        if let Some(key_path) = lookup(&format!("{prefix}WEBTRANSPORT_KEY_PATH")) {
             self.server.webtransport.key_path = Some(key_path);
         }
 
-        if let Ok(keepalive_ms) = std::env::var(format!("{prefix}WEBTRANSPORT_KEEPALIVE_MS")) {
+        if let Some(keepalive_ms) = lookup(&format!("{prefix}WEBTRANSPORT_KEEPALIVE_MS")) {
             self.server.webtransport.keepalive_interval_ms =
                 keepalive_ms.parse::<u64>().map_err(|err| {
                     RuntimeError::InvalidConfig(format!(
@@ -120,8 +163,8 @@ impl AppConfig {
                 })?;
         }
 
-        if let Ok(buffer_capacity) =
-            std::env::var(format!("{prefix}WEBTRANSPORT_STREAM_BUFFER_CAPACITY"))
+        if let Some(buffer_capacity) =
+            lookup(&format!("{prefix}WEBTRANSPORT_STREAM_BUFFER_CAPACITY"))
         {
             self.server.webtransport.stream_buffer_capacity =
                 buffer_capacity.parse::<usize>().map_err(|err| {
@@ -182,6 +225,11 @@ pub struct ServerConfig {
     /// deployment did before this existed. See [`crate::tls`].
     #[serde(default)]
     pub tls: crate::tls::TlsSettings,
+    /// 15.7 · where the Prometheus scrape listener binds (`ip:port`). `None`
+    /// binds nothing — metrics are closed until an operator opens them. See
+    /// [`crate::metrics`] for why this is a second address and not a route.
+    #[serde(default)]
+    pub metrics_addr: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -193,6 +241,7 @@ impl Default for ServerConfig {
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
             webtransport: WebTransportConfig::default(),
             tls: crate::tls::TlsSettings::default(),
+            metrics_addr: None,
         }
     }
 }
@@ -203,6 +252,20 @@ impl ServerConfig {
             RuntimeError::InvalidConfig(format!("invalid server host '{}': {err}", self.host))
         })?;
         Ok(SocketAddr::new(ip, self.port))
+    }
+
+    /// The scrape listener's address, when one is configured.
+    pub fn metrics_socket_addr(&self) -> Result<Option<SocketAddr>, RuntimeError> {
+        self.metrics_addr
+            .as_deref()
+            .map(|addr| {
+                addr.parse::<SocketAddr>().map_err(|err| {
+                    RuntimeError::InvalidConfig(format!(
+                        "invalid metrics address '{addr}' (expected ip:port, e.g. 127.0.0.1:9464): {err}"
+                    ))
+                })
+            })
+            .transpose()
     }
 
     pub fn validate(&self) -> Result<(), RuntimeError> {
@@ -218,6 +281,15 @@ impl ServerConfig {
         }
         self.webtransport.validate()?;
         self.socket_addr()?;
+        if let (Some(metrics), Ok(app)) = (self.metrics_socket_addr()?, self.socket_addr()) {
+            // A shared address would bind twice and fail with "address in use",
+            // which names neither setting.
+            if metrics == app {
+                return Err(RuntimeError::InvalidConfig(format!(
+                    "the metrics address {metrics} is the app's own address; give it its own port"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -471,6 +543,96 @@ fn parse_bool_env(name: &str, value: &str) -> Result<bool, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| (*v).to_string())
+    }
+
+    #[test]
+    fn tuning_overrides_set_the_timeouts_and_leave_the_bind_address_alone() {
+        let mut config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+            forge: ForgeConfig::default(),
+        };
+        let (host, port) = (config.server.host.clone(), config.server.port);
+        config
+            .apply_tuning_env_overrides_from(
+                "ALBEDO_",
+                env(&[
+                    ("ALBEDO_REQUEST_TIMEOUT_MS", "1500"),
+                    ("ALBEDO_SHUTDOWN_TIMEOUT_MS", "250"),
+                    ("ALBEDO_SERVER_PORT", "9999"),
+                    ("ALBEDO_SERVER_HOST", "0.0.0.0"),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(config.server.request_timeout_ms, 1500);
+        assert_eq!(config.server.shutdown_timeout_ms, 250);
+        assert_eq!(
+            (config.server.host.as_str(), config.server.port),
+            (host.as_str(), port),
+            "the tuning overrides must not touch what a CLI flag decides"
+        );
+
+        config
+            .apply_bind_env_overrides_from(
+                "ALBEDO_",
+                env(&[("ALBEDO_SERVER_PORT", "9999"), ("ALBEDO_SERVER_HOST", "0.0.0.0")]),
+            )
+            .unwrap();
+        assert_eq!((config.server.host.as_str(), config.server.port), ("0.0.0.0", 9999));
+    }
+
+    #[test]
+    fn a_malformed_timeout_in_the_environment_is_refused_by_name() {
+        let mut config = AppConfig {
+            server: ServerConfig::default(),
+            renderer: None,
+            layouts: Vec::new(),
+            routes: Vec::new(),
+            forge: ForgeConfig::default(),
+        };
+        let err = config
+            .apply_tuning_env_overrides_from("ALBEDO_", env(&[("ALBEDO_REQUEST_TIMEOUT_MS", "15s")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("ALBEDO_REQUEST_TIMEOUT_MS"), "{err}");
+    }
+
+    #[test]
+    fn metrics_address_comes_from_the_environment_and_is_off_by_default() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.server.metrics_socket_addr().unwrap(), None);
+
+        config
+            .apply_tuning_env_overrides_from("ALBEDO_", env(&[("ALBEDO_METRICS_ADDR", "0.0.0.0:9091")]))
+            .unwrap();
+        assert_eq!(
+            config.server.metrics_socket_addr().unwrap(),
+            Some("0.0.0.0:9091".parse().unwrap())
+        );
+
+        // Empty is the off switch a template can carry.
+        config
+            .apply_tuning_env_overrides_from("ALBEDO_", env(&[("ALBEDO_METRICS_ADDR", "")]))
+            .unwrap();
+        assert_eq!(config.server.metrics_addr, None);
+
+        let err = config
+            .apply_tuning_env_overrides_from("ALBEDO_", env(&[("ALBEDO_METRICS_ADDR", "9091")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("ALBEDO_METRICS_ADDR"), "{err}");
+    }
+
+    #[test]
+    fn metrics_address_may_not_be_the_app_address() {
+        let mut cfg = ServerConfig::default();
+        cfg.metrics_addr = Some(format!("{}:{}", cfg.host, cfg.port));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("its own port"), "{err}");
+    }
 
     #[test]
     fn test_default_server_config_validates() {

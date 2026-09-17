@@ -224,6 +224,8 @@ pub fn is_bare_npm_specifier(specifier: &str) -> bool {
     // does not exist.
     if matches!(s, "react" | "react-dom" | "albedo" | "albedo/forge")
         || s == crate::transforms::shared_slots::SOURCE_BINDINGS_MODULE
+        || s == crate::middleware::MIDDLEWARE_MODULE
+        || s == crate::jobs::JOBS_MODULE
         || s.starts_with("react/")
     {
         return false;
@@ -1867,6 +1869,27 @@ pub fn scan_bare_imports(source: &str) -> Vec<String> {
     esm_specifiers(&module)
         .into_iter()
         .filter(|specifier| is_bare_npm_specifier(specifier))
+        .filter(|specifier| seen.insert(specifier.clone()))
+        .collect()
+}
+
+/// Scan a project source for the **relative** specifiers it imports or
+/// re-exports from — the project-module half of [`scan_bare_imports`].
+///
+/// Side-effect imports and `export * from` count, which is why this reads the
+/// AST again rather than `ParsedModule::imports`: that map is keyed by local
+/// binding, so an import that binds nothing is invisible to it, and a module
+/// graph built from it would load a file before a dependency it never named.
+#[must_use]
+pub fn scan_relative_imports(source: &str) -> Vec<String> {
+    let Some(module) = parse_project_module(source) else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    esm_specifiers(&module)
+        .into_iter()
+        .filter(|specifier| specifier.starts_with("./") || specifier.starts_with("../"))
         .filter(|specifier| seen.insert(specifier.clone()))
         .collect()
 }

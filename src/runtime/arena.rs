@@ -274,6 +274,14 @@ impl ArenaControl {
         self.in_request.store(false, Relaxed);
     }
 
+    /// Request-time bytes currently outstanding — the one gauge the engine reads
+    /// on every request boundary, so it gets a load of its own rather than the
+    /// eight a full [`Self::stats`] snapshot costs.
+    #[inline]
+    pub fn system_live_bytes(&self) -> usize {
+        self.system_live_bytes.load(Relaxed)
+    }
+
     pub fn stats(&self) -> ArenaStats {
         ArenaStats {
             persistent_used: self.persistent.top.load(Relaxed),

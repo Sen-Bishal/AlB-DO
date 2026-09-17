@@ -425,6 +425,49 @@ pub async fn sessions_for(
 /// [`SessionRejection::PrincipalGone`] — recoverable, but the wrong order is the
 /// one that leaves a window where the account is gone and the session is not.
 ///
+/// JOBS · 15.5 — one page of registered principals, ordered, for a fan-out.
+///
+/// Keyset pagination rather than `OFFSET`: a scheduled fan-out expands over
+/// minutes and rows are being written the whole time, so an offset would skip a
+/// principal whenever one was inserted earlier in the ordering, and re-send to
+/// another whenever one was deleted. Ordering by the principal itself makes the
+/// cursor a value that keeps meaning the same thing.
+///
+/// `after` is exclusive; pass `None` for the first page.
+///
+/// 🪤 Returns the **raw** strings, not [`PrincipalId`]s. A row whose principal
+/// is outside the partition-key alphabet is a corrupted row, and the two ways to
+/// handle it here are both wrong: parsing and skipping drops one person's work
+/// silently and forever, while parsing and failing stalls the cursor so nobody
+/// after them is ever reached either. The caller holds the cursor and is the
+/// only one that can advance past a bad row *and* say so, so it gets the choice.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn principals_after(
+    db: &dyn DataSubstrate,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let rows = db
+        .query(
+            &format!(
+                "SELECT principal FROM {USERS} WHERE principal > ?1 ORDER BY principal LIMIT ?2"
+            ),
+            &[
+                SqlValue::Text(after.unwrap_or("").to_string()),
+                SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )
+        .await?;
+    Ok(rows
+        .rows
+        .iter()
+        .filter_map(|row| row.get(0).and_then(SqlValue::as_str))
+        .map(str::to_string)
+        .collect())
+}
+
 /// # Errors
 /// [`StoreError`] on substrate failure.
 pub async fn delete_principal(db: &dyn DataSubstrate, principal: &PrincipalId) -> Result<()> {

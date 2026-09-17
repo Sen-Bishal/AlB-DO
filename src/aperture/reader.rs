@@ -370,6 +370,7 @@ mod tests {
         [(
             "github".to_string(),
             SourceDecl {
+                limit: None,
                 base: "https://api.github.com".to_string(),
                 auth: None,
                 headers: BTreeMap::new(),

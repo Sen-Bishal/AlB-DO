@@ -510,6 +510,45 @@ pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> 
     Ok(options)
 }
 
+/// The environment variable that sets the bind host when `--host` is absent.
+pub const SERVER_HOST_ENV: &str = "ALBEDO_SERVER_HOST";
+/// The environment variable that sets the bind port when `--port` is absent.
+pub const SERVER_PORT_ENV: &str = "ALBEDO_SERVER_PORT";
+
+/// Settle the bind address from four sources, strongest first: an explicit
+/// `--host`/`--port`, then [`SERVER_HOST_ENV`]/[`SERVER_PORT_ENV`], then the
+/// config file, then the defaults `server` already carries.
+///
+/// 🔴 The environment used to be read only by the JSON config-file loader, so
+/// on `albedo serve` these variables did nothing: `ALBEDO_SERVER_PORT=5477`
+/// bound 3000. They worked in the emitted container only because its `CMD`
+/// shell-expands them into flags. Layered *under* the flags rather than
+/// applied after them — someone who types `--port` meant it.
+fn layer_server_bind(
+    server: &mut DevServerConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+    host_flag: Option<String>,
+    port_flag: Option<u16>,
+) -> Result<(), String> {
+    if let Some(host) = host_flag.or_else(|| lookup(SERVER_HOST_ENV)) {
+        server.host = host;
+    }
+    let port = match port_flag {
+        Some(port) => Some(port),
+        None => lookup(SERVER_PORT_ENV)
+            .map(|raw| {
+                raw.trim()
+                    .parse::<u16>()
+                    .map_err(|_| format!("{SERVER_PORT_ENV} must be a port number, got '{raw}'"))
+            })
+            .transpose()?,
+    };
+    if let Some(port) = port {
+        server.port = port;
+    }
+    Ok(())
+}
+
 pub fn resolve_dev_contract(
     raw_args: &[String],
     cwd: &Path,
@@ -575,12 +614,12 @@ pub fn resolve_dev_contract(
         return Err(format!("dev root '{}' is not a directory", root.display()));
     }
 
-    if let Some(host) = cli.host_override {
-        config.server.host = host;
-    }
-    if let Some(port) = cli.port_override {
-        config.server.port = port;
-    }
+    layer_server_bind(
+        &mut config.server,
+        |key| std::env::var(key).ok(),
+        cli.host_override,
+        cli.port_override,
+    )?;
     if cli.no_hmr {
         config.hmr.enabled = false;
         config.hmr.transport = HmrTransport::Sse;
@@ -1348,6 +1387,51 @@ fn default_root() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_bind_address_is_flag_then_environment_then_config() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| (*v).to_string())
+        };
+        let from_config = || super::DevServerConfig { host: "10.0.0.1".to_string(), port: 4000 };
+
+        // Nothing set: the config file stands.
+        let mut server = from_config();
+        super::layer_server_bind(&mut server, env(&[]), None, None).unwrap();
+        assert_eq!((server.host.as_str(), server.port), ("10.0.0.1", 4000));
+
+        // Environment over the config file.
+        let mut server = from_config();
+        super::layer_server_bind(
+            &mut server,
+            env(&[("ALBEDO_SERVER_HOST", "0.0.0.0"), ("ALBEDO_SERVER_PORT", "5477")]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!((server.host.as_str(), server.port), ("0.0.0.0", 5477));
+
+        // A flag over the environment, each half independently.
+        let mut server = from_config();
+        super::layer_server_bind(
+            &mut server,
+            env(&[("ALBEDO_SERVER_HOST", "0.0.0.0"), ("ALBEDO_SERVER_PORT", "5477")]),
+            None,
+            Some(3001),
+        )
+        .unwrap();
+        assert_eq!((server.host.as_str(), server.port), ("0.0.0.0", 3001));
+
+        let mut server = from_config();
+        let err = super::layer_server_bind(&mut server, env(&[("ALBEDO_SERVER_PORT", "eighty")]), None, None)
+            .unwrap_err();
+        assert!(err.contains("ALBEDO_SERVER_PORT"), "{err}");
+        // …and a malformed variable is not an error when a flag makes it moot.
+        let mut server = from_config();
+        super::layer_server_bind(&mut server, env(&[("ALBEDO_SERVER_PORT", "eighty")]), None, Some(3001))
+            .unwrap();
+        assert_eq!(server.port, 3001);
+    }
+
     use super::*;
 
     #[test]

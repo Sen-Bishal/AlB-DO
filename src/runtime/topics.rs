@@ -413,6 +413,7 @@ mod tests {
         let decls: std::collections::BTreeMap<String, SourceDecl> = [(
             "github".to_string(),
             SourceDecl {
+                limit: None,
                 base: "https://api.github.com".to_string(),
                 auth: None,
                 headers: std::collections::BTreeMap::new(),

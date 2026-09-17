@@ -59,6 +59,28 @@ impl Resolve for ApertureResolver {
     }
 }
 
+/// Lower a failed send, recovering an egress refusal from the error chain.
+///
+/// 🪤 **The resolver's refusal arrives wrapped.** [`ApertureResolver`] returns an
+/// [`EgressDenial`](crate::aperture::egress::EgressDenial), `reqwest` wraps it as
+/// a connect error, and that error's `Display` is only *"error sending request
+/// for url (…)"* — the cause lives in `source()`. Lowered with `to_string()`, a
+/// named host that resolves into a denied range read as a **transport failure**:
+/// the exact misreport `workflow::resolve_one` names the `Egress` variant to
+/// prevent, reached anyway because only IP-literal URLs ever produced that
+/// variant. Found by a middleware test whose refusal came back looking like a
+/// dead port.
+fn send_error(err: reqwest::Error) -> ApertureError {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+    while let Some(current) = cause {
+        if let Some(denial) = current.downcast_ref::<crate::aperture::egress::EgressDenial>() {
+            return ApertureError::Egress(denial.clone());
+        }
+        cause = current.source();
+    }
+    ApertureError::Transport(err.to_string())
+}
+
 /// The production [`Transport`].
 #[derive(Debug)]
 pub struct ReqwestTransport {
@@ -108,10 +130,7 @@ impl Transport for ReqwestTransport {
             builder = builder.body(body.clone());
         }
 
-        let response = builder
-            .send()
-            .await
-            .map_err(|err| ApertureError::Transport(err.to_string()))?;
+        let response = builder.send().await.map_err(send_error)?;
 
         let status = response.status().as_u16();
         let etag = header_string(&response, "etag");
@@ -194,6 +213,27 @@ mod tests {
         assert!(
             declared.resolve(name).await.is_ok(),
             "a declaration is the authority the allowlist carries"
+        );
+    }
+
+    /// The whole path, not the resolver alone: a denial raised inside DNS
+    /// resolution must reach the caller as `Egress`, never as `Transport`.
+    #[tokio::test]
+    async fn a_resolver_refusal_surfaces_as_egress_not_as_a_transport_failure() {
+        let transport =
+            ReqwestTransport::new(Arc::new(EgressPolicy::new(EgressMode::Serve))).expect("builds");
+        let err = transport
+            .send(&WireRequest {
+                method: "GET".to_string(),
+                url: "http://localhost:9/".to_string(),
+                headers: Vec::new(),
+                body: None,
+            })
+            .await
+            .expect_err("serve refuses loopback");
+        assert!(
+            matches!(err, ApertureError::Egress(_)),
+            "a policy decision must not read as a network fault: {err}"
         );
     }
 

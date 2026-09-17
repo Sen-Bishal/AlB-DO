@@ -2166,6 +2166,28 @@ impl CompiledProject {
                         ));
                     }
                 }
+                // JOBS · 15.5 — recorded, not performed, for the same reason the
+                // FORGE writes above are: this function is synchronous and the
+                // queue is a table.
+                HandlerEffect::Enqueue {
+                    name,
+                    args,
+                    id,
+                    delay,
+                } => {
+                    if !crate::jobs::collect::record(crate::jobs::EnqueueIntent {
+                        name: name.clone(),
+                        args: args.clone(),
+                        id: id.clone(),
+                        delay: delay.clone(),
+                    }) {
+                        return Err(anyhow!(
+                            "enqueue('{name}') was called but no job collector is installed. \
+                             Queueing needs a substrate — add a `forge` block to \
+                             albedo.config.ts, or dispatch through a path that installs one"
+                        ));
+                    }
+                }
             }
             if let Some(instruction) = effect.into_instruction() {
                 instructions.push(instruction);

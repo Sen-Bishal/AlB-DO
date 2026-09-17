@@ -70,7 +70,10 @@ pub mod graph;
 pub mod hydration;
 pub mod incremental;
 pub mod ir;
+/// JOBS · 15.5 — scheduled and enqueued background work.
+pub mod jobs;
 pub mod manifest;
+pub mod middleware;
 pub mod parser;
 pub mod routing;
 pub mod preflight;

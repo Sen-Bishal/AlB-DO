@@ -52,6 +52,7 @@ fn github_sources() -> BTreeMap<String, SourceDecl> {
     [(
         "github".to_string(),
         SourceDecl {
+            limit: None,
             base: "https://api.github.com".to_string(),
             auth: None,
             headers: BTreeMap::new(),

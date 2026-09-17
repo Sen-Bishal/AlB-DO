@@ -383,6 +383,7 @@ mod tests {
         [(
             "acme".to_string(),
             SourceDecl {
+                limit: None,
                 base: "https://api.acme.test".to_string(),
                 auth: None,
                 headers: BTreeMap::new(),
@@ -566,6 +567,61 @@ mod tests {
             );
         }
         assert_eq!(transport.calls(), 1);
+    }
+
+    /// A declared source's `limit` bounds its own polling too. The loop has no
+    /// caller to charge, which is why the budget lives in the client: every
+    /// refresh passes through the same gate an action's `fetch()` does, and one
+    /// refused for budget leaves the last good value standing.
+    #[tokio::test]
+    async fn the_refresh_loop_spends_the_same_host_budget_and_stops_at_it() {
+        let transport = Arc::new(CountingTransport::scripted(
+            (1..=20)
+                .map(|n| Ok(json(&format!(r#"{{"n":{n}}}"#), &format!("\"v{n}\""))))
+                .collect(),
+        ));
+        let reader = reader("0s", transport.clone());
+        let shutter = crate::shutter::Shutter::new().expect("default limits");
+        shutter
+            .set_upstream_quota(
+                "api.acme.test",
+                crate::shutter::Quota::with_burst(3, std::time::Duration::from_secs(3_600), 3)
+                    .unwrap(),
+            )
+            .unwrap();
+        reader.client().install_upstream_budget(shutter.clone());
+
+        let registry = Arc::new(BroadcastRegistry::new());
+        let wanted = wanted(&reader);
+        refresh_topic(&reader, &registry, &wanted).await;
+        let _tab = viewer(&registry, &wanted.topic);
+
+        let refresher = RefreshLoop::new(Arc::clone(&registry), Arc::clone(&reader));
+        for _ in 0..10 {
+            refresher.tick().await;
+        }
+
+        assert_eq!(transport.calls(), 3, "the warm plus two polls, then the budget held");
+        assert!(reader.client().metrics().throttled >= 1, "later polls were refused, not skipped");
+        assert_eq!(
+            registry.get(&wanted.topic).unwrap().current_value(),
+            br#"{"n":3}"#.to_vec(),
+            "the last value that was actually fetched stands"
+        );
+
+        // And the budget the loop spent is the one a request would peek.
+        assert!(
+            !shutter
+                .outbound_call(
+                    &crate::shutter::Key::Address {
+                        addr: std::net::IpAddr::from([10, 0, 0, 1]),
+                        class: crate::shutter::OperationClass::Outbound,
+                    },
+                    "api.acme.test",
+                )
+                .is_admitted(),
+            "background polling and request traffic draw on one budget"
+        );
     }
 
     /// Rule 2's other half. A broken upstream is retried on its declared

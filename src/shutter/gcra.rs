@@ -92,6 +92,14 @@ pub enum QuotaError {
         /// The burst it would have to fit inside.
         burst: u32,
     },
+    /// A shared budget split across instances would give each less than one
+    /// unit of burst, so the instances together would exceed it.
+    CannotPartition {
+        /// The budget's burst.
+        burst: u32,
+        /// How many instances it was to be split across.
+        instances: u32,
+    },
 }
 
 impl std::fmt::Display for QuotaError {
@@ -105,6 +113,12 @@ impl std::fmt::Display for QuotaError {
             Self::UnusablePeriod => {
                 f.write_str("the period is zero or too long to express in nanoseconds")
             }
+            Self::CannotPartition { burst, instances } => write!(
+                f,
+                "a budget with a burst of {burst} cannot be split across {instances} instances — \
+                 each would need at least one, and together they would admit {instances}. Raise \
+                 the budget or lower the instance count"
+            ),
             Self::WeightExceedsBurst { weight, burst } => write!(
                 f,
                 "an operation weighing {weight} can never be admitted by a limit whose burst is \
@@ -163,6 +177,37 @@ impl Quota {
     #[must_use]
     pub const fn max_weight(&self) -> u32 {
         self.burst
+    }
+
+    /// This quota's share when it is enforced independently by `instances`
+    /// processes that together must not exceed it.
+    ///
+    /// The rate is divided by stretching the period rather than shrinking the
+    /// count — `600/min` across 4 is `600 per 4 min` — so the arithmetic stays
+    /// exact in integers. The burst is divided and floored, which can only
+    /// under-admit.
+    ///
+    /// # Errors
+    /// [`QuotaError::CannotPartition`] when a share would have no burst at all:
+    /// rounding it up to one would let the instances together burst past the
+    /// budget they were meant to share.
+    pub fn partitioned(&self, instances: u32) -> Result<Self, QuotaError> {
+        if instances <= 1 {
+            return Ok(*self);
+        }
+        let burst = self.burst / instances;
+        if burst == 0 {
+            return Err(QuotaError::CannotPartition {
+                burst: self.burst,
+                instances,
+            });
+        }
+        let emission_interval = self.emission_interval.saturating_mul(u64::from(instances));
+        Ok(Self {
+            emission_interval,
+            tolerance: emission_interval.saturating_mul(u64::from(burst)),
+            burst,
+        })
     }
 
     /// Burst size, for `RateLimit-Limit`.

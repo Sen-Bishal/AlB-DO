@@ -61,7 +61,28 @@ impl ProjectScanner {
         {
             let file_path = entry.path();
 
-            if file_path.is_file() && self.is_component_file(file_path) {
+            // 15.6 · the root-level middleware is a request hook, not a
+            // component. Its default export is a function, so the parser would
+            // otherwise list it as one and tier it — `B middleware  imports npm`
+            // in the build report, and a manifest entry for a thing that is
+            // never rendered. Only this scan skips it: `ComponentProject` still
+            // loads the file, because that is where its declaration is read.
+            //
+            // 15.5 · `jobs.ts` is the same shape and was missed the same way —
+            // it built as `B __module__jobs`, so the file was tiered, bundled
+            // and never run. **Any root entry the framework runs itself belongs
+            // in this list**; the next one will be missed too if it is added
+            // anywhere else.
+            let is_framework_entry = file_path.parent() == Some(path)
+                && file_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        crate::middleware::declare::ENTRY_NAMES.contains(&name)
+                            || crate::jobs::declare::ENTRY_NAMES.contains(&name)
+                    });
+
+            if file_path.is_file() && !is_framework_entry && self.is_component_file(file_path) {
                 match self.parser.parse_file(file_path) {
                     Ok(mut comps) => components.append(&mut comps),
                     Err(err) => failures.push(ScanFailure {

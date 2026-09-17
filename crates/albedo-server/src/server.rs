@@ -75,7 +75,7 @@ const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// through one stable handle rather than a per-build clone.
 #[derive(Clone)]
 pub(crate) struct LiveRuntime {
-    broadcast: Arc<BroadcastRegistry>,
+    pub(crate) broadcast: Arc<BroadcastRegistry>,
     forge_substrate: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
     row_projector:
         Arc<std::sync::RwLock<Option<Arc<dyn dom_render_compiler::forge::RowProjector>>>>,
@@ -84,7 +84,7 @@ pub(crate) struct LiveRuntime {
     /// immutable, so it is built once and shared (a hot reload reuses it rather
     /// than rebuilding). Phase 1: the built-in guestbook default; Phase 2: the
     /// app-declared schema, loaded here at construction.
-    forge_schema: Arc<dom_render_compiler::forge::ForgeSchema>,
+    pub(crate) forge_schema: Arc<dom_render_compiler::forge::ForgeSchema>,
     /// APERTURE · the declared-source read path, or `None` when the app declared
     /// no `sources` block.
     ///
@@ -106,6 +106,10 @@ pub(crate) struct LiveRuntime {
     /// Live state, not build output: it owns a connection pool, so re-minting it
     /// on every dev file save would drop every keep-alive an author is watching.
     aperture_client: Arc<std::sync::OnceLock<Arc<dom_render_compiler::aperture::ApertureClient>>>,
+    /// JOBS · 15.5 — how anything that enqueues work tells the runner to stop
+    /// sleeping. On the live runtime rather than in the world so a dev reload
+    /// keeps the one runner it already spawned.
+    jobs: Arc<std::sync::OnceLock<crate::jobs::JobHandle>>,
     /// AUTH · the request-time identity path.
     ///
     /// Held here, beside the FORGE substrate and the APERTURE reader, because
@@ -153,6 +157,7 @@ impl LiveRuntime {
             forge_schema: Arc::new(dom_render_compiler::forge::ForgeSchema::guestbook_default()),
             source_reader: Arc::new(std::sync::OnceLock::new()),
             aperture_client: Arc::new(std::sync::OnceLock::new()),
+            jobs: Arc::new(std::sync::OnceLock::new()),
             auth: Arc::new(std::sync::OnceLock::new()),
             oauth: Arc::new(crate::handlers::oauth_routes::OAuthRuntime::default()),
             uploads: Arc::new(std::sync::OnceLock::new()),
@@ -221,6 +226,19 @@ impl LiveRuntime {
         self.aperture_client.get()
     }
 
+    /// JOBS · 15.5 — adopt the runner's wake handle.
+    fn install_jobs(&self, handle: crate::jobs::JobHandle) {
+        let _ = self.jobs.set(handle);
+    }
+
+    /// The job runner's wake handle, once one has been spawned.
+    ///
+    /// `None` on an app with no substrate, which is also an app with no queue —
+    /// so a caller that cannot wake the runner also had nothing to enqueue.
+    fn jobs(&self) -> Option<&crate::jobs::JobHandle> {
+        self.jobs.get()
+    }
+
     /// The OIDC discovery cache.
     fn oauth(&self) -> &crate::handlers::oauth_routes::OAuthRuntime {
         &self.oauth
@@ -246,7 +264,7 @@ impl LiveRuntime {
     /// than borrowed so the caller can hold it across an `.await` without
     /// keeping the lock — the write path awaits `apply_writes`, the resync path
     /// awaits `project_rows`.
-    fn projector(&self) -> Option<Arc<dyn dom_render_compiler::forge::RowProjector>> {
+    pub(crate) fn projector(&self) -> Option<Arc<dyn dom_render_compiler::forge::RowProjector>> {
         self.row_projector
             .read()
             .expect("row projector lock poisoned")
@@ -563,12 +581,25 @@ impl ActionHandler for CompiledProjectActionAdapter {
                 }
             });
 
-            let (instructions, writes) = dom_render_compiler::aperture::drive_workflow(
+            let (instructions, (writes, queued)) =
+                dom_render_compiler::aperture::drive_workflow_admitting(
                 client.as_ref(),
                 &mut journal,
                 &dom_render_compiler::aperture::WorkflowLimits::default(),
                 self.build_id.as_ref(),
                 durability.as_ref(),
+                // SHUTTER · each staged `fetch()` is charged to the caller and to
+                // its host's shared budget before it is recorded or sent. The
+                // caller comes from the dispatcher's scope — see
+                // `shutter::outbound_scope`.
+                |request| {
+                    crate::shutter::admit_outbound(&request.url).map_err(|reason| {
+                        dom_render_compiler::aperture::WorkflowError::Refused {
+                            url: request.url.clone(),
+                            reason,
+                        }
+                    })
+                },
                 |seeded| {
                     // Cloned per pass, outside the async block, so the future
                     // owns everything and borrows neither `self` nor the pool.
@@ -595,6 +626,11 @@ impl ActionHandler for CompiledProjectActionAdapter {
                             // the same terms `__albedo_effects` is rebuilt.
                             let collector =
                                 dom_render_compiler::forge::install_forge_write_collector();
+                            // 15.5 · the same discard rule, for the same reason:
+                            // a suspended pass's enqueues are dropped and the
+                            // body records them again when it re-runs.
+                            let queued =
+                                dom_render_compiler::jobs::install_enqueue_collector();
                             let pass = project.invoke_action_quickjs_pass(
                                 engine,
                                 &envelope,
@@ -604,11 +640,16 @@ impl ActionHandler for CompiledProjectActionAdapter {
                             );
                             // `ForgeWrite` is plain data, so the recorded
                             // intents cross back over the thread boundary.
-                            pass.map(|pass| (pass, collector.take())).map_err(|err| {
-                                format!(
+                            // Both lists travel as one payload: `drive_workflow`
+                            // carries exactly one "what this pass committed"
+                            // value, and the discard-on-suspend rule has to
+                            // apply to both halves identically.
+                            pass.map(|pass| (pass, (collector.take(), queued.take())))
+                                .map_err(|err| {
+                                    format!(
                                     "compiled action handler {action_id} (quickjs) failed: {err:#}"
                                 )
-                            })
+                                })
                         })
                         .await
                         .map_err(|err| {
@@ -659,6 +700,49 @@ impl ActionHandler for CompiledProjectActionAdapter {
                 // is the only layer that knows who to charge for it. See
                 // `shutter::note_fan_out`.
                 crate::shutter::note_fan_out(fan_out.subscribers);
+            }
+
+            // 15.5 · the rows `enqueue()` asked for, written AFTER the durable
+            // writes for the reason the job runner uses: an action that appends
+            // a row and queues a job to process it must not have the job become
+            // claimable before the row exists.
+            if !queued.is_empty() {
+                let substrate = self.live.forge_substrate.get().ok_or_else(|| {
+                    RuntimeError::RequestHandling(format!(
+                        "compiled action handler {action_id} called enqueue() but no FORGE \
+                         substrate is wired; the job queue is a table"
+                    ))
+                })?;
+                // The handle carries the declaration, so an action and a job
+                // body agree about what a valid job name is.
+                let jobs = self.live.jobs().ok_or_else(|| {
+                    RuntimeError::RequestHandling(format!(
+                        "compiled action handler {action_id} called enqueue() but no job runner \
+                         is installed; the queue needs a FORGE substrate"
+                    ))
+                })?;
+                let now_ms = crate::auth::now_ms();
+                for intent in &queued {
+                    crate::jobs::write_enqueue(
+                        substrate.as_ref(),
+                        jobs,
+                        intent,
+                        // 🔑 The identity rule: queued work inherits the
+                        // principal of the request that queued it. A password
+                        // reset queued by alice runs as alice.
+                        ctx.principal.as_ref().map(|p| p.as_str().to_string()),
+                        now_ms,
+                    )
+                    .await
+                    .map_err(|err| {
+                        RuntimeError::RequestHandling(format!(
+                            "compiled action handler {action_id}: {err}"
+                        ))
+                    })?;
+                }
+                // The runner may be parked until a schedule hours away; without
+                // this the work sits until then.
+                jobs.wake();
             }
 
             // …and only now is the workflow finished.
@@ -830,6 +914,14 @@ struct RenderWorld {
     /// Lives on the world (not on the process) so a dev reload that changes an
     /// island's imports swaps the chunk table with everything else it swaps.
     npm_chunks: Arc<dom_render_compiler::bundler::client_npm::ClientNpmGraph>,
+    /// MIDDLEWARE · 15.6 — the project's `src/middleware.ts`, when it has one.
+    /// On the world rather than the process so a dev reload that edits the file
+    /// swaps it with everything else.
+    middleware_plan: Option<Arc<crate::middleware::MiddlewarePlan>>,
+    /// 15.7 · the QuickJS pool this world's adapters check out from, held here
+    /// only so a metrics scrape can read it. On the world because a dev reload
+    /// builds a new pool with the new world.
+    engine_pool: Option<Arc<crate::engine_pool::QuickJsEnginePool>>,
 }
 
 #[derive(Clone)]
@@ -874,6 +966,9 @@ struct RuntimeState {
     /// output, and one that also reset every accumulated limit would hand out a
     /// fresh budget on every file save. See `development-plan/AUTH.md` R6.
     shutter: Arc<crate::shutter::Limiter>,
+    /// 15.7 · request counters for the Prometheus scrape. Persistent, so a dev
+    /// reload does not reset a counter a dashboard is rating.
+    http_metrics: Arc<crate::metrics::HttpMetrics>,
 }
 
 impl RuntimeState {
@@ -1051,9 +1146,14 @@ impl AlbedoServerBuilder {
     /// pure-Rust evaluator rejects (loops, `try`/`catch`, array methods).
     #[must_use]
     pub fn with_quickjs_action_engine_pool(mut self, size: usize) -> Self {
-        self.action_engine_pool = Some(Arc::new(crate::engine_pool::QuickJsEnginePool::with_size(
-            size,
-        )));
+        // The job budget is the request timeout: past it the request has
+        // already been answered with a timeout, so JS still running is running
+        // for nobody — and holding an engine while it does.
+        self.action_engine_pool = Some(Arc::new(
+            crate::engine_pool::QuickJsEnginePool::with_size(size).with_job_budget(
+                Duration::from_millis(self.config.server.request_timeout_ms),
+            ),
+        ));
         self
     }
 
@@ -1879,6 +1979,19 @@ impl AlbedoServerBuilder {
                     });
                 }
             }
+            // A Rust `RuntimeMiddleware` only wraps `execute_route`, which a
+            // manifest route never reaches — the streaming arm serves it. The
+            // check above already refuses the pairing, but as a missing
+            // handler named `albedo-manifest-streaming`, which sends the reader
+            // looking for the wrong thing.
+            if route.entry_module.is_some() && !route.middleware.is_empty() {
+                return Err(RuntimeError::ServerStartup(format!(
+                    "route `{}` attaches Rust middleware {:?}, but a compiled route is served \
+                     by the manifest stream, which Rust middleware never wraps. Write it as \
+                     `src/middleware.ts` instead",
+                    route.path, route.middleware
+                )));
+            }
             for middleware in &route.middleware {
                 if !self.middleware.contains_key(middleware.as_str()) {
                     return Err(RuntimeError::MiddlewareNotFound {
@@ -1940,6 +2053,78 @@ impl AlbedoServerBuilder {
             )))
         };
 
+        // MIDDLEWARE · 15.6 — found, validated and graphed from the same compiled
+        // project the build checked. Refused rather than skipped when it cannot
+        // run: a middleware that silently does not run is a guard that guards
+        // nothing, and discovering that from a request log is too late.
+        let middleware_plan = match self.reactive_project.as_deref() {
+            None => None,
+            Some(project) => match dom_render_compiler::middleware::declaration(project) {
+                Ok(None) => None,
+                Err(problems) => {
+                    return Err(RuntimeError::ServerStartup(format!(
+                        "src/middleware.ts cannot be served:\n  - {}",
+                        problems.join("\n  - ")
+                    )))
+                }
+                Ok(Some(decl)) => {
+                    let Some(pool) = self.action_engine_pool.clone() else {
+                        return Err(RuntimeError::ServerStartup(format!(
+                            "{} needs the QuickJS engine pool to run, and this server was built \
+                             without one (`with_quickjs_action_engine_pool`)",
+                            decl.entry
+                        )));
+                    };
+                    let modules = dom_render_compiler::middleware::module_graph(project, &decl.entry)
+                        .map_err(RuntimeError::ServerStartup)?;
+                    Some(Arc::new(crate::middleware::MiddlewarePlan::new(
+                        decl.entry,
+                        decl.matcher,
+                        modules,
+                        pool,
+                    )))
+                }
+            },
+        };
+
+        // JOBS · 15.5 — found and graphed here, beside the middleware and for
+        // the same reason: a jobs file that cannot run must fail the boot. The
+        // alternative is a schedule that silently never fires, which is only
+        // discoverable by noticing that something did *not* happen — the worst
+        // class of failure this codebase keeps finding.
+        let jobs_plan = match self.reactive_project.as_deref() {
+            None => None,
+            Some(project) => match dom_render_compiler::jobs::declare::declaration(project) {
+                Ok(None) => None,
+                Err(problems) => {
+                    return Err(RuntimeError::ServerStartup(format!(
+                        "src/jobs.ts cannot be served:\n  - {}",
+                        problems.join("\n  - ")
+                    )))
+                }
+                Ok(Some(decl)) => {
+                    let Some(pool) = self.action_engine_pool.clone() else {
+                        return Err(RuntimeError::ServerStartup(format!(
+                            "{} needs the QuickJS engine pool to run, and this server was built \
+                             without one (`with_quickjs_action_engine_pool`)",
+                            decl.entry
+                        )));
+                    };
+                    let modules =
+                        dom_render_compiler::jobs::declare::module_graph(project, &decl.entry)
+                            .map_err(RuntimeError::ServerStartup)?;
+                    let entry = decl.entry.clone();
+                    Some(crate::jobs::JobsPlan::new(
+                        entry,
+                        decl,
+                        modules,
+                        pool,
+                        Arc::clone(&self.live.aperture_client),
+                    ))
+                }
+            },
+        };
+
         let world = RenderWorld {
             router: Arc::new(router),
             handlers: Arc::new(self.handlers),
@@ -1968,7 +2153,38 @@ impl AlbedoServerBuilder {
                     .map(|runtime| runtime.client_npm().clone())
                     .unwrap_or_default(),
             ),
+            middleware_plan,
+            engine_pool: self.action_engine_pool.clone(),
         };
+
+        let shutter = Arc::new(
+            crate::shutter::Limiter::from_env()
+                .map_err(|err| RuntimeError::ServerStartup(format!("SHUTTER: {err}")))?,
+        );
+        // SHUTTER · a declared source's `limit` is its host's budget across every
+        // caller. Installed from the same lowered registry the egress allowlist
+        // comes from, so a host cannot be declared in one and missed in the other.
+        if let Some(reader) = self.live.source_reader() {
+            for (host, quota) in reader.registry().upstream_limits() {
+                shutter.shutter().set_upstream_quota(host, quota).map_err(|err| {
+                    RuntimeError::ServerStartup(format!(
+                        "the `limit` declared for `{host}` cannot be enforced: {err}"
+                    ))
+                })?;
+            }
+        }
+        // …and charged at the wire, by every client that can send. The reader's
+        // client and the workflow client are usually one instance, but not by
+        // construction — a test or embedder can install a client first — and a
+        // client left ungated would be the one surface the budget cannot see.
+        // Installed on every build, replacing the last: these clients outlive a
+        // dev reload, and the limiter does not.
+        if let Some(client) = self.live.aperture_client() {
+            client.install_upstream_budget(shutter.shutter().clone());
+        }
+        if let Some(reader) = self.live.source_reader() {
+            reader.client().install_upstream_budget(shutter.shutter().clone());
+        }
 
         let state = RuntimeState {
             world: Arc::new(RwLock::new(Arc::new(world))),
@@ -1987,10 +2203,8 @@ impl AlbedoServerBuilder {
             // admit its own heaviest operation fails the build rather than
             // surfacing later as one endpoint that 429s at every instant — a
             // symptom indistinguishable from load. See `Limits::check_admits_heaviest`.
-            shutter: Arc::new(
-                crate::shutter::Limiter::from_env()
-                    .map_err(|err| RuntimeError::ServerStartup(format!("SHUTTER: {err}")))?,
-            ),
+            shutter,
+            http_metrics: Arc::new(crate::metrics::HttpMetrics::new()),
         };
 
         Ok(AlbedoServer {
@@ -1999,6 +2213,8 @@ impl AlbedoServerBuilder {
             auth_registry: self.auth_registry,
             island_ssr_failures,
             static_render_failures,
+            jobs_plan,
+            shutdown: watch::channel(false).0,
         })
     }
 }
@@ -2017,6 +2233,17 @@ pub struct AlbedoServer {
     /// in `build()` and held for the same reason: boot decides them, only the
     /// readiness callback can print them.
     static_render_failures: Vec<dom_render_compiler::manifest::schema::StaticRenderFailure>,
+    /// JOBS · 15.5 — the app's `src/jobs.ts`, found and graphed in `build()` so
+    /// a broken jobs file fails the boot rather than a 03:00 fire. `None` for an
+    /// app that declares none; the framework's built-ins run either way.
+    ///
+    /// Taken by `run()` when it spawns the runner, which is why it is an
+    /// `Option` that is moved out rather than a shared handle.
+    jobs_plan: Option<crate::jobs::JobsPlan>,
+    /// Flipped once, when shutdown begins. Owned by the server rather than
+    /// minted inside `run` because [`Self::router`] needs it too: every event
+    /// stream the router serves ends on it — see [`end_event_streams_on_shutdown`].
+    shutdown: watch::Sender<bool>,
 }
 
 /// What a boot changed on the author's behalf, handed to the readiness callback.
@@ -2101,11 +2328,35 @@ impl AlbedoServer {
     /// [`run`](Self::run) does the right thing; this exists for tests and for
     /// embedders composing their own stack, who should add the layer themselves.
     pub fn router(&self) -> Router {
+        let shutdown = self.shutdown.subscribe();
+        let http_metrics = self.state.http_metrics.clone();
         Router::new()
             .route("/", any(dispatch))
             .route("/{*path}", any(dispatch))
             .with_state(self.state.clone())
+            .layer(axum::middleware::map_response(move |response: Response| {
+                end_event_streams_on_shutdown(shutdown.clone(), response)
+            }))
             .layer(compression_layer())
+            // Outermost, so the count includes every response the stack
+            // produces — a dispatch-panic 500 as much as a 200.
+            .layer(axum::middleware::from_fn(move |request, next| {
+                crate::metrics::record_http(http_metrics.clone(), request, next)
+            }))
+    }
+
+    /// 15.7 · bind the Prometheus scrape listener at `addr` when this server
+    /// runs. The code-level twin of `ALBEDO_METRICS_ADDR`, for embedders and
+    /// tests that cannot set the environment of a process they share.
+    #[must_use]
+    pub fn with_metrics_addr(mut self, addr: SocketAddr) -> Self {
+        self.config.server.metrics_addr = Some(addr.to_string());
+        self
+    }
+
+    /// 15.7 · one Prometheus scrape of this server, as the listener serves it.
+    pub fn render_metrics(&self) -> String {
+        render_metrics(&self.state)
     }
 
     /// Handle on the dev inspector's shared state, when one is mounted.
@@ -2207,6 +2458,20 @@ impl AlbedoServer {
     pub async fn run_with_ready<F>(self, on_ready: F) -> Result<(), RuntimeError>
     where
         F: FnOnce(&BootReport) + Send + 'static,
+    {
+        self.run_until(on_ready, shutdown_signal()).await
+    }
+
+    /// [`run_with_ready`](Self::run_with_ready), shutting down when `shutdown`
+    /// resolves instead of on SIGINT/SIGTERM.
+    ///
+    /// For an embedder with its own lifecycle, and for tests: this rig is
+    /// Windows, which delivers no SIGTERM, and a graceful-shutdown test that
+    /// cannot start a shutdown tests nothing.
+    pub async fn run_until<F, S>(mut self, on_ready: F, shutdown: S) -> Result<(), RuntimeError>
+    where
+        F: FnOnce(&BootReport) + Send + 'static,
+        S: std::future::Future<Output = ()> + Send + 'static,
     {
         let mut report = BootReport::default();
         // Decided at build time, surfaced here — this is the only path out to
@@ -2479,13 +2744,44 @@ impl AlbedoServer {
         info!(
             target: "albedo.shutter",
             trusted_proxies = self.state.shutter.trusted_proxies(),
-            "SHUTTER active; set {} when running behind a load balancer",
-            crate::shutter::TRUSTED_PROXIES_ENV
+            instances = self.state.shutter.shutter().instances(),
+            "SHUTTER active; set {} when running behind a load balancer, and {} to the number \
+             of processes serving this app so app-wide budgets are split between them",
+            crate::shutter::TRUSTED_PROXIES_ENV,
+            crate::shutter::INSTANCES_ENV
         );
         let router = self.router();
 
         let shutdown_timeout = Duration::from_millis(self.config.server.shutdown_timeout_ms);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shutdown_tx = self.shutdown.clone();
+        let shutdown_rx = self.shutdown.subscribe();
+
+        // 15.7 · bound before `on_ready`, like the app listener: a metrics port
+        // that is already taken is a boot failure, not a scrape that silently
+        // never answers.
+        let metrics_task = match self.config.server.metrics_socket_addr()? {
+            None => None,
+            Some(metrics_addr) => {
+                let metrics_listener = TcpListener::bind(metrics_addr).await.map_err(|err| {
+                    RuntimeError::ServerStartup(format!(
+                        "metrics listener could not bind {metrics_addr}: {err}"
+                    ))
+                })?;
+                info!(
+                    target: "albedo.metrics",
+                    "Prometheus metrics at http://{}/metrics",
+                    metrics_listener.local_addr().unwrap_or(metrics_addr)
+                );
+                let state = self.state.clone();
+                let scrape: Arc<dyn Fn() -> String + Send + Sync> =
+                    Arc::new(move || render_metrics(&state));
+                Some(tokio::spawn(crate::metrics::serve(
+                    metrics_listener,
+                    scrape,
+                    shutdown_rx.clone(),
+                )))
+            }
+        };
 
         if let Some(inspector_state) = self.state.inspector.clone() {
             info!("ALBEDO dev inspector mounted at /__albedo");
@@ -2517,6 +2813,55 @@ impl AlbedoServer {
             });
         }
 
+        // JOBS · 15.5 — the runner. Spawned here for the reason the refresh loop
+        // is: this is where a substrate and a shutdown signal both exist, and
+        // binding it to `shutdown_rx` is what stops a dev reload from
+        // accumulating one runner per reload.
+        //
+        // Requires the substrate, and says so rather than starting a runner that
+        // could never claim anything: the queue *is* a table.
+        match self.state.live.forge_substrate.get() {
+            Some(substrate) => {
+                let scheduled = self
+                    .jobs_plan
+                    .as_ref()
+                    .map_or(0, |plan| plan.scheduled_count());
+                for statement in dom_render_compiler::jobs::queue::ddl() {
+                    substrate.migrate(&statement).await.map_err(|err| {
+                        RuntimeError::ServerStartup(format!(
+                            "the job queue's table could not be created: {err}"
+                        ))
+                    })?;
+                }
+                let (runner, handle) = crate::jobs::JobRunner::new(
+                    self.jobs_plan.take(),
+                    Arc::clone(substrate),
+                    self.state.live.clone(),
+                    crate::auth::now_ms(),
+                );
+                self.state.live.install_jobs(handle);
+                if scheduled > 0 {
+                    info!("JOBS: {scheduled} scheduled job(s) declared");
+                }
+                let shutdown = shutdown_rx.clone();
+                tokio::spawn(async move { runner.run(shutdown).await });
+            }
+            // An app with a jobs file and no substrate is broken in the way a
+            // declared auth provider with no substrate is: the queue has nowhere
+            // to live, so every fire would be dropped silently.
+            None if self.jobs_plan.is_some() => {
+                return Err(RuntimeError::ServerStartup(
+                    "src/jobs.ts declares jobs, but this app has no FORGE substrate. The job \
+                     queue is a table — add a `forge` block to albedo.config.ts, or remove \
+                     src/jobs.ts"
+                        .to_string(),
+                ))
+            }
+            // No substrate and no jobs file: the built-ins have nothing to sweep
+            // either, because the tables they sweep do not exist.
+            None => {}
+        }
+
         let webtransport_task = if self.config.server.webtransport.enabled {
             let world = self.state.world();
             let shared_sessions = world
@@ -2541,7 +2886,7 @@ impl AlbedoServer {
         let graceful_shutdown = {
             let shutdown_tx = shutdown_tx.clone();
             async move {
-                shutdown_signal().await;
+                shutdown.await;
                 let _ = shutdown_tx.send(true);
             }
         };
@@ -2597,6 +2942,12 @@ impl AlbedoServer {
         let _ = shutdown_tx.send(true);
 
         if let Some(task) = acme_task {
+            task.abort();
+        }
+
+        // Its graceful shutdown watches the same signal; a scrape is a short
+        // request, so there is nothing worth waiting on past the app's drain.
+        if let Some(task) = metrics_task {
             task.abort();
         }
 
@@ -2689,6 +3040,53 @@ impl DevReloadHandle {
     }
 }
 
+/// 15.7 · gather what a scrape reads from the live runtime and render it.
+fn render_metrics(state: &RuntimeState) -> String {
+    let world = state.world();
+    let engine_pool = world.engine_pool.as_ref().map(|pool| {
+        let (confinements, confinement_failures) = pool.confinement_counts();
+        crate::metrics::EnginePoolGauges {
+            size: pool.size(),
+            live: pool.live_engines(),
+            busy: pool.busy_engines(),
+            interruptions: pool.interruptions(),
+            replacements: pool.replacements(),
+            confinements,
+            confinement_failures,
+        }
+    });
+    // The reader's client and the workflow client are usually one instance, but
+    // not by construction (see `build`) — count each distinct client once.
+    let reader_client = state.live.source_reader().map(|reader| reader.client().clone());
+    let workflow_client = state.live.aperture_client().cloned();
+    let mut clients: Vec<Arc<dom_render_compiler::aperture::ApertureClient>> = Vec::new();
+    for client in [reader_client, workflow_client].into_iter().flatten() {
+        if !clients.iter().any(|seen| Arc::ptr_eq(seen, &client)) {
+            clients.push(client);
+        }
+    }
+    let aperture = clients.iter().map(|client| client.metrics()).reduce(|a, b| {
+        dom_render_compiler::aperture::MetricsSnapshot {
+            upstream_requests: a.upstream_requests + b.upstream_requests,
+            conditional_requests: a.conditional_requests + b.conditional_requests,
+            not_modified: a.not_modified + b.not_modified,
+            value_changes: a.value_changes + b.value_changes,
+            fresh_hits: a.fresh_hits + b.fresh_hits,
+            coalesced: a.coalesced + b.coalesced,
+            stale_on_error: a.stale_on_error + b.stale_on_error,
+            throttled: a.throttled + b.throttled,
+        }
+    });
+    let runtime = crate::metrics::RuntimeGauges {
+        engine_pool,
+        phosphor_lanes: state.phosphor.lane_count(),
+        broadcast_topics: world.broadcast.topic_count(),
+        aperture,
+        shutter_degraded_decisions: state.shutter.shutter().degraded_decisions(),
+    };
+    crate::metrics::render(&state.http_metrics, &runtime)
+}
+
 /// Top-level axum entry point. Runs the real dispatch in a separate tokio
 /// task so a panicking handler surfaces as a 500 rather than a dropped
 /// connection.
@@ -2708,6 +3106,50 @@ impl DevReloadHandle {
 /// that content type. Streamed **HTML** is still compressed — the encoder
 /// flushes per polled chunk, so Tier-B injection chunks keep arriving
 /// progressively.
+/// End an event stream's body the moment shutdown begins.
+///
+/// 🔴 **An event stream never finishes on its own, and every live page holds
+/// one.** The PHOSPHOR trunk, the per-tab patch stream, the dev overlay and HMR
+/// streams and the inspector feed are all `text/event-stream` bodies that run
+/// until the client leaves. A graceful shutdown waits for in-flight responses —
+/// so with a single browser attached it waited out the *entire*
+/// `shutdown_timeout_ms`, every time, and `docker stop` killed the process
+/// mid-drain (`docker-optimizations.md` § 3b).
+///
+/// Waiting on them was always wasted: there is no "rest of the response" to
+/// deliver. Ending the body lets hyper close the connection cleanly; the
+/// browser's `EventSource` reconnects on its own `retry:` cadence — to the
+/// replacement process, in a rolling deploy.
+///
+/// Applied on the router, by content type, rather than in each handler — so a
+/// stream added later cannot forget to end.
+async fn end_event_streams_on_shutdown(
+    mut shutdown: watch::Receiver<bool>,
+    response: Response,
+) -> Response {
+    let is_event_stream = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    if !is_event_stream {
+        return response;
+    }
+    let stop = async move {
+        // A dropped sender means the server that could shut down is gone — not
+        // that it did. Parking keeps an embedder's router streaming.
+        if shutdown.wait_for(|fired| *fired).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let (parts, body) = response.into_parts();
+    let body = Body::from_stream(futures_util::StreamExt::take_until(
+        body.into_data_stream(),
+        stop,
+    ));
+    Response::from_parts(parts, body)
+}
+
 fn compression_layer() -> CompressionLayer<And<DefaultPredicate, NotForContentType>> {
     CompressionLayer::new()
         .compress_when(DefaultPredicate::new().and(NotForContentType::const_new(
@@ -2936,7 +3378,16 @@ async fn dispatch_inner(
     request: Request<Body>,
 ) -> Response {
     let mut rationed: Option<Verdict> = None;
-    let mut response = dispatch_routed(&state, peer, request, &mut rationed).await;
+    let mut middleware_headers: Option<dom_render_compiler::middleware::outcome::Headers> = None;
+    let mut response =
+        dispatch_routed(&state, peer, request, &mut rationed, &mut middleware_headers).await;
+    // MIDDLEWARE · 15.6 — a `next()` or `rewrite()` decision's headers, on
+    // whatever the route answered. Stamped here for the reason the budget headers
+    // below are: every branch of `dispatch_routed` returns its own response, and
+    // one stamp is the only way none of them forgets.
+    if let Some(headers) = &middleware_headers {
+        crate::middleware::stamp(response.headers_mut(), headers);
+    }
     // SHUTTER · budget headers on **admitted** responses too, not only on
     // refusals. A client that first learns its budget when it has already run out
     // cannot pace itself, which is how a well-behaved integration becomes a
@@ -2952,8 +3403,9 @@ async fn dispatch_inner(
 async fn dispatch_routed(
     state: &RuntimeState,
     peer: Option<IpAddr>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     rationed: &mut Option<Verdict>,
+    middleware_headers: &mut Option<dom_render_compiler::middleware::outcome::Headers>,
 ) -> Response {
     // Start the server-compute clock at the very top so the reported number
     // includes routing (the perfect-hash matcher is ours to claim) — but not a
@@ -2966,8 +3418,8 @@ async fn dispatch_routed(
         Err(err) => return err.into_response(),
     };
 
-    let path = request.uri().path().to_string();
-    let query = request.uri().query().map(str::to_string);
+    let mut path = request.uri().path().to_string();
+    let mut query = request.uri().query().map(str::to_string);
 
     // Load the live render world ONCE for this request so a concurrent dev
     // hot-swap can't split a single request across two worlds. Persistent state
@@ -3226,6 +3678,137 @@ async fn dispatch_routed(
         }
     }
 
+    // MIDDLEWARE · 15.6 — userland interception, placed after every lane the
+    // framework serves to itself and before every lane an app serves. Which
+    // lanes are which is `middleware::in_scope`, not this ordering alone: the
+    // live lanes above return before reaching here, and the sign-in endpoints
+    // below are excluded by path, because they sit after the uploads branch.
+    //
+    // 🔑 **It can refuse, redirect or rewrite; it cannot grant.** Identity is
+    // resolved here and handed over, and every gate below — the route's
+    // `export const auth`, the action gate, CSRF — still runs against whatever
+    // path the request ends up on.
+    // The identity the middleware resolved, handed to whichever branch serves
+    // the request so it is not looked up a second time. Headers are unchanged by
+    // a rewrite, so the answer is the one that branch would have computed.
+    let mut resolved_identity: Option<crate::auth::Identity> = None;
+    if let Some(plan) = world.middleware_plan.clone() {
+        if plan.applies_to(path.as_str()) {
+            let identity = state.live.identity(request.headers()).await;
+            // Charged before the engine is checked out: this runs userland code
+            // on paths as cheap as a favicon, and an unrationed engine checkout
+            // per request is a way to starve every render of engines.
+            if let Err(refusal) = ration(
+                state,
+                peer,
+                request.headers(),
+                &identity,
+                Cost::flat(OperationClass::Read),
+                rationed,
+            ) {
+                return refusal;
+            }
+
+            let session_cookie = state
+                .live
+                .auth()
+                .map(|auth| auth.registry().session_cookie.clone());
+            let request_json = crate::middleware::request_json(
+                method.as_str(),
+                path.as_str(),
+                query.as_deref(),
+                request.headers(),
+                session_cookie.as_deref(),
+            );
+            // A `fetch()` is charged per call, to the same caller, in the
+            // outbound class — see `MiddlewarePlan::run`.
+            let outbound_key =
+                state
+                    .shutter
+                    .key(&identity, peer, request.headers(), OperationClass::Outbound);
+            let admit = |url: &str| match state.shutter.outbound_call(&outbound_key, url) {
+                Some(verdict) if !verdict.is_admitted() => Err(verdict),
+                _ => Ok(()),
+            };
+            let outcome = match plan
+                .run(
+                    request_json,
+                    crate::middleware::user_json(&identity),
+                    session_cookie.as_deref(),
+                    world.request_timeout,
+                    crate::middleware::Outbound {
+                        client: state.live.aperture_client().map(|client| client.as_ref()),
+                        admit: &admit,
+                    },
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(crate::middleware::RunError::Refused(verdict)) => {
+                    return crate::shutter::too_many_requests(&verdict)
+                }
+                Err(crate::middleware::RunError::Failed(message)) => {
+                    return crate::middleware::failure_response(&message)
+                }
+            };
+
+            if let Some(response) = crate::middleware::terminal_response(&outcome) {
+                if state.request_timings {
+                    crate::timing::print_request(method.as_str(), &path, started.elapsed());
+                }
+                return response;
+            }
+
+            if let dom_render_compiler::middleware::Outcome::Rewrite {
+                path: target,
+                query: target_query,
+                ..
+            } = &outcome
+            {
+                // An action or upload request has already been dispatched by its
+                // request line; re-pointing it at a page would run a form
+                // submit's body against whatever route that is.
+                if crate::middleware::is_framework_path(path.as_str()) {
+                    return crate::middleware::failure_response(&format!(
+                        "middleware rewrote `{path}`, which is a framework route; only app paths \
+                         can be rewritten"
+                    ));
+                }
+                path = target.clone();
+                if target_query.is_some() {
+                    query = target_query.clone();
+                }
+                let path_and_query = match &query {
+                    Some(query) => format!("{path}?{query}"),
+                    None => path.clone(),
+                };
+                let mut parts = request.uri().clone().into_parts();
+                parts.path_and_query = match path_and_query.parse() {
+                    Ok(parsed) => Some(parsed),
+                    Err(err) => {
+                        return crate::middleware::failure_response(&format!(
+                            "middleware rewrote to `{path_and_query}`, which is not a valid \
+                             request path: {err}"
+                        ))
+                    }
+                };
+                match axum::http::Uri::from_parts(parts) {
+                    Ok(uri) => *request.uri_mut() = uri,
+                    Err(err) => {
+                        return crate::middleware::failure_response(&format!(
+                            "middleware rewrote to `{path_and_query}`: {err}"
+                        ))
+                    }
+                }
+            }
+
+            if !outcome.headers().is_empty() {
+                *middleware_headers = Some(outcome.headers().clone());
+            }
+            resolved_identity = Some(identity);
+        }
+    }
+
     // UPLOADS · 15.1 — stored bytes back out. A `GET`, no session required by
     // default, and deliberately *not* guarded here: the id is a content hash,
     // which is derived from bytes the holder already has and is therefore not a
@@ -3430,7 +4013,10 @@ async fn dispatch_routed(
     // never offer.
     if method == HttpMethod::Post {
         if let Some(action_name) = form_action_segment(path.as_str()) {
-            let principal = state.live.identity(request.headers()).await;
+            let principal = match resolved_identity.take() {
+                Some(identity) => identity,
+                None => state.live.identity(request.headers()).await,
+            };
 
             // Priced exactly as the envelope path: same admission cost, same
             // post-hoc fan-out surcharge. A cheaper no-JS path would be a
@@ -3447,16 +4033,29 @@ async fn dispatch_routed(
                 Err(refusal) => return refusal,
             };
 
-            let (response, fan_out) = crate::shutter::metered(run_form_action_route(
-                &world,
-                state.dev_error_registry.as_ref(),
-                request,
-                action_name,
-                principal,
-                state.live.uploads(),
-                state.live.forge_substrate.get().cloned(),
-            ))
+            let outbound_caller =
+                state
+                    .shutter
+                    .key(&principal, peer, request.headers(), OperationClass::Outbound);
+            let ((response, fan_out), outbound_refusal) = crate::shutter::outbound_scope(
+                Arc::clone(&state.shutter),
+                outbound_caller,
+                crate::shutter::metered(run_form_action_route(
+                    &world,
+                    state.dev_error_registry.as_ref(),
+                    request,
+                    action_name,
+                    principal,
+                    state.live.uploads(),
+                    state.live.forge_substrate.get().cloned(),
+                )),
+            )
             .await;
+            // A refused `fetch()` ended the workflow with nothing committed; say
+            // so as the rate limit it was, not as whatever error it surfaced as.
+            if let Some(verdict) = outbound_refusal {
+                return crate::shutter::too_many_requests(&verdict);
+            }
 
             if fan_out > 0 {
                 state
@@ -3480,7 +4079,10 @@ async fn dispatch_routed(
         // asset request carries the same cookies, and paying an indexed lookup
         // for every image on the page would be a real cost for an answer
         // nothing on that path reads.
-        let principal = state.live.identity(request.headers()).await;
+        let principal = match resolved_identity.take() {
+            Some(identity) => identity,
+            None => state.live.identity(request.headers()).await,
+        };
 
         // SHUTTER · an action is charged in two parts, because its price is only
         // half knowable in advance.
@@ -3506,13 +4108,24 @@ async fn dispatch_routed(
             Err(refusal) => return refusal,
         };
 
-        let (response, fan_out) = crate::shutter::metered(run_action_route(
-            &world,
-            state.dev_error_registry.as_ref(),
-            request,
-            principal,
-        ))
+        let outbound_caller =
+            state
+                .shutter
+                .key(&principal, peer, request.headers(), OperationClass::Outbound);
+        let ((response, fan_out), outbound_refusal) = crate::shutter::outbound_scope(
+            Arc::clone(&state.shutter),
+            outbound_caller,
+            crate::shutter::metered(run_action_route(
+                &world,
+                state.dev_error_registry.as_ref(),
+                request,
+                principal,
+            )),
+        )
         .await;
+        if let Some(verdict) = outbound_refusal {
+            return crate::shutter::too_many_requests(&verdict);
+        }
 
         // Settled unconditionally, and deliberately after the fact: the write is
         // committed and a limiter does not un-commit one. What this buys is that
@@ -3667,7 +4280,10 @@ async fn dispatch_routed(
     // precisely the cross-principal bleed invariant 2.2 forbids, and two lookups
     // are two chances to disagree. Costs nothing when no session cookie was
     // presented — `AuthRuntime::resolve` returns without spending a query.
-    let identity = state.live.identity(request.headers()).await;
+    let identity = match resolved_identity.take() {
+        Some(identity) => identity,
+        None => state.live.identity(request.headers()).await,
+    };
     if let Err(refusal) = ration(
         state,
         peer,

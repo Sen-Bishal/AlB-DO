@@ -29,6 +29,8 @@
 //! | [`deferred_module_loads`] | a `require("…")` shipped verbatim and threw in the browser |
 //! | [`partitioned_whole_reads`] | a whole read of a partitioned collection dropped the component |
 //! | [`portable_module_paths`] | every artifact keyed on this machine's own paths, so a build served nowhere else |
+//! | [`middleware`] | a `src/middleware.ts` whose matcher, default export or imports could not be read |
+//! | [`jobs`] | a `src/jobs.ts` whose schedule, options or imports could not be read |
 
 use crate::bundler::npm::LoadForm;
 use crate::forge::skeleton::ForgeSchema;
@@ -237,6 +239,40 @@ pub fn portable_module_paths(manifest: Option<&RenderManifestV2>) -> Option<Fail
     })
 }
 
+/// A `src/middleware.ts` that cannot run as written.
+///
+/// Boot refuses the same file through the same reader, so this is not the only
+/// thing standing between a broken middleware and a request. It is here so CI
+/// hears about it rather than the container.
+#[must_use]
+pub fn middleware(compiled: &CompiledProject) -> Option<Failure> {
+    match crate::middleware::declaration(compiled) {
+        Ok(_) => None,
+        Err(problems) => Some(Failure {
+            heading: "the middleware cannot run as written".to_string(),
+            problems,
+        }),
+    }
+}
+
+/// JOBS · 15.5 — a `src/jobs.ts` that cannot run as written.
+///
+/// Worth failing a build over more than most of these, because of *when* the
+/// alternative surfaces. A broken route 404s the first time anybody opens it. A
+/// broken schedule does nothing at all, and "nothing happened" is only
+/// noticeable by someone who knew to expect something — days later, and usually
+/// from its absence rather than from an error.
+#[must_use]
+pub fn jobs(compiled: &CompiledProject) -> Option<Failure> {
+    match crate::jobs::declare::declaration(compiled) {
+        Ok(_) => None,
+        Err(problems) => Some(Failure {
+            heading: "the jobs file cannot run as written".to_string(),
+            problems,
+        }),
+    }
+}
+
 /// Run every check and collect what failed.
 ///
 /// All of them, not the first: a `forge` block edited without its readers
@@ -257,6 +293,8 @@ pub fn run(
         route_default_exports(compiled, served),
         form_actions(compiled),
         literal_topics(compiled, schema),
+        middleware(compiled),
+        jobs(compiled),
     ]
     .into_iter()
     .flatten()

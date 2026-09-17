@@ -105,6 +105,9 @@ tracing            = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # System / utilities
+# The `albedo` binary's global allocator. See `src/bin/albedo.rs` for the
+# measurement that put it there.
+mimalloc      = { version = "0.1" }
 core_affinity = { version = "0.8" }
 num_cpus      = { version = "1" }
 rquickjs      = { version = "0.9" }
@@ -136,6 +139,23 @@ hyper-util       = { version = "0.1", features = ["server", "server-auto", "serv
 # and aws-lc-rs additionally needs a C toolchain to build.
 rustls-acme      = { version = "0.15", default-features = false, features = ["ring", "tokio", "webpki-roots"] }
 rustls-pki-types = { version = "1.9" }
+
+# 15.5 · jobs — the cron expression parser and the calendar it needs.
+# Item 15's rule for a table-stakes surface is *wrap, do not innovate*, and a
+# schedule is a calendar problem: DST transitions, month lengths and leap years
+# are where hand-rolled schedulers fire twice or not at all. `chrono` was
+# already in `Cargo.lock` transitively, so this adds one crate, not two.
+# 🪤 `cron` parses the SIX-field form (seconds first). The declared surface is
+# the five-field form every operator already knows, normalised in
+# `jobs::schedule` — see the note there on why the boundary, not the user,
+# absorbs that difference.
+# 🪤 Pinned to 0.12 deliberately, not through neglect: 0.15+ parse with `winnow`
+# 0.6, and this tree already resolves `winnow` 0.7 — taking it would put two
+# majors of the same parser in the binary to read a five-field string whose
+# grammar has not changed since cron(8). 0.12 adds exactly one crate and no
+# duplicate. Revisit when something else needs winnow 0.6 anyway.
+cron   = { version = "0.12" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # NAPI (Node.js bridge)
 napi        = { version = "2.16", default-features = false, features = ["napi8", "serde-json"] }
@@ -258,6 +278,10 @@ walkdir.workspace            = true
 notify.workspace             = true
 rquickjs.workspace           = true
 time.workspace               = true
+# 15.5 · jobs — schedules. See the workspace entry for why these and not a
+# hand-rolled tick calendar.
+cron.workspace               = true
+chrono.workspace             = true
 reqwest.workspace            = true
 url.workspace                = true
 
@@ -328,6 +352,24 @@ required-features = ["forge"]
 # `unsafe_code` sat "forbid" over a tree containing `unsafe`.
 [lints]
 workspace = true
+
+# 🔴 Measured 2026-09-17: `target/` had reached **440 GB**, of which **266 GB was
+# `.pdb` debug symbols** — 1 275 files, many over 400 MB, including several
+# copies of the SAME test binary under different input hashes (`metrics_http`
+# twice at ~430 MB each). Cargo never garbage-collects a stale hashed artifact,
+# so every change to a test's inputs mints another full symbol file and keeps
+# the old one for the life of the directory.
+#
+# Without this table `debug` defaults to full debug info, which is what makes
+# those files that size. `line-tables-only` keeps the `file:line` that panic
+# backtraces need — this project reads them on every test failure — and drops
+# the type and variable tables that account for nearly all of the bulk.
+#
+# 🪤 Do **not** set `debug = false` here to save more: a backtrace without line
+# numbers turns a failing test into a hunt, and the access-violation work
+# (`project_lib_test_access_violation`) depends on reading them.
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 opt-level     = 3

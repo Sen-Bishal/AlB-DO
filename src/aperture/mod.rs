@@ -90,7 +90,8 @@ pub use refresh::{
 pub use typegen::emit_sources_dts;
 pub use workflow::{now_ms, Durability};
 pub use workflow::{
-    drive_workflow, resolve_pending, WorkflowError, WorkflowLimits, DEFAULT_WORKFLOW_DEADLINE,
+    drive_workflow, drive_workflow_admitting, resolve_pending, WorkflowError, WorkflowLimits,
+    DEFAULT_WORKFLOW_DEADLINE,
     IDEMPOTENCY_KEY_HEADER,
 };
 

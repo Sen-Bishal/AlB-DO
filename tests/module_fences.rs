@@ -183,6 +183,23 @@ const SERVER_MAY_REACH: &[(&str, &str)] = &[
     // crosses — `upload` has no parser, no analysis and no build step.
     ("upload", "the upload id alphabet, the on-disk layout, and the declared bounds"),
     ("aperture", "the outbound HTTP client the server stages suspensions through"),
+    // Shared by the same rule as `upload`: the build's `preflight` and the
+    // server's boot must find, read and graph `src/middleware.ts` with ONE reader,
+    // and the outcome a body returns must be validated by the same code the tests
+    // pin. It does read an AST (`config.matcher`), but only through the already
+    // parsed project the server holds anyway — no parser crosses.
+    ("middleware", "the middleware declaration, compiled matcher and outcome validation"),
+    // 15.5 · admitted on the same rule as `upload` and `middleware`, and the
+    // vocabulary here is unusually load-bearing: a scheduled fire's ROW ID is
+    // derived from its schedule (`jobs::queue::fire_id` over
+    // `jobs::schedule::Schedule`), and exactly-once firing is the claim that two
+    // processes computing that id independently compute the *same* id. A second
+    // spelling on the server side would not be a refactor — it would be two
+    // processes running every nightly job twice, with nothing to detect it.
+    // The declaration types travel with them for the reason `upload`'s do: the
+    // build and boot must read `src/jobs.ts` with one reader, through the
+    // already-parsed project. No parser and no build step crosses.
+    ("jobs", "the fire id, the schedule calendar, the queue protocol and the declaration"),
     ("shutter", "the streaming/suspension machinery"),
     ("hydration", "tier and hydration types travelling on the manifest"),
     ("types", "shared identifier newtypes"),

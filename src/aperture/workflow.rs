@@ -157,6 +157,14 @@ pub enum WorkflowError {
     },
     /// The pass itself failed — the body threw, or the engine did.
     Pass(String),
+    /// A staged call was refused admission before it was sent — today, a rate
+    /// limit. Nothing went out for this pass, so nothing is left indeterminate.
+    Refused {
+        /// The call that was refused.
+        url: String,
+        /// Why, in the admitter's words.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for WorkflowError {
@@ -166,6 +174,11 @@ impl std::fmt::Display for WorkflowError {
                 f,
                 "aperture: this action exceeded its {after:?} workflow deadline after {passes} \
                  pass(es); nothing it did was committed"
+            ),
+            Self::Refused { url, reason } => write!(
+                f,
+                "aperture: a call to {url} was refused before it was sent ({reason}); nothing \
+                 this action did was committed"
             ),
             Self::PassCap { cap } => write!(
                 f,
@@ -452,11 +465,40 @@ pub async fn drive_workflow<T, F, Fut>(
     limits: &WorkflowLimits,
     build_id: &str,
     durability: Option<&Durability<'_>>,
+    pass: F,
+) -> Result<(Vec<Instruction>, T), WorkflowError>
+where
+    F: FnMut(Journal) -> Fut,
+    Fut: Future<Output = Result<(ActionPass, T), WorkflowError>>,
+{
+    drive_workflow_admitting(client, journal, limits, build_id, durability, |_| Ok(()), pass).await
+}
+
+/// [`drive_workflow`], asking `admit` about every staged call **before** it is
+/// recorded or sent.
+///
+/// The hook exists for rate limiting: the only layer that knows who is calling
+/// is the dispatcher, and the only moment a refusal saves anything is before the
+/// request leaves. A refusal ends the workflow with [`WorkflowError::Refused`]
+/// and — because it happens before `resolve_pending` — before any intent is
+/// written to a durable ledger, so a refused call leaves no `Unknown` row behind
+/// for a retry to trip over.
+///
+/// # Errors
+/// As [`drive_workflow`], plus whatever `admit` returns.
+pub async fn drive_workflow_admitting<T, F, Fut, A>(
+    client: &ApertureClient,
+    journal: &mut Journal,
+    limits: &WorkflowLimits,
+    build_id: &str,
+    durability: Option<&Durability<'_>>,
+    admit: A,
     mut pass: F,
 ) -> Result<(Vec<Instruction>, T), WorkflowError>
 where
     F: FnMut(Journal) -> Fut,
     Fut: Future<Output = Result<(ActionPass, T), WorkflowError>>,
+    A: Fn(&PendingRequest) -> Result<(), WorkflowError>,
 {
     let started = Instant::now();
     let mut passes = 0usize;
@@ -510,6 +552,9 @@ where
             });
         }
 
+        for request in &pending {
+            admit(request)?;
+        }
         resolve_pending(client, journal, &pending, durability).await?;
     }
 }
@@ -781,6 +826,73 @@ mod tests {
             WorkflowError::Deadline { passes: 1, .. }
         ));
         assert_eq!(transport.calls(), 0, "the body ran; nothing went out");
+    }
+
+    /// The admission hook runs before `resolve_pending`: a refused call never
+    /// reaches the transport, and the workflow ends without committing.
+    #[tokio::test]
+    async fn a_refused_call_is_never_sent() {
+        let transport = Arc::new(CountingTransport::always(ok_json("{}")));
+        let client = client(transport.clone());
+        let mut journal = Journal::new("w", "b");
+
+        let result = drive_workflow_admitting(
+            &client,
+            &mut journal,
+            &WorkflowLimits::default(),
+            "b",
+            None,
+            |request| {
+                Err(WorkflowError::Refused {
+                    url: request.url.clone(),
+                    reason: "over budget".to_string(),
+                })
+            },
+            |_| async {
+                Ok((
+                    ActionPass::Suspended {
+                        pending: vec![staged(0, "POST", "https://api.test/charge")],
+                        journal_len: 0,
+                    },
+                    (),
+                ))
+            },
+        )
+        .await;
+
+        assert!(matches!(result.unwrap_err(), WorkflowError::Refused { .. }));
+        assert_eq!(transport.calls(), 0, "refused before it left");
+        assert!(journal.is_empty(), "and before any intent was recorded");
+
+        // Control: the same workflow, admitted, does send.
+        let mut journal = Journal::new("w", "b");
+        let mut sent_once = false;
+        let _ = drive_workflow_admitting(
+            &client,
+            &mut journal,
+            &WorkflowLimits::default(),
+            "b",
+            None,
+            |_| Ok(()),
+            |seeded| {
+                let done = std::mem::replace(&mut sent_once, true) || !seeded.is_empty();
+                async move {
+                    Ok((
+                        if done {
+                            ActionPass::Completed(Vec::new())
+                        } else {
+                            ActionPass::Suspended {
+                                pending: vec![staged(0, "POST", "https://api.test/charge")],
+                                journal_len: 0,
+                            }
+                        },
+                        (),
+                    ))
+                }
+            },
+        )
+        .await;
+        assert_eq!(transport.calls(), 1, "control: an admitted call goes out");
     }
 
     #[tokio::test]

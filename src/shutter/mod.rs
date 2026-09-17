@@ -123,6 +123,19 @@ pub enum Key {
         /// The account being attempted, already normalised by the caller.
         subject: String,
     },
+    /// A third party, by host — the **callee's** budget, shared by every caller.
+    ///
+    /// The per-caller outbound bucket bounds how hard one visitor can push this
+    /// app into somebody else's API. It cannot bound the total: a thousand
+    /// visitors each get their own. What an operator actually has to protect is
+    /// the upstream's quota — GitHub's 5 000 an hour, a payment provider's
+    /// per-second ceiling — and that is one number per host, whoever is asking.
+    /// Same shape as [`Self::Account`], which exists because per-caller limiting
+    /// cannot see a distributed attack on one account either.
+    Upstream {
+        /// Lower-cased host, as the request URL names it.
+        host: String,
+    },
 }
 
 impl Key {
@@ -132,6 +145,7 @@ impl Key {
         match self {
             Self::Principal { class, .. } | Self::Address { class, .. } => *class,
             Self::Account { .. } => OperationClass::Credential,
+            Self::Upstream { .. } => OperationClass::Outbound,
         }
     }
 
@@ -235,6 +249,9 @@ pub struct Limits {
     pub credential: Quota,
     /// The target account's own budget for *failed* attempts.
     pub account: Quota,
+    /// Each upstream host's budget across **all** callers, in calls — unless a
+    /// declared source states its own (`sources.<name>.limit`).
+    pub upstream: Quota,
 }
 
 impl Default for Limits {
@@ -249,9 +266,18 @@ impl Default for Limits {
             // Weight already encodes fan-out, so this is writes-worth-of-work
             // rather than write-calls.
             write: Quota::with_burst(120, minute, 60).expect("write"),
-            // Someone else's quota. Tight, because exhausting it is not
-            // recoverable by adding capacity on our side.
-            outbound: Quota::with_burst(60, minute, 20).expect("outbound"),
+            // Someone else's quota, per visitor. Denominated in UNITS, and an
+            // outbound call weighs 8 — so this is a burst of 10 calls and 120 a
+            // minute sustained.
+            //
+            // 📏 It was `(60, minute, 20)`: **2 calls, then 7.5 a minute**. Nothing
+            // charged this class until a middleware's `fetch()` did (15.6), and
+            // the first page-traffic test 429'd its third quick navigation. A
+            // per-visitor bucket bounds one client's amplification into a third
+            // party; it does not protect that party's *global* quota — a thousand
+            // visitors each get their own. That needs an app-wide budget, which
+            // does not exist yet.
+            outbound: Quota::with_burst(960, minute, 80).expect("outbound"),
             // Ten attempts a minute from one caller is far above what a human
             // typing a password produces and far below what guessing needs.
             credential: Quota::with_burst(10, minute, 5).expect("credential"),
@@ -260,6 +286,11 @@ impl Default for Limits {
             // and making it tight would hand an attacker a lockout primitive.
             // See `Shutter::credential_attempt`.
             account: Quota::with_burst(50, Duration::from_secs(3_600), 20).expect("account"),
+            // Per host, all callers together, one unit per call. A default has
+            // to be a guess about someone else's quota, so it is a conservative
+            // one — ten a second sustained — and the real answer is a declared
+            // source's own `limit`. An undeclared host has nobody to say.
+            upstream: Quota::with_burst(600, minute, 60).expect("upstream"),
         }
     }
 }
@@ -270,6 +301,7 @@ impl Limits {
     pub const fn for_key(&self, key: &Key) -> &Quota {
         match key {
             Key::Account { .. } => &self.account,
+            Key::Upstream { .. } => &self.upstream,
             Key::Principal { class, .. } | Key::Address { class, .. } => match class {
                 OperationClass::StaticRead => &self.static_read,
                 OperationClass::Read => &self.read,
@@ -367,9 +399,27 @@ struct Inner {
     overflow: Box<[Cell]>,
     capacity: usize,
     limits: Limits,
+    /// Per-host overrides of [`Limits::upstream`], from declared sources —
+    /// stored already partitioned.
+    upstream_overrides: DashMap<String, Quota>,
+    /// How many processes enforce the app-wide budgets between them. See
+    /// [`Shutter::partitioned`].
+    instances: u32,
+    /// [`Limits::upstream`] and [`Limits::account`], partitioned once.
+    upstream_share: Quota,
+    account_share: Quota,
     clock: Arc<dyn Clock>,
     /// Count of decisions served by `overflow`, for observability.
     degraded_decisions: AtomicU64,
+}
+
+impl std::fmt::Debug for Shutter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shutter")
+            .field("instances", &self.inner.instances)
+            .field("tracked_keys", &self.inner.exact.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Shutter {
@@ -394,13 +444,55 @@ impl Shutter {
         clock: Arc<dyn Clock>,
         capacity: usize,
     ) -> Result<Self, QuotaError> {
+        Self::partitioned(limits, clock, capacity, 1)
+    }
+
+    /// A limiter that is one of `instances` processes serving the same app.
+    ///
+    /// ## What is split, and what is not
+    ///
+    /// **App-wide budgets are split** — each upstream host's and each account's.
+    /// They describe one external quota that every process draws on, so N
+    /// processes each enforcing the whole of it admit N times the budget.
+    ///
+    /// **Per-caller budgets are not.** A visitor is spread across instances by
+    /// the load balancer, so they see up to N× their own limit; splitting it
+    /// would instead starve a visitor pinned to one instance by sticky sessions,
+    /// which is the worse failure for a limit whose job is fairness, not quota.
+    ///
+    /// ## Why a static split and not a shared ledger
+    ///
+    /// Coordinating would need a store every process reaches. FORGE's substrate
+    /// is a local file, so it reaches only processes on one machine — the
+    /// topology item 13.2 already refuses for serving divergent reads — and
+    /// never the multi-machine deployment the question is really about. A split
+    /// costs nothing per request and is exact about its one failure: when load is
+    /// uneven, a busy instance runs out while an idle one holds budget. That
+    /// under-admits; it can never over-admit.
+    ///
+    /// # Errors
+    /// [`QuotaError`] if a class could never admit its heaviest operation, or an
+    /// app-wide budget cannot be split across `instances`.
+    pub fn partitioned(
+        limits: Limits,
+        clock: Arc<dyn Clock>,
+        capacity: usize,
+        instances: u32,
+    ) -> Result<Self, QuotaError> {
         limits.check_admits_heaviest()?;
+        let instances = instances.max(1);
+        let upstream_share = limits.upstream.partitioned(instances)?;
+        let account_share = limits.account.partitioned(instances)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 exact: DashMap::new(),
                 overflow: (0..OVERFLOW_CELLS).map(|_| Cell::new()).collect(),
                 capacity: capacity.max(1),
                 limits,
+                upstream_overrides: DashMap::new(),
+                instances,
+                upstream_share,
+                account_share,
                 clock,
                 degraded_decisions: AtomicU64::new(0),
             }),
@@ -413,7 +505,7 @@ impl Shutter {
     /// endpoint does ([`cost::classify`], [`Cost::fan_out`]) and this rations it.
     pub fn charge(&self, key: &Key, cost: Cost) -> Verdict {
         let now = self.inner.clock.now();
-        let quota = self.inner.limits.for_key(key);
+        let quota = &self.quota_for(key);
         let (decision, degraded) = self.with_cell(key, |cell| cell.charge(quota, now, cost.weight));
         if degraded {
             self.inner
@@ -449,7 +541,7 @@ impl Shutter {
             return;
         }
         let now = self.inner.clock.now();
-        let quota = self.inner.limits.for_key(key);
+        let quota = &self.quota_for(key);
         let (_, degraded) = self.with_cell(key, |cell| cell.debit(quota, now, cost.weight));
         if degraded {
             self.inner
@@ -483,7 +575,7 @@ impl Shutter {
         let account_key = Key::Account {
             subject: account.to_string(),
         };
-        let account_quota = self.inner.limits.for_key(&account_key);
+        let account_quota = &self.quota_for(&account_key);
         let (account_ok, account_degraded) =
             self.with_cell(&account_key, |cell| cell.peek(account_quota, now, 1));
 
@@ -520,8 +612,122 @@ impl Shutter {
         let key = Key::Account {
             subject: account.to_string(),
         };
-        let quota = self.inner.limits.for_key(&key);
+        let quota = &self.quota_for(&key);
         let _ = self.with_cell(&key, |cell| cell.charge(quota, now, 1));
+    }
+
+    /// State the budget a declared upstream host allows, replacing the default.
+    ///
+    /// Takes effect for the next decision; a cell already in debt keeps its
+    /// debt, measured against the new quota.
+    ///
+    /// # Errors
+    /// [`QuotaError::CannotPartition`] when this limiter is one of several
+    /// instances and the stated budget cannot be split among them.
+    pub fn set_upstream_quota(&self, host: &str, quota: Quota) -> Result<(), QuotaError> {
+        let share = quota.partitioned(self.inner.instances)?;
+        self.inner
+            .upstream_overrides
+            .insert(host.to_ascii_lowercase(), share);
+        Ok(())
+    }
+
+    /// How many instances this limiter's app-wide budgets are split across.
+    #[must_use]
+    pub fn instances(&self) -> u32 {
+        self.inner.instances
+    }
+
+    /// The quota `key` answers to — overrides and the instance split included.
+    fn quota_for(&self, key: &Key) -> Quota {
+        match key {
+            Key::Upstream { host } => self
+                .inner
+                .upstream_overrides
+                .get(host)
+                .map_or(self.inner.upstream_share, |quota| *quota),
+            Key::Account { .. } => self.inner.account_share,
+            _ => *self.inner.limits.for_key(key),
+        }
+    }
+
+    /// Charge one real network call to `host`'s app-wide budget.
+    ///
+    /// Called by APERTURE's client at the single point every request leaves the
+    /// process — a declared read, its refresh loop, an OAuth exchange, an
+    /// action's or a middleware's `fetch()`. A cache hit never gets here and
+    /// never costs anything, which is the whole reason the charge lives at the
+    /// transport and not at the call site.
+    pub fn upstream_charge(&self, host: &str) -> Verdict {
+        let now = self.inner.clock.now();
+        let key = Key::Upstream {
+            host: host.to_ascii_lowercase(),
+        };
+        let quota = self.quota_for(&key);
+        let (decision, degraded) = self.with_cell(&key, |cell| cell.charge(&quota, now, 1));
+        if degraded {
+            self.inner
+                .degraded_decisions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Verdict {
+            decision,
+            cost: Cost::flat(OperationClass::Outbound),
+            limit: quota.burst(),
+            degraded,
+        }
+    }
+
+    /// Admit one request-driven call from `caller` to `host`: **peek** the
+    /// host's app-wide budget and **charge** the caller's.
+    ///
+    /// The host is charged later, by APERTURE's client, when the request
+    /// actually leaves ([`Self::upstream_charge`]) — so every surface pays it
+    /// once, including the ones with no caller at all (a refresh loop). Peeking
+    /// here is what keeps a caller from being charged for a call an exhausted
+    /// host would refuse anyway, and what lets a request path answer `429`
+    /// before any work is staged.
+    ///
+    /// Two concurrent calls can both pass the peek and one then be refused at
+    /// the transport, having charged its caller — bounded by concurrency at the
+    /// edge of the budget, and the price of not holding a lock across two cells.
+    pub fn outbound_call(&self, caller: &Key, host: &str) -> Verdict {
+        let now = self.inner.clock.now();
+        let caller_cost = Cost::flat(OperationClass::Outbound);
+        let caller_quota = self.quota_for(caller);
+        let upstream_key = Key::Upstream {
+            host: host.to_ascii_lowercase(),
+        };
+        let upstream_quota = self.quota_for(&upstream_key);
+
+        let (upstream_ok, upstream_degraded) =
+            self.with_cell(&upstream_key, |cell| cell.peek(&upstream_quota, now, 1));
+        if !upstream_ok {
+            let (decision, _) =
+                self.with_cell(&upstream_key, |cell| cell.charge(&upstream_quota, now, 0));
+            let refusal = match decision {
+                Decision::Refuse { .. } => decision,
+                Decision::Admit { reset_after, .. } => Decision::Refuse {
+                    retry_after: reset_after,
+                    reset_after,
+                },
+            };
+            return Verdict {
+                decision: refusal,
+                cost: caller_cost,
+                limit: upstream_quota.burst(),
+                degraded: upstream_degraded,
+            };
+        }
+
+        let (caller_ok, _) =
+            self.with_cell(caller, |cell| cell.peek(&caller_quota, now, caller_cost.weight));
+        if !caller_ok {
+            // Refuses without charging — `charge` never charges a refusal.
+            return self.charge(caller, caller_cost);
+        }
+
+        self.charge(caller, caller_cost)
     }
 
     /// Exact cells currently held.
@@ -644,6 +850,167 @@ mod tests {
             16
         )
         .is_err());
+    }
+
+    /// 🔑 The property the per-caller bucket cannot give: a third party's budget
+    /// is spent by everyone, so a crowd exhausts it even though no single caller
+    /// is near their own limit.
+    #[test]
+    fn an_upstream_budget_is_shared_by_every_caller() {
+        let clock = Arc::new(ManualClock::new());
+        let shutter = shutter(&clock);
+        shutter
+            .set_upstream_quota("api.test", Quota::with_burst(5, Duration::from_secs(60), 5).unwrap())
+            .unwrap();
+
+        // Admission, then the charge the client makes when the call leaves.
+        let admitted = (0..20u8)
+            .filter(|n| {
+                shutter
+                    .outbound_call(&caller(*n, OperationClass::Outbound), "api.test")
+                    .is_admitted()
+                    && shutter.upstream_charge("api.test").is_admitted()
+            })
+            .count();
+        assert_eq!(admitted, 5, "twenty distinct callers share the upstream's five");
+
+        // Control: another host has its own budget.
+        assert!(shutter
+            .outbound_call(&caller(99, OperationClass::Outbound), "other.test")
+            .is_admitted());
+    }
+
+    #[test]
+    fn a_refused_outbound_call_charges_neither_budget() {
+        let clock = Arc::new(ManualClock::new());
+        let shutter = shutter(&clock);
+        shutter
+            .set_upstream_quota("api.test", Quota::with_burst(1, Duration::from_secs(60), 1).unwrap())
+            .unwrap();
+        let me = caller(1, OperationClass::Outbound);
+
+        assert!(shutter.outbound_call(&me, "api.test").is_admitted());
+        assert!(shutter.upstream_charge("api.test").is_admitted());
+        for _ in 0..50 {
+            assert!(!shutter.outbound_call(&me, "api.test").is_admitted());
+        }
+        // The caller was refused by the upstream fifty times and is not in debt
+        // for it: a call to another host is admitted at once.
+        assert!(
+            shutter.outbound_call(&me, "other.test").is_admitted(),
+            "refusals by the upstream must not have spent the caller's budget"
+        );
+    }
+
+    #[test]
+    fn a_caller_out_of_budget_does_not_spend_the_upstream() {
+        let clock = Arc::new(ManualClock::new());
+        let shutter = shutter(&clock);
+        shutter
+            .set_upstream_quota("api.test", Quota::with_burst(12, Duration::from_secs(60), 12).unwrap())
+            .unwrap();
+        let greedy = caller(1, OperationClass::Outbound);
+
+        let mut admitted = 0;
+        for _ in 0..40 {
+            if shutter.outbound_call(&greedy, "api.test").is_admitted() {
+                assert!(shutter.upstream_charge("api.test").is_admitted());
+                admitted += 1;
+            }
+        }
+        assert!(admitted < 12, "the caller's own budget ran out first ({admitted})");
+        let left = 12 - admitted;
+        let others = (2..40u8)
+            .filter(|n| {
+                shutter
+                    .outbound_call(&caller(*n, OperationClass::Outbound), "api.test")
+                    .is_admitted()
+                    && shutter.upstream_charge("api.test").is_admitted()
+            })
+            .count();
+        assert_eq!(others, left, "the greedy caller's refusals left the upstream's budget intact");
+    }
+
+    /// A caller-less charge — the refresh loop's — spends the same host budget a
+    /// request-driven call peeks, so a request is refused once background reads
+    /// have used it up.
+    #[test]
+    fn a_background_charge_is_seen_by_the_next_request() {
+        let clock = Arc::new(ManualClock::new());
+        let shutter = shutter(&clock);
+        shutter
+            .set_upstream_quota("api.test", Quota::with_burst(3, Duration::from_secs(60), 3).unwrap())
+            .unwrap();
+        for _ in 0..3 {
+            assert!(shutter.upstream_charge("api.test").is_admitted());
+        }
+        assert!(!shutter
+            .outbound_call(&caller(1, OperationClass::Outbound), "api.test")
+            .is_admitted());
+    }
+
+    /// 🔑 N instances each enforcing their share admit, together, no more than
+    /// the whole budget — for the default and for a declared override.
+    #[test]
+    fn instances_together_admit_no_more_than_the_whole_app_wide_budget() {
+        let whole = Quota::with_burst(12, Duration::from_secs(60), 12).unwrap();
+        let clock = Arc::new(ManualClock::new());
+        let instances: Vec<Shutter> = (0..4)
+            .map(|_| {
+                let s = Shutter::partitioned(
+                    Limits::default(),
+                    Arc::clone(&clock) as Arc<dyn Clock>,
+                    DEFAULT_EXACT_CAPACITY,
+                    4,
+                )
+                .unwrap();
+                s.set_upstream_quota("api.test", whole).unwrap();
+                s
+            })
+            .collect();
+        let admitted: usize = instances
+            .iter()
+            .map(|s| (0..100).filter(|_| s.upstream_charge("api.test").is_admitted()).count())
+            .sum();
+        assert_eq!(admitted, 12, "four shares of twelve");
+
+        // The RATE is split too, not only the burst. The whole budget refills
+        // 12 a minute, so 4 in 20 s; four shares must refill 4 between them,
+        // not 4 each. (A window short enough not to hit the burst cap, which
+        // would hide an unsplit rate.)
+        clock.advance(Duration::from_secs(20));
+        let refilled: usize = instances
+            .iter()
+            .map(|s| (0..100).filter(|_| s.upstream_charge("api.test").is_admitted()).count())
+            .sum();
+        assert_eq!(refilled, 4, "20 s of a 12/min budget, across all instances");
+
+        // Per-caller budgets are NOT split: each instance still gives one caller
+        // its full burst.
+        let visitor = caller(7, OperationClass::Read);
+        assert!(instances[0].charge(&visitor, Cost::flat(OperationClass::Read)).is_admitted());
+        assert_eq!(
+            (0..200)
+                .filter(|_| instances[1].charge(&visitor, Cost::flat(OperationClass::Read)).is_admitted())
+                .count(),
+            50,
+            "the read burst is 100 units at weight 2 on every instance"
+        );
+    }
+
+    #[test]
+    fn a_budget_too_small_to_split_is_refused_rather_than_rounded_up() {
+        let s = Shutter::partitioned(
+            Limits::default(),
+            Arc::new(ManualClock::new()) as Arc<dyn Clock>,
+            16,
+            8,
+        )
+        .unwrap();
+        let err = s
+            .set_upstream_quota("api.test", Quota::with_burst(4, Duration::from_secs(60), 4).unwrap())
+            .unwrap_err();
+        assert!(matches!(err, QuotaError::CannotPartition { burst: 4, instances: 8 }), "{err}");
     }
 
     #[test]

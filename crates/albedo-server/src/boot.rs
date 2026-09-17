@@ -247,7 +247,7 @@ fn boot_inner(
         ))
     })?;
 
-    let app_config = AppConfig {
+    let mut app_config = AppConfig {
         server: ServerConfig {
             host: opts.host.clone(),
             port: opts.port,
@@ -287,6 +287,10 @@ fn boot_inner(
             ),
         },
     };
+    // The environment's timeouts and WebTransport settings. Host and port are
+    // not taken here: they have CLI flags, and the environment is layered under
+    // those when the contract is resolved (`dev::contract`), not over them.
+    app_config.apply_tuning_env_overrides_from("ALBEDO_", |key| std::env::var(key).ok())?;
 
     // A1 · run compiled action bodies through the QuickJS executor in
     // production. Sized to the host's parallelism so per-worker checkouts rarely

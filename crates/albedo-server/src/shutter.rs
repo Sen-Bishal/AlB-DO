@@ -256,6 +256,16 @@ pub fn subject(
 /// same in every environment.
 pub const TRUSTED_PROXIES_ENV: &str = "ALBEDO_TRUSTED_PROXIES";
 
+/// How many processes serve this app. App-wide budgets — each upstream host's
+/// and each account's — are split across them, so N instances together admit
+/// what one would. See [`Shutter::partitioned`] for what is split and why this
+/// is a declaration rather than a coordinated count.
+///
+/// Unset means one. An operator scaling out who forgets it gets N× every
+/// third-party budget, which is the failure this exists to prevent — so the
+/// boot report states the value in effect.
+pub const INSTANCES_ENV: &str = "ALBEDO_INSTANCES";
+
 /// The bucket a request answers to when no peer address is available.
 ///
 /// Only reachable when the router was mounted without connect info — an embedder
@@ -291,7 +301,17 @@ impl Limiter {
             Ok(raw) => parse_trusted_proxies(&raw)?,
             Err(_) => TrustedProxies::none(),
         };
-        let shutter = Shutter::new().map_err(|err: QuotaError| err.to_string())?;
+        let instances = match std::env::var(INSTANCES_ENV) {
+            Ok(raw) => parse_instances(&raw)?,
+            Err(_) => 1,
+        };
+        let shutter = Shutter::partitioned(
+            dom_render_compiler::shutter::Limits::default(),
+            Arc::new(dom_render_compiler::shutter::MonotonicClock::new()),
+            dom_render_compiler::shutter::DEFAULT_EXACT_CAPACITY,
+            instances,
+        )
+        .map_err(|err: QuotaError| format!("{INSTANCES_ENV}={instances}: {err}"))?;
         Ok(Self { shutter, proxies })
     }
 
@@ -332,6 +352,18 @@ impl Limiter {
         self.shutter.charge(key, cost)
     }
 
+    /// Admit one outbound call from `caller` to `url`'s host, charging the
+    /// caller's outbound bucket and the host's shared one — both or neither. See
+    /// [`Shutter::outbound_call`].
+    ///
+    /// A URL with no parseable host is admitted without charge: it cannot leave
+    /// the process, and APERTURE refuses it with the reason when it tries.
+    #[must_use]
+    pub fn outbound_call(&self, caller: &Key, url: &str) -> Option<Verdict> {
+        let host = url::Url::parse(url).ok()?.host_str()?.to_string();
+        Some(self.shutter.outbound_call(caller, &host))
+    }
+
     /// Record a cost that only became knowable after the work ran. See
     /// [`Shutter::debit`].
     pub fn debit(&self, key: &Key, cost: Cost) {
@@ -343,6 +375,18 @@ impl Limiter {
     #[must_use]
     pub fn shutter(&self) -> &Shutter {
         &self.shutter
+    }
+}
+
+/// A positive instance count. Anything else is refused at boot rather than
+/// read as one: a typo in a scaling setting that silently means "not scaled" is
+/// the failure the setting exists to prevent.
+fn parse_instances(raw: &str) -> Result<u32, String> {
+    match raw.trim().parse::<u32>() {
+        Ok(n) if n >= 1 => Ok(n),
+        _ => Err(format!(
+            "{INSTANCES_ENV}=\"{raw}\" is not a positive whole number of instances"
+        )),
     }
 }
 
@@ -414,6 +458,70 @@ pub fn note_fan_out(subscribers: u32) {
     let _ = FAN_OUT.try_with(|meter| {
         meter.fetch_add(subscribers, Ordering::Relaxed);
     });
+}
+
+tokio::task_local! {
+    /// Who a dispatch's outbound calls are charged to, and the refusal if one
+    /// happened.
+    ///
+    /// The same channel [`FAN_OUT`] is, for the mirror-image reason: an action's
+    /// `fetch()` is staged deep inside the workflow driver, and only the
+    /// dispatcher knows the caller. Nothing in between should carry a rate
+    /// limiter through its signature.
+    static OUTBOUND: OutboundScope;
+}
+
+#[derive(Clone)]
+struct OutboundScope {
+    limiter: Arc<Limiter>,
+    caller: Key,
+    refused: Arc<std::sync::Mutex<Option<Verdict>>>,
+}
+
+/// Run `future` with outbound calls charged to `caller`, and report the
+/// refusal that stopped it, if one did — so the dispatcher can answer `429`
+/// rather than the error the refused workflow produced.
+pub async fn outbound_scope<F, T>(limiter: Arc<Limiter>, caller: Key, future: F) -> (T, Option<Verdict>)
+where
+    F: std::future::Future<Output = T>,
+{
+    let refused = Arc::new(std::sync::Mutex::new(None));
+    let scope = OutboundScope {
+        limiter,
+        caller,
+        refused: Arc::clone(&refused),
+    };
+    let value = OUTBOUND.scope(scope, future).await;
+    let refusal = refused.lock().map(|mut slot| slot.take()).unwrap_or(None);
+    (value, refusal)
+}
+
+/// Admit one outbound call to `url` against the current dispatch's caller.
+///
+/// # Errors
+/// A reason, when the caller or the upstream host is out of budget.
+///
+/// 🔴 **Outside an [`outbound_scope`] this admits everything.** Every production
+/// path that can stage a call — the action dispatchers — installs one; a
+/// test driving an adapter directly does not, and should not have to build a
+/// limiter to do so. A new dispatch path that stages calls must install a scope;
+/// `tests/outbound_budget_http.rs` fails if the action path stops reaching one.
+pub fn admit_outbound(url: &str) -> Result<(), String> {
+    OUTBOUND
+        .try_with(|scope| match scope.limiter.outbound_call(&scope.caller, url) {
+            Some(verdict) if !verdict.is_admitted() => {
+                let reason = format!(
+                    "outbound budget exhausted; retry after {}s",
+                    verdict.retry_after_secs().unwrap_or(1)
+                );
+                if let Ok(mut slot) = scope.refused.lock() {
+                    slot.get_or_insert(verdict);
+                }
+                Err(reason)
+            }
+            _ => Ok(()),
+        })
+        .unwrap_or(Ok(()))
 }
 
 /// Header names from the IETF `ratelimit-headers` draft, which is what modern

@@ -38,6 +38,8 @@ tracing.workspace              = true
 # emits. Without this the ~66 instrumentation sites in the tree have no receiver.
 tracing-subscriber.workspace   = true
 url.workspace                  = true
+# The `albedo` binary's global allocator — `src/bin/albedo.rs` has the numbers.
+mimalloc.workspace             = true
 uuid.workspace                 = true
 quinn.workspace                = true
 rustls-pemfile.workspace       = true

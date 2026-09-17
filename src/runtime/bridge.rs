@@ -81,6 +81,21 @@ pub enum HandlerEffect {
     /// FORGE · a `remove(collection, key)` call: a durable delete of the row
     /// identified by `key`.
     ForgeDelete { collection: String, key: Value },
+    /// JOBS · 15.5 — an `enqueue(name, args, options)` call.
+    ///
+    /// Opcode-free like the FORGE writes, and for the same reason: nothing
+    /// happens in this session. The row is written by the caller after the body
+    /// returns, and the work happens later, elsewhere.
+    Enqueue {
+        /// The job's export name in `src/jobs.ts`.
+        name: String,
+        /// The JSON argument the body passed.
+        args: Value,
+        /// A caller-supplied row id, which makes the enqueue idempotent.
+        id: Option<String>,
+        /// How long to wait before it may run, as written (`"5m"`).
+        delay: Option<String>,
+    },
 }
 
 impl HandlerEffect {
@@ -100,7 +115,10 @@ impl HandlerEffect {
             }
             HandlerEffect::ForgeAppend { .. }
             | HandlerEffect::ForgeUpdate { .. }
-            | HandlerEffect::ForgeDelete { .. } => None,
+            | HandlerEffect::ForgeDelete { .. }
+            // Nothing happens in this session: the row is written after the body
+            // returns and the work runs later, elsewhere.
+            | HandlerEffect::Enqueue { .. } => None,
         }
     }
 
@@ -113,7 +131,8 @@ impl HandlerEffect {
             }
             HandlerEffect::ForgeAppend { .. }
             | HandlerEffect::ForgeUpdate { .. }
-            | HandlerEffect::ForgeDelete { .. } => None,
+            | HandlerEffect::ForgeDelete { .. }
+            | HandlerEffect::Enqueue { .. } => None,
         }
     }
 }
@@ -241,6 +260,10 @@ struct RawEffect {
     /// handler). Stamped from the sealed provenance stack.
     #[serde(default)]
     origin: Option<String>,
+    /// JOBS · 15.5 — how long `enqueue()` asked to wait before the new job may
+    /// run, as written (`"5m"`). Absent everywhere else.
+    #[serde(default)]
+    delay: Option<String>,
 }
 
 /// Raw shape of one staged request, as the `fetch` builtin pushes it.
@@ -475,6 +498,20 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     script.push_str(
         "const remove=function(collection,key){var __r=__albedo_rec('forge_delete');__r.topic=String(collection);__r.key=__albedo_forge_key('remove',key);__albedo_emit(__r);return null;};\n",
     );
+    // JOBS · 15.5 · `enqueue(name, args, options)` — put background work on the
+    // queue from an action.
+    //
+    // This is the shape the transactional-email case needs: a form action that
+    // must not block on an upstream, must survive a 503, and must not send twice
+    // if the user double-submits (`options.id`). Doing it inline instead means a
+    // provider outage turns a sign-up into a failed sign-up.
+    //
+    // A `const` inside the handler IIFE like its siblings, NOT a global — the
+    // Gate-4 property `lower_effect` documents. The job-side binding is an
+    // import for the same reason; see `quickjs_engine`'s `__albedo_jobs`.
+    script.push_str(
+        "const enqueue=function(name,args,options){if(typeof name!=='string'||name.length===0){throw new TypeError('enqueue(name, args): name must be the exported job name');}var __o=options||{};var __p=(args===undefined||args===null)?{}:args;if(typeof __p!=='object'||Array.isArray(__p)){throw new TypeError('enqueue(name, args): args must be an object');}var __r=__albedo_rec('job_enqueue');__r.topic=name;__r.value=__p;if(__o.id!==undefined&&__o.id!==null){__r.key=String(__o.id);}if(__o.delay!==undefined&&__o.delay!==null){__r.delay=String(__o.delay);}__albedo_emit(__r);return null;};\n",
+    );
 
     // ── APERTURE A2 · the suspend protocol ───────────────────────────────
     //
@@ -526,7 +563,7 @@ var step=__albedo_step++;\
 var method=(init&&init.method)?String(init.method).toUpperCase():'GET';\
 var target=String(url);\
 var body=null;\
-if(init&&init.body!==undefined&&init.body!==null){body=(typeof init.body==='string')?init.body:JSON.stringify(init.body);}\
+if(init&&init.body!==undefined&&init.body!==null){body=(typeof init.body==='string')?init.body:__albedo_S.stringify(init.body);}\
 var digest=__albedo_digest(method+'\\n'+target+'\\n'+(body===null?'':body));\
 var recorded=(step<__albedo_journal.length)?__albedo_journal[step]:null;\
 if(recorded){\
@@ -629,7 +666,7 @@ throw __ALBEDO_SUSPEND;\
     // a swallowed sentinel degrades to *suspend anyway*, never to *commit the
     // effects of a body that never got its data*.
     script.push_str(
-        "if(__albedo_suspended){return '{\"ok\":false,\"suspend\":'+__albedo_S.stringify(__albedo_S.stringify(__albedo_pending))+',\"journal_len\":'+__albedo_S.stringify(__albedo_journal.length|0)+'}';}\n",
+        "if(__albedo_suspended){return '{\"ok\":false,\"suspend\":'+__albedo_S.stringify(__albedo_S.stringify(__albedo_pending))+',\"journal_len\":'+__albedo_S.stringify(__albedo_journal.length|0)+',\"integrity\":'+__albedo_S.stringify(__albedo_S.integrity())+'}';}\n",
     );
     script.push_str(
         // 🔑 The envelope itself is CONCATENATED, not `stringify`d from an
@@ -652,7 +689,7 @@ throw __ALBEDO_SUSPEND;\
         "return '{\"ok\":true,\"value\":'+__albedo_S.stringify(__albedo_effects_json())+',\"result\":'+__albedo_S.stringify(__albedo_result_json)+',\"integrity\":'+__albedo_S.stringify(__albedo_integrity)+'}';\n",
     );
     script.push_str(
-        "}catch(err){if(__albedo_suspended||__albedo_is_suspend(err)){return '{\"ok\":false,\"suspend\":'+__albedo_S.stringify(__albedo_S.stringify(__albedo_pending))+',\"journal_len\":'+__albedo_S.stringify(__albedo_journal.length|0)+'}';}const message=(err&&typeof err.message==='string')?err.message:String(err);return '{\"ok\":false,\"error\":'+__albedo_S.stringify(message)+'}';}\n",
+        "}catch(err){if(__albedo_suspended||__albedo_is_suspend(err)){return '{\"ok\":false,\"suspend\":'+__albedo_S.stringify(__albedo_S.stringify(__albedo_pending))+',\"journal_len\":'+__albedo_S.stringify(__albedo_journal.length|0)+',\"integrity\":'+__albedo_S.stringify(__albedo_S.integrity())+'}';}const message=(err&&typeof err.message==='string')?err.message:String(err);return '{\"ok\":false,\"error\":'+__albedo_S.stringify(message)+'}';}\n",
     );
     script.push_str("})()");
     Ok(script)
@@ -678,6 +715,17 @@ pub(crate) fn decode_handler_run(
     })?;
 
     if let Some(raw) = envelope.suspend.as_deref() {
+        // SANDGATE-B on the suspend path. The completed path refuses a poisoned
+        // realm below; this arm returns before reaching it, and a suspended pass
+        // is exactly the one that staged an outbound request whose body was
+        // serialised — so a `toJSON` hook could rewrite what goes on the wire.
+        // Checked here, against the same probe, before the request is admitted.
+        if let Some(reason) = envelope.integrity.as_deref().filter(|r| !r.is_empty()) {
+            return Err(RuntimeError::render(format!(
+                "handler '{entry}' refused: the JS realm has '{reason}' installed, which can \
+                 rewrite the body of a request it stages. This is realm poisoning — see SANDGATE-B."
+            )));
+        }
         let staged: Vec<RawPending> = serde_json::from_str(raw).map_err(|err| {
             RuntimeError::render(format!(
                 "failed to decode suspended requests for '{entry}': {err}"
@@ -753,6 +801,47 @@ pub(crate) fn decode_handler_run(
         .collect::<RuntimeResult<Vec<HandlerEffect>>>()?;
 
     Ok(HandlerRun::Completed(HandlerOutcome { effects, result }))
+}
+
+/// JOBS · 15.5 — lower a job pass's staged effect list.
+///
+/// The job path stages through its own prologue (the write builtins are
+/// module-scoped imports there, not handler-IIFE `const`s), but the **records it
+/// stages are byte-identical** to an action's, so they lower here. One lowering
+/// for a FORGE write, one SANDGATE-B origin check, one place to change — rather
+/// than a second implementation that agrees today.
+///
+/// `json` is the `{"effects":[…]}` / `{"refused":…}` envelope the prologue's
+/// `finish` returns.
+///
+/// # Errors
+/// The envelope is unreadable, an effect is malformed, or the pass was refused
+/// because a `toJSON` hook was planted while it ran.
+pub fn lower_staged_effects(entry: &str, json: &str) -> RuntimeResult<Vec<HandlerEffect>> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        effects: Vec<RawEffect>,
+        #[serde(default)]
+        refused: Option<String>,
+    }
+
+    let envelope: Envelope = serde_json::from_str(json).map_err(|err| {
+        RuntimeError::render(format!(
+            "failed to decode the effect list for '{entry}': {err}"
+        ))
+    })?;
+    if let Some(hook) = envelope.refused {
+        return Err(RuntimeError::render(format!(
+            "job '{entry}' recorded an effect while a `toJSON` hook was planted ({hook}); the \
+             pass was refused rather than trusted. See SANDGATE-B."
+        )));
+    }
+    envelope
+        .effects
+        .into_iter()
+        .map(|effect| lower_effect(entry, effect))
+        .collect()
 }
 
 fn lower_effect(entry: &str, raw: RawEffect) -> RuntimeResult<HandlerEffect> {
@@ -862,6 +951,33 @@ fn lower_effect(entry: &str, raw: RawEffect) -> RuntimeResult<HandlerEffect> {
             })?;
             let key = forge_scalar_key(raw.key, entry, &collection, "forge_delete")?;
             Ok(HandlerEffect::ForgeDelete { collection, key })
+        }
+        // JOBS · 15.5 — `enqueue()`. The name rides in `topic` and the argument
+        // in `value`, reusing the envelope the FORGE writes already use rather
+        // than adding fields only one kind reads.
+        "job_enqueue" => {
+            let name = raw.topic.ok_or_else(|| {
+                RuntimeError::render(format!("job_enqueue effect in '{entry}' is missing a name"))
+            })?;
+            // An id is optional, but if one crossed it must be a string: it
+            // becomes a primary key, and a non-scalar reaching SQL as one is
+            // exactly the class `forge_scalar_key` exists to refuse.
+            let id = match raw.key {
+                None | Some(Value::Null) => None,
+                Some(Value::String(id)) => Some(id),
+                Some(other) => {
+                    return Err(RuntimeError::render(format!(
+                        "enqueue('{name}') in '{entry}' was given a non-string id ({other}); an \
+                         id becomes the queue row's primary key"
+                    )))
+                }
+            };
+            Ok(HandlerEffect::Enqueue {
+                name,
+                args: raw.value,
+                id,
+                delay: raw.delay,
+            })
         }
         other => Err(RuntimeError::render(format!(
             "handler '{entry}' produced an unknown effect kind '{other}'"
@@ -1077,6 +1193,44 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
         assert!(message.contains("SANDGATE-B"), "Got: {message}");
+    }
+
+    /// 🔴 SANDGATE-B on the **suspend** path — the arm that carries a staged
+    /// request's serialised body. It returned before the integrity check the
+    /// completed path runs, so a `toJSON` hook could rewrite an outbound body.
+    #[test]
+    fn a_suspended_pass_in_a_poisoned_realm_is_refused_before_the_request_is_sent() {
+        let pending = serde_json::to_string(&serde_json::json!([
+            { "step": 0, "method": "POST", "url": "https://a.test/", "body": "{\"forged\":true}",
+              "headers": [], "digest": "x" }
+        ]))
+        .unwrap();
+        let envelope = serde_json::json!({
+            "ok": false, "suspend": pending, "journal_len": 0,
+            "integrity": "Object.prototype.toJSON"
+        })
+        .to_string();
+        let err = decode_handler_run("routes/x", &envelope).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
+        assert!(message.contains("SANDGATE-B"), "Got: {message}");
+    }
+
+    /// CONTROL — a clean suspend still stages its request. A suspend arm that
+    /// refused unconditionally would pass the test above for the wrong reason.
+    #[test]
+    fn a_clean_suspended_pass_stages_its_request() {
+        let pending = serde_json::to_string(&serde_json::json!([
+            { "step": 0, "method": "GET", "url": "https://a.test/", "body": null,
+              "headers": [], "digest": "x" }
+        ]))
+        .unwrap();
+        let envelope =
+            serde_json::json!({ "ok": false, "suspend": pending, "journal_len": 0 }).to_string();
+        match decode_handler_run("routes/x", &envelope).expect("a clean suspend is accepted") {
+            HandlerRun::Suspended { pending, .. } => assert_eq!(pending.len(), 1),
+            HandlerRun::Completed(_) => panic!("expected a suspension"),
+        }
     }
 
     #[test]

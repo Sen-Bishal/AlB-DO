@@ -305,6 +305,7 @@ mod tests {
                 (
                     (*name).to_string(),
                     SourceDecl {
+                        limit: None,
                         base: (*base).to_string(),
                         auth: None,
                         headers: BTreeMap::new(),

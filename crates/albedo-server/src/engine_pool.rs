@@ -50,7 +50,9 @@ use serde_json::Map;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
+use std::panic::AssertUnwindSafe;
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Semaphore};
 
 /// Number of representative handler evals run against a fresh engine at
@@ -65,6 +67,26 @@ const POOL_WARMUP_RENDERS: u32 = 10;
 /// render interns the component's QuickJS shapes/atoms into the persistent region;
 /// the rest are cheap confirmation that the now-warm path is stable.
 const RENDER_WARMUP_REPS: u32 = 2;
+
+/// How long an engine thread under load keeps polling its channel after a job
+/// before it parks.
+///
+/// 📏 **The thread hop was cheap; the parking was not.** Measured through
+/// `serve` with 16 requests in flight on a trivial middleware (release, stage
+/// timers, p50 of the whole request): parking after every job gave **46–52 µs**,
+/// polling for 200 µs first gave **31–37 µs** — and the JS eval inside the job
+/// fell from 22–25 µs to 13–16 µs, because a thread that parks lets its core
+/// idle down between jobs and the next job pays to wake it. Running the eval
+/// inline on the tokio worker instead (no hop at all) gave 31 µs, so polling
+/// recovers what removing the pool would, without putting user JS on the
+/// threads that serve every other connection. 50 µs recovered about two thirds.
+const SPIN_WHILE_HOT: Duration = Duration::from_micros(200);
+
+/// An engine spins only if its previous job arrived within this long of the one
+/// before it finishing — that is, only while it is actually busy. An idle server
+/// parks every engine at once and burns nothing; the cost of polling is paid
+/// only under load, where the core is spent on this pool's work anyway.
+const HOT_GAP: Duration = Duration::from_millis(2);
 
 /// A component to warm every pool engine's *render* path with. Owns its full
 /// dependency-ordered module graph and an entry spec so a pool worker can load and
@@ -94,10 +116,16 @@ pub enum EnginePoolError {
     /// The semaphore was closed — the pool is shutting down.
     #[error("engine pool is shutting down")]
     ShuttingDown,
-    /// The worker thread died (panicked) before returning a result. The engine
-    /// it owned is gone; the pool will be one engine short until rebuilt.
-    #[error("engine worker thread terminated before returning a result")]
+    /// The job panicked before returning a result — or, if even replacing its
+    /// engine failed, the worker thread is gone. A panicking job's engine is
+    /// replaced with a freshly provisioned one, so this is normally the cost of
+    /// the one job and not of the pool slot.
+    #[error("engine job panicked before returning a result")]
     WorkerLost,
+    /// Every engine in the pool has died and been retired. Nothing can run
+    /// until the pool is rebuilt — a dev reload or a restart does that.
+    #[error("every engine in the pool has died; restart the server")]
+    Exhausted,
 }
 
 /// One pooled engine, represented by the sender end of its thread's job
@@ -106,6 +134,30 @@ pub enum EnginePoolError {
 /// per engine, so popping it from the idle stack guarantees exclusive access.
 struct Worker {
     job_tx: Sender<Job>,
+}
+
+/// A worker popped for one checkout, returned to the idle stack when dropped —
+/// including when the checkout's future is cancelled mid-job.
+struct CheckedOut<'a> {
+    worker: Option<Worker>,
+    idle: &'a Mutex<Vec<Worker>>,
+}
+
+impl CheckedOut<'_> {
+    fn job_tx(&self) -> &Sender<Job> {
+        &self.worker.as_ref().expect("worker held until drop").job_tx
+    }
+}
+
+impl Drop for CheckedOut<'_> {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            // A poisoned lock means another checkout panicked while holding it
+            // for an O(1) push/pop; keep the engine rather than lose it too.
+            let mut idle = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            idle.push(worker);
+        }
+    }
 }
 
 /// Bounded, warm-on-construction pool of [`QuickJsEngine`]s, each pinned to a
@@ -133,6 +185,32 @@ pub struct QuickJsEnginePool {
     /// How many of those rebuilds failed. Non-zero means an engine in this pool
     /// is under-populated and will fail the next render loudly.
     confinement_failures: Arc<AtomicU64>,
+    /// How long one checkout's JS may run before the engine stops it. `None`
+    /// runs unbounded — see [`Self::with_job_budget`].
+    job_budget: Option<std::time::Duration>,
+    /// How many checkouts ran past `job_budget` and were stopped.
+    interruptions: Arc<AtomicU64>,
+    /// What every engine in the pool has been given since construction, so an
+    /// engine replaced after a panic can be given it too.
+    provision: Arc<Mutex<Provision>>,
+    /// How many engines have been replaced after a job panicked on them.
+    replacements: Arc<AtomicU64>,
+    /// Engines still serving — `size` minus every slot retired because its
+    /// thread is gone. Zero closes the semaphore.
+    live: std::sync::atomic::AtomicUsize,
+}
+
+/// The pool-wide installs a replacement engine needs to be interchangeable with
+/// the rest: the latest npm set and the latest render warm-up set. Each is
+/// replaced wholesale, because every build hands the pool the complete list.
+#[derive(Default)]
+struct Provision {
+    npm: Vec<NpmArtifactRegistration>,
+    warm: Vec<WarmupComponent>,
+    /// Test-only: make the next replacement panic, which nothing in production
+    /// can be relied on to do on demand.
+    #[cfg(test)]
+    fail_replacement: bool,
 }
 
 impl QuickJsEnginePool {
@@ -148,6 +226,8 @@ impl QuickJsEnginePool {
         let size = size.max(1);
         let mut idle = Vec::with_capacity(size);
         let mut joins = Vec::with_capacity(size);
+        let provision = Arc::new(Mutex::new(Provision::default()));
+        let replacements = Arc::new(AtomicU64::new(0));
 
         for i in 0..size {
             let (job_tx, job_rx) = mpsc::channel::<Job>();
@@ -158,7 +238,11 @@ impl QuickJsEnginePool {
 
             let handle = thread::Builder::new()
                 .name(format!("albedo-qjs-engine-{i}"))
-                .spawn(move || engine_worker_loop(job_rx, ready_tx))
+                .spawn({
+                    let provision = Arc::clone(&provision);
+                    let replacements = Arc::clone(&replacements);
+                    move || engine_worker_loop(job_rx, ready_tx, &provision, &replacements)
+                })
                 .expect("failed to spawn QuickJS engine worker thread");
 
             // Wait for this worker to finish warmup. If the worker panicked
@@ -182,7 +266,56 @@ impl QuickJsEnginePool {
                 .unwrap_or(true),
             confinements: Arc::new(AtomicU64::new(0)),
             confinement_failures: Arc::new(AtomicU64::new(0)),
+            job_budget: None,
+            interruptions: Arc::new(AtomicU64::new(0)),
+            provision,
+            replacements,
+            live: std::sync::atomic::AtomicUsize::new(size),
         }
+    }
+
+    /// Engines still serving: the pool's size, less every slot whose thread
+    /// died and was retired.
+    #[must_use]
+    pub fn live_engines(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// Engines checked out right now: live engines less the free permits. A
+    /// point-in-time read for the metrics scrape, never a scheduling input.
+    #[must_use]
+    pub fn busy_engines(&self) -> usize {
+        self.live_engines()
+            .saturating_sub(self.permits.available_permits())
+    }
+
+    /// How many engines have been replaced because a job panicked on them.
+    #[must_use]
+    pub fn replacements(&self) -> u64 {
+        self.replacements.load(Ordering::Relaxed)
+    }
+
+    /// Stop a checkout's JS once it has run for `budget`, and rebuild that
+    /// engine's realm before it serves again.
+    ///
+    /// # Why the pool needs this and a `timeout` around the caller is not it
+    ///
+    /// 🔴 A `tokio::time::timeout` drops the *future waiting on* an engine. The
+    /// engine's thread is not a future; it went on running whatever it was
+    /// given. A `while (true) {}` — in a middleware, a component, an action
+    /// body — therefore took its engine out of service for the life of the
+    /// process, and enough of them took out the pool. `serve` sets this to the
+    /// request timeout: past that point nobody is waiting for the answer.
+    #[must_use]
+    pub fn with_job_budget(mut self, budget: std::time::Duration) -> Self {
+        self.job_budget = Some(budget);
+        self
+    }
+
+    /// How many checkouts have been stopped for running past the job budget.
+    #[must_use]
+    pub fn interruptions(&self) -> u64 {
+        self.interruptions.load(Ordering::Relaxed)
     }
 
     /// SANDGATE-A · `(confinements, failures)` this pool has performed.
@@ -237,29 +370,62 @@ impl QuickJsEnginePool {
         F: FnOnce(&mut QuickJsEngine) -> R + Send + 'static,
         R: Send + 'static,
     {
-        // Gate concurrency to the engine count. Holding the permit for the
-        // whole call keeps the popped worker exclusively ours until checkin.
-        let _permit = self
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| EnginePoolError::ShuttingDown)?;
+        self.with_engine_budget(self.job_budget, f).await
+    }
 
-        // A permit in hand guarantees an idle worker exists. Pop without
-        // holding the lock across any await.
-        let worker = {
-            let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
-            idle.pop()
-                .expect("permit acquired but no idle engine — pool invariant broken")
-        };
-
+    /// [`Self::with_engine`] with this checkout's own deadline instead of the
+    /// pool's.
+    ///
+    /// 15.5 · a job declares its own `timeout`, and a job is the place slow work
+    /// was deliberately moved to — so it must be able to run longer than a
+    /// request's budget without that budget being raised for every render on the
+    /// same pool. The interrupt, the realm rebuild and the accounting are
+    /// unchanged; only the instant differs.
+    ///
+    /// # Errors
+    /// As [`Self::with_engine`].
+    pub async fn with_engine_budget<F, R>(
+        &self,
+        budget: Option<std::time::Duration>,
+        f: F,
+    ) -> Result<R, EnginePoolError>
+    where
+        F: FnOnce(&mut QuickJsEngine) -> R + Send + 'static,
+        R: Send + 'static,
+    {
         let (result_tx, result_rx) = oneshot::channel::<R>();
         let confine = self.confine_after_use;
+        let interruptions = Arc::clone(&self.interruptions);
         let confinements = Arc::clone(&self.confinements);
         let failures = Arc::clone(&self.confinement_failures);
         let job: Job = Box::new(move |engine: &mut QuickJsEngine| {
+            // The caller gave up while this job queued — a disconnect, or its
+            // timeout. Nothing is waiting for the value and a caller applies a
+            // job's effects only after receiving it, so running it is pure cost.
+            if result_tx.is_closed() {
+                return;
+            }
+            engine.set_deadline(budget.map(|budget| std::time::Instant::now() + budget));
+            let value = f(engine);
+            engine.set_deadline(None);
             // If the receiver was dropped (caller cancelled), discard quietly.
-            let _ = result_tx.send(f(engine));
+            let _ = result_tx.send(value);
+
+            // An interrupted script skipped every `finally` on its way out, so
+            // this realm may hold one request's host seed or a dangling
+            // provenance frame. Rebuilt regardless of `confine`: that switch is
+            // about third-party code, this is about a realm we know is torn.
+            let interrupted = engine.take_interrupted();
+            if interrupted {
+                interruptions.fetch_add(1, Ordering::Relaxed);
+                // `eprintln!`, not `tracing`: with no subscriber configured a
+                // tracing event reaches nobody (`project_silent_island_death`).
+                eprintln!(
+                    "albedo: a script ran past the request timeout ({} ms) and was stopped; \
+                     its engine's realm is being rebuilt",
+                    budget.map_or(0, |budget| budget.as_millis())
+                );
+            }
 
             // ── SANDGATE-A · the request boundary ─────────────────────────
             //
@@ -282,7 +448,7 @@ impl QuickJsEnginePool {
             // but serves a route importing nothing has an untouched realm, and
             // confining it costs the full 1.06 ms replay to protect against
             // nothing.
-            if confine && engine.third_party_code_ran() {
+            if interrupted || (confine && engine.third_party_code_ran()) {
                 confinements.fetch_add(1, Ordering::Relaxed);
                 if let Err(err) = engine.confine() {
                     failures.fetch_add(1, Ordering::Relaxed);
@@ -301,22 +467,70 @@ impl QuickJsEnginePool {
             }
         });
 
-        // Ship the job. Send failing means the worker thread is gone.
-        let send_result = worker.job_tx.send(job);
+        // Ship the job. A send can only fail when the worker's thread is gone —
+        // it panicked, and replacing its engine panicked too — and a failed
+        // send hands the job back unrun, so it is retried on another engine.
+        let mut job = job;
+        loop {
+            // Gate concurrency to the engine count. Holding the permit for the
+            // whole call keeps the popped worker exclusively ours until checkin.
+            let permit = self.permits.acquire().await.map_err(|_| {
+                if self.live.load(Ordering::Relaxed) == 0 {
+                    EnginePoolError::Exhausted
+                } else {
+                    EnginePoolError::ShuttingDown
+                }
+            })?;
 
-        // Always return the worker to the idle stack so the next checkout can
-        // reuse it, even if this job errored. The permit drops at end of scope.
-        let result = match send_result {
-            Ok(()) => result_rx.await.map_err(|_| EnginePoolError::WorkerLost),
-            Err(_) => Err(EnginePoolError::WorkerLost),
-        };
+            // A permit in hand guarantees an idle worker exists. Pop without
+            // holding the lock across any await.
+            //
+            // 🔴 Held in a guard, not a local, because this future can be DROPPED at
+            // the `.await` below — a client disconnect or a `timeout` around the
+            // request does exactly that. A plain local was dropped with it, which
+            // closed the engine's channel and ended its thread while the permit went
+            // back to the semaphore: one fewer engine than permits, and the next
+            // checkout to find the stack empty panicked on the `expect` above. The
+            // guard returns the worker on every exit instead. It is declared after
+            // `permit`, so it drops first: the engine is back on the stack before
+            // the permit that lets someone pop it is released. A worker still busy
+            // with the abandoned job is safe to hand out — the next job queues on
+            // its FIFO channel behind it, the same way a confinement does.
+            let mut worker = CheckedOut {
+                worker: Some({
+                    let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
+                    idle.pop()
+                        .expect("permit acquired but no idle engine — pool invariant broken")
+                }),
+                idle: &self.idle,
+            };
 
-        {
-            let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
-            idle.push(worker);
+            match worker.job_tx().send(job) {
+                // The guard returns the worker to the idle stack when it drops —
+                // on return, on error, and on cancellation — then the permit.
+                Ok(()) => return result_rx.await.map_err(|_| EnginePoolError::WorkerLost),
+                Err(mpsc::SendError(unrun)) => {
+                    // 🔴 Retired, not returned. A dead slot pushed back on the
+                    // stack answered every later checkout that popped it with
+                    // `WorkerLost`, for the life of the process. Dropping the
+                    // sender and forgetting its permit shrinks the pool to the
+                    // engines that exist.
+                    worker.worker.take();
+                    permit.forget();
+                    let remaining = self.live.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                    eprintln!(
+                        "albedo: a QuickJS engine thread is gone and its pool slot was retired; \
+                         {remaining} of {} engines remain",
+                        self.size
+                    );
+                    if remaining == 0 {
+                        self.permits.close();
+                        return Err(EnginePoolError::Exhausted);
+                    }
+                    job = unrun;
+                }
+            }
         }
-
-        result
     }
 
     /// Warm the *render* path of **every** engine in the pool with `components`.
@@ -336,6 +550,7 @@ impl QuickJsEnginePool {
         if components.is_empty() {
             return;
         }
+        lock_provision(&self.provision).warm = components.to_vec();
 
         let workers: Vec<Worker> = {
             let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
@@ -407,6 +622,7 @@ impl QuickJsEnginePool {
         if artifacts.is_empty() {
             return 0;
         }
+        lock_provision(&self.provision).npm = artifacts.to_vec();
 
         let workers: Vec<Worker> = {
             let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
@@ -496,9 +712,37 @@ impl Drop for QuickJsEnginePool {
     }
 }
 
+fn lock_provision(provision: &Mutex<Provision>) -> std::sync::MutexGuard<'_, Provision> {
+    // Held only to swap or clone two vectors; a poisoned lock still holds a
+    // complete value, and a replacement engine needs it more than it needs purity.
+    provision.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A new engine given everything the pool has given its others: warmed, with
+/// the npm bundles registered, then the render path warmed — the order
+/// [`QuickJsEnginePool::install_npm_bundles`] documents.
+fn provisioned_engine(provision: &Mutex<Provision>) -> QuickJsEngine {
+    let (npm, warm) = {
+        let provision = lock_provision(provision);
+        #[cfg(test)]
+        assert!(!provision.fail_replacement, "test: replacement provisioning fails");
+        (provision.npm.clone(), provision.warm.clone())
+    };
+    let mut engine = QuickJsEngine::new();
+    warm_engine(&mut engine);
+    register_npm_artifacts(&mut engine, &npm);
+    warm_render_targets(&mut engine, &warm);
+    engine
+}
+
 /// Body of an engine worker thread: construct an engine, warm it, signal ready,
 /// then service jobs until the job channel closes.
-fn engine_worker_loop(job_rx: mpsc::Receiver<Job>, ready_tx: Sender<()>) {
+fn engine_worker_loop(
+    job_rx: mpsc::Receiver<Job>,
+    ready_tx: Sender<()>,
+    provision: &Mutex<Provision>,
+    replacements: &AtomicU64,
+) {
     let mut engine = QuickJsEngine::new();
     warm_engine(&mut engine);
 
@@ -509,10 +753,75 @@ fn engine_worker_loop(job_rx: mpsc::Receiver<Job>, ready_tx: Sender<()>) {
     }
     drop(ready_tx);
 
-    // Blocking recv: parked with zero CPU cost until a job arrives or the pool
-    // drops the sender (loop ends, thread exits, engine drops cleanly).
-    while let Ok(job) = job_rx.recv() {
-        job(&mut engine);
+    // Parked on a blocking recv while idle — zero CPU until a job arrives or the
+    // pool drops the sender (the thread exits and the engine drops cleanly).
+    // Under load it polls for `SPIN_WHILE_HOT` first.
+    let mut last_gap = Duration::MAX;
+    let mut finished = Instant::now();
+    loop {
+        let mut polled = None;
+        if last_gap < HOT_GAP {
+            let until = Instant::now() + SPIN_WHILE_HOT;
+            while polled.is_none() && Instant::now() < until {
+                match job_rx.try_recv() {
+                    Ok(job) => polled = Some(job),
+                    Err(mpsc::TryRecvError::Empty) => std::hint::spin_loop(),
+                    Err(mpsc::TryRecvError::Disconnected) => return,
+                }
+            }
+        }
+        let job = match polled {
+            Some(job) => job,
+            None => match job_rx.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            },
+        };
+        last_gap = finished.elapsed();
+
+        // 🔴 A panic in a job used to end this thread. Its sender stayed on the
+        // idle stack, so the slot answered every later checkout with
+        // `WorkerLost` for the life of the process. The job's own caller still
+        // gets that error — its result sender unwound with the closure — but the
+        // slot gets a new engine.
+        if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| job(&mut engine))) {
+            let reason = payload
+                .downcast_ref::<&str>()
+                .map(|reason| (*reason).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-string panic payload".to_string());
+            eprintln!(
+                "albedo: a job panicked on a QuickJS engine ({reason}); replacing the engine"
+            );
+            // Leaked, not dropped. The panic unwound through code that was
+            // holding the runtime, and freeing a QuickJS runtime in a state we
+            // cannot vouch for can trip its internal assertions and abort the
+            // process — trading one failed request for all of them. A leak costs
+            // one engine's memory per panic; a panic is a bug, and rare.
+            match std::panic::catch_unwind(AssertUnwindSafe(|| provisioned_engine(provision))) {
+                Ok(fresh) => {
+                    std::mem::forget(std::mem::replace(&mut engine, fresh));
+                    replacements.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    // Replacing the engine panicked too, so this thread has no
+                    // engine to serve with. It ends, and the pool retires the
+                    // slot the next time a checkout finds its channel closed.
+                    //
+                    // 🪤 Caught for one reason only, and it is not observable in
+                    // a test: without the catch the thread still ends, but by
+                    // unwinding — which would DROP the suspect engine, the thing
+                    // the leak above exists to avoid.
+                    eprintln!(
+                        "albedo: replacing the engine panicked as well; this engine thread is \
+                         stopping and its pool slot will be retired"
+                    );
+                    std::mem::forget(engine);
+                    return;
+                }
+            }
+        }
+        finished = Instant::now();
     }
 }
 
@@ -914,6 +1223,247 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
         assert_eq!(b, 1);
     }
 
+    /// 🔴 A job that panics must cost that job, not the engine.
+    ///
+    /// The worker thread used to die with the panic. Its sender stayed on the
+    /// idle stack, so every later checkout that popped it failed with
+    /// `WorkerLost` — for the life of the process, one pool slot permanently
+    /// answering every request routed to it with an error.
+    ///
+    /// The replacement must also be *provisioned*: a bare new engine has no npm
+    /// aliases, and every per-request component that imports a package would
+    /// fail on it (`without_installation_a_pooled_engine_has_no_npm_aliases` is
+    /// the control for that half).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_that_panics_costs_the_job_not_the_engine() {
+        use dom_render_compiler::runtime::engine::RuntimeEngine;
+
+        let pool = QuickJsEnginePool::with_size(1);
+        assert_eq!(pool.install_npm_bundles(&fake_npm_artifacts()), 0);
+
+        let lost = pool
+            .with_engine(|_| -> () { panic!("a bug in a pool consumer") })
+            .await;
+        assert!(
+            matches!(lost, Err(EnginePoolError::WorkerLost)),
+            "CONTROL — the panicking job itself reports a lost result: {lost:?}"
+        );
+
+        for round in 0..2 {
+            let outcome = pool
+                .with_engine(|engine| {
+                    engine
+                        .load_module("__probe__", ALIAS_PROBE)
+                        .map_err(|err| err.to_string())
+                })
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("round {round}: the pool slot died with the job that panicked: {err}")
+                });
+            assert!(
+                outcome.is_ok(),
+                "round {round}: the replacement engine was not provisioned with the npm bundles: \
+                 {outcome:?}"
+            );
+        }
+        assert_eq!(pool.replacements(), 1);
+    }
+
+    impl QuickJsEnginePool {
+        fn fail_replacements_for_test(&self) {
+            lock_provision(&self.provision).fail_replacement = true;
+        }
+
+        /// Wait until `n` worker threads have ended.
+        async fn exited_workers(&self, n: usize) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let exited = self
+                    .joins
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|handle| handle.is_finished())
+                    .count();
+                if exited >= n {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "{exited} of {n} workers exited");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    /// 🔴 A slot whose replacement engine also fails is retired — not left on
+    /// the stack answering every checkout that pops it with `WorkerLost`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slot_whose_replacement_also_panics_is_retired() {
+        let pool = QuickJsEnginePool::with_size(2);
+        pool.fail_replacements_for_test();
+        let lost = pool.with_engine(|_| -> () { panic!("a bug in a pool consumer") }).await;
+        assert!(matches!(lost, Err(EnginePoolError::WorkerLost)), "{lost:?}");
+        pool.exited_workers(1).await;
+
+        for round in 0..6 {
+            let ok = pool
+                .with_engine(|engine| engine.is_initialized())
+                .await
+                .unwrap_or_else(|err| panic!("round {round}: the dead slot answered: {err}"));
+            assert!(ok);
+        }
+        assert_eq!(pool.live_engines(), 1, "the dead slot was not retired");
+    }
+
+    /// …and a pool with no engine left says so, rather than waiting forever
+    /// for a permit no engine will ever release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pool_with_no_engine_left_fails_instead_of_hanging() {
+        let pool = QuickJsEnginePool::with_size(1);
+        pool.fail_replacements_for_test();
+        let _ = pool.with_engine(|_| -> () { panic!("a bug in a pool consumer") }).await;
+        pool.exited_workers(1).await;
+
+        for _ in 0..2 {
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                pool.with_engine(|engine| engine.is_initialized()),
+            )
+            .await
+            .expect("🔴 a pool with no engines hung its caller");
+            assert!(matches!(outcome, Err(EnginePoolError::Exhausted)), "{outcome:?}");
+        }
+    }
+
+    /// 🔴 A checkout whose caller goes away must give its engine back.
+    ///
+    /// A request future is dropped whenever its client disconnects or a
+    /// `tokio::time::timeout` around it fires. The permit is released by that
+    /// drop; the engine has to be too, or the pool ends up with more permits
+    /// than engines and the next checkout that finds the idle stack empty
+    /// panics on the pool invariant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_checkout_returns_its_engine_to_the_pool() {
+        let pool = Arc::new(QuickJsEnginePool::with_size(1));
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            pool.with_engine(|_| std::thread::sleep(std::time::Duration::from_millis(200))),
+        )
+        .await;
+        assert!(cancelled.is_err(), "CONTROL — the checkout must actually be cancelled");
+
+        // The one engine is still finishing the abandoned job; a checkout now
+        // must wait for it and then succeed, twice, on the same engine.
+        for round in 0..2 {
+            let pool = Arc::clone(&pool);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::spawn(async move { pool.with_engine(|engine| engine.is_initialized()).await }),
+            )
+            .await
+            .expect("the pool must not hang after a cancelled checkout")
+            .expect("the pool must not panic after a cancelled checkout");
+            assert!(
+                outcome.expect("checkout succeeds"),
+                "round {round}: the engine that served the cancelled checkout was lost"
+            );
+        }
+    }
+
+    /// 🔴 A checkout that never returns is stopped at the job budget, its realm
+    /// is rebuilt, and the same engine serves the next checkout clean.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runaway_checkout_is_stopped_and_its_realm_rebuilt() {
+        let pool = QuickJsEnginePool::with_size(1)
+            .with_job_budget(std::time::Duration::from_millis(50));
+        let spin = r#"
+            export function generateMetadata() {
+                globalThis.__torn = "left by the runaway";
+                while (true) {}
+            }
+            export default function Spin() { return null; }
+        "#;
+        let probe = r#"
+            export function generateMetadata() { return { title: String(globalThis.__torn) }; }
+            export default function Probe() { return null; }
+        "#;
+
+        let started = std::time::Instant::now();
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pool.with_engine(move |engine| {
+                engine.load_module("routes/spin.tsx", spin).unwrap();
+                engine.load_module("routes/probe.tsx", probe).unwrap();
+                engine.eval_route_metadata("routes/spin.tsx", "{}").is_err()
+            }),
+        )
+        .await
+        .expect("🔴 the runaway checkout was never stopped")
+        .expect("checkout");
+        assert!(stopped, "an endless generateMetadata must end in an error");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        let title = pool
+            .with_engine(|engine| {
+                engine
+                    .eval_route_metadata("routes/probe.tsx", "{}")
+                    .map(|metadata| metadata.map(|m| m["title"].clone()))
+                    .map_err(|err| err.to_string())
+            })
+            .await
+            .expect("the same engine serves the next checkout");
+        assert_eq!(
+            title,
+            Ok(Some(serde_json::json!("undefined"))),
+            "state the interrupted script left behind survived — the realm was not rebuilt"
+        );
+        assert_eq!(pool.interruptions(), 1);
+    }
+
+    /// CONTROL — within its budget a checkout is never interrupted, and its
+    /// realm is not rebuilt for nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checkout_within_its_budget_is_left_alone() {
+        let pool = QuickJsEnginePool::with_size(1)
+            .with_job_budget(std::time::Duration::from_millis(500));
+        let ok = pool
+            .with_engine(|engine| {
+                engine
+                    .load_module(
+                        "routes/busy.tsx",
+                        r#"
+                        export function generateMetadata() {
+                            globalThis.__kept = "kept";
+                            const end = Date.now() + 100; while (Date.now() < end) {}
+                            return { title: "done" };
+                        }
+                        export default function Busy() { return null; }
+                        "#,
+                    )
+                    .unwrap();
+                engine.eval_route_metadata("routes/busy.tsx", "{}").is_ok()
+            })
+            .await
+            .unwrap();
+        assert!(ok, "100 ms of work inside a 500 ms budget must complete");
+        let kept = pool
+            .with_engine(|engine| {
+                engine
+                    .load_module(
+                        "routes/read.tsx",
+                        r#"
+                        export function generateMetadata() { return { title: String(globalThis.__kept) }; }
+                        export default function Read() { return null; }
+                        "#,
+                    )
+                    .unwrap();
+                engine.eval_route_metadata("routes/read.tsx", "{}").unwrap().unwrap()["title"].clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(kept, serde_json::json!("kept"), "an uninterrupted realm was rebuilt");
+        assert_eq!(pool.interruptions(), 0);
+    }
+
     /// Concurrent checkouts beyond the pool size queue on the semaphore rather
     /// than oversubscribing engines, and all complete.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -928,6 +1478,102 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
         }
         for h in handles {
             assert!(h.await.expect("task joins").expect("checkout ok"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod pool_cost {
+    /// 📏 The price of one checkout with no work in it — the thread hop there and
+    /// back that every pooled render, action and middleware pays. Ignored: a
+    /// measurement. `cargo test --release -p albedo-server --lib pool_round_trip
+    /// -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn pool_round_trip() {
+        let pool = super::QuickJsEnginePool::with_size(4);
+        for _ in 0..2_000 {
+            pool.with_engine(|_| ()).await.unwrap();
+        }
+        const N: u32 = 20_000;
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            pool.with_engine(|_| ()).await.unwrap();
+        }
+        eprintln!(
+            "empty with_engine round trip, back to back: {} ns",
+            start.elapsed().as_nanos() / u128::from(N)
+        );
+
+        // The shape real traffic has: requests arrive apart, so the worker has
+        // parked on its channel and the checkout pays to wake it.
+        const SPACED: u32 = 500;
+        let mut total = std::time::Duration::ZERO;
+        for _ in 0..SPACED {
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            let start = std::time::Instant::now();
+            pool.with_engine(|_| ()).await.unwrap();
+            total += start.elapsed();
+        }
+        eprintln!(
+            "empty with_engine round trip, 3 ms apart:   {} ns",
+            total.as_nanos() / u128::from(SPACED)
+        );
+    }
+
+    /// 📏 The hop under the shape a loaded server gives it: 16 requests in
+    /// flight, each spending `gap` on its tokio worker (parsing, routing,
+    /// identity, writing the response) between checkouts, on a pool sized the
+    /// way `serve` sizes it. The gap is busy, not a sleep — a request does not
+    /// yield while it builds a header map — and it is what lets an engine thread
+    /// park between jobs, which is the cost back-to-back loops never see.
+    #[test]
+    #[ignore]
+    fn pool_hop_under_load() {
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = std::sync::Arc::new(super::QuickJsEnginePool::with_size(workers));
+        for gap_us in [0u64, 20, 40, 100, 400] {
+            let gap = std::time::Duration::from_micros(gap_us);
+            let samples = rt.block_on(async {
+                let mut tasks = Vec::new();
+                for _ in 0..16 {
+                    let pool = std::sync::Arc::clone(&pool);
+                    tasks.push(tokio::spawn(async move {
+                        let mut lat = Vec::with_capacity(2_000);
+                        for i in 0..2_200 {
+                            let spin = std::time::Instant::now();
+                            while spin.elapsed() < gap {
+                                std::hint::spin_loop();
+                            }
+                            let start = std::time::Instant::now();
+                            pool.with_engine(|_| ()).await.unwrap();
+                            if i >= 200 {
+                                lat.push(start.elapsed().as_nanos() as u64);
+                            }
+                        }
+                        lat
+                    }));
+                }
+                let mut all = Vec::new();
+                for t in tasks {
+                    all.extend(t.await.unwrap());
+                }
+                all
+            });
+            let mut s = samples;
+            s.sort_unstable();
+            let pct = |p: f64| s[((s.len() as f64 - 1.0) * p) as usize] / 1_000;
+            eprintln!(
+                "16 in flight, gap {gap_us:>3} µs: hop p50 {:>5} µs  p90 {:>5} µs  p99 {:>5} µs",
+                pct(0.5),
+                pct(0.9),
+                pct(0.99)
+            );
         }
     }
 }

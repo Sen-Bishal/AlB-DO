@@ -120,6 +120,17 @@ pub struct SourceDecl {
     /// The routes, keyed by the name the author calls: `github.repo(…)`.
     #[serde(default)]
     pub routes: BTreeMap<String, RouteDecl>,
+    /// How many calls this app may make to the source's host, **across every
+    /// caller** — `"5000/h"`, `"80/m"`, `"10/s"`. Charged by every request-driven
+    /// call to that host: an action's `fetch()` and a middleware's. Absent means
+    /// SHUTTER's default for an upstream host.
+    ///
+    /// 🔴 **Not charged by this source's own refresh loop.** Declared reads are
+    /// polled on their `refresh` window by `aperture::refresh`, which never
+    /// consults SHUTTER — so the upstream sees those calls on top of this budget.
+    /// Leave headroom for them, or they will be what exhausts the real quota.
+    #[serde(default)]
+    pub limit: Option<String>,
 }
 
 /// Why a `sources` block was refused.
@@ -175,6 +186,21 @@ pub enum SourceSchemaError {
         route: String,
         /// The offending value.
         value: String,
+    },
+    /// `limit` did not parse.
+    InvalidLimit {
+        /// Source name.
+        source: String,
+        /// The offending value.
+        value: String,
+    },
+    /// Two sources on one host state different limits. The upstream has one
+    /// quota for the host, so there is no honest way to keep both.
+    ConflictingLimit {
+        /// The shared host.
+        host: String,
+        /// The sources that disagree.
+        sources: (String, String),
     },
     /// A declared route named a non-idempotent method.
     NonIdempotentMethod {
@@ -251,6 +277,19 @@ impl std::fmt::Display for SourceSchemaError {
                 f,
                 "source `{source}`, route `{route}`: could not parse `refresh: \"{value}\"` \
                  (expected e.g. \"250ms\", \"30s\", \"5m\", \"1h\")"
+            ),
+            Self::InvalidLimit { source, value } => write!(
+                f,
+                "source `{source}`: could not parse `limit: \"{value}\"` (expected calls per \
+                 unit, e.g. \"5000/h\", \"80/m\", \"10/s\")"
+            ),
+            Self::ConflictingLimit {
+                host,
+                sources: (a, b),
+            } => write!(
+                f,
+                "sources `{a}` and `{b}` both call `{host}` but state different `limit`s. The \
+                 host has one quota, so they must agree — or only one of them should state it"
             ),
             Self::NonIdempotentMethod {
                 source,
@@ -411,6 +450,8 @@ impl SourceRoute {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceRegistry {
     routes: BTreeMap<String, SourceRoute>,
+    /// Stated per-host budgets, and the source that stated each.
+    limits: BTreeMap<String, (crate::shutter::Quota, String)>,
 }
 
 impl SourceRegistry {
@@ -431,9 +472,28 @@ impl SourceRegistry {
         F: Fn(&str) -> Option<String>,
     {
         let mut routes = BTreeMap::new();
+        let mut limits: BTreeMap<String, (crate::shutter::Quota, String)> = BTreeMap::new();
         for (source_name, decl) in declarations {
             require_identifier("source", source_name)?;
             let (base, host) = lower_base(source_name, &decl.base)?;
+            if let Some(text) = &decl.limit {
+                let quota = parse_limit(text).ok_or_else(|| SourceSchemaError::InvalidLimit {
+                    source: source_name.clone(),
+                    value: text.clone(),
+                })?;
+                match limits.get(&host) {
+                    Some((existing, other)) if *existing != quota => {
+                        return Err(SourceSchemaError::ConflictingLimit {
+                            host: host.clone(),
+                            sources: (other.clone(), source_name.clone()),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        limits.insert(host.clone(), (quota, source_name.clone()));
+                    }
+                }
+            }
             if decl.routes.is_empty() {
                 return Err(SourceSchemaError::NoRoutes {
                     source: source_name.clone(),
@@ -491,7 +551,15 @@ impl SourceRegistry {
                 routes.insert(lowered.qualified_name(), lowered);
             }
         }
-        Ok(Self { routes })
+        Ok(Self { routes, limits })
+    }
+
+    /// Every host whose source stated a `limit`, with the budget it stated —
+    /// installed into SHUTTER at boot as that host's shared upstream quota.
+    pub fn upstream_limits(&self) -> impl Iterator<Item = (&str, crate::shutter::Quota)> {
+        self.limits
+            .iter()
+            .map(|(host, (quota, _))| (host.as_str(), *quota))
     }
 
     /// Look up a route by source and route name.
@@ -708,6 +776,22 @@ fn lower_path(
 }
 
 /// Parse `"250ms"`, `"30s"`, `"5m"`, `"1h"`.
+/// `"5000/h"` → 5 000 calls an hour, with the whole allowance available as a
+/// burst. A full burst is right for a third party's quota: the upstream counts
+/// calls per window and does not care whether they arrived together.
+fn parse_limit(text: &str) -> Option<crate::shutter::Quota> {
+    let (count, unit) = text.trim().split_once('/')?;
+    let count: u32 = count.trim().parse().ok().filter(|n| *n > 0)?;
+    let period = match unit.trim() {
+        "s" | "sec" | "second" => Duration::from_secs(1),
+        "m" | "min" | "minute" => Duration::from_secs(60),
+        "h" | "hour" => Duration::from_secs(3_600),
+        "d" | "day" => Duration::from_secs(86_400),
+        _ => return None,
+    };
+    crate::shutter::Quota::with_burst(count, period, count).ok()
+}
+
 fn parse_duration(text: &str) -> Option<Duration> {
     let text = text.trim();
     let (digits, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
@@ -734,6 +818,7 @@ mod tests {
 
     fn source(base: &str, routes: &[(&str, &str)]) -> SourceDecl {
         SourceDecl {
+            limit: None,
             base: base.to_string(),
             auth: None,
             headers: BTreeMap::new(),
@@ -751,6 +836,43 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_stated_limit_lowers_to_a_host_quota() {
+        let mut github = source("https://api.github.com", &[("repo", "/repos/{owner}")]);
+        github.limit = Some("5000/h".to_string());
+        let registry = registry(&[("github", github)]).expect("valid");
+        let limits: Vec<_> = registry.upstream_limits().collect();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].0, "api.github.com");
+        assert_eq!(limits[0].1.burst(), 5_000);
+    }
+
+    #[test]
+    fn an_unreadable_limit_is_refused_by_name() {
+        for bad in ["5000", "fast/h", "0/s", "10/week", "-1/m"] {
+            let mut decl = source("https://api.test", &[("r", "/r")]);
+            decl.limit = Some(bad.to_string());
+            let err = registry(&[("api", decl)]).expect_err(bad);
+            assert!(err.to_string().contains(bad), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn two_sources_on_one_host_must_agree_on_its_limit() {
+        let mut a = source("https://api.test", &[("r", "/r")]);
+        a.limit = Some("10/s".to_string());
+        let mut b = source("https://api.test/v2", &[("r", "/r")]);
+        b.limit = Some("20/s".to_string());
+        let err = registry(&[("a", a.clone()), ("b", b)]).expect_err("disagree");
+        assert!(err.to_string().contains("api.test"), "{err}");
+
+        // Control: agreement, or only one stating it, is fine.
+        let mut c = source("https://api.test/v3", &[("r", "/r")]);
+        c.limit = Some("10/s".to_string());
+        assert!(registry(&[("a", a.clone()), ("c", c)]).is_ok());
+        assert!(registry(&[("a", a), ("d", source("https://api.test/v4", &[("r", "/r")]))]).is_ok());
     }
 
     fn registry(decls: &[(&str, SourceDecl)]) -> Result<SourceRegistry, SourceSchemaError> {
@@ -1083,6 +1205,7 @@ mod tests {
     #[test]
     fn a_source_with_no_routes_is_refused() {
         let decl = SourceDecl {
+            limit: None,
             base: "https://x.test".to_string(),
             auth: None,
             headers: BTreeMap::new(),

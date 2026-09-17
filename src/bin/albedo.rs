@@ -31,6 +31,31 @@ mod first_run;
 #[path = "albedo/tui/mod.rs"]
 mod tui;
 
+/// 📏 **mimalloc, because the process heap was serialising the engine pool.**
+///
+/// Every pooled engine allocates request memory through the Rust allocator
+/// (`runtime::arena`), and on the Windows system heap those allocations contend.
+/// One engine per thread, sharing nothing else, a trivial middleware eval took
+/// (`middleware_eval_parallel`, release):
+///
+/// | threads | system heap | mimalloc |
+/// |---|---|---|
+/// | 1  | 9.5 µs  | 6.8 µs |
+/// | 8  | 15.4 µs | 7.1 µs |
+/// | 16 | 25.4 µs | 9.4 µs |
+///
+/// Under `serve` with 16 requests in flight the eval measured 27 µs against the
+/// single-threaded 9.5 — the allocator, not the engine and not the pool's thread
+/// hop (8–10 µs p50, `pool_hop_under_load`). It is not middleware-specific:
+/// single-threaded, a 50-row render went 1.38 → 1.10 ms and an action 214 →
+/// 157 µs (`request_boundary_gc_cost`).
+///
+/// Set here and nowhere else: the binary owns the process. The library and its
+/// tests keep the system allocator, and `tests/adversarial_input.rs` installs
+/// its own counting allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const PORT_AUTO_INCREMENT_LIMIT: u16 = 10;
 
 // Palette — "Halation". ALBEDO is the fraction of light a surface reflects, and
@@ -1699,6 +1724,13 @@ VOLUME /data
 # process handles SIGTERM and drains, rather than being killed at the 10s mark.
 ENV ALBEDO_SHUTDOWN_TIMEOUT_MS=5000
 
+# Prometheus metrics — closed unless you open them. A second listener serving
+# `GET /metrics`, never on the app port. Don't publish it with `-p`; point your
+# scraper (or an OpenTelemetry Collector's prometheus receiver) at it over the
+# container network:
+#
+#   docker run -e ALBEDO_METRICS_ADDR=0.0.0.0:9464 ... <image>
+
 # 🔴 ALBEDO_PUBLIC_ORIGIN — an app with auth will not boot without it.
 #
 # A container has to bind 0.0.0.0, and binding 0.0.0.0 over plain HTTP with auth
@@ -1801,6 +1833,10 @@ kill_timeout = "10s"
   # the operator having to work it out. Change this when you attach a custom
   # domain — it is what decides whether the `__Host-` session cookie is stored.
   ALBEDO_PUBLIC_ORIGIN = "https://{app_name}.fly.dev"
+  # 15.7 · the Prometheus scrape listener, for the [metrics] block below. `[::]`
+  # rather than `0.0.0.0`: Fly's private network is IPv6, and a dual-stack bind
+  # answers both. Not in [http_service], so the edge never proxies it.
+  ALBEDO_METRICS_ADDR = "[::]:9091"
 
 # 🪤 Without this the database lives in the machine's ephemeral filesystem and
 # every deploy starts empty. `fly volumes create albedo_data --size 1` first.
@@ -1821,6 +1857,11 @@ kill_timeout = "10s"
   method = "GET"
   path = "/"
   timeout = "5s"
+
+# Fly scrapes this into its managed Prometheus (Grafana at fly-metrics.net).
+[metrics]
+  port = 9091
+  path = "/metrics"
 "#
     )
 }
@@ -1896,7 +1937,7 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     // bakabox click → `/_albedo/action` → slot update closes end-to-end.
     let cwd = std::env::current_dir()
         .map_err(|err| format!("failed to resolve current directory: {err}"))?;
-    let mut contract = resolve_dev_contract(raw_args, &cwd)?;
+    let contract = resolve_dev_contract(raw_args, &cwd)?;
     print_boot_banner();
     print_section("serve");
     print_kv("project", contract.project_dir.display());
@@ -1909,11 +1950,15 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     // classification and the only consumer never received it.
     let tier_report = run_prod_build(&contract)?;
 
-    // `resolve_dev_contract` already absorbed `--host` / `--port` from
-    // `raw_args`. Pull the bind address back out for the banner.
+    // `resolve_dev_contract` already settled the bind address — `--host` /
+    // `--port`, then `ALBEDO_SERVER_HOST` / `ALBEDO_SERVER_PORT`, then the
+    // config's `server` block. Only the TLS flags are read again here.
+    //
+    // 🔴 This used to copy `parse_serve_args`'s host and port back over the
+    // contract, and those are plain values defaulting to 127.0.0.1:3000 — so on
+    // `serve` a port from the environment *or from the config file* was
+    // silently replaced by 3000 whenever no flag was typed.
     let serve_options = parse_serve_args(raw_args)?;
-    contract.server.host = serve_options.host.clone();
-    contract.server.port = serve_options.port;
 
     boot_and_run_production_server(&contract, Some(tier_report), serve_options.tls)
 }
@@ -5061,6 +5106,29 @@ mod tests {
             env.get("ALBEDO_FORGE_DB").and_then(toml::Value::as_str),
             Some("/data/forge.db"),
             "the mount is useless unless FORGE is pointed at it"
+        );
+
+        // 15.7 · Fly scrapes `[metrics]`, and the listener only exists if the
+        // environment opens it — on the port that block names.
+        let metrics = table
+            .get("metrics")
+            .and_then(toml::Value::as_table)
+            .expect("fly.toml has a top-level [metrics] table");
+        let scrape_port = metrics
+            .get("port")
+            .and_then(toml::Value::as_integer)
+            .expect("[metrics] names a port");
+        let addr: std::net::SocketAddr = env
+            .get("ALBEDO_METRICS_ADDR")
+            .and_then(toml::Value::as_str)
+            .expect("ALBEDO_METRICS_ADDR opens the listener [metrics] scrapes")
+            .parse()
+            .expect("ALBEDO_METRICS_ADDR is ip:port");
+        assert_eq!(i64::from(addr.port()), scrape_port, "the listener and the scrape agree on a port");
+        assert_ne!(
+            i64::from(addr.port()),
+            table["http_service"]["internal_port"].as_integer().unwrap(),
+            "metrics must not share the port the edge proxies to the internet"
         );
     }
 

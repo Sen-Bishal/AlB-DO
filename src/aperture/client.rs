@@ -61,6 +61,14 @@ pub enum ApertureError {
     /// The upstream answered `304` but nothing was cached to revalidate — a
     /// conditional request was sent on validators that were evicted mid-flight.
     DanglingRevalidation,
+    /// This app's budget for the host is spent — SHUTTER's app-wide upstream
+    /// limit, a declared source's `limit`. Nothing was sent.
+    Throttled {
+        /// The host whose budget is spent.
+        host: String,
+        /// When the next call would be admitted.
+        retry_after: Duration,
+    },
 }
 
 impl std::fmt::Display for ApertureError {
@@ -72,6 +80,12 @@ impl std::fmt::Display for ApertureError {
             ApertureError::Timeout { after } => {
                 write!(f, "aperture: request timed out after {after:?}")
             }
+            ApertureError::Throttled { host, retry_after } => write!(
+                f,
+                "aperture: this app's budget for `{host}` is spent; nothing was sent (next call \
+                 admitted in {:.1}s)",
+                retry_after.as_secs_f64()
+            ),
             ApertureError::DanglingRevalidation => write!(
                 f,
                 "aperture: upstream returned 304 but the cached entry was evicted mid-flight"
@@ -225,6 +239,7 @@ pub struct Metrics {
     fresh_hits: AtomicU64,
     coalesced: AtomicU64,
     stale_on_error: AtomicU64,
+    throttled: AtomicU64,
 }
 
 /// An immutable read of [`Metrics`].
@@ -246,6 +261,8 @@ pub struct MetricsSnapshot {
     pub coalesced: u64,
     /// Times a stale body was served because the upstream failed.
     pub stale_on_error: u64,
+    /// Requests refused before the wire because the host's budget was spent.
+    pub throttled: u64,
 }
 
 impl Metrics {
@@ -258,6 +275,7 @@ impl Metrics {
             fresh_hits: self.fresh_hits.load(Ordering::Relaxed),
             coalesced: self.coalesced.load(Ordering::Relaxed),
             stale_on_error: self.stale_on_error.load(Ordering::Relaxed),
+            throttled: self.throttled.load(Ordering::Relaxed),
         }
     }
 }
@@ -273,6 +291,10 @@ pub struct ApertureClient {
     inflight: DashMap<ResourceKey, watch::Receiver<Option<SharedOutcome>>>,
     metrics: Metrics,
     timeout: Duration,
+    /// SHUTTER's app-wide upstream budgets, charged at the wire. Replaceable
+    /// rather than set-once: this client outlives a dev reload, and every reload
+    /// builds a new limiter that the next charge has to land in.
+    upstream_budget: std::sync::RwLock<Option<crate::shutter::Shutter>>,
 }
 
 impl ApertureClient {
@@ -290,6 +312,21 @@ impl ApertureClient {
             inflight: DashMap::new(),
             metrics: Metrics::default(),
             timeout: DEFAULT_REQUEST_TIMEOUT,
+            upstream_budget: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Charge every request this client sends to `shutter`'s budget for its
+    /// host, replacing whichever limiter was installed before.
+    ///
+    /// 🔑 **The one place every outbound request passes**, whoever made it — a
+    /// declared read and its refresh loop, an OAuth exchange, an action's or a
+    /// middleware's `fetch()`. Charging at each call site would have to find all
+    /// of them and would miss the next one; charging here cannot. A response
+    /// served from cache never reaches the wire and is never charged.
+    pub fn install_upstream_budget(&self, shutter: crate::shutter::Shutter) {
+        if let Ok(mut slot) = self.upstream_budget.write() {
+            *slot = Some(shutter);
         }
     }
 
@@ -545,6 +582,27 @@ impl ApertureClient {
     }
 
     async fn send_with_timeout(&self, wire: &WireRequest) -> Result<WireResponse, ApertureError> {
+        // The charge is synchronous, so it runs under the read guard — no clone
+        // of the limiter per request, and the guard is gone before the await.
+        let refused = match self.upstream_budget.read() {
+            Ok(slot) => slot.as_ref().and_then(|shutter| {
+                // Every URL reaching here already passed `check_url`, so it
+                // parses and has a host; a miss is not a request that can leave.
+                let url = Url::parse(&wire.url).ok()?;
+                let host = url.host_str()?;
+                match shutter.upstream_charge(host).decision {
+                    crate::shutter::Decision::Refuse { retry_after, .. } => {
+                        Some((host.to_string(), retry_after))
+                    }
+                    crate::shutter::Decision::Admit { .. } => None,
+                }
+            }),
+            Err(_) => None,
+        };
+        if let Some((host, retry_after)) = refused {
+            self.metrics.throttled.fetch_add(1, Ordering::Relaxed);
+            return Err(ApertureError::Throttled { host, retry_after });
+        }
         self.metrics
             .upstream_requests
             .fetch_add(1, Ordering::Relaxed);
@@ -724,6 +782,77 @@ mod tests {
 
         assert_eq!(transport.calls(), 1);
         assert_eq!(client.metrics().fresh_hits, 1);
+    }
+
+    fn budgeted(transport: Arc<dyn Transport>, host: &str, burst: u32) -> ApertureClient {
+        let shutter = crate::shutter::Shutter::new().expect("default limits");
+        shutter
+            .set_upstream_quota(
+                host,
+                crate::shutter::Quota::with_burst(burst, Duration::from_secs(3_600), burst).unwrap(),
+            )
+            .unwrap();
+        let client = client(transport);
+        client.install_upstream_budget(shutter);
+        client
+    }
+
+    /// 🔑 The gate is at the wire: a refused request never reaches the transport,
+    /// and every path that sends — here `send_effect`, the workflow's — is charged.
+    #[tokio::test]
+    async fn a_host_over_budget_is_refused_before_the_wire() {
+        let transport = Arc::new(CountingTransport::always(ok_response(b"{}", None)));
+        let client = budgeted(transport.clone(), "x.test", 2);
+        let effect = ApertureRequest {
+            method: "POST".to_string(),
+            url: "https://x.test/charge".to_string(),
+            scope: CacheScope::App,
+            ttl: Duration::ZERO,
+            headers: Vec::new(),
+            body: None,
+        };
+        assert!(client.send_effect(&effect).await.is_ok());
+        assert!(client.send_effect(&effect).await.is_ok());
+        let err = client.send_effect(&effect).await.unwrap_err();
+        assert!(matches!(err, ApertureError::Throttled { ref host, .. } if host == "x.test"), "{err}");
+        assert_eq!(transport.calls(), 2, "the refused request never left");
+        assert_eq!(client.metrics().throttled, 1);
+
+        // Control: another host is not affected.
+        let other = ApertureRequest { url: "https://y.test/".to_string(), ..effect };
+        assert!(client.send_effect(&other).await.is_ok());
+    }
+
+    /// A cache hit is not a call the upstream sees, so it must not cost one —
+    /// the reason the charge lives here and not at the call site. And a
+    /// declared read refused for budget degrades like any failed read: it
+    /// serves its last good value, so a refresh loop that runs out of budget
+    /// leaves a page stale rather than empty.
+    #[tokio::test]
+    async fn a_cache_hit_spends_nothing_and_a_throttled_read_serves_its_last_good_value() {
+        let transport = Arc::new(CountingTransport::always(ok_response(b"{\"n\":1}", None)));
+        let client = budgeted(transport.clone(), "x.test", 2);
+
+        let fresh = ApertureRequest::get("https://x.test/a", Duration::from_secs(60));
+        for _ in 0..5 {
+            assert!(client.fetch(&fresh).await.is_ok());
+        }
+        assert_eq!(transport.calls(), 1, "one wire call and four fresh hits spend one unit");
+
+        // A read that is always stale spends the second unit…
+        let polled = ApertureRequest::get("https://x.test/b", Duration::ZERO);
+        assert_eq!(client.fetch(&polled).await.unwrap().disposition, Disposition::Fetched);
+        assert_eq!(transport.calls(), 2);
+
+        // …and its next poll is refused at the wire and served from what it had.
+        let again = client.fetch(&polled).await.expect("degrades to the last good value");
+        assert_eq!(again.disposition, Disposition::StaleOnError);
+        assert_eq!(transport.calls(), 2, "nothing was sent");
+        assert_eq!(client.metrics().throttled, 1);
+
+        // An uncached read over budget has nothing to fall back on.
+        let cold = ApertureRequest::get("https://x.test/c", Duration::ZERO);
+        assert!(matches!(client.fetch(&cold).await.unwrap_err(), ApertureError::Throttled { .. }));
     }
 
     #[tokio::test]

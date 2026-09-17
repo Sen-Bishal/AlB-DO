@@ -39,6 +39,26 @@ const DEFAULT_GC_THRESHOLD: usize = 256 * 1024;
 /// collector does not run inside one. A confined Radix request's whole live set
 /// measured ~250 KB (SANDGATE gate 5), so this is two orders above it.
 const REBUILD_GC_THRESHOLD: usize = 64 * 1024 * 1024;
+
+/// Request-time growth tolerated before a request boundary forces a collection.
+///
+/// 📏 **A forced collection walks every live object on the engine, not the
+/// request's.** It used to run at the end of every scoped render, handler,
+/// metadata eval and middleware pass. Measured in release (`middleware_eval_cost`):
+/// a trivial middleware took **23.5 µs** on an empty engine and **6 367 µs** on
+/// one holding 150 000 retained objects — against 9.5 µs with no forced pass —
+/// so every request paid for the size of everything the app had loaded. A pool
+/// engine carries the prelude, the npm bundles and every Tier-B component.
+///
+/// The forced pass bought nothing a request needs. Since the arena redesign,
+/// request memory is freed per block by QuickJS's refcounting, so acyclic garbage
+/// is gone the moment it is dropped; only *cycles* wait for a collector, and
+/// QuickJS runs its own when allocation crosses [`DEFAULT_GC_THRESHOLD`]. So the
+/// boundary now collects only when request-time memory has actually grown by
+/// this much since the last collection — which a request that creates no cycles
+/// never does — keeping outstanding request memory bounded by a fixed slack
+/// rather than by the runtime's growth heuristic alone.
+const BOUNDARY_GC_SLACK: usize = 4 * 1024 * 1024;
 use swc_ecma_transforms_react::{jsx, Options as JsxOptions, Runtime as JsxRuntime};
 use swc_ecma_transforms_typescript::strip_type;
 use swc_ecma_visit::VisitMutWith;
@@ -62,6 +82,152 @@ struct MetadataEnvelope {
     ok: bool,
     value: Option<serde_json::Value>,
     error: Option<String>,
+}
+
+/// What a middleware pass decided: [`MetadataEnvelope`]'s shape, plus the
+/// SANDGATE-B refusal naming the hook that made the realm untrustworthy.
+#[derive(Debug, Deserialize)]
+struct MiddlewareEnvelope {
+    ok: bool,
+    value: Option<serde_json::Value>,
+    error: Option<String>,
+    refused: Option<String>,
+}
+
+/// What a middleware pass staged, as its `finish` closure reports it.
+#[derive(Debug, Deserialize)]
+struct MiddlewareStaged {
+    #[serde(default)]
+    pending: Vec<RawMiddlewarePending>,
+    refused: Option<String>,
+}
+
+/// A plain, writable, enumerable, configurable data property — with every
+/// attribute *applied*, which rquickjs's `Property` builder does not do: it sets
+/// the attribute bits without the `HAS_*` bits that make QuickJS honour them, so
+/// redefining an accessor through it produces a read-only property.
+struct HostDataProperty<'js>(rquickjs::Value<'js>);
+
+impl<'js> rquickjs::object::AsProperty<'js, ()> for HostDataProperty<'js> {
+    fn config(
+        self,
+        ctx: &Ctx<'js>,
+    ) -> rquickjs::Result<(
+        rquickjs::object::PropertyFlags,
+        rquickjs::Value<'js>,
+        rquickjs::Value<'js>,
+        rquickjs::Value<'js>,
+    )> {
+        use rquickjs::qjs;
+        let flags = qjs::JS_PROP_HAS_VALUE
+            | qjs::JS_PROP_HAS_WRITABLE
+            | qjs::JS_PROP_HAS_ENUMERABLE
+            | qjs::JS_PROP_HAS_CONFIGURABLE
+            | qjs::JS_PROP_C_W_E;
+        let undefined = rquickjs::Value::new_undefined(ctx.clone());
+        Ok((flags as rquickjs::object::PropertyFlags, self.0, undefined.clone(), undefined))
+    }
+}
+
+/// Put the realm's `fetch` back the way a middleware pass found it, from the
+/// host. `true` only when the realm is verifiably as it was.
+///
+/// 🔴 This was `globalThis.fetch = previous` in the glue, and the body could beat
+/// it two ways: make `fetch` non-writable, and the assignment is a silent no-op
+/// in sloppy mode; or plant a setter, and the assignment *calls the body's code*,
+/// which ignores it. Either left the pass's journal-backed stub answering
+/// `fetch` for the next request on the engine.
+///
+/// So this *defines* rather than assigns — a definition replaces an accessor and
+/// invokes no setter — and deletes when there was nothing to restore. A
+/// property the body made non-configurable refuses both, and the caller
+/// rebuilds the realm.
+fn restore_fetch<'js>(
+    globals: &rquickjs::Object<'js>,
+    previous: Option<rquickjs::Value<'js>>,
+) -> bool {
+    match previous {
+        Some(value) => globals.prop("fetch", HostDataProperty(value)).is_ok(),
+        None => globals.remove("fetch").is_ok() && matches!(globals.contains_key("fetch"), Ok(false)),
+    }
+}
+
+fn middleware_refusal(entry: &str, hook: &str) -> RuntimeError {
+    RuntimeError::render(format!(
+        "middleware '{entry}' was refused: `{hook}` is planted in this realm, which could \
+         rewrite what the middleware decided or the requests it staged. No application sets \
+         one; a package that does is refused here exactly as it is for an action (SANDGATE-B)"
+    ))
+}
+
+/// 15.5 · one pass of a job body — [`QuickJsEngine::eval_job`].
+///
+/// This began as an alias for [`MiddlewareRun`], which was right while the two
+/// were the same protocol. They are not any more: a job body can record durable
+/// effects (`append`, `update`, `remove`, `enqueue`) and a middleware cannot, so
+/// a completed job pass carries them and a completed middleware pass has nothing
+/// to carry. The `fetch()` half is still shared, and still runs through the same
+/// prologue.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobRun {
+    /// The body settled.
+    Completed {
+        /// Its raw return value, `null` for nothing.
+        value: serde_json::Value,
+        /// What it recorded, in call order, for the caller to apply.
+        effects: Vec<crate::runtime::bridge::HandlerEffect>,
+    },
+    /// The body is waiting on `fetch()` calls the journal cannot answer yet.
+    ///
+    /// 🔑 **Effects staged on a suspended pass are discarded, not returned.**
+    /// The body re-runs from the top against a journal that answers it, and
+    /// records them again. Returning them here would commit a write for every
+    /// round trip the body took — the rule `compiled.rs` states as *"nothing
+    /// commits on a suspended pass"*.
+    Suspended {
+        /// Every call staged this pass, in step order.
+        pending: Vec<crate::runtime::bridge::PendingRequest>,
+        /// How many journal steps the pass was seeded with.
+        journal_len: u32,
+    },
+}
+
+/// 15.6 · one pass of a middleware — [`QuickJsEngine::eval_middleware`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum MiddlewareRun {
+    /// The body settled. The value is its raw return, `null` for nothing.
+    Completed(serde_json::Value),
+    /// The body is waiting on `fetch()` calls the journal cannot answer yet.
+    /// Resolve them, append the outcomes, and run the pass again.
+    Suspended {
+        /// Every call staged this pass, in step order.
+        pending: Vec<crate::runtime::bridge::PendingRequest>,
+        /// How many journal steps the pass was seeded with.
+        journal_len: u32,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMiddlewarePending {
+    step: u32,
+    method: String,
+    url: String,
+    body: Option<String>,
+    headers: Vec<(String, String)>,
+    digest: String,
+}
+
+impl RawMiddlewarePending {
+    fn lower(self) -> crate::runtime::bridge::PendingRequest {
+        crate::runtime::bridge::PendingRequest {
+            step: self.step,
+            method: self.method,
+            url: self.url,
+            body: self.body,
+            headers: self.headers,
+            digest: self.digest,
+        }
+    }
 }
 
 /// Number of leading renders that run in persistent (non-reset) mode so QuickJS can
@@ -113,6 +279,10 @@ pub struct QuickJsEngine {
     /// The collector threshold restored after a rebuild — see
     /// [`Self::set_gc_threshold`] and `REBUILD_GC_THRESHOLD`.
     gc_threshold: usize,
+    /// Request-time live bytes just after the last collection — or the lowest
+    /// seen since, if memory has shrunk. The floor [`BOUNDARY_GC_SLACK`] is
+    /// measured from.
+    gc_floor: usize,
     /// Suppresses ledger recording while `ensure_initialized` installs the
     /// bootstrap's preloaded libraries.
     ///
@@ -123,6 +293,17 @@ pub struct QuickJsEngine {
     /// once from the replay — which is not incorrect, just silently double the
     /// work, growing with the size of the preload set.
     suspend_ledger: bool,
+    /// When JS running on this engine must stop — read by the runtime's
+    /// interrupt handler, set per job by [`Self::set_deadline`].
+    ///
+    /// 🔴 Without it nothing stopped a script that never returns. A request
+    /// timeout drops the *future* waiting on the engine; the engine's thread
+    /// kept executing `while (true) {}`, so every such request permanently
+    /// took an engine out of service.
+    deadline: Rc<std::cell::Cell<Option<Instant>>>,
+    /// Latched by the interrupt handler when it stops a script; read and
+    /// cleared by [`Self::take_interrupted`].
+    interrupted: Rc<std::cell::Cell<bool>>,
 }
 
 impl QuickJsEngine {
@@ -141,7 +322,36 @@ impl QuickJsEngine {
             bytecode: BytecodeCache::from_env(),
             suspend_ledger: false,
             gc_threshold: DEFAULT_GC_THRESHOLD,
+            gc_floor: 0,
+            deadline: Rc::new(std::cell::Cell::new(None)),
+            interrupted: Rc::new(std::cell::Cell::new(false)),
         }
+    }
+
+    /// Stop any JS this engine runs once `deadline` passes — or never, with
+    /// `None`. An interrupted script ends in an uncatchable exception, so a
+    /// userland `try`/`catch` cannot absorb it; the call that was running
+    /// returns an error and the engine is usable again.
+    ///
+    /// The check rides QuickJS's own interrupt poll (every few thousand
+    /// operations), so a script under its deadline pays one `Instant::now()`
+    /// per poll and nothing per operation.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline.set(deadline);
+    }
+
+    /// Whether a deadline has stopped a script since the last call, clearing
+    /// the latch.
+    ///
+    /// 🔴 **An interrupted realm is not a clean realm.** The interrupt is
+    /// uncatchable, so it skips every JS `finally` on the way out — and the
+    /// glue restores per-request state in `finally` blocks: the render's host
+    /// seed, and the npm linker's provenance frame, which would otherwise
+    /// attribute every later effect on this engine to whichever package was
+    /// running when the clock ran out. A caller that sees `true` should
+    /// [`Self::confine`] before the engine serves anything else.
+    pub fn take_interrupted(&mut self) -> bool {
+        self.interrupted.replace(false)
     }
 
     /// **Discard this engine's JS realm and build a fresh one on the SAME
@@ -374,8 +584,7 @@ impl QuickJsEngine {
             })
         });
         if scoped {
-            self.runtime.as_ref().expect("runtime initialized").run_gc();
-            self.arena.end_request();
+            self.end_request_scope();
         }
 
         let envelope_json = eval_result?;
@@ -450,8 +659,7 @@ impl QuickJsEngine {
         let eval_ms = eval_start.elapsed().as_millis();
 
         if scoped {
-            self.runtime.as_ref().expect("runtime initialized").run_gc();
-            self.arena.end_request();
+            self.end_request_scope();
         }
 
         let envelope_json = render_result?;
@@ -521,8 +729,7 @@ impl QuickJsEngine {
         });
 
         if scoped {
-            self.runtime.as_ref().expect("runtime initialized").run_gc();
-            self.arena.end_request();
+            self.end_request_scope();
         }
 
         let envelope_json = eval_result?;
@@ -542,15 +749,397 @@ impl QuickJsEngine {
         }
     }
 
+    /// 15.6 · run one pass of the project's middleware against one request.
+    ///
+    /// `request_json` is the frozen request object the body receives and
+    /// `user_json` its principal (`null` when anonymous). `journal_json` is the
+    /// APERTURE journal as [`crate::aperture::Journal::to_script_value`] renders
+    /// it — `[]` on a first pass.
+    ///
+    /// A pass either completes with the body's raw return value (`null` for
+    /// "returned nothing"), which the server validates with
+    /// `middleware::outcome::decode`, or **suspends** with the `fetch()` calls
+    /// it could not answer from the journal. See the glue's `fetch` for why a
+    /// suspension is a promise that never settles rather than a thrown sentinel.
+    ///
+    /// # Errors
+    /// The entry is not loaded, has no default export function, threw, did not
+    /// settle for a reason other than a staged `fetch()`, or returned while a
+    /// `fetch()` it started was still unanswered.
+    /// 15.5 · Run one pass of a job body — a named export of `src/jobs.ts`,
+    /// called as `handler(args, { user })`.
+    ///
+    /// Same protocol as [`Self::eval_middleware`], and deliberately the same
+    /// prologue: the pass installs the journal-backed `fetch` through
+    /// `__ALBEDO_MIDDLEWARE_BEGIN`, so a job's outbound calls get the SANDGATE-B
+    /// staging, the digest-replay check and the never-settling-promise
+    /// suspension without a second implementation of any of it.
+    ///
+    /// `user_json` is the principal this run is **for**, already resolved, or
+    /// `"null"` for an anonymous run. The body cannot widen it: there is no
+    /// system identity to widen to.
+    ///
+    /// # Errors
+    /// The entry is not loaded, has no exported job by that name, threw, did not
+    /// settle for a reason other than a staged `fetch()`, or returned while a
+    /// `fetch()` it started was still unanswered.
+    pub fn eval_job(
+        &mut self,
+        entry: &str,
+        name: &str,
+        args_json: &str,
+        user_json: &str,
+        journal_json: &str,
+    ) -> RuntimeResult<JobRun> {
+        self.ensure_initialized()?;
+
+        let scoped = !self.force_persistent && self.renders_done >= ARENA_WARMUP_RENDERS;
+        self.renders_done = self.renders_done.saturating_add(1);
+        if scoped {
+            self.arena.begin_request();
+        }
+
+        let eval_result = self.context.as_ref().unwrap().with(|ctx| {
+            let globals = ctx.globals();
+            let begin_fn: Function = globals.get("__ALBEDO_MIDDLEWARE_BEGIN").map_err(|err| {
+                RuntimeError::render(format!("job pass prologue missing: {err}"))
+            })?;
+            let eval_fn: Function = globals
+                .get("__ALBEDO_EVAL_JOB")
+                .map_err(|err| RuntimeError::render(format!("job eval function missing: {err}")))?;
+            let effects_begin: Function =
+                globals.get("__ALBEDO_JOB_EFFECTS_BEGIN").map_err(|err| {
+                    RuntimeError::render(format!("job effect prologue missing: {err}"))
+                })?;
+            // 🔑 Captured and restored by the HOST — see `restore_fetch`.
+            let previous_fetch: Option<rquickjs::Value> = match globals.contains_key("fetch") {
+                Ok(false) => None,
+                Ok(true) => Some(globals.get("fetch").map_err(|err| {
+                    RuntimeError::render(format!("job '{name}' could not read `fetch`: {err}"))
+                })?),
+                Err(err) => {
+                    return Err(RuntimeError::render(format!(
+                        "job '{name}' could not read `fetch`: {err}"
+                    )))
+                }
+            };
+            let finish: Function = match begin_fn
+                .call::<(String, String), Function>((entry.to_string(), journal_json.to_string()))
+            {
+                Ok(finish) => finish,
+                Err(err) => {
+                    let restored = restore_fetch(&globals, previous_fetch);
+                    return Ok((
+                        Err(err),
+                        Err(RuntimeError::render(format!(
+                            "job '{name}' pass could not begin"
+                        ))),
+                        Err(RuntimeError::render(format!(
+                            "job '{name}' recorded no effects: its pass never began"
+                        ))),
+                        restored,
+                    ));
+                }
+            };
+            // Opened AFTER the fetch prologue and closed BEFORE it, so a failure
+            // in either leaves neither half installed.
+            let effects_finish: Function = match effects_begin.call::<(), Function>(()) {
+                Ok(finish) => finish,
+                Err(err) => {
+                    let restored = restore_fetch(&globals, previous_fetch);
+                    return Ok((
+                        Err(err),
+                        Err(RuntimeError::render(format!(
+                            "job '{name}' pass could not begin"
+                        ))),
+                        Err(RuntimeError::render(format!(
+                            "job '{name}' could not open its effect pass"
+                        ))),
+                        restored,
+                    ));
+                }
+            };
+
+            let called = eval_fn.call::<(String, String, String, String), MaybePromise>((
+                entry.to_string(),
+                name.to_string(),
+                args_json.to_string(),
+                user_json.to_string(),
+            ));
+            let settled = match called {
+                Ok(maybe) => maybe.finish::<String>(),
+                Err(err) => Err(err),
+            };
+            // Closed unconditionally, on every exit: an effect pass left open
+            // would make the NEXT job on this engine throw "a pass is already
+            // open", which is a failure attributed to the wrong job.
+            let effects_json = effects_finish.call::<(), String>(()).map_err(|err| {
+                RuntimeError::render(format!("job '{name}' effect epilogue failed: {err}"))
+            });
+            let restored = restore_fetch(&globals, previous_fetch);
+            let staged = finish.call::<(), String>(()).map_err(|err| {
+                RuntimeError::render(format!("job '{name}' pass epilogue failed: {err}"))
+            });
+            Ok::<_, RuntimeError>((settled, staged, effects_json, restored))
+        });
+
+        if scoped {
+            self.end_request_scope();
+        }
+
+        let (settled, staged_json, effects_json, restored) = eval_result?;
+        if !restored {
+            self.confine()?;
+            return Err(RuntimeError::render(format!(
+                "job '{name}' made the realm's `fetch` unrestorable; the engine's realm was \
+                 rebuilt"
+            )));
+        }
+        let staged: MiddlewareStaged = serde_json::from_str(&staged_json?).map_err(|err| {
+            RuntimeError::render(format!("job '{name}' staged an unreadable fetch(): {err}"))
+        })?;
+        if let Some(hook) = staged.refused {
+            return Err(middleware_refusal(name, &hook));
+        }
+        let pending = staged.pending;
+        let journal_len = serde_json::from_str::<Vec<serde_json::Value>>(journal_json)
+            .map(|steps| steps.len())
+            .unwrap_or(0);
+
+        match settled {
+            Err(rquickjs::Error::WouldBlock) if !pending.is_empty() => Ok(JobRun::Suspended {
+                journal_len: u32::try_from(journal_len).unwrap_or(u32::MAX),
+                pending: pending.into_iter().map(RawMiddlewarePending::lower).collect(),
+            }),
+            // Effects are deliberately dropped here — see `JobRun::Suspended`.
+            Err(rquickjs::Error::WouldBlock) => Err(RuntimeError::render(format!(
+                "job '{name}' did not settle — it awaited something that can never resolve \
+                 during a run (a timer, or a promise nothing resolves)"
+            ))),
+            Err(err) => Err(RuntimeError::render(format!(
+                "failed to invoke job '{name}': {err}"
+            ))),
+            // A job's fire-and-forget fetch is worse than a middleware's: the
+            // runner marks the row done the moment the body returns, so the call
+            // is not merely late — it is never issued, and the row says the work
+            // succeeded.
+            Ok(_) if !pending.is_empty() => Err(RuntimeError::render(format!(
+                "job '{name}' returned while {} fetch() call(s) it started were still \
+                 unanswered. Await every fetch() a job makes — the run is recorded as done \
+                 when the body returns, so an un-awaited call is never sent at all",
+                pending.len()
+            ))),
+            Ok(envelope_json) => {
+                let envelope: MiddlewareEnvelope =
+                    serde_json::from_str(&envelope_json).map_err(|err| {
+                        RuntimeError::render(format!(
+                            "failed to decode the result of job '{name}': {err}"
+                        ))
+                    })?;
+                if let Some(hook) = envelope.refused {
+                    return Err(middleware_refusal(name, &hook));
+                }
+                if envelope.ok {
+                    Ok(JobRun::Completed {
+                        value: envelope.value.unwrap_or(serde_json::Value::Null),
+                        effects: crate::runtime::bridge::lower_staged_effects(
+                            name,
+                            &effects_json?,
+                        )?,
+                    })
+                } else {
+                    Err(RuntimeError::render(format!(
+                        "job '{name}' threw: {}",
+                        envelope.error.unwrap_or_else(|| "unknown error".to_string())
+                    )))
+                }
+            }
+        }
+    }
+
+    pub fn eval_middleware(
+        &mut self,
+        entry: &str,
+        request_json: &str,
+        user_json: &str,
+        journal_json: &str,
+    ) -> RuntimeResult<MiddlewareRun> {
+        self.ensure_initialized()?;
+
+        let scoped = !self.force_persistent && self.renders_done >= ARENA_WARMUP_RENDERS;
+        self.renders_done = self.renders_done.saturating_add(1);
+        if scoped {
+            self.arena.begin_request();
+        }
+
+        let eval_result = self.context.as_ref().unwrap().with(|ctx| {
+            let globals = ctx.globals();
+            let begin_fn: Function = globals.get("__ALBEDO_MIDDLEWARE_BEGIN").map_err(|err| {
+                RuntimeError::render(format!("middleware pass prologue missing: {err}"))
+            })?;
+            let eval_fn: Function = globals.get("__ALBEDO_EVAL_MIDDLEWARE").map_err(|err| {
+                RuntimeError::render(format!("middleware eval function missing: {err}"))
+            })?;
+            // 🔑 Captured and restored by the HOST — see `restore_fetch`.
+            let previous_fetch: Option<rquickjs::Value> = match globals.contains_key("fetch") {
+                Ok(false) => None,
+                Ok(true) => Some(globals.get("fetch").map_err(|err| {
+                    RuntimeError::render(format!("middleware '{entry}' could not read `fetch`: {err}"))
+                })?),
+                Err(err) => {
+                    return Err(RuntimeError::render(format!(
+                        "middleware '{entry}' could not read `fetch`: {err}"
+                    )))
+                }
+            };
+            let finish: Function = match begin_fn
+                .call::<(String, String), Function>((entry.to_string(), journal_json.to_string()))
+            {
+                Ok(finish) => finish,
+                Err(err) => {
+                    let restored = restore_fetch(&globals, previous_fetch);
+                    return Ok((
+                        Err(err),
+                        Err(RuntimeError::render(format!(
+                            "middleware '{entry}' pass could not begin"
+                        ))),
+                        restored,
+                    ));
+                }
+            };
+            let called = eval_fn.call::<(String, String, String), MaybePromise>((
+                entry.to_string(),
+                request_json.to_string(),
+                user_json.to_string(),
+            ));
+            // Settle before restoring: continuations that call `fetch` run
+            // while the queue drains.
+            let settled = match called {
+                Ok(maybe) => maybe.finish::<String>(),
+                Err(err) => Err(err),
+            };
+            // A body can make `fetch` non-writable, and then this fails; the
+            // caller rebuilds the realm rather than leave the stub behind.
+            let restored = restore_fetch(&globals, previous_fetch);
+            let staged = finish.call::<(), String>(()).map_err(|err| {
+                RuntimeError::render(format!("middleware '{entry}' pass epilogue failed: {err}"))
+            });
+            Ok::<_, RuntimeError>((settled, staged, restored))
+        });
+
+        if scoped {
+            self.end_request_scope();
+        }
+
+        let (settled, staged_json, restored) = eval_result?;
+        if !restored {
+            // The realm still answers `fetch` with this request's journal. Nothing
+            // this pass returns is worth serving from an engine in that state.
+            self.confine()?;
+            return Err(RuntimeError::render(format!(
+                "middleware '{entry}' made the realm's `fetch` unrestorable; the engine's realm \
+                 was rebuilt"
+            )));
+        }
+        let staged: MiddlewareStaged = serde_json::from_str(&staged_json?).map_err(|err| {
+            RuntimeError::render(format!("middleware '{entry}' staged an unreadable fetch(): {err}"))
+        })?;
+        if let Some(hook) = staged.refused {
+            return Err(middleware_refusal(entry, &hook));
+        }
+        let pending = staged.pending;
+        let journal_len = serde_json::from_str::<Vec<serde_json::Value>>(journal_json)
+            .map(|steps| steps.len())
+            .unwrap_or(0);
+
+        match settled {
+            Err(rquickjs::Error::WouldBlock) if !pending.is_empty() => Ok(MiddlewareRun::Suspended {
+                journal_len: u32::try_from(journal_len).unwrap_or(u32::MAX),
+                pending: pending.into_iter().map(RawMiddlewarePending::lower).collect(),
+            }),
+            Err(rquickjs::Error::WouldBlock) => Err(RuntimeError::render(format!(
+                "middleware '{entry}' did not settle — it awaited something that can never \
+                 resolve during a request (a timer, or a promise nothing resolves)"
+            ))),
+            Err(err) => Err(RuntimeError::render(format!(
+                "failed to invoke middleware '{entry}': {err}"
+            ))),
+            Ok(_) if !pending.is_empty() => Err(RuntimeError::render(format!(
+                "middleware '{entry}' returned while {} fetch() call(s) it started were still \
+                 unanswered. Await every fetch() a middleware makes — a fire-and-forget call \
+                 would be issued after the response it was meant to inform",
+                pending.len()
+            ))),
+            Ok(envelope_json) => {
+                let envelope: MiddlewareEnvelope =
+                    serde_json::from_str(&envelope_json).map_err(|err| {
+                        RuntimeError::render(format!(
+                            "failed to decode the result of middleware '{entry}': {err}"
+                        ))
+                    })?;
+                if let Some(hook) = envelope.refused {
+                    return Err(middleware_refusal(entry, &hook));
+                }
+                if envelope.ok {
+                    Ok(MiddlewareRun::Completed(
+                        envelope.value.unwrap_or(serde_json::Value::Null),
+                    ))
+                } else {
+                    Err(RuntimeError::render(format!(
+                        "middleware '{entry}' threw: {}",
+                        envelope.error.unwrap_or_else(|| "unknown error".to_string())
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Close a request-scoped arena bracket, collecting only if request-time
+    /// memory has grown past [`BOUNDARY_GC_SLACK`] since the last collection.
+    fn end_request_scope(&mut self) {
+        let live = self.arena.system_live_bytes();
+        if live < self.gc_floor {
+            self.gc_floor = live;
+        }
+        if live > self.gc_floor.saturating_add(BOUNDARY_GC_SLACK) {
+            self.collect_garbage();
+        }
+        self.arena.end_request();
+    }
+
+    /// Run a full cycle collection now, and measure future growth from here.
+    ///
+    /// The request path no longer does this per request (see
+    /// [`BOUNDARY_GC_SLACK`]); a caller that needs a settled heap — a leak
+    /// check, a memory report — asks for one.
+    pub fn collect_garbage(&mut self) {
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.run_gc();
+        }
+        self.gc_floor = self.arena.system_live_bytes();
+    }
+
     fn ensure_initialized(&mut self) -> RuntimeResult<()> {
         if self.initialized {
             return Ok(());
         }
 
         let arena = self.arena.clone();
+        let deadline = Rc::clone(&self.deadline);
+        let interrupted = Rc::clone(&self.interrupted);
         let runtime = self.runtime.get_or_insert_with(|| {
-            Runtime::new_with_alloc(ArenaAllocator::new(arena))
-                .expect("QuickJS runtime creation failed")
+            let runtime = Runtime::new_with_alloc(ArenaAllocator::new(arena))
+                .expect("QuickJS runtime creation failed");
+            // Installed once, on the runtime — which outlives every realm
+            // rebuild — so a confined engine keeps it.
+            runtime.set_interrupt_handler(Some(Box::new(move || {
+                let stop = deadline.get().is_some_and(|at| Instant::now() >= at);
+                if stop {
+                    interrupted.set(true);
+                }
+                stop
+            })));
+            runtime
         });
 
         if self.context.is_none() {
@@ -1151,6 +1740,438 @@ globalThis.__ALBEDO_EVAL_METADATA = function(entry, propsJson) {{
     return __albedo_envelope_err(message);
   }}
 }};
+
+// 15.6 · the `albedo/middleware` helpers. Each builds a branded plain object and
+// nothing else: the server validates every field in Rust (`middleware::outcome`),
+// so these are a convenience, never a boundary. Frozen so a package loaded in
+// the same realm cannot swap `redirect` for something that answers differently.
+globalThis.__albedo_middleware = Object.freeze({{
+  next: function(init) {{
+    return {{ __albedo_middleware: 'next', headers: init ? init.headers : undefined }};
+  }},
+  redirect: function(location, init) {{
+    const options = (typeof init === 'number') ? {{ status: init }} : (init || {{}});
+    return {{ __albedo_middleware: 'redirect', location: location, status: options.status, headers: options.headers }};
+  }},
+  rewrite: function(path, init) {{
+    return {{ __albedo_middleware: 'rewrite', path: path, headers: init ? init.headers : undefined }};
+  }},
+  respond: function(body, init) {{
+    const options = init || {{}};
+    return {{
+      __albedo_middleware: 'respond',
+      body: (body === undefined || body === null) ? '' : body,
+      status: (options.status === undefined) ? 200 : options.status,
+      headers: options.headers
+    }};
+  }}
+}});
+
+// 15.6 · run a project's middleware: the entry module's default export, called
+// as `middleware(request, {{ user }})`. Returns DATA like `generateMetadata`
+// does, and an async middleware is driven to settlement by the host.
+//
+// ── `fetch()` — the APERTURE suspend protocol, in promise form ──────────
+//
+// An action body suspends by THROWING a sentinel, which is why the compiler
+// folds every userland `catch` in an action. A middleware is an ordinary
+// module, not a compiled body, so that fold is not applied — and a sentinel
+// thrown into `try {{ await fetch(u) }} catch {{}}` would be swallowed and the
+// middleware would carry on without its answer.
+//
+// So here a call whose answer is not yet recorded returns a promise that NEVER
+// SETTLES on this pass. The job queue drains, nothing can make progress, the
+// host sees `WouldBlock` with requests staged, and treats that as a
+// suspension: resolve them with the engine released, append to the journal,
+// run the body again. A recorded step resolves (or rejects) immediately.
+// Nothing is ever thrown at userland code that it did not cause, and
+// `Promise.all([fetch(a), fetch(b)])` stages both in one pass.
+globalThis.__albedo_mw_digest = function(s) {{
+  var h = 2166136261;
+  for (var i = 0; i < s.length; i++) {{ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }}
+  return (h >>> 0).toString(16);
+}};
+
+globalThis.__albedo_mw_response = function(rec) {{
+  var headers = rec.headers || {{}};
+  return {{
+    status: rec.status,
+    ok: rec.status >= 200 && rec.status < 300,
+    url: rec.url,
+    headers: {{ get: function(n) {{
+      var k = String(n).toLowerCase();
+      return Object.prototype.hasOwnProperty.call(headers, k) ? headers[k] : null;
+    }} }},
+    text: function() {{ return Promise.resolve(rec.body); }},
+    json: function() {{
+      try {{ return Promise.resolve(JSON.parse(rec.body)); }} catch (e) {{ return Promise.reject(e); }}
+    }}
+  }};
+}};
+
+// Called by the host BEFORE the body runs. Installs this pass's journal-backed
+// `fetch` and returns the pass's `finish` — a closure only the host holds.
+//
+// 🔴 The staged list used to sit on `globalThis.__albedo_mw_pass`, where the body
+// could replace it, and the epilogue restored `fetch` in JS, which a body that
+// made `fetch` non-writable turned into a silent no-op. Neither is reachable
+// now: the realm has no reference to what was staged, and the host — not JS —
+// puts `fetch` back.
+globalThis.__ALBEDO_MIDDLEWARE_BEGIN = function(entry, journalJson) {{
+  const S = globalThis.__albedo_sealed;
+  const __albedo_journal = S.parse(journalJson);
+  // SANDGATE-B, as the action effect channel does it: every staged request is
+  // encoded at the moment it is staged, through the pristine `stringify`, into a
+  // null-prototype table — and only in a realm with no planted `toJSON`, checked
+  // in the same synchronous step. `finish` assembles the list by concatenating
+  // those strings, so no object is serialised after the body has had a chance
+  // to hook one.
+  const staged = S.record();
+  let stagedCount = 0;
+  let refused = null;
+  let __albedo_step = 0;
+
+  globalThis.fetch = function(url, init) {{
+    const step = __albedo_step++;
+    // Checked BEFORE anything is encoded, and again at staging below: the body
+    // is the first thing serialised, and a hook that forges it and then deletes
+    // itself would pass a check that only ran afterwards.
+    const hookedAtCall = S.integrity();
+    if (hookedAtCall !== null && refused === null) {{ refused = hookedAtCall; }}
+    const method = (init && init.method) ? String(init.method).toUpperCase() : 'GET';
+    const target = String(url);
+    let body = null;
+    if (init && init.body !== undefined && init.body !== null) {{
+      const rawBody = init.body;
+      body = (typeof rawBody === 'string') ? rawBody : S.stringify(rawBody);
+    }}
+    const digest = __albedo_mw_digest(method + '\n' + target + '\n' + (body === null ? '' : body));
+    const recorded = (step < __albedo_journal.length) ? __albedo_journal[step] : null;
+    if (recorded) {{
+      if (recorded.d !== digest) {{
+        return Promise.reject(new Error('albedo: ' + entry + ' asked for a different request at fetch #' + step
+          + ' when it re-ran. A middleware that calls out must ask for the same things in the same order'
+          + ' every time it runs.'));
+      }}
+      return recorded.ok === true
+        ? Promise.resolve(__albedo_mw_response(recorded.v))
+        : Promise.reject(new Error(recorded.e));
+    }}
+    // Headers travel with the request and are never digested or journaled:
+    // a journal dump must not be a credential dump.
+    const headers = [];
+    if (init && init.headers) {{
+      const h = init.headers;
+      if (Array.isArray(h)) {{
+        for (let i = 0; i < h.length; i++) {{ headers.push([String(h[i][0]), String(h[i][1])]); }}
+      }} else {{
+        for (const k in h) {{ if (Object.prototype.hasOwnProperty.call(h, k)) {{ headers.push([String(k), String(h[k])]); }} }}
+      }}
+    }}
+    const reason = S.integrity();
+    if (reason !== null) {{
+      if (refused === null) {{ refused = reason; }}
+    }} else if (refused === null) {{
+      const rec = S.record();
+      rec.step = step;
+      rec.method = method;
+      rec.url = target;
+      rec.body = body;
+      rec.headers = headers;
+      rec.digest = digest;
+      staged[stagedCount] = S.stringify(rec);
+      stagedCount = stagedCount + 1;
+    }}
+    return new Promise(function() {{}});
+  }};
+
+  return function() {{
+    if (refused !== null) {{
+      return '{{"refused":' + S.stringify(String(refused)) + '}}';
+    }}
+    let out = '{{"pending":[';
+    for (let i = 0; i < stagedCount; i++) {{
+      out = out + (i === 0 ? '' : ',') + staged[i];
+    }}
+    return out + ']}}';
+  }};
+}};
+
+globalThis.__ALBEDO_EVAL_MIDDLEWARE = function(entry, requestJson, userJson) {{
+  // The decision is encoded here, and refused here if a `toJSON` hook is planted
+  // — checked immediately before the one `stringify` it would rewrite.
+  //
+  // Both envelopes are built HERE, from the sealed holder — which is
+  // non-writable — and not through the shared `__albedo_envelope_*` builders:
+  // those are ordinary globals, and a body that reassigns one would otherwise
+  // author the envelope the host reads.
+  const __albedo_S = globalThis.__albedo_sealed;
+  const __albedo_decided = function(value) {{
+    const reason = __albedo_S.integrity();
+    if (reason !== null) {{
+      return '{{"ok":false,"refused":' + __albedo_S.stringify(String(reason)) + '}}';
+    }}
+    const encoded = __albedo_S.stringify(value);
+    return '{{"ok":true,"value":' + (typeof encoded === 'string' ? encoded : 'null') + '}}';
+  }};
+  const __albedo_failed = function(message) {{
+    return '{{"ok":false,"error":' + __albedo_S.stringify(String(message)) + '}}';
+  }};
+
+  try {{
+    const __albedo_record = globalThis.__ALBEDO_MODULES[entry];
+    if (typeof __albedo_record === 'undefined') {{
+      throw new Error('{MODULE_MISSING_MARKER}' + entry);
+    }}
+    const __albedo_fn = (__albedo_record !== null && typeof __albedo_record === 'object')
+      ? __albedo_record.default
+      : __albedo_record;
+    if (typeof __albedo_fn !== 'function') {{
+      throw new Error(entry + ' has no default export function to run');
+    }}
+    const __albedo_request = Object.freeze(JSON.parse(requestJson));
+    const __albedo_context = Object.freeze({{ user: JSON.parse(userJson) }});
+    const __albedo_value = __albedo_fn(__albedo_request, __albedo_context);
+    if (__albedo_value !== null
+        && (typeof __albedo_value === 'object' || typeof __albedo_value === 'function')
+        && typeof __albedo_value.then === 'function') {{
+      return __albedo_value.then(
+        function(__albedo_resolved) {{
+          return __albedo_decided(__albedo_resolved === undefined ? null : __albedo_resolved);
+        }},
+        function(__albedo_err) {{
+          const __albedo_msg = (__albedo_err && typeof __albedo_err.message === 'string')
+            ? __albedo_err.message
+            : String(__albedo_err);
+          return __albedo_failed(__albedo_msg);
+        }}
+      );
+    }}
+    return __albedo_decided(__albedo_value === undefined ? null : __albedo_value);
+  }} catch (err) {{
+    const message = (err && typeof err.message === 'string') ? err.message : String(err);
+    return __albedo_failed(message);
+  }}
+}};
+
+// 15.5 · the `albedo/jobs` helpers.
+//
+// `job(options, handler)` returns the handler and nothing else. The options are
+// read from the AST at build time (`jobs::declare`) and are inert here — there
+// is deliberately no runtime path by which a schedule can differ from the one
+// the build lowered, because a schedule that only exists at runtime is a
+// schedule `albedo build` cannot refuse.
+//
+// Frozen for the reason `__albedo_middleware` is: a package loaded into the same
+// realm must not be able to swap `job` for something that returns a different
+// body than the one the build inspected.
+//
+// ── Why the write builtins are IMPORTED and not global ────────────────
+//
+// `bridge.rs::lower_effect` records why: Gate 4 established that
+// `append`/`update`/`remove` are **`const`s inside the per-request handler IIFE,
+// not globals**, which is what makes the SANDGATE-B origin stamp a tripwire that
+// should never fire rather than the only thing standing between a package and a
+// database write.
+//
+// A job body is a module export, so a host-injected local is not available — but
+// putting write authority on `globalThis` would hand every package in the realm
+// a reachable `append`. So a job imports its writes (`import {{ append }} from
+// "albedo/jobs"`), which binds through this holder exactly as
+// `albedo/middleware` binds `redirect`.
+//
+// Reachability through the holder is then bounded by state, not by scope:
+// `currentPass` is a closure variable here that nothing outside this glue can
+// name, the builtins are inert unless a pass is open, and any effect recorded
+// while a package's factory body is on the provenance stack is refused by the
+// origin stamp. That last one is **load-bearing for jobs**, where for actions it
+// is only a tripwire — see the note in `jobs::declare`.
+globalThis.__albedo_jobs = (function() {{
+  let currentPass = null;
+
+  const S = function() {{ return globalThis.__albedo_sealed; }};
+
+  const stage = function(builtin, build) {{
+    if (currentPass === null) {{
+      throw new Error('albedo: ' + builtin + '() may only be called while a job is running');
+    }}
+    const sealed = S();
+    // Checked BEFORE the record is built and encoded, in the same synchronous
+    // step as the one `stringify` a planted `toJSON` would rewrite.
+    const hooked = sealed.integrity();
+    if (hooked !== null) {{
+      if (currentPass.refused === null) {{ currentPass.refused = hooked; }}
+      return null;
+    }}
+    const rec = sealed.record();
+    build(rec);
+    rec.origin = sealed.currentOrigin();
+    currentPass.staged[currentPass.n] = sealed.stringify(rec);
+    currentPass.n = currentPass.n + 1;
+    return null;
+  }};
+
+  const forgeKey = function(name, key) {{
+    if (key === null || typeof key === 'object') {{
+      throw new TypeError(name + '(collection, key): key must be a string, number, or boolean');
+    }}
+    return key;
+  }};
+
+  // Installed by the HOST before the body runs, and torn down by the `finish`
+  // it returns. Re-entry throws rather than replacing the open pass: replacing
+  // it would send the real body's writes to a list the host never reads, which
+  // is a silent dropped write — the worst available failure.
+  globalThis.__ALBEDO_JOB_EFFECTS_BEGIN = function() {{
+    if (currentPass !== null) {{
+      throw new Error('albedo: a job effect pass is already open');
+    }}
+    const sealed = S();
+    const pass = {{ staged: sealed.record(), n: 0, refused: null }};
+    currentPass = pass;
+    return function() {{
+      currentPass = null;
+      if (pass.refused !== null) {{
+        return '{{"refused":' + sealed.stringify(String(pass.refused)) + '}}';
+      }}
+      let out = '{{"effects":[';
+      for (let i = 0; i < pass.n; i++) {{
+        out = out + (i === 0 ? '' : ',') + pass.staged[i];
+      }}
+      return out + ']}}';
+    }};
+  }};
+
+  return Object.freeze({{
+    job: function(options, handler) {{
+      if (typeof handler !== 'function') {{
+        throw new Error('albedo: job() needs a handler function as its second argument');
+      }}
+      return handler;
+    }},
+    // The same three durable mutations an action body has, in the same
+    // `{{kind, topic, value, key}}` envelope `bridge.rs` already decodes — so
+    // there is one lowering for a FORGE write, not two.
+    append: function(collection, record) {{
+      if (record === null || typeof record !== 'object' || Array.isArray(record)) {{
+        throw new TypeError('append(collection, record): record must be an object');
+      }}
+      return stage('append', function(r) {{
+        r.kind = 'forge_append';
+        r.topic = String(collection);
+        r.value = record;
+      }});
+    }},
+    update: function(collection, key, fields) {{
+      if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {{
+        throw new TypeError('update(collection, key, fields): fields must be an object');
+      }}
+      const k = forgeKey('update', key);
+      return stage('update', function(r) {{
+        r.kind = 'forge_update';
+        r.topic = String(collection);
+        r.key = k;
+        r.value = fields;
+      }});
+    }},
+    remove: function(collection, key) {{
+      const k = forgeKey('remove', key);
+      return stage('remove', function(r) {{
+        r.kind = 'forge_delete';
+        r.topic = String(collection);
+        r.key = k;
+      }});
+    }},
+    // Put another job on the queue. `options.id` makes it idempotent — a repeat
+    // with the same id is a no-op rather than a second delivery.
+    enqueue: function(name, args, options) {{
+      if (typeof name !== 'string' || name.length === 0) {{
+        throw new TypeError('enqueue(name, args): name must be the exported job name');
+      }}
+      const opts = options || {{}};
+      const payload = (args === undefined || args === null) ? {{}} : args;
+      if (typeof payload !== 'object' || Array.isArray(payload)) {{
+        throw new TypeError('enqueue(name, args): args must be an object');
+      }}
+      return stage('enqueue', function(r) {{
+        r.kind = 'job_enqueue';
+        r.topic = name;
+        r.value = payload;
+        if (opts.id !== undefined && opts.id !== null) {{ r.key = String(opts.id); }}
+        if (opts.delay !== undefined && opts.delay !== null) {{ r.delay = String(opts.delay); }}
+      }});
+    }}
+  }});
+}})();
+
+// 15.5 · run one pass of a job body: a NAMED export of the entry module, called
+// as `handler(args, {{ user }})`.
+//
+// Named rather than default because one file declares many jobs — which is the
+// only structural difference from `__ALBEDO_EVAL_MIDDLEWARE`. Everything else is
+// shared on purpose: the pass prologue (`__ALBEDO_MIDDLEWARE_BEGIN`) installs the
+// journal-backed `fetch` and the SANDGATE-B staging, and a job runs under exactly
+// that protocol. A second copy of that staging is precisely the two-implementations
+// -of-one-contract shape this codebase keeps paying for.
+//
+// 🔑 The integrity check is not optional here. Engine-pool round 7 found the
+// action `fetch` suspend path had shipped without one, which left a staged body
+// forgeable; this path is the same protocol and gets the same check, in the same
+// synchronous step as the one `stringify` a planted `toJSON` would rewrite.
+globalThis.__ALBEDO_EVAL_JOB = function(entry, name, argsJson, userJson) {{
+  const __albedo_S = globalThis.__albedo_sealed;
+  const __albedo_decided = function(value) {{
+    const reason = __albedo_S.integrity();
+    if (reason !== null) {{
+      return '{{"ok":false,"refused":' + __albedo_S.stringify(String(reason)) + '}}';
+    }}
+    const encoded = __albedo_S.stringify(value);
+    return '{{"ok":true,"value":' + (typeof encoded === 'string' ? encoded : 'null') + '}}';
+  }};
+  const __albedo_failed = function(message) {{
+    return '{{"ok":false,"error":' + __albedo_S.stringify(String(message)) + '}}';
+  }};
+
+  try {{
+    const __albedo_record = globalThis.__ALBEDO_MODULES[entry];
+    if (typeof __albedo_record === 'undefined') {{
+      throw new Error('{MODULE_MISSING_MARKER}' + entry);
+    }}
+    const __albedo_fn = (__albedo_record !== null && typeof __albedo_record === 'object')
+      ? __albedo_record[name]
+      : undefined;
+    if (typeof __albedo_fn !== 'function') {{
+      throw new Error(entry + ' has no exported job called ' + name
+        + '. A job is `export const ' + name + ' = job({{ … }}, handler)`');
+    }}
+    // Frozen like the middleware's request: a body that mutated its own
+    // arguments would be mutating a value the host re-supplies identically on
+    // the next pass, so the mutation would silently vanish on a fetch() replay.
+    const __albedo_args = Object.freeze(JSON.parse(argsJson));
+    const __albedo_context = Object.freeze({{ user: JSON.parse(userJson) }});
+    const __albedo_value = __albedo_fn(__albedo_args, __albedo_context);
+    if (__albedo_value !== null
+        && (typeof __albedo_value === 'object' || typeof __albedo_value === 'function')
+        && typeof __albedo_value.then === 'function') {{
+      return __albedo_value.then(
+        function(__albedo_resolved) {{
+          return __albedo_decided(__albedo_resolved === undefined ? null : __albedo_resolved);
+        }},
+        function(__albedo_err) {{
+          const __albedo_msg = (__albedo_err && typeof __albedo_err.message === 'string')
+            ? __albedo_err.message
+            : String(__albedo_err);
+          return __albedo_failed(__albedo_msg);
+        }}
+      );
+    }}
+    return __albedo_decided(__albedo_value === undefined ? null : __albedo_value);
+  }} catch (err) {{
+    const message = (err && typeof err.message === 'string') ? err.message : String(err);
+    return __albedo_failed(message);
+  }}
+}};
+
 "#
     )
 }
@@ -4223,6 +5244,8 @@ fn is_framework_runtime_import(source: &str) -> bool {
     matches!(source, "react" | "react-dom" | "albedo")
         || source == FORGE_BINDINGS_MODULE
         || source == SOURCE_BINDINGS_MODULE
+        || source == crate::middleware::MIDDLEWARE_MODULE
+        || source == crate::jobs::JOBS_MODULE
 }
 
 /// The compiler-generated collection bindings (`import { messages } from
@@ -4430,6 +5453,44 @@ action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";
     // transpile fold has already replaced every legitimate use. Bind a tripwire
     // so a shape the fold missed reports its own cause instead of a bare
     // ReferenceError.
+    // 15.6 · `albedo/middleware` binds to its own frozen object rather than to
+    // globals, so `next` and `redirect` never become global names every
+    // component on the engine can see.
+    // 15.5 · `albedo/jobs` binds the same way and for the same reason — one
+    // frozen holder, no new global names — so the two share this arm rather
+    // than growing a near-copy of it.
+    let helper_holder = match import_decl.src.value.as_ref() {
+        source if source == crate::middleware::MIDDLEWARE_MODULE => Some("__albedo_middleware"),
+        source if source == crate::jobs::JOBS_MODULE => Some("__albedo_jobs"),
+        _ => None,
+    };
+    if let Some(holder) = helper_holder {
+        let mut statements = Vec::new();
+        for import_specifier in &import_decl.specifiers {
+            let (local, key) = match import_specifier {
+                ImportSpecifier::Named(named) => {
+                    let local = named.local.sym.to_string();
+                    let exported = match named.imported.as_ref() {
+                        None => local.clone(),
+                        Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
+                        Some(ModuleExportName::Str(s)) => s.value.to_string(),
+                    };
+                    (local, Some(exported))
+                }
+                ImportSpecifier::Default(spec) => (spec.local.sym.to_string(), None),
+                ImportSpecifier::Namespace(spec) => (spec.local.sym.to_string(), None),
+            };
+            match key {
+                Some(key) => {
+                    let key = serde_json::Value::String(key).to_string();
+                    statements.push(format!("const {local} = globalThis.{holder}[{key}];"));
+                }
+                None => statements.push(format!("const {local} = globalThis.{holder};")),
+            }
+        }
+        return Ok(statements);
+    }
+
     let bindings_stub: Option<fn(&str) -> String> = match import_decl.src.value.as_ref() {
         FORGE_BINDINGS_MODULE => Some(forge_collection_stub),
         SOURCE_BINDINGS_MODULE => Some(source_route_stub),
@@ -4944,10 +6005,13 @@ mod tests {
             assert_eq!(out.html, expected);
         }
 
-        // Settle one post-warmup render, then snapshot the steady-state baseline.
+        // Settle one post-warmup render, collect, then snapshot the steady-state
+        // baseline — collected, so warmup's uncollected cycles cannot pad it and hide
+        // a leak in the comparison at the end.
         let _ = engine
             .render_component("routes/stress", props)
             .expect("settle render");
+        engine.collect_garbage();
         let base = engine.arena_stats();
         assert!(
             base.persistent_used > 0,
@@ -4972,13 +6036,26 @@ mod tests {
                 stats.persistent_used, base.persistent_used,
                 "persistent region grew on steady-state render {i}"
             );
-            // QuickJS frees each render's request memory (refcount + cycle collector), so
-            // outstanding request bytes never ratchet up — no leak, no reset needed.
-            assert_eq!(
-                stats.system_live_bytes, base.system_live_bytes,
-                "request memory leaked on steady-state render {i}"
+            // Refcounting frees each render's acyclic request memory at once; cycles wait
+            // for a collection, which the boundary now forces only past a fixed slack.
+            // So outstanding request bytes stay within that slack on every render…
+            assert!(
+                stats.system_live_bytes <= base.system_live_bytes + super::BOUNDARY_GC_SLACK,
+                "request memory outgrew the boundary slack on steady-state render {i}: {} > {} + {}",
+                stats.system_live_bytes, base.system_live_bytes, super::BOUNDARY_GC_SLACK
             );
         }
+
+        // …and a collection returns them exactly to the baseline. That is the leak
+        // check: anything still outstanding after a full collection is retained.
+        engine.collect_garbage();
+        let settled = engine.arena_stats().system_live_bytes;
+        assert!(
+            settled <= base.system_live_bytes,
+            "request memory leaked across {STEADY} renders: {settled} bytes outstanding after a \
+             collection, baseline {}",
+            base.system_live_bytes
+        );
 
         // Persistent capacity was never exceeded (no warmup-state spill to the system path).
         assert_eq!(
@@ -5304,6 +6381,44 @@ mod tests {
             }],
             "the effect carries the value the upstream returned"
         );
+    }
+
+    /// 🔴 SANDGATE-B, end to end on the suspend path: a body that plants a
+    /// `toJSON` hook and then stages an object-bodied `fetch` is refused, not
+    /// suspended. Before the fix the body was serialised with the realm's own
+    /// `JSON.stringify` and the suspend arm ran no integrity check, so the hook
+    /// could rewrite the request that went upstream.
+    #[test]
+    fn a_poisoned_body_that_stages_a_fetch_is_refused() {
+        use super::QuickJsEngine;
+        use crate::ir::opcode::SlotId;
+        use crate::runtime::bridge::HandlerInvocation;
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use serde_json::Map;
+
+        let mut engine = QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let env = Map::new();
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
+        let setters = vec![("setOk".to_string(), SlotId(1))];
+        let invocation = HandlerInvocation {
+            body: "Object.prototype.toJSON = function () { return { forged: true }; }; \
+                   fetch('https://api.test/write', { method: 'POST', body: { real: 1 } });",
+            is_block: true,
+            env: &env,
+            raw_bindings: &[],
+            setters: &setters,
+            event_json: None,
+            broadcast_current: &bc,
+            journal: None,
+        };
+        let err = engine
+            .eval_handler_run("routes/poisoned", &invocation)
+            .expect_err("a poisoned realm must not stage a request");
+        let message = err.to_string();
+        assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
+        assert!(message.contains("SANDGATE-B"), "Got: {message}");
     }
 
     /// 🔴 **This test falsifies `APERTURE.md` § 5.4's second property.**
@@ -6370,6 +7485,1098 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
             .eval_route_metadata("routes/plain.tsx", "{}")
             .expect("eval ok")
             .is_none());
+    }
+
+    // ── 15.5 · jobs under QuickJS ───────────────────────────────────
+
+    /// One pass with an empty journal that must complete.
+    fn job_completed(
+        engine: &mut super::QuickJsEngine,
+        name: &str,
+        args: &str,
+        user: &str,
+    ) -> serde_json::Value {
+        match engine
+            .eval_job("jobs.ts", name, args, user, "[]")
+            .expect("runs")
+        {
+            super::JobRun::Completed { value, .. } => value,
+            other => panic!("expected a completed pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_job_body_runs_and_sees_its_args_and_its_principal() {
+        let mut engine = middleware_engine(&[(
+            "jobs.ts",
+            r#"
+                import { job } from "albedo/jobs";
+                export const echo = job({ retries: 0 }, (args, ctx) => ({
+                    got: args.value,
+                    who: ctx.user === null ? "anonymous" : ctx.user.id,
+                }));
+            "#,
+        )]);
+
+        let anon = job_completed(&mut engine, "echo", r#"{"value":7}"#, "null");
+        assert_eq!(anon["got"], 7);
+        assert_eq!(anon["who"], "anonymous", "a plain scheduled run is anonymous");
+
+        // The fan-out's shape: the same body, one principal, supplied by the
+        // host. There is no way for the body to widen this.
+        let owned = job_completed(&mut engine, "echo", r#"{"value":7}"#, r#"{"id":"alice"}"#);
+        assert_eq!(owned["who"], "alice");
+    }
+
+    #[test]
+    fn an_async_job_body_is_driven_to_settlement() {
+        let mut engine = middleware_engine(&[(
+            "jobs.ts",
+            r#"
+                import { job } from "albedo/jobs";
+                export const slow = job({}, async () => {
+                    const doubled = await Promise.resolve(21);
+                    return doubled * 2;
+                });
+            "#,
+        )]);
+        assert_eq!(job_completed(&mut engine, "slow", "{}", "null"), 42);
+    }
+
+    #[test]
+    fn a_job_that_throws_surfaces_its_message_rather_than_a_generic_failure() {
+        let mut engine = middleware_engine(&[(
+            "jobs.ts",
+            r#"
+                import { job } from "albedo/jobs";
+                export const bad = job({}, () => { throw new Error("upstream said no"); });
+            "#,
+        )]);
+        let err = engine
+            .eval_job("jobs.ts", "bad", "{}", "null", "[]")
+            .expect_err("a throwing body is an error, not a completion");
+        let message = err.to_string();
+        assert!(
+            message.contains("upstream said no"),
+            "the operator needs the body's own reason, got: {message}"
+        );
+        assert!(message.contains("bad"), "and which job it was: {message}");
+    }
+
+    /// The failure an author actually hits: a typo in the schedule's name, or a
+    /// job removed from the file while rows for it are still queued.
+    #[test]
+    fn an_unknown_job_name_says_so_and_names_the_shape_it_wanted() {
+        let mut engine = middleware_engine(&[(
+            "jobs.ts",
+            r#"
+                import { job } from "albedo/jobs";
+                export const real = job({}, () => null);
+            "#,
+        )]);
+        let message = engine
+            .eval_job("jobs.ts", "ghost", "{}", "null", "[]")
+            .expect_err("no such export")
+            .to_string();
+        assert!(message.contains("ghost"), "got: {message}");
+        assert!(
+            message.contains("job("),
+            "the message must show the declaration shape: {message}"
+        );
+    }
+
+    /// `job()` returns the handler, and a second argument that is not a function
+    /// is refused **at module load** — earlier than the run, because `job()` is
+    /// called at the module's top level. So a jobs file with this mistake never
+    /// becomes a loaded module at all, rather than failing at 3 a.m. on the
+    /// first fire.
+    #[test]
+    fn job_refuses_a_handler_that_is_not_a_function_when_the_module_loads() {
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        let mut engine = super::QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        let message = engine
+            .load_module(
+                "jobs.ts",
+                r#"
+                    import { job } from "albedo/jobs";
+                    export const broken = job({ schedule: "@daily" }, "not a function");
+                "#,
+            )
+            .expect_err("a jobs file with a non-function handler must not load")
+            .to_string();
+        assert!(
+            message.contains("handler function"),
+            "the message must say what was wrong, got: {message}"
+        );
+    }
+
+    /// A job's `fetch()` suspends exactly as a middleware's does — the shared
+    /// prologue is what makes that true, and this is the test that would notice
+    /// if jobs ever grew their own staging.
+    #[test]
+    fn a_job_that_fetches_suspends_with_its_call_staged() {
+        let mut engine = middleware_engine(&[(
+            "jobs.ts",
+            r#"
+                import { job } from "albedo/jobs";
+                export const caller = job({}, async () => {
+                    const res = await fetch("https://example.test/ping");
+                    return await res.text();
+                });
+            "#,
+        )]);
+        match engine
+            .eval_job("jobs.ts", "caller", "{}", "null", "[]")
+            .expect("suspends rather than failing")
+        {
+            super::JobRun::Suspended { pending, journal_len } => {
+                assert_eq!(journal_len, 0, "the first pass is seeded with nothing");
+                assert_eq!(pending.len(), 1, "one call staged");
+                assert_eq!(pending[0].url, "https://example.test/ping");
+                assert_eq!(pending[0].method, "GET");
+            }
+            other => panic!("expected a suspension, got {other:?}"),
+        }
+    }
+
+    /// The one a job gets wrong that a middleware mostly does not: starting a
+    /// call and returning without awaiting it. The row would be marked done and
+    /// the call never sent.
+    #[test]
+    fn a_job_that_returns_without_awaiting_its_fetch_is_refused() {
+        let mut engine = middleware_engine(&[(
+            "jobs.ts",
+            r#"
+                import { job } from "albedo/jobs";
+                export const leaky = job({}, () => { fetch("https://example.test/x"); return "done"; });
+            "#,
+        )]);
+        let message = engine
+            .eval_job("jobs.ts", "leaky", "{}", "null", "[]")
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            message.contains("never sent"),
+            "the message must say the call does not happen at all: {message}"
+        );
+    }
+
+    /// A job body's durable writes reach the host as the same effect records an
+    /// action's do.
+    #[test]
+    fn a_job_body_records_forge_writes_and_enqueues() {
+        use crate::runtime::bridge::HandlerEffect;
+
+        let mut engine = middleware_engine(&[(
+            "jobs.ts",
+            r#"
+                import { job, append, update, remove, enqueue } from "albedo/jobs";
+                export const writer = job({}, () => {
+                    append("guestbook", { author: "a", message: "m" });
+                    update("guestbook", 3, { message: "edited" });
+                    remove("guestbook", 4);
+                    enqueue("followup", { n: 1 }, { id: "once", delay: "5m" });
+                });
+            "#,
+        )]);
+
+        let super::JobRun::Completed { effects, .. } = engine
+            .eval_job("jobs.ts", "writer", "{}", "null", "[]")
+            .expect("runs")
+        else {
+            panic!("expected a completed pass");
+        };
+        assert_eq!(effects.len(), 4, "every call must reach the host: {effects:?}");
+
+        match &effects[0] {
+            HandlerEffect::ForgeAppend { collection, record } => {
+                assert_eq!(collection, "guestbook");
+                assert_eq!(record["author"], "a");
+            }
+            other => panic!("expected an append, got {other:?}"),
+        }
+        match &effects[1] {
+            HandlerEffect::ForgeUpdate { key, fields, .. } => {
+                assert_eq!(key, &serde_json::json!(3));
+                assert_eq!(fields["message"], "edited");
+            }
+            other => panic!("expected an update, got {other:?}"),
+        }
+        assert!(matches!(&effects[2], HandlerEffect::ForgeDelete { .. }));
+        match &effects[3] {
+            HandlerEffect::Enqueue {
+                name,
+                args,
+                id,
+                delay,
+            } => {
+                assert_eq!(name, "followup");
+                assert_eq!(args["n"], 1);
+                assert_eq!(id.as_deref(), Some("once"));
+                assert_eq!(delay.as_deref(), Some("5m"));
+            }
+            other => panic!("expected an enqueue, got {other:?}"),
+        }
+    }
+
+    /// 🔑 **Nothing commits on a suspended pass.** A body that writes and then
+    /// awaits a `fetch()` runs again from the top; if the first pass's effects
+    /// were returned, the write would be applied once per round trip.
+    #[test]
+    fn effects_staged_before_a_suspension_are_discarded_not_returned() {
+        let mut engine = middleware_engine(&[(
+            "jobs.ts",
+            r#"
+                import { job, append } from "albedo/jobs";
+                export const writer = job({}, async () => {
+                    append("guestbook", { author: "before", message: "the fetch" });
+                    await fetch("https://example.test/ping");
+                    append("guestbook", { author: "after", message: "the fetch" });
+                });
+            "#,
+        )]);
+
+        match engine
+            .eval_job("jobs.ts", "writer", "{}", "null", "[]")
+            .expect("suspends")
+        {
+            super::JobRun::Suspended { pending, .. } => {
+                assert_eq!(pending.len(), 1, "the call is staged");
+                // The assertion is the VARIANT: a suspension carries no effects
+                // at all, so the append before the await cannot be applied.
+            }
+            super::JobRun::Completed { .. } => {
+                panic!("a body awaiting an unanswered fetch must suspend, not complete")
+            }
+        }
+    }
+
+    /// The write builtins are inert outside a run, so a package that got hold of
+    /// one through the holder cannot stage into whatever pass happens to be open
+    /// later.
+    #[test]
+    fn a_write_builtin_called_outside_a_job_run_throws() {
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        let mut engine = super::QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+
+        // Module top-level code runs at load — which is exactly the position a
+        // package's factory body is in, and exactly when no pass is open.
+        let err = engine
+            .load_module(
+                "sneaky.ts",
+                r#"
+                    import { append } from "albedo/jobs";
+                    append("guestbook", { author: "x", message: "y" });
+                    export default function C() { return null; }
+                "#,
+            )
+            .expect_err("a write staged outside a run must throw");
+        assert!(
+            err.to_string().contains("while a job is running"),
+            "got: {err}"
+        );
+    }
+
+    /// Re-entry is refused rather than allowed to replace the open pass.
+    ///
+    /// Replacing it would send the real body's writes to a list the host never
+    /// reads — a silently dropped write, which is worse than a loud failure.
+    #[test]
+    fn a_second_effect_pass_cannot_be_opened_over_an_open_one() {
+        use crate::runtime::engine::RuntimeEngine;
+        let mut engine = middleware_engine(&[(
+            "jobs.ts",
+            r#"
+                import { job, append } from "albedo/jobs";
+                export const sneaky = job({}, () => {
+                    globalThis.__ALBEDO_JOB_EFFECTS_BEGIN();
+                    append("guestbook", { author: "x", message: "y" });
+                });
+            "#,
+        )]);
+        let _ = &mut engine as &mut dyn RuntimeEngine;
+
+        let err = engine
+            .eval_job("jobs.ts", "sneaky", "{}", "null", "[]")
+            .expect_err("re-entry must be refused");
+        assert!(
+            err.to_string().contains("already open"),
+            "got: {err}"
+        );
+    }
+
+    // ── 15.6 · middleware under QuickJS ─────────────────────────────
+
+    fn middleware_engine(modules: &[(&str, &str)]) -> super::QuickJsEngine {
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        let mut engine = super::QuickJsEngine::new();
+        engine.init(&BootstrapPayload::default()).expect("engine init");
+        for (spec, src) in modules {
+            engine.load_module(spec, src).expect("loads");
+        }
+        engine
+    }
+
+    /// One pass with an empty journal that must complete.
+    fn completed(
+        engine: &mut super::QuickJsEngine,
+        request: &str,
+        user: &str,
+    ) -> serde_json::Value {
+        match engine
+            .eval_middleware("middleware.ts", request, user, "[]")
+            .expect("runs")
+        {
+            super::MiddlewareRun::Completed(value) => value,
+            other => panic!("expected a completed pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn middleware_sees_the_request_and_user_and_its_helpers_build_branded_outcomes() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"
+                import { redirect, next as proceed, respond, rewrite } from "albedo/middleware";
+                export default function middleware(request, { user }) {
+                    if (request.path === "/admin" && !user) return redirect("/sign-in", 302);
+                    if (request.path === "/teapot") return respond("short and stout", { status: 418 });
+                    if (request.path === "/old") return rewrite("/new");
+                    if (request.path === "/nothing") return;
+                    return proceed({ headers: { "x-seen": request.method + " " + (user ? user.id : "anon") } });
+                }
+            "#,
+        )]);
+        let req = |path: &str| serde_json::json!({ "method": "GET", "path": path }).to_string();
+
+        let v = completed(&mut engine, &req("/admin"), "null");
+        assert_eq!(v["__albedo_middleware"], "redirect");
+        assert_eq!(v["location"], "/sign-in");
+        assert_eq!(v["status"], 302);
+
+        let v = completed(&mut engine, &req("/teapot"), "null");
+        assert_eq!(v["status"], 418);
+        assert_eq!(v["body"], "short and stout");
+
+        assert_eq!(completed(&mut engine, &req("/old"), "null")["path"], "/new");
+        assert!(completed(&mut engine, &req("/nothing"), "null").is_null());
+
+        let v = completed(&mut engine, &req("/admin"), r#"{"id":"u1"}"#);
+        assert_eq!(v["headers"]["x-seen"], "GET u1");
+    }
+
+    /// The helpers are not globals: a component on the same engine cannot see
+    /// a `redirect` it never imported.
+    #[test]
+    fn middleware_helpers_do_not_leak_into_the_global_scope() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"
+                export default function middleware() {
+                    return { __albedo_middleware: "next", headers: { "x-globals": String(typeof redirect) + "," + String(typeof next) } };
+                }
+            "#,
+        )]);
+        let v = completed(&mut engine, "{}", "null");
+        assert_eq!(v["headers"]["x-globals"], "undefined,undefined");
+    }
+
+    #[test]
+    fn an_async_middleware_is_awaited_and_a_throw_is_an_error_not_a_continue() {
+        let mut engine = middleware_engine(&[
+            ("lib/policy.ts", r#"export const blocked = ["/banned"];"#),
+            (
+                "middleware.ts",
+                r#"
+                    import { respond } from "albedo/middleware";
+                    import { blocked } from "./lib/policy";
+                    export default async function middleware(request) {
+                        await Promise.resolve();
+                        if (request.path === "/boom") throw new Error("kaput");
+                        if (blocked.includes(request.path)) return respond("", { status: 403 });
+                    }
+                "#,
+            ),
+        ]);
+        let v = completed(&mut engine, r#"{"path":"/banned"}"#, "null");
+        assert_eq!(v["status"], 403, "the relative import resolved and the promise settled");
+
+        let err = engine
+            .eval_middleware("middleware.ts", r#"{"path":"/boom"}"#, "null", "[]")
+            .expect_err("a throw must not read as continue");
+        assert!(err.to_string().contains("kaput"), "{err}");
+    }
+
+    #[test]
+    fn a_middleware_module_without_a_default_function_is_an_error() {
+        let mut engine = middleware_engine(&[("middleware.ts", "export const config = {};")]);
+        let err = engine
+            .eval_middleware("middleware.ts", "{}", "null", "[]")
+            .expect_err("nothing to run");
+        assert!(err.to_string().contains("no default export"), "{err}");
+    }
+
+    /// 📏 Where a middleware request's engine time goes. Ignored: a measurement,
+    /// not a check. `cargo test --release -p dom-render-compiler --lib
+    /// middleware_eval_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn middleware_eval_cost() {
+        use crate::runtime::engine::RuntimeEngine;
+        use std::time::Instant;
+        const SRC: &str = r#"
+            import { next } from "albedo/middleware";
+            export default async function middleware(request) { return next(); }
+        "#;
+        const N: u32 = 20_000;
+        let request = serde_json::json!({
+            "method": "GET", "path": "/", "query": null,
+            "headers": { "accept": "*/*", "user-agent": "curl/8.0", "host": "127.0.0.1:3942" },
+            "cookies": {}
+        })
+        .to_string();
+
+        let measure = |label: &str, engine: &mut super::QuickJsEngine, reload: bool| {
+            for _ in 0..2_000 {
+                let _ = engine.eval_middleware("middleware.ts", &request, "null", "[]");
+            }
+            let start = Instant::now();
+            for _ in 0..N {
+                if reload {
+                    engine.load_module("middleware.ts", SRC).unwrap();
+                }
+                engine.eval_middleware("middleware.ts", &request, "null", "[]").unwrap();
+            }
+            let per = start.elapsed().as_nanos() / u128::from(N);
+            eprintln!("{label:<44} {per:>7} ns");
+        };
+
+        let mut scoped = middleware_engine(&[("middleware.ts", SRC)]);
+        measure("eval, request-scoped arena", &mut scoped, false);
+        measure("load_module (hash hit) + eval, scoped", &mut scoped, true);
+
+        let mut persistent = middleware_engine(&[("middleware.ts", SRC)]);
+        persistent.begin_warmup();
+        measure("eval, persistent arena", &mut persistent, false);
+
+        // A realistic pool engine is not empty: the prelude, npm bundles and
+        // every Tier-B component live on it. A forced collection walks all of
+        // that, so its cost is the app's size, not the middleware's.
+        const HEAP: &str = r#"
+            export const retained = Array.from({ length: 150000 }, (_, i) => ({ i, s: "row" + i, next: null }));
+            export default function Big() { return null; }
+        "#;
+        let mut heavy = middleware_engine(&[("big.ts", HEAP), ("middleware.ts", SRC)]);
+        measure("eval, scoped, 150k retained objects on engine", &mut heavy, false);
+        let mut heavy_persistent = middleware_engine(&[("big.ts", HEAP), ("middleware.ts", SRC)]);
+        heavy_persistent.begin_warmup();
+        measure("eval, persistent, 150k retained objects", &mut heavy_persistent, false);
+    }
+
+    /// 📏 The same eval, one engine per thread, `threads` at once — the shape a
+    /// pool under load has. Engines share nothing but the process allocator, so
+    /// any rise over the one-thread figure is contention there (or the CPU), not
+    /// the engine. Ignored: a measurement.
+    /// `cargo test --release -p dom-render-compiler --lib middleware_eval_parallel
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn middleware_eval_parallel() {
+        use std::time::Instant;
+        const SRC: &str = r#"
+            import { next } from "albedo/middleware";
+            export default async function middleware(request) { return next(); }
+        "#;
+        const N: u32 = 20_000;
+        let request = serde_json::json!({
+            "method": "GET", "path": "/", "query": null,
+            "headers": { "accept": "*/*", "user-agent": "curl/8.0", "host": "127.0.0.1:3942" },
+            "cookies": {}
+        })
+        .to_string();
+        for threads in [1usize, 4, 8, 16] {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let request = request.clone();
+                    std::thread::spawn(move || {
+                        let mut engine = middleware_engine(&[("middleware.ts", SRC)]);
+                        for _ in 0..2_000 {
+                            let _ = engine.eval_middleware("middleware.ts", &request, "null", "[]");
+                        }
+                        barrier.wait();
+                        let start = Instant::now();
+                        for _ in 0..N {
+                            engine.eval_middleware("middleware.ts", &request, "null", "[]").unwrap();
+                        }
+                        start.elapsed().as_nanos() / u128::from(N)
+                    })
+                })
+                .collect();
+            let per: Vec<u128> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let mean = per.iter().sum::<u128>() / per.len() as u128;
+            eprintln!("{threads:>2} threads: eval {mean:>6} ns each");
+        }
+    }
+
+    /// 📏 What the request-boundary collection costs a **render** and an
+    /// **action**, not only a middleware — each measured two ways on the same
+    /// engine: as the boundary behaves now, and with a full collection forced
+    /// after every call, which is what every scoped boundary did before
+    /// [`super::BOUNDARY_GC_SLACK`]. Ignored: a measurement.
+    /// `cargo test --release -p dom-render-compiler --lib request_boundary_gc_cost
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn request_boundary_gc_cost() {
+        use crate::runtime::engine::RuntimeEngine;
+        use crate::runtime::HandlerInvocation;
+        use std::time::Instant;
+
+        // A list page's worth of markup: a real render allocates per element.
+        const LIST: &str = r#"
+            export default function List({ rows }) {
+                return <ul>{rows.map((r) => <li key={r.id} data-id={r.id}><b>{r.title}</b> {r.body}</li>)}</ul>;
+            }
+        "#;
+        const HEAP: &str = r#"
+            export const retained = Array.from({ length: 150000 }, (_, i) => ({ i, s: "row" + i, next: null }));
+            export default function Big() { return null; }
+        "#;
+        let props = serde_json::json!({
+            "rows": (0..50).map(|i| serde_json::json!({ "id": i, "title": format!("t{i}"), "body": "lorem ipsum" }))
+                .collect::<Vec<_>>()
+        })
+        .to_string();
+
+        let env = serde_json::Map::new();
+        let broadcast_current: Vec<(String, Vec<u8>)> = Vec::new();
+        let setters = [("setCount".to_string(), crate::ir::opcode::SlotId(0))];
+        let invocation = HandlerInvocation {
+            body: "const items = [1, 2, 3].map((x) => ({ x, y: x * 2 }));\n\
+                   let total = 0; for (const it of items) { total += it.y; }\n\
+                   setCount(total);",
+            is_block: true,
+            env: &env,
+            raw_bindings: &[],
+            setters: &setters,
+            event_json: None,
+            broadcast_current: &broadcast_current,
+            journal: None,
+        };
+
+        const N: u32 = 5_000;
+        fn time(label: &str, mut call: impl FnMut()) -> u128 {
+            for _ in 0..500 {
+                call();
+            }
+            let start = Instant::now();
+            for _ in 0..N {
+                call();
+            }
+            let per = start.elapsed().as_nanos() / u128::from(N);
+            eprintln!("  {label:<34} {per:>9} ns");
+            per
+        }
+
+        // The shape before the comparison: what a render costs per row and what
+        // an action costs with nothing in its body, so the savings below read
+        // against the right denominator.
+        {
+            let mut e = middleware_engine(&[("list.tsx", LIST)]);
+            let rows = |n: usize| {
+                serde_json::json!({ "rows": (0..n).map(|i| serde_json::json!({ "id": i, "title": "t", "body": "b" })).collect::<Vec<_>>() })
+                    .to_string()
+            };
+            for n in [0usize, 5, 50] {
+                let props = rows(n);
+                time(&format!("render, {n} rows"), || {
+                    e.render_component("list.tsx", &props).unwrap();
+                });
+            }
+            let trivial = HandlerInvocation {
+                body: "1",
+                is_block: false,
+                env: &env,
+                raw_bindings: &[],
+                setters: &[],
+                event_json: None,
+                broadcast_current: &broadcast_current,
+                journal: None,
+            };
+            time("action, body `1`", || {
+                e.eval_handler("trivial_action", &trivial).unwrap();
+            });
+        }
+        for (heap_label, heavy) in [("empty engine", false), ("150k retained objects", true)] {
+            let mut modules = vec![("list.tsx", LIST)];
+            if heavy {
+                modules.insert(0, ("big.ts", HEAP));
+            }
+            let mut engine = middleware_engine(&modules);
+            eprintln!("{heap_label}");
+
+            let now = time("render, boundary as shipped", || {
+                engine.render_component("list.tsx", &props).unwrap();
+            });
+            let forced = time("render, GC forced every call", || {
+                engine.render_component("list.tsx", &props).unwrap();
+                engine.collect_garbage();
+            });
+            eprintln!("  {:<34} {:>8.1}x", "render saving", forced as f64 / now as f64);
+
+            let now = time("action, boundary as shipped", || {
+                engine.eval_handler("bench_action", &invocation).unwrap();
+            });
+            let forced = time("action, GC forced every call", || {
+                engine.eval_handler("bench_action", &invocation).unwrap();
+                engine.collect_garbage();
+            });
+            eprintln!("  {:<34} {:>8.1}x", "action saving", forced as f64 / now as f64);
+        }
+    }
+
+    // ── 15.6 · fetch() from a middleware ────────────────────────────
+
+    /// Record an answer for every request a suspended pass staged, the way
+    /// `aperture::resolve_pending` records one, and hand back the journal JSON
+    /// the next pass is seeded with.
+    fn answer(
+        journal: &mut crate::aperture::Journal,
+        run: super::MiddlewareRun,
+        respond: impl Fn(&crate::runtime::bridge::PendingRequest) -> crate::aperture::StepOutcome,
+    ) -> (String, Vec<crate::runtime::bridge::PendingRequest>) {
+        let super::MiddlewareRun::Suspended { pending, journal_len } = run else {
+            panic!("expected a suspended pass, got {run:?}");
+        };
+        assert_eq!(journal_len as usize, journal.len(), "the pass saw the whole journal");
+        for request in &pending {
+            journal
+                .append(
+                    request.step,
+                    crate::aperture::StepKind::Fetch,
+                    request.digest.clone(),
+                    respond(request),
+                )
+                .expect("appends in order");
+        }
+        (journal.to_script_value().to_string(), pending)
+    }
+
+    fn ok_body(url: &str, body: &str) -> crate::aperture::StepOutcome {
+        crate::aperture::StepOutcome::Completed(serde_json::json!({
+            "status": 200, "body": body, "url": url,
+            "headers": { "content-type": "application/json" }
+        }))
+    }
+
+    #[test]
+    fn a_fetch_suspends_the_pass_and_the_replay_reads_the_recorded_answer() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"
+                import { next, respond } from "albedo/middleware";
+                export default async function middleware(request) {
+                    const res = await fetch("https://flags.test/v1?path=" + request.path, {
+                        headers: { authorization: "Bearer secret" },
+                    });
+                    const flags = await res.json();
+                    if (!flags.open) return respond("closed", { status: 503 });
+                    return next({ headers: { "x-flag-status": String(res.status) } });
+                }
+            "#,
+        )]);
+        let mut journal = crate::aperture::Journal::new("mw", "b");
+
+        let first = engine
+            .eval_middleware("middleware.ts", r#"{"path":"/a"}"#, "null", "[]")
+            .expect("first pass");
+        let (seeded, pending) = answer(&mut journal, first, |r| ok_body(&r.url, r#"{"open":false}"#));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].url, "https://flags.test/v1?path=/a");
+        assert_eq!(pending[0].method, "GET");
+        assert_eq!(
+            pending[0].headers,
+            vec![("authorization".to_string(), "Bearer secret".to_string())],
+            "headers travel with the staged request"
+        );
+        assert!(
+            !seeded.contains("secret"),
+            "and never reach the journal the next pass is seeded with: {seeded}"
+        );
+
+        match engine
+            .eval_middleware("middleware.ts", r#"{"path":"/a"}"#, "null", &seeded)
+            .expect("replay")
+        {
+            super::MiddlewareRun::Completed(v) => {
+                assert_eq!(v["status"], 503);
+                assert_eq!(v["body"], "closed");
+            }
+            other => panic!("the replay should complete, got {other:?}"),
+        }
+    }
+
+    /// The reason this is a never-settling promise and not a thrown sentinel.
+    #[test]
+    fn a_try_catch_around_fetch_cannot_swallow_the_suspension() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"
+                import { next } from "albedo/middleware";
+                export default async function middleware() {
+                    let got = "fallback";
+                    try {
+                        got = await (await fetch("https://a.test/")).text();
+                    } catch (e) {
+                        got = "caught";
+                    }
+                    return next({ headers: { "x-got": got } });
+                }
+            "#,
+        )]);
+        let mut journal = crate::aperture::Journal::new("mw", "b");
+        let first = engine.eval_middleware("middleware.ts", "{}", "null", "[]").unwrap();
+        let (seeded, _) = answer(&mut journal, first, |r| ok_body(&r.url, "live"));
+        match engine.eval_middleware("middleware.ts", "{}", "null", &seeded).unwrap() {
+            super::MiddlewareRun::Completed(v) => assert_eq!(v["headers"]["x-got"], "live"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn promise_all_stages_every_request_in_one_pass() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"
+                export default async function middleware() {
+                    const [a, b] = await Promise.all([fetch("https://a.test/"), fetch("https://b.test/", { method: "post", body: { n: 1 } })]);
+                    return { __albedo_middleware: "next", headers: { "x-both": (await a.text()) + (await b.text()) } };
+                }
+            "#,
+        )]);
+        let mut journal = crate::aperture::Journal::new("mw", "b");
+        let first = engine.eval_middleware("middleware.ts", "{}", "null", "[]").unwrap();
+        let (seeded, pending) = answer(&mut journal, first, |r| ok_body(&r.url, if r.step == 0 { "A" } else { "B" }));
+        assert_eq!(pending.len(), 2, "both calls staged together: {pending:?}");
+        assert_eq!(pending[1].method, "POST");
+        assert_eq!(pending[1].body.as_deref(), Some(r#"{"n":1}"#));
+
+        match engine.eval_middleware("middleware.ts", "{}", "null", &seeded).unwrap() {
+            super::MiddlewareRun::Completed(v) => assert_eq!(v["headers"]["x-both"], "AB"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_upstream_call_rejects_and_can_be_handled() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"
+                export default async function middleware() {
+                    try { await fetch("https://down.test/"); } catch (e) {
+                        return { __albedo_middleware: "next", headers: { "x-err": e.message } };
+                    }
+                }
+            "#,
+        )]);
+        let mut journal = crate::aperture::Journal::new("mw", "b");
+        let first = engine.eval_middleware("middleware.ts", "{}", "null", "[]").unwrap();
+        let (seeded, _) = answer(&mut journal, first, |_| {
+            crate::aperture::StepOutcome::Failed("connection refused".to_string())
+        });
+        match engine.eval_middleware("middleware.ts", "{}", "null", &seeded).unwrap() {
+            super::MiddlewareRun::Completed(v) => assert_eq!(v["headers"]["x-err"], "connection refused"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fire_and_forget_fetch_is_refused_rather_than_sent_after_the_response() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"
+                export default function middleware() {
+                    fetch("https://analytics.test/beacon", { method: "POST", body: "hit" });
+                }
+            "#,
+        )]);
+        let err = engine
+            .eval_middleware("middleware.ts", "{}", "null", "[]")
+            .expect_err("an unawaited call must be loud");
+        assert!(err.to_string().contains("still unanswered"), "{err}");
+    }
+
+    #[test]
+    fn a_replay_that_asks_for_something_else_is_an_error() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"
+                export default async function middleware(request) {
+                    await fetch("https://a.test/" + request.path);
+                }
+            "#,
+        )]);
+        let mut journal = crate::aperture::Journal::new("mw", "b");
+        let first = engine.eval_middleware("middleware.ts", r#"{"path":"x"}"#, "null", "[]").unwrap();
+        let (seeded, _) = answer(&mut journal, first, |r| ok_body(&r.url, ""));
+        let err = engine
+            .eval_middleware("middleware.ts", r#"{"path":"y"}"#, "null", &seeded)
+            .expect_err("diverged");
+        assert!(err.to_string().contains("different request"), "{err}");
+    }
+
+    /// The realm's own `fetch` is put back after every pass, so a render on
+    /// this engine does not inherit the middleware's journal-backed one.
+    #[test]
+    fn the_middleware_fetch_is_uninstalled_after_the_pass() {
+        let mut engine = middleware_engine(&[
+            (
+                "middleware.ts",
+                r#"export default async function middleware() { await fetch("https://a.test/"); }"#,
+            ),
+            (
+                "routes/probe.tsx",
+                r#"
+                    export function generateMetadata() { return { title: String(globalThis.fetch) }; }
+                    export default function Probe() { return <main></main>; }
+                "#,
+            ),
+        ]);
+        let title = |engine: &mut super::QuickJsEngine| {
+            engine
+                .eval_route_metadata("routes/probe.tsx", "{}")
+                .expect("metadata")
+                .expect("present")["title"]
+                .clone()
+        };
+        let before = title(&mut engine);
+        let _ = engine.eval_middleware("middleware.ts", "{}", "null", "[]").unwrap();
+        assert_eq!(title(&mut engine), before, "the realm's fetch was restored");
+    }
+
+    /// 🔴 A script that never returns is stopped at the deadline, and the engine
+    /// serves the next call. The control is a bounded loop running well past
+    /// where the deadline would fall, with no deadline set.
+    #[test]
+    fn a_deadline_stops_a_script_that_never_returns_and_the_engine_survives() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"export default function middleware(request) {
+                if (request.path === "/spin") { try { while (true) {} } catch (e) { return { brand: "swallowed" }; } }
+                if (request.path === "/long") { const end = Date.now() + 150; while (Date.now() < end) {} }
+                return null;
+            }"#,
+        )]);
+
+        // CONTROL — no deadline: 150 ms of work completes.
+        assert!(
+            engine.eval_middleware("middleware.ts", r#"{"path":"/long"}"#, "null", "[]").is_ok(),
+            "without a deadline a long script must be allowed to finish"
+        );
+
+        engine.set_deadline(Some(std::time::Instant::now() + std::time::Duration::from_millis(40)));
+        let started = std::time::Instant::now();
+        let err = engine
+            .eval_middleware("middleware.ts", r#"{"path":"/spin"}"#, "null", "[]")
+            .expect_err("an endless loop must not produce a value — and must return");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the interrupt took {:?}",
+            started.elapsed()
+        );
+        assert!(!err.to_string().contains("swallowed"), "a userland catch absorbed the interrupt: {err}");
+
+        engine.set_deadline(None);
+        assert!(
+            engine.eval_middleware("middleware.ts", r#"{"path":"/"}"#, "null", "[]").is_ok(),
+            "the interrupted engine must serve the next call"
+        );
+    }
+
+    /// A middleware cannot pin this pass's journal-backed `fetch` into the realm.
+    ///
+    /// 🔴 Restoring `fetch` used to be JS — `globalThis.fetch = previous` — and a
+    /// body that made the property non-writable turned that into a silent no-op
+    /// in sloppy mode. The stub, holding this request's journal, then answered
+    /// `fetch` for every later render and middleware on the engine.
+    #[test]
+    fn a_middleware_cannot_pin_its_fetch_into_the_realm() {
+        // Non-writable and non-configurable: an assignment is a silent no-op,
+        // and so is a definition — only a realm rebuild removes it.
+        a_middleware_cannot_pin_its_fetch_with(
+            r#"Object.defineProperty(globalThis, "fetch", { value: globalThis.fetch, writable: false, configurable: false });"#,
+        );
+        // A setter: an assignment runs the body's code, which ignores it.
+        a_middleware_cannot_pin_its_fetch_with(
+            r#"const stub = globalThis.fetch;
+               Object.defineProperty(globalThis, "fetch", { configurable: true, get() { return stub; }, set(v) {} });"#,
+        );
+    }
+
+    fn a_middleware_cannot_pin_its_fetch_with(pin: &str) {
+        let middleware = format!("export default function middleware() {{ {pin} return null; }}");
+        let mut engine = middleware_engine(&[
+            ("middleware.ts", middleware.as_str()),
+            (
+                "routes/probe.tsx",
+                r#"
+                    export function generateMetadata() { return { title: String(globalThis.fetch) }; }
+                    export default function Probe() { return <main></main>; }
+                "#,
+            ),
+        ]);
+        let title = |engine: &mut super::QuickJsEngine| {
+            engine
+                .eval_route_metadata("routes/probe.tsx", "{}")
+                .expect("metadata")
+                .expect("present")["title"]
+                .clone()
+        };
+        let before = title(&mut engine);
+        let _ = engine.eval_middleware("middleware.ts", "{}", "null", "[]");
+        assert_eq!(
+            title(&mut engine),
+            before,
+            "the middleware pinned its pass's fetch into the realm with: {pin}"
+        );
+    }
+
+    /// 🔴 A planted `toJSON` must refuse the pass before a staged `fetch()` is
+    /// encoded — it could otherwise rewrite the request after the call site,
+    /// headers included.
+    ///
+    /// The same rule actions have lived under since SANDGATE-B: a realm with a
+    /// `toJSON` hook on an intrinsic prototype is refused, because no
+    /// application plants one and a serialised boundary is exactly what it
+    /// rewrites.
+    #[test]
+    fn a_planted_to_json_refuses_the_pass_before_a_staged_fetch_is_encoded() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"export default async function middleware() {
+                Object.defineProperty(Array.prototype, "toJSON", { configurable: true, value: function () {
+                    return (this.length === 1 && Array.isArray(this[0])) ? [["authorization", "forged"]] : Array.from(this);
+                } });
+                await fetch("https://a.test/", { headers: { "x-real": "1" } });
+            }"#,
+        )]);
+        let outcome = engine.eval_middleware("middleware.ts", "{}", "null", "[]");
+        let err = match outcome {
+            Err(err) => err,
+            Ok(run) => panic!("🔴 a hooked realm staged a request anyway: {run:?}"),
+        };
+        assert!(err.to_string().contains("Array.prototype.toJSON"), "{err}");
+    }
+
+    /// 🔴 A hook that forges and then removes itself must not slip between the
+    /// body's encoding and the check — the body used to be encoded with the
+    /// realm's own `JSON.stringify`, before any check ran.
+    #[test]
+    fn a_self_removing_to_json_cannot_forge_a_staged_body() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"export default async function middleware() {
+                Object.defineProperty(Object.prototype, "toJSON", { configurable: true, value: function () {
+                    delete Object.prototype.toJSON;
+                    return { forged: true };
+                } });
+                await fetch("https://a.test/", { method: "POST", body: { real: 1 } });
+            }"#,
+        )]);
+        let outcome = engine.eval_middleware("middleware.ts", "{}", "null", "[]");
+        let err = match outcome {
+            Err(err) => err,
+            Ok(run) => panic!("🔴 a self-removing hook staged a request anyway: {run:?}"),
+        };
+        assert!(err.to_string().contains("Object.prototype.toJSON"), "{err}");
+    }
+
+    /// 🔴 Overwriting a glue global must not forge the decision. The envelope
+    /// builders are writable globals shared with the render path; the
+    /// middleware glue used to call them by name, at encode time.
+    #[test]
+    fn an_overwritten_envelope_builder_cannot_forge_the_decision() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"export default function middleware() {
+                const forge = function () { return '{"ok":true,"value":{"forged":true}}'; };
+                globalThis.__albedo_envelope_ok_json = forge;
+                globalThis.__albedo_envelope_err = forge;
+                return null;
+            }"#,
+        )]);
+        let run = engine
+            .eval_middleware("middleware.ts", "{}", "null", "[]")
+            .expect("the pass completes");
+        assert_eq!(
+            run,
+            super::MiddlewareRun::Completed(serde_json::Value::Null),
+            "🔴 the decision came from an overwritten global"
+        );
+    }
+
+    /// 🔴 …and before the middleware's decision is encoded.
+    #[test]
+    fn a_planted_to_json_refuses_the_outcome_of_the_pass() {
+        let mut engine = middleware_engine(&[(
+            "middleware.ts",
+            r#"import { next } from "albedo/middleware";
+            export default function middleware() {
+                const decided = next({ headers: { "x-real": "1" } });
+                Object.defineProperty(Object.prototype, "toJSON", { configurable: true, value: function () {
+                    return { forged: true };
+                } });
+                return decided;
+            }"#,
+        )]);
+        let outcome = engine.eval_middleware("middleware.ts", "{}", "null", "[]");
+        let err = match outcome {
+            Err(err) => err,
+            Ok(run) => panic!("🔴 a hooked realm's decision was accepted: {run:?}"),
+        };
+        assert!(err.to_string().contains("Object.prototype.toJSON"), "{err}");
+    }
+
+    /// An interrupted pass leaves the realm's `fetch` as it found it.
+    ///
+    /// Holds by construction — the host restores `fetch` with a property write
+    /// that runs no JS — and pinned here because the restore used to be JS,
+    /// where an uncatchable interrupt skips a `finally` and a body can make the
+    /// write a no-op (`a_middleware_cannot_pin_its_fetch_into_the_realm`).
+    #[test]
+    fn an_interrupted_middleware_pass_still_uninstalls_its_fetch() {
+        let mut engine = middleware_engine(&[
+            (
+                "middleware.ts",
+                r#"export default async function middleware() { fetch("https://a.test/"); while (true) {} }"#,
+            ),
+            (
+                "routes/probe.tsx",
+                r#"
+                    export function generateMetadata() { return { title: String(globalThis.fetch) }; }
+                    export default function Probe() { return <main></main>; }
+                "#,
+            ),
+        ]);
+        let title = |engine: &mut super::QuickJsEngine| {
+            engine
+                .eval_route_metadata("routes/probe.tsx", "{}")
+                .expect("metadata")
+                .expect("present")["title"]
+                .clone()
+        };
+        let before = title(&mut engine);
+        engine.set_deadline(Some(std::time::Instant::now() + std::time::Duration::from_millis(40)));
+        let _ = engine
+            .eval_middleware("middleware.ts", "{}", "null", "[]")
+            .expect_err("the loop is interrupted");
+        engine.set_deadline(None);
+        assert_eq!(title(&mut engine), before, "an interrupted pass left its fetch installed");
     }
 
     // ── Phase L · form-action rewrite under QuickJS ──────────────────

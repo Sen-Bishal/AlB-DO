@@ -411,6 +411,147 @@ declare module "albedo" {
   ): (args: Args) => Promise<R>;
 }
 
+// ── `src/middleware.ts` ─────────────────────────────────────────────
+//
+// One file, run on every app request its `config.matcher` admits —
+// pages, `public/` files, actions and uploads. The body can return
+// nothing (continue), or one of the four decisions below. It can refuse,
+// redirect or rewrite; it can never grant — a route's own
+// `export const auth` still runs on whatever path the request lands on.
+//
+// The server validates every field in Rust, so these types describe what
+// is accepted rather than being the check.
+//
+// `fetch()` works inside a middleware — the global one, with `.json()` and
+// `.text()` — and goes out through the same egress policy an action's does:
+// a private or loopback host must be declared as a `sources` base. Every call
+// counts against the visitor's outbound rate limit, and every call must be
+// awaited: one still in flight when the middleware returns is an error.
+declare module "albedo/middleware" {
+  // The request as the middleware sees it. `cookies` never includes the
+  // framework's own session cookies, and there is no raw `cookie` header:
+  // the identity a session proves arrives already resolved, as `user`.
+  export interface MiddlewareRequest {
+    readonly method: string;
+    readonly path: string;
+    readonly query: string | null;
+    readonly headers: Readonly<Record<string, string>>;
+    readonly cookies: Readonly<Record<string, string>>;
+  }
+
+  export interface MiddlewareContext {
+    // The same `user` every render sees: `{ id }` when signed in.
+    readonly user: { readonly id: string } | null;
+  }
+
+  // `set-cookie` may repeat; every other header is a single string.
+  export type MiddlewareHeaders = Record<string, string | string[]>;
+
+  export interface MiddlewareDecision {
+    readonly __albedo_middleware: "next" | "redirect" | "rewrite" | "respond";
+  }
+
+  // Continue to the route, adding `headers` to its response.
+  export function next(init?: { headers?: MiddlewareHeaders }): MiddlewareDecision;
+  // A path starting with `/`, or an absolute http(s) URL. Defaults to 307.
+  export function redirect(
+    location: string,
+    init?: 301 | 302 | 303 | 307 | 308 | { status?: 301 | 302 | 303 | 307 | 308; headers?: MiddlewareHeaders },
+  ): MiddlewareDecision;
+  // Serve another path in this app instead (never under `/_albedo/`).
+  export function rewrite(path: string, init?: { headers?: MiddlewareHeaders }): MiddlewareDecision;
+  // Answer now. `body` is a string — JSON.stringify an object first.
+  export function respond(
+    body?: string,
+    init?: { status?: number; headers?: MiddlewareHeaders },
+  ): MiddlewareDecision;
+
+  export type Middleware = (
+    request: MiddlewareRequest,
+    context: MiddlewareContext,
+  ) => MiddlewareDecision | void | Promise<MiddlewareDecision | void>;
+}
+
+// ── JOBS · 15.5 — scheduled and enqueued background work ────────
+//
+// One `src/jobs.ts`, one export per job. The options are read from the
+// SOURCE at build time, not at runtime, so every value here must be a
+// literal — a computed schedule is a build error, because a schedule the
+// compiler cannot read is one it cannot refuse.
+declare module "albedo/jobs" {
+  export interface JobContext {
+    // Who this run is FOR. `null` on a plain scheduled run, which is
+    // anonymous exactly like an unauthenticated request — an
+    // identity-partitioned collection is refused to it.
+    //
+    // Non-null on a run reached by `over: "users"`, where the scheduled
+    // fire expands into one run per principal. There is no third case:
+    // ALBEDO has no system identity that sees every user's rows, which is
+    // why a per-user job is a fan-out rather than a privileged read.
+    readonly user: { readonly id: string } | null;
+  }
+
+  export interface JobOptions {
+    // When it runs on its own. Omit for a job that only runs when
+    // enqueued. Five-field cron ("0 3 * * *"), an alias ("@daily",
+    // "@hourly", "@weekly", "@monthly", "@yearly", "@minutely"), or an
+    // interval ("every 30s", "every 5m", "every 2h").
+    //
+    // Five fields, as in a crontab — NOT the six-field seconds-first form.
+    readonly schedule?: string;
+    // Expand each scheduled fire into one run per registered principal,
+    // each receiving that principal as `context.user`. Requires
+    // `schedule`; an enqueued job already carries the principal that
+    // enqueued it.
+    readonly over?: "users";
+    // Attempts AFTER the first, with exponential backoff and jitter.
+    // Defaults to 0 — a body that is not idempotent must not be retried
+    // by accident, so retrying is something you ask for.
+    readonly retries?: number;
+    // How long one run may take before it is interrupted. "30s" by
+    // default; "15m" is the ceiling. Work that needs longer wants to be
+    // several enqueued jobs, so a restart costs one step instead of all
+    // of it.
+    readonly timeout?: string;
+  }
+
+  // Declare a job. Returns the handler; the options are build-time facts.
+  export function job<Args = Record<string, never>, R = void>(
+    options: JobOptions,
+    handler: (args: Args, context: JobContext) => R | Promise<R>,
+  ): (args: Args, context: JobContext) => R | Promise<R>;
+
+  // ── Writes, imported rather than ambient ──────────────────────
+  //
+  // A job body imports what it may do. That is not style: `append` and its
+  // siblings are ambient globals inside an ACTION body only because they are
+  // locals of the per-request handler, unreachable from any package sharing
+  // the realm. A job body is an ordinary module, so making them global would
+  // hand every package in the realm a reachable database write. Importing
+  // them keeps that surface closed.
+  //
+  // They may only be called while a job is running; calling one at module
+  // top level throws.
+  export function append<T extends Record<string, unknown>>(
+    collection: string,
+    record: T,
+  ): void;
+  export function remove(collection: string, key: string | number): void;
+  export function update<T extends Record<string, unknown>>(
+    collection: string,
+    key: string | number,
+    fields: T,
+  ): void;
+
+  // Queue another job. It inherits THIS run's principal: work enqueued by
+  // one user's fan-out run stays that user's. Nothing widens.
+  export function enqueue<T extends Record<string, unknown>>(
+    name: string,
+    args?: T,
+    options?: { id?: string; delay?: string },
+  ): void;
+}
+
 // ── The supported React surface ─────────────────────────────────
 //
 // ALBEDO is React-shaped, and `useState` is only recognised when it
@@ -489,6 +630,26 @@ declare function update<T extends Record<string, unknown>>(
   collection: string,
   key: string | number,
   fields: T,
+): Promise<void>;
+
+// JOBS · 15.5 — put background work on the queue from an action.
+//
+// The shape transactional email wants: the action returns immediately, the
+// work retries on its own, and `options.id` makes a double-submit land once.
+// The queued job inherits THIS request's principal, so it runs as the user
+// who caused it — there is no system identity to escalate to.
+//
+// `name` is an export in `src/jobs.ts`; an unknown one fails the run loudly
+// rather than queueing a row that could only ever dead-letter.
+declare function enqueue<T extends Record<string, unknown>>(
+  name: string,
+  args?: T,
+  options?: {
+    // Makes the enqueue idempotent — a repeat with the same id is a no-op.
+    id?: string;
+    // Wait this long before it may run: "30s", "5m", "2h", "1d".
+    delay?: string;
+  },
 ): Promise<void>;
 
 // Phase P · Stream E.1 — the `<children />` JSX intrinsic in
