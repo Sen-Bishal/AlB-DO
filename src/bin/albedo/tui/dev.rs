@@ -30,14 +30,9 @@ use ratatui::Frame;
 use super::theme;
 use super::TerminalGuard;
 
-/// The version line. Carried here rather than from `CARGO_PKG_VERSION` because
-/// it is a *product* label, not a crate version — the two move independently.
-pub const VERSION_LABEL: &str = "V : BETA 1";
-
-/// STRATEGY's solar ladder, shown as a quiet footer to the wordmark. Free
-/// framework at Sol; every rung above it sells hosted compute, never the
-/// binary.
-pub const TIER_LADDER: [&str; 4] = ["SOL", "EQUINOX", "UMBRA", "PERSEPHONE"];
+/// The version line: the version of the binary that is running, which is what
+/// a bug report has to quote.
+pub const VERSION_LABEL: &str = concat!("V : ", env!("CARGO_PKG_VERSION"));
 
 /// How many rows each scrolling panel retains. Bounded on purpose: an unbounded
 /// log in a long-running dev session is a slow memory leak that only shows up
@@ -297,8 +292,6 @@ impl Dashboard {
         let mut side: Vec<Line> = vec![Line::from(""), Line::from("")];
         side.push(Line::from(brand_spans("ALB'DO")));
         side.push(Line::from(Span::styled(VERSION_LABEL, theme::value())));
-        side.push(Line::from(""));
-        side.push(Line::from(ladder_spans()));
         frame.render_widget(Paragraph::new(side), columns[1]);
     }
 
@@ -307,8 +300,6 @@ impl Dashboard {
         let mut spans = brand_spans("ALB'DO");
         spans.push(Span::raw("   "));
         spans.push(Span::styled(VERSION_LABEL, theme::value()));
-        spans.push(Span::raw("   "));
-        spans.extend(ladder_spans());
         frame.render_widget(
             Paragraph::new(Line::from(spans)).block(
                 Block::default()
@@ -610,19 +601,6 @@ fn brand_spans(text: &str) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// The solar pricing ladder, dimmed so it reads as a footer to the mark rather
-/// than competing with it.
-fn ladder_spans() -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for (index, name) in TIER_LADDER.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" · ", theme::dim()));
-        }
-        spans.push(Span::styled(*name, theme::label()));
-    }
-    spans
-}
-
 /// Height of one bar in the pulse, on a **log scale**.
 ///
 /// Server-compute times here span nanoseconds to milliseconds — six orders of
@@ -755,17 +733,14 @@ mod tests {
             .collect::<String>()
     }
 
-    /// The brand statement. These four names are the STRATEGY pricing ladder and
-    /// the version is a product label — both are load-bearing text, not
-    /// decoration, so they are pinned.
+    /// The masthead names the product and the exact version running — the
+    /// version a bug report has to quote.
     #[test]
-    fn the_masthead_carries_the_version_and_the_full_pricing_ladder() {
+    fn the_masthead_carries_the_mark_and_the_running_version() {
         let text = screen(&dashboard(), 120, 30);
         assert!(text.contains("ALB'DO"), "{text}");
-        assert!(text.contains("V : BETA 1"), "{text}");
-        for tier in TIER_LADDER {
-            assert!(text.contains(tier), "missing ladder rung {tier}: {text}");
-        }
+        assert!(text.contains(VERSION_LABEL), "{text}");
+        assert!(VERSION_LABEL.ends_with(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
@@ -899,7 +874,7 @@ mod tests {
         let tall = screen(&dashboard(), 104, 38);
         assert!(tall.contains("█████╗"), "block art on a tall terminal");
         assert!(tall.contains("ALB'DO"), "the literal mark rides beside the art");
-        assert!(tall.contains("V : BETA 1"), "{tall}");
+        assert!(tall.contains(VERSION_LABEL), "{tall}");
 
         let short = screen(&dashboard(), 104, 30);
         assert!(
@@ -907,7 +882,7 @@ mod tests {
             "the art must collapse rather than starve the panels"
         );
         assert!(short.contains("ALB'DO"), "the mark itself always shows");
-        assert!(short.contains("V : BETA 1"), "and so does the version");
+        assert!(short.contains(VERSION_LABEL), "and so does the version");
     }
 
     /// Latencies here span six orders of magnitude; a linear pulse would show

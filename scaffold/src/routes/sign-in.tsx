@@ -25,7 +25,9 @@
 //     export const auth = "required";
 //
 // A stranger who asks for it is refused before the render runs and sent here,
-// because `login: "/sign-in"` in albedo.config.ts named this page. Nothing is
+// because `login: "/sign-in"` in albedo.config.ts named this page — and once
+// they sign in, they land back on the page they asked for, not on this one.
+// No `?next=` to thread through your forms: the gate remembers it. Nothing is
 // inferred from "the route with a form on it" — a security-adjacent redirect
 // target that moved when you added a form somewhere else would be a bad thing
 // to own.
@@ -39,9 +41,12 @@
 // You do not opt into that and you cannot forget to.
 //
 // So an anonymous visitor and a signed-in one get different HTML from the same
-// component, with no client-side "am I logged in yet" flash. Only `id` is
-// exposed: profile fields are rows in `albedo_users`, read like any other row,
-// so mentioning `user` never silently joins a table you did not ask for.
+// component, with no client-side "am I logged in yet" flash. It carries the
+// profile the session already proved — `email`, `name`, `image` (each `null`
+// when the provider did not supply it), the `provider` this session used and
+// every provider connected to the account — and nothing a provider sent that
+// ALB'DO did not normalize, so a provider changing its payload cannot change
+// your component. See `AlbedoUser` in albedo-env.d.ts.
 //
 // The same prop is what unlocks per-person data:
 //
@@ -49,8 +54,11 @@
 //
 // That read *is* the policy. There is no channel name you could write, so
 // there is nothing to author beside the query and nothing to keep in step.
+// Only `id` may key it: an email changes when the person does, an owner can't.
 
-export default function SignIn({ user }: { user: { id: string } | null }) {
+import type { AlbedoUser } from "albedo";
+
+export default function SignIn({ user }: { user: AlbedoUser | null }) {
   if (user) {
     return (
       <main className="page">
@@ -64,17 +72,22 @@ export default function SignIn({ user }: { user: { id: string } | null }) {
           </p>
 
           {/* Signing out revokes THIS session, not every session: logging out
-              on a laptop must not sign you out on a phone. */}
+              on a laptop must not sign you out on a phone. The second form is
+              for when you want exactly that — a lost device, a leaked password. */}
           <form action="/_albedo/auth/logout" method="POST" className="row">
             <button className="submit" type="submit">
               sign out
             </button>
           </form>
+          <form action="/_albedo/auth/logout-all" method="POST" className="row">
+            <button className="submit" type="submit">
+              sign out everywhere
+            </button>
+          </form>
 
           <p className="plate-note">
-            The session is a row in <code>albedo_sessions</code>, partitioned by
-            principal &mdash; so revoking one is a delete, and it travels the
-            same delta path your own data does.
+            The session is a row in <code>albedo_sessions</code>. Signing out
+            deletes it, and any live connection it had open closes with it.
           </p>
         </section>
       </main>

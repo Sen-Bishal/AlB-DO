@@ -45,7 +45,9 @@ use walkdir::WalkDir;
 /// the CLI and userland code agree on where routes live.
 pub const ROUTES_DIRNAME: &str = "routes";
 
-const ROUTE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js"];
+/// `md` is a Markdown page (`crate::markdown`) — a route, and only a route: a
+/// `layout.md` is not registered as a layout here, and the build refuses it.
+const ROUTE_EXTENSIONS: &[&str] = &["tsx", "jsx", "ts", "js", "md"];
 const LAYOUT_FILE_STEM: &str = "layout";
 const ERROR_FILE_STEM: &str = "error";
 const LOADING_FILE_STEM: &str = "loading";
@@ -215,6 +217,13 @@ pub fn discover_routes(routes_dir: &Path) -> Result<RouteDiscovery, RouteDiscove
 
         let stem = file_stem(&rel_path).unwrap_or_default();
         if stem.starts_with('_') {
+            continue;
+        }
+        let is_markdown = rel_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(crate::markdown::MARKDOWN_EXTENSION));
+        if is_markdown && is_convention_stem(stem) {
             continue;
         }
 
@@ -422,7 +431,36 @@ fn is_convention_stem(stem: &str) -> bool {
         .any(|conv| stem.eq_ignore_ascii_case(conv))
 }
 
-fn url_prefix_covers(prefix: &str, url: &str) -> bool {
+/// Is `path` a `layout.*` convention file inside a `routes/` directory?
+///
+/// Takes the path in any spelling the pipeline carries — absolute, project-
+/// relative, `\`- or `/`-separated — because the component graph keys on the
+/// host path and the compiled project on a project-relative spec, and both ask.
+/// The test is the one discovery applies: the stem, under `routes/`.
+pub fn is_layout_file(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let Some(tail) = normalized
+        .split_once("/routes/")
+        .map(|(_, tail)| tail)
+        .or_else(|| normalized.strip_prefix("routes/"))
+    else {
+        return false;
+    };
+    let tail = Path::new(tail);
+    // `layout.md` is refused by the Markdown lowering rather than registered.
+    let is_markdown = tail
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(crate::markdown::MARKDOWN_EXTENSION));
+    has_route_extension(tail)
+        && !is_markdown
+        && file_stem(tail).is_some_and(|stem| stem.eq_ignore_ascii_case(LAYOUT_FILE_STEM))
+}
+
+/// True when a file whose reach is `prefix` (see [`directory_url_prefix`]) covers
+/// the route `url` — `/docs` covers `/docs` and `/docs/a`, never `/docsx`. The one
+/// reach rule for everything placed in `routes/`: layouts, boundaries, and the
+/// stylesheets `albedo build` scopes by directory.
+pub fn url_prefix_covers(prefix: &str, url: &str) -> bool {
     if prefix == "/" {
         return true;
     }
@@ -433,7 +471,9 @@ fn url_prefix_covers(prefix: &str, url: &str) -> bool {
     url.starts_with(with_slash.as_str())
 }
 
-fn directory_url_prefix(rel_path: &Path) -> String {
+/// The URL prefix a file at `rel_path` (relative to the routes root) reaches: its
+/// directory's — `docs/layout.tsx` → `/docs`, a file at the top → `/`.
+pub fn directory_url_prefix(rel_path: &Path) -> String {
     let mut segments = Vec::new();
     if let Some(parent) = rel_path.parent() {
         for component in parent.components() {
@@ -543,6 +583,29 @@ mod tests {
     }
 
     #[test]
+    fn a_layout_file_is_recognised_in_every_spelling_the_pipeline_carries() {
+        for path in [
+            "routes/layout.tsx",
+            "routes/shop/[cat]/layout.jsx",
+            "C:\\app\\src\\routes\\shop\\[cat]\\layout.tsx",
+            "/srv/app/src/routes/layout.ts",
+        ] {
+            assert!(is_layout_file(path), "{path}");
+        }
+        for path in [
+            // Outside `routes/`, the stem means nothing.
+            "src/components/layout.tsx",
+            // A page *about* layouts, and a neighbour of one.
+            "routes/layouts.tsx",
+            "routes/shop/layout/index.tsx",
+            // `layout.md` is refused by the Markdown lowering, not a layout here.
+            "routes/docs/layout.md",
+        ] {
+            assert!(!is_layout_file(path), "{path}");
+        }
+    }
+
+    #[test]
     fn underscore_files_yield_no_url() {
         assert_eq!(file_path_to_url(Path::new("_helpers.tsx")), None);
     }
@@ -589,6 +652,44 @@ mod tests {
                 PathBuf::from("blog/layout.tsx"),
             ]
         );
+    }
+
+    #[test]
+    fn markdown_pages_are_routes_under_their_layouts_and_never_layouts() {
+        let temp = tempdir().unwrap();
+        let routes = temp.path().join("routes");
+        fs::create_dir_all(&routes).unwrap();
+        write(&routes, "layout.tsx", "export default function Root() {}");
+        write(&routes, "docs/layout.tsx", "export default function Docs() {}");
+        write(&routes, "docs/index.md", "# Docs");
+        write(&routes, "docs/routing.md", "# Routing");
+        write(&routes, "docs/_draft.md", "# Not yet");
+        // Refused by the build (`crate::markdown`); here it must simply not be
+        // taken for a layout, or it would wrap `/docs/*` with nothing.
+        write(&routes, "docs/guide/layout.md", "# Not a layout");
+
+        let discovery = discover_routes(&routes).unwrap();
+        let urls: Vec<&str> = discovery.routes.iter().map(|r| r.url_path.as_str()).collect();
+        assert_eq!(urls, vec!["/docs", "/docs/routing"]);
+        assert!(discovery
+            .layouts
+            .iter()
+            .all(|layout| layout.source_rel_path.extension().unwrap() == "tsx"));
+        assert_eq!(
+            discovery.routes[1].layout_chain,
+            vec![PathBuf::from("layout.tsx"), PathBuf::from("docs/layout.tsx")]
+        );
+    }
+
+    #[test]
+    fn a_markdown_page_and_a_component_at_one_url_are_a_duplicate() {
+        let temp = tempdir().unwrap();
+        let routes = temp.path().join("routes");
+        fs::create_dir_all(&routes).unwrap();
+        write(&routes, "about.tsx", "");
+        write(&routes, "about.md", "");
+        let err = discover_routes(&routes).unwrap_err();
+        assert!(matches!(err, RouteDiscoveryError::DuplicateRoute { .. }));
     }
 
     #[test]

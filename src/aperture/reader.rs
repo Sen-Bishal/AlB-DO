@@ -159,8 +159,14 @@ pub struct SourceReader {
 
 impl SourceReader {
     /// Build over an existing registry and client.
+    ///
+    /// Hands the registry's credentials to the client here, in the constructor
+    /// every other one goes through, because this client is also the one an
+    /// action's `fetch()` goes out through (the server adopts it) — so a source
+    /// declared for `fetch()` alone works on every path that builds a reader.
     #[must_use]
     pub fn new(registry: Arc<SourceRegistry>, client: Arc<ApertureClient>) -> Self {
+        client.install_source_credentials(registry.credentials().clone());
         Self { registry, client }
     }
 

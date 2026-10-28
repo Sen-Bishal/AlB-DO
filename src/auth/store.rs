@@ -106,10 +106,16 @@ pub async fn resolve_session(
     now_ms: i64,
 ) -> Result<Resolved> {
     let hash = token.hash();
+    // The connected providers ride the same query as a correlated subquery over
+    // `albedo_accounts (principal)`, which is indexed for exactly this read. A
+    // second round trip per authenticated request would cost more than the
+    // join it would save.
     let rows = db
         .query(
             &format!(
-                "SELECT s.principal, s.provider, s.expires_at, u.email, u.name, u.image \
+                "SELECT s.principal, s.provider, s.expires_at, u.email, u.name, u.image, \
+                 (SELECT group_concat(a.provider, ',') FROM {ACCOUNTS} a \
+                  WHERE a.principal = s.principal) \
                  FROM {SESSIONS} s JOIN {USERS} u ON u.principal = s.principal \
                  WHERE s.token_hash = ?1"
             ),
@@ -149,6 +155,7 @@ pub async fn resolve_session(
         name: optional_text_at(row, 4),
         image: optional_text_at(row, 5),
         provider: text_at(row, 1, "sessions.provider")?,
+        providers: provider_list(optional_text_at(row, 6).as_deref()),
         // Claims are per-login, not per-session-read: re-projecting them on
         // every request would mean either storing the provider's whole payload
         // on the session row or calling the provider again. Neither is worth it
@@ -343,12 +350,10 @@ pub async fn revoke_session(db: &dyn DataSubstrate, token: &TokenHash) -> Result
 
 /// End every session for a principal — log out everywhere.
 ///
-/// 🔑 **This is `AUTH.md` § 5, and it is one `DELETE`.** The rows are a
-/// partition of `albedo_sessions` keyed by principal, so removing them is a
-/// delta on a topic the delta kernel already fans out. Every other tab drops
-/// its live lane in the same frame as any other write — no polling, no TTL, no
-/// revocation list. The instant-global-logout property is the engine that
-/// already shipped, pointed at a new table.
+/// One `DELETE`: every other device's next request resolves no session. A
+/// device with a live lane already open is not told by this — the server's
+/// sign-out route ends those lanes itself (`PhosphorState::end_lanes_where` in
+/// `albedo-server`).
 ///
 /// # Errors
 /// [`StoreError`] on substrate failure.
@@ -628,32 +633,6 @@ pub async fn lookup_credential(
     }))
 }
 
-/// The profile stored for a principal, for building a [`Principal`] after a
-/// credential check has already established *who*.
-///
-/// # Errors
-/// [`StoreError`] on substrate failure.
-pub async fn profile_for(
-    db: &dyn DataSubstrate,
-    principal: &PrincipalId,
-) -> Result<ProviderProfile> {
-    let rows = db
-        .query(
-            &format!("SELECT email, name, image FROM {USERS} WHERE principal = ?1"),
-            &[SqlValue::Text(principal.as_str().to_string())],
-        )
-        .await?;
-    let Some(row) = rows.rows.first() else {
-        return Ok(ProviderProfile::default());
-    };
-    Ok(ProviderProfile {
-        email: optional_text_at(row, 0),
-        name: optional_text_at(row, 1),
-        image: optional_text_at(row, 2),
-        claims: JsonMap::new(),
-    })
-}
-
 /// What a provider told us about a human, already projected out of its own
 /// claim shape by the provider's `claimMap`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -668,7 +647,7 @@ pub struct ProviderProfile {
     pub claims: JsonMap<String, JsonValue>,
 }
 
-async fn lookup_account(
+pub(crate) async fn lookup_account(
     db: &dyn DataSubstrate,
     provider: &str,
     subject: &str,
@@ -697,26 +676,233 @@ fn build_principal(id: PrincipalId, provider: &str, profile: &ProviderProfile) -
         name: profile.name.clone(),
         image: profile.image.clone(),
         provider: provider.to_string(),
+        providers: Vec::new(),
         claims: profile.claims.clone(),
     }
+}
+
+/// A `group_concat` of provider names, as a sorted, de-duplicated list.
+///
+/// A comma is safe as the separator because a provider name cannot contain one
+/// — [`crate::auth::is_valid_provider_name`] admits only an identifier alphabet.
+fn provider_list(concatenated: Option<&str>) -> Vec<String> {
+    let mut providers: Vec<String> = concatenated
+        .unwrap_or_default()
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    providers.sort();
+    providers.dedup();
+    providers
+}
+
+/// The principal behind `id`, with its profile and connected providers — for a
+/// path that knows **who** but has no session to resolve: a job running for a
+/// user, a webhook naming one.
+///
+/// `provider` is empty: nothing signed in, so nothing vouched for this request.
+/// [`Principal::user_value`] shows it as `null`.
+///
+/// # Errors
+/// [`StoreError`] when the substrate fails. An unknown id is `Ok(None)`.
+pub async fn load_principal(db: &dyn DataSubstrate, id: &PrincipalId) -> Result<Option<Principal>> {
+    let rows = db
+        .query(
+            &format!(
+                "SELECT u.email, u.name, u.image, \
+                 (SELECT group_concat(a.provider, ',') FROM {ACCOUNTS} a \
+                  WHERE a.principal = u.principal) \
+                 FROM {USERS} u WHERE u.principal = ?1"
+            ),
+            &[SqlValue::Text(id.as_str().to_string())],
+        )
+        .await?;
+    let Some(row) = rows.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(Principal {
+        id: id.clone(),
+        email: optional_text_at(row, 0),
+        name: optional_text_at(row, 1),
+        image: optional_text_at(row, 2),
+        provider: String::new(),
+        providers: provider_list(optional_text_at(row, 3).as_deref()),
+        claims: JsonMap::new(),
+    }))
+}
+
+/// What connecting a provider identity to a signed-in principal did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkOutcome {
+    /// The identity now signs in as this principal.
+    Linked,
+    /// It already did — a second click on "Connect", or a retried callback.
+    AlreadyLinked,
+    /// It signs in as **somebody else**. Never moved: taking an identity from
+    /// one principal to give it to another is an account takeover whichever
+    /// side asked, and the owner of the other account never agreed to it.
+    TakenByAnother,
+    /// This principal already has a *different* identity at this provider — a
+    /// second GitHub account. Refused so "connected: github" names one thing,
+    /// and disconnecting it is not ambiguous.
+    ProviderAlreadyConnected,
+}
+
+/// Connect `(provider, subject)` to an existing, signed-in `principal`.
+///
+/// 🔑 **Explicit, never by email.** Nothing here compares addresses: two
+/// providers reporting the same email is not proof of one human (an identity
+/// provider may never have verified it), and linking on it is the classic
+/// pre-account-takeover. The caller has already proved control of *both* sides
+/// — a live session for the principal, and a completed provider sign-in for the
+/// identity — which is the only evidence that is.
+///
+/// Race-safe on the `(provider, subject)` unique index, like
+/// [`upsert_principal`]: a concurrent sign-in that minted a principal for the
+/// same identity makes this insert fail, and the loser reads the winner.
+///
+/// # Errors
+/// [`StoreError`] when the substrate fails.
+pub async fn link_account(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+    provider: &str,
+    subject: &str,
+    now_ms: i64,
+) -> Result<LinkOutcome> {
+    let classify = |owner: &PrincipalId| {
+        if owner == principal {
+            LinkOutcome::AlreadyLinked
+        } else {
+            LinkOutcome::TakenByAnother
+        }
+    };
+    if let Some(owner) = lookup_account(db, provider, subject).await? {
+        return Ok(classify(&owner));
+    }
+    let existing = db
+        .query(
+            &format!("SELECT 1 FROM {ACCOUNTS} WHERE principal = ?1 AND provider = ?2"),
+            &[
+                SqlValue::Text(principal.as_str().to_string()),
+                SqlValue::Text(provider.to_string()),
+            ],
+        )
+        .await?;
+    if !existing.rows.is_empty() {
+        return Ok(LinkOutcome::ProviderAlreadyConnected);
+    }
+    let inserted = db
+        .execute(
+            &format!(
+                "INSERT INTO {ACCOUNTS} (principal, provider, subject, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)"
+            ),
+            &[
+                SqlValue::Text(principal.as_str().to_string()),
+                SqlValue::Text(provider.to_string()),
+                SqlValue::Text(subject.to_string()),
+                SqlValue::Integer(now_ms),
+            ],
+        )
+        .await;
+    match inserted {
+        Ok(_) => Ok(LinkOutcome::Linked),
+        Err(err) => match lookup_account(db, provider, subject).await? {
+            Some(owner) => Ok(classify(&owner)),
+            None => Err(err.into()),
+        },
+    }
+}
+
+/// What disconnecting a provider did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlinkOutcome {
+    /// Disconnected; the number of *other* sessions it had opened, now ended.
+    Unlinked { sessions_ended: u64 },
+    /// Refused: it is the only way this principal can sign in, and removing it
+    /// would lock the account with its data inside.
+    LastMethod,
+    /// This principal has no identity at that provider.
+    NotConnected,
+}
+
+/// Disconnect `provider` from `principal`, in one transaction: its account row,
+/// its credential (a password hash, when the provider is one), and every
+/// session it opened **except `keep`** — the session asking, which stays signed
+/// in whichever method it used. Ending the others is the point of the button
+/// when the reason is "that account was compromised".
+///
+/// # Errors
+/// [`StoreError`] when the substrate fails.
+pub async fn unlink_account(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+    provider: &str,
+    keep: &TokenHash,
+) -> Result<UnlinkOutcome> {
+    let who = SqlValue::Text(principal.as_str().to_string());
+    let which = SqlValue::Text(provider.to_string());
+    let tx = db.begin().await?;
+    let connected = tx
+        .query(
+            &format!("SELECT provider FROM {ACCOUNTS} WHERE principal = ?1"),
+            std::slice::from_ref(&who),
+        )
+        .await?;
+    let providers: Vec<&str> = connected
+        .rows
+        .iter()
+        .filter_map(|row| row.get(0).and_then(SqlValue::as_str))
+        .collect();
+    if !providers.contains(&provider) {
+        tx.rollback().await?;
+        return Ok(UnlinkOutcome::NotConnected);
+    }
+    if providers.iter().all(|name| *name == provider) {
+        tx.rollback().await?;
+        return Ok(UnlinkOutcome::LastMethod);
+    }
+    tx.execute(
+        &format!("DELETE FROM {ACCOUNTS} WHERE principal = ?1 AND provider = ?2"),
+        &[who.clone(), which.clone()],
+    )
+    .await?;
+    tx.execute(
+        &format!("DELETE FROM {CREDENTIALS} WHERE principal = ?1 AND provider = ?2"),
+        &[who.clone(), which.clone()],
+    )
+    .await?;
+    let sessions_ended = tx
+        .execute(
+            &format!(
+                "DELETE FROM {SESSIONS} WHERE principal = ?1 AND provider = ?2 \
+                 AND token_hash <> ?3"
+            ),
+            &[who, which, SqlValue::Text(keep.as_str().to_string())],
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(UnlinkOutcome::Unlinked { sessions_ended })
 }
 
 fn optional_param(value: Option<&str>) -> SqlValue {
     value.map_or(SqlValue::Null, |value| SqlValue::Text(value.to_string()))
 }
 
-fn text_at(row: &Row, idx: usize, what: &str) -> Result<String> {
+pub(crate) fn text_at(row: &Row, idx: usize, what: &str) -> Result<String> {
     row.get(idx)
         .and_then(SqlValue::as_str)
         .map(str::to_string)
         .ok_or_else(|| StoreError::Corrupt(format!("{what} is not text")))
 }
 
-fn optional_text_at(row: &Row, idx: usize) -> Option<String> {
+pub(crate) fn optional_text_at(row: &Row, idx: usize) -> Option<String> {
     row.get(idx).and_then(SqlValue::as_str).map(str::to_string)
 }
 
-fn int_at(row: &Row, idx: usize, what: &str) -> Result<i64> {
+pub(crate) fn int_at(row: &Row, idx: usize, what: &str) -> Result<i64> {
     match row.get(idx) {
         Some(SqlValue::Integer(value)) => Ok(*value),
         _ => Err(StoreError::Corrupt(format!("{what} is not an integer"))),

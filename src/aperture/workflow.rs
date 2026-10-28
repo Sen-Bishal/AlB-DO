@@ -30,6 +30,7 @@ use crate::aperture::cache::CacheScope;
 use crate::aperture::ledger::JournalLedger;
 use crate::aperture::client::{ApertureClient, ApertureError, ApertureRequest};
 use crate::aperture::journal::{Journal, JournalError, StepKind, StepOutcome, DEFAULT_PASS_CAP};
+use crate::aperture::SourceCredentials;
 use crate::ir::opcode::Instruction;
 use crate::runtime::bridge::PendingRequest;
 use crate::runtime::compiled::ActionPass;
@@ -255,6 +256,42 @@ fn wire_request(pending: &PendingRequest, journal: &Journal) -> ApertureRequest 
     }
 }
 
+/// Put the declared source's headers on one of a body's calls — or refuse it.
+///
+/// After [`wire_request`], so what the journal's digest and the ledger saw is
+/// what the BODY staged: the credential is never part of either, and rotating a
+/// key cannot make a replay look like a different call. See
+/// [`crate::aperture::SourceCredential`] for which URLs a source covers.
+///
+/// A URL that does not parse passes through untouched: `send_effect` refuses it
+/// with the error that names the actual problem.
+fn with_source_credential(
+    mut request: ApertureRequest,
+    credentials: &SourceCredentials,
+) -> Result<ApertureRequest, String> {
+    let Ok(url) = url::Url::parse(&request.url) else {
+        return Ok(request);
+    };
+    let Some(credential) = credentials.for_url(&url) else {
+        return Ok(request);
+    };
+    for (name, value) in &credential.headers {
+        if request
+            .headers
+            .iter()
+            .any(|(authored, _)| authored.eq_ignore_ascii_case(name))
+        {
+            // The header's NAME only — its value is the secret.
+            return Err(format!(
+                "aperture: {} {} sets its own `{name}` header, but source `{}` in                  albedo.config supplies that header for this URL. The server attaches a                  declared source's headers itself; remove it from the call",
+                request.method, request.url, credential.source
+            ));
+        }
+        request.headers.push((name.clone(), value.clone()));
+    }
+    Ok(request)
+}
+
 /// Encode a response as the record `__albedo_response` replays.
 ///
 /// Shaped like the web platform's because § 5.5 requires copy-pasted vendor code
@@ -361,9 +398,10 @@ pub async fn resolve_pending(
     pending: &[PendingRequest],
     durability: Option<&Durability<'_>>,
 ) -> Result<(), WorkflowError> {
-    let requests: Vec<ApertureRequest> = pending
+    let credentials = client.source_credentials();
+    let requests: Vec<Result<ApertureRequest, String>> = pending
         .iter()
-        .map(|staged| wire_request(staged, journal))
+        .map(|staged| with_source_credential(wire_request(staged, journal), &credentials))
         .collect();
 
     // ── A3 · the bracket ─────────────────────────────────────────────────
@@ -406,7 +444,14 @@ pub async fn resolve_pending(
     let outcomes = futures_util::future::join_all(
         requests
             .iter()
-            .map(|request| resolve_one(client, request))
+            .map(|request| async move {
+                match request {
+                    Ok(request) => resolve_one(client, request).await,
+                    // Refused before it could leave, so the body sees a throw at
+                    // the call that caused it — the egress refusal's shape.
+                    Err(reason) => StepOutcome::Failed(reason.clone()),
+                }
+            })
             .collect::<Vec<_>>(),
     )
     .await;
@@ -596,6 +641,91 @@ mod tests {
             headers: Vec::new(),
             digest: format!("d{step}"),
         }
+    }
+
+    fn credentialed(base: &str, token: &str) -> SourceCredentials {
+        let decl = crate::aperture::SourceDecl {
+            limit: None,
+            base: base.to_string(),
+            auth: Some(crate::aperture::AuthDecl {
+                bearer: Some(token.to_string()),
+                bearer_env: None,
+                scope: None,
+            }),
+            headers: std::collections::BTreeMap::new(),
+            routes: std::collections::BTreeMap::new(),
+        };
+        let map = std::collections::BTreeMap::from([("pay".to_string(), decl)]);
+        crate::aperture::SourceRegistry::from_declarations(&map, |_| None)
+            .expect("lowers")
+            .credentials()
+            .clone()
+    }
+
+    /// The consequence, not the shape: the key is on the wire to the declared
+    /// origin, on nothing else, and in no record the journal keeps.
+    #[tokio::test]
+    async fn a_declared_source_credential_reaches_the_wire_and_only_the_wire() {
+        let transport = Arc::new(CountingTransport::always(ok_json(r#"{"id":"cs_1"}"#)));
+        let client = client(transport.clone());
+        client.install_source_credentials(credentialed("https://api.pay.test", "sk_live_secret"));
+        let mut journal = Journal::new("w", "b");
+
+        resolve_pending(
+            &client,
+            &mut journal,
+            &[
+                staged(0, "POST", "https://api.pay.test/v1/checkout/sessions"),
+                staged(1, "GET", "https://elsewhere.test/v1/checkout/sessions"),
+                staged(2, "GET", "http://api.pay.test/v1/customers"),
+            ],
+            None,
+        )
+        .await
+        .expect("resolves");
+
+        let sent = transport.requests();
+        let auth_of = |url: &str| {
+            sent.iter()
+                .find(|wire| wire.url == url)
+                .and_then(|wire| {
+                    wire.headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                        .map(|(_, value)| value.clone())
+                })
+        };
+        assert_eq!(
+            auth_of("https://api.pay.test/v1/checkout/sessions").as_deref(),
+            Some("Bearer sk_live_secret")
+        );
+        assert_eq!(auth_of("https://elsewhere.test/v1/checkout/sessions"), None);
+        assert_eq!(auth_of("http://api.pay.test/v1/customers"), None, "never in the clear");
+        assert!(
+            !journal.to_script_value().to_string().contains("sk_live_secret"),
+            "the journal holds what the body staged and what came back, never the key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_that_brings_its_own_credential_to_a_declared_source_is_refused() {
+        let transport = Arc::new(CountingTransport::always(ok_json("{}")));
+        let client = client(transport.clone());
+        client.install_source_credentials(credentialed("https://api.pay.test", "sk_live_secret"));
+        let mut journal = Journal::new("w", "b");
+        let mut call = staged(0, "GET", "https://api.pay.test/v1/customers");
+        call.headers = vec![("Authorization".to_string(), "Bearer sk_other".to_string())];
+
+        resolve_pending(&client, &mut journal, &[call], None)
+            .await
+            .expect("a refused step is still a recorded step");
+
+        assert_eq!(transport.calls(), 0, "refused before it could leave");
+        let record = journal.to_script_value()[0].clone();
+        assert_eq!(record["ok"], Value::Bool(false));
+        let reason = record.to_string();
+        assert!(reason.contains("authorization") && reason.contains("`pay`"), "{reason}");
+        assert!(!reason.contains("sk_live_secret"), "the refusal never quotes the key");
     }
 
     #[tokio::test]

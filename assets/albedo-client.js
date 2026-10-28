@@ -1095,6 +1095,38 @@
     );
   }
 
+  // ALB-03 · the attributes a `javascript:` URL runs from, and what replaces
+  // one. Asserted equal to `runtime::jsx_attributes::URL_ATTRIBUTES` and
+  // `BLOCKED_URL` by a Rust test; `safeAttributeValue` is the same loop as
+  // `is_script_url` there. An island that renders `href={profile.website}` on
+  // the client must refuse what the server renderers refuse.
+  var URL_ATTRIBUTES = {
+    action: true,
+    cite: true,
+    data: true,
+    formaction: true,
+    href: true,
+    poster: true,
+    src: true,
+    'xlink:href': true,
+  };
+
+  var BLOCKED_URL = "javascript:throw new Error('ALBEDO blocked a javascript: URL as a security precaution.')";
+
+  function safeAttributeValue(name, value) {
+    var s = String(value);
+    if (!hasOwn(URL_ATTRIBUTES, String(name).toLowerCase())) { return s; }
+    var i = 0;
+    var scheme = '';
+    while (i < s.length && s.charCodeAt(i) <= 32) { i++; }
+    for (; i < s.length && scheme.length < 11; i++) {
+      var c = s.charAt(i);
+      if (c === '\t' || c === '\n' || c === '\r') { continue; }
+      scheme += (c >= 'A' && c <= 'Z') ? String.fromCharCode(c.charCodeAt(0) + 32) : c;
+    }
+    return (scheme === 'javascript:' || scheme.slice(0, 9) === 'vbscript:') ? BLOCKED_URL : s;
+  }
+
 
   // 🔑 `document.createElement('svg')` produces an `HTMLUnknownElement`, not an
   // SVG element — it renders **nothing**, silently. Every icon package in npm
@@ -1244,7 +1276,7 @@
       dom.setAttribute(key, '');
       return;
     }
-    dom.setAttribute(key, String(newValue));
+    dom.setAttribute(key, safeAttributeValue(key, newValue));
   }
 
   // --- helpers -------------------------------------------------------------
@@ -1315,7 +1347,20 @@
     // Enter the same `useId` scope the server rendered this island under.
     // `module_path` is the string it passed as `entry`.
     beginIdScope(island.module_path || island.component_id);
-    hydrateIsland(h(component, island.props || {}), root);
+    // An island the server rendered for THIS request carries that request's
+    // props on its root; the payload's are the boot render's, shared by every
+    // visitor. Hydrating from the payload would adopt markup rendered for
+    // `/x/7` with the props of no request at all.
+    var props = island.props || {};
+    var carried = root.getAttribute && root.getAttribute('data-albedo-props');
+    if (carried) {
+      try {
+        props = JSON.parse(carried);
+      } catch (_e) {
+        // Unreadable: the payload's props are the only other answer there is.
+      }
+    }
+    hydrateIsland(h(component, props), root);
   }
 
   var api = {

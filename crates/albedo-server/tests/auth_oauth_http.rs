@@ -152,9 +152,13 @@ async fn the_oauth_legs_are_reachable_and_the_redirect_is_guarded() {
         host: "127.0.0.1".to_string(),
         port,
         dev_mode: false,
+        hmr: false,
         forge: Default::default(),
         sources: Default::default(),
         uploads: Default::default(),
+        email: None,
+        redirects: Vec::new(),
+        webhooks: Default::default(),
         auth: AuthDeclaration {
             providers,
             ..Default::default()

@@ -225,6 +225,89 @@ pub struct CompiledComponent {
     pub derived_locals: HashMap<String, Expr>,
 }
 
+/// What one component reads from the live world, split three ways because the
+/// three resolve differently: a static topic is named at build time, a
+/// partition needs a key from the request, a source needs a fetch.
+///
+/// Answered per *component*, not per module, because the question a route asks
+/// — "what may a subscriber to me receive?" — is answered by everything the
+/// route renders, and a child is as often a named export, or a second function
+/// in the page's own file, as it is a default export.
+impl CompiledComponent {
+    /// The broadcast topics this component names literally, in source order.
+    pub fn static_topics(&self) -> impl Iterator<Item = &str> + '_ {
+        self.shared_slots.iter().filter_map(SharedSlotBinding::static_topic)
+    }
+
+    /// PRISM · the partitioned bindings, lowered for the manifest.
+    ///
+    /// The `match` on `KeySource` is total, which is what it was written for:
+    /// item 5 P1 added `Identity` and the compiler pointed here. Both variants
+    /// lower — an identity-keyed binding is carried to serve time exactly like a
+    /// param-keyed one, and the decision about *whether it resolves* belongs to
+    /// [`crate::runtime::resolve_partition_topics`], which is the one place that
+    /// knows whether a request has a principal.
+    #[must_use]
+    pub fn partition_specs(&self) -> Vec<crate::manifest::schema::PartitionTopicSpec> {
+        use crate::manifest::schema::{PartitionKeySource, PartitionTopicSpec};
+        use crate::transforms::shared_slots::{KeySource, TopicSpec};
+
+        self.shared_slots
+            .iter()
+            .filter_map(|binding| {
+                let TopicSpec::Partition { collection, column, key } = &binding.spec else {
+                    return None;
+                };
+                let key = match key {
+                    KeySource::Param(name) => PartitionKeySource::RouteParam(name.clone()),
+                    KeySource::Identity => PartitionKeySource::Identity,
+                };
+                Some(PartitionTopicSpec {
+                    binding: binding.binding_name.clone(),
+                    collection: collection.clone(),
+                    column: column.clone(),
+                    key,
+                })
+            })
+            .collect()
+    }
+
+    /// APERTURE · the `useSharedSlot(<source>.<route>({ … }))` bindings,
+    /// lowered for the manifest.
+    #[must_use]
+    pub fn source_specs(&self) -> Vec<crate::manifest::schema::SourceTopicSpec> {
+        use crate::manifest::schema::{SourceArgSpec, SourceTopicSpec};
+        use crate::transforms::shared_slots::{SourceArg, TopicSpec};
+
+        self.shared_slots
+            .iter()
+            .filter_map(|binding| {
+                let TopicSpec::Source { source, route, args } = &binding.spec else {
+                    return None;
+                };
+                Some(SourceTopicSpec {
+                    binding: binding.binding_name.clone(),
+                    source: source.clone(),
+                    route: route.clone(),
+                    args: args
+                        .iter()
+                        .map(|(name, value)| match value {
+                            SourceArg::Param(param) => SourceArgSpec::Param {
+                                name: name.clone(),
+                                param: param.clone(),
+                            },
+                            SourceArg::Literal(literal) => SourceArgSpec::Literal {
+                                name: name.clone(),
+                                value: literal.clone(),
+                            },
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+}
+
 /// One handler the server can re-execute when bakabox POSTs an action
 /// envelope keyed on `proxy_id`.
 #[derive(Debug, Clone)]
@@ -306,12 +389,6 @@ impl CssModuleRegistry {
         self.files.len()
     }
 
-    /// Phase P · E.3 — iterate every loaded file's `(key, scoped)`
-    /// pair. The key is the project-relative path with `/`
-    /// separators; the value is the full scoping result.
-    pub fn iter_files(&self) -> impl Iterator<Item = (&str, &ScopedCssModule)> {
-        self.files.iter().map(|(k, v)| (k.as_str(), v))
-    }
 }
 
 /// Phase-K facade over [`ComponentProject`]. Owns the per-component
@@ -361,7 +438,7 @@ pub struct CompiledProject {
     /// P6 · action ids whose form is rendered inside a list `.map(...)` — so it
     /// repeats per row. Their per-field `data-albedo-error` ids
     /// (`allocate_field_error_id`, constant per action+field) would collide
-    /// across rows, so `form_error_span_seed` emits no spans for them and the
+    /// across rows, so `form_feedback_span_seed` emits no spans for them and the
     /// submit projection is skipped: a repeated form gets no inline per-field
     /// validation (there is no unique node to paint), which is strictly better
     /// than duplicate ids that misroute a `SetText` or break keyed
@@ -1046,6 +1123,10 @@ impl CompiledProject {
                  function __esc(v){return __str(v).replace(/&/g,'&amp;').replace(/</g,'&lt;')\
                  .replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\n",
             );
+            preamble.push_str(&format!(
+                "var __url={};\n",
+                crate::runtime::jsx_attributes::safe_url_js()
+            ));
             for (name, slot_id) in &list.deps {
                 let slot = slot_id.0;
                 let initial = slot_initials
@@ -1271,6 +1352,36 @@ impl CompiledProject {
         topics.into_iter().collect()
     }
 
+    /// How many components in the whole project read each collection — a
+    /// static topic under its own name, a partitioned read under its
+    /// collection. A component that reads one twice counts once.
+    ///
+    /// The row projector renders a collection's rows from its *sole* reader and
+    /// sends that markup to every subscriber of the collection. That is only
+    /// what each subscriber's page renders if no other component, in any tier,
+    /// reads the collection too — so "sole" has to be asked of the project, not
+    /// of the Tier-B plan alone.
+    #[must_use]
+    pub fn collection_reader_counts(&self) -> HashMap<String, usize> {
+        use crate::transforms::shared_slots::TopicSpec;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for component in self.components.values() {
+            let read: std::collections::BTreeSet<&str> = component
+                .shared_slots
+                .iter()
+                .filter_map(|binding| match &binding.spec {
+                    TopicSpec::Static(topic) => Some(topic.as_str()),
+                    TopicSpec::Partition { collection, .. } => Some(collection.as_str()),
+                    TopicSpec::Source { .. } => None,
+                })
+                .collect();
+            for collection in read {
+                *counts.entry(collection.to_string()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
     /// The topics one render `entry`'s component reads via `useSharedSlot`, in
     /// source order.
     ///
@@ -1285,17 +1396,36 @@ impl CompiledProject {
     /// the same thing from a seed (nothing).
     #[must_use]
     pub fn shared_slot_topics_for_entry(&self, entry: &str) -> Vec<String> {
-        let Some((module_spec, function_name)) = self.project.resolve_entry_component(entry) else {
-            return Vec::new();
-        };
-        let Some(component) = self.component_meta(&module_spec, &function_name) else {
-            return Vec::new();
-        };
-        component
-            .shared_slots
-            .iter()
-            .filter_map(|binding| binding.static_topic().map(str::to_string))
-            .collect()
+        self.entry_component(entry)
+            .map(|component| component.static_topics().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The compiled component an `entry`'s module exports by default.
+    fn entry_component(&self, entry: &str) -> Option<&CompiledComponent> {
+        let (module_spec, function_name) = self.project.resolve_entry_component(entry)?;
+        self.component_meta(&module_spec, &function_name)
+    }
+
+    /// The compiled component `function_name` in `entry`'s module — or, when
+    /// the module has no function by that name, its default export (an
+    /// anonymous default is named after its file, not its function).
+    ///
+    /// The per-component counterpart of the `*_for_entry` lookups, which answer
+    /// for a module's default export only. That is right for a route leaf and
+    /// wrong for what the leaf renders: a module with only named exports has no
+    /// default to answer for at all.
+    #[must_use]
+    pub fn component_in_entry(
+        &self,
+        entry: &str,
+        function_name: &str,
+    ) -> Option<&CompiledComponent> {
+        let module_spec = self.project.resolve_entry(entry)?;
+        self.component_meta(&module_spec, function_name).or_else(|| {
+            let default_export = self.module(&module_spec)?.default_export.as_deref()?;
+            self.component_meta(&module_spec, default_export)
+        })
     }
 
     /// PRISM · the partitioned shared-slot bindings one render `entry`'s
@@ -1307,47 +1437,14 @@ impl CompiledProject {
     /// own partitions — resolving another route's binding against this route's
     /// params would mint a topic the page never renders, which is the read
     /// capability PRISM invariant 2 denies.
-    ///
-    /// The `match` on `KeySource` is total, which is what it was written for:
-    /// item 5 P1 added `Identity` and the compiler pointed here. Both variants
-    /// lower — an identity-keyed binding is carried to serve time exactly like a
-    /// param-keyed one, and the decision about *whether it resolves* belongs to
-    /// [`crate::runtime::resolve_partition_topics`], which is the one place that
-    /// knows whether a request has a principal.
     #[must_use]
     pub fn shared_slot_partitions_for_entry(
         &self,
         entry: &str,
     ) -> Vec<crate::manifest::schema::PartitionTopicSpec> {
-        use crate::transforms::shared_slots::{KeySource, TopicSpec};
-
-        let Some((module_spec, function_name)) = self.project.resolve_entry_component(entry) else {
-            return Vec::new();
-        };
-        let Some(component) = self.component_meta(&module_spec, &function_name) else {
-            return Vec::new();
-        };
-        component
-            .shared_slots
-            .iter()
-            .filter_map(|binding| {
-                let TopicSpec::Partition { collection, column, key } = &binding.spec else {
-                    return None;
-                };
-                let key = match key {
-                    KeySource::Param(name) => {
-                        crate::manifest::schema::PartitionKeySource::RouteParam(name.clone())
-                    }
-                    KeySource::Identity => crate::manifest::schema::PartitionKeySource::Identity,
-                };
-                Some(crate::manifest::schema::PartitionTopicSpec {
-                    binding: binding.binding_name.clone(),
-                    collection: collection.clone(),
-                    column: column.clone(),
-                    key,
-                })
-            })
-            .collect()
+        self.entry_component(entry)
+            .map(CompiledComponent::partition_specs)
+            .unwrap_or_default()
     }
 
     /// APERTURE · this entry's `useSharedSlot(<source>.<route>({ … }))` bindings,
@@ -1362,47 +1459,9 @@ impl CompiledProject {
         &self,
         entry: &str,
     ) -> Vec<crate::manifest::schema::SourceTopicSpec> {
-        use crate::manifest::schema::{SourceArgSpec, SourceTopicSpec};
-        use crate::transforms::shared_slots::{SourceArg, TopicSpec};
-
-        let Some((module_spec, function_name)) = self.project.resolve_entry_component(entry) else {
-            return Vec::new();
-        };
-        let Some(component) = self.component_meta(&module_spec, &function_name) else {
-            return Vec::new();
-        };
-        component
-            .shared_slots
-            .iter()
-            .filter_map(|binding| {
-                let TopicSpec::Source {
-                    source,
-                    route,
-                    args,
-                } = &binding.spec
-                else {
-                    return None;
-                };
-                Some(SourceTopicSpec {
-                    binding: binding.binding_name.clone(),
-                    source: source.clone(),
-                    route: route.clone(),
-                    args: args
-                        .iter()
-                        .map(|(name, value)| match value {
-                            SourceArg::Param(param) => SourceArgSpec::Param {
-                                name: name.clone(),
-                                param: param.clone(),
-                            },
-                            SourceArg::Literal(literal) => SourceArgSpec::Literal {
-                                name: name.clone(),
-                                value: literal.clone(),
-                            },
-                        })
-                        .collect(),
-                })
-            })
-            .collect()
+        self.entry_component(entry)
+            .map(CompiledComponent::source_specs)
+            .unwrap_or_default()
     }
 
     /// APERTURE · every `useSharedSlot(<source>.<route>({ … }))` in the project,
@@ -1576,6 +1635,41 @@ impl CompiledProject {
     /// components, or two or more.** The third tuple field carries the ones
     /// found, so the refusal can name them instead of claiming a file that
     /// exports two components has no component in it.
+    /// Every layout whose component **provably** reads `params` or `user`, as
+    /// `(module_spec, function_name, props read)`, sorted.
+    ///
+    /// A layout is rendered once per route, at build time, from `{ route }`
+    /// alone — so either read is `undefined` on every request, and a layout
+    /// guarding it (`params ? … : …`) renders its fallback forever while the
+    /// build and every request succeed. Consumed by
+    /// [`crate::preflight::layout_request_reads`].
+    ///
+    /// 🔑 **Proof, not suspicion.** This feeds a refusal, so it must not round
+    /// toward "reads it" the way `parser::takes_route_params` does (correctly —
+    /// a false positive there only costs a per-request render). Counted:
+    /// `{ params }` / `{ user }` in the signature, and `p.params` / `p["user"]`
+    /// / `const { params } = p` on a whole-props parameter `p`. Not counted: a
+    /// rest element, `{...p}` handed to something else, or a bare `user`
+    /// identifier — each may or may not reach the prop, and an author refused
+    /// for a read they did not write has no edit that satisfies the check.
+    #[must_use]
+    pub fn layouts_reading_request(&self) -> Vec<(String, String, Vec<&'static str>)> {
+        let mut found: Vec<(String, String, Vec<&'static str>)> = self
+            .project
+            .modules()
+            .iter()
+            .filter(|(spec, _)| crate::routing::file_based::is_layout_file(spec))
+            .filter_map(|(spec, module)| {
+                let name = module.default_export.as_ref()?;
+                let function = module.functions.get(name)?;
+                let reads = request_props_read(function);
+                (!reads.is_empty()).then(|| (spec.clone(), name.clone(), reads))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
     #[must_use]
     pub fn routes_without_default_export(&self, served: &[String]) -> Vec<(String, String, Vec<String>)> {
         let mut broken: Vec<(String, String, Vec<String>)> = self
@@ -1656,30 +1750,6 @@ impl CompiledProject {
         writable
     }
 
-    /// Phase O.2 · all `useSharedSlot` bindings for one component
-    /// (`{module_spec}::{function_name}`), in source order. Returns
-    /// an empty slice for components that don't use shared slots.
-    pub fn shared_slots_for_component(
-        &self,
-        module_spec: &str,
-        function_name: &str,
-    ) -> &[SharedSlotBinding] {
-        self.components
-            .get(&(module_spec.to_string(), function_name.to_string()))
-            .map(|c| c.shared_slots.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Phase P · Stream C.1 — every `export const NAME = action(...)`
-    /// declaration in one module, in source order. Returns an empty
-    /// slice when the module declares no actions (or is unknown).
-    pub fn action_declarations_for_module(&self, module_spec: &str) -> &[ActionDeclaration] {
-        self.action_declarations
-            .get(module_spec)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
     /// Phase P · Stream C.1 — iterate every TS-side action across
     /// every module in the project, yielding `(module_spec, action)`
     /// pairs. Order is module-iteration order (HashMap, not stable
@@ -1709,6 +1779,17 @@ impl CompiledProject {
         &self,
         envelope: &ActionEnvelope,
         slots: &SessionSlotView,
+    ) -> Result<Vec<Instruction>> {
+        self.invoke_action_as(envelope, slots, crate::runtime::RequestBindings::anonymous())
+    }
+
+    /// [`Self::invoke_action`] for a known request — its `user` and `origin`,
+    /// bound by those names in the body. See [`crate::runtime::RequestBindings`].
+    pub fn invoke_action_as(
+        &self,
+        envelope: &ActionEnvelope,
+        slots: &SessionSlotView,
+        request: &crate::runtime::RequestBindings,
     ) -> Result<Vec<Instruction>> {
         let handler = self
             .handler(envelope.action_id)
@@ -1746,6 +1827,7 @@ impl CompiledProject {
             component,
             slots,
             form_payload.as_ref(),
+            request,
         )?;
         explicit.extend(slots.drain_pending());
         Ok(explicit)
@@ -1769,8 +1851,25 @@ impl CompiledProject {
         slots: &SessionSlotView,
         broadcast: &crate::runtime::broadcast::BroadcastRegistry,
     ) -> Result<Vec<Instruction>> {
+        self.invoke_action_with_broadcast_as(
+            envelope,
+            slots,
+            broadcast,
+            crate::runtime::RequestBindings::anonymous(),
+        )
+    }
+
+    /// [`Self::invoke_action_with_broadcast`] for a known request — see
+    /// [`Self::invoke_action_as`].
+    pub fn invoke_action_with_broadcast_as(
+        &self,
+        envelope: &ActionEnvelope,
+        slots: &SessionSlotView,
+        broadcast: &crate::runtime::broadcast::BroadcastRegistry,
+        request: &crate::runtime::RequestBindings,
+    ) -> Result<Vec<Instruction>> {
         let _broadcast_guard = crate::runtime::eval::core::install_phase_k_broadcast(broadcast);
-        self.invoke_action(envelope, slots)
+        self.invoke_action_as(envelope, slots, request)
     }
 
     /// FORGE · [`Self::invoke_action_with_broadcast`] plus a durable-write
@@ -1794,9 +1893,11 @@ impl CompiledProject {
         envelope: &ActionEnvelope,
         slots: &SessionSlotView,
         broadcast: &crate::runtime::broadcast::BroadcastRegistry,
+        request: &crate::runtime::RequestBindings,
     ) -> Result<(Vec<Instruction>, Vec<crate::forge::ForgeWrite>)> {
         let collector = crate::forge::install_forge_write_collector();
-        let instructions = self.invoke_action_with_broadcast(envelope, slots, broadcast)?;
+        let instructions =
+            self.invoke_action_with_broadcast_as(envelope, slots, broadcast, request)?;
         let writes = collector.take();
         Ok((instructions, writes))
     }
@@ -1853,7 +1954,14 @@ impl CompiledProject {
         slots: &SessionSlotView,
         broadcast: Option<&BroadcastRegistry>,
     ) -> Result<Vec<Instruction>> {
-        match self.invoke_action_quickjs_pass(engine, envelope, slots, broadcast, None)? {
+        match self.invoke_action_quickjs_pass(
+            engine,
+            envelope,
+            slots,
+            broadcast,
+            None,
+            crate::runtime::RequestBindings::anonymous(),
+        )? {
             ActionPass::Completed(instructions) => Ok(instructions),
             ActionPass::Suspended { pending, .. } => Err(anyhow!(
                 "action {} called fetch() ({} request(s) staged) but was dispatched without a \
@@ -1889,6 +1997,8 @@ impl CompiledProject {
         slots: &SessionSlotView,
         broadcast: Option<&BroadcastRegistry>,
         journal: Option<&crate::aperture::Journal>,
+        // The request's `user` and `origin` — see [`Self::invoke_action_as`].
+        request: &crate::runtime::RequestBindings,
     ) -> Result<ActionPass> {
         let handler = self
             .handler(envelope.action_id)
@@ -2083,6 +2193,7 @@ impl CompiledProject {
             raw_bindings: &raw_bindings,
             setters: &setters,
             event_json: event_string.as_deref(),
+            request,
             broadcast_current: &broadcast_current,
             journal: seeded_journal.as_ref(),
         };
@@ -2208,9 +2319,9 @@ impl CompiledProject {
         // own opcodes (the list delta) with it. Skip the projection for those
         // actions — the handler's opcodes still ship; only inline field
         // validation is unavailable for a repeated form.
+        let result = outcome.result.unwrap_or(Value::Null);
         if !self.list_repeated_actions.contains(&envelope.action_id) {
             if let Some((action_name, fields)) = self.action_form_fields.get(&envelope.action_id) {
-                let result = outcome.result.unwrap_or(Value::Null);
                 instructions.extend(crate::runtime::form_result::project_form_result(
                     action_name,
                     &result,
@@ -2218,6 +2329,10 @@ impl CompiledProject {
                 ));
             }
         }
+        // `{ redirect }` — for EVERY action, not only a form with reserved slots:
+        // a "Buy" button in a list row sends the browser to checkout exactly as a
+        // lone one does. Last, so the slot writes above land first.
+        instructions.extend(crate::runtime::form_result::redirect_of(&result));
 
         // State writes above marked the slot dirty; the returned vector already
         // carries those SlotSets, so consume and discard the dirty set to keep
@@ -2302,25 +2417,21 @@ impl CompiledProject {
     /// (`albedo-server`'s pooled registry) builds its own host seed and must
     /// inject the identical spans — this method is the one place the markup
     /// and ids are generated, so the two render paths cannot diverge.
-    pub fn form_error_span_seed(&self) -> serde_json::Map<String, Value> {
+    ///
+    /// The seed carries every **feedback** sink, not only the error ones: the
+    /// form's success sink rides at the end of the same string (see
+    /// [`crate::transforms::form::form_feedback_spans`]), which is why the host
+    /// key and the server's plumbing still say "error spans" while holding both.
+    pub fn form_feedback_span_seed(&self) -> serde_json::Map<String, Value> {
         let mut seed = serde_json::Map::new();
         for (action_id, (action_name, fields)) in &self.action_form_fields {
-            // A form rendered per row can't carry unique error-span ids, so it
-            // gets none — the duplicate `data-albedo-id`s a shared seed would
-            // stamp on every row are worse than the absence of inline validation.
+            // A form rendered per row can't carry unique sink ids, so it gets
+            // none — the duplicate `data-albedo-id`s a shared seed would stamp
+            // on every row are worse than the absence of inline feedback.
             if self.list_repeated_actions.contains(action_id) {
                 continue;
             }
-            let html: String = fields
-                .iter()
-                .map(|field| {
-                    format!(
-                        "<span data-albedo-id=\"{}\" data-albedo-error=\"{}\"></span>",
-                        crate::transforms::form::allocate_field_error_id(action_name, field),
-                        field,
-                    )
-                })
-                .collect();
+            let html = crate::transforms::form::form_feedback_spans(action_name, fields);
             seed.insert(action_name.clone(), Value::String(html));
         }
         seed
@@ -2429,7 +2540,7 @@ impl CompiledProject {
         // independent of the per-component host above — a form can live in
         // a component with no hooks at all, so this is added unconditionally
         // (empty when the project has no form actions).
-        let form_error_spans = self.form_error_span_seed();
+        let form_error_spans = self.form_feedback_span_seed();
         if !form_error_spans.is_empty() {
             host.insert(
                 "formErrorSpans".to_string(),
@@ -2729,6 +2840,10 @@ fn jsx_node_to_html_js(node: &Expr, parts: &mut Vec<String>, buf: &mut String) -
                 continue;
             }
             let html_name = jsx_attr_name_to_html(attr_name.sym.as_ref());
+            // ALB-03 · a row's `href={row.url}` is filled from data the visitor
+            // wrote, so URL attributes go through the same rule as the renderers:
+            // a literal is checked here, a hole by the thunk's `__url`.
+            let is_url = crate::runtime::jsx_attributes::is_url_attribute(html_name);
             match &jsx_attr.value {
                 None => {
                     buf.push(' ');
@@ -2738,7 +2853,12 @@ fn jsx_node_to_html_js(node: &Expr, parts: &mut Vec<String>, buf: &mut String) -
                     buf.push(' ');
                     buf.push_str(html_name);
                     buf.push_str("=\"");
-                    buf.push_str(&escape_html_attr(s.value.as_ref()));
+                    buf.push_str(&escape_html_attr(
+                        crate::runtime::jsx_attributes::safe_attribute_value(
+                            html_name,
+                            s.value.as_ref(),
+                        ),
+                    ));
                     buf.push('"');
                 }
                 Some(JSXAttrValue::Lit(lit)) => {
@@ -2755,7 +2875,12 @@ fn jsx_node_to_html_js(node: &Expr, parts: &mut Vec<String>, buf: &mut String) -
                         buf.push_str(html_name);
                         buf.push_str("=\"");
                         flush(parts, buf);
-                        parts.push(format!("__esc(__str({}))", expr_to_js(e)?));
+                        let value = format!("__str({})", expr_to_js(e)?);
+                        parts.push(if is_url {
+                            format!("__esc(__url({value}))")
+                        } else {
+                            format!("__esc({value})")
+                        });
                         buf.push('"');
                     }
                 }
@@ -2988,12 +3113,86 @@ fn extract_param_names(function: &ComponentFunction) -> Vec<String> {
     out
 }
 
-/// Helper used by the Phase J `extract` recursion to surface that a
-/// `Stmt` exists. Kept here so the public surface remains close to
-/// the data types it touches.
-#[allow(dead_code)]
-pub(crate) fn is_compiled_stmt_root(_stmt: &Stmt) -> bool {
-    true
+/// The request-scoped props — `params`, `user` — this component **provably**
+/// reads off its props object. See [`CompiledProject::layouts_reading_request`]
+/// for what counts as proof and why nothing weaker may.
+fn request_props_read(function: &ComponentFunction) -> Vec<&'static str> {
+    use swc_ecma_ast::{Lit, MemberProp, ObjectPatProp, Pat, PropName, VarDeclarator};
+    use swc_ecma_visit::{Visit, VisitWith};
+
+    const REQUEST_PROPS: [&str; 2] = ["params", "user"];
+
+    let mut read: HashSet<&'static str> = HashSet::new();
+    match function.params.first() {
+        Some(ParamBinding::Object(fields)) => {
+            for (key, _local) in fields {
+                if let Some(prop) = REQUEST_PROPS.iter().find(|prop| **prop == key.as_str()) {
+                    read.insert(prop);
+                }
+            }
+        }
+        Some(ParamBinding::Ident(props)) => {
+            struct Reads<'a> {
+                props: &'a str,
+                read: HashSet<&'static str>,
+            }
+            impl Reads<'_> {
+                fn note(&mut self, key: &str) {
+                    if let Some(prop) = REQUEST_PROPS.iter().find(|prop| **prop == key) {
+                        self.read.insert(prop);
+                    }
+                }
+            }
+            impl Visit for Reads<'_> {
+                // `props.params`, `props["user"]`.
+                fn visit_member_expr(&mut self, member: &swc_ecma_ast::MemberExpr) {
+                    if matches!(&*member.obj, Expr::Ident(ident) if ident.sym.as_ref() == self.props) {
+                        match &member.prop {
+                            MemberProp::Ident(name) => self.note(name.sym.as_ref()),
+                            MemberProp::Computed(computed) => {
+                                if let Expr::Lit(Lit::Str(key)) = &*computed.expr {
+                                    self.note(key.value.as_ref());
+                                }
+                            }
+                            MemberProp::PrivateName(_) => {}
+                        }
+                    }
+                    member.visit_children_with(self);
+                }
+                // `const { params } = props`.
+                fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+                    let from_props = declarator.init.as_deref().is_some_and(
+                        |init| matches!(init, Expr::Ident(ident) if ident.sym.as_ref() == self.props),
+                    );
+                    if let (true, Pat::Object(object)) = (from_props, &declarator.name) {
+                        for prop in &object.props {
+                            match prop {
+                                ObjectPatProp::Assign(assign) => self.note(assign.key.sym.as_ref()),
+                                ObjectPatProp::KeyValue(kv) => match &kv.key {
+                                    PropName::Ident(name) => self.note(name.sym.as_ref()),
+                                    PropName::Str(name) => self.note(name.value.as_ref()),
+                                    _ => {}
+                                },
+                                ObjectPatProp::Rest(_) => {}
+                            }
+                        }
+                    }
+                    declarator.visit_children_with(self);
+                }
+            }
+            let mut reads = Reads {
+                props: props.as_str(),
+                read: HashSet::new(),
+            };
+            function.body_stmts.visit_with(&mut reads);
+            read = reads.read;
+        }
+        Some(ParamBinding::Ignore) | None => {}
+    }
+    REQUEST_PROPS
+        .into_iter()
+        .filter(|prop| read.contains(prop))
+        .collect()
 }
 
 /// Phase P · Stream E.3 — walk every module's imports, resolve

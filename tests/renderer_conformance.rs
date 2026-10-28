@@ -57,6 +57,12 @@ fn props_for(corpus: &str, entry: &str) -> Value {
         ("render_quickjs/escaped_props_text", _) => json!({
             "bio": "<script>alert(1)</script> & \"quoted\" 'single'"
         }),
+        // ALB-03 · script URLs arriving from outside, in URL attributes.
+        ("render_quickjs/script_urls", _) => json!({
+            "website": " JaVa\tScRiPt:alert(1)",
+            "photo": "javascript:alert(2)",
+            "safe": "https://example.com/a?b=c&d=e"
+        }),
         ("scaffold", "routes/room/[id].tsx") => json!({ "params": { "id": "lobby" } }),
         _ => json!({}),
     }
@@ -595,6 +601,23 @@ fn each_declared_refusal_still_classifies_as_a_decline() {
             "switch_stmt",
             "statement: switch",
             "export default function C(){ switch (1) { default: break; } return <p>x</p>; }",
+        ),
+        // The static renderer's own refusals, one per wrapper a message can
+        // arrive in: bare, behind a method list, and inside a poisoned local.
+        (
+            "unknown_call",
+            "static: calling `format()`",
+            "export default function C(){ return <p>{format(1)}</p>; }",
+        ),
+        (
+            "string_method",
+            "static: `.normalize()` on a string",
+            "export default function C(){ return <p>{\"x\".normalize()}</p>; }",
+        ),
+        (
+            "poisoned_local",
+            "static: the regular expression `/a/g`",
+            "export default function C(){ const r = /a/g; return <p>{r}</p>; }",
         ),
     ];
 

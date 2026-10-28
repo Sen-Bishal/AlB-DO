@@ -136,6 +136,38 @@ pub struct ForgeCollection {
     /// inference, or a `params`-keyed read, which is what keeps those paths
     /// byte-for-byte what they were.
     pub identity_partitioned: bool,
+    /// ALB-02 · who may update or remove an existing row of a collection that is
+    /// not identity-partitioned. [`EditRule::Author`] unless the `forge` block
+    /// says otherwise.
+    pub edit: EditRule,
+}
+
+/// ALB-02 · who may `update` or `remove` a row once it exists.
+///
+/// 🔴 Before this, owner checks ran only on identity-partitioned collections,
+/// and that mark is inferred from a component reading
+/// `.where({ owner: user.id })`. Every other collection — a guestbook, posts, a
+/// listing, anything with public reads — accepted `update` and `remove` from
+/// any caller holding a CSRF token, which every visitor has. The starter app
+/// shipped an action that let a stranger delete any row by id.
+///
+/// The default is now the one rule that needs no declaration: **you may change
+/// what you added.** The server knows who ran each append, because it ran it,
+/// so authorship is recorded rather than declared (see
+/// [`crate::forge::write::AUTHORS_DDL`]). A row with no recorded author — added
+/// anonymously, seeded, or written before authorship existed — is changed by
+/// nobody. Appending stays open to anyone; that is spam, which the rate limiter
+/// prices, not someone else's row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditRule {
+    /// Only the signed-in principal that appended a row may update or remove it.
+    #[default]
+    Author,
+    /// Any caller, signed in or not, may update or remove any row. For a shared
+    /// board or a wiki — declared as `edit: "anyone"`, so it is never the
+    /// accident it used to be.
+    Anyone,
 }
 
 impl ForgeCollection {
@@ -165,6 +197,7 @@ impl ForgeCollection {
             partition_by: None,
             fields: BTreeMap::new(),
             identity_partitioned: false,
+            edit: EditRule::Author,
         }
     }
 
@@ -182,6 +215,13 @@ impl ForgeCollection {
     #[must_use]
     pub fn with_fields(mut self, fields: BTreeMap<String, FieldSpec>) -> Self {
         self.fields = fields;
+        self
+    }
+
+    /// Attach the declared [`EditRule`], same shape as the two above.
+    #[must_use]
+    pub fn with_edit(mut self, edit: EditRule) -> Self {
+        self.edit = edit;
         self
     }
 }
@@ -398,6 +438,18 @@ impl ForgeSchema {
         self
     }
 
+    /// Every collection as `edit: "anyone"`. For tests of write *mechanics* —
+    /// fan-out, partitions, rollback — that change seed rows with no principal,
+    /// which the default [`EditRule::Author`] refuses.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn open_to_anyone(mut self) -> Self {
+        for collection in &mut self.collections {
+            collection.edit = EditRule::Anyone;
+        }
+        self
+    }
+
     /// The collection driving wire slot `slot_id`, if any. `O(log n)` binary
     /// search over the dense id spine; the payload is touched once.
     #[must_use]
@@ -432,9 +484,19 @@ impl ForgeSchema {
         self.collections.len()
     }
 
-    /// The built-in default: the walking-skeleton guestbook, reproducing the old
-    /// `FORGE_SLOTS` const exactly (same query, same key, same DDL + ada/alan
-    /// seed). Used until an app declares its own schema.
+    /// No collections — what an app that declares no `forge` block gets.
+    ///
+    /// An app without a data model gets no tables. The database still opens
+    /// (auth, jobs, uploads and mail keep their own tables in it); it simply
+    /// holds nothing of the app's that the app did not ask for.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::build(Vec::new()).expect("an empty schema has nothing to collide")
+    }
+
+    /// A one-collection fixture — the walking-skeleton guestbook with two seed
+    /// rows. Test and bench builds only: production never invents a table.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn guestbook_default() -> Self {
         let guestbook = ForgeCollection::new(
@@ -466,7 +528,7 @@ impl ForgeSchema {
 
 impl Default for ForgeSchema {
     fn default() -> Self {
-        Self::guestbook_default()
+        Self::empty()
     }
 }
 
@@ -504,6 +566,7 @@ pub async fn bootstrap_schema(
     substrate: &dyn DataSubstrate,
     schema: &ForgeSchema,
 ) -> crate::forge::value::Result<()> {
+    substrate.migrate(crate::forge::write::AUTHORS_DDL).await?;
     for collection in schema.collections() {
         for ddl in collection.migrations.iter() {
             substrate.migrate(ddl).await?;

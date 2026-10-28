@@ -63,11 +63,6 @@ pub struct PayloadIndex {
 }
 
 impl PayloadIndex {
-    /// Total bytes of file content, excluding the index and trailer.
-    #[must_use]
-    pub fn content_len(&self) -> u64 {
-        self.entries.iter().map(|entry| entry.len).sum()
-    }
 }
 
 /// Reject a path that would escape the directory it is extracted into.
@@ -268,6 +263,11 @@ pub fn should_ship(relative_path: &str) -> bool {
         // The incremental build cache: an input to the build, never read while
         // serving.
         ".albedo-cache",
+        // `--domain`'s ACME cache: the Let's Encrypt account key and every
+        // issued certificate's private key, under names no extension rule
+        // catches. A key for this machine's domain does not belong in an
+        // artifact that runs anywhere.
+        crate::tls::DEFAULT_ACME_CACHE_DIR,
     ];
 
     if segments
@@ -321,8 +321,80 @@ pub fn should_ship(relative_path: &str) -> bool {
     if *name == "albedo-linux-amd64" {
         return false;
     }
+    // 🔴 ALB-04 (2026-10-27): `.env` travelled. `albedo dev` teaches keeping
+    // keys in `.env`, and `ship` then wrote them, in plain text, into every
+    // binary and image — whoever received the artifact got the production keys.
+    // A shipped app reads its secrets from the environment it runs in.
+    if is_secret_file(name) {
+        return false;
+    }
 
     true
+}
+
+/// Does a file named `name` hold a secret by convention?
+///
+/// Matched on the file name alone, case-insensitively: dotenv files (`.env`,
+/// `.env.local`, `.env.production`, and `.env.example` too — nothing at runtime
+/// reads it), private keys and certificate stores, registry and machine
+/// credentials, and SSH keys by their standard names. A name list rather than a
+/// content scan because the cost of a false positive is a file left out and
+/// named, and the cost of a false negative is a leaked key.
+#[must_use]
+pub fn is_secret_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") {
+        return true;
+    }
+    if matches!(
+        lower.as_str(),
+        ".npmrc" | ".netrc" | ".pypirc" | "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519"
+    ) {
+        return true;
+    }
+    [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"]
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+}
+
+/// Secret-shaped files under the project's `public/`, as project-relative
+/// paths, sorted.
+///
+/// Everything in `public/` is served to anyone who asks, so a key there is
+/// already public on `albedo serve`. `ship` refuses by name instead of quietly
+/// leaving it out: leaving it out would make the shipped app look safe while the
+/// source tree and every non-shipped deploy still publish the file.
+///
+/// # Errors
+/// An IO failure while walking `public/`.
+pub fn secret_files_in_public(project_dir: &Path) -> Result<Vec<String>, String> {
+    let public = project_dir.join("public");
+    if !public.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    let mut stack = vec![public];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|err| format!("failed to read '{}': {err}", dir.display()))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|err| format!("failed to read a directory entry: {err}"))?
+                .path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|name| is_secret_file(&name.to_string_lossy()))
+            {
+                if let Ok(relative) = path.strip_prefix(project_dir) {
+                    found.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// Walk `project_dir` and list everything [`should_ship`] admits.
@@ -668,6 +740,58 @@ mod tests {
         assert!(!should_ship(".albedo-app-6cae2768a239ce6d/.albedo/dist/render-manifest.v2.json"));
         assert!(!should_ship(".albedo-app-6cae2768a239ce6d/src/App.tsx"));
         assert!(!should_ship(".albedo-app-6cae2768a239ce6d/.albedo-unpacked"));
+    }
+
+    /// 🔴 ALB-04 · the audit's payload index held `.env`, `public/.env` and
+    /// `.albedo/dist/public/.env`, and `grep -a` found the live key in the
+    /// binary in plain text.
+    #[test]
+    fn secrets_do_not_travel_wherever_they_sit() {
+        for path in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".ENV",
+            "public/.env",
+            ".albedo/dist/public/.env",
+            "certs/site.pem",
+            "certs/site.KEY",
+            "keys/store.p12",
+            ".npmrc",
+            ".netrc",
+            "deploy/id_ed25519",
+            ".albedo-acme/cached_account_abc",
+        ] {
+            assert!(!should_ship(path), "{path} must not travel");
+        }
+        // Names that only resemble one.
+        for path in [
+            "src/environment.ts",
+            "src/routes/env.tsx",
+            "src/components/KeyPad.tsx",
+            "public/keyboard.svg",
+            "src/id_card.tsx",
+        ] {
+            assert!(should_ship(path), "{path} is an ordinary file");
+        }
+    }
+
+    /// `ship` refuses by name when a secret sits where it is served.
+    #[test]
+    fn secrets_in_public_are_found_by_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for path in ["public/.env", "public/nested/server.key", "public/logo.png", ".env"] {
+            let full = dir.path().join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&full, b"x").expect("write");
+        }
+        assert_eq!(
+            secret_files_in_public(dir.path()).expect("walk"),
+            vec!["public/.env".to_string(), "public/nested/server.key".to_string()],
+            "the root .env is where it belongs; only public/ is refused"
+        );
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(secret_files_in_public(empty.path()).expect("walk").is_empty());
     }
 
     /// Collection walks the tree, applies the rule, and returns a stable order

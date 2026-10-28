@@ -50,6 +50,30 @@ pub struct RequestRecord {
     pub elapsed: Duration,
 }
 
+/// Environment variable that turns per-request timing lines on for a
+/// non-interactive `albedo serve` (`1`, `true`, `yes` or `on`).
+pub const REQUEST_TIMINGS_ENV: &str = "ALBEDO_REQUEST_TIMINGS";
+
+/// Whether a CLI-booted server prints a timing line per request.
+///
+/// On for `albedo dev`, and whenever stdout is a terminal — that is the live
+/// dashboard, where each request is a row. **Off** for a server writing to a
+/// pipe or a log (a container, a systemd unit) unless
+/// [`REQUEST_TIMINGS_ENV`] asks: an ANSI-coloured line per request is noise in
+/// a log aggregator and a lock on stdout for every request, and production
+/// latency has a proper home in the Prometheus endpoint.
+#[must_use]
+pub fn request_timings_default(dev_mode: bool) -> bool {
+    use std::io::IsTerminal;
+    let asked = std::env::var(REQUEST_TIMINGS_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    dev_mode || asked || std::io::stdout().is_terminal()
+}
+
 /// Route request timings to `sender` instead of stdout.
 ///
 /// Returns `false` if a sink was already installed — first caller wins, and the

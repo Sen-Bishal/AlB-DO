@@ -46,6 +46,7 @@
 //! it is last and why it is explicit.
 
 pub mod declare;
+pub mod email_token;
 pub mod oauth;
 pub mod password;
 pub mod principal;

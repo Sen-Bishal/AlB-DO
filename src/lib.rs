@@ -1,6 +1,6 @@
 //! # dom-render-compiler
 //!
-//! The core compiler crate for [AlBDO](https://albedo.dev) — a Rust-native DOM render compiler
+//! The core compiler crate for [AlBDO](https://github.com/Sen-Bishal/AlB-DO) — a Rust-native DOM render compiler
 //! and HTTP runtime for JSX/TSX applications.
 //!
 //! This crate is responsible for the full compilation pipeline:
@@ -22,9 +22,7 @@
 //! | B | the **server** — the state escapes this client (shared, persisted, or server-computed) | markup only, **zero component JS**; updates ride the wire as opcodes |
 //! | C | the **client** — the state escapes nothing | a compiled island, the only tier that ships component code |
 //!
-//! ⚠️ **This table used to have B and C inverted** (B "Island only", C "Full
-//! hydration") — the same defect item 4.9 T0 fixed in `tier_reason_to_message`
-//! and the `albedo dev` dashboard. **Tier B ships no component JavaScript.**
+//! **Tier B ships no component JavaScript.**
 //!
 //! ## Quick start
 //!
@@ -64,6 +62,7 @@ pub mod conformance;
 pub mod dev;
 pub mod doctor;
 pub mod effects;
+pub mod email;
 pub mod estimator;
 pub mod forge;
 pub mod graph;
@@ -73,6 +72,8 @@ pub mod ir;
 /// JOBS · 15.5 — scheduled and enqueued background work.
 pub mod jobs;
 pub mod manifest;
+/// A `.md` file under `routes/` is a page, lowered to a JSX module at build time.
+pub mod markdown;
 pub mod middleware;
 pub mod parser;
 pub mod routing;
@@ -83,6 +84,8 @@ pub mod shutter;
 pub mod transforms;
 pub mod types;
 pub mod upload;
+/// Inbound webhooks: a provider's signed POST, verified and queued as a job.
+pub mod webhook;
 
 pub use analysis::adaptive;
 pub use analysis::analyzer;
@@ -173,7 +176,7 @@ impl RenderCompiler {
         let cache = IncrementalCache::new(cache_dir);
 
         if let Err(e) = cache.load() {
-            eprintln!("Warning: Failed to load cache: {}", e);
+            tracing::warn!("Failed to load cache: {}", e);
         }
 
         Self {
@@ -437,12 +440,12 @@ impl RenderCompiler {
             let changes = cache.detect_changes(file_paths);
 
             if changes.is_empty() {
-                println!(" No changes detected - using full cache");
+                tracing::info!(" No changes detected - using full cache");
             } else {
-                println!(" Detected changes:");
-                println!("   - Changed: {} files", changes.changed_files.len());
-                println!("   - New: {} files", changes.new_files.len());
-                println!("   - Deleted: {} files", changes.deleted_files.len());
+                tracing::info!(" Detected changes:");
+                tracing::info!("   - Changed: {} files", changes.changed_files.len());
+                tracing::info!("   - New: {} files", changes.new_files.len());
+                tracing::info!("   - Deleted: {} files", changes.deleted_files.len());
             }
 
             cache.invalidate_changed_files(&changes);
@@ -464,7 +467,7 @@ impl RenderCompiler {
             let total_components = self.graph.len();
             let cached_count = total_components.saturating_sub(invalidated.len());
 
-            println!(
+            tracing::info!(
                 "Cache status: {}/{} components cached ({:.1}%)",
                 cached_count,
                 total_components,
@@ -485,7 +488,7 @@ impl RenderCompiler {
 
             if !invalidated.is_empty() || !changes.new_files.is_empty() {
                 let reanalyze_count = invalidated.len() + changes.new_files.len();
-                println!(" Reanalyzing {} components...", reanalyze_count);
+                tracing::info!(" Reanalyzing {} components...", reanalyze_count);
 
                 let new_analyses = self.run_analysis()?;
 
@@ -498,7 +501,7 @@ impl RenderCompiler {
                             if let Err(e) =
                                 cache.cache_analysis(component.clone(), analysis.clone(), file_path)
                             {
-                                eprintln!("Warning: Failed to cache component {:?}: {}", id, e);
+                                tracing::warn!("Failed to cache component {:?}: {}", id, e);
                             }
                         }
                     }
@@ -515,7 +518,7 @@ impl RenderCompiler {
                                     analysis.clone(),
                                     file_path,
                                 ) {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "Warning: Failed to cache new component {:?}: {}",
                                         comp_id, e
                                     );
@@ -560,10 +563,10 @@ impl RenderCompiler {
         let estimated_improvement_ms = sequential_time - parallel_time;
 
         if let Some(stats) = cache_stats {
-            println!(" Cache performance:");
-            println!("   - Hit rate: {:.1}%", stats.cache_hit_rate * 100.0);
-            println!("   - Total cached: {}", stats.total_cached);
-            println!("   - Files tracked: {}", stats.files_tracked);
+            tracing::info!(" Cache performance:");
+            tracing::info!("   - Hit rate: {:.1}%", stats.cache_hit_rate * 100.0);
+            tracing::info!("   - Total cached: {}", stats.total_cached);
+            tracing::info!("   - Files tracked: {}", stats.files_tracked);
         }
 
         Ok(OptimizationResult {
@@ -586,7 +589,7 @@ impl RenderCompiler {
     pub fn save_cache(&self) -> std::io::Result<()> {
         if let Some(cache) = &self.cache {
             cache.save()?;
-            println!(" Cache saved successfully");
+            tracing::info!(" Cache saved successfully");
         }
         Ok(())
     }
@@ -619,14 +622,25 @@ impl RenderCompiler {
                 component.is_interactive,
                 component.is_client_interactive,
                 component.state_escapes,
-                component.reads_principal,
+                component.render_needs_request(),
                 component.imports_npm,
                 component.is_above_fold,
                 weight_bytes,
                 tiering_inputs,
             );
 
-            let reason = tier_reason_to_message(decision.reason, decision.tier);
+            // The one reason whose wording depends on which fact fired.
+            let reason = match decision.reason {
+                TieringReason::RequestScoped => {
+                    let read = match (component.reads_principal, component.reads_route_params) {
+                        (true, true) => "reads `user` and route `params`",
+                        (false, true) => "reads route `params`",
+                        _ => "reads `user`",
+                    };
+                    format!("{read} - rendered per request, no component JS")
+                }
+                other => tier_reason_to_message(other, decision.tier),
+            };
             report.components.push(ComponentTierSummary {
                 name: component.name,
                 file: component.file_path,
@@ -714,8 +728,11 @@ fn tier_reason_to_message(reason: TieringReason, tier: Tier) -> String {
         }
         // AUTH § 3. Always Tier B — the tier is not a preference here, it is the
         // only one with a request in scope.
+        // The tier report words this one itself, from the component, to say
+        // WHICH request prop it read; this arm knows only the reason, so it
+        // names neither rather than guessing `user` for a `[slug]` page.
         TieringReason::RequestScoped => {
-            "reads `user` - rendered per request, no component JS".to_string()
+            "reads the request - rendered per request, no component JS".to_string()
         }
         // Always Tier B, and for a reason worth naming in the dashboard: the
         // author sees a component they wrote as pure static markup appear one

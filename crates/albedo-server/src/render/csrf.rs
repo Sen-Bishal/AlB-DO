@@ -15,11 +15,21 @@
 //!
 //! Not a replacement for SameSite cookies or origin checks — this is
 //! defence in depth, not the only line.
+//!
+//! ## Lifetime
+//!
+//! A token is minted for every tab that renders a page — including every
+//! crawler and health check, none of which keep a cookie — and the server is
+//! never told a tab closed. So tokens are stamped on use and swept when idle
+//! ([`CsrfRegistry::evict_idle`]); a form left open past that answers "reload
+//! the page", exactly as a stale form already does.
 
 use axum::http::HeaderMap;
 use dashmap::DashMap;
 use dom_render_compiler::runtime::SessionId;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Hidden form field name the renderers inject and the dispatcher
 /// validates.
@@ -58,9 +68,26 @@ pub const ALBEDO_SESSION_COOKIE: &str = "__Host-albedo-session";
 /// Server-wide CSRF registry. Cloneable — internally an
 /// `Arc<DashMap>` — so the renderer and the dispatcher can both hold
 /// a handle. One instance per `AlbedoServer`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CsrfRegistry {
-    tokens: Arc<DashMap<SessionId, String>>,
+    tokens: Arc<DashMap<SessionId, Minted>>,
+    born: Instant,
+}
+
+impl Default for CsrfRegistry {
+    fn default() -> Self {
+        Self {
+            tokens: Arc::default(),
+            born: Instant::now(),
+        }
+    }
+}
+
+/// A tab's token and when it was last used, in milliseconds since the
+/// registry was built. Atomic so a read can restamp it without a write lock.
+struct Minted {
+    token: String,
+    seen_ms: AtomicU64,
 }
 
 /// Failure modes surfaced by [`CsrfRegistry::validate`]. Both map to
@@ -91,11 +118,34 @@ impl CsrfRegistry {
     /// first `entry().or_insert` write lands in the map. The map only
     /// ever holds one token per session.
     pub fn token_for(&self, session: SessionId) -> String {
+        let now = self.now_ms();
         if let Some(existing) = self.tokens.get(&session) {
-            return existing.clone();
+            existing.seen_ms.store(now, Ordering::Relaxed);
+            return existing.token.clone();
         }
-        let fresh = mint_token();
-        self.tokens.entry(session).or_insert(fresh).clone()
+        let fresh = Minted {
+            token: mint_token(),
+            seen_ms: AtomicU64::new(now),
+        };
+        self.tokens.entry(session).or_insert(fresh).token.clone()
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Drop every tab's token that has not been minted, read or checked for
+    /// `idle`. Returns how many went.
+    pub fn evict_idle(&self, idle: Duration) -> usize {
+        let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+        self.evict_seen_before(self.now_ms().saturating_sub(idle_ms))
+    }
+
+    fn evict_seen_before(&self, cutoff_ms: u64) -> usize {
+        let before = self.tokens.len();
+        self.tokens
+            .retain(|_, minted| minted.seen_ms.load(Ordering::Relaxed) >= cutoff_ms);
+        before.saturating_sub(self.tokens.len())
     }
 
     /// Compare a presented token against the stored one for
@@ -111,16 +161,15 @@ impl CsrfRegistry {
         if presented.is_empty() {
             return Err(CsrfError::Missing);
         }
-        if constant_time_eq(stored.as_bytes(), presented.as_bytes()) {
+        stored.seen_ms.store(self.now_ms(), Ordering::Relaxed);
+        if constant_time_eq(stored.token.as_bytes(), presented.as_bytes()) {
             Ok(())
         } else {
             Err(CsrfError::Invalid)
         }
     }
 
-    /// Drop the token for a closed session so the table doesn't grow
-    /// unbounded on long-running servers. Called from the WT
-    /// session-close path.
+    /// Drop the token for one session.
     pub fn clear(&self, session: SessionId) {
         self.tokens.remove(&session);
     }
@@ -419,6 +468,26 @@ mod tests {
         let out = substitute_csrf_token_in_html(rendered, "deadbeef");
         assert_eq!(out.matches("value=\"deadbeef\"").count(), 2);
         assert!(!out.contains("value=\"\" data-albedo-csrf"));
+    }
+
+    /// Idle tabs' tokens go and used ones stay — and "used" includes a
+    /// validation, so a tab that only ever submits keeps its token.
+    #[test]
+    fn idle_tokens_are_evicted_and_used_ones_kept() {
+        let registry = CsrfRegistry::new();
+        let idle = SessionId::random();
+        let submitting = SessionId::random();
+        let _ = registry.token_for(idle);
+        let token = registry.token_for(submitting);
+        registry.tokens.get(&idle).unwrap().seen_ms.store(0, Ordering::Relaxed);
+        registry.tokens.get(&submitting).unwrap().seen_ms.store(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(5));
+        registry.validate(submitting, &token).expect("valid");
+
+        assert_eq!(registry.evict_seen_before(1), 1);
+        assert!(matches!(registry.validate(idle, "anything"), Err(CsrfError::Missing)));
+        assert!(registry.validate(submitting, &token).is_ok(), "the used token survives");
+        assert_eq!(registry.token_for(submitting), token, "and is still the same token");
     }
 
     #[test]

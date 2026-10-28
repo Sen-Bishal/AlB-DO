@@ -13,16 +13,31 @@
 //! always single-consumer (the action dispatcher after a handler runs,
 //! or the tick loop on the runtime side) and the lock is held only
 //! while building the `SlotSet` vector.
+//!
+//! ## Lifetime
+//!
+//! A session is a browser tab's cookie, and the server is never told when
+//! one ends: the cookie has no expiry and a closed tab sends nothing. So
+//! nothing here waits for an end. Every read and write stamps the session,
+//! and [`SlotStore::evict_idle`] drops sessions that have gone quiet — the
+//! server sweeps with [`SESSION_IDLE_TTL`].
 
 use crate::ir::opcode::{Instruction, SlotId};
 use crate::runtime::session::SessionId;
 use dashmap::DashMap;
 use rustc_hash::FxHashSet;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long a session's slots outlive its last read or write.
+///
+/// A tab idle for longer than this that acts again starts from its hooks'
+/// initial values — what a reload would give it anyway.
+pub const SESSION_IDLE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Concurrent server-side slot store. Constructed once per server and
 /// shared via `Arc<SlotStore>`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SlotStore {
     /// `(session, slot) -> value`. The value is owned `Vec<u8>` so
     /// readers can return a clone without holding a `DashMap` ref
@@ -32,6 +47,20 @@ pub struct SlotStore {
     /// into a SlotSet vector and clear the set. `FxHashSet` because
     /// hashing here is on the hot path.
     dirty: Mutex<FxHashSet<(SessionId, SlotId)>>,
+    /// Each session's last read or write, in milliseconds since `born`.
+    last_seen: DashMap<SessionId, u64>,
+    born: Instant,
+}
+
+impl Default for SlotStore {
+    fn default() -> Self {
+        Self {
+            values: DashMap::new(),
+            dirty: Mutex::default(),
+            last_seen: DashMap::new(),
+            born: Instant::now(),
+        }
+    }
 }
 
 impl SlotStore {
@@ -41,13 +70,25 @@ impl SlotStore {
         Self::default()
     }
 
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn touch(&self, session: SessionId) {
+        self.last_seen.insert(session, self.now_ms());
+    }
+
     /// Reads the current value of a slot. Returns `None` when the slot
     /// has not been written for this session yet. Allocates — for hot
     /// paths that compare against the previous value, consider
     /// computing the hash before the read.
     #[must_use]
     pub fn read(&self, session: SessionId, slot_id: SlotId) -> Option<Vec<u8>> {
-        self.values.get(&(session, slot_id)).map(|entry| entry.clone())
+        let value = self.values.get(&(session, slot_id)).map(|entry| entry.clone());
+        if value.is_some() {
+            self.touch(session);
+        }
+        value
     }
 
     /// Writes a new value into the slot and records it as dirty so the
@@ -56,9 +97,41 @@ impl SlotStore {
     /// produces one `SlotSet` carrying the final value (HashSet dedup).
     pub fn write(&self, session: SessionId, slot_id: SlotId, value: Vec<u8>) {
         self.values.insert((session, slot_id), value);
+        self.touch(session);
         if let Ok(mut dirty) = self.dirty.lock() {
             dirty.insert((session, slot_id));
         }
+    }
+
+    /// Drop every session that has neither read nor written a slot for
+    /// `idle`. Returns how many sessions went.
+    ///
+    /// One pass over the value table however many sessions leave. A session
+    /// that wakes between being selected and being dropped loses the value it
+    /// just wrote; for a session idle this long that is the same outcome as
+    /// arriving a moment later.
+    pub fn evict_idle(&self, idle: Duration) -> usize {
+        let idle_ms = u64::try_from(idle.as_millis()).unwrap_or(u64::MAX);
+        self.evict_seen_before(self.now_ms().saturating_sub(idle_ms))
+    }
+
+    fn evict_seen_before(&self, cutoff_ms: u64) -> usize {
+        let mut gone = FxHashSet::default();
+        self.last_seen.retain(|session, seen| {
+            let keep = *seen >= cutoff_ms;
+            if !keep {
+                gone.insert(*session);
+            }
+            keep
+        });
+        if gone.is_empty() {
+            return 0;
+        }
+        self.values.retain(|(session, _), _| !gone.contains(session));
+        if let Ok(mut dirty) = self.dirty.lock() {
+            dirty.retain(|(session, _)| !gone.contains(session));
+        }
+        gone.len()
     }
 
     /// Drains every dirty slot for the supplied session into a vector
@@ -89,10 +162,9 @@ impl SlotStore {
         out
     }
 
-    /// Removes every value belonging to `session`. Call this when the
-    /// session's WT connection closes so the table doesn't grow
-    /// unbounded across long-lived servers (Risk #13).
+    /// Removes every value belonging to `session`.
     pub fn clear_session(&self, session: SessionId) {
+        self.last_seen.remove(&session);
         self.values.retain(|(s, _), _| *s != session);
         if let Ok(mut dirty) = self.dirty.lock() {
             dirty.retain(|(s, _)| *s != session);
@@ -258,5 +330,47 @@ mod tests {
         assert_eq!(store.read(keep, slot(1)), Some(b"keep".to_vec()));
         // Dirty entries for the cleared session must also be gone.
         assert!(store.drain_set_instructions(drop).is_empty());
+    }
+
+    /// Sessions nobody has touched since the cutoff go — values, pending
+    /// dirty entries and all — and the ones touched after it stay.
+    #[test]
+    fn idle_sessions_are_evicted_and_active_ones_kept() {
+        let store = SlotStore::new();
+        let idle = SessionId::random();
+        let active = SessionId::random();
+        store.write(idle, slot(1), b"idle".to_vec());
+        store.write(idle, slot(2), b"idle2".to_vec());
+        store.write(active, slot(1), b"active".to_vec());
+        store.last_seen.insert(idle, 10);
+        store.last_seen.insert(active, 1_000);
+
+        assert_eq!(store.evict_seen_before(500), 1);
+
+        assert!(store.read(idle, slot(1)).is_none());
+        assert!(store.drain_set_instructions(idle).is_empty(), "no dirty entry outlives its session");
+        assert_eq!(store.read(active, slot(1)), Some(b"active".to_vec()));
+        assert_eq!(store.len(), 1);
+    }
+
+    /// A read keeps a session alive as much as a write does: a tab that only
+    /// renders what it set earlier is still in use.
+    #[test]
+    fn reading_a_slot_refreshes_its_session() {
+        let store = SlotStore::new();
+        let session = SessionId::random();
+        store.write(session, slot(1), b"v".to_vec());
+        store.last_seen.insert(session, 0);
+        std::thread::sleep(Duration::from_millis(5));
+        let _ = store.read(session, slot(1));
+        let seen = *store.last_seen.get(&session).unwrap();
+        assert!(seen >= 5, "the read restamped the session: {seen}");
+        assert_eq!(store.evict_seen_before(1), 0, "read after the cutoff, so it stays");
+    }
+
+    #[test]
+    fn a_zero_ttl_sweep_with_nothing_written_is_a_no_op() {
+        let store = SlotStore::new();
+        assert_eq!(store.evict_idle(Duration::ZERO), 0);
     }
 }

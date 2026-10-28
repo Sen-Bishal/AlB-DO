@@ -288,7 +288,7 @@ pub fn render(http: &HttpMetrics, runtime: &RuntimeGauges) -> String {
         gauge(&mut out, "albedo_engine_pool_busy", "Engines checked out right now.", pool.busy as f64);
         counter(&mut out, "albedo_engine_interruptions_total", "Checkouts stopped for running past the job budget.", pool.interruptions);
         counter(&mut out, "albedo_engine_replacements_total", "Engines replaced after a job panicked on them.", pool.replacements);
-        counter(&mut out, "albedo_engine_confinements_total", "SANDGATE-A realm rebuilds after a checkout.", pool.confinements);
+        counter(&mut out, "albedo_engine_confinements_total", "JavaScript realms rebuilt after a checkout, so no request sees another's state.", pool.confinements);
         counter(&mut out, "albedo_engine_confinement_failures_total", "Realm rebuilds that failed.", pool.confinement_failures);
     }
 

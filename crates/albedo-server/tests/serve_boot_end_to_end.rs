@@ -106,12 +106,16 @@ impl Fixture {
             host: "127.0.0.1".to_string(),
             port: 0,
             dev_mode: false,
+            hmr: false,
             // No `forge` block — boot installs the built-in guestbook default,
             // which is what these fixtures asserted against before an app could
             // declare its own collections.
             forge: Default::default(),
             sources: Default::default(),
         uploads: Default::default(),
+        email: None,
+        redirects: Vec::new(),
+        webhooks: Default::default(),
             // No `auth` block either — every request resolves as anonymous,
             // and none of AUTH's tables are emitted.
             auth: Default::default(),
@@ -240,9 +244,13 @@ fn boot_production_server_fails_loud_when_dist_dir_missing() {
         host: "127.0.0.1".to_string(),
         port: 0,
         dev_mode: false,
+        hmr: false,
         forge: Default::default(),
         sources: Default::default(),
         uploads: Default::default(),
+        email: None,
+        redirects: Vec::new(),
+        webhooks: Default::default(),
         auth: Default::default(),
         tls: Default::default(),
     };

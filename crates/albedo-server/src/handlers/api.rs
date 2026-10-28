@@ -57,6 +57,7 @@ mod tests {
             body: Bytes::copy_from_slice(body),
             metadata: BTreeMap::new(),
             principal: None,
+            user: None,
         }
     }
 

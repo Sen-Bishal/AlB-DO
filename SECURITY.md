@@ -2,12 +2,11 @@
 
 ## Supported versions
 
-AlBDO is pre-1.0 and under active development. Only the latest release on
-`main` receives fixes of any kind, including security fixes.
+Security fixes are made against the latest release. Upgrade to it to receive them.
 
 | Version | Supported |
 | ------- | --------- |
-| `0.1.0-alpha.x` (latest) | ✅ |
+| `1.0.x` (latest) | ✅ |
 | anything older | ❌ |
 
 There is no long-term support branch and no backporting. If you are running

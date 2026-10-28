@@ -22,6 +22,7 @@ use crate::runtime::compiled::{
 use crate::runtime::eval::ComponentProject;
 use crate::runtime::session::SessionId;
 use crate::runtime::slot_store::{SessionSlotView, SlotStore};
+use crate::transforms::column_reads::{column_key, column_reads, ColumnReads};
 use crate::transforms::form::allocate_form_action_id;
 use crate::runtime::webtransport::{
     WTRenderMode, WTStreamRouter, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
@@ -30,7 +31,7 @@ use crate::runtime::webtransport::{
 use crate::types::{Component, ComponentId};
 use serde_json::{json, Value};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,6 +53,16 @@ struct CompiledRenderProject {
 struct ShellPlaceholder {
     order: u32,
     html: String,
+}
+
+/// One route's live reads, from [`ManifestBuilder::collect_route_reads`].
+#[derive(Default)]
+struct RouteReads {
+    topics: Vec<String>,
+    partitions: Vec<PartitionTopicSpec>,
+    sources: Vec<SourceTopicSpec>,
+    /// Bounded column reads only; see `RouteManifest::shared_slot_columns`.
+    columns: BTreeMap<String, Vec<String>>,
 }
 
 /// Sentinel `parent_placeholder` for a Tier-C island mounted in a layout. It
@@ -271,16 +282,6 @@ impl<'a> ManifestBuilder<'a> {
             }
         }
 
-        // Phase P · per-route metadata. Topics are global today (every
-        // route knows every topic the project references) — the
-        // session over-subscribes a few extra mpsc::Sender clones,
-        // which is cheap. Per-route precision is a follow-up.
-        let shared_slot_topics = self
-            .compiled_render_project
-            .as_ref()
-            .map(|cp| cp.project.shared_slot_topics())
-            .unwrap_or_default();
-
         // AUTH § 8.1.3 · which actions this route declares. Now a real
         // attribution rather than a stub — the route's gate is enforced on the
         // action path by looking each dispatched id up in here.
@@ -336,21 +337,15 @@ impl<'a> ManifestBuilder<'a> {
             dynamic_metadata.is_some(),
         );
 
-        // PRISM · per-route, and computed here rather than beside
-        // `shared_slot_topics` above because it needs the finished node set —
-        // `tier_c` only carries its layout islands after the extend above.
-        let shared_slot_partitions =
-            self.collect_partition_specs_for_route(&tier_a_root, &tier_b, &tier_c, &layout_chain);
+        // Everything the route's live lanes may carry: one walk, three lists.
+        let RouteReads {
+            topics: shared_slot_topics,
+            partitions: shared_slot_partitions,
+            sources: shared_slot_sources,
+            columns: shared_slot_columns,
+        } = self.collect_route_reads(root_component, &layout_chain);
 
-        // APERTURE · the same walk over the same finished node set, for the
-        // other derivation. Kept as a separate list rather than a merged one
-        // because the two resolve against different registries and warm through
-        // different paths — a single list would force every consumer to
-        // re-discriminate.
-        let shared_slot_sources =
-            self.collect_source_specs_for_route(&tier_a_root, &tier_b, &tier_c, &layout_chain);
-
-        RouteManifest {
+        let mut manifest = RouteManifest {
             route: route.to_string(),
             shell,
             tier_a_root,
@@ -360,13 +355,26 @@ impl<'a> ManifestBuilder<'a> {
             auth,
             shared_slot_partitions,
             shared_slot_sources,
+            shared_slot_columns,
             action_ids,
             layout_chain,
             error_component,
             loading_component,
             metadata,
             dynamic_metadata,
+        };
+        // 🔴 Every route shipped `runtime.js` and `link-forms.js` — a page of
+        // pure Tier-A markup included — under a build report that says Tier A is
+        // "zero JS". On such a page the runtime scans for anchors it will not
+        // find and installs handlers nothing will call. Decided here, on the
+        // finished route, because the answer needs all of it: the nodes, the
+        // live topics, and the markup the scripts would act on.
+        if !route_needs_client_runtime(&manifest) {
+            manifest.shell.shim_script.clear();
+            manifest.shell.doctype_and_head =
+                manifest.shell.doctype_and_head.replacen(TIER_B_INJECT_BOOTSTRAP, "", 1);
         }
+        manifest
     }
 
     /// Slice 3 — return the leaf component's name when its module exports a
@@ -715,7 +723,7 @@ impl<'a> ManifestBuilder<'a> {
         // When `layout_chain` is empty, `wrap_in_layouts` is a no-op
         // and the body_open shape stays identical to pre-E.1 — no
         // observable change for routes without a `routes/layout.tsx`.
-        let wrapped = self.wrap_in_layouts(inner, layout_chain, layout_island_map);
+        let wrapped = self.wrap_in_layouts(inner, route, layout_chain, layout_island_map);
 
         let mut doctype_and_head = String::from(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
@@ -851,112 +859,94 @@ impl<'a> ManifestBuilder<'a> {
         out
     }
 
-    /// PRISM · the partitioned shared-slot bindings read by the components
-    /// **this route actually renders**.
+    /// What this route's live lanes may carry — its static topics, partitions
+    /// and declared sources — read off **every component the route renders**:
+    /// the leaf, each layout in its chain, and all of their descendants, at any
+    /// depth and in any tier.
     ///
-    /// Walks the same node set as [`Self::collect_scoped_module_css_for_route`]
-    /// plus the Tier-A children nested inside Tier-B nodes and the layout chain,
-    /// because every one of those is markup this route emits — and the set of
-    /// things a route may subscribe to has to be exactly the set of things it
-    /// renders. That equality is PRISM invariant 2, and it is the entire
-    /// security argument for shipping dynamic topics before auth: the subscribe
-    /// path grants precisely the read the page GET already granted.
+    /// The set a route may subscribe to has to be exactly the set it renders.
+    /// That equality is PRISM invariant 2, and it is the whole security argument
+    /// for the live lanes: a subscribe grants precisely the read the page GET
+    /// already granted, and the GET is where `export const auth` is enforced.
     ///
-    /// Sorted and deduplicated so the manifest is byte-stable across builds of
-    /// the same source — a route's topic list shifting between builds would make
-    /// manifest diffs unreadable and slot ids look nondeterministic when they
-    /// are not.
-    fn collect_partition_specs_for_route(
-        &self,
-        tier_a_root: &[RenderedNode],
-        tier_b: &[TierBNode],
-        tier_c: &[TierCNode],
-        layout_chain: &[String],
-    ) -> Vec<PartitionTopicSpec> {
+    /// 🔴 ALB-01 (2026-10-27). Static topics used to be granted project-wide
+    /// ("per-route precision is a follow-up") while partitions and sources were
+    /// per-route, so `/_albedo/patches?p=/` — a public page — streamed the rows
+    /// of a collection only an `auth = "required"` page read. One walk feeding
+    /// all three lists is what stops them drifting apart again.
+    ///
+    /// The walk is over the component graph rather than the manifest's node
+    /// lists: those leave out a Tier-A component inlined into a Tier-A parent,
+    /// which renders on this route all the same — and a live read there was
+    /// silently non-live once grants stopped being global.
+    ///
+    /// Sorted and deduplicated so the manifest is byte-stable across builds.
+    fn collect_route_reads(&self, root: ComponentId, layout_chain: &[String]) -> RouteReads {
         let Some(compiled) = self.compiled_render_project.as_ref() else {
-            return Vec::new();
+            return RouteReads::default();
         };
 
-        let mut specs: BTreeSet<PartitionTopicSpec> = BTreeSet::new();
-        let mut record = |component_name: &str| {
-            if let Some(component) = self.components.values().find(|c| c.name == component_name) {
-                if let Some(spec) =
-                    self.component_entry_for_project(component, compiled.root.as_path())
-                {
-                    specs.extend(compiled.project.shared_slot_partitions_for_entry(&spec));
-                }
-            }
-        };
-
-        for node in tier_a_root {
-            record(&node.component_id);
-        }
-        for node in tier_b {
-            record(&node.component_id);
-            // A Tier-A component nested inside an async page is rendered by this
-            // route as surely as the page is; missing it would make a partition
-            // silently non-live in exactly the composition the framework
-            // encourages.
-            for child in &node.tier_a_children {
-                record(&child.component_id);
-            }
-        }
-        for node in tier_c {
-            record(&node.component_id);
-        }
+        let mut stack = vec![root];
         for layout in layout_chain {
-            record(layout);
-        }
-
-        specs.into_iter().collect()
-    }
-
-    /// APERTURE · every declared-source binding this route renders.
-    ///
-    /// Deliberately the same walk as [`Self::collect_partition_specs_for_route`],
-    /// including the nested Tier-A children inside an async page — a source read
-    /// in a nested component is rendered by this route as surely as one in the
-    /// page, and missing it would make the slot silently non-live in exactly the
-    /// composition the framework encourages.
-    fn collect_source_specs_for_route(
-        &self,
-        tier_a_root: &[RenderedNode],
-        tier_b: &[TierBNode],
-        tier_c: &[TierCNode],
-        layout_chain: &[String],
-    ) -> Vec<SourceTopicSpec> {
-        let Some(compiled) = self.compiled_render_project.as_ref() else {
-            return Vec::new();
-        };
-
-        let mut specs: BTreeSet<SourceTopicSpec> = BTreeSet::new();
-        let mut record = |component_name: &str| {
-            if let Some(component) = self.components.values().find(|c| c.name == component_name) {
-                if let Some(spec) =
-                    self.component_entry_for_project(component, compiled.root.as_path())
-                {
-                    specs.extend(compiled.project.shared_slot_sources_for_entry(&spec));
-                }
-            }
-        };
-
-        for node in tier_a_root {
-            record(&node.component_id);
-        }
-        for node in tier_b {
-            record(&node.component_id);
-            for child in &node.tier_a_children {
-                record(&child.component_id);
+            if let Some((id, _)) = self.components.iter().find(|(_, c)| &c.name == layout) {
+                stack.push(*id);
             }
         }
-        for node in tier_c {
-            record(&node.component_id);
-        }
-        for layout in layout_chain {
-            record(layout);
+
+        let mut visited: HashSet<ComponentId> = HashSet::new();
+        let mut topics: BTreeSet<String> = BTreeSet::new();
+        let mut partitions: BTreeSet<PartitionTopicSpec> = BTreeSet::new();
+        let mut sources: BTreeSet<SourceTopicSpec> = BTreeSet::new();
+        let mut columns: BTreeMap<String, ColumnReads> = BTreeMap::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            stack.extend(self.sorted_children(id));
+            let Some(component) = self.components.get(&id) else {
+                continue;
+            };
+            let Some(meta) = self
+                .component_entry_for_project(component, compiled.root.as_path())
+                .and_then(|entry| compiled.project.component_in_entry(&entry, &component.name))
+            else {
+                continue;
+            };
+            topics.extend(meta.static_topics().map(str::to_string));
+            partitions.extend(meta.partition_specs());
+            sources.extend(meta.source_specs());
+
+            // Column projection · what this component reads from each binding,
+            // merged across every component on the route that reads the same
+            // thing. A component whose AST cannot be found reads everything —
+            // the same answer the walk gives when it cannot follow a row.
+            let function = compiled
+                .project
+                .module(&meta.module_spec)
+                .and_then(|module| module.functions.get(&meta.function_name));
+            for binding in &meta.shared_slots {
+                let read = function.map_or(ColumnReads::All, |function| {
+                    column_reads(function, &binding.binding_name)
+                });
+                columns
+                    .entry(column_key(&binding.spec))
+                    .and_modify(|merged: &mut ColumnReads| merged.merge(&read))
+                    .or_insert(read);
+            }
         }
 
-        specs.into_iter().collect()
+        RouteReads {
+            topics: topics.into_iter().collect(),
+            partitions: partitions.into_iter().collect(),
+            sources: sources.into_iter().collect(),
+            columns: columns
+                .into_iter()
+                .filter_map(|(key, read)| match read {
+                    ColumnReads::Only(fields) => Some((key, fields.into_iter().collect())),
+                    ColumnReads::All => None,
+                })
+                .collect(),
+        }
     }
 
     /// Phase P · Stream E.1 — wrap a route's inner body content in
@@ -969,8 +959,12 @@ impl<'a> ManifestBuilder<'a> {
     /// route content first, then the next layer absorbs THAT result,
     /// and so on, until the outermost layout owns the whole tree.
     ///
-    /// Each layout component is rendered statically with empty props
-    /// — layout files declare `<children />` to mark the inner
+    /// Each layout component is rendered statically with one prop,
+    /// `route` — the pattern of the route it is wrapping (`/docs/routing`,
+    /// `/blog/[slug]`), so a navigation can mark the current page with
+    /// `aria-current` without a request. It is the *pattern*, not the URL:
+    /// the render happens once per route at build time, and every `[slug]`
+    /// shares it. Layout files declare `<children />` to mark the inner
     /// substitution point, which the renderer emits as
     /// [`crate::runtime::eval::LAYOUT_CHILDREN_SENTINEL`]. The wrap
     /// pass `str::replace`s that sentinel with the accumulated inner
@@ -985,6 +979,7 @@ impl<'a> ManifestBuilder<'a> {
     fn wrap_in_layouts(
         &self,
         leaf_html: String,
+        route: &str,
         layout_chain: &[String],
         layout_island_map: &std::collections::HashMap<String, String>,
     ) -> String {
@@ -1002,7 +997,7 @@ impl<'a> ManifestBuilder<'a> {
 
         let mut accumulated = leaf_html;
         for layout_name in layout_chain.iter().rev() {
-            let Some(layout_html) = self.render_layout_html(layout_name) else {
+            let Some(layout_html) = self.render_layout_html(layout_name, route) else {
                 // 🔴 `tracing::warn!` was the ONLY report of this, and this file
                 // already documents why that reaches nobody: the build and the
                 // serve are separate processes, and a log line exists only when
@@ -1068,9 +1063,10 @@ impl<'a> ManifestBuilder<'a> {
     /// Resolve a layout component name to its statically-rendered
     /// HTML. Returns `None` when the component isn't registered or
     /// rendering fails — caller's job to decide what to do with that.
-    fn render_layout_html(&self, layout_name: &str) -> Option<String> {
+    fn render_layout_html(&self, layout_name: &str, route: &str) -> Option<String> {
         let component = self.components.values().find(|c| c.name == layout_name)?;
-        match self.render_static_component_html(component) {
+        let props = serde_json::json!({ "route": route });
+        match self.render_static_component_html_with_props(component, &props) {
             Ok(html) => Some(html),
             // A layout that will not render takes every route beneath it with
             // it, so it is recorded exactly like any other Tier-A refusal.
@@ -1101,8 +1097,6 @@ impl<'a> ManifestBuilder<'a> {
         order_counter: &mut u32,
         assets: &AssetManifest,
     ) -> (Vec<TierCNode>, std::collections::HashMap<String, String>) {
-        use std::collections::HashSet;
-
         let mut nodes = Vec::new();
         let mut map = std::collections::HashMap::new();
         let mut emitted: HashSet<ComponentId> = HashSet::new();
@@ -1494,6 +1488,10 @@ impl<'a> ManifestBuilder<'a> {
                 order: next_order(order_counter),
             },
             side_effects: metadata.effect_profile.side_effects,
+            // The rule a Tier-B node's props come from, applied to an island:
+            // the serve path cannot tell the two apart, because both need the
+            // request and neither can be rendered without one.
+            dynamic_prop_keys: self.dynamic_prop_keys_for_component(component),
         }
     }
 
@@ -1577,7 +1575,16 @@ impl<'a> ManifestBuilder<'a> {
     /// every call site and the only thing left to fall back on was a scrape of
     /// the component's own source text.
     fn render_static_component_html(&self, component: &Component) -> Result<String, String> {
-        let empty_props = Value::Object(Default::default());
+        self.render_static_component_html_with_props(component, &Value::Object(Default::default()))
+    }
+
+    /// [`Self::render_static_component_html`] with the props a caller knows at
+    /// build time — today only a layout's `route`.
+    fn render_static_component_html_with_props(
+        &self,
+        component: &Component,
+        props: &Value,
+    ) -> Result<String, String> {
 
         // Phase P · Stream E.3 — route the Tier-A static render
         // through the CompiledProject path (with hook_compile off)
@@ -1602,7 +1609,7 @@ impl<'a> ManifestBuilder<'a> {
                     match render_entry_with_bindings(
                         &compiled.project,
                         entry.as_str(),
-                        &empty_props,
+                        props,
                         &slots,
                         &opts,
                     ) {
@@ -1640,7 +1647,7 @@ impl<'a> ManifestBuilder<'a> {
         };
         match render_project
             .project
-            .render_entry(entry.as_str(), &empty_props)
+            .render_entry(entry.as_str(), props)
         {
             // Empty is allowed here too, and is returned as-is: both paths ran
             // without raising, so this component genuinely renders to nothing.
@@ -1746,7 +1753,9 @@ impl<'a> ManifestBuilder<'a> {
     fn dynamic_prop_keys_for_component(&self, component: &Component) -> Vec<String> {
         let mut keys = Vec::new();
         let module_path = component.file_path.replace('\\', "/");
-        if module_path.contains('[') && module_path.contains(']') {
+        // The predicate the tier decision uses too — a page that receives
+        // `params` here must never have been baked without it.
+        if crate::parser::is_dynamic_route_path(&module_path) {
             // A `[slug]` route component receives the parsed route params as a
             // single `params` object prop (`{ slug }`) — the Next-idiomatic
             // shape `async function Page({ params })` expects. The serve path
@@ -1910,7 +1919,7 @@ fn materialize_forge_seeds(working_dir: Option<&std::path::Path>) -> Vec<(String
                     )
                     .unwrap_or_default();
                     let schema = if declarations.is_empty() {
-                        crate::forge::skeleton::ForgeSchema::guestbook_default()
+                        crate::forge::skeleton::ForgeSchema::empty()
                     } else {
                         match crate::forge::ForgeSchema::from_declarations(&declarations) {
                             Ok(schema) => schema,
@@ -2092,6 +2101,47 @@ fn common_ancestor(mut left: PathBuf, right: &Path) -> Option<PathBuf> {
 const TIER_B_INJECT_BOOTSTRAP: &str = "<script>(function(){var w=window;\
 w.__albedo_inject=function(){(w.__ALBEDO_INJECT_QUEUE=w.__ALBEDO_INJECT_QUEUE||[]).push(arguments);};\
 w.__albedo_hydrate=function(){(w.__ALBEDO_HYDRATE_QUEUE=w.__ALBEDO_HYDRATE_QUEUE||[]).push(arguments);};})();</script>";
+
+/// Does anything on this route need the client runtime (`runtime.js` and
+/// `link-forms.js`)?
+///
+/// Yes for anything the server drives after the first paint — a Tier-B or
+/// Tier-C node, a live topic, an action, a boundary — and for markup the two
+/// scripts act on: a `<Link>` (`data-albedo-link`), a form (an action form is
+/// intercepted, a plain POST form gets its in-flight marks), a slot anchor, an
+/// inline opcode frame. A route with none of these gets no script at all, and
+/// works the same: its links are real `<a href>`s.
+///
+/// 🔑 Errs toward shipping. A false "yes" costs the bytes this used to cost on
+/// every route; a false "no" breaks a page, so every signal here is one the
+/// scripts provably read rather than one they might.
+pub(crate) fn route_needs_client_runtime(route: &RouteManifest) -> bool {
+    if !route.tier_b.is_empty()
+        || !route.tier_c.is_empty()
+        || !route.shared_slot_topics.is_empty()
+        || !route.shared_slot_partitions.is_empty()
+        || !route.shared_slot_sources.is_empty()
+        || !route.action_ids.is_empty()
+        || route.error_component.is_some()
+        || route.loading_component.is_some()
+    {
+        return true;
+    }
+    // What `albedo-link-forms.js` and `albedo-runtime.js` query the document for.
+    const CLIENT_MARKERS: [&str; 6] = [
+        "data-albedo-link",
+        "<form",
+        "data-albedo-slot",
+        "data-albedo-list-slot",
+        "application/x-albedo-frame",
+        "data-albedo-tier",
+    ];
+    let shell = &route.shell;
+    [shell.doctype_and_head.as_str(), shell.body_open.as_str(), shell.body_close.as_str()]
+        .into_iter()
+        .chain(route.tier_a_root.iter().map(|node| node.html.as_str()))
+        .any(|html| CLIENT_MARKERS.iter().any(|marker| html.contains(marker)))
+}
 
 fn default_shim_script(enable_wt_bootstrap: bool) -> String {
     let mut script = "<script type=\"module\" src=\"/_albedo/runtime.js\"></script>".to_string();

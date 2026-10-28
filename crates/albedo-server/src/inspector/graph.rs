@@ -45,7 +45,6 @@ pub enum GraphSource {
     #[default]
     Empty,
     Manifest,
-    Demo,
 }
 
 fn now_ms() -> u64 {
@@ -107,64 +106,5 @@ impl GraphSnapshot {
             generated_at_ms: now_ms(),
             source: GraphSource::Manifest,
         }
-    }
-
-    /// Small seeded graph used when no manifest is loaded — keeps the
-    /// inspector visualization meaningful out of the box rather than
-    /// presenting an empty canvas.
-    pub fn demo() -> Self {
-        let nodes = vec![
-            node(1, "AppShell", EventTier::A, 0.92, 4_200, "src/app/shell.tsx"),
-            node(2, "Header", EventTier::A, 0.88, 1_180, "src/components/Header.tsx"),
-            node(3, "TodoList", EventTier::B, 0.62, 2_640, "src/features/todo/List.tsx"),
-            node(4, "TodoItem", EventTier::B, 0.55, 1_840, "src/features/todo/Item.tsx"),
-            node(5, "AddTodo", EventTier::C, 0.40, 3_120, "src/features/todo/AddForm.tsx"),
-            node(6, "Filter", EventTier::B, 0.71, 920, "src/features/todo/Filter.tsx"),
-            node(7, "Counter", EventTier::A, 0.83, 460, "src/components/Counter.tsx"),
-            node(8, "Footer", EventTier::A, 0.95, 380, "src/components/Footer.tsx"),
-        ];
-        let edges = vec![
-            edge(1, 2),
-            edge(1, 3),
-            edge(1, 8),
-            edge(3, 4),
-            edge(3, 6),
-            edge(3, 5),
-            edge(2, 7),
-            edge(6, 7),
-        ];
-        Self {
-            nodes,
-            edges,
-            generated_at_ms: now_ms(),
-            source: GraphSource::Demo,
-        }
-    }
-}
-
-fn node(
-    id: u64,
-    label: &str,
-    tier: EventTier,
-    albedo: f32,
-    weight_bytes: u64,
-    module_path: &str,
-) -> ComponentNode {
-    ComponentNode {
-        id,
-        label: label.to_string(),
-        tier,
-        albedo,
-        weight_bytes,
-        module_path: module_path.to_string(),
-        can_defer: matches!(tier, EventTier::B | EventTier::C),
-    }
-}
-
-fn edge(from: u64, to: u64) -> ComponentEdge {
-    ComponentEdge {
-        from,
-        to,
-        multiplicity: 1,
     }
 }

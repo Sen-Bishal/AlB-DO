@@ -40,8 +40,8 @@ pub struct DevConfig {
     pub routes: HashMap<String, String>,
     /// FORGE collections this app declares — the `forge` block, keyed by
     /// collection name (which is both the `useSharedSlot` topic and, by default,
-    /// the table). Empty means "no declaration", and the runtime falls back to
-    /// the built-in walking-skeleton guestbook.
+    /// the table). Empty means the app declares no collections and gets no
+    /// tables.
     ///
     /// A `BTreeMap` so the declaration order that reaches
     /// [`ForgeSchema::from_declarations`](crate::forge::ForgeSchema::from_declarations)
@@ -74,6 +74,56 @@ pub struct DevConfig {
     /// anonymous, which is what an app without login wants.
     #[serde(default)]
     pub auth: crate::auth::AuthDeclaration,
+
+    /// EMAIL · 15.3 — sender and provider, the `email` block.
+    ///
+    /// Absent means the app sends no mail: `sendEmail()` refuses, and an `auth`
+    /// flow that needs mail (reset, verify, magic link) fails the build.
+    #[serde(default)]
+    pub email: Option<crate::email::EmailDecl>,
+
+    /// Origins an action may send the browser to with `return { redirect }` —
+    /// a checkout page, an identity provider. Same-origin paths never need
+    /// listing. Anything else is refused, so an action cannot become an open
+    /// redirect whatever it computes. Each entry is an `https` origin:
+    /// `"https://checkout.stripe.com"`. See [`parse_redirect_origin`].
+    #[serde(default)]
+    pub redirects: Vec<String>,
+
+    /// Inbound webhooks — the `webhooks` block. See [`crate::webhook`].
+    #[serde(default)]
+    pub webhooks: BTreeMap<String, crate::webhook::WebhookDecl>,
+}
+
+/// Canonicalize one `redirects` entry to `scheme://host[:port]`, lowercase.
+///
+/// `https` only, and an origin only — no path, query or fragment, no
+/// credentials. An allowlist entry with a path would read as "only that page"
+/// while permitting the whole host, which is the misunderstanding an allowlist
+/// must not invite.
+///
+/// # Errors
+/// What is wrong with the entry.
+pub fn parse_redirect_origin(raw: &str) -> Result<String, String> {
+    let url = url::Url::parse(raw.trim())
+        .map_err(|_| format!("`{raw}` is not a URL; write an origin like \"https://checkout.example.com\""))?;
+    if url.scheme() != "https" {
+        return Err(format!("`{raw}` must be https"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("`{raw}` must not carry credentials"));
+    }
+    if (url.path() != "/" && !url.path().is_empty()) || url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "`{raw}` must be an origin only — no path, query or fragment; the whole origin is \
+             allowed either way"
+        ));
+    }
+    let origin = url.origin();
+    if !origin.is_tuple() {
+        return Err(format!("`{raw}` has no host"));
+    }
+    Ok(origin.ascii_serialization())
 }
 
 impl Default for DevConfig {
@@ -92,6 +142,9 @@ impl Default for DevConfig {
             sources: BTreeMap::new(),
             uploads: BTreeMap::new(),
             auth: crate::auth::AuthDeclaration::default(),
+            email: None,
+            redirects: Vec::new(),
+            webhooks: BTreeMap::new(),
         }
     }
 }
@@ -136,6 +189,52 @@ impl DevConfig {
             })
             .map_err(|err| format!("invalid `sources` block: {err}"))?;
         }
+
+        // EMAIL · 15.3 — the block is structurally checked here so a typo in a
+        // sender address fails `albedo build`, not the first password reset.
+        if let Some(email) = &self.email {
+            email
+                .lower()
+                .map_err(|err| format!("invalid `email` block: {err}"))?;
+        }
+        // Magic link beside an unconfirmed password provider: the configuration
+        // in which proving an address can hand you a stranger's account.
+        self.auth
+            .check_supported()
+            .and_then(|()| self.auth.check_email_proof())
+            .map_err(|err| format!("invalid `auth` block: {err}"))?;
+
+        // An auth flow that mails a link, in an app that cannot send mail, is a
+        // reset button that silently does nothing. Read from the declarations
+        // rather than the lowered registry: lowering resolves secrets, which a
+        // build machine may not have.
+        if self.email.is_none() {
+            if let Some((name, why)) = self.auth.providers.iter().find_map(|(name, decl)| {
+                let magic = decl.kind == Some(crate::auth::ProviderKind::MagicLink)
+                    || (decl.kind.is_none() && name == "magiclink");
+                if magic {
+                    Some((name, "a magic link provider signs people in by email"))
+                } else if decl.reset.is_some() {
+                    Some((name, "`reset: \"email\"` mails a reset link"))
+                } else if decl.verify.is_some() {
+                    Some((name, "`verify: \"required\"` mails a confirmation link"))
+                } else {
+                    None
+                }
+            }) {
+                return Err(format!(
+                    "auth provider `{name}`: {why}, but there is no `email` block to send it                      with. Add one, e.g. `email: {{ from: \"App <no-reply@example.com>\",                      provider: \"log\" }}` for local development"
+                ));
+            }
+        }
+
+        for origin in &self.redirects {
+            parse_redirect_origin(origin).map_err(|err| format!("invalid `redirects` entry: {err}"))?;
+        }
+        // Structure only: whether the secret is set is the machine's business,
+        // and whether the job exists is checked at boot, against src/jobs.ts.
+        crate::webhook::validate_declarations(&self.webhooks)
+            .map_err(|err| format!("invalid `webhooks` block: {err}"))?;
         Ok(())
     }
 }
@@ -204,7 +303,64 @@ impl DevWatchConfig {
                 return Err("watch.ignore must not contain empty patterns".to_string());
             }
         }
-        Ok(())
+        self.ignore_matcher().map(|_| ())
+    }
+
+    /// `ignore`, compiled.
+    ///
+    /// # Errors
+    /// A pattern that is not a valid glob, named.
+    pub fn ignore_matcher(&self) -> Result<WatchIgnore, String> {
+        self.ignore
+            .iter()
+            .map(|pattern| {
+                glob::Pattern::new(pattern)
+                    .map_err(|err| format!("watch.ignore pattern \"{pattern}\" is not a valid glob: {err}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|patterns| WatchIgnore { patterns })
+    }
+}
+
+/// The dev watcher's `watch.ignore` patterns.
+///
+/// Matched against a changed path relative to the project directory, with `/`
+/// separators on every platform, so a config means the same on Windows as
+/// anywhere else. `*` stays within one directory; `**` crosses them.
+#[derive(Debug, Clone, Default)]
+pub struct WatchIgnore {
+    patterns: Vec<glob::Pattern>,
+}
+
+impl WatchIgnore {
+    /// Whether a change to `path` should not trigger a rebuild. A path outside
+    /// `project_dir` is never ignored.
+    #[must_use]
+    pub fn ignores(&self, project_dir: &Path, path: &Path) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let Ok(relative) = path.strip_prefix(project_dir) else {
+            return false;
+        };
+        let relative = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let options = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        };
+        // A directory whose contents a pattern ignores is ignored itself:
+        // `**/node_modules/**` should also swallow the event for creating
+        // `node_modules`, or installing a package still rebuilds. Probed with a
+        // child name no pattern plausibly singles out.
+        let child = format!("{relative}/\u{0}");
+        self.patterns.iter().any(|pattern| {
+            pattern.matches_with(&relative, options) || pattern.matches_with(&child, options)
+        })
     }
 }
 
@@ -228,9 +384,13 @@ impl Default for DevHmrConfig {
 
 impl DevHmrConfig {
     fn validate(&self) -> Result<(), String> {
-        if !self.enabled && self.transport != HmrTransport::Sse {
+        // The dev server pushes hot reload over one server-sent-events stream;
+        // there is no WebSocket endpoint behind the other spelling.
+        if self.transport != HmrTransport::Sse {
             return Err(
-                "hmr.transport can only differ from default when hmr.enabled=true".to_string(),
+                "hmr.transport \"web_socket\" is not available: hot reload is served over \
+                 server-sent events. Remove the key or set it to \"sse\"."
+                    .to_string(),
             );
         }
         Ok(())
@@ -395,7 +555,7 @@ pub struct ResolvedDevContract {
     pub route_layouts: HashMap<String, Vec<String>>,
     /// The app's declared FORGE collections, carried through from
     /// [`DevConfig::forge`]. Empty means the app declared none, and the boot
-    /// path falls back to the built-in guestbook default.
+    /// path serves no collections.
     #[serde(default)]
     pub forge: BTreeMap<String, crate::forge::CollectionDecl>,
     /// APERTURE · the app's declared sources, carried through from
@@ -411,6 +571,18 @@ pub struct ResolvedDevContract {
     /// [`DevConfig::uploads`]. Empty means the app accepts no files.
     #[serde(default)]
     pub uploads: BTreeMap<String, crate::upload::UploadDecl>,
+
+    /// [`DevConfig::email`]. `None` means the app sends no mail.
+    #[serde(default)]
+    pub email: Option<crate::email::EmailDecl>,
+
+    /// [`DevConfig::redirects`], canonicalized by [`parse_redirect_origin`].
+    #[serde(default)]
+    pub redirects: Vec<String>,
+
+    /// [`DevConfig::webhooks`].
+    #[serde(default)]
+    pub webhooks: BTreeMap<String, crate::webhook::WebhookDecl>,
 }
 
 pub fn parse_dev_cli_args(raw_args: &[String]) -> Result<DevCliOptions, String> {
@@ -547,6 +719,27 @@ fn layer_server_bind(
         server.port = port;
     }
     Ok(())
+}
+
+impl ResolvedDevContract {
+    /// Settings this version accepts but does not act on, when an app has set
+    /// them to something other than their default.
+    ///
+    /// Still parsed, so an existing config keeps loading. Named rather than
+    /// ignored, because a setting that silently does nothing reads as one that
+    /// works. `hot_set` feeds a scheduler the server does not run; `static_slice`
+    /// governs a cache that request rendering does not consult.
+    #[must_use]
+    pub fn inert_settings(&self) -> Vec<&'static str> {
+        let mut inert = Vec::new();
+        if !self.hot_set.is_empty() {
+            inert.push("hot_set");
+        }
+        if !self.static_slice.enabled || !self.static_slice.opt_out.is_empty() {
+            inert.push("static_slice");
+        }
+        inert
+    }
 }
 
 pub fn resolve_dev_contract(
@@ -762,6 +955,15 @@ pub fn resolve_dev_contract(
         sources: config.sources,
         auth: config.auth,
         uploads: config.uploads,
+        email: config.email,
+        // Validated above (`DevConfig::validate`), so a failure here is a bug in
+        // that ordering — kept as the raw entry rather than panicking on it.
+        redirects: config
+            .redirects
+            .iter()
+            .map(|raw| parse_redirect_origin(raw).unwrap_or_else(|_| raw.clone()))
+            .collect(),
+        webhooks: config.webhooks,
     })
 }
 
@@ -1569,7 +1771,7 @@ export default defineConfig({
   root: "src/components",
   entry: "App.tsx",
   server: { host: "127.0.0.1", port: 3005 },
-  hmr: { enabled: true, transport: "web_socket" },
+  hmr: { enabled: true, transport: "sse" },
   hot_set: [{ component: "LiveChart", priority: "high" }],
   static_slice: { enabled: true, opt_out: ["LiveChart"] }
 });
@@ -1580,8 +1782,87 @@ export default defineConfig({
         let config = parse_dev_config_file(&path).unwrap();
         assert_eq!(config.entry.as_deref(), Some("App.tsx"));
         assert_eq!(config.server.port, 3005);
-        assert_eq!(config.hmr.transport, HmrTransport::WebSocket);
+        assert_eq!(config.hmr.transport, HmrTransport::Sse);
         assert_eq!(config.hot_set[0].component, "LiveChart");
+    }
+
+    /// The scaffold's own patterns, against the paths a watcher reports:
+    /// absolute, native separators, at any depth.
+    #[test]
+    fn watch_ignore_matches_project_relative_paths_at_any_depth() {
+        let watch = DevWatchConfig {
+            debounce_ms: 75,
+            ignore: vec![
+                "**/.git/**".to_string(),
+                "**/node_modules/**".to_string(),
+                "src/*.tmp".to_string(),
+            ],
+        };
+        let ignore = watch.ignore_matcher().expect("valid globs");
+        let project = Path::new("/work/app");
+        let at = |relative: &str| project.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+
+        assert!(ignore.ignores(project, &at(".git/index")));
+        assert!(ignore.ignores(project, &at("src/node_modules/pkg/index.js")));
+        assert!(
+            ignore.ignores(project, &at("src/node_modules")),
+            "creating the ignored directory itself must not rebuild"
+        );
+        assert!(!ignore.ignores(project, &at("src")), "an ancestor of ignored paths is not ignored");
+        assert!(ignore.ignores(project, &at("src/draft.tmp")));
+        assert!(!ignore.ignores(project, &at("src/routes/draft.tmp")), "`*` stays in one directory");
+        assert!(!ignore.ignores(project, &at("src/routes/index.tsx")));
+        assert!(
+            !ignore.ignores(project, Path::new("/elsewhere/.git/index")),
+            "a path outside the project is never ignored"
+        );
+
+        let broken = DevWatchConfig {
+            debounce_ms: 75,
+            ignore: vec!["src/[".to_string()],
+        };
+        let err = broken.validate().expect_err("an unclosed class is not a glob");
+        assert!(err.contains("src/["), "{err}");
+    }
+
+    /// A config carrying the old scaffold's defaults says nothing; one that
+    /// asks for something these settings can no longer do is told so.
+    #[test]
+    fn only_non_default_inert_settings_are_named() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("App.tsx"), "export default function App(){return null;}").unwrap();
+        let write = |body: &str| {
+            std::fs::write(temp.path().join(DEV_CONFIG_TS), format!(
+                "export default {{ contract_version: 1, root: \"src\", entry: \"App.tsx\", {body} }};"
+            ))
+            .unwrap();
+            resolve_dev_contract(&[], temp.path()).expect("resolves")
+        };
+
+        let defaults = write("hot_set: [], static_slice: { enabled: true, opt_out: [] }");
+        assert!(defaults.inert_settings().is_empty());
+
+        let asking = write(
+            "hot_set: [{ component: \"App\", priority: \"high\" }], \
+             static_slice: { enabled: true, opt_out: [\"App\"] }",
+        );
+        assert_eq!(asking.inert_settings(), vec!["hot_set", "static_slice"]);
+    }
+
+    /// Parsing accepts the spelling; validation refuses it, because nothing
+    /// serves hot reload over a WebSocket and a config that asks for one would
+    /// otherwise be silently ignored.
+    #[test]
+    fn a_websocket_hmr_transport_is_refused_rather_than_ignored() {
+        let hmr = DevHmrConfig {
+            enabled: true,
+            transport: HmrTransport::WebSocket,
+        };
+        let err = hmr.validate().expect_err("no WebSocket endpoint exists");
+        assert!(err.contains("server-sent events"), "{err}");
+        assert!(DevHmrConfig::default().validate().is_ok());
     }
 
     #[test]

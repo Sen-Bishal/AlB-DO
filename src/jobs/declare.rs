@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use swc_ecma_ast::{Expr, Lit, Prop, PropName, PropOrSpread};
 
-use super::schedule::{Schedule, ScheduleError};
+use super::schedule::Schedule;
 use crate::runtime::compiled::CompiledProject;
 
 /// The file names a jobs module may have, relative to the project root (`src/`).
@@ -482,10 +482,6 @@ impl std::fmt::Display for JobDecl {
         }
     }
 }
-
-/// Re-exported so callers can name the parse failure without reaching into
-/// [`super::schedule`].
-pub type DeclaredScheduleError = ScheduleError;
 
 #[cfg(test)]
 mod tests {

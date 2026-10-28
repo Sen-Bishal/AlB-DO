@@ -6,5 +6,26 @@ dist/
 *.log
 .DS_Store
 
+# Runtime state. The server writes these into your project while it runs.
+# None of it is source code, and some of it is secret.
+#
+# The database, with its -wal and -shm files beside it. Your users' rows live
+# here, so committing it publishes them.
+forge.db
+forge.db-*
+# Files your users upload.
+/uploads/
+# The certificate store for `albedo serve --domain`: your ACME account key and
+# your site's TLS private key.
+.albedo-acme/
+# A shipped binary, its unfinished download, and the directory it unpacks
+# into on first run.
+*.albedo-bin
+*.albedo-bin.exe
+*.albedo-bin.partial
+.albedo-app-*/
+# The incremental build cache.
+.albedo-cache/
+
 # Un-ignore index.html (needed for scaffold)
 !index.html

@@ -36,3 +36,24 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+  # Releases are built by the stable compiler (see release.yml). This catches a
+  # change that only nightly accepts before a tag does.
+  release-build:
+    name: Release build · stable
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the albedo binary
+        run: cargo build --release --locked -p albedo-server --bin albedo
+
+      - name: Smoke test
+        run: ./target/release/albedo --version

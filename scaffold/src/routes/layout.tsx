@@ -17,7 +17,7 @@ export default function RootLayout() {
       <children />
 
       <footer className="colophon">
-        <span>src/routes/index.tsx</span>
+        <span>src/routes/layout.tsx</span>
         <span>
           <a href="https://github.com/Sen-Bishal/AlB-DO" rel="noreferrer">
             docs

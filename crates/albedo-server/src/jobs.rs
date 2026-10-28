@@ -100,6 +100,16 @@ impl JobsPlan {
         }
     }
 
+    /// The file this plan runs, as the build named it.
+    pub(crate) fn entry(&self) -> &str {
+        &self.entry
+    }
+
+    /// Whether src/jobs.ts declares a job named `name`.
+    pub(crate) fn declares(&self, name: &str) -> bool {
+        self.decl.get(name).is_some()
+    }
+
     /// How many of this app's jobs run on a schedule. For the boot line.
     pub(crate) fn scheduled_count(&self) -> usize {
         self.decl.scheduled().count()
@@ -116,16 +126,14 @@ impl JobsPlan {
         &self,
         job: &ClaimedJob,
         timeout: Duration,
+        // The principal this run is *for*, as the `user` JSON the body reads —
+        // resolved by the runner, which holds the database. `null` is anonymous
+        // and there is no third option — see `jobs::declare`'s identity note.
+        user: Arc<str>,
     ) -> Result<Vec<dom_render_compiler::runtime::bridge::HandlerEffect>, String> {
         use dom_render_compiler::aperture::{Journal, DEFAULT_PASS_CAP};
 
         let args: Arc<str> = Arc::from(job.args.as_str());
-        // The principal this run is *for*, already resolved. `null` is anonymous
-        // and there is no third option — see `jobs::declare`'s identity note.
-        let user: Arc<str> = Arc::from(match &job.principal {
-            Some(principal) => format!(r#"{{"id":{}}}"#, serde_json::Value::String(principal.clone())),
-            None => "null".to_string(),
-        });
         let mut journal: Option<Journal> = None;
 
         for _ in 0..DEFAULT_PASS_CAP {
@@ -212,6 +220,9 @@ pub(crate) struct JobHandle {
     /// `None` for an app with no `src/jobs.ts`; every `enqueue()` is then a
     /// refusal, which is correct — there is nothing it could name.
     decl: Option<Arc<JobsDecl>>,
+    /// 15.3 · whether an `email` block is installed. `sendEmail()` in an app
+    /// without one is refused at the call, not dead-lettered later.
+    email: bool,
 }
 
 impl JobHandle {
@@ -246,14 +257,51 @@ pub(crate) async fn write_enqueue(
     principal: Option<String>,
     now_ms: i64,
 ) -> Result<(), String> {
-    // Refused rather than queued: a row naming a job that does not exist could
-    // only ever dead-letter, and the author should hear about the typo from the
-    // thing that made it, not from a failed row an hour later.
-    let Some(max_attempts) = handle.max_attempts_for(&intent.name) else {
-        return Err(format!(
-            "enqueue('{}') names a job that src/jobs.ts does not declare",
-            intent.name
-        ));
+    // 15.3 · the one framework job app code may queue. Its argument is
+    // validated HERE, at the trust boundary, so a bad address throws in the
+    // action that wrote it instead of dead-lettering an hour later — and the
+    // row stores the envelope, so the runner never parses author JSON.
+    let (max_attempts, args) = match Builtin::from_name(&intent.name) {
+        Some(builtin) if builtin.is_enqueueable() => {
+            if !handle.email {
+                return Err(
+                    "sendEmail() needs an `email` block in albedo.config — e.g. \
+                     `email: { from: \"App <no-reply@example.com>\", provider: \"log\" }` \
+                     for local development"
+                        .to_string(),
+                );
+            }
+            let message = dom_render_compiler::email::Message::from_authored(&intent.args)
+                .map_err(|err| format!("sendEmail(): {err}"))?;
+            // Attached uploads must exist and belong to whoever this send runs
+            // for — checked now so the action that asked hears about it.
+            crate::email::check_attachments(db, principal.as_deref(), &message).await?;
+            let queued = dom_render_compiler::email::QueuedEmail {
+                message,
+                sensitive: false,
+            };
+            let args = serde_json::to_string(&queued).map_err(|err| err.to_string())?;
+            (builtin.max_attempts(), args)
+        }
+        // The framework's other work is not the app's to trigger.
+        Some(_) => {
+            return Err(format!(
+                "enqueue('{}') names a framework job that runs on its own schedule",
+                intent.name
+            ))
+        }
+        // Refused rather than queued: a row naming a job that does not exist
+        // could only ever dead-letter, and the author should hear about the
+        // typo from the thing that made it, not from a failed row an hour later.
+        None => match handle.max_attempts_for(&intent.name) {
+            Some(max_attempts) => (max_attempts, intent.args.to_string()),
+            None => {
+                return Err(format!(
+                    "enqueue('{}') names a job that src/jobs.ts does not declare",
+                    intent.name
+                ))
+            }
+        },
     };
 
     let delay_ms = match intent.delay.as_deref() {
@@ -276,7 +324,7 @@ pub(crate) async fn write_enqueue(
             .clone()
             .unwrap_or_else(|| format!("{}:{:016x}", intent.name, rand::random::<u64>())),
         name: intent.name.clone(),
-        args: intent.args.to_string(),
+        args,
         principal,
         run_at_ms: now_ms.saturating_add(delay_ms),
         max_attempts,
@@ -286,6 +334,42 @@ pub(crate) async fn write_enqueue(
         .await
         .map(|_| ())
         .map_err(|err| format!("enqueue('{}') failed: {err}", intent.name))
+}
+
+/// Queue one of the framework's own emails — the AUTH flows.
+///
+/// Marked sensitive: it carries a reset or sign-in link, so its row is scrubbed
+/// on dead-letter as well as on success. `id` makes it idempotent; `None`
+/// mints one.
+///
+/// # Errors
+/// The row could not be written.
+pub(crate) async fn queue_email(
+    db: &dyn DataSubstrate,
+    handle: &JobHandle,
+    message: dom_render_compiler::email::Message,
+    now_ms: i64,
+) -> Result<(), String> {
+    let builtin = Builtin::SendEmail;
+    let queued = dom_render_compiler::email::QueuedEmail {
+        message,
+        sensitive: true,
+    };
+    let request = Enqueue {
+        id: format!("{}:{:016x}", builtin.name(), rand::random::<u64>()),
+        name: builtin.name().to_string(),
+        args: serde_json::to_string(&queued).map_err(|err| err.to_string())?,
+        // Framework mail runs for nobody: it touches no partitioned data.
+        principal: None,
+        run_at_ms: now_ms,
+        max_attempts: builtin.max_attempts(),
+        fanout: false,
+    };
+    queue::enqueue(db, &request)
+        .await
+        .map_err(|err| format!("could not queue an email: {err}"))?;
+    handle.wake();
+    Ok(())
 }
 
 /// `"30s"`, `"5m"`, `"2h"` — an `enqueue()` delay, in milliseconds.
@@ -344,6 +428,31 @@ pub(crate) struct JobRunner {
 }
 
 impl JobRunner {
+    /// The `user` a run for `principal` sees — the same
+    /// `Principal::user_value` a page and an action see, read from the database
+    /// because a job has no session to resolve. Loaded per run, never cached: a
+    /// job queued before an email changed runs with the email as it is now.
+    ///
+    /// A principal that no longer exists still runs as its id, with the profile
+    /// unknown — the id is what the run was queued for, and what its writes are
+    /// owned by. A database failure does the same rather than failing the job:
+    /// the id is the authorization, the profile is only presentation.
+    async fn user_json(&self, principal: Option<&str>) -> Arc<str> {
+        use dom_render_compiler::auth::{Principal, PrincipalId};
+        let Some(raw) = principal else {
+            return Arc::from("null");
+        };
+        let Ok(id) = PrincipalId::parse(raw) else {
+            return Arc::from(format!(r#"{{"id":{}}}"#, serde_json::Value::String(raw.to_string())));
+        };
+        let loaded = dom_render_compiler::auth::store::load_principal(self.db.as_ref(), &id)
+            .await
+            .ok()
+            .flatten();
+        let principal = loaded.unwrap_or_else(|| Principal::new(id, ""));
+        Arc::from(principal.user_value().to_string())
+    }
+
     /// Build a runner and the handle the server keeps.
     pub(crate) fn new(
         plan: Option<JobsPlan>,
@@ -356,9 +465,13 @@ impl JobRunner {
         // The framework's own first, so a `SELECT … ORDER BY run_at` tie between
         // a built-in and an app job resolves the same way on every process.
         for builtin in Builtin::ALL {
+            // `SendEmail` has no schedule: it runs only when a row is queued.
+            let Some(schedule) = builtin.schedule() else {
+                continue;
+            };
             scheduled.push(Scheduled {
                 name: builtin.name().to_string(),
-                schedule: builtin.schedule(),
+                schedule,
                 max_attempts: builtin.max_attempts(),
                 fanout: false,
             });
@@ -385,6 +498,7 @@ impl JobRunner {
         let handle = JobHandle {
             wake: Arc::clone(&wake),
             decl: plan.as_ref().map(|plan| Arc::clone(&plan.decl)),
+            email: live.email().is_some(),
         };
         (
             Self {
@@ -563,6 +677,10 @@ impl JobRunner {
     /// else on the engine. No lookup that could disagree with itself, because
     /// the two name spaces cannot overlap (see `jobs::builtin`).
     async fn execute(&mut self, row: &ClaimedJob, now_ms: i64) {
+        if Builtin::from_name(&row.name) == Some(Builtin::SendEmail) {
+            self.send_email(row, now_ms).await;
+            return;
+        }
         if let Some(builtin) = Builtin::from_name(&row.name) {
             match self.run_builtin(builtin).await {
                 Ok(()) => self.record_success(row, now_ms).await,
@@ -592,7 +710,8 @@ impl JobRunner {
         };
         let timeout = decl.timeout;
 
-        let effects = match plan.run(row, timeout).await {
+        let user = self.user_json(row.principal.as_deref()).await;
+        let effects = match plan.run(row, timeout, user).await {
             Ok(effects) => effects,
             Err(message) => {
                 self.record_failure(row, now_ms, &message).await;
@@ -723,6 +842,74 @@ impl JobRunner {
         Ok(())
     }
 
+    /// 15.3 · deliver one queued email.
+    ///
+    /// Three endings, and what each does to the row:
+    ///
+    /// | outcome | row | `args` |
+    /// |---|---|---|
+    /// | accepted | `done` | scrubbed — a delivered body is personal data with no further use |
+    /// | retry | back to `pending` with backoff, or dead-lettered when attempts run out | kept, unless it dead-lettered and is sensitive |
+    /// | reject | dead-lettered now, with the provider's reason | kept, unless sensitive |
+    ///
+    /// A sensitive row is one the AUTH flows queued: its body is a live reset
+    /// or sign-in link, and a dead letter is kept until somebody reads it.
+    async fn send_email(&self, row: &ClaimedJob, now_ms: i64) {
+        use dom_render_compiler::email::{QueuedEmail, SendOutcome};
+
+        let Some(email) = self.live.email() else {
+            // The block was removed while mail was queued. Nothing will ever
+            // send it; say so once instead of thirteen times.
+            self.record_terminal(row, now_ms, "this app no longer declares an `email` block")
+                .await;
+            return;
+        };
+        let queued: QueuedEmail = match serde_json::from_str(&row.args) {
+            Ok(queued) => queued,
+            Err(err) => {
+                self.record_terminal(row, now_ms, &format!("unreadable email row: {err}"))
+                    .await;
+                return;
+            }
+        };
+
+        match email
+            .deliver(&queued, &row.id, self.db.as_ref(), row.principal.as_deref())
+            .await
+        {
+            SendOutcome::Accepted(provider_id) => {
+                tracing::debug!(
+                    target: "albedo.email", id = %row.id, provider_id = ?provider_id,
+                    "email accepted"
+                );
+                self.record_success(row, now_ms).await;
+                self.redact(row).await;
+            }
+            SendOutcome::Retry(reason) => {
+                let dead = row.attempts >= row.max_attempts;
+                self.record_failure(row, now_ms, &reason).await;
+                if dead && queued.sensitive {
+                    self.redact(row).await;
+                }
+            }
+            SendOutcome::Reject(reason) => {
+                self.record_terminal(row, now_ms, &reason).await;
+                if queued.sensitive {
+                    self.redact(row).await;
+                }
+            }
+        }
+    }
+
+    async fn redact(&self, row: &ClaimedJob) {
+        if let Err(err) = queue::redact_args(self.db.as_ref(), &row.id).await {
+            tracing::error!(
+                target: "albedo.email", id = %row.id, error = %err,
+                "a sent email's body could not be scrubbed from the queue"
+            );
+        }
+    }
+
     /// The framework's own work, in Rust.
     async fn run_builtin(&self, builtin: Builtin) -> Result<(), String> {
         match builtin {
@@ -730,17 +917,38 @@ impl JobRunner {
                 // 🔑 The call this whole item exists to make. Until 15.5 this
                 // function's only caller in the repository was a test, so every
                 // deployed app accumulated expired session rows forever.
+                let now = crate::auth::now_ms();
                 let purged = dom_render_compiler::auth::store::purge_expired_sessions(
                     self.db.as_ref(),
-                    crate::auth::now_ms(),
+                    now,
                 )
                 .await
                 .map_err(|err| err.to_string())?;
                 if purged > 0 {
                     tracing::info!(rows = purged, "expired sessions swept");
                 }
+                // 15.3 · mailed tokens expire in minutes and are refused once
+                // expired; this is the table not growing, on the same tick.
+                // The table exists exactly when an auth runtime with providers
+                // is installed — boot creates it alongside the auth tables.
+                if self
+                    .live
+                    .auth()
+                    .is_some_and(|auth| !auth.registry().is_empty())
+                {
+                    let tokens =
+                        dom_render_compiler::auth::email_token::purge_expired(self.db.as_ref(), now)
+                            .await
+                            .map_err(|err| err.to_string())?;
+                    if tokens > 0 {
+                        tracing::info!(rows = tokens, "expired email tokens swept");
+                    }
+                }
                 Ok(())
             }
+            // Dispatched by `execute` before reaching here; a row that got here
+            // anyway has nothing to run.
+            Builtin::SendEmail => Err("albedo:send_email is not a scheduled job".to_string()),
         }
     }
 

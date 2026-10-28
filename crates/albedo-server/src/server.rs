@@ -2,8 +2,8 @@ use crate::actions::{ActionHandler, SessionSlots};
 use crate::api::ApiHandler;
 use crate::config::AppConfig;
 use crate::contract::{
-    AllowAllAuthProvider, AuthDecision, AuthProvider, LayoutHandler, PropsLoader, RouteHandler,
-    RuntimeMiddleware,
+    AuthDecision, AuthProvider, LayoutHandler, PropsLoader, RouteHandler, RuntimeMiddleware,
+    UnconfiguredAuthProvider,
 };
 use crate::error::RuntimeError;
 use crate::handlers::action::{run_action_request, ActionRegistry, FormActionIds, GatedActionIds};
@@ -13,7 +13,8 @@ use crate::handlers::{
     streaming_handler, streaming_handler_with_match, StreamingAppState, StreamingTransportConfig,
 };
 use crate::inspector::{
-    self as inspector_routes, GraphSnapshot as InspectorGraphSnapshot, InspectorState,
+    self as inspector_routes, GraphSnapshot as InspectorGraphSnapshot, InspectorPublisher,
+    InspectorState,
 };
 use crate::lifecycle::{RequestContext, ResponseBody, ResponsePayload};
 use crate::render::csrf::CsrfRegistry;
@@ -44,6 +45,9 @@ use tower_http::compression::CompressionLayer;
 use tracing::{debug, error, info, warn};
 
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// How often idle slot-store sessions are swept. The TTL is hours, so a
+/// sweep a few minutes late changes nothing.
+const SLOT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Bridge from a Phase-K `CompiledProject`'s handler registry to the
 /// server's `ActionHandler` trait. One adapter is registered per
@@ -82,8 +86,8 @@ pub(crate) struct LiveRuntime {
     /// The FORGE collection registry — the `topic → (query, schema)` allowlist
     /// the write path resolves against and boot hydrates from. App-static and
     /// immutable, so it is built once and shared (a hot reload reuses it rather
-    /// than rebuilding). Phase 1: the built-in guestbook default; Phase 2: the
-    /// app-declared schema, loaded here at construction.
+    /// than rebuilding). Empty until boot installs the app-declared schema; an
+    /// app that declares none keeps it empty and gets no tables.
     pub(crate) forge_schema: Arc<dom_render_compiler::forge::ForgeSchema>,
     /// APERTURE · the declared-source read path, or `None` when the app declared
     /// no `sources` block.
@@ -134,6 +138,21 @@ pub(crate) struct LiveRuntime {
     /// the life of the process, and re-lowering the registry on every file save
     /// would change the bound an in-flight upload is being measured against.
     uploads: Arc<std::sync::OnceLock<Arc<UploadRuntime>>>,
+    /// EMAIL · 15.3 — the lowered `email` block and its transport.
+    ///
+    /// Live for the reason `uploads` is: app-static, and a dev reload must not
+    /// swap the transport a queued row is about to be sent through.
+    email: Arc<std::sync::OnceLock<Arc<crate::email::EmailRuntime>>>,
+    /// Where an action may redirect — the `redirects` block. Unset means only
+    /// same-origin paths, which is the right default for an app that listed none.
+    redirects: Arc<std::sync::OnceLock<Arc<crate::redirects::RedirectPolicy>>>,
+    /// Inbound webhooks — the lowered `webhooks` block, secrets resolved.
+    webhooks: Arc<std::sync::OnceLock<Arc<dom_render_compiler::webhook::WebhookRegistry>>>,
+    /// Where this app is reached — what an action reads as `origin`, and the
+    /// base of every emailed link. Resolved once, when `serve` knows the TLS
+    /// mode and port; `Some(None)` when nothing configures one. Never from a
+    /// request's `Host` header. See [`crate::email::resolve_link_origin`].
+    app_origin: Arc<std::sync::OnceLock<Option<String>>>,
 }
 
 /// What the request path needs to accept a file.
@@ -154,14 +173,46 @@ impl LiveRuntime {
             broadcast: Arc::new(BroadcastRegistry::new()),
             forge_substrate: Arc::new(std::sync::OnceLock::new()),
             row_projector: Arc::new(std::sync::RwLock::new(None)),
-            forge_schema: Arc::new(dom_render_compiler::forge::ForgeSchema::guestbook_default()),
+            forge_schema: Arc::new(dom_render_compiler::forge::ForgeSchema::empty()),
             source_reader: Arc::new(std::sync::OnceLock::new()),
             aperture_client: Arc::new(std::sync::OnceLock::new()),
             jobs: Arc::new(std::sync::OnceLock::new()),
             auth: Arc::new(std::sync::OnceLock::new()),
             oauth: Arc::new(crate::handlers::oauth_routes::OAuthRuntime::default()),
             uploads: Arc::new(std::sync::OnceLock::new()),
+            email: Arc::new(std::sync::OnceLock::new()),
+            redirects: Arc::new(std::sync::OnceLock::new()),
+            webhooks: Arc::new(std::sync::OnceLock::new()),
+            app_origin: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Where this app is reached, once `serve` has resolved it.
+    fn app_origin(&self) -> Option<&str> {
+        self.app_origin.get().and_then(Option::as_deref)
+    }
+
+    /// The redirect policy — same-origin only until boot installs the config's.
+    pub(crate) fn redirects(&self) -> Arc<crate::redirects::RedirectPolicy> {
+        self.redirects
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::redirects::RedirectPolicy::default()))
+    }
+
+    /// Install the redirect policy. Idempotent, on the uploads terms.
+    fn install_redirects(&self, policy: Arc<crate::redirects::RedirectPolicy>) {
+        let _ = self.redirects.set(policy);
+    }
+
+    /// The declared webhooks, once boot has installed them.
+    fn webhooks(&self) -> Option<&Arc<dom_render_compiler::webhook::WebhookRegistry>> {
+        self.webhooks.get()
+    }
+
+    /// Install the webhooks. Idempotent, on the uploads terms.
+    fn install_webhooks(&self, webhooks: Arc<dom_render_compiler::webhook::WebhookRegistry>) {
+        let _ = self.webhooks.set(webhooks);
     }
 
     /// Install the AUTH request path. Idempotent, on the same terms as the
@@ -195,8 +246,18 @@ impl LiveRuntime {
     /// gets. Fail closed by returning nothing rather than by constructing an
     /// empty runtime here: a default-constructed one would carry a substrate
     /// nobody chose.
-    fn auth(&self) -> Option<&Arc<crate::auth::AuthRuntime>> {
+    pub(crate) fn auth(&self) -> Option<&Arc<crate::auth::AuthRuntime>> {
         self.auth.get()
+    }
+
+    /// EMAIL · 15.3 — the installed mail runtime, if the app declared one.
+    pub(crate) fn email(&self) -> Option<&Arc<crate::email::EmailRuntime>> {
+        self.email.get()
+    }
+
+    /// Install the mail runtime. Idempotent, on the same terms as the uploads.
+    fn install_email(&self, email: Arc<crate::email::EmailRuntime>) {
+        let _ = self.email.set(email);
     }
 
     /// Install the APERTURE read path. Idempotent; a second call is ignored, so
@@ -467,6 +528,44 @@ struct CompiledProjectActionAdapter {
 impl ActionHandler for CompiledProjectActionAdapter {
     async fn handle(
         &self,
+        ctx: &RequestContext,
+        envelope: &dom_render_compiler::ir::action::ActionEnvelope,
+        slots: SessionSlots,
+    ) -> Result<Vec<dom_render_compiler::ir::opcode::Instruction>, RuntimeError> {
+        let instructions = self.dispatch(ctx, envelope, slots).await?;
+        // `return { redirect }` becomes a `Navigate`, and every one is checked
+        // HERE, before either transport sends it: the JS frame and the no-JS
+        // `303` both carry what this returns, so one check covers both. A
+        // same-origin path always passes; another origin only when the config
+        // lists it — so no value an action computes, from a form field or an
+        // upstream response, can turn it into an open redirect.
+        let policy = self.live.redirects();
+        for instruction in &instructions {
+            if let dom_render_compiler::ir::opcode::Instruction::Navigate { url } = instruction {
+                if let Err(reason) = policy.check(url) {
+                    return Err(RuntimeError::RequestHandling(format!(
+                        "action {} redirected to `{url}`, which is refused: {reason}",
+                        self.action_id
+                    )));
+                }
+            }
+        }
+        Ok(instructions)
+    }
+}
+
+impl CompiledProjectActionAdapter {
+    /// The request-scoped names this action's body reads: `user` from the
+    /// request's identity, `origin` from configuration.
+    fn request_bindings(&self, ctx: &RequestContext) -> dom_render_compiler::runtime::RequestBindings {
+        dom_render_compiler::runtime::RequestBindings {
+            user: ctx.user.clone(),
+            origin: self.live.app_origin().map(str::to_string),
+        }
+    }
+
+    async fn dispatch(
+        &self,
         // AUTH F1 · read at last. The context has always reached this method and
         // was always ignored; it is what carries the request's principal to the
         // write path, which is the one place a row's owner can be checked.
@@ -610,6 +709,10 @@ impl ActionHandler for CompiledProjectActionAdapter {
                     // Two `Arc` bumps. The view must be cloned rather than moved
                     // because a suspended body will need it again.
                     let view = view.clone();
+                    // Who is asking and where the app lives — the same values
+                    // on every pass, so a body that suspends and re-runs decides
+                    // for the same person.
+                    let request = self.request_bindings(ctx);
 
                     async move {
                         pool.with_engine(move |engine| {
@@ -637,6 +740,7 @@ impl ActionHandler for CompiledProjectActionAdapter {
                                 &view,
                                 Some(broadcast.as_ref()),
                                 Some(&seeded),
+                                &request,
                             );
                             // `ForgeWrite` is plain data, so the recorded
                             // intents cross back over the thread boundary.
@@ -796,7 +900,12 @@ impl ActionHandler for CompiledProjectActionAdapter {
         if let Some(substrate) = self.live.forge_substrate.get() {
             let (instructions, writes) = self
                 .project
-                .invoke_action_with_forge(envelope, &view, self.live.broadcast.as_ref())
+                .invoke_action_with_forge(
+                    envelope,
+                    &view,
+                    self.live.broadcast.as_ref(),
+                    &self.request_bindings(ctx),
+                )
                 .map_err(|err| {
                     RuntimeError::RequestHandling(format!(
                         "compiled action handler {} failed: {err:#}",
@@ -834,7 +943,12 @@ impl ActionHandler for CompiledProjectActionAdapter {
         // `Arc<BroadcastRegistry>`. Fan-out lands on every subscribed
         // session over the WT patches lane without further plumbing.
         self.project
-            .invoke_action_with_broadcast(envelope, &view, self.live.broadcast.as_ref())
+            .invoke_action_with_broadcast_as(
+                envelope,
+                &view,
+                self.live.broadcast.as_ref(),
+                &self.request_bindings(ctx),
+            )
             .map_err(|err| {
                 RuntimeError::RequestHandling(format!(
                     "compiled action handler {} failed: {err:#}",
@@ -930,8 +1044,8 @@ struct RuntimeState {
     /// guard is released immediately so nothing is held across an `.await`.
     /// Swapped wholesale by the dev reloader — `serve` never writes it.
     world: Arc<RwLock<Arc<RenderWorld>>>,
-    /// Persists across a world swap so its `set_graph` heartbeat and any open
-    /// inspector UI survive a dev reload.
+    /// Persists across a world swap so an open inspector UI survives a dev
+    /// reload; [`bind_inspector`] re-points it at each new world.
     inspector: Option<Arc<InspectorState>>,
     /// Phase M.1 — error registry the floating overlay subscribes
     /// to. `None` in production builds; `Some` when dev mode is on.
@@ -982,6 +1096,29 @@ impl RuntimeState {
     }
 }
 
+/// Point the dev inspector at `world`: the component graph it draws, and the
+/// publisher the evaluator's render events reach it through. Run when the
+/// server starts and again on every dev reload, which rebuilds the world but
+/// keeps the inspector — without it the inspector would go on describing the
+/// app as it was at startup.
+fn bind_inspector(inspector: &Arc<InspectorState>, world: &RenderWorld) {
+    let manifest = world
+        .streaming_runtime
+        .as_ref()
+        .map(|streaming| streaming.manifest.as_ref());
+    let publisher = InspectorPublisher::new(inspector.clone());
+    match manifest {
+        Some(manifest) => {
+            inspector.set_graph(InspectorGraphSnapshot::from_manifest(manifest));
+            crate::inspector::publisher::attach(publisher.with_manifest(manifest));
+        }
+        None => {
+            inspector.set_graph(InspectorGraphSnapshot::empty());
+            crate::inspector::publisher::attach(publisher);
+        }
+    }
+}
+
 pub struct AlbedoServerBuilder {
     config: AppConfig,
     handlers: HashMap<String, SharedHandler>,
@@ -1005,9 +1142,8 @@ pub struct AlbedoServerBuilder {
     middleware: HashMap<String, SharedMiddleware>,
     auth_provider: SharedAuthProvider,
     renderer: Option<RendererRuntime>,
-    /// Dev inspector toggle. `Some(true)` / `Some(false)` overrides the
-    /// default. `None` defaults to `cfg!(debug_assertions)` — on in
-    /// debug builds, off in release.
+    /// Dev inspector toggle. `None` means off: the inspector is a development
+    /// surface and is mounted only when asked for.
     inspector_enabled: Option<bool>,
     /// Phase-E opcode registry. When set, the WT streaming path runs
     /// Tier-B render functions through this and ships opcodes; when
@@ -1017,10 +1153,12 @@ pub struct AlbedoServerBuilder {
     /// stashed alongside so the pipeline can spawn resolver Futures.
     /// Userland binds both via `with_pipeline`.
     pipeline: Option<(FourLaneRuntimePipeline, tokio::runtime::Handle)>,
-    /// Phase M — dev-mode toggle. `Some(true)` / `Some(false)`
-    /// overrides; `None` defaults to `cfg!(debug_assertions)` so
-    /// debug builds get the overlay + HMR endpoints automatically.
+    /// Dev-mode toggle (error overlay + HMR endpoints). `None` means off: a
+    /// server exposes development surfaces only when asked for, never because
+    /// of how its binary happened to be compiled.
     dev_mode_enabled: Option<bool>,
+    /// Hot reload, within dev mode. On unless turned off.
+    hmr_enabled: Option<bool>,
     /// Print each request's server-compute time (ns/µs) to the terminal.
     /// Off by default so library embedders + the test harness stay silent;
     /// `boot_production_server` flips it on for both `albedo dev` and
@@ -1034,6 +1172,9 @@ pub struct AlbedoServerBuilder {
     /// `None` until `boot.rs` supplies one; the resulting runtime resolves
     /// everybody as anonymous when no providers were declared.
     auth_registry: Option<dom_render_compiler::auth::AuthRegistry>,
+    /// EMAIL · 15.3 — the lowered block and its transport, waiting for `run()`
+    /// to decide where links point.
+    email_plan: Option<EmailPlan>,
     /// Phase N — `Cache-Control` value applied to every public asset
     /// response. `None` means auto: `public, max-age=3600` when dev
     /// mode is off, `no-store` when dev mode is on.
@@ -1078,15 +1219,18 @@ impl AlbedoServerBuilder {
             props_loaders: HashMap::new(),
             layouts: HashMap::new(),
             middleware: HashMap::new(),
-            auth_provider: Arc::new(AllowAllAuthProvider),
+            // Fails closed: see `UnconfiguredAuthProvider`.
+            auth_provider: Arc::new(UnconfiguredAuthProvider),
             renderer: None,
             inspector_enabled: None,
             opcode_registry: None,
             pipeline: None,
             dev_mode_enabled: None,
+            hmr_enabled: None,
             request_timings_enabled: false,
             public_dirs: Vec::new(),
             auth_registry: None,
+            email_plan: None,
             public_cache_control: None,
             // Minted empty; `register_compiled_project` clones the same handles
             // into every adapter, `run()` fills the substrate, `build()`
@@ -1197,6 +1341,34 @@ impl AlbedoServerBuilder {
         self
     }
 
+    /// EMAIL · 15.3 — build the transport the `email` block names.
+    ///
+    /// Built here so a missing `apiKey` variable fails the boot. Installed in
+    /// `run()`, which is where the TLS mode — and so the link origin — is known.
+    ///
+    /// # Errors
+    /// The key names an unset environment variable.
+    pub(crate) fn with_email(
+        mut self,
+        config: dom_render_compiler::email::EmailConfig,
+        project_dir: std::path::PathBuf,
+        dev_mode: bool,
+    ) -> Result<Self, String> {
+        let mailer = crate::email::mailer_for(
+            &config,
+            Arc::clone(&self.live.aperture_client),
+            project_dir.join(".albedo").join("outbox"),
+            dev_mode,
+        )?;
+        self.email_plan = Some(EmailPlan {
+            config,
+            mailer,
+            dev_mode,
+            project_dir,
+        });
+        Ok(self)
+    }
+
     /// UPLOADS · 15.1 — install the declared buckets and the project root.
     ///
     /// Lowered in `boot.rs` for the same reason the `auth` block is: a bad
@@ -1213,6 +1385,21 @@ impl AlbedoServerBuilder {
             registry,
             project_dir,
         }));
+        self
+    }
+
+    /// Install where actions may redirect — the `redirects` block.
+    #[must_use]
+    pub(crate) fn with_redirects(self, policy: crate::redirects::RedirectPolicy) -> Self {
+        self.live.install_redirects(Arc::new(policy));
+        self
+    }
+
+    /// Install the declared webhooks. Lowered in `boot.rs`, where a missing
+    /// secret or a job `src/jobs.ts` does not declare can fail the boot by name.
+    #[must_use]
+    pub(crate) fn with_webhooks(self, registry: dom_render_compiler::webhook::WebhookRegistry) -> Self {
+        self.live.install_webhooks(Arc::new(registry));
         self
     }
 
@@ -1244,26 +1431,16 @@ impl AlbedoServerBuilder {
         self
     }
 
-    /// Phase N — override the `Cache-Control` header used for public
-    /// asset responses. When unset the value tracks dev mode:
-    /// `no-store` in dev, `public, max-age=3600` in production.
-    #[must_use]
-    pub fn with_public_cache_control(mut self, value: impl Into<String>) -> Self {
-        self.public_cache_control = Some(value.into());
-        self
-    }
-
-    /// Phase M — explicit toggle for the error overlay + HMR
-    /// surface mounted at `/_albedo/dev/*`. `None` (default) means
-    /// auto: enabled on `cfg!(debug_assertions)`, off otherwise.
+    /// Toggle for the error overlay + HMR surface mounted at
+    /// `/_albedo/dev/*`. Off unless enabled.
     #[must_use]
     pub fn with_dev_mode(mut self, enabled: bool) -> Self {
         self.dev_mode_enabled = Some(enabled);
         self
     }
 
-    /// Install the app's FORGE collection registry, replacing the built-in
-    /// guestbook default [`LiveRuntime::new`] mints.
+    /// Install the app's FORGE collection registry, replacing the empty one
+    /// [`LiveRuntime::new`] mints.
     ///
     /// The schema is app-static: it is the `topic → (query, schema)` allowlist
     /// the write path resolves against, and it is fixed for the life of the
@@ -1293,10 +1470,13 @@ impl AlbedoServerBuilder {
         self
     }
 
-    /// Forces the dev inspector on or off. By default the inspector is mounted
-    /// when the binary is built with debug assertions and skipped otherwise —
-    /// call this to override that policy (for example, to expose the inspector
-    /// in a release-mode preview build).
+    /// Mount the dev inspector at `/__albedo`. Off unless enabled; `albedo dev`
+    /// enables it, `albedo serve` does not.
+    pub fn with_hmr(mut self, enabled: bool) -> Self {
+        self.hmr_enabled = Some(enabled);
+        self
+    }
+
     pub fn with_inspector(mut self, enabled: bool) -> Self {
         self.inspector_enabled = Some(enabled);
         self
@@ -1489,16 +1669,6 @@ impl AlbedoServerBuilder {
         self
     }
 
-    pub fn register_props_loader(
-        mut self,
-        loader_id: impl Into<String>,
-        loader: impl PropsLoader + 'static,
-    ) -> Self {
-        self.props_loaders
-            .insert(loader_id.into(), Arc::new(loader));
-        self
-    }
-
     pub fn register_layout(
         mut self,
         layout_id: impl Into<String>,
@@ -1506,16 +1676,6 @@ impl AlbedoServerBuilder {
     ) -> Self {
         self.layouts
             .insert(layout_id.into(), Arc::new(layout_handler));
-        self
-    }
-
-    pub fn register_middleware(
-        mut self,
-        middleware_id: impl Into<String>,
-        middleware: impl RuntimeMiddleware + 'static,
-    ) -> Self {
-        self.middleware
-            .insert(middleware_id.into(), Arc::new(middleware));
         self
     }
 
@@ -1726,25 +1886,32 @@ impl AlbedoServerBuilder {
             // snapshot) would reintroduce the null-slot bug in a subtler form.
             // P6 · the per-action error-span markup the Tier-B shim appends to
             // its forms. Generated once here from the compiled project's form
-            // manifest via the SAME `form_error_span_seed` the non-pooled render
+            // manifest via the SAME `form_feedback_span_seed` the non-pooled render
             // path calls, so both emit identical sinks at the ids the submit
             // projection targets — no missing node, no dropped frame.
             let form_error_spans = self
                 .reactive_project
                 .as_deref()
-                .map(|project| project.form_error_span_seed())
+                .map(|project| project.form_feedback_span_seed())
                 .unwrap_or_default();
             // S4 · the same pool, plan and error spans back FORGE's row
             // projector, so a delta's row markup comes off the identical
             // template and engine a request would render it with. Installed
             // here rather than in `register_compiled_project` because the plan
             // does not exist until now; the adapters already hold this cell.
-            self.live
-                .install_projector(Arc::new(crate::render::PooledRowProjector::new(
+            let project_readers = self
+                .reactive_project
+                .as_deref()
+                .map(|project| project.collection_reader_counts())
+                .unwrap_or_default();
+            self.live.install_projector(Arc::new(
+                crate::render::PooledRowProjector::new(
                     pool.clone(),
                     plan.clone(),
                     form_error_spans.clone(),
-                )));
+                )
+                .with_project_readers(project_readers),
+            ));
 
             // PRISM · the warmer is the `LiveRuntime` itself — the persistent
             // tier holding the schema, the substrate and the registry. Cloning
@@ -1878,7 +2045,8 @@ impl AlbedoServerBuilder {
 
         // Resolved here (not at its original site below) because the streaming
         // state needs it to decide whether to inject the dev overlay/HMR client.
-        let dev_mode_enabled = self.dev_mode_enabled.unwrap_or(cfg!(debug_assertions));
+        let dev_mode_enabled = self.dev_mode_enabled.unwrap_or(false);
+        let hmr_enabled = dev_mode_enabled && self.hmr_enabled.unwrap_or(true);
 
         let mut pipeline_binding = self.pipeline;
         let streaming_runtime = renderer.as_ref().map(|runtime| {
@@ -1898,7 +2066,13 @@ impl AlbedoServerBuilder {
             // subsequent action-handler `broadcast()` calls fan out to.
             .with_broadcast(broadcast.clone())
             .with_hydration(route_hydration.clone())
-            .with_dev_mode(dev_mode_enabled);
+            // The project the reactive blocks above were built from, so an
+            // island re-rendered for a request is wired by the same code.
+            .with_islands(crate::render::islands::IslandServices {
+                project: self.reactive_project.clone(),
+            })
+            .with_dev_mode(dev_mode_enabled)
+            .with_hmr(hmr_enabled);
             let state = match pipeline_binding.take() {
                 Some((pipeline, handle)) => {
                     let pipeline = pipeline.with_slot_store(slot_store.clone());
@@ -1946,7 +2120,9 @@ impl AlbedoServerBuilder {
         for route in &self.config.routes {
             let has_layout_handlers = match router.match_route(route.method, route.path.as_str()) {
                 RouteMatch::Matched(matched) => !matched.target.layout_handlers.is_empty(),
-                RouteMatch::MethodNotAllowed { .. } | RouteMatch::NotFound => true,
+                RouteMatch::MethodNotAllowed { .. }
+                | RouteMatch::UndecodableParam { .. }
+                | RouteMatch::NotFound => true,
             };
 
             let route_uses_manifest_streaming =
@@ -2011,27 +2187,19 @@ impl AlbedoServerBuilder {
             }
         }
 
-        let inspector_enabled = self.inspector_enabled.unwrap_or(cfg!(debug_assertions));
-        let inspector = if inspector_enabled {
-            let inspector_state = Arc::new(InspectorState::new());
-            if let Some(streaming) = streaming_runtime.as_ref() {
-                inspector_state.set_graph(InspectorGraphSnapshot::from_manifest(
-                    streaming.manifest.as_ref(),
-                ));
-            }
-            Some(inspector_state)
-        } else {
-            None
-        };
+        let inspector_enabled = self.inspector_enabled.unwrap_or(false);
+        // Its graph and live events are bound when the server runs — see
+        // `bind_inspector`.
+        let inspector = inspector_enabled.then(|| Arc::new(InspectorState::new()));
 
-        // Phase M · mint dev-mode registries when enabled. `dev_mode_enabled`
-        // was resolved earlier (the streaming state needs it); defaults follow
-        // the inspector convention (on in debug builds, off in release) so a
-        // `cargo run --release` server doesn't leak dev routes.
+        // Mint the dev-mode registries when dev mode is on. `dev_mode_enabled`
+        // was resolved earlier (the streaming state needs it) and is off unless
+        // the builder turned it on, so a server never exposes dev routes by
+        // default.
         let (dev_error_registry, dev_hmr_registry) = if dev_mode_enabled {
             (
                 Some(Arc::new(crate::dev::DevErrorRegistry::new())),
-                Some(Arc::new(crate::dev::HmrRegistry::new())),
+                hmr_enabled.then(|| Arc::new(crate::dev::HmrRegistry::new())),
             )
         } else {
             (None, None)
@@ -2125,6 +2293,21 @@ impl AlbedoServerBuilder {
             },
         };
 
+        // A webhook queues a job; one naming a job src/jobs.ts does not declare
+        // would accept every delivery with `200` and then dead-letter each one —
+        // the provider satisfied, the events lost. So it stops the boot here,
+        // the first place both declarations are in hand.
+        if let Some(webhooks) = self.live.webhooks() {
+            for hook in webhooks.iter() {
+                if !jobs_plan.as_ref().is_some_and(|plan| plan.declares(&hook.job)) {
+                    return Err(RuntimeError::ServerStartup(format!(
+                        "webhook `{}` queues job `{}`, which src/jobs.ts does not declare",
+                        hook.name, hook.job
+                    )));
+                }
+            }
+        }
+
         let world = RenderWorld {
             router: Arc::new(router),
             handlers: Arc::new(self.handlers),
@@ -2211,6 +2394,7 @@ impl AlbedoServerBuilder {
             config: self.config,
             state,
             auth_registry: self.auth_registry,
+            email_plan: self.email_plan,
             island_ssr_failures,
             static_render_failures,
             jobs_plan,
@@ -2219,12 +2403,23 @@ impl AlbedoServerBuilder {
     }
 }
 
+/// EMAIL · what `with_email` built and `run()` installs.
+struct EmailPlan {
+    config: dom_render_compiler::email::EmailConfig,
+    mailer: Arc<dyn crate::email::Mailer>,
+    dev_mode: bool,
+    /// Uploaded attachments are read from under it.
+    project_dir: std::path::PathBuf,
+}
+
 pub struct AlbedoServer {
     config: AppConfig,
     state: RuntimeState,
     /// AUTH · the lowered `auth` block, installed onto the live runtime by
     /// `run()` once the substrate it resolves against is open.
     auth_registry: Option<dom_render_compiler::auth::AuthRegistry>,
+    /// EMAIL · 15.3 — installed by `run()` once the link origin is known.
+    email_plan: Option<EmailPlan>,
     /// Islands that failed to server-render during `build()`, held until
     /// `run_with_ready` can hand them to the [`BootReport`]. Boot decides them;
     /// only the readiness callback can print them.
@@ -2398,6 +2593,22 @@ impl AlbedoServer {
         self.state.world().public_assets.clone()
     }
 
+    /// The app's files that only a running process can run, as `(what, entry)`:
+    /// `src/middleware.ts` runs on every request and `src/jobs.ts` on a clock.
+    /// Read by the static export, which refuses on each — a host that serves
+    /// files does neither, and an export that dropped them would ship the app
+    /// without its guard or its schedule.
+    pub(crate) fn process_bound_entries(&self) -> Vec<(&'static str, String)> {
+        let mut entries = Vec::new();
+        if let Some(plan) = self.state.world().middleware_plan.as_ref() {
+            entries.push(("middleware", plan.entry().to_string()));
+        }
+        if let Some(plan) = self.jobs_plan.as_ref() {
+            entries.push(("jobs", plan.entry().to_string()));
+        }
+        entries
+    }
+
     /// Phase O.2 · handle on the per-server broadcast registry.
     /// Route handlers, action handlers, and userland watchers all
     /// resolve topics against this `Arc`. Always available — there
@@ -2411,9 +2622,10 @@ impl AlbedoServer {
     /// `None` when dev mode is off (a hardened `albedo serve`), so the reload
     /// machinery is impossible to reach against a production server.
     pub fn dev_reload_handle(&self) -> Option<DevReloadHandle> {
-        // Gate on the HMR registry — its presence IS the "dev mode on" signal,
-        // and the handle needs it to notify clients.
-        self.state.dev_hmr_registry.as_ref()?;
+        // Gate on the error registry — its presence IS the "dev mode on"
+        // signal. Not the HMR registry: `--no-hmr` still rebuilds on save, it
+        // only stops pushing the result to open pages.
+        self.state.dev_error_registry.as_ref()?;
         Some(DevReloadHandle {
             world: self.state.world.clone(),
             hmr: self.state.dev_hmr_registry.clone(),
@@ -2424,6 +2636,7 @@ impl AlbedoServer {
             // subscribers) and the already-open substrate instead of stranding
             // them behind a swapped-out world.
             live: self.state.live.clone(),
+            inspector: self.state.inspector.clone(),
             revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -2630,6 +2843,18 @@ impl AlbedoServer {
             match self.state.live.forge_substrate.get() {
                 Some(substrate) => {
                     let providers = registry.providers.len();
+                    // 15.3 · the mailed-token tables ride with the auth tables:
+                    // the hourly sweep and every email flow assume they exist
+                    // whenever providers do.
+                    if providers > 0 {
+                        for statement in dom_render_compiler::auth::email_token::ddl() {
+                            substrate.migrate(&statement).await.map_err(|err| {
+                                RuntimeError::ServerStartup(format!(
+                                    "AUTH: the email token table could not be created: {err}"
+                                ))
+                            })?;
+                        }
+                    }
                     self.state
                         .live
                         .install_auth(Arc::new(crate::auth::AuthRuntime::new(
@@ -2690,6 +2915,65 @@ impl AlbedoServer {
             public_origin.as_deref(),
         ) {
             return Err(RuntimeError::ServerStartup(refusal));
+        }
+
+        // Where this app is reached — resolved for EVERY app, not only one that
+        // mails links: an action reads it as `origin` (a payment provider's
+        // return URL is built on it), so a malformed `ALBEDO_PUBLIC_ORIGIN` is a
+        // boot failure whether or not an `email` block exists. Configuration
+        // only; a request's `Host` header never becomes it.
+        let acme_domain = match &tls_mode {
+            crate::tls::TlsMode::Acme { domains, .. } => domains.first().cloned(),
+            _ => None,
+        };
+        let app_origin = crate::email::resolve_link_origin(
+            public_origin.as_deref(),
+            acme_domain.as_deref(),
+            self.config.server.host.as_str(),
+            self.config.server.port,
+            tls_mode.is_enabled(),
+            self.state.dev_error_registry.is_some(),
+        )
+        .map_err(RuntimeError::ServerStartup)?;
+        let _ = self.state.live.app_origin.set(app_origin.clone());
+
+        // EMAIL · 15.3 — decide where links point, then install. Before the
+        // listener binds (a misconfigured origin is a boot failure, not a
+        // broken reset email) and before the job runner is built (its handle
+        // records whether `sendEmail()` has anywhere to go).
+        if let Some(plan) = self.email_plan.take() {
+            let link_origin = app_origin.clone();
+            let mails_links = self
+                .auth_registry
+                .as_ref()
+                .and_then(|registry| registry.providers.iter().find(|p| p.sends_email()));
+            if let (Some(provider), None) = (mails_links, link_origin.as_ref()) {
+                return Err(RuntimeError::ServerStartup(format!(
+                    "auth provider `{}` emails links, but nothing says where this app is                      reached. Set {}=https://your.domain — a link is never built from a                      request's Host header, which an attacker controls",
+                    provider.name,
+                    crate::tls::PUBLIC_ORIGIN_ENV
+                )));
+            }
+            if plan.config.provider == dom_render_compiler::email::ProviderKind::Log
+                && !plan.dev_mode
+            {
+                // stderr: this must reach the operator with or without a
+                // `tracing` subscriber.
+                eprintln!(
+                    "  ⚠  email: provider \"log\" writes mail to .albedo/outbox/ and sends                      nothing. Declare a real provider before real users sign up."
+                );
+            }
+            info!(
+                target: "albedo.email",
+                provider = plan.config.provider.as_str(),
+                "EMAIL enabled"
+            );
+            self.state.live.install_email(Arc::new(crate::email::EmailRuntime::new(
+                plan.config,
+                plan.mailer,
+                link_origin,
+                plan.project_dir,
+            )));
         }
 
         let mut acme_driver = None;
@@ -2783,9 +3067,41 @@ impl AlbedoServer {
             }
         };
 
-        if let Some(inspector_state) = self.state.inspector.clone() {
+        if let Some(inspector_state) = self.state.inspector.as_ref() {
             info!("ALBEDO dev inspector mounted at /__albedo");
-            crate::inspector::heartbeat::spawn(inspector_state, shutdown_rx.clone());
+            bind_inspector(inspector_state, &self.state.world());
+        }
+
+        // Per-tab state — `useState` values in the slot store, CSRF tokens —
+        // is keyed by a cookie whose end the server never sees, so idle tabs
+        // are swept rather than waited for. Read through `world()` each time:
+        // a dev reload swaps both.
+        {
+            let state = self.state.clone();
+            let mut shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut sweep = tokio::time::interval(SLOT_SWEEP_INTERVAL);
+                sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                sweep.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = sweep.tick() => {
+                            let ttl = dom_render_compiler::runtime::slot_store::SESSION_IDLE_TTL;
+                            let world = state.world();
+                            let slots = world.slot_store.evict_idle(ttl);
+                            let tokens = world.csrf.evict_idle(ttl);
+                            if slots + tokens > 0 {
+                                debug!(target: "albedo.slots", slots, tokens, "idle tab state evicted");
+                            }
+                        }
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
         }
 
         // APERTURE · the thing that asks. Without it a declared source is a
@@ -2941,6 +3257,20 @@ impl AlbedoServer {
 
         let _ = shutdown_tx.send(true);
 
+        // EMAIL · a "mail me a link" request that was answered before its token
+        // and queue writes finished must not lose them to the exit. Bounded by
+        // the same deadline as the connection drain; they are two DB writes.
+        if let Some(email) = self.state.live.email() {
+            let unfinished = email.drain(shutdown_timeout).await;
+            if unfinished > 0 {
+                warn!(
+                    target: "albedo.email",
+                    unfinished,
+                    "shutdown deadline passed with emailed-link work still running"
+                );
+            }
+        }
+
         if let Some(task) = acme_task {
             task.abort();
         }
@@ -2980,6 +3310,8 @@ pub struct DevReloadHandle {
     /// The running server's live singletons, threaded into every rebuild so a
     /// hot reload swaps *build output* without discarding *live state*.
     live: LiveRuntime,
+    /// The running server's inspector, re-pointed at every new world.
+    inspector: Option<Arc<InspectorState>>,
     revision: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -3008,6 +3340,9 @@ impl DevReloadHandle {
                 self.report_build_error(err.to_string());
             })?;
         let new_world = fresh.state.world();
+        if let Some(inspector) = &self.inspector {
+            bind_inspector(inspector, &new_world);
+        }
         *self.world.write().expect("render world lock poisoned") = new_world;
 
         let revision = self
@@ -3400,6 +3735,66 @@ async fn dispatch_inner(
     response
 }
 
+/// The 404 a browser gets: the app's own `/404` route rendered with status 404,
+/// or the built-in page when the app declares none — or when its page fails,
+/// since a not-found page that answers 500 is worse than a plain one.
+///
+/// The `/404` route is reached by dispatching an internal `GET` for it, so it
+/// is rendered, gated and limited exactly as a visit to `/404` would be.
+async fn not_found_page(
+    state: &RuntimeState,
+    peer: Option<IpAddr>,
+    method: HttpMethod,
+    headers: &HeaderMap,
+    path: &str,
+    rationed: &mut Option<Verdict>,
+    middleware_headers: &mut Option<dom_render_compiler::middleware::outcome::Headers>,
+) -> Response {
+    use crate::handlers::not_found::{builtin_page, carries_over, NOT_FOUND_ROUTE};
+
+    let declared = matches!(
+        state.world().router.match_route(HttpMethod::Get, NOT_FOUND_ROUTE),
+        RouteMatch::Matched(_)
+    );
+    // `path != NOT_FOUND_ROUTE` is the recursion guard: the internal request is
+    // for `/404` itself, which is declared, so it can only come back here if the
+    // route vanished in between — and then it gets the built-in page.
+    if declared && path != NOT_FOUND_ROUTE {
+        let mut internal = Request::builder()
+            .method(if method == HttpMethod::Head { "HEAD" } else { "GET" })
+            .uri(NOT_FOUND_ROUTE);
+        for (name, value) in headers {
+            if carries_over(name) {
+                internal = internal.header(name, value);
+            }
+        }
+        if let Ok(internal) = internal.body(Body::empty()) {
+            let mut response = Box::pin(dispatch_routed(
+                state,
+                peer,
+                internal,
+                rationed,
+                middleware_headers,
+            ))
+            .await;
+            if response.status().is_success() {
+                *response.status_mut() = StatusCode::NOT_FOUND;
+                return response;
+            }
+            tracing::warn!(
+                target: "albedo.routes",
+                status = %response.status(),
+                "the app's /404 page did not render; serving the built-in one",
+            );
+        }
+    }
+    let mut response = builtin_page(path);
+    if method == HttpMethod::Head {
+        *response.body_mut() = Body::empty();
+    }
+    response
+}
+
 async fn dispatch_routed(
     state: &RuntimeState,
     peer: Option<IpAddr>,
@@ -3486,7 +3881,7 @@ async fn dispatch_routed(
                     .get("p")
                     .and_then(|values| values.first().cloned())
                     .unwrap_or_else(|| "/".to_string());
-                let topics = resolve_route_topics(
+                let grants = resolve_route_topics(
                     &world,
                     streaming_runtime,
                     page_path.as_str(),
@@ -3501,7 +3896,7 @@ async fn dispatch_routed(
                 let projector = projector_arc.as_deref();
                 match streaming_runtime.broadcast() {
                     Some(broadcast) => {
-                        crate::handlers::serve_patch_stream(broadcast.clone(), &topics, projector)
+                        crate::handlers::serve_patch_stream(broadcast.clone(), &grants, projector)
                             .await
                             .into_response()
                     }
@@ -3676,6 +4071,39 @@ async fn dispatch_routed(
                 }
             }
         }
+    }
+
+    // WEBHOOKS — a provider's signed POST to a declared path. Ahead of
+    // middleware, like the framework's own lanes: it authenticates by its
+    // signature, and a middleware rule written for people would turn every
+    // delivery into a redirect the provider cannot follow. See `webhooks.rs`.
+    if let Some(hook) = state
+        .live
+        .webhooks()
+        .and_then(|hooks| hooks.get(path.as_str()))
+        .cloned()
+    {
+        let identity = crate::auth::Identity::Anonymous;
+        if let Err(refusal) = ration(
+            state,
+            peer,
+            request.headers(),
+            &identity,
+            Cost::flat(OperationClass::Write),
+            rationed,
+        ) {
+            return refusal;
+        }
+        let (parts, body) = request.into_parts();
+        return crate::webhooks::receive(
+            &hook,
+            method.as_str(),
+            &parts.headers,
+            body,
+            state.live.forge_substrate.get().cloned(),
+            state.live.jobs().cloned(),
+        )
+        .await;
     }
 
     // MIDDLEWARE · 15.6 — userland interception, placed after every lane the
@@ -3857,14 +4285,16 @@ async fn dispatch_routed(
     if let Some((leg, provider_name)) =
         crate::handlers::oauth_routes::match_oauth_route(path.as_str())
     {
-        use crate::handlers::oauth_routes::OAuthRequest;
+        use crate::handlers::oauth_routes::{OAuthRequest, OAuthRoute};
 
-        if method != HttpMethod::Get {
+        // Each leg answers one method: `start`/`callback` are navigations
+        // (`GET`), `link` changes an account (a CSRF-checked `POST`).
+        if method.as_str() != leg.method() {
             return ResponsePayload::new(
                 StatusCode::METHOD_NOT_ALLOWED,
-                "oauth sign-in endpoints accept GET only".to_string(),
+                format!("this oauth endpoint accepts {} only", leg.method()),
             )
-            .with_header("allow", "GET")
+            .with_header("allow", leg.method())
             .into_response();
         }
 
@@ -3898,10 +4328,23 @@ async fn dispatch_routed(
         let origin = public_origin_for(state, request.headers());
         let query = request.uri().query().unwrap_or_default().to_string();
         let headers = request.headers().clone();
+        // The tab session the link form's CSRF token is bound to — as for the
+        // password endpoints, a fresh id when absent, which cannot validate.
+        let session = crate::render::csrf::read_session_cookie(&headers)
+            .unwrap_or_else(SessionId::random);
+        let provider_name = provider_name.to_string();
+        let body = if leg == OAuthRoute::Link {
+            match to_bytes(request.into_body(), crate::forms::MAX_FORM_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
+            }
+        } else {
+            bytes::Bytes::new()
+        };
 
         return crate::handlers::oauth_routes::run_oauth_route(
             leg,
-            provider_name,
+            &provider_name,
             OAuthRequest {
                 auth: auth.as_ref(),
                 oauth: state.live.oauth(),
@@ -3910,9 +4353,53 @@ async fn dispatch_routed(
                 query: &query,
                 origin: &origin,
                 headers: &headers,
+                csrf: world.csrf.as_ref(),
+                session,
+                body,
             },
         )
         .await;
+    }
+
+    // AUTH × EMAIL · 15.3 — the pages an emailed link lands on. `GET` only, and
+    // ahead of the `POST` endpoints that share their paths: the page renders the
+    // button, the `POST` behind it spends the token. See `email_routes` for why
+    // a link must never spend anything on `GET`.
+    if method == HttpMethod::Get {
+        if let Some(page) = crate::handlers::email_routes::match_email_page(path.as_str()) {
+            let Some(auth) = state.live.auth() else {
+                return RuntimeError::RouteNotFound {
+                    method: method.as_str().to_string(),
+                    path,
+                }
+                .into_response();
+            };
+            let auth = auth.clone();
+            let identity = state.live.identity(request.headers()).await;
+            // A token lookup per request, from a stranger: the credential class.
+            if let Err(refusal) = ration(
+                state,
+                peer,
+                request.headers(),
+                &identity,
+                Cost::flat(OperationClass::Credential),
+                rationed,
+            ) {
+                return refusal;
+            }
+            let query = request.uri().query().unwrap_or_default().to_string();
+            return crate::handlers::email_routes::run_email_page(
+                page,
+                crate::handlers::email_routes::PageRequest {
+                    auth: auth.as_ref(),
+                    csrf: world.csrf.as_ref(),
+                    session: crate::render::csrf::read_session_cookie(request.headers()),
+                    query: &query,
+                    email: state.live.email().map(AsRef::as_ref),
+                },
+            )
+            .await;
+        }
     }
 
     // AUTH · P2 — the first-party sign-in endpoints. Placed ahead of everything
@@ -3958,8 +4445,9 @@ async fn dispatch_routed(
         // request, and never the KDF, which is the expensive part.
         if auth_route != AuthRoute::PasswordLogin {
             let cost = match auth_route {
-                AuthRoute::PasswordRegister => Cost::flat(OperationClass::Credential),
-                _ => Cost::flat(OperationClass::Write),
+                AuthRoute::Logout | AuthRoute::LogoutAll => Cost::flat(OperationClass::Write),
+                // Everything else mints an account, a session or a mailed link.
+                _ => Cost::flat(OperationClass::Credential),
             };
             if let Err(refusal) = ration(state, peer, request.headers(), &identity, cost, rationed)
             {
@@ -3992,9 +4480,18 @@ async fn dispatch_routed(
                 body,
                 shutter: state.shutter.as_ref(),
                 caller,
+                email: state.live.email().cloned(),
+                jobs: state.live.jobs().cloned(),
+                phosphor: state.phosphor.as_ref(),
             },
         )
         .await;
+        // A wrong password answers in the sign-in form, not on a page of its own.
+        let response = crate::handlers::auth_routes::into_form_feedback(
+            response,
+            path.as_str(),
+            &parts.headers,
+        );
 
         if state.request_timings {
             crate::timing::print_request(method.as_str(), &path, started.elapsed());
@@ -4263,6 +4760,20 @@ async fn dispatch_routed(
                         .join(", "),
                 )
                 .into_response(),
+                // The route exists; the param is bytes, not text. Named rather
+                // than a 404 so nobody goes looking for a missing page.
+                RouteMatch::UndecodableParam { name } => RuntimeError::RequestHandling(format!(
+                    "route param `{name}` is not valid UTF-8 once percent-decoded"
+                ))
+                .into_response(),
+                // A person who followed a broken link gets a page, not JSON.
+                _ if matches!(method, HttpMethod::Get | HttpMethod::Head)
+                    && crate::handlers::not_found::wants_html(request.headers()) =>
+                {
+                    let headers = request.headers().clone();
+                    not_found_page(state, peer, method, &headers, &path, rationed, middleware_headers)
+                        .await
+                }
                 // `NotFound`, and `Matched` which the arm above took.
                 _ => RuntimeError::RouteNotFound {
                     method: method.as_str().to_string(),
@@ -4348,10 +4859,13 @@ async fn dispatch_routed(
                     .and_then(|auth| auth.registry().login_path.as_deref());
                 let navigating =
                     crate::handlers::auth_gate::is_document_navigation(request.headers());
-                return crate::handlers::auth_gate::refuse_anonymous(
+                // Where they were going, so the sign-in returns them there.
+                let requested = request.uri().path_and_query().map(|pq| pq.as_str().to_string());
+                return crate::handlers::auth_gate::refuse_anonymous_returning(
                     &route_pattern,
                     login_path,
                     navigating,
+                    requested.as_deref(),
                 );
             }
             // AUTH · the render path's identity — the third of the three
@@ -4515,7 +5029,7 @@ async fn run_action_route(
         &parts.headers,
         body.clone(),
     )
-    .with_principal(principal.principal().map(|who| who.id.clone()));
+    .with_identity(principal.principal());
 
     // AUTH · P0 records the identity on the action path; F1's write-path
     // enforcement is what consumes it. Logged at debug so a "why did this action
@@ -4671,7 +5185,7 @@ async fn run_form_action_route(
         &parts.headers,
         body.clone(),
     )
-    .with_principal(principal.principal().map(|who| who.id.clone()));
+    .with_identity(principal.principal());
 
     if let Some(who) = principal.principal() {
         tracing::debug!(
@@ -4818,7 +5332,7 @@ fn resolve_route_topics(
     streaming: &Arc<StreamingAppState>,
     page_path: &str,
     principal: Option<&dom_render_compiler::auth::PrincipalId>,
-) -> Option<Vec<String>> {
+) -> Option<Vec<dom_render_compiler::runtime::TopicGrant>> {
     Some(resolve_route_topics_detailed(world, streaming, page_path, None, principal)?.0)
 }
 
@@ -4847,7 +5361,11 @@ fn resolve_route_topics_detailed(
     // granted none, which is what makes "cannot name it" an enforcement rather
     // than a description.
     principal: Option<&dom_render_compiler::auth::PrincipalId>,
-) -> Option<(Vec<String>, Vec<ResolvedPartition>, Vec<ResolvedSourceTopic>)> {
+) -> Option<(
+    Vec<dom_render_compiler::runtime::TopicGrant>,
+    Vec<ResolvedPartition>,
+    Vec<ResolvedSourceTopic>,
+)> {
     let RouteMatch::Matched(matched) = world.router.match_route(HttpMethod::Get, page_path) else {
         return None;
     };
@@ -4910,7 +5428,13 @@ fn resolve_route_topics_detailed(
     let mut topics = route.shared_slot_topics.clone();
     topics.extend(partitions.iter().map(|resolved| resolved.topic.clone()));
     topics.extend(sources.iter().map(|resolved| resolved.topic.clone()));
-    Some((topics, partitions, sources))
+    // Column projection · each topic travels with the columns this route reads
+    // from it, so every lane cuts the JSON it sends to what the page renders.
+    let grants = dom_render_compiler::transforms::column_reads::route_grants(
+        &route.shared_slot_columns,
+        &topics,
+    );
+    Some((grants, partitions, sources))
 }
 
 /// PHOSPHOR's [`crate::handlers::phosphor::RouteAuthority`] over the live
@@ -4949,14 +5473,14 @@ impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority {
         &self,
         principal: Option<&dom_render_compiler::auth::PrincipalId>,
         path: &str,
-    ) -> Option<Vec<String>> {
+    ) -> Option<Vec<dom_render_compiler::runtime::TopicGrant>> {
         let streaming = self.world.streaming_runtime.as_ref()?;
         let registry = self
             .live
             .source_reader
             .get()
             .map(|reader| reader.registry().as_ref());
-        let (topics, partitions, sources) =
+        let (grants, partitions, sources) =
             resolve_route_topics_detailed(&self.world, streaming, path, registry, principal)?;
         if !partitions.is_empty() {
             crate::topics::TopicWarmer::warm(&self.live, &partitions).await;
@@ -4964,7 +5488,7 @@ impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority {
         if !sources.is_empty() {
             crate::topics::TopicWarmer::warm_sources(&self.live, &sources).await;
         }
-        Some(topics)
+        Some(grants)
     }
 
     fn registry(&self) -> Arc<BroadcastRegistry> {
@@ -5921,7 +6445,11 @@ mod tests {
             forge: Default::default(),
         };
 
+        // Installed explicitly: the default provider fails closed, so a
+        // `Role` route with nothing configured is refused (see
+        // `contract::tests::the_default_provider_fails_closed`).
         let server = AlbedoServerBuilder::new(config)
+            .with_auth_provider(crate::contract::AllowAllAuthProvider)
             .register_api_handler("admin", |_ctx: RequestContext| async move {
                 Ok(ApiResponse::ok(Bytes::from_static(b"admin-area")))
             })

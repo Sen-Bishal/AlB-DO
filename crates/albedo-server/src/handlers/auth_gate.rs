@@ -16,11 +16,14 @@
 //! login route at all — absent is a legitimate choice, and the fallback is the
 //! refusal this module already gave.
 //!
-//! ⚖️ **The redirect does not carry a return path, on purpose.** Sending
-//! `?next=/account` would ship a parameter nothing consumes — the sign-in page
-//! does not read one — which is the same mistake as the `login_path` knob this
-//! module refused to invent before the route existed. Carrying the origin back
-//! is a real feature and it starts at the sign-in page, not here.
+//! ⚖️ **The destination rides a cookie, not the URL.** The note that stood
+//! here said carrying the origin back "is a real feature and it starts at the
+//! sign-in page" — true, and it was needed the moment a flow had to be
+//! "buy → sign up → back to checkout". It does not start at the sign-in page
+//! after all: four different flows complete a sign-in, and none of them can
+//! rely on a page threading a `?next=` through its forms and links. So the gate
+//! remembers the destination ([`NEXT_COOKIE`]) and `open_session` — where every
+//! sign-in ends — consumes it. See [`refuse_anonymous_returning`].
 //!
 //! 🔑 **Fail closed.** The declared path is re-parsed through
 //! [`ReturnPath`] before it reaches a `Location` header, even though
@@ -69,12 +72,74 @@ pub fn is_document_navigation(headers: &HeaderMap) -> bool {
 
 #[must_use]
 pub fn refuse_anonymous(route: &str, login_path: Option<&str>, navigating: bool) -> Response {
+    refuse_anonymous_returning(route, login_path, navigating, None)
+}
+
+/// Where a signed-out visitor was going when the gate sent them to sign in.
+///
+/// ## Why a cookie, not `?next=`
+///
+/// Sign-in completes in four places — a password form, a sign-up form, an OAuth
+/// callback, a mailed link — and three of them never see the sign-in page's URL:
+/// a form posts back its own path, an OAuth start link is written by the app,
+/// a mailed link opens in a fresh tab. A query parameter would have to be
+/// threaded through every one of them by every app. A cookie set here, where the
+/// destination is known, and read in `open_session`, where every sign-in ends,
+/// covers all four with nothing to author.
+///
+/// `__Host-`, `HttpOnly`, `SameSite=Lax` like the session cookie; ten minutes,
+/// because it answers "where was I going *just now*"; and re-validated through
+/// [`ReturnPath`] when read, so a planted value can only ever name a path on
+/// this origin.
+pub const NEXT_COOKIE: &str = "__Host-albedo_next";
+const NEXT_TTL_SECONDS: u32 = 600;
+
+/// The `Set-Cookie` that remembers `destination`.
+fn remember_destination(destination: &ReturnPath) -> String {
+    let encoded: String = url::form_urlencoded::byte_serialize(destination.as_str().as_bytes()).collect();
+    format!("{NEXT_COOKIE}={encoded}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={NEXT_TTL_SECONDS}")
+}
+
+/// The `Set-Cookie` that forgets it — sent with every completed sign-in.
+#[must_use]
+pub fn forget_destination() -> String {
+    format!("{NEXT_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0")
+}
+
+/// The remembered destination, if the request carries a valid one.
+#[must_use]
+pub fn remembered_destination(headers: &HeaderMap) -> Option<ReturnPath> {
+    let raw = dom_render_compiler::auth::read_cookie(
+        headers.get(header::COOKIE)?.to_str().ok()?,
+        NEXT_COOKIE,
+    )?;
+    let decoded: String = url::form_urlencoded::parse(format!("v={raw}").as_bytes())
+        .next()
+        .map(|(_, value)| value.into_owned())?;
+    ReturnPath::parse(&decoded)
+}
+
+/// [`refuse_anonymous`], remembering `requested` (the path and query the
+/// visitor asked for) so the sign-in they are sent to returns them there.
+#[must_use]
+pub fn refuse_anonymous_returning(
+    route: &str,
+    login_path: Option<&str>,
+    navigating: bool,
+    requested: Option<&str>,
+) -> Response {
     debug_assert!(!route.is_empty(), "a matched route pattern is never empty");
 
     // A person, and somewhere honest to send them.
     if navigating {
         if let Some(target) = login_path.and_then(ReturnPath::parse) {
-            return see_other(&target).into_response();
+            let mut response = see_other(&target).into_response();
+            if let Some(destination) = requested.and_then(ReturnPath::parse) {
+                if let Ok(cookie) = remember_destination(&destination).parse() {
+                    response.headers_mut().append(header::SET_COOKIE, cookie);
+                }
+            }
+            return response;
         }
     }
 
@@ -104,6 +169,46 @@ pub fn refuse_anonymous(route: &str, login_path: Option<&str>, navigating: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The redirect to sign in remembers where the visitor was going, and the
+    /// remembered value reads back — as a path on this origin, only.
+    #[test]
+    fn the_sign_in_redirect_remembers_the_destination_and_only_a_local_one() {
+        let response = refuse_anonymous_returning(
+            "/account/upgrade",
+            Some("/sign-in"),
+            true,
+            Some("/account/upgrade?plan=pro"),
+        );
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|v| v.starts_with(NEXT_COOKIE))
+            .expect("the destination is remembered")
+            .to_string();
+        assert!(cookie.contains("HttpOnly") && cookie.contains("Secure"), "{cookie}");
+
+        let value = cookie.split(';').next().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, value.parse().unwrap());
+        assert_eq!(
+            remembered_destination(&headers).map(|p| p.as_str().to_string()),
+            Some("/account/upgrade?plan=pro".to_string())
+        );
+
+        // A planted cookie naming another origin reads as nothing.
+        let mut planted = HeaderMap::new();
+        planted.insert(header::COOKIE, format!("{NEXT_COOKIE}=%2F%2Fevil.example").parse().unwrap());
+        assert!(remembered_destination(&planted).is_none());
+
+        // A programmatic client gets the 401 and no cookie.
+        let api = refuse_anonymous_returning("/account", Some("/sign-in"), false, Some("/account"));
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+        assert!(api.headers().get(header::SET_COOKIE).is_none());
+    }
 
     #[test]
     fn an_anonymous_request_to_a_gated_route_gets_401() {

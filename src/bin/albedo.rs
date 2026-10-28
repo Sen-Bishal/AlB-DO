@@ -69,7 +69,7 @@ const MUTED: u8 = 245; // warm-neutral gray — labels, secondary copy
 
 // Shared column width for help listings (commands + flags), so the description
 // column aligns across both. Longest label is "completions <shell>" (19).
-const COL_WIDTH: usize = 20;
+const COL_WIDTH: usize = 26;
 
 // Wordmark shimmer: a low→high luminance ascent, deep gold rising to cream — the
 // "glow" made literal, per-character (mirrors `gradient_text`). The "instrument
@@ -210,10 +210,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         // Trust polish · what the build already knows about itself. Every check
         // is a derivation, never a maintained list — see `doctor::matrix`.
         "doctor" => run_doctor_command(&args[2..]),
-        // The instrument panel as intended, drawn from synthetic signal. Kept
-        // behind its own verb precisely so `dev`'s rule — if a number appears,
-        // something measured it — stays true of `dev`. See `tui::demo`.
-        "demo" => tui::demo::run(),
+        // 15.3 · `albedo email test <address>` — one real send through the
+        // configured provider, answered in the terminal.
+        "email" => run_email_command(&args[2..]),
         // Phase J CLI clarity:
         //   * `albedo files [dir]` — pure static file server; serves any directory verbatim. This
         //     is what `albedo serve` did before.
@@ -225,12 +224,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "serve" => run_serve_command(&args[2..]),
         "run" => run_command(&args[2..]),
         "completions" => run_completions_command(&args[2..]),
+        // Plain and machine-readable: installers, bug reports and scripts parse
+        // this line, so it carries no styling.
+        "--version" | "-V" => {
+            println!("albedo {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
         }
         unknown => Err(format!(
-            "unknown command '{unknown}'. Run `albdo help` to see available commands."
+            "unknown command '{unknown}'. Run `albedo help` to see available commands."
         )),
     }
 }
@@ -432,6 +437,85 @@ fn run_budget_command(raw_args: &[String]) -> Result<(), String> {
 /// by a route parameter is correct for an unguessable id and a leak for a
 /// sequential one — and a tool that failed the build over a judgement would be
 /// turned off, taking the type check with it.
+const EMAIL_USAGE: &str = "usage: albedo email test <address> [project-dir]\n\n  \
+    Sends one message through the provider in albedo.config's `email` block,\n  \
+    now, and prints the provider's answer. Nothing is queued: this is for\n  \
+    checking that a configuration delivers before a user's password reset\n  \
+    depends on it.";
+
+/// `albedo email test <address> [project]`.
+///
+/// Sends synchronously and reports the provider's own words, because the
+/// question an operator is asking — *does this key, this sender, this domain
+/// actually deliver?* — has no other honest answer. A queued send would only
+/// say "a row was written".
+fn run_email_command(raw_args: &[String]) -> Result<(), String> {
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{EMAIL_USAGE}");
+        return Ok(());
+    }
+    if raw_args.first().map(String::as_str) != Some("test") {
+        return Err(EMAIL_USAGE.to_string());
+    }
+    let rest = &raw_args[1..];
+    let Some(to) = rest.iter().find(|arg| arg.contains('@')).cloned() else {
+        return Err(format!("which address should receive the test?\n\n{EMAIL_USAGE}"));
+    };
+    let forwarded: Vec<String> = rest.iter().filter(|arg| **arg != to).cloned().collect();
+
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let contract = resolve_dev_contract(&forwarded, &cwd)?;
+    let decl = contract.email.as_ref().ok_or_else(|| {
+        "albedo.config has no `email` block — there is nothing to test. Add one, e.g.\n  \
+         email: { from: \"App <no-reply@example.com>\", provider: \"resend\", \
+         apiKey: { env: \"RESEND_API_KEY\" } }"
+            .to_string()
+    })?;
+    let config = decl
+        .lower()
+        .map_err(|err| format!("invalid `email` block: {err}"))?;
+    let provider = config.provider.as_str();
+    let from = config.from.formatted();
+    let outbox = contract.project_dir.join(".albedo").join("outbox");
+
+    print_section("email test");
+    print_kv("provider", provider);
+    print_kv("from", &from);
+    print_kv("to", &to);
+    println!();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("could not start a runtime: {err}"))?;
+    let outcome = runtime.block_on(albedo_server::email::send_test(config, &to, outbox))?;
+
+    use dom_render_compiler::email::SendOutcome;
+    match outcome {
+        SendOutcome::Accepted(id) => {
+            println!(
+                "  ✓ {provider} accepted the message{}",
+                id.map(|id| format!(" (id {id})")).unwrap_or_default()
+            );
+            if provider != "log" {
+                println!(
+                    "    Accepted is not delivered: if it does not arrive, check the provider's \
+                     activity log and the recipient's spam folder."
+                );
+            }
+            Ok(())
+        }
+        SendOutcome::Retry(reason) => Err(format!(
+            "{provider} did not accept it, and the failure looks temporary — a running server \
+             would retry:\n  {reason}"
+        )),
+        SendOutcome::Reject(reason) => Err(format!(
+            "{provider} refused it, and retrying would not help:\n  {reason}"
+        )),
+    }
+}
+
 fn run_doctor_command(raw_args: &[String]) -> Result<(), String> {
     if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_doctor_help();
@@ -1177,6 +1261,22 @@ fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir()
         .map_err(|err| format!("failed to resolve current directory: {err}"))?;
     let contract = resolve_dev_contract(&options.forwarded, &cwd)?;
+
+    // ALB-04 · before anything is built or written, for every target: a key in
+    // `public/` is served to every visitor and copied into every artifact, so
+    // there is no target it would be safe to ship it to.
+    let exposed = albedo_server::bundle_payload::secret_files_in_public(&contract.project_dir)?;
+    if !exposed.is_empty() {
+        return Err(format!(
+            "ship refused: {} look{} like secrets, and everything in public/ is served to \
+             anyone who asks. Move {} out of public/ — albedo reads .env from the project root, \
+             and a shipped app takes its keys from the environment it runs in — then ship again.",
+            exposed.join(", "),
+            if exposed.len() == 1 { "s" } else { "" },
+            if exposed.len() == 1 { "it" } else { "them" },
+        ));
+    }
+
     let skip_budget = raw_args.iter().any(|arg| arg == "--no-budget");
     run_prod_build_with_budget(&contract, skip_budget, true, false)?;
 
@@ -1191,16 +1291,53 @@ fn run_ship_command(raw_args: &[String]) -> Result<(), String> {
         ShipTarget::Docker => configure_ship_docker(&contract),
         ShipTarget::Fly => configure_ship_fly(&contract),
         ShipTarget::Binary => configure_ship_binary(&contract),
-        ShipTarget::Static => {
-            print_section("static");
-            print_ok("static export ready");
-            print_kv(
-                "dist",
-                contract.project_dir.join(".albedo").join("dist").display(),
-            );
-            Ok(())
-        }
+        ShipTarget::Static => configure_ship_static(&contract),
     }
+}
+
+/// `albedo ship --target static` — every route as the HTML file `serve` would
+/// send for it, beside `public/` and the client scripts, ready for any host
+/// that serves files.
+///
+/// 🔴 This arm used to print `static export ready` and point at `.albedo/dist`,
+/// which holds build manifests and **no HTML** — the server assembles pages per
+/// request. Found 2026-09-30 on an all-Tier-A site whose `dist` had no `.html`
+/// in it. See `albedo_server::static_export` for how pages are now produced
+/// (through the server's own router) and what is refused.
+fn configure_ship_static(contract: &ResolvedDevContract) -> Result<(), String> {
+    use albedo_server::static_export;
+
+    print_section("static");
+    let opts = albedo_server::ProductionServerOptions::from_contract(contract);
+    let out_dir = static_export::default_out_dir(&contract.project_dir);
+    let site =
+        static_export::export_static_site(&opts, &out_dir).map_err(|err| err.to_string())?;
+
+    print_ok(format!(
+        "{} page(s) + {} file(s), each rendered by the stack `serve` runs",
+        site.pages.len(),
+        site.files.len()
+    ));
+    print_kv("output", site.out_dir.display());
+    for page in &site.pages {
+        print_kv(
+            "page",
+            format!("{}  →  {}", page.url, page.path.display()),
+        );
+    }
+    print_kv(
+        "size",
+        format!("{:.1} KB", site.total_bytes() as f64 / 1024.0),
+    );
+    println!();
+    println!(
+        "    {}",
+        style(
+            "upload the folder to any static host; it is replaced whole on every export.",
+            "2"
+        )
+    );
+    Ok(())
 }
 
 /// `albedo ship --target binary` — write one file that is runtime plus app.
@@ -1379,7 +1516,7 @@ fn prompt_ship_target() -> Result<ShipTarget, String> {
     println!(
         "    {} static     {}",
         style_256("4", ACCENT_SOFT, true),
-        style("export dist/ for any CDN", "2")
+        style("every page as a file, for any static host", "2")
     );
     println!();
     print!("  {} ", style_256("›", ACCENT, true));
@@ -1607,51 +1744,22 @@ fn configure_ship_fly(contract: &ResolvedDevContract) -> Result<(), String> {
 /// ship-target tests can assert key lines without depending on file
 /// I/O.
 fn build_docker_template() -> String {
-    r#"# Emitted by `albedo ship --target docker`.
+    r#"# Written by `albedo ship --target docker`.
 #
-# Stage 1 installs npm dependencies, stage 2 builds THE ONE FILE, and the
-# runtime stage is a slim base with that one file in it. Nothing here compiles
-# Rust: `albedo-linux-amd64`, written beside this file by
-# `albedo ship --target docker`, is the runtime the builder uses.
+# Three stages: `deps` installs your npm dependencies, `builder` turns the app
+# into one self-contained executable with `albedo ship --target binary`, and
+# `runtime` is a slim image holding only that executable. Nothing compiles
+# Rust: `albedo-linux-amd64`, written beside this file by `albedo ship`, is the
+# albedo the builder runs.
 #
-# --- corrected 2026-09-02 -----------------------------------------------
-# This template used to copy only `.albedo/dist` + `public` and run
-# `albedo serve --dir dist`, which is the STATIC FILE SERVER. The container
-# served markup and nothing else: no FORGE, no actions, no per-request
-# render, no auth -- for a framework whose claim is that the compiler emits
-# your backend. The runtime stage also carried no source tree, so
-# project-mode `serve` could not have worked there even with the CMD fixed,
-# and `.dockerignore` excluded `node_modules`, so any app with an npm
-# dependency failed in the builder too. Three faults, one cause: the target
-# was written for a static-site model and never revisited when the framework
-# grew a backend and npm support.
-#
-# --- corrected 2026-09-06 (item 13.4) ------------------------------------
-# The fix above left this target contradicting `ship --target binary`. That
-# target's whole claim is "one file -- copy it to any box and run it"; this
-# one still assembled a runtime stage by hand out of four COPY lines
-# (`src/`, `albedo.config.*`, `public/`, `npm-server-bundles.json`), which is
-# the same list `bundle_payload::should_ship` already computes. Two
-# definitions of "what a deployment consists of", drifting independently --
-# and the Dockerfile's copy had already drifted once, which is why the block
-# above exists.
-#
-# There is now ONE definition. The builder runs `ship --target binary`, and
-# the runtime stage copies its output. Anything `should_ship` starts or stops
-# including follows this image automatically.
-#
-# 🪤 The builder stage cannot be removed. `ship --target binary` appends the
-# project to *the running executable*, so the file it produces is for the
-# host that produced it -- a Windows or macOS dev box cannot emit a Linux
-# ELF this way. Compiling inside the image is what makes the output
-# linux/amd64 regardless of where `albedo ship` was typed. Use
-# `--platform=$BUILDPLATFORM` and a cross toolchain only if you need the
-# builder to run natively on an arm64 machine.
-# ------------------------------------------------------------------------
+# The builder stage is required even though the binary target exists: `ship
+# --target binary` appends your project to the albedo that runs it, so its
+# output is for the machine that produced it. Running it here makes the output
+# linux/amd64 wherever `albedo ship` was typed.
 
 FROM node:22-bookworm AS deps
 WORKDIR /workspace
-# `albedo build` resolves bare specifiers out of `node_modules`, so they are
+# `albedo build` resolves bare imports out of `node_modules`, so they are
 # installed here rather than copied from the host: a lockfile install is
 # reproducible, and the host's tree may be built for another platform.
 COPY package.json package-lock.json* ./
@@ -1659,40 +1767,24 @@ RUN if [ -f package-lock.json ]; then npm ci; \
     elif [ -f package.json ]; then npm install; \
     else mkdir -p node_modules; fi
 
-# --- corrected 2026-09-06, second pass (13.4c) ---------------------------
-# This stage was `FROM rust:1-bookworm` and ran `cargo build --release --bin
-# albedo`. It could never have worked: the build context is YOUR APP, which has
-# no `Cargo.toml` and no Rust source, so it failed in 0.17 s with
-# `could not find Cargo.toml in /workspace`. The line predates the 13.4 rewrite,
-# so this target had never built an image in any version -- it was written as
-# though the context were the ALBEDO repo.
-#
-# 🔑 The image never needed a Rust toolchain. It needs ONE Linux executable.
-# `albedo ship --target binary` appends your project to the *running* albedo, so
-# with a linux/amd64 albedo in the image this stage is a slim base that compiles
-# nothing. `albedo ship --target docker` puts that binary next to this file.
-# ------------------------------------------------------------------------
 FROM debian:bookworm-slim AS builder
 WORKDIR /workspace
 COPY albedo-linux-amd64 /usr/local/bin/albedo
 RUN chmod +x /usr/local/bin/albedo
 COPY . .
 COPY --from=deps /workspace/node_modules ./node_modules
-# Fail HERE, not at container start. `ship` runs the same production build
-# `albedo build` does, so preflight still refuses the defects that would
-# otherwise serve HTTP 200 with something missing -- an unresolvable import,
-# a topic nothing writes, a route with no component to render.
-#
-# The output is named for the project directory, so it is moved to a fixed
-# path rather than guessed at in the COPY below.
+# The same production build `albedo build` runs, so a defect it refuses — an
+# unresolvable import, a route with nothing to render — fails the image build
+# here rather than the container at start. The output is named for the project
+# directory, so it is moved to a fixed path for the COPY below.
 RUN albedo ship --target binary \
     && mkdir -p /out \
     && mv /workspace/*.albedo-bin /out/albedo-app \
     && chmod +x /out/albedo-app
 
 FROM debian:bookworm-slim AS runtime
-# ca-certificates for outbound TLS (APERTURE fetches, ACME); wget for the
-# healthcheck below. Nothing else -- no Node, no source tree, no toolchain.
+# ca-certificates for outbound TLS (fetches to declared sources, ACME); wget for
+# the healthcheck below. Nothing else: no Node, no source tree, no toolchain.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
@@ -1703,68 +1795,51 @@ ENV ALBEDO_SERVER_HOST=0.0.0.0
 ENV ALBEDO_SERVER_PORT=3000
 EXPOSE 3000
 
-# FORGE's database, named explicitly rather than left to the default.
-#
-# 🪤 A shipped binary defaults its database to a path BESIDE ITSELF, and
-# unpacks its project into a directory keyed by build id. Left implicit, the
-# database would land in `/app` next to a per-build unpack directory, inside
-# the container's writable layer -- so `docker run` twice is two empty
-# databases, which for an app with real data is data loss that looks like a
-# successful release. `VOLUME` makes docker create a real volume even when
-# the operator forgets `-v`; name it to keep it across `docker rm`:
+# The database lives on a volume. Without one it would sit in the container's
+# writable layer, and every new container would start with an empty database.
+# Name the volume so it survives `docker rm`:
 #
 #   docker run -v albedo-data:/data -p 3000:3000 <image>
 ENV ALBEDO_FORGE_DB=/data/forge.db
 VOLUME /data
 
-# 🪤 `shutdown_timeout_ms` bounds the drain that `docker stop` starts. Docker
-# sends SIGTERM and then SIGKILLs after its own grace period (10s default),
-# so keep this under `docker stop -t`.
-# 📏 Measured 2026-09-06: `docker stop` returns in 0s with exit code 0 — the
-# process handles SIGTERM and drains, rather than being killed at the 10s mark.
+# How long a shutdown may spend finishing in-flight requests. `docker stop`
+# sends SIGTERM and kills the container after its own grace period (10s by
+# default), so keep this below `docker stop -t`.
 ENV ALBEDO_SHUTDOWN_TIMEOUT_MS=5000
 
-# Prometheus metrics — closed unless you open them. A second listener serving
-# `GET /metrics`, never on the app port. Don't publish it with `-p`; point your
-# scraper (or an OpenTelemetry Collector's prometheus receiver) at it over the
-# container network:
+# Prometheus metrics are off unless you turn them on. They are served by a
+# second listener, never the app port. Don't publish it with `-p`; point your
+# scraper at it over the container network:
 #
 #   docker run -e ALBEDO_METRICS_ADDR=0.0.0.0:9464 ... <image>
 
-# 🔴 ALBEDO_PUBLIC_ORIGIN — an app with auth will not boot without it.
+# ALBEDO_PUBLIC_ORIGIN: an app with sign-in will not start without it.
 #
-# A container has to bind 0.0.0.0, and binding 0.0.0.0 over plain HTTP with auth
-# configured is refused on purpose: session cookies carry the `__Host-` prefix,
-# browsers will not store those over HTTP, and signing in would silently do
-# nothing forever with no error anywhere.
-#
-# 🔑 Inside a container the bind address cannot answer that question. `-p
-# 127.0.0.1:3000:3000`, an ingress terminating TLS, and a port open to the
-# internet all look identical from in here. So say how users actually reach you:
+# Session cookies use the `__Host-` prefix, which browsers only store over
+# HTTPS. From inside a container albedo cannot tell whether users reach it
+# through a TLS-terminating proxy or over plain HTTP, so tell it:
 #
 #   local testing:   -e ALBEDO_PUBLIC_ORIGIN=http://localhost:3000
 #   production:      -e ALBEDO_PUBLIC_ORIGIN=https://app.example.com
 #
-# Deliberately NOT defaulted in this image. A default would be a lie the moment
-# the image is deployed anywhere real, and it would disarm the one check that
-# catches a login which silently never works.
+# It is not defaulted here on purpose: a wrong default would let the app start
+# with a sign-in that silently never works.
 #
-# Serving HTTPS from the container itself is the alternative:
+# To serve HTTPS from the container itself instead:
 #   -v /certs:/certs -e ALBEDO_TLS_CERT=/certs/fullchain.pem \
 #                    -e ALBEDO_TLS_KEY=/certs/key.pem
 #
-# 🪤 ALBEDO_TRUSTED_PROXIES also satisfies the check, but do not reach for it to
-# silence this. It decides whose `X-Forwarded-For` the rate limiter believes —
-# a security setting, not a checkbox.
+# ALBEDO_TRUSTED_PROXIES also satisfies the check, but set it only to the
+# addresses of your load balancers: it decides whose `X-Forwarded-For` the rate
+# limiter believes.
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- "http://127.0.0.1:${ALBEDO_SERVER_PORT}/" >/dev/null 2>&1 || exit 1
 
-# 🔑 The shipped binary is NOT a CLI -- it carries a payload, so it serves
-# that payload and ignores subcommands (`src/bin/albedo.rs`, `run_shipped_app`).
-# `--host`/`--port` still apply. Exec form via `sh -c` so the ENV above is
-# expanded, and `exec` so the binary is PID 1 and receives SIGTERM directly
-# rather than through a shell that would not forward it.
+# The shipped executable serves the app it carries; it takes `--host` and
+# `--port` and no subcommands. `sh -c` expands the ENV above, and `exec` makes
+# the executable PID 1 so it receives SIGTERM directly.
 CMD ["sh", "-c", "exec /app/albedo-app --host ${ALBEDO_SERVER_HOST} --port ${ALBEDO_SERVER_PORT}"]
 "#
 
@@ -1780,9 +1855,8 @@ target/doc
 target/package
 target/tmp
 # A previously shipped binary is the runtime plus a whole copy of the app.
-# Sending it into the build context would upload it and then have the builder
-# overwrite it -- `bundle_payload::should_ship` already excludes both of these
-# from the payload for the same reason.
+# Sending it into the build context would upload it only for the builder to
+# overwrite it; `albedo ship` leaves both out of the app it packages too.
 *.albedo-bin
 *.albedo-bin.exe
 .albedo-app-*
@@ -1790,6 +1864,17 @@ target/tmp
 # transaction, and the container mounts its own volume anyway.
 forge.db
 forge.db-*
+# Secrets. The builder stage copies the whole context, so anything here would
+# sit in an image layer and could reach the payload. The container gets its
+# keys from `-e` / your platform's secret store at run time, never from a file.
+# `albedo ship` leaves these out of every artifact as well.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+.albedo-acme
 **/*.log
 **/.DS_Store
 **/Thumbs.db
@@ -1799,23 +1884,19 @@ forge.db-*
 
 fn build_fly_toml_template(app_name: &str) -> String {
     format!(
-        r#"# Phase N · fly.toml emitted by `albedo ship --target fly`.
-# Pairs with the Dockerfile above; Fly builds the image remotely and
-# runs it under a tiny VM. Adjust `primary_region` to whichever Fly
-# region your users live closest to.
+        r#"# Written by `albedo ship --target fly`, alongside the Dockerfile it builds.
+# Set `primary_region` to the Fly region closest to your users.
 
 app = "{app_name}"
 primary_region = "iad"
 
-# 🔑 `auto_stop_machines` below means the platform stops this machine on every
-# idle cycle, not just on deploy — so the stop signal is on the hot path, and a
-# machine that dies instantly cuts whatever requests were in flight. Stated
-# explicitly rather than left to the platform default. `kill_timeout` is the
-# outer bound on ALBEDO_SHUTDOWN_TIMEOUT_MS below: Fly SIGKILLs after it, so
-# the drain has to finish first.
+# Fly stops idle machines (`auto_stop_machines` below), so a shutdown happens
+# on every idle cycle, not only on deploy. SIGTERM lets albedo finish in-flight
+# requests; `kill_timeout` is how long Fly waits before killing the machine, so
+# it must exceed ALBEDO_SHUTDOWN_TIMEOUT_MS below.
 #
-# 🪤 These are TOP-LEVEL keys and must stay above the first `[table]` header —
-# a bare key after `[mounts]` is `mounts.kill_signal`, which Fly does not read.
+# These two keys must stay above the first `[table]` header: after `[mounts]`,
+# a bare key belongs to that table and Fly would not read it.
 kill_signal = "SIGTERM"
 kill_timeout = "10s"
 
@@ -1827,19 +1908,17 @@ kill_timeout = "10s"
   ALBEDO_SERVER_PORT = "3000"
   ALBEDO_FORGE_DB = "/data/forge.db"
   ALBEDO_SHUTDOWN_TIMEOUT_MS = "5000"
-  # 🔑 Unlike a bare container, Fly's topology is KNOWN: `force_https` below
-  # means the edge terminates TLS and every app gets `<app>.fly.dev`. So the
-  # origin browsers use is not a guess here, and an app with auth boots without
-  # the operator having to work it out. Change this when you attach a custom
-  # domain — it is what decides whether the `__Host-` session cookie is stored.
+  # The address browsers use. Fly terminates TLS at its edge (`force_https`
+  # below) and serves every app at `<app>.fly.dev`. Change this when you attach
+  # a custom domain: sign-in only works on the origin named here.
   ALBEDO_PUBLIC_ORIGIN = "https://{app_name}.fly.dev"
-  # 15.7 · the Prometheus scrape listener, for the [metrics] block below. `[::]`
-  # rather than `0.0.0.0`: Fly's private network is IPv6, and a dual-stack bind
-  # answers both. Not in [http_service], so the edge never proxies it.
+  # The Prometheus listener for the [metrics] block below. `[::]` because Fly's
+  # private network is IPv6; it is not in [http_service], so the edge never
+  # exposes it.
   ALBEDO_METRICS_ADDR = "[::]:9091"
 
-# 🪤 Without this the database lives in the machine's ephemeral filesystem and
-# every deploy starts empty. `fly volumes create albedo_data --size 1` first.
+# The database lives on a volume; without it every deploy starts empty.
+# Create it once: `fly volumes create albedo_data --size 1`.
 [mounts]
   source = "albedo_data"
   destination = "/data"
@@ -1941,6 +2020,7 @@ fn run_serve_command(raw_args: &[String]) -> Result<(), String> {
     print_boot_banner();
     print_section("serve");
     print_kv("project", contract.project_dir.display());
+    warn_inert_settings(&contract);
     print_foreign_layout_notice(&contract);
     print_kv("mode", "production (build + serve)");
     println!();
@@ -2050,7 +2130,7 @@ fn boot_and_run_production_server(
 /// it does (no rendering, no stitcher; bytes off disk).
 fn run_files_command(raw_args: &[String]) -> Result<(), String> {
     if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print_serve_help();
+        print_files_help();
         return Ok(());
     }
 
@@ -2339,6 +2419,10 @@ fn run_command(raw_args: &[String]) -> Result<(), String> {
 }
 
 fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_dev_help(raw_args.iter().any(|arg| arg == "--prod" || arg == "--production"));
+        return Ok(());
+    }
     let mut forwarded = Vec::new();
     let mut prod_mode = false;
     let mut skip_budget = false;
@@ -2369,10 +2453,17 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
         }
     }
     let contract = resolve_dev_contract(&forwarded, &cwd)?;
+    // Before anything boots: every `{ env: … }` in albedo.config is read at
+    // boot, and a missing one refuses to start. See `load_dev_env_files`.
+    let loaded_env = load_dev_env_files(&contract.project_dir);
 
     print_boot_banner();
     print_section(if prod_mode { "build" } else { "dev" });
     print_kv("project", contract.project_dir.display());
+    for (file, count) in &loaded_env {
+        print_kv("env", format!("{count} from {file}"));
+    }
+    warn_inert_settings(&contract);
     print_foreign_layout_notice(&contract);
     print_kv(
         "server",
@@ -2389,7 +2480,6 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
                 "disabled".to_string()
             },
         );
-        print_kv("hot set", format!("{}/32", contract.hot_set.len()));
         print_kv(
             "config",
             contract
@@ -2416,6 +2506,82 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     // Dev mode never gates on budget; the flag is silently accepted.
     let _ = skip_budget;
     run_live_dev_runtime(contract)
+}
+
+/// `albedo dev` only: read `.env.local`, then `.env`, from the project
+/// directory into the process environment. Returns what each file set.
+///
+/// ## Why dev, and why never over what is already set
+///
+/// An app with sign-in or payments names its secrets with `{ env: "…" }`, and
+/// boot refuses to start while one is unset — the right call in production,
+/// where a missing secret is a broken deploy. In development it meant six
+/// `export`s in every new shell before the site would even render its home
+/// page. These files are already git-ignored by the scaffold, so this is the
+/// convention the project was already set up for.
+///
+/// `albedo serve` does not read them: a production process gets its
+/// environment from whatever runs it, and a `.env` left in a deploy directory
+/// silently supplying a secret is exactly the kind of answer nobody can find
+/// later. And nothing here overrides a variable the shell already set —
+/// `.env.local` is read first so it wins over `.env`, and the shell wins over
+/// both.
+///
+/// The format is the common subset: `KEY=value` per line, `#` comments, an
+/// optional `export ` prefix, one pair of matching quotes stripped. No `${…}`
+/// interpolation and no multi-line values — a secret that needs either is one
+/// the shell should set.
+fn load_dev_env_files(project_dir: &std::path::Path) -> Vec<(&'static str, usize)> {
+    let mut loaded = Vec::new();
+    for file in [".env.local", ".env"] {
+        let Ok(text) = std::fs::read_to_string(project_dir.join(file)) else {
+            continue;
+        };
+        let mut count = 0;
+        for (key, value) in parse_env_file(&text) {
+            if std::env::var_os(&key).is_none() {
+                // Edition 2021, and called before any runtime or server thread
+                // exists — the one moment writing the environment is sound.
+                std::env::set_var(&key, value);
+                count += 1;
+            }
+        }
+        loaded.push((file, count));
+    }
+    loaded
+}
+
+/// `KEY=value` pairs from a `.env` file. A line that is not one is skipped.
+fn parse_env_file(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            let valid_key = key
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid_key {
+                return None;
+            }
+            let value = value.trim();
+            let unquoted = [('"', '"'), ('\'', '\'')]
+                .iter()
+                .find_map(|(open, close)| {
+                    value
+                        .strip_prefix(*open)
+                        .and_then(|rest| rest.strip_suffix(*close))
+                })
+                .unwrap_or(value);
+            Some((key.to_string(), unquoted.to_string()))
+        })
+        .collect()
 }
 
 /// One renderer for dev and prod. `albedo dev` boots the SAME production
@@ -2658,26 +2824,66 @@ fn dev_watch_and_reload(
         );
         return;
     }
+    // The config sits outside `root`. Watched so an edit to it is at least
+    // announced: it is read once at boot, and the running server keeps the one
+    // it started with.
+    let config_path = contract
+        .config_path
+        .clone()
+        .filter(|path| watcher.watch(path.as_path(), RecursiveMode::NonRecursive).is_ok());
+    let ignore = contract.watch.ignore_matcher().unwrap_or_default();
+
+    // Two sinks, one decision made at startup: with a dashboard every
+    // outcome becomes a row in its event log, without one it prints exactly
+    // as it always did. The browser overlay is told either way — a build
+    // error belongs on the page that failed to render, regardless of what
+    // the terminal is doing.
+    let report = |event: tui::dev::DashEvent| {
+        if let Some(sender) = &dash {
+            let _ = sender.send(event);
+        }
+    };
 
     loop {
         // Block until the first change, then drain the rest of the burst so a
         // multi-file save rebuilds once.
-        if event_rx.recv().is_err() {
+        let Ok(first) = event_rx.recv() else {
             return; // sender dropped — watcher gone
+        };
+        let mut batch = vec![first];
+        while let Ok(next) = event_rx.recv_timeout(debounce) {
+            batch.push(next);
         }
-        while event_rx.recv_timeout(debounce).is_ok() {}
+        // An error event names no path but still means something changed.
+        let mut unattributed = false;
+        let mut paths = Vec::new();
+        for event in batch {
+            match event {
+                Ok(event) => paths.extend(event.paths),
+                Err(_) => unattributed = true,
+            }
+        }
+        let is_config = |path: &PathBuf| config_path.as_ref() == Some(path);
+        if paths.iter().any(is_config) {
+            let notice = "albedo.config changed — restart `albedo dev` to apply it; \
+                          the running server keeps the configuration it started with";
+            if dash.is_some() {
+                report(tui::dev::DashEvent::Note {
+                    message: notice.to_string(),
+                });
+            } else {
+                print_warn(notice);
+            }
+        }
+        let source_changed = unattributed
+            || paths
+                .iter()
+                .any(|path| !is_config(path) && !ignore.ignores(&contract.project_dir, path));
+        if !source_changed {
+            continue;
+        }
 
         let rebuild_start = Instant::now();
-        // Two sinks, one decision made at startup: with a dashboard every
-        // outcome becomes a row in its event log, without one it prints exactly
-        // as it always did. The browser overlay is told either way — a build
-        // error belongs on the page that failed to render, regardless of what
-        // the terminal is doing.
-        let report = |event: tui::dev::DashEvent| {
-            if let Some(sender) = &dash {
-                let _ = sender.send(event);
-            }
-        };
         match run_prod_build_quiet(&contract) {
             Ok(_tiers) => match reload.reload(&opts) {
                 Ok(()) => {
@@ -2908,21 +3114,35 @@ fn parse_http_request_head<R: std::io::Read>(
     Ok((first_line, headers, leftover))
 }
 
-/// Global (non-module) CSS only. `.module.css` files carry their own
-/// build-scoped class names and are injected per-route as scoped
-/// `<style>` blocks by the manifest builder, so concatenating them
-/// raw here would double-ship the rules with the wrong (unscoped)
-/// selectors. Everything else under the tree is plain global CSS.
-fn collect_global_css_bundle(root: &Path) -> String {
-    collect_css_bundle_filtered(root, |path| {
-        !path
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .ends_with(".module.css")
-    })
+/// One plain stylesheet, and the routes it reaches.
+struct Stylesheet {
+    /// The URL prefix it covers, by [`url_prefix_covers`]: `/` for a file
+    /// outside `routes/`, its directory's prefix for one inside.
+    ///
+    /// [`url_prefix_covers`]: dom_render_compiler::routing::file_based::url_prefix_covers
+    reach: String,
+    /// The file, headed by its project-relative path.
+    text: String,
 }
 
-fn collect_css_bundle_filtered(root: &Path, keep: impl Fn(&Path) -> bool) -> String {
+/// Every non-module stylesheet under `root`, with its reach, ordered so a later
+/// one can override an earlier: the global files first, then each directory's
+/// deeper than the last.
+///
+/// 🔑 **A stylesheet under `routes/<dir>/` reaches only the routes at or below
+/// `<dir>`** — the rule `layout.tsx` beside it already follows, so a section's
+/// styles live with its layout and ship only on its pages. Anything outside
+/// `routes/` (the usual `src/styles.css`) is global, as before. Until this, every
+/// stylesheet was inlined into every route: a docs section's CSS rode on the
+/// landing page, and the landing page's scroll set piece on every doc.
+///
+/// `.module.css` files are excluded: they carry build-scoped class names and the
+/// manifest builder injects them per route, so shipping them raw here too would
+/// double every rule under the wrong (unscoped) selectors.
+fn collect_stylesheets(root: &Path) -> Vec<Stylesheet> {
+    use dom_render_compiler::routing::{file_based::directory_url_prefix, ROUTES_DIRNAME};
+
+    let routes_dir = root.join(ROUTES_DIRNAME);
     let mut css_files = WalkDir::new(root)
         .follow_links(true)
         .into_iter()
@@ -2936,13 +3156,29 @@ fn collect_css_bundle_filtered(root: &Path, keep: impl Fn(&Path) -> bool) -> Str
                 .map(|ext| ext.eq_ignore_ascii_case("css"))
                 .unwrap_or(false)
         })
-        .filter(|entry| keep(entry.path()))
-        .map(|entry| entry.path().to_path_buf())
+        .filter(|entry| {
+            !entry
+                .path()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".module.css")
+        })
+        .map(|entry| {
+            let path = entry.path().to_path_buf();
+            let reach = path
+                .strip_prefix(&routes_dir)
+                .map(directory_url_prefix)
+                .unwrap_or_else(|_| "/".to_string());
+            (reach, path)
+        })
         .collect::<Vec<_>>();
-    css_files.sort();
+    css_files.sort_by(|(reach_a, path_a), (reach_b, path_b)| {
+        let depth = |reach: &str| if reach == "/" { 0 } else { reach.matches('/').count() };
+        depth(reach_a).cmp(&depth(reach_b)).then_with(|| path_a.cmp(path_b))
+    });
 
-    let mut out = String::new();
-    for path in css_files {
+    let mut sheets = Vec::new();
+    for (reach, path) in css_files {
         if let Ok(source) = std::fs::read_to_string(&path) {
             // Project-relative, never absolute. This comment is inlined into a
             // `<style>` block in **every route shell**, so an absolute path here
@@ -2952,14 +3188,25 @@ fn collect_css_bundle_filtered(root: &Path, keep: impl Fn(&Path) -> bool) -> Str
             // leaked the same thing into files nobody ever fetched. This one
             // ships.)
             let display = path.strip_prefix(root).unwrap_or(path.as_path());
-            out.push_str("\n/* ");
-            out.push_str(display.to_string_lossy().replace('\\', "/").as_str());
-            out.push_str(" */\n");
-            out.push_str(source.as_str());
-            out.push('\n');
+            let text = format!(
+                "\n/* {} */\n{}\n",
+                display.to_string_lossy().replace('\\', "/"),
+                source
+            );
+            sheets.push(Stylesheet { reach, text });
         }
     }
-    out
+    sheets
+}
+
+/// The CSS one route ships: every stylesheet whose reach covers it, in order.
+fn css_for_route(sheets: &[Stylesheet], route: &str) -> String {
+    use dom_render_compiler::routing::file_based::url_prefix_covers;
+    sheets
+        .iter()
+        .filter(|sheet| url_prefix_covers(&sheet.reach, route))
+        .map(|sheet| sheet.text.as_str())
+        .collect()
 }
 
 /// A4 · inline every global `.css` file under `root` into each route's
@@ -2970,23 +3217,25 @@ fn collect_css_bundle_filtered(root: &Path, keep: impl Fn(&Path) -> bool) -> Str
 /// zero global CSS and a real app needs a manual `public/styles.css` +
 /// `<link>` workaround. Mirrors the dev path's `collect_css_bundle`
 /// concatenation, minus `.module.css` (already injected scoped,
-/// per-route, by the manifest builder). Returns the routes touched.
+/// per-route, by the manifest builder). Each route gets only the stylesheets
+/// that reach it — see [`collect_stylesheets`]. Returns the routes touched.
 fn inject_global_css_into_shells(
     manifest: &mut dom_render_compiler::manifest::schema::RenderManifestV2,
     root: &Path,
 ) -> usize {
-    let global_css = collect_global_css_bundle(root);
-    if global_css.trim().is_empty() {
-        return 0;
-    }
-    let style_block = format!("<style data-albedo-global-css>{global_css}</style>");
+    let sheets = collect_stylesheets(root);
     let mut touched = 0usize;
-    for route in manifest.routes.values_mut() {
+    for (route_path, route) in manifest.routes.iter_mut() {
+        let css = css_for_route(&sheets, route_path);
+        if css.trim().is_empty() {
+            continue;
+        }
         let head = &mut route.shell.doctype_and_head;
         // Idempotent — never double-inject if a shell already carries it.
         if head.contains("data-albedo-global-css") {
             continue;
         }
+        let style_block = format!("<style data-albedo-global-css>{css}</style>");
         match head.rfind("</head>") {
             Some(pos) => head.insert_str(pos, &style_block),
             None => head.push_str(&style_block),
@@ -3324,7 +3573,7 @@ fn run_prod_build_with_budget(
                 // their absence cannot produce a false accusation, which is the
                 // failure direction that matters.
                 let schema = if contract.forge.is_empty() {
-                    dom_render_compiler::forge::ForgeSchema::guestbook_default()
+                    dom_render_compiler::forge::ForgeSchema::empty()
                 } else {
                     match dom_render_compiler::forge::ForgeSchema::from_declarations(
                         &contract.forge,
@@ -3576,22 +3825,25 @@ fn run_prod_build_with_budget(
         }
     }
 
-    // Phase N · copy `<project>/public/` into `.albedo/dist/public/`
+    // Phase N · mirror `<project>/public/` into `.albedo/dist/public/`
     // so a pure-static deploy (CDN / static-export ship target) ships
     // images, favicons, fonts, etc. alongside the rendered shell and
-    // hydration JS. Idempotent — re-runs overwrite the existing files
-    // without leaving stale entries because we copy into a fresh
-    // sub-dir each build.
-    let public_src = contract.project_dir.join("public");
-    if public_src.is_dir() {
-        let public_dst = out_dir.join("public");
-        let copied = copy_public_dir(&public_src, &public_dst)?;
-        if copied > 0 && !quiet {
-            print_kv(
-                "public",
-                format!("{copied} file{}", if copied == 1 { "" } else { "s" }),
-            );
-        }
+    // hydration JS.
+    //
+    // 🔴 This comment used to say re-runs leave no stale entries "because we
+    // copy into a fresh sub-dir each build". Nothing made the sub-dir fresh:
+    // the copy went over whatever the last build left, so a file deleted from
+    // `public/` stayed in `dist/public/` — which `serve` mounts and the static
+    // export reads — and kept shipping. See `sync_public_dir`.
+    let copied = sync_public_dir(
+        &contract.project_dir.join("public"),
+        &out_dir.join("public"),
+    )?;
+    if copied > 0 && !quiet {
+        print_kv(
+            "public",
+            format!("{copied} file{}", if copied == 1 { "" } else { "s" }),
+        );
     }
 
     // Phase O.1 + O.3 · gate the build on the tier budget. File-gated:
@@ -3608,15 +3860,50 @@ fn run_prod_build_with_budget(
     Ok(tier_report)
 }
 
-/// Phase N · recursive directory copy used by the `public/` ship
+/// Make `dst` hold exactly what `src` holds — or nothing, when there is no
+/// `src` any more. Returns the count of files copied.
+///
+/// The removals come AFTER the copy: during an `albedo dev` rebuild the
+/// server is reading `dst`, and clearing it first would 404 files that still
+/// exist for as long as the copy takes.
+fn sync_public_dir(src: &Path, dst: &Path) -> Result<usize, String> {
+    if src.is_dir() {
+        return copy_public_dir(src, dst);
+    }
+    // The project removed `public/` outright. `src` does not exist, so `dst`
+    // cannot be it or inside it.
+    if dst.is_dir() {
+        std::fs::remove_dir_all(dst)
+            .map_err(|err| format!("failed to remove stale '{}': {err}", dst.display()))?;
+    }
+    Ok(0)
+}
+
+/// Phase N · recursive directory MIRROR used by the `public/` ship
 /// step. Returns the count of files copied so the build summary can
 /// print it. Skips symlinks (they'd require a portability story
 /// across platforms) and surfaces the offending path on any IO
 /// failure so the user sees exactly what went wrong.
+///
+/// Anything in `dst` that `src` does not have is removed after the copy —
+/// including a path that is a symlink in `src`, which is not copied.
 fn copy_public_dir(src: &Path, dst: &Path) -> Result<usize, String> {
+    // Mirroring into a directory that holds the source, or sits inside it,
+    // would prune the author's own files. Refused outright rather than reasoned
+    // about: no configuration this build produces nests the two.
+    if let (Ok(src_abs), Ok(dst_abs)) = (src.canonicalize(), dst.canonicalize()) {
+        if src_abs.starts_with(&dst_abs) || dst_abs.starts_with(&src_abs) {
+            return Err(format!(
+                "refusing to mirror '{}' into '{}': the directories overlap",
+                src.display(),
+                dst.display()
+            ));
+        }
+    }
     std::fs::create_dir_all(dst)
         .map_err(|err| format!("failed to create '{}': {err}", dst.display()))?;
     let mut count = 0usize;
+    let mut kept: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for entry in WalkDir::new(src).follow_links(false) {
         let entry = entry.map_err(|err| format!("public/ walk failed: {err}"))?;
         let path = entry.path();
@@ -3631,12 +3918,23 @@ fn copy_public_dir(src: &Path, dst: &Path) -> Result<usize, String> {
         }
         let target = dst.join(rel);
         if path.is_dir() {
+            // A file where the source now has a directory.
+            if target.is_file() {
+                std::fs::remove_file(&target)
+                    .map_err(|err| format!("failed to remove '{}': {err}", target.display()))?;
+            }
             std::fs::create_dir_all(&target)
                 .map_err(|err| format!("failed to create '{}': {err}", target.display()))?;
+            kept.insert(rel.to_path_buf());
         } else if path.is_file() {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|err| format!("failed to create '{}': {err}", parent.display()))?;
+            }
+            // A directory where the source now has a file.
+            if target.is_dir() {
+                std::fs::remove_dir_all(&target)
+                    .map_err(|err| format!("failed to remove '{}': {err}", target.display()))?;
             }
             std::fs::copy(path, &target).map_err(|err| {
                 format!(
@@ -3645,8 +3943,30 @@ fn copy_public_dir(src: &Path, dst: &Path) -> Result<usize, String> {
                     target.display()
                 )
             })?;
+            kept.insert(rel.to_path_buf());
             count += 1;
         }
+    }
+
+    // Children before parents, so a directory is empty by the time it is
+    // reached if everything in it was stale.
+    for entry in WalkDir::new(dst).follow_links(false).contents_first(true) {
+        let entry = entry.map_err(|err| format!("dist public/ walk failed: {err}"))?;
+        let rel = entry
+            .path()
+            .strip_prefix(dst)
+            .map_err(|err| format!("dist public/ path strip failed: {err}"))?;
+        if rel.as_os_str().is_empty() || kept.contains(rel) {
+            continue;
+        }
+        let removed = if entry.file_type().is_dir() {
+            std::fs::remove_dir(entry.path())
+        } else {
+            std::fs::remove_file(entry.path())
+        };
+        removed.map_err(|err| {
+            format!("failed to remove stale '{}': {err}", entry.path().display())
+        })?;
     }
     Ok(count)
 }
@@ -3668,7 +3988,9 @@ fn read_manifest_module_source(
 
     for candidate in candidates {
         if candidate.is_file() {
-            return std::fs::read_to_string(&candidate).map_err(|err| {
+            // A Markdown page's module is the JSX it lowers to; the file on disk is
+            // Markdown, and the artifacts carry what the engine will execute.
+            return dom_render_compiler::markdown::read_module_source(&candidate).map_err(|err| {
                 format!(
                     "failed to read module source '{}': {err}",
                     candidate.display()
@@ -3926,11 +4248,11 @@ fn sanitize_package_name(value: &str) -> Option<String> {
 }
 
 fn albedo_runtime_shim_template() -> String {
-    include_str!("../../assets/albedo-runtime.js").to_string()
+    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/albedo-runtime.js"))
 }
 
 fn albedo_hydration_runtime_template() -> String {
-    include_str!("../../assets/albedo-hydration.js").to_string()
+    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/albedo-hydration.js"))
 }
 
 /// Bakabox bincode decoder, deployed to `_albedo/bincode.js` so the
@@ -3938,21 +4260,21 @@ fn albedo_hydration_runtime_template() -> String {
 /// origin. Pairs with [`albedo_runtime_shim_template`]; the two ship
 /// together or the import will 404 at boot.
 fn albedo_bincode_template() -> String {
-    include_str!("../../assets/bincode.js").to_string()
+    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/bincode.js"))
 }
 
 /// Bakabox WT bootstrap, deployed to `_albedo/wt-bootstrap.js`. Imports
 /// `./bincode.js` at runtime, so it must ship alongside both the
 /// runtime and the decoder.
 fn albedo_wt_bootstrap_template() -> String {
-    include_str!("../../assets/albedo-wt-bootstrap.js").to_string()
+    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/albedo-wt-bootstrap.js"))
 }
 
 /// PHOSPHOR · the shared per-browser lane, deployed to
 /// `_albedo/phosphor.js`. Imported by the WT bootstrap as `./phosphor.js`,
 /// so the two ship together or the import 404s at boot.
 fn albedo_phosphor_template() -> String {
-    include_str!("../../assets/phosphor.js").to_string()
+    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/phosphor.js"))
 }
 
 /// Phase L · client-side Link / form-action / Navigate interception.
@@ -3961,7 +4283,7 @@ fn albedo_phosphor_template() -> String {
 /// asset MUST load after the main runtime — the shell shim emits the
 /// `<script>` tag in document order to guarantee that.
 fn albedo_link_forms_template() -> String {
-    include_str!("../../assets/albedo-link-forms.js").to_string()
+    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/albedo-link-forms.js"))
 }
 
 fn run_completions_command(raw_args: &[String]) -> Result<(), String> {
@@ -3972,12 +4294,12 @@ fn run_completions_command(raw_args: &[String]) -> Result<(), String> {
         "fish" => COMPLETIONS_FISH,
         "powershell" | "pwsh" => COMPLETIONS_POWERSHELL,
         _ => {
-            return Err("usage: albdo completions <bash|zsh|fish|powershell>\n\
+            return Err("usage: albedo completions <bash|zsh|fish|powershell>\n\
                  Examples:\n  \
-                   albdo completions bash        >> ~/.bashrc\n  \
-                   albdo completions zsh         >> ~/.zshrc\n  \
-                   albdo completions fish        > ~/.config/fish/completions/albdo.fish\n  \
-                   albdo completions powershell  >> $PROFILE"
+                   albedo completions bash        >> ~/.bashrc\n  \
+                   albedo completions zsh         >> ~/.zshrc\n  \
+                   albedo completions fish        > ~/.config/fish/completions/albedo.fish\n  \
+                   albedo completions powershell  >> $PROFILE"
                 .to_string());
         }
     };
@@ -3986,20 +4308,20 @@ fn run_completions_command(raw_args: &[String]) -> Result<(), String> {
 }
 
 // ─── Static completion scripts ────────────────────────────────────────────────
-// Generated once here; the CI pipes `albdo completions <shell>` to produce the
+// Generated once here; the CI pipes `albedo completions <shell>` to produce the
 // files that get bundled into each platform installer.
 
-const COMPLETIONS_BASH: &str = r#"# albdo bash completions
-_albdo_completions() {
+const COMPLETIONS_BASH: &str = r#"# albedo bash completions
+_albedo_completions() {
     local cur prev words
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local commands="init dev build ship serve files budget doctor demo run completions help"
+    local commands="init dev build ship serve files budget doctor email run completions help"
 
     case "$prev" in
-        albdo)
+        albedo)
             COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
             return 0
             ;;
@@ -4043,11 +4365,11 @@ _albdo_completions() {
 
     COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
 }
-complete -F _albdo_completions albdo
+complete -F _albedo_completions albedo
 "#;
 
-const COMPLETIONS_ZSH: &str = r#"#compdef albdo
-_albdo() {
+const COMPLETIONS_ZSH: &str = r#"#compdef albedo
+_albedo() {
     local -a commands
     commands=(
         'init:Create a tiered starter app scaffold'
@@ -4058,7 +4380,7 @@ _albdo() {
         'files:Static file server (defaults to .albedo/dist)'
         'budget:Evaluate the tier budget against the current build'
         'doctor:Report what the build already knows about itself'
-        'demo:Draw the instrument panel from synthetic signal'
+        'email:Send a test email through the configured provider'
         'run:Run a sub-mode (e.g. run dev)'
         'completions:Emit shell completion script to stdout'
         'help:Show command list and examples'
@@ -4079,7 +4401,7 @@ _albdo() {
 
     case $state in
         (cmd)
-            _describe 'albdo commands' commands && return 0
+            _describe 'albedo commands' commands && return 0
             ;;
     esac
 
@@ -4089,7 +4411,7 @@ _albdo() {
 
     case $state in
         (cmd)
-            _describe 'albdo commands' commands
+            _describe 'albedo commands' commands
             ;;
         (args)
             case $words[2] in
@@ -4129,71 +4451,71 @@ _albdo() {
             ;;
     esac
 }
-_albdo "$@"
+_albedo "$@"
 "#;
 
-const COMPLETIONS_FISH: &str = r#"# albdo fish completions
-set -l albdo_commands init dev build ship serve files budget doctor demo run completions help
+const COMPLETIONS_FISH: &str = r#"# albedo fish completions
+set -l albedo_commands init dev build ship serve files budget doctor email run completions help
 
 # Disable file completions for the main command
-complete -c albdo -f
+complete -c albedo -f
 
 # Top-level commands
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a init        -d 'Create a tiered starter app scaffold'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a dev         -d 'Start the live dev server with HMR'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a build       -d 'Compile an optimised production build'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a ship        -d 'Build and configure deployment target files'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a serve       -d 'Serve static files from a directory'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a budget      -d 'Evaluate the tier budget against the current build'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a doctor      -d 'Report what the build already knows about itself'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a demo        -d 'Draw the instrument panel from synthetic signal'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a run         -d 'Run a sub-mode'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a completions -d 'Emit shell completion script to stdout'
-complete -c albdo -n "__fish_use_subcommand $albdo_commands" -a help        -d 'Show command list and examples'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a init        -d 'Create a tiered starter app scaffold'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a dev         -d 'Start the live dev server with HMR'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a build       -d 'Compile an optimised production build'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a ship        -d 'Build and configure deployment target files'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a serve       -d 'Serve static files from a directory'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a budget      -d 'Evaluate the tier budget against the current build'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a doctor      -d 'Report what the build already knows about itself'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a email       -d 'Send a test email through the configured provider'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a run         -d 'Run a sub-mode'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a completions -d 'Emit shell completion script to stdout'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a help        -d 'Show command list and examples'
 
 # completions <shell>
-complete -c albdo -n "__fish_seen_subcommand_from completions" -a "bash zsh fish powershell"
+complete -c albedo -n "__fish_seen_subcommand_from completions" -a "bash zsh fish powershell"
 
 # dev / build flags
 for sub in dev build run
-    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l config  -d 'Use explicit albedo config file'     -r
-    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l entry   -d 'Override entry module'               -r
-    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l host    -d 'Override server host'                -r
-    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l port    -d 'Override server port'                -r
-    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l no-hmr  -d 'Disable HMR'
-    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l strict  -d 'Enable strict startup behaviour'
-    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l verbose -d 'Verbose diagnostics'
-    complete -c albdo -n "__fish_seen_subcommand_from $sub" -l open    -d 'Open browser on startup'
+    complete -c albedo -n "__fish_seen_subcommand_from $sub" -l config  -d 'Use explicit albedo config file'     -r
+    complete -c albedo -n "__fish_seen_subcommand_from $sub" -l entry   -d 'Override entry module'               -r
+    complete -c albedo -n "__fish_seen_subcommand_from $sub" -l host    -d 'Override server host'                -r
+    complete -c albedo -n "__fish_seen_subcommand_from $sub" -l port    -d 'Override server port'                -r
+    complete -c albedo -n "__fish_seen_subcommand_from $sub" -l no-hmr  -d 'Disable HMR'
+    complete -c albedo -n "__fish_seen_subcommand_from $sub" -l strict  -d 'Enable strict startup behaviour'
+    complete -c albedo -n "__fish_seen_subcommand_from $sub" -l verbose -d 'Verbose diagnostics'
+    complete -c albedo -n "__fish_seen_subcommand_from $sub" -l open    -d 'Open browser on startup'
 end
-complete -c albdo -n "__fish_seen_subcommand_from dev build" -l prod -d 'Production build mode'
+complete -c albedo -n "__fish_seen_subcommand_from dev build" -l prod -d 'Production build mode'
 
 # ship flags
-complete -c albdo -n "__fish_seen_subcommand_from ship" -l target -d 'Deployment target' -r -a "docker fly static"
-complete -c albdo -n "__fish_seen_subcommand_from ship" -l config -d 'Use explicit albedo config file' -r
-complete -c albdo -n "__fish_seen_subcommand_from ship" -l no-budget -d 'Skip the tier-budget gate'
+complete -c albedo -n "__fish_seen_subcommand_from ship" -l target -d 'Deployment target' -r -a "docker fly static"
+complete -c albedo -n "__fish_seen_subcommand_from ship" -l config -d 'Use explicit albedo config file' -r
+complete -c albedo -n "__fish_seen_subcommand_from ship" -l no-budget -d 'Skip the tier-budget gate'
 
 # budget flags
-complete -c albdo -n "__fish_seen_subcommand_from budget" -l strict -d 'Require tier-budget.toml; fail if missing'
-complete -c albdo -n "__fish_seen_subcommand_from budget" -l format -d 'Output format' -r -a "pretty json"
-complete -c albdo -n "__fish_seen_subcommand_from budget" -l config -d 'Use explicit albedo config file' -r
+complete -c albedo -n "__fish_seen_subcommand_from budget" -l strict -d 'Require tier-budget.toml; fail if missing'
+complete -c albedo -n "__fish_seen_subcommand_from budget" -l format -d 'Output format' -r -a "pretty json"
+complete -c albedo -n "__fish_seen_subcommand_from budget" -l config -d 'Use explicit albedo config file' -r
 
 # serve flags
-complete -c albdo -n "__fish_seen_subcommand_from serve" -l dir  -d 'Directory to serve' -r
-complete -c albdo -n "__fish_seen_subcommand_from serve" -l host -d 'Bind host'          -r
-complete -c albdo -n "__fish_seen_subcommand_from serve" -l port -d 'Bind port'          -r
+complete -c albedo -n "__fish_seen_subcommand_from serve" -l dir  -d 'Directory to serve' -r
+complete -c albedo -n "__fish_seen_subcommand_from serve" -l host -d 'Bind host'          -r
+complete -c albedo -n "__fish_seen_subcommand_from serve" -l port -d 'Bind port'          -r
 
 # init flags
-complete -c albdo -n "__fish_seen_subcommand_from init" -l force -d 'Overwrite existing files'
+complete -c albedo -n "__fish_seen_subcommand_from init" -l force -d 'Overwrite existing files'
 "#;
 
-const COMPLETIONS_POWERSHELL: &str = r#"# albdo PowerShell tab-completion
-Register-ArgumentCompleter -Native -CommandName @('albdo', 'albdo.exe') -ScriptBlock {
+const COMPLETIONS_POWERSHELL: &str = r#"# albedo PowerShell tab-completion
+Register-ArgumentCompleter -Native -CommandName @('albedo', 'albedo.exe') -ScriptBlock {
     param($wordToComplete, $commandAst, $cursorPosition)
 
     $tokens = $commandAst.CommandElements
     $nTokens = $tokens.Count
 
-    $commands = @('init','dev','build','ship','serve','files','budget','doctor','demo','run','completions','help')
+    $commands = @('init','dev','build','ship','serve','files','budget','doctor','email','run','completions','help')
     $devFlags = @('--config','--entry','--host','--port','--no-hmr','--strict','--verbose','--open','--prod','--no-budget')
 
     if ($nTokens -le 2) {
@@ -4259,24 +4581,18 @@ fn print_help() {
     print_command("init", "<name>", "scaffold a new app");
     print_command("dev", "[dir]", "start the dev server — live reload");
     print_command("build", "[dir]", "compile for production");
-    print_command("serve", "", "build and run the production server");
+    print_command("serve", "[dir]", "build and run the production server");
     print_command("ship", "[dir]", "build and configure a deploy target");
     print_command("files", "[dir]", "serve static files from a folder");
     print_command("budget", "[dir]", "check the tier budget");
     print_command("doctor", "[dir]", "report what the build knows about itself");
-    print_command("demo", "", "draw the instrument panel — synthetic signal");
+    print_command("email test", "<address> [dir]", "send one real email to check the provider");
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
+    print_command("--version", "", "print the version");
 
     print_section("dev flags");
-    print_option("--config <FILE>", "explicit albedo config");
-    print_option("--entry <FILE>", "override entry module");
-    print_option("--host <IP>", "server host");
-    print_option("--port <PORT>", "server port");
-    print_option("--no-hmr", "disable HMR");
-    print_option("--strict", "strict startup");
-    print_option("--verbose, -v", "verbose diagnostics");
-    print_option("--open", "open browser on start");
+    print_dev_flags(true);
     print_option("--prod", "production build mode");
 
     print_section("examples");
@@ -4326,20 +4642,13 @@ fn print_doctor_help() {
     print_option("--json", "machine-readable report for CI");
     print_option("--config <FILE>", "explicit albedo config");
     println!();
-    println!(
-        "  {}",
-        style(
-            "reports the reach matrix (what each route reads and what keys it), the rate-limit",
-            "2"
-        )
-    );
-    println!(
-        "  {}",
-        style(
-            "class each route answers to, and `tsc --noEmit`. Exits non-zero on a type error only.",
-            "2"
-        )
-    );
+    for line in [
+        "reports the reach matrix (what each route reads and what keys it),",
+        "the rate-limit class each route answers to, and `tsc --noEmit`.",
+        "Exits non-zero on a type error only.",
+    ] {
+        println!("  {}", style(line, "2"));
+    }
     println!();
 }
 
@@ -4390,17 +4699,71 @@ fn print_serve_help() {
     );
     println!();
     print_option("--host <IP>", "bind host (default: 127.0.0.1)");
-    print_option("--domain <NAME>", "serve HTTPS with an automatic Let's Encrypt certificate");
+    print_option("--domain <NAME>", "automatic HTTPS via Let's Encrypt");
     print_option("--acme-contact <EMAIL>", "optional ACME account contact");
-    print_option("--acme-cache <DIR>", "where certificates persist (default: .albedo-acme)");
-    print_option("--acme-staging", "use the Let's Encrypt staging CA while rehearsing");
-    print_option("--tls-cert <FILE>", "serve HTTPS with a certificate you already have");
+    print_option("--acme-cache <DIR>", "certificate store (default: .albedo-acme)");
+    print_option("--acme-staging", "rehearse against Let's Encrypt staging");
+    print_option("--tls-cert <FILE>", "HTTPS with a certificate you already have");
     print_option("--tls-key <FILE>", "the PEM key for --tls-cert");
     print_option("--port <PORT>", "bind port (default: 3000)");
-    print_option(
-        "<dir> | --dir <DIR>",
-        "BACK-COMPAT: falls through to `albedo files <dir>` (static-only)",
+    print_option("--dir <DIR>", "static files only — same as `albedo files`");
+    println!();
+}
+
+/// The flags `dev` and `build` read — one parser, one list. `server` adds the
+/// ones only a running dev server has a use for.
+fn print_dev_flags(server: bool) {
+    print_option("--config <FILE>", "explicit albedo config");
+    print_option("--entry <FILE>", "override entry module");
+    if server {
+        print_option("--host <IP>", "server host");
+        print_option("--port <PORT>", "server port");
+        print_option("--no-hmr", "disable HMR");
+        print_option("--open", "open browser on start");
+    }
+    print_option("--strict", "strict startup");
+    print_option("--verbose, -v", "verbose diagnostics");
+}
+
+fn print_dev_help(build: bool) {
+    print_banner();
+    let (name, what) = if build {
+        ("build", "compiles the app for production and checks the tier budget")
+    } else {
+        ("dev", "serves the app and rebuilds it on every save")
+    };
+    print_section(name);
+    println!(
+        "  {}  {}",
+        style("usage", "2"),
+        style(&format!("albedo {name} [dir] [options]"), "1")
     );
+    println!();
+    println!("    {} {what}", style("·", "2"));
+    println!();
+    print_dev_flags(!build);
+    if build {
+        print_option("--no-budget", "skip the tier-budget gate");
+    }
+    println!();
+}
+
+fn print_files_help() {
+    print_banner();
+    print_section("files");
+    println!(
+        "  {}  {}",
+        style("usage", "2"),
+        style("albedo files [dir] [--host <IP>] [--port <PORT>]", "1")
+    );
+    println!();
+    println!(
+        "    {} serves a folder as static files: no build, no server",
+        style("·", "2")
+    );
+    println!();
+    print_option("--host <IP>", "bind host (default: 127.0.0.1)");
+    print_option("--port <PORT>", "bind port (default: 3000)");
     println!();
 }
 
@@ -4440,7 +4803,7 @@ fn print_banner() {
         gradient_text("albedo", &BRAND_PALETTE, true),
         style_256("·", ACCENT_DEEP, false),
         style(env!("CARGO_PKG_VERSION"), "1"),
-        style("— fast JSX for Rust", "2")
+        style("— components, data and server in one binary", "2")
     );
     // Halation halo — a dim champagne hairline under the wordmark (the glow
     // around a bright thing). Six glyphs to match "albedo".
@@ -4477,25 +4840,13 @@ fn print_boot_banner() {
         println!("  {}", style_256(line, ROW_LUMEN[row], true));
     }
     println!();
-    // The brand + the "version" label, then the solar tier ladder (STRATEGY's
-    // Sol → Equinox → Umbra → Persephone) as the signature line — muted so the
-    // hierarchy holds: mark brightest, Version Beta next, the tiers a quiet
-    // footer. Slashes dimmed to let the names carry.
-    // Version label and ladder come from the dashboard's constants, not a second
-    // copy — the banner and the TUI masthead are the same statement rendered by
-    // two different engines, and a drift between them is the kind of thing
-    // nobody notices until a screenshot goes out.
-    let sep = style(" / ", "2");
-    let tiers = tui::dev::TIER_LADDER
-        .iter()
-        .map(|name| style_256(name, MUTED, false))
-        .collect::<Vec<_>>()
-        .join(&sep);
+    // The mark, then the running version. The label comes from the
+    // dashboard's constant, not a second copy — the banner and the TUI masthead
+    // are the same statement rendered by two engines.
     println!(
-        "  {}  {}   {}",
+        "  {}  {}",
         gradient_text("ALB'DO", &BRAND_PALETTE, true),
         style_256(tui::dev::VERSION_LABEL, ACCENT_SOFT, true),
-        tiers,
     );
     // Full-width champagne hairline — the halo under the mark (41 to match art).
     println!("  {}", style_256(&"─".repeat(41), ACCENT_DEEP, false));
@@ -4513,6 +4864,16 @@ fn print_kv(label: &str, value: impl std::fmt::Display) {
 
 fn print_ok(message: impl std::fmt::Display) {
     println!("  {} {}", style("✓", "1;32"), message);
+}
+
+/// Name each config setting that is set and does nothing — see
+/// `ResolvedDevContract::inert_settings`.
+fn warn_inert_settings(contract: &ResolvedDevContract) {
+    for key in contract.inert_settings() {
+        print_warn(format!(
+            "albedo.config `{key}` has no effect in this version of albedo and can be removed"
+        ));
+    }
 }
 
 fn print_warn(message: impl std::fmt::Display) {
@@ -4648,6 +5009,161 @@ fn supports_color() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The common subset, and nothing that could turn a value into something
+    /// else: no interpolation, one pair of quotes, `#` only as a whole line.
+    #[test]
+    fn a_dotenv_file_parses_the_common_subset() {
+        let text = "# a comment
+
+STRIPE_SECRET_KEY=sk_test_1
+export GITHUB_CLIENT_ID = \"Iv1.abc\"
+QUOTED='a b'
+HASH=abc#def
+EMPTY=
+not a pair
+1BAD=x
+ALSO-BAD=x
+REF=${OTHER}
+";
+        assert_eq!(
+            parse_env_file(text),
+            vec![
+                ("STRIPE_SECRET_KEY".to_string(), "sk_test_1".to_string()),
+                ("GITHUB_CLIENT_ID".to_string(), "Iv1.abc".to_string()),
+                ("QUOTED".to_string(), "a b".to_string()),
+                ("HASH".to_string(), "abc#def".to_string()),
+                ("EMPTY".to_string(), String::new()),
+                ("REF".to_string(), "${OTHER}".to_string()),
+            ]
+        );
+    }
+
+    /// Every file albedo writes into someone's project is theirs to read and
+    /// commit. It explains what they need to know — never how albedo itself
+    /// was built: no plan item numbers, no dated fix notes, no internal
+    /// markers, no pointers into albedo's own source tree.
+    #[test]
+    fn files_written_into_a_project_carry_no_internal_history() {
+        let written = [
+            ("scaffold layout", SCAFFOLD_LAYOUT.to_string()),
+            ("scaffold index", SCAFFOLD_INDEX_ROUTE.to_string()),
+            ("scaffold guestbook", SCAFFOLD_GUESTBOOK_ROUTE.to_string()),
+            ("scaffold room", SCAFFOLD_ROOM_ROUTE.to_string()),
+            ("scaffold sign-in", SCAFFOLD_SIGN_IN_ROUTE.to_string()),
+            ("scaffold hero", SCAFFOLD_HERO.to_string()),
+            ("scaffold counter", SCAFFOLD_COUNTER.to_string()),
+            ("scaffold env.d.ts", SCAFFOLD_ENV_DTS.to_string()),
+            ("scaffold styles", SCAFFOLD_STYLES.to_string()),
+            ("scaffold config", SCAFFOLD_CONFIG.to_string()),
+            ("scaffold package.json", SCAFFOLD_PACKAGE_JSON.to_string()),
+            ("scaffold tsconfig", SCAFFOLD_TSCONFIG.to_string()),
+            ("scaffold README", SCAFFOLD_README.to_string()),
+            ("scaffold .gitignore", SCAFFOLD_GITIGNORE.to_string()),
+            ("scaffold tier budget", SCAFFOLD_TIER_BUDGET.to_string()),
+            ("Dockerfile", build_docker_template()),
+            (".dockerignore", build_dockerignore_template()),
+            ("fly.toml", build_fly_toml_template("demo-app")),
+        ];
+        let markers = [
+            "🔴", "🔑", "🪤", "📏", "🛑", "TODO", "FIXME", "Phase ", "item 1", "corrected 20",
+            "src/bin/", ".rs`", ".rs:", "assets/albedo",
+        ];
+        let ident = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        for (name, text) in written {
+            for marker in markers {
+                assert!(!text.contains(marker), "{name} carries `{marker}`");
+            }
+            // A Rust path (`module::item`) — not an IPv6 `[::]`, and not a CSS
+            // pseudo-element, which the stylesheet is full of.
+            if name != "scaffold styles" {
+                let rust_path = text.match_indices("::").find(|&(at, _)| {
+                    ident(text[..at].chars().next_back()) && ident(text[at + 2..].chars().next())
+                });
+                assert!(rust_path.is_none(), "{name} names a Rust path near byte {rust_path:?}");
+            }
+            let plan_ref = text.split_whitespace().find(|word| {
+                let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
+                matches!(word.split_once('.'), Some((major, minor))
+                    if (10..=15).contains(&major.parse::<u32>().unwrap_or(0))
+                        && minor.len() == 1
+                        && minor.chars().all(|c| c.is_ascii_digit()))
+            });
+            assert!(plan_ref.is_none(), "{name} cites a plan item: {plan_ref:?}");
+        }
+    }
+
+    /// Everything the server writes into a project at runtime must be kept out
+    /// of git by the `.gitignore` every `albedo init` app starts with. It was
+    /// not: the scaffold ignored `.albedo/` and nothing else, so the first app
+    /// built on ALB'DO pushed its `forge.db` — waitlist rows and all — on its
+    /// first commit. The uploads directory and the ACME cache (an account key
+    /// and a TLS private key) were one `git add .` from the same fate.
+    ///
+    /// The required patterns are built from the constants the runtime writes
+    /// with, not restated: rename one and this fails here, before an app
+    /// commits the new path.
+    #[test]
+    fn the_scaffold_gitignore_keeps_every_runtime_write_out_of_git() {
+        let lines: Vec<&str> = SCAFFOLD_GITIGNORE.lines().map(str::trim).collect();
+        let db = albedo_server::forge_db_path::DEFAULT_FORGE_DB_FILENAME;
+        let required = [
+            // The database and its WAL/SHM sidecars, wherever `forge.db_path` puts it.
+            db.to_string(),
+            format!("{db}-*"),
+            // Uploaded bytes live under the project root — anchored, so an app's
+            // own `src/uploads/` component folder is not swept up with them.
+            format!("/{}/", dom_render_compiler::upload::UPLOAD_DIR),
+            // The ACME account key and issued certificates.
+            format!("{}/", albedo_server::tls::DEFAULT_ACME_CACHE_DIR),
+            // A shipped binary, its staging file, and its unpacked tree.
+            "*.albedo-bin".to_string(),
+            "*.albedo-bin.partial".to_string(),
+            ".albedo-app-*/".to_string(),
+        ];
+        for pattern in &required {
+            assert!(
+                lines.contains(&pattern.as_str()),
+                "the scaffold .gitignore must ignore `{pattern}`; it has: {lines:?}"
+            );
+        }
+    }
+
+    /// A stylesheet under `routes/<dir>/` ships only on the routes at or below
+    /// `<dir>`, after the global ones — and `/docsx` is not below `/docs`.
+    #[test]
+    fn a_stylesheet_under_routes_reaches_only_its_own_subtree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("src");
+        for (rel, css) in [
+            ("styles.css", "global{}"),
+            ("routes/docs/docs.css", "docs{}"),
+            ("routes/docs/guide/deep.css", "deep{}"),
+            ("routes/docs/card.module.css", "module{}"),
+        ] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, css).unwrap();
+        }
+        let sheets = collect_stylesheets(&root);
+        let rules = |route: &str| -> Vec<&str> {
+            let css = css_for_route(&sheets, route);
+            ["global{}", "docs{}", "deep{}", "module{}"]
+                .into_iter()
+                .filter(|rule| css.contains(rule))
+                .collect()
+        };
+
+        assert_eq!(rules("/"), ["global{}"]);
+        assert_eq!(rules("/docsx"), ["global{}"]);
+        assert_eq!(rules("/docs"), ["global{}", "docs{}"]);
+        assert_eq!(rules("/docs/guide/deploy"), ["global{}", "docs{}", "deep{}"]);
+
+        let deep = css_for_route(&sheets, "/docs/guide/deploy");
+        assert!(deep.find("global{}") < deep.find("docs{}"), "global first: {deep}");
+        assert!(deep.find("docs{}") < deep.find("deep{}"), "outer before inner: {deep}");
+        assert!(deep.contains("/* routes/docs/docs.css */"), "{deep}");
+    }
 
     /// Wraps adversarial bytes the way `read_http_request_head` wraps a socket:
     /// a `Take`-capped `BufReader`, so the test exercises the exact bound path.
@@ -4810,6 +5326,10 @@ mod tests {
         assert!(ignore.contains(".git"));
         assert!(ignore.contains("node_modules"));
         assert!(ignore.contains("target/debug"));
+        // ALB-04 · the builder stage copies the whole context.
+        for secret in ["**/.env\n", "**/.env.*\n", "**/*.pem\n", "**/*.key\n", ".albedo-acme\n"] {
+            assert!(ignore.contains(secret), "missing {secret:?}");
+        }
     }
 
     #[test]
@@ -4845,6 +5365,9 @@ mod tests {
             sources: Default::default(),
             auth: Default::default(),
             uploads: Default::default(),
+            email: None,
+            redirects: Vec::new(),
+            webhooks: Default::default(),
         };
         let err = configure_ship_vercel(&contract).unwrap_err();
         assert!(err.contains("vercel is not a supported"));
@@ -4881,8 +5404,56 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let src = temp.path().join("public");
         std::fs::create_dir_all(&src).unwrap();
-        let count = copy_public_dir(&src, &temp.path().join("dist")).unwrap();
+        let count = copy_public_dir(&src, &temp.path().join("dist").join("public")).unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// 🔴 A file deleted from `public/` stayed in `dist/public/` and kept being
+    /// served. The next build must leave exactly what the source holds.
+    #[test]
+    fn a_file_deleted_from_public_is_gone_from_dist_after_the_next_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("public");
+        let dst = temp.path().join("dist").join("public");
+        std::fs::create_dir_all(src.join("old").join("deep")).unwrap();
+        std::fs::create_dir_all(src.join("kept")).unwrap();
+        std::fs::write(src.join("gone.txt"), b"x").unwrap();
+        std::fs::write(src.join("stays.txt"), b"x").unwrap();
+        std::fs::write(src.join("old").join("deep").join("a.png"), b"x").unwrap();
+        std::fs::write(src.join("kept").join("b.png"), b"x").unwrap();
+        // A path that is a directory in one build and a file in the next.
+        std::fs::create_dir_all(src.join("flip")).unwrap();
+        std::fs::write(src.join("flip").join("inner.txt"), b"x").unwrap();
+        assert_eq!(sync_public_dir(&src, &dst).unwrap(), 5);
+
+        std::fs::remove_file(src.join("gone.txt")).unwrap();
+        std::fs::remove_dir_all(src.join("old")).unwrap();
+        std::fs::remove_dir_all(src.join("flip")).unwrap();
+        std::fs::write(src.join("flip"), b"now a file").unwrap();
+        assert_eq!(sync_public_dir(&src, &dst).unwrap(), 3);
+
+        assert!(dst.join("stays.txt").is_file());
+        assert!(dst.join("kept").join("b.png").is_file());
+        assert!(!dst.join("gone.txt").exists(), "a deleted file must not keep shipping");
+        assert!(!dst.join("old").exists(), "a deleted directory must not keep shipping");
+        assert_eq!(std::fs::read(dst.join("flip")).unwrap(), b"now a file");
+
+        // And with `public/` removed outright, nothing of it is left to serve.
+        std::fs::remove_dir_all(&src).unwrap();
+        assert_eq!(sync_public_dir(&src, &dst).unwrap(), 0);
+        assert!(!dst.exists());
+    }
+
+    /// Mirroring prunes, so it must never be pointed at the source itself.
+    #[test]
+    fn mirroring_public_into_itself_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("public");
+        std::fs::create_dir_all(src.join("inner")).unwrap();
+        std::fs::write(src.join("logo.svg"), b"<svg/>").unwrap();
+        assert!(copy_public_dir(&src, &src).is_err());
+        assert!(copy_public_dir(&src, &src.join("inner")).is_err());
+        assert!(src.join("logo.svg").is_file(), "the source must be untouched");
     }
 
     #[test]

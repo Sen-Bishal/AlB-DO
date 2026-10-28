@@ -24,6 +24,7 @@
 //! |---|---|
 //! | [`literal_topics`] | a mistyped `useSharedSlot("…")` rendered an empty list forever |
 //! | [`route_default_exports`] | a route with no `export default` served only the layout |
+//! | [`layout_request_reads`] | a layout reading `params`/`user` rendered `undefined` for everyone |
 //! | [`form_actions`] | a `<form action="action:…">` naming nothing was a dead end at click time |
 //! | [`npm_imports`] | an uninstalled package dropped the route's content |
 //! | [`deferred_module_loads`] | a `require("…")` shipped verbatim and threw in the browser |
@@ -273,6 +274,43 @@ pub fn jobs(compiled: &CompiledProject) -> Option<Failure> {
     }
 }
 
+/// A layout that reads `params` or `user`.
+///
+/// A layout is rendered **once per route, at build time**, from `{ route }`
+/// alone — there is no request yet, so both props are `undefined` on every
+/// URL. A layout that guards the read renders its fallback for every visitor
+/// with the build and every request green; one that does not throws at build.
+/// Either way the author wrote a read that can never see a value.
+///
+/// The build's tier report used to say the opposite —
+/// `B ShopLayout  reads route params - rendered per request` — which is the
+/// claim this check replaces with a refusal. Only provable reads are refused;
+/// see [`CompiledProject::layouts_reading_request`].
+#[must_use]
+pub fn layout_request_reads(compiled: &CompiledProject) -> Option<Failure> {
+    let found = compiled.layouts_reading_request();
+    (!found.is_empty()).then(|| Failure {
+        heading: "a layout cannot read `params` or `user` — it is rendered once per route at \
+                  build time, before any request exists, so the value is `undefined` for every \
+                  visitor. Read it in the page, which is rendered per request"
+            .to_string(),
+        problems: found
+            .iter()
+            .map(|(spec, function, reads)| {
+                let reads = reads
+                    .iter()
+                    .map(|prop| match *prop {
+                        "params" => "route `params`".to_string(),
+                        other => format!("`{other}`"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                format!("{spec} ({function}) reads {reads}")
+            })
+            .collect(),
+    })
+}
+
 /// Run every check and collect what failed.
 ///
 /// All of them, not the first: a `forge` block edited without its readers
@@ -291,6 +329,7 @@ pub fn run(
         deferred_module_loads(compiled),
         partitioned_whole_reads(compiled, schema),
         route_default_exports(compiled, served),
+        layout_request_reads(compiled),
         form_actions(compiled),
         literal_topics(compiled, schema),
         middleware(compiled),

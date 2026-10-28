@@ -2,7 +2,6 @@ use crate::error::RuntimeError;
 use crate::routing::{AuthPolicy, HttpMethod};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
 
 // Runtime direction:
 // - Apply ALBEDO plans to actual rendering behavior (critical-first SSR, deferred module loading,
@@ -50,22 +49,6 @@ pub struct ForgeConfig {
 }
 
 impl AppConfig {
-    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
-        let path = path.as_ref();
-        let contents = std::fs::read_to_string(path).map_err(|err| RuntimeError::ConfigIo {
-            path: path.display().to_string(),
-            message: err.to_string(),
-        })?;
-
-        let mut config: AppConfig =
-            serde_json::from_str(&contents).map_err(|err| RuntimeError::ConfigParse {
-                path: path.display().to_string(),
-                message: err.to_string(),
-            })?;
-        config.apply_env_overrides("ALBEDO_")?;
-        config.validate()?;
-        Ok(config)
-    }
 
     pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), RuntimeError> {
         let lookup = |key: &str| std::env::var(key).ok();
@@ -421,12 +404,8 @@ impl RouteSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RendererConfig {
     pub artifacts_dir: String,
-    #[serde(default)]
-    pub cache_snapshot_path: Option<String>,
     #[serde(default = "default_renderer_cache_ttl_ms")]
     pub cache_ttl_ms: u64,
-    #[serde(default = "default_renderer_cache_swr_ms")]
-    pub cache_swr_ms: u64,
     #[serde(default = "default_renderer_cache_max_entries")]
     pub cache_max_entries: usize,
 }
@@ -520,10 +499,6 @@ const fn default_webtransport_stream_buffer_capacity() -> usize {
 
 const fn default_renderer_cache_ttl_ms() -> u64 {
     30_000
-}
-
-const fn default_renderer_cache_swr_ms() -> u64 {
-    120_000
 }
 
 const fn default_renderer_cache_max_entries() -> usize {

@@ -60,6 +60,19 @@ cargo test --workspace
 > resource limit, not a broken tree — CI runs the workspace form on all three
 > platforms.
 
+### What ships, and what does not
+
+A release contains the `albedo` binary alone (`cargo build --release -p
+albedo-server --bin albedo`). Two things exist only for development:
+
+- **Developer tools** — the benchmark harness `albedo-bench` and the analysis
+  CLI `dom-compiler` build only with `--features dev-tools`.
+- **Test doubles** — a recording substrate, a scripted HTTP transport, a
+  hand-moved clock and a seeded fixture schema live behind the `test-support`
+  feature. The crates' dev-dependencies turn it on, so every test and bench sees
+  them and no release build contains them. Code outside `#[cfg(test)]` must not
+  reach for them.
+
 ## Pre-commit Hook Setup (optional, recommended)
 
 The repo ships a hook at [`.hooks/pre-commit`](./.hooks/pre-commit). Install it
@@ -82,9 +95,17 @@ when you are deliberately committing work in progress.
 
 ## CI and Release Expectations
 
-- Binaries are auto-published by the `Release Binaries (Main)` workflow from `main`.
-- The release workflow publishes three platform archives: Linux, Windows, and macOS.
-- Do not manually edit release assets on GitHub; update source/workflows and let automation publish.
+- A release is a tag. Bump `version` in the root `Cargo.toml`, then push
+  `vX.Y.Z` with the same number — the workflow refuses a tag that disagrees.
+- `.github/workflows/release.yml` builds `albedo` for Windows x64, macOS
+  (Intel and Apple Silicon) and Linux (x64 and arm64), makes each binary report
+  its own version before packaging it, builds the Windows MSI, and opens a
+  **draft** release. Publishing the draft is a maintainer's decision.
+- Rehearse a release without tagging: Actions → Release → Run workflow. Every
+  target is built and packaged and the artifacts stay on the run; nothing is
+  published.
+- Nothing is published from `main`. Do not edit release assets by hand on
+  GitHub; change the source or the workflow and cut a new tag.
 
 ## Documentation Policy
 

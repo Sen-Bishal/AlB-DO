@@ -14,8 +14,9 @@ use crate::transforms::events::HandlerBody;
 // *detected* name for the element being rendered, so the parser that
 // produces it needs a distinct name to stay readable.
 use crate::transforms::form::{
-    action_endpoint, allocate_field_error_id, form_action_name as parse_form_action_sentinel,
-    plain_form_needs_hidden_inputs, CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR, FORM_HIDDEN_INPUTS,
+    action_endpoint, field_error_span, form_action_name as parse_form_action_sentinel,
+    form_ok_span, plain_form_needs_hidden_inputs, CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR,
+    FORM_HIDDEN_INPUTS,
 };
 use crate::types::ComponentId;
 use anyhow::{anyhow, Result};
@@ -26,7 +27,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::runtime::eval::component::{
-    arg_num, classnames_collect, date_value_ms, escape_html, fnv1a_32, fnv1a_hash,
+    arg_num, as_rendered_html, classnames_collect, date_value_ms, escape_html, fnv1a_32, fnv1a_hash,
     import_candidates, is_classnames_source, is_component_module, is_component_tag, is_truthy,
     is_void_tag, json_int, json_num, lit_to_value, make_date_value, make_html_value,
     normalize_jsx_text, normalize_slashes, normalize_specifier, prop_name_to_string,
@@ -1257,6 +1258,478 @@ thread_local! {
 /// inner Arrow/Fn unchanged. Mirrors `transforms::actions::unwrap_parens`
 /// — the action authoring path lets the user wrap an updater in
 /// `(...)` or a TS cast for the same reasons.
+/// The one key of an *unrenderable* value: a module constant whose initializer
+/// this evaluator could not evaluate.
+///
+/// `Value` has no poison variant, so the failure travels as an object holding
+/// only this key. It is produced in exactly two places — seeding a module's
+/// constants, and resolving an imported one — and every read of a name passes
+/// through [`check_renderable`], so it cannot reach markup: it becomes the
+/// error at the read. The key is not a valid JS identifier, so no author data
+/// can collide with it.
+const UNRENDERABLE_KEY: &str = "\u{0}albedo:unrenderable";
+
+fn unrenderable(error: &anyhow::Error) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(UNRENDERABLE_KEY.to_string(), Value::String(format!("{error:#}")));
+    Value::Object(map)
+}
+
+/// Every name a binding pattern binds — `x`, `{ a, b: c }`, `[d, ...e]`.
+fn pattern_names(pat: &swc_ecma_ast::Pat) -> Vec<String> {
+    use swc_ecma_ast::{ObjectPatProp, Pat};
+    match pat {
+        Pat::Ident(binding) => vec![binding.id.sym.to_string()],
+        Pat::Array(array) => array.elems.iter().flatten().flat_map(pattern_names).collect(),
+        Pat::Object(object) => object
+            .props
+            .iter()
+            .flat_map(|prop| match prop {
+                ObjectPatProp::Assign(assign) => vec![assign.key.sym.to_string()],
+                ObjectPatProp::KeyValue(kv) => pattern_names(&kv.value),
+                ObjectPatProp::Rest(rest) => pattern_names(&rest.arg),
+            })
+            .collect(),
+        Pat::Rest(rest) => pattern_names(&rest.arg),
+        Pat::Assign(assign) => pattern_names(&assign.left),
+        Pat::Invalid(_) | Pat::Expr(_) => Vec::new(),
+    }
+}
+
+/// `value`, unless it is [`unrenderable`] — then the reason it could not be
+/// evaluated, naming the binding that was read.
+fn check_renderable(name: &str, value: Value) -> Result<Value> {
+    if let Value::Object(map) = &value {
+        if let Some(Value::String(reason)) = map.get(UNRENDERABLE_KEY) {
+            return Err(anyhow!("`{name}` could not be evaluated: {reason}"));
+        }
+    }
+    Ok(value)
+}
+
+/// An inline callback's body: an arrow's expression, or a block's statements.
+enum CallbackBody<'a> {
+    Expr(&'a swc_ecma_ast::Expr),
+    Stmts(&'a [swc_ecma_ast::Stmt]),
+}
+
+/// How many parameters an inline callback declares — `0` for anything else.
+fn callback_arity(callback: &swc_ecma_ast::Expr) -> usize {
+    match unwrap_updater_parens(callback) {
+        swc_ecma_ast::Expr::Arrow(arrow) => arrow.params.len(),
+        swc_ecma_ast::Expr::Fn(fn_expr) => fn_expr.function.params.len(),
+        _ => 0,
+    }
+}
+
+/// `===` for `includes` / `indexOf`: primitives by type and value (numbers as
+/// numbers, so `1` finds `1.0`), and objects and arrays by structure.
+///
+/// Structure is the one divergence from JavaScript, which compares objects by
+/// identity. The evaluator has no identities — every value is a copy — and the
+/// case that matters in a render, finding an element taken from the same list
+/// (`pages.indexOf(current)`), is true either way. Two distinct but equal
+/// objects compare equal here and not in the browser.
+fn strict_equals(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        _ => left == right,
+    }
+}
+
+/// JavaScript's ToIntegerOrInfinity, with `NaN` as `0`.
+fn integer_or_zero(value: &Value) -> f64 {
+    let n = to_number(value);
+    if n.is_nan() {
+        0.0
+    } else {
+        n.trunc()
+    }
+}
+
+/// A `slice`-style position: negative counts from the end, clamped to `0..=len`.
+fn relative_index(value: &Value, len: usize) -> usize {
+    let n = integer_or_zero(value);
+    let len_f = len as f64;
+    let at = if n < 0.0 { (len_f + n).max(0.0) } else { n.min(len_f) };
+    at as usize
+}
+
+/// `Array.prototype.flat(depth)`.
+fn flatten(items: &[Value], depth: f64) -> Vec<Value> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::Array(inner) if depth >= 1.0 => out.extend(flatten(inner, depth - 1.0)),
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+/// JavaScript's ToString, for the places JavaScript applies it — `+` with a
+/// string, a template literal, `String(x)`, a string method's arguments.
+///
+/// It differs from [`value_to_string`] in one place: an array joins with `,`.
+/// `value_to_string` concatenates, which is right for a JSX child (`{items}`
+/// renders each item) and wrong everywhere else — `${tags}` of `["a", "b"]` is
+/// `"a,b"` in JavaScript, and was `"ab"` here.
+fn js_string(value: &Value) -> String {
+    match value {
+        Value::Array(items) => items.iter().map(js_string).collect::<Vec<_>>().join(","),
+        other => value_to_string(other),
+    }
+}
+
+/// JavaScript's ToPrimitive: arrays and objects become their string form, and
+/// everything else is already primitive.
+fn to_primitive(value: &Value) -> Value {
+    match value {
+        Value::Array(_) | Value::Object(_) => Value::String(js_string(value)),
+        other => other.clone(),
+    }
+}
+
+/// JavaScript's whitespace for `trim` and number parsing: WhiteSpace plus
+/// LineTerminator. Not `char::is_whitespace`, which counts U+0085 and misses
+/// U+FEFF — both the other way round from JavaScript.
+fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n'
+            | '\u{B}'
+            | '\u{C}'
+            | '\r'
+            | ' '
+            | '\u{A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
+}
+
+/// JavaScript's StringToNumber: `NaN` for anything that is not a numeric
+/// literal, `0` for blank. Rust's `f64::from_str` accepts `inf`, `NaN` and
+/// `infinity` in any case, which JavaScript does not, so the spelling is
+/// checked before it is parsed.
+fn string_to_number(s: &str) -> f64 {
+    let s = s.trim_matches(is_js_whitespace);
+    if s.is_empty() {
+        return 0.0;
+    }
+    for (prefix, radix) in [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)] {
+        if let Some(digits) = s.strip_prefix(prefix) {
+            if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                return f64::NAN;
+            }
+            return digits
+                .chars()
+                .fold(0.0, |n, c| n * f64::from(radix) + f64::from(c.to_digit(radix).unwrap_or(0)));
+        }
+    }
+    let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if unsigned == "Infinity" {
+        return if s.starts_with('-') { f64::NEG_INFINITY } else { f64::INFINITY };
+    }
+    if !unsigned
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
+    {
+        return f64::NAN;
+    }
+    s.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// JavaScript's ToNumber, `NaN` included. [`to_number`] maps every failure to
+/// `0` because a `Value` cannot hold a NaN, which is right for the arithmetic
+/// that renders and wrong for a comparison: `"abc" >= 0` is false in
+/// JavaScript, and `0 >= 0` is not.
+///
+/// `null` is `0`. `undefined` would be `NaN`, but the evaluator holds both as
+/// one value; `null` is the reading that matches [`to_number`].
+fn js_number(value: &Value) -> f64 {
+    match value {
+        Value::Null => 0.0,
+        Value::Bool(b) => f64::from(u8::from(*b)),
+        Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+        Value::String(s) => string_to_number(s),
+        Value::Array(_) | Value::Object(_) => js_number(&to_primitive(value)),
+    }
+}
+
+/// JavaScript's ToInt32 — the operand of every bitwise operator.
+fn to_int32(value: &Value) -> i32 {
+    to_uint32(value) as i32
+}
+
+/// JavaScript's ToUint32 — `>>>`, and a shift's count.
+fn to_uint32(value: &Value) -> u32 {
+    let n = js_number(value);
+    if !n.is_finite() {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
+/// `==`: JavaScript's loose equality. `null` equals only itself; a boolean
+/// becomes a number; a number and a string compare as numbers; an array or
+/// object compares to a primitive through its string form.
+///
+/// Two arrays or objects compare by structure, as [`strict_equals`] does, for
+/// the reason given there.
+fn loose_equals(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::Bool(_), _) => loose_equals(&json_num(js_number(left)), right),
+        (_, Value::Bool(_)) => loose_equals(left, &json_num(js_number(right))),
+        (Value::Number(_), Value::String(_)) | (Value::String(_), Value::Number(_)) => {
+            js_number(left) == js_number(right)
+        }
+        (Value::Array(_) | Value::Object(_), Value::Array(_) | Value::Object(_)) => {
+            strict_equals(left, right)
+        }
+        (Value::Array(_) | Value::Object(_), _) => loose_equals(&to_primitive(left), right),
+        (_, Value::Array(_) | Value::Object(_)) => loose_equals(left, &to_primitive(right)),
+        _ => strict_equals(left, right),
+    }
+}
+
+/// `<` and friends: two strings compare by UTF-16 code unit, as JavaScript
+/// orders them; anything else compares as numbers. `None` is JavaScript's
+/// `undefined` result — a `NaN` on either side — which makes every one of the
+/// four operators false.
+fn js_compare(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    let (left, right) = (to_primitive(left), to_primitive(right));
+    if let (Value::String(a), Value::String(b)) = (&left, &right) {
+        return Some(a.encode_utf16().cmp(b.encode_utf16()));
+    }
+    js_number(&left).partial_cmp(&js_number(&right))
+}
+
+/// `typeof` of a value the evaluator holds. `None` for `null`: the evaluator
+/// holds `null` and `undefined` as one value, and `typeof` is the operator
+/// whose whole answer is which of the two it is.
+fn typeof_value(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(_) => Some("number"),
+        Value::String(_) => Some("string"),
+        Value::Array(_) | Value::Object(_) => Some("object"),
+        Value::Null => None,
+    }
+}
+
+/// `typeof` of a global the evaluator does not bind but QuickJS — the engine
+/// a static render must agree with — does. A name that is neither declared
+/// nor one of these is `undefined`, exactly as in JavaScript.
+fn global_typeof(name: &str) -> Option<&'static str> {
+    match name {
+        "Math" | "JSON" | "Reflect" | "console" | "globalThis" => Some("object"),
+        "Array" | "Boolean" | "Date" | "Error" | "Function" | "Map" | "Number" | "Object"
+        | "Promise" | "RegExp" | "Set" | "String" | "Symbol" | "WeakMap" | "WeakSet"
+        | "parseInt" | "parseFloat" | "isNaN" | "isFinite" | "encodeURIComponent"
+        | "decodeURIComponent" | "encodeURI" | "decodeURI" => Some("function"),
+        _ => None,
+    }
+}
+
+/// `name` as an index, when it is one in JavaScript's sense: `"0"`, `"12"` —
+/// not `"01"`, `"+1"` or `" 1"`, which are ordinary property names there and
+/// which `usize::from_str` would partly accept.
+fn canonical_index(name: &str) -> Option<usize> {
+    let canonical = name == "0"
+        || (!name.is_empty() && !name.starts_with('0') && name.bytes().all(|b| b.is_ascii_digit()));
+    canonical.then(|| name.parse().ok()).flatten()
+}
+
+/// The UTF-16 code units of `s`: JavaScript's string indices, lengths and
+/// positions all count these, not `char`s and not bytes.
+fn utf16(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// The string for a run of UTF-16 code units. A slice that cuts a surrogate
+/// pair in half has no `String` form; its lone half becomes U+FFFD, which is
+/// also what it becomes when JavaScript's version reaches a UTF-8 page.
+fn from_utf16(units: &[u16]) -> String {
+    String::from_utf16_lossy(units)
+}
+
+/// The first position at or after `from` where `needle` occurs in `haystack`.
+fn find_units(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    (from..=haystack.len() - needle.len()).find(|&i| haystack[i..].starts_with(needle))
+}
+
+/// The last position at or before `from` where `needle` occurs in `haystack`.
+fn rfind_units(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let last = from.min(haystack.len() - needle.len());
+    (0..=last).rev().find(|&i| haystack[i..].starts_with(needle))
+}
+
+/// The most UTF-16 code units one `repeat` / `padStart` / `padEnd` may build.
+/// JavaScript's own ceiling is about 2^30; a static render that asks for more
+/// than this is a bug in the page, not a string anyone will read.
+const MAX_BUILT_STRING_UNITS: usize = 1 << 24;
+
+/// `parseInt(input, radix)`: the longest run of digits after optional
+/// whitespace and sign, a `0x` prefix honoured when the radix is 16 or unset.
+fn parse_int(input: &str, radix: Option<&Value>) -> f64 {
+    let s = input.trim_start_matches(is_js_whitespace);
+    let (negative, mut s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let mut radix = radix.map_or(0, to_int32);
+    let mut strip_prefix = true;
+    if radix == 0 {
+        radix = 10;
+    } else if !(2..=36).contains(&radix) {
+        return f64::NAN;
+    } else if radix != 16 {
+        strip_prefix = false;
+    }
+    if strip_prefix && (s.starts_with("0x") || s.starts_with("0X")) {
+        s = &s[2..];
+        radix = 16;
+    }
+    let digits: String = s.chars().take_while(|c| c.is_digit(radix as u32)).collect();
+    if digits.is_empty() {
+        return f64::NAN;
+    }
+    // Decimal through the float parser, which rounds the whole digit string
+    // once; other radices accumulate, as the specification permits.
+    let magnitude = if radix == 10 {
+        digits.parse::<f64>().unwrap_or(f64::NAN)
+    } else {
+        digits.chars().fold(0.0, |n, c| {
+            n * f64::from(radix) + f64::from(c.to_digit(radix as u32).unwrap_or(0))
+        })
+    };
+    if negative {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// `parseFloat(input)`: the longest prefix that is a decimal literal.
+fn parse_float(input: &str) -> f64 {
+    let s = input.trim_start_matches(is_js_whitespace);
+    let bytes = s.as_bytes();
+    let digits_from = |mut i: usize| {
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    if s[i..].starts_with("Infinity") {
+        return if s.starts_with('-') { f64::NEG_INFINITY } else { f64::INFINITY };
+    }
+    let int_end = digits_from(i);
+    let mut has_digits = int_end > i;
+    i = int_end;
+    if bytes.get(i) == Some(&b'.') {
+        let frac_end = digits_from(i + 1);
+        if has_digits || frac_end > i + 1 {
+            has_digits = true;
+            i = frac_end;
+        }
+    }
+    if !has_digits {
+        return f64::NAN;
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        let sign = usize::from(matches!(bytes.get(i + 1), Some(b'+' | b'-')));
+        let exp_end = digits_from(i + 1 + sign);
+        if exp_end > i + 1 + sign {
+            i = exp_end;
+        }
+    }
+    s[..i].parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// JavaScript's GetSubstitution for a string pattern, which has no captures:
+/// `$$` is `$`, `$&` the match, `` $` `` what precedes it, `$'` what follows
+/// it, and every other `$` — `$1` included — is literal.
+fn substitute(template: &str, matched: &str, before: &str, after: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        let expansion = match chars.peek() {
+            Some('$') => "$",
+            Some('&') => matched,
+            Some('`') => before,
+            Some('\'') => after,
+            _ => {
+                out.push('$');
+                continue;
+            }
+        };
+        out.push_str(expansion);
+        chars.next();
+    }
+    out
+}
+
+/// `Number.prototype.toFixed`. A tie rounds UP in JavaScript and to even in
+/// Rust's formatter — `(2.5).toFixed(0)` is `"3"` where `format!` gives `"2"`,
+/// and `(0.125).toFixed(2)` is `"0.13"` against `"0.12"`. A negative zero
+/// prints unsigned, because JavaScript tests `x < 0` and `-0 < 0` is false.
+fn js_to_fixed(x: f64, digits: usize) -> String {
+    let negative = x < 0.0;
+    let magnitude = x.abs();
+    // A tie is exact: the full expansion — at most 1074 fractional digits for
+    // an f64 — ends in a 5 at the first place dropped. Nudged one ulp up, it
+    // is no longer a tie, and any correct rounding of it rounds up.
+    let exact = format!("{magnitude:.1100}");
+    let fraction = exact.split_once('.').map_or("", |(_, fraction)| fraction).as_bytes();
+    let is_tie = fraction.get(digits) == Some(&b'5')
+        && fraction[digits + 1..].iter().all(|&digit| digit == b'0');
+    let rounded = if is_tie {
+        f64::from_bits(magnitude.to_bits() + 1)
+    } else {
+        magnitude
+    };
+    let text = format!("{rounded:.digits$}");
+    if negative {
+        format!("-{text}")
+    } else {
+        text
+    }
+}
+
+/// `encodeURIComponent(input)`: every UTF-8 byte percent-encoded except
+/// JavaScript's unreserved set.
+fn encode_uri_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 fn unwrap_updater_parens(expr: &swc_ecma_ast::Expr) -> &swc_ecma_ast::Expr {
     use swc_ecma_ast::Expr;
     match expr {
@@ -1750,7 +2223,7 @@ impl ComponentProject {
                 .strip_prefix(&root)
                 .map_err(|err| anyhow!("failed to compute module path: {err}"))?;
             let specifier = normalize_specifier(relative);
-            let source = std::fs::read_to_string(path)
+            let source = crate::markdown::read_module_source(path)
                 .map_err(|err| anyhow!("failed to read '{}': {err}", path.display()))?;
             let parsed = parse_module_impl(&source, path)?;
             source_hashes.insert(specifier.clone(), fnv1a_hash(source.as_bytes()));
@@ -1822,7 +2295,7 @@ impl ComponentProject {
                 continue;
             }
 
-            match std::fs::read_to_string(&absolute_path) {
+            match crate::markdown::read_module_source(&absolute_path) {
                 Ok(source) => {
                     let next_hash = fnv1a_hash(source.as_bytes());
                     if self.source_hashes.get(&specifier).copied() == Some(next_hash) {
@@ -1886,11 +2359,6 @@ impl ComponentProject {
         Ok(report)
     }
 
-    pub fn component_id_for_specifier(&self, specifier: &str) -> Option<ComponentId> {
-        let spec = normalize_slashes(specifier);
-        self.specifier_to_id.get(&spec).copied()
-    }
-
     pub fn component_id_for_name(&self, name: &str) -> Option<ComponentId> {
         self.specifier_to_id
             .iter()
@@ -1902,10 +2370,6 @@ impl ComponentProject {
                     .unwrap_or(false)
             })
             .map(|(_, &id)| id)
-    }
-
-    pub fn component_id_by_name(&self, name: &str) -> Option<ComponentId> {
-        self.component_id_for_name(name)
     }
 
     pub fn render_entry(&self, entry: &str, props: &Value) -> Result<String> {
@@ -2038,6 +2502,9 @@ impl ComponentProject {
         component: &CompiledComponent,
         slots: &SessionSlotView,
         form_payload: Option<&Value>,
+        // The request's `user` and `origin` — each binds `null` when absent,
+        // never leaving the name to whatever else is in scope.
+        request: &crate::runtime::RequestBindings,
     ) -> Result<Vec<Instruction>> {
         let _guard = PhaseKGuard::install(slots.clone());
         // Push the component's scope. We don't need any of the
@@ -2121,6 +2588,17 @@ impl ComponentProject {
         if let Some(payload) = form_payload {
             env.insert("form".to_string(), payload.clone());
         }
+        // `user` on the same rule, and bound even when anonymous: a captured
+        // `user` prop from the render that posted here, or a module constant of
+        // that name, must not stand in for who is asking NOW. An action decides
+        // on behalf of the request's principal and nobody else.
+        env.insert(
+            "user".to_string(),
+            request.user.clone().unwrap_or(Value::Null),
+        );
+        // `origin` on the same rule — and from configuration only, so a module
+        // constant cannot stand in for it and neither can a request header.
+        env.insert("origin".to_string(), request.origin_value());
 
         let result: Result<Vec<Instruction>> = match body {
             HandlerBody::Expr(expr) => {
@@ -2141,7 +2619,7 @@ impl ComponentProject {
         result
     }
 
-    fn resolve_entry(&self, entry: &str) -> Option<String> {
+    pub(crate) fn resolve_entry(&self, entry: &str) -> Option<String> {
         let entry = normalize_slashes(entry);
         if self.modules.contains_key(&entry) {
             return Some(entry);
@@ -2191,9 +2669,14 @@ impl ComponentProject {
         // across the call.
         let constants = module.module_constants.clone();
         for (name, expr) in constants {
+            // A constant that cannot be evaluated is bound as unrenderable, not
+            // as `null`: reading it raises the reason, and a constant nobody
+            // reads (an `action(...)`, a regex for a handler) costs nothing.
+            // `null` here rendered as empty and failed nothing — `pages =
+            // sections.flatMap(...)` gave a docs site an empty pager, green.
             let value = self
                 .eval_expr(module_spec, &expr, env)
-                .unwrap_or(Value::Null);
+                .unwrap_or_else(|error| unrenderable(&error));
             env.insert(name, value);
         }
     }
@@ -2302,42 +2785,16 @@ impl ComponentProject {
                 fragment,
                 env,
             )?)),
+            // A regular expression has no value here, and `null` in its place
+            // made `s.replace(/-/g, " ")` replace the text "null" — or, as an
+            // argument to `split`, return the string whole.
+            Expr::Lit(Lit::Regex(regex)) => self.unmodelled(
+                module_spec,
+                &format!("the regular expression `/{}/{}`", regex.exp, regex.flags),
+            ),
+            Expr::Lit(Lit::BigInt(_)) => self.unmodelled(module_spec, "a BigInt literal"),
             Expr::Lit(lit) => Ok(lit_to_value(lit)),
-            Expr::Ident(ident) => {
-                let name = ident.sym.to_string();
-                if let Some(value) = env.get(&name) {
-                    return Ok(value.clone());
-                }
-                // Not a local binding — it may be a VALUE imported from another
-                // module. `env` only ever holds this module's own constants and
-                // params (`seed_env_with_module_constants` says as much), and
-                // `module.imports` was consulted only when resolving a
-                // COMPONENT (`render_component_ref`). So `import { site } from
-                // "../config"` had nowhere to resolve and fell straight to the
-                // `Null` below — which renders as the empty string.
-                //
-                // The damage was invisible and total: `{site.tagline}` emitted
-                // `<h1 class="h1"></h1>`, and a route whose whole body mapped
-                // over an imported array rendered zero rows. Nothing warned,
-                // because a missing value and a legitimately-null one took the
-                // same path. It also made a shared `config.ts` impossible, so
-                // projects were pushed toward duplicating data per file.
-                if let Some(value) = self.resolve_imported_value(module_spec, &name) {
-                    return Ok(value);
-                }
-                // Still unresolved. An identifier the evaluator cannot bind is
-                // worth more than a `debug!`: it is about to render as nothing.
-                // Phase K wires reactive bindings, so this is not always a bug —
-                // hence `warn` rather than a hard error — but it must be
-                // findable without turning on trace logging.
-                tracing::warn!(
-                    target: "albedo::eval",
-                    ident = %name,
-                    module = %module_spec,
-                    "unbound identifier in JSX expression — rendering as empty",
-                );
-                Ok(Value::Null)
-            }
+            Expr::Ident(ident) => self.eval_ident(module_spec, &ident.sym, env),
             Expr::Member(member) => self.eval_member(module_spec, member, env),
             Expr::Paren(paren) => self.eval_expr(module_spec, &paren.expr, env),
             Expr::Tpl(tpl) => self.eval_tpl(module_spec, tpl, env),
@@ -2383,6 +2840,53 @@ impl ComponentProject {
         }
     }
 
+    /// Resolve a bare identifier: a local binding, else a value imported from
+    /// another module, else `Null` (with a warning).
+    ///
+    /// Every read of a name goes through here — `x` in an expression and `{ x }`
+    /// in an object literal alike — so a constant that could not be evaluated
+    /// (see [`unrenderable`]) raises its reason wherever it is read, and an
+    /// imported value resolves in both positions.
+    fn eval_ident(&self, module_spec: &str, name: &str, env: &HashMap<String, Value>) -> Result<Value> {
+        if let Some(value) = env.get(name) {
+            return check_renderable(name, value.clone());
+        }
+        // Not a local binding — it may be a VALUE imported from another
+        // module. `env` only ever holds this module's own constants and
+        // params (`seed_env_with_module_constants` says as much), and
+        // `module.imports` was consulted only when resolving a
+        // COMPONENT (`render_component_ref`). So `import { site } from
+        // "../config"` had nowhere to resolve and fell straight to the
+        // `Null` below — which renders as the empty string.
+        //
+        // The damage was invisible and total: `{site.tagline}` emitted
+        // `<h1 class="h1"></h1>`, and a route whose whole body mapped
+        // over an imported array rendered zero rows. Nothing warned,
+        // because a missing value and a legitimately-null one took the
+        // same path. It also made a shared `config.ts` impossible, so
+        // projects were pushed toward duplicating data per file.
+        if let Some(value) = self.resolve_imported_value(module_spec, name) {
+            return check_renderable(name, value);
+        }
+        // `undefined` is a global, not a missing binding — `x === undefined`
+        // must not log a warning that something failed to resolve.
+        if name == "undefined" {
+            return Ok(Value::Null);
+        }
+        // Still unresolved. An identifier the evaluator cannot bind is
+        // worth more than a `debug!`: it is about to render as nothing.
+        // Phase K wires reactive bindings, so this is not always a bug —
+        // hence `warn` rather than a hard error — but it must be
+        // findable without turning on trace logging.
+        tracing::warn!(
+            target: "albedo::eval",
+            ident = %name,
+            module = %module_spec,
+            "unbound identifier in JSX expression — rendering as empty",
+        );
+        Ok(Value::Null)
+    }
+
     fn eval_opt_chain(
         &self,
         module_spec: &str,
@@ -2398,16 +2902,62 @@ impl ComponentProject {
                 }
                 self.eval_member_on(module_spec, &obj, &member.prop, env)
             }
+            // `items?.map(f)` and `obj.method?.()`. This was `Null` whatever the
+            // receiver held, so an optional chain over a real list rendered
+            // nothing. The call is the same method dispatch a plain call gets;
+            // a `null` receiver short-circuits, which is what `?.` means.
             OptChainBase::Call(call) => {
-                let callee = self.eval_expr(module_spec, &call.callee, env)?;
-                if matches!(callee, Value::Null) {
+                let member = match unwrap_updater_parens(&call.callee) {
+                    Expr::Member(member) => Some(member),
+                    Expr::OptChain(OptChainExpr { base, .. }) => match &**base {
+                        OptChainBase::Member(member) => Some(member),
+                        OptChainBase::Call(_) => None,
+                    },
+                    _ => None,
+                };
+                let Some((member, MemberProp::Ident(ident))) = member.map(|m| (m, &m.prop)) else {
+                    return self.unmodelled(module_spec, "an optional call of this shape");
+                };
+                let method = ident.sym.to_string();
+                let receiver = self.eval_expr(module_spec, &member.obj, env)?;
+                if matches!(receiver, Value::Null) {
                     return Ok(Value::Null);
                 }
-                // Callable-value support is Phase K; until then, treat
-                // optional calls as null when reachable.
-                Ok(Value::Null)
+                match self.eval_instance_method(module_spec, &receiver, &method, &call.args, env)? {
+                    Some(value) => Ok(value),
+                    None => self.unmodelled(module_spec, &format!("`.{method}?.()`")),
+                }
             }
         }
+    }
+
+    /// The value of something this evaluator does not model.
+    ///
+    /// A static render refuses it by name: its markup is the page, and a `null`
+    /// in its place renders as nothing with the build green. A hook-compile
+    /// render is a pre-render the client corrects, and keeps the `null` it has
+    /// always produced — refusing there would cost every Tier-B page its
+    /// server paint over a call its own island makes anyway.
+    fn unmodelled(&self, module_spec: &str, what: &str) -> Result<Value> {
+        self.unmodelled_or(module_spec, what, Value::Null)
+    }
+
+    /// [`Self::unmodelled`] with the hook-compile render's stand-in chosen by
+    /// the caller — an empty list for a spread, say, where `null` is not the
+    /// shape the caller continues with.
+    fn unmodelled_or<T>(&self, module_spec: &str, what: &str, hook_compile_value: T) -> Result<T> {
+        if phase_k_enabled() {
+            tracing::debug!(
+                target: "albedo::eval",
+                module = %module_spec,
+                what,
+                "unmodelled in a hook-compile render — standing in a placeholder",
+            );
+            return Ok(hook_compile_value);
+        }
+        Err(anyhow!(
+            "{what} is not supported by the static renderer (module '{module_spec}')"
+        ))
     }
 
     fn eval_new_expr(
@@ -2437,12 +2987,11 @@ impl ComponentProject {
                 return Ok(make_date_value(ms));
             }
         }
-        tracing::debug!(
-            target: "albedo::eval",
-            module = %module_spec,
-            "unhandled `new` constructor — evaluating to null",
-        );
-        Ok(Value::Null)
+        let constructor = match &*new_expr.callee {
+            Expr::Ident(ident) => format!("`new {}()`", ident.sym),
+            _ => "this `new` expression".to_string(),
+        };
+        self.unmodelled(module_spec, &constructor)
     }
 
     fn eval_member(
@@ -2499,7 +3048,7 @@ impl ComponentProject {
                         return Ok(items.get(idx as usize).cloned().unwrap_or(Value::Null));
                     }
                 }
-                let prop_name = value_to_string(&key);
+                let prop_name = js_string(&key);
                 self.lookup_named_prop(object, &prop_name)
             }
             MemberProp::Ident(ident) => {
@@ -2522,15 +3071,24 @@ impl ComponentProject {
                 "length" => Ok(json_int(items.len() as i64)),
                 _ => {
                     // Numeric string indexing: `arr["0"]` matches JS semantics.
-                    if let Ok(idx) = prop_name.parse::<usize>() {
+                    if let Some(idx) = canonical_index(prop_name) {
                         return Ok(items.get(idx).cloned().unwrap_or(Value::Null));
                     }
                     Ok(Value::Null)
                 }
             },
+            // UTF-16 code units, as JavaScript counts: `"😀".length` is 2, and
+            // `s[i]` is one unit. Counting `char`s disagreed on every string
+            // outside the Basic Multilingual Plane.
             Value::String(s) => match prop_name {
-                "length" => Ok(json_int(s.chars().count() as i64)),
-                _ => Ok(Value::Null),
+                "length" => Ok(json_int(s.encode_utf16().count() as i64)),
+                _ => match canonical_index(prop_name) {
+                    Some(i) => Ok(s
+                        .encode_utf16()
+                        .nth(i)
+                        .map_or(Value::Null, |unit| Value::String(from_utf16(&[unit])))),
+                    None => Ok(Value::Null),
+                },
             },
             _ => Ok(Value::Null),
         }
@@ -2552,7 +3110,7 @@ impl ComponentProject {
             result.push_str(&text);
             if i < tpl.exprs.len() {
                 let val = self.eval_expr(module_spec, &tpl.exprs[i], env)?;
-                result.push_str(&value_to_string(&val));
+                result.push_str(&js_string(&val));
             }
         }
         Ok(Value::String(result))
@@ -2600,20 +3158,24 @@ impl ComponentProject {
                 // `null + 1` fall to string concat — silently breaking
                 // broadcast updaters like `(n) => n + 1` whose first
                 // call sees `n = null` and produces "1" instead of 1.
+                //
+                // Both sides go through ToPrimitive first, so an array is a
+                // string here too: `[1] + [2]` is `"12"`, not `0`.
+                let (left, right) = (to_primitive(&left), to_primitive(&right));
                 match (&left, &right) {
                     (Value::String(_), _) | (_, Value::String(_)) => Ok(Value::String(format!(
                         "{}{}",
-                        value_to_string(&left),
-                        value_to_string(&right)
+                        js_string(&left),
+                        js_string(&right)
                     ))),
-                    _ => Ok(json_num(to_number(&left) + to_number(&right))),
+                    _ => self.number_result(module_spec, "+", js_number(&left) + js_number(&right)),
                 }
             }
             BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Exp => {
                 let left = self.eval_expr(module_spec, &bin.left, env)?;
                 let right = self.eval_expr(module_spec, &bin.right, env)?;
-                let l = to_number(&left);
-                let r = to_number(&right);
+                let l = js_number(&left);
+                let r = js_number(&right);
                 let value = match bin.op {
                     BinaryOp::Sub => l - r,
                     BinaryOp::Mul => l * r,
@@ -2622,38 +3184,89 @@ impl ComponentProject {
                     BinaryOp::Exp => l.powf(r),
                     _ => unreachable!(),
                 };
-                Ok(json_num(value))
+                self.number_result(module_spec, bin.op.as_str(), value)
             }
+            // 🔴 These compared `to_number` of each side, which is `0` for any
+            // string that is not a number — so `"b" > "a"` was `0 > 0`, false,
+            // and `"abc" >= 0` was true.
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
+                use std::cmp::Ordering::{Equal, Greater, Less};
                 let left = self.eval_expr(module_spec, &bin.left, env)?;
                 let right = self.eval_expr(module_spec, &bin.right, env)?;
-                let l = to_number(&left);
-                let r = to_number(&right);
-                let result = match bin.op {
-                    BinaryOp::Lt => l < r,
-                    BinaryOp::Gt => l > r,
-                    BinaryOp::LtEq => l <= r,
-                    BinaryOp::GtEq => l >= r,
+                let order = js_compare(&left, &right);
+                Ok(Value::Bool(match bin.op {
+                    BinaryOp::Lt => order == Some(Less),
+                    BinaryOp::Gt => order == Some(Greater),
+                    BinaryOp::LtEq => matches!(order, Some(Less | Equal)),
+                    BinaryOp::GtEq => matches!(order, Some(Greater | Equal)),
+                    _ => unreachable!(),
+                }))
+            }
+            // 🔴 All four compared `value_to_string` of each side, so `1 === "1"`
+            // was true, `null == ""` was true, `[1, 2] === "12"` was true, and
+            // `0 == null` was false only by luck of the spelling.
+            BinaryOp::EqEqEq | BinaryOp::NotEqEq | BinaryOp::EqEq | BinaryOp::NotEq => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                let right = self.eval_expr(module_spec, &bin.right, env)?;
+                let equal = match bin.op {
+                    BinaryOp::EqEqEq | BinaryOp::NotEqEq => strict_equals(&left, &right),
+                    _ => loose_equals(&left, &right),
+                };
+                Ok(Value::Bool(match bin.op {
+                    BinaryOp::EqEqEq | BinaryOp::EqEq => equal,
+                    _ => !equal,
+                }))
+            }
+            BinaryOp::BitOr
+            | BinaryOp::BitAnd
+            | BinaryOp::BitXor
+            | BinaryOp::LShift
+            | BinaryOp::RShift
+            | BinaryOp::ZeroFillRShift => {
+                let left = self.eval_expr(module_spec, &bin.left, env)?;
+                let right = self.eval_expr(module_spec, &bin.right, env)?;
+                let shift = to_uint32(&right) & 31;
+                let value = match bin.op {
+                    BinaryOp::BitOr => f64::from(to_int32(&left) | to_int32(&right)),
+                    BinaryOp::BitAnd => f64::from(to_int32(&left) & to_int32(&right)),
+                    BinaryOp::BitXor => f64::from(to_int32(&left) ^ to_int32(&right)),
+                    BinaryOp::LShift => f64::from(to_int32(&left).wrapping_shl(shift)),
+                    BinaryOp::RShift => f64::from(to_int32(&left) >> shift),
+                    BinaryOp::ZeroFillRShift => f64::from(to_uint32(&left) >> shift),
                     _ => unreachable!(),
                 };
-                Ok(Value::Bool(result))
+                Ok(json_num(value))
             }
-            BinaryOp::EqEq | BinaryOp::EqEqEq => {
-                let left = self.eval_expr(module_spec, &bin.left, env)?;
-                let right = self.eval_expr(module_spec, &bin.right, env)?;
-                Ok(Value::Bool(
-                    value_to_string(&left) == value_to_string(&right),
-                ))
+            // `key in object`: own keys only. JavaScript also finds inherited
+            // ones (`"toString" in {}` is true); data here has no prototype to
+            // inherit from, and a render asking that question is asking about
+            // its data.
+            BinaryOp::In => {
+                let key = js_string(&self.eval_expr(module_spec, &bin.left, env)?);
+                let target = self.eval_expr(module_spec, &bin.right, env)?;
+                let is_data = date_value_ms(&target).is_none() && as_rendered_html(&target).is_none();
+                match &target {
+                    Value::Object(map) if is_data => Ok(Value::Bool(map.contains_key(&key))),
+                    Value::Array(items) => Ok(Value::Bool(
+                        key == "length" || canonical_index(&key).is_some_and(|i| i < items.len()),
+                    )),
+                    _ => self.unmodelled(module_spec, "`in` on a value that is not plain data"),
+                }
             }
-            BinaryOp::NotEq | BinaryOp::NotEqEq => {
-                let left = self.eval_expr(module_spec, &bin.left, env)?;
-                let right = self.eval_expr(module_spec, &bin.right, env)?;
-                Ok(Value::Bool(
-                    value_to_string(&left) != value_to_string(&right),
-                ))
-            }
-            _ => Ok(Value::Null),
+            BinaryOp::InstanceOf => self.unmodelled(module_spec, "`instanceof`"),
         }
+    }
+
+    /// The number an arithmetic operator produced — or, when JavaScript's
+    /// answer is `NaN` or `Infinity`, which a `Value` cannot hold, the operator
+    /// named as unmodelled. It used to become `null` and render as nothing
+    /// where JavaScript renders `NaN`.
+    fn number_result(&self, module_spec: &str, op: &str, value: f64) -> Result<Value> {
+        if value.is_finite() {
+            return Ok(json_num(value));
+        }
+        let kind = if value.is_nan() { "NaN" } else { "Infinity" };
+        self.unmodelled(module_spec, &format!("arithmetic (`{op}`) that produces {kind}"))
     }
 
     fn eval_cond(
@@ -2677,19 +3290,114 @@ impl ComponentProject {
         env: &HashMap<String, Value>,
     ) -> Result<Value> {
         use swc_ecma_ast::*;
+        // `typeof` looks at the operand before evaluating it: an undeclared
+        // name is `"undefined"` in JavaScript, not an error and not a warning.
+        if unary.op == UnaryOp::TypeOf {
+            return self.eval_typeof(module_spec, &unary.arg, env);
+        }
+        if unary.op == UnaryOp::Delete {
+            return self.unmodelled(module_spec, "`delete`");
+        }
         let val = self.eval_expr(module_spec, &unary.arg, env)?;
+        // Every operator below was `null` for anything but `!` and `-` of a
+        // number — so `-"5"`, `+value` and `~~n` rendered as nothing.
         match unary.op {
             UnaryOp::Bang => Ok(Value::Bool(!is_truthy(&val))),
-            UnaryOp::Minus => {
-                if let Value::Number(n) = &val {
-                    Ok(serde_json::Number::from_f64(-n.as_f64().unwrap_or(0.0))
-                        .map(Value::Number)
-                        .unwrap_or(Value::Null))
-                } else {
-                    Ok(Value::Null)
+            UnaryOp::Minus => self.number_result(module_spec, "-", -js_number(&val)),
+            UnaryOp::Plus => self.number_result(module_spec, "+", js_number(&val)),
+            UnaryOp::Tilde => Ok(json_num(f64::from(!to_int32(&val)))),
+            UnaryOp::Void => Ok(Value::Null),
+            UnaryOp::TypeOf | UnaryOp::Delete => unreachable!("handled above"),
+        }
+    }
+
+    /// `typeof operand`, answered only where the answer is certain.
+    ///
+    /// The evaluator holds `null` and `undefined` as one value, and `typeof`
+    /// is the one operator that tells them apart — so a `null` is answered from
+    /// where it came from, when that settles it: a name nothing declares, a
+    /// property the object does not have, an index past the end, a `?.` that
+    /// short-circuited. Anything else that is `null` is refused by
+    /// [`typeof_value`] rather than guessed.
+    fn eval_typeof(
+        &self,
+        module_spec: &str,
+        operand: &swc_ecma_ast::Expr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        use swc_ecma_ast::*;
+        let answer = |kind: &str| Ok(Value::String(kind.to_string()));
+        let answer_for = |value: &Value| match typeof_value(value) {
+            Some(kind) => answer(kind),
+            None => self.unmodelled(
+                module_spec,
+                "`typeof` of a value that is null or undefined (the static renderer holds both \
+                 as one value; test with `x == null`, which is true for both)",
+            ),
+        };
+        let missing_from = |object: &Value, prop: &MemberProp, env: &HashMap<String, Value>| {
+            let is_data = date_value_ms(object).is_none() && as_rendered_html(object).is_none();
+            Ok::<bool, anyhow::Error>(match (object, prop) {
+                (Value::Object(map), MemberProp::Ident(name)) if is_data => {
+                    !map.contains_key(name.sym.as_ref())
                 }
+                (Value::Object(map), MemberProp::Computed(key)) if is_data => {
+                    !map.contains_key(&js_string(&self.eval_expr(module_spec, &key.expr, env)?))
+                }
+                (Value::Array(items), MemberProp::Computed(key)) => {
+                    let key = js_string(&self.eval_expr(module_spec, &key.expr, env)?);
+                    canonical_index(&key).is_some_and(|i| i >= items.len())
+                }
+                _ => false,
+            })
+        };
+
+        match unwrap_updater_parens(operand) {
+            Expr::Ident(ident) if !env.contains_key(ident.sym.as_ref()) => {
+                let name = ident.sym.as_ref();
+                let module = self.modules.get(module_spec);
+                if module.is_some_and(|m| m.functions.contains_key(name)) {
+                    return answer("function");
+                }
+                if module.is_some_and(|m| m.imports.contains_key(name)) {
+                    return match self.resolve_imported_value(module_spec, name) {
+                        Some(value) => {
+                            answer_for(&check_renderable(name, value)?)
+                        }
+                        None => self.unmodelled(
+                            module_spec,
+                            &format!("`typeof {name}` of an import that is not a constant"),
+                        ),
+                    };
+                }
+                answer(global_typeof(name).unwrap_or("undefined"))
             }
-            _ => Ok(Value::Null),
+            Expr::Member(member) => {
+                let object = self.eval_expr(module_spec, &member.obj, env)?;
+                if missing_from(&object, &member.prop, env)? {
+                    return answer("undefined");
+                }
+                let value = self.eval_member_on(module_spec, &object, &member.prop, env)?;
+                answer_for(&value)
+            }
+            Expr::OptChain(OptChainExpr { base, .. }) => match &**base {
+                OptChainBase::Member(member) => {
+                    let object = self.eval_expr(module_spec, &member.obj, env)?;
+                    if matches!(object, Value::Null) || missing_from(&object, &member.prop, env)? {
+                        return answer("undefined");
+                    }
+                    let value = self.eval_member_on(module_spec, &object, &member.prop, env)?;
+                    answer_for(&value)
+                }
+                OptChainBase::Call(_) => {
+                    let value = self.eval_expr(module_spec, operand, env)?;
+                    answer_for(&value)
+                }
+            },
+            other => {
+                let value = self.eval_expr(module_spec, other, env)?;
+                answer_for(&value)
+            }
         }
     }
 
@@ -2699,14 +3407,64 @@ impl ComponentProject {
         arr: &swc_ecma_ast::ArrayLit,
         env: &HashMap<String, Value>,
     ) -> Result<Value> {
-        use swc_ecma_ast::*;
+        // 🔴 A spread element was skipped and a hole was dropped, so
+        // `[...pages, extra]` was `[extra]` and `[a, , b].length` was 2.
         let mut out = Vec::with_capacity(arr.elems.len());
         for elem in &arr.elems {
-            if let Some(ExprOrSpread { expr, spread: None }) = elem {
-                out.push(self.eval_expr(module_spec, expr, env)?);
+            match elem {
+                None => out.push(Value::Null),
+                Some(elem) if elem.spread.is_some() => {
+                    let spread = self.eval_expr(module_spec, &elem.expr, env)?;
+                    out.extend(self.spread_items(module_spec, spread)?);
+                }
+                Some(elem) => out.push(self.eval_expr(module_spec, &elem.expr, env)?),
             }
         }
         Ok(Value::Array(out))
+    }
+
+    /// The elements `...value` contributes to an array or an argument list:
+    /// an array's items, a string's code points. Anything else is not
+    /// iterable in JavaScript, which throws.
+    fn spread_items(&self, module_spec: &str, value: Value) -> Result<Vec<Value>> {
+        match value {
+            Value::Array(items) => Ok(items),
+            Value::String(s) => Ok(s.chars().map(|c| Value::String(c.to_string())).collect()),
+            other => {
+                let kind = match other {
+                    Value::Null => "null or undefined",
+                    Value::Bool(_) => "boolean",
+                    Value::Number(_) => "number",
+                    _ => "non-array object",
+                };
+                // A hook-compile render skipped these before, and still does.
+                self.unmodelled_or(
+                    module_spec,
+                    &format!("`...` of a {kind} value, which is not iterable,"),
+                    Vec::new(),
+                )
+            }
+        }
+    }
+
+    /// Call arguments, with `...xs` expanded in place — so `Math.max(...xs)` is
+    /// the largest of `xs`, not the largest of nothing.
+    fn eval_args(
+        &self,
+        module_spec: &str,
+        args: &[swc_ecma_ast::ExprOrSpread],
+        env: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>> {
+        let mut out = Vec::with_capacity(args.len());
+        for arg in args {
+            let value = self.eval_expr(module_spec, &arg.expr, env)?;
+            if arg.spread.is_some() {
+                out.extend(self.spread_items(module_spec, value)?);
+            } else {
+                out.push(value);
+            }
+        }
+        Ok(out)
     }
 
     fn eval_object_expr(
@@ -2716,22 +3474,58 @@ impl ComponentProject {
         env: &HashMap<String, Value>,
     ) -> Result<Value> {
         use swc_ecma_ast::*;
+        // 🔴 A spread, a computed key and a method were each skipped without a
+        // word: `{ ...base, title }` was `{ title }`, and `{ [key]: value }` was
+        // `{}`.
         let mut map = serde_json::Map::new();
         for prop in &obj.props {
-            if let PropOrSpread::Prop(prop_box) = prop {
-                match prop_box.as_ref() {
-                    Prop::KeyValue(kv) => {
-                        if let Some(key) = prop_name_to_string(&kv.key) {
-                            let val = self.eval_expr(module_spec, &kv.value, env)?;
-                            map.insert(key, val);
+            let prop_box = match prop {
+                PropOrSpread::Prop(prop_box) => prop_box,
+                PropOrSpread::Spread(spread) => {
+                    let value = self.eval_expr(module_spec, &spread.expr, env)?;
+                    if date_value_ms(&value).is_some() || as_rendered_html(&value).is_some() {
+                        return self.unmodelled(module_spec, "`...` of a date or rendered element");
+                    }
+                    match value {
+                        Value::Object(source) => map.extend(source),
+                        Value::Array(items) => map.extend(
+                            items.into_iter().enumerate().map(|(i, item)| (i.to_string(), item)),
+                        ),
+                        Value::String(s) => map.extend(
+                            s.encode_utf16()
+                                .enumerate()
+                                .map(|(i, unit)| (i.to_string(), Value::String(from_utf16(&[unit])))),
+                        ),
+                        // `null`, `undefined`, booleans and numbers have no own
+                        // properties, so spreading one adds nothing — not an error.
+                        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+                    }
+                    continue;
+                }
+            };
+            match prop_box.as_ref() {
+                Prop::KeyValue(kv) => {
+                    let key = match &kv.key {
+                        PropName::Computed(computed) => {
+                            js_string(&self.eval_expr(module_spec, &computed.expr, env)?)
                         }
-                    }
-                    Prop::Shorthand(ident) => {
-                        let name = ident.sym.to_string();
-                        let val = env.get(&name).cloned().unwrap_or(Value::Null);
-                        map.insert(name, val);
-                    }
-                    _ => {}
+                        other => match prop_name_to_string(other) {
+                            Some(key) => key,
+                            None => return self.unmodelled(module_spec, "this object key"),
+                        },
+                    };
+                    let val = self.eval_expr(module_spec, &kv.value, env)?;
+                    map.insert(key, val);
+                }
+                // `{ x }` reads `x` exactly as `{ x: x }` would — an imported
+                // value resolves, and an unevaluable constant raises.
+                Prop::Shorthand(ident) => {
+                    let name = ident.sym.to_string();
+                    let val = self.eval_ident(module_spec, &name, env)?;
+                    map.insert(name, val);
+                }
+                Prop::Method(_) | Prop::Getter(_) | Prop::Setter(_) | Prop::Assign(_) => {
+                    return self.unmodelled(module_spec, "a method, getter or setter in an object literal");
                 }
             }
         }
@@ -2778,6 +3572,13 @@ impl ComponentProject {
                     {
                         return Ok(value);
                     }
+                    let receiver = match &obj_val {
+                        Value::Null => "null or undefined",
+                        Value::Bool(_) => "a boolean",
+                        _ => "an object",
+                    };
+                    return self
+                        .unmodelled(module_spec, &format!("calling `.{method}()` on {receiver}"));
                 }
             }
         }
@@ -2938,27 +3739,158 @@ impl ComponentProject {
                     }
                 }
 
+                // A local binding shadows everything below — and a local is a
+                // value here, never a function, so there is nothing to call.
+                if env.contains_key(&fn_name) {
+                    return self.unmodelled(
+                        module_spec,
+                        &format!(
+                            "calling `{fn_name}()`, a function defined inside a component or \
+                             passed in as a value — move it to module level,"
+                        ),
+                    );
+                }
+
                 // JS-style coercions.
                 if fn_name == "String" || fn_name == "Number" || fn_name == "Boolean" {
-                    let arg = match call.args.first() {
-                        Some(a) if a.spread.is_none() => {
-                            self.eval_expr(module_spec, &a.expr, env)?
-                        }
-                        _ => Value::Null,
-                    };
-                    return Ok(match fn_name.as_str() {
-                        "String" => Value::String(value_to_string(&arg)),
-                        "Number" => json_num(to_number(&arg)),
-                        "Boolean" => Value::Bool(is_truthy(&arg)),
+                    let arg = self.eval_args(module_spec, &call.args, env)?.into_iter().next();
+                    return match (fn_name.as_str(), arg) {
+                        ("String", arg) => Ok(Value::String(arg.as_ref().map_or_else(String::new, js_string))),
+                        ("Number", None) => Ok(json_int(0)),
+                        ("Number", Some(arg)) => self.number_result(module_spec, "Number()", js_number(&arg)),
+                        ("Boolean", arg) => Ok(Value::Bool(arg.as_ref().is_some_and(is_truthy))),
                         _ => unreachable!(),
-                    });
+                    };
                 }
+
+                // A function declared in this module, or imported from another
+                // project module, is called for its value. Before this, every
+                // such call — `formatDate(post.date)` — was `null`, and rendered
+                // as nothing. Ahead of the globals, which a module's own
+                // declaration shadows.
+                //
+                // Static renders only. A hook-compile render runs inside a
+                // component's slot scope, and a called function's own
+                // `useState` would be matched against that scope's slots by
+                // name — so there it stays the `null` it always was.
+                if !phase_k_enabled() {
+                    if let Some((target, local)) = self.resolve_callable(module_spec, &fn_name) {
+                        let args = self.eval_args(module_spec, &call.args, env)?;
+                        return self.call_module_function(module_spec, &fn_name, &target, &local, args);
+                    }
+                }
+
+                if let Some(value) = self.eval_global_function(module_spec, &fn_name, call, env)? {
+                    return Ok(value);
+                }
+
+                return self.unmodelled(module_spec, &format!("calling `{fn_name}()`"));
             }
         }
 
-        Ok(Value::Null)
+        self.unmodelled(module_spec, "a call of this shape")
     }
 
+    /// The module and local name a bare call `name()` refers to: a function
+    /// declared in `module_spec`, or one imported from a project module.
+    fn resolve_callable(&self, module_spec: &str, name: &str) -> Option<(String, String)> {
+        let module = self.modules.get(module_spec)?;
+        if module.functions.contains_key(name) {
+            return Some((module_spec.to_string(), name.to_string()));
+        }
+        let binding = module.imports.get(name)?;
+        if !binding.source.starts_with('.') {
+            return None;
+        }
+        let target = self.resolve_import(module_spec, &binding.source)?;
+        let target_module = self.modules.get(&target)?;
+        let local = if binding.export_name == "default" {
+            target_module.default_export.clone()?
+        } else {
+            binding.export_name.clone()
+        };
+        target_module.functions.contains_key(&local).then_some((target, local))
+    }
+
+    /// Call a module-level function for its value: its parameters bound
+    /// positionally, its module's constants in scope, its `return` the result.
+    ///
+    /// `caller` and `called` are the module and name the call was written
+    /// with; `module_spec` and `name` are where it resolved. A failure is named
+    /// once, by the outermost call — the one in the component being rendered.
+    fn call_module_function(
+        &self,
+        caller: &str,
+        called: &str,
+        module_spec: &str,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        thread_local! {
+            static CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
+        }
+        /// Deep enough for any helper a render calls; shallow enough that a
+        /// function calling itself forever stops with a message, not a stack
+        /// overflow that takes the build down with it — each level is several
+        /// large evaluator frames, and a debug build on Windows starts with 1 MiB.
+        const MAX_CALL_DEPTH: u32 = 32;
+
+        let function = self
+            .modules
+            .get(module_spec)
+            .and_then(|module| module.functions.get(name))
+            .ok_or_else(|| anyhow!("function '{name}' missing in module '{module_spec}'"))?;
+        let depth = CALL_DEPTH.with(Cell::get);
+        if depth >= MAX_CALL_DEPTH {
+            return Err(anyhow!(
+                "`{name}()` nested more than {MAX_CALL_DEPTH} calls deep (module '{module_spec}')"
+            ));
+        }
+        CALL_DEPTH.with(|cell| cell.set(depth + 1));
+        let mut env = HashMap::new();
+        self.seed_env_with_module_constants(module_spec, &mut env);
+        bind_params_positional(&function.params, &Value::Array(args), &mut env);
+        let result = self.eval_body_value(module_spec, &function.body_stmts, &mut env);
+        CALL_DEPTH.with(|cell| cell.set(depth));
+        match result {
+            Ok(value) => Ok(value.unwrap_or(Value::Null)),
+            Err(error) if depth > 0 => Err(error),
+            // Flattened, not `.context()`: the build reports `to_string()`,
+            // which shows a context and drops its cause.
+            Err(error) => Err(anyhow!("{error:#} (in `{called}()`, called from module '{caller}')")),
+        }
+    }
+
+    /// The global functions a render reaches for — `parseInt`, `parseFloat`,
+    /// `encodeURIComponent`. `None` for any other name.
+    fn eval_global_function(
+        &self,
+        module_spec: &str,
+        name: &str,
+        call: &swc_ecma_ast::CallExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Option<Value>> {
+        if !matches!(name, "parseInt" | "parseFloat" | "encodeURIComponent" | "isNaN" | "isFinite") {
+            return Ok(None);
+        }
+        let args = self.eval_args(module_spec, &call.args, env)?;
+        let first = args.first().cloned().unwrap_or(Value::Null);
+        let value = match name {
+            "parseInt" => self.number_result(module_spec, "parseInt()", parse_int(&js_string(&first), args.get(1)))?,
+            "parseFloat" => self.number_result(module_spec, "parseFloat()", parse_float(&js_string(&first)))?,
+            "encodeURIComponent" => Value::String(encode_uri_component(&js_string(&first))),
+            "isNaN" => Value::Bool(js_number(&first).is_nan()),
+            "isFinite" => Value::Bool(js_number(&first).is_finite()),
+            _ => unreachable!(),
+        };
+        Ok(Some(value))
+    }
+
+    /// `Math.floor(x)`, `Object.keys(o)` and the rest of the global namespaces.
+    ///
+    /// `None` when `ns` is not one of them, so the caller dispatches the call
+    /// as a method on a value. A method of one of them that is not modelled
+    /// here is unmodelled by name: it fell through to a `null` before.
     fn eval_static_namespace_call(
         &self,
         module_spec: &str,
@@ -2967,33 +3899,64 @@ impl ComponentProject {
         args: &[swc_ecma_ast::ExprOrSpread],
         env: &HashMap<String, Value>,
     ) -> Result<Option<Value>> {
-        let evaluated: Vec<Value> = args
-            .iter()
-            .filter(|a| a.spread.is_none())
-            .map(|a| self.eval_expr(module_spec, &a.expr, env))
-            .collect::<Result<Vec<_>>>()?;
+        const NAMESPACES: [&str; 8] =
+            ["Math", "JSON", "Object", "Array", "Number", "Date", "String", "console"];
+        if !NAMESPACES.contains(&ns) {
+            return Ok(None);
+        }
+        // A `console.log` left in a render has nothing to put on the page, and
+        // must not cost the page its component. Its arguments are not
+        // evaluated: whatever they say is for a console this render does not have.
+        if ns == "console" {
+            return Ok(Some(Value::Null));
+        }
+        // `Array.from(x, mapFn)`: the callback is called, not evaluated.
+        if (ns, method) == ("Array", "from") {
+            return self.eval_array_from(module_spec, args, env).map(Some);
+        }
+
+        let evaluated = self.eval_args(module_spec, args, env)?;
+        let arg = |i: usize| evaluated.get(i).cloned().unwrap_or(Value::Null);
+        let math = |value: f64| self.number_result(module_spec, &format!("Math.{method}()"), value);
 
         let result = match (ns, method) {
             // Math.* — covers everything that shows up in display logic.
-            ("Math", "floor") => json_num(arg_num(&evaluated, 0).floor()),
-            ("Math", "ceil") => json_num(arg_num(&evaluated, 0).ceil()),
-            ("Math", "round") => json_num(arg_num(&evaluated, 0).round()),
-            ("Math", "trunc") => json_num(arg_num(&evaluated, 0).trunc()),
-            ("Math", "abs") => json_num(arg_num(&evaluated, 0).abs()),
-            ("Math", "sqrt") => json_num(arg_num(&evaluated, 0).sqrt()),
-            ("Math", "max") => json_num(
-                evaluated
-                    .iter()
-                    .map(to_number)
-                    .fold(f64::NEG_INFINITY, f64::max),
-            ),
-            ("Math", "min") => json_num(
-                evaluated
-                    .iter()
-                    .map(to_number)
-                    .fold(f64::INFINITY, f64::min),
-            ),
-            ("Math", "pow") => json_num(arg_num(&evaluated, 0).powf(arg_num(&evaluated, 1))),
+            ("Math", "floor") => math(arg_num(&evaluated, 0).floor())?,
+            ("Math", "ceil") => math(arg_num(&evaluated, 0).ceil())?,
+            // JavaScript rounds a half UP — `Math.round(-2.5)` is `-2` — where
+            // `f64::round` rounds it away from zero, to `-3`.
+            ("Math", "round") => {
+                let x = arg_num(&evaluated, 0);
+                let floor = x.floor();
+                math(if x - floor >= 0.5 { floor + 1.0 } else { floor })?
+            }
+            ("Math", "trunc") => math(arg_num(&evaluated, 0).trunc())?,
+            ("Math", "abs") => math(arg_num(&evaluated, 0).abs())?,
+            ("Math", "sqrt") => math(arg_num(&evaluated, 0).sqrt())?,
+            ("Math", "sign") => {
+                let x = arg_num(&evaluated, 0);
+                math(if x == 0.0 { 0.0 } else { x.signum() })?
+            }
+            ("Math", "max") => math(evaluated.iter().map(js_number).fold(f64::NEG_INFINITY, |a, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            }))?,
+            ("Math", "min") => math(evaluated.iter().map(js_number).fold(f64::INFINITY, |a, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.min(b)
+                }
+            }))?,
+            ("Math", "pow") => math(arg_num(&evaluated, 0).powf(arg_num(&evaluated, 1)))?,
+            ("Math", "random") => {
+                return self
+                    .unmodelled(module_spec, "`Math.random()`, which would differ on every build,")
+                    .map(Some)
+            }
 
             // Date statics — no system clock in Phase J (deterministic SSR).
             // `Date.now()` returns 0; user code that wants a real timestamp
@@ -3012,22 +3975,126 @@ impl ComponentProject {
                 None => Value::Null,
             },
 
-            // Object.keys / Object.values — used in admin/debug UIs.
-            ("Object", "keys") => match evaluated.first() {
-                Some(Value::Object(map)) => {
-                    Value::Array(map.keys().cloned().map(Value::String).collect())
+            // Object.keys / values / entries — over an object's own keys, an
+            // array's indices, or a string's code units, as JavaScript does.
+            ("Object", "keys" | "values" | "entries") => {
+                let target = arg(0);
+                if matches!(target, Value::Null)
+                    || date_value_ms(&target).is_some()
+                    || as_rendered_html(&target).is_some()
+                {
+                    return self
+                        .unmodelled(module_spec, &format!("`Object.{method}()` of this value"))
+                        .map(Some);
                 }
-                _ => Value::Array(Vec::new()),
+                let entries: Vec<(String, Value)> = match target {
+                    Value::Object(map) => map.into_iter().collect(),
+                    Value::Array(items) => {
+                        items.into_iter().enumerate().map(|(i, v)| (i.to_string(), v)).collect()
+                    }
+                    Value::String(s) => s
+                        .encode_utf16()
+                        .enumerate()
+                        .map(|(i, unit)| (i.to_string(), Value::String(from_utf16(&[unit]))))
+                        .collect(),
+                    Value::Bool(_) | Value::Number(_) | Value::Null => Vec::new(),
+                };
+                Value::Array(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| match method {
+                            "keys" => Value::String(key),
+                            "values" => value,
+                            _ => Value::Array(vec![Value::String(key), value]),
+                        })
+                        .collect(),
+                )
+            }
+            ("Object", "fromEntries") => match arg(0) {
+                Value::Array(pairs) => {
+                    let mut map = Map::new();
+                    for pair in pairs {
+                        let Value::Array(pair) = pair else {
+                            return self
+                                .unmodelled(module_spec, "`Object.fromEntries()` of a non-pair")
+                                .map(Some);
+                        };
+                        let key = pair.first().map_or_else(String::new, js_string);
+                        map.insert(key, pair.get(1).cloned().unwrap_or(Value::Null));
+                    }
+                    Value::Object(map)
+                }
+                _ => {
+                    return self
+                        .unmodelled(module_spec, "`Object.fromEntries()` of a non-array")
+                        .map(Some)
+                }
             },
-            ("Object", "values") => match evaluated.first() {
-                Some(Value::Object(map)) => Value::Array(map.values().cloned().collect()),
-                _ => Value::Array(Vec::new()),
-            },
+            ("Array", "isArray") => Value::Bool(matches!(arg(0), Value::Array(_))),
+            ("Number", "isInteger") => Value::Bool(
+                matches!(arg(0), Value::Number(ref n) if n.as_f64().is_some_and(|f| f == f.trunc())),
+            ),
+            ("Number", "isFinite") => Value::Bool(matches!(arg(0), Value::Number(_))),
+            ("Number", "parseInt") => self.number_result(
+                module_spec,
+                "Number.parseInt()",
+                parse_int(&js_string(&arg(0)), evaluated.get(1)),
+            )?,
+            ("Number", "parseFloat") => self.number_result(
+                module_spec,
+                "Number.parseFloat()",
+                parse_float(&js_string(&arg(0))),
+            )?,
 
-            _ => return Ok(None),
+            _ => return self.unmodelled(module_spec, &format!("`{ns}.{method}()`")).map(Some),
         };
 
         Ok(Some(result))
+    }
+
+    /// `Array.from(source, mapFn?)` — an array, a string's code points, or an
+    /// array-like `{ length: n }` (the `Array.from({ length: 3 }, (_, i) => i)`
+    /// idiom), each item passed through `mapFn` with its index when given.
+    fn eval_array_from(
+        &self,
+        module_spec: &str,
+        args: &[swc_ecma_ast::ExprOrSpread],
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        if args.iter().any(|arg| arg.spread.is_some()) {
+            return self.unmodelled(module_spec, "`Array.from()` with a spread argument");
+        }
+        let source = match args.first() {
+            Some(arg) => self.eval_expr(module_spec, &arg.expr, env)?,
+            None => Value::Null,
+        };
+        let is_data = as_rendered_html(&source).is_none() && date_value_ms(&source).is_none();
+        let items = match source {
+            Value::Object(map) if is_data => {
+                let length = map.get("length").map_or(0.0, integer_or_zero).max(0.0);
+                if length > MAX_BUILT_STRING_UNITS as f64 {
+                    return self.unmodelled(module_spec, "`Array.from()` of more than 16M items");
+                }
+                (0..length as usize)
+                    .map(|i| map.get(&i.to_string()).cloned().unwrap_or(Value::Null))
+                    .collect()
+            }
+            other => self.spread_items(module_spec, other)?,
+        };
+        let Some(mapper) = args.get(1) else {
+            return Ok(Value::Array(items));
+        };
+        let mut mapped = Vec::with_capacity(items.len());
+        for (i, item) in items.into_iter().enumerate() {
+            mapped.push(self.call_callback_with(
+                module_spec,
+                "Array.from",
+                &mapper.expr,
+                vec![item, json_int(i as i64)],
+                env,
+            )?);
+        }
+        Ok(Value::Array(mapped))
     }
 
     fn eval_instance_method(
@@ -3040,33 +4107,21 @@ impl ComponentProject {
     ) -> Result<Option<Value>> {
         // Date instance methods first — Date is encoded as a tagged object.
         if let Some(ms) = date_value_ms(receiver) {
-            return Ok(Some(self.eval_date_method(method, ms)));
+            return match self.eval_date_method(method, ms) {
+                Some(value) => Ok(Some(value)),
+                None => self.unmodelled(module_spec, &format!("`.{method}()` on a Date")).map(Some),
+            };
         }
 
         match receiver {
-            Value::String(s) => {
-                let result = match method {
-                    "toUpperCase" => Some(Value::String(s.to_uppercase())),
-                    "toLowerCase" => Some(Value::String(s.to_lowercase())),
-                    "trim" => Some(Value::String(s.trim().to_string())),
-                    "trimStart" | "trimLeft" => Some(Value::String(s.trim_start().to_string())),
-                    "trimEnd" | "trimRight" => Some(Value::String(s.trim_end().to_string())),
-                    "toString" => Some(Value::String(s.clone())),
-                    _ => None,
-                };
-                Ok(result)
-            }
+            Value::String(s) => self.eval_string_method(module_spec, s, method, args, env).map(Some),
             Value::Number(n) => {
                 let f = n.as_f64().unwrap_or(0.0);
-                let evaluated: Vec<Value> = args
-                    .iter()
-                    .filter(|a| a.spread.is_none())
-                    .map(|a| self.eval_expr(module_spec, &a.expr, env))
-                    .collect::<Result<Vec<_>>>()?;
+                let evaluated = self.eval_args(module_spec, args, env)?;
                 let result = match method {
                     "toFixed" => {
                         let digits = arg_num(&evaluated, 0).clamp(0.0, 100.0) as usize;
-                        Some(Value::String(format!("{:.*}", digits, f)))
+                        Value::String(js_to_fixed(f, digits))
                     }
                     "toString" => {
                         let radix = if evaluated.is_empty() {
@@ -3075,7 +4130,7 @@ impl ComponentProject {
                             arg_num(&evaluated, 0)
                         };
                         if radix == 10.0 {
-                            Some(Value::String(value_to_string(receiver)))
+                            Value::String(value_to_string(receiver))
                         } else if (radix - radix.trunc()).abs() < f64::EPSILON
                             && (2.0..=36.0).contains(&radix)
                             && f.is_finite()
@@ -3098,62 +4153,722 @@ impl ComponentProject {
                                 digits.insert(0, ch);
                                 value /= radix as u128;
                             }
-                            Some(Value::String(format!("{sign}{digits}")))
+                            Value::String(format!("{sign}{digits}"))
                         } else {
-                            Some(Value::String(value_to_string(receiver)))
+                            Value::String(value_to_string(receiver))
                         }
                     }
-                    _ => None,
+                    "valueOf" => receiver.clone(),
+                    "toLocaleString" => {
+                        return self
+                            .unmodelled(
+                                module_spec,
+                                "`.toLocaleString()` on a number (its output depends on a locale \
+                                 the static renderer does not have)",
+                            )
+                            .map(Some)
+                    }
+                    other => {
+                        return self
+                            .unmodelled(module_spec, &format!("`.{other}()` on a number"))
+                            .map(Some)
+                    }
                 };
-                Ok(result)
+                Ok(Some(result))
             }
-            Value::Array(items) => match method {
-                "map" => {
-                    if let Some(swc_ecma_ast::ExprOrSpread {
-                        expr: mapper,
-                        spread: None,
-                    }) = args.first()
-                    {
-                        // An ARRAY, not a joined string. `xs.map(x => <li/>)` is
-                        // the ordinary way to write a list, and flattening it to
-                        // text here erased the fact that each element was
-                        // markup — which then made `{xs.map(...)}` in a child
-                        // position indistinguishable from a user string, and so
-                        // escapable. `value_to_string` still concatenates an
-                        // array, so every consumer that wanted the joined text
-                        // gets the same bytes it did before.
-                        let parts = items
-                            .iter()
-                            .enumerate()
-                            .map(|(i, item)| self.eval_closure(module_spec, mapper, item, i, env))
-                            .collect::<Result<Vec<_>>>()?;
-                        return Ok(Some(Value::Array(parts)));
-                    }
-                    Ok(Some(Value::Null))
-                }
-                "join" => {
-                    let sep = match args.first() {
-                        Some(a) if a.spread.is_none() => {
-                            value_to_string(&self.eval_expr(module_spec, &a.expr, env)?)
-                        }
-                        _ => ",".to_string(),
-                    };
-                    let parts: Vec<String> = items.iter().map(value_to_string).collect();
-                    Ok(Some(Value::String(parts.join(&sep))))
-                }
-                _ => Ok(None),
-            },
+            Value::Array(items) => self
+                .eval_array_method(module_spec, items, method, args, env)
+                .map(Some),
             _ => Ok(None),
         }
     }
 
-    fn eval_date_method(&self, method: &str, ms: f64) -> Value {
+    /// `s.method(args)` for a string — implemented on UTF-16 code units, the
+    /// units JavaScript indexes a string by, or unmodelled by name.
+    ///
+    /// 🔴 Until this existed six methods were modelled and every other one —
+    /// `includes`, `startsWith`, `split`, `replace`, `slice`, `padStart` — was
+    /// `null`: `{slug.split("-").join(" ")}` rendered nothing, and
+    /// `title.startsWith("Re:") ? a : b` always took `b`.
+    fn eval_string_method(
+        &self,
+        module_spec: &str,
+        s: &str,
+        method: &str,
+        args: &[swc_ecma_ast::ExprOrSpread],
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        const SUPPORTED: &str = "at, charAt, concat, endsWith, includes, indexOf, lastIndexOf, \
+                                 padEnd, padStart, repeat, replace, replaceAll, slice, split, \
+                                 startsWith, substr, substring, toLowerCase, toUpperCase, \
+                                 toString, trim, trimEnd, trimStart, valueOf";
         match method {
-            "getTime" | "valueOf" => json_num(ms),
-            "toISOString" | "toJSON" | "toString" => {
-                Value::String(value_to_string(&make_date_value(ms)))
+            // The replacement may be a callback, which is called, not evaluated.
+            "replace" | "replaceAll" => return self.eval_string_replace(module_spec, s, method, args, env),
+            "localeCompare" => {
+                return self.unmodelled(
+                    module_spec,
+                    "`.localeCompare()` (its order depends on a locale the static renderer does \
+                     not have; `<` compares by code unit)",
+                )
             }
-            _ => Value::Null,
+            "match" | "matchAll" | "search" => {
+                return self.unmodelled(
+                    module_spec,
+                    &format!("`.{method}()`, which takes a regular expression,"),
+                )
+            }
+            _ => {}
+        }
+
+        let evaluated = self.eval_args(module_spec, args, env)?;
+        let units = utf16(s);
+        let len = units.len();
+        let string = |units: &[u16]| Ok(Value::String(from_utf16(units)));
+        // An argument read as a position: missing or `null` is `None`.
+        let given = |i: usize| evaluated.get(i).filter(|value| !matches!(value, Value::Null));
+        let position = |i: usize, default: usize| {
+            given(i).map_or(default, |value| integer_or_zero(value).clamp(0.0, len as f64) as usize)
+        };
+        // An argument read as a string. Missing is `undefined`, whose string is
+        // "undefined"; a `null` could be either, and the two spell differently.
+        let text = |i: usize| -> Result<Option<Vec<u16>>> {
+            match evaluated.get(i) {
+                None => Ok(Some(utf16("undefined"))),
+                Some(Value::Null) => Ok(None),
+                Some(value) => Ok(Some(utf16(&js_string(value)))),
+            }
+        };
+        let ambiguous = || {
+            self.unmodelled(
+                module_spec,
+                &format!(
+                    "`.{method}()` with a null-or-undefined argument (the static renderer holds \
+                     both as one value, and JavaScript spells them differently)"
+                ),
+            )
+        };
+
+        match method {
+            "toUpperCase" | "toLowerCase" | "toLocaleUpperCase" | "toLocaleLowerCase"
+                if method.starts_with("toLocale") && !evaluated.is_empty() =>
+            {
+                self.unmodelled(module_spec, &format!("`.{method}()` with a locale"))
+            }
+            "toUpperCase" | "toLocaleUpperCase" => Ok(Value::String(s.to_uppercase())),
+            "toLowerCase" | "toLocaleLowerCase" => Ok(Value::String(s.to_lowercase())),
+            "trim" => Ok(Value::String(s.trim_matches(is_js_whitespace).to_string())),
+            "trimStart" | "trimLeft" => {
+                Ok(Value::String(s.trim_start_matches(is_js_whitespace).to_string()))
+            }
+            "trimEnd" | "trimRight" => {
+                Ok(Value::String(s.trim_end_matches(is_js_whitespace).to_string()))
+            }
+            "toString" | "valueOf" => Ok(Value::String(s.to_string())),
+            "at" => {
+                let n = given(0).map_or(0.0, integer_or_zero);
+                let i = if n < 0.0 { len as f64 + n } else { n };
+                Ok(if i >= 0.0 && (i as usize) < len {
+                    Value::String(from_utf16(&units[i as usize..=i as usize]))
+                } else {
+                    Value::Null
+                })
+            }
+            "charAt" => {
+                let n = given(0).map_or(0.0, integer_or_zero);
+                if n >= 0.0 && (n as usize) < len {
+                    string(&units[n as usize..=n as usize])
+                } else {
+                    string(&[])
+                }
+            }
+            "includes" | "startsWith" | "endsWith" | "indexOf" => {
+                let Some(needle) = text(0)? else { return ambiguous() };
+                match method {
+                    "includes" => Ok(Value::Bool(find_units(&units, &needle, position(1, 0)).is_some())),
+                    "startsWith" => Ok(Value::Bool(units[position(1, 0)..].starts_with(&needle))),
+                    "endsWith" => {
+                        let end = position(1, len);
+                        Ok(Value::Bool(
+                            end >= needle.len() && units[end - needle.len()..end] == needle[..],
+                        ))
+                    }
+                    _ => Ok(json_int(
+                        find_units(&units, &needle, position(1, 0)).map_or(-1, |i| i as i64),
+                    )),
+                }
+            }
+            "lastIndexOf" => {
+                let Some(needle) = text(0)? else { return ambiguous() };
+                // A missing or NaN position searches from the end.
+                let from = match given(1).map(js_number) {
+                    Some(n) if !n.is_nan() => n.trunc().clamp(0.0, len as f64) as usize,
+                    _ => len,
+                };
+                Ok(json_int(rfind_units(&units, &needle, from).map_or(-1, |i| i as i64)))
+            }
+            "slice" => {
+                let start = given(0).map_or(0, |value| relative_index(value, len));
+                let end = given(1).map_or(len, |value| relative_index(value, len));
+                string(if start < end { &units[start..end] } else { &[] })
+            }
+            "substring" => {
+                let (a, b) = (position(0, 0), position(1, len));
+                string(&units[a.min(b)..a.max(b)])
+            }
+            "substr" => {
+                let start = given(0).map_or(0, |value| relative_index(value, len));
+                let count = given(1).map_or((len - start) as f64, integer_or_zero);
+                let end = start + count.clamp(0.0, (len - start) as f64) as usize;
+                string(&units[start..end])
+            }
+            "split" => {
+                let limit = given(1).map_or(u32::MAX, to_uint32) as usize;
+                let separator = match evaluated.first() {
+                    // No separator: the whole string, once.
+                    None => return Ok(Value::Array(if limit == 0 { Vec::new() } else { vec![Value::String(s.to_string())] })),
+                    Some(Value::Null) => return ambiguous(),
+                    Some(value) => utf16(&js_string(value)),
+                };
+                let mut parts = Vec::new();
+                if limit == 0 {
+                    return Ok(Value::Array(parts));
+                }
+                if separator.is_empty() {
+                    parts.extend(units.iter().take(limit).map(|&unit| Value::String(from_utf16(&[unit]))));
+                    return Ok(Value::Array(parts));
+                }
+                let mut from = 0;
+                while let Some(at) = find_units(&units, &separator, from) {
+                    parts.push(Value::String(from_utf16(&units[from..at])));
+                    if parts.len() == limit {
+                        return Ok(Value::Array(parts));
+                    }
+                    from = at + separator.len();
+                }
+                parts.push(Value::String(from_utf16(&units[from..])));
+                Ok(Value::Array(parts))
+            }
+            "padStart" | "padEnd" => {
+                let target = given(0).map_or(0.0, integer_or_zero);
+                if target <= len as f64 {
+                    return Ok(Value::String(s.to_string()));
+                }
+                if target > MAX_BUILT_STRING_UNITS as f64 {
+                    return self.unmodelled(module_spec, &format!("`.{method}()` to {target} characters"));
+                }
+                let filler = match given(1) {
+                    None => vec![u16::from(b' ')],
+                    Some(value) => utf16(&js_string(value)),
+                };
+                if filler.is_empty() {
+                    return Ok(Value::String(s.to_string()));
+                }
+                let pad: Vec<u16> = filler.iter().copied().cycle().take(target as usize - len).collect();
+                let joined: Vec<u16> = if method == "padStart" {
+                    pad.into_iter().chain(units.iter().copied()).collect()
+                } else {
+                    units.iter().copied().chain(pad).collect()
+                };
+                string(&joined)
+            }
+            "repeat" => {
+                let count = given(0).map_or(0.0, js_number);
+                let count = if count.is_nan() { 0.0 } else { count.trunc() };
+                if count < 0.0 || count.is_infinite() {
+                    return self.unmodelled(module_spec, &format!("`.repeat({count})`, a RangeError,"));
+                }
+                if len as f64 * count > MAX_BUILT_STRING_UNITS as f64 {
+                    return self.unmodelled(module_spec, "`.repeat()` past 16M characters");
+                }
+                Ok(Value::String(s.repeat(count as usize)))
+            }
+            "concat" => Ok(Value::String(
+                std::iter::once(s.to_string()).chain(evaluated.iter().map(js_string)).collect(),
+            )),
+            other => self.unmodelled(
+                module_spec,
+                &format!("`.{other}()` on a string (supported: {SUPPORTED})"),
+            ),
+        }
+    }
+
+    /// `s.replace(pattern, replacement)` and `s.replaceAll(...)` for a string
+    /// pattern. A regular expression never arrives: its literal is refused
+    /// where it is evaluated. The replacement is a string — with JavaScript's
+    /// `$$`, `$&`, `` $` `` and `$'` honoured — or an inline callback, called
+    /// with the match, its position and the whole string.
+    fn eval_string_replace(
+        &self,
+        module_spec: &str,
+        s: &str,
+        method: &str,
+        args: &[swc_ecma_ast::ExprOrSpread],
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        if args.iter().any(|arg| arg.spread.is_some()) {
+            return self.unmodelled(module_spec, &format!("`.{method}()` with a spread argument"));
+        }
+        let ambiguous = || {
+            self.unmodelled(
+                module_spec,
+                &format!("`.{method}()` with a null-or-undefined argument"),
+            )
+        };
+        let pattern = match args.first() {
+            None => utf16("undefined"),
+            Some(arg) => match self.eval_expr(module_spec, &arg.expr, env)? {
+                Value::Null => return ambiguous(),
+                value => utf16(&js_string(&value)),
+            },
+        };
+        let callback = args
+            .get(1)
+            .map(|arg| &*arg.expr)
+            .filter(|expr| matches!(unwrap_updater_parens(expr), swc_ecma_ast::Expr::Arrow(_) | swc_ecma_ast::Expr::Fn(_)));
+        let template = match (callback, args.get(1)) {
+            (Some(_), _) => None,
+            (None, None) => Some("undefined".to_string()),
+            (None, Some(arg)) => match self.eval_expr(module_spec, &arg.expr, env)? {
+                Value::Null => return ambiguous(),
+                value => Some(js_string(&value)),
+            },
+        };
+
+        let units = utf16(s);
+        let mut matches = Vec::new();
+        let mut from = 0;
+        while let Some(at) = find_units(&units, &pattern, from) {
+            matches.push(at);
+            if method == "replace" {
+                break;
+            }
+            from = at + pattern.len().max(1);
+            if from > units.len() {
+                break;
+            }
+        }
+
+        let mut out = String::with_capacity(s.len());
+        let mut copied = 0;
+        for at in matches {
+            out.push_str(&from_utf16(&units[copied..at]));
+            let matched = from_utf16(&units[at..at + pattern.len()]);
+            match (&template, callback) {
+                (Some(template), _) => {
+                    let before = from_utf16(&units[..at]);
+                    let after = from_utf16(&units[at + pattern.len()..]);
+                    out.push_str(&substitute(template, &matched, &before, &after));
+                }
+                (None, Some(callback)) => {
+                    let value = self.call_callback_with(
+                        module_spec,
+                        method,
+                        callback,
+                        vec![Value::String(matched), json_int(at as i64), Value::String(s.to_string())],
+                        env,
+                    )?;
+                    out.push_str(&js_string(&value));
+                }
+                (None, None) => unreachable!("a replacement is a template or a callback"),
+            }
+            copied = at + pattern.len();
+        }
+        out.push_str(&from_utf16(&units[copied..]));
+        Ok(Value::String(out))
+    }
+
+    /// `items.method(args)` for an array — every method either implemented or
+    /// refused by name.
+    ///
+    /// 🔴 Until this existed only `map` and `join` were modelled, and any other
+    /// method fell through to `Null`: `pages.findIndex(...)` was `null`, so
+    /// `at >= 0` was false, and a docs layout shipped with an empty pager — build
+    /// green, HTTP 200, nothing said. An unmodelled method is now an error, which
+    /// the build reports as a refused static render naming the component.
+    ///
+    /// Callbacks are inline arrows or function expressions; one passed by name is
+    /// refused, because this evaluator resolves names to values, not functions.
+    /// Mutating methods are refused rather than faked: a render has no array to
+    /// mutate that anything else would observe, so `sort()` here could only be
+    /// `toSorted()` under another name — say the one you mean.
+    fn eval_array_method(
+        &self,
+        module_spec: &str,
+        items: &[Value],
+        method: &str,
+        args: &[swc_ecma_ast::ExprOrSpread],
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        const SUPPORTED: &str = "map, join, filter, find, findIndex, findLast, findLastIndex, \
+                                 some, every, includes, indexOf, lastIndexOf, at, slice, concat, \
+                                 flat, flatMap, reduce, reduceRight, toReversed, toSorted, toString";
+        if args.iter().any(|arg| arg.spread.is_some()) {
+            return Err(anyhow!(
+                "`.{method}(...)` with a spread argument is not supported by the static \
+                 renderer (module '{module_spec}')"
+            ));
+        }
+        let arg = |index: usize| -> Result<Option<Value>> {
+            args.get(index)
+                .map(|arg| self.eval_expr(module_spec, &arg.expr, env))
+                .transpose()
+        };
+        let first_arg = args.first().map(|arg| &*arg.expr);
+        let callback = || {
+            first_arg.ok_or_else(|| anyhow!("`.{method}()` needs a callback (module '{module_spec}')"))
+        };
+        let call = |callback: &swc_ecma_ast::Expr, item: &Value, index: usize| {
+            self.call_array_callback(module_spec, method, callback, item, index, items, env)
+        };
+        let index_value = |index: Option<usize>| {
+            json_int(index.map_or(-1, |index| index as i64))
+        };
+
+        match method {
+            "map" => {
+                // An ARRAY, not a joined string. `xs.map(x => <li/>)` is the
+                // ordinary way to write a list, and flattening it to text here
+                // erased the fact that each element was markup — which then made
+                // `{xs.map(...)}` in a child position indistinguishable from a
+                // user string, and so escapable. `value_to_string` still
+                // concatenates an array, so every consumer that wanted the
+                // joined text gets the same bytes it did before.
+                let mapper = callback()?;
+                let parts = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| self.eval_closure(module_spec, mapper, item, i, env))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Value::Array(parts))
+            }
+            "join" | "toString" => {
+                let sep = match arg(0)? {
+                    Some(sep) if method == "join" => value_to_string(&sep),
+                    _ => ",".to_string(),
+                };
+                let parts: Vec<String> = items.iter().map(value_to_string).collect();
+                Ok(Value::String(parts.join(&sep)))
+            }
+            "filter" => {
+                let predicate = callback()?;
+                let mut kept = Vec::new();
+                for (i, item) in items.iter().enumerate() {
+                    if is_truthy(&call(predicate, item, i)?) {
+                        kept.push(item.clone());
+                    }
+                }
+                Ok(Value::Array(kept))
+            }
+            "find" | "findIndex" | "findLast" | "findLastIndex" => {
+                let predicate = callback()?;
+                let mut found = None;
+                let order: Box<dyn Iterator<Item = (usize, &Value)>> = if method.contains("Last") {
+                    Box::new(items.iter().enumerate().rev())
+                } else {
+                    Box::new(items.iter().enumerate())
+                };
+                for (i, item) in order {
+                    if is_truthy(&call(predicate, item, i)?) {
+                        found = Some(i);
+                        break;
+                    }
+                }
+                Ok(if method.ends_with("Index") {
+                    index_value(found)
+                } else {
+                    found.map_or(Value::Null, |i| items[i].clone())
+                })
+            }
+            "some" | "every" => {
+                let predicate = callback()?;
+                let want = method == "some";
+                for (i, item) in items.iter().enumerate() {
+                    if is_truthy(&call(predicate, item, i)?) == want {
+                        return Ok(Value::Bool(want));
+                    }
+                }
+                Ok(Value::Bool(!want))
+            }
+            "includes" | "indexOf" | "lastIndexOf" => {
+                if args.len() > 1 {
+                    return Err(anyhow!(
+                        "`.{method}()` with a start position is not supported by the static \
+                         renderer (module '{module_spec}')"
+                    ));
+                }
+                let needle = arg(0)?.unwrap_or(Value::Null);
+                let found = if method == "lastIndexOf" {
+                    items.iter().rposition(|item| strict_equals(item, &needle))
+                } else {
+                    items.iter().position(|item| strict_equals(item, &needle))
+                };
+                Ok(if method == "includes" {
+                    Value::Bool(found.is_some())
+                } else {
+                    index_value(found)
+                })
+            }
+            "at" => {
+                let n = arg(0)?.map_or(0.0, |v| integer_or_zero(&v));
+                let i = if n < 0.0 { items.len() as f64 + n } else { n };
+                Ok(if i >= 0.0 && (i as usize) < items.len() {
+                    items[i as usize].clone()
+                } else {
+                    Value::Null
+                })
+            }
+            "slice" => {
+                let len = items.len();
+                let start = arg(0)?.map_or(0, |v| relative_index(&v, len));
+                let end = arg(1)?.map_or(len, |v| relative_index(&v, len));
+                Ok(Value::Array(if start < end {
+                    items[start..end].to_vec()
+                } else {
+                    Vec::new()
+                }))
+            }
+            "concat" => {
+                let mut out = items.to_vec();
+                for i in 0..args.len() {
+                    match arg(i)?.unwrap_or(Value::Null) {
+                        Value::Array(more) => out.extend(more),
+                        other => out.push(other),
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+            "flat" => {
+                let depth = arg(0)?.map_or(1.0, |v| to_number(&v));
+                Ok(Value::Array(flatten(items, if depth.is_nan() { 0.0 } else { depth })))
+            }
+            "flatMap" => {
+                let mapper = callback()?;
+                let mut mapped = Vec::with_capacity(items.len());
+                for (i, item) in items.iter().enumerate() {
+                    mapped.push(call(mapper, item, i)?);
+                }
+                Ok(Value::Array(flatten(&mapped, 1.0)))
+            }
+            "reduce" | "reduceRight" => {
+                let reducer = callback()?;
+                let order: Vec<usize> = if method == "reduce" {
+                    (0..items.len()).collect()
+                } else {
+                    (0..items.len()).rev().collect()
+                };
+                let mut order = order.into_iter();
+                let mut acc = match arg(1)? {
+                    Some(initial) => initial,
+                    None => match order.next() {
+                        Some(first) => items[first].clone(),
+                        None => {
+                            return Err(anyhow!(
+                                "`.{method}()` of an empty array with no initial value \
+                                 (module '{module_spec}')"
+                            ))
+                        }
+                    },
+                };
+                for i in order {
+                    acc = self.call_callback_with(
+                        module_spec,
+                        method,
+                        reducer,
+                        vec![acc, items[i].clone(), json_int(i as i64)],
+                        env,
+                    )?;
+                }
+                Ok(acc)
+            }
+            "toReversed" => Ok(Value::Array(items.iter().rev().cloned().collect())),
+            "toSorted" => {
+                let mut sorted = items.to_vec();
+                match args.first() {
+                    None => sorted.sort_by_key(value_to_string),
+                    Some(comparator) => {
+                        // `sort_by` cannot return an error, so the first one is
+                        // held and raised after — the order is discarded with it.
+                        let mut failure = None;
+                        sorted.sort_by(|a, b| {
+                            if failure.is_some() {
+                                return std::cmp::Ordering::Equal;
+                            }
+                            match self.call_callback_with(
+                                module_spec,
+                                method,
+                                &comparator.expr,
+                                vec![a.clone(), b.clone()],
+                                env,
+                            ) {
+                                Ok(result) => to_number(&result)
+                                    .partial_cmp(&0.0)
+                                    .unwrap_or(std::cmp::Ordering::Equal),
+                                Err(error) => {
+                                    failure = Some(error);
+                                    std::cmp::Ordering::Equal
+                                }
+                            }
+                        });
+                        if let Some(error) = failure {
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(Value::Array(sorted))
+            }
+            "sort" | "reverse" | "push" | "pop" | "shift" | "unshift" | "splice" | "fill"
+            | "copyWithin" => Err(anyhow!(
+                "`.{method}()` mutates the array, which the static renderer does not model \
+                 (module '{module_spec}'). Use the copying form — `toSorted`, `toReversed`, \
+                 `concat`, `slice` — which returns the new array."
+            )),
+            "forEach" => Err(anyhow!(
+                "`.forEach()` returns nothing to render (module '{module_spec}'). Use `.map()`."
+            )),
+            other => Err(anyhow!(
+                "`.{other}()` on an array is not supported by the static renderer \
+                 (module '{module_spec}'). Supported: {SUPPORTED}."
+            )),
+        }
+    }
+
+    /// Call an array method's callback with `(item, index)` — and the array
+    /// itself as a third argument only when the callback declares one, so the
+    /// common case does not copy the array once per element.
+    #[allow(clippy::too_many_arguments)]
+    fn call_array_callback(
+        &self,
+        module_spec: &str,
+        method: &str,
+        callback: &swc_ecma_ast::Expr,
+        item: &Value,
+        index: usize,
+        array: &[Value],
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        let mut args = vec![item.clone(), json_int(index as i64)];
+        if callback_arity(callback) > 2 {
+            args.push(Value::Array(array.to_vec()));
+        }
+        self.call_callback_with(module_spec, method, callback, args, env)
+    }
+
+    /// Call an inline callback for its VALUE. Unlike [`Self::eval_closure`] —
+    /// which renders a `map` callback's block body to markup — a block body here
+    /// returns what its `return` returns, so `(x) => { return x.done; }` is a
+    /// boolean, not the string `"false"` (which is truthy).
+    fn call_callback_with(
+        &self,
+        module_spec: &str,
+        method: &str,
+        callback: &swc_ecma_ast::Expr,
+        args: Vec<Value>,
+        parent_env: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        use swc_ecma_ast::*;
+        let args = Value::Array(args);
+        let (params, body): (Vec<ParamBinding>, CallbackBody<'_>) =
+            match unwrap_updater_parens(callback) {
+                Expr::Arrow(arrow) => (
+                    arrow.params.iter().map(param_from_pat).collect(),
+                    match &*arrow.body {
+                        BlockStmtOrExpr::Expr(expr) => CallbackBody::Expr(&**expr),
+                        BlockStmtOrExpr::BlockStmt(block) => CallbackBody::Stmts(&block.stmts[..]),
+                    },
+                ),
+                Expr::Fn(fn_expr) => (
+                    fn_expr.function.params.iter().map(|p| param_from_pat(&p.pat)).collect(),
+                    CallbackBody::Stmts(
+                        fn_expr
+                            .function
+                            .body
+                            .as_ref()
+                            .map_or(&[][..], |body| &body.stmts[..]),
+                    ),
+                ),
+                _ => {
+                    return Err(anyhow!(
+                        "`.{method}()` needs an inline arrow or function expression; the \
+                         static renderer cannot call a function passed by name \
+                         (module '{module_spec}')"
+                    ))
+                }
+            };
+        let mut env = parent_env.clone();
+        bind_params_positional(&params, &args, &mut env);
+        match body {
+            CallbackBody::Expr(expr) => self.eval_expr(module_spec, expr, &env),
+            CallbackBody::Stmts(stmts) => {
+                Ok(self.eval_body_value(module_spec, stmts, &mut env)?.unwrap_or(Value::Null))
+            }
+        }
+    }
+
+    /// A block body's `return` value — [`Self::eval_body_stmts`] with the value
+    /// kept, and the same statements supported and refused.
+    fn eval_body_value(
+        &self,
+        module_spec: &str,
+        stmts: &[swc_ecma_ast::Stmt],
+        env: &mut HashMap<String, Value>,
+    ) -> Result<Option<Value>> {
+        use swc_ecma_ast::*;
+        for stmt in stmts {
+            match stmt {
+                Stmt::Return(ret) => {
+                    return Ok(Some(match &ret.arg {
+                        Some(expr) => self.eval_expr(module_spec, expr, env)?,
+                        None => Value::Null,
+                    }));
+                }
+                Stmt::Decl(Decl::Var(var)) => self.eval_var_decl_into_env(module_spec, var, env),
+                Stmt::Expr(expr_stmt) => {
+                    let _ = self.eval_expr(module_spec, &expr_stmt.expr, env)?;
+                }
+                Stmt::If(if_stmt) => {
+                    let test = self.eval_expr(module_spec, &if_stmt.test, env)?;
+                    let taken = if is_truthy(&test) {
+                        Some(&*if_stmt.cons)
+                    } else {
+                        if_stmt.alt.as_deref()
+                    };
+                    if let Some(branch) = taken {
+                        if let Some(value) =
+                            self.eval_body_value(module_spec, std::slice::from_ref(branch), env)?
+                        {
+                            return Ok(Some(value));
+                        }
+                    }
+                }
+                Stmt::Block(block) => {
+                    if let Some(value) = self.eval_body_value(module_spec, &block.stmts, env)? {
+                        return Ok(Some(value));
+                    }
+                }
+                Stmt::Empty(_) => {}
+                other => {
+                    return Err(anyhow!(
+                        "unsupported statement `{}` in pure-Rust evaluator for module '{}'; \
+                         this construct must run on the QuickJS engine (Tier B/C)",
+                        statement_kind(other),
+                        module_spec
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// A Date method, or `None` for one this evaluator does not model — the
+    /// caller names it rather than rendering a `null`.
+    fn eval_date_method(&self, method: &str, ms: f64) -> Option<Value> {
+        match method {
+            "getTime" | "valueOf" => Some(json_num(ms)),
+            "toISOString" | "toJSON" | "toString" => {
+                Some(Value::String(value_to_string(&make_date_value(ms))))
+            }
+            _ => None,
         }
     }
 
@@ -3517,10 +5232,15 @@ impl ComponentProject {
                     .unwrap_or(Value::Null);
                 let args = Value::Array(vec![arg.clone(), index_val]);
                 bind_params_positional(&params, &args, &mut env);
+                // 🔴 A block body went through `eval_body_stmts`, which returns
+                // the `return` as TEXT — so `xs.map((x) => { return <li/>; })`
+                // lost the markup marker, and each `<li>` was escaped onto the
+                // page as literal `&lt;li …&gt;`. `eval_body_value` keeps the
+                // value, markup included.
                 match &*arrow.body {
-                    BlockStmtOrExpr::BlockStmt(block) => self
-                        .eval_body_stmts(module_spec, &block.stmts, &mut env)
-                        .map(Value::String),
+                    BlockStmtOrExpr::BlockStmt(block) => Ok(self
+                        .eval_body_value(module_spec, &block.stmts, &mut env)?
+                        .unwrap_or(Value::Null)),
                     BlockStmtOrExpr::Expr(body_expr) => {
                         self.eval_expr(module_spec, body_expr, &env)
                     }
@@ -3540,22 +5260,46 @@ impl ComponentProject {
                 let args = Value::Array(vec![arg.clone(), index_val]);
                 bind_params_positional(&params, &args, &mut env);
                 if let Some(body) = &fn_expr.function.body {
-                    self.eval_body_stmts(module_spec, &body.stmts, &mut env)
-                        .map(Value::String)
+                    Ok(self
+                        .eval_body_value(module_spec, &body.stmts, &mut env)?
+                        .unwrap_or(Value::Null))
                 } else {
                     Ok(Value::Null)
                 }
             }
-            _ => Ok(Value::Null),
+            // `items.map(renderRow)`: a function passed by name. This evaluator
+            // binds names to values, not functions, so it has nothing to call —
+            // and `Null` here rendered the whole list as nothing, silently.
+            _ => Err(anyhow!(
+                "`.map()` needs an inline arrow or function expression; the static \
+                 renderer cannot call a function passed by name (module '{module_spec}')"
+            )),
         }
     }
 
+    /// A body's rendered `return` — empty when control falls off the end.
     fn eval_body_stmts(
         &self,
         module_spec: &str,
         stmts: &[swc_ecma_ast::Stmt],
         env: &mut HashMap<String, Value>,
     ) -> Result<String> {
+        Ok(self.eval_body_returned(module_spec, stmts, env)?.unwrap_or_default())
+    }
+
+    /// The statements' rendered `return`, or `None` when control falls off
+    /// the end of them.
+    ///
+    /// 🔴 This answered with a bare `String` and read an empty one as "did not
+    /// return", so a branch that returned nothing — `if (!user) return null;`
+    /// — looked like a branch that did not return at all, and the render ran
+    /// on past its own guard into the code the guard was there to stop.
+    fn eval_body_returned(
+        &self,
+        module_spec: &str,
+        stmts: &[swc_ecma_ast::Stmt],
+        env: &mut HashMap<String, Value>,
+    ) -> Result<Option<String>> {
         use swc_ecma_ast::*;
 
         for stmt in stmts {
@@ -3566,7 +5310,7 @@ impl ComponentProject {
                     } else {
                         Value::Null
                     };
-                    return Ok(value_to_string(&value));
+                    return Ok(Some(value_to_string(&value)));
                 }
                 Stmt::Decl(Decl::Var(var)) => {
                     self.eval_var_decl_into_env(module_spec, var, env);
@@ -3585,32 +5329,26 @@ impl ComponentProject {
                 // into the taken branch with the same environment (function
                 // scope — handlers and Tier-A render bodies are small and don't
                 // rely on block-scoped shadowing). A `return` reached inside the
-                // branch surfaces as a non-empty string and short-circuits, the
-                // same convention the top-level loop uses.
+                // branch short-circuits — whatever it returned, empty included.
                 Stmt::If(if_stmt) => {
                     let test = self.eval_expr(module_spec, &if_stmt.test, env)?;
-                    if is_truthy(&test) {
-                        let returned = self.eval_body_stmts(
-                            module_spec,
-                            std::slice::from_ref(&if_stmt.cons),
-                            env,
-                        )?;
-                        if !returned.is_empty() {
-                            return Ok(returned);
-                        }
-                    } else if let Some(alt) = &if_stmt.alt {
-                        let returned =
-                            self.eval_body_stmts(module_spec, std::slice::from_ref(alt), env)?;
-                        if !returned.is_empty() {
-                            return Ok(returned);
+                    let taken = if is_truthy(&test) {
+                        Some(&*if_stmt.cons)
+                    } else {
+                        if_stmt.alt.as_deref()
+                    };
+                    if let Some(branch) = taken {
+                        if let Some(returned) =
+                            self.eval_body_returned(module_spec, std::slice::from_ref(branch), env)?
+                        {
+                            return Ok(Some(returned));
                         }
                     }
                 }
                 // A nested block (`{ ... }`) is evaluated inline.
                 Stmt::Block(block) => {
-                    let returned = self.eval_body_stmts(module_spec, &block.stmts, env)?;
-                    if !returned.is_empty() {
-                        return Ok(returned);
+                    if let Some(returned) = self.eval_body_returned(module_spec, &block.stmts, env)? {
+                        return Ok(Some(returned));
                     }
                 }
                 // An empty statement (`;`) is a no-op, not unsupported.
@@ -3632,7 +5370,7 @@ impl ComponentProject {
                 }
             }
         }
-        Ok(String::new())
+        Ok(None)
     }
 
     fn eval_var_decl_into_env(
@@ -3740,12 +5478,27 @@ impl ComponentProject {
                 }
             }
 
-            // Phase J fallback: existing behaviour.
-            let value = if let Some(init) = &decl.init {
-                self.eval_expr(module_spec, init, env)
-                    .unwrap_or(Value::Null)
-            } else {
-                Value::Null
+            // Phase J fallback.
+            let value = match &decl.init {
+                None => Value::Null,
+                Some(init) => match self.eval_expr(module_spec, init, env) {
+                    Ok(value) => value,
+                    // A hook-compile render keeps the `null` it always had —
+                    // see `unmodelled` for why that render may.
+                    Err(_) if phase_k_enabled() => Value::Null,
+                    // 🔴 A static render bound `null` here too, which swallowed
+                    // every refusal made inside a local: `const label =
+                    // title.normalize()` rendered `{label}` as nothing, with the
+                    // reason discarded. Now each name the declaration binds is
+                    // poisoned, as a module constant is, and raises when read.
+                    Err(error) => {
+                        let poisoned = unrenderable(&error);
+                        for name in pattern_names(&decl.name) {
+                            env.insert(name, poisoned.clone());
+                        }
+                        continue;
+                    }
+                },
             };
             apply_var_pat_to_env(&decl.name, value, env);
         }
@@ -3831,7 +5584,9 @@ impl ComponentProject {
                         // Handlers are not data and do not survive the trip: a
                         // closure cannot be serialised into a payload, and the
                         // island's own `onClick`s are compiled into its bundle.
-                        if !name.starts_with("on") {
+                        // A handler, not a NAME starting with "on" — `only` and
+                        // `onboarding` are data (see `is_event_handler_prop`).
+                        if !crate::parser::is_event_handler_prop(&name) {
                             // Serialised into the page for the island to boot
                             // from, so the internal markup marker is unwrapped
                             // to the plain string it stands for.
@@ -3856,7 +5611,9 @@ impl ComponentProject {
 
             let mut props = Map::new();
             for (name, value) in self.read_attrs(module_spec, &element.opening.attrs, env)? {
-                if !name.starts_with("on") {
+                // The tier ladder's own handler test, so a prop it calls data
+                // is never dropped here as a handler (`only`, `onboarding`).
+                if !crate::parser::is_event_handler_prop(&name) {
                     props.insert(name, value);
                 }
             }
@@ -4079,6 +5836,23 @@ impl ComponentProject {
             }
             None => "",
         };
+        // …and a form-action form closes on its success sink, the slot an
+        // action's `{ ok }` return is projected onto. Last child, which is also
+        // where the QuickJS shim's seed puts it, so both paths agree.
+        //
+        // A plain form posting to a framework endpoint whose refusal is a
+        // sentence (a wrong password) closes on that endpoint's sink instead —
+        // see `transforms::form::FEEDBACK_ENDPOINTS`.
+        let body_suffix: String = match form_action_name.as_deref() {
+            Some(name) => form_ok_span(name),
+            None if tag == "form" && !body_prefix.is_empty() => attrs
+                .iter()
+                .find_map(|(name, value)| (name == "action").then(|| value.as_str()).flatten())
+                .and_then(crate::transforms::form::feedback_endpoint)
+                .map(crate::transforms::form::endpoint_feedback_span)
+                .unwrap_or_default(),
+            None => String::new(),
+        };
 
         // Phase L · sibling `data-albedo-error` span for every named
         // field rendered inside a form-action form. The stable id is
@@ -4092,13 +5866,8 @@ impl ComponentProject {
                 attrs
                     .iter()
                     .find(|(n, _)| n == "name")
-                    .and_then(|(_, v)| v.as_str().map(str::to_string))
-                    .map(|field| {
-                        let id = allocate_field_error_id(&action, &field);
-                        format!(
-                            "<span data-albedo-id=\"{id}\" data-albedo-error=\"{field}\"></span>"
-                        )
-                    })
+                    .and_then(|(_, v)| v.as_str())
+                    .map(|field| field_error_span(&action, field))
                     .unwrap_or_default()
             } else {
                 String::new()
@@ -4114,9 +5883,9 @@ impl ComponentProject {
                 format!("<{tag} {attrs_html} />")
             }
         } else if attrs_html.is_empty() {
-            format!("<{tag}>{body_prefix}{children_html}</{tag}>")
+            format!("<{tag}>{body_prefix}{children_html}{body_suffix}</{tag}>")
         } else {
-            format!("<{tag} {attrs_html}>{body_prefix}{children_html}</{tag}>")
+            format!("<{tag} {attrs_html}>{body_prefix}{children_html}{body_suffix}</{tag}>")
         };
 
         Ok(format!("{element_html}{error_span_suffix}"))
@@ -4783,10 +6552,14 @@ impl ComponentProject {
         // would if the value had been declared where it is used.
         let mut target_env = HashMap::new();
         self.seed_env_with_module_constants(&target, &mut target_env);
-        let value = self.eval_expr(&target, &init, &target_env).ok();
+        // `Some` either way: the constant exists, so its failure is the answer —
+        // `None` would read as "no such import" and render the name as empty.
+        let value = self
+            .eval_expr(&target, &init, &target_env)
+            .unwrap_or_else(|error| unrenderable(&error));
 
         IMPORT_DEPTH.with(|d| d.set(depth));
-        value
+        Some(value)
     }
 
     fn resolve_import(&self, current_module: &str, source: &str) -> Option<String> {

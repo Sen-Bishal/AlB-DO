@@ -32,6 +32,26 @@
 //! be optimised later, which is why the ergonomics and the architecture point
 //! the same way here.
 //!
+//! ## A source is also how its origin is reached — from a bare `fetch()` too
+//!
+//! A source's `auth` and `headers` are attached to an action's, a job's or a
+//! middleware's `fetch()` aimed at that source — same scheme, host and port,
+//! under its base path — by the server, after the body staged the call. So a
+//! secret API key has exactly one way into a request and never passes through
+//! JavaScript: no package in the realm can read it, the journal never records
+//! it (it stores what the body staged), and no redirect carries it anywhere,
+//! because none is followed. `routes` are optional for this reason — a source
+//! that only exists to be `fetch()`ed, like a payments API, declares none:
+//!
+//! ```ts
+//! sources: {
+//!   stripe: { base: "https://api.stripe.com", auth: { bearerEnv: "STRIPE_SECRET_KEY" } },
+//! }
+//! ```
+//!
+//! `scope` is required only beside `routes`: it says who a CACHED response may
+//! be shared with, and a bare `fetch()` is never cached. See [`SourceCredential`].
+//!
 //! ## The param alphabet is PRISM's, and that is load-bearing twice
 //!
 //! A resolved param must satisfy [`is_valid_partition_key`] —
@@ -148,11 +168,6 @@ pub enum SourceSchemaError {
         /// Source name.
         source: String,
     },
-    /// A source declared no routes, so nothing can be called on it.
-    NoRoutes {
-        /// Source name.
-        source: String,
-    },
     /// A source or route name is not usable as a TSX identifier.
     InvalidName {
         /// `"source"` or `"route"`.
@@ -211,7 +226,8 @@ pub enum SourceSchemaError {
         /// The offending method.
         method: String,
     },
-    /// `auth` was declared with no `scope`. **The § 7 build error.**
+    /// `auth` was declared beside `routes` with no `scope`. **The § 7 build
+    /// error.** A source with no routes needs none — nothing of it is cached.
     AuthWithoutScope {
         /// Source name.
         source: String,
@@ -242,12 +258,6 @@ impl std::fmt::Display for SourceSchemaError {
                 "source `{source}`: `base` must be an origin and path prefix only — \
                  move the query or fragment onto the route's `path`"
             ),
-            Self::NoRoutes { source } => {
-                write!(
-                    f,
-                    "source `{source}`: declares no `routes`, so nothing can be read from it"
-                )
-            }
             Self::InvalidName { kind, name } => write!(
                 f,
                 "{kind} name `{name}` is not a valid identifier — it is called from TSX as \
@@ -310,8 +320,8 @@ impl std::fmt::Display for SourceSchemaError {
             ),
             Self::UserScopeNeedsAuth { source } => write!(
                 f,
-                "source `{source}`: `scope: \"user\"` needs a signed-in principal to key the \
-                 cache by, which arrives with auth (TODO #1 item 5). Until then, use \
+                "source `{source}`: `scope: \"user\"` is not supported: a per-user credential \
+                 needs a per-principal cache, which sources do not have. Use \
                  `scope: \"app\"` with a service credential"
             ),
             Self::MissingEnv { source, variable } => write!(
@@ -452,6 +462,83 @@ pub struct SourceRegistry {
     routes: BTreeMap<String, SourceRoute>,
     /// Stated per-host budgets, and the source that stated each.
     limits: BTreeMap<String, (crate::shutter::Quota, String)>,
+    /// Every source's host, routes or not — the egress allowlist. Not derived
+    /// from `routes`, because a source with none is still a declared host.
+    hosts: BTreeSet<String>,
+    /// What a bare `fetch()` to each source carries. See [`SourceCredential`].
+    credentials: SourceCredentials,
+}
+
+/// The headers a source attaches to a bare `fetch()` aimed at it: its static
+/// `headers`, then the `authorization` its `auth` resolves to.
+///
+/// ## Why "aimed at it" is scheme + host + port + base path, all four
+///
+/// The credential goes where the author declared it would and nowhere a URL
+/// could be bent to reach: `http://` never gets an `https://` source's key (the
+/// transport would send it in the clear), another port is another server, and a
+/// base of `https://example.com/api` does not cover `/apiary` — the path must
+/// equal the base or continue it after a `/`. The URL compared is the parsed
+/// one, so `..` segments are already resolved before the prefix test.
+///
+/// A body that sets a header the source supplies is refused, not overridden:
+/// two credentials for one request is a mistake either way, and silently
+/// dropping the author's would hide it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCredential {
+    /// The source that declared it — named when a call is refused.
+    pub source: String,
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+    /// The base path without its trailing slash; empty at the origin root.
+    path: String,
+    /// Sent with every call the source covers.
+    pub headers: Vec<(String, String)>,
+}
+
+impl SourceCredential {
+    /// Whether a call to `url` is one this source's credential goes on.
+    #[must_use]
+    pub fn covers(&self, url: &Url) -> bool {
+        url.scheme() == self.scheme
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(&self.host))
+            && url.port_or_known_default() == self.port
+            && (self.path.is_empty()
+                || url.path() == self.path
+                || url
+                    .path()
+                    .strip_prefix(self.path.as_str())
+                    .is_some_and(|rest| rest.starts_with('/')))
+    }
+}
+
+/// Every [`SourceCredential`] an app declared, looked up by URL.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceCredentials(Vec<SourceCredential>);
+
+impl SourceCredentials {
+    /// The credential a call to `url` carries, if any. Two sources on one
+    /// origin resolve to the one with the longer base path — the more specific
+    /// declaration — and, at equal length, the first by name.
+    #[must_use]
+    pub fn for_url(&self, url: &Url) -> Option<&SourceCredential> {
+        self.0
+            .iter()
+            .filter(|credential| credential.covers(url))
+            .fold(None, |best: Option<&SourceCredential>, candidate| match best {
+                Some(best) if best.path.len() >= candidate.path.len() => Some(best),
+                _ => Some(candidate),
+            })
+    }
+
+    /// Whether no source declared a credential.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl SourceRegistry {
@@ -473,6 +560,8 @@ impl SourceRegistry {
     {
         let mut routes = BTreeMap::new();
         let mut limits: BTreeMap<String, (crate::shutter::Quota, String)> = BTreeMap::new();
+        let mut hosts = BTreeSet::new();
+        let mut credentials = Vec::new();
         for (source_name, decl) in declarations {
             require_identifier("source", source_name)?;
             let (base, host) = lower_base(source_name, &decl.base)?;
@@ -494,12 +583,8 @@ impl SourceRegistry {
                     }
                 }
             }
-            if decl.routes.is_empty() {
-                return Err(SourceSchemaError::NoRoutes {
-                    source: source_name.clone(),
-                });
-            }
-            let (scope, auth_header) = lower_auth(source_name, decl.auth.as_ref(), &env)?;
+            let (scope, auth_header) =
+                lower_auth(source_name, decl.auth.as_ref(), &env, !decl.routes.is_empty())?;
 
             let mut headers: Vec<(String, String)> = decl
                 .headers
@@ -508,6 +593,22 @@ impl SourceRegistry {
                 .collect();
             if let Some(header) = auth_header {
                 headers.push(header);
+            }
+
+            hosts.insert(host.clone());
+            if !headers.is_empty() {
+                // `lower_base` already parsed this and refused what is not an
+                // http(s) origin with a host, so the parse cannot fail here.
+                if let Ok(url) = Url::parse(&base) {
+                    credentials.push(SourceCredential {
+                        source: source_name.clone(),
+                        scheme: url.scheme().to_string(),
+                        host: host.clone(),
+                        port: url.port_or_known_default(),
+                        path: url.path().trim_end_matches('/').to_string(),
+                        headers: headers.clone(),
+                    });
+                }
             }
 
             for (route_name, route) in &decl.routes {
@@ -551,7 +652,18 @@ impl SourceRegistry {
                 routes.insert(lowered.qualified_name(), lowered);
             }
         }
-        Ok(Self { routes, limits })
+        Ok(Self {
+            routes,
+            limits,
+            hosts,
+            credentials: SourceCredentials(credentials),
+        })
+    }
+
+    /// What a bare `fetch()` to each declared source carries.
+    #[must_use]
+    pub fn credentials(&self) -> &SourceCredentials {
+        &self.credentials
     }
 
     /// Every host whose source stated a `limit`, with the budget it stated —
@@ -568,12 +680,6 @@ impl SourceRegistry {
         self.routes.get(&format!("{source}.{route}"))
     }
 
-    /// Look up by the qualified `"source.route"` spelling.
-    #[must_use]
-    pub fn get_qualified(&self, qualified: &str) -> Option<&SourceRoute> {
-        self.routes.get(qualified)
-    }
-
     /// Every declared host — **the egress allowlist**, APERTURE invariant 2.7.
     ///
     /// This is the whole security argument for declaration: the allowlist is
@@ -581,10 +687,7 @@ impl SourceRegistry {
     /// to configure and nothing to forget.
     #[must_use]
     pub fn declared_hosts(&self) -> BTreeSet<String> {
-        self.routes
-            .values()
-            .map(|route| route.host.clone())
-            .collect()
+        self.hosts.clone()
     }
 
     /// Iterate every lowered route, in stable `"source.route"` order.
@@ -667,10 +770,16 @@ fn lower_base(source: &str, base: &str) -> Result<(String, String), SourceSchema
 }
 
 /// Resolve the credential and the sharing scope together, because § 7 ties them.
+///
+/// `has_routes` because `scope` answers a question only a cached read asks: a
+/// source with no routes is reached only by bare `fetch()`, which is never
+/// cached, so demanding a sharing scope there would be a ceremony that guards
+/// nothing. Beside routes the refusal to default stands.
 fn lower_auth<F>(
     source: &str,
     auth: Option<&AuthDecl>,
     env: &F,
+    has_routes: bool,
 ) -> Result<(CacheScope, Option<(String, String)>), SourceSchemaError>
 where
     F: Fn(&str) -> Option<String>,
@@ -681,11 +790,12 @@ where
     };
 
     match auth.scope {
-        None => {
+        None if has_routes => {
             return Err(SourceSchemaError::AuthWithoutScope {
                 source: source.to_string(),
             })
         }
+        None => {}
         Some(AuthScope::User) => {
             return Err(SourceSchemaError::UserScopeNeedsAuth {
                 source: source.to_string(),
@@ -1042,8 +1152,12 @@ mod tests {
         let err = registry(&[("api", decl)]).expect_err("must refuse");
         assert!(matches!(err, SourceSchemaError::UserScopeNeedsAuth { .. }));
         assert!(
-            err.to_string().contains("item 5"),
-            "the error must name the item"
+            err.to_string().contains("scope: \"app\""),
+            "the error must say what to use instead: {err}"
+        );
+        assert!(
+            !err.to_string().contains("item 5") && !err.to_string().contains("TODO"),
+            "a user-facing error must not cite the internal plan: {err}"
         );
     }
 
@@ -1203,18 +1317,116 @@ mod tests {
     }
 
     #[test]
-    fn a_source_with_no_routes_is_refused() {
+    fn a_source_with_no_routes_is_a_declared_host_and_a_credential() {
+        // No `routes`, and no `scope` either: a source reached only by bare
+        // `fetch()` has nothing cached, so there is no sharing to scope.
         let decl = SourceDecl {
             limit: None,
-            base: "https://x.test".to_string(),
-            auth: None,
-            headers: BTreeMap::new(),
+            base: "https://api.pay.test/".to_string(),
+            auth: Some(AuthDecl {
+                bearer: None,
+                bearer_env: Some("PAY_KEY".to_string()),
+                scope: None,
+            }),
+            headers: BTreeMap::from([("pay-version".to_string(), "7".to_string())]),
             routes: BTreeMap::new(),
         };
+        let map = BTreeMap::from([("pay".to_string(), decl)]);
+        let registry = SourceRegistry::from_declarations(&map, |name| {
+            (name == "PAY_KEY").then(|| "sk_test_1".to_string())
+        })
+        .expect("a route-less source lowers");
+
+        assert!(registry.is_empty(), "no routes, so nothing for typegen");
+        assert!(registry.declared_hosts().contains("api.pay.test"));
+        let url = Url::parse("https://api.pay.test/v1/checkout/sessions").unwrap();
+        let credential = registry.credentials().for_url(&url).expect("covered");
+        assert_eq!(credential.source, "pay");
+        assert_eq!(
+            credential.headers,
+            vec![
+                ("pay-version".to_string(), "7".to_string()),
+                ("authorization".to_string(), "Bearer sk_test_1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn scope_is_still_required_beside_routes() {
+        let mut decl = source("https://x.test", &[("thing", "/a")]);
+        decl.auth = Some(AuthDecl {
+            bearer: Some("t".to_string()),
+            bearer_env: None,
+            scope: None,
+        });
         assert!(matches!(
             registry(&[("api", decl)]),
-            Err(SourceSchemaError::NoRoutes { .. })
+            Err(SourceSchemaError::AuthWithoutScope { .. })
         ));
+    }
+
+    /// The credential goes to the declared origin and base path, and nowhere a
+    /// URL can be bent to reach: not plain http, not another port or host, not
+    /// a path that merely shares the base's first letters.
+    #[test]
+    fn a_credential_covers_its_origin_and_base_path_only() {
+        let mut decl = source("https://api.x.test/v1", &[]);
+        decl.auth = Some(AuthDecl {
+            bearer: Some("t".to_string()),
+            bearer_env: None,
+            scope: None,
+        });
+        let registry = registry(&[("x", decl)]).expect("lowers");
+        let covered = |url: &str| {
+            registry
+                .credentials()
+                .for_url(&Url::parse(url).unwrap())
+                .is_some()
+        };
+
+        assert!(covered("https://api.x.test/v1"));
+        assert!(covered("https://api.x.test/v1/charges?limit=3"));
+        assert!(covered("https://API.X.TEST:443/v1/charges"));
+        assert!(!covered("http://api.x.test/v1/charges"), "never in the clear");
+        assert!(!covered("https://api.x.test:8443/v1/charges"), "another server");
+        assert!(!covered("https://api.x.test.evil.test/v1/charges"));
+        assert!(!covered("https://x.test/v1/charges"));
+        assert!(!covered("https://api.x.test/v10/charges"), "a prefix, not a segment");
+        assert!(!covered("https://api.x.test/"));
+        assert!(!covered("https://api.x.test/v1/../admin"), "`..` resolved first");
+    }
+
+    #[test]
+    fn a_source_without_auth_or_headers_attaches_nothing() {
+        let registry = registry(&[("open", source("https://open.test", &[]))]).expect("lowers");
+        assert!(registry.credentials().is_empty());
+        assert!(registry.declared_hosts().contains("open.test"));
+    }
+
+    #[test]
+    fn the_more_specific_base_wins_on_a_shared_origin() {
+        let with_token = |base: &str, token: &str| {
+            let mut decl = source(base, &[]);
+            decl.auth = Some(AuthDecl {
+                bearer: Some(token.to_string()),
+                bearer_env: None,
+                scope: None,
+            });
+            decl
+        };
+        let registry = registry(&[
+            ("broad", with_token("https://h.test", "broad")),
+            ("narrow", with_token("https://h.test/admin", "narrow")),
+        ])
+        .expect("lowers");
+        let at = |url: &str| {
+            registry
+                .credentials()
+                .for_url(&Url::parse(url).unwrap())
+                .map(|c| c.source.clone())
+        };
+        assert_eq!(at("https://h.test/admin/x").as_deref(), Some("narrow"));
+        assert_eq!(at("https://h.test/public").as_deref(), Some("broad"));
     }
 
     #[test]

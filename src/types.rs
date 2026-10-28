@@ -55,6 +55,17 @@ pub struct Component {
     /// Defaults to `false` so existing manifests deserialize unchanged.
     #[serde(default)]
     pub reads_principal: bool,
+    /// **This render needs the request's URL.** True for a dynamic route's
+    /// page (`[slug].tsx`) whose signature can reach the `params` prop — read
+    /// off the AST by `parser::takes_route_params`, not declared.
+    ///
+    /// The same tier impossibility as [`Self::reads_principal`], for the other
+    /// prop only a request has: baked at build time, `params` is `{}`, and every
+    /// URL the route serves gets the page for no slug at all.
+    ///
+    /// Defaults to `false` so existing manifests deserialize unchanged.
+    #[serde(default)]
+    pub reads_route_params: bool,
     /// **The pure-Rust evaluator cannot execute this component.** True when the
     /// component's file imports a specifier the evaluator cannot resolve —
     /// anything not relative, which in practice means npm. Derived from the AST
@@ -97,6 +108,7 @@ impl Component {
             is_client_interactive: false,
             state_escapes: false,
             reads_principal: false,
+            reads_route_params: false,
             imports_npm: false,
             is_lcp_candidate: false,
             effect_profile: EffectProfile::default(),
@@ -105,6 +117,33 @@ impl Component {
             line_number: 0,
             is_module_only: false,
         }
+    }
+
+    /// **The render needs the request** — for `user`, or for a dynamic route's
+    /// `params`. Either keeps the component off Tier A, because Tier-A markup
+    /// is baked once at build time and there is no request to read them from.
+    ///
+    /// The one place the two facts are combined. Every caller of
+    /// `decide_tier_and_hydration` passes this, so the tier report, the
+    /// manifest and the corpus probes cannot describe different tiers — they
+    /// had, when each call site spelled the `||` out itself and the probes
+    /// were never told about `params`.
+    ///
+    /// 🔑 **Never for a layout**, whatever it reads. A layout is rendered once
+    /// per route at build time with `{ route }` and nothing else
+    /// (`ManifestBuilder::render_layout_html`); no tier puts it on the request
+    /// path. Answering `true` here made the tier report print
+    /// `B ShopLayout  reads route params - rendered per request` about markup
+    /// baked at build. A layout that provably reads `params` or `user` is
+    /// refused instead (`preflight::layout_request_reads`); one whose signature
+    /// only *might* reach them is tiered as what it is.
+    pub fn render_needs_request(&self) -> bool {
+        !self.is_layout() && (self.reads_principal || self.reads_route_params)
+    }
+
+    /// This component is a `routes/**/layout.*` convention file.
+    pub fn is_layout(&self) -> bool {
+        crate::routing::file_based::is_layout_file(&self.file_path)
     }
 
     pub fn calculate_adjusted_bitrate(&self) -> f64 {

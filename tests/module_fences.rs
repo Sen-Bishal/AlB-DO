@@ -200,6 +200,31 @@ const SERVER_MAY_REACH: &[(&str, &str)] = &[
     // build and boot must read `src/jobs.ts` with one reader, through the
     // already-parsed project. No parser and no build step crosses.
     ("jobs", "the fire id, the schedule calendar, the queue protocol and the declaration"),
+    // 15.3 · admitted on the `jobs` rule. A queued email is written by the
+    // request path and read back by the runner, so `QueuedEmail`'s row format
+    // must have ONE definition; and `albedo build` (`DevConfig::validate`) and
+    // boot must lower the `email` block with one reader, or a sender address the
+    // build accepted could fail the boot. The provider wire formats are pure
+    // functions with no I/O — the network stays on the server side, behind its
+    // `Mailer` trait. No parser and no build step crosses.
+    ("email", "the email block, message validation, queued-row format and provider wire formats"),
+    // Admitted on the `upload`/`jobs` rule — ONE reader for build and boot — and
+    // the reach is at boot, never on a request. Boot re-reads every manifest
+    // module from the project tree and uses the build's precompiled script only
+    // when the hash of what IT read matches what the BUILD read. For a Markdown
+    // page the build read its lowering, so boot must read through the same
+    // function, or the hash misses and QuickJS is handed Markdown. A pure
+    // text → text function; it touches the disk only to stat link targets.
+    // (The cleaner end state is the build emitting `runtime-module-sources.json`,
+    // which boot already prefers when present — then no source reader crosses.)
+    ("markdown", "the one reader of a page's module source, shared by build and boot"),
+    // Admitted on the `upload`/`email` rule: the build validates the `webhooks`
+    // block and the request path verifies deliveries against it, and a second
+    // spelling of "what a Stripe signature is" on the server side would be a
+    // verifier nobody tested. Pure functions over bytes and headers — the HTTP
+    // and the queue stay on the server side (`webhooks.rs`). No parser and no
+    // build step crosses.
+    ("webhook", "the webhook declaration, signature schemes and event-id rules"),
     ("shutter", "the streaming/suspension machinery"),
     ("hydration", "tier and hydration types travelling on the manifest"),
     ("types", "shared identifier newtypes"),

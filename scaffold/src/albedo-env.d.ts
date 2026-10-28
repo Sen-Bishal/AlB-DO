@@ -28,7 +28,7 @@ declare namespace JSX {
     | AlbedoChild[];
   type AlbedoChildren = AlbedoChild | AlbedoChild[];
 
-  // Phase L Link/form data attributes are reserved by the renderer.
+  // Link/form data attributes are reserved by the renderer.
   // Authors may add custom `data-*` attributes via the index signature.
   type DataAttributes = { [key: `data-${string}`]: string | number | boolean };
   type AriaAttributes = { [key: `aria-${string}`]: string | number | boolean };
@@ -38,13 +38,11 @@ declare namespace JSX {
 
   // The base properties every JSX element accepts.
   interface AlbedoBaseAttributes extends DataAttributes, AriaAttributes {
-    // Framework-reserved props. These are consumed by the renderer and
-    // never reach the DOM — the authoritative list is
-    // `runtime::eval::component::is_reserved_jsx_prop`, which covers
-    // exactly `key`, `ref` and `children`. `key` in particular is not
-    // decoration: it supplies the `RowKey` that keyed-list
-    // reconciliation uses to keep untouched rows' DOM nodes across a
-    // write, so a `.map()` over a slot needs it.
+    // Framework-reserved props: exactly `key`, `ref` and `children`. The
+    // renderer consumes them and they never reach the DOM. `key` in
+    // particular is not decoration: keyed-list reconciliation uses it to
+    // keep untouched rows' DOM nodes across a write, so a `.map()` over a
+    // slot needs it.
     key?: string | number;
     ref?: unknown;
     children?: AlbedoChildren;
@@ -338,7 +336,7 @@ declare namespace JSX {
     // Albedo built-in components
     Link: AlbedoLinkAttributes;
 
-    // Phase P · Stream E.1 — `<children />` intrinsic marks the
+    // `<children />` intrinsic marks the
     // substitution point inside a `routes/layout.tsx`. The
     // renderer emits a sentinel comment that the manifest builder
     // post-substitutes with the leaf route's HTML.
@@ -351,7 +349,7 @@ declare namespace JSX {
   }
 }
 
-// ── Phase P · `albedo` framework module surface ─────────────────
+// ── `albedo` framework module surface ─────────────────
 //
 // The runtime recognises `useSharedSlot` + `action` only when they
 // resolve to imports from `"albedo"`. The declarations below
@@ -359,7 +357,7 @@ declare namespace JSX {
 // renderer's extractor sees the canonical binding source.
 
 declare module "albedo" {
-  // Phase O.2 — read-only handle on a server-side broadcast topic.
+  // Read-only handle on a server-side broadcast topic.
   // The value flows in over the WT patches lane on first paint and
   // on every subsequent `broadcast()` write. `T` is whatever JSON
   // shape the action handlers write — strings, numbers, arrays,
@@ -384,18 +382,86 @@ declare module "albedo" {
   export function useSharedSlot<Row>(source: SharedSlotSource<Row>): Row[];
 
   // The submitted fields of a `<form action="action:NAME" method="POST">`,
-  // keyed by each input's `name` attribute. The interpreter seeds this as
-  // the handler's argument (`eval/core.rs` — "seeded LAST so it shadows a
-  // module constant or prop of the same name"). Values arrive as strings:
-  // an `<input name="id">` is `"3"`, not `3`.
+  // keyed by each input's `name` attribute, passed as the handler's
+  // argument. A field shadows a module constant or prop of the same name.
+  // Values arrive as strings: an `<input name="id">` is `"3"`, not `3`.
   export type ActionForm = Record<string, string>;
 
-  // What every action handler receives.
-  export interface ActionArgs {
-    form: ActionForm;
+  // Who is asking — the same value a component's `user` prop, a middleware's
+  // `context.user` and a job's `context.user` receive. Profile fields the
+  // provider did not supply are `null`, never missing, so `user.name ?? …`
+  // means the same thing however the person signed in.
+  //
+  // Only `id` may key a partition (`.where({ owner: user.id })`): an email
+  // or a name changes when the person does, and an owner key must not.
+  export interface AlbedoUser {
+    readonly id: string;
+    readonly email: string | null;
+    readonly name: string | null;
+    readonly image: string | null;
+    // The provider THIS session signed in with; `null` for a run nothing
+    // signed in — a job's, or a webhook's.
+    readonly provider: string | null;
+    // Every provider connected to the account ("password", "github", …).
+    // Connect one by POSTing to `/_albedo/auth/oauth/<provider>/link`,
+    // disconnect by POSTing `provider` to `/_albedo/auth/unlink`; the last
+    // way in cannot be disconnected.
+    readonly providers: readonly string[];
   }
 
-  // Phase P · Stream C.1 — declare an HTTP action handler. Body
+  // What every action handler receives. `user` is `null` for an anonymous
+  // request, exactly as a component's prop is.
+  //
+  // `origin` is where this app is reached — "https://your.domain", with no
+  // trailing slash — for an absolute URL another service sends people back to:
+  // `${origin}/account`. It comes from ALBEDO_PUBLIC_ORIGIN (or the ACME
+  // domain, or localhost in development) and never from the request's Host
+  // header, which the caller controls. `null` when nothing configures one.
+  //
+  // `fetch()` works in an action body. A call aimed at a source declared in
+  // albedo.config.ts carries that source's `auth` and `headers`, attached by
+  // the server — so a secret key never appears in your code:
+  //
+  //   sources: { stripe: { base: "https://api.stripe.com", auth: { bearerEnv: "STRIPE_SECRET_KEY" } } }
+  //
+  //   const res = await fetch("https://api.stripe.com/v1/checkout/sessions", { method: "POST", body });
+  //
+  // Don't set that header yourself: a call that brings its own is refused.
+  export interface ActionArgs {
+    form: ActionForm;
+    user: AlbedoUser | null;
+    origin: string | null;
+  }
+
+  // What a FORM's action may return. It is written into slots the compiler
+  // reserved inside that form — no client code, no state to manage:
+  //
+  //   return { error: { email: "Enter a real address." } }  // that field's slot
+  //   return { ok: "You're on the list." }                  // the form's success slot
+  //   return {}                                             // clears them all
+  //
+  // One or the other: a failing result clears a stale success message, and a
+  // succeeding one clears stale errors. It works with JavaScript off too — the
+  // message rides the redirect back and the page lands on the form.
+  // Style the slots with `[data-albedo-error]` and `[data-albedo-ok]`; the
+  // success slot is a `role="status"` live region, so it is also announced.
+  //
+  //   return { redirect: "/account" }                        // go somewhere else
+  //
+  // A path in this app always may. Another origin only when it is listed in
+  // `redirects` in albedo.config.ts, and it must be `https://` — anything else
+  // fails the action rather than sending anyone there, so no URL built from a
+  // form field or an upstream reply can become an open redirect. The check
+  // runs AFTER the body, so a write the body made has already committed.
+  // A result that also carries a non-empty `error` stays on the form.
+  export type FormResult =
+    | { error: Record<string, string> }
+    | { ok: string | true }
+    | { redirect: string }
+    | Record<string, never>
+    | void;
+
+  // Declare an HTTP action handler. Body
   // runs server-side when bakabox POSTs `/_albedo/action` for this
   // declaration's `action_id` (FNV-1a-32 of the export name).
   //
@@ -440,8 +506,8 @@ declare module "albedo/middleware" {
   }
 
   export interface MiddlewareContext {
-    // The same `user` every render sees: `{ id }` when signed in.
-    readonly user: { readonly id: string } | null;
+    // The same `user` every render sees; `null` when anonymous.
+    readonly user: import("albedo").AlbedoUser | null;
   }
 
   // `set-cookie` may repeat; every other header is a single string.
@@ -472,7 +538,7 @@ declare module "albedo/middleware" {
   ) => MiddlewareDecision | void | Promise<MiddlewareDecision | void>;
 }
 
-// ── JOBS · 15.5 — scheduled and enqueued background work ────────
+// ── JOBS — scheduled and enqueued background work ─────────────
 //
 // One `src/jobs.ts`, one export per job. The options are read from the
 // SOURCE at build time, not at runtime, so every value here must be a
@@ -488,7 +554,10 @@ declare module "albedo/jobs" {
     // fire expands into one run per principal. There is no third case:
     // ALBEDO has no system identity that sees every user's rows, which is
     // why a per-user job is a fan-out rather than a privileged read.
-    readonly user: { readonly id: string } | null;
+    //
+    // A job enqueued by a request, or by a webhook that names its principal
+    // (`principal:` in the webhook's declaration), runs FOR that person too.
+    readonly user: import("albedo").AlbedoUser | null;
   }
 
   export interface JobOptions {
@@ -550,36 +619,41 @@ declare module "albedo/jobs" {
     args?: T,
     options?: { id?: string; delay?: string },
   ): void;
+
+  // Queue an email. See the global `sendEmail` below for the shape.
+  export function sendEmail(
+    message: AlbedoEmail,
+    options?: { id?: string; delay?: string },
+  ): void;
 }
 
 // ── The supported React surface ─────────────────────────────────
 //
 // ALBEDO is React-shaped, and `useState` is only recognised when it
-// resolves to an import from `"react"` — `transforms/hooks.rs` checks the
-// binding's source, exactly as `useSharedSlot` is checked against
-// `"albedo"`. So this import is load-bearing, not a compatibility shim,
-// and it has to be declared for the scaffold's own Counter to type-check.
+// resolves to an import from `"react"` — the compiler checks the binding's
+// source, exactly as `useSharedSlot` is checked against `"albedo"`. So this
+// import is load-bearing, not a compatibility shim, and it has to be
+// declared for the scaffold's own Counter to type-check.
 //
-// What is declared here is what the runtime actually implements: the
-// surface pinned by `quickjs_engine.rs::full_hook_surface_renders_without_crashing`
-// (server: effects are no-ops) and by `assets/albedo-client.js` (client:
-// `useEffect` runs after paint). Anything absent from this list is absent
+// What is declared here is what the runtime actually implements, on the
+// server (where effects are no-ops) and in the browser (where `useEffect`
+// runs after paint). Anything absent from this list is absent
 // on purpose — a missing export is a build error, which is the honest
 // signal. Do not widen it to match React's API without a runtime path to
 // match; a declaration the interpreter cannot honour turns a compile-time
 // error into a silent no-op at runtime.
 declare module "react" {
   // Slot-backed state. The setter takes a VALUE, not an updater function:
-  // setter dispatch in `eval/core.rs` evaluates the first argument and
-  // JSON-encodes it, so `setCount(c => c + 1)` would store a function and
-  // is deliberately not typed. Read the current value and pass the next
-  // one — `setCount(count + 1)`.
+  // it evaluates its argument and stores it as JSON, so
+  // `setCount(c => c + 1)` would store a function and is deliberately not
+  // typed. Read the current value and pass the next one —
+  // `setCount(count + 1)`.
   export function useState<S>(initial: S): [S, (next: S) => void];
 
   // Runs after the component is painted on the client; a no-op on the
   // server. Returning a function registers teardown. A component that
   // calls this hydrates eagerly rather than on interaction — a passive
-  // effect would otherwise never run (see `effects.rs`).
+  // effect would otherwise never run.
   export function useEffect(
     effect: () => void | (() => void),
     deps?: readonly unknown[],
@@ -595,7 +669,7 @@ declare module "react" {
   ): T;
 }
 
-// Phase P · Stream C.2 — `broadcast(topic, updater)` is a free
+// `broadcast(topic, updater)` is a free
 // ident the interpreter intercepts inside action handler bodies.
 // The TypeScript declaration mirrors what the interpreter expects.
 declare function broadcast<T>(
@@ -632,7 +706,7 @@ declare function update<T extends Record<string, unknown>>(
   fields: T,
 ): Promise<void>;
 
-// JOBS · 15.5 — put background work on the queue from an action.
+// JOBS — put background work on the queue from an action.
 //
 // The shape transactional email wants: the action returns immediately, the
 // work retries on its own, and `options.id` makes a double-submit land once.
@@ -652,7 +726,46 @@ declare function enqueue<T extends Record<string, unknown>>(
   },
 ): Promise<void>;
 
-// Phase P · Stream E.1 — the `<children />` JSX intrinsic in
+// ── EMAIL ──────────────────────────────────────────────────────
+//
+// `sendEmail` does not send: it validates the message and queues it, and
+// the job runner delivers it with retries — so a provider outage delays
+// the email instead of failing the action. Needs an `email` block in
+// albedo.config. An invalid address or a line break in `subject` throws
+// HERE, in the action, rather than dead-lettering an hour later.
+//
+// Addresses are "ada@example.com" or "Ada Lovelace <ada@example.com>".
+// At most 50 recipients across to/cc/bcc; `text` + `html` at most 1 MiB.
+interface AlbedoEmail {
+  to: string | string[];
+  subject: string;
+  text?: string;
+  html?: string;
+  cc?: string | string[];
+  bcc?: string | string[];
+  replyTo?: string;
+  // Overrides the block's `from`; must be a sender your provider accepts.
+  from?: string;
+  // Up to 10 files, 10 MiB in all. Inline content (base64) is capped at
+  // 5 MiB because it waits in the queue row; for anything larger, attach a
+  // stored upload by id. An upload is attachable only by the user who
+  // uploaded it — an id is a name, not a permission.
+  attachments?: Array<
+    | { filename: string; content: string; contentType?: string }
+    | { upload: string; filename?: string; contentType?: string }
+  >;
+}
+declare function sendEmail(
+  message: AlbedoEmail,
+  options?: {
+    // Makes it idempotent — a double-submitted form sends once.
+    id?: string;
+    // Wait this long before sending: "30s", "5m", "2h", "1d".
+    delay?: string;
+  },
+): Promise<void>;
+
+// The `<children />` JSX intrinsic in
 // `routes/layout.tsx` marks where the wrapped route renders.
 // Declared here so the type-checker stops flagging the unknown
 // tag; the renderer treats it as a sentinel-emitting host element.

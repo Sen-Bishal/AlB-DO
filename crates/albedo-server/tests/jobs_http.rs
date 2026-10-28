@@ -226,6 +226,22 @@ async fn a_scheduled_job_writes_to_forge_and_the_job_it_enqueued_runs() {
         // And the job the body enqueued, which only runs if `enqueue()` wrote a
         // row that the runner then claimed.
         wait_for(&base, "from tick", Duration::from_secs(30)).await;
+        // Keep serving until the schedule has fired more than once. The page
+        // can show the first fire and its followup before the second tick is
+        // due, and stopping the server then would leave one fire to count —
+        // which says nothing about whether the schedule repeats.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let ticks = job_rows(&app.join("forge.db"))
+                .await
+                .into_iter()
+                .filter(|(name, state, _)| name == "tick" && state == "done")
+                .count();
+            if ticks >= 2 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         html
     };
     tokio::time::sleep(Duration::from_millis(500)).await;

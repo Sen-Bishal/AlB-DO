@@ -260,6 +260,7 @@ fn a_package_can_no_longer_forge_a_durable_write_into_someone_elses_handler() {
         raw_bindings: &[],
         setters: &[],
         event_json: None,
+        request: dom_render_compiler::runtime::RequestBindings::anonymous(),
         broadcast_current: &[],
         journal: None,
     };

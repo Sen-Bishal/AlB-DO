@@ -32,23 +32,6 @@ impl EffectProfile {
         }
     }
 
-    pub fn is_pure(&self) -> bool {
-        !self.hooks && !self.asynchronous && !self.io && !self.side_effects
-    }
-
-    pub fn dominant_kind(&self) -> EffectKind {
-        if self.side_effects {
-            EffectKind::SideEffects
-        } else if self.io {
-            EffectKind::Io
-        } else if self.asynchronous {
-            EffectKind::Async
-        } else if self.hooks {
-            EffectKind::Hooks
-        } else {
-            EffectKind::Pure
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -290,10 +273,21 @@ pub fn decide_tier_and_hydration(
     }
 
     // 🔑 Checked before the weight rule below, which would otherwise promote a
-    // large principal-reading component to Tier C — an island whose props are
-    // computed once at boot, so it has the same no-request problem Tier A does,
-    // one tier up. A component that needs the request is served from the tier
-    // that has one.
+    // large request-reading component to Tier C. That would now render
+    // correctly — an island's request props are resolved per request since
+    // 2026-10-16 (`TierCNode::dynamic_prop_keys`, and the props a Tier-B parent
+    // passes it are read off that parent's per-request render). It would also
+    // ship the component's code to the browser for a component that has no
+    // hooks, no effects and no client handler to run there. Tier B renders it
+    // per request with no component JS, so it is served from Tier B.
+    //
+    // 🪤 This comment used to say Tier C had "the same no-request problem" as
+    // Tier A, and that was true — islands were rendered once at boot — but this
+    // check was only ever its guard on the weight branch. The hooks, io and
+    // side-effects branches above return Tier C first, so a `[id]` page holding
+    // `useState` was an island that rendered `params` as nothing on every URL.
+    // The fix for those is per-request islands, not this check: their code has
+    // to reach the browser, and only Tier C sends it.
     if reads_principal {
         return TieringDecision {
             tier: Tier::B,
@@ -449,8 +443,9 @@ mod tests {
     }
 
     /// 🔑 The size rule must not reclaim it. A large principal-reading component
-    /// would otherwise be promoted to Tier C — an island whose props are computed
-    /// once at boot, which has the same no-request problem one tier up.
+    /// would otherwise be promoted to Tier C — an island, which shipped its code
+    /// to the browser for a component with nothing to run there (and, until
+    /// 2026-10-16, rendered from props computed once at boot).
     #[test]
     fn a_large_component_that_reads_user_is_tier_b_not_an_island() {
         let parsed = crate::parser::ComponentParser::new()

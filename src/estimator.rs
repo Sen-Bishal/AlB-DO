@@ -1,5 +1,4 @@
 use crate::parser::ParsedComponent;
-use std::path::Path;
 
 pub struct WeightEstimator {
     base_component_weight: f64,
@@ -25,17 +24,6 @@ impl WeightEstimator {
 
         if component.is_default_export {
             weight += 100.0;
-        }
-
-        weight
-    }
-
-    pub fn estimate_with_file_size(&self, component: &ParsedComponent, file_path: &Path) -> f64 {
-        let mut weight = self.estimate(component);
-
-        if let Ok(metadata) = std::fs::metadata(file_path) {
-            let file_size = metadata.len() as f64;
-            weight += file_size * 0.3;
         }
 
         weight
@@ -119,6 +107,7 @@ mod tests {
             is_client_interactive: false,
             state_escapes: false,
             reads_principal: false,
+            reads_route_params: false,
             source_hash: 1,
             import_sources: Vec::new(),
             is_module_only: false,

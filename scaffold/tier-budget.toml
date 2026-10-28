@@ -1,4 +1,4 @@
-# Phase O.1 + O.3 tier-budget gate.
+# Tier-budget gate.
 #
 # `albedo build` and `albedo ship` fail when any route's component
 # fan-out, payload weight, or bundle size exceeds the ceilings
@@ -9,13 +9,13 @@
 # to disable the gate project-wide.
 
 [defaults]
-# Phase O.1 — source-weight ceilings.
+# Source-weight ceilings.
 tier_a_max_components_per_route = 50
 tier_b_max_kb_per_route = 8
 tier_b_max_kb_per_component = 4
 tier_c_max_concurrent_fetches_per_route = 10
 
-# Phase O.3 — post-emit measured-bytes ceiling for Tier-B wrapper
+# Post-emit measured-bytes ceiling for Tier-B wrapper
 # JS. The wrapper is the only thing bakabox actually downloads for
 # a Tier-B island; capping it keeps hydration cost predictable.
 tier_b_bundle_max_kb_per_component = 1

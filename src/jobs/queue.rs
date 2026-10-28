@@ -422,6 +422,25 @@ pub async fn complete(db: &dyn DataSubstrate, id: &str, now_ms: i64) -> Result<(
     .map_err(|err| QueueError::Substrate(err.to_string()))
 }
 
+/// Replace a row's `args` with `{}`.
+///
+/// For a row whose argument should not outlive its purpose: a sent email's
+/// body is personal data with no further use, and one carrying a sign-in link
+/// is a live credential until it expires. The row itself — name, state,
+/// attempts, error — stays, so an operator can still see *that* it ran.
+///
+/// # Errors
+/// [`QueueError::Substrate`] if the write is refused.
+pub async fn redact_args(db: &dyn DataSubstrate, id: &str) -> Result<()> {
+    db.execute(
+        &format!("UPDATE {JOBS} SET args = '{{}}' WHERE id = ?"),
+        &[SqlValue::Text(id.to_string())],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|err| QueueError::Substrate(err.to_string()))
+}
+
 /// Record a failed attempt: back to `pending` with a delay, or `failed` for good.
 ///
 /// Returns the instant it will next be tried, or `None` when it dead-lettered.

@@ -310,6 +310,20 @@ impl ReturnPath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The path with any fragment removed — what a browser actually requests,
+    /// and so what a render of this page is keyed by.
+    #[must_use]
+    pub fn without_fragment(&self) -> &str {
+        self.0.split('#').next().unwrap_or("/")
+    }
+
+    /// The same page, scrolled to `anchor`. Re-parsed rather than concatenated,
+    /// so the result is held to every rule the original was.
+    #[must_use]
+    pub fn at_anchor(&self, anchor: &str) -> Self {
+        Self::parse(&format!("{}#{anchor}", self.without_fragment())).unwrap_or_else(|| self.clone())
+    }
 }
 
 impl Default for ReturnPath {
@@ -383,6 +397,146 @@ pub fn see_other(path: &ReturnPath) -> Response<Body> {
         .header(header::VARY, "Cookie")
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+// ── Form feedback across the redirect ──────────────────────────────────────
+
+/// Cookie carrying a form's feedback from a JS-less submit to the render its
+/// `303` lands on. `__Host-` for the same reasons as the session cookie: no
+/// sibling subdomain can plant one, so the only writer is this server.
+pub const FEEDBACK_COOKIE: &str = "__Host-albedo-feedback";
+
+/// Encoded-size ceiling: far above any sentence a form says back, far under the
+/// 4 KiB per cookie every browser guarantees.
+const FEEDBACK_MAX_BYTES: usize = 1536;
+
+/// Long enough to survive the redirect; short enough that feedback the reader
+/// never came back for cannot surface on some later visit.
+const FEEDBACK_MAX_AGE_SECS: u32 = 60;
+
+/// A form's feedback, carried across a JS-less submit's redirect.
+///
+/// The enhanced path applies the action's opcode frame in place — including the
+/// `SetText`s `runtime::form_result` projects onto the form's error and success
+/// sinks. A browser with no JavaScript gets `303` instead, and until this the
+/// frame was simply dropped: the no-JS reader learned **nothing** about their
+/// submit — not that it worked, not what was wrong. That is the asymmetry
+/// [`run_form_action_request`](crate::handlers::action) exists to rule out.
+///
+/// So the frame is not dropped; it is **deferred**. Its non-empty `SetText`s ride
+/// this cookie to the next render of the return path, where
+/// `transforms::form::fill_form_feedback` writes them into the sinks that render
+/// reserved. Same opcodes, same ids, same text — applied on the server one
+/// request later instead of in the browser in place.
+///
+/// The cookie is not trusted for anything. A reader can only rewrite their own,
+/// the fill only ever writes into an *empty feedback sink*, and it escapes what
+/// it writes — so the worst a forged value achieves is odd text on the forger's
+/// own screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormFeedback {
+    path: String,
+    entries: Vec<(u32, String)>,
+}
+
+impl FormFeedback {
+    /// What the frame would have painted: every `SetText` that carries text.
+    /// Empty ones are clears, and a fresh render's sinks are already empty.
+    ///
+    /// Read **last-first**, because the projection is appended after the
+    /// handler's own opcodes — so when the budget runs out, what is lost is
+    /// never the form's feedback. `None` when there is nothing to say.
+    pub fn from_frame(
+        path: &ReturnPath,
+        frame: &[dom_render_compiler::ir::opcode::Instruction],
+    ) -> Option<Self> {
+        use dom_render_compiler::ir::opcode::Instruction;
+        let path = path.without_fragment().to_string();
+        let mut budget = FEEDBACK_MAX_BYTES.saturating_sub(encoded_len("p", &path));
+        let mut entries = Vec::new();
+        for op in frame.iter().rev() {
+            let Instruction::SetText { stable_id, text } = op else { continue };
+            let Ok(text) = std::str::from_utf8(text) else { continue };
+            let cost = encoded_len(&stable_id.0.to_string(), text);
+            if text.is_empty() || cost > budget {
+                continue;
+            }
+            budget -= cost;
+            entries.push((stable_id.0, text.to_string()));
+        }
+        (!entries.is_empty()).then_some(Self { path, entries })
+    }
+
+    /// One message for one sink: a framework endpoint's refusal, carried back to
+    /// the form that posted it (`auth_routes::into_form_feedback`). `None` when
+    /// there is nothing to say or it would not fit the cookie.
+    pub fn message(path: &ReturnPath, sink: u32, text: &str) -> Option<Self> {
+        let path = path.without_fragment().to_string();
+        let cost = encoded_len("p", &path) + encoded_len(&sink.to_string(), text);
+        (!text.is_empty() && cost <= FEEDBACK_MAX_BYTES).then(|| Self {
+            path,
+            entries: vec![(sink, text.to_string())],
+        })
+    }
+
+    /// The `Set-Cookie` value that carries this feedback across the redirect.
+    /// Form encoding needs no second pass: its whole alphabet — alphanumerics,
+    /// `*-._`, `%XX`, `+`, `=`, `&` — sits inside RFC 6265's cookie-octet set.
+    pub fn set_cookie(&self) -> String {
+        let mut value = url::form_urlencoded::Serializer::new(String::new());
+        value.append_pair("p", &self.path);
+        for (id, text) in &self.entries {
+            value.append_pair(&id.to_string(), text);
+        }
+        format!(
+            "{FEEDBACK_COOKIE}={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={FEEDBACK_MAX_AGE_SECS}",
+            value.finish()
+        )
+    }
+
+    /// Feedback is one-shot: the render that consumes it also expires it.
+    pub fn clear_cookie() -> String {
+        format!("{FEEDBACK_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0")
+    }
+
+    /// `Some(feedback)` when the request carries the cookie — `Some` with no
+    /// entries if its value is mangled, so the caller still expires it. A bad
+    /// cookie costs a message, never a page.
+    pub fn read(headers: &HeaderMap) -> Option<Self> {
+        let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+        let (_, value) = dom_render_compiler::auth::cookie_entries(raw)
+            .find(|(name, _)| *name == FEEDBACK_COOKIE)?;
+        let mut path = String::new();
+        let mut entries = Vec::new();
+        for (key, text) in url::form_urlencoded::parse(value.as_bytes()) {
+            if key == "p" {
+                path = text.into_owned();
+            } else if let Ok(id) = key.parse::<u32>() {
+                entries.push((id, text.into_owned()));
+            }
+        }
+        Some(Self { path, entries })
+    }
+
+    /// The entries to paint on a render of `request_path` — only the page the
+    /// submit returned to. Anywhere else the feedback is stale by definition.
+    pub fn entries_for(&self, request_path: &str) -> &[(u32, String)] {
+        if self.path == request_path {
+            &self.entries
+        } else {
+            &[]
+        }
+    }
+}
+
+/// Bytes `key=value&` costs once form-encoded — the exact unit of the budget.
+fn encoded_len(key: &str, value: &str) -> usize {
+    let encoded = |s: &str| {
+        url::form_urlencoded::byte_serialize(s.as_bytes())
+            .map(str::len)
+            .sum::<usize>()
+    };
+    encoded(key) + encoded(value) + 2
 }
 
 #[cfg(test)]
@@ -576,5 +730,72 @@ mod tests {
             "no-store"
         );
         assert_eq!(response.headers().get(header::VARY).unwrap(), "Cookie");
+    }
+
+    // ── feedback across the redirect ─────────────────────────────────
+
+    use dom_render_compiler::ir::opcode::{Instruction, StableId};
+
+    fn set_text(id: u32, text: &str) -> Instruction {
+        Instruction::SetText { stable_id: StableId(id), text: text.as_bytes().to_vec() }
+    }
+
+    /// Replay a `Set-Cookie` value the way a browser would send it back.
+    fn sent_back(set_cookie: &str) -> HeaderMap {
+        let pair = set_cookie.split(';').next().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("theme=dark; {pair}").parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn feedback_survives_the_round_trip_through_a_real_cookie() {
+        let path = ReturnPath::parse("/room/42?tab=chat").unwrap();
+        let frame = [set_text(7, ""), set_text(9, "You're on the list; see you & soon.")];
+        let feedback = FormFeedback::from_frame(&path, &frame).expect("one sink has text");
+
+        let cookie = feedback.set_cookie();
+        for attr in ["Path=/", "HttpOnly", "Secure", "SameSite=Lax", "Max-Age=60"] {
+            assert!(cookie.contains(attr), "missing {attr}: {cookie}");
+        }
+        let read = FormFeedback::read(&sent_back(&cookie)).expect("cookie is present");
+        // The clear (empty text) was never carried; the message survives `;` and `&`.
+        assert_eq!(read.entries_for("/room/42?tab=chat"), &[(9, "You're on the list; see you & soon.".to_string())]);
+        // Keyed by the page it was issued for, and nowhere else.
+        assert!(read.entries_for("/").is_empty());
+    }
+
+    #[test]
+    fn a_frame_with_nothing_to_say_carries_nothing() {
+        let path = ReturnPath::root();
+        assert!(FormFeedback::from_frame(&path, &[set_text(1, "")]).is_none());
+        assert!(FormFeedback::from_frame(&path, &[]).is_none());
+    }
+
+    #[test]
+    fn the_budget_keeps_the_projection_which_comes_last() {
+        // A handler's own large SetText first, the form's feedback last: when
+        // both cannot fit, the one that goes is never the feedback.
+        let huge = "x".repeat(FEEDBACK_MAX_BYTES);
+        let frame = [set_text(1, &huge), set_text(2, "Enter a real address.")];
+        let feedback = FormFeedback::from_frame(&ReturnPath::root(), &frame).unwrap();
+        assert_eq!(feedback.entries_for("/"), &[(2, "Enter a real address.".to_string())]);
+        assert!(feedback.set_cookie().len() < FEEDBACK_MAX_BYTES + 128);
+    }
+
+    #[test]
+    fn a_mangled_cookie_still_reads_as_present_so_it_is_expired() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("{FEEDBACK_COOKIE}=%%%;junk").parse().unwrap());
+        let read = FormFeedback::read(&headers).expect("present, so the render expires it");
+        assert!(read.entries_for("/").is_empty());
+        assert!(FormFeedback::clear_cookie().contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn the_anchor_replaces_any_fragment_and_keeps_the_query() {
+        let path = ReturnPath::parse("/room/42?tab=chat#old").unwrap();
+        assert_eq!(path.at_anchor("albedo-feedback-join").as_str(), "/room/42?tab=chat#albedo-feedback-join");
+        assert_eq!(path.without_fragment(), "/room/42?tab=chat");
     }
 }

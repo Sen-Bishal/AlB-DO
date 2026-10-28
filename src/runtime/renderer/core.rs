@@ -75,14 +75,6 @@ impl ModuleRegistry {
         );
     }
 
-    pub fn register_from_manifest(
-        &mut self,
-        manifest: &RenderManifestV2,
-        module_sources: &HashMap<String, String>,
-    ) -> RuntimeResult<()> {
-        self.register_from_manifest_with_precompiled(manifest, module_sources, None)
-    }
-
     pub fn register_from_manifest_with_precompiled(
         &mut self,
         manifest: &RenderManifestV2,
@@ -336,50 +328,6 @@ pub enum RouteStreamChunkKind {
 pub struct RouteStreamChunk {
     pub kind: RouteStreamChunkKind,
     pub content: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct RouteRenderStreamResult {
-    pub chunks: Vec<RouteStreamChunk>,
-    pub head_tags: Vec<String>,
-    pub hydration_payload: String,
-    pub timings: RenderTimings,
-}
-
-pub fn route_render_result_to_stream(result: RouteRenderResult) -> RouteRenderStreamResult {
-    let mut chunks = Vec::new();
-    chunks.push(RouteStreamChunk {
-        kind: RouteStreamChunkKind::ShellHtml,
-        content: result.shell_html.clone(),
-    });
-
-    for deferred in &result.deferred_chunks {
-        chunks.push(RouteStreamChunk {
-            kind: RouteStreamChunkKind::DeferredHtml,
-            content: deferred.clone(),
-        });
-    }
-
-    for head_tag in &result.head_tags {
-        chunks.push(RouteStreamChunk {
-            kind: RouteStreamChunkKind::HeadTag,
-            content: head_tag.clone(),
-        });
-    }
-
-    if result.hydration_payload != "{}" {
-        chunks.push(RouteStreamChunk {
-            kind: RouteStreamChunkKind::HydrationPayload,
-            content: result.hydration_payload.clone(),
-        });
-    }
-
-    RouteRenderStreamResult {
-        chunks,
-        head_tags: result.head_tags,
-        hydration_payload: result.hydration_payload,
-        timings: result.timings,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

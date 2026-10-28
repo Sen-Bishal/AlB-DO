@@ -65,7 +65,7 @@ use dom_render_compiler::forge::RowProjector;
 use dom_render_compiler::ir::opcode::{Instruction, OpcodeFrame, ReconcileRow, RowKey};
 use dom_render_compiler::ir::wire::encode_frame;
 use dom_render_compiler::runtime::session::SessionId;
-use dom_render_compiler::runtime::{broadcast_slot_id, BroadcastRegistry};
+use dom_render_compiler::runtime::{broadcast_slot_id, BroadcastRegistry, GrantedSeed, TopicGrant};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,27 +101,26 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(1_000);
 /// one whose "no stream" branch only shows up on some pages.
 pub async fn serve_patch_stream(
     broadcast: Arc<BroadcastRegistry>,
-    topics: &[String],
+    grants: &[TopicGrant],
     resync: Option<&dyn RowProjector>,
 ) -> Response<Body> {
     let session = SessionId::random();
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(PATCH_CHANNEL_CAPACITY);
 
-    // Subscribe BEFORE anything else: `auto_subscribe` registers the sink and
-    // reads each topic's value under that topic's linearization lock, so a
+    // Subscribe BEFORE anything else: `subscribe_granted` registers the sink
+    // and reads each topic's value under that topic's linearization lock, so a
     // write racing this connect either lands in `initial` or arrives as a frame
     // afterwards — never both, never neither. Everything below is computed from
     // the values it returned, so the resync describes exactly the state this
     // subscription started from and live frames stack on top of it in order.
-    let initial = broadcast.auto_subscribe(session, sender, topics);
-    let seed_values: Vec<(String, Vec<u8>)> = topics
-        .iter()
-        .zip(initial.iter())
-        .filter_map(|(topic, instruction)| match instruction {
-            Instruction::SlotSet { value, .. } => Some((topic.clone(), value.clone())),
-            _ => None,
-        })
-        .collect();
+    //
+    // Column projection · `initial` is cut to the columns the route reads;
+    // `seed_values` stays whole because it only feeds the resync *render*, and
+    // that render's output is the route's own row markup.
+    let GrantedSeed {
+        instructions: initial,
+        values: seed_values,
+    } = broadcast.subscribe_granted(session, sender, grants);
 
     let seed = (!initial.is_empty())
         .then(|| OpcodeFrame {
@@ -302,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn opening_the_stream_subscribes_the_connection_to_the_routes_topics() {
         let broadcast = Arc::new(BroadcastRegistry::new());
-        let response = serve_patch_stream(broadcast.clone(), &["guestbook".to_string()], None).await;
+        let response = serve_patch_stream(broadcast.clone(), &[TopicGrant::whole("guestbook")], None).await;
         assert_eq!(response.status(), 200);
 
         let topic = broadcast
@@ -333,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn a_write_after_connect_reaches_the_subscribed_connection() {
         let broadcast = Arc::new(BroadcastRegistry::new());
-        let _response = serve_patch_stream(broadcast.clone(), &["guestbook".to_string()], None).await;
+        let _response = serve_patch_stream(broadcast.clone(), &[TopicGrant::whole("guestbook")], None).await;
 
         let report = broadcast
             .write_topic("guestbook", br#"[{"id":1}]"#.to_vec())
@@ -415,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_stream_unsubscribes_the_connection() {
         let broadcast = Arc::new(BroadcastRegistry::new());
-        let response = serve_patch_stream(broadcast.clone(), &["guestbook".to_string()], None).await;
+        let response = serve_patch_stream(broadcast.clone(), &[TopicGrant::whole("guestbook")], None).await;
         assert_eq!(broadcast.get("guestbook").unwrap().subscriber_count(), 1);
 
         drop(response);

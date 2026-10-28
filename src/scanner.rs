@@ -83,7 +83,16 @@ impl ProjectScanner {
                     });
 
             if file_path.is_file() && !is_framework_entry && self.is_component_file(file_path) {
-                match self.parser.parse_file(file_path) {
+                // Through `read_module_source`, not `parse_file`: a Markdown page
+                // is parsed as the JSX module it lowers to, and a page that will
+                // not lower is a failure here like any other unparseable file.
+                let parsed = crate::markdown::read_module_source(file_path)
+                    .map_err(|err| CompilerError::AnalysisFailed(err.to_string()))
+                    .and_then(|source| {
+                        self.parser
+                            .parse_source(&source, file_path.to_str().unwrap_or("unknown"))
+                    });
+                match parsed {
                     Ok(mut comps) => components.append(&mut comps),
                     Err(err) => failures.push(ScanFailure {
                         path: file_path.to_path_buf(),
@@ -133,6 +142,7 @@ impl ProjectScanner {
             component.is_client_interactive = parsed.is_client_interactive;
             component.state_escapes = parsed.state_escapes;
             component.reads_principal = parsed.reads_principal;
+            component.reads_route_params = parsed.reads_route_params;
             component.imports_npm =
                 crate::parser::imports_unresolvable_specifier(&parsed.import_sources);
             component.effect_profile = parsed.effect_profile;
@@ -191,11 +201,6 @@ impl ProjectScanner {
         Ok(self.build_compiler(components))
     }
 
-    pub fn scan_and_build_canonical_ir(&self, path: &Path) -> Result<CanonicalIrDocument> {
-        let components = self.scan_directory(path)?;
-        Ok(self.build_canonical_ir(&components))
-    }
-
     fn is_component_file(&self, path: &Path) -> bool {
         // Phase P · post-P wire-through — skip ambient TS declaration
         // files. Same exclusion is mirrored in
@@ -204,6 +209,9 @@ impl ProjectScanner {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.ends_with(".d.ts") || name.ends_with(".d.tsx") {
             return false;
+        }
+        if crate::markdown::is_markdown_page(path) {
+            return true;
         }
         if let Some(ext) = path.extension() {
             let ext_str = ext.to_str().unwrap_or("");
@@ -324,6 +332,9 @@ mod tests {
         assert!(scanner.is_component_file(Path::new("App.tsx")));
         assert!(!scanner.is_component_file(Path::new("style.css")));
         assert!(!scanner.is_component_file(Path::new("README.md")));
+        // Markdown is a component only as a page — under `routes/`.
+        assert!(scanner.is_component_file(Path::new("src/routes/docs/intro.md")));
+        assert!(!scanner.is_component_file(Path::new("src/components/NOTES.md")));
     }
 
     #[test]

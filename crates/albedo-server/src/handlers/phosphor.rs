@@ -59,10 +59,10 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use dashmap::DashMap;
 use dom_render_compiler::forge::RowProjector;
-use dom_render_compiler::ir::opcode::{Instruction, OpcodeFrame};
+use dom_render_compiler::ir::opcode::OpcodeFrame;
 use dom_render_compiler::ir::wire::encode_frame;
 use dom_render_compiler::runtime::session::SessionId;
-use dom_render_compiler::runtime::BroadcastRegistry;
+use dom_render_compiler::runtime::{BroadcastRegistry, GrantedSeed, TopicGrant};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -148,11 +148,12 @@ const HELLO_EVENT: &str = "hello";
 /// unimplemented (AUTH R2).
 #[async_trait::async_trait]
 pub trait RouteAuthority: Send + Sync {
+    /// The route's topics, each with the columns of it the route reads.
     async fn authorize_route(
         &self,
         principal: Option<&PrincipalId>,
         path: &str,
-    ) -> Option<Vec<String>>;
+    ) -> Option<Vec<TopicGrant>>;
     /// The broadcast registry circuits subscribe against. Resolved per
     /// subscribe call (not pinned at trunk-open) so a dev world-swap binds
     /// NEW circuits to the live world; existing circuits keep the registry
@@ -245,11 +246,10 @@ pub struct Lane {
     ///
     /// Held for the lane's lifetime rather than re-resolved per subscribe,
     /// which is what makes every route a lane subscribes to be judged against
-    /// one identity. The consequence — a session revoked mid-lane keeps its open
-    /// trunk until the lane closes — is not a hole: revocation deletes the
-    /// session *row*, which is a delta on a topic the lane is subscribed to, so
-    /// the lane learns about its own death on the wire it already has. That is
-    /// `AUTH.md` § 5 doing the work a re-resolution loop would otherwise do.
+    /// one identity. The consequence is that a session revoked while its lane
+    /// is open would keep streaming until the tab closed: nothing about deleting
+    /// a session row reaches the lane on its own. So every revocation ends the
+    /// lanes it covers — see [`PhosphorState::end_lanes_where`].
     principal: crate::auth::Identity,
 }
 
@@ -280,6 +280,27 @@ impl PhosphorState {
     /// Diagnostic — number of open lanes.
     pub fn lane_count(&self) -> usize {
         self.lanes.len()
+    }
+
+    /// End every open lane whose identity `revoked` covers. Returns how many.
+    ///
+    /// A lane resolves who it belongs to once, when it opens, and keeps that
+    /// for its life. Without this, a session that was signed out — or signed
+    /// out everywhere, reset, or taken over — would go on receiving live data
+    /// for as long as its tab stayed open. Ending the lane makes the browser
+    /// reconnect, and the new lane resolves what the cookie is worth now.
+    ///
+    /// `notify_one`, not `notify_waiters`: the trunk may be between polls of
+    /// its kill future, and `notify_one` leaves a permit the next poll takes.
+    pub fn end_lanes_where(&self, revoked: impl Fn(&crate::auth::Identity) -> bool) -> usize {
+        let mut ended = 0;
+        for lane in self.lanes.iter() {
+            if revoked(&lane.principal) {
+                lane.kill.notify_one();
+                ended += 1;
+            }
+        }
+        ended
     }
 
     #[cfg(test)]
@@ -557,7 +578,7 @@ async fn subscribe_routes(
 
     for add in request.add {
         // AUTH R2 · the lane's *principal* decides, not its tab id.
-        let Some(topics) = authority
+        let Some(grants) = authority
             .authorize_route(lane.principal().principal().map(|who| &who.id), &add.p)
             .await
         else {
@@ -596,17 +617,16 @@ async fn subscribe_routes(
             // returns each topic's current value under its lock. That makes
             // "second tab joins an already-live route" and "first tab opens
             // the route" the same code path.
-            let instructions = sub
+            //
+            // Column projection · the seed is cut to the columns the route
+            // reads, and so is every snapshot this circuit receives after it;
+            // `values` stays whole because it only feeds the resync render.
+            let GrantedSeed {
+                instructions,
+                values,
+            } = sub
                 .registry
-                .auto_subscribe(sub.session, sub.sender.clone(), &topics);
-            let values: Vec<(String, Vec<u8>)> = topics
-                .iter()
-                .zip(instructions.iter())
-                .filter_map(|(topic, instruction)| match instruction {
-                    Instruction::SlotSet { value, .. } => Some((topic.clone(), value.clone())),
-                    _ => None,
-                })
-                .collect();
+                .subscribe_granted(sub.session, sub.sender.clone(), &grants);
             (instructions, values, sub.pending_rx.take())
         };
 
@@ -714,6 +734,7 @@ fn plain(status: StatusCode, message: String) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dom_render_compiler::ir::opcode::Instruction;
     use dom_render_compiler::ir::wire::decode_frame;
     use dom_render_compiler::runtime::broadcast_slot_id;
 
@@ -731,8 +752,10 @@ mod tests {
             &self,
             _principal: Option<&PrincipalId>,
             path: &str,
-        ) -> Option<Vec<String>> {
-            self.table.get(path).cloned()
+        ) -> Option<Vec<TopicGrant>> {
+            self.table
+                .get(path)
+                .map(|topics| topics.iter().map(TopicGrant::whole).collect())
         }
         fn registry(&self) -> Arc<BroadcastRegistry> {
             self.registry.clone()
@@ -772,6 +795,58 @@ mod tests {
             }),
             rx,
         )
+    }
+
+    /// Revocation ends exactly the lanes it names — by account, or by one
+    /// session — and a lane ended while its trunk was not polling still ends.
+    #[tokio::test]
+    async fn revocation_ends_only_the_lanes_it_covers() {
+        use crate::auth::Identity;
+        use dom_render_compiler::auth::{Principal, PrincipalId, TokenHash};
+
+        let state = PhosphorState::new();
+        let ada = PrincipalId::mint();
+        let signed_in = |who: &PrincipalId, token: &str| Identity::Authenticated {
+            principal: Box::new(Principal::new(who.clone(), "password")),
+            token: TokenHash::of(token),
+        };
+        let lanes = [
+            ("ada-laptop", signed_in(&ada, "laptop")),
+            ("ada-phone", signed_in(&ada, "phone")),
+            ("bob", signed_in(&PrincipalId::mint(), "bob")),
+            ("stranger", Identity::Anonymous),
+        ];
+        for (name, identity) in lanes {
+            let (lane, _rx) = test_lane(1);
+            let lane = Arc::new(Lane {
+                trunk: lane.trunk.clone(),
+                kill: Arc::new(Notify::new()),
+                routes: Mutex::new(HashMap::new()),
+                budget: Mutex::new(TokenBucket::new()),
+                identity: None,
+                principal: identity,
+            });
+            state.lanes.insert(name.to_string(), lane);
+        }
+        let ended = |name: &str| {
+            let kill = state.get(name).expect("lane").kill.clone();
+            async move {
+                tokio::time::timeout(Duration::from_millis(50), kill.notified())
+                    .await
+                    .is_ok()
+            }
+        };
+
+        let laptop = TokenHash::of("laptop");
+        assert_eq!(state.end_lanes_where(|identity| identity.token() == Some(&laptop)), 1);
+        assert!(ended("ada-laptop").await, "the signed-out session's lane ends");
+        assert!(!ended("ada-phone").await, "signing out one device leaves the other");
+
+        let everywhere =
+            state.end_lanes_where(|identity| identity.principal().is_some_and(|p| p.id == ada));
+        assert_eq!(everywhere, 2);
+        assert!(ended("ada-phone").await, "signing out everywhere reaches every device");
+        assert!(!ended("bob").await && !ended("stranger").await, "nobody else is touched");
     }
 
     fn add(path: &str, nonce: Option<&str>, resync: bool) -> SubscribeRequest {

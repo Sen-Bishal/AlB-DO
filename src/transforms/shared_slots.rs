@@ -330,8 +330,8 @@ impl std::fmt::Display for SharedSlotExtractError {
             Self::IdentityKeyNotYetSupported { binding_name } => write!(
                 f,
                 "useSharedSlot{}: per-user *source* arguments (`user.id` on an APERTURE route) \
-                 land with item 5 P5 (`scope: \"user\"`). Per-user FORGE partitions \
-                 (`todos.where({{ owner: user.id }})`) and route parameters work today",
+                 are not supported. Per-user FORGE partitions \
+                 (`todos.where({{ owner: user.id }})`) and route parameters work instead",
                 binding_name
                     .as_deref()
                     .map(|name| format!(" assigned to '{name}'"))
@@ -1313,7 +1313,7 @@ mod tests {
     /// two refusals now say different things and confusing them would tell an
     /// author to wait for something that already shipped.
     #[test]
-    fn an_aperture_source_argument_keyed_by_identity_still_names_its_milestone() {
+    fn an_aperture_source_argument_keyed_by_identity_names_what_works_instead() {
         let err = extract_err(
             r#"
             import { useSharedSlot } from "albedo";
@@ -1329,8 +1329,12 @@ mod tests {
             "got {err:?}"
         );
         assert!(
-            err.to_string().contains("P5"),
-            "the message must name the phase that unblocks it: {err}"
+            err.to_string().contains("work") && err.to_string().contains("route parameters"),
+            "the message must say what does work instead: {err}"
+        );
+        assert!(
+            !err.to_string().contains("P5") && !err.to_string().contains("item 5"),
+            "a user-facing error must not cite the internal plan: {err}"
         );
     }
 
@@ -1916,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn a_user_scoped_source_argument_names_item_five() {
+    fn a_user_scoped_source_argument_is_refused_with_an_alternative() {
         let err = extract_err(
             r#"
             import { useSharedSlot } from "albedo";
@@ -1931,7 +1935,8 @@ mod tests {
             err,
             SharedSlotExtractError::IdentityKeyNotYetSupported { .. }
         ));
-        assert!(err.to_string().contains("item 5"));
+        assert!(err.to_string().contains("not supported"), "{err}");
+        assert!(!err.to_string().contains("item 5"), "{err}");
     }
 
     #[test]

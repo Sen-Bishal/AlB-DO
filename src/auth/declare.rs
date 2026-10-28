@@ -507,9 +507,18 @@ pub struct ProviderDecl {
 
     // ── password ──
     /// How a password is reset. Only `"email"` today; absent means no reset
-    /// flow, which is a legitimate choice for an internal tool.
+    /// flow, which is a legitimate choice for an internal tool. `"email"`
+    /// requires an `email` block — checked at boot, where both are known.
     #[serde(default)]
     pub reset: Option<String>,
+    /// Whether a new password account must confirm its address before it can
+    /// sign in. Only `"required"` today; absent means no confirmation step.
+    ///
+    /// `"required"` also closes signup enumeration: a sign-up for a taken
+    /// address answers exactly like a new one, and the address's owner is
+    /// emailed instead.
+    #[serde(default)]
+    pub verify: Option<String>,
 }
 
 /// The `auth` block.
@@ -614,6 +623,33 @@ pub enum AuthSchemaError {
         /// The variable name.
         variable: String,
     },
+    /// A provider kind this release declares but does not serve.
+    Unsupported {
+        /// Provider name.
+        provider: String,
+        /// Its kind.
+        kind: ProviderKind,
+    },
+    /// A magic-link provider beside a password provider that lets unproven
+    /// addresses sign in. See [`AuthDeclaration::check_email_proof`].
+    UnprovenPasswordBesideMagicLink {
+        /// The password provider.
+        password: String,
+        /// The magic-link provider.
+        magic: String,
+    },
+    /// An option has a value it does not accept, or is declared on a kind that
+    /// has no use for it.
+    InvalidOption {
+        /// Provider name.
+        provider: String,
+        /// Which field.
+        field: &'static str,
+        /// The offending value.
+        value: String,
+        /// What it accepts.
+        expected: &'static str,
+    },
 }
 
 impl std::fmt::Display for AuthSchemaError {
@@ -625,17 +661,30 @@ impl std::fmt::Display for AuthSchemaError {
                  principal it mints, so it must match [a-z0-9_-]{{1,32}}"
             ),
             Self::ProviderNeedsKind { provider } => {
-                let presets: Vec<&str> = PRESETS.iter().map(|preset| preset.name).collect();
+                // Only what this release serves — naming a kind the build would
+                // then refuse (see `check_supported`) sends the author in a circle.
+                let served = |kind: ProviderKind| {
+                    !matches!(
+                        kind,
+                        ProviderKind::Passkey | ProviderKind::Delegated | ProviderKind::Custom
+                    )
+                };
+                let presets: Vec<&str> = PRESETS
+                    .iter()
+                    .filter(|preset| served(preset.kind))
+                    .map(|preset| preset.name)
+                    .collect();
                 let kinds: Vec<&str> = ProviderKind::all()
                     .iter()
+                    .filter(|kind| served(**kind) && **kind != ProviderKind::Password
+                        && **kind != ProviderKind::MagicLink)
                     .map(|kind| kind.as_str())
                     .collect();
                 write!(
                     f,
                     "auth provider `{provider}`: needs a `kind`, because `{provider}` is not a \
                      known preset. Presets that infer their own kind: {}. Otherwise declare one \
-                     of: {}. Anything not covered by the first six is `kind: \"custom\"` with a \
-                     `module` — that path is open on purpose",
+                     of: {}",
                     presets.join(", "),
                     kinds.join(", "),
                 )
@@ -682,6 +731,32 @@ impl std::fmt::Display for AuthSchemaError {
                 f,
                 "auth provider `{provider}`: `{field}` reads environment variable `{variable}`, \
                  which is not set"
+            ),
+            Self::Unsupported { provider, kind } => write!(
+                f,
+                "auth provider `{provider}` is kind `{}`, which this release of AlBDO does not \
+                 serve — nothing would answer its sign-in, so the app refuses to build rather \
+                 than ship a login that cannot succeed. Supported kinds: password, oauth, oidc, \
+                 magiclink",
+                kind.as_str()
+            ),
+            Self::UnprovenPasswordBesideMagicLink { password, magic } => write!(
+                f,
+                "auth provider `{password}` needs `verify: \"required\"` because `{magic}` signs \
+                 people in by email. Without it, a stranger can register someone else's address \
+                 with a password, sign in, and fill that account with whatever they like; when \
+                 the real owner later signs in by link, the account they land in is the \
+                 stranger's. With it, an unconfirmed account can never sign in, so there is \
+                 nothing to inherit"
+            ),
+            Self::InvalidOption {
+                provider,
+                field,
+                value,
+                expected,
+            } => write!(
+                f,
+                "auth provider `{provider}`: `{field}` = `{value}` is not accepted — {expected}"
             ),
         }
     }
@@ -746,6 +821,19 @@ pub struct ResolvedProvider {
     pub client_id: Option<SecretDecl>,
     /// The client secret, still unresolved.
     pub client_secret: Option<SecretDecl>,
+    /// Password only: `reset: "email"` — the forgot-password flow is on.
+    pub reset_by_email: bool,
+    /// Password only: `verify: "required"` — sign-in waits for a confirmed address.
+    pub verify_email: bool,
+}
+
+impl ResolvedProvider {
+    /// Whether this provider sends mail at all — the question boot asks of an
+    /// app with no `email` block.
+    #[must_use]
+    pub fn sends_email(&self) -> bool {
+        self.kind == ProviderKind::MagicLink || self.reset_by_email || self.verify_email
+    }
 }
 
 /// The lowered `auth` block.
@@ -841,6 +929,76 @@ impl AuthRegistry {
 }
 
 impl AuthDeclaration {
+    /// Refuse a provider whose kind has no server-side flow in this release.
+    ///
+    /// `passkey`, `delegated` (the Clerk and Auth0 presets) and `custom` are
+    /// part of the declaration vocabulary, and the server has no routes, token
+    /// verification or resolver for them. Accepting one would build an app whose
+    /// sign-in silently never works; this makes it a build error instead.
+    ///
+    /// # Errors
+    /// [`AuthSchemaError::Unsupported`], naming the first such provider.
+    pub fn check_supported(&self) -> Result<(), AuthSchemaError> {
+        for (name, decl) in &self.providers {
+            let kind = decl
+                .kind
+                .or_else(|| preset_for(name).map(|preset| preset.kind));
+            if let Some(
+                kind @ (ProviderKind::Passkey | ProviderKind::Delegated | ProviderKind::Custom),
+            ) = kind
+            {
+                return Err(AuthSchemaError::Unsupported {
+                    provider: name.clone(),
+                    kind,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse `magiclink` beside a password provider without `verify: "required"`.
+    ///
+    /// ## Why a build error and not a runtime policy
+    ///
+    /// A magic link proves its clicker owns the mailbox, and on first use it has
+    /// to decide what to do about a password account already registered to that
+    /// address. Every answer is wrong for someone *if unconfirmed accounts can
+    /// sign in*: linking hands the owner whatever a squatter built there (the
+    /// pre-account-takeover attack), and not linking splits one person in two.
+    /// The dilemma exists only because an unproven account could have been
+    /// *used*. Under `verify: "required"` it cannot — sign-in waits for the
+    /// address — so the account a magic link claims is an empty shell and the
+    /// takeover in `email_token::resolve_magic_link` inherits nothing.
+    ///
+    /// Read from the declarations, not the lowered providers, so `albedo build`
+    /// can run it without resolving secrets.
+    ///
+    /// # Errors
+    /// [`AuthSchemaError::UnprovenPasswordBesideMagicLink`].
+    pub fn check_email_proof(&self) -> Result<(), AuthSchemaError> {
+        let kind_of = |name: &str, decl: &ProviderDecl| {
+            decl.kind.or_else(|| preset_for(name).map(|preset| preset.kind))
+        };
+        let Some(magic) = self
+            .providers
+            .iter()
+            .find(|(name, decl)| kind_of(name, decl) == Some(ProviderKind::MagicLink))
+            .map(|(name, _)| name)
+        else {
+            return Ok(());
+        };
+        match self.providers.iter().find(|(name, decl)| {
+            kind_of(name, decl) == Some(ProviderKind::Password)
+                && decl.verify.as_deref() != Some("required")
+        }) {
+            Some((password, _)) => Err(AuthSchemaError::UnprovenPasswordBesideMagicLink {
+                password: password.clone(),
+                magic: magic.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Validate and lower the whole block.
     ///
     /// # Errors
@@ -866,6 +1024,7 @@ impl AuthDeclaration {
         for (name, decl) in &self.providers {
             providers.push(decl.lower(name)?);
         }
+        self.check_email_proof()?;
 
         let login_path = match self.login.as_deref() {
             Some(raw) if !is_rooted_app_path(raw) => {
@@ -929,6 +1088,15 @@ impl ProviderDecl {
         let scopes = self.scopes_for(kind, preset);
         let claim_map = self.claim_map_with_defaults(preset);
 
+        // 🔑 `reset` was declared, documented and dropped here until 15.3 — no
+        // field on the resolved provider carried it, so `reset: "email"` meant
+        // nothing and a typo in it meant nothing too. Both options now lower,
+        // and both refuse a value or a kind they cannot honour.
+        let reset_by_email =
+            password_option(name, kind, "reset", self.reset.as_deref(), "email")?;
+        let verify_email =
+            password_option(name, kind, "verify", self.verify.as_deref(), "required")?;
+
         Ok(ResolvedProvider {
             name: name.to_string(),
             kind,
@@ -938,6 +1106,8 @@ impl ProviderDecl {
             claim_map,
             client_id: self.client_id.clone(),
             client_secret: self.client_secret.clone(),
+            reset_by_email,
+            verify_email,
         })
     }
 
@@ -1166,6 +1336,39 @@ pub fn is_valid_provider_name(name: &str) -> bool {
 /// `http` is refused for every provider endpoint, including in development: an
 /// authorization code or a client secret crossing plaintext is the same mistake
 /// in both environments, and a dev-only exemption is how it reaches production.
+/// Lower a password-only switch whose one accepted value is `accepted`.
+///
+/// Absent is `false`. Present on another kind is an error rather than ignored:
+/// `reset: "email"` on a passkey provider is an author who believes a reset
+/// flow exists, and silence would let them ship believing it.
+fn password_option(
+    provider: &str,
+    kind: ProviderKind,
+    field: &'static str,
+    value: Option<&str>,
+    accepted: &'static str,
+) -> Result<bool, AuthSchemaError> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let refuse = |expected| AuthSchemaError::InvalidOption {
+        provider: provider.to_string(),
+        field,
+        value: value.to_string(),
+        expected,
+    };
+    if kind != ProviderKind::Password {
+        return Err(refuse("only a `password` provider has this option"));
+    }
+    if value != accepted {
+        return Err(refuse(match field {
+            "reset" => "the only reset flow is \"email\"",
+            _ => "the only value is \"required\"",
+        }));
+    }
+    Ok(true)
+}
+
 fn require_https(provider: &str, field: &'static str, raw: &str) -> Result<Url, AuthSchemaError> {
     let url = Url::parse(raw).map_err(|err| AuthSchemaError::InvalidUrl {
         provider: provider.to_string(),
@@ -1290,8 +1493,11 @@ mod tests {
             }
         );
         let rendered = error.to_string();
-        assert!(rendered.contains("custom"), "must name the escape hatch");
-        assert!(rendered.contains("oidc"), "must list the generic kinds");
+        assert!(rendered.contains("oidc") && rendered.contains("oauth"), "must list the generic kinds");
+        assert!(
+            !rendered.contains("custom") && !rendered.contains("passkey"),
+            "must not suggest a kind the build refuses: {rendered}"
+        );
     }
 
     /// The extensibility claim, asserted directly: a provider nobody has heard
@@ -1590,6 +1796,108 @@ mod tests {
                 value: "forever".to_string()
             }
         );
+    }
+
+    /// 15.3 · `reset` used to lower to nothing. Now it lowers, and both email
+    /// options refuse what they cannot honour.
+    #[test]
+    fn password_email_options_lower_and_refuse_what_they_cannot_honour() {
+        let lower = |decl: serde_json::Value| {
+            serde_json::from_value::<ProviderDecl>(decl)
+                .expect("parses")
+                .lower("password")
+        };
+        let on = lower(serde_json::json!({ "reset": "email", "verify": "required" })).expect("lowers");
+        assert!(on.reset_by_email && on.verify_email && on.sends_email());
+
+        let off = lower(serde_json::json!({})).expect("lowers");
+        assert!(!off.reset_by_email && !off.verify_email && !off.sends_email());
+
+        for bad in [
+            serde_json::json!({ "reset": "sms" }),
+            serde_json::json!({ "verify": "optional" }),
+        ] {
+            assert!(
+                matches!(lower(bad.clone()), Err(AuthSchemaError::InvalidOption { .. })),
+                "{bad}"
+            );
+        }
+
+        let on_passkey = serde_json::from_value::<ProviderDecl>(serde_json::json!({ "reset": "email" }))
+            .expect("parses")
+            .lower("passkey");
+        assert!(matches!(on_passkey, Err(AuthSchemaError::InvalidOption { field: "reset", .. })));
+
+        let magic = ProviderDecl::default().lower("magiclink").expect("a preset");
+        assert!(magic.sends_email(), "a magic link provider is nothing but email");
+    }
+
+    /// A provider kind with no server-side flow must fail the build — by kind
+    /// declared, and by a preset's inferred kind.
+    #[test]
+    fn provider_kinds_without_a_server_flow_are_refused() {
+        for providers in [
+            serde_json::json!({ "passkey": {} }),
+            serde_json::json!({ "clerk": { "domain": { "value": "x.clerk.accounts.dev" } } }),
+            serde_json::json!({ "sso": { "kind": "custom", "module": "src/auth.ts" } }),
+            serde_json::json!({ "jwt": { "kind": "delegated" } }),
+        ] {
+            let decl = serde_json::from_value::<AuthDeclaration>(serde_json::json!({
+                "providers": providers.clone()
+            }))
+            .expect("parses");
+            let err = decl.check_supported().unwrap_err();
+            assert!(matches!(err, AuthSchemaError::Unsupported { .. }), "{providers}: {err}");
+            assert!(err.to_string().contains("Supported kinds"), "{err}");
+        }
+        for supported in [
+            serde_json::json!({ "password": {}, "github": {} }),
+            serde_json::json!({ "google": {}, "magiclink": {} }),
+            serde_json::json!({ "corp": { "kind": "oidc", "issuer": "https://id.example.com" } }),
+        ] {
+            let decl = serde_json::from_value::<AuthDeclaration>(serde_json::json!({
+                "providers": supported.clone()
+            }))
+            .expect("parses");
+            assert!(decl.check_supported().is_ok(), "{supported}");
+        }
+    }
+
+    /// A magic link beside a password provider that lets unproven accounts sign
+    /// in is the configuration where a takeover inherits a squatter's work.
+    #[test]
+    fn magic_link_beside_an_unverified_password_provider_is_refused() {
+        let block = |password: serde_json::Value| {
+            serde_json::from_value::<AuthDeclaration>(serde_json::json!({
+                "providers": { "password": password, "magiclink": {} }
+            }))
+            .expect("parses")
+        };
+        let err = block(serde_json::json!({ "reset": "email" })).lower().unwrap_err();
+        assert_eq!(
+            err,
+            AuthSchemaError::UnprovenPasswordBesideMagicLink {
+                password: "password".into(),
+                magic: "magiclink".into(),
+            }
+        );
+        assert!(err.to_string().contains("verify: \"required\""), "{err}");
+        assert!(block(serde_json::json!({ "verify": "required" })).lower().is_ok());
+
+        // Either alone is fine; the refusal is about the pair.
+        for alone in [
+            serde_json::json!({ "providers": { "password": {} } }),
+            serde_json::json!({ "providers": { "magiclink": {} } }),
+            serde_json::json!({ "providers": { "email-link": { "kind": "magiclink" }, "pw": { "kind": "password" } } }),
+        ] {
+            let decl = serde_json::from_value::<AuthDeclaration>(alone.clone()).expect("parses");
+            let result = decl.check_email_proof();
+            if alone["providers"].get("pw").is_some() {
+                assert!(result.is_err(), "kinds are inferred from `kind`, not only preset names");
+            } else {
+                assert!(result.is_ok(), "{alone}");
+            }
+        }
     }
 
     #[test]

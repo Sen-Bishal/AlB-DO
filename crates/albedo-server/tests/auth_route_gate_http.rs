@@ -318,9 +318,13 @@ async fn a_gated_route_refuses_the_live_lane_and_its_action_to_a_stranger() {
         host: "127.0.0.1".to_string(),
         port,
         dev_mode: false,
+        hmr: false,
         forge: Default::default(),
         sources: Default::default(),
         uploads: Default::default(),
+        email: None,
+        redirects: Vec::new(),
+        webhooks: Default::default(),
         auth: AuthDeclaration {
             providers,
             ..Default::default()
@@ -474,4 +478,93 @@ async fn a_gated_route_refuses_the_live_lane_and_its_action_to_a_stranger() {
         StatusCode::UNAUTHORIZED,
         "control: the same action, the same token, a resolved principal"
     );
+
+    // ── 6 · sign out everywhere ──
+    //
+    // A second device signs in to the same account, then the first asks for
+    // every session to end. The second device's next request is a stranger's.
+    let other_device = load_public_page(&client, &base).await;
+    let signed_in_elsewhere = client
+        .post(format!("{base}/_albedo/auth/password/login"))
+        .header("cookie", &other_device.cookie)
+        .form(&[
+            ("_csrf", other_device.csrf.as_str()),
+            ("_albedo_return", other_device.return_path.as_str()),
+            ("email", "dash@example.com"),
+            ("password", "correct horse battery staple"),
+        ])
+        .send()
+        .await
+        .expect("responds");
+    let other_session = signed_in_elsewhere
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .find(|value| value.starts_with("__Host-albedo_session="))
+        .expect("the second device signs in")
+        .to_string();
+    let other_cookies = format!("{}; {other_session}", other_device.cookie);
+    let before = client
+        .get(format!("{base}/dash"))
+        .header("cookie", &other_cookies)
+        .send()
+        .await
+        .expect("responds");
+    assert_eq!(before.status(), StatusCode::OK, "control: the second device is signed in");
+    // …and is live on the gated route, with a lane opened under that session.
+    let (other_lane, mut other_trunk) = open_lane(&client, &base, Some(&other_cookies)).await;
+    let live = subscribe(&client, &base, &other_lane, &["/dash"], Some(&other_cookies)).await;
+    assert_eq!(
+        granted(&live, "ok"),
+        vec!["/dash".to_string()],
+        "control: the second device streams the gated route — got {live}"
+    );
+
+    let everywhere = client
+        .post(format!("{base}/_albedo/auth/logout-all"))
+        .header("cookie", &both_cookies)
+        .form(&[
+            ("_csrf", form.csrf.as_str()),
+            ("_albedo_return", form.return_path.as_str()),
+        ])
+        .send()
+        .await
+        .expect("responds");
+    assert_eq!(everywhere.status(), StatusCode::SEE_OTHER);
+    assert!(
+        everywhere
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| value.starts_with("__Host-albedo_session=") && value.contains("Max-Age=0")),
+        "this device's cookie is cleared too"
+    );
+
+    // The lane that was already open ends, rather than streaming the gated
+    // route to a revoked session until its tab closes.
+    let lane_ended = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while let Ok(Some(_)) = other_trunk.chunk().await {}
+    })
+    .await;
+    assert!(
+        lane_ended.is_ok(),
+        "the other device's open live lane kept streaming after it was signed out"
+    );
+
+    for (device, cookies) in [("the device that asked", &both_cookies), ("the other device", &other_cookies)] {
+        let after = client
+            .get(format!("{base}/dash"))
+            .header("cookie", cookies)
+            .send()
+            .await
+            .expect("responds");
+        assert_eq!(
+            after.status(),
+            StatusCode::UNAUTHORIZED,
+            "{device} still holds a live session after signing out everywhere"
+        );
+    }
 }

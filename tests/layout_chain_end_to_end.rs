@@ -161,6 +161,22 @@ fn nested_route_applies_outer_layout_then_inner_layout_then_leaf() {
     );
 }
 
+/// A layout is rendered once per route, with that route's pattern as `route` —
+/// so one shared layout can mark the page it is wrapping (`aria-current`) with
+/// no request and no client code. Each route's shell must carry its own.
+#[test]
+fn each_layout_render_receives_the_route_it_wraps() {
+    let manifest = build_layouts_manifest();
+
+    let root = manifest.routes["/"].shell.body_open.as_str();
+    assert!(root.contains(r#"data-route="/""#), "{root}");
+    assert!(!root.contains("aria-current"), "`/` is not `/nested`: {root}");
+
+    let nested = manifest.routes["/nested"].shell.body_open.as_str();
+    assert!(nested.contains(r#"data-route="/nested""#), "{nested}");
+    assert!(nested.contains(r#"aria-current="page""#), "{nested}");
+}
+
 #[test]
 fn children_sentinel_is_substituted_without_leaving_residue() {
     let manifest = build_layouts_manifest();

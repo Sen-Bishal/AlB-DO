@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Tier {
@@ -214,10 +214,15 @@ pub struct RouteManifest {
     pub tier_a_root: Vec<RenderedNode>,
     pub tier_b: Vec<TierBNode>,
     pub tier_c: Vec<TierCNode>,
-    /// Phase P · broadcast topics referenced by any component on this
-    /// route. The streaming handler auto-subscribes each WT session
-    /// to these at render time so JSX-side `useSharedSlot("topic")`
-    /// resolves without explicit subscribe.
+    /// Phase P · the broadcast topics the components **this route renders**
+    /// read. Every live lane subscribes a page to exactly these, so they are
+    /// the read capability the page's GET already granted — and no more.
+    ///
+    /// 🔴 Until 2026-10-28 this was every topic in the project, on the theory
+    /// that a static topic "is already public". It is not: a topic read only by
+    /// an `auth = "required"` page is exactly as private as that page, and the
+    /// project-wide list streamed it to anonymous visitors of every public route
+    /// (ALB-01). See `ManifestBuilder::collect_route_reads`.
     #[serde(default)]
     pub shared_slot_topics: Vec<String>,
     /// AUTH § 4 · whether an anonymous request may render this route.
@@ -254,6 +259,19 @@ pub struct RouteManifest {
     /// derivations — a topic is reachable only through a route that renders it.
     #[serde(default)]
     pub shared_slot_sources: Vec<SourceTopicSpec>,
+    /// Column projection · the fields this route reads from each live
+    /// binding, keyed by what the binding names: a static topic, a partitioned
+    /// collection, or a declared source as `aperture:<source>.<route>`.
+    ///
+    /// Only **bounded** reads are listed. An absent key means every column —
+    /// the walk could not prove less (a row handed to a child component,
+    /// spread, passed to a function) — and a manifest written before this field
+    /// means the same, which is what it did. The lanes cut every JSON value
+    /// they send down to these fields plus the collection's key, so a page that
+    /// renders a waitlist's count is never sent the emails on it. See
+    /// [`crate::transforms::column_reads`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shared_slot_columns: BTreeMap<String, Vec<String>>,
     /// Phase P · TS-side action handler names + their wire
     /// `action_id`s for this route. Populated once Stream C lands
     /// the `action()` extractor; the field exists now so manifests
@@ -528,6 +546,19 @@ pub struct TierCNode {
     /// falls back to full A3 hydration, where its effect actually runs.
     #[serde(default)]
     pub side_effects: bool,
+    /// The request-scoped props this island reads itself — `params` for a
+    /// `[slug]` route component, `user` for one that names the principal —
+    /// resolved per request exactly as [`TierBNode::dynamic_prop_keys`] is.
+    ///
+    /// 🔴 An island used to be rendered once at boot from `initial_props`, which
+    /// the build captured with no request in scope. A `[id]` page that held
+    /// state was Tier C and rendered `params` as nothing on every URL. This is
+    /// what tells the serve path that this island cannot be rendered from boot.
+    ///
+    /// Skipped when empty, so a manifest for an app with no such island is
+    /// byte-identical to one written before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_prop_keys: Vec<String>,
 }
 
 /// AUTH § 4 · whether a **page route** may be rendered for an anonymous request.

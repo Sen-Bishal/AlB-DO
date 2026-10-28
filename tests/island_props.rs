@@ -90,18 +90,65 @@ fn the_parents_props_reach_the_island_node() {
 /// Handlers are not data. A closure cannot be serialised into a payload, and
 /// the island's own `onClick` is compiled into its bundle — shipping a
 /// stringified closure as a prop would be worse than useless.
+///
+/// 🪤 This used to assert that no captured key *starts with* "on", over a
+/// fixture that passed no handler at all — so it passed vacuously while
+/// pinning the bug below as the rule. `handlers.tsx` now passes one.
 #[test]
 fn event_handler_attributes_are_not_captured_as_props() {
     let manifest = build_manifest();
-    let props = &badge_node(&manifest).initial_props;
-    let object = props.as_object().expect("props must be an object");
+    let props = &manifest
+        .routes
+        .values()
+        .flat_map(|route| route.tier_c.iter())
+        .find(|node| node.component_id == "Pressable")
+        .expect("Pressable must be a Tier-C island — it has a hook and a handler")
+        .initial_props;
 
-    for key in object.keys() {
-        assert!(
-            !key.starts_with("on"),
-            "`{key}` is a handler and must not be captured as a prop; got {props}"
-        );
-    }
+    // Captured at all — or the absence below would prove nothing.
+    assert_eq!(props.get("step").and_then(|v| v.as_f64()), Some(3.0), "got {props}");
+    assert!(
+        props.get("onBump").is_none(),
+        "`onBump` is a handler and must not be captured as a prop; got {props}"
+    );
+    assert_eq!(
+        props.get("once").and_then(|v| v.as_str()),
+        Some("yes"),
+        "`once` sits beside a handler and is still data; got {props}"
+    );
+}
+
+/// …and a prop whose name merely begins with "on" is data.
+///
+/// 🔴 Both evaluator sites filtered with `starts_with("on")`, so `only`,
+/// `onboarding`, `once` and `online` were dropped as if they were handlers —
+/// from an island's captured props, and from a plain child component's props —
+/// silently: the build stayed green and the value was simply absent.
+#[test]
+fn a_prop_named_on_something_is_data_not_a_handler() {
+    let manifest = build_manifest();
+    let props = &badge_node(&manifest).initial_props;
+    assert_eq!(
+        props.get("only").and_then(|v| v.as_str()),
+        Some("solo"),
+        "the island's `only` was dropped; got {props}"
+    );
+    assert_eq!(
+        props.get("onboarding").and_then(|v| v.as_str()),
+        Some("step1"),
+        "the island's `onboarding` was dropped; got {props}"
+    );
+
+    // The other path: `Plan` is rendered inline into the route's static markup,
+    // which a Tier-A route carries in its shell.
+    let home = manifest.routes.get("/").expect("the index route");
+    let html: String = std::iter::once(home.shell.body_open.as_str())
+        .chain(home.tier_a_root.iter().map(|node| node.html.as_str()))
+        .collect();
+    assert!(
+        html.contains("plan annual after trial"),
+        "a child component's `only`/`onboarding` were dropped:\n{html}"
+    );
 }
 
 /// Consumer 1 — the client hydration payload. Every island is seeded from its

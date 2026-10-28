@@ -34,7 +34,6 @@
 //! which is the exact threat a CSRF token guards against.
 
 use crate::actions::{ActionHandler, SessionSlots};
-use crate::error::RuntimeError;
 use crate::lifecycle::RequestContext;
 use crate::render::csrf::CsrfRegistry;
 use axum::body::Body;
@@ -193,7 +192,7 @@ pub async fn run_form_action_request(
     slots: SessionSlots,
     overlay: Option<&crate::dev::SharedErrorRegistry>,
 ) -> Response<Body> {
-    use crate::forms::{negotiate_accept, see_other, FormBody, Wants};
+    use crate::forms::{negotiate_accept, see_other, FormBody, FormFeedback, Wants};
 
     let content_type = ctx.headers.get("content-type").map(String::as_str);
     let form = match FormBody::decode(content_type, body.as_ref()) {
@@ -232,18 +231,56 @@ pub async fn run_form_action_request(
     )
     .await
     {
+        // `return { redirect }` — the browser is sent where the action said,
+        // already checked against `redirects` by the action adapter. The
+        // no-JS answer to a `Navigate` is the `303` a browser follows itself.
+        Ok(instructions) if wants == Wants::Redirect && navigate_target(&instructions).is_some() => {
+            let url = navigate_target(&instructions).unwrap_or_default();
+            Response::builder()
+                .status(StatusCode::SEE_OTHER)
+                .header(header::LOCATION, url)
+                .header("cache-control", "no-store")
+                .body(Body::empty())
+                .unwrap_or_else(|_| Response::new(Body::empty()))
+        }
         Ok(instructions) => match wants {
             Wants::Frame => frame_response(instructions),
-            // The opcodes are deliberately dropped here, and that is not a loss:
-            // they describe an in-place mutation of a DOM this caller does not
-            // have. The browser re-requests the page, and the render it gets
-            // back is built from the state the action just committed — which is
-            // the same information by a different route, and the reason
-            // POST/Redirect/GET is the pattern rather than a fallback.
-            Wants::Redirect => see_other(&return_path),
+            // The opcodes describe an in-place mutation of a DOM this caller
+            // does not have, so they are not sent. The browser re-requests the
+            // page, and the render it gets back is built from the state the
+            // action just committed — the same information by a different
+            // route, and the reason POST/Redirect/GET is the pattern rather than
+            // a fallback.
+            //
+            // Except for one thing the re-render cannot rebuild: what the action
+            // *said* about this submit — the `{ error }` / `{ ok }` the frame
+            // projects onto the form's sinks. That is the only state that lives
+            // in the response rather than in FORGE, so it rides the redirect
+            // (`FormFeedback`) and is painted by the render it lands on — which
+            // it lands on at the form, not at the top of the page.
+            Wants::Redirect => match FormFeedback::from_frame(&return_path, &instructions) {
+                Some(feedback) => {
+                    let anchor = dom_render_compiler::transforms::form::form_feedback_anchor(action_name);
+                    let mut response = see_other(&return_path.at_anchor(&anchor));
+                    if let Ok(cookie) = axum::http::HeaderValue::from_str(&feedback.set_cookie()) {
+                        response.headers_mut().append(axum::http::header::SET_COOKIE, cookie);
+                    }
+                    response
+                }
+                None => see_other(&return_path),
+            },
         },
         Err(refusal) => refusal,
     }
+}
+
+/// Where an action's `Navigate` sends the browser, if it emitted one — the last,
+/// as the client applies them in order and the last one wins.
+fn navigate_target(instructions: &[dom_render_compiler::ir::opcode::Instruction]) -> Option<&str> {
+    instructions.iter().rev().find_map(|instruction| match instruction {
+        dom_render_compiler::ir::opcode::Instruction::Navigate { url } => Some(url.as_str()),
+        _ => None,
+    })
 }
 
 /// `ActionEventKind::Submit` — mirrored from
@@ -445,19 +482,6 @@ fn error_response(status: StatusCode, message: String) -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Convenience wrapper so the [`crate::error::RuntimeError`] surface
-/// stays the canonical failure type for action handlers. Currently
-/// unused outside `RuntimeError::Authentication` mapping — the
-/// dispatcher converts every error variant uniformly to 500 in this
-/// Phase-G MVP.
-#[allow(dead_code)]
-pub(crate) fn status_for_error(err: &RuntimeError) -> StatusCode {
-    match err {
-        RuntimeError::Authentication(_) => StatusCode::UNAUTHORIZED,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
 /// Try to read a `_csrf` string field out of a JSON-encoded payload.
 ///
 /// Returns:
@@ -489,6 +513,7 @@ fn extract_csrf_field(payload: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::actions::{ActionHandler, SessionSlots};
+    use crate::error::RuntimeError;
     use axum::body::to_bytes;
     use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};
     use dom_render_compiler::ir::opcode::{Instruction, SlotId, StableId, TagId};
@@ -506,6 +531,7 @@ mod tests {
             body: Bytes::new(),
             metadata: Default::default(),
             principal: None,
+            user: None,
         }
     }
 
@@ -1199,6 +1225,58 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&payload).expect("json payload");
         assert_eq!(value["author"], serde_json::json!("ada"));
         assert_eq!(value["message"], serde_json::json!("hello"));
+    }
+
+    /// The no-JS half of the feedback channel: what the action said about the
+    /// submit is not dropped with the rest of the frame. It rides the redirect
+    /// in a cookie, and the redirect lands on the form's success sink.
+    #[tokio::test]
+    async fn a_browser_form_submit_carries_its_feedback_across_the_redirect() {
+        use dom_render_compiler::ir::opcode::{Instruction, StableId};
+        use dom_render_compiler::transforms::form::allocate_form_ok_id;
+
+        let csrf_registry = CsrfRegistry::new();
+        let session = SessionId::random();
+        let token = csrf_registry.token_for(session);
+
+        let mut registry: ActionRegistry = HashMap::new();
+        let handler: Arc<dyn ActionHandler> = Arc::new(
+            |_ctx: RequestContext, _env: ActionEnvelope, _slots: SessionSlots| async move {
+                Ok(vec![Instruction::SetText {
+                    stable_id: StableId(allocate_form_ok_id("join")),
+                    text: b"You're on the list.".to_vec(),
+                }])
+            },
+        );
+        registry.insert(allocate_form_action_id("join"), handler);
+
+        let response = run_form_action_request(
+            &registry,
+            &csrf_registry,
+            &form_actions(&[allocate_form_action_id("join")]),
+            &no_gated_actions(),
+            form_ctx(Some("text/html,*/*;q=0.8")),
+            "join",
+            Bytes::from(format!("_csrf={token}&_albedo_return=%2F&email=a%40b.co")),
+            slots_for(session),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/#albedo-feedback-join",
+            "the reader must land on their form's feedback, not the top of the page"
+        );
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("the feedback rides a cookie")
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with(crate::forms::FEEDBACK_COOKIE), "{cookie}");
+        assert!(cookie.contains("You%27re+on+the+list."), "{cookie}");
     }
 
     /// The gate is inherited, not re-implemented. A form-encoded submit with no

@@ -86,7 +86,7 @@ fn an_awaiting_handler_suspends_once_then_completes_with_its_effects() {
         passes += 1;
         assert!(passes < 6, "runaway replay");
         match project
-            .invoke_action_quickjs_pass(&mut engine, &envelope, &slots, None, Some(&journal))
+            .invoke_action_quickjs_pass(&mut engine, &envelope, &slots, None, Some(&journal), dom_render_compiler::runtime::RequestBindings::anonymous())
             .expect("pass dispatches")
         {
             ActionPass::Completed(instructions) => break instructions,
@@ -157,7 +157,7 @@ fn a_handler_that_never_calls_out_completes_in_one_pass() {
 
     let journal = Journal::new("w", "b");
     match project
-        .invoke_action_quickjs_pass(&mut engine, &envelope, &slots, None, Some(&journal))
+        .invoke_action_quickjs_pass(&mut engine, &envelope, &slots, None, Some(&journal), dom_render_compiler::runtime::RequestBindings::anonymous())
         .expect("dispatches")
     {
         ActionPass::Completed(instructions) => {

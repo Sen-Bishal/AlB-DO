@@ -315,7 +315,7 @@ impl Limiter {
         Ok(Self { shutter, proxies })
     }
 
-    /// Build from parts. Tests inject a [`ManualClock`](dom_render_compiler::shutter::ManualClock)
+    /// Build from parts. Tests inject a `ManualClock`
     /// through the [`Shutter`]; nothing in production does.
     #[must_use]
     pub fn with(shutter: Shutter, proxies: TrustedProxies) -> Self {

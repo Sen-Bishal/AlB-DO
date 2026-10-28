@@ -178,7 +178,8 @@ pub struct QuickJsEnginePool {
     /// Number of engines/threads the pool owns.
     size: usize,
     /// SANDGATE-A · confine an engine's realm after every checkout on which
-    /// third-party code could have run. Off via `ALBEDO_SANDGATE=0`.
+    /// third-party code could have run. Always on: it is a security boundary,
+    /// and a boundary an environment variable can remove is not one.
     confine_after_use: bool,
     /// How many checkouts have been followed by a realm rebuild.
     confinements: Arc<AtomicU64>,
@@ -261,9 +262,7 @@ impl QuickJsEnginePool {
             permits: Arc::new(Semaphore::new(size)),
             joins: Mutex::new(joins),
             size,
-            confine_after_use: std::env::var("ALBEDO_SANDGATE")
-                .map(|value| value != "0")
-                .unwrap_or(true),
+            confine_after_use: true,
             confinements: Arc::new(AtomicU64::new(0)),
             confinement_failures: Arc::new(AtomicU64::new(0)),
             job_budget: None,
@@ -335,17 +334,6 @@ impl QuickJsEnginePool {
     #[must_use]
     pub fn confines(&self) -> bool {
         self.confine_after_use
-    }
-
-    /// Builds a pool sized to the available parallelism (falling back to 1).
-    /// This is the boot-time default; matches the multi-thread runtime's
-    /// worker count closely enough that checkouts rarely queue.
-    #[must_use]
-    pub fn with_default_size() -> Self {
-        let n = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        Self::with_size(n)
     }
 
     /// Number of engines in the pool.
@@ -461,7 +449,8 @@ impl QuickJsEnginePool {
                     tracing::error!(
                         target: "albedo.sandgate",
                         error = %err,
-                        "SANDGATE confinement failed; this engine's realm is                          incompletely populated and the next render on it will fail"
+                        "rebuilding the sandbox failed; this engine's realm is incompletely \
+                         populated and the next render on it will fail"
                     );
                 }
             }
@@ -864,6 +853,7 @@ fn warm_engine(engine: &mut QuickJsEngine) {
         raw_bindings: &[],
         setters: &setters,
         event_json: None,
+        request: dom_render_compiler::runtime::RequestBindings::anonymous(),
         broadcast_current: &broadcast_current,
         journal: None,
     };
@@ -1188,6 +1178,7 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
                     raw_bindings: &[],
                     setters: &[],
                     event_json: None,
+                    request: dom_render_compiler::runtime::RequestBindings::anonymous(),
                     broadcast_current: &bc,
                     journal: None,
                 };

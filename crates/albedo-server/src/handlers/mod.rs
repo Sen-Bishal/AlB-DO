@@ -4,6 +4,8 @@ pub mod api;
 pub mod auth_gate;
 pub mod auth_routes;
 pub mod dev;
+pub mod email_routes;
+pub mod not_found;
 pub mod oauth_routes;
 pub mod patches;
 pub mod phosphor;

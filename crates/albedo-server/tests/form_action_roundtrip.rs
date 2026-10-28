@@ -79,6 +79,7 @@ fn ctx() -> RequestContext {
         body: Bytes::new(),
         metadata: BTreeMap::new(),
         principal: None,
+        user: None,
     }
 }
 

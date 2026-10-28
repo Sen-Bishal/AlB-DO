@@ -2012,21 +2012,6 @@ pub fn bundle_npm_dependency(
     })
 }
 
-/// Bundle a set of bare specifiers. Artifacts for files shared between
-/// specifiers (e.g. two `date-fns/…` subpaths) collapse at load time via
-/// their identical keys and source hashes.
-pub fn bundle_npm_dependencies(
-    search_dir: &Path,
-    specifiers: impl IntoIterator<Item = impl AsRef<str>>,
-    options: &ShakeOptions,
-) -> Result<Vec<NpmDependencyBundle>, NpmBundleError> {
-    let mut bundles = Vec::new();
-    for specifier in specifiers {
-        bundles.push(bundle_npm_dependency(search_dir, specifier.as_ref(), options)?);
-    }
-    Ok(bundles)
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {

@@ -75,12 +75,6 @@ impl ApiResponse {
         self
     }
 
-    /// Returns `self` with the body replaced.
-    #[must_use]
-    pub fn with_body(mut self, body: impl Into<Bytes>) -> Self {
-        self.body = body.into();
-        self
-    }
 }
 
 impl IntoResponse for ApiResponse {
@@ -168,6 +162,7 @@ mod tests {
             body: Bytes::from_static(b"payload"),
             metadata: BTreeMap::new(),
             principal: None,
+            user: None,
         };
         let response = handler.handle(ctx).await.unwrap();
         assert_eq!(response.body.as_ref(), b"payload");

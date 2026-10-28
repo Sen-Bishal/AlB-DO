@@ -81,6 +81,20 @@
 
   // ── 1. Link click interception ────────────────────────────────
 
+  // The path + query the DOM was last rendered for. A step that only moves
+  // the fragment — an in-page anchor, which Chrome reports as a `popstate`
+  // too, or Back from `#plans` to the top — stays on the same route, and the
+  // browser has already scrolled it. Refreshing the route there re-rendered
+  // the whole body for nothing: a request per anchor click, typed input
+  // wiped, and the element the fragment names replaced, so `:target` never
+  // held.
+  let renderedPath = globalScope.location.pathname + globalScope.location.search;
+
+  function pathOf(href) {
+    const url = new URL(href, globalScope.location.href);
+    return url.pathname + url.search;
+  }
+
   // Capture-phase listener so an inner element's stopPropagation()
   // doesn't lose the Link click before we see it. Match on the
   // closest ancestor carrying `data-albedo-link` so users can wrap
@@ -119,6 +133,10 @@
       if (url.origin !== globalScope.location.origin) {
         return;
       }
+      // A fragment on this same page is the browser's to scroll to.
+      if (url.hash && url.pathname + url.search === renderedPath) {
+        return;
+      }
       event.preventDefault();
       navigateToRoute(url.pathname + url.search + url.hash);
     },
@@ -130,6 +148,7 @@
   // refresh call already issues the WT request that streams the
   // shell and the Tier-C patches.
   function navigateToRoute(pathWithQuery) {
+    renderedPath = pathOf(pathWithQuery);
     const refresh = ALBEDO.requestRouteRefresh
       ? ALBEDO.requestRouteRefresh(pathWithQuery)
       : Promise.resolve();
@@ -154,9 +173,14 @@
   }
 
   // Browser back/forward — translate popstate into a route refresh
-  // against the new URL so the rendered DOM matches the URL bar.
+  // against the new URL so the rendered DOM matches the URL bar. Only when
+  // the route changed: a fragment-only step is left to the browser.
   globalScope.addEventListener('popstate', function onAlbedoPopState() {
     const loc = globalScope.location;
+    if (loc.pathname + loc.search === renderedPath) {
+      return;
+    }
+    renderedPath = loc.pathname + loc.search;
     const path = loc.pathname + loc.search + loc.hash;
     if (ALBEDO.requestRouteRefresh) {
       ALBEDO.requestRouteRefresh(path);
@@ -164,6 +188,9 @@
   });
 
   // ── 2. Form submit interception ───────────────────────────────
+
+  // Set by the Navigate handler when a frame sends the page to another origin.
+  let leavingPage = false;
 
   // Capture-phase, like the click handler, so a child element's
   // preventDefault chain can't make us miss the submit.
@@ -188,10 +215,73 @@
         return;
       }
       event.preventDefault();
-      submitAlbedoForm(form, actionName);
+      // A second press while the first is still in flight is swallowed, not
+      // queued: it would send the same intention twice.
+      if (form.getAttribute('aria-busy') === 'true') {
+        return;
+      }
+      submitAlbedoForm(form, actionName, event.submitter || null);
     },
     true,
   );
+
+  // A plain form — no action name, so the browser posts it itself (the sign-in
+  // forms, sign-out) — gets the same in-flight marks, so a stylesheet can show
+  // one loading state for every form on the site. Bubble phase, and only if
+  // nothing else took the submit.
+  //
+  // Nothing is DISABLED here, unlike an action's submit: the browser builds
+  // what it sends AFTER this event, and a disabled control — the pressed
+  // button included — would silently drop out of it. A second press is left
+  // to the page's own styles (`pointer-events`), and to the server's
+  // double-submit handling, which does not depend on this.
+  document.addEventListener('submit', function markPlainFormInFlight(event) {
+    if (event.defaultPrevented) {
+      return;
+    }
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || resolveFormActionName(form)) {
+      return;
+    }
+    if ((form.getAttribute('method') || '').toLowerCase() !== 'post') {
+      return;
+    }
+    let target;
+    try {
+      target = new URL(form.action, globalScope.location.href);
+    } catch (_err) {
+      return;
+    }
+    if (target.origin !== globalScope.location.origin) {
+      return;
+    }
+    form.setAttribute('aria-busy', 'true');
+    form.setAttribute('data-albedo-state', 'busy');
+    if (event.submitter) {
+      event.submitter.setAttribute('data-albedo-pressed', '');
+    }
+  });
+
+  // Back to a page the browser kept in memory: every mark says "in flight"
+  // about a request that already ended, so they all go — and the controls an
+  // action's submit disabled come back.
+  globalScope.addEventListener('pageshow', function clearStaleInFlight(event) {
+    if (!event.persisted) {
+      return;
+    }
+    leavingPage = false;
+    document.querySelectorAll('form[data-albedo-state="busy"]').forEach(function clear(form) {
+      form.removeAttribute('aria-busy');
+      form.removeAttribute('data-albedo-state');
+    });
+    document.querySelectorAll('[data-albedo-pressed]').forEach(function unpress(el) {
+      el.removeAttribute('data-albedo-pressed');
+    });
+    document.querySelectorAll('[data-albedo-held]').forEach(function release(el) {
+      el.removeAttribute('data-albedo-held');
+      el.disabled = false;
+    });
+  });
 
   // Serialize a form to a flat JSON object, encode the action
   // envelope, POST it, then hand the response bytes back to the
@@ -227,8 +317,8 @@
     );
   }
 
-  function submitAlbedoForm(form, actionName) {
-    const payload = serializeFormToJson(form, mintIntentToken());
+  function submitAlbedoForm(form, actionName, submitter) {
+    const payload = serializeFormToJson(form, mintIntentToken(), submitter);
     const actionId = resolveActionId(actionName);
 
     // `encodeActionEnvelope` (bincode.js) reads camelCase `actionId` /
@@ -266,6 +356,44 @@
       formHeaders['x-albedo-csrf'] = csrfToken;
     }
 
+    // The form's lifecycle, stated on the form itself so a stylesheet — not
+    // app code — can show it: `aria-busy` + `data-albedo-state="busy"` while in
+    // flight (submit controls disabled, so a second press has nothing to
+    // press), `data-albedo-state="failed"` when the request never produced a
+    // frame, and neither once it did. What the ACTION said — `{ error }`,
+    // `{ ok }` — arrives in the frame and lands in the form's own sinks; this
+    // only covers the case where nothing arrived to say it. Before this, that
+    // case was a console line: the reader clicked and saw nothing, either way.
+    // Disabled only after serializing, because disabled fields are not sent.
+    const controls = Array.prototype.filter.call(form.elements, function isLiveSubmit(el) {
+      return (el.type === 'submit' || el.type === 'image') && !el.disabled;
+    });
+    function settle(state) {
+      form.removeAttribute('aria-busy');
+      controls.forEach(function enable(el) {
+        el.disabled = false;
+        el.removeAttribute('data-albedo-held');
+      });
+      if (submitter) {
+        submitter.removeAttribute('data-albedo-pressed');
+      }
+      if (state) {
+        form.setAttribute('data-albedo-state', state);
+      } else {
+        form.removeAttribute('data-albedo-state');
+      }
+    }
+    form.setAttribute('aria-busy', 'true');
+    form.setAttribute('data-albedo-state', 'busy');
+    // Which button — so the loading state shows on the one that was pressed.
+    if (submitter) {
+      submitter.setAttribute('data-albedo-pressed', '');
+    }
+    controls.forEach(function disable(el) {
+      el.disabled = true;
+      el.setAttribute('data-albedo-held', '');
+    });
+
     fetch(ACTION_ENDPOINT, {
       method: 'POST',
       headers: formHeaders,
@@ -287,13 +415,23 @@
       })
       .then(function applyFrame(buffer) {
         if (!buffer) {
+          settle('failed');
           return;
         }
         if (ALBEDO.applyFrameBytes) {
           ALBEDO.applyFrameBytes(new Uint8Array(buffer));
         }
+        // The frame sent the page to another origin (a checkout, a billing
+        // portal): the request is not over until that page arrives, so the
+        // form stays in flight rather than looking idle for the second the
+        // next page takes. `pageshow` clears it if the reader comes back.
+        if (leavingPage) {
+          return;
+        }
+        settle(null);
       })
       .catch(function reportFormFailure(err) {
+        settle('failed');
         if (globalScope.console && globalScope.console.error) {
           globalScope.console.error('ALBEDO form submit failed', err);
         }
@@ -304,7 +442,14 @@
   // serialized as UTF-8 bytes. Multi-select and same-name checkbox
   // groups collapse into arrays. File inputs are skipped — they need
   // a multipart path that this Stage 1 envelope can't carry yet.
-  function serializeFormToJson(form, intentToken) {
+  // `submitter` is the button that was pressed, when there was one. Only IT
+  // contributes its `name=value` — the rule the browser applies to a JS-less
+  // submit, so `<button name="intent" value="cancel">` beside a sibling
+  // `value="change"` sends the one that was clicked either way. Before this,
+  // every named <button> was appended regardless, so the payload said
+  // whichever came last, and the same form did different things with
+  // JavaScript on and off.
+  function serializeFormToJson(form, intentToken, submitter) {
     const out = Object.create(null);
 
     const elements = form.elements;
@@ -320,10 +465,15 @@
         // Stage 2: file uploads via multipart envelope.
         continue;
       }
-      if (tag === 'input' && type === 'submit') {
-        // Submit buttons surface as form elements but should not
-        // contribute their click label to the payload unless the
-        // user explicitly assigned a name with semantic meaning.
+      const isSubmitControl =
+        (tag === 'input' && (type === 'submit' || type === 'image')) ||
+        (tag === 'button' && (type === 'submit' || type === ''));
+      if (isSubmitControl) {
+        if (el === submitter) appendField(out, name, el.value);
+        continue;
+      }
+      if (tag === 'button') {
+        // `type="button"` / `type="reset"` are never submitted.
         continue;
       }
       if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
@@ -396,19 +546,36 @@
       if (typeof url !== 'string' || url.length === 0) {
         return;
       }
-      navigateToRoute(url);
+      // Another origin — a checkout page, an identity provider, allowed by the
+      // app's `redirects` (the server refused anything else before this frame
+      // was sent). A route refresh cannot render a page this app does not
+      // serve, so it is a real navigation.
+      let target;
+      try {
+        target = new URL(url, globalScope.location.href);
+      } catch (_err) {
+        return;
+      }
+      if (target.origin !== globalScope.location.origin) {
+        leavingPage = true;
+        globalScope.location.assign(target.href);
+        return;
+      }
+      navigateToRoute(target.pathname + target.search + target.hash);
     });
   }
 
   // ── Hashing fallback ──────────────────────────────────────────
 
   // Replicates `runtime::eval::component::fnv1a_32`. Used when the
-  // runtime hasn't exposed `hashActionName` yet — same bytes as the
-  // server's hash family so action_ids align.
+  // runtime hasn't exposed `hashActionName` yet — the same BYTES as the
+  // server's hash, which are UTF-8. 🔴 This hashed `charCodeAt(i)`, a UTF-16
+  // code unit, which agrees with UTF-8 on ASCII only.
   function fnv1a32(name) {
+    const bytes = new TextEncoder().encode(name);
     let hash = 0x811c9dc5 >>> 0;
-    for (let i = 0; i < name.length; i++) {
-      hash = (hash ^ name.charCodeAt(i)) >>> 0;
+    for (let i = 0; i < bytes.length; i++) {
+      hash = (hash ^ bytes[i]) >>> 0;
       hash = Math.imul(hash, 0x01000193) >>> 0;
     }
     return hash >>> 0;

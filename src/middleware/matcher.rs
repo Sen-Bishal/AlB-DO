@@ -225,6 +225,19 @@ impl Pattern {
 /// query string and wrong for a path.
 #[must_use]
 pub fn percent_decode_path(raw: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(raw)).into_owned()
+}
+
+/// The bytes a percent-encoded path spells, before anyone decides whether they
+/// are text.
+///
+/// A `%` not followed by two hex digits is not an escape and stands for itself —
+/// WHATWG URL's percent-decode, and what a browser sends for a hand-typed
+/// `/sale/50%`. Split out of [`percent_decode_path`] so the router's route
+/// `params` (which are served, and so cannot paper over invalid UTF-8 the way a
+/// comparison can) read escapes by this same rule rather than a second copy.
+#[must_use]
+pub fn percent_decode_bytes(raw: &str) -> Vec<u8> {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -240,7 +253,7 @@ pub fn percent_decode_path(raw: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 #[cfg(test)]

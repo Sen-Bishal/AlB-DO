@@ -161,10 +161,6 @@ impl ComponentGraph {
         self.components.get(&id).map(|r| r.clone())
     }
 
-    /// Get all components as an iterator
-    pub fn iter_components(&self) -> impl Iterator<Item = Component> + '_ {
-        self.components.iter().map(|r| r.value().clone())
-    }
 }
 
 impl Default for ComponentGraph {

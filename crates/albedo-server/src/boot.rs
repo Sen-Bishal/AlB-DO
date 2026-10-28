@@ -51,13 +51,15 @@ pub struct ProductionServerOptions {
     /// production streaming pipeline. `false` for `albedo serve`; `albedo dev`
     /// boots this same pipeline with it `true`.
     pub dev_mode: bool,
+    /// Push rebuilds to open pages (hot reload). Only meaningful with
+    /// `dev_mode`; `albedo dev --no-hmr` turns it off, and the watcher still
+    /// rebuilds — the page is refreshed by hand.
+    pub hmr: bool,
     /// The app's FORGE collections, as declared in the config's `forge` block.
     ///
-    /// `None` means the app declared none, and boot installs the built-in
-    /// walking-skeleton guestbook — which is what every project did before an
-    /// app could say what its data was. Kept as the *declarations* rather than a
-    /// built `ForgeSchema` so the failure surfaces here, at boot, with the
-    /// offending collection named.
+    /// Empty means the app declared none, and it gets no tables of its own.
+    /// Kept as the *declarations* rather than a built `ForgeSchema` so the
+    /// failure surfaces here, at boot, with the offending collection named.
     pub forge: BTreeMap<String, dom_render_compiler::forge::CollectionDecl>,
     /// APERTURE · the app's declared external sources, from the config's
     /// `sources` block.
@@ -79,6 +81,12 @@ pub struct ProductionServerOptions {
     ///
     /// Empty means the app accepts no files — a bound, not an omission.
     pub uploads: BTreeMap<String, dom_render_compiler::upload::UploadDecl>,
+    /// EMAIL · 15.3 — the config's `email` block. `None` means no mail.
+    pub email: Option<dom_render_compiler::email::EmailDecl>,
+    /// Origins an action may redirect to — the config's `redirects`.
+    pub redirects: Vec<String>,
+    /// Inbound webhooks — the config's `webhooks` block.
+    pub webhooks: BTreeMap<String, dom_render_compiler::webhook::WebhookDecl>,
     /// TLS + ACME, already resolved from flags and environment by the CLI.
     ///
     /// Carried rather than read from the environment here, so the flag surface
@@ -102,10 +110,14 @@ impl ProductionServerOptions {
             // `albedo serve` is production by default; `albedo dev` flips this on
             // via `ProductionServerOptions { dev_mode: true, .. }`.
             dev_mode: false,
+            hmr: contract.hmr.enabled,
             forge: contract.forge.clone(),
             sources: contract.sources.clone(),
             auth: contract.auth.clone(),
             uploads: contract.uploads.clone(),
+            email: contract.email.clone(),
+            redirects: contract.redirects.clone(),
+            webhooks: contract.webhooks.clone(),
             // The environment is the fallback; a caller with flags overwrites
             // this before booting.
             tls: crate::tls::TlsSettings::from_env(),
@@ -303,15 +315,12 @@ fn boot_inner(
         .map(|n| n.get())
         .unwrap_or(1);
 
-    // Force dev mode off so a release `albedo serve` never leaks the
-    // overlay/HMR endpoints. The inspector follows the same default
-    // policy; tests can flip it back on via the builder.
     // The app's declared collections, lowered and validated here so a malformed
     // `forge` block fails the boot with the offending collection named, rather
-    // than surfacing later as a topic that renders nothing. No declaration keeps
-    // the built-in guestbook, which is what every pre-Phase-2 project relied on.
+    // than surfacing later as a topic that renders nothing. No declaration means
+    // no app tables: the framework never invents data an app did not declare.
     let forge_schema = if opts.forge.is_empty() {
-        dom_render_compiler::forge::ForgeSchema::guestbook_default()
+        dom_render_compiler::forge::ForgeSchema::empty()
     } else {
         dom_render_compiler::forge::ForgeSchema::from_declarations(&opts.forge).map_err(|err| {
             RuntimeError::ServerStartup(format!("invalid `forge` block in albedo.config: {err}"))
@@ -331,6 +340,9 @@ fn boot_inner(
     // change is already a delta, so revoking on one device drops every other
     // tab's lane on the wire that already exists. A side table would need a
     // second mechanism to say the same thing.
+    opts.auth.check_supported().map_err(|err| {
+        RuntimeError::ServerStartup(format!("invalid `auth` block in albedo.config: {err}"))
+    })?;
     let auth_registry = opts.auth.lower().map_err(|err| {
         RuntimeError::ServerStartup(format!("invalid `auth` block in albedo.config: {err}"))
     })?;
@@ -450,7 +462,36 @@ fn boot_inner(
     // What it buys is the private case: a self-hosted IdP on a loopback or
     // RFC1918 address is denied by `check_address` unless its host is declared,
     // and the `auth` block is where an author declares it.
-    let auth_egress_hosts = auth_registry.egress_hosts();
+    // EMAIL · 15.3 — lowered here, beside `auth`, because the two are checked
+    // against each other: an auth flow that mails a link in an app with no
+    // `email` block is a reset button that does nothing, so it stops the boot.
+    // `albedo build` refuses the same app through `DevConfig::validate`; this is
+    // the second gate, for a server booted from options rather than a config.
+    let email_config = opts
+        .email
+        .as_ref()
+        .map(|decl| {
+            decl.lower().map_err(|err| {
+                RuntimeError::ServerStartup(format!("invalid `email` block in albedo.config: {err}"))
+            })
+        })
+        .transpose()?;
+    if email_config.is_none() {
+        if let Some(provider) = auth_registry.providers.iter().find(|p| p.sends_email()) {
+            return Err(RuntimeError::ServerStartup(format!(
+                "auth provider `{}` sends email (a reset, confirmation or sign-in link), but                  albedo.config has no `email` block to send it with",
+                provider.name
+            )));
+        }
+    }
+
+    // The mail provider's host joins the allowlist beside the auth hosts, for
+    // the reason they are there: a relay on a private address is refused by
+    // `check_address` unless it is declared, and the `email` block declares it.
+    let mut auth_egress_hosts = auth_registry.egress_hosts();
+    if let Some(host) = email_config.as_ref().and_then(|config| config.egress_host()) {
+        auth_egress_hosts.insert(host);
+    }
     let source_reader = if opts.sources.is_empty() && auth_egress_hosts.is_empty() {
         None
     } else {
@@ -555,10 +596,13 @@ fn boot_inner(
         .with_renderer_runtime(renderer)
         .with_forge_schema(forge_schema)
         .with_dev_mode(opts.dev_mode)
-        // Surface ALBEDO's own per-request server-compute time (ns/µs) in the
-        // terminal for both `albedo dev` and `albedo serve` — the honest number,
-        // published live. See `crate::timing`.
-        .with_request_timings(true)
+        .with_hmr(opts.hmr)
+        // The inspector is a development surface: `albedo dev` only.
+        .with_inspector(opts.dev_mode)
+        // ALBEDO's own per-request server-compute time (ns/µs): on for `dev`
+        // and the interactive dashboard, opt-in for a server writing to a log.
+        // See `crate::timing::request_timings_default`.
+        .with_request_timings(crate::timing::request_timings_default(opts.dev_mode))
         .with_quickjs_action_engine_pool(action_engine_pool_size);
 
     // Dev reload only: reuse the running server's live singletons so the
@@ -582,6 +626,32 @@ fn boot_inner(
     // `forge.db` is: a shipped binary must not write its uploads wherever it
     // happened to be launched from.
     builder = builder.with_uploads(upload_registry, opts.project_dir.clone());
+    // Where actions may redirect, and the signed inbound webhooks. Both lowered
+    // here so a bad entry — or a webhook secret whose variable is unset — stops
+    // the boot by name instead of refusing requests later for a reason nobody
+    // can see.
+    let redirects = crate::redirects::RedirectPolicy::new(&opts.redirects).map_err(|err| {
+        RuntimeError::ServerStartup(format!("invalid `redirects` in albedo.config: {err}"))
+    })?;
+    builder = builder.with_redirects(redirects);
+    if !opts.webhooks.is_empty() {
+        let webhooks = dom_render_compiler::webhook::WebhookRegistry::from_declarations(
+            &opts.webhooks,
+            |name| std::env::var(name).ok(),
+        )
+        .map_err(|err| {
+            RuntimeError::ServerStartup(format!("invalid `webhooks` block in albedo.config: {err}"))
+        })?;
+        builder = builder.with_webhooks(webhooks);
+    }
+    // EMAIL · the transport is built now so an `apiKey` naming an unset
+    // variable fails the boot; the link origin is decided in `run()`, where the
+    // TLS mode is known.
+    if let Some(config) = email_config {
+        builder = builder
+            .with_email(config, opts.project_dir.clone(), opts.dev_mode)
+            .map_err(RuntimeError::ServerStartup)?;
+    }
 
     let mut builder = builder.register_compiled_project(Arc::new(compiled));
 

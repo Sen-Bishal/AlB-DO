@@ -73,6 +73,11 @@ pub struct RequestContext {
     /// dispatcher turned it into, and components and topic resolution must never
     /// re-derive identity from the cookie themselves.
     pub principal: Option<PrincipalId>,
+    /// What a component reads as `user` —
+    /// [`Principal::user_value`](dom_render_compiler::auth::Principal::user_value),
+    /// computed once at dispatch from the same resolution as [`Self::principal`].
+    /// `None` on a context built without one; see [`Self::resolve`].
+    pub user: Option<Value>,
 }
 
 impl RequestContext {
@@ -81,14 +86,22 @@ impl RequestContext {
         // `null` rather than to an absent prop, so `user?.id` is the honest
         // spelling and a component cannot accidentally read a stale binding.
         //
-        // Only `id` is exposed here. Profile fields live on `albedo_users` and
-        // are read like any other row; putting them in scope would make every
-        // component that mentions `user` a reason to join a table it never asked
-        // for, and would tempt a partition key that cannot be one.
+        // The profile is in scope — `email`, `name`, `image`, and the providers
+        // this human can sign in with — because an account page has to show
+        // them and `albedo_users` is reserved, so there was no other way to read
+        // them. Neither earlier objection survives: the session lookup already
+        // JOINs `albedo_users` (the fields were fetched on every authenticated
+        // request and then dropped), and the compiler refuses any `user.*` but
+        // `user.id` as a partition key, so showing an email cannot tempt one.
         if key == "user" {
-            return Ok(match &self.principal {
-                Some(id) => serde_json::json!({ "id": id.as_str() }),
-                None => Value::Null,
+            return Ok(match (&self.user, &self.principal) {
+                (Some(user), _) => user.clone(),
+                // A context that carries only the id — a test, an older caller —
+                // still answers in the one shape, with the profile unknown.
+                (None, Some(id)) => {
+                    dom_render_compiler::auth::Principal::new(id.clone(), "").user_value()
+                }
+                (None, None) => Value::Null,
             });
         }
 
@@ -218,22 +231,21 @@ impl TierBDataFetcher for DefaultTierBDataFetcher {
     ) -> Result<(String, Value), RenderError> {
         let value = match &dep.source {
             DataSource::RequestContext { key } => ctx.resolve(key)?,
-            DataSource::Cache {
-                cache_key_template,
-                ttl_s,
-            } => serde_json::json!({
-                "cache_key": cache_key_template,
-                "ttl_s": ttl_s,
-                "hit": false
-            }),
-            DataSource::HttpFetch {
-                url_template,
-                method,
-            } => serde_json::json!({
-                "url": url_template,
-                "method": method,
-                "status": "not_fetched_in_default_fetcher"
-            }),
+            // This fetcher holds no cache, so every lookup is a miss — and a
+            // miss is `null`, never an object describing one. A made-up value
+            // would reach a render as if it were data.
+            DataSource::Cache { .. } => Value::Null,
+            // A declared HTTP fetch this fetcher cannot perform is a failed
+            // fetch, said so, not an invented response.
+            DataSource::HttpFetch { url_template, .. } => {
+                return Err(RenderError::DataFetchFailure {
+                    key: dep.key.clone(),
+                    message: format!(
+                        "the default data fetcher does not perform HTTP fetches ({url_template}); \
+                         install a `TierBDataFetcher` that does"
+                    ),
+                });
+            }
         };
 
         Ok((dep.key.clone(), value))
@@ -559,11 +571,15 @@ pub type TierBRenderPlan = HashMap<String, TierBEntryPlan>;
 /// `placeholder_id` is the island node's manifest `placeholder_id`
 /// (`__c_<slug>_<id>`), which contains no markup-significant characters, so the
 /// `{:?}` JS-string encoding is exact.
+///
+/// `props` is handed on, so the placeholder carries what the parent passed
+/// on this request (see [`crate::render::islands`]). The stub used to drop it,
+/// which is why `<Picker id={params.id} />` rendered the id the build saw.
 #[must_use]
 pub fn island_client_reference_stub(placeholder_id: &str) -> String {
     format!(
         "export default (function __albedoIslandRef(props) {{ \
-return globalThis.__albedo_island_placeholder({placeholder_id:?}); }});"
+return globalThis.__albedo_island_placeholder({placeholder_id:?}, props); }});"
     )
 }
 
@@ -571,7 +587,7 @@ return globalThis.__albedo_island_placeholder({placeholder_id:?}); }});"
 /// real HTML by rendering them through the warmed QuickJS [`engine pool`], the
 /// same warmed/concurrent/arena engines that execute `action()` calls.
 ///
-/// Replaces [`StubTierBRenderRegistry`] (which returned an empty `<section>`,
+/// Replaces the old stub registry (which returned an empty `<section>`,
 /// so every Tier-B node — async server components AND legit interactive Tier-B —
 /// rendered nothing on `albedo serve`). Each `call` checks out an engine, loads
 /// the component's module graph (idempotent after the first checkout), and runs
@@ -593,7 +609,7 @@ pub struct PooledTierBRenderRegistry {
     /// must render whatever is current *at that request*.
     broadcast: Arc<dom_render_compiler::runtime::BroadcastRegistry>,
     /// P6 · per-action `data-albedo-error` span markup, keyed by action name.
-    /// Computed once at boot by [`dom_render_compiler::runtime::eval::CompiledProject::form_error_span_seed`]
+    /// Computed once at boot by [`dom_render_compiler::runtime::eval::CompiledProject::form_feedback_span_seed`]
     /// — the SAME generator the non-pooled render path uses — so a Tier-B
     /// form emits the exact error sinks the submit projection targets and
     /// bakabox stops dropping the frame. Empty when the project has no forms.
@@ -942,8 +958,37 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
     }
 }
 
+/// What a server with no Tier-B renderer installed does with a Tier-B node:
+/// refuses it, loudly.
+///
+/// `albedo serve` always installs the pooled registry, so this is reached only
+/// by an embedder that streams a manifest without a compiled project. The
+/// alternative it replaced rendered a placeholder carrying the component's
+/// props in an HTML attribute — server data written into a public page.
+pub struct UnconfiguredTierBRenderRegistry;
+
+#[async_trait]
+impl TierBRenderRegistry for UnconfiguredTierBRenderRegistry {
+    async fn call(
+        &self,
+        render_fn: &str,
+        _props: &Value,
+        _data: &HashMap<String, Value>,
+    ) -> Result<String, RenderError> {
+        let message = "no Tier-B renderer is configured on this server".to_string();
+        Err(RenderError::RegistryFailure {
+            render_fn: render_fn.to_string(),
+            thrown_message: message.clone(),
+            diagnostic: message,
+        })
+    }
+}
+
+/// A registry that echoes its inputs as markup. Tests only.
+#[cfg(test)]
 pub struct StubTierBRenderRegistry;
 
+#[cfg(test)]
 #[async_trait]
 impl TierBRenderRegistry for StubTierBRenderRegistry {
     async fn call(
@@ -961,12 +1006,13 @@ impl TierBRenderRegistry for StubTierBRenderRegistry {
     }
 }
 
-/// Phase-E stub opcode registry. Used by `SharedRenderServices::default()`
-/// and by tests; returns an empty instruction vector. Real renderers
+/// An opcode registry that emits nothing. Tests only; real renderers
 /// implement [`TierBOpcodeRegistry`] to emit opcodes that target the
 /// placeholder element via its server-assigned `StableId`.
+#[cfg(test)]
 pub struct StubTierBOpcodeRegistry;
 
+#[cfg(test)]
 #[async_trait]
 impl TierBOpcodeRegistry for StubTierBOpcodeRegistry {
     async fn call(
@@ -994,7 +1040,7 @@ pub struct SharedRenderServices {
 impl Default for SharedRenderServices {
     fn default() -> Self {
         Self {
-            registry: Arc::new(StubTierBRenderRegistry),
+            registry: Arc::new(UnconfiguredTierBRenderRegistry),
             data_fetcher: Arc::new(DefaultTierBDataFetcher),
             opcode_registry: None,
         }
@@ -1311,11 +1357,13 @@ mod tests {
     fn island_client_reference_stub_emits_placeholder_call() {
         // The server-graph stub for a Tier-C island must call the prelude
         // placeholder primitive with the island's exact manifest placeholder id
-        // and export it as default — no island code, no other output.
+        // and export it as default — no island code, no other output. It hands
+        // on `props`: dropping them is what froze an island under a per-request
+        // page at the value the build saw.
         let stub = island_client_reference_stub("__c_progress_7");
         assert!(
-            stub.contains("globalThis.__albedo_island_placeholder(\"__c_progress_7\")"),
-            "stub must call the placeholder primitive with the pid: {stub}"
+            stub.contains("globalThis.__albedo_island_placeholder(\"__c_progress_7\", props)"),
+            "stub must call the placeholder primitive with the pid and props: {stub}"
         );
         assert!(
             stub.trim_start().starts_with("export default"),

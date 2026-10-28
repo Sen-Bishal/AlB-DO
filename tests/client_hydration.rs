@@ -2054,3 +2054,51 @@ client: {client:#?}"
         "the Tabs gap changed. If it SHRANK, delete this test and put Tabs back          in the strict parity list; if it GREW, something regressed."
     );
 }
+
+// ALB-03 · an island whose state becomes a `javascript:` URL. The server
+// renderers refuse it at first paint; this is the client half, where a later
+// state change reaches `applyProp` and `setAttribute` with no server in between.
+const SCRIPT_URL_SCENARIO: &str = r#"
+function Link(props) {
+  var s = useState(props.url);
+  var url = s[0], set = s[1];
+  return h('a', {
+    href: url,
+    title: url,
+    onClick: function () { set(' JaVa\tScRiPt:alert(1)'); },
+  }, 'site');
+}
+
+var container = document.createElement('div');
+var a = document.createElement('a');
+a.setAttribute('href', 'https://example.com/');
+a.setAttribute('title', 'https://example.com/');
+a.appendChild(document.createTextNode('site'));
+container.appendChild(a);
+
+__albedoClient.hydrate(h(Link, { url: 'https://example.com/' }), container);
+var before = a.getAttribute('href');
+a.__dispatch('click');
+
+JSON.stringify({ before: before, href: a.getAttribute('href'), title: a.getAttribute('title') });
+"#;
+
+#[test]
+fn an_island_never_writes_a_script_url_into_an_href() {
+    let runtime = Runtime::new().expect("quickjs runtime should initialize");
+    let context = Context::full(&runtime).expect("quickjs context should initialize");
+    let summary: String = context.with(|ctx| {
+        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<String, _>(SCRIPT_URL_SCENARIO).expect("scenario should evaluate")
+    });
+    let value: serde_json::Value = serde_json::from_str(&summary).expect("summary is JSON");
+
+    assert_eq!(value["before"], "https://example.com/");
+    assert_eq!(
+        value["href"],
+        dom_render_compiler::runtime::jsx_attributes::BLOCKED_URL,
+        "the client must refuse what the server renderers refuse"
+    );
+    assert_eq!(value["title"], " JaVa\tScRiPt:alert(1)", "a text attribute is text");
+}

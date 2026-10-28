@@ -76,6 +76,8 @@ sha2.workspace   = true
 rand.workspace   = true
 
 [dev-dependencies]
+# The compiler crate's test doubles, for this crate's tests only.
+dom-render-compiler = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 # 13.1 only: `tokio::test(start_paused)` needs `test-util`. The drain
 # deadline is a timer, and a test that really slept 5 s to prove a 5 s timeout

@@ -69,13 +69,28 @@ use tracing::{debug, warn};
 /// from planting a `state` we would then happily match against.
 pub const FLOW_COOKIE: &str = "__Host-albedo_oauth";
 
-/// Which of the two legs a path names.
+/// Which leg a path names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthRoute {
     /// Mint a flow and redirect to the provider.
     Start,
-    /// Receive the code and open a session.
+    /// Receive the code and open a session — or, for a link flow, connect it.
     Callback,
+    /// `POST` · mint a flow that CONNECTS the identity to the signed-in
+    /// principal instead of signing in as it. See [`link_start`].
+    Link,
+}
+
+impl OAuthRoute {
+    /// The one method this leg answers. `start`/`callback` are navigations and
+    /// must be `GET`; `link` changes an account and is a CSRF-checked `POST`.
+    #[must_use]
+    pub fn method(self) -> &'static str {
+        match self {
+            Self::Start | Self::Callback => "GET",
+            Self::Link => "POST",
+        }
+    }
 }
 
 /// Match a request path, yielding the leg and the provider name.
@@ -105,6 +120,7 @@ pub fn match_oauth_route(path: &str) -> Option<(OAuthRoute, &str)> {
     match leg {
         "start" => Some((OAuthRoute::Start, provider)),
         "callback" => Some((OAuthRoute::Callback, provider)),
+        "link" => Some((OAuthRoute::Link, provider)),
         _ => None,
     }
 }
@@ -182,6 +198,13 @@ pub struct OAuthRequest<'a> {
     pub origin: &'a str,
     /// Request headers, for the pending-flow cookie.
     pub headers: &'a HeaderMap,
+    /// `link` only — it is a form `POST`, so it carries a CSRF token bound to
+    /// the tab session, checked exactly as the password endpoints check theirs.
+    pub csrf: &'a crate::render::csrf::CsrfRegistry,
+    /// The tab session that token is bound to.
+    pub session: dom_render_compiler::runtime::SessionId,
+    /// The submitted form. Empty for the two `GET` legs.
+    pub body: bytes::Bytes,
 }
 
 /// Run one leg.
@@ -210,13 +233,76 @@ pub async fn run_oauth_route(
     match route {
         OAuthRoute::Start => start(provider, &request).await,
         OAuthRoute::Callback => callback(provider, &request).await,
+        OAuthRoute::Link => link_start(provider, &request).await,
     }
 }
 
 /// `GET /_albedo/auth/oauth/{provider}/start`.
 async fn start(provider: &ResolvedProvider, request: &OAuthRequest<'_>) -> Response<Body> {
     let back = return_path_from(request.query);
+    begin_flow(provider, request, back, None).await
+}
 
+/// `POST /_albedo/auth/oauth/{provider}/link` — connect this provider to the
+/// account that is signed in.
+///
+/// The same flow as [`start`], with the principal to connect to recorded in the
+/// pending-flow cookie; the callback then links instead of signing in.
+///
+/// ## Why `POST` + CSRF when `start` is a `GET`
+///
+/// `start` changes nothing — it only redirects — while this one ends in a write
+/// to somebody's account. A cross-site `GET` could at worst connect the victim's
+/// OWN provider identity to their own account (the provider signs in whoever is
+/// at the keyboard, and the `state` in the cookie binds the callback to this
+/// browser), so a `GET` would not be exploitable — but "a state change is a
+/// CSRF-checked `POST`" is a rule this codebase keeps without exceptions, and a
+/// rule with one exception is the one someone copies.
+///
+/// Signed-in only. Anonymous, there is nothing to connect to, and quietly
+/// falling back to a sign-in would turn a "connect" button into a "sign up as
+/// a new person" button.
+async fn link_start(provider: &ResolvedProvider, request: &OAuthRequest<'_>) -> Response<Body> {
+    use crate::forms::FormBody;
+
+    let content_type = request
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let form = match FormBody::decode(content_type, request.body.as_ref()) {
+        Ok(form) => form,
+        Err(err) => return refusal(StatusCode::BAD_REQUEST, &err.to_string(), &ReturnPath::root()),
+    };
+    let back = form.return_path();
+    let token_valid = form
+        .get(crate::render::csrf::CSRF_FIELD_NAME)
+        .is_some_and(|token| request.csrf.validate(request.session, token).is_ok());
+    if !token_valid {
+        warn!(target: "albedo.auth", provider = %provider.name, "link submit failed CSRF validation");
+        return refusal(
+            StatusCode::FORBIDDEN,
+            "This form is stale. Reload the page and try again.",
+            &back,
+        );
+    }
+    let Some(principal) = request.identity.principal() else {
+        return refusal(
+            StatusCode::UNAUTHORIZED,
+            "Sign in first — a sign-in method is connected to the account you are signed in to.",
+            &back,
+        );
+    };
+    begin_flow(provider, request, back, Some(principal.id.clone())).await
+}
+
+/// Mint a flow and redirect to the authorization server. `link` is the
+/// principal a link flow connects to; `None` is a sign-in.
+async fn begin_flow(
+    provider: &ResolvedProvider,
+    request: &OAuthRequest<'_>,
+    back: ReturnPath,
+    link: Option<dom_render_compiler::auth::PrincipalId>,
+) -> Response<Body> {
     let endpoints = match request
         .oauth
         .endpoints_for(provider, request.aperture)
@@ -238,9 +324,16 @@ async fn start(provider: &ResolvedProvider, request: &OAuthRequest<'_>) -> Respo
         state: flow.state,
         verifier: flow.verifier,
         back: back.as_str().to_string(),
+        link,
     };
 
-    let mut response = redirect_to(&flow.authorize_url);
+    // `303` for the `POST` link leg so the browser follows with a `GET`, as the
+    // authorization endpoint requires; `302` for `start`, as before.
+    let mut response = if pending.link.is_some() {
+        see_other_to(&flow.authorize_url)
+    } else {
+        redirect_to(&flow.authorize_url)
+    };
     set_cookie(&mut response, &pending.set_cookie());
     response
 }
@@ -344,6 +437,12 @@ async fn callback(provider: &ResolvedProvider, request: &OAuthRequest<'_>) -> Re
         }
     };
 
+    // A link flow ends here: the identity is CONNECTED to the account that
+    // started it, and nobody signs in as anybody new.
+    if let Some(link_to) = &pending.link {
+        return finish(link_identity(provider, request, link_to, &subject, &back).await);
+    }
+
     // Where the id becomes ours. `(provider, subject)` is unique in the schema,
     // so a race between two first logins for one human resolves to one
     // principal by the constraint rather than by a lock.
@@ -374,6 +473,74 @@ async fn callback(provider: &ResolvedProvider, request: &OAuthRequest<'_>) -> Re
         "oauth sign-in"
     );
     finish(open_session(request, &principal.id, &provider.name, &back).await)
+}
+
+/// Finish a link flow: connect `(provider, subject)` to `link_to`.
+///
+/// The provider has just proved who the identity is; the principal still has to
+/// be the one signed in. Between `link` and this callback the person may have
+/// signed out, or into a different account in another tab — connecting to the
+/// principal in the cookie then would attach an identity to an account the
+/// browser no longer holds. So the session is asked again, and must agree.
+async fn link_identity(
+    provider: &ResolvedProvider,
+    request: &OAuthRequest<'_>,
+    link_to: &dom_render_compiler::auth::PrincipalId,
+    subject: &str,
+    back: &ReturnPath,
+) -> Response<Body> {
+    use dom_render_compiler::auth::store::LinkOutcome;
+
+    let signed_in_as_the_same_person = request
+        .identity
+        .principal()
+        .is_some_and(|current| &current.id == link_to);
+    if !signed_in_as_the_same_person {
+        return refusal(
+            StatusCode::CONFLICT,
+            "You signed out, or into a different account, while connecting. Sign in and try again.",
+            back,
+        );
+    }
+    let outcome = store::link_account(
+        request.auth.substrate().as_ref(),
+        link_to,
+        &provider.name,
+        subject,
+        now_ms(),
+    )
+    .await;
+    match outcome {
+        Ok(LinkOutcome::Linked | LinkOutcome::AlreadyLinked) => {
+            debug!(target: "albedo.auth", principal = %link_to, provider = %provider.name, "identity linked");
+            see_other(back)
+        }
+        Ok(LinkOutcome::TakenByAnother) => refusal(
+            StatusCode::CONFLICT,
+            &format!(
+                "That {} account already signs in to a different account here, so it was not \
+                 connected. Sign in with it to use that account instead.",
+                provider.name
+            ),
+            back,
+        ),
+        Ok(LinkOutcome::ProviderAlreadyConnected) => refusal(
+            StatusCode::CONFLICT,
+            &format!(
+                "A different {} account is already connected. Disconnect it first.",
+                provider.name
+            ),
+            back,
+        ),
+        Err(err) => {
+            warn!(target: "albedo.auth", %err, "linking an identity failed");
+            refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The account could not be connected. Try again.",
+                back,
+            )
+        }
+    }
 }
 
 /// Mint the session and set its cookie.
@@ -409,8 +576,13 @@ async fn open_session(
         }
     };
 
-    let mut response = see_other(back);
+    // The same rule as the password endpoints' `open_session`: a destination
+    // remembered by the gate wins, and is spent.
+    let back = crate::handlers::auth_gate::remembered_destination(request.headers)
+        .unwrap_or_else(|| back.clone());
+    let mut response = see_other(&back);
     set_cookie(&mut response, &request.auth.set_cookie(&token));
+    set_cookie(&mut response, &crate::handlers::auth_gate::forget_destination());
     response
 }
 
@@ -423,6 +595,9 @@ pub struct PendingFlow {
     pub verifier: String,
     /// Where the person was going.
     pub back: String,
+    /// A link flow: the principal to connect the identity to. `None` is a
+    /// sign-in.
+    pub link: Option<dom_render_compiler::auth::PrincipalId>,
 }
 
 impl PendingFlow {
@@ -431,14 +606,20 @@ impl PendingFlow {
     /// `state` and `verifier` are base64url alphabet by construction, so `.` is
     /// a separator neither of them can contain. `back` is percent-encoded
     /// because it is a path and can legitimately contain anything a path can.
+    /// A link flow appends the principal id, whose alphabet has no `.` either.
     #[must_use]
     pub fn encode(&self) -> String {
-        format!(
+        let mut encoded = format!(
             "{}.{}.{}",
             self.state,
             self.verifier,
             percent_encode(&self.back)
-        )
+        );
+        if let Some(link) = &self.link {
+            encoded.push('.');
+            encoded.push_str(link.as_str());
+        }
+        encoded
     }
 
     /// Decode a cookie value, or `None` if it is not one of ours.
@@ -448,7 +629,13 @@ impl PendingFlow {
         let state = parts.next()?.to_string();
         let verifier = parts.next()?.to_string();
         let back = percent_decode(parts.next()?);
-        // A fourth segment means this is not our encoding. Refusing rather than
+        // The link target, through the same validator every stored id passes —
+        // a cookie is attacker-writable input like any other.
+        let link = match parts.next() {
+            None => None,
+            Some(raw) => Some(dom_render_compiler::auth::PrincipalId::parse(raw).ok()?),
+        };
+        // A fifth segment means this is not our encoding. Refusing rather than
         // ignoring the tail matters: `verify_state` is only sound if the value
         // it compares is the whole value we wrote.
         if parts.next().is_some() || state.is_empty() || verifier.is_empty() {
@@ -458,6 +645,7 @@ impl PendingFlow {
             state,
             verifier,
             back,
+            link,
         })
     }
 
@@ -567,6 +755,13 @@ fn see_other(back: &ReturnPath) -> Response<Body> {
     crate::forms::see_other(back)
 }
 
+/// A `303` to the authorization server — the answer to the `POST` link leg.
+fn see_other_to(url: &str) -> Response<Body> {
+    let mut response = redirect_to(url);
+    *response.status_mut() = StatusCode::SEE_OTHER;
+    response
+}
+
 /// Append a `Set-Cookie`, dropping it rather than panicking if it will not
 /// parse — the same reasoning as `auth_routes::set_cookie`.
 fn set_cookie(response: &mut Response<Body>, value: &str) {
@@ -650,6 +845,12 @@ mod tests {
             match_oauth_route("/_albedo/auth/oauth/google/callback"),
             Some((OAuthRoute::Callback, "google"))
         );
+        assert_eq!(
+            match_oauth_route("/_albedo/auth/oauth/google/link"),
+            Some((OAuthRoute::Link, "google"))
+        );
+        assert_eq!(OAuthRoute::Link.method(), "POST");
+        assert_eq!(OAuthRoute::Start.method(), "GET");
     }
 
     /// The property the literal match in `auth_routes` gets for free and this
@@ -676,15 +877,32 @@ mod tests {
             state: "s-tate".to_string(),
             verifier: "veri_fier".to_string(),
             back: "/dashboard?tab=1&q=a b".to_string(),
+            link: None,
+        };
+        assert_eq!(PendingFlow::decode(&flow.encode()), Some(flow));
+    }
+
+    /// A link flow carries the principal it connects to, and it survives the
+    /// cookie round trip — the callback's whole decision rests on it.
+    #[test]
+    fn a_link_flow_round_trips_with_its_target() {
+        let flow = PendingFlow {
+            state: "s-tate".to_string(),
+            verifier: "veri_fier".to_string(),
+            back: "/account".to_string(),
+            link: Some(dom_render_compiler::auth::PrincipalId::parse("u_7f3a").unwrap()),
         };
         assert_eq!(PendingFlow::decode(&flow.encode()), Some(flow));
     }
 
     /// A tail we did not write means the value is not ours, and `verify_state`
-    /// is only sound over the whole value we wrote.
+    /// is only sound over the whole value we wrote. A fourth segment is a link
+    /// target — and must be a valid principal id, or the whole value is refused.
     #[test]
     fn a_value_with_extra_segments_is_not_ours() {
-        assert_eq!(PendingFlow::decode("a.b.c.d"), None);
+        assert_eq!(PendingFlow::decode("a.b.c.u_1.e"), None);
+        assert_eq!(PendingFlow::decode("a.b.c.u:admin"), None);
+        assert_eq!(PendingFlow::decode("a.b.c."), None);
         assert_eq!(PendingFlow::decode("a"), None);
         assert_eq!(PendingFlow::decode(".b.c"), None);
         assert_eq!(PendingFlow::decode("a..c"), None);
@@ -699,6 +917,7 @@ mod tests {
             state: "s".to_string(),
             verifier: "v".to_string(),
             back: "/".to_string(),
+            link: None,
         };
         let cookie = flow.set_cookie();
         assert!(cookie.contains("SameSite=Lax"), "{cookie}");
@@ -717,6 +936,7 @@ mod tests {
             state: "s".to_string(),
             verifier: "v".to_string(),
             back: "/".to_string(),
+            link: None,
         }
         .set_cookie();
         let clear = PendingFlow::clear_cookie();

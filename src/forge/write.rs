@@ -51,7 +51,7 @@ use crate::forge::delta::{
     project_inserted_rows, RenderedRows, RowProjector,
 };
 use crate::transforms::shared_slot_lists::RowProjection;
-use crate::forge::skeleton::{materialize_slot, ForgeCollection, ForgeSchema, SortDir};
+use crate::forge::skeleton::{materialize_slot, EditRule, ForgeCollection, ForgeSchema, SortDir};
 use crate::auth::PrincipalId;
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Result, SqlValue, SubstrateError};
@@ -533,6 +533,120 @@ fn authorize_existing_row(
     }
 }
 
+/// ALB-02 · who appended each row of every collection that is not
+/// identity-partitioned — the fact the default [`EditRule::Author`] checks.
+///
+/// A side table rather than a column on the app's own table: the app's schema
+/// stays exactly what its `forge` block declares, drift checks see nothing new,
+/// and a principal id never rides along in a materialised row to every reader.
+/// Keyed by *table*, not topic, because two collections may front one table and
+/// a row's author is a fact about the row.
+///
+/// Only signed-in appends are recorded. An anonymous row has no author, and a
+/// row with no author is changed by nobody unless its collection says
+/// `edit: "anyone"`.
+pub const AUTHORS_DDL: &str = "CREATE TABLE IF NOT EXISTS albedo_row_authors (\
+     collection TEXT NOT NULL, row_key INTEGER NOT NULL, principal TEXT NOT NULL, \
+     PRIMARY KEY (collection, row_key))";
+
+/// ALB-02 · the author check for a row that already exists, in a collection that
+/// is not identity-partitioned (those have [`authorize_existing_row`]).
+///
+/// One query answers both "is the row there" and "who added it", so the check
+/// and the write share the transaction with no window between them. A missing
+/// row is not a refusal, for the reason `authorize_existing_row` gives: the
+/// statement affects nothing either way, and "you may not" is a different fact
+/// from "there was nothing there".
+async fn authorize_author(
+    tx: &dyn crate::forge::substrate::Transaction,
+    slot: &ForgeCollection,
+    key: &Value,
+    principal: Option<&PrincipalId>,
+) -> Result<()> {
+    if slot.identity_partitioned || slot.edit == EditRule::Anyone {
+        return Ok(());
+    }
+    let Some(principal) = principal else {
+        return Err(SubstrateError::Backend(format!(
+            "FORGE write refused: a row of '{}' can be changed only by the signed-in user who \
+             added it, and this request is anonymous. Declare `edit: \"anyone\"` on the \
+             collection if any visitor may change any row",
+            slot.topic
+        )));
+    };
+    // `table` and `key_column` are identifier-validated at schema build; the
+    // key and the collection name are bound.
+    let sql = format!(
+        "SELECT a.principal FROM {table} AS t LEFT JOIN albedo_row_authors AS a \
+         ON a.collection = ?2 AND a.row_key = t.{key} WHERE t.{key} = ?1",
+        table = slot.table,
+        key = slot.key_column,
+    );
+    let bound = key_to_sqlvalue(&slot.topic, &slot.key_column, key)?;
+    let rows = tx
+        .query(&sql, &[bound, SqlValue::Text(slot.table.clone())])
+        .await?;
+    let Some(row) = rows.rows.first() else {
+        return Ok(());
+    };
+    match row.get(0) {
+        Some(SqlValue::Text(author)) if author == principal.as_str() => Ok(()),
+        // As in `authorize_existing_row`, the other principal's id stays out of
+        // a message the caller can read.
+        Some(SqlValue::Text(_)) => Err(SubstrateError::Backend(format!(
+            "FORGE write refused: this row of '{}' was added by a different user. A row can be \
+             changed only by the user who added it",
+            slot.topic
+        ))),
+        _ => Err(SubstrateError::Backend(format!(
+            "FORGE write refused: this row of '{}' has no recorded author — it was added \
+             anonymously, seeded, or written before authorship was recorded — so no request may \
+             change it. Declare `edit: \"anyone\"` on the collection if any visitor may",
+            slot.topic
+        ))),
+    }
+}
+
+/// ALB-02 · record that `principal` appended the row `key` of `slot`, in the
+/// append's own transaction.
+///
+/// `OR REPLACE` because a stale record for a key would otherwise make the
+/// append fail; `AUTOINCREMENT` never reuses a key, so in practice there is none.
+async fn record_author(
+    tx: &dyn crate::forge::substrate::Transaction,
+    slot: &ForgeCollection,
+    key: Option<SqlValue>,
+    principal: &PrincipalId,
+) -> Result<()> {
+    let key = match key {
+        Some(key) => key,
+        // A substrate without `RETURNING`: the row this transaction just wrote.
+        None => tx
+            .query("SELECT last_insert_rowid()", &[])
+            .await?
+            .rows
+            .first()
+            .and_then(|row| row.get(0).cloned())
+            .ok_or_else(|| {
+                SubstrateError::Backend(format!(
+                    "FORGE append: the new row of '{}' has no key to record its author against",
+                    slot.topic
+                ))
+            })?,
+    };
+    tx.execute(
+        "INSERT OR REPLACE INTO albedo_row_authors (collection, row_key, principal) \
+         VALUES (?1, ?2, ?3)",
+        &[
+            SqlValue::Text(slot.table.clone()),
+            key,
+            SqlValue::Text(principal.as_str().to_string()),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 /// AUTH F1 · the owner check for the row a write **leaves behind** — Postgres
 /// RLS's `WITH CHECK`.
 ///
@@ -818,12 +932,6 @@ pub async fn apply_writes(
         return Ok(FanOut::default());
     }
 
-    // Temporary write-path instrumentation (env-gated, off by default): times the
-    // four phases per touched slot to `stderr`. Gated so it costs nothing in the
-    // hot path unless `ALBEDO_FORGE_TIMING` is set. Remove once the design call is
-    // made from the numbers.
-    let timing = std::env::var_os("ALBEDO_FORGE_TIMING").is_some();
-
     // Resolve every collection against the schema BEFORE opening the
     // transaction: an unknown collection is an authoring error, and it should
     // not cost a write lock or leave a half-built transaction to roll back.
@@ -846,7 +954,6 @@ pub async fn apply_writes(
     // fully resolved before the transaction opens.
     let mut touched: Vec<Touched<'_>> = Vec::new();
 
-    let t_commit = std::time::Instant::now();
     let tx = substrate.begin().await?;
     for write in writes {
         // The slot is borrowed from the schema, resolved in `touched` above —
@@ -872,6 +979,16 @@ pub async fn apply_writes(
             },
             _ => None,
         };
+
+        // ALB-02 · the author check, for the two writes that change a row that
+        // already exists. Inside the transaction, so nothing can re-author the
+        // row between the check and the statement.
+        if let ForgeWrite::Update { key, .. } | ForgeWrite::Delete { key, .. } = write {
+            if let Err(err) = authorize_author(tx.as_ref(), slot, key, principal).await {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+        }
 
         // Learn which channel(s) this write moves, before it moves them.
         let resolved = match write {
@@ -953,6 +1070,16 @@ pub async fn apply_writes(
                         return Err(err);
                     }
                 };
+                // ALB-02 · a signed-in append records its author. An
+                // identity-partitioned row already names its owner in its
+                // partition column. `RETURNING` lists the key first.
+                if let (Some(principal), false) = (principal, slot.identity_partitioned) {
+                    let key = rows.rows.first().and_then(|row| row.get(0).cloned());
+                    if let Err(err) = record_author(tx.as_ref(), slot, key, principal).await {
+                        let _ = tx.rollback().await;
+                        return Err(err);
+                    }
+                }
                 // A substrate that does not honour `RETURNING` yields no row.
                 // That is not an error — it only costs the zero-query path, and
                 // the fan-out falls back to re-reading (`reserve.rs:266` records
@@ -984,6 +1111,23 @@ pub async fn apply_writes(
                     let _ = tx.rollback().await;
                     return Err(err);
                 }
+                // ALB-02 · a removed row takes its authorship record with it.
+                if let ForgeWrite::Delete { key, .. } = write {
+                    let forgotten = match key_to_sqlvalue(&slot.topic, &slot.key_column, key) {
+                        Ok(key) => {
+                            tx.execute(
+                                "DELETE FROM albedo_row_authors WHERE collection = ?1 AND row_key = ?2",
+                                &[SqlValue::Text(slot.table.clone()), key],
+                            )
+                            .await
+                        }
+                        Err(err) => Err(err),
+                    };
+                    if let Err(err) = forgotten {
+                        let _ = tx.rollback().await;
+                        return Err(err);
+                    }
+                }
                 for channel in &channels {
                     record_outcome(&mut touched, channel, None);
                 }
@@ -1004,7 +1148,6 @@ pub async fn apply_writes(
     };
 
     tx.commit().await?;
-    let commit_el = t_commit.elapsed();
 
     // Durable now — safe to tell the world.
     for Touched {
@@ -1022,7 +1165,6 @@ pub async fn apply_writes(
         // on the very lock it is running under. What survives into the closure
         // is only the diff: pure, bounded by the collection size, and the one
         // step that genuinely needs the pre-state it is replacing.
-        let t_mat = std::time::Instant::now();
         // PRISM § 6.2 · the write path stops re-running the query.
         //
         // An append already knows its record (from `RETURNING`) and its
@@ -1051,12 +1193,10 @@ pub async fn apply_writes(
         } else {
             None
         };
-        let queried = spliced.is_none();
         let bytes = match spliced {
             Some(bytes) => bytes,
             None => materialize_slot(substrate, slot, partition.as_deref()).await?,
         };
-        let mat_el = t_mat.elapsed();
 
         // Choose what to render. A `PerRecord` collection renders only the rows
         // this write changed — each over a singleton collection, `O(1)` in the
@@ -1066,7 +1206,6 @@ pub async fn apply_writes(
         // render that covers only the changed keys: a reconcile needs every row,
         // so if the classified fast path can't satisfy one it re-renders after the
         // lock (`needs_whole` below).
-        let t_proj = std::time::Instant::now();
         let (rows, partial) = match projector {
             Some(p) if p.projection_class(&slot.topic) == RowProjection::PerRecord => {
                 match render_changed_rows(p, slot, &channel, partition.as_deref(), broadcast, &bytes).await {
@@ -1080,30 +1219,7 @@ pub async fn apply_writes(
             Some(p) => (p.project_rows(&slot.topic, partition.as_deref(), &bytes).await, false),
             None => (None, false),
         };
-        let proj_el = t_proj.elapsed();
-        let row_count = rows.as_ref().map(|r| r.len()).unwrap_or(0);
 
-        // Dev correctness gate: prove the singleton-rendered rows are byte-identical
-        // to the whole-view render's slice of them. A `PerRecord` misclassification
-        // would surface here loudly rather than as a stranded row in production.
-        if partial && std::env::var_os("ALBEDO_FORGE_VERIFY").is_some() {
-            if let (Some(p), Some(changed)) = (projector, rows.as_ref()) {
-                if let Some(whole) = p.project_rows(&slot.topic, partition.as_deref(), &bytes).await {
-                    for (key, html) in changed.iter() {
-                        match whole.get(key) {
-                            Some(expected) if expected == html => {}
-                            other => eprintln!(
-                                "[forge-verify] DIVERGENCE topic={} key={} \
-                                 singleton={:?} whole={:?}",
-                                slot.topic, key, html, other
-                            ),
-                        }
-                    }
-                }
-            }
-        }
-
-        let t_fan = std::time::Instant::now();
         // The channel, not the collection: a partitioned write fans out on its
         // own partition's topic. `projection_class` / `project_rows` above stay
         // keyed by `slot.topic`, because the row TEMPLATE belongs to the
@@ -1131,7 +1247,6 @@ pub async fn apply_writes(
                 update,
             }
         });
-        let fan_el = t_fan.elapsed();
 
         // Rare, off-lock: the changed-only render could not satisfy a reconcile.
         // Render the whole view now and ship the full ordered set so keyed anchors
@@ -1146,23 +1261,6 @@ pub async fn apply_writes(
                     });
                 }
             }
-        }
-
-        if timing {
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-            eprintln!(
-                "[forge-timing] channel={} rows={} partial={} value={} commit={:.3}ms                  materialize={:.3}ms project={:.3}ms fanout={:.3}ms",
-                channel,
-                row_count,
-                partial,
-                // The number this instrumentation exists to move: `spliced` means
-                // the write never touched the database to learn its new value.
-                if queried { "queried" } else { "spliced" },
-                ms(commit_el),
-                ms(mat_el),
-                ms(proj_el),
-                ms(fan_el),
-            );
         }
     }
 
@@ -1956,7 +2054,7 @@ mod substrate_tests {
     #[tokio::test]
     async fn an_update_falls_back_to_the_query_and_stays_correct() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        let schema = ForgeSchema::guestbook_default();
+        let schema = ForgeSchema::guestbook_default().open_to_anyone();
         bootstrap_schema(&db, &schema).await.unwrap();
         let broadcast = BroadcastRegistry::new();
         hydrate_topics(&db, &broadcast, &schema).await.unwrap();
@@ -2264,7 +2362,7 @@ mod substrate_tests {
     #[tokio::test]
     async fn a_partition_changing_update_notifies_both_sides() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        let schema = partitioned_schema();
+        let schema = partitioned_schema().open_to_anyone();
         bootstrap_schema(&db, &schema).await.unwrap();
         let broadcast = BroadcastRegistry::new();
 
@@ -2304,7 +2402,7 @@ mod substrate_tests {
     #[tokio::test]
     async fn a_delete_fans_out_on_the_partition_the_row_was_in() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        let schema = partitioned_schema();
+        let schema = partitioned_schema().open_to_anyone();
         bootstrap_schema(&db, &schema).await.unwrap();
         let broadcast = BroadcastRegistry::new();
 
@@ -2967,7 +3065,7 @@ mod substrate_tests {
         apply_writes(
             &db,
             &broadcast,
-            &ForgeSchema::guestbook_default(),
+            &ForgeSchema::guestbook_default().open_to_anyone(),
             &[update("guestbook", json!(1), json!({ "author": "turing" }))],
             Some(&Guestbook),
             None,
@@ -3034,7 +3132,7 @@ mod substrate_tests {
         apply_writes(
             &db,
             &broadcast,
-            &ForgeSchema::guestbook_default(),
+            &ForgeSchema::guestbook_default().open_to_anyone(),
             &[delete("guestbook", json!(2))],
             Some(&Guestbook),
             None,
@@ -3072,7 +3170,7 @@ mod substrate_tests {
         let err = apply_writes(
             &db,
             &broadcast,
-            &ForgeSchema::guestbook_default(),
+            &ForgeSchema::guestbook_default().open_to_anyone(),
             &[
                 delete("guestbook", json!(1)),
                 update("guestbook", Value::Null, json!({ "author": "x" })),
@@ -3569,5 +3667,141 @@ mod owner_rules_tests {
             stored(&db).await,
             vec![("anyones-room".to_string(), "hello".to_string())]
         );
+    }
+
+    async fn run(
+        db: &LibSqlSubstrate,
+        schema: &ForgeSchema,
+        write: ForgeWrite,
+        principal: Option<&PrincipalId>,
+    ) -> Result<FanOut> {
+        apply_writes(db, &BroadcastRegistry::new(), schema, &[write], None, principal).await
+    }
+
+    async fn authors_recorded(db: &LibSqlSubstrate) -> i64 {
+        db.query("SELECT COUNT(*) FROM albedo_row_authors", &[])
+            .await
+            .expect("count authors")
+            .rows[0]
+            .get(0)
+            .and_then(SqlValue::as_i64)
+            .expect("a count")
+    }
+
+    /// 🔴 ALB-02, as the audit reproduced it: one visitor adds a row, another
+    /// removes it by id. Public reads, no identity partition — the shape of a
+    /// guestbook, a forum post, a listing.
+    #[tokio::test]
+    async fn a_stranger_cannot_change_or_remove_a_row_they_did_not_add() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = room_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        run(&db, &schema, append_todo(Some("lobby"), "alice was here"), Some(&alice()))
+            .await
+            .expect("alice appends");
+
+        for (who, principal) in [("bob", Some(bob())), ("anonymous", None)] {
+            for write in [set_text(1, "defaced"), delete(1)] {
+                let err = run(&db, &schema, write, principal.as_ref())
+                    .await
+                    .expect_err("someone else's row must be refused");
+                assert!(format!("{err}").contains("refused"), "{who}: {err}");
+                assert!(!format!("{err}").contains("u_alice"), "{who} must not learn the author: {err}");
+            }
+        }
+        assert_eq!(
+            stored(&db).await,
+            vec![("lobby".to_string(), "alice was here".to_string())],
+            "the row is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_author_can_change_and_remove_their_own_row() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = room_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        run(&db, &schema, append_todo(Some("lobby"), "draft"), Some(&alice()))
+            .await
+            .unwrap();
+        assert_eq!(authors_recorded(&db).await, 1);
+
+        // A form submits the key as text; it must find the same row.
+        let mut fields = Map::new();
+        fields.insert("text".into(), Value::String("final".into()));
+        let from_a_form = ForgeWrite::Update {
+            collection: "todos".into(),
+            key: Value::String("1".into()),
+            fields,
+        };
+        run(&db, &schema, from_a_form, Some(&alice()))
+            .await
+            .expect("the author edits");
+        assert_eq!(stored(&db).await[0].1, "final");
+
+        run(&db, &schema, delete(1), Some(&alice()))
+            .await
+            .expect("the author removes");
+        assert!(stored(&db).await.is_empty());
+        assert_eq!(authors_recorded(&db).await, 0, "the record goes with the row");
+
+        // A missing row is "nothing there", not "you may not".
+        run(&db, &schema, delete(99), Some(&alice()))
+            .await
+            .expect("a missing row is not a refusal");
+    }
+
+    /// An anonymous or seeded row has no author, so the default has nobody to
+    /// allow — rather than everybody.
+    #[tokio::test]
+    async fn a_row_with_no_author_is_changed_by_nobody() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = room_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        run(&db, &schema, append_todo(Some("lobby"), "anon"), None)
+            .await
+            .expect("anyone may append");
+        assert_eq!(authors_recorded(&db).await, 0);
+
+        let err = run(&db, &schema, delete(1), Some(&alice()))
+            .await
+            .expect_err("no author, no edit");
+        assert!(format!("{err}").contains("no recorded author"), "{err}");
+        assert_eq!(stored(&db).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn edit_anyone_opens_every_row_to_every_caller() {
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = room_schema().open_to_anyone();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        run(&db, &schema, append_todo(Some("lobby"), "shared"), Some(&alice()))
+            .await
+            .unwrap();
+        run(&db, &schema, delete(1), None)
+            .await
+            .expect("declared open, so a stranger may remove");
+        assert!(stored(&db).await.is_empty());
+    }
+
+    /// A misspelled rule is a config error, never a silent fallback to either
+    /// side.
+    #[test]
+    fn the_edit_rule_is_one_of_two_words() {
+        use crate::forge::declare::CollectionDecl;
+        use crate::forge::skeleton::EditRule;
+
+        let parse = |edit: &str| {
+            serde_json::from_value::<CollectionDecl>(serde_json::json!({
+                "fields": { "text": "text" },
+                "edit": edit,
+            }))
+        };
+        assert_eq!(parse("author").unwrap().edit, EditRule::Author);
+        assert_eq!(parse("anyone").unwrap().edit, EditRule::Anyone);
+        assert!(parse("everyone").is_err());
+        let omitted: CollectionDecl =
+            serde_json::from_value(serde_json::json!({ "fields": { "text": "text" } })).unwrap();
+        assert_eq!(omitted.edit, EditRule::Author, "the default is the safe one");
     }
 }

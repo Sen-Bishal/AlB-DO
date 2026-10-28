@@ -31,7 +31,6 @@ use ratatui::crossterm::{
 use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
 
-pub mod demo;
 pub mod dev;
 pub mod theme;
 

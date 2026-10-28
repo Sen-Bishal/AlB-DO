@@ -438,6 +438,193 @@ pub fn allocate_field_error_id(action_name: &str, field_name: &str) -> u32 {
     fnv1a_32(key.as_bytes())
 }
 
+/// FNV-1a-32 of the form's **success** key — the one `data-albedo-ok` sink a
+/// form-action form reserves beside its per-field error sinks. Its own key
+/// family (`form-ok:` against `form-error:`), so no field name can hash onto it.
+pub fn allocate_form_ok_id(action_name: &str) -> u32 {
+    fnv1a_32(format!("form-ok:{action_name}").as_bytes())
+}
+
+/// The framework's own endpoints whose refusal is a sentence for the person who
+/// filled the form — "that email and password do not match", "that address is
+/// already registered" — rather than a status for a program.
+///
+/// A plain `<form>` posting to one of these gets ONE feedback sink, and a
+/// browser's submit that is refused comes back to the page that posted with the
+/// message in it (`auth_routes::into_form_feedback`), the way an action's
+/// `{ error }` does. Before this, the answer was a bare page of its own with a
+/// "Back" link: correct, and nothing like the page the reader was on.
+///
+/// Exact paths, and only the ones a page carries at most one form for. An
+/// endpoint that can sit in several forms on one page (`/_albedo/auth/unlink`,
+/// once per connected provider) would stamp the same sink id several times,
+/// and a message would land in whichever came first — so it keeps its own
+/// refusal page.
+pub const FEEDBACK_ENDPOINTS: [&str; 5] = [
+    "/_albedo/auth/password/login",
+    "/_albedo/auth/password/register",
+    "/_albedo/auth/password/forgot",
+    "/_albedo/auth/password/set",
+    "/_albedo/auth/magiclink/start",
+];
+
+/// The key family an endpoint sink's id is hashed from — its own, beside
+/// `form-error:` and `form-ok:`, so no action or field can collide with it.
+pub const ENDPOINT_FEEDBACK_KEY: &str = "form-endpoint:";
+
+/// An endpoint sink, with `{id}` for its id and `{anchor}` for its element id.
+/// One spelling, handed to the QuickJS shim as a value so the two renderers
+/// cannot drift. Its head is the `<span data-albedo-id="N" data-albedo-error`
+/// [`fill_form_feedback`] writes into.
+pub const ENDPOINT_FEEDBACK_SPAN: &str =
+    "<span data-albedo-id=\"{id}\" data-albedo-error=\"\" role=\"alert\" id=\"{anchor}\"></span>";
+
+/// What an endpoint's anchor is built from: every path segment after this
+/// root, joined with `-` onto `albedo-feedback` — `/_albedo/auth/password/login`
+/// is `#albedo-feedback-password-login`, the same family an action's sink uses.
+pub const FEEDBACK_ENDPOINT_ROOT: &str = "/_albedo/auth";
+
+/// The endpoint a plain form's refusal is keyed on — its `action` without a
+/// query or fragment — when it is one of [`FEEDBACK_ENDPOINTS`].
+#[must_use]
+pub fn feedback_endpoint(action: &str) -> Option<&'static str> {
+    let path = action.trim().split(['?', '#']).next().unwrap_or("");
+    FEEDBACK_ENDPOINTS.iter().copied().find(|endpoint| *endpoint == path)
+}
+
+/// The id of the sink a refusal from `endpoint` is carried into.
+#[must_use]
+pub fn allocate_endpoint_feedback_id(endpoint: &str) -> u32 {
+    fnv1a_32(format!("{ENDPOINT_FEEDBACK_KEY}{endpoint}").as_bytes())
+}
+
+/// The element id of an endpoint's sink — where a refused submit's redirect
+/// lands, so the sentence is on screen rather than below the fold.
+#[must_use]
+pub fn endpoint_feedback_anchor(endpoint: &str) -> String {
+    let rest = endpoint.strip_prefix(FEEDBACK_ENDPOINT_ROOT).unwrap_or(endpoint);
+    format!("albedo-feedback{}", rest.replace('/', "-"))
+}
+
+/// The sink a plain form posting to `endpoint` closes on.
+#[must_use]
+pub fn endpoint_feedback_span(endpoint: &str) -> String {
+    ENDPOINT_FEEDBACK_SPAN
+        .replace("{id}", &allocate_endpoint_feedback_id(endpoint).to_string())
+        .replace("{anchor}", &endpoint_feedback_anchor(endpoint))
+}
+
+#[cfg(test)]
+mod endpoint_feedback_tests {
+    use super::*;
+
+    #[test]
+    fn a_feedback_endpoint_is_matched_exactly_and_by_path() {
+        assert_eq!(
+            feedback_endpoint("/_albedo/auth/password/login"),
+            Some("/_albedo/auth/password/login")
+        );
+        // The query a link might carry, and stray whitespace, are not part of it.
+        assert_eq!(
+            feedback_endpoint(" /_albedo/auth/password/login?next=/account "),
+            Some("/_albedo/auth/password/login")
+        );
+        for other in [
+            "/_albedo/auth/unlink",
+            "/_albedo/auth/password/login/extra",
+            "/_albedo/auth/password/log",
+            "https://evil.example/_albedo/auth/password/login",
+            "",
+        ] {
+            assert_eq!(feedback_endpoint(other), None, "{other}");
+        }
+    }
+
+    /// The sink's head is exactly what `fill_form_feedback` writes into.
+    #[test]
+    fn an_endpoint_sink_is_one_the_fill_can_write() {
+        let endpoint = "/_albedo/auth/password/login";
+        let id = allocate_endpoint_feedback_id(endpoint);
+        let html = format!("<form>{}</form>", endpoint_feedback_span(endpoint));
+        let filled = fill_form_feedback(&html, &[(id, "Wrong <password>".to_string())]);
+        assert!(filled.contains(">Wrong &lt;password&gt;</span>"), "{filled}");
+        assert_eq!(endpoint_feedback_anchor(endpoint), "albedo-feedback-password-login");
+        assert!(filled.contains("id=\"albedo-feedback-password-login\""), "{filled}");
+    }
+}
+
+/// The `id` of a form's success sink. A JS-less submit redirects back to this
+/// fragment, so the reader lands on their form's feedback rather than at the
+/// top of the page — without it a message rendered below the fold is a
+/// message nobody sees.
+pub fn form_feedback_anchor(action_name: &str) -> String {
+    format!("albedo-feedback-{action_name}")
+}
+
+/// One field's error sink.
+pub fn field_error_span(action_name: &str, field_name: &str) -> String {
+    format!(
+        "<span data-albedo-id=\"{}\" data-albedo-error=\"{}\"></span>",
+        allocate_field_error_id(action_name, field_name),
+        escape_attribute_value(field_name),
+    )
+}
+
+/// The form's success sink. `role="status"` makes it a polite live region, so
+/// the message the projection writes into it is announced, not just painted —
+/// and it has to exist empty *before* that write for the announcement to fire,
+/// which is exactly what a compile-time-reserved slot is.
+pub fn form_ok_span(action_name: &str) -> String {
+    format!(
+        "<span data-albedo-id=\"{}\" data-albedo-ok id=\"{}\" role=\"status\"></span>",
+        allocate_form_ok_id(action_name),
+        escape_attribute_value(&form_feedback_anchor(action_name)),
+    )
+}
+
+/// Every feedback sink a form-action form reserves: one error span per
+/// declared field, then the success span. The single source of this markup —
+/// the pure-Rust renderer and the QuickJS seed both call it, so the nodes
+/// `runtime::form_result::project_form_result` addresses exist on every path
+/// with the same ids, and [`fill_form_feedback`] can find them.
+pub fn form_feedback_spans(action_name: &str, fields: &[String]) -> String {
+    let mut html: String = fields
+        .iter()
+        .map(|field| field_error_span(action_name, field))
+        .collect();
+    html.push_str(&form_ok_span(action_name));
+    html
+}
+
+/// Paint carried feedback into the sinks a render reserved — the JS-less twin
+/// of the browser applying the projection's `SetText` frame in place. Same
+/// ids, same text, one request later and on the server.
+///
+/// Only an **empty feedback sink** is ever written: the entry must address a
+/// `<span data-albedo-id="N" data-albedo-error…>` or `…data-albedo-ok…>` whose
+/// next bytes are `</span>`. So a carried entry can reach no other node and
+/// overwrite no markup, whatever produced it — the entries arrive in a cookie,
+/// and the fill is the reason that is safe. Text is escaped on the way in.
+pub fn fill_form_feedback(html: &str, entries: &[(u32, String)]) -> String {
+    let mut out = html.to_string();
+    for (id, text) in entries {
+        if text.is_empty() {
+            continue;
+        }
+        for marker in ["data-albedo-error", "data-albedo-ok"] {
+            let head = format!("<span data-albedo-id=\"{id}\" {marker}");
+            let Some(start) = out.find(&head) else { continue };
+            let Some(tag_len) = out[start..].find('>') else { break };
+            let body = start + tag_len + 1;
+            if out[body..].starts_with("</span>") {
+                out.insert_str(body, &escape_attribute_value(text));
+            }
+            break;
+        }
+    }
+    out
+}
+
 /// Walks every JSX `<form>` in the function body and returns the
 /// metadata for those whose `action` is a form-action sentinel.
 ///
@@ -1104,6 +1291,65 @@ mod tests {
         assert_ne!(a, c);
         // Same inputs are deterministic.
         assert_eq!(a, allocate_field_error_id("submit_login", "user"));
+    }
+
+    #[test]
+    fn the_success_sink_has_its_own_key_family() {
+        // A field literally named "ok" must not land on the success sink:
+        // `form-error:join:ok` and `form-ok:join` are different keys.
+        let ok = allocate_form_ok_id("join");
+        // An endpoint sink is its own key family: no action's success or
+        // field sink can land on it.
+        assert_ne!(ok, allocate_endpoint_feedback_id("join"));
+        assert_ne!(
+            allocate_endpoint_feedback_id("/_albedo/auth/password/login"),
+            allocate_endpoint_feedback_id("/_albedo/auth/password/register"),
+        );
+        assert_ne!(ok, allocate_field_error_id("join", "ok"));
+        assert_ne!(ok, allocate_form_ok_id("subscribe"));
+        assert_eq!(ok, allocate_form_ok_id("join"));
+    }
+
+    #[test]
+    fn feedback_spans_are_the_error_sinks_then_the_success_sink() {
+        let html = form_feedback_spans("join", &["email".to_string()]);
+        let error = format!(
+            "<span data-albedo-id=\"{}\" data-albedo-error=\"email\"></span>",
+            allocate_field_error_id("join", "email")
+        );
+        let ok = format!(
+            "<span data-albedo-id=\"{}\" data-albedo-ok id=\"albedo-feedback-join\" role=\"status\"></span>",
+            allocate_form_ok_id("join")
+        );
+        assert_eq!(html, format!("{error}{ok}"));
+        // A form with no fields still reserves its success sink.
+        assert_eq!(form_feedback_spans("join", &[]), ok);
+    }
+
+    #[test]
+    fn carried_feedback_fills_only_empty_feedback_sinks() {
+        let ok_id = allocate_form_ok_id("join");
+        let err_id = allocate_field_error_id("join", "email");
+        let html = format!(
+            "<p data-albedo-id=\"{ok_id}\">x</p>{}",
+            form_feedback_spans("join", &["email".to_string()])
+        );
+        let out = fill_form_feedback(
+            &html,
+            &[
+                (ok_id, "You're <in>".to_string()),
+                (err_id, String::new()),
+                (424242, "nowhere".to_string()),
+            ],
+        );
+        // The sink is filled, escaped; the unrelated node sharing the id is not.
+        assert!(out.contains("role=\"status\">You're &lt;in&gt;</span>"), "{out}");
+        assert!(out.starts_with(&format!("<p data-albedo-id=\"{ok_id}\">x</p>")), "{out}");
+        // An empty entry and an unknown id change nothing.
+        assert!(out.contains("data-albedo-error=\"email\"></span>"), "{out}");
+        assert!(!out.contains("nowhere"));
+        // A sink that already has content is never written into.
+        assert_eq!(fill_form_feedback(&out, &[(ok_id, "twice".to_string())]), out);
     }
 
     #[test]

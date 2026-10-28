@@ -294,6 +294,21 @@ pub fn classify_evaluator_error(message: &str) -> Verdict {
         };
     }
 
+    // The static renderer's refusals — `unmodelled` in `eval/core.rs`, and the
+    // array and string method dispatchers — all say this, after naming the
+    // construct. The name is what precedes it, less the wrappers a refusal can
+    // arrive inside: a poisoned constant's "`x` could not be evaluated: " in
+    // front, and a method list's " (supported: …)" behind.
+    const STATIC_REFUSAL: &str = " is not supported by the static renderer";
+    if let Some(at) = message.find(STATIC_REFUSAL) {
+        let named = &message[..at];
+        let named = named.rsplit("could not be evaluated: ").next().unwrap_or(named);
+        let named = named.split(" (supported:").next().unwrap_or(named);
+        return Verdict::EvaluatorDeclined {
+            construct: format!("static: {}", named.trim()),
+        };
+    }
+
     Verdict::EvaluatorFaulted {
         reason: message.to_string(),
     }

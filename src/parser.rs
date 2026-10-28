@@ -79,6 +79,7 @@ impl ComponentParser {
                 // A module-only node is never rendered, so it has no render to
                 // be request-scoped.
                 reads_principal: false,
+                reads_route_params: false,
                 source_hash,
                 is_module_only: true,
             });
@@ -143,6 +144,10 @@ pub struct ParsedComponent {
     /// AUTH § 3 · this component names `user`, so the render needs the
     /// request's principal. See [`scan_reads_principal`].
     pub reads_principal: bool,
+    /// This component is a dynamic route's page and its signature can reach
+    /// the route's `params`, so the render needs the request's URL. See
+    /// [`takes_route_params`].
+    pub reads_route_params: bool,
     pub source_hash: u64,
     /// True when this node represents a file that declared NO component but
     /// DOES export something (a pure data/util/lib module). It is a graph +
@@ -203,6 +208,8 @@ impl ComponentVisitor {
             collector.finish()
         };
         analysis.reads_principal |= scan_reads_principal(&[], &params);
+        analysis.reads_route_params =
+            is_dynamic_route_path(&self.file_path) && takes_route_params(&params);
         analysis
     }
 
@@ -230,6 +237,8 @@ impl ComponentVisitor {
         }
         let mut analysis = collector.finish();
         analysis.reads_principal = scan_reads_principal(&body_stmts, &arrow.params);
+        analysis.reads_route_params =
+            is_dynamic_route_path(&self.file_path) && takes_route_params(&arrow.params);
         analysis
     }
 
@@ -262,6 +271,7 @@ impl ComponentVisitor {
             is_client_interactive: analysis.is_client_interactive,
             state_escapes: analysis.state_escapes,
             reads_principal: analysis.reads_principal,
+            reads_route_params: analysis.reads_route_params,
             source_hash: self.source_hash,
             is_module_only: false,
         });
@@ -394,6 +404,8 @@ struct ComponentAnalysis {
     /// the AST rather than a heuristic, which is the distinction
     /// `TODO.md` P-c asks the decision path to stop losing.
     reads_principal: bool,
+    /// The render needs the route's `params` — see [`takes_route_params`].
+    reads_route_params: bool,
 }
 
 #[derive(Default)]
@@ -435,6 +447,8 @@ impl EffectCollector {
             // time), but a `user` read anywhere in the component still means the
             // render needs the principal.
             reads_principal: false,
+            // Filled at the call site, which knows the file and the signature.
+            reads_route_params: false,
         }
     }
 
@@ -665,7 +679,22 @@ impl Visit for EffectCollector {
     }
 }
 
-fn is_event_handler_prop(name: &str) -> bool {
+/// Is `name` an event-handler prop — `on` followed by an uppercase letter
+/// (`onClick`, `onPress`)?
+///
+/// React's own convention, and the one the client runtime binds by
+/// (`albedo-client.js`). The one definition: tiering asks it here, and the
+/// evaluator asks it when it decides which of a component's props are data —
+/// the two must agree, or a prop the tier ladder calls data is dropped as a
+/// handler.
+///
+/// 🔴 The evaluator's two component-prop sites used `starts_with("on")`
+/// instead, so `<Plan only="annual" />`, `onboarding`, `once`, `online` were
+/// dropped from a child component's props and from an island's captured props,
+/// with no error anywhere (fixed 2026-10-16). A host element's `on*`
+/// attributes are a different rule — React DOM ignores every unknown one — and
+/// stay with `eval::component::render_attrs`.
+pub(crate) fn is_event_handler_prop(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() > 2 && &bytes[..2] == b"on" && bytes[2].is_ascii_uppercase()
 }
@@ -870,6 +899,51 @@ pub fn imports_unresolvable_specifier(import_sources: &[String]) -> bool {
 /// character to be `/`, or `react-dom` would slip through on `starts_with`.
 fn is_react_specifier(source: &str) -> bool {
     source == "react" || source.starts_with("react/")
+}
+
+/// Is `path` a dynamic route — a file with a `[param]` segment, whose page
+/// receives that segment as `params`?
+///
+/// One predicate for the two places that must agree: this scan, which keeps
+/// such a page off Tier A, and `ManifestBuilder::dynamic_prop_keys_for_component`,
+/// which records the `params` prop the server then resolves per request.
+pub fn is_dynamic_route_path(path: &str) -> bool {
+    path.contains('[') && path.contains(']')
+}
+
+/// Can this component's signature reach its route's `params`?
+///
+/// 🔴 Nothing asked before 2026-10-07, so a `[slug]` page with no hooks was
+/// Tier A: rendered ONCE, at build time, from `{}`. `params.slug` was empty on
+/// every URL the route served — `/blog/a` and `/blog/b` were the same page, and
+/// the slug they were for was nowhere in it. `reads_principal` had closed the
+/// identical hole for `user`; `params` is the other prop that only a request has.
+///
+/// Read off the signature rather than the body, because `params` arrives
+/// through the props object and nowhere else: a page that takes no props
+/// cannot read it, and one that destructures props without naming it (and
+/// without a `...rest`) does not. Every other shape — `props`, a rest element,
+/// a computed key — **rounds toward "reads it"**, by the rule
+/// [`scan_reads_principal`] states: the cost of a false positive is a page
+/// rendered per request instead of baked once, which is slower and correct.
+fn takes_route_params(params: &[Pat]) -> bool {
+    const ROUTE_PARAMS: &str = "params";
+    match params.first() {
+        None => false,
+        Some(Pat::Object(object)) => object.props.iter().any(|prop| match prop {
+            ObjectPatProp::Assign(assign) => assign.key.sym.as_ref() == ROUTE_PARAMS,
+            ObjectPatProp::KeyValue(kv) => match &kv.key {
+                PropName::Ident(ident) => ident.sym.as_ref() == ROUTE_PARAMS,
+                PropName::Str(key) => key.value.as_ref() == ROUTE_PARAMS,
+                PropName::Num(_) | PropName::BigInt(_) => false,
+                PropName::Computed(_) => true,
+            },
+            ObjectPatProp::Rest(_) => true,
+        }),
+        // `({ params } = {})` — the pattern is on the left.
+        Some(Pat::Assign(assign)) => takes_route_params(std::slice::from_ref(&*assign.left)),
+        Some(_) => true,
+    }
 }
 
 fn scan_reads_principal(stmts: &[Stmt], params: &[Pat]) -> bool {

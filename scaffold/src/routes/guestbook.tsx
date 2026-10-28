@@ -37,8 +37,12 @@ export const sign_guestbook = action(({ form }) =>
   append("guestbook", { author: form.author, message: form.message }),
 );
 
-// `remove(collection, key)` retracts the row identified by `key`.
-export const remove_entry = action(({ form }) => remove("guestbook", form.id));
+// `update` and `remove` exist too, and they are authorized for you: a row can
+// be changed only by the signed-in user who added it. A stranger's
+// `remove("guestbook", 1)` is refused, and so is anyone's on a row signed
+// while signed out — it has no author to check against. A collection that
+// really is open to everyone says so in `albedo.config.ts` with
+// `edit: "anyone"`.
 
 export default function Guestbook() {
   // The topic is materialized from forge.db at boot and seeded before
@@ -86,17 +90,6 @@ export default function Guestbook() {
         <input className="field" name="message" placeholder="say something" />
         <button className="submit" type="submit">
           sign
-        </button>
-      </form>
-
-      <form action="action:remove_entry" method="POST" className="entry">
-        <input
-          className="field field-narrow"
-          name="id"
-          placeholder="row to drop"
-        />
-        <button className="submit submit-quiet" type="submit">
-          remove
         </button>
       </form>
 

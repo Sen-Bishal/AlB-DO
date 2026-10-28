@@ -45,6 +45,51 @@ export const DEFAULT_SUSPENSE_ATTRIBUTE = 'data-albedo-suspense';
 export const DEFAULT_ACTION_ENDPOINT = '/_albedo/action';
 
 /**
+ * ALB-03 · the attributes a `javascript:` URL runs from, and what replaces one.
+ * Asserted equal to `runtime::jsx_attributes::URL_ATTRIBUTES` and `BLOCKED_URL`
+ * by a Rust test. Both attribute sinks below — a `SetAttr` frame and a slot
+ * painted into an attribute — carry values that can come from another visitor's
+ * row, so they apply the same rule the server renderers do.
+ */
+const URL_ATTRIBUTES = {
+  action: true,
+  cite: true,
+  data: true,
+  formaction: true,
+  href: true,
+  poster: true,
+  src: true,
+  'xlink:href': true,
+};
+
+const BLOCKED_URL = "javascript:throw new Error('ALBEDO blocked a javascript: URL as a security precaution.')";
+
+/**
+ * The value to write for `name`: `value`, or `BLOCKED_URL` when `name` is a URL
+ * attribute and `value` would run as script. The same loop as
+ * `runtime::jsx_attributes::is_script_url`.
+ *
+ * @param {string} name
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function safeAttributeValue(name, value) {
+  const s = String(value);
+  if (!Object.prototype.hasOwnProperty.call(URL_ATTRIBUTES, String(name).toLowerCase())) {
+    return s;
+  }
+  let i = 0;
+  let scheme = '';
+  while (i < s.length && s.charCodeAt(i) <= 32) i++;
+  for (; i < s.length && scheme.length < 11; i++) {
+    const c = s.charAt(i);
+    if (c === '\t' || c === '\n' || c === '\r') continue;
+    scheme += c >= 'A' && c <= 'Z' ? String.fromCharCode(c.charCodeAt(0) + 32) : c;
+  }
+  return scheme === 'javascript:' || scheme.slice(0, 9) === 'vbscript:' ? BLOCKED_URL : s;
+}
+
+/**
  * Pre-installation no-op dispatcher. The `Bakabox` constructor uses
  * this as a default so the VM is usable before
  * [`createActionDispatcher`] has been wired (the bootstrap block at
@@ -69,6 +114,21 @@ function noopEventDispatcher(proxyId, event) {
  * @param {Event} event
  * @returns {{ kind: number, payload: Uint8Array }}
  */
+function formDataWithSubmitter(form, submitter) {
+  // The pressed button's `name=value` is part of a browser's own submit, so it
+  // must be part of this one or the form means something else with JavaScript
+  // on. `new FormData(form, submitter)` says exactly that where it exists; the
+  // fallback appends the same pair by hand.
+  if (!submitter) return new FormData(form);
+  try {
+    return new FormData(form, submitter);
+  } catch {
+    const data = new FormData(form);
+    if (submitter.name) data.append(submitter.name, submitter.value);
+    return data;
+  }
+}
+
 function classifyEvent(event) {
   const type = event?.type ?? 'other';
   if (type === 'click' || type === 'dblclick' || type === 'mousedown' || type === 'mouseup') {
@@ -95,7 +155,7 @@ function classifyEvent(event) {
       try {
         return {
           kind: ACTION_EVENT_KIND.Submit,
-          payload: encodeFormDataPayload(new FormData(form)),
+          payload: encodeFormDataPayload(formDataWithSubmitter(form, event.submitter)),
         };
       } catch {
         // Fall through to the empty-payload submit shape on encoding errors.
@@ -613,7 +673,7 @@ export class Bakabox {
   _opSetAttr({ stableId, attrId, value }) {
     const element = this._requireNode(stableId, 'SetAttr');
     const attrName = this._lookupIntern(this.attrs, attrId, 'attr');
-    element.setAttribute(attrName, this._decodeBytes(value));
+    element.setAttribute(attrName, safeAttributeValue(attrName, this._decodeBytes(value)));
   }
 
   _opSetText({ stableId, text }) {
@@ -769,7 +829,7 @@ export class Bakabox {
         // different site kind.
         const element = this._siteElement(site);
         const attrName = site.attrName || this.attrs.get(site.attrId);
-        if (element && attrName) element.setAttribute(attrName, paint);
+        if (element && attrName) element.setAttribute(attrName, safeAttributeValue(attrName, paint));
       } else if (site.kind === 'html') {
         const element = this._siteElement(site);
         if (element) element.innerHTML = paint;
@@ -1418,14 +1478,12 @@ if (globalScope && globalScope.document) {
       return encodeActionEnvelope(envelope);
     },
     hashActionName: function hashActionName(name) {
-      // FNV-1a-32, same family Phase L / Stream C use for action_id.
-      // Mirrors `dom_render_compiler::transforms::form::allocate_form_action_id`.
-      var hash = 0x811c9dc5 >>> 0;
-      for (var i = 0; i < name.length; i++) {
-        hash ^= name.charCodeAt(i) & 0xff;
-        hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
-      }
-      return hash;
+      // FNV-1a-32 over the name's UTF-8 bytes — what
+      // `dom_render_compiler::transforms::form::allocate_form_action_id`
+      // hashes. 🔴 This hashed `charCodeAt(i) & 0xff`, the low byte of each
+      // UTF-16 unit, which agrees with UTF-8 on ASCII and nowhere else: an
+      // action named `größe` posted an id the server had never allocated.
+      return fnv1a32Utf8(name);
     },
     requestRouteRefresh: function requestRouteRefresh(path) {
       // Fetch the route HTML + re-apply any inline opcode frame.

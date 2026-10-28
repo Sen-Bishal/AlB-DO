@@ -79,10 +79,6 @@ use crate::aperture::journal::{Journal, StepKind, StepOutcome};
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Result as SubstrateResult, SqlValue};
 
-/// The table. Reserved-prefixed, so an app cannot declare a collection that
-/// collides with it — `auth::schema::is_reserved` already guards `albedo_`.
-pub const WORKFLOW_STEPS_TABLE: &str = "albedo_workflow_steps";
-
 /// DDL, idempotent per the substrate contract.
 ///
 /// The primary key is `(workflow, step)`, which is the log's own identity: a
@@ -562,9 +558,6 @@ const RESULT_DDL: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS albedo_workflow_results_completed \
      ON albedo_workflow_results (completed_at)",
 ];
-
-/// The table holding one row per finished workflow.
-pub const WORKFLOW_RESULTS_TABLE: &str = "albedo_workflow_results";
 
 impl JournalLedger<'_> {
     /// Record that a workflow finished, and what it answered.

@@ -5,7 +5,7 @@
 //! libSQL's remote / embedded-replica modes are a later (deploy-manifold /
 //! edge) concern. This is the first backend that actually *executes* the SQL
 //! the compiler synthesizes, rather than recording it like
-//! [`RecordingSubstrate`](crate::forge::mem::RecordingSubstrate).
+//! `RecordingSubstrate`.
 //!
 //! ## Concurrency shape
 //!

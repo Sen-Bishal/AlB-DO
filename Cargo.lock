@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "albedo-node"
-version = "0.1.0-alpha.1"
+version = "1.0.0"
 dependencies = [
  "dom-render-compiler",
  "napi",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "albedo-server"
-version = "0.1.0-alpha.1"
+version = "1.0.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "dom-render-compiler"
-version = "0.1.0-alpha.1"
+version = "1.0.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1236,12 +1236,16 @@ dependencies = [
  "cron",
  "crossbeam",
  "dashmap",
+ "dom-render-compiler",
  "futures-util",
+ "glob",
+ "hmac",
  "libsql",
  "lru 0.12.5",
  "notify",
  "num_cpus",
  "once_cell",
+ "pulldown-cmark",
  "rand 0.8.5",
  "rayon",
  "regex",
@@ -1755,6 +1759,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "home"
@@ -3265,6 +3278,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.13.1",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
@@ -5130,6 +5154,12 @@ checksum = "e1b88fcfe09e89d3866a5c11019378088af2d24c3fbd4f0543f96b479ec90697"
 dependencies = [
  "version_check",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-id"

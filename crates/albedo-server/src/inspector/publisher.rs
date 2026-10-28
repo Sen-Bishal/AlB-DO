@@ -9,67 +9,128 @@
 //!   `frame_tick`, with per-lane patch counts and bytes.
 //!
 //! [`InspectorPublisher`] implements both. It owns a handle on
-//! [`InspectorState`] and an optional name→tier map sourced from the build
-//! manifest so each event lands with the right tier swatch — when the map is
-//! missing or the name is not in it, events default to `Tier::B`, which is the
-//! safe middle of the inspector's palette.
+//! [`InspectorState`] and, from the build manifest, each component's graph
+//! node id and tier — so a render lights up the node the graph drew for it,
+//! in the right swatch. A component the manifest does not name gets a
+//! content-hashed id (`module_spec + name`, xxh3-64) and `Tier::B`, the safe
+//! middle of the inspector's palette.
 //!
-//! Component IDs are content-hashed from `module_spec + name` (xxh3-64). They
-//! are stable across renders within one process but intentionally not stable
-//! across rename — that is a property a content hash cannot offer, and the
-//! inspector treats node identity as ephemeral within a session.
+//! The evaluator's observer slots are process-wide and set once; [`attach`]
+//! installs a forwarder into them the first time an inspector is mounted, and
+//! points it at the newest publisher every time after.
 
 use super::events::{EventTier, RenderEvent};
 use super::state::InspectorState;
-use dom_render_compiler::manifest::schema::Tier;
+use dom_render_compiler::manifest::schema::RenderManifestV2;
 use dom_render_compiler::runtime::render_observer::{
-    LaneFrameReport, LaneObserver, RenderInfo, RenderObserver,
+    install_lane_observer, install_render_observer, LaneFrameReport, LaneObserver, RenderInfo,
+    RenderObserver,
 };
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Once, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xxhash_rust::xxh3::xxh3_64;
 
 #[derive(Debug)]
 pub struct InspectorPublisher {
     inspector: Arc<InspectorState>,
-    /// Map of `component_name → Tier`, sourced from `RenderManifestV2.components`.
-    /// Optional — when absent (no manifest, no compile-time tiering), every
-    /// event defaults to `Tier::B`.
-    tier_map: HashMap<String, Tier>,
+    /// `component_name → (graph node id, tier)` from the build manifest. A name
+    /// two components share is left out: it cannot say which node rendered.
+    known: HashMap<String, (u64, EventTier)>,
 }
 
 impl InspectorPublisher {
     pub fn new(inspector: Arc<InspectorState>) -> Self {
         Self {
             inspector,
-            tier_map: HashMap::new(),
+            known: HashMap::new(),
         }
     }
 
-    pub fn with_tier_map(mut self, tier_map: HashMap<String, Tier>) -> Self {
-        self.tier_map = tier_map;
+    /// Resolve component names against `manifest`, the same components
+    /// [`super::GraphSnapshot::from_manifest`] draws.
+    #[must_use]
+    pub fn with_manifest(mut self, manifest: &RenderManifestV2) -> Self {
+        let mut known = HashMap::with_capacity(manifest.components.len());
+        let mut shared = HashSet::new();
+        for entry in &manifest.components {
+            let identity = (entry.id, EventTier::from(entry.tier));
+            if known.insert(entry.name.clone(), identity).is_some() {
+                shared.insert(entry.name.as_str());
+            }
+        }
+        for name in shared {
+            known.remove(name);
+        }
+        self.known = known;
         self
     }
 
-    fn tier_for(&self, name: &str) -> EventTier {
-        self.tier_map
+    fn identify(&self, name: &str, module_spec: &str) -> (u64, EventTier) {
+        self.known
             .get(name)
             .copied()
-            .map_or(EventTier::B, EventTier::from)
+            .unwrap_or_else(|| (component_id(name, module_spec), EventTier::B))
     }
 
     fn cascade_ids(&self, names: &[String]) -> Vec<u64> {
-        names.iter().map(|n| component_id(n, "")).collect()
+        names.iter().map(|name| self.identify(name, "").0).collect()
     }
+}
+
+/// The publisher feeding the inspector mounted now.
+///
+/// `albedo dev` keeps one inspector for the life of the process but rebuilds
+/// the manifest on every save, so the publisher is replaced each time and the
+/// forwarder always reads the current one.
+static CURRENT: RwLock<Option<Arc<InspectorPublisher>>> = RwLock::new(None);
+
+struct Forwarder;
+
+fn current() -> Option<Arc<InspectorPublisher>> {
+    CURRENT.read().ok().and_then(|slot| slot.clone())
+}
+
+impl RenderObserver for Forwarder {
+    fn on_render(&self, info: RenderInfo) {
+        if let Some(publisher) = current() {
+            publisher.on_render(info);
+        }
+    }
+}
+
+impl LaneObserver for Forwarder {
+    fn on_frame(&self, report: LaneFrameReport) {
+        if let Some(publisher) = current() {
+            publisher.on_frame(report);
+        }
+    }
+}
+
+/// Route the evaluator's render and lane events to `publisher`'s inspector,
+/// replacing whichever publisher had them. A process that never mounts an
+/// inspector never calls this, and its render path finds no observer at all.
+pub fn attach(publisher: InspectorPublisher) {
+    if let Ok(mut slot) = CURRENT.write() {
+        *slot = Some(Arc::new(publisher));
+    }
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let forwarder = Arc::new(Forwarder);
+        // Refused only if something else took the slot first; the inspector
+        // then shows no live events rather than someone else's.
+        let _ = install_render_observer(forwarder.clone());
+        let _ = install_lane_observer(forwarder);
+    });
 }
 
 impl RenderObserver for InspectorPublisher {
     fn on_render(&self, info: RenderInfo) {
+        let (component_id, tier) = self.identify(&info.component_name, &info.module_spec);
         let event = RenderEvent {
-            component_id: component_id(&info.component_name, &info.module_spec),
+            component_id,
             component_name: info.component_name.clone(),
-            tier: self.tier_for(&info.component_name),
+            tier,
             duration_us: info.duration_us,
             timestamp_ms: now_ms(),
             cascade_children: self.cascade_ids(&info.cascade_children),
@@ -129,36 +190,69 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    use dom_render_compiler::manifest::schema::{ComponentManifestEntry, HydrationMode, Tier};
+
+    fn manifest(components: &[(u64, &str, Tier)]) -> RenderManifestV2 {
+        let mut manifest = RenderManifestV2::legacy_defaults();
+        manifest.components = components
+            .iter()
+            .map(|&(id, name, tier)| ComponentManifestEntry {
+                id,
+                name: name.to_string(),
+                module_path: format!("src/{name}.tsx"),
+                tier,
+                weight_bytes: 0,
+                priority: 0.0,
+                dependencies: Vec::new(),
+                can_defer: false,
+                hydration_mode: HydrationMode::None,
+            })
+            .collect();
+        manifest
+    }
+
+    /// A render, and a cascade naming it, both land on the node the graph drew
+    /// from the manifest — otherwise the graph never lights up.
     #[test]
-    fn cascade_ids_match_published_event_ids() {
+    fn events_carry_the_graph_node_id_from_the_manifest() {
         let inspector = Arc::new(InspectorState::new());
-        let publisher = InspectorPublisher::new(inspector.clone());
+        let publisher = InspectorPublisher::new(inspector.clone()).with_manifest(&manifest(&[
+            (11, "List", Tier::B),
+            (12, "Item", Tier::C),
+        ]));
+        let mut events = inspector.subscribe();
 
         publisher.on_render(RenderInfo {
-            component_name: "TodoList".to_string(),
-            module_spec: "src/Todo.tsx".to_string(),
+            component_name: "List".to_string(),
+            module_spec: "src/List.tsx".to_string(),
             duration_us: 320,
-            cascade_children: vec!["TodoItem".to_string(), "Filter".to_string()],
+            cascade_children: vec!["Item".to_string(), "Unlisted".to_string()],
         });
-        publisher.on_render(RenderInfo {
-            component_name: "TodoItem".to_string(),
-            module_spec: "src/Todo.tsx".to_string(),
-            duration_us: 90,
-            cascade_children: vec![],
-        });
+        let event = events.try_recv().expect("the render was published");
+        assert_eq!((event.component_id, event.tier), (11, EventTier::B));
+        assert_eq!(event.cascade_children[0], 12, "a cascade names the child's node");
+        assert_eq!(
+            event.cascade_children[1],
+            component_id("Unlisted", ""),
+            "a component the manifest does not name still gets a stable id"
+        );
+        assert_eq!(inspector.metrics().snapshot().total_renders, 1);
+    }
 
-        let snapshot = inspector.metrics().snapshot();
-        assert_eq!(snapshot.total_renders, 2);
-        // Cascade child id of "TodoItem" published by TodoList should equal
-        // the id "TodoItem" reports for itself when the empty module_spec is
-        // used by `cascade_ids`. This verifies the inspector can join cascades
-        // back to nodes by name even when module_spec is unknown.
-        let from_cascade = component_id("TodoItem", "");
-        let from_render = component_id("TodoItem", "src/Todo.tsx");
-        assert_ne!(from_cascade, from_render);
-        // The current shape uses module_spec = "" for cascades because the
-        // child's module isn't on the parent's frame. This is documented in
-        // the publisher; if the choice changes, this test should change too.
+    /// Two components sharing a name cannot say which of them rendered, so
+    /// neither borrows a node id.
+    #[test]
+    fn a_shared_name_resolves_to_no_node() {
+        let inspector = Arc::new(InspectorState::new());
+        let publisher = InspectorPublisher::new(inspector).with_manifest(&manifest(&[
+            (1, "Button", Tier::A),
+            (2, "Button", Tier::C),
+            (3, "Card", Tier::A),
+        ]));
+        assert_eq!(publisher.identify("Card", "x"), (3, EventTier::A));
+        let (id, tier) = publisher.identify("Button", "src/a.tsx");
+        assert!(id != 1 && id != 2, "an ambiguous name must not claim a node");
+        assert_eq!(tier, EventTier::B);
     }
 
     #[test]

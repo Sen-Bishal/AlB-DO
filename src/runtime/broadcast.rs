@@ -140,6 +140,69 @@ use tokio::sync::mpsc;
 /// forwards verbatim to stream slot 2 (patches).
 pub type BroadcastSender = mpsc::Sender<Vec<u8>>;
 
+/// Column projection · the fields of a topic's rows one subscription may
+/// receive. Shared (`Arc`) because every tab on a route carries the same set,
+/// and hashed by content so a fan-out projects once per distinct set rather
+/// than once per subscriber.
+pub type Columns = Arc<std::collections::BTreeSet<String>>;
+
+/// What [`BroadcastRegistry::subscribe_granted`] hands back.
+#[derive(Debug, Default)]
+pub struct GrantedSeed {
+    /// One `SlotSet` per grant, each value cut to its grant's columns.
+    pub instructions: Vec<Instruction>,
+    /// `(topic, whole value)` per grant, for server-side use only.
+    pub values: Vec<(String, Vec<u8>)>,
+}
+
+/// One topic a subscription is granted, and the columns of it the
+/// subscribing route reads — `None` for all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicGrant {
+    pub topic: String,
+    pub columns: Option<Columns>,
+}
+
+impl TopicGrant {
+    /// A grant of the whole value — what every subscription was before
+    /// column projection, and still is for a route the walk could not bound.
+    #[must_use]
+    pub fn whole(topic: impl Into<String>) -> Self {
+        Self {
+            topic: topic.into(),
+            columns: None,
+        }
+    }
+}
+
+/// `value` cut down to `columns`: each object in an array keeps only those
+/// keys, as does an object itself. Anything else — a scalar, an array of
+/// scalars, bytes that are not JSON — has no columns and is returned as it
+/// came, so a raw broadcast topic is never mangled by a projection meant for
+/// rows.
+#[must_use]
+pub fn project_value(value: &[u8], columns: &std::collections::BTreeSet<String>) -> Vec<u8> {
+    let retain = |object: &mut serde_json::Map<String, serde_json::Value>| {
+        object.retain(|key, _| columns.contains(key));
+    };
+    let mut parsed = match serde_json::from_slice::<serde_json::Value>(value) {
+        Ok(parsed) => parsed,
+        Err(_) => return value.to_vec(),
+    };
+    match &mut parsed {
+        serde_json::Value::Array(rows) => {
+            for row in rows.iter_mut() {
+                if let serde_json::Value::Object(object) = row {
+                    retain(object);
+                }
+            }
+        }
+        serde_json::Value::Object(object) => retain(object),
+        _ => return value.to_vec(),
+    }
+    serde_json::to_vec(&parsed).unwrap_or_else(|_| value.to_vec())
+}
+
 /// What a topic *is*, as opposed to what it is called.
 ///
 /// PRISM § 5.1 splits a topic's **identity** (this, plus the subscriber set and
@@ -260,6 +323,11 @@ pub struct BroadcastTopic {
     /// Subscribed sessions. `DashMap` so an in-progress write iterating
     /// subscribers doesn't block a fresh subscribe on the same topic.
     subscribers: DashMap<SessionId, BroadcastSender>,
+    /// Column projection · the subscribers whose route reads only some of
+    /// this topic's columns, and which. A session absent here receives values
+    /// whole. Kept beside `subscribers` (not inside it) so every path that only
+    /// needs the sinks is untouched, and written under the same value lock.
+    projections: DashMap<SessionId, Columns>,
     /// PRISM · monotonic version of `value`, bumped on every write **under the
     /// same lock that publishes it**, so a version and the bytes it names cannot
     /// disagree.
@@ -634,6 +702,7 @@ impl BroadcastRegistry {
                     slot_id,
                     value: Mutex::new(initial),
                     subscribers: DashMap::new(),
+                    projections: DashMap::new(),
                     version: AtomicU64::new(0),
                     identity,
                     touched: AtomicU64::new(self.tick.fetch_add(1, Ordering::Relaxed)),
@@ -990,20 +1059,6 @@ impl BroadcastRegistry {
             .map_or(0, |entry| entry.subscriber_count())
     }
 
-    /// Snapshot of every registered topic's current value, as
-    /// `(topic, value_bytes)`. Used by the QuickJS action path to seed an
-    /// updater-form `broadcast(topic, fn)` evaluator with the pre-write state so
-    /// the updater's first read matches what the pure-Rust path reads via
-    /// `current_value()`. A topic absent from the snapshot is treated as `null`
-    /// by the caller (first-call default), matching pure-Rust semantics for an
-    /// as-yet-unregistered topic.
-    pub fn snapshot_values(&self) -> Vec<(String, Vec<u8>)> {
-        self.topics
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().current_value()))
-            .collect()
-    }
-
     /// Current values for just these topics, skipping any that are not
     /// registered.
     ///
@@ -1050,6 +1105,9 @@ impl BroadcastRegistry {
         let current = {
             let guard = topic_entry.lock_value();
             topic_entry.subscribers.insert(session, sender);
+            // A plain subscribe is a whole-value one; a projection left from an
+            // earlier grant on this session must not outlive it.
+            topic_entry.projections.remove(&session);
             guard.clone()
         };
         topic_entry
@@ -1070,6 +1128,7 @@ impl BroadcastRegistry {
     pub fn unsubscribe(&self, session: SessionId, topic: &str) {
         if let Some(topic_entry) = self.topics.get(topic) {
             topic_entry.subscribers.remove(&session);
+            topic_entry.projections.remove(&session);
         }
         if let Some(mut topics) = self.by_session.get_mut(&session) {
             topics.remove(topic);
@@ -1086,6 +1145,7 @@ impl BroadcastRegistry {
         for topic in topics {
             if let Some(topic_entry) = self.topics.get(&topic) {
                 topic_entry.subscribers.remove(&session);
+                topic_entry.projections.remove(&session);
             }
         }
     }
@@ -1191,15 +1251,14 @@ impl BroadcastRegistry {
         // of the value, can later be *ordered* against the deltas that follow.
         topic_entry.version.fetch_add(1, Ordering::Relaxed);
 
-        let instructions = vec![instruction];
-
-        let encoded = encode_frame(&OpcodeFrame {
+        let frame = OpcodeFrame {
             frame_id: self.next_frame_id.fetch_add(1, Ordering::Relaxed),
             component_id: None,
-            instructions,
-        })?;
+            instructions: vec![instruction],
+        };
+        let encoded = encode_frame(&frame)?;
 
-        let report = self.fan_out(topic, &topic_entry, &encoded);
+        let report = self.fan_out(topic, &topic_entry, &frame, &encoded);
         drop(guard);
         topic_entry
             .touched
@@ -1232,18 +1291,69 @@ impl BroadcastRegistry {
     /// the client reconnects and re-subscribes from current state. The cost of
     /// being wrong in this direction is one reconnect; the cost of being wrong
     /// in the other is a page that lies.
+    ///
+    /// # A snapshot is cut per subscriber's columns
+    ///
+    /// A `SlotSet` carries the stored value — every row, every column — so a
+    /// subscriber whose route reads only some columns gets it cut down to
+    /// those ([`project_value`]). Encoded once per distinct column set, not per
+    /// subscriber: a topic has as many sets as routes read it, a handful, while
+    /// it may have thousands of tabs. A list opcode passes untouched — its rows
+    /// are the markup the route's own template rendered, not columns.
+    ///
+    /// A projected frame that fails to encode is **not** replaced by the whole
+    /// one; that subscriber is dropped like a refused send and resubscribes
+    /// from a fresh, projected seed.
     fn fan_out(
         &self,
         topic: &str,
         topic_entry: &BroadcastTopic,
+        frame: &OpcodeFrame,
         encoded: &[u8],
     ) -> BroadcastDelivery {
         let mut report = BroadcastDelivery::default();
         let mut to_remove: Vec<SessionId> = Vec::new();
 
+        let snapshot = match frame.instructions.as_slice() {
+            [Instruction::SlotSet { slot_id, value }] if !topic_entry.projections.is_empty() => {
+                Some((*slot_id, value.as_slice()))
+            }
+            _ => None,
+        };
+        let mut projected: std::collections::HashMap<Columns, Option<Vec<u8>>> =
+            std::collections::HashMap::new();
+
         for entry in topic_entry.subscribers.iter() {
             let session = *entry.key();
-            match entry.value().try_send(encoded.to_vec()) {
+            let columns = snapshot.and_then(|_| {
+                topic_entry
+                    .projections
+                    .get(&session)
+                    .map(|columns| columns.value().clone())
+            });
+            let bytes = match (snapshot, columns) {
+                (Some((slot_id, value)), Some(columns)) => projected
+                    .entry(columns.clone())
+                    .or_insert_with(|| {
+                        encode_frame(&OpcodeFrame {
+                            frame_id: frame.frame_id,
+                            component_id: None,
+                            instructions: vec![Instruction::SlotSet {
+                                slot_id,
+                                value: project_value(value, &columns),
+                            }],
+                        })
+                        .ok()
+                    })
+                    .clone(),
+                _ => Some(encoded.to_vec()),
+            };
+            let Some(bytes) = bytes else {
+                report.dropped_closed.push(session);
+                to_remove.push(session);
+                continue;
+            };
+            match entry.value().try_send(bytes) {
                 Ok(()) => report.delivered += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     report.dropped_full.push(session);
@@ -1260,6 +1370,7 @@ impl BroadcastRegistry {
             // Remove from this topic first: `cleanup_session` walks the reverse
             // index, and this topic's entry there is what points back here.
             topic_entry.subscribers.remove(&session);
+            topic_entry.projections.remove(&session);
             if let Some(mut topics) = self.by_session.get_mut(&session) {
                 topics.remove(topic);
             }
@@ -1290,25 +1401,61 @@ impl BroadcastRegistry {
         sender: BroadcastSender,
         topics: &[String],
     ) -> Vec<Instruction> {
-        let mut out = Vec::with_capacity(topics.len());
-        for topic in topics {
-            let topic_arc = self.topic(topic.clone(), Vec::new());
-            // Same atomic register-then-snapshot as `subscribe`.
+        let grants: Vec<TopicGrant> = topics.iter().map(TopicGrant::whole).collect();
+        self.subscribe_granted(session, sender, &grants).instructions
+    }
+
+    /// Column projection · [`Self::auto_subscribe`] where each topic carries
+    /// the columns the subscribing route reads. The seed is cut to them, and so
+    /// is every snapshot this session is sent afterwards (see `fan_out`); list
+    /// deltas already carry rendered rows, not columns, and pass untouched.
+    ///
+    /// Returns the seed instructions for the wire **and** each topic's whole
+    /// value. The second is for a server-side resync render, which must see the
+    /// row as stored — it is never sent.
+    pub fn subscribe_granted(
+        &self,
+        session: SessionId,
+        sender: BroadcastSender,
+        grants: &[TopicGrant],
+    ) -> GrantedSeed {
+        let mut seed = GrantedSeed {
+            instructions: Vec::with_capacity(grants.len()),
+            values: Vec::with_capacity(grants.len()),
+        };
+        for grant in grants {
+            let topic_arc = self.topic(grant.topic.clone(), Vec::new());
+            // Same atomic register-then-snapshot as `subscribe`; the
+            // projection is registered under the same lock, so no write can
+            // fan out to this sink between the two and reach it whole.
             let value = {
                 let guard = topic_arc.lock_value();
                 topic_arc.subscribers.insert(session, sender.clone());
+                match &grant.columns {
+                    Some(columns) => {
+                        topic_arc.projections.insert(session, columns.clone());
+                    }
+                    None => {
+                        topic_arc.projections.remove(&session);
+                    }
+                }
                 guard.clone()
             };
             self.by_session
                 .entry(session)
                 .or_default()
-                .insert(topic.clone());
-            out.push(Instruction::SlotSet {
+                .insert(grant.topic.clone());
+            let sent = match &grant.columns {
+                Some(columns) => project_value(&value, columns),
+                None => value.clone(),
+            };
+            seed.instructions.push(Instruction::SlotSet {
                 slot_id: topic_arc.slot_id,
-                value,
+                value: sent,
             });
+            seed.values.push((grant.topic.clone(), value));
         }
-        out
+        seed
     }
 
     /// Diagnostic — number of registered topics.
@@ -1316,13 +1463,6 @@ impl BroadcastRegistry {
         self.topics.len()
     }
 
-    /// Diagnostic — number of sessions tracked in the reverse index.
-    /// May briefly include sessions whose only subscription was just
-    /// removed; the entry is dropped on next [`Self::cleanup_session`]
-    /// or once the empty set is observed.
-    pub fn session_count(&self) -> usize {
-        self.by_session.len()
-    }
 }
 
 /// Lower a [`ListUpdate`] to the single opcode that carries it, or `None` when
@@ -2594,5 +2734,132 @@ mod tests {
         let payload = rx.recv().await.expect("write reaches subscriber");
         let (_, value) = extract_slot_set(&payload);
         assert_eq!(value, b"hello");
+    }
+
+    // ── Column projection ────────────────────────────────────────────────
+
+    const WAITLIST: &[u8] =
+        br#"[{"email":"ada@private.test","id":1,"name":"Ada"},{"email":"bob@private.test","id":2,"name":"Bob"}]"#;
+
+    fn cols(fields: &[&str]) -> Columns {
+        Arc::new(fields.iter().map(|f| (*f).to_string()).collect())
+    }
+
+    #[test]
+    fn a_value_is_cut_to_its_columns_and_nothing_else_is_touched() {
+        assert_eq!(
+            project_value(WAITLIST, &cols(&["id", "name"])),
+            br#"[{"id":1,"name":"Ada"},{"id":2,"name":"Bob"}]"#.to_vec()
+        );
+        assert_eq!(project_value(WAITLIST, &cols(&["id"])), br#"[{"id":1},{"id":2}]"#.to_vec());
+        assert_eq!(
+            project_value(br#"{"stars":42,"token":"x"}"#, &cols(&["stars"])),
+            br#"{"stars":42}"#.to_vec()
+        );
+        // No columns to cut: a scalar, an array of scalars, raw bytes.
+        for untouched in [&b"7"[..], br#"["a","b"]"#, b"not json", b""] {
+            assert_eq!(project_value(untouched, &cols(&["id"])), untouched.to_vec());
+        }
+    }
+
+    /// The seed a granted subscriber joins with, beside a whole one.
+    #[test]
+    fn a_granted_seed_carries_only_the_routes_columns() {
+        let registry = BroadcastRegistry::new();
+        registry.topic("waitlist", WAITLIST.to_vec());
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        let seed = registry.subscribe_granted(
+            SessionId::random(),
+            tx,
+            &[TopicGrant {
+                topic: "waitlist".to_string(),
+                columns: Some(cols(&["id"])),
+            }],
+        );
+        match seed.instructions.as_slice() {
+            [Instruction::SlotSet { value, .. }] => {
+                assert_eq!(value, br#"[{"id":1},{"id":2}]"#);
+            }
+            other => panic!("expected one SlotSet, got {other:?}"),
+        }
+        assert_eq!(seed.values, vec![("waitlist".to_string(), WAITLIST.to_vec())], "kept whole server-side");
+
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        let whole = registry.auto_subscribe(SessionId::random(), tx, &["waitlist".to_string()]);
+        assert!(matches!(whole.as_slice(), [Instruction::SlotSet { value, .. }] if value == WAITLIST));
+    }
+
+    /// Every later snapshot, per subscriber, encoded once per column set.
+    #[test]
+    fn a_snapshot_fans_out_cut_per_subscriber() {
+        let registry = BroadcastRegistry::new();
+        registry.topic("waitlist", b"[]".to_vec());
+        let grant = |columns: Option<Columns>| {
+            [TopicGrant {
+                topic: "waitlist".to_string(),
+                columns,
+            }]
+        };
+        let (count_tx, mut count_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (count2_tx, mut count2_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (admin_tx, mut admin_rx) = mpsc::channel::<Vec<u8>>(8);
+        registry.subscribe_granted(SessionId::random(), count_tx, &grant(Some(cols(&["id"]))));
+        registry.subscribe_granted(SessionId::random(), count2_tx, &grant(Some(cols(&["id"]))));
+        registry.subscribe_granted(SessionId::random(), admin_tx, &grant(None));
+
+        let delivery = registry.write_topic("waitlist", WAITLIST.to_vec()).unwrap();
+        assert_eq!(delivery.delivered, 3);
+
+        let counted = drain_into_vec(&mut count_rx).remove(0);
+        assert_eq!(extract_slot_set(&counted).1, br#"[{"id":1},{"id":2}]"#.to_vec());
+        assert_eq!(drain_into_vec(&mut count2_rx).remove(0), counted, "one encode per column set");
+        assert_eq!(extract_slot_set(&drain_into_vec(&mut admin_rx)[0]).1, WAITLIST.to_vec());
+    }
+
+    /// A list opcode's rows are rendered markup, not columns: untouched.
+    #[test]
+    fn a_list_delta_is_not_projected() {
+        let registry = BroadcastRegistry::new();
+        registry.topic("waitlist", b"[]".to_vec());
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        registry.subscribe_granted(
+            SessionId::random(),
+            tx,
+            &[TopicGrant {
+                topic: "waitlist".to_string(),
+                columns: Some(cols(&["id"])),
+            }],
+        );
+        registry
+            .write_topic_delta("waitlist", |_| TopicTransition {
+                value: WAITLIST.to_vec(),
+                update: ListUpdate::Delta(vec![change(1, "1", "<li>Ada</li>")]),
+            })
+            .unwrap();
+        match instructions_of(&drain_into_vec(&mut rx)[0]).as_slice() {
+            [Instruction::SlotDelta { changes, .. }] => assert_eq!(changes[0].payload, b"<li>Ada</li>"),
+            other => panic!("expected the delta untouched, got {other:?}"),
+        }
+    }
+
+    /// A plain subscribe after a granted one is whole again — the projection
+    /// belongs to the grant, not the session.
+    #[test]
+    fn a_projection_does_not_outlive_its_grant() {
+        let registry = BroadcastRegistry::new();
+        registry.topic("waitlist", b"[]".to_vec());
+        let session = SessionId::random();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        registry.subscribe_granted(
+            session,
+            tx.clone(),
+            &[TopicGrant {
+                topic: "waitlist".to_string(),
+                columns: Some(cols(&["id"])),
+            }],
+        );
+        registry.subscribe(session, "waitlist", tx).unwrap();
+        registry.write_topic("waitlist", WAITLIST.to_vec()).unwrap();
+        assert_eq!(extract_slot_set(&drain_into_vec(&mut rx)[0]).1, WAITLIST.to_vec());
     }
 }

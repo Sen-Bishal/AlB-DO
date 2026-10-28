@@ -295,6 +295,11 @@ pub struct ApertureClient {
     /// rather than set-once: this client outlives a dev reload, and every reload
     /// builds a new limiter that the next charge has to land in.
     upstream_budget: std::sync::RwLock<Option<crate::shutter::Shutter>>,
+    /// What a body's bare `fetch()` to a declared source carries. Read by
+    /// [`crate::aperture::resolve_pending`] and nothing else, so the
+    /// framework's own calls through this client (an OAuth exchange) are never
+    /// handed an app's credential.
+    source_credentials: std::sync::RwLock<Arc<crate::aperture::SourceCredentials>>,
 }
 
 impl ApertureClient {
@@ -313,7 +318,26 @@ impl ApertureClient {
             metrics: Metrics::default(),
             timeout: DEFAULT_REQUEST_TIMEOUT,
             upstream_budget: std::sync::RwLock::new(None),
+            source_credentials: std::sync::RwLock::new(Arc::default()),
         }
+    }
+
+    /// Adopt the credentials the app's `sources` block declares, replacing any
+    /// installed before. See [`crate::aperture::SourceCredential`].
+    pub fn install_source_credentials(&self, credentials: crate::aperture::SourceCredentials) {
+        if let Ok(mut slot) = self.source_credentials.write() {
+            *slot = Arc::new(credentials);
+        }
+    }
+
+    /// The credentials installed now — one snapshot, so a whole pass of calls
+    /// is judged against the same declaration.
+    #[must_use]
+    pub fn source_credentials(&self) -> Arc<crate::aperture::SourceCredentials> {
+        self.source_credentials
+            .read()
+            .map(|slot| Arc::clone(&slot))
+            .unwrap_or_default()
     }
 
     /// Charge every request this client sends to `shutter`'s budget for its
@@ -648,8 +672,10 @@ fn build_wire_request(request: &ApertureRequest, validators: &Validators) -> Wir
 
 /// A [`Transport`] that records every request and replays scripted responses.
 ///
-/// The gates' instrument. Not `#[cfg(test)]` because the benches in
-/// `benches/aperture_gates.rs` are a separate crate and need it too.
+/// The gates' instrument. Compiled for tests and benches only (the
+/// `test-support` feature, which the crate's dev-dependencies enable) — never
+/// into a release binary.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct CountingTransport {
     responses: std::sync::Mutex<Vec<Result<WireResponse, ApertureError>>>,
@@ -659,6 +685,7 @@ pub struct CountingTransport {
     delay: Duration,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl CountingTransport {
     /// A transport that answers every request with `response`.
     #[must_use]
@@ -708,6 +735,7 @@ impl CountingTransport {
 }
 
 #[async_trait]
+#[cfg(any(test, feature = "test-support"))]
 impl Transport for CountingTransport {
     async fn send(&self, request: &WireRequest) -> Result<WireResponse, ApertureError> {
         self.calls.fetch_add(1, Ordering::Relaxed);

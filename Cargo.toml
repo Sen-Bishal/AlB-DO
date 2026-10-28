@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.1.0-alpha.1"
+version      = "1.0.0"
 edition      = "2021"
 rust-version = "1.77.0"
 authors      = ["Bishal Sen <bishalsenpersonal@gmail.com>"]
@@ -115,6 +115,8 @@ time          = { version = "0.3", features = ["formatting"] }
 
 # File system / watching
 notify   = { version = "6" }
+# `watch.ignore` in albedo.config. Already in the lock file; no new vendor cost.
+glob     = { version = "0.3" }
 walkdir  = { version = "2" }
 # The `albedo` CLI's terminal UI. `ratatui` re-exports the `crossterm`
 # it was built against, so the binary uses `ratatui::crossterm` rather
@@ -156,6 +158,21 @@ rustls-pki-types = { version = "1.9" }
 # duplicate. Revisit when something else needs winnow 0.6 anyway.
 cron   = { version = "0.12" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Markdown pages — a `.md` file under `routes/` is a route (`src/markdown.rs`).
+# CommonMark is a spec with a 600-case conformance suite and a long tail of
+# precedence rules; *wrap, do not innovate* applies exactly as it does to
+# multipart and cron. `pulldown-cmark` is the pull parser rustdoc and mdBook are
+# built on. `default-features = false` drops its HTML writer and CLI: the page is
+# lowered to JSX, never to HTML, so the evaluator's own escaping is the only
+# path text takes to the wire.
+pulldown-cmark = { version = "0.13", default-features = false }
+
+# Inbound webhooks — the HMAC-SHA256 every payment and code host signs its POSTs
+# with (`src/webhook.rs`). RustCrypto's `hmac` over the `sha2` already here: one
+# crate on the `digest` 0.10 both share, and `verify_slice` compares in constant
+# time, which a hand-rolled `==` over two digests does not.
+hmac = { version = "0.12" }
 
 # NAPI (Node.js bridge)
 napi        = { version = "2.16", default-features = false, features = ["napi8", "serde-json"] }
@@ -217,9 +234,13 @@ categories.workspace  = true
 # explicitly listed below build under `dom-render-compiler`.
 autobins = false
 
+# Developer tools. Not part of the product and not in a release: each builds
+# only with `--features dev-tools`, so `cargo build --release` produces the
+# `albedo` binary alone.
 [[bin]]
 name = "dom-compiler"
 path = "src/bin/dom-compiler.rs"
+required-features = ["dev-tools"]
 
 # Note: the `albedo` CLI moved to the `albedo-server` crate in Phase P
 # Stream A so it can call `boot_production_server` without re-introducing
@@ -232,6 +253,7 @@ path = "src/bin/dom-compiler.rs"
 [[bin]]
 name = "albedo-bench"
 path = "src/bin/albedo-bench.rs"
+required-features = ["dev-tools"]
 
 [features]
 # FORGE — the backend-less backend (development-plan/backend.md). ON BY
@@ -242,6 +264,14 @@ path = "src/bin/albedo-bench.rs"
 # left out of the binary.
 default = ["forge"]
 forge = ["dep:libsql"]
+# The benchmark harness and the legacy analysis CLI. Off by default and never
+# shipped; see the `[[bin]]` entries above.
+dev-tools = []
+# Test doubles and fixtures (a recording substrate, a scripted transport, a
+# hand-moved clock, a seeded demo schema). Enabled only through the
+# dev-dependencies below, so tests and benches see them and a release build
+# does not contain them.
+test-support = []
 
 [dependencies]
 async-trait.workspace        = true
@@ -276,12 +306,15 @@ base64.workspace             = true
 num_cpus.workspace           = true
 walkdir.workspace            = true
 notify.workspace             = true
+glob.workspace               = true
 rquickjs.workspace           = true
 time.workspace               = true
 # 15.5 · jobs — schedules. See the workspace entry for why these and not a
 # hand-rolled tick calendar.
 cron.workspace               = true
 chrono.workspace             = true
+pulldown-cmark.workspace     = true
+hmac.workspace               = true
 reqwest.workspace            = true
 url.workspace                = true
 
@@ -295,6 +328,8 @@ swc_ecma_transforms_typescript.workspace = true
 swc_ecma_visit.workspace                 = true
 
 [dev-dependencies]
+# Turns on `test-support` for this crate's own tests and benches only.
+dom-render-compiler = { path = ".", features = ["test-support"] }
 tempfile.workspace  = true
 regex.workspace     = true
 criterion.workspace = true

@@ -1,15 +1,27 @@
 name: Release
 
+# A release is a tag. `v1.2.3` builds `albedo` 1.2.3 for every platform below
+# and opens a DRAFT GitHub release with the artifacts attached; publishing it is
+# a human decision.
+#
+# Run it by hand (Actions -> Release -> Run workflow) to rehearse: every target
+# is built, smoke-tested and packaged, the MSI included, and the artifacts are
+# kept on the run. Nothing is published.
+
 on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  # rust-toolchain.toml pins nightly only for rustfmt's comment options. A
+  # release binary is built by the stable compiler.
+  RUSTUP_TOOLCHAIN: stable
 
 jobs:
   build:
@@ -19,32 +31,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target:   x86_64-pc-windows-msvc
-            os:       windows-latest
-            artifact: albdo-windows-x64
-            cross:    false
-          - target:   x86_64-apple-darwin
-            os:       macos-13
-            artifact: albdo-macos-x64
-            cross:    false
-          - target:   aarch64-apple-darwin
-            os:       macos-latest
-            artifact: albdo-macos-arm64
-            cross:    false
-          - target:   x86_64-unknown-linux-gnu
-            os:       ubuntu-22.04
-            artifact: albdo-linux-x64
-            cross:    false
-          - target:   aarch64-unknown-linux-gnu
-            os:       ubuntu-22.04
-            artifact: albdo-linux-arm64
-            cross:    true
+          - target: x86_64-pc-windows-msvc
+            os:     windows-latest
+            cross:  false
+          - target: x86_64-apple-darwin
+            os:     macos-15-intel
+            cross:  false
+          - target: aarch64-apple-darwin
+            os:     macos-latest
+            cross:  false
+          - target: x86_64-unknown-linux-gnu
+            os:     ubuntu-22.04
+            cross:  false
+          - target: aarch64-unknown-linux-gnu
+            os:     ubuntu-22.04
+            cross:  true
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
@@ -52,129 +59,109 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross (ARM Linux only)
-        if: matrix.cross == true
+      # The binary reports CARGO_PKG_VERSION. A tag that disagrees would ship an
+      # artifact named one version that calls itself another. A rehearsal has no
+      # tag and takes the crate's version.
+      - name: Check the tag matches the crate version
+        shell: bash
+        run: |
+          CRATE=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$CRATE" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $CRATE"
+            exit 1
+          fi
+          echo "VERSION=$CRATE" >> "$GITHUB_ENV"
+
+      - name: Install cross
+        if: matrix.cross
         run: cargo install cross --locked
 
       - name: Build
         shell: bash
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target "${{ matrix.target }}" --bin albdo
-          else
-            cargo build --release --target "${{ matrix.target }}" --bin albdo
-          fi
+          TOOL=cargo
+          [ "${{ matrix.cross }}" = "true" ] && TOOL=cross
+          $TOOL build --release --locked --target "${{ matrix.target }}" -p albedo-server --bin albedo
 
       - name: Resolve binary path
-        id: bin
         shell: bash
         run: |
           EXT=""
           [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
-          echo "path=target/${{ matrix.target }}/release/albdo${EXT}" >> "$GITHUB_OUTPUT"
+          echo "BIN=target/${{ matrix.target }}/release/albedo${EXT}" >> "$GITHUB_ENV"
 
-      # ── Generate shell completions from the real binary ──────────────────────
-      - name: Generate completions
+      # Run the binary we are about to ship — through qemu for the cross build —
+      # and make it say its own version. A binary that cannot start never
+      # reaches an archive.
+      - name: Smoke test and generate completions
         shell: bash
         run: |
-          BIN="${{ steps.bin.outputs.path }}"
-          mkdir -p installer/completions
-          "$BIN" completions bash        > installer/completions/albdo.bash
-          "$BIN" completions zsh         > installer/completions/_albdo
-          "$BIN" completions fish        > installer/completions/albdo.fish
-          "$BIN" completions powershell  > installer/completions/_albdo.ps1
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            run() { cross run --release --locked --target "${{ matrix.target }}" -p albedo-server --bin albedo -- "$@"; }
+          else
+            run() { "$BIN" "$@"; }
+          fi
+          ACTUAL=$(run --version)
+          if [ "$ACTUAL" != "albedo $VERSION" ]; then
+            echo "::error::the binary reports '$ACTUAL', expected 'albedo $VERSION'"
+            exit 1
+          fi
+          mkdir -p stage/completions
+          run completions bash       > stage/completions/albedo.bash
+          run completions zsh        > stage/completions/_albedo
+          run completions fish       > stage/completions/albedo.fish
+          run completions powershell > stage/completions/_albedo.ps1
 
-      # ══════════════════════ WINDOWS ═══════════════════════════════════════════
+      - name: Package (macOS, Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          NAME="albedo-${VERSION}-${{ matrix.target }}"
+          mkdir -p "stage/$NAME"
+          cp "$BIN" "stage/$NAME/albedo"
+          chmod 755 "stage/$NAME/albedo"
+          cp -R stage/completions "stage/$NAME/completions"
+          cp LICENSE.md README.md "stage/$NAME/"
+          mkdir -p dist
+          tar -C stage -czf "dist/$NAME.tar.gz" "$NAME"
+          (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+
       - name: Install WiX Toolset
         if: runner.os == 'Windows'
-        run: dotnet tool install --global wix
+        run: dotnet tool install --global wix --version 5.0.2
 
-      - name: Stage Windows artifacts
+      - name: Package (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          cp "${{ steps.bin.outputs.path }}" installer/windows/albdo.exe
-          cp installer/completions/_albdo.ps1 installer/windows/_albdo.ps1
+          $name = "albedo-$env:VERSION-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "stage/$name", dist | Out-Null
+          Copy-Item $env:BIN "stage/$name/albedo.exe"
+          Copy-Item -Recurse stage/completions "stage/$name/completions"
+          Copy-Item LICENSE.md, README.md "stage/$name/"
+          Compress-Archive -Path "stage/$name" -DestinationPath "dist/$name.zip" -Force
+          $binary = (Resolve-Path $env:BIN).Path
+          wix build installer/windows/AlBDO.wxs `
+            -d "Version=$env:VERSION" `
+            -d "BinaryPath=$binary" `
+            -o "dist/AlBDO-$env:VERSION-x64.msi"
+          if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+          Get-ChildItem dist -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Out-File -Encoding ascii "$($_.FullName).sha256"
+          }
 
-      - name: Build Windows installer (.msi)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
-          cd installer/windows
-          wix build AlBDO.wxs -o "AlBDO-${VERSION}-x64.msi"
-
-      - name: Upload Windows installer
-        if: runner.os == 'Windows'
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: installer/windows/AlBDO-*.msi
-
-      # ══════════════════════ MACOS ═════════════════════════════════════════════
-      - name: Stage macOS binary and completions
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p installer/macos/root/usr/local/bin
-          mkdir -p installer/macos/root/usr/local/share/albdo/completions
-          cp "${{ steps.bin.outputs.path }}" installer/macos/root/usr/local/bin/albdo
-          chmod 755 installer/macos/root/usr/local/bin/albdo
-          cp installer/completions/albdo.bash installer/macos/root/usr/local/share/albdo/completions/
-          cp installer/completions/_albdo     installer/macos/root/usr/local/share/albdo/completions/
-          cp installer/completions/albdo.fish installer/macos/root/usr/local/share/albdo/completions/
-
-      - name: Build macOS .pkg + .dmg
-        if: runner.os == 'macOS'
-        run: |
-          chmod +x installer/macos/build-pkg.sh
-          bash installer/macos/build-pkg.sh "${{ github.ref_name }}" "${{ matrix.artifact }}"
-
-      - name: Upload macOS .dmg
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: installer/macos/*.dmg
-
-      # ══════════════════════ LINUX ═════════════════════════════════════════════
-      - name: Resolve Debian arch
-        if: runner.os == 'Linux'
-        id: deb_arch
-        shell: bash
-        run: |
-          case "${{ matrix.target }}" in
-            x86_64*)  echo "arch=amd64" >> "$GITHUB_OUTPUT" ;;
-            aarch64*) echo "arch=arm64" >> "$GITHUB_OUTPUT" ;;
-          esac
-
-      - name: Stage Linux artifacts
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p installer/linux/deb/usr/bin
-          mkdir -p installer/linux/deb/usr/share/albdo/completions
-          cp "${{ steps.bin.outputs.path }}" installer/linux/deb/usr/bin/albdo
-          chmod 755 installer/linux/deb/usr/bin/albdo
-          cp installer/completions/albdo.bash installer/linux/deb/usr/share/albdo/completions/
-          cp installer/completions/_albdo     installer/linux/deb/usr/share/albdo/completions/
-          cp installer/completions/albdo.fish installer/linux/deb/usr/share/albdo/completions/
-
-      - name: Build .deb
-        if: runner.os == 'Linux'
-        run: |
-          chmod +x installer/linux/build-deb.sh
-          bash installer/linux/build-deb.sh "${{ github.ref_name }}" "${{ steps.deb_arch.outputs.arch }}"
-
-      - name: Upload .deb
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: installer/linux/*.deb
+          name: albedo-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
 
   release:
-    name: Publish Release
+    name: Publish release (draft)
     needs: build
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -183,10 +170,10 @@ jobs:
           path: dist/
           merge-multiple: true
 
-      - name: Create GitHub Release (draft)
+      - name: Create GitHub release (draft)
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*
+          files: dist/*
           draft: true
           generate_release_notes: true
           name: AlBDO ${{ github.ref_name }}
@@ -195,10 +182,13 @@ jobs:
 
             | Platform            | Download |
             |---------------------|----------|
-            | Windows x64         | `AlBDO-<version>-x64.msi` |
-            | macOS Intel         | `AlBDO-<version>-macos-x64.dmg` |
-            | macOS Apple Silicon | `AlBDO-<version>-macos-arm64.dmg` |
-            | Linux x64           | `albdo_<version>_amd64.deb` |
-            | Linux arm64         | `albdo_<version>_arm64.deb` |
+            | Windows x64         | `AlBDO-<version>-x64.msi` (installer) or `albedo-<version>-x86_64-pc-windows-msvc.zip` |
+            | macOS Intel         | `albedo-<version>-x86_64-apple-darwin.tar.gz` |
+            | macOS Apple Silicon | `albedo-<version>-aarch64-apple-darwin.tar.gz` |
+            | Linux x64           | `albedo-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux arm64         | `albedo-<version>-aarch64-unknown-linux-gnu.tar.gz` |
 
-            Run `albdo --version` after installation to verify.
+            Every file has a `.sha256` beside it. Archives contain the `albedo`
+            binary and shell completions under `completions/`.
+
+            Run `albedo --version` after installing to verify.

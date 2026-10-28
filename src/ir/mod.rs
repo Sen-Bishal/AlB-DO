@@ -464,6 +464,7 @@ mod tests {
             is_client_interactive: false,
             state_escapes: false,
             reads_principal: false,
+            reads_route_params: false,
             source_hash: 42,
             import_sources: Vec::new(),
             is_module_only: false,

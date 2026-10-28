@@ -70,14 +70,160 @@ pub struct IslandRenderFailure {
 /// `closing_scripts` (the client runtime + per-island IIFEs + payload +
 /// bootstrap) before `</body>`. Computing this at boot keeps the `!Send`
 /// QuickJS render off the concurrent request path.
+///
+/// An island whose props this request decides is rendered again on the request
+/// path instead — through the engine pool or the compiled project, never the
+/// boot renderer — and [`Self::islands`] is what that pass needs.
 #[derive(Debug, Clone, Default)]
 pub struct RouteHydration {
     /// `(placeholder_id, marked_island_html)` pairs. The placeholder's empty
     /// `<div data-albedo-tier="c"></div>` is replaced wholesale by the marked
     /// HTML so the island marker lands on the component's own root element.
     pub placeholders: Vec<(String, String)>,
-    /// The `<script>` block emitted before `</body>`.
+    /// The `<script>` block emitted before `</body>`, less [`Self::installs`].
     pub closing_scripts: String,
+    /// One binding-mode `boot(…)` script per serve-wired island, as
+    /// `(placeholder_id, script)`, emitted after `closing_scripts`.
+    ///
+    /// Kept apart from `closing_scripts` because each is a function of that
+    /// island's props: an island re-rendered for one request needs its own,
+    /// and booting the boot-time one as well would bind the island twice.
+    pub installs: Vec<(String, String)>,
+    /// Every island on this route the serve path may re-render for a request,
+    /// keyed by placeholder id. See [`crate::render::islands`].
+    pub islands: HashMap<String, RequestIsland>,
+}
+
+impl RouteHydration {
+    /// The closing script block, with `overrides` (placeholder id → install)
+    /// taking the place of the boot-time install for the islands this request
+    /// re-rendered.
+    #[must_use]
+    pub fn closing_scripts_for(&self, overrides: &HashMap<String, String>) -> String {
+        let mut out = self.closing_scripts.clone();
+        for (placeholder_id, install) in &self.installs {
+            out.push_str(overrides.get(placeholder_id).unwrap_or(install));
+        }
+        out
+    }
+}
+
+/// What the serve path needs to render one island again, for one request.
+///
+/// 🔴 Islands were rendered once, at boot, from the props the build captured —
+/// with no request in scope. A `[id]` page holding state, a `<Picker
+/// id={params.id} />` under a per-request page, and an island passed `user`
+/// all served the build's value on every URL and to every visitor.
+#[derive(Debug, Clone)]
+pub struct RequestIsland {
+    /// The props the boot render used — what the parent passed when the build
+    /// rendered it.
+    pub boot_props: serde_json::Value,
+    /// The request props this island reads itself
+    /// (`TierCNode::dynamic_prop_keys`).
+    pub dynamic_prop_keys: Vec<String>,
+    /// How it was served at boot, which is how it is served again.
+    pub render: IslandRender,
+}
+
+/// The two ways an island reaches the page — see
+/// [`RendererRuntime::build_reactive_blocks`] and
+/// [`RendererRuntime::build_hydration_blocks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IslandRender {
+    /// Serve-wired: the binding payload is rebuilt from the compiled project
+    /// under this render-entry spec.
+    Binding { entry: String },
+    /// Hydrated (A3): rendered through the engine pool under `plan_key`, and
+    /// hydrated from the props the markup carries.
+    Hydrate { plan_key: String, component_id: u64 },
+}
+
+/// The render-plan key an island is registered under for per-request SSR.
+/// Prefixed so it cannot collide with a Tier-B `render::*` key or a route
+/// boundary's bare component name.
+#[must_use]
+pub fn island_plan_key(component_name: &str) -> String {
+    format!("island:{component_name}")
+}
+
+/// The props an island is rendered from at boot: what its parent passed, plus
+/// each request prop it reads, as an anonymous request with no route params
+/// would supply it (`params: {}`, `user: null`).
+///
+/// The boot render is the fallback a request uses only when its own render
+/// fails, but it must not throw: `params.id` on a missing `params` raised at
+/// boot and reported a page that renders fine on every request as an island
+/// absent from its page.
+pub(crate) fn boot_island_props(
+    initial_props: &serde_json::Value,
+    dynamic_prop_keys: &[String],
+) -> serde_json::Value {
+    let mut props = match initial_props {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for key in dynamic_prop_keys {
+        let empty = match key.as_str() {
+            "params" => serde_json::Value::Object(serde_json::Map::new()),
+            _ => serde_json::Value::Null,
+        };
+        props.entry(key.clone()).or_insert(empty);
+    }
+    serde_json::Value::Object(props)
+}
+
+/// Binding mode needs at least one text/attr/derived/list binding driven by at
+/// least one client handler; anything else falls back to A3. The boot pass and
+/// the request pass ask the same question, so it is asked here once.
+pub(crate) fn is_serve_wireable(
+    payload: &dom_render_compiler::runtime::compiled::ReactivePayload,
+) -> bool {
+    (!payload.texts.is_empty()
+        || !payload.attrs.is_empty()
+        || !payload.derived.is_empty()
+        || !payload.lists.is_empty())
+        && !payload.events.is_empty()
+}
+
+/// The `boot(…)` script that wires one serve-wired island.
+pub(crate) fn reactive_install_script(
+    payload: &dom_render_compiler::runtime::compiled::ReactivePayload,
+) -> Option<String> {
+    let json = serde_json::to_string(payload).ok()?;
+    Some(format!(
+        "<script>window.__albedoReactive&&window.__albedoReactive.boot({});</script>",
+        escape_inline_script(&json)
+    ))
+}
+
+/// Mark an island's SSR markup for hydration — and, when it was rendered for
+/// one request, carry that request's props on it, where the client reads them
+/// in preference to the payload's boot-time props.
+#[must_use]
+pub fn mark_island_html(
+    html: &str,
+    component_id: u64,
+    request_props: Option<&serde_json::Value>,
+) -> String {
+    let marked = inject_island_marker(html, component_id);
+    let Some(props) = request_props else {
+        return marked;
+    };
+    let Ok(json) = serde_json::to_string(props) else {
+        return marked;
+    };
+    let marker = format!(" data-albedo-island=\"{component_id}\"");
+    let escaped = json
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    marked.replacen(
+        &marker,
+        &format!("{marker} data-albedo-props=\"{escaped}\""),
+        1,
+    )
 }
 
 /// Make `js` safe to embed verbatim in an inline `<script>`: only `</` can
@@ -116,6 +262,8 @@ pub(crate) fn merge_island_blocks(
                 let merged = slot.get_mut();
                 merged.placeholders.extend(block.placeholders);
                 merged.closing_scripts.push_str(&block.closing_scripts);
+                merged.installs.extend(block.installs);
+                merged.islands.extend(block.islands);
             }
             Entry::Vacant(slot) => {
                 slot.insert(block);
@@ -300,6 +448,9 @@ impl RendererRuntime {
             trigger: HydrationTrigger,
             /// 4.8 · what the parent passed this island, from the manifest.
             props: serde_json::Value,
+            /// The island's manifest name — its per-request plan key.
+            component_name: String,
+            dynamic_prop_keys: Vec<String>,
         }
 
         // Phase 1 — gather island metadata from the manifest (immutable borrows
@@ -341,6 +492,8 @@ impl RendererRuntime {
                     source: module.code.clone(),
                     trigger: trigger_from_mode(node.hydration_mode),
                     props: node.initial_props.clone(),
+                    component_name: node.component_id.clone(),
+                    dynamic_prop_keys: node.dynamic_prop_keys.clone(),
                 });
             }
             if !islands.is_empty() {
@@ -421,9 +574,22 @@ impl RendererRuntime {
                 }
             }
             let mut plan_islands = Vec::new();
+            let mut request_islands = HashMap::new();
 
             for island in &islands {
-                if let Some(html) = self.render_island_html(&island.module_path, &island.props) {
+                request_islands.insert(
+                    island.placeholder_id.clone(),
+                    RequestIsland {
+                        boot_props: island.props.clone(),
+                        dynamic_prop_keys: island.dynamic_prop_keys.clone(),
+                        render: IslandRender::Hydrate {
+                            plan_key: island_plan_key(&island.component_name),
+                            component_id: island.component_id,
+                        },
+                    },
+                );
+                let boot_props = boot_island_props(&island.props, &island.dynamic_prop_keys);
+                if let Some(html) = self.render_island_html(&island.module_path, &boot_props) {
                     placeholders.push((
                         island.placeholder_id.clone(),
                         inject_island_marker(&html, island.component_id),
@@ -463,7 +629,10 @@ impl RendererRuntime {
                     module_path: island.module_path.clone(),
                     trigger: island.trigger,
                     dependencies: Vec::new(),
-                    props: island.props.clone(),
+                    // The props the SSR above rendered from, so the two agree. A
+                    // request that re-renders the island carries its own on the
+                    // markup, which the client prefers.
+                    props: boot_props,
                 });
             }
 
@@ -497,6 +666,8 @@ impl RendererRuntime {
                 RouteHydration {
                     placeholders,
                     closing_scripts: scripts,
+                    installs: Vec::new(),
+                    islands: request_islands,
                 },
             );
         }
@@ -530,12 +701,12 @@ impl RendererRuntime {
             "/../../assets/albedo-reactive.js"
         ));
 
-        let empty_props = serde_json::Value::Object(Default::default());
         let mut blocks = HashMap::new();
 
         for (path, route) in &self.manifest.routes {
             let mut placeholders = Vec::new();
-            let mut installs = String::new();
+            let mut installs = Vec::new();
+            let mut request_islands = HashMap::new();
 
             for node in &route.tier_c {
                 if node.hydration_mode == HydrationMode::None {
@@ -561,52 +732,49 @@ impl RendererRuntime {
                 // always took props; it was only ever handed an empty object, so a
                 // serve-wired island's initial paint ignored `<Counter start={41} />`
                 // and its `useState(start)` opened on `undefined`.
-                let props = match &node.initial_props {
-                    serde_json::Value::Null => &empty_props,
-                    captured => captured,
-                };
+                let props = boot_island_props(&node.initial_props, &node.dynamic_prop_keys);
 
                 let slots = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
-                let payload = match compiled.build_reactive_payload(entry, props, &slots) {
+                let payload = match compiled.build_reactive_payload(entry, &props, &slots) {
                     // Binding mode requires at least one text/attr/derived binding
                     // driven by at least one client handler. Anything else (no
                     // handler, no slot read, structural-only) is not eligible —
                     // fall through to the A3 island path.
-                    Ok(p)
-                        if (!p.texts.is_empty()
-                            || !p.attrs.is_empty()
-                            || !p.derived.is_empty()
-                            || !p.lists.is_empty())
-                            && !p.events.is_empty() =>
-                    {
-                        p
-                    }
+                    Ok(p) if is_serve_wireable(&p) => p,
                     _ => continue,
+                };
+                let Some(install) = reactive_install_script(&payload) else {
+                    continue;
                 };
 
                 // Fill the empty Tier-C placeholder with the Phase K HTML — the
                 // SAME render the binding frame was emitted from, so its
                 // `data-albedo-id` stamps line up with every BindEvent/SetTextRef.
                 placeholders.push((node.placeholder_id.clone(), payload.html.clone()));
-
-                if let Ok(json) = serde_json::to_string(&payload) {
-                    installs
-                        .push_str("<script>window.__albedoReactive&&window.__albedoReactive.boot(");
-                    installs.push_str(&escape_inline_script(&json));
-                    installs.push_str(");</script>");
-                }
+                installs.push((node.placeholder_id.clone(), install));
+                request_islands.insert(
+                    node.placeholder_id.clone(),
+                    RequestIsland {
+                        boot_props: node.initial_props.clone(),
+                        dynamic_prop_keys: node.dynamic_prop_keys.clone(),
+                        render: IslandRender::Binding {
+                            entry: entry.to_string(),
+                        },
+                    },
+                );
             }
 
             if !placeholders.is_empty() {
                 let mut scripts = String::from("<script>");
                 scripts.push_str(&escape_inline_script(driver));
                 scripts.push_str("</script>");
-                scripts.push_str(&installs);
                 blocks.insert(
                     path.clone(),
                     RouteHydration {
                         placeholders,
                         closing_scripts: scripts,
+                        installs,
+                        islands: request_islands,
                     },
                 );
             }
@@ -685,6 +853,28 @@ impl RendererRuntime {
             // path calls `call_metadata` with.
             if let Some(name) = route.dynamic_metadata.as_deref() {
                 self.add_component_to_plan(&mut plan, &by_name, &island_modules, compiled, name, name);
+            }
+
+            // Every island, under its own key, so a request whose props differ
+            // from the boot render's can render it again. With NO client-
+            // reference substitution: an island's own subtree renders inline,
+            // exactly as the boot render and the client bundle both render it.
+            //
+            // ⚠️ The island's module is the stub in every Tier-B plan above and
+            // the real component here, under the same specifier. Each render
+            // reloads its whole plan and an engine re-evaluates a module whose
+            // source changed, so the two never see each other's — at the cost
+            // of a recompile when one engine alternates between them.
+            let no_client_references = HashMap::new();
+            for node in &route.tier_c {
+                self.add_component_to_plan(
+                    &mut plan,
+                    &by_name,
+                    &no_client_references,
+                    compiled,
+                    &island_plan_key(&node.component_id),
+                    &node.component_id,
+                );
             }
         }
         plan
@@ -984,7 +1174,9 @@ fn load_module_sources(
             continue;
         }
         let resolved = resolve_portable_module_path(&component.module_path, &project_root);
-        let source = std::fs::read_to_string(&resolved).map_err(|err| {
+        // A Markdown page registers as the JSX module it lowers to, exactly as the
+        // build saw it — the engine cannot execute Markdown.
+        let source = dom_render_compiler::markdown::read_module_source(&resolved).map_err(|err| {
             RuntimeError::RendererArtifactIo {
                 path: resolved.display().to_string(),
                 message: err.to_string(),
@@ -1048,6 +1240,7 @@ mod tests {
                 .map(|(id, html)| (id.to_string(), html.to_string()))
                 .collect(),
             closing_scripts: scripts.to_string(),
+            ..RouteHydration::default()
         }
     }
 

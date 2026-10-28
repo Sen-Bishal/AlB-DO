@@ -46,20 +46,59 @@ fn npm_runtime_js() -> &'static str {
     CACHED.get_or_init(dom_render_compiler::bundler::client_npm::build_browser_npm_runtime_script)
 }
 
+/// `source`, minified once for the life of the process.
+///
+/// The files in `assets/` are written to be read and carry their reasoning in
+/// comments; a browser needs none of it. See `bundler::minify` — layout and
+/// comments go, nothing is renamed.
+fn minified(slot: &'static OnceLock<String>, source: &str) -> &'static str {
+    slot.get_or_init(|| dom_render_compiler::bundler::minify::minify_script(source))
+        .as_str()
+}
+
+/// Every fixed URL [`resolve_albedo_asset`] answers.
+///
+/// Public for the static export, which has to write each script a page can load
+/// — `runtime.js` imports `./bincode.js` and, lazily, `/_albedo/hydration.js`, so
+/// following the page's own `<script>` tags would miss two of them. It is also
+/// the list `known_assets_resolve_to_non_empty_bodies` walks, so a path listed
+/// here that the match stops answering fails that test instead of 404ing on
+/// somebody's static host.
+pub const EMBEDDED_ASSET_PATHS: &[&str] = &[
+    "/_albedo/runtime.js",
+    "/_albedo/bincode.js",
+    "/_albedo/link-forms.js",
+    "/_albedo/hydration.js",
+    "/_albedo/client.js",
+    "/_albedo/wt-bootstrap.js",
+    "/_albedo/phosphor.js",
+    dom_render_compiler::bundler::client_npm::CLIENT_NPM_RUNTIME_URL,
+];
+
 /// Resolve `path` to one of the in-binary bakabox client assets.
 /// Returns `Some(body)` for the known framework-reserved URLs;
 /// `None` for everything else (caller falls through to the
 /// regular dispatch).
 fn resolve_albedo_asset(path: &str) -> Option<&'static str> {
+    static RUNTIME: OnceLock<String> = OnceLock::new();
+    static BINCODE: OnceLock<String> = OnceLock::new();
+    static LINK_FORMS: OnceLock<String> = OnceLock::new();
+    static HYDRATION: OnceLock<String> = OnceLock::new();
+    static CLIENT: OnceLock<String> = OnceLock::new();
+    static WT_BOOTSTRAP: OnceLock<String> = OnceLock::new();
+    static PHOSPHOR: OnceLock<String> = OnceLock::new();
+    static NPM_RUNTIME: OnceLock<String> = OnceLock::new();
     match path {
-        "/_albedo/runtime.js" => Some(RUNTIME_JS),
-        "/_albedo/bincode.js" => Some(BINCODE_JS),
-        "/_albedo/link-forms.js" => Some(LINK_FORMS_JS),
-        "/_albedo/hydration.js" => Some(HYDRATION_JS),
-        "/_albedo/client.js" => Some(CLIENT_JS),
-        "/_albedo/wt-bootstrap.js" => Some(WT_BOOTSTRAP_JS),
-        "/_albedo/phosphor.js" => Some(PHOSPHOR_JS),
-        dom_render_compiler::bundler::client_npm::CLIENT_NPM_RUNTIME_URL => Some(npm_runtime_js()),
+        "/_albedo/runtime.js" => Some(minified(&RUNTIME, RUNTIME_JS)),
+        "/_albedo/bincode.js" => Some(minified(&BINCODE, BINCODE_JS)),
+        "/_albedo/link-forms.js" => Some(minified(&LINK_FORMS, LINK_FORMS_JS)),
+        "/_albedo/hydration.js" => Some(minified(&HYDRATION, HYDRATION_JS)),
+        "/_albedo/client.js" => Some(minified(&CLIENT, CLIENT_JS)),
+        "/_albedo/wt-bootstrap.js" => Some(minified(&WT_BOOTSTRAP, WT_BOOTSTRAP_JS)),
+        "/_albedo/phosphor.js" => Some(minified(&PHOSPHOR, PHOSPHOR_JS)),
+        dom_render_compiler::bundler::client_npm::CLIENT_NPM_RUNTIME_URL => {
+            Some(minified(&NPM_RUNTIME, npm_runtime_js()))
+        }
         _ => None,
     }
 }
@@ -120,16 +159,7 @@ mod tests {
 
     #[test]
     fn known_assets_resolve_to_non_empty_bodies() {
-        for path in [
-            "/_albedo/runtime.js",
-            "/_albedo/bincode.js",
-            "/_albedo/link-forms.js",
-            "/_albedo/hydration.js",
-            "/_albedo/client.js",
-            "/_albedo/wt-bootstrap.js",
-            "/_albedo/phosphor.js",
-            dom_render_compiler::bundler::client_npm::CLIENT_NPM_RUNTIME_URL,
-        ] {
+        for &path in EMBEDDED_ASSET_PATHS {
             let body = resolve_albedo_asset(path).unwrap_or_else(|| {
                 panic!("expected asset to resolve: {path}")
             });
@@ -138,6 +168,18 @@ mod tests {
                 "asset body must be non-empty: {path}"
             );
         }
+    }
+
+    /// What a browser receives is minified — no commentary, far fewer bytes —
+    /// and still exports the globals the page shell calls.
+    #[test]
+    fn served_assets_are_minified_and_keep_their_contract() {
+        let served = resolve_albedo_asset("/_albedo/runtime.js").expect("resolves");
+        assert!(served.len() * 2 < RUNTIME_JS.len(), "{} vs {}", served.len(), RUNTIME_JS.len());
+        assert!(!served.contains("\n//") && !served.contains("/*"), "comments were shipped");
+        assert!(served.contains("__ALBEDO_INJECT_QUEUE"), "the inject-queue contract survives");
+        let client = resolve_albedo_asset("/_albedo/client.js").expect("resolves");
+        assert!(client.contains("__ALBEDO_HYDRATE_ISLAND"), "the hydration entry point survives");
     }
 
     #[test]

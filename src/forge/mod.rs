@@ -24,7 +24,7 @@
 //! - [`substrate`] — the [`DataSubstrate`] trait: the one seam every
 //!   backend (libSQL for Phase 0, BYO-Postgres later, an edge KV further
 //!   out) implements.
-//! - [`mem`] — [`RecordingSubstrate`](mem::RecordingSubstrate), an
+//! - `mem` (test builds only) — `RecordingSubstrate`, an
 //!   in-memory test double that lets the wiring be exercised before the
 //!   real libSQL backend is attached.
 //! - [`reserve`] — [`Reservations`](reserve::Reservations), atomic claiming
@@ -47,6 +47,8 @@ pub mod bindings;
 pub mod declare;
 pub mod delta;
 pub mod drift;
+// A recording test double. Test and bench builds only.
+#[cfg(any(test, feature = "test-support"))]
 pub mod mem;
 pub mod reserve;
 pub mod skeleton;

@@ -37,6 +37,11 @@ use crate::runtime::engine::{RuntimeError, RuntimeResult};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+/// Names a handler script binds from the REQUEST — the payload, the form, and
+/// who is asking. A component or module binding of the same name is not seeded:
+/// it would be a duplicate declaration, and the request's value must win.
+const REQUEST_BOUND_NAMES: [&str; 4] = ["event", "form", "user", "origin"];
+
 /// One side effect a handler body produced, in source order.
 ///
 /// Both variants lower to an [`Instruction::SlotSet`] — the client cannot tell
@@ -165,6 +170,11 @@ pub struct HandlerInvocation<'a> {
     pub setters: &'a [(String, SlotId)],
     /// Optional event payload exposed to the body as the global `event`.
     pub event_json: Option<&'a str>,
+    /// The request's `user` and `origin`, bound as `const user` / `const
+    /// origin` — `null` when absent. Always bound, so nothing else in scope can
+    /// stand in for who is asking or where the app lives. See
+    /// [`crate::runtime::RequestBindings`].
+    pub request: &'a crate::runtime::RequestBindings,
     /// Pre-write snapshot of broadcast topic values as **raw JSON bytes**
     /// (topic → the topic's stored encoding), used to resolve updater-form
     /// `broadcast(topic, fn)` calls inside JS: the builtin reads the current
@@ -322,13 +332,21 @@ pub struct HandlerOutcome {
 /// generated source). We refuse anything else loudly rather than risk emitting
 /// malformed or injectable source — a non-identifier binding name is a bug in
 /// the caller, not user input to tolerate.
+///
+/// 🔴 This accepted ASCII only, but JavaScript identifiers are Unicode
+/// (`ID_Start`/`ID_Continue`, plus `$` and `_`), and every name reaching it was
+/// already accepted by the parser as one. So `export const größe = action(…)`
+/// compiled, rendered, and then failed on every submit as "not a valid
+/// JavaScript identifier". SWC's own character classes are the parser's, so a
+/// name the parser bound is a name this admits — and nothing that could break
+/// out of `let {name}=` is either.
 fn is_js_identifier(name: &str) -> bool {
+    use swc_ecma_ast::Ident;
     let mut chars = name.chars();
     match chars.next() {
-        Some(c) if c == '_' || c == '$' || c.is_ascii_alphabetic() => {}
-        _ => return false,
+        Some(first) if Ident::is_valid_start(first) => chars.all(Ident::is_valid_continue),
+        _ => false,
     }
-    chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
 }
 
 /// Serialize a JSON value to a JS literal safe to splice into source. We go
@@ -512,6 +530,13 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     script.push_str(
         "const enqueue=function(name,args,options){if(typeof name!=='string'||name.length===0){throw new TypeError('enqueue(name, args): name must be the exported job name');}var __o=options||{};var __p=(args===undefined||args===null)?{}:args;if(typeof __p!=='object'||Array.isArray(__p)){throw new TypeError('enqueue(name, args): args must be an object');}var __r=__albedo_rec('job_enqueue');__r.topic=name;__r.value=__p;if(__o.id!==undefined&&__o.id!==null){__r.key=String(__o.id);}if(__o.delay!==undefined&&__o.delay!==null){__r.delay=String(__o.delay);}__albedo_emit(__r);return null;};\n",
     );
+    // EMAIL · 15.3 · `sendEmail(message, options)` — an `enqueue` of the
+    // framework's `albedo:send_email` job. Same record, same lowering, same
+    // discard-on-suspend rule; the server validates the message when it writes
+    // the row, so a bad address is an error in THIS action, not a dead letter.
+    script.push_str(
+        "const sendEmail=function(message,options){if(message===null||typeof message!=='object'||Array.isArray(message)){throw new TypeError('sendEmail(message): message must be an object like { to, subject, text }');}var __o=options||{};var __r=__albedo_rec('job_enqueue');__r.topic='albedo:send_email';__r.value=message;if(__o.id!==undefined&&__o.id!==null){__r.key=String(__o.id);}if(__o.delay!==undefined&&__o.delay!==null){__r.delay=String(__o.delay);}__albedo_emit(__r);return null;};\n",
+    );
 
     // ── APERTURE A2 · the suspend protocol ───────────────────────────────
     //
@@ -580,11 +605,18 @@ throw __ALBEDO_SUSPEND;\
     // Seed engine-trusted raw-JS bindings first (useState initials, module
     // constants). A later store-backed JSON binding for the same name shadows
     // the initial, which is correct: a written slot is newer than its initial.
+    //
+    // A name the request binds itself below (`event`, `form`, `user`, `origin`) is skipped:
+    // `let user=…` then `const user=…` is a SyntaxError that fails the whole
+    // action, and the request's value is the one that must win anyway.
     for (name, expr_src) in inv.raw_bindings {
         if !is_js_identifier(name) {
             return Err(RuntimeError::render(format!(
                 "handler binding name '{name}' is not a valid JavaScript identifier"
             )));
+        }
+        if REQUEST_BOUND_NAMES.contains(&name.as_str()) {
+            continue;
         }
         script.push_str(&format!("let {name}=({expr_src});\n"));
     }
@@ -595,6 +627,9 @@ throw __ALBEDO_SUSPEND;\
             return Err(RuntimeError::render(format!(
                 "handler binding name '{name}' is not a valid JavaScript identifier"
             )));
+        }
+        if REQUEST_BOUND_NAMES.contains(&name.as_str()) {
+            continue;
         }
         script.push_str(&format!("let {name}={};\n", js_literal(value)?));
     }
@@ -636,6 +671,18 @@ throw __ALBEDO_SUSPEND;\
     script.push_str(
         "const form=(event!==null&&typeof event==='object'&&!Array.isArray(event))?event:undefined;\n",
     );
+
+    // `user` — who is asking, on the pure-Rust interpreter's rule: always bound,
+    // `null` when anonymous.
+    match &inv.request.user {
+        Some(user) => script.push_str(&format!("const user={};\n", js_literal(user)?)),
+        None => script.push_str("const user=null;\n"),
+    }
+    // `origin` — where the app is reached, from configuration only.
+    script.push_str(&format!(
+        "const origin={};\n",
+        js_literal(&inv.request.origin_value())?
+    ));
 
     // Run the body inside a nested arrow so a userland `return` is CAPTURED as
     // the action's result instead of escaping the effect-collection epilogue.
@@ -723,7 +770,8 @@ pub(crate) fn decode_handler_run(
         if let Some(reason) = envelope.integrity.as_deref().filter(|r| !r.is_empty()) {
             return Err(RuntimeError::render(format!(
                 "handler '{entry}' refused: the JS realm has '{reason}' installed, which can \
-                 rewrite the body of a request it stages. This is realm poisoning — see SANDGATE-B."
+                 rewrite the body of a request it stages. The app or one of its packages \
+                 patched a JavaScript built-in, so the request was not sent."
             )));
         }
         let staged: Vec<RawPending> = serde_json::from_str(raw).map_err(|err| {
@@ -772,7 +820,9 @@ pub(crate) fn decode_handler_run(
     // report.
     if let Some(reason) = envelope.integrity.as_deref().filter(|r| !r.is_empty()) {
         return Err(RuntimeError::render(format!(
-            "handler '{entry}' refused: the JS realm has '{reason}' installed, which can rewrite              serialised effect payloads. This is realm poisoning — see SANDGATE-B."
+            "handler '{entry}' refused: the JS realm has '{reason}' installed, which can \
+             rewrite serialised effect payloads. The app or one of its packages patched a \
+             JavaScript built-in, so its effects were refused rather than trusted."
         )));
     }
 
@@ -833,8 +883,9 @@ pub fn lower_staged_effects(entry: &str, json: &str) -> RuntimeResult<Vec<Handle
     })?;
     if let Some(hook) = envelope.refused {
         return Err(RuntimeError::render(format!(
-            "job '{entry}' recorded an effect while a `toJSON` hook was planted ({hook}); the \
-             pass was refused rather than trusted. See SANDGATE-B."
+            "job '{entry}' recorded an effect while a `toJSON` hook was planted ({hook}). The \
+             app or one of its packages patched a JavaScript built-in, so the pass was refused \
+             rather than trusted."
         )));
     }
     envelope
@@ -861,7 +912,9 @@ fn lower_effect(entry: &str, raw: RawEffect) -> RuntimeResult<HandlerEffect> {
     // findings that would otherwise surface as a mysterious write.
     if let Some(origin) = raw.origin.as_deref().filter(|o| !o.is_empty()) {
         return Err(RuntimeError::render(format!(
-            "handler '{entry}' produced a '{}' effect while the module '{origin}' was              executing. Effects may only be recorded by application code; a package              reached an effect builtin. See SANDGATE-B.",
+            "handler '{entry}' produced a '{}' effect while the module '{origin}' was \
+             executing. Effects may only be recorded by application code; a package reached \
+             an effect builtin, so the effect was refused.",
             raw.kind
         )));
     }
@@ -1006,6 +1059,18 @@ fn forge_scalar_key(
 mod tests {
     use super::*;
 
+    /// A name the parser accepted as an identifier is one this admits —
+    /// Unicode included — and nothing that could leave `let {name}=` is.
+    #[test]
+    fn identifiers_are_javascript_identifiers_not_ascii_ones() {
+        for name in ["größe", "名前", "café", "$el", "_a1", "x"] {
+            assert!(is_js_identifier(name), "{name} is a JavaScript identifier");
+        }
+        for name in ["", "1a", "a-b", "a b", "a;x()", "a=1", "a/*", "a\u{2028}b"] {
+            assert!(!is_js_identifier(name), "{name:?} must be refused");
+        }
+    }
+
     fn env(pairs: &[(&str, Value)]) -> Map<String, Value> {
         pairs
             .iter()
@@ -1037,6 +1102,7 @@ mod tests {
             raw_bindings: &[],
             setters: &setters,
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -1060,6 +1126,7 @@ mod tests {
             raw_bindings: &raw,
             setters: &[],
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -1078,6 +1145,7 @@ mod tests {
             raw_bindings: &[],
             setters: &[],
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -1098,6 +1166,7 @@ mod tests {
             raw_bindings: &[],
             setters: &[],
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -1166,7 +1235,7 @@ mod tests {
             message.contains("npm:evil@1.0.0/index.js"),
             "the refusal must name the module it caught. Got: {message}"
         );
-        assert!(message.contains("SANDGATE-B"), "Got: {message}");
+        assert!(message.contains("a package reached an effect builtin"), "Got: {message}");
     }
 
     /// The ordinary case must not trip it: a handler body runs with the
@@ -1192,7 +1261,7 @@ mod tests {
         let err = decode_completed("routes/x", &envelope).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
-        assert!(message.contains("SANDGATE-B"), "Got: {message}");
+        assert!(message.contains("patched a JavaScript built-in"), "Got: {message}");
     }
 
     /// 🔴 SANDGATE-B on the **suspend** path — the arm that carries a staged
@@ -1213,7 +1282,7 @@ mod tests {
         let err = decode_handler_run("routes/x", &envelope).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
-        assert!(message.contains("SANDGATE-B"), "Got: {message}");
+        assert!(message.contains("patched a JavaScript built-in"), "Got: {message}");
     }
 
     /// CONTROL — a clean suspend still stages its request. A suspend arm that
@@ -1283,6 +1352,7 @@ mod tests {
             raw_bindings: &[],
             setters: &[],
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         })
@@ -1306,6 +1376,7 @@ mod tests {
             raw_bindings: &[],
             setters: &[],
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         })
@@ -1391,6 +1462,7 @@ mod tests {
                 raw_bindings: &[],
                 setters: &[],
                 event_json,
+                request: crate::runtime::RequestBindings::anonymous(),
                 broadcast_current: &bc,
                 journal: None,
             })

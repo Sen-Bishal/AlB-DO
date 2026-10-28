@@ -3,14 +3,14 @@
 //! Surfaces a real-time view of what the renderer is doing: a force-directed
 //! component graph, a metrics sidebar, and an SSE-fed event log. The module
 //! is self-contained — its only entry points from the rest of the server are
-//! [`InspectorState`], the dispatch helpers in [`api`], and the optional
-//! [`heartbeat`] task. No production routes change behaviour because of this
-//! module unless the inspector is explicitly enabled at builder time.
+//! [`InspectorState`], the dispatch helpers in [`api`], and
+//! [`publisher::attach`], which routes the evaluator's real render events to
+//! it. No production routes change behaviour because of this module unless the
+//! inspector is explicitly enabled at builder time.
 
 pub mod api;
 pub mod events;
 pub mod graph;
-pub mod heartbeat;
 pub mod metrics;
 pub mod publisher;
 pub mod state;

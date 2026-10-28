@@ -9,45 +9,89 @@ often none — and it does the same for your data: a collection you declare in
 config becomes a persisted table, a live subscription, and a typed `.d.ts`,
 without a server directory, an ORM, an API route, or any WebSocket code.
 
-It is a work in progress — a prototype built in the open, not a finished
-framework. Everything under "What works" below is implemented and exercised by
-the test suite; everything under "What isn't done" is honest about the gaps.
-The APIs will still move.
+Everything below is implemented and exercised by the test suite. What is not
+supported is listed under [Limitations](#limitations), and the build refuses a
+configuration that would depend on it rather than shipping something that
+silently does nothing.
 
 ---
 
-## What works right now
+## Install
+
+Download the build for your platform from the
+[releases page](https://github.com/Sen-Bishal/AlB-DO/releases):
+
+| Platform            | File |
+|---------------------|------|
+| Windows x64         | `AlBDO-<version>-x64.msi` (per-user installer, adds `albedo` to `PATH`) or the `.zip` |
+| macOS Intel         | `albedo-<version>-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `albedo-<version>-aarch64-apple-darwin.tar.gz` |
+| Linux x64           | `albedo-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64         | `albedo-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+
+Every file has a `.sha256` beside it. The archives contain the `albedo` binary
+and shell completions; put the binary on your `PATH`, then check it:
+
+```sh
+albedo --version
+```
+
+Shell completions: `albedo completions <bash|zsh|fish|powershell>`.
+
+## Quick start
+
+```sh
+albedo init my-app
+```
+
+```sh
+cd my-app && albedo dev
+```
+
+| Command | What it does |
+|---|---|
+| `albedo init <dir>` | Create a new app |
+| `albedo dev` | Development server with hot reload and the error overlay |
+| `albedo build` | Production build; fails on anything `serve` would refuse |
+| `albedo serve` | Build and serve in production mode |
+| `albedo ship --target <binary\|docker\|fly>` | Package the app for deployment |
+| `albedo doctor` | Report what the compiler decided about each route, and why |
+| `albedo budget` | Check the build against the tier byte budget |
+| `albedo email test <address>` | Send one real email through the configured provider |
+| `albedo files <dir>` | Serve a directory as static files |
+| `albedo --version` | Print the version |
+
+---
+
+## What's included
 
 ### Compiler and rendering
 
 - `.tsx`/`.jsx` parsed with SWC and rendered to HTML.
 - **Three-tier classification, decided at build time, with nothing to
-  configure.** Every component is analysed for what it actually does and
-  compiled accordingly (see [How rendering is decided](#how-rendering-is-decided)).
-- **Binding mode** — for many stateful components the compiler ships a few
-  hundred bytes of bindings instead of hydrating the whole component. A click
-  updates the bound node locally: no VDOM, no re-render, no network round-trip.
+  configure** (see [How rendering is decided](#how-rendering-is-decided)).
 - File-based routing, nested `layout.tsx` composition, and dynamic routes
   (`/post/[id]`).
 - `error.tsx` / `loading.tsx` boundaries, and `async` server components.
-- Global CSS and CSS modules, `<title>` and meta tags.
-- `useState` / `useEffect` / `useRef` / `useMemo` / `useCallback` islands that
-  hydrate in the browser.
+- Global CSS and CSS modules, `<title>` and meta tags, `generateMetadata`.
+- `useState` / `useEffect` / `useRef` / `useMemo` / `useCallback` /
+  `useContext` / `useId`, `forwardRef`, `createPortal` and `cloneElement`.
+  `useContext` resolves a Provider's value during the server render.
 - Server `action()` handlers and SSR run under an embedded JS engine (QuickJS),
   so real JavaScript — loops, `try`, array methods — works, and a broken
-  construct fails loudly instead of rendering null.
-- npm dependencies bundled in-tree for SSR and actions (tested against `zod`
-  and `date-fns`).
-- A dev server with hot reload over SSE.
+  construct fails loudly instead of rendering null. Each engine's realm is
+  rebuilt after any checkout on which third-party code ran.
+- npm dependencies bundled at build time for SSR and actions; `node_modules` is
+  not needed at runtime.
 
-### FORGE — the backend, on by default
+### FORGE — the database, on by default
 
-- Declare a collection in `albedo.config.ts` and it exists: table, seed rows,
-  and a live topic. No migration folder, no ORM, no API route.
+- Declare a collection in `albedo.config.ts` and it exists: table and live
+  topic. No migration folder, no ORM, no API route. Optional `seed` rows for
+  reference data.
 - Field types `text`, `int`, `real`, `bool`, `timestamp`, with a trailing `?`
-  for nullable. A `bool` round-trips as a `bool` — writing `true` and reading
-  it back does not hand you a `1`.
-- `append` / `update` / `remove` as server actions.
+  for nullable. A `bool` round-trips as a `bool`.
+- `append` / `update` / `remove` from server actions and jobs.
 - **Additive schema evolution.** Add a nullable field, restart, and the column
   is added with existing rows intact. Anything else is refused by name rather
   than applied halfway.
@@ -60,91 +104,166 @@ The APIs will still move.
 - Keyed rows: a write re-renders the changed row and leaves the untouched DOM
   nodes alone.
 - **Dynamic topics** — a route parameter can name a topic, so `/room/[id]`,
-  per-user data, and multi-tenancy work rather than being a compile error.
+  per-user data, and multi-tenancy work.
 - Route-scoped subscription: a client subscribes to the route it is on, not to
   every topic in the app.
 
 ### Auth
 
-- Session cookies, first-party password credentials (argon2), and CSRF
-  protection on same-origin POST forms.
-- Route gating by declared policy.
+- Session cookies (`__Host-`, `HttpOnly`, `SameSite=Lax`), rotated on sign-in,
+  stored hashed. Sign out ends one session (`POST /_albedo/auth/logout`); sign
+  out everywhere ends every session of the account (`POST
+  /_albedo/auth/logout-all`).
+- Providers: **password** (argon2id), **OAuth 2.0** (presets for GitHub, GitLab
+  and Discord, or any server by URL), **OpenID Connect** (presets for Google,
+  Microsoft, Apple and Twitch, or any issuer by discovery), and **magic link**.
+- **Password reset** (`reset: "email"`) and **email confirmation**
+  (`verify: "required"`). With confirmation on, sign-up does not reveal whether
+  an address already has an account.
+- Emailed links land on a page with a button, so a mail scanner that prefetches
+  the link cannot spend it; tokens are single-use, stored hashed, and a newer
+  link voids an older one.
+- Route gating with `export const auth = "required"`; strangers are redirected
+  to the declared sign-in route.
 - `user` reaches components as a prop, and identity is a legal **partition
   key** — so `messages.where({ owner: user.id })` is row-level security that
   cannot be authored apart from the read, because the read *is* the policy.
-- **The sign-in flow works with JavaScript disabled.**
-- GCRA rate limiting on credential attempts.
+- **The sign-in flow works with JavaScript disabled.** CSRF protection on every
+  same-origin POST form.
+- GCRA rate limiting per caller, per targeted account, and per mailbox.
+
+### Email
+
+- An `email` block with Resend, Postmark, SendGrid or Mailgun, or `log`, which
+  writes each message to `.albedo/outbox/` as an `.eml` file for development.
+- `sendEmail({ to, subject, text, html, cc, bcc, replyTo, attachments })` from
+  any action or job. Messages are validated when queued — a bad address or a
+  line break in a subject throws in the action — and delivered by the job
+  queue with retries; a provider's permanent refusal is not retried.
+- Attachments inline (base64) or by upload id; an upload can be attached only
+  by the user who uploaded it.
+- The framework's own emails (reset, confirm, sign-in link) can be replaced per
+  field with `{{app}}`, `{{link}}` and `{{expires}}` placeholders.
+- Links in mail are built from `ALBEDO_PUBLIC_ORIGIN` (or the ACME domain),
+  never from a request's `Host` header.
+
+### Background jobs
+
+- `src/jobs.ts`: `export const nightly = job({ schedule: "@daily" }, fn)`.
+  Five-field cron, `@aliases` and `every N` intervals; `enqueue()` from actions
+  and jobs, with an optional id that makes it idempotent.
+- A durable queue with leases, exponential backoff with jitter, and
+  dead-lettering. A scheduled fire runs exactly once, even across a restart.
+- A job runs **for** a principal, never as a system identity; `over: "users"`
+  fans a schedule out into one run per user.
+
+### Middleware and uploads
+
+- `src/middleware.ts` (Next-shaped `matcher` + default export) can refuse,
+  redirect or rewrite a request. It cannot grant one: the route's own gate runs
+  after it.
+- Declared `uploads` buckets with type and size limits. A handler receives a
+  content-addressed reference, never the bytes.
 
 ### Calling the outside world
 
-- **`await fetch(...)` works inside a handler or action body** — written as
-  plain JavaScript, exactly as any vendor's sample code spells it. The compiler
-  lowers the `await`; the server suspends the body, resolves the request, and
-  replays it against a journal that answers.
+- **`await fetch(...)` works inside a handler, action or job body** — written as
+  plain JavaScript. The server suspends the body, resolves the request, and
+  replays it against a durable journal, so a completed call is not repeated.
 - A declared `sources` block makes a remote endpoint a topic: it refreshes,
   paints like any other slot, and generates types into `.albedo/sources.d.ts`.
 - An **egress policy enforced inside the DNS resolver**, so a declared allowlist
   cannot be walked around by DNS rebinding, by an IP-literal URL, or by a
   redirect (redirects are refused outright).
 - Response caching, single-flight coalescing, conditional requests, derived
-  idempotency keys, and a request deadline.
+  idempotency keys, a per-host upstream budget, and a request deadline.
+
+### Operations
+
+- One binary. `albedo ship --target binary` produces a self-contained
+  executable; `--target docker` and `--target fly` write the deployment files.
+- HTTPS in-process from a certificate you provide, or from Let's Encrypt with
+  `albedo serve --domain app.example.com` (TLS-ALPN-01, port 443).
+- Graceful shutdown on `SIGTERM`/Ctrl-C: in-flight requests and live streams
+  drain within a deadline.
+- Prometheus metrics on a separate listener (`ALBEDO_METRICS_ADDR`).
+- Correct client addresses behind a load balancer (`ALBEDO_TRUSTED_PROXIES`).
 
 ---
 
-## What isn't done
+## Configuration
 
-- **Outbound `fetch()` works, but does not batch or survive a crash.** Three
-  independent GETs in one handler cost three round trips — request hoisting
-  isn't built. The journal is in-memory, so there is no crash recovery and no
-  retry policy for a call that fails halfway.
-- **No OAuth.** Password is the only first-party credential; the outbound half
-  it needs now exists, but the provider flows are not written.
-- **No file uploads.** Zero code in tree.
-- **No passkeys.** Password is the only first-party credential today.
-- **`forwardRef`, `createPortal`, and `useId` do not exist** — verified zero
-  occurrences in the tree. Most React component libraries (shadcn/ui included)
-  depend on at least one, so they will not work.
-- **`useContext` server-renders the context *default*, not the Provider
-  value.** A single SSR pass invokes `h` eagerly, so a nested Provider cannot
-  thread its value down; the client applies it on hydration. It does not
-  crash, but SSR output and post-hydration output differ.
-- No production-ready guarantees. Pre-1.0, expect rough edges and breaking
-  changes.
-- The columnar wire format is designed and encoded but has no emitter yet.
+An app is configured by `albedo.config.ts` at its root; `albedo init` writes a
+commented one. The top-level blocks:
+
+| Block | Declares |
+|---|---|
+| `server` | Bind host and port |
+| `forge` | Collections: fields, ordering, `partition_by`, optional `seed` |
+| `auth` | Session lifetime and cookie, providers, and the sign-in route (`login`) |
+| `email` | Sender, provider, API key (`{ env: "NAME" }`), templates |
+| `uploads` | Buckets: accepted types and size limits |
+| `sources` | External HTTP endpoints read as topics |
+
+Secrets are declared as `{ env: "VARIABLE" }` and read at boot, never written
+into the config file.
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `ALBEDO_SERVER_HOST`, `ALBEDO_SERVER_PORT` | Bind address; `--host` / `--port` override |
+| `ALBEDO_PUBLIC_ORIGIN` | The origin browsers use (`https://app.example.com`). Required behind a proxy or in a container, and the base of every link in email |
+| `ALBEDO_TLS_CERT`, `ALBEDO_TLS_KEY` | PEM certificate and key for in-process HTTPS |
+| `ALBEDO_ACME_DOMAIN` | Comma-separated domains to obtain a Let's Encrypt certificate for (`--domain`) |
+| `ALBEDO_ACME_CONTACT` | Let's Encrypt account contact (`--acme-contact`) |
+| `ALBEDO_ACME_CACHE` | Where the ACME account and certificates are cached (`--acme-cache`) |
+| `ALBEDO_ACME_STAGING` | Use the Let's Encrypt staging CA — rehearse with this first (`--acme-staging`) |
+| `ALBEDO_FORGE_DB` | Path of the database file, e.g. on a mounted volume |
+| `ALBEDO_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges whose `X-Forwarded-For` is believed |
+| `ALBEDO_INSTANCES` | Number of processes sharing app-wide rate budgets (default 1) |
+| `ALBEDO_METRICS_ADDR` | Serve Prometheus metrics on this address (off when unset) |
+| `ALBEDO_REQUEST_TIMEOUT_MS` | Per-request deadline (default 15000) |
+| `ALBEDO_SHUTDOWN_TIMEOUT_MS` | Drain deadline on shutdown (default 5000) |
+| `ALBEDO_REQUEST_TIMINGS` | `1` to print a timing line per request when stdout is not a terminal |
+| `ALBEDO_SANDGATE_BYTECODE` | `0` disables the cached-bytecode fast path for npm packages |
+| `ALBEDO_NO_TUI` | Disable the interactive terminal dashboard |
+| `NO_COLOR` | Disable coloured output |
+| `RUST_LOG` | Log filter for structured logs, e.g. `albedo=info` |
+
+---
+
+## Limitations
+
+- **One server process per database.** Two processes serving the same
+  `forge.db` would each hold their own live view of it, so a write through one
+  is not pushed to clients of the other. Scale vertically; horizontal scaling is
+  not supported.
+- **Auth providers:** passkeys (WebAuthn), delegated JWT providers (the Clerk
+  and Auth0 presets) and custom resolver modules are not supported. Declaring
+  one fails the build.
+- **Outbound calls are not batched.** Three independent `fetch()` calls in one
+  handler cost three round trips.
+- **Email** is sent through an HTTP provider; SMTP is not supported.
 - No published head-to-head benchmark against other frameworks. The numbers
   below are AlB'DO measured on one machine.
 
 ---
 
-## Try it
-
-```sh
-albedo init my-app
-```
-
-```sh
-cd my-app && albedo dev
-```
-
-`albedo build` produces a production build; `albedo serve` builds and serves
-it; `albedo doctor` reports what the compiler decided and why.
-
----
-
 ## How rendering is decided
 
-The compiler reads each component's effects at build time and picks how much,
-if any, client JavaScript it needs.
+The compiler reads each component at build time and decides who owns its
+state — and therefore how much, if any, component JavaScript ships.
 
 ```
-Tier A   no hooks, no async, no side effects   →  plain HTML, zero JS
-Tier B   event handlers, light interactivity   →  bindings only (~250–400 B)
-Tier C   full hooks / async / side effects     →  full client hydration
+Tier A   no state at all                           →  markup only, zero JS
+Tier B   state owned by the server (shared,        →  markup only, zero component JS;
+         persisted or server-computed)                updates arrive as opcodes
+Tier C   state owned by the client alone           →  a compiled island
 ```
 
 The decision is a property of the code, not an annotation. Adding `useState`
-to a Tier A component moves it to B or C at the next build; removing it moves
-it back.
+to a Tier A component moves it at the next build; removing it moves it back.
 
 ## The pipeline
 
@@ -246,18 +365,11 @@ AlB'DO's own overhead is — they don't simulate your network or your database.
 
 ## Where it's headed
 
-Roughly in order:
-
-1. **Compatibility** — `forwardRef`, `createPortal`, `useId`, and a Provider
-   value that survives SSR, so existing component libraries work. This is the
-   largest gap between "it runs my code" and "it runs the code I already have."
-2. **Durability for outbound calls** — persisting the journal so a partially
-   completed call survives a restart, and hoisting independent requests so they
-   batch instead of serializing.
-3. **OAuth**, on top of the outbound path that now exists.
-4. **File uploads.**
-5. **A real app, ported** — take an existing React/Next app across and write up
-   the friction honestly.
+1. **Horizontal scaling** — more than one server process per database.
+2. **Passkeys**, and delegated JWT providers (Clerk, Auth0).
+3. **Batched outbound calls** — independent `fetch()` requests issued together
+   instead of one after another.
+4. **SMTP** as an email transport, beside the HTTP providers.
 
 ---
 
@@ -275,8 +387,12 @@ src/
   bundler/          classify → plan → rewrite → emit
   runtime/          render kernel, QuickJS engine, broadcast
   forge/            the database: declare, write, projection, drift
-  auth/             principal, session, password, policy
-  aperture/         outbound HTTP client, egress policy, cache
+  auth/             principal, session, password, OAuth, mailed tokens
+  email/            the `email` block, message validation, provider formats
+  jobs/             job declarations, schedules, the durable queue
+  middleware/       middleware declaration and matching
+  upload/           upload buckets and storage
+  aperture/         outbound HTTP client, egress policy, cache, journal
   routing/          route matching, dynamic segments
   doctor/           the reach matrix behind `albedo doctor`
   shutter/          GCRA rate limiting
@@ -284,6 +400,7 @@ crates/
   albedo-server/    axum + tokio HTTP runtime, the `albedo` binary
   albedo-node/      Node-API bridge (napi)
 scaffold/           what `albedo init` writes
+installer/          the Windows MSI source
 tests/              integration, conformance, and wire fixtures
 fuzz/               cargo-fuzz targets for the wire decoders
 ```

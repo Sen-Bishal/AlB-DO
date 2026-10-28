@@ -75,11 +75,10 @@ pub mod workflow;
 pub use bindings::{validate_source_bindings, SourceBinding, SourceBindingProblem};
 pub use declare::{
     source_topic_name, AuthDecl, AuthScope, PathSegment, ResolvedSource, RouteDecl, SourceDecl,
-    SourceRegistry, SourceRoute, SourceSchemaError, DEFAULT_REFRESH,
+    SourceCredential, SourceCredentials, SourceRegistry, SourceRoute, SourceSchemaError,
+    DEFAULT_REFRESH,
 };
-pub use ledger::{
-    JournalLedger, DEFAULT_RETENTION, DEFAULT_SWEEP_INTERVAL, WORKFLOW_STEPS_TABLE,
-};
+pub use ledger::{JournalLedger, DEFAULT_RETENTION, DEFAULT_SWEEP_INTERVAL};
 pub use journal::{
     Journal, JournalError, Step, StepKind, StepOutcome, DEFAULT_PASS_CAP, DEFAULT_STEP_CAP,
 };
@@ -100,8 +99,10 @@ pub use cache::{
     DEFAULT_RESPONSE_BUDGET,
 };
 pub use client::{
-    ApertureClient, ApertureError, ApertureRequest, CountingTransport, Disposition, FetchOutcome,
-    Metrics, MetricsSnapshot, Transport, WireRequest, WireResponse, DEFAULT_REQUEST_TIMEOUT,
+    ApertureClient, ApertureError, ApertureRequest, Disposition, FetchOutcome, Metrics,
+    MetricsSnapshot, Transport, WireRequest, WireResponse, DEFAULT_REQUEST_TIMEOUT,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use client::CountingTransport;
 pub use egress::{AddressClass, EgressDenial, EgressMode, EgressPolicy};
 pub use transport::{ApertureResolver, ReqwestTransport};

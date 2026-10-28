@@ -11,9 +11,8 @@ use crate::runtime::eval::ComponentProject;
 use crate::runtime::static_slice::build_static_slice_manifest;
 
 use super::core::{
-    entry_matches_path, normalize_invalidation_token, route_render_result_to_stream, unique_stable,
-    FsRouteRenderRequest, ModuleRegistry, RenderTimings, RouteRenderRequest, RouteRenderResult,
-    RouteRenderStreamResult, StaticSliceCacheKey,
+    entry_matches_path, normalize_invalidation_token, unique_stable, FsRouteRenderRequest,
+    ModuleRegistry, RenderTimings, RouteRenderRequest, RouteRenderResult, StaticSliceCacheKey,
 };
 
 const PROPS_CACHE_MAX_ENTRIES: usize = 256;
@@ -192,14 +191,6 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         Ok(())
     }
 
-    pub fn prime_runtime_cache(&mut self, requests: &[RouteRenderRequest]) -> RuntimeResult<()> {
-        self.warm_runtime()?;
-        for request in requests {
-            self.render_route(request)?;
-        }
-        Ok(())
-    }
-
     /// A2 · register one npm factory/alias artifact on this renderer's own
     /// engine.
     ///
@@ -279,13 +270,6 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         self.render_route_with_overrides(route, None, Vec::new())
     }
 
-    pub fn render_route_stream(
-        &mut self,
-        route: &RouteRenderRequest,
-    ) -> RuntimeResult<RouteRenderStreamResult> {
-        self.render_route_stream_with_overrides(route, None, Vec::new())
-    }
-
     pub fn render_route_with_manifest_hydration(
         &mut self,
         route: &RouteRenderRequest,
@@ -316,40 +300,6 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
             Ok(result)
         } else {
             self.render_route_with_overrides(route, Some("{}".to_string()), Vec::new())
-        }
-    }
-
-    pub fn render_route_stream_with_manifest_hydration(
-        &mut self,
-        route: &RouteRenderRequest,
-        manifest: &RenderManifestV2,
-    ) -> RuntimeResult<RouteRenderStreamResult> {
-        let artifacts =
-            hydration::build_hydration_artifacts(manifest, route.entry.as_str(), &route.props_json)
-                .map_err(|err| {
-                    crate::runtime::engine::RuntimeError::render(format!(
-                        "failed to build hydration artifacts for route '{}': {err}",
-                        route.entry
-                    ))
-                })?;
-
-        if let Some(artifacts) = artifacts {
-            let entry_id = entry_island_id(&artifacts.plan);
-            let mut head_tags = self.build_client_island_head_tags(&artifacts.plan);
-            head_tags.push(artifacts.payload_script_tag);
-            head_tags.push(artifacts.bootstrap_script_tag);
-            let mut result = self.render_route_with_overrides(
-                route,
-                Some(artifacts.payload_json),
-                head_tags,
-            )?;
-            if let Some(id) = entry_id {
-                result.html = inject_island_marker(&result.html, id);
-                result.shell_html = inject_island_marker(&result.shell_html, id);
-            }
-            Ok(route_render_result_to_stream(result))
-        } else {
-            self.render_route_stream_with_overrides(route, Some("{}".to_string()), Vec::new())
         }
     }
 
@@ -386,17 +336,6 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         tags.push("<script src=\"/_albedo/client.js\"></script>".to_string());
         tags.extend(island_scripts);
         tags
-    }
-
-    fn render_route_stream_with_overrides(
-        &mut self,
-        route: &RouteRenderRequest,
-        hydration_payload_override: Option<String>,
-        extra_head_tags: Vec<String>,
-    ) -> RuntimeResult<RouteRenderStreamResult> {
-        let result =
-            self.render_route_with_overrides(route, hydration_payload_override, extra_head_tags)?;
-        Ok(route_render_result_to_stream(result))
     }
 
     fn render_route_with_overrides(
@@ -549,47 +488,6 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         route: &FsRouteRenderRequest,
     ) -> RuntimeResult<RouteRenderResult> {
         self.render_route_from_component_dir_with_overrides(route, None, Vec::new())
-    }
-
-    pub fn render_route_from_component_dir_with_manifest_hydration(
-        &mut self,
-        route: &FsRouteRenderRequest,
-        manifest: &RenderManifestV2,
-    ) -> RuntimeResult<RouteRenderResult> {
-        let artifacts = hydration::build_hydration_artifacts(
-            manifest,
-            route.entry_module.as_str(),
-            &route.props_json,
-        )
-        .map_err(|err| {
-            crate::runtime::engine::RuntimeError::render(format!(
-                "failed to build hydration artifacts for filesystem route '{}': {err}",
-                route.entry_module
-            ))
-        })?;
-
-        if let Some(artifacts) = artifacts {
-            let entry_id = entry_island_id(&artifacts.plan);
-            let mut head_tags = self.build_client_island_head_tags(&artifacts.plan);
-            head_tags.push(artifacts.payload_script_tag);
-            head_tags.push(artifacts.bootstrap_script_tag);
-            let mut result = self.render_route_from_component_dir_with_overrides(
-                route,
-                Some(artifacts.payload_json),
-                head_tags,
-            )?;
-            if let Some(id) = entry_id {
-                result.html = inject_island_marker(&result.html, id);
-                result.shell_html = inject_island_marker(&result.shell_html, id);
-            }
-            Ok(result)
-        } else {
-            self.render_route_from_component_dir_with_overrides(
-                route,
-                Some("{}".to_string()),
-                Vec::new(),
-            )
-        }
     }
 
     fn render_route_from_component_dir_with_overrides(

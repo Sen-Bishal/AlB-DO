@@ -132,6 +132,7 @@ fn invocation<'a>(env: &'a serde_json::Map<String, serde_json::Value>) -> Handle
         raw_bindings: &[],
         setters: &[],
         event_json: None,
+        request: dom_render_compiler::runtime::RequestBindings::anonymous(),
         broadcast_current: &[],
         journal: None,
     }
@@ -240,8 +241,9 @@ fn a_tojson_hook_on_object_prototype_refuses_the_handler_loudly() {
         "the refusal must name the hook it found, or it is unactionable. Got: {message}"
     );
     assert!(
-        message.contains("SANDGATE-B"),
-        "the refusal must point at the doctrine that explains it. Got: {message}"
+        message.contains("patched a JavaScript built-in"),
+        "the refusal must say what went wrong, in terms the app's author can act on. \
+         Got: {message}"
     );
 }
 

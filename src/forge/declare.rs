@@ -129,7 +129,10 @@ pub struct FieldSpec {
 impl FieldSpec {
     #[must_use]
     pub fn new(ty: FieldType) -> Self {
-        Self { ty, nullable: false }
+        Self {
+            ty,
+            nullable: false,
+        }
     }
 
     #[must_use]
@@ -231,6 +234,11 @@ pub struct CollectionDecl {
     /// declared fields; values bind as parameters.
     #[serde(default)]
     pub seed: Vec<BTreeMap<String, serde_json::Value>>,
+    /// ALB-02 · who may update or remove a row: `"author"` (the default — the
+    /// signed-in principal that appended it) or `"anyone"`. Any other value is a
+    /// config error rather than a silent fallback.
+    #[serde(default)]
+    pub edit: crate::forge::skeleton::EditRule,
 }
 
 impl CollectionDecl {
@@ -294,7 +302,8 @@ impl CollectionDecl {
         // The key is the AUTOINCREMENT primary key; every declared field is a
         // NOT NULL column of its scalar type. `IF NOT EXISTS` because migrations
         // re-run on every boot.
-        let mut ddl = format!("CREATE TABLE IF NOT EXISTS {table} ({key} INTEGER PRIMARY KEY AUTOINCREMENT");
+        let mut ddl =
+            format!("CREATE TABLE IF NOT EXISTS {table} ({key} INTEGER PRIMARY KEY AUTOINCREMENT");
         for (column, spec) in &self.fields {
             // A required field keeps the `NOT NULL` it always had — which is
             // what preserves the built-in default's DDL byte for byte. Only an
@@ -364,7 +373,8 @@ impl CollectionDecl {
         .with_partition_by(self.partition_by.clone())
         // Carried onto the runtime collection so the read path can render a
         // `bool` as `true` rather than the `1` it is stored as.
-        .with_fields(self.fields.clone()))
+        .with_fields(self.fields.clone())
+        .with_edit(self.edit))
     }
 
     /// The `ORDER BY` clause, re-emitted from a *parse* rather than passed
@@ -475,7 +485,11 @@ impl CollectionDecl {
         if value.is_null() {
             // A null in a required column would fail the `NOT NULL` at insert
             // time, on boot, with SQLite's wording instead of ours.
-            return if spec.nullable { Ok(SqlValue::Null) } else { Err(mismatch()) };
+            return if spec.nullable {
+                Ok(SqlValue::Null)
+            } else {
+                Err(mismatch())
+            };
         }
 
         match (spec.ty, value) {
@@ -489,7 +503,9 @@ impl CollectionDecl {
             }
             // Reals accept whole numbers too — `1` for a ratio is not a typo,
             // and JSON has no way to write `1.0` distinctly.
-            (FieldType::Real, Value::Number(n)) => n.as_f64().map(SqlValue::Real).ok_or_else(mismatch),
+            (FieldType::Real, Value::Number(n)) => {
+                n.as_f64().map(SqlValue::Real).ok_or_else(mismatch)
+            }
             _ => Err(mismatch()),
         }
     }
@@ -618,7 +634,10 @@ mod tests {
             "SELECT id, author FROM guestbook ORDER BY id"
         );
         assert!(
-            !collection.migrations.iter().any(|sql| sql.contains("CREATE INDEX")),
+            !collection
+                .migrations
+                .iter()
+                .any(|sql| sql.contains("CREATE INDEX")),
             "no partition, no index: {:?}",
             collection.migrations
         );
@@ -648,7 +667,9 @@ mod tests {
 
     #[test]
     fn an_unpartitioned_collection_lowers_exactly_as_before() {
-        let collection = decl(&[("author", FieldType::Text)]).lower("guestbook").expect("lowers");
+        let collection = decl(&[("author", FieldType::Text)])
+            .lower("guestbook")
+            .expect("lowers");
         assert_eq!(collection.partition_by, None);
     }
 
@@ -847,7 +868,10 @@ mod tests {
 
         assert_eq!(lowered.seed[0].sql, "INSERT INTO notes (body) VALUES (?1)");
         assert!(!lowered.seed[0].sql.contains("DROP"));
-        assert_eq!(*lowered.seed[0].params, [SqlValue::Text(hostile.to_string())]);
+        assert_eq!(
+            *lowered.seed[0].params,
+            [SqlValue::Text(hostile.to_string())]
+        );
     }
 
     #[test]
@@ -898,7 +922,10 @@ mod tests {
             (FieldType::Text, serde_json::json!(3)),
             // A timestamp is epoch millis; a date string is not parsed, guessed
             // at, or accepted.
-            (FieldType::Timestamp, serde_json::json!("2026-08-03T00:00:00Z")),
+            (
+                FieldType::Timestamp,
+                serde_json::json!("2026-08-03T00:00:00Z"),
+            ),
         ] {
             let result = CollectionDecl {
                 seed: vec![seed_row(&[("field", bad.clone())])],
@@ -974,7 +1001,10 @@ mod tests {
         assert!(message.contains("boolean"), "quotes the input: {message}");
         assert!(message.contains("bool"), "lists the real names: {message}");
         assert!(message.contains("timestamp"), "{message}");
-        assert!(message.contains('?'), "mentions the nullable suffix: {message}");
+        assert!(
+            message.contains('?'),
+            "mentions the nullable suffix: {message}"
+        );
     }
 
     /// The conformance property in this module's docs, extended: a declaration
@@ -1017,7 +1047,10 @@ mod tests {
     #[test]
     fn several_declared_collections_build_one_schema() {
         let declarations: BTreeMap<String, CollectionDecl> = [
-            ("guestbook".to_string(), decl(&[("author", FieldType::Text)])),
+            (
+                "guestbook".to_string(),
+                decl(&[("author", FieldType::Text)]),
+            ),
             ("todos".to_string(), decl(&[("title", FieldType::Text)])),
             ("chat".to_string(), decl(&[("body", FieldType::Text)])),
         ]

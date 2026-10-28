@@ -19,8 +19,41 @@ pub trait AuthProvider: Send + Sync {
     ) -> Result<AuthDecision, RuntimeError>;
 }
 
+/// Allows every request, whatever its route's policy.
+///
+/// **Not the default.** An embedder that genuinely wants every declared policy
+/// ignored installs this explicitly with
+/// [`AlbedoServerBuilder::with_auth_provider`](crate::AlbedoServerBuilder::with_auth_provider).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AllowAllAuthProvider;
+
+/// The default provider: what a server with no auth provider installed does
+/// with a route that declares a policy.
+///
+/// **Fails closed.** `Optional` is allowed — the route asked for nothing. A
+/// route declaring `Required` or `Role(..)` is refused, because nothing was
+/// installed that could establish either; allowing it would turn a missing
+/// line of configuration into a route anyone can reach.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnconfiguredAuthProvider;
+
+#[async_trait]
+impl AuthProvider for UnconfiguredAuthProvider {
+    async fn authorize(
+        &self,
+        _ctx: &RequestContext,
+        policy: &AuthPolicy,
+    ) -> Result<AuthDecision, RuntimeError> {
+        Ok(match policy {
+            AuthPolicy::Optional => AuthDecision::Allow,
+            AuthPolicy::Required | AuthPolicy::Role(_) => AuthDecision::Deny {
+                reason: "this route requires authentication, and no auth provider is \
+                         configured on this server"
+                    .to_string(),
+            },
+        })
+    }
+}
 
 #[async_trait]
 impl AuthProvider for AllowAllAuthProvider {
@@ -93,5 +126,42 @@ where
 {
     async fn load_props(&self, ctx: RequestContext) -> Result<Value, RuntimeError> {
         (self)(ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::HttpMethod;
+
+    fn ctx() -> RequestContext {
+        RequestContext::new(
+            HttpMethod::Get,
+            "/admin".to_string(),
+            None,
+            std::collections::BTreeMap::new(),
+            &axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+    }
+
+    /// A route that declares a policy on a server that installed nothing to
+    /// enforce it must be refused, not waved through.
+    #[tokio::test]
+    async fn the_default_provider_fails_closed() {
+        let provider = UnconfiguredAuthProvider;
+        assert_eq!(
+            provider.authorize(&ctx(), &AuthPolicy::Optional).await.unwrap(),
+            AuthDecision::Allow
+        );
+        for policy in [AuthPolicy::Required, AuthPolicy::Role("admin".into())] {
+            assert!(
+                matches!(
+                    provider.authorize(&ctx(), &policy).await.unwrap(),
+                    AuthDecision::Deny { .. }
+                ),
+                "{policy:?} must be refused without a provider"
+            );
+        }
     }
 }

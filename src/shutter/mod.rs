@@ -196,12 +196,14 @@ impl Clock for MonotonicClock {
     }
 }
 
-/// A clock tests move by hand.
+/// A clock tests move by hand. Test and bench builds only.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct ManualClock {
     now: AtomicU64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ManualClock {
     /// A clock at zero.
     #[must_use]
@@ -223,6 +225,7 @@ impl ManualClock {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Clock for ManualClock {
     fn now(&self) -> Nanos {
         self.now.load(Ordering::Relaxed)

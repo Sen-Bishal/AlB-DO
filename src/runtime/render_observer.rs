@@ -6,7 +6,8 @@
 //!   evaluator (`ComponentProject::render_local`). It carries the cascade chain
 //!   collected from a thread-local stack — when component `A` calls into `B`
 //!   during its render, `B` is recorded as a cascade child of `A` before its
-//!   own frame opens.
+//!   own frame opens. Request-time renders that cross an `.await` report
+//!   through [`publish_render`] instead, without a cascade.
 //! * [`LaneObserver`] sees one event per **runtime** [`super::frame::frame_tick`]
 //!   call. It exposes the per-lane patch counts and bytes the muxer just
 //!   shipped, which the dev inspector renders as a lane-utilization heatmap.
@@ -182,6 +183,21 @@ impl Drop for FrameGuard {
     }
 }
 
+/// Publish one render the caller timed itself, for render paths that cross an
+/// `.await` — a task can resume on another thread, where the thread-local frame
+/// stack cannot follow it. Carries no cascade: an async render has no enclosing
+/// frame to nest in. Cheap when no observer is installed.
+pub fn publish_render(name: &str, module_spec: &str, started_at: Instant) {
+    if let Some(observer) = render_observer() {
+        observer.on_render(RenderInfo {
+            component_name: name.to_string(),
+            module_spec: module_spec.to_string(),
+            duration_us: u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            cascade_children: Vec::new(),
+        });
+    }
+}
+
 /// Forwards a frame report to the installed [`LaneObserver`], if any.
 /// Called from [`super::frame::frame_tick`] after it computes its
 /// [`super::frame::FrameReport`]. Cheap when no observer is installed
@@ -270,6 +286,28 @@ mod tests {
             })
             .unwrap_or_default();
         (result, new_events)
+    }
+
+    /// An async render times itself and publishes without a frame, and leaves
+    /// the frame stack alone — it may resume on a thread whose stack is another
+    /// render's.
+    #[test]
+    fn publish_render_reports_the_callers_timing_outside_any_frame() {
+        let (_, events) = with_recorder(|_| {
+            let _outer = enter_frame_guard("Outer", "src/Outer.tsx");
+            let started_at = Instant::now();
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            publish_render("Guestbook", "", started_at);
+        });
+        assert_eq!(events.len(), 2, "{events:?}");
+        let async_render = &events[0];
+        assert_eq!(async_render.component_name, "Guestbook");
+        assert!(async_render.duration_us >= 200, "{async_render:?}");
+        assert!(async_render.cascade_children.is_empty());
+        assert!(
+            events[1].cascade_children.is_empty(),
+            "an async render is not a cascade child of whatever frame is open"
+        );
     }
 
     #[test]

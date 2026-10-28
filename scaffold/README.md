@@ -23,7 +23,7 @@ albedo ship     # package for deployment (docker / fly / static)
 ├── public/
 │   └── index.html          — static shell used by the file-server fallback
 ├── src/
-│   ├── routes/             — file-based routes (Phase N)
+│   ├── routes/             — file-based routes
 │   │   ├── layout.tsx      — root layout wrapping every route below
 │   │   ├── index.tsx       — `/`          landing
 │   │   ├── guestbook.tsx   — `/guestbook` live FORGE collection

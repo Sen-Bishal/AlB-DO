@@ -1,4 +1,4 @@
-// Phase N+ — file-based routing. `root` points at `src/` and the
+// File-based routing. `root` points at `src/` and the
 // renderer discovers every `.tsx` under `routes/` automatically.
 // `entry` is the default route's component file relative to `root`;
 // other routes are discovered (and named) by their file path.
@@ -9,15 +9,18 @@ export default {
   server: { host: "127.0.0.1", port: 3000 },
   watch: { debounce_ms: 75, ignore: ["**/.git/**", "**/node_modules/**"] },
   hmr: { enabled: true, transport: "sse" },
-  hot_set: [],
-  static_slice: { enabled: true, opt_out: [] },
 
   // ── FORGE ────────────────────────────────────────────────────────
   //
   // THIS IS THE BACKEND. There is no server directory, no ORM, no
   // migration folder, no API layer. Declare the shape of the data and
-  // ALBEDO emits the table, the query that materializes it, and the
-  // seed rows — then keeps every connected client in sync with it.
+  // ALBEDO emits the table and the query that materializes it — then keeps
+  // every connected client in sync with it.
+  //
+  // A collection may also declare `seed: [ … ]` — rows written once, into an
+  // empty table, on first boot. Use it for reference data your app needs
+  // (plans, categories); these collections start empty and fill as people
+  // post.
   //
   // `id` is implicit on every collection (INTEGER PRIMARY KEY
   // AUTOINCREMENT) and is what live reconciliation keys on.
@@ -39,13 +42,14 @@ export default {
   // `?` for nullable (`nickname: "text?"`). These decide the shape your rows
   // arrive in: a `bool` is `true`, never `1`; a `timestamp` is epoch
   // milliseconds, so `new Date(row.posted_at)` works with no conversion.
+  //
+  // Anyone may append. Only the signed-in user who added a row may `update`
+  // or `remove` it — the server records who ran each append, so there is no
+  // owner column to declare. `edit: "anyone"` opens a collection's rows to
+  // every visitor; say it only when that is what you mean.
   forge: {
     guestbook: {
       fields: { author: "text", message: "text" },
-      seed: [
-        { author: "ada", message: "first light" },
-        { author: "alan", message: "the machine stirs" },
-      ],
     },
 
     // `partition_by` splits one collection into many independent live
@@ -61,10 +65,6 @@ export default {
     messages: {
       fields: { room: "text", author: "text", body: "text" },
       partition_by: "room",
-      seed: [
-        { room: "lobby", author: "ada", body: "welcome to the lobby" },
-        { room: "quiet", author: "alan", body: "a different room entirely" },
-      ],
     },
   },
 
@@ -76,15 +76,16 @@ export default {
   // prop on every render — either a principal or null. There is no auth
   // library to install and no users table to design.
   //
-  // `password` is a known provider, so it infers what it is. Anything that
-  // is not a known name has to say (`kind: "oauth" | "oidc" | "delegated" |
-  // "custom"`) — guessing at an unknown name has a silently wrong answer.
+  // `password` is a known provider, so it infers what it is, as do `github`,
+  // `google`, `discord` and `magiclink`. Anything else has to say what it is
+  // (`kind: "oauth"` or `kind: "oidc"`) — guessing at an unknown name has a
+  // silently wrong answer.
   //
   // See src/routes/sign-in.tsx. Gate any route on a session with
   // `export const auth = "required"` in that route's file; a stranger who
   // asks for it is sent to `login` below.
   //
-  // 🔑 `albedo_` is a reserved prefix. A collection declared under it above
+  // `albedo_` is a reserved prefix. A collection declared under it above
   // is refused at boot — otherwise an app could replace the session table,
   // or read every user's row as one live topic.
   auth: {
@@ -94,4 +95,32 @@ export default {
     },
     login: "/sign-in",
   },
+
+  // ── EMAIL ────────────────────────────────────────────────────────
+  //
+  // Uncomment to send mail. `sendEmail({ to, subject, text })` then works in
+  // any action or job, and the password provider above can take
+  // `reset: "email"` (a forgot-password flow) and `verify: "required"`
+  // (confirm the address before first sign-in). Add `magiclink: {}` under
+  // `providers` for passwordless sign-in.
+  //
+  // `provider: "log"` sends nothing: each message lands in
+  // `.albedo/outbox/` as an .eml file, and `albedo dev` prints it. For real
+  // mail use "resend", "postmark", "sendgrid" or "mailgun" with
+  // `apiKey: { env: "RESEND_API_KEY" }`. Links in mail point at
+  // ALBEDO_PUBLIC_ORIGIN in production — never at a request's Host header.
+  //
+  // The framework's own emails (reset, confirm, sign-in link, sign-up notice)
+  // can be replaced field by field under `templates` — passwordReset,
+  // verifyEmail, magicLink, alreadyRegistered — using {{app}}, {{link}} and
+  // {{expires}}. The build refuses a body without {{link}} or a subject with it.
+  //
+  // Check a real provider before users depend on it:
+  //   albedo email test you@example.com
+  //
+  // email: {
+  //   from: "My App <no-reply@example.com>",
+  //   provider: "log",
+  //   // templates: { magicLink: { subject: "Your {{app}} sign-in link" } },
+  // },
 };

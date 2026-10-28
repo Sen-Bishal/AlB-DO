@@ -3,7 +3,7 @@
 //!
 //! Separated from `client.rs` so that everything above this file is free of
 //! `reqwest` types: the cache, the coalescer and the metrics are all testable
-//! against [`CountingTransport`](super::client::CountingTransport) with no
+//! against `CountingTransport` with no
 //! network, no TLS and no DNS.
 
 use crate::aperture::client::{ApertureError, Transport, WireRequest, WireResponse};

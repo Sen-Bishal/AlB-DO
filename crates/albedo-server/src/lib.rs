@@ -51,6 +51,7 @@ pub mod bundle_payload;
 pub mod config;
 pub mod contract;
 pub mod dev;
+pub mod email;
 pub mod engine_pool;
 pub mod error;
 pub mod forge_db_path;
@@ -61,16 +62,19 @@ pub(crate) mod jobs;
 pub mod lifecycle;
 pub mod metrics;
 pub(crate) mod middleware;
+pub mod redirects;
 pub mod render;
 pub mod renderer_runtime;
 pub mod routing;
 pub mod server;
 pub mod shutter;
+pub mod static_export;
 pub mod uploads;
 pub mod timing;
 pub mod tls;
 pub mod topics;
 pub mod webtransport;
+pub(crate) mod webhooks;
 
 pub use actions::{ActionHandler, SessionSlots};
 pub use boot::{boot_production_server, ProductionServerOptions};
@@ -78,7 +82,7 @@ pub use api::{ApiHandler, ApiResponse};
 pub use config::{AppConfig, LayoutSpec, RendererConfig, RouteSpec, ServerConfig};
 pub use contract::{
     AllowAllAuthProvider, AuthDecision, AuthProvider, LayoutHandler, PropsLoader, RouteHandler,
-    RuntimeMiddleware,
+    RuntimeMiddleware, UnconfiguredAuthProvider,
 };
 pub use engine_pool::{EnginePoolError, QuickJsEnginePool};
 pub use error::RuntimeError;

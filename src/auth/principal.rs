@@ -176,6 +176,14 @@ pub struct Principal {
     /// `auth.providers` block, not the provider *kind*. Two Okta tenants are two
     /// names and one kind, and telling them apart matters.
     pub provider: String,
+    /// Every provider this human can sign in with — the `albedo_accounts` rows
+    /// behind [`Self::id`], sorted. What an account page lists as "connected",
+    /// and what decides whether one may be disconnected (never the last).
+    ///
+    /// Empty when the principal was built without reading them — a freshly
+    /// minted one in a test, or a path that never loaded the accounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
     /// The provider's raw claim payload.
     ///
     /// Never merged into the fields above, so a provider cannot overwrite an id
@@ -194,8 +202,38 @@ impl Principal {
             name: None,
             image: None,
             provider: provider.into(),
+            providers: Vec::new(),
             claims: serde_json::Map::new(),
         }
+    }
+
+    /// What app code sees as `user` — in a page, an action, middleware and a
+    /// job alike. **The one definition**, so the four cannot drift apart: a
+    /// field present in a render and absent in the action that render's form
+    /// posts to would be `undefined` in exactly one of them, silently.
+    ///
+    /// `{ id, email, name, image, provider, providers }`. Absent profile fields
+    /// are `null`, never missing, so `user.email ?? "…"` means the same thing
+    /// whichever provider signed the person in.
+    ///
+    /// `claims` is deliberately not here: it is a provider's raw payload, read
+    /// once at sign-in, and putting it in scope would make its shape — which the
+    /// provider controls — part of every component that mentions `user`.
+    ///
+    /// Only `id` may key a partition (`.where({ owner: user.id })`); the compiler
+    /// refuses any other `user.*` there, so the profile fields can be shown
+    /// without tempting an owner key that changes when the person does.
+    #[must_use]
+    pub fn user_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id.as_str(),
+            "email": self.email,
+            "name": self.name,
+            "image": self.image,
+            // Empty for a principal nothing signed in — a job's, a webhook's.
+            "provider": (!self.provider.is_empty()).then_some(&self.provider),
+            "providers": self.providers,
+        })
     }
 }
 
@@ -267,6 +305,29 @@ mod tests {
             .claims
             .insert("id".to_string(), serde_json::json!("attacker"));
         assert_eq!(principal.id, minted);
+    }
+
+    /// The shape app code reads. Every key present — `null` when unknown — so a
+    /// component never has to tell "missing" from "empty".
+    #[test]
+    fn the_user_value_has_every_key_and_nothing_else() {
+        let mut principal = Principal::new(PrincipalId::parse("u_7f3a").unwrap(), "github");
+        principal.email = Some("ada@example.com".to_string());
+        principal.providers = vec!["github".to_string(), "password".to_string()];
+        principal
+            .claims
+            .insert("login".to_string(), serde_json::json!("ada"));
+        assert_eq!(
+            principal.user_value(),
+            serde_json::json!({
+                "id": "u_7f3a",
+                "email": "ada@example.com",
+                "name": null,
+                "image": null,
+                "provider": "github",
+                "providers": ["github", "password"],
+            })
+        );
     }
 
     #[test]

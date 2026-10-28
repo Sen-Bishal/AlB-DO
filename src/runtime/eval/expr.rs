@@ -233,7 +233,8 @@ fn parse_source(source: &str, file_path: &Path) -> Result<Module> {
         })
     } else {
         Syntax::Es(EsSyntax {
-            jsx: matches!(ext, "jsx" | "js"),
+            // `md`: a Markdown page arrives here already lowered to JSX.
+            jsx: matches!(ext, "jsx" | "js" | "md"),
             decorators: true,
             ..Default::default()
         })

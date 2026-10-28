@@ -38,9 +38,14 @@
 //! [`absorb_timing`](dom_render_compiler::auth::password::absorb_timing) on every
 //! miss, a caller cannot use the login endpoint to learn who has an account.
 //!
-//! **Signup: that the address is taken.** It has to — see
-//! `dom_render_compiler::auth::password`'s module docs for why the quiet
-//! alternative is worse rather than better when there is no email channel.
+//! **Signup: that the address is taken** — unless the provider declares
+//! `verify: "required"` (15.3). Then there is an email channel, and the quiet
+//! alternative stops being worse: a taken address answers exactly like a new
+//! one, and its owner is mailed instead. See `email_routes::register_quietly`.
+//!
+//! The email flows themselves — reset, verify, magic link — live in
+//! [`crate::handlers::email_routes`] and are dispatched from here, so they pass
+//! the same CSRF check before anything reads a field.
 
 use crate::auth::{now_ms, AuthRuntime, Identity};
 use crate::forms::{see_other, FormBody, ReturnPath};
@@ -52,12 +57,11 @@ use dom_render_compiler::auth::password::{
     absorb_timing, hash_password, normalize_email, verify_password, PasswordError,
 };
 use dom_render_compiler::auth::store::{self, ProviderProfile};
-use dom_render_compiler::auth::ProviderKind;
+use dom_render_compiler::auth::{ProviderKind, ResolvedProvider};
+
+use crate::handlers::email_routes;
 use dom_render_compiler::runtime::SessionId;
 use tracing::{debug, warn};
-
-/// Path prefix every first-party auth endpoint lives under.
-pub const AUTH_ROUTE_PREFIX: &str = "/_albedo/auth/";
 
 /// Field the login and signup forms submit the address under.
 pub const EMAIL_FIELD: &str = "email";
@@ -81,22 +85,50 @@ pub enum AuthRoute {
     PasswordLogin,
     /// End the presented session.
     Logout,
+    /// End every session of the signed-in account — sign out on every device.
+    LogoutAll,
+    /// 15.3 · mail a password reset link.
+    PasswordForgot,
+    /// 15.3 · spend a reset link on a new password.
+    PasswordReset,
+    /// 15.3 · mail a sign-in link.
+    MagicLinkStart,
+    /// 15.3 · spend a sign-in link.
+    MagicLinkSignIn,
+    /// 15.3 · spend a confirmation link.
+    VerifyEmail,
+    /// Disconnect one sign-in method from the signed-in account.
+    Unlink,
+    /// Mail the signed-in account a link to set a first password — how a
+    /// password is connected to an account that signed up another way.
+    PasswordSet,
 }
 
 /// Match a request path against the first-party endpoints.
 ///
-/// Exhaustive and literal: three paths, no patterns, no prefixes that could
+/// Exhaustive and literal: named paths, no patterns, no prefixes that could
 /// swallow a longer path. `/_albedo/auth/password/login/../../x` does not reach
-/// anything here because it is not one of these three strings.
+/// anything here because it is not one of these strings.
 #[must_use]
 pub fn match_auth_route(path: &str) -> Option<AuthRoute> {
     match path {
         "/_albedo/auth/password/register" => Some(AuthRoute::PasswordRegister),
         "/_albedo/auth/password/login" => Some(AuthRoute::PasswordLogin),
         "/_albedo/auth/logout" => Some(AuthRoute::Logout),
+        "/_albedo/auth/logout-all" => Some(AuthRoute::LogoutAll),
+        "/_albedo/auth/password/forgot" => Some(AuthRoute::PasswordForgot),
+        crate::handlers::email_routes::RESET_PATH => Some(AuthRoute::PasswordReset),
+        "/_albedo/auth/magiclink/start" => Some(AuthRoute::MagicLinkStart),
+        crate::handlers::email_routes::MAGIC_SIGNIN_PATH => Some(AuthRoute::MagicLinkSignIn),
+        crate::handlers::email_routes::VERIFY_PATH => Some(AuthRoute::VerifyEmail),
+        "/_albedo/auth/unlink" => Some(AuthRoute::Unlink),
+        "/_albedo/auth/password/set" => Some(AuthRoute::PasswordSet),
         _ => None,
     }
 }
+
+/// Field the disconnect form names its provider under.
+pub const PROVIDER_FIELD: &str = "provider";
 
 /// Everything an auth endpoint needs from the request, gathered once.
 pub struct AuthRequest<'a> {
@@ -122,6 +154,27 @@ pub struct AuthRequest<'a> {
     pub shutter: &'a crate::shutter::Limiter,
     /// The caller's bucket.
     pub caller: dom_render_compiler::shutter::Key,
+    /// 15.3 · the mail runtime, for the flows that send a link. `None` in an
+    /// app with no `email` block, where those flows answer `404`.
+    pub(crate) email: Option<std::sync::Arc<crate::email::EmailRuntime>>,
+    /// 15.3 · the job queue, which is what actually sends.
+    pub(crate) jobs: Option<crate::jobs::JobHandle>,
+    /// The live lanes, so a revoked session stops receiving live data at once
+    /// rather than when its tab closes.
+    pub(crate) phosphor: &'a crate::handlers::PhosphorState,
+}
+
+/// End every live lane `principal` has open — after its sessions were revoked.
+pub(crate) fn end_lanes_of(
+    request: &AuthRequest<'_>,
+    principal: &dom_render_compiler::auth::PrincipalId,
+) {
+    let ended = request
+        .phosphor
+        .end_lanes_where(|identity| identity.principal().is_some_and(|p| &p.id == principal));
+    if ended > 0 {
+        debug!(target: "albedo.auth", ended, "live lanes of a revoked account ended");
+    }
 }
 
 /// Run one first-party auth endpoint.
@@ -168,6 +221,77 @@ pub async fn run_auth_route(route: AuthRoute, request: AuthRequest<'_>) -> Respo
         AuthRoute::PasswordRegister => register(&request, &form, &back).await,
         AuthRoute::PasswordLogin => login(&request, &form, &back).await,
         AuthRoute::Logout => logout(&request, &back).await,
+        AuthRoute::LogoutAll => logout_all(&request, &back).await,
+        AuthRoute::PasswordForgot => email_routes::forgot(&request, &form, &back).await,
+        AuthRoute::PasswordReset => email_routes::reset(&request, &form).await,
+        AuthRoute::MagicLinkStart => email_routes::magic_start(&request, &form, &back).await,
+        AuthRoute::MagicLinkSignIn => email_routes::magic_signin(&request, &form).await,
+        AuthRoute::VerifyEmail => email_routes::verify(&request, &form).await,
+        AuthRoute::Unlink => unlink(&request, &form, &back).await,
+        AuthRoute::PasswordSet => email_routes::set_password(&request, &back).await,
+    }
+}
+
+/// `POST /_albedo/auth/unlink` — disconnect one sign-in method (form field
+/// `provider`) from the signed-in account.
+///
+/// Refused for the last method: the account would be locked with its data
+/// inside, and nothing — not support, not the owner — could open it again.
+/// Otherwise the method's other sessions end with it (their live lanes too, so
+/// they stop receiving data now rather than on their next request), and the
+/// session asking stays signed in.
+async fn unlink(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) -> Response<Body> {
+    use dom_render_compiler::auth::store::UnlinkOutcome;
+
+    let (Some(principal), Some(token)) = (request.identity.principal(), request.identity.token())
+    else {
+        // `403`, not `401`: every `401` in this file is the one login refusal
+        // (`LOGIN_REFUSED`), and a test holds the file to that.
+        return refusal(StatusCode::FORBIDDEN, "Sign in first.", back);
+    };
+    let Some(provider) = form
+        .get(PROVIDER_FIELD)
+        .filter(|name| dom_render_compiler::auth::is_valid_provider_name(name))
+    else {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "Say which sign-in method to disconnect.",
+            back,
+        );
+    };
+    let outcome =
+        store::unlink_account(request.auth.substrate().as_ref(), &principal.id, provider, token)
+            .await;
+    match outcome {
+        Ok(UnlinkOutcome::Unlinked { sessions_ended }) => {
+            let ended = request.phosphor.end_lanes_where(|identity| {
+                identity.token() != Some(token)
+                    && identity
+                        .principal()
+                        .is_some_and(|who| who.id == principal.id && who.provider == provider)
+            });
+            debug!(target: "albedo.auth", provider, sessions_ended, ended, "sign-in method disconnected");
+            see_other(back)
+        }
+        Ok(UnlinkOutcome::LastMethod) => refusal(
+            StatusCode::CONFLICT,
+            "That is the only way to sign in to this account, so it cannot be disconnected. \
+             Connect another first.",
+            back,
+        ),
+        Ok(UnlinkOutcome::NotConnected) => refusal(
+            StatusCode::NOT_FOUND,
+            "That sign-in method is not connected to this account.",
+            back,
+        ),
+        Err(err) => {
+            warn!(target: "albedo.auth", %err, "disconnecting a sign-in method failed");
+            refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong. Try again.",
+                back,
+            )
+        }
     }
 }
 
@@ -176,12 +300,11 @@ pub async fn run_auth_route(route: AuthRoute, request: AuthRequest<'_>) -> Respo
 /// An endpoint for an undeclared provider is a `404`, not a `501`: the route
 /// genuinely does not exist for this app, and saying "not implemented" would
 /// imply it might be.
-fn declares(auth: &AuthRuntime, kind: ProviderKind) -> Option<&str> {
+fn declares(auth: &AuthRuntime, kind: ProviderKind) -> Option<&ResolvedProvider> {
     auth.registry()
         .providers
         .iter()
         .find(|provider| provider.kind == kind)
-        .map(|provider| provider.name.as_str())
 }
 
 /// `POST /_albedo/auth/password/register`.
@@ -190,14 +313,14 @@ async fn register(
     form: &FormBody,
     back: &ReturnPath,
 ) -> Response<Body> {
-    let Some(provider) = declares(request.auth, ProviderKind::Password) else {
+    let Some(declared) = declares(request.auth, ProviderKind::Password) else {
         return refusal(
             StatusCode::NOT_FOUND,
             "This app does not offer password sign-up.",
             back,
         );
     };
-    let provider = provider.to_string();
+    let provider = declared.name.clone();
 
     let Some(email) = form.get(EMAIL_FIELD).and_then(normalize_email) else {
         return refusal(
@@ -226,19 +349,41 @@ async fn register(
         }
     };
 
-    let profile = ProviderProfile {
-        email: Some(email.clone()),
-        ..ProviderProfile::default()
-    };
-    let created = store::create_credential_account(
+    // 15.3 · with confirmation required, new and taken answer identically — in
+    // time as well — and nobody is signed in until the link is used. Creation
+    // itself moves off the response path; see `register_quietly`.
+    if declared.verify_email {
+        return email_routes::register_quietly(request, declared, email, secret, form, back);
+    }
+
+    // An address a magic-link user has PROVED is theirs: a password sign-up for
+    // it would otherwise mint a second principal for the same person, or — worse,
+    // in an app without confirmation — let a stranger claim it. They add a
+    // password through "forgot password" instead.
+    let created = match dom_render_compiler::auth::email_token::verified_principal(
         request.auth.substrate().as_ref(),
-        &provider,
         &email,
-        &profile,
-        &secret,
-        now_ms(),
     )
-    .await;
+    .await
+    {
+        Ok(Some(_)) => Ok(None),
+        Ok(None) => {
+            let profile = ProviderProfile {
+                email: Some(email.clone()),
+                ..ProviderProfile::default()
+            };
+            store::create_credential_account(
+                request.auth.substrate().as_ref(),
+                &provider,
+                &email,
+                &profile,
+                &secret,
+                now_ms(),
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
 
     let principal = match created {
         Ok(Some(principal)) => principal,
@@ -273,14 +418,14 @@ async fn register(
 
 /// `POST /_albedo/auth/password/login`.
 async fn login(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) -> Response<Body> {
-    let Some(provider) = declares(request.auth, ProviderKind::Password) else {
+    let Some(declared) = declares(request.auth, ProviderKind::Password) else {
         return refusal(
             StatusCode::NOT_FOUND,
             "This app does not offer password sign-in.",
             back,
         );
     };
-    let provider = provider.to_string();
+    let provider = declared.name.clone();
     let password = form.get(PASSWORD_FIELD).unwrap_or_default();
 
     // An unparseable address still pays for a hash. Returning early here would
@@ -353,6 +498,14 @@ async fn login(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) ->
         return refusal(StatusCode::UNAUTHORIZED, LOGIN_REFUSED, back);
     }
 
+    // 15.3 · the right password is not enough until the address is proven.
+    // Checked after the KDF, so it adds nothing to the timing of a wrong one.
+    if declared.verify_email
+        && !email_routes::is_verified(request.auth, &credential.principal, &email).await
+    {
+        return email_routes::unverified_login(request, declared, credential.principal, email, back);
+    }
+
     debug!(
         target: "albedo.auth",
         principal = %credential.principal,
@@ -377,12 +530,35 @@ async fn logout(request: &AuthRequest<'_>, back: &ReturnPath) -> Response<Body> 
             Ok(rows) => debug!(target: "albedo.auth", rows, "session revoked"),
             Err(err) => warn!(target: "albedo.auth", %err, "session revocation failed"),
         }
+        request
+            .phosphor
+            .end_lanes_where(|identity| identity.token() == Some(token));
     }
 
     // The cookie is cleared whether or not the revocation succeeded. Those are
     // two different failures — a live row we could not delete is a real problem,
     // a cookie we could not clear is *this browser staying signed in* — and only
     // one of them is visible to the person who clicked the button.
+    let mut response = see_other(back);
+    set_cookie(&mut response, &request.auth.clear_cookie());
+    response
+}
+
+/// `POST /_albedo/auth/logout-all` — end every session the signed-in account
+/// holds, this one included.
+///
+/// What someone reaches for after losing a device or changing a leaked
+/// password. Other tabs and devices lose their session on their next request;
+/// nothing has to be told. Anonymous callers have nothing to end, and get the
+/// same redirect a signed-in one does.
+async fn logout_all(request: &AuthRequest<'_>, back: &ReturnPath) -> Response<Body> {
+    if let Some(principal) = request.identity.principal() {
+        match store::revoke_all_sessions(request.auth.substrate().as_ref(), &principal.id).await {
+            Ok(rows) => debug!(target: "albedo.auth", rows, "every session revoked"),
+            Err(err) => warn!(target: "albedo.auth", %err, "revoking every session failed"),
+        }
+        end_lanes_of(request, &principal.id);
+    }
     let mut response = see_other(back);
     set_cookie(&mut response, &request.auth.clear_cookie());
     response
@@ -398,7 +574,7 @@ async fn logout(request: &AuthRequest<'_>, back: &ReturnPath) -> Response<Body> 
 /// victim's session the moment they authenticate, unless the id changes at that
 /// moment. Both entry points into this function are exactly that moment, so the
 /// rotation lives here and neither of them can forget it.
-async fn open_session(
+pub(crate) async fn open_session(
     request: &AuthRequest<'_>,
     principal: &dom_render_compiler::auth::PrincipalId,
     provider: &str,
@@ -428,8 +604,14 @@ async fn open_session(
         }
     };
 
-    let mut response = see_other(back);
+    // Where the person was going when a gate sent them here, if one did — the
+    // cookie wins over the form's own return path (the sign-in page itself),
+    // and is spent either way.
+    let back = crate::handlers::auth_gate::remembered_destination(request.headers)
+        .unwrap_or_else(|| back.clone());
+    let mut response = see_other(&back);
     set_cookie(&mut response, &request.auth.set_cookie(&token));
+    set_cookie(&mut response, &crate::handlers::auth_gate::forget_destination());
     response
 }
 
@@ -462,7 +644,67 @@ fn set_cookie(response: &mut Response<Body>, value: &str) {
 /// a password. A plain status plus a plain body is what is honest today; § "P2's
 /// shape" is where the re-render-with-errors version belongs, once a login route
 /// exists to re-render.
-fn refusal(status: StatusCode, message: &str, back: &ReturnPath) -> Response<Body> {
+pub(crate) fn refusal(status: StatusCode, message: &str, back: &ReturnPath) -> Response<Body> {
+    let mut response = refusal_page(status, message, back);
+    // What [`into_form_feedback`] needs to put this sentence back in the form
+    // that posted, if a browser's own submit is what got it.
+    response.extensions_mut().insert(Refused {
+        message: message.to_string(),
+        back: back.clone(),
+    });
+    response
+}
+
+/// A refusal's sentence and where the form that earned it lives.
+#[derive(Debug, Clone)]
+pub(crate) struct Refused {
+    message: String,
+    back: ReturnPath,
+}
+
+/// A refusal from one of `transforms::form::FEEDBACK_ENDPOINTS`, answered as
+/// the page that posted — `303` back to it, the sentence carried in the form
+/// feedback cookie into the one sink the renderer closed that form on. So a
+/// wrong password reads like an action's `{ error }`: in the form, on the page
+/// the reader was on, with JavaScript or without.
+///
+/// Only for a browser's own submit (a document navigation). A script, `curl`
+/// or a test client keeps the refusal as it was — its status code is the
+/// answer a program reads. And only for an endpoint the renderer reserved a
+/// sink for; anything else would be redirected to a page with nowhere to say
+/// why, which is worse than the refusal page.
+pub(crate) fn into_form_feedback(
+    response: Response<Body>,
+    endpoint: &str,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let Some(endpoint) = dom_render_compiler::transforms::form::feedback_endpoint(endpoint) else {
+        return response;
+    };
+    if !crate::handlers::auth_gate::is_document_navigation(headers) {
+        return response;
+    }
+    let Some(refused) = response.extensions().get::<Refused>() else {
+        return response;
+    };
+    let sink = dom_render_compiler::transforms::form::allocate_endpoint_feedback_id(endpoint);
+    let Some(feedback) = crate::forms::FormFeedback::message(&refused.back, sink, &refused.message)
+    else {
+        return response;
+    };
+    // To the sink itself, as an action's refusal lands on its form: a sentence
+    // below the fold is one nobody reads.
+    let anchor = dom_render_compiler::transforms::form::endpoint_feedback_anchor(endpoint);
+    let target = ReturnPath::parse(&format!("{}#{anchor}", refused.back.without_fragment()))
+        .unwrap_or_else(|| refused.back.clone());
+    let mut back = see_other(&target);
+    set_cookie(&mut back, &feedback.set_cookie());
+    back
+}
+
+/// The refusal as a page of its own — what a program, or a form with no sink
+/// for it, is answered with.
+fn refusal_page(status: StatusCode, message: &str, back: &ReturnPath) -> Response<Body> {
     let body = format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Sign-in</title></head>\
          <body><main><p>{}</p><p><a href=\"{}\">Back</a></p></main></body></html>",
@@ -497,6 +739,62 @@ fn escape_html(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    fn navigating() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        headers
+    }
+
+    /// A browser's own submit of the sign-in form is answered AS the sign-in
+    /// page, the sentence carried into the form; everything else keeps the
+    /// refusal it always had.
+    #[test]
+    fn a_refused_sign_in_goes_back_to_the_form_that_posted() {
+        let back = ReturnPath::parse("/account/sign-in").unwrap();
+        let login = "/_albedo/auth/password/login";
+
+        let answered = into_form_feedback(
+            refusal(StatusCode::UNAUTHORIZED, LOGIN_REFUSED, &back),
+            login,
+            &navigating(),
+        );
+        assert_eq!(answered.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            answered.headers()[header::LOCATION],
+            "/account/sign-in#albedo-feedback-password-login"
+        );
+        let cookie = answered.headers()[header::SET_COOKIE].to_str().unwrap().to_string();
+        let sink =
+            dom_render_compiler::transforms::form::allocate_endpoint_feedback_id(login).to_string();
+        assert!(cookie.starts_with(crate::forms::FEEDBACK_COOKIE), "{cookie}");
+        assert!(cookie.contains(&format!("{sink}=That+email")), "{cookie}");
+
+        // A program asked: its answer is the status code.
+        let for_a_program = into_form_feedback(
+            refusal(StatusCode::UNAUTHORIZED, LOGIN_REFUSED, &back),
+            login,
+            &HeaderMap::new(),
+        );
+        assert_eq!(for_a_program.status(), StatusCode::UNAUTHORIZED);
+
+        // No sink was reserved for this endpoint, so there is nowhere to say it.
+        let unlink = into_form_feedback(
+            refusal(StatusCode::CONFLICT, "last way in", &back),
+            "/_albedo/auth/unlink",
+            &navigating(),
+        );
+        assert_eq!(unlink.status(), StatusCode::CONFLICT);
+    }
+
+    /// A success is never touched, whatever asked.
+    #[test]
+    fn only_a_refusal_is_carried_back() {
+        let back = ReturnPath::parse("/account").unwrap();
+        let ok = into_form_feedback(see_other(&back), "/_albedo/auth/password/login", &navigating());
+        assert_eq!(ok.status(), StatusCode::SEE_OTHER);
+        assert!(ok.headers().get(header::SET_COOKIE).is_none());
+    }
+
     #[test]
     fn the_three_endpoints_match_exactly_and_nothing_else_does() {
         assert_eq!(
@@ -511,9 +809,19 @@ mod tests {
             match_auth_route("/_albedo/auth/logout"),
             Some(AuthRoute::Logout)
         );
+        assert_eq!(
+            match_auth_route("/_albedo/auth/logout-all"),
+            Some(AuthRoute::LogoutAll)
+        );
+        assert_eq!(match_auth_route("/_albedo/auth/unlink"), Some(AuthRoute::Unlink));
+        assert_eq!(
+            match_auth_route("/_albedo/auth/password/set"),
+            Some(AuthRoute::PasswordSet)
+        );
         for path in [
             "/_albedo/auth/",
             "/_albedo/auth/password",
+            "/_albedo/auth/unlink/github",
             "/_albedo/auth/password/login/",
             "/_albedo/auth/password/login/extra",
             "/_albedo/auth/PASSWORD/login",

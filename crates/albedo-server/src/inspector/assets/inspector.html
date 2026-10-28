@@ -712,8 +712,7 @@
     graphSrcLabel.textContent =
       `${snapshot.nodes.length} nodes · ${(snapshot.edges || []).length} edges · ${snapshot.source}`;
     graphSrcPill.textContent =
-      snapshot.source === 'manifest' ? 'manifest graph' :
-      snapshot.source === 'demo'     ? 'demo graph' : 'no graph';
+      snapshot.source === 'manifest' ? 'manifest graph' : 'no graph';
   }
 
   // ── Metrics render ─────────────────────────────────────────────

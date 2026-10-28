@@ -13,6 +13,11 @@ pub fn is_component_module(path: &Path) -> bool {
     if name.ends_with(".d.ts") || name.ends_with(".d.tsx") {
         return false;
     }
+    // A Markdown page is loaded as the JSX module it lowers to — see
+    // `crate::markdown::read_module_source`, which every loader reads through.
+    if crate::markdown::is_markdown_page(path) {
+        return true;
+    }
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
         Some("jsx" | "tsx" | "js" | "ts")
@@ -353,7 +358,9 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
             _ => {
                 let text = value_to_string(value);
                 if !text.is_empty() {
-                    out.push(format!("{attr_name}=\"{}\"", escape_attr(&text)));
+                    // ALB-03 · a `javascript:` URL never reaches an href/src/action.
+                    let text = jsx_attributes::safe_attribute_value(attr_name, &text);
+                    out.push(format!("{attr_name}=\"{}\"", escape_attr(text)));
                 }
             }
         }

@@ -21,6 +21,7 @@ pub mod quickjs_engine;
 pub mod react_host;
 pub mod render_observer;
 pub mod renderer;
+pub mod request_bindings;
 pub mod scheduler;
 pub mod session;
 pub mod slot_store;
@@ -33,8 +34,9 @@ pub use bridge::{
 };
 pub use broadcast::{
     broadcast_slot_id, check_topic_slot_ids, is_valid_partition_key, partition_topic_name,
-    BroadcastDelivery, BroadcastError, BroadcastRegistry, BroadcastSender, BroadcastTopic,
-    ExternalWarm, LiveExternalTopic, TopicIdentity, DEFAULT_TOPIC_VALUE_BUDGET,
+    project_value, BroadcastDelivery, BroadcastError, BroadcastRegistry, BroadcastSender,
+    BroadcastTopic, Columns, ExternalWarm, GrantedSeed, LiveExternalTopic, TopicGrant,
+    TopicIdentity, DEFAULT_TOPIC_VALUE_BUDGET,
 };
 pub use compiled::{
     allocate_proxy_id, allocate_slot_id, render_entry_with_bindings, render_entry_with_broadcast,
@@ -42,6 +44,7 @@ pub use compiled::{
     ResolvedHandler,
 };
 pub use eval::{render_from_components_dir, ComponentProject, PatchReport};
+pub use request_bindings::RequestBindings;
 pub use session::SessionId;
 pub use topics::{
     resolve_partition_topics, resolve_source_topics, split_partition_topic, ResolvedPartition,

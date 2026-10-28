@@ -4,7 +4,6 @@ use super::events::RenderEvent;
 use super::graph::GraphSnapshot;
 use super::metrics::MetricsAggregator;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 /// Bounded broadcast capacity. SSE subscribers that lag behind have their
@@ -88,9 +87,3 @@ impl InspectorState {
     }
 }
 
-pub(super) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}

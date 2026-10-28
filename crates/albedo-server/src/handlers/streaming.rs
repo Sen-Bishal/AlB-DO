@@ -74,12 +74,19 @@ pub struct StreamingAppState {
     /// SSR HTML and emits the client runtime + island IIFEs + payload +
     /// bootstrap before `</body>`. Empty for tests / Tier-A-only builds.
     hydration: Arc<HashMap<String, crate::renderer_runtime::RouteHydration>>,
+    /// What an island needs to be rendered again for one request — see
+    /// [`crate::render::islands`]. Default (no project) leaves serve-wired
+    /// islands on their boot render; hydrated ones still re-render through
+    /// the Tier-B registry.
+    islands: crate::render::islands::IslandServices,
     /// Dev mode — when set, `build_stream` injects the error-overlay + HMR
     /// client `<script>` tags (served at `/_albedo/dev/*`) before `</body>`, so
     /// `albedo dev` runs the SAME production streaming pipeline as `albedo serve`
     /// and gets the overlay + slot-preserving hot reload on top. `false` for
     /// `albedo serve` and tests.
     dev_mode: bool,
+    /// Hot reload within dev mode: whether the page gets the HMR client.
+    hmr: bool,
 }
 
 impl StreamingAppState {
@@ -98,7 +105,9 @@ impl StreamingAppState {
             csrf: Arc::new(crate::render::csrf::CsrfRegistry::new()),
             broadcast: None,
             hydration: Arc::new(HashMap::new()),
+            islands: crate::render::islands::IslandServices::default(),
             dev_mode: false,
+            hmr: false,
         }
     }
 
@@ -108,6 +117,14 @@ impl StreamingAppState {
     #[must_use]
     pub fn with_dev_mode(mut self, dev_mode: bool) -> Self {
         self.dev_mode = dev_mode;
+        self
+    }
+
+    /// Inject the hot-reload client with the dev scripts. Only read when dev
+    /// mode is on.
+    #[must_use]
+    pub fn with_hmr(mut self, hmr: bool) -> Self {
+        self.hmr = hmr;
         self
     }
 
@@ -121,6 +138,15 @@ impl StreamingAppState {
         hydration: Arc<HashMap<String, crate::renderer_runtime::RouteHydration>>,
     ) -> Self {
         self.hydration = hydration;
+        self
+    }
+
+    /// Bind what islands need to be rendered per request. Production wires the
+    /// compiled project the reactive blocks were built from, so a serve-wired
+    /// island's binding payload is rebuilt by the same code that built it.
+    #[must_use]
+    pub fn with_islands(mut self, islands: crate::render::islands::IslandServices) -> Self {
+        self.islands = islands;
         self
     }
 
@@ -389,7 +415,7 @@ pub async fn streaming_handler_with_match(
             "page rendered under a resolved principal"
         );
     }
-    let principal = identity.principal().map(|who| who.id.clone());
+    let principal = identity.principal().cloned();
     serve_manifest_route(app, req, route_pattern, params, principal).await
 }
 
@@ -407,7 +433,10 @@ async fn serve_manifest_route(
     // correct value rather than a shortcut: an undispatched render must not
     // invent an identity, and an identity-keyed binding on it resolves to no
     // topic, which is the same answer an anonymous visitor gets.
-    principal: Option<dom_render_compiler::auth::PrincipalId>,
+    //
+    // The whole principal, not only its id: the id keys topics, and the rest is
+    // what a component reads as `user.email` and `user.providers`.
+    principal: Option<dom_render_compiler::auth::Principal>,
 ) -> Response {
     let path = req.uri().path().to_string();
     let negotiated_transport = negotiate_transport(&req, &app.transport);
@@ -479,7 +508,14 @@ async fn serve_manifest_route(
         }
     }
 
-    let stream = build_stream(route, ctx, app, response_transport, page_session);
+    // A JS-less form submit's feedback, carried across its redirect (see
+    // `forms::FormFeedback`). Read here, painted by the fill pass, and expired on
+    // this response whether or not this page was the one it was issued for —
+    // feedback is one-shot.
+    let feedback = crate::forms::FormFeedback::read(req.headers());
+    let expire_feedback = feedback.is_some();
+
+    let stream = build_stream(route, ctx, app, response_transport, page_session, feedback);
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -497,6 +533,9 @@ async fn serve_manifest_route(
             header::SET_COOKIE,
             crate::render::csrf::build_session_set_cookie(page_session),
         );
+    }
+    if expire_feedback {
+        response = response.header(header::SET_COOKIE, crate::forms::FormFeedback::clear_cookie());
     }
 
     if let Some(alt_svc) = transport_config.alt_svc {
@@ -598,8 +637,13 @@ struct TierBResolveCtx<'a> {
     error_component: Option<String>,
     loading_component: Option<String>,
     island_fills: std::sync::Arc<Vec<(String, String)>>,
+    /// This route's islands, for the per-request pass over each chunk.
+    hydration: Option<&'a crate::renderer_runtime::RouteHydration>,
     csrf_token: std::sync::Arc<str>,
     return_path: std::sync::Arc<str>,
+    /// Carried form feedback to paint into this response's sinks — empty unless
+    /// a JS-less submit redirected here. See `forms::FormFeedback`.
+    feedback: std::sync::Arc<[(u32, String)]>,
 }
 
 /// Resolve one Tier-B node to the chunk that represents it — success, the
@@ -612,7 +656,15 @@ struct TierBResolveCtx<'a> {
 /// resolver is the point — an error path that only one of them handled would be
 /// a difference nobody notices until the boundary fails to render on whichever
 /// path is rarer.
-async fn resolve_tier_b_node(node: TierBNode, shared: &TierBResolveCtx<'_>) -> InjectionChunk {
+///
+/// Also returns the binding-mode installs owed by islands this chunk rendered
+/// for this request (see [`crate::render::islands`]), which the closing scripts
+/// emit in place of their boot-time ones.
+async fn resolve_tier_b_node(
+    node: TierBNode,
+    shared: &TierBResolveCtx<'_>,
+) -> (InjectionChunk, Vec<(String, String)>) {
+    let started_at = std::time::Instant::now();
     let render_result = timeout(
         Duration::from_millis(node.timeout_ms.max(1)),
         render_tier_b(
@@ -623,6 +675,15 @@ async fn resolve_tier_b_node(node: TierBNode, shared: &TierBResolveCtx<'_>) -> I
         ),
     )
     .await;
+    // A render that finished, thrown or not, is one the dev inspector shows; a
+    // timeout never finished and has no duration to report.
+    if render_result.is_ok() {
+        dom_render_compiler::runtime::render_observer::publish_render(
+            &node.component_id,
+            "",
+            started_at,
+        );
+    }
 
     // Every arm below that carries component-rendered markup goes through the
     // same fill as the shell — including the boundaries, since an `error.tsx`
@@ -634,11 +695,24 @@ async fn resolve_tier_b_node(node: TierBNode, shared: &TierBResolveCtx<'_>) -> I
             &shared.island_fills,
             &shared.csrf_token,
             &shared.return_path,
+            &shared.feedback,
         )
     };
 
     match render_result {
-        Ok(Ok(html)) => InjectionChunk::success(&node, fill(html)),
+        Ok(Ok(html)) => {
+            // Islands first: their placeholders carry the props this render
+            // passed them, and only what this pass leaves is filled from boot.
+            let (html, installs) = crate::render::islands::render_request_islands(
+                html,
+                shared.hydration,
+                shared.ctx,
+                &shared.app.islands,
+                shared.app.services.registry.as_ref(),
+            )
+            .await;
+            (InjectionChunk::success(&node, fill(html)), installs)
+        }
         Ok(Err(err)) => {
             // Logged before anything is decided about the response. Without
             // this a throwing Tier-B node with no `error.tsx` produced a blank
@@ -661,7 +735,7 @@ async fn resolve_tier_b_node(node: TierBNode, shared: &TierBResolveCtx<'_>) -> I
             let error_props = json!({
                 "error": { "message": err.user_message() }
             });
-            match render_route_boundary(
+            let chunk = match render_route_boundary(
                 shared.app.as_ref(),
                 shared.error_component.as_deref(),
                 &error_props,
@@ -670,12 +744,13 @@ async fn resolve_tier_b_node(node: TierBNode, shared: &TierBResolveCtx<'_>) -> I
             {
                 Some(html) => InjectionChunk::error_boundary(&node, fill(html)),
                 None => InjectionChunk::error(&node, err),
-            }
+            };
+            (chunk, Vec::new())
         }
         Err(_) => {
             // The component timed out. Prefer the route's `loading.tsx` UI over
             // the generic timeout div.
-            match render_route_boundary(
+            let chunk = match render_route_boundary(
                 shared.app.as_ref(),
                 shared.loading_component.as_deref(),
                 &json!({}),
@@ -684,7 +759,8 @@ async fn resolve_tier_b_node(node: TierBNode, shared: &TierBResolveCtx<'_>) -> I
             {
                 Some(html) => InjectionChunk::fallback_with_html(&node, fill(html)),
                 None => InjectionChunk::fallback(&node),
-            }
+            };
+            (chunk, Vec::new())
         }
     }
 }
@@ -729,6 +805,7 @@ fn build_stream(
     app: Arc<StreamingAppState>,
     negotiated_transport: NegotiatedTransport,
     page_session: dom_render_compiler::runtime::SessionId,
+    feedback: Option<crate::forms::FormFeedback>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
     use dom_render_compiler::manifest::metadata::{
         lower_metadata_object, render_head_metadata, DYNAMIC_HEAD_MARKER,
@@ -747,6 +824,14 @@ fn build_stream(
         // route *pattern*: a form on `/room/42` must send its reader back to
         // `/room/42`, not to `/room/[id]`.
         let return_path: std::sync::Arc<str> = std::sync::Arc::from(ctx.path.as_str());
+
+        // What a JS-less submit's action said, if it returned here. Keyed by the
+        // same `ctx.path` the return field was stamped with, so feedback issued
+        // for another page paints nothing.
+        let feedback: std::sync::Arc<[(u32, String)]> = feedback
+            .as_ref()
+            .map(|carried| carried.entries_for(&ctx.path).into())
+            .unwrap_or_else(|| std::sync::Arc::from(Vec::new()));
 
         // Route boundary component names (`error.tsx` / `loading.tsx`), if any,
         // and the island fill data — hoisted above the shell because the inline
@@ -775,8 +860,10 @@ fn build_stream(
             error_component,
             loading_component,
             island_fills,
+            hydration,
             csrf_token: csrf_token.clone(),
             return_path: return_path.clone(),
+            feedback: feedback.clone(),
         };
 
         // ── Pass 1 · the nodes that are painted into the shell ──
@@ -788,6 +875,10 @@ fn build_stream(
         let (inline_nodes, streamed_nodes): (Vec<TierBNode>, Vec<TierBNode>) =
             route.tier_b.iter().cloned().partition(painted_inline);
 
+        // Placeholder id → the install an island rendered for this request
+        // owes, in place of its boot-time one. Collected from every pass.
+        let mut island_installs: HashMap<String, String> = HashMap::new();
+
         let mut painted: HashMap<String, InjectionChunk> = HashMap::new();
         if !inline_nodes.is_empty() {
             let mut inline_futures: FuturesUnordered<_> = inline_nodes
@@ -798,19 +889,37 @@ fn build_stream(
                     async move { (id, resolve_tier_b_node(node, shared).await) }
                 })
                 .collect();
-            while let Some((id, chunk)) = inline_futures.next().await {
+            while let Some((id, (chunk, installs))) = inline_futures.next().await {
                 painted.insert(id, chunk);
+                island_installs.extend(installs);
             }
         }
 
-        let mut shell = build_shell_chunk(
-            &route,
-            negotiated_transport,
-            app.transport.webtransport_path.as_str(),
+        // The shell's own islands — a route that IS an island, or one that
+        // reads `user` itself — render for this request before the boot fill.
+        let (shell, installs) = crate::render::islands::render_request_islands(
+            assemble_shell(
+                &route,
+                negotiated_transport,
+                app.transport.webtransport_path.as_str(),
+                &csrf_token,
+                &painted,
+            ),
+            hydration,
+            &ctx,
+            &app.islands,
+            app.services.registry.as_ref(),
+        )
+        .await;
+        island_installs.extend(installs);
+        let mut shell = fill_server_placeholders(
+            shell,
+            hydration
+                .map(|h| h.placeholders.as_slice())
+                .unwrap_or_default(),
             &csrf_token,
             &return_path,
-            hydration,
-            &painted,
+            &feedback,
         );
 
         // Slice 3 — a route exporting `generateMetadata` carries a head marker
@@ -854,7 +963,8 @@ fn build_stream(
             })
             .collect();
 
-        while let Some(chunk) = tier_b_futures.next().await {
+        while let Some((chunk, installs)) = tier_b_futures.next().await {
+            island_installs.extend(installs);
             yield Ok(Bytes::from(chunk.into_script_tag()));
         }
 
@@ -862,9 +972,13 @@ fn build_stream(
         // bootstrap precomputed at boot. Replaces the legacy `bundle_path`
         // (`/_albedo/chunks/*.js`, never emitted → 404) + `__albedo_hydrate`
         // path. Absent for Tier-A-only routes.
+        //
+        // Emitted after pass 2 on purpose: an island inside a streamed chunk is
+        // wired by the install this request rendered for it, which has to run
+        // after the chunk is injected — and is only known once it resolved.
         let mut closing = String::new();
         if let Some(hydration) = hydration {
-            closing.push_str(&hydration.closing_scripts);
+            closing.push_str(&hydration.closing_scripts_for(&island_installs));
         }
 
         // Dev mode — inject the shared SSE channel, then the error overlay and
@@ -882,9 +996,11 @@ fn build_stream(
         if app.dev_mode {
             closing.push_str(
                 "<script src=\"/_albedo/dev/stream.js\" defer></script>\
-                 <script src=\"/_albedo/dev/overlay.js\" defer></script>\
-                 <script src=\"/_albedo/dev/hmr-apply.js\" defer></script>",
+                 <script src=\"/_albedo/dev/overlay.js\" defer></script>",
             );
+            if app.hmr {
+                closing.push_str("<script src=\"/_albedo/dev/hmr-apply.js\" defer></script>");
+            }
         }
 
         closing.push_str(&route.shell.body_close);
@@ -898,21 +1014,48 @@ fn build_shell_chunk(
     webtransport_path: &str,
     csrf_token: &str,
     request_path: &str,
+    feedback: &[(u32, String)],
     hydration: Option<&crate::renderer_runtime::RouteHydration>,
     // Tier-B nodes already resolved on this request, keyed by placeholder id.
     // Empty on the WebTransport path, which ships opcode frames rather than
     // injected markup and is JS-guaranteed by definition.
     painted: &HashMap<String, InjectionChunk>,
 ) -> String {
+    fill_server_placeholders(
+        assemble_shell(route, negotiated_transport, webtransport_path, csrf_token, painted),
+        hydration
+            .map(|h| h.placeholders.as_slice())
+            .unwrap_or_default(),
+        csrf_token,
+        request_path,
+        feedback,
+    )
+}
+
+/// The shell with this request's Tier-B renders painted in, before any island
+/// is filled — the point at which [`crate::render::islands`] decides which of
+/// its islands this request renders.
+fn assemble_shell(
+    route: &RouteManifest,
+    negotiated_transport: NegotiatedTransport,
+    webtransport_path: &str,
+    csrf_token: &str,
+    painted: &HashMap<String, InjectionChunk>,
+) -> String {
     let mut shell = route.shell.doctype_and_head.clone();
     shell.push_str(&route.shell.body_open);
-    shell.push_str(&transport_hint_script(
-        negotiated_transport,
-        webtransport_path,
-        route_needs_live_lane(route),
-    ));
-    shell.push_str(&csrf_bootstrap_script(csrf_token));
-    shell.push_str(&route.shell.shim_script);
+    // Both globals are read by the client runtime and by nothing else, so a
+    // route the build gave no runtime (see `route_needs_client_runtime`) gets
+    // neither — a page of static markup ships no script at all.
+    if !route.shell.shim_script.is_empty() {
+        shell.push_str(&transport_hint_script(
+            negotiated_transport,
+            webtransport_path,
+            route_needs_live_lane(route),
+        ));
+        shell.push_str(&csrf_bootstrap_script(csrf_token));
+        shell.push_str(&route.shell.shim_script);
+    }
 
     for node in &route.tier_a_root {
         shell = shell.replace(
@@ -934,16 +1077,7 @@ fn build_shell_chunk(
     // This now covers only what pass 1 did not paint — a node that streams. Its
     // build-time HTML is still better than an empty hole while the real chunk is
     // in flight, on exactly the terms its own gate describes.
-    shell = seed_tier_b_placeholders(shell, &route.tier_b);
-
-    fill_server_placeholders(
-        shell,
-        hydration
-            .map(|h| h.placeholders.as_slice())
-            .unwrap_or_default(),
-        csrf_token,
-        request_path,
-    )
+    seed_tier_b_placeholders(shell, &route.tier_b)
 }
 
 /// The single server-side fill pass. Every chunk of rendered HTML goes
@@ -966,8 +1100,19 @@ fn fill_server_placeholders(
     islands: &[(String, String)],
     csrf_token: &str,
     request_path: &str,
+    feedback: &[(u32, String)],
 ) -> String {
     let with_islands = replace_island_placeholders(html, islands);
+    // A JS-less submit's feedback, painted into the sinks this chunk reserved —
+    // after the islands land, so a form inside one is reached too. Here and not
+    // in some page-level step for the reason this function exists: the sink may
+    // sit in the shell or in any Tier-B chunk, and every one of them comes
+    // through this pass. No-op (and no allocation) when nothing was carried.
+    let with_islands = if feedback.is_empty() {
+        with_islands
+    } else {
+        dom_render_compiler::transforms::form::fill_form_feedback(&with_islands, feedback)
+    };
     // Phase L · stamp the per-session token into every hidden CSRF input
     // the renderers emitted. No-op for any page without a form.
     let with_csrf = crate::render::csrf::substitute_csrf_token_in_html(&with_islands, csrf_token);
@@ -1144,6 +1289,9 @@ async fn stream_route_over_webtransport(
         // missing on the Tier-B path, and the cost of being wrong is a reader
         // silently landing on `/`.
         ctx.path.as_str(),
+        // No carried feedback: it only exists after a JS-less submit, and this
+        // session was opened by JavaScript.
+        &[],
         None,
         // No painted nodes on this path. WebTransport delivers Tier-B as opcode
         // frames on the patches lane, not as injected markup, so painting here
@@ -1173,11 +1321,15 @@ async fn stream_route_over_webtransport(
             if let Some(patches_sender) =
                 sessions.stream_sender(session_id, WT_STREAM_SLOT_PATCHES)
             {
-                let initial = broadcast.auto_subscribe(
-                    page_session,
-                    patches_sender,
+                // Column projection · the same per-route columns the other two
+                // lanes cut by, from the same rule.
+                let grants = dom_render_compiler::transforms::column_reads::route_grants(
+                    &route.shared_slot_columns,
                     &route.shared_slot_topics,
                 );
+                let initial = broadcast
+                    .subscribe_granted(page_session, patches_sender, &grants)
+                    .instructions;
                 if !initial.is_empty() {
                     let frame = dom_render_compiler::ir::opcode::OpcodeFrame {
                         frame_id: 0,
@@ -1370,7 +1522,7 @@ fn request_context_from_request(
     // AUTH item 5 P1 · resolved once by the dispatcher and carried, never
     // re-derived here from `cookies`. Two places deciding who the caller is is
     // two places that can disagree, and the one that renders would win silently.
-    principal: Option<dom_render_compiler::auth::PrincipalId>,
+    principal: Option<dom_render_compiler::auth::Principal>,
 ) -> TierBRequestContext {
     let mut headers = HashMap::new();
     let mut cookies = HashMap::new();
@@ -1390,7 +1542,8 @@ fn request_context_from_request(
         params,
         headers,
         cookies,
-        principal,
+        user: principal.as_ref().map(dom_render_compiler::auth::Principal::user_value),
+        principal: principal.map(|who| who.id),
     }
 }
 
@@ -1505,7 +1658,7 @@ fn maybe_webtransport_session_id(req: &Request) -> Option<Uuid> {
 /// The token is 32 hex chars from [`crate::render::csrf`], so JSON
 /// string-encoding it is belt-and-suspenders against any character that
 /// would need escaping inside the `<script>`.
-fn csrf_bootstrap_script(csrf_token: &str) -> String {
+pub(crate) fn csrf_bootstrap_script(csrf_token: &str) -> String {
     let literal = serde_json::to_string(csrf_token).unwrap_or_else(|_| "\"\"".to_string());
     format!("<script>globalThis.__ALBEDO_CSRF__={literal};</script>")
 }
@@ -1545,7 +1698,7 @@ fn transport_hint_script(
 /// — and shipped to the client as `__ALBEDO_LIVE__`. A new live surface can
 /// never again need a matching edit in a selector string on the other side of
 /// the wire.
-fn route_needs_live_lane(route: &RouteManifest) -> bool {
+pub(crate) fn route_needs_live_lane(route: &RouteManifest) -> bool {
     // A broadcast topic the route reads — scalar or list, it is the same
     // question, and it is exactly what auto-subscribe keys on.
     if !route.shared_slot_topics.is_empty() {
@@ -1853,6 +2006,7 @@ mod tests {
             auth: Default::default(),
             shared_slot_partitions: Vec::new(),
             shared_slot_sources: Vec::new(),
+            shared_slot_columns: Default::default(),
             action_ids: Vec::new(),
             layout_chain: Vec::new(),
             error_component: None,
@@ -1961,7 +2115,7 @@ mod tests {
         use dom_render_compiler::transforms::form::CSRF_PLACEHOLDER_INPUT;
 
         let html = format!("<main><form data-albedo-action=\"sign\">{CSRF_PLACEHOLDER_INPUT}</form></main>");
-        let out = fill_server_placeholders(html, &[], "cafebabe", "/guestbook");
+        let out = fill_server_placeholders(html, &[], "cafebabe", "/guestbook", &[]);
 
         assert!(
             out.contains("value=\"cafebabe\""),
@@ -1970,6 +2124,24 @@ mod tests {
         assert!(
             !out.contains("value=\"\""),
             "an empty token is the silent failure this guards: {out}"
+        );
+    }
+
+    /// A JS-less submit's carried feedback is painted by the one fill pass —
+    /// into a sink that arrived inside island markup too, which only works
+    /// because the feedback fill runs after the islands land.
+    #[test]
+    fn fill_server_placeholders_paints_carried_feedback_into_island_sinks() {
+        use dom_render_compiler::transforms::form::{allocate_form_ok_id, form_ok_span};
+
+        let html = "<main><div id=\"i1\" data-albedo-tier=\"c\"></div></main>".to_string();
+        let fills = vec![("i1".to_string(), format!("<form>{}</form>", form_ok_span("join")))];
+        let feedback = [(allocate_form_ok_id("join"), "You're on the list.".to_string())];
+        let out = fill_server_placeholders(html, &fills, "cafebabe", "/", &feedback);
+
+        assert!(
+            out.contains("role=\"status\">You're on the list.</span></form>"),
+            "the island's success sink must be painted: {out}"
         );
     }
 
@@ -1988,7 +2160,7 @@ mod tests {
             format!("<form data-albedo-action=\"sign\">{CSRF_PLACEHOLDER_INPUT}</form>"),
         )];
 
-        let out = fill_server_placeholders(html, &fills, "deadbeef", "/guestbook");
+        let out = fill_server_placeholders(html, &fills, "deadbeef", "/guestbook", &[]);
         assert!(
             out.contains("value=\"deadbeef\""),
             "a form arriving via an island must still get a token: {out}"
@@ -2009,7 +2181,7 @@ mod tests {
             format!("<form data-albedo-action=\"sign\">{FORM_HIDDEN_INPUTS}</form>"),
         )];
 
-        let out = fill_server_placeholders(html, &fills, "deadbeef", "/room/42?tab=chat");
+        let out = fill_server_placeholders(html, &fills, "deadbeef", "/room/42?tab=chat", &[]);
         assert!(out.contains("value=\"deadbeef\""), "{out}");
         assert!(
             out.contains("value=\"/room/42?tab=chat\""),

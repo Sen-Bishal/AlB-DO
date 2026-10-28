@@ -155,8 +155,9 @@ fn restore_fetch<'js>(
 fn middleware_refusal(entry: &str, hook: &str) -> RuntimeError {
     RuntimeError::render(format!(
         "middleware '{entry}' was refused: `{hook}` is planted in this realm, which could \
-         rewrite what the middleware decided or the requests it staged. No application sets \
-         one; a package that does is refused here exactly as it is for an action (SANDGATE-B)"
+         rewrite what the middleware decided or the requests it staged. The app or one of its \
+         packages patched a JavaScript built-in; it is refused here exactly as it is for an \
+         action."
     ))
 }
 
@@ -355,8 +356,8 @@ impl QuickJsEngine {
     }
 
     /// **Discard this engine's JS realm and build a fresh one on the SAME
-    /// runtime.** Experimental — the mechanism TODO 10.0's confinement half
-    /// would be built on, and the instrument that prices it.
+    /// runtime.** SANDGATE-A's confinement mechanism: the engine pool calls it
+    /// after every checkout on which third-party code could have run.
     ///
     /// 🔑 A `Context` owns the intrinsics (`Object.prototype`, `JSON`, …) and the
     /// globals, which is the entire mutable surface a third-party package can
@@ -1325,7 +1326,7 @@ impl QuickJsEngine {
                         RuntimeError::load(
                             LoadErrorKind::EngineFailure,
                             format!(
-                                "SANDGATE replay failed to re-register '{}': {}",
+                                "rebuilding the sandbox failed to re-register '{}': {}",
                                 entry.specifier,
                                 describe_js_error(&ctx, &err)
                             ),
@@ -1404,14 +1405,6 @@ impl QuickJsEngine {
         (self.ledger.resident_bytes(), self.bytecode.resident_bytes())
     }
 
-    /// Drop the replay ledger and every compiled artifact.
-    ///
-    /// For a dev reload that swapped the project out from under the engine:
-    /// replaying the previous world would resurrect modules that no longer
-    /// exist, which is worse than a cold realm.
-    pub fn forget_ledger(&mut self) {
-        self.ledger.clear();
-    }
 }
 
 impl RuntimeEngine for QuickJsEngine {
@@ -2100,6 +2093,22 @@ globalThis.__albedo_jobs = (function() {{
         if (opts.id !== undefined && opts.id !== null) {{ r.key = String(opts.id); }}
         if (opts.delay !== undefined && opts.delay !== null) {{ r.delay = String(opts.delay); }}
       }});
+    }},
+    // 15.3 · queue an email. An `enqueue` of the framework's own
+    // `albedo:send_email` job — the server validates the message as it writes
+    // the row, exactly as it does for an action's `sendEmail()`.
+    sendEmail: function(message, options) {{
+      if (message === null || typeof message !== 'object' || Array.isArray(message)) {{
+        throw new TypeError('sendEmail(message): message must be an object like {{ to, subject, text }}');
+      }}
+      const opts = options || {{}};
+      return stage('sendEmail', function(r) {{
+        r.kind = 'job_enqueue';
+        r.topic = 'albedo:send_email';
+        r.value = message;
+        if (opts.id !== undefined && opts.id !== null) {{ r.key = String(opts.id); }}
+        if (opts.delay !== undefined && opts.delay !== null) {{ r.delay = String(opts.delay); }}
+      }});
     }}
   }});
 }})();
@@ -2441,8 +2450,9 @@ fn build_quickjs_module_helpers_script() -> String {
 /// break out into the surrounding script.
 fn build_form_contract_script() -> String {
     use crate::transforms::form::{
-        ACTION_ENDPOINT_PREFIX, CSRF_PLACEHOLDER_INPUT, FORM_ACTION_ATTR, FORM_ACTION_PREFIX,
-        FORM_HIDDEN_INPUTS,
+        ACTION_ENDPOINT_PREFIX, CSRF_PLACEHOLDER_INPUT, ENDPOINT_FEEDBACK_KEY,
+        ENDPOINT_FEEDBACK_SPAN, FEEDBACK_ENDPOINTS, FEEDBACK_ENDPOINT_ROOT, FORM_ACTION_ATTR,
+        FORM_ACTION_PREFIX, FORM_HIDDEN_INPUTS,
     };
     // Infallible: `serde_json` cannot fail to encode a `&str`.
     let js = |value: &str| {
@@ -2450,12 +2460,18 @@ fn build_form_contract_script() -> String {
     };
     format!(
         "globalThis.__ALBEDO_FORM_CONTRACT = {{ prefix: {}, attr: {}, csrfInput: {}, \
-         endpointPrefix: {}, hiddenInputs: {} }};",
+         endpointPrefix: {}, hiddenInputs: {}, feedbackEndpoints: {}, \
+         endpointFeedbackKey: {}, endpointFeedbackSpan: {}, feedbackEndpointRoot: {} }};",
         js(FORM_ACTION_PREFIX),
         js(FORM_ACTION_ATTR),
         js(CSRF_PLACEHOLDER_INPUT),
         js(ACTION_ENDPOINT_PREFIX),
         js(FORM_HIDDEN_INPUTS),
+        serde_json::to_string(&FEEDBACK_ENDPOINTS)
+            .expect("encoding a list of &str as JSON cannot fail"),
+        js(ENDPOINT_FEEDBACK_KEY),
+        js(ENDPOINT_FEEDBACK_SPAN),
+        js(FEEDBACK_ENDPOINT_ROOT),
     )
 }
 
@@ -3182,7 +3198,10 @@ if (typeof globalThis.h !== 'function') {
         }
         continue;
       }
-      attrs += ' ' + attrName + '="' + __albedo_escape_attr(value) + '"';
+      // ALB-03 · a `javascript:` URL in href/src/action/… is replaced, by the
+      // rule `runtime::jsx_attributes` generates for both server renderers.
+      attrs += ' ' + attrName + '="'
+        + __albedo_escape_attr(globalThis.__albedo_attr_value(attrName, value)) + '"';
     }
 
     // Phase L · stamp the real endpoint, the rewritten action hook, and the
@@ -3211,7 +3230,7 @@ if (typeof globalThis.h !== 'function') {
       // (children are already stringified before the form runs), so it can't
       // see which fields belong to the form and instead appends the whole
       // set at the form's end. The markup + ids come from the server
-      // (`form_error_span_seed`, same `allocate_field_error_id` the pure-Rust
+      // (`form_feedback_span_seed`, same `form_feedback_spans` the pure-Rust
       // path uses), so the nodes exist with the exact ids the projection
       // addresses — bakabox no longer hits a missing node and drops the
       // frame. Placement differs from Tier-A only for a *visible* error
@@ -3226,9 +3245,23 @@ if (typeof globalThis.h !== 'function') {
       // A plain same-origin POST form — the sign-in forms are the first
       // instance. No `data-albedo-action` and no rewritten `action`: the
       // author's URL is the one that posts, and there is nothing for the
-      // client interceptor to key on. It gets the hidden inputs and nothing
-      // else.
-      inner = globalThis.__ALBEDO_FORM_CONTRACT.hiddenInputs + inner;
+      // client interceptor to key on. It gets the hidden inputs — and, when
+      // it posts to an endpoint whose refusal is a sentence, that endpoint's
+      // one feedback sink, exactly as the pure-Rust renderer closes it.
+      const contract = globalThis.__ALBEDO_FORM_CONTRACT;
+      inner = contract.hiddenInputs + inner;
+      const path = typeof safeProps.action === 'string'
+        ? safeProps.action.trim().split(/[?#]/)[0]
+        : '';
+      if (contract.feedbackEndpoints.indexOf(path) !== -1) {
+        // `endpoint_feedback_anchor`'s rule: the segments after the root,
+        // joined with `-` onto `albedo-feedback`.
+        const anchor = 'albedo-feedback'
+          + path.slice(contract.feedbackEndpointRoot.length).split('/').join('-');
+        inner = inner + contract.endpointFeedbackSpan
+          .replace('{id}', globalThis.__albedo_fnv1a_32(contract.endpointFeedbackKey + path))
+          .replace('{anchor}', anchor);
+      }
     }
     // Void elements close themselves. The ` />` spelling (and the space before
     // it) is the pure-Rust renderer's, so the two agree byte-for-byte rather
@@ -3266,8 +3299,35 @@ if (typeof globalThis.h !== 'function') {
   // parent's island child (`eval::core`), so a single serve-time fill pass
   // replaces it with the island's SSR markup + `data-albedo-island` marker for
   // every island uniformly, regardless of which renderer emitted the hole.
-  globalThis.__albedo_island_placeholder = function(placeholderId) {
-    return new AlbedoHtml('<div id="' + placeholderId + '" data-albedo-tier="c"></div>');
+  //
+  // `props` is what the parent passed THIS render — on the request path, from
+  // this request's `params`/`user`/data. They ride out on the placeholder as
+  // `data-albedo-props`, because the island is rendered after this render
+  // returns, standalone, and nothing else survives the trip: without them an
+  // island under a per-request page rendered from the props the BUILD captured.
+  // The serve pass consumes the attribute and replaces the whole placeholder,
+  // so it never reaches a browser. Kept to what a payload can carry: handlers
+  // are compiled into the island's own bundle, and `children` is markup the
+  // island skip site has never captured either.
+  globalThis.__albedo_island_placeholder = function(placeholderId, props) {
+    let carried = '';
+    if (props && typeof props === 'object') {
+      const data = {};
+      let any = false;
+      for (const key of Object.keys(props)) {
+        const value = props[key];
+        if (key === 'children' || typeof value === 'function' || typeof value === 'undefined'
+            || typeof value === 'symbol') {
+          continue;
+        }
+        data[key] = value instanceof AlbedoHtml ? value.v : value;
+        any = true;
+      }
+      if (any) {
+        carried = ' data-albedo-props="' + __albedo_escape_attr(JSON.stringify(data)) + '"';
+      }
+    }
+    return new AlbedoHtml('<div id="' + placeholderId + '" data-albedo-tier="c"' + carried + '></div>');
   };
 
   // Shell-stamped anchor ids, the QuickJS half of `eval::core`'s
@@ -3287,10 +3347,12 @@ if (typeof globalThis.h !== 'function') {
   };
   globalThis.__albedo_stable_id = function(moduleSpec) {
     const counter = __albedo_element_counter++;
-    const key = String(moduleSpec) + '#' + counter;
-    // FNV-1a over UTF-8 BYTES, matching `fnv1a_32(key.as_bytes())`. Specs are
-    // ASCII in practice, but a project under a non-ASCII path would otherwise
-    // hash differently on each side and silently unbind every element in it.
+    return globalThis.__albedo_fnv1a_32(String(moduleSpec) + '#' + counter);
+  };
+  // FNV-1a over UTF-8 BYTES, matching `fnv1a_32(key.as_bytes())`. Specs are
+  // ASCII in practice, but a project under a non-ASCII path would otherwise
+  // hash differently on each side and silently unbind every element in it.
+  globalThis.__albedo_fnv1a_32 = function(key) {
     let hash = 0x811c9dc5 >>> 0;
     for (let i = 0; i < key.length; i++) {
       const code = key.charCodeAt(i);
@@ -6161,6 +6223,7 @@ mod tests {
             raw_bindings: &[],
             setters: &setters,
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -6193,6 +6256,60 @@ mod tests {
         assert_eq!(effects.len(), 2);
     }
 
+    /// `user` and `origin` come from the REQUEST, whatever the module holds:
+    /// a constant named `origin` (a planted `https://` URL a checkout would
+    /// happily send people back to) must not stand in for configuration, and
+    /// an anonymous request binds both to `null` rather than leaving the names
+    /// to whatever else is in scope.
+    #[test]
+    fn a_handler_reads_user_and_origin_from_the_request_never_the_module() {
+        use super::QuickJsEngine;
+        use crate::ir::opcode::SlotId;
+        use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
+        use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
+        use crate::runtime::RequestBindings;
+        use serde_json::{json, Map, Value};
+
+        let mut engine = QuickJsEngine::new();
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
+        let mut env: Map<String, Value> = Map::new();
+        env.insert("origin".to_string(), Value::from("https://planted.test"));
+        env.insert("user".to_string(), json!({ "id": "u_planted" }));
+        let setters = vec![("setOut".to_string(), SlotId(4))];
+        let bc: Vec<(String, Vec<u8>)> = Vec::new();
+        let run = |engine: &mut QuickJsEngine, request: &RequestBindings| {
+            let invocation = HandlerInvocation {
+                body: "setOut(String(user && user.id) + ' @ ' + String(origin));",
+                is_block: true,
+                env: &env,
+                raw_bindings: &[],
+                setters: &setters,
+                event_json: None,
+                request,
+                broadcast_current: &bc,
+                journal: None,
+            };
+            match engine
+                .eval_handler("routes/account", &invocation)
+                .expect("handler runs")
+                .effects
+                .remove(0)
+            {
+                HandlerEffect::SlotSet { value, .. } => String::from_utf8(value).unwrap(),
+                other => panic!("expected a slot write, got {other:?}"),
+            }
+        };
+
+        let signed_in = RequestBindings {
+            user: Some(json!({ "id": "u_1" })),
+            origin: Some("https://app.test".to_string()),
+        };
+        assert_eq!(run(&mut engine, &signed_in), r#""u_1 @ https://app.test""#);
+        assert_eq!(run(&mut engine, RequestBindings::anonymous()), r#""null @ null""#);
+    }
+
     // A throw inside the handler must surface loudly, not vanish.
     #[test]
     fn eval_handler_surfaces_thrown_errors() {
@@ -6215,6 +6332,7 @@ mod tests {
             raw_bindings: &[],
             setters: &[],
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -6264,6 +6382,7 @@ mod tests {
             raw_bindings: &[],
             setters: &setters,
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -6318,6 +6437,7 @@ mod tests {
                 raw_bindings: &[],
                 setters,
                 event_json: None,
+                request: crate::runtime::RequestBindings::anonymous(),
                 broadcast_current: &bc,
                 journal: Some(&seeded),
             };
@@ -6410,6 +6530,7 @@ mod tests {
             raw_bindings: &[],
             setters: &setters,
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -6418,7 +6539,7 @@ mod tests {
             .expect_err("a poisoned realm must not stage a request");
         let message = err.to_string();
         assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
-        assert!(message.contains("SANDGATE-B"), "Got: {message}");
+        assert!(message.contains("patched a JavaScript built-in"), "Got: {message}");
     }
 
     /// 🔴 **This test falsifies `APERTURE.md` § 5.4's second property.**
@@ -6693,6 +6814,7 @@ mod tests {
             raw_bindings: &[],
             setters: &[],
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: Some(&seeded),
         };
@@ -6730,6 +6852,7 @@ mod tests {
                 raw_bindings: &[],
                 setters: &[],
                 event_json: None,
+                request: crate::runtime::RequestBindings::anonymous(),
                 broadcast_current: &bc,
                 journal: None,
             };
@@ -6786,6 +6909,7 @@ mod tests {
             raw_bindings: &[],
             setters: &setters,
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -6825,6 +6949,7 @@ mod tests {
             raw_bindings: &[],
             setters: &setters,
             event_json: Some(r#"{"value":"typed text"}"#),
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -6866,6 +6991,7 @@ mod tests {
             raw_bindings: &[],
             setters: &[],
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &bc,
             journal: None,
         };
@@ -7396,16 +7522,18 @@ mod tests {
             .load_module(
                 "components/Progress.tsx",
                 "export default (function __albedoIslandRef(props) { \
-return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
+return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
             )
             .expect("stub loads");
 
         // An async server page that mounts the island as a child. The island
         // must appear as its placeholder hole, not as executed island markup.
+        // Mounted twice: bare, and with props this render computed.
         let page = r#"
             import Progress from "../components/Progress";
             export default async function Page() {
-                return <main><h1>Essay</h1><Progress /></main>;
+                const label = "a&b" + "\"<";
+                return <main><h1>Essay</h1><Progress /><Progress pct={40} label={label} onTick={() => 1} /></main>;
             }
         "#;
         engine
@@ -7422,6 +7550,16 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
             "async page must emit the island's empty placeholder hole, got: {}",
             out.html
         );
+        // What the parent passed on THIS render rides out on the hole, escaped
+        // for an attribute — and a handler, which no payload can carry, does not.
+        assert!(
+            out.html.contains(
+                r#"<div id="__c_progress_7" data-albedo-tier="c" data-albedo-props="{&quot;pct&quot;:40,&quot;label&quot;:&quot;a&amp;b\&quot;&lt;&quot;}"></div>"#
+            ),
+            "the placeholder must carry the props this render passed, got: {}",
+            out.html
+        );
+        assert!(!out.html.contains("onTick"), "{}", out.html);
         assert!(
             out.html.contains("<h1>Essay</h1>"),
             "the page's own server content still renders: {}",
@@ -8065,6 +8203,7 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
             raw_bindings: &[],
             setters: &setters,
             event_json: None,
+            request: crate::runtime::RequestBindings::anonymous(),
             broadcast_current: &broadcast_current,
             journal: None,
         };
@@ -8105,6 +8244,7 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
                 raw_bindings: &[],
                 setters: &[],
                 event_json: None,
+                request: crate::runtime::RequestBindings::anonymous(),
                 broadcast_current: &broadcast_current,
                 journal: None,
             };
@@ -8909,6 +9049,29 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\"); });",
             "{html}",
         );
         assert!(!html.contains(FORM_ACTION_ATTR), "{html}");
+        // …and it closes on the login endpoint's feedback sink, byte-for-byte
+        // the span the pure-Rust renderer closes it on: the id is FNV-1a in JS
+        // here and in Rust there, and a wrong password is only ever shown if
+        // the two agree.
+        let sink = crate::transforms::form::endpoint_feedback_span("/_albedo/auth/password/login");
+        assert!(html.contains(&sink), "expected {sink} in {html}");
+    }
+
+    /// A plain form to an endpoint that can sit in several forms on one page
+    /// (`/_albedo/auth/unlink`) gets no sink — one id stamped twice would send
+    /// a message to whichever form came first.
+    #[test]
+    fn only_a_singleton_endpoint_gets_a_feedback_sink_through_the_shim() {
+        let html = engine_rendering(
+            "routes/methods.tsx",
+            r#"
+            export default function Methods() {
+                return <form action="/_albedo/auth/unlink" method="POST"></form>;
+            }
+            "#,
+            "{}",
+        );
+        assert!(!html.contains("role=\"alert\""), "{html}");
     }
 
     /// The disclosure half, through the shim: an off-origin POST form must not

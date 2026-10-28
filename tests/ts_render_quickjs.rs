@@ -187,6 +187,42 @@ fn quickjs_form_render_emits_error_spans_at_the_projection_ids() {
     );
 }
 
+#[test]
+fn both_renderers_close_a_form_on_its_success_sink() {
+    // The `{ ok }` projection writes to `allocate_form_ok_id(action)`. That node
+    // must exist on BOTH render paths, or the success opcode lands on nothing and
+    // the client drops the whole frame. Each path must render the sink as the
+    // form's last child, from the one `form_ok_span` both call.
+    use dom_render_compiler::transforms::form::form_ok_span;
+
+    let project =
+        CompiledProject::load_from_dir(render_fixture("form_errors")).expect("form fixture compiles");
+    let slots = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
+    let props = Value::Object(Default::default());
+    let sink_then_close = format!("{}</form>", form_ok_span("sign_guestbook"));
+
+    let quickjs = project
+        .render_entry_quickjs(&mut engine(), "Component.tsx", &props, &slots)
+        .expect("quickjs render succeeds")
+        .html;
+    let pure = render_entry_with_bindings(
+        &project,
+        "Component.tsx",
+        &props,
+        &slots,
+        &RenderOptions { hook_compile: true },
+    )
+    .expect("pure-Rust render succeeds")
+    .html;
+
+    for (path, html) in [("quickjs", &quickjs), ("pure-Rust", &pure)] {
+        assert!(
+            html.contains(&sink_then_close),
+            "{path} render must close the form on its success sink: {html}"
+        );
+    }
+}
+
 /// The form-in-list-row invariant: a `<form action="…">` inside a `.map()`
 /// repeats per row, and its per-field error-span ids are constant per
 /// (action, field) — so seeding them stamps duplicate `data-albedo-id`s across
@@ -201,7 +237,7 @@ fn form_error_spans_are_suppressed_for_a_form_rendered_inside_a_map() {
     let project =
         CompiledProject::load_from_dir(render_fixture("form_in_list")).expect("fixture compiles");
 
-    let seed = project.form_error_span_seed();
+    let seed = project.form_feedback_span_seed();
     assert!(
         !seed.contains_key("set_score"),
         "a per-row (.map) form's error spans must be suppressed to avoid duplicate \

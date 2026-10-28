@@ -211,6 +211,7 @@ fn forged_write(engine: &mut QuickJsEngine) -> bool {
         raw_bindings: &[],
         setters: &[],
         event_json: None,
+        request: dom_render_compiler::runtime::RequestBindings::anonymous(),
         broadcast_current: &[],
         journal: None,
     };

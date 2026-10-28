@@ -6,7 +6,6 @@ use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures_util::stream;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -35,6 +34,11 @@ pub struct RequestContext {
     /// write to an identity-partitioned collection is refused outright — so a
     /// new call site that forgets this fails loudly and closed, never open.
     pub principal: Option<PrincipalId>,
+    /// What an action body reads as `user` — the same
+    /// [`Principal::user_value`](dom_render_compiler::auth::Principal::user_value)
+    /// the page that posted to it rendered with. Set with [`principal`](Self::principal)
+    /// by [`with_identity`](Self::with_identity) so the two cannot disagree.
+    pub user: Option<Value>,
 }
 
 impl RequestContext {
@@ -56,7 +60,17 @@ impl RequestContext {
             body,
             metadata: BTreeMap::new(),
             principal: None,
+            user: None,
         }
+    }
+
+    /// Attach the request's resolved identity: its id, for ownership, and the
+    /// `user` an action body reads — from one value, in one call.
+    #[must_use]
+    pub fn with_identity(mut self, principal: Option<&dom_render_compiler::auth::Principal>) -> Self {
+        self.principal = principal.map(|who| who.id.clone());
+        self.user = principal.map(dom_render_compiler::auth::Principal::user_value);
+        self
     }
 
     /// Attach the request's resolved principal.
@@ -77,14 +91,6 @@ impl RequestContext {
             .and_then(|values| values.first().map(String::as_str))
     }
 
-    pub fn parse_json_body<T: DeserializeOwned>(&self) -> Result<T, RuntimeError> {
-        serde_json::from_slice::<T>(&self.body).map_err(|err| {
-            RuntimeError::RequestHandling(format!(
-                "failed to parse JSON request body for '{}': {err}",
-                self.path
-            ))
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,12 +107,6 @@ pub enum ResponseBody {
 }
 
 impl ResponseBody {
-    pub fn as_full_bytes(&self) -> Option<&Bytes> {
-        match self {
-            Self::Full(bytes) => Some(bytes),
-            Self::Stream(_) => None,
-        }
-    }
 
     fn into_axum_body(self) -> Body {
         match self {

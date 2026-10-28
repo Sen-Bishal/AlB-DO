@@ -69,9 +69,8 @@ pub trait FromFormPayload: Sized + Send {
 // collide with userland custom impls that wrap a `DeserializeOwned`
 // value to add validation. Users wire one of two paths:
 //
-//   1. Their type derives `serde::Deserialize` AND they hand it to
-//      [`form_action_handler_json`] which performs JSON decode under
-//      the hood.
+//   1. Their type derives `serde::Deserialize` AND they wrap it in
+//      [`JsonFormPayload`], which performs the JSON decode.
 //   2. Their type implements `FromFormPayload` directly with custom
 //      validation that emits `FormDecodeError::Validation`.
 
@@ -153,8 +152,8 @@ where
 /// [`form_action_id`] to derive the matching `action_id`.
 ///
 /// Use this when your target type implements [`FromFormPayload`]
-/// directly (typically with custom validation). For the simpler JSON
-/// decode path, use [`form_action_handler_json`] instead.
+/// directly (typically with custom validation). For a plain
+/// `serde::Deserialize` type, use [`JsonFormPayload`] as `T`.
 pub fn form_action_handler<T, F, Fut>(
     action_name: impl Into<String>,
     handler: F,
@@ -169,42 +168,9 @@ where
     ))
 }
 
-/// Wrapper that adapts a `serde::Deserialize` type into a
-/// [`FromFormPayload`] without manual validation. Equivalent to
-/// `form_action_handler::<JsonFormPayload<T>, _, _>` but hides the
-/// wrapping noise at the call site.
-///
-/// Errors from `serde_json` are surfaced as
-/// `FormDecodeError::Malformed` and bubble up to the dispatcher as a
-/// 400; this path performs no field-level validation. For per-field
-/// error messages, implement `FromFormPayload` manually.
-pub fn form_action_handler_json<T, F, Fut>(
-    action_name: impl Into<String>,
-    handler: F,
-) -> Arc<dyn ActionHandler>
-where
-    T: serde::de::DeserializeOwned + Send + 'static,
-    F: Fn(RequestContext, T, SessionSlots) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Vec<Instruction>, RuntimeError>> + Send + 'static,
-{
-    // Wrap T in `JsonFormPayload<T>` which provides the
-    // `FromFormPayload` impl via JSON decoding, then unwrap before
-    // calling the user closure.
-    let action_name = action_name.into();
-    let adapter = move |ctx: RequestContext, payload: JsonFormPayload<T>, slots: SessionSlots| {
-        let fut = handler(ctx, payload.0, slots);
-        fut
-    };
-    Arc::new(TypedFormActionHandler::<JsonFormPayload<T>, _, _>::new(
-        action_name,
-        adapter,
-    ))
-}
-
 /// Newtype that gives any `DeserializeOwned` type a
-/// [`FromFormPayload`] impl through `serde_json::from_slice`. Used
-/// internally by [`form_action_handler_json`]; exposed because tests
-/// occasionally find it convenient.
+/// [`FromFormPayload`] impl through `serde_json::from_slice` — the JSON
+/// decode path for [`form_action_handler`].
 pub struct JsonFormPayload<T>(pub T);
 
 impl<T> FromFormPayload for JsonFormPayload<T>

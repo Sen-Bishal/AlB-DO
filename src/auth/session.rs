@@ -124,12 +124,6 @@ impl TokenHash {
         Self(hex)
     }
 
-    /// Adopt a hash read back from the database.
-    #[must_use]
-    pub fn from_stored(raw: impl Into<String>) -> Self {
-        Self(raw.into())
-    }
-
     /// As it appears in a SQL parameter.
     #[must_use]
     pub fn as_str(&self) -> &str {

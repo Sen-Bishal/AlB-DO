@@ -1,0 +1,5 @@
+Your framework makes you write "use client" because it never looked at your component. AlB'DO looks — one Rust binary that decides per component what actually ships, and turns a config block into a table, a live subscription and a typed .d.ts.
+
+70 µs to render and serve. Measured on one machine, pre-1.0.
+
+github.com/Sen-Bishal/AlB-DO

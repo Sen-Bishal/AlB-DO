@@ -33,7 +33,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use dom_render_compiler::middleware::outcome::Headers;
 use dom_render_compiler::middleware::{Matcher, Outcome};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 use dom_render_compiler::middleware::outcome::FRAMEWORK_COOKIE_PREFIX;
 
@@ -61,6 +61,11 @@ impl MiddlewarePlan {
             modules: Arc::new(modules),
             pool,
         }
+    }
+
+    /// The file this plan runs, as the build named it.
+    pub(crate) fn entry(&self) -> &str {
+        &self.entry
     }
 
     /// Whether this request enters the middleware: in scope, and matched.
@@ -323,10 +328,10 @@ pub(crate) fn request_json(
     Value::Object(request).to_string()
 }
 
-/// `user` as every render sees it: `{ id }`, or `null`.
+/// `user` as every render sees it — `Principal::user_value`, or `null`.
 pub(crate) fn user_json(identity: &crate::auth::Identity) -> String {
     match identity.principal() {
-        Some(principal) => json!({ "id": principal.id.as_str() }).to_string(),
+        Some(principal) => principal.user_value().to_string(),
         None => "null".to_string(),
     }
 }
@@ -412,6 +417,7 @@ pub(crate) fn failure_response(message: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn framework_lanes_are_out_of_scope_and_app_requests_are_in() {

@@ -64,8 +64,11 @@ fn tag_starts(rest: &str, name: &str) -> bool {
     if rest.len() < open_len || !rest.starts_with('<') {
         return false;
     }
-    if !rest[1..open_len].eq_ignore_ascii_case(name) {
-        return false;
+    // `get`, not `rest[1..open_len]`: the byte after a short tag can sit inside a
+    // multibyte character (`<li>—`), and slicing there panicked the whole build.
+    match rest.get(1..open_len) {
+        Some(candidate) if candidate.eq_ignore_ascii_case(name) => {}
+        _ => return false,
     }
     match rest[open_len..].chars().next() {
         Some(c) => c.is_whitespace() || c == '>' || c == '/',

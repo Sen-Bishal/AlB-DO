@@ -286,12 +286,16 @@ async fn a_stranger_signs_up_signs_in_and_signs_out_over_http() {
         host: "127.0.0.1".to_string(),
         port,
         dev_mode: false,
+        hmr: false,
         // No `forge` block: boot installs the built-in default, which is what
         // opens the substrate. Auth *requires* one, and declaring providers
         // without a substrate is a startup error by design.
         forge: Default::default(),
         sources: Default::default(),
         uploads: Default::default(),
+        email: None,
+        redirects: Vec::new(),
+        webhooks: Default::default(),
         auth: AuthDeclaration {
             providers,
             ..Default::default()

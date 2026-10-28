@@ -381,6 +381,7 @@ mod tests {
             hydration_mode: HydrationMode::Immediate,
             position: position("root", 0),
             side_effects: false,
+            dynamic_prop_keys: Vec::new(),
         }
     }
 
@@ -405,6 +406,7 @@ mod tests {
             auth: Default::default(),
             shared_slot_partitions: Vec::new(),
             shared_slot_sources: Vec::new(),
+            shared_slot_columns: Default::default(),
             action_ids: Vec::new(),
             layout_chain: Vec::new(),
             error_component: None,

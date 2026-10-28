@@ -498,11 +498,11 @@ fn relative_path_to_fs_path(path: &str) -> PathBuf {
 }
 
 fn emit_wt_bootstrap_source() -> String {
-    include_str!("../../assets/albedo-wt-bootstrap.js").to_string()
+    crate::bundler::minify::minify_script(include_str!("../../assets/albedo-wt-bootstrap.js"))
 }
 
 fn emit_phosphor_source() -> String {
-    include_str!("../../assets/phosphor.js").to_string()
+    crate::bundler::minify::minify_script(include_str!("../../assets/phosphor.js"))
 }
 
 #[cfg(test)]

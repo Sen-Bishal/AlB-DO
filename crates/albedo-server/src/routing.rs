@@ -3,7 +3,7 @@ use crate::error::RuntimeError;
 use http::Method;
 use matchit::Router;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -78,6 +78,9 @@ pub struct RouteTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchedRoute {
     pub target: RouteTarget,
+    /// Captured segments, percent-decoded — see [`decode_route_param`]. Every
+    /// consumer (the render's `params` prop, partition and source keys, the
+    /// subscribe lanes) reads this map, so none of them decodes on its own.
     pub params: BTreeMap<String, String>,
 }
 
@@ -85,6 +88,9 @@ pub struct MatchedRoute {
 pub enum RouteMatch {
     Matched(MatchedRoute),
     MethodNotAllowed { allowed: Vec<HttpMethod> },
+    /// The path names a route, but the param `name` percent-decodes to bytes
+    /// that are not UTF-8, so there is no string to hand the page.
+    UndecodableParam { name: String },
     NotFound,
 }
 
@@ -184,7 +190,12 @@ impl CompiledRouter {
         if let Some(target) = entry.methods.get(&method) {
             let mut params = BTreeMap::new();
             for (key, value) in matched.params.iter() {
-                params.insert(key.to_string(), value.to_string());
+                let Some(decoded) = decode_route_param(value) else {
+                    return RouteMatch::UndecodableParam {
+                        name: key.to_string(),
+                    };
+                };
+                params.insert(key.to_string(), decoded);
             }
             return RouteMatch::Matched(MatchedRoute {
                 target: target.clone(),
@@ -211,6 +222,48 @@ pub fn parse_query_string(query: Option<&str>) -> BTreeMap<String, Vec<String>> 
     }
 
     parsed
+}
+
+/// One captured route param as the text its URL spelled, or `None` when that
+/// text is not UTF-8.
+///
+/// The router matches the path **as it arrived**, so which route answers — and
+/// where one segment ends — is settled by the literal `/`s before anything is
+/// decoded. Only then is each segment of the capture decoded on its own and the
+/// pieces rejoined with `/`. That order is the whole rule for `%2F`:
+///
+/// - In a `[id]` capture it decodes to `/`. `/post/a%2Fb` is still the one
+///   segment that matched `post/[id]` — it never reaches a deeper route — and
+///   `id === "a/b"` is what `encodeURIComponent("a/b")` put in the link, so the
+///   value round-trips.
+/// - In a `[...rest]` capture it decodes to `/` too, so `/files/a%2Fb` and
+///   `/files/a/b` both give `"a/b"`. The rest arrives as one string, and a string
+///   has no way to say which `/` was a segment boundary. Refusing `%2F` here
+///   would keep the two apart only by answering 400 to a link built with
+///   `encodeURIComponent`, for a value whose text is the same either way.
+///
+/// Invalid UTF-8 (`%FF`, a truncated `%C3`) is refused rather than kept raw or
+/// replaced with U+FFFD. Kept raw, `/post/%FF` and `/post/%25FF` would hand a
+/// page the same `"%FF"` — the half-decoded value this function exists to end.
+/// Replaced, `%FE` and `%FF` would both become `"\u{FFFD}"`: two URLs, one page,
+/// and nothing to tell them apart. Neither is what the URL said, and
+/// `encodeURIComponent` never produces such a URL, so nobody linking normally is
+/// refused.
+///
+/// A `%` that does not start an escape (`/sale/50%`) is kept as itself — see
+/// [`percent_decode_bytes`](dom_render_compiler::middleware::matcher::percent_decode_bytes),
+/// which the middleware matcher reads paths with too.
+fn decode_route_param(raw: &str) -> Option<String> {
+    let segments = raw
+        .split('/')
+        .map(|segment| {
+            String::from_utf8(
+                dom_render_compiler::middleware::matcher::percent_decode_bytes(segment),
+            )
+            .ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(segments.join("/"))
 }
 
 fn validate_route_path(path: &str) -> Result<(), RuntimeError> {
@@ -495,22 +548,6 @@ fn join_route_segments(segments: &[String]) -> String {
     }
 }
 
-pub fn query_singleton_map(
-    values: &BTreeMap<String, Vec<String>>,
-) -> Result<HashMap<String, String>, RuntimeError> {
-    let mut out = HashMap::new();
-    for (key, items) in values {
-        if let Some(value) = items.first() {
-            out.insert(key.clone(), value.clone());
-        } else {
-            return Err(RuntimeError::RequestHandling(format!(
-                "query key '{key}' has no value"
-            )));
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +703,82 @@ mod tests {
             }
             other => panic!("unexpected route match: {other:?}"),
         }
+    }
+
+    fn param_at(router: &CompiledRouter, path: &str, name: &str) -> String {
+        match router.match_route(HttpMethod::Get, path) {
+            RouteMatch::Matched(matched) => matched
+                .params
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{path}: no `{name}` in {:?}", matched.params)),
+            other => panic!("{path}: unexpected route match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn captured_params_are_percent_decoded_after_the_route_is_chosen() {
+        let router = CompiledRouter::from_route_specs(&[
+            route("post", HttpMethod::Get, "/post/[id]", "post.show"),
+            route("post_edit", HttpMethod::Get, "/post/[id]/edit", "post.edit"),
+            route("files", HttpMethod::Get, "/files/[...path]", "files.show"),
+        ])
+        .unwrap();
+
+        assert_eq!(param_at(&router, "/post/caf%C3%A9", "id"), "café");
+        assert_eq!(param_at(&router, "/post/%3Cscript%3E", "id"), "<script>");
+        // A path keeps `+` — that is a query-string rule, not a path one.
+        assert_eq!(param_at(&router, "/post/a+b%20c", "id"), "a+b c");
+        // `%2F` is decoded only after the literal `/`s picked the route: the
+        // one-segment route answers, never the deeper one.
+        match router.match_route(HttpMethod::Get, "/post/a%2Fedit") {
+            RouteMatch::Matched(matched) => {
+                assert_eq!(matched.target.handler_id, "post.show");
+                assert_eq!(matched.params.get("id").map(String::as_str), Some("a/edit"));
+            }
+            other => panic!("unexpected route match: {other:?}"),
+        }
+        // A rest capture decodes each segment and rejoins them with `/`.
+        assert_eq!(
+            param_at(&router, "/files/caf%C3%A9/a%2Fb/%3C", "path"),
+            "café/a/b/<"
+        );
+        // A `%` that starts no escape is text, as a browser sends it.
+        assert_eq!(param_at(&router, "/post/50%", "id"), "50%");
+        assert_eq!(param_at(&router, "/post/%zz", "id"), "%zz");
+        assert_eq!(param_at(&router, "/post/%25zz", "id"), "%zz");
+    }
+
+    #[test]
+    fn a_param_that_is_not_utf8_once_decoded_is_refused_by_name() {
+        let router = CompiledRouter::from_route_specs(&[
+            route("post", HttpMethod::Get, "/post/[id]", "post.show"),
+            route("files", HttpMethod::Get, "/files/[...path]", "files.show"),
+        ])
+        .unwrap();
+
+        for path in ["/post/%FF", "/post/caf%C3", "/post/%C3%28"] {
+            assert_eq!(
+                router.match_route(HttpMethod::Get, path),
+                RouteMatch::UndecodableParam {
+                    name: "id".to_string()
+                },
+                "{path}"
+            );
+        }
+        // Split across a segment boundary is not a character either.
+        assert_eq!(
+            router.match_route(HttpMethod::Get, "/files/%C3/%A9"),
+            RouteMatch::UndecodableParam {
+                name: "path".to_string()
+            }
+        );
+        // The method is judged first: a route that does not answer DELETE says
+        // so whatever its param would have decoded to.
+        assert!(matches!(
+            router.match_route(HttpMethod::Delete, "/post/%FF"),
+            RouteMatch::MethodNotAllowed { .. }
+        ));
     }
 
     #[test]

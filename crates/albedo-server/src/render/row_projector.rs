@@ -51,6 +51,10 @@ pub struct PooledRowProjector {
     /// SSR's by exactly those spans — the class of near-miss this whole design
     /// exists to rule out.
     form_error_spans: serde_json::Map<String, Value>,
+    /// How many components in the whole project read each collection
+    /// (`CompiledProject::collection_reader_counts`). `None` when no compiled
+    /// project was available, which keeps the plan-only rule.
+    project_readers: Option<std::collections::HashMap<String, usize>>,
 }
 
 impl PooledRowProjector {
@@ -64,7 +68,16 @@ impl PooledRowProjector {
             pool,
             plan,
             form_error_spans,
+            project_readers: None,
         }
+    }
+
+    /// Count readers across the whole project, not only the Tier-B plan. See
+    /// [`Self::sole_reader`].
+    #[must_use]
+    pub fn with_project_readers(mut self, readers: std::collections::HashMap<String, usize>) -> Self {
+        self.project_readers = Some(readers);
+        self
     }
 
     /// The single component that reads `collection`, or `None` when none or
@@ -75,7 +88,21 @@ impl PooledRowProjector {
     /// consequence is not a slower path but a dead one: no sole reader means no
     /// projected rows, which means a partitioned write ships its snapshot with
     /// `ListUpdate::None` and every keyed list anchor on the page sits still.
+    ///
+    /// Column projection · and "sole" is asked of the **project**. The rows
+    /// rendered here go to every subscriber of the collection, and a subscriber
+    /// only renders these exact rows if this is the only component, in any
+    /// tier, that reads it. A second reader the plan cannot see — one on a
+    /// public page rendering the count of a list a gated page renders in full —
+    /// would otherwise be sent the gated page's row markup. With two readers
+    /// there is no single template anyway; the write falls back to a snapshot,
+    /// which the lanes cut to each subscriber's columns.
     fn sole_reader(&self, collection: &str) -> Option<(&String, &TierBEntryPlan)> {
+        if let Some(readers) = &self.project_readers {
+            if readers.get(collection).copied().unwrap_or(0) > 1 {
+                return None;
+            }
+        }
         let mut found = None;
         for entry in &self.plan {
             let reads = entry.1.shared_topics.iter().any(|topic| topic == collection)

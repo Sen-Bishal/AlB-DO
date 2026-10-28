@@ -158,14 +158,6 @@ impl TlsSettings {
         }
     }
 
-    /// Whether anything was configured at all.
-    #[must_use]
-    pub fn is_unset(&self) -> bool {
-        let blank = |value: &Option<String>| {
-            value.as_deref().map(str::trim).unwrap_or_default().is_empty()
-        };
-        blank(&self.cert_path) && blank(&self.key_path) && self.domains.is_empty()
-    }
 }
 
 /// Split a comma-separated domain list, dropping blanks.
