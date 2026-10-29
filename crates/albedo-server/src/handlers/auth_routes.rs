@@ -63,6 +63,45 @@ use crate::handlers::email_routes;
 use dom_render_compiler::runtime::SessionId;
 use tracing::{debug, warn};
 
+/// Run Argon2 on the blocking pool, at most one hash per core at a time.
+///
+/// Each hash is ~19 MiB and tens of milliseconds of CPU. Run inline on an
+/// async worker, as many logins as there are cores stalled every request the
+/// server was handling. On the blocking pool with no cap, a flood would start
+/// up to 512 threads at 19 MiB each. Callers over the cap wait without a thread.
+async fn run_kdf<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let permits = PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
+        tokio::sync::Semaphore::new(cores)
+    });
+    let _permit = permits.acquire().await.ok()?;
+    tokio::task::spawn_blocking(work).await.ok()
+}
+
+/// [`hash_password`] off the async workers.
+pub(crate) async fn hash_password_off_runtime(password: &str) -> Result<String, PasswordError> {
+    let password = password.to_owned();
+    run_kdf(move || hash_password(&password))
+        .await
+        .unwrap_or_else(|| Err(PasswordError::Kdf("the hashing task did not finish".to_string())))
+}
+
+/// [`verify_password`] off the async workers. A task that dies verifies nothing.
+async fn verify_password_off_runtime(stored: &str, password: &str) -> bool {
+    let (stored, password) = (stored.to_owned(), password.to_owned());
+    run_kdf(move || verify_password(&stored, &password))
+        .await
+        .unwrap_or(false)
+}
+
+/// [`absorb_timing`] off the async workers, through the same queue as a real
+/// check so a missing account still costs what a wrong password does.
+async fn absorb_timing_off_runtime(password: &str) {
+    let password = password.to_owned();
+    run_kdf(move || absorb_timing(&password)).await;
+}
+
 /// Field the login and signup forms submit the address under.
 pub const EMAIL_FIELD: &str = "email";
 
@@ -334,7 +373,7 @@ async fn register(
     // Hashed before the account is claimed, so a policy failure costs no write —
     // and, more importantly, so the plaintext never travels further than this
     // frame.
-    let secret = match hash_password(password) {
+    let secret = match hash_password_off_runtime(password).await {
         Ok(secret) => secret,
         Err(err @ (PasswordError::TooShort | PasswordError::TooLong)) => {
             return refusal(StatusCode::BAD_REQUEST, &err.to_string(), back);
@@ -445,7 +484,7 @@ async fn login(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) ->
         if !verdict.is_admitted() {
             return crate::shutter::too_many_requests(&verdict);
         }
-        absorb_timing(password);
+        absorb_timing_off_runtime(password).await;
         return refusal(StatusCode::UNAUTHORIZED, LOGIN_REFUSED, back);
     };
 
@@ -474,7 +513,7 @@ async fn login(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) ->
         Ok(None) => {
             // No account, or an account with no password (a passkey-only human).
             // Both answer identically, and both pay the same KDF cost.
-            absorb_timing(password);
+            absorb_timing_off_runtime(password).await;
             request.shutter.shutter().note_credential_failure(&email);
             return refusal(StatusCode::UNAUTHORIZED, LOGIN_REFUSED, back);
         }
@@ -487,12 +526,12 @@ async fn login(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) ->
             // it would mean an outage locks people out for the length of the
             // window after it ends.
             warn!(target: "albedo.auth", %err, "credential lookup failed");
-            absorb_timing(password);
+            absorb_timing_off_runtime(password).await;
             return refusal(StatusCode::UNAUTHORIZED, LOGIN_REFUSED, back);
         }
     };
 
-    if !verify_password(&credential.secret_hash, password) {
+    if !verify_password_off_runtime(&credential.secret_hash, password).await {
         debug!(target: "albedo.auth", "password verification failed");
         request.shutter.shutter().note_credential_failure(&email);
         return refusal(StatusCode::UNAUTHORIZED, LOGIN_REFUSED, back);
@@ -738,6 +777,39 @@ fn escape_html(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A password check leaves the async runtime free to run other requests.
+    ///
+    /// On a one-thread runtime an inline Argon2 call gives the ticker no turn
+    /// at all until it returns; off the runtime, the ticker runs throughout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_password_check_leaves_the_runtime_free() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let password = "correct horse battery staple";
+        let stored = hash_password(password).expect("hashes");
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = Arc::clone(&ticks);
+            async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        assert!(verify_password_off_runtime(&stored, password).await, "the right password verifies");
+        assert!(!verify_password_off_runtime(&stored, "wrong password").await, "a wrong one does not");
+        absorb_timing_off_runtime(password).await;
+        let hashed = hash_password_off_runtime(password).await.expect("hashes off the runtime");
+        assert!(verify_password(&hashed, password), "the off-runtime hash is a real hash");
+        let during = ticks.load(Ordering::Relaxed);
+        ticker.abort();
+
+        assert!(during >= 10, "the runtime ran other work {during} times while hashing");
+    }
 
     fn navigating() -> HeaderMap {
         let mut headers = HeaderMap::new();

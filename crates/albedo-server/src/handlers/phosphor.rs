@@ -53,7 +53,6 @@
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, StatusCode};
-use dom_render_compiler::auth::PrincipalId;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
@@ -139,7 +138,9 @@ const HELLO_EVENT: &str = "hello";
 /// one place both live lanes pass through
 /// (`server::resolve_route_topics_detailed`) rather than here — same reason the
 /// render and subscribe paths share one topic resolver: two copies of an
-/// authorization rule are two rules.
+/// authorization rule are two rules. `src/middleware.ts` is the third gate in
+/// front of a page and is checked just before it
+/// (`server::lane_page_after_middleware`).
 ///
 /// 🔑 **`principal`, not `SessionId`.** The two are different things and the
 /// distinction is load-bearing: a `SessionId` is a *tab* — minted for anyone who
@@ -149,9 +150,12 @@ const HELLO_EVENT: &str = "hello";
 #[async_trait::async_trait]
 pub trait RouteAuthority: Send + Sync {
     /// The route's topics, each with the columns of it the route reads.
+    ///
+    /// The whole identity, not just its principal id: `src/middleware.ts` is
+    /// shown `user`, and it judges each subscribed page as it judged the page load.
     async fn authorize_route(
         &self,
-        principal: Option<&PrincipalId>,
+        identity: &crate::auth::Identity,
         path: &str,
     ) -> Option<Vec<TopicGrant>>;
     /// The broadcast registry circuits subscribe against. Resolved per
@@ -578,9 +582,7 @@ async fn subscribe_routes(
 
     for add in request.add {
         // AUTH R2 · the lane's *principal* decides, not its tab id.
-        let Some(grants) = authority
-            .authorize_route(lane.principal().principal().map(|who| &who.id), &add.p)
-            .await
+        let Some(grants) = authority.authorize_route(lane.principal(), &add.p).await
         else {
             outcome.denied.push(add.p);
             continue;
@@ -750,7 +752,7 @@ mod tests {
     impl RouteAuthority for StaticAuthority {
         async fn authorize_route(
             &self,
-            _principal: Option<&PrincipalId>,
+            _identity: &crate::auth::Identity,
             path: &str,
         ) -> Option<Vec<TopicGrant>> {
             self.table

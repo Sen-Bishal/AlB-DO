@@ -15,8 +15,9 @@
 //!
 //! - **dedup is free** — the same file uploaded twice is one file on disk, and the second write is a
 //!   rename onto a path that already exists;
-//! - **`Cache-Control: immutable` is honest** rather than aspirational, because the id cannot
-//!   survive a change to the bytes;
+//! - **the id is a perfect `ETag`**, because it cannot survive a change to the bytes, so a browser
+//!   that already has a file revalidates for a `304`. (Not `immutable`: that let shared caches
+//!   answer for the app, past any middleware gating the read.)
 //! - **the id is not a capability.** It is derived from content anyone holding the file already has,
 //!   so it must not be treated as an unguessable token. Anything private needs an authorization
 //!   check on the read, exactly as a FORGE row does. This is written down because the opposite

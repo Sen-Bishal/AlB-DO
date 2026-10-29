@@ -3251,7 +3251,15 @@ impl AlbedoServer {
                 }
             }
             Some(tls) => {
-                serve_https(listener, router, tls, graceful_shutdown, shutdown_timeout).await
+                serve_https(
+                    listener,
+                    router,
+                    tls,
+                    graceful_shutdown,
+                    shutdown_timeout,
+                    TLS_TIMEOUTS,
+                )
+                .await
             }
         };
 
@@ -3492,6 +3500,31 @@ fn compression_layer() -> CompressionLayer<And<DefaultPredicate, NotForContentTy
         )))
 }
 
+/// How long an HTTPS connection may stay silent at each stage.
+#[derive(Debug, Clone, Copy)]
+struct TlsTimeouts {
+    /// TCP accepted, TLS handshake not finished.
+    handshake: Duration,
+    /// Waiting for a request's headers (HTTP/1). Never runs while a response,
+    /// such as a live-update stream, is being sent.
+    header_read: Duration,
+}
+
+const TLS_TIMEOUTS: TlsTimeouts = TlsTimeouts {
+    handshake: Duration::from_secs(10),
+    header_read: Duration::from_secs(30),
+};
+
+/// An accept error that belongs to one connection, not to the listener.
+fn is_connection_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
 /// Serve the router over TLS.
 ///
 /// This is `axum::serve`'s loop with a `TlsAcceptor` in front, written out
@@ -3510,14 +3543,20 @@ fn compression_layer() -> CompressionLayer<And<DefaultPredicate, NotForContentTy
 /// propagated: every port scanner and every plain-HTTP request to the HTTPS
 /// port produces one, and treating those as server errors would end the accept
 /// loop for the whole process.
+///
+/// A connection that says nothing is closed: one that never finishes the
+/// handshake after `timeouts.handshake`, and one that never finishes a
+/// request's headers after `timeouts.header_read`. Without them each idle
+/// socket held a task and a file descriptor forever.
 async fn serve_https(
     listener: TcpListener,
     router: axum::Router,
     tls: std::sync::Arc<rustls::ServerConfig>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain_timeout: Duration,
+    timeouts: TlsTimeouts,
 ) -> Result<(), RuntimeError> {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
     use hyper_util::server::conn::auto::Builder as ConnBuilder;
     use hyper_util::server::graceful::GracefulShutdown;
 
@@ -3529,12 +3568,19 @@ async fn serve_https(
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(pair) => pair,
+                // A client that hung up between SYN and accept: nothing to wait
+                // for, and ending the loop would take the server down with it.
+                Err(err) if is_connection_error(&err) => continue,
                 Err(err) => {
-                    // An accept error is per-connection (a client that hung up
-                    // between SYN and accept, or a transient fd exhaustion);
-                    // ending the loop would take the server down with it.
-                    warn!(error = %err, "TLS listener failed to accept a connection");
-                    continue;
+                    // Anything else — running out of file descriptors above all —
+                    // lasts until something frees up, and retrying at once is a
+                    // CPU spin that floods the log. The same pause `axum::serve`
+                    // takes.
+                    warn!(error = %err, "TLS listener failed to accept a connection; pausing 1 s");
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                        () = &mut shutdown => break,
+                    }
                 }
             },
             () = &mut shutdown => break,
@@ -3545,13 +3591,18 @@ async fn serve_https(
         let watcher = graceful.watcher();
 
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    debug!(peer = %peer, error = %err, "TLS handshake failed");
-                    return;
-                }
-            };
+            let tls_stream =
+                match tokio::time::timeout(timeouts.handshake, acceptor.accept(stream)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(err)) => {
+                        debug!(peer = %peer, error = %err, "TLS handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        debug!(peer = %peer, "TLS handshake timed out");
+                        return;
+                    }
+                };
 
             let service = hyper::service::service_fn(
                 move |mut request: Request<hyper::body::Incoming>| {
@@ -3568,9 +3619,23 @@ async fn serve_https(
             // The builder has to outlive the connection future it produces, so
             // it gets its own binding rather than being a temporary in the
             // same expression.
+            //
+            // The protocol comes from ALPN, not from sniffing the first bytes:
+            // the sniff is a read with no timeout of its own, so a client that
+            // finished the handshake and sent nothing was held forever. HTTP/2
+            // over TLS is only spoken after ALPN agrees on `h2`.
+            //
+            // The timer is what makes hyper's header timeout run at all: with
+            // none set, hyper skips its 30 s default without a word.
+            let h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
             let builder = ConnBuilder::new(TokioExecutor::new());
-            let connection =
-                builder.serve_connection_with_upgrades(TokioIo::new(tls_stream), service);
+            let mut builder = if h2 { builder.http2_only() } else { builder.http1_only() };
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(timeouts.header_read);
+            builder.http2().timer(TokioTimer::new());
+            let connection = builder.serve_connection(TokioIo::new(tls_stream), service);
 
             if let Err(err) = watcher.watch(connection.into_owned()).await {
                 debug!(peer = %peer, error = %err, "TLS connection ended with an error");
@@ -3881,13 +3946,25 @@ async fn dispatch_routed(
                     .get("p")
                     .and_then(|values| values.first().cloned())
                     .unwrap_or_else(|| "/".to_string());
-                let grants = resolve_route_topics(
+                let page = lane_page_after_middleware(
+                    state,
                     &world,
-                    streaming_runtime,
-                    page_path.as_str(),
-                    identity.principal().map(|who| &who.id),
+                    peer,
+                    request.headers(),
+                    &identity,
+                    &page_path,
                 )
-                .unwrap_or_default();
+                .await;
+                let grants = page
+                    .and_then(|page| {
+                        resolve_route_topics(
+                            &world,
+                            streaming_runtime,
+                            page.as_str(),
+                            identity.principal().map(|who| &who.id),
+                        )
+                    })
+                    .unwrap_or_default();
                 // Only a reconnect needs a resync, and only the current
                 // projector can produce it. Cloned out of the live slot into an
                 // owned local so the borrow survives the `.await` below without
@@ -3988,7 +4065,7 @@ async fn dispatch_routed(
         ) {
             return refusal;
         }
-        let (_parts, body) = request.into_parts();
+        let (parts, body) = request.into_parts();
         let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
             Ok(body) => body,
             Err(err) => {
@@ -3999,6 +4076,11 @@ async fn dispatch_routed(
             world: world.clone(),
             projector: state.live.projector(),
             live: state.live.clone(),
+            gate: LaneGate {
+                state,
+                peer,
+                headers: parts.headers,
+            },
         };
         let response = crate::handlers::phosphor::handle_subscribe(
             state.phosphor.clone(),
@@ -4111,6 +4193,8 @@ async fn dispatch_routed(
     // lanes are which is `middleware::in_scope`, not this ordering alone: the
     // live lanes above return before reaching here, and the sign-in endpoints
     // below are excluded by path, because they sit after the uploads branch.
+    // The lanes still answer to it: each runs it on the page it would grant
+    // (`lane_page_after_middleware`), so a page refused here grants no topics.
     //
     // 🔑 **It can refuse, redirect or rewrite; it cannot grant.** Identity is
     // resolved here and handed over, and every gate below — the route's
@@ -4274,7 +4358,17 @@ async fn dispatch_routed(
         ) {
             return refusal;
         }
-        return crate::uploads::serve(substrate.as_ref(), &uploads.project_dir, upload_id).await;
+        let if_none_match = request
+            .headers()
+            .get(axum::http::header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok());
+        return crate::uploads::serve(
+            substrate.as_ref(),
+            &uploads.project_dir,
+            upload_id,
+            if_none_match,
+        )
+        .await;
     }
 
     // AUTH · 15.4 — the OAuth legs. Ahead of the password endpoints because
@@ -5351,6 +5445,85 @@ fn resolve_route_topics(
 /// it and throw away a warm response cache. `None` means the app declared no
 /// sources, in which case the manifest's source specs cannot resolve and the
 /// list is empty.
+/// The page a live lane may be granted, after `src/middleware.ts` has judged a
+/// `GET` of `page_path` — `None` when it would not have served that page.
+///
+/// A lane grants a page's topics, so it has to be refused wherever the page is.
+/// `export const auth` is checked in [`resolve_route_topics_detailed`]; this is
+/// the other gate in front of a page, and the only one that can express a role.
+/// The middleware sees the lane request's headers and the lane's identity, so it
+/// decides what it decided on the page load. `next()` keeps the page, a rewrite
+/// to an app path grants the page it rewrote to (that is what the `GET`
+/// rendered), and anything else refuses. A failed middleware refuses too.
+///
+/// The page's query string never reaches the lane, so a middleware that decides
+/// on `request.query` sees none here.
+async fn lane_page_after_middleware(
+    state: &RuntimeState,
+    world: &RenderWorld,
+    peer: Option<IpAddr>,
+    headers: &HeaderMap,
+    identity: &crate::auth::Identity,
+    page_path: &str,
+) -> Option<String> {
+    use dom_render_compiler::middleware::Outcome;
+
+    let Some(plan) = world.middleware_plan.as_ref() else {
+        return Some(page_path.to_string());
+    };
+    if !plan.applies_to(page_path) {
+        return Some(page_path.to_string());
+    }
+    let session_cookie = state
+        .live
+        .auth()
+        .map(|auth| auth.registry().session_cookie.clone());
+    let request_json = crate::middleware::request_json(
+        "GET",
+        page_path,
+        None,
+        headers,
+        session_cookie.as_deref(),
+    );
+    let outbound_key = state
+        .shutter
+        .key(identity, peer, headers, OperationClass::Outbound);
+    let admit = |url: &str| match state.shutter.outbound_call(&outbound_key, url) {
+        Some(verdict) if !verdict.is_admitted() => Err(verdict),
+        _ => Ok(()),
+    };
+    let outcome = plan
+        .run(
+            request_json,
+            crate::middleware::user_json(identity),
+            session_cookie.as_deref(),
+            world.request_timeout,
+            crate::middleware::Outbound {
+                client: state.live.aperture_client().map(|client| client.as_ref()),
+                admit: &admit,
+            },
+        )
+        .await;
+    match outcome {
+        Ok(Outcome::Next { .. }) => Some(page_path.to_string()),
+        Ok(Outcome::Rewrite { path, .. }) if !crate::middleware::is_framework_path(&path) => {
+            Some(path)
+        }
+        Ok(_) => None,
+        Err(crate::middleware::RunError::Failed(message)) => {
+            eprintln!("albedo: {message} (live lane for `{page_path}` refused)");
+            tracing::error!(
+                target: "albedo.middleware",
+                error = %message,
+                page = %page_path,
+                "middleware failed; live lane refused"
+            );
+            None
+        }
+        Err(crate::middleware::RunError::Refused(_)) => None,
+    }
+}
+
 fn resolve_route_topics_detailed(
     world: &RenderWorld,
     streaming: &Arc<StreamingAppState>,
@@ -5448,7 +5621,7 @@ fn resolve_route_topics_detailed(
 /// Item 5 adds the `user.id` key source and a per-topic policy check inside this
 /// same function; the protocol, the envelope, the election and the caps do not
 /// move.
-struct WorldRouteAuthority {
+struct WorldRouteAuthority<'a> {
     world: Arc<RenderWorld>,
     projector: Option<Arc<dyn dom_render_compiler::forge::RowProjector>>,
     /// The persistent tier — schema + substrate + registry — so read-through
@@ -5457,10 +5630,19 @@ struct WorldRouteAuthority {
     /// a rebuilt world has a fresh registry, and a partition warmed into the
     /// old one would be invisible to the new one.
     live: LiveRuntime,
+    /// What `src/middleware.ts` judges each subscribed page with.
+    gate: LaneGate<'a>,
+}
+
+/// The subscribe request a lane's middleware check runs against.
+struct LaneGate<'a> {
+    state: &'a RuntimeState,
+    peer: Option<IpAddr>,
+    headers: HeaderMap,
 }
 
 #[async_trait::async_trait]
-impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority {
+impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority<'_> {
     /// Resolve, warm, then grant.
     ///
     /// The warm is inside the choke point rather than beside it because a topic
@@ -5471,17 +5653,27 @@ impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority {
     /// empty.
     async fn authorize_route(
         &self,
-        principal: Option<&dom_render_compiler::auth::PrincipalId>,
+        identity: &crate::auth::Identity,
         path: &str,
     ) -> Option<Vec<dom_render_compiler::runtime::TopicGrant>> {
         let streaming = self.world.streaming_runtime.as_ref()?;
+        let page = lane_page_after_middleware(
+            self.gate.state,
+            &self.world,
+            self.gate.peer,
+            &self.gate.headers,
+            identity,
+            path,
+        )
+        .await?;
         let registry = self
             .live
             .source_reader
             .get()
             .map(|reader| reader.registry().as_ref());
+        let principal = identity.principal().map(|who| &who.id);
         let (grants, partitions, sources) =
-            resolve_route_topics_detailed(&self.world, streaming, path, registry, principal)?;
+            resolve_route_topics_detailed(&self.world, streaming, &page, registry, principal)?;
         if !partitions.is_empty() {
             crate::topics::TopicWarmer::warm(&self.live, &partitions).await;
         }
@@ -5683,6 +5875,158 @@ mod tests {
     use axum::body::to_bytes;
     use bytes::Bytes;
     use tower::ServiceExt;
+
+    /// An HTTPS connection that never finishes its handshake, or finishes it
+    /// and never sends a request, is closed instead of held forever.
+    ///
+    /// 🔴 Before: no handshake timeout, and no hyper timer so no header timeout
+    /// either. Both sockets stayed open, each holding a task and a file
+    /// descriptor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_https_connection_is_closed() {
+        use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+        /// Everything the server sends until it closes, or `None` if it is
+        /// still open when `window` ends.
+        async fn until_closed(stream: &mut (impl AsyncRead + Unpin), window: Duration) -> Option<Vec<u8>> {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            let deadline = tokio::time::Instant::now() + window;
+            loop {
+                match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+                    Err(_) => return None,
+                    Ok(Ok(0) | Err(_)) => return Some(seen),
+                    Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+                }
+            }
+        }
+
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+        let cert = fixtures.join("localhost-cert.pem");
+        let tls = crate::tls::server_config_from_files(&cert, &fixtures.join("localhost-key.pem"))
+            .expect("the fixture pair loads");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "served" }));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let timeouts = TlsTimeouts {
+            handshake: Duration::from_millis(300),
+            header_read: Duration::from_millis(300),
+        };
+        let server = tokio::spawn(serve_https(
+            listener,
+            router,
+            tls,
+            async {
+                let _ = stopped.await;
+            },
+            Duration::from_secs(1),
+            timeouts,
+        ));
+
+        // TCP open, handshake never started.
+        let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        assert!(
+            until_closed(&mut silent, Duration::from_secs(5)).await.is_some(),
+            "a connection that never started the handshake was held open"
+        );
+
+        // The fixture is self-signed as a CA, which webpki refuses as a server
+        // certificate. This test is about the server's timeouts, not trust, so
+        // the client checks signatures and nothing else.
+        #[derive(Debug)]
+        struct AnyCertificate(Arc<rustls::crypto::CryptoProvider>);
+        impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
+            fn verify_server_cert(
+                &self,
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &[rustls::pki_types::CertificateDer<'_>],
+                _: &rustls::pki_types::ServerName<'_>,
+                _: &[u8],
+                _: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &rustls::pki_types::CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls12_signature(
+                    message,
+                    cert,
+                    dss,
+                    &self.0.signature_verification_algorithms,
+                )
+            }
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &rustls::pki_types::CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls13_signature(
+                    message,
+                    cert,
+                    dss,
+                    &self.0.signature_verification_algorithms,
+                )
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                self.0.signature_verification_algorithms.supported_schemes()
+            }
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let localhost = rustls::pki_types::ServerName::try_from("localhost").expect("name");
+
+        // Handshake done, no request ever sent.
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        let mut idle = connector
+            .connect(localhost.clone(), tcp)
+            .await
+            .expect("the handshake completes");
+        assert!(
+            until_closed(&mut idle, Duration::from_secs(5)).await.is_some(),
+            "a connection that sent no request was held open"
+        );
+
+        // Control: a prompt request is still answered.
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        let mut prompt = connector.connect(localhost, tcp).await.expect("the handshake completes");
+        prompt
+            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+            .await
+            .expect("request sent");
+        let answer = until_closed(&mut prompt, Duration::from_secs(5))
+            .await
+            .expect("the server finishes the response and closes");
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("served"), "{answer}");
+
+        // Control: a client that agrees on `h2` through ALPN is served HTTP/2.
+        let h2 = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("client")
+            .get(format!("https://127.0.0.1:{}/", addr.port()))
+            .send()
+            .await
+            .expect("an HTTP/2 request is answered");
+        assert_eq!(h2.version(), reqwest::Version::HTTP_2);
+        assert_eq!(h2.text().await.expect("body"), "served");
+
+        let _ = stop.send(());
+        let _ = server.await;
+    }
 
     /// 🔴 **`shutdown_timeout_ms` was read, validated, defaulted and threaded
     /// into a parameter named `_timeout` that was never used.** These three

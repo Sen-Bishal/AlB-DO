@@ -658,3 +658,201 @@ async fn a_lane_carries_only_the_columns_its_page_renders() {
     assert!(!carries(&count_live, "eve-private"), "/count was sent the new email");
     assert!(!carries(&count_live, "Eve"), "/count was sent the new name");
 }
+
+// ── 10-29 review #1 · a middleware refusal reaches the live lanes ──────────
+
+const PAYROLL: &str = "ADMIN-ONLY-PAYROLL-5150";
+const ADMIN_EMAIL: &str = "admin@example.com";
+
+/// A role check — the one gate `export const auth` cannot express, so the one
+/// an app has to write in middleware.
+const ROLE_MIDDLEWARE: &str = r#"import { next, respond } from "albedo/middleware";
+
+export default function middleware(request, { user }) {
+  if (request.path.startsWith("/payroll") && (!user || user.email !== "admin@example.com")) {
+    return respond("admins only", { status: 403 });
+  }
+  return next();
+}
+"#;
+
+/// The only route that reads `payroll`, so a lane carrying it can only have
+/// been granted this route.
+const PAYROLL_PAGE: &str = r#"import { useSharedSlot } from "albedo";
+
+export const auth = "required";
+
+export default function Payroll() {
+  const rows = useSharedSlot("payroll");
+  return <ul>{rows.map((r) => <li key={r.id}>{r.line}</li>)}</ul>;
+}
+"#;
+
+/// `/_albedo/patches?p={page}`'s first moments, sent as `cookie`.
+async fn lane_bytes_as(base: &str, page: &str, cookie: &str) -> Vec<u8> {
+    let mut response = client()
+        .get(format!("{base}/_albedo/patches?p={page}"))
+        .header("cookie", cookie)
+        .header("last-event-id", "0")
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("the lane answers");
+    read_for(&mut response, Duration::from_millis(1500)).await.1
+}
+
+/// Open a PHOSPHOR trunk as `cookie`, subscribe it to `page`, and return the
+/// routes the server denied and every frame the trunk then carried.
+async fn phosphor_as(base: &str, page: &str, cookie: &str) -> (Vec<String>, Vec<u8>) {
+    let mut trunk = client()
+        .get(format!("{base}/_albedo/phosphor"))
+        .header("cookie", cookie)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("the trunk opens");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut text = String::new();
+    let lane = loop {
+        if let Some(at) = text.find(r#""lane":""#) {
+            let rest = &text[at + 8..];
+            if let Some(end) = rest.find('"') {
+                break rest[..end].to_string();
+            }
+        }
+        let chunk = tokio::time::timeout_at(deadline, trunk.chunk())
+            .await
+            .expect("the trunk says hello in time")
+            .expect("the trunk reads")
+            .expect("the trunk stays open");
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    };
+
+    let body = serde_json::json!({ "lane": lane, "add": [{ "p": page, "n": "probe" }] });
+    let outcome = client()
+        .post(format!("{base}/_albedo/phosphor/routes"))
+        .header("cookie", cookie)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("subscribe answers")
+        .text()
+        .await
+        .expect("subscribe body");
+    let outcome: serde_json::Value = serde_json::from_str(&outcome)
+        .unwrap_or_else(|err| panic!("subscribe JSON ({err}): {outcome}"));
+    let denied = outcome["denied"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|p| p.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+
+    let mut text = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    while let Ok(Ok(Some(chunk))) = tokio::time::timeout_at(deadline, trunk.chunk()).await {
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    let mut frames = Vec::new();
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        let Ok(envelope) = serde_json::from_str::<serde_json::Value>(data.trim()) else { continue };
+        if let Some(frame) = envelope["f"].as_str() {
+            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(frame) {
+                frames.extend(decoded);
+            }
+        }
+    }
+    (denied, frames)
+}
+
+/// Register `email` from a fresh tab and return its tab + session cookies.
+async fn signed_in_as(base: &str, email: &str) -> String {
+    let visitor = arrive(base).await;
+    let registered = client()
+        .post(format!("{base}/_albedo/auth/password/register"))
+        .header("cookie", &visitor.cookie)
+        .form(&[
+            ("_csrf", visitor.csrf.as_str()),
+            ("_albedo_return", visitor.return_path.as_str()),
+            ("email", email),
+            ("password", "correct horse battery staple"),
+        ])
+        .send()
+        .await
+        .expect("register answers");
+    let session = cookie_named(&registered, "__Host-albedo_session=")
+        .unwrap_or_else(|| panic!("registering {email} signs in ({})", registered.status()));
+    format!("{}; {session}", visitor.cookie)
+}
+
+async fn payroll_page(base: &str, cookie: &str) -> (StatusCode, String) {
+    let response = client()
+        .get(format!("{base}/payroll"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .expect("the page answers");
+    (response.status(), response.text().await.expect("body"))
+}
+
+/// A page `src/middleware.ts` refuses is refused on both live lanes too.
+///
+/// 🔴 Before: the middleware ran only on app paths and the lanes checked only
+/// `export const auth`, so a signed-in non-admin got 403 from `GET /payroll`
+/// and every payroll row from `/_albedo/patches?p=/payroll` and from a
+/// PHOSPHOR subscribe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_middleware_refusal_also_closes_the_live_lanes() {
+    let (home, _work, app) = project();
+    let config_path = app.join("albedo.config.ts");
+    let config = fs::read_to_string(&config_path).expect("config");
+    fs::write(
+        &config_path,
+        config.replacen(
+            "forge: {",
+            &format!(
+                "forge: {{\n    payroll: {{ fields: {{ line: \"text\" }}, seed: [{{ line: \"{PAYROLL}\" }}] }},\n"
+            ),
+            1,
+        ),
+    )
+    .expect("config");
+    write(&app, "src/middleware.ts", ROLE_MIDDLEWARE);
+    write(&app, "src/routes/payroll.tsx", PAYROLL_PAGE);
+    run_ok(albedo(home.path(), &app).args(["build", "."]), "albedo build");
+    let (_server, base) = serve(home.path(), &app).await;
+
+    let admin = signed_in_as(&base, ADMIN_EMAIL).await;
+    let staff = signed_in_as(&base, "staff@example.com").await;
+
+    // The page itself: refused to staff, served to the admin.
+    let (status, _) = payroll_page(&base, &staff).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "control: the middleware refuses staff the page");
+    let (status, html) = payroll_page(&base, &admin).await;
+    assert_eq!(status, StatusCode::OK, "control: the admin gets the page");
+    assert!(html.contains(PAYROLL), "control: the page renders the row");
+
+    // The patches lane.
+    assert!(
+        carries(&lane_bytes_as(&base, "/payroll", &admin).await, PAYROLL),
+        "control: the admin's patches lane carries payroll"
+    );
+    assert!(
+        !carries(&lane_bytes_as(&base, "/payroll", &staff).await, PAYROLL),
+        "staff's patches lane carried payroll the middleware refused them"
+    );
+
+    // The PHOSPHOR lane.
+    let (denied, frames) = phosphor_as(&base, "/payroll", &admin).await;
+    assert!(denied.is_empty(), "control: the admin's subscribe is granted ({denied:?})");
+    assert!(carries(&frames, PAYROLL), "control: the admin's trunk is seeded with payroll");
+    let (denied, frames) = phosphor_as(&base, "/payroll", &staff).await;
+    assert_eq!(denied, vec!["/payroll".to_string()], "staff's subscribe to /payroll is denied");
+    assert!(!carries(&frames, PAYROLL), "staff's trunk carried payroll the middleware refused them");
+
+    // A public route stays live for staff: the gate refuses a page, it does
+    // not switch the lanes off.
+    let (denied, frames) = phosphor_as(&base, "/notices", &staff).await;
+    assert!(denied.is_empty(), "control: staff may subscribe to /notices ({denied:?})");
+    assert!(carries(&frames, NOTICE), "control: staff's /notices trunk is seeded");
+}

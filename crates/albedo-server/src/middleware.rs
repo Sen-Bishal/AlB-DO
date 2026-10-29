@@ -15,6 +15,11 @@
 //! machinery a page needs in order to work at all, or a credential surface whose
 //! rate limiting is ordered around being reached directly.
 //!
+//! A live lane is not run through it as a request of its own, but it is judged
+//! by it: before a lane is granted a page's topics, the middleware decides a
+//! `GET` of that page (`server::lane_page_after_middleware`). Without that, a
+//! role check here refused the page and streamed its rows anyway.
+//!
 //! Uploads are in scope on purpose: a content-addressed id is not a capability
 //! (see `upload::store`), and a middleware is the one place an app can put an
 //! authorization check in front of that route without a framework change.

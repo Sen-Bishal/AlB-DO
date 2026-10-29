@@ -34,7 +34,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{header, Response, StatusCode};
 use dom_render_compiler::auth::email_token::{self, Purpose};
-use dom_render_compiler::auth::password::{hash_password, normalize_email, PasswordError};
+use dom_render_compiler::auth::password::{normalize_email, PasswordError};
 use dom_render_compiler::auth::session::SessionToken;
 use dom_render_compiler::auth::store::{self, ProviderProfile};
 use dom_render_compiler::auth::{PrincipalId, ProviderKind, ResolvedProvider};
@@ -312,7 +312,11 @@ pub(crate) async fn reset(request: &AuthRequest<'_>, form: &FormBody) -> Respons
     };
     // Policy before the token is spent: a too-short password must not cost the
     // person their link.
-    let secret = match hash_password(form.get(PASSWORD_FIELD).unwrap_or_default()) {
+    let secret = match crate::handlers::auth_routes::hash_password_off_runtime(
+        form.get(PASSWORD_FIELD).unwrap_or_default(),
+    )
+    .await
+    {
         Ok(secret) => secret,
         Err(err @ (PasswordError::TooShort | PasswordError::TooLong)) => {
             let again = ReturnPath::parse(&format!(

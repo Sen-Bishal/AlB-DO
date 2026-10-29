@@ -189,13 +189,32 @@ async fn stored_bytes_are_reachable_and_the_guards_hold() {
         "a part's declared type is a claim; nosniff is what stops a lying file \
          from being served as whatever a sniffer decides it looks like"
     );
-    assert!(
-        headers
-            .get("cache-control")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|value| value.contains("immutable")),
-        "the id is the hash, so immutable is honest: {headers:?}"
+    // 🔴 Was `public, max-age=31536000, immutable`: any shared cache or CDN
+    // kept a copy and answered for the app, so a middleware gating this route
+    // never saw the request.
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("private, no-cache"),
+        "shared caches keep no copy, and the browser asks before reusing its own"
     );
+    let etag = headers
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("the hash is the entity tag")
+        .to_string();
+    assert_eq!(etag, format!("\"{id}\""));
+    let revalidated = client
+        .get(format!("{base}/_albedo/uploads/{id}"))
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .expect("responds");
+    assert_eq!(
+        revalidated.status(),
+        StatusCode::NOT_MODIFIED,
+        "a browser that has the file pays a 304, not the bytes"
+    );
+    assert!(revalidated.bytes().await.expect("body").is_empty());
 
     // ── 3 · the guards ──
     // Every one of these would be a filesystem read if the id alphabet were a

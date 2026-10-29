@@ -449,11 +449,17 @@ pub fn serve_id(path: &str) -> Option<&str> {
 /// - **`Content-Disposition: attachment` for anything we did not positively decide is safe to
 ///   render inline.** The bytes are attacker-supplied and same-origin, which is the shape that
 ///   turns an upload store into stored XSS.
-/// - **`immutable`, honestly.** The id is the hash, so these bytes cannot change.
+/// - **`private, no-cache`, with the hash as the `ETag`.** The bytes never change, but who may
+///   read them can. A shared cache or CDN holding a copy would answer for the app, and
+///   `src/middleware.ts`, the place an app gates this route, would never see the request. So
+///   every read reaches the server, and a browser that already has the file gets a `304`
+///   instead of the bytes. An app whose uploads are public can set its own `cache-control`
+///   from middleware.
 pub async fn serve(
     db: &dyn DataSubstrate,
     project_dir: &Path,
     id: &str,
+    if_none_match: Option<&str>,
 ) -> axum::response::Response {
     use axum::http::{header as h, StatusCode};
 
@@ -464,6 +470,17 @@ pub async fn serve(
             "no such upload",
         ));
     };
+
+    let etag = format!("\"{id}\"");
+    if if_none_match.is_some_and(|header| etag_matches(header, &etag)) {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::NOT_MODIFIED,
+            [
+                (h::ETAG, etag),
+                (h::CACHE_CONTROL, UPLOAD_CACHE_CONTROL.to_string()),
+            ],
+        ));
+    }
     let Ok(path) = store::path_for(project_dir, id) else {
         return axum::response::IntoResponse::into_response(StatusCode::NOT_FOUND);
     };
@@ -491,10 +508,8 @@ pub async fn serve(
     axum::response::IntoResponse::into_response((
         [
             (h::CONTENT_TYPE, record.content_type.clone()),
-            (
-                h::CACHE_CONTROL,
-                "public, max-age=31536000, immutable".to_string(),
-            ),
+            (h::CACHE_CONTROL, UPLOAD_CACHE_CONTROL.to_string()),
+            (h::ETAG, etag),
             (h::CONTENT_DISPOSITION, disposition),
             (
                 h::HeaderName::from_static("x-content-type-options"),
@@ -503,6 +518,18 @@ pub async fn serve(
         ],
         bytes,
     ))
+}
+
+/// Browsers may keep a copy, but must ask before using it; shared caches keep none.
+const UPLOAD_CACHE_CONTROL: &str = "private, no-cache";
+
+/// Whether an `If-None-Match` header names this entity tag. Weak and strong
+/// forms compare equal: the bytes behind an upload id never change.
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    if_none_match
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == etag)
 }
 
 /// Types we are willing to render inline in the app's own origin.
@@ -690,8 +717,8 @@ mod tests {
         assert_eq!(stored.principal.as_deref(), Some("u_test"));
     }
 
-    /// The same bytes twice is one file. This is what makes
-    /// `Cache-Control: immutable` on the serve path honest.
+    /// The same bytes twice is one file. This is what makes the id a
+    /// trustworthy `ETag` on the serve path.
     #[tokio::test]
     async fn the_same_bytes_twice_are_one_file() {
         let temp = tempfile::tempdir().expect("tempdir");

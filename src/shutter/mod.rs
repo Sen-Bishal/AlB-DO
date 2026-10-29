@@ -65,7 +65,6 @@ pub use cost::{classify, classify_route, compress_fanout, Cost, OperationClass};
 pub use gcra::{Cell, Decision, Nanos, Quota, QuotaError};
 
 use dashmap::DashMap;
-use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -149,10 +148,20 @@ impl Key {
         }
     }
 
+    /// The overflow cell for this key, under hash keys drawn once per process
+    /// from the OS RNG. `AHasher::default()` uses fixed keys, so an attacker
+    /// could precompute keys that share a chosen account's cell and drain it.
     fn slot(&self) -> usize {
-        let mut hasher = ahash::AHasher::default();
-        self.hash(&mut hasher);
-        (hasher.finish() as usize) & (OVERFLOW_CELLS - 1)
+        static STATE: std::sync::OnceLock<ahash::RandomState> = std::sync::OnceLock::new();
+        let state = STATE.get_or_init(|| {
+            ahash::RandomState::with_seeds(
+                rand::random(),
+                rand::random(),
+                rand::random(),
+                rand::random(),
+            )
+        });
+        (state.hash_one(self) as usize) & (OVERFLOW_CELLS - 1)
     }
 }
 
@@ -827,6 +836,35 @@ mod tests {
             addr: addr(last),
             class,
         }
+    }
+
+    /// Keys an attacker picked to share a victim's overflow cell under the fixed
+    /// `AHasher::default()` keys do not share it under the process's own keys.
+    ///
+    /// 🔴 Before: every precomputed key landed in the victim's cell.
+    #[test]
+    fn overflow_cells_cannot_be_targeted_with_precomputed_keys() {
+        use std::hash::{Hash, Hasher};
+        let fixed_slot = |key: &Key| {
+            let mut hasher = ahash::AHasher::default();
+            key.hash(&mut hasher);
+            (hasher.finish() as usize) & (OVERFLOW_CELLS - 1)
+        };
+        let victim = Key::Account {
+            subject: "ceo@example.com".to_string(),
+        };
+        let target = fixed_slot(&victim);
+        let colliders: Vec<Key> = (0u32..)
+            .map(|i| Key::Account {
+                subject: format!("spray{i}@example.com"),
+            })
+            .filter(|key| fixed_slot(key) == target)
+            .take(32)
+            .collect();
+
+        let shared = colliders.iter().filter(|key| key.slot() == victim.slot()).count();
+        // By chance, about 32 / 8 192 of them would share it.
+        assert!(shared < 4, "{shared} of 32 precomputed keys share the victim's overflow cell");
     }
 
     /// The defaults must be able to admit the heaviest operation they can

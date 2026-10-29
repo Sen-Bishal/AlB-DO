@@ -205,21 +205,33 @@ impl TrustedProxies {
         if !self.trusts(peer) {
             return peer;
         }
-        let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-        else {
-            return peer;
+
+        // Every line, in order. A proxy may add its own `X-Forwarded-For` line
+        // rather than append to the client's (HAProxy's `option forwardfor`
+        // does), and reading only the first line would read the client's.
+        let lines: Vec<&str> = match headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .map(|value| value.to_str())
+            .collect::<Result<_, _>>()
+        {
+            Ok(lines) => lines,
+            Err(_) => return peer,
         };
 
         // Right to left: the rightmost entries were appended by infrastructure
         // we trust, and anything the client forged sits to the left of them.
         // The first entry that is not itself a trusted hop is the real client.
-        forwarded
-            .rsplit(',')
-            .filter_map(|entry| parse_forwarded_entry(entry.trim()))
-            .find(|addr| !self.trusts(*addr))
-            .unwrap_or(peer)
+        // An entry that does not parse ends the walk: everything left of it is
+        // the client's own writing, so stepping past it would believe that.
+        for entry in lines.iter().rev().flat_map(|line| line.rsplit(',')) {
+            match parse_forwarded_entry(entry.trim()) {
+                Some(addr) if self.trusts(addr) => {}
+                Some(addr) => return addr,
+                None => return peer,
+            }
+        }
+        peer
     }
 }
 
@@ -680,6 +692,31 @@ mod tests {
             proxies.client_addr(edge, &headers_with_xff("198.51.100.7, 10.0.0.2")),
             ip(198, 51, 100, 7)
         );
+    }
+
+    /// A proxy that adds its own header line instead of appending is still
+    /// read from the right: the client's forged line is the first one.
+    ///
+    /// 🔴 Before: only the first line was read, so the client picked its bucket.
+    #[test]
+    fn a_proxy_that_adds_its_own_header_line_is_still_believed_over_the_client() {
+        let balancer = ip(10, 0, 0, 1);
+        let proxies = TrustedProxies::new(vec![balancer]);
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        headers.append("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        assert_eq!(
+            proxies.client_addr(balancer, &headers),
+            ip(198, 51, 100, 7),
+            "the client's own line was believed"
+        );
+
+        // An entry that does not parse stops the walk at the peer rather than
+        // stepping past it into the client's writing.
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        headers.append("x-forwarded-for", "unknown".parse().unwrap());
+        assert_eq!(proxies.client_addr(balancer, &headers), balancer);
     }
 
     #[test]
