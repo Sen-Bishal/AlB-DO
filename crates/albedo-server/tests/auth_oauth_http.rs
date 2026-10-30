@@ -164,6 +164,7 @@ async fn the_oauth_legs_are_reachable_and_the_redirect_is_guarded() {
             ..Default::default()
         },
         tls: Default::default(),
+        forge_db: None,
     };
 
     let server = boot_production_server(&opts).expect("server boots with an oauth provider");

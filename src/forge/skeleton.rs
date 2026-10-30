@@ -616,7 +616,9 @@ pub async fn hydrate_topics(
 /// Materialise every collection to `(topic, JSON bytes)` without touching a
 /// broadcast registry. Used at **build time**: the manifest builder seeds a
 /// fresh registry with these before Stream-B pre-renders each Tier-B island, so
-/// the baked HTML carries persisted rows rather than the `b"null"` placeholder.
+/// the baked HTML carries a collection rather than the `b"null"` placeholder —
+/// read from a throwaway database holding the declared `seed` rows, never the
+/// project's own (see `materialize_forge_seeds` in `manifest::builder`).
 /// Same materialisation [`hydrate_topics`] uses at serve-boot, factored out so
 /// both paths agree byte-for-byte.
 ///

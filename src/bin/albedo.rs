@@ -107,6 +107,11 @@ const SCAFFOLD_ROOM_ROUTE: &str = include_str!("../../scaffold/src/routes/room/[
 const SCAFFOLD_SIGN_IN_ROUTE: &str = include_str!("../../scaffold/src/routes/sign-in.tsx");
 const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/components/Hero.tsx");
 const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/src/components/Counter.tsx");
+// 15.2 · `albedo test` examples — a component, a page, accounts.
+const SCAFFOLD_HERO_TEST: &str = include_str!("../../scaffold/src/components/Hero.test.tsx");
+const SCAFFOLD_GUESTBOOK_TEST: &str =
+    include_str!("../../scaffold/src/routes/guestbook.test.tsx");
+const SCAFFOLD_SIGN_IN_TEST: &str = include_str!("../../scaffold/src/routes/sign-in.test.tsx");
 const SCAFFOLD_ENV_DTS: &str = include_str!("../../scaffold/src/albedo-env.d.ts");
 const SCAFFOLD_STYLES: &str = include_str!("../../scaffold/src/styles.css");
 const SCAFFOLD_CONFIG: &str = include_str!("../../scaffold/albedo.config.ts");
@@ -210,6 +215,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         // Trust polish · what the build already knows about itself. Every check
         // is a derivation, never a maintained list — see `doctor::matrix`.
         "doctor" => run_doctor_command(&args[2..]),
+        // 15.2 · the app's own tests, against the server `serve` runs and the
+        // renderers the build uses — see `albedo_server::test_runner`.
+        "test" => run_test_command(&args[2..]),
         // 15.3 · `albedo email test <address>` — one real send through the
         // configured provider, answered in the terminal.
         "email" => run_email_command(&args[2..]),
@@ -756,7 +764,7 @@ fn unattributed_route_files(root: &Path) -> Vec<String> {
             let is_route_shaped = matches!(
                 path.extension().and_then(|ext| ext.to_str()),
                 Some("tsx" | "jsx" | "ts" | "js")
-            );
+            ) && !dom_render_compiler::testing::is_test_module(path);
             let name = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
             // App Router names the route file; Pages Router makes every file one.
             if is_route_shaped && (convention == "pages" || matches!(name, "page" | "route")) {
@@ -4089,6 +4097,22 @@ fn scaffold_project(target: &Path, options: &InitOptions) -> Result<(), String> 
         SCAFFOLD_COUNTER,
         options.force,
     )?;
+    // Tests beside what they test — `albedo test` runs them.
+    write_scaffold_file(
+        &target.join("src").join("components").join("Hero.test.tsx"),
+        SCAFFOLD_HERO_TEST,
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join("src").join("routes").join("guestbook.test.tsx"),
+        SCAFFOLD_GUESTBOOK_TEST,
+        options.force,
+    )?;
+    write_scaffold_file(
+        &target.join("src").join("routes").join("sign-in.test.tsx"),
+        SCAFFOLD_SIGN_IN_TEST,
+        options.force,
+    )?;
     write_scaffold_file(
         &target.join("src").join("styles.css"),
         SCAFFOLD_STYLES,
@@ -4318,7 +4342,7 @@ _albedo_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local commands="init dev build ship serve files budget doctor email run completions help"
+    local commands="init dev build ship serve files budget doctor test email run completions help"
 
     case "$prev" in
         albedo)
@@ -4347,6 +4371,10 @@ _albedo_completions() {
             ;;
         doctor)
             COMPREPLY=( $(compgen -W "--json --config" -- "$cur") )
+            return 0
+            ;;
+        test)
+            COMPREPLY=( $(compgen -W "--filter --timeout --config" -- "$cur") )
             return 0
             ;;
         --format)
@@ -4380,6 +4408,7 @@ _albedo() {
         'files:Static file server (defaults to .albedo/dist)'
         'budget:Evaluate the tier budget against the current build'
         'doctor:Report what the build already knows about itself'
+        'test:Run the test files against the app server'
         'email:Send a test email through the configured provider'
         'run:Run a sub-mode (e.g. run dev)'
         'completions:Emit shell completion script to stdout'
@@ -4438,6 +4467,12 @@ _albedo() {
                         '--json[Machine-readable report for CI]' \
                         '--config[Use explicit albedo.config.json/ts]:file:_files'
                     ;;
+                (test)
+                    _arguments \
+                        '--filter[Run only tests whose name contains this]:text' \
+                        '--timeout[Seconds before a test is stopped]:seconds' \
+                        '--config[Use explicit albedo.config.json/ts]:file:_files'
+                    ;;
                 (serve)
                     _arguments \
                         '--dir[Directory to serve]:directory:_files -/' \
@@ -4455,7 +4490,7 @@ _albedo "$@"
 "#;
 
 const COMPLETIONS_FISH: &str = r#"# albedo fish completions
-set -l albedo_commands init dev build ship serve files budget doctor email run completions help
+set -l albedo_commands init dev build ship serve files budget doctor test email run completions help
 
 # Disable file completions for the main command
 complete -c albedo -f
@@ -4468,6 +4503,7 @@ complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a ship        -d
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a serve       -d 'Serve static files from a directory'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a budget      -d 'Evaluate the tier budget against the current build'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a doctor      -d 'Report what the build already knows about itself'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a test        -d 'Run the test files against the app server'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a email       -d 'Send a test email through the configured provider'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a run         -d 'Run a sub-mode'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a completions -d 'Emit shell completion script to stdout'
@@ -4515,7 +4551,7 @@ Register-ArgumentCompleter -Native -CommandName @('albedo', 'albedo.exe') -Scrip
     $tokens = $commandAst.CommandElements
     $nTokens = $tokens.Count
 
-    $commands = @('init','dev','build','ship','serve','files','budget','doctor','email','run','completions','help')
+    $commands = @('init','dev','build','ship','serve','files','budget','doctor','test','email','run','completions','help')
     $devFlags = @('--config','--entry','--host','--port','--no-hmr','--strict','--verbose','--open','--prod','--no-budget')
 
     if ($nTokens -le 2) {
@@ -4557,6 +4593,10 @@ Register-ArgumentCompleter -Native -CommandName @('albedo', 'albedo.exe') -Scrip
             @('--json','--config') | Where-Object { $_ -like "$wordToComplete*" } |
                 ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
         }
+        'test' {
+            @('--filter','--timeout','--config') | Where-Object { $_ -like "$wordToComplete*" } |
+                ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
+        }
         { $_ -in 'serve','files' } {
             @('--dir','--host','--port') | Where-Object { $_ -like "$wordToComplete*" } |
                 ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_) }
@@ -4586,6 +4626,7 @@ fn print_help() {
     print_command("files", "[dir]", "serve static files from a folder");
     print_command("budget", "[dir]", "check the tier budget");
     print_command("doctor", "[dir]", "report what the build knows about itself");
+    print_command("test", "[dir]", "run the app's *.test.tsx files");
     print_command("email test", "<address> [dir]", "send one real email to check the provider");
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
@@ -4628,6 +4669,228 @@ fn print_ship_help() {
     print_option("--config <FILE>", "explicit albedo config");
     print_option("--entry <FILE>", "override entry module");
     print_option("--no-budget", "skip the tier-budget gate");
+    println!();
+}
+
+/// 15.2 · `albedo test [dir] [--filter <text>] [--timeout <seconds>]`.
+///
+/// Builds the app the way `serve` does, then runs every test file against it —
+/// see `albedo_server::test_runner` for what a test reaches and why each file
+/// gets its own server and database.
+fn run_test_command(raw_args: &[String]) -> Result<(), String> {
+    use albedo_server::test_runner::{discover_test_files, run_tests, TestRunOptions, TestStatus};
+
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_test_help();
+        return Ok(());
+    }
+
+    let mut name_filter = None;
+    let mut timeout = Duration::from_secs(10);
+    let mut forwarded = Vec::new();
+    let mut idx = 0;
+    while idx < raw_args.len() {
+        match raw_args[idx].as_str() {
+            "--filter" | "-t" => {
+                let text = raw_args
+                    .get(idx + 1)
+                    .ok_or_else(|| "--filter needs the text a test name must contain".to_string())?;
+                name_filter = Some(text.clone());
+                idx += 2;
+            }
+            "--timeout" => {
+                let seconds = raw_args
+                    .get(idx + 1)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|seconds| *seconds > 0)
+                    .ok_or_else(|| "--timeout needs a whole number of seconds, 1 or more".to_string())?;
+                timeout = Duration::from_secs(seconds);
+                idx += 2;
+            }
+            _ => {
+                forwarded.push(raw_args[idx].clone());
+                idx += 1;
+            }
+        }
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let contract = resolve_dev_contract(&forwarded, &cwd)?;
+    print_boot_banner();
+    print_section("test");
+    print_kv("project", contract.project_dir.display());
+
+    let files = discover_test_files(&contract.project_dir);
+    if files.is_empty() {
+        return Err(format!(
+            "no test files in {}. A test file is named like `card.test.tsx` (or .ts, .jsx, \
+             .js, or .spec.*) and imports from \"albedo/test\" — `albedo test --help` shows one.",
+            contract.project_dir.display()
+        ));
+    }
+    print_kv("files", files.len());
+    if let Some(text) = &name_filter {
+        print_kv("filter", text);
+    }
+
+    run_prod_build(&contract)?;
+
+    let mut server = albedo_server::ProductionServerOptions::from_contract(&contract);
+    // A test server never terminates TLS or asks Let's Encrypt for anything,
+    // whatever this shell's environment says.
+    server.tls = albedo_server::tls::TlsSettings::default();
+    // Mail goes to `.albedo/outbox`, never through a real provider: a test that
+    // signs someone up must not email a stranger.
+    if let Some(email) = server.email.as_mut() {
+        email.provider = dom_render_compiler::email::ProviderKind::Log;
+    }
+    let opts = TestRunOptions {
+        server,
+        files,
+        name_filter: name_filter.clone(),
+        timeout,
+    };
+
+    print_section("results");
+    let started = Instant::now();
+    let project_dir = contract.project_dir.clone();
+    let reports = run_tests(&opts, |report| print_test_file(&project_dir, report))?;
+
+    let (mut passed, mut failed, mut skipped, mut todo) = (0usize, 0usize, 0usize, 0usize);
+    let mut broken_files = 0usize;
+    for report in &reports {
+        if report.error.is_some() {
+            broken_files += 1;
+        }
+        for test in &report.tests {
+            match test.status {
+                TestStatus::Passed => passed += 1,
+                TestStatus::Failed(_) => failed += 1,
+                TestStatus::Skipped => skipped += 1,
+                TestStatus::Todo => todo += 1,
+            }
+        }
+    }
+
+    print_section("summary");
+    let mut parts = vec![style(&format!("{passed} passed"), "1;32")];
+    if failed > 0 {
+        parts.push(style(&format!("{failed} failed"), "1;31"));
+    }
+    if skipped > 0 {
+        parts.push(style(&format!("{skipped} skipped"), "33"));
+    }
+    if todo > 0 {
+        parts.push(style(&format!("{todo} todo"), "36"));
+    }
+    print_kv("tests", parts.join(&style(" · ", "2")));
+    print_kv(
+        "files",
+        if broken_files > 0 {
+            format!("{} · {}", reports.len(), style(&format!("{broken_files} did not run"), "1;31"))
+        } else {
+            reports.len().to_string()
+        },
+    );
+    print_kv("time", colorize_timing_ms(started.elapsed().as_secs_f64() * 1000.0));
+    println!();
+
+    if failed > 0 || broken_files > 0 {
+        return Err(format!(
+            "{} failed",
+            [
+                (failed > 0).then(|| format!("{failed} test(s)")),
+                (broken_files > 0).then(|| format!("{broken_files} file(s)")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" and ")
+        ));
+    }
+    if passed == 0 {
+        // Nothing ran is not a pass: a filter that matches nothing, or a run of
+        // nothing but skips, would otherwise go green in CI and prove nothing.
+        return Err(match name_filter {
+            Some(text) => format!("no test name contains \"{text}\" — nothing ran"),
+            None => "every test was skipped — nothing ran".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn print_test_file(project_dir: &Path, report: &albedo_server::test_runner::FileReport) {
+    use albedo_server::test_runner::TestStatus;
+
+    let name = report
+        .file
+        .strip_prefix(project_dir)
+        .unwrap_or(&report.file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mark = if report.failed() {
+        style("✗", "1;31")
+    } else {
+        style("✓", "1;32")
+    };
+    println!(
+        "  {mark} {}  {}",
+        style(&name, "1"),
+        style(&format!("{:.0} ms", report.elapsed.as_secs_f64() * 1000.0), "2")
+    );
+    if let Some(error) = &report.error {
+        for line in error.lines() {
+            println!("      {}", style(line, "31"));
+        }
+        return;
+    }
+    for test in &report.tests {
+        let (glyph, detail) = match &test.status {
+            TestStatus::Passed => (style("✓", "32"), None),
+            TestStatus::Failed(reason) => (style("✗", "1;31"), Some(reason)),
+            TestStatus::Skipped => (style("↓", "33"), None),
+            TestStatus::Todo => (style("○", "36"), None),
+        };
+        let timing = if matches!(test.status, TestStatus::Passed | TestStatus::Failed(_)) {
+            style(&format!("{:.0} ms", test.elapsed.as_secs_f64() * 1000.0), "2")
+        } else {
+            String::new()
+        };
+        println!("      {glyph} {}  {timing}", test.name);
+        if let Some(reason) = detail {
+            for line in reason.lines() {
+                println!("          {}", style(line, "31"));
+            }
+        }
+    }
+}
+
+fn print_test_help() {
+    print_banner();
+    print_section("test");
+    println!(
+        "  {}  {}",
+        style("usage", "2"),
+        style("albedo test [dir] [--filter <text>] [--timeout <seconds>]", "1")
+    );
+    print_option("--filter <text>", "run only tests whose name contains this");
+    print_option("--timeout <seconds>", "stop a test that runs longer (default 10)");
+    print_option("--config <FILE>", "explicit albedo config");
+    println!();
+    for line in [
+        "runs every *.test.{ts,tsx,js,jsx} and *.spec.* file in the project.",
+        "",
+        "  import { test, expect, render, visit, signUp } from \"albedo/test\";",
+        "",
+        "render(<Card title=\"x\" />) renders a component with the renderer the app",
+        "uses for its tier. visit(\"/path\") asks the app's own server, and",
+        "page.submit(\"action\", { field }) posts a form the way a browser does.",
+        "Each file gets a fresh server and a throwaway database seeded from the",
+        "config. Email goes to .albedo/outbox, never to a real provider.",
+    ] {
+        println!("  {}", style(line, "2"));
+    }
     println!();
 }
 
@@ -5255,6 +5518,9 @@ REF=${OTHER}
         assert!(target.join("src/routes/layout.tsx").is_file());
         assert!(target.join("src/routes/index.tsx").is_file());
         assert!(target.join("src/routes/guestbook.tsx").is_file());
+        assert!(target.join("src/routes/guestbook.test.tsx").is_file());
+        assert!(target.join("src/routes/sign-in.test.tsx").is_file());
+        assert!(target.join("src/components/Hero.test.tsx").is_file());
         assert!(target.join("src/components/Hero.tsx").is_file());
         assert!(target.join("src/components/Counter.tsx").is_file());
         assert!(target.join("src/styles.css").is_file());

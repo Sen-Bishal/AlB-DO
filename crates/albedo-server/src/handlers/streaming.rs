@@ -1170,8 +1170,10 @@ fn replace_island_placeholders(mut html: String, placeholders: &[(String, String
 /// correcting it. Seeding is therefore limited to nodes whose render is a pure
 /// function of the build: no request props, no request-scoped data.
 ///
-/// Live data may still have moved since the build (a FORGE collection gains
-/// rows), so a seeded list can be briefly stale. That is the ordinary
+/// A FORGE list is seeded as a fresh deployment holds it — its declared `seed`
+/// rows, or empty — never with rows from whatever database sat beside the build
+/// (`manifest::builder::materialize_forge_seeds`): this HTML reaches visitors. So
+/// a seeded list is briefly behind the live one. That is the ordinary
 /// server-streaming trade and it is strictly better than an empty element: the
 /// content is correct in shape, correct in structure, and replaced within the
 /// same response.

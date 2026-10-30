@@ -627,6 +627,118 @@ declare module "albedo/jobs" {
   ): void;
 }
 
+// `albedo test` — what a `*.test.tsx` file imports. Every file gets its own
+// server and a throwaway database seeded from `albedo.config.ts`; each test
+// starts as a fresh visitor.
+declare module "albedo/test" {
+  // Read markup the way a test asks for it. Selectors: tag, #id, .class and
+  // [attr] / [attr="v"], joined by spaces or `>`.
+  export interface Found {
+    readonly tag: string;
+    readonly attrs: Record<string, string>;
+    attr(name: string): string | null;
+    // Visible text, whitespace collapsed.
+    readonly text: string;
+    readonly html: string;
+    find(selector: string): Found | null;
+    findAll(selector: string): Found[];
+  }
+
+  export interface View {
+    readonly html: string;
+    // The words a reader sees: `<body>`'s text, scripts and styles left out.
+    readonly text: string;
+    find(selector: string): Found | null;
+    findAll(selector: string): Found[];
+    contains(text: string): boolean;
+  }
+
+  // What `render()` returned: the component's markup from the renderer the
+  // app uses for its tier.
+  export interface Rendered extends View {
+    readonly tier: "A" | "B" | "C";
+    readonly component: string;
+  }
+
+  // What `visit()` and `submit()` returned: the page as the server sent it,
+  // after any redirects.
+  export interface Page extends View {
+    readonly status: number;
+    // The path finally answered, after redirects.
+    readonly url: string;
+    readonly headers: Record<string, string>;
+    readonly redirects: { status: number; url: string }[];
+    header(name: string): string | null;
+    // Submit a form on this page as a browser would: its hidden fields, the
+    // values given, this visitor's cookies, redirects followed. `target` is
+    // the action name (`action:sign_guestbook` → "sign_guestbook") or the
+    // form's own action URL. A field the form does not have is an error.
+    submit(target: string, fields?: Record<string, string | number | boolean>): Page;
+  }
+
+  // A signed-in visitor, for `visit(path, { as: user })`.
+  export interface User {
+    readonly email: string;
+  }
+
+  export function test(name: string, fn: () => void | Promise<void>): void;
+  export namespace test {
+    function skip(name: string, fn: () => void | Promise<void>): void;
+    function only(name: string, fn: () => void | Promise<void>): void;
+    function todo(name: string): void;
+  }
+  export const it: typeof test;
+  export function describe(name: string, fn: () => void): void;
+  export namespace describe {
+    function skip(name: string, fn: () => void): void;
+    function only(name: string, fn: () => void): void;
+  }
+  export function beforeEach(fn: () => void | Promise<void>): void;
+  export function afterEach(fn: () => void | Promise<void>): void;
+
+  // Render one component from the app with data props, through the renderer
+  // the app uses for its tier. `shared` seeds `useSharedSlot` topics and
+  // `state` seeds `useState` hooks in order, for a Tier-B component.
+  export function render(
+    element: JSX.Element,
+    options?: { shared?: Record<string, unknown>; state?: unknown[] },
+  ): Rendered;
+
+  // Ask the app's own server for a page, as a browser navigation. Without
+  // `as`, the visitor is this test's anonymous one.
+  export function visit(
+    path: string,
+    options?: { as?: User; follow?: boolean },
+  ): Page;
+
+  // Through the app's password endpoints. Throws with the server's reason
+  // when it refuses.
+  export function signUp(email: string, password: string): User;
+  export function signIn(email: string, password: string): User;
+  export function signOut(user: User): void;
+
+  interface Matchers {
+    toBe(expected: unknown): void;
+    toEqual(expected: unknown): void;
+    toBeTruthy(): void;
+    toBeFalsy(): void;
+    toBeNull(): void;
+    toBeUndefined(): void;
+    toBeDefined(): void;
+    // A string, an array, or a View/Page — a View is searched by its text.
+    toContain(item: unknown): void;
+    toMatch(pattern: string | RegExp): void;
+    toHaveLength(length: number): void;
+    toHaveProperty(path: string | string[], value?: unknown): void;
+    toBeGreaterThan(n: number): void;
+    toBeGreaterThanOrEqual(n: number): void;
+    toBeLessThan(n: number): void;
+    toBeLessThanOrEqual(n: number): void;
+    toThrow(expected?: string | RegExp): void;
+  }
+  export function expect(actual: unknown): Matchers & { not: Matchers };
+}
+
 // ── The supported React surface ─────────────────────────────────
 //
 // ALBEDO is React-shaped, and `useState` is only recognised when it

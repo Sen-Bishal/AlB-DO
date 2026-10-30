@@ -93,6 +93,13 @@ pub struct ProductionServerOptions {
     /// is what decides and this module has one input instead of two that could
     /// disagree.
     pub tls: crate::tls::TlsSettings,
+    /// Where `forge.db` lives, when the caller decides rather than the
+    /// environment. Wins over `ALBEDO_FORGE_DB` and the project default.
+    ///
+    /// `None` for every server that serves people. `albedo test` sets it to a
+    /// file in a temporary directory, so a test run never reads or writes the
+    /// app's own data, and each test file starts from the config's seeds.
+    pub forge_db: Option<PathBuf>,
 }
 
 impl ProductionServerOptions {
@@ -121,6 +128,7 @@ impl ProductionServerOptions {
             // The environment is the fallback; a caller with flags overwrites
             // this before booting.
             tls: crate::tls::TlsSettings::from_env(),
+            forge_db: None,
         }
     }
 }
@@ -284,8 +292,9 @@ fn boot_inner(
         // finished absolute path — otherwise the default falls back to a
         // CWD-relative `forge.db`, which is the bug being fixed.
         forge: ForgeConfig {
-            db_path: Some(
-                crate::forge_db_path::resolve_forge_db_path(
+            db_path: Some(match &opts.forge_db {
+                Some(path) => path.display().to_string(),
+                None => crate::forge_db_path::resolve_forge_db_path(
                     None,
                     crate::forge_db_path::forge_db_env().as_deref(),
                     // `dist_dir`, not `source_root`: the resolver climbs two
@@ -296,7 +305,7 @@ fn boot_inner(
                 )
                 .display()
                 .to_string(),
-            ),
+            }),
         },
     };
     // The environment's timeouts and WebTransport settings. Host and port are

@@ -242,7 +242,15 @@ const SERVER_MAY_REACH: &[(&str, &str)] = &[
     ("transforms", "form vocabulary only — field names, CSRF placeholders, id allocation"),
     ("bundler", "the client asset surface the server serves (emit, client_npm)"),
     ("graph", "test-only, inside #[cfg(test)] modules in handlers/streaming.rs"),
+    // 15.2 · `albedo test`. The test realm runs an author's test files, and the
+    // harness that answers them (`test_runner.rs`) is in the server crate because
+    // it boots the server. Admitted for that ONE file — the CLI command's
+    // harness, never the request path — which the test below enforces.
+    ("testing", "the `albedo test` realm, reached only by test_runner.rs"),
 ];
+
+/// Modules admitted for exactly one server file, and that file.
+const ONLY_FROM: &[(&str, &str)] = &[("testing", "test_runner.rs")];
 
 #[test]
 fn the_server_reaches_only_into_declared_compiler_modules() {
@@ -265,7 +273,10 @@ fn the_server_reaches_only_into_declared_compiler_modules() {
                 if module.is_empty() {
                     continue;
                 }
-                if !SERVER_MAY_REACH.iter().any(|(m, _)| *m == module) {
+                let wrong_file = ONLY_FROM
+                    .iter()
+                    .any(|(m, file)| *m == module && !path.ends_with(file));
+                if wrong_file || !SERVER_MAY_REACH.iter().any(|(m, _)| *m == module) {
                     violations.push(format!(
                         "{}:{} reaches dom_render_compiler::{module}",
                         rel(&path, &root),

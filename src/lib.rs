@@ -84,6 +84,8 @@ pub mod shutter;
 pub mod transforms;
 pub mod types;
 pub mod upload;
+/// `albedo test`: which files are tests, and the realm a test file runs in.
+pub mod testing;
 /// Inbound webhooks: a provider's signed POST, verified and queued as a job.
 pub mod webhook;
 

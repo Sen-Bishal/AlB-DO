@@ -210,6 +210,10 @@ impl ProjectScanner {
         if name.ends_with(".d.ts") || name.ends_with(".d.tsx") {
             return false;
         }
+        // A test file is not a component — see `crate::testing::is_test_module`.
+        if crate::testing::is_test_module(path) {
+            return false;
+        }
         if crate::markdown::is_markdown_page(path) {
             return true;
         }

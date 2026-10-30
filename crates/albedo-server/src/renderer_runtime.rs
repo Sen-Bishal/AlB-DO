@@ -363,6 +363,32 @@ impl RendererRuntime {
     // The engine is still rendered *to* at boot, by `render_island_html`, keyed
     // by island module path — that is the shape a QuickJS render actually takes.
 
+    /// Render one component through this runtime's QuickJS renderer — the
+    /// engine island SSR uses — with `props_json` and an optional host seed
+    /// (`{ state, shared }`).
+    ///
+    /// For `albedo test`'s `render()` of a Tier-B or Tier-C component: the same
+    /// request shape [`Self::render_island_html`] builds, with the error kept
+    /// rather than logged, because a test is the reader it is for.
+    pub(crate) fn render_component(
+        &mut self,
+        module_path: &str,
+        props_json: String,
+        host_json: Option<String>,
+    ) -> Result<String, String> {
+        let request = RouteRenderRequest {
+            entry: module_path.to_string(),
+            props_json,
+            module_order: Vec::new(),
+            hydration_payload: None,
+            host_json,
+        };
+        self.renderer
+            .render_route(&request)
+            .map(|result| result.html)
+            .map_err(|err| err.to_string())
+    }
+
     pub fn revalidate_path(&mut self, path: &str) {
         self.renderer.revalidate_path(path);
     }

@@ -120,6 +120,7 @@ impl Fixture {
             // and none of AUTH's tables are emitted.
             auth: Default::default(),
             tls: Default::default(),
+            forge_db: None,
         }
     }
 }
@@ -253,6 +254,7 @@ fn boot_production_server_fails_loud_when_dist_dir_missing() {
         webhooks: Default::default(),
         auth: Default::default(),
         tls: Default::default(),
+        forge_db: None,
     };
 
     let err = match boot_production_server(&opts) {

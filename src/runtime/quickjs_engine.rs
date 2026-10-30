@@ -64,7 +64,7 @@ use swc_ecma_transforms_typescript::strip_type;
 use swc_ecma_visit::VisitMutWith;
 
 const MODULE_RECORD_FLAG: &str = "__albedo_is_module_record";
-const MODULE_MISSING_MARKER: &str = "__ALBEDO_MODULE_MISSING__:";
+pub(crate) const MODULE_MISSING_MARKER: &str = "__ALBEDO_MODULE_MISSING__:";
 const INVALID_ENTRY_EXPORT_MARKER: &str = "__ALBEDO_INVALID_ENTRY_EXPORT__:";
 
 #[derive(Debug, Deserialize)]
@@ -353,6 +353,19 @@ impl QuickJsEngine {
     /// [`Self::confine`] before the engine serves anything else.
     pub fn take_interrupted(&mut self) -> bool {
         self.interrupted.replace(false)
+    }
+
+    /// Run `f` inside this engine's context, initialising the engine first.
+    ///
+    /// For `albedo test`'s realm ([`crate::testing::TestRealm`]), which installs
+    /// globals of its own. Crate-internal on purpose: an engine that serves
+    /// requests never takes globals from outside its prelude.
+    pub(crate) fn with_ctx<R>(&mut self, f: impl FnOnce(Ctx<'_>) -> R) -> RuntimeResult<R> {
+        self.ensure_initialized()?;
+        let context = self.context.as_ref().ok_or_else(|| {
+            RuntimeError::render("the QuickJS context is missing after initialisation".to_string())
+        })?;
+        Ok(context.with(f))
     }
 
     /// **Discard this engine's JS realm and build a fresh one on the SAME
@@ -5308,6 +5321,7 @@ fn is_framework_runtime_import(source: &str) -> bool {
         || source == SOURCE_BINDINGS_MODULE
         || source == crate::middleware::MIDDLEWARE_MODULE
         || source == crate::jobs::JOBS_MODULE
+        || source == crate::testing::TEST_MODULE
 }
 
 /// The compiler-generated collection bindings (`import { messages } from
@@ -5524,6 +5538,9 @@ action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";
     let helper_holder = match import_decl.src.value.as_ref() {
         source if source == crate::middleware::MIDDLEWARE_MODULE => Some("__albedo_middleware"),
         source if source == crate::jobs::JOBS_MODULE => Some("__albedo_jobs"),
+        // `albedo test` — the test API lives on one frozen holder installed by
+        // the test realm's prelude, for the same reason as the two above.
+        source if source == crate::testing::TEST_MODULE => Some("__albedo_test"),
         _ => None,
     };
     if let Some(holder) = helper_holder {

@@ -330,6 +330,7 @@ async fn a_gated_route_refuses_the_live_lane_and_its_action_to_a_stranger() {
             ..Default::default()
         },
         tls: Default::default(),
+        forge_db: None,
     };
 
     let server = boot_production_server(&opts).expect("server boots");

@@ -36,6 +36,7 @@
 //! - Names starting with `_` (private modules; not turned into routes).
 //! - Non `{tsx,jsx,ts,js}` extensions.
 //! - Hidden files / directories (any segment starting with `.`).
+//! - Test files (`*.test.tsx`, `*.spec.ts`, …) — `crate::testing::is_test_module`.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -214,6 +215,10 @@ pub fn discover_routes(routes_dir: &Path) -> Result<RouteDiscovery, RouteDiscove
         if !has_route_extension(&rel_path) {
             continue;
         }
+        // `guestbook.test.tsx` beside `guestbook.tsx` is a test, not `/guestbook.test`.
+        if crate::testing::is_test_module(&rel_path) {
+            continue;
+        }
 
         let stem = file_stem(&rel_path).unwrap_or_default();
         if stem.starts_with('_') {
@@ -316,7 +321,7 @@ pub fn discover_routes(routes_dir: &Path) -> Result<RouteDiscovery, RouteDiscove
 /// unsupported extensions).
 pub fn file_path_to_url(rel_path: &Path) -> Option<String> {
     let stem = file_stem(rel_path)?;
-    if stem.starts_with('_') || is_convention_stem(stem) {
+    if stem.starts_with('_') || is_convention_stem(stem) || crate::testing::is_test_module(rel_path) {
         return None;
     }
     if !has_route_extension(rel_path) {

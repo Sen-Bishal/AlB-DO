@@ -103,12 +103,13 @@ pub struct ManifestBuilder<'a> {
     /// later `error_component` / `loading_component` once Stream E.2
     /// extends the discovery struct).
     discovered_routes: Vec<DiscoveredRoute>,
-    /// FORGE — build-time materialised shared-slot seeds (`topic → JSON
-    /// bytes`), read from the substrate in [`Self::new`]. `render_tier_b_inline`
-    /// pre-seeds its registry with these so the Stream-B pre-render bakes the
-    /// persisted rows into Tier-B HTML instead of the empty `b"null"`
-    /// placeholder. Empty unless the `forge` feature is on and a `forge.db`
-    /// exists at the project root.
+    /// FORGE — build-time shared-slot values (`topic → JSON bytes`) from
+    /// [`materialize_forge_seeds`]: each collection as a fresh deployment holds
+    /// it — its declared `seed` rows or `[]` — never the project's `forge.db`.
+    /// `render_tier_b_inline` pre-seeds its registry with these so the Stream-B
+    /// pre-render renders the page's shape instead of the `b"null"`
+    /// placeholder. Empty unless the `forge` feature is on and the app declares
+    /// collections.
     forge_topic_seeds: Vec<(String, Vec<u8>)>,
     /// Tier-A renders that failed, in the order they were attempted.
     ///
@@ -1401,10 +1402,11 @@ impl<'a> ManifestBuilder<'a> {
         let slot_store = Arc::new(SlotStore::new());
         let slots = SessionSlotView::new(session, slot_store);
         let broadcast = BroadcastRegistry::new();
-        // FORGE — pre-seed the topics the substrate materialised at build
-        // start, so a `useSharedSlot` read during this pre-render sees the
-        // persisted rows rather than the empty placeholder. No-op when the
-        // seed list is empty (non-forge builds, or no `forge.db`).
+        // FORGE — pre-seed each topic with what a fresh deployment holds (its
+        // declared `seed` rows, or `[]`), so a `useSharedSlot` read during this
+        // pre-render sees a collection rather than the empty placeholder. Never
+        // the project's own rows — see `materialize_forge_seeds`. No-op when the
+        // seed list is empty (non-forge builds, or no collections).
         for (topic, bytes) in &self.forge_topic_seeds {
             broadcast.topic(topic.as_str(), bytes.clone());
         }
@@ -1585,75 +1587,13 @@ impl<'a> ManifestBuilder<'a> {
         component: &Component,
         props: &Value,
     ) -> Result<String, String> {
-
-        // Phase P · Stream E.3 — route the Tier-A static render
-        // through the CompiledProject path (with hook_compile off)
-        // so `styles.foo` resolves to the scoped class name via the
-        // CSS-module registry installed by `render_entry_with_bindings`.
-        // Falls back to the legacy static ComponentProject when no
-        // compiled project is available (test fixtures, etc.).
-        // The first real error wins. A component that fails on the compiled
-        // path and is then merely *absent* from the Phase J project should
-        // report why it failed, not that a fallback could not find it.
-        let mut first_error: Option<String> = None;
-
-        if let Some(compiled) = self.compiled_render_project.as_ref() {
-            match self.component_entry_for_project(component, compiled.root.as_path()) {
-                Some(entry) => {
-                    let session = SessionId::random();
-                    let slot_store = Arc::new(SlotStore::new());
-                    let slots = SessionSlotView::new(session, slot_store);
-                    let opts = RenderOptions {
-                        hook_compile: false,
-                    };
-                    match render_entry_with_bindings(
-                        &compiled.project,
-                        entry.as_str(),
-                        props,
-                        &slots,
-                        &opts,
-                    ) {
-                        Ok(output) if !output.html.trim().is_empty() => return Ok(output.html),
-                        // Empty output is not a failure — a component may render
-                        // nothing. Fall through to the Phase J project, which is
-                        // what this path has always done.
-                        Ok(_) => {}
-                        Err(error) => first_error = Some(error.to_string()),
-                    }
-                }
-                None => {
-                    first_error = Some(format!(
-                        "'{}' is not under the compiled render root '{}'",
-                        component.file_path,
-                        compiled.root.display()
-                    ));
-                }
-            }
-        }
-
-        let Some(render_project) = self.static_render_project.as_ref() else {
-            return Err(first_error
-                .unwrap_or_else(|| "no static render project was built".to_string()));
-        };
-        let Some(entry) = self.component_entry_for_project(component, render_project.root.as_path())
-        else {
-            return Err(first_error.unwrap_or_else(|| {
-                format!(
-                    "'{}' is not under the static render root '{}'",
-                    component.file_path,
-                    render_project.root.display()
-                )
-            }));
-        };
-        match render_project
-            .project
-            .render_entry(entry.as_str(), props)
-        {
-            // Empty is allowed here too, and is returned as-is: both paths ran
-            // without raising, so this component genuinely renders to nothing.
-            Ok(html) => Ok(html),
-            Err(error) => Err(first_error.unwrap_or_else(|| error.to_string())),
-        }
+        render_tier_a_html(
+            self.compiled_render_project.as_ref(),
+            self.static_render_project.as_ref(),
+            self.resolve_component_path(component.file_path.as_str()).as_deref(),
+            component.file_path.as_str(),
+            props,
+        )
     }
 
     /// A Tier-A render that failed, made **named and invisible** rather than
@@ -1872,16 +1812,29 @@ impl<'a> ManifestBuilder<'a> {
     }
 }
 
-/// FORGE — materialise the shared-slot seeds from `forge.db` at the project
-/// root, at build time, so the Stream-B pre-render bakes persisted rows into
-/// Tier-B HTML. Runs on a dedicated thread with its own current-thread runtime:
-/// `albedo build` drives the manifest build synchronously, but dev hot-reload
-/// rebuilds from *inside* the serve runtime, where a bare `block_on` would
-/// panic. Any failure (no `forge.db`, open/query error) degrades to an empty
-/// seed set, leaving non-FORGE behaviour unchanged.
+/// FORGE — materialise the shared-slot values the Stream-B pre-render bakes
+/// into Tier-B HTML: **what a fresh deployment of this source would hold** —
+/// the declared schema and its `seed` rows, in a throwaway database.
+///
+/// 🔴 This read the project's own `forge.db` until 2026-10-30. Whatever rows sat
+/// on the machine that ran the build were baked into `initial_html`, written
+/// into `.albedo/dist`, packed by `albedo ship` into the binary or image, and
+/// seeded into the shell a visitor reached over WebTransport received
+/// (`seed_tier_b_placeholders`; that path paints nothing per request, so the
+/// build's HTML is what fills the hole). A developer's test rows on a laptop;
+/// production rows on a build box beside production. A build is a function of
+/// the source — the database it happens to sit next to is not an input.
+/// Pinned by `crates/albedo-server/tests/build_artifact_local_data.rs`.
+///
+/// Reading no project database also means creating none: `forge.db` is made by
+/// whatever serves the app, with the schema that serves it.
+///
+/// Runs on a dedicated thread with its own current-thread runtime: `albedo
+/// build` drives the manifest build synchronously, but dev hot-reload rebuilds
+/// from *inside* the serve runtime, where a bare `block_on` would panic. Any
+/// failure degrades to an empty seed set, leaving non-FORGE behaviour unchanged.
 #[cfg(feature = "forge")]
 fn materialize_forge_seeds(working_dir: Option<&std::path::Path>) -> Vec<(String, Vec<u8>)> {
-    let db_path = working_dir.map_or_else(|| PathBuf::from("forge.db"), |dir| dir.join("forge.db"));
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -1892,28 +1845,14 @@ fn materialize_forge_seeds(working_dir: Option<&std::path::Path>) -> Vec<(String
                     return Vec::new();
                 };
                 runtime.block_on(async {
-                    let Ok(substrate) =
-                        crate::forge::LibSqlSubstrate::open_local(&db_path).await
-                    else {
-                        return Vec::new();
-                    };
-                    // The app's declared collections, or the built-in default
-                    // when it declares none — **the same choice
-                    // `boot_production_server` makes**, and it has to be.
-                    //
-                    // This bake runs before the serve boot and *creates*
-                    // `forge.db` when it is absent, so a schema that disagrees
-                    // with the serve path's does not merely bake stale seeds:
-                    // it creates the wrong table, and every later boot is
-                    // measured against it. Until item 6 this was pinned to
-                    // `guestbook_default()` with a comment promising to change
-                    // "when app-declared schemas land (Phase 2)" — they landed,
-                    // this did not follow, and the result was that an app
-                    // declaring its own `guestbook` with any extra field could
-                    // never start: the build recreated the two-column default,
-                    // then the boot refused against it. It read as the drift
-                    // check being broken; the drift check was the only reason
-                    // anyone could see it at all.
+                    // The app's declared collections, or none — **the same
+                    // choice `boot_production_server` makes**. When this baked
+                    // the project's `forge.db` it also *created* it, and a
+                    // schema that disagreed with the serve path's (pinned to
+                    // `guestbook_default()` until item 6) made apps that
+                    // declared their own `guestbook` unbootable. The database
+                    // is throwaway now, but the bake must still be what that
+                    // app serves on first boot, so the schema is still theirs.
                     let declarations = crate::dev::contract::load_forge_declarations(
                         working_dir.unwrap_or_else(|| std::path::Path::new(".")),
                     )
@@ -1928,6 +1867,21 @@ fn materialize_forge_seeds(working_dir: Option<&std::path::Path>) -> Vec<(String
                             // lets that be the message the author sees.
                             Err(_) => return Vec::new(),
                         }
+                    };
+                    // No collections, nothing to bake — and no database opened.
+                    // Most builds (every app without a `forge` block, most test
+                    // fixtures) end here, which keeps a libSQL open and teardown
+                    // off the build path: several alive at once is what the
+                    // STATUS_ACCESS_VIOLATION teardown crash needs.
+                    if schema.is_empty() {
+                        return Vec::new();
+                    }
+                    // A fresh database, deleted when this returns: the bake
+                    // sees exactly the declared `seed` rows `bootstrap_schema`
+                    // writes into an empty table, and nothing else.
+                    let Ok(substrate) = crate::forge::LibSqlSubstrate::open_ephemeral().await
+                    else {
+                        return Vec::new();
                     };
                     if crate::forge::skeleton::bootstrap_schema(&substrate, &schema)
                         .await
@@ -2038,9 +1992,18 @@ fn build_static_render_project(
     components: &HashMap<ComponentId, Component>,
     working_dir: Option<&Path>,
 ) -> Option<StaticRenderProject> {
-    let mut module_files = components
+    let module_files = components
         .values()
         .filter_map(|component| resolve_component_path(component.file_path.as_str(), working_dir))
+        .collect::<Vec<_>>();
+    static_render_project_for_files(module_files)
+}
+
+/// The Phase J render project over a set of component files: rooted at their
+/// common ancestor, which is what the entries it renders are relative to.
+fn static_render_project_for_files(module_files: Vec<PathBuf>) -> Option<StaticRenderProject> {
+    let mut module_files = module_files
+        .into_iter()
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();
 
@@ -2081,6 +2044,130 @@ fn resolve_component_path(file_path: &str, working_dir: Option<&Path>) -> Option
         Some(path)
     } else {
         working_dir.map(|cwd| cwd.join(path))
+    }
+}
+
+/// Render one Tier-A component to the HTML a page bakes for it.
+///
+/// **The one Tier-A renderer.** The build calls it for every Tier-A component
+/// it bakes into a page, and `albedo test`'s `render()` calls it for a Tier-A
+/// component under test, so a component test asserts against the markup a
+/// visitor gets and not a look-alike. A second copy of this ladder is how the
+/// two would drift.
+///
+/// `absolute` is the component's file on disk; `label` is how an error names it.
+fn render_tier_a_html(
+    compiled: Option<&CompiledRenderProject>,
+    static_project: Option<&StaticRenderProject>,
+    absolute: Option<&Path>,
+    label: &str,
+    props: &Value,
+) -> Result<String, String> {
+    let entry_under = |root: &Path| -> Option<String> {
+        let relative = absolute?.strip_prefix(root).ok()?;
+        Some(relative.to_string_lossy().replace('\\', "/"))
+    };
+
+    // Phase P · Stream E.3 — route the Tier-A static render
+    // through the CompiledProject path (with hook_compile off)
+    // so `styles.foo` resolves to the scoped class name via the
+    // CSS-module registry installed by `render_entry_with_bindings`.
+    // Falls back to the legacy static ComponentProject when no
+    // compiled project is available (test fixtures, etc.).
+    // The first real error wins. A component that fails on the compiled
+    // path and is then merely *absent* from the Phase J project should
+    // report why it failed, not that a fallback could not find it.
+    let mut first_error: Option<String> = None;
+
+    if let Some(compiled) = compiled {
+        match entry_under(compiled.root.as_path()) {
+            Some(entry) => {
+                let session = SessionId::random();
+                let slot_store = Arc::new(SlotStore::new());
+                let slots = SessionSlotView::new(session, slot_store);
+                let opts = RenderOptions {
+                    hook_compile: false,
+                };
+                match render_entry_with_bindings(
+                    &compiled.project,
+                    entry.as_str(),
+                    props,
+                    &slots,
+                    &opts,
+                ) {
+                    Ok(output) if !output.html.trim().is_empty() => return Ok(output.html),
+                    // Empty output is not a failure — a component may render
+                    // nothing. Fall through to the Phase J project, which is
+                    // what this path has always done.
+                    Ok(_) => {}
+                    Err(error) => first_error = Some(error.to_string()),
+                }
+            }
+            None => {
+                first_error = Some(format!(
+                    "'{label}' is not under the compiled render root '{}'",
+                    compiled.root.display()
+                ));
+            }
+        }
+    }
+
+    let Some(render_project) = static_project else {
+        return Err(first_error.unwrap_or_else(|| "no static render project was built".to_string()));
+    };
+    let Some(entry) = entry_under(render_project.root.as_path()) else {
+        return Err(first_error.unwrap_or_else(|| {
+            format!(
+                "'{label}' is not under the static render root '{}'",
+                render_project.root.display()
+            )
+        }));
+    };
+    match render_project.project.render_entry(entry.as_str(), props) {
+        // Empty is allowed here too, and is returned as-is: both paths ran
+        // without raising, so this component genuinely renders to nothing.
+        Ok(html) => Ok(html),
+        Err(error) => Err(first_error.unwrap_or_else(|| error.to_string())),
+    }
+}
+
+/// The build's Tier-A renderer, held by something other than the build.
+///
+/// `albedo test` renders Tier-A components with this so `render(<Card />)`
+/// produces what a page bakes for `<Card />`. It is assembled from the same
+/// helpers [`ManifestBuilder`] uses ([`build_static_render_project`],
+/// [`build_compiled_render_project`]) over the same set of files, and renders
+/// through [`render_tier_a_html`], the function the build itself calls.
+pub struct TierARenderer {
+    static_project: Option<StaticRenderProject>,
+    compiled: Option<CompiledRenderProject>,
+}
+
+impl TierARenderer {
+    /// Load the render projects over `component_files` — absolute paths, the
+    /// component set a build scanned.
+    #[must_use]
+    pub fn load(component_files: &[PathBuf]) -> Self {
+        let static_project = static_render_project_for_files(component_files.to_vec());
+        let compiled = build_compiled_render_project(&static_project);
+        Self {
+            static_project,
+            compiled,
+        }
+    }
+
+    /// Render the default export of `file` with `props`.
+    ///
+    /// # Errors
+    /// The renderer's own reason, as the build would have recorded it.
+    pub fn render(&self, file: &Path, props: &Value) -> Result<String, String> {
+        render_tier_a_html(
+            self.compiled.as_ref(),
+            self.static_project.as_ref(),
+            Some(file),
+            file.to_string_lossy().as_ref(),
+            props,
+        )
     }
 }
 

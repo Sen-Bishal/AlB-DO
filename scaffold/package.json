@@ -7,6 +7,7 @@
     "dev": "albedo dev",
     "build": "albedo build",
     "ship": "albedo ship",
+    "test": "albedo test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {},

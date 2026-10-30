@@ -41,6 +41,8 @@ url.workspace                  = true
 # The `albedo` binary's global allocator — `src/bin/albedo.rs` has the numbers.
 mimalloc.workspace             = true
 uuid.workspace                 = true
+# `albedo test` gives each test file a throwaway `forge.db` in a temp dir.
+tempfile.workspace             = true
 quinn.workspace                = true
 rustls-pemfile.workspace       = true
 rustls.workspace               = true

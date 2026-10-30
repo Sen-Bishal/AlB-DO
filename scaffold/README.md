@@ -11,6 +11,7 @@ albedo dev      # live dev server with HMR + bakabox + /_albedo/action
 albedo build    # compile for production (gates on tier-budget.toml)
 albedo serve    # boot a real AlbedoServer against the built artefacts
 albedo budget   # standalone tier-budget gate (CI-friendly)
+albedo test     # run every *.test.tsx against the app's own server
 albedo ship     # package for deployment (docker / fly / static)
 ```
 
@@ -28,9 +29,11 @@ albedo ship     # package for deployment (docker / fly / static)
 │   │   ├── index.tsx       — `/`          landing
 │   │   ├── guestbook.tsx   — `/guestbook` live FORGE collection
 │   │   ├── sign-in.tsx     — `/sign-in`   accounts, from the `auth` block
+│   │   ├── *.test.tsx      — tests for the page beside them
 │   │   └── room/[id].tsx   — `/room/:id`  one live channel per room
 │   ├── components/
 │   │   ├── Hero.tsx        — Tier A · pure, static HTML
+│   │   ├── Hero.test.tsx   — component tests, run by `albedo test`
 │   │   └── Counter.tsx     — Tier C · a client island
 │   ├── albedo-env.d.ts     — ambient JSX + framework module types
 │   └── styles.css          — hand-crafted stylesheet (auto-bundled)
@@ -241,6 +244,44 @@ auto-bundled by AlBDO's dev pipeline. CSS modules work too — drop a
 `Card.module.css` next to a component and reference scoped classes via
 `styles.card`. The build injects scoped CSS into each route's `<style>`
 block automatically.
+
+## Testing
+
+`albedo test` runs every `*.test.tsx` (or `.ts`, `.jsx`, `.js`, `.spec.*`)
+in the project. There is nothing to install — the runner is in `albedo`.
+
+```tsx
+import { test, expect, render, visit, signUp } from "albedo/test";
+import Card from "./Card";
+
+test("a card shows its title", () => {
+  expect(render(<Card title="Payroll" />)).toContain("Payroll");
+});
+
+test("signing the guestbook adds a row", () => {
+  const page = visit("/guestbook").submit("sign_guestbook", {
+    author: "Ada",
+    message: "hi",
+  });
+  expect(page.findAll(".ledger .row")).toHaveLength(1);
+});
+```
+
+- `render(<Card />)` renders one component with the renderer the app uses
+  for its tier, so you test the markup a visitor gets. Props are data;
+  `{ shared, state }` seed `useSharedSlot` topics and `useState` hooks.
+- `visit(path)` asks the app's own server for a page, as a browser would;
+  `page.submit(action, fields)` posts one of its forms. `signUp`, `signIn`
+  and `visit(path, { as: user })` test anything behind a session — route
+  gates and `src/middleware.ts` included.
+- Each file gets a fresh server and a throwaway database seeded from
+  `albedo.config.ts`. Your `forge.db` is never opened, and email goes to
+  `.albedo/outbox/`, never to a real provider.
+- `albedo test --filter <text>` runs the tests whose name contains it. A
+  failure, or a run where nothing ran, exits non-zero — CI-ready.
+
+Interactions that need JavaScript in the browser (a click on an island) are
+for a browser runner such as Playwright against `albedo serve`.
 
 ## Next steps
 

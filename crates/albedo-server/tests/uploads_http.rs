@@ -109,6 +109,7 @@ async fn stored_bytes_are_reachable_and_the_guards_hold() {
         redirects: Vec::new(),
         webhooks: Default::default(),
         tls: Default::default(),
+        forge_db: None,
     };
 
     let server = boot_production_server(&opts).expect("boots with an uploads block");

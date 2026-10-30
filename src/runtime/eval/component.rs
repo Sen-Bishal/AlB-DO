@@ -13,6 +13,12 @@ pub fn is_component_module(path: &Path) -> bool {
     if name.ends_with(".d.ts") || name.ends_with(".d.tsx") {
         return false;
     }
+    // `card.test.tsx` is run by `albedo test`, never rendered — see
+    // `crate::testing::is_test_module`, which the scanner and route discovery
+    // read too.
+    if crate::testing::is_test_module(path) {
+        return false;
+    }
     // A Markdown page is loaded as the JSX module it lowers to — see
     // `crate::markdown::read_module_source`, which every loader reads through.
     if crate::markdown::is_markdown_page(path) {

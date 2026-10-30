@@ -69,6 +69,7 @@ pub mod routing;
 pub mod server;
 pub mod shutter;
 pub mod static_export;
+pub mod test_runner;
 pub mod uploads;
 pub mod timing;
 pub mod tls;

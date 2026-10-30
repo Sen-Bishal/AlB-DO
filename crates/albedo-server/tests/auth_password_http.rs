@@ -301,6 +301,7 @@ async fn a_stranger_signs_up_signs_in_and_signs_out_over_http() {
             ..Default::default()
         },
         tls: Default::default(),
+        forge_db: None,
     };
 
     let server = boot_production_server(&opts).expect("server boots with a password provider");
