@@ -144,10 +144,17 @@ impl AuthRuntime {
         let hash = token.hash();
 
         match store::resolve_session(self.substrate.as_ref(), &token, now_ms()).await {
-            Ok(Resolved::Principal(principal)) => Identity::Authenticated {
-                principal,
-                token: hash,
-            },
+            Ok(Resolved::Principal(mut principal)) => {
+                // R1a · only declared roles count. The store returns every
+                // granted row; a role the config no longer names is inert here
+                // rather than deleted, so a config edit can narrow access but
+                // never destroy a grant.
+                principal.retain_declared_roles(&self.registry.roles);
+                Identity::Authenticated {
+                    principal,
+                    token: hash,
+                }
+            }
             Ok(Resolved::Anonymous(reason)) => {
                 tracing::debug!(target: "albedo.auth", %reason, "request is anonymous");
                 Identity::Anonymous

@@ -68,6 +68,10 @@ const POOL_WARMUP_RENDERS: u32 = 10;
 /// the rest are cheap confirmation that the now-warm path is stable.
 const RENDER_WARMUP_REPS: u32 = 2;
 
+/// Recovery executes app registrations too; it must not strand a worker when
+/// no request deadline is configured, or when a job has a much longer budget.
+const ENGINE_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long an engine thread under load keeps polling its channel after a job
 /// before it parks.
 ///
@@ -108,7 +112,14 @@ pub struct WarmupComponent {
 ///
 /// Type-erased to a single signature so heterogeneous return types `R` all flow
 /// through the same channel; the `R` is captured inside the boxed closure.
-type Job = Box<dyn FnOnce(&mut QuickJsEngine) + Send + 'static>;
+type Job = Box<dyn FnOnce(&mut QuickJsEngine) -> JobOutcome + Send + 'static>;
+
+/// A failed reset is not an ordinary job error: its rolled-back realm still
+/// contains request state. Only a fresh, provisioned engine may serve again.
+enum JobOutcome {
+    Reuse,
+    Replace,
+}
 
 /// Errors surfaced by [`QuickJsEnginePool::with_engine`].
 #[derive(Debug, thiserror::Error)]
@@ -288,7 +299,7 @@ impl QuickJsEnginePool {
             .saturating_sub(self.permits.available_permits())
     }
 
-    /// How many engines have been replaced because a job panicked on them.
+    /// How many engines have been replaced after a panic or failed confinement.
     #[must_use]
     pub fn replacements(&self) -> u64 {
         self.replacements.load(Ordering::Relaxed)
@@ -391,7 +402,7 @@ impl QuickJsEnginePool {
             // timeout. Nothing is waiting for the value and a caller applies a
             // job's effects only after receiving it, so running it is pure cost.
             if result_tx.is_closed() {
-                return;
+                return JobOutcome::Reuse;
             }
             engine.set_deadline(budget.map(|budget| std::time::Instant::now() + budget));
             let value = f(engine);
@@ -438,22 +449,24 @@ impl QuickJsEnginePool {
             // nothing.
             if interrupted || (confine && engine.third_party_code_ran()) {
                 confinements.fetch_add(1, Ordering::Relaxed);
-                if let Err(err) = engine.confine() {
+                // 🔴 Replay used to run without a deadline, then log a failure
+                // and reuse the rollback context, leaking the prior request.
+                let replay_budget = budget
+                    .unwrap_or(ENGINE_MAINTENANCE_TIMEOUT)
+                    .min(ENGINE_MAINTENANCE_TIMEOUT);
+                engine.set_deadline(Some(Instant::now() + replay_budget));
+                let reset = engine.confine();
+                engine.set_deadline(None);
+                engine.take_interrupted();
+                if let Err(err) = reset {
                     failures.fetch_add(1, Ordering::Relaxed);
-                    // Loud, and not swallowed: this engine's realm is now
-                    // missing modules, so the next render on it fails with a
-                    // missing-module error that names a package rather than
-                    // this. `project_silent_island_death` is the precedent —
-                    // a failure nobody can hear is a failure that gets
-                    // rediscovered from the symptom.
-                    tracing::error!(
-                        target: "albedo.sandgate",
-                        error = %err,
-                        "rebuilding the sandbox failed; this engine's realm is incompletely \
-                         populated and the next render on it will fail"
+                    eprintln!(
+                        "albedo: rebuilding the sandbox failed ({err}); replacing the engine"
                     );
+                    return JobOutcome::Replace;
                 }
             }
+            JobOutcome::Reuse
         });
 
         // Ship the job. A send can only fail when the worker's thread is gone —
@@ -555,6 +568,7 @@ impl QuickJsEnginePool {
             let job: Job = Box::new(move |engine: &mut QuickJsEngine| {
                 warm_render_targets(engine, &components);
                 let _ = done_tx.send(());
+                JobOutcome::Reuse
             });
             // If a worker is gone its result never arrives; skip it.
             if worker.job_tx.send(job).is_ok() {
@@ -624,6 +638,7 @@ impl QuickJsEnginePool {
             let artifacts = artifacts.to_vec();
             let job: Job = Box::new(move |engine: &mut QuickJsEngine| {
                 let _ = done_tx.send(register_npm_artifacts(engine, &artifacts));
+                JobOutcome::Reuse
             });
             if worker.job_tx.send(job).is_ok() {
                 dones.push(done_rx);
@@ -718,9 +733,20 @@ fn provisioned_engine(provision: &Mutex<Provision>) -> QuickJsEngine {
         (provision.npm.clone(), provision.warm.clone())
     };
     let mut engine = QuickJsEngine::new();
+    engine.set_deadline(Some(Instant::now() + ENGINE_MAINTENANCE_TIMEOUT));
     warm_engine(&mut engine);
-    register_npm_artifacts(&mut engine, &npm);
+    // A fresh but incompletely provisioned engine is not a valid replacement.
+    assert_eq!(
+        register_npm_artifacts(&mut engine, &npm),
+        0,
+        "replacement engine could not register the pool's npm bundles"
+    );
     warm_render_targets(&mut engine, &warm);
+    assert!(
+        !engine.take_interrupted(),
+        "replacement engine provisioning timed out"
+    );
+    engine.set_deadline(None);
     engine
 }
 
@@ -773,41 +799,47 @@ fn engine_worker_loop(
         // `WorkerLost` for the life of the process. The job's own caller still
         // gets that error — its result sender unwound with the closure — but the
         // slot gets a new engine.
-        if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| job(&mut engine))) {
-            let reason = payload
-                .downcast_ref::<&str>()
-                .map(|reason| (*reason).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "a non-string panic payload".to_string());
-            eprintln!(
-                "albedo: a job panicked on a QuickJS engine ({reason}); replacing the engine"
-            );
-            // Leaked, not dropped. The panic unwound through code that was
-            // holding the runtime, and freeing a QuickJS runtime in a state we
-            // cannot vouch for can trip its internal assertions and abort the
-            // process — trading one failed request for all of them. A leak costs
-            // one engine's memory per panic; a panic is a bug, and rare.
-            match std::panic::catch_unwind(AssertUnwindSafe(|| provisioned_engine(provision))) {
-                Ok(fresh) => {
-                    std::mem::forget(std::mem::replace(&mut engine, fresh));
-                    replacements.fetch_add(1, Ordering::Relaxed);
+        let panicked = match std::panic::catch_unwind(AssertUnwindSafe(|| job(&mut engine))) {
+            Ok(JobOutcome::Reuse) => {
+                finished = Instant::now();
+                continue;
+            }
+            Ok(JobOutcome::Replace) => false,
+            Err(payload) => {
+                let reason = payload
+                    .downcast_ref::<&str>()
+                    .map(|reason| (*reason).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a non-string panic payload".to_string());
+                eprintln!(
+                    "albedo: a job panicked on a QuickJS engine ({reason}); replacing the engine"
+                );
+                true
+            }
+        };
+        match std::panic::catch_unwind(AssertUnwindSafe(|| provisioned_engine(provision))) {
+            Ok(fresh) => {
+                let previous = std::mem::replace(&mut engine, fresh);
+                if panicked {
+                    // A panic may have unwound through inconsistent runtime
+                    // state; dropping that runtime can abort the process.
+                    std::mem::forget(previous);
+                } else {
+                    // A returned replay error leaves a valid, dirty context.
+                    // Reclaim it rather than leaking on every reset failure.
+                    drop(previous);
                 }
-                Err(_) => {
-                    // Replacing the engine panicked too, so this thread has no
-                    // engine to serve with. It ends, and the pool retires the
-                    // slot the next time a checkout finds its channel closed.
-                    //
-                    // 🪤 Caught for one reason only, and it is not observable in
-                    // a test: without the catch the thread still ends, but by
-                    // unwinding — which would DROP the suspect engine, the thing
-                    // the leak above exists to avoid.
-                    eprintln!(
-                        "albedo: replacing the engine panicked as well; this engine thread is \
-                         stopping and its pool slot will be retired"
-                    );
+                replacements.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                eprintln!(
+                    "albedo: replacing the engine failed; this engine thread is \
+                     stopping and its pool slot will be retired"
+                );
+                if panicked {
                     std::mem::forget(engine);
-                    return;
                 }
+                return;
             }
         }
         finished = Instant::now();
@@ -1212,6 +1244,141 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
 
         assert_eq!(a, 1);
         assert_eq!(b, 1);
+    }
+
+    fn install_failed_replay(engine: &mut QuickJsEngine) {
+        use dom_render_compiler::runtime::engine::RuntimeEngine;
+        engine
+            .load_module(
+                "dirty.tsx",
+                r#"
+            export default function Dirty() {
+                globalThis.request_marker = 'PRIVATE';
+                return <p>first request</p>;
+            }
+        "#,
+            )
+            .unwrap();
+        engine.render_component("dirty.tsx", "{}").unwrap();
+        // Valid in this request; throws when replayed into a clean realm.
+        engine
+            .load_precompiled_module(
+                "npm:replay-fault",
+                r#"
+            if (!globalThis.request_marker) throw new Error('replay failed');
+            globalThis.__albedo_sealed.markThirdPartyRan();
+        "#,
+                998123,
+            )
+            .unwrap();
+    }
+
+    /// A failed replay rolls back to the dirty context. It must never be
+    /// handed to another request, even though the first result already left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_confinement_replaces_the_dirty_engine() {
+        use dom_render_compiler::runtime::engine::RuntimeEngine;
+
+        let pool = QuickJsEnginePool::with_size(1);
+        assert_eq!(pool.install_npm_bundles(&fake_npm_artifacts()), 0);
+        pool.with_engine(install_failed_replay).await.unwrap();
+
+        let (html, npm_loaded) = pool
+            .with_engine(|engine| {
+                engine
+                    .load_module(
+                        "clean.tsx",
+                        r#"
+                export default function Clean() {
+                    return <p>{globalThis.request_marker || 'CLEAN'}</p>;
+                }
+            "#,
+                    )
+                    .unwrap();
+                let html = engine.render_component("clean.tsx", "{}").unwrap().html;
+                let npm_loaded = engine.load_module("alias.tsx", ALIAS_PROBE).is_ok();
+                (html, npm_loaded)
+            })
+            .await
+            .unwrap();
+        assert!(
+            html.contains("CLEAN") && !html.contains("PRIVATE"),
+            "{html}"
+        );
+        assert!(npm_loaded, "replacement lost the pool's npm registrations");
+        assert_eq!(pool.confinement_counts().1, 1);
+        assert_eq!(pool.replacements(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_confinement_with_broken_provisioning_retires_the_slot() {
+        let pool = QuickJsEnginePool::with_size(1);
+        // Recovery must not accept an engine missing the pool's registrations.
+        lock_provision(&pool.provision).npm = vec![(
+            "npm:broken-replacement".into(),
+            "throw new Error('replacement registration failed');".into(),
+            998125,
+        )];
+        pool.with_engine(install_failed_replay).await.unwrap();
+        pool.exited_workers(1).await;
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            pool.with_engine(|engine| engine.is_initialized()),
+        )
+        .await
+        .expect("exhausted pool hung its caller");
+        assert!(matches!(next, Err(EnginePoolError::Exhausted)), "{next:?}");
+        assert_eq!(pool.confinement_counts().1, 1);
+        assert_eq!(pool.live_engines(), 0);
+    }
+
+    /// Resetting a sandbox executes registration code too. Request deadlines
+    /// must also bound that replay, or one registration can strand a worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn confinement_replay_has_a_deadline() {
+        use dom_render_compiler::runtime::engine::RuntimeEngine;
+
+        let pool = QuickJsEnginePool::with_size(1).with_job_budget(Duration::from_millis(40));
+        pool.with_engine(|engine| {
+            engine
+                .load_module(
+                    "marker.tsx",
+                    r#"
+                export default function Marker() {
+                    globalThis.request_marker = 'PRIVATE';
+                    return <p>ready</p>;
+                }
+            "#,
+                )
+                .unwrap();
+            engine.render_component("marker.tsx", "{}").unwrap();
+            engine
+                .load_precompiled_module(
+                    "npm:slow-replay",
+                    r#"
+                if (!globalThis.request_marker) {
+                    const until = Date.now() + 400;
+                    while (Date.now() < until) {}
+                }
+                globalThis.__albedo_sealed.markThirdPartyRan();
+            "#,
+                    998124,
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        // Queued after confinement, so this also waits for its outcome.
+        assert!(pool
+            .with_engine(|engine| engine.is_initialized())
+            .await
+            .unwrap());
+        assert_eq!(
+            pool.confinement_counts().1,
+            1,
+            "unbounded replay was accepted"
+        );
+        assert_eq!(pool.replacements(), 1);
     }
 
     /// 🔴 A job that panics must cost that job, not the engine.

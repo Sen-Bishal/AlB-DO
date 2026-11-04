@@ -407,6 +407,11 @@ declare module "albedo" {
     // disconnect by POSTing `provider` to `/_albedo/auth/unlink`; the last
     // way in cannot be disconnected.
     readonly providers: readonly string[];
+    // The roles this person holds — only ones `auth.roles` declares, granted
+    // with `albedo roles grant <email> <role>`. Empty, never missing, so
+    // `user.roles.includes("admin")` is always safe. Gate a whole route with
+    // `export const auth = { role: "admin" }`.
+    readonly roles: readonly string[];
   }
 
   // What every action handler receives. `user` is `null` for an anonymous

@@ -216,8 +216,8 @@ pub struct EmailRuntime {
     /// from configuration — fine for an app that only calls `sendEmail()`,
     /// fatal at boot for one whose auth flows mail links.
     link_origin: Option<String>,
-    /// Project root; uploaded attachments are read from under it.
-    project_dir: PathBuf,
+    /// The data directory; uploaded attachments are read from under it.
+    data_dir: PathBuf,
     inflight: Arc<Inflight>,
 }
 
@@ -252,13 +252,13 @@ impl EmailRuntime {
         config: EmailConfig,
         mailer: Arc<dyn Mailer>,
         link_origin: Option<String>,
-        project_dir: PathBuf,
+        data_dir: PathBuf,
     ) -> Self {
         Self {
             config,
             mailer,
             link_origin,
-            project_dir,
+            data_dir,
             inflight: Arc::new(Inflight::default()),
         }
     }
@@ -346,7 +346,7 @@ impl EmailRuntime {
         if let Err(err) = queued.message.validate() {
             return SendOutcome::Reject(format!("the queued message is invalid: {err}"));
         }
-        let files = match resolve_attachments(db, &self.project_dir, principal, &queued.message).await
+        let files = match resolve_attachments(db, &self.data_dir, principal, &queued.message).await
         {
             Ok(files) => files,
             Err(outcome) => return outcome,
@@ -396,23 +396,29 @@ async fn owned_upload(
     principal: Option<&str>,
     id: &str,
 ) -> Result<dom_render_compiler::upload::store::StoredUpload, String> {
-    let stored = dom_render_compiler::upload::store::lookup(db, id)
+    // Every record of these bytes, and the sender's own among them: two people
+    // may have uploaded the same file, and each owns their own record of it.
+    let records = dom_render_compiler::upload::store::records(db, id)
         .await
-        .map_err(|err| format!("attachment `{id}`: {err}"))?
-        .ok_or_else(|| format!("attachment `{id}` is not a stored upload"))?;
-    if stored.principal.as_deref() != principal {
-        return Err(format!(
-            "attachment `{id}` belongs to a different user than the one this email is sent for"
-        ));
+        .map_err(|err| format!("attachment `{id}`: {err}"))?;
+    if records.is_empty() {
+        return Err(format!("attachment `{id}` is not a stored upload"));
     }
-    Ok(stored)
+    records
+        .into_iter()
+        .find(|record| record.principal.as_deref() == principal)
+        .ok_or_else(|| {
+            format!(
+                "attachment `{id}` belongs to a different user than the one this email is sent for"
+            )
+        })
 }
 
 /// Read every attachment's bytes. A missing or foreign upload is permanent; a
 /// read error is retried.
 async fn resolve_attachments(
     db: &dyn DataSubstrate,
-    project_dir: &std::path::Path,
+    data_dir: &std::path::Path,
     principal: Option<&str>,
     message: &Message,
 ) -> Result<Vec<ResolvedAttachment>, SendOutcome> {
@@ -435,7 +441,7 @@ async fn resolve_attachments(
                 let stored = owned_upload(db, principal, id)
                     .await
                     .map_err(SendOutcome::Reject)?;
-                let path = dom_render_compiler::upload::store::path_for(project_dir, id)
+                let path = dom_render_compiler::upload::store::path_for(data_dir, id)
                     .map_err(|err| SendOutcome::Reject(err.to_string()))?;
                 let bytes = match tokio::fs::read(&path).await {
                     Ok(bytes) => bytes,

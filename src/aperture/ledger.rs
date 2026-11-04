@@ -132,13 +132,36 @@ pub const DEFAULT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// spelling of the four operations the driver needs.
 pub struct JournalLedger<'a> {
     substrate: &'a dyn DataSubstrate,
+    claim: Option<&'a crate::aperture::admission::ActionClaim>,
 }
 
 impl<'a> JournalLedger<'a> {
     /// Wrap a substrate. Cheap — no I/O until something is asked of it.
     #[must_use]
     pub fn new(substrate: &'a dyn DataSubstrate) -> Self {
-        Self { substrate }
+        Self {
+            substrate,
+            claim: None,
+        }
+    }
+
+    /// Fence workflow journal mutations to the admitted attempt.
+    #[must_use]
+    pub const fn with_claim(mut self, claim: &'a crate::aperture::admission::ActionClaim) -> Self {
+        self.claim = Some(claim);
+        self
+    }
+
+    async fn execute(&self, sql: &str, params: &[SqlValue]) -> SubstrateResult<u64> {
+        if let Some(claim) = self.claim {
+            let tx = self.substrate.begin().await?;
+            claim.check(tx.as_ref(), crate::aperture::now_ms()).await?;
+            let affected = tx.execute(sql, params).await?;
+            tx.commit().await?;
+            Ok(affected)
+        } else {
+            self.substrate.execute(sql, params).await
+        }
     }
 
     /// Create the table if it is not there.
@@ -146,7 +169,11 @@ impl<'a> JournalLedger<'a> {
     /// # Errors
     /// Propagates the substrate's migration error.
     pub async fn migrate(&self) -> SubstrateResult<()> {
-        for ddl in DDL.iter().chain(RESULT_DDL.iter()) {
+        for ddl in DDL
+            .iter()
+            .chain(RESULT_DDL.iter())
+            .chain(std::iter::once(&crate::aperture::admission::DDL))
+        {
             self.substrate.migrate(ddl).await?;
         }
         Ok(())
@@ -173,23 +200,22 @@ impl<'a> JournalLedger<'a> {
         digest: &str,
         now_ms: i64,
     ) -> SubstrateResult<()> {
-        self.substrate
-            .execute(
-                "INSERT OR IGNORE INTO albedo_workflow_steps \
+        self.execute(
+            "INSERT OR IGNORE INTO albedo_workflow_steps \
                  (workflow, step, build_id, kind, digest, state, value, started_at, settled_at) \
                  VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)",
-                &[
-                    SqlValue::Text(workflow.to_string()),
-                    SqlValue::Integer(i64::from(index)),
-                    SqlValue::Text(build_id.to_string()),
-                    SqlValue::Text(kind.as_str().to_string()),
-                    SqlValue::Text(digest.to_string()),
-                    SqlValue::Text(STATE_UNKNOWN.to_string()),
-                    SqlValue::Integer(now_ms),
-                ],
-            )
-            .await
-            .map(|_| ())
+            &[
+                SqlValue::Text(workflow.to_string()),
+                SqlValue::Integer(i64::from(index)),
+                SqlValue::Text(build_id.to_string()),
+                SqlValue::Text(kind.as_str().to_string()),
+                SqlValue::Text(digest.to_string()),
+                SqlValue::Text(STATE_UNKNOWN.to_string()),
+                SqlValue::Integer(now_ms),
+            ],
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Record how step `index` ended.
@@ -220,20 +246,19 @@ impl<'a> JournalLedger<'a> {
             StepOutcome::Unknown => return Ok(()),
         };
 
-        self.substrate
-            .execute(
-                "UPDATE albedo_workflow_steps SET state = ?, value = ?, settled_at = ? \
+        self.execute(
+            "UPDATE albedo_workflow_steps SET state = ?, value = ?, settled_at = ? \
                  WHERE workflow = ? AND step = ? AND state = 'unknown'",
-                &[
-                    SqlValue::Text(state.to_string()),
-                    value,
-                    SqlValue::Integer(now_ms),
-                    SqlValue::Text(workflow.to_string()),
-                    SqlValue::Integer(i64::from(index)),
-                ],
-            )
-            .await
-            .map(|_| ())
+            &[
+                SqlValue::Text(state.to_string()),
+                value,
+                SqlValue::Integer(now_ms),
+                SqlValue::Text(workflow.to_string()),
+                SqlValue::Integer(i64::from(index)),
+            ],
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Rebuild a workflow's log from disk, or `None` when it has no rows.
@@ -326,24 +351,30 @@ impl<'a> JournalLedger<'a> {
     /// # Errors
     /// Propagates the substrate's write error.
     pub async fn sweep(&self, cutoff_ms: i64) -> SubstrateResult<u64> {
-        let steps = self
-            .substrate
-            .execute(
-                "DELETE FROM albedo_workflow_steps WHERE started_at < ?",
-                &[SqlValue::Integer(cutoff_ms)],
-            )
-            .await?;
-        // Both tables, in one call. A sweep that cleared the steps and left the
-        // results would leave the table this exists to bound growing anyway —
-        // and it is the one a caller is least likely to remember, because it is
-        // the one added second.
-        let results = self
-            .substrate
-            .execute(
-                "DELETE FROM albedo_workflow_results WHERE completed_at < ?",
-                &[SqlValue::Integer(cutoff_ms)],
-            )
-            .await?;
+        let tx = self.substrate.begin().await?;
+        // Active attempts retain their journal even if an operator supplies a
+        // cutoff newer than the usual retention window.
+        let steps = tx.execute(
+            "DELETE FROM albedo_workflow_steps WHERE started_at < ? AND workflow NOT IN \
+             (SELECT workflow FROM albedo_action_admissions WHERE completed_at IS NULL AND lease_until >= ?)",
+            &[cutoff_ms.into(), crate::aperture::now_ms().into()],
+        ).await?;
+        let results = tx.execute(
+            "DELETE FROM albedo_workflow_results WHERE completed_at < ? AND workflow NOT IN \
+             (SELECT workflow FROM albedo_action_admissions WHERE completed_at IS NULL AND lease_until > ?)",
+            &[cutoff_ms.into(), crate::aperture::now_ms().into()],
+        ).await?;
+        tx.execute(
+            "DELETE FROM albedo_action_admissions WHERE completed_at < ? \
+             OR (completed_at IS NULL AND lease_until < ? AND lease_until <= ?)",
+            &[
+                cutoff_ms.into(),
+                cutoff_ms.into(),
+                crate::aperture::now_ms().into(),
+            ],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(steps + results)
     }
 }
@@ -560,26 +591,8 @@ const RESULT_DDL: &[&str] = &[
 ];
 
 impl JournalLedger<'_> {
-    /// Record that a workflow finished, and what it answered.
-    ///
-    /// # 🔑 Why this is written AFTER the effects, never before
-    ///
-    /// A completing dispatch does two durable things: it applies the body's
-    /// FORGE writes, and it records this. They are not in one transaction —
-    /// `apply_writes` owns its own — so one of them is second, and which one
-    /// decides what a crash in between costs:
-    ///
-    /// * **result first** → a crash loses the writes and the retry is answered
-    ///   from the log, so the data is *silently gone*;
-    /// * **writes first** → a crash replays the body and re-applies them, so
-    ///   the data is *duplicated*.
-    ///
-    /// Duplication is recoverable and visible; silent loss is neither. And the
-    /// second option is not a regression, because re-applying is exactly what
-    /// happens today with no result table at all.
-    ///
-    /// `INSERT OR IGNORE`: two racing dispatches of one intention both finish,
-    /// and the first answer is the one already sent to somebody.
+    /// Record a standalone workflow result. Compiled actions instead use
+    /// `ActionClaim::complete` inside their effects transaction.
     ///
     /// # Errors
     /// Propagates the substrate's write error.

@@ -160,8 +160,10 @@ pub(crate) struct LiveRuntime {
 pub struct UploadRuntime {
     /// The lowered `uploads` block.
     pub registry: dom_render_compiler::upload::UploadRegistry,
-    /// Project root. Bytes land under `<project_dir>/uploads/`.
-    pub project_dir: std::path::PathBuf,
+    /// The data directory — the database's — so bytes land under
+    /// `<data_dir>/uploads/`, beside the records that point at them. See
+    /// [`crate::forge_db_path::data_dir_for`].
+    pub data_dir: std::path::PathBuf,
 }
 
 impl LiveRuntime {
@@ -232,10 +234,14 @@ impl LiveRuntime {
     /// Before boot installs a runtime, everybody is anonymous — which is the
     /// same answer an app with no declared providers gets, and the safe one.
     async fn identity(&self, headers: &axum::http::HeaderMap) -> crate::auth::Identity {
-        match self.auth.get() {
+        let identity = match self.auth.get() {
             Some(auth) => auth.resolve(headers).await,
             None => crate::auth::Identity::Anonymous,
-        }
+        };
+        // The one place a request learns who it is, so the access log reads
+        // the answer here instead of asking the database again.
+        crate::access_log::note_identity(&identity);
+        identity
     }
 
     /// The installed AUTH runtime, for the login flows that need to *write* a
@@ -555,9 +561,109 @@ impl ActionHandler for CompiledProjectActionAdapter {
 }
 
 impl CompiledProjectActionAdapter {
+    async fn complete_action(
+        &self,
+        ctx: &RequestContext,
+        instructions: &[dom_render_compiler::ir::opcode::Instruction],
+        writes: &[dom_render_compiler::forge::ForgeWrite],
+        queued: &[dom_render_compiler::jobs::EnqueueIntent],
+        claim: Option<&dom_render_compiler::aperture::admission::ActionClaim>,
+    ) -> Result<(), RuntimeError> {
+        use dom_render_compiler::ir::wire::WireEncode;
+        let error = |err: String| {
+            RuntimeError::RequestHandling(format!("action {}: {err}", self.action_id))
+        };
+        // Refuse a redirect before committing effects or recording its result.
+        let policy = self.live.redirects();
+        for instruction in instructions {
+            if let dom_render_compiler::ir::opcode::Instruction::Navigate { url } = instruction {
+                policy
+                    .check(url)
+                    .map_err(|reason| error(format!("redirect refused: {reason}")))?;
+            }
+        }
+        let Some(db) = self.live.forge_substrate.get() else {
+            if !writes.is_empty() || !queued.is_empty() {
+                return Err(error("durable effects need a FORGE substrate".to_string()));
+            }
+            return Ok(());
+        };
+        let claim = claim.ok_or_else(|| error("missing durable action admission".to_string()))?;
+        let mut jobs_to_write = Vec::with_capacity(queued.len());
+        for intent in queued {
+            let jobs = self
+                .live
+                .jobs()
+                .ok_or_else(|| error("enqueue() needs a job runner".to_string()))?;
+            jobs_to_write.push(
+                crate::jobs::prepare_enqueue(
+                    db.as_ref(),
+                    jobs,
+                    intent,
+                    ctx.principal.as_ref().map(ToString::to_string),
+                    crate::auth::now_ms(),
+                )
+                .await
+                .map_err(&error)?,
+            );
+        }
+        let bytes = instructions
+            .to_vec()
+            .wire_encode()
+            .map_err(|e| error(e.to_string()))?;
+        let tx = db.begin().await.map_err(|e| error(e.to_string()))?;
+        claim
+            .check(tx.as_ref(), dom_render_compiler::aperture::now_ms())
+            .await
+            .map_err(|e| error(e.to_string()))?;
+        let pending = dom_render_compiler::forge::write::apply_writes_in_transaction(
+            tx.as_ref(),
+            self.live.broadcast.as_ref(),
+            self.live.forge_schema.as_ref(),
+            writes,
+            ctx.principal.as_ref(),
+        )
+        .await
+        .map_err(|e| error(e.to_string()))?;
+        for job in &jobs_to_write {
+            dom_render_compiler::jobs::queue::enqueue_in_transaction(tx.as_ref(), job)
+                .await
+                .map_err(|e| error(e.to_string()))?;
+        }
+        claim
+            .complete(tx.as_ref(), &bytes, dom_render_compiler::aperture::now_ms())
+            .await
+            .map_err(|e| error(e.to_string()))?;
+        tx.commit().await.map_err(|e| error(e.to_string()))?;
+        if !queued.is_empty() {
+            if let Some(jobs) = self.live.jobs() {
+                jobs.wake();
+            }
+        }
+        // Publication is a cache update after the durable commit. A projection
+        // failure cannot turn committed effects into a failed/re-executed intent.
+        let projector = self.live.projector();
+        match pending
+            .publish(
+                db.as_ref(),
+                self.live.broadcast.as_ref(),
+                projector.as_deref(),
+            )
+            .await
+        {
+            Ok(fan_out) => crate::shutter::note_fan_out(fan_out.subscribers),
+            Err(err) => tracing::warn!(action_id = self.action_id, error = %err,
+                "action committed but live publication failed"),
+        }
+        Ok(())
+    }
+
     /// The request-scoped names this action's body reads: `user` from the
     /// request's identity, `origin` from configuration.
-    fn request_bindings(&self, ctx: &RequestContext) -> dom_render_compiler::runtime::RequestBindings {
+    fn request_bindings(
+        &self,
+        ctx: &RequestContext,
+    ) -> dom_render_compiler::runtime::RequestBindings {
         dom_render_compiler::runtime::RequestBindings {
             user: ctx.user.clone(),
             origin: self.live.app_origin().map(str::to_string),
@@ -572,6 +678,90 @@ impl CompiledProjectActionAdapter {
         ctx: &RequestContext,
         envelope: &dom_render_compiler::ir::action::ActionEnvelope,
         slots: SessionSlots,
+    ) -> Result<Vec<dom_render_compiler::ir::opcode::Instruction>, RuntimeError> {
+        // Include admission wait, body execution and completion in the deadline.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            self.dispatch_attempt(ctx, envelope, slots),
+        )
+        .await
+        .map_err(|_| {
+            RuntimeError::RequestHandling(
+                "action attempt timed out; retry the intent after its lease expires".to_string(),
+            )
+        })?
+    }
+
+    async fn dispatch_attempt(
+        &self,
+        ctx: &RequestContext,
+        envelope: &dom_render_compiler::ir::action::ActionEnvelope,
+        slots: SessionSlots,
+    ) -> Result<Vec<dom_render_compiler::ir::opcode::Instruction>, RuntimeError> {
+        use dom_render_compiler::aperture::admission::{ActionClaim, Admission};
+        use dom_render_compiler::ir::wire::WireDecode;
+        use sha2::{Digest, Sha256};
+
+        let identity = workflow_identity(self.action_id, ctx.principal.as_ref(), envelope);
+        let substrate = self.live.forge_substrate.get();
+        let claim = if let Some(db) = substrate {
+            // JSON key ordering and transport-only form fields do not change an
+            // intention. Bind all authored inputs as well as the event kind.
+            let mut payload = serde_json::from_slice::<serde_json::Value>(&envelope.payload).ok();
+            if let Some(serde_json::Value::Object(fields)) = payload.as_mut() {
+                fields.remove("_csrf");
+                fields.remove("_albedo_return");
+            }
+            let canonical = payload
+                .map(|v| v.to_string().into_bytes())
+                .unwrap_or_else(|| envelope.payload.clone());
+            let mut digest = Sha256::new();
+            digest.update(self.action_id.to_le_bytes());
+            digest.update([envelope.event_kind]);
+            digest.update(&canonical);
+            let digest = format!("{:x}", digest.finalize());
+            match ActionClaim::acquire_now(
+                db.as_ref(),
+                &identity.id,
+                self.build_id.as_ref(),
+                &digest,
+            )
+            .await
+            .map_err(|e| RuntimeError::RequestHandling(e.to_string()))?
+            {
+                Admission::Acquired(claim) => Some(claim),
+                Admission::Busy => return Err(RuntimeError::ActionInProgress),
+                Admission::Completed(bytes) => {
+                    let (instructions, consumed) = Vec::<
+                        dom_render_compiler::ir::opcode::Instruction,
+                    >::wire_decode(&bytes)
+                    .map_err(|e| {
+                        RuntimeError::RequestHandling(format!("unreadable action result: {e}"))
+                    })?;
+                    if consumed != bytes.len() {
+                        return Err(RuntimeError::RequestHandling(
+                            "action result has trailing bytes".to_string(),
+                        ));
+                    }
+                    return Ok(instructions);
+                }
+            }
+        } else {
+            None
+        };
+        // A cancelled owner's lease expires without relying on an async
+        // destructor; the attempt token fences any later durable mutations.
+        self.dispatch_admitted(ctx, envelope, slots, &identity, claim.as_ref())
+            .await
+    }
+
+    async fn dispatch_admitted(
+        &self,
+        ctx: &RequestContext,
+        envelope: &dom_render_compiler::ir::action::ActionEnvelope,
+        slots: SessionSlots,
+        identity: &WorkflowIdentity,
+        claim: Option<&dom_render_compiler::aperture::admission::ActionClaim>,
     ) -> Result<Vec<dom_render_compiler::ir::opcode::Instruction>, RuntimeError> {
         debug_assert_eq!(
             envelope.action_id, self.action_id,
@@ -610,51 +800,14 @@ impl CompiledProjectActionAdapter {
                 )));
             };
 
-            // A3 · the workflow's identity, and whether it can be resumed.
-            //
-            // 🔑 **A random id per dispatch makes a persisted log unreachable.**
-            // That is why A3 is not "write the journal down": a uuid minted here
-            // is gone with the process, so a retry after a crash mints a new one,
-            // finds nothing, and re-issues every completed call under fresh keys.
-            // Persistence without stable identity buys a log nobody can ever
-            // find again.
-            let identity = workflow_identity(self.action_id, ctx.principal.as_ref(), envelope);
-
             let substrate = self.live.forge_substrate.get().cloned();
-            let ledger = substrate
-                .as_ref()
-                .map(|s| dom_render_compiler::aperture::JournalLedger::new(s.as_ref()));
-
-            // A3 · the submit that already happened.
-            //
-            // 🔑 Resuming the *steps* stops a completed upstream call from being
-            // re-issued. It does not stop the body's own effects — a FORGE
-            // append — from being applied a second time, because a replayed body
-            // runs its writes again. So a workflow that finished answers from
-            // the log instead of running at all, which is what turns "no
-            // duplicate charge" into "no duplicate submit".
-            //
-            // Only for a resumable identity: an id this process invented cannot
-            // have finished in an earlier one.
-            if identity.resumable {
-                if let Some(ledger) = &ledger {
-                    if let Ok(Some(bytes)) =
-                        ledger.completed(&identity.id, self.build_id.as_ref()).await
-                    {
-                        use dom_render_compiler::ir::wire::WireDecode;
-                        if let Ok((instructions, _)) =
-                            Vec::<dom_render_compiler::ir::opcode::Instruction>::wire_decode(&bytes)
-                        {
-                            tracing::debug!(
-                                target: "albedo.aperture.ledger",
-                                workflow = %identity.id,
-                                "answering a repeated submit from the recorded result"
-                            );
-                            return Ok(instructions);
-                        }
-                    }
+            let ledger = substrate.as_ref().map(|s| {
+                let ledger = dom_render_compiler::aperture::JournalLedger::new(s.as_ref());
+                match claim {
+                    Some(claim) => ledger.with_claim(claim),
+                    None => ledger,
                 }
-            }
+            });
 
             // Resume: a retry of the same intention picks the log back up rather
             // than starting a second one. A log that will not load is not fatal —
@@ -662,7 +815,9 @@ impl CompiledProjectActionAdapter {
             // carries its own idempotency key, so the upstream deduplicates what
             // this server cannot remember.
             let resumed = match (&ledger, identity.resumable) {
-                (Some(ledger), true) => ledger.load(&identity.id).await.ok().flatten(),
+                (Some(ledger), true) => ledger.load(&identity.id).await.map_err(|err| {
+                    RuntimeError::RequestHandling(format!("action journal load failed: {err}"))
+                })?,
                 _ => None,
             };
             let mut journal = resumed.unwrap_or_else(|| {
@@ -672,100 +827,100 @@ impl CompiledProjectActionAdapter {
                 )
             });
 
-            let durability = ledger.as_ref().map(|ledger| {
-                dom_render_compiler::aperture::Durability {
-                    ledger,
-                    workflow_id: &identity.id,
-                    build_id: self.build_id.as_ref(),
-                }
-            });
+            let durability =
+                ledger
+                    .as_ref()
+                    .map(|ledger| dom_render_compiler::aperture::Durability {
+                        ledger,
+                        workflow_id: &identity.id,
+                        build_id: self.build_id.as_ref(),
+                    });
 
             let (instructions, (writes, queued)) =
                 dom_render_compiler::aperture::drive_workflow_admitting(
-                client.as_ref(),
-                &mut journal,
-                &dom_render_compiler::aperture::WorkflowLimits::default(),
-                self.build_id.as_ref(),
-                durability.as_ref(),
-                // SHUTTER · each staged `fetch()` is charged to the caller and to
-                // its host's shared budget before it is recorded or sent. The
-                // caller comes from the dispatcher's scope — see
-                // `shutter::outbound_scope`.
-                |request| {
-                    crate::shutter::admit_outbound(&request.url).map_err(|reason| {
-                        dom_render_compiler::aperture::WorkflowError::Refused {
-                            url: request.url.clone(),
-                            reason,
-                        }
-                    })
-                },
-                |seeded| {
-                    // Cloned per pass, outside the async block, so the future
-                    // owns everything and borrows neither `self` nor the pool.
-                    let pool = Arc::clone(pool);
-                    let project = self.project.clone();
-                    let broadcast = self.live.broadcast.clone();
-                    let envelope = envelope.clone();
-                    // Two `Arc` bumps. The view must be cloned rather than moved
-                    // because a suspended body will need it again.
-                    let view = view.clone();
-                    // Who is asking and where the app lives — the same values
-                    // on every pass, so a body that suspends and re-runs decides
-                    // for the same person.
-                    let request = self.request_bindings(ctx);
+                    client.as_ref(),
+                    &mut journal,
+                    &dom_render_compiler::aperture::WorkflowLimits::default(),
+                    self.build_id.as_ref(),
+                    durability.as_ref(),
+                    // SHUTTER · each staged `fetch()` is charged to the caller and to
+                    // its host's shared budget before it is recorded or sent. The
+                    // caller comes from the dispatcher's scope — see
+                    // `shutter::outbound_scope`.
+                    |request| {
+                        crate::shutter::admit_outbound(&request.url).map_err(|reason| {
+                            dom_render_compiler::aperture::WorkflowError::Refused {
+                                url: request.url.clone(),
+                                reason,
+                            }
+                        })
+                    },
+                    |seeded| {
+                        // Cloned per pass, outside the async block, so the future
+                        // owns everything and borrows neither `self` nor the pool.
+                        let pool = Arc::clone(pool);
+                        let project = self.project.clone();
+                        let broadcast = self.live.broadcast.clone();
+                        let envelope = envelope.clone();
+                        // Two `Arc` bumps. The view must be cloned rather than moved
+                        // because a suspended body will need it again.
+                        let view = view.clone();
+                        // Who is asking and where the app lives — the same values
+                        // on every pass, so a body that suspends and re-runs decides
+                        // for the same person.
+                        let request = self.request_bindings(ctx);
 
-                    async move {
-                        pool.with_engine(move |engine| {
-                            // FORGE · the write collector is a THREAD-LOCAL and
-                            // the body runs on the pool's own engine thread, so
-                            // it must be installed inside this closure. Around
-                            // the `await` it would leave an `append()` recording
-                            // into a collector on the wrong thread — silently
-                            // discarding a durable write.
-                            //
-                            // Installed per *pass*, which is what makes the
-                            // discard rule work: a pass that suspends hands its
-                            // intents back and `drive_workflow` drops them, on
-                            // the same terms `__albedo_effects` is rebuilt.
-                            let collector =
-                                dom_render_compiler::forge::install_forge_write_collector();
-                            // 15.5 · the same discard rule, for the same reason:
-                            // a suspended pass's enqueues are dropped and the
-                            // body records them again when it re-runs.
-                            let queued =
-                                dom_render_compiler::jobs::install_enqueue_collector();
-                            let pass = project.invoke_action_quickjs_pass(
-                                engine,
-                                &envelope,
-                                &view,
-                                Some(broadcast.as_ref()),
-                                Some(&seeded),
-                                &request,
-                            );
-                            // `ForgeWrite` is plain data, so the recorded
-                            // intents cross back over the thread boundary.
-                            // Both lists travel as one payload: `drive_workflow`
-                            // carries exactly one "what this pass committed"
-                            // value, and the discard-on-suspend rule has to
-                            // apply to both halves identically.
-                            pass.map(|pass| (pass, (collector.take(), queued.take())))
-                                .map_err(|err| {
-                                    format!(
+                        async move {
+                            pool.with_engine(move |engine| {
+                                // FORGE · the write collector is a THREAD-LOCAL and
+                                // the body runs on the pool's own engine thread, so
+                                // it must be installed inside this closure. Around
+                                // the `await` it would leave an `append()` recording
+                                // into a collector on the wrong thread — silently
+                                // discarding a durable write.
+                                //
+                                // Installed per *pass*, which is what makes the
+                                // discard rule work: a pass that suspends hands its
+                                // intents back and `drive_workflow` drops them, on
+                                // the same terms `__albedo_effects` is rebuilt.
+                                let collector =
+                                    dom_render_compiler::forge::install_forge_write_collector();
+                                // 15.5 · the same discard rule, for the same reason:
+                                // a suspended pass's enqueues are dropped and the
+                                // body records them again when it re-runs.
+                                let queued = dom_render_compiler::jobs::install_enqueue_collector();
+                                let pass = project.invoke_action_quickjs_pass(
+                                    engine,
+                                    &envelope,
+                                    &view,
+                                    Some(broadcast.as_ref()),
+                                    Some(&seeded),
+                                    &request,
+                                );
+                                // `ForgeWrite` is plain data, so the recorded
+                                // intents cross back over the thread boundary.
+                                // Both lists travel as one payload: `drive_workflow`
+                                // carries exactly one "what this pass committed"
+                                // value, and the discard-on-suspend rule has to
+                                // apply to both halves identically.
+                                pass.map(|pass| (pass, (collector.take(), queued.take())))
+                                    .map_err(|err| {
+                                        format!(
                                     "compiled action handler {action_id} (quickjs) failed: {err:#}"
                                 )
-                                })
-                        })
-                        .await
-                        .map_err(|err| {
-                            format!("engine pool checkout for action {action_id} failed: {err}")
-                        })
-                        .and_then(|inner| inner)
-                        .map_err(dom_render_compiler::aperture::WorkflowError::Pass)
-                    }
-                },
-            )
-            .await
-            .map_err(|err| RuntimeError::RequestHandling(err.to_string()))?;
+                                    })
+                            })
+                            .await
+                            .map_err(|err| {
+                                format!("engine pool checkout for action {action_id} failed: {err}")
+                            })
+                            .and_then(|inner| inner)
+                            .map_err(dom_render_compiler::aperture::WorkflowError::Pass)
+                        }
+                    },
+                )
+                .await
+                .map_err(|err| RuntimeError::RequestHandling(err.to_string()))?;
 
             if !journal.is_empty() {
                 debug!(
@@ -776,114 +931,8 @@ impl CompiledProjectActionAdapter {
                 );
             }
 
-            if !writes.is_empty() {
-                let substrate = self.live.forge_substrate.get().ok_or_else(|| {
-                    RuntimeError::RequestHandling(format!(
-                        "compiled action handler {action_id} called append() but no FORGE \
-                         substrate is wired; rebuild with --features forge"
-                    ))
-                })?;
-                // S4 · the current row projector, cloned out of the live slot
-                // so the borrow the write path passes outlives no lock guard.
-                let projector = self.live.projector();
-                let fan_out = dom_render_compiler::forge::apply_writes(
-                    substrate.as_ref(),
-                    self.live.broadcast.as_ref(),
-                    self.live.forge_schema.as_ref(),
-                    &writes,
-                    projector.as_deref(),
-                    ctx.principal.as_ref(),
-                )
-                .await
-                .map_err(|err| {
-                    RuntimeError::RequestHandling(format!(
-                        "compiled action handler {action_id} FORGE write failed: {err}"
-                    ))
-                })?;
-                // SHUTTER · report the blast radius back to the dispatcher, which
-                // is the only layer that knows who to charge for it. See
-                // `shutter::note_fan_out`.
-                crate::shutter::note_fan_out(fan_out.subscribers);
-            }
-
-            // 15.5 · the rows `enqueue()` asked for, written AFTER the durable
-            // writes for the reason the job runner uses: an action that appends
-            // a row and queues a job to process it must not have the job become
-            // claimable before the row exists.
-            if !queued.is_empty() {
-                let substrate = self.live.forge_substrate.get().ok_or_else(|| {
-                    RuntimeError::RequestHandling(format!(
-                        "compiled action handler {action_id} called enqueue() but no FORGE \
-                         substrate is wired; the job queue is a table"
-                    ))
-                })?;
-                // The handle carries the declaration, so an action and a job
-                // body agree about what a valid job name is.
-                let jobs = self.live.jobs().ok_or_else(|| {
-                    RuntimeError::RequestHandling(format!(
-                        "compiled action handler {action_id} called enqueue() but no job runner \
-                         is installed; the queue needs a FORGE substrate"
-                    ))
-                })?;
-                let now_ms = crate::auth::now_ms();
-                for intent in &queued {
-                    crate::jobs::write_enqueue(
-                        substrate.as_ref(),
-                        jobs,
-                        intent,
-                        // 🔑 The identity rule: queued work inherits the
-                        // principal of the request that queued it. A password
-                        // reset queued by alice runs as alice.
-                        ctx.principal.as_ref().map(|p| p.as_str().to_string()),
-                        now_ms,
-                    )
-                    .await
-                    .map_err(|err| {
-                        RuntimeError::RequestHandling(format!(
-                            "compiled action handler {action_id}: {err}"
-                        ))
-                    })?;
-                }
-                // The runner may be parked until a schedule hours away; without
-                // this the work sits until then.
-                jobs.wake();
-            }
-
-            // …and only now is the workflow finished.
-            //
-            // 🔑 **After the writes, never before.** The two are not in one
-            // transaction, so one is second, and which one decides what a crash
-            // between them costs: result-first loses the writes *silently*,
-            // writes-first duplicates them *visibly*. Duplication is recoverable
-            // and is also exactly what happens today with no result table at
-            // all, so this ordering cannot regress anything. See
-            // `JournalLedger::complete`.
-            if identity.resumable {
-                if let Some(ledger) = &ledger {
-                    use dom_render_compiler::ir::wire::WireEncode;
-                    if let Ok(bytes) = instructions.wire_encode() {
-                        // A failure here costs a repeated submit's protection,
-                        // not the submit — the effects are already durable.
-                        if let Err(err) = ledger
-                            .complete(
-                                &identity.id,
-                                self.build_id.as_ref(),
-                                &bytes,
-                                dom_render_compiler::aperture::now_ms(),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                target: "albedo.aperture.ledger",
-                                workflow = %identity.id,
-                                error = %err,
-                                "could not record the workflow result; a repeated submit \
-                                 would run again"
-                            );
-                        }
-                    }
-                }
-            }
+            self.complete_action(ctx, &instructions, &writes, &queued, claim)
+                .await?;
 
             return Ok(instructions);
         }
@@ -897,41 +946,28 @@ impl CompiledProjectActionAdapter {
         // The body still runs when no substrate is wired; `append()` then fails
         // inside the body with a clear message rather than being silently
         // dropped, which is the only honest outcome for a durable write.
-        if let Some(substrate) = self.live.forge_substrate.get() {
-            let (instructions, writes) = self
-                .project
-                .invoke_action_with_forge(
-                    envelope,
-                    &view,
-                    self.live.broadcast.as_ref(),
-                    &self.request_bindings(ctx),
-                )
-                .map_err(|err| {
-                    RuntimeError::RequestHandling(format!(
-                        "compiled action handler {} failed: {err:#}",
-                        self.action_id
-                    ))
-                })?;
+        if self.live.forge_substrate.get().is_some() {
+            let (instructions, writes, queued) = {
+                let queued = dom_render_compiler::jobs::install_enqueue_collector();
+                let (instructions, writes) = self
+                    .project
+                    .invoke_action_with_forge(
+                        envelope,
+                        &view,
+                        self.live.broadcast.as_ref(),
+                        &self.request_bindings(ctx),
+                    )
+                    .map_err(|err| {
+                        RuntimeError::RequestHandling(format!(
+                            "compiled action handler {} failed: {err:#}",
+                            self.action_id
+                        ))
+                    })?;
 
-            // Applied AFTER the body returned Ok: a body that errored partway
-            // never reaches here, so its earlier appends are discarded with it.
-            let projector = self.live.projector();
-            let fan_out = dom_render_compiler::forge::apply_writes(
-                substrate.as_ref(),
-                self.live.broadcast.as_ref(),
-                self.live.forge_schema.as_ref(),
-                &writes,
-                projector.as_deref(),
-                ctx.principal.as_ref(),
-            )
-            .await
-            .map_err(|err| {
-                RuntimeError::RequestHandling(format!(
-                    "compiled action handler {} FORGE write failed: {err}",
-                    self.action_id
-                ))
-            })?;
-            crate::shutter::note_fan_out(fan_out.subscribers);
+                (instructions, writes, queued.take())
+            };
+            self.complete_action(ctx, &instructions, &writes, &queued, claim)
+                .await?;
 
             return Ok(instructions);
         }
@@ -1083,6 +1119,8 @@ struct RuntimeState {
     /// 15.7 · request counters for the Prometheus scrape. Persistent, so a dev
     /// reload does not reset a counter a dashboard is rating.
     http_metrics: Arc<crate::metrics::HttpMetrics>,
+    /// Scheduled backups, as a scrape reports them.
+    backups: Arc<crate::backups::BackupStatus>,
 }
 
 impl RuntimeState {
@@ -1351,7 +1389,8 @@ impl AlbedoServerBuilder {
     pub(crate) fn with_email(
         mut self,
         config: dom_render_compiler::email::EmailConfig,
-        project_dir: std::path::PathBuf,
+        project_dir: &std::path::Path,
+        data_dir: std::path::PathBuf,
         dev_mode: bool,
     ) -> Result<Self, String> {
         let mailer = crate::email::mailer_for(
@@ -1364,7 +1403,7 @@ impl AlbedoServerBuilder {
             config,
             mailer,
             dev_mode,
-            project_dir,
+            data_dir,
         });
         Ok(self)
     }
@@ -1379,12 +1418,10 @@ impl AlbedoServerBuilder {
     pub(crate) fn with_uploads(
         self,
         registry: dom_render_compiler::upload::UploadRegistry,
-        project_dir: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
     ) -> Self {
-        self.live.install_uploads(Arc::new(UploadRuntime {
-            registry,
-            project_dir,
-        }));
+        self.live
+            .install_uploads(Arc::new(UploadRuntime { registry, data_dir }));
         self
     }
 
@@ -2098,18 +2135,25 @@ impl AlbedoServerBuilder {
         // A project with no gated route produces an empty set and the check
         // below is one hash lookup that always misses — which is the price of
         // it being unconditional rather than something a request could skip.
-        let gated_action_ids: GatedActionIds = streaming_runtime
-            .as_ref()
-            .map(|runtime| {
-                runtime
-                    .manifest
-                    .routes
-                    .values()
-                    .filter(|route| !route.auth.allows_anonymous())
-                    .flat_map(|route| route.action_ids.iter().map(|entry| entry.action_id))
-                    .collect()
-            })
-            .unwrap_or_default();
+        //
+        // R1a · each id carries the gate of every route declaring it, so the
+        // action door can apply roles as well as "signed in".
+        let mut gated_action_ids = GatedActionIds::new();
+        if let Some(runtime) = streaming_runtime.as_ref() {
+            for route in runtime
+                .manifest
+                .routes
+                .values()
+                .filter(|route| !route.auth.allows_anonymous())
+            {
+                for entry in &route.action_ids {
+                    gated_action_ids
+                        .entry(entry.action_id)
+                        .or_default()
+                        .push(route.auth.clone());
+                }
+            }
+        }
 
         let has_entry_routes = self
             .config
@@ -2388,6 +2432,7 @@ impl AlbedoServerBuilder {
             // symptom indistinguishable from load. See `Limits::check_admits_heaviest`.
             shutter,
             http_metrics: Arc::new(crate::metrics::HttpMetrics::new()),
+            backups: Arc::new(crate::backups::BackupStatus::default()),
         };
 
         Ok(AlbedoServer {
@@ -2408,8 +2453,8 @@ struct EmailPlan {
     config: dom_render_compiler::email::EmailConfig,
     mailer: Arc<dyn crate::email::Mailer>,
     dev_mode: bool,
-    /// Uploaded attachments are read from under it.
-    project_dir: std::path::PathBuf,
+    /// The data directory; uploaded attachments are read from under it.
+    data_dir: std::path::PathBuf,
 }
 
 pub struct AlbedoServer {
@@ -2477,6 +2522,13 @@ pub struct BootReport {
     /// HTML with every tag stripped, under a green build and a clean console.
     /// The scrape is gone; what is left is this list.
     pub static_render_failures: Vec<dom_render_compiler::manifest::schema::StaticRenderFailure>,
+    /// A staged `albedo db restore` this boot swapped in, described. It
+    /// replaced the author's database, so it is said, not logged.
+    pub restored: Option<String>,
+    /// The backup schedule, described; `None` when nothing schedules one.
+    /// Not a change, so not in [`Self::lines`] — `serve` prints it, and says
+    /// so when it is off.
+    pub backups: Option<String>,
 }
 
 impl BootReport {
@@ -2486,11 +2538,17 @@ impl BootReport {
     /// cannot drift into describing the same event three different ways.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
+        // First: everything after it describes the restored database.
         let mut out: Vec<String> = self
-            .schema_additions
+            .restored
             .iter()
-            .map(|addition| format!("FORGE · {addition}"))
+            .map(|restored| format!("BACKUP · {restored}"))
             .collect();
+        out.extend(
+            self.schema_additions
+                .iter()
+                .map(|addition| format!("FORGE · {addition}")),
+        );
         // Phrased as absence, because that is what happened. "failed to render"
         // reads like a degraded page; the component is simply not on it.
         out.extend(self.island_ssr_failures.iter().map(|failure| {
@@ -2525,7 +2583,22 @@ impl AlbedoServer {
     pub fn router(&self) -> Router {
         let shutdown = self.shutdown.subscribe();
         let http_metrics = self.state.http_metrics.clone();
+        // A2 · the probes, ahead of dispatch so no middleware, gate or rate
+        // limit can answer for them. See `crate::health`.
+        let readiness = crate::health::Readiness {
+            shutdown: self.shutdown.subscribe(),
+            substrate: Arc::clone(&self.state.live.forge_substrate),
+        };
+        let access_log = Arc::new(crate::access_log::AccessLog {
+            enabled: self.config.server.access_log,
+            limiter: Arc::clone(&self.state.shutter),
+        });
         Router::new()
+            .route(crate::health::HEALTH_PATH, axum::routing::get(crate::health::health))
+            .route(
+                crate::health::READY_PATH,
+                axum::routing::get(move || crate::health::ready(readiness.clone())),
+            )
             .route("/", any(dispatch))
             .route("/{*path}", any(dispatch))
             .with_state(self.state.clone())
@@ -2537,6 +2610,11 @@ impl AlbedoServer {
             // produces — a dispatch-panic 500 as much as a 200.
             .layer(axum::middleware::from_fn(move |request, next| {
                 crate::metrics::record_http(http_metrics.clone(), request, next)
+            }))
+            // A3 · outside even the metrics, so the request id is on every
+            // response and every line. See `crate::access_log`.
+            .layer(axum::middleware::from_fn(move |request, next| {
+                crate::access_log::layer(access_log.clone(), request, next)
             }))
     }
 
@@ -2641,6 +2719,39 @@ impl AlbedoServer {
         })
     }
 
+    fn resolved_db_path(&self) -> std::path::PathBuf {
+        let artifacts_dir = self.config.renderer.as_ref().map_or_else(
+            || std::path::PathBuf::from(".albedo/dist"),
+            |renderer| std::path::PathBuf::from(renderer.artifacts_dir.as_str()),
+        );
+        crate::forge_db_path::resolve_forge_db_path(
+            self.config.forge.db_path.as_deref(),
+            crate::forge_db_path::forge_db_env().as_deref(),
+            &artifacts_dir,
+        )
+    }
+
+    fn resolve_tls(&self, db_path: &std::path::Path) -> Result<crate::tls::TlsMode, RuntimeError> {
+        let project_root = self.config.renderer.as_ref().map_or_else(
+            || std::path::PathBuf::from("."),
+            |renderer| {
+                std::path::Path::new(renderer.artifacts_dir.as_str())
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .map_or_else(
+                        || std::path::PathBuf::from("."),
+                        std::path::Path::to_path_buf,
+                    )
+            },
+        );
+        crate::tls::resolve_for_data_dir(
+            &self.config.server.tls,
+            &project_root,
+            &crate::forge_db_path::data_dir_for(db_path),
+        )
+        .map_err(RuntimeError::ServerStartup)
+    }
+
     /// Boot and serve until shutdown.
     ///
     /// Every startup failure — an unopenable `forge.db`, a schema the database
@@ -2691,6 +2802,8 @@ impl AlbedoServer {
         // the author.
         report.island_ssr_failures = self.island_ssr_failures.clone();
         report.static_render_failures = self.static_render_failures.clone();
+        // TLS persistence uses this path even when the FORGE feature is off.
+        let db_path = self.resolved_db_path();
         // FORGE — open the durable substrate exactly once, before the listener
         // binds. This is the sole async boot seam (`build()` is synchronous),
         // and the handle lives on the persistent `RuntimeState` tier so a dev
@@ -2708,25 +2821,34 @@ impl AlbedoServer {
             // restart lost every row written into the image. The path is now
             // derived from the artifacts this server is already reading, and
             // overridable by config or `ALBEDO_FORGE_DB` for a mounted volume.
-            let artifacts_dir = self.config.renderer.as_ref().map_or_else(
-                || std::path::PathBuf::from(".albedo/dist"),
-                |renderer| std::path::PathBuf::from(renderer.artifacts_dir.as_str()),
-            );
-            let db_path = crate::forge_db_path::resolve_forge_db_path(
-                self.config.forge.db_path.as_deref(),
-                crate::forge_db_path::forge_db_env().as_deref(),
-                &artifacts_dir,
-            );
 
-            let opened = LibSqlSubstrate::open_local(&db_path)
+
+            // A restore `albedo db restore` staged, swapped in before anything
+            // has the database open — the one moment that is true. See
+            // `forge::backup` for why it is staged rather than applied live.
+            if let Some(applied) = forge::backup::apply_staged_restore(&db_path)
+                .map_err(|err| RuntimeError::ServerStartup(format!("BACKUP: {err}")))?
+            {
+                report.restored = Some(format!(
+                    "restored the backup taken {} from {}; the database it replaced is kept at {}",
+                    applied.taken_at.as_deref().unwrap_or("(time unknown)"),
+                    applied.snapshot.as_deref().unwrap_or("(source unknown)"),
+                    applied.previous.as_ref().map_or_else(
+                        || "— (there was none)".to_string(),
+                        |previous| previous.display().to_string()
+                    ),
+                ));
+            }
+
+            let opened = Arc::new(LibSqlSubstrate::open_local(&db_path)
                 .await
                 .map_err(|err| {
                     RuntimeError::ServerStartup(format!(
                         "FORGE: failed to open {}: {err}",
                         db_path.display()
                     ))
-                })?;
-            let substrate: Arc<dyn forge::DataSubstrate> = Arc::new(opened);
+                })?);
+            let substrate: Arc<dyn forge::DataSubstrate> = opened.clone();
 
             // Gate 1 — hand-authored schema, then materialise every
             // FORGE-backed shared-slot topic from the substrate into the
@@ -2822,6 +2944,16 @@ impl AlbedoServer {
                 });
             }
 
+            // Scheduled backups. Here, after the schema is reconciled, so the
+            // first snapshot is of the database this server actually serves.
+            let data_dir = crate::forge_db_path::data_dir_for(&db_path);
+            if let Some(plan) =
+                crate::backups::Plan::from_settings(&self.config.server.backup, &data_dir)
+            {
+                report.backups = Some(plan.describe());
+                crate::backups::spawn(plan, opened, data_dir, Arc::clone(&self.state.backups));
+            }
+
             // Fill the cell every action adapter is already holding a clone of.
             // Before the listener binds, so no request can race an empty cell —
             // and `set` cannot fail here (nothing else writes it). Held on the
@@ -2884,17 +3016,7 @@ impl AlbedoServer {
         // TLS · decided before the listener binds, so a half-written `tls`
         // block or an unreadable certificate fails the boot rather than
         // quietly serving the site on the wrong scheme.
-        let project_root = self.config.renderer.as_ref().map_or_else(
-            || std::path::PathBuf::from("."),
-            |renderer| {
-                std::path::Path::new(renderer.artifacts_dir.as_str())
-                    .parent()
-                    .and_then(std::path::Path::parent)
-                    .map_or_else(|| std::path::PathBuf::from("."), std::path::Path::to_path_buf)
-            },
-        );
-        let tls_mode = crate::tls::resolve(&self.config.server.tls, &project_root)
-            .map_err(RuntimeError::ServerStartup)?;
+        let tls_mode = self.resolve_tls(&db_path)?;
 
         // AUTH × TLS · the refusal that exists because the alternative is a
         // login that silently never works. See `tls::insecure_auth_refusal`.
@@ -2972,7 +3094,7 @@ impl AlbedoServer {
                 plan.config,
                 plan.mailer,
                 link_origin,
-                plan.project_dir,
+                plan.data_dir,
             )));
         }
 
@@ -3203,14 +3325,12 @@ impl AlbedoServer {
             let shutdown_tx = shutdown_tx.clone();
             async move {
                 shutdown.await;
-                let _ = shutdown_tx.send(true);
+                // `send_replace`, not `send`: `send` keeps the old value when
+                // no receiver is subscribed at that instant, and readiness
+                // reads this flag from receivers made later.
+                shutdown_tx.send_replace(true);
             }
         };
-
-        // The other half of the signal fix: a bound on the drain itself. The
-        // clock starts when `graceful_shutdown` above flips the watch, so this
-        // is idle for the entire life of a healthy server.
-        let drain_deadline = drain_deadline(shutdown_rx.clone(), shutdown_timeout);
 
         // Everything that can fail a boot has now succeeded: the substrate is
         // open and agrees with the schema, the TCP listener is bound, and the
@@ -3218,52 +3338,29 @@ impl AlbedoServer {
         // anyone the server is up.
         on_ready(&report);
 
-        // SHUTTER · `into_make_service_with_connect_info` is what puts the peer
-        // address in front of the limiter. Without it every anonymous request in
-        // the process shares one bucket — see `shutter::UNATTRIBUTED`, which is
-        // the deliberate answer for an embedder that mounts `router()` itself,
-        // not something the serve path should ever rely on.
         // Now that the listener is bound, TLS-ALPN-01 is answerable — start
         // driving issuance and renewal. Aborted when serving ends so the task
         // cannot outlive the server it was obtaining certificates for.
         let acme_task = acme_driver.map(|driver| tokio::spawn(driver.run()));
 
-        let http_result = match tls_server_config {
-            None => {
-                let serve = axum::serve(
-                    listener,
-                    router.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .with_graceful_shutdown(graceful_shutdown);
-                // `axum::serve` drains without a bound of its own, so the
-                // deadline has to be raced against it from out here.
-                tokio::select! {
-                    result = serve => {
-                        result.map_err(|err| RuntimeError::ServerRuntime(err.to_string()))
-                    }
-                    () = drain_deadline => {
-                        warn!(
-                            timeout_ms = shutdown_timeout.as_millis(),
-                            "graceful shutdown exceeded shutdown_timeout_ms; closing remaining connections"
-                        );
-                        Ok(())
-                    }
-                }
-            }
-            Some(tls) => {
-                serve_https(
-                    listener,
-                    router,
-                    tls,
-                    graceful_shutdown,
-                    shutdown_timeout,
-                    TLS_TIMEOUTS,
-                )
-                .await
-            }
-        };
+        // One connection loop for both schemes. Plain HTTP used to go through
+        // `axum::serve`, which installs no hyper timer (so no header timeout)
+        // and sniffs HTTP/1 vs HTTP/2 with an unbounded read — the two holes
+        // the TLS path had closed, left open on the path most deployments use
+        // behind a proxy. The loop also carries what the plain path got from
+        // `into_make_service_with_connect_info` (the peer SHUTTER keys on) and
+        // the drain bound `shutdown_timeout_ms` promises.
+        let http_result = serve_connections(
+            listener,
+            router,
+            tls_server_config,
+            graceful_shutdown,
+            shutdown_timeout,
+            CONNECTION_TIMEOUTS,
+        )
+        .await;
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.send_replace(true);
 
         // EMAIL · a "mail me a link" request that was answered before its token
         // and queue writes finished must not lose them to the exit. Bounded by
@@ -3426,6 +3523,7 @@ fn render_metrics(state: &RuntimeState) -> String {
         broadcast_topics: world.broadcast.topic_count(),
         aperture,
         shutter_degraded_decisions: state.shutter.shutter().degraded_decisions(),
+        backups: state.backups.read(),
     };
     crate::metrics::render(&state.http_metrics, &runtime)
 }
@@ -3500,17 +3598,17 @@ fn compression_layer() -> CompressionLayer<And<DefaultPredicate, NotForContentTy
         )))
 }
 
-/// How long an HTTPS connection may stay silent at each stage.
+/// How long a connection may stay silent at each stage.
 #[derive(Debug, Clone, Copy)]
-struct TlsTimeouts {
-    /// TCP accepted, TLS handshake not finished.
-    handshake: Duration,
+pub(crate) struct ConnTimeouts {
+    /// TCP accepted, TLS handshake not finished. Unused on plain HTTP.
+    pub(crate) handshake: Duration,
     /// Waiting for a request's headers (HTTP/1). Never runs while a response,
     /// such as a live-update stream, is being sent.
-    header_read: Duration,
+    pub(crate) header_read: Duration,
 }
 
-const TLS_TIMEOUTS: TlsTimeouts = TlsTimeouts {
+pub(crate) const CONNECTION_TIMEOUTS: ConnTimeouts = ConnTimeouts {
     handshake: Duration::from_secs(10),
     header_read: Duration::from_secs(30),
 };
@@ -3525,42 +3623,52 @@ fn is_connection_error(err: &std::io::Error) -> bool {
     )
 }
 
-/// Serve the router over TLS.
+/// Serve the router on `listener` — over TLS when `tls` is set, plain HTTP/1.1
+/// otherwise.
 ///
-/// This is `axum::serve`'s loop with a `TlsAcceptor` in front, written out
-/// rather than borrowed because axum does not ship a TLS entry point. Two
-/// things it must not lose, both of which are silent if dropped:
+/// This is `axum::serve`'s loop written out, for both schemes. Plain HTTP used
+/// `axum::serve` itself until 2026-10-30, and inherited its two holes: it
+/// installs no hyper timer, so the header timeout never ran, and it picks
+/// HTTP/1 or HTTP/2 by sniffing the first bytes with a read that has no
+/// timeout. A client that connected and said nothing held a task and a file
+/// descriptor forever — on the path most deployments use, behind a proxy.
+///
+/// Things it must not lose, each silent if dropped:
 ///
 /// * **`ConnectInfo`** — SHUTTER keys its rate-limit buckets on the peer, and
-///   without this every request in the process shares `UNATTRIBUTED`. The plain
-///   path gets it from `into_make_service_with_connect_info`; here it is
-///   inserted per connection by hand.
-/// * **graceful shutdown** — in-flight requests finish instead of being cut,
-///   which for a streaming response is the difference between a complete page
-///   and a truncated one.
+///   without it every request in the process shares `UNATTRIBUTED`. Inserted
+///   per connection by hand.
+/// * **graceful shutdown, bounded** — in-flight requests finish instead of being
+///   cut (for a streaming response, a complete page rather than a truncated
+///   one), and `drain_timeout` (`shutdown_timeout_ms`) is how long they get: a
+///   connection that will not finish must not hold the process open.
+///
+/// A connection that says nothing is closed: one that never finishes the TLS
+/// handshake after `timeouts.handshake`, and one that never finishes a
+/// request's headers after `timeouts.header_read`.
+///
+/// The protocol is decided without reading from the client. Over TLS it comes
+/// from ALPN (HTTP/2 is only spoken after ALPN agrees on `h2`). Plain HTTP is
+/// HTTP/1.1 only: nothing in the server uses cleartext HTTP/2 or connection
+/// upgrades, and a reverse proxy speaks HTTP/1.1 upstream unless told
+/// otherwise.
 ///
 /// 🪤 A failed handshake is logged at `debug` and the connection dropped, never
 /// propagated: every port scanner and every plain-HTTP request to the HTTPS
 /// port produces one, and treating those as server errors would end the accept
 /// loop for the whole process.
-///
-/// A connection that says nothing is closed: one that never finishes the
-/// handshake after `timeouts.handshake`, and one that never finishes a
-/// request's headers after `timeouts.header_read`. Without them each idle
-/// socket held a task and a file descriptor forever.
-async fn serve_https(
+pub(crate) async fn serve_connections(
     listener: TcpListener,
     router: axum::Router,
-    tls: std::sync::Arc<rustls::ServerConfig>,
+    tls: Option<std::sync::Arc<rustls::ServerConfig>>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain_timeout: Duration,
-    timeouts: TlsTimeouts,
+    timeouts: ConnTimeouts,
 ) -> Result<(), RuntimeError> {
-    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use hyper_util::rt::TokioIo;
     use hyper_util::server::graceful::GracefulShutdown;
 
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
     let graceful = GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
 
@@ -3576,7 +3684,7 @@ async fn serve_https(
                     // lasts until something frees up, and retrying at once is a
                     // CPU spin that floods the log. The same pause `axum::serve`
                     // takes.
-                    warn!(error = %err, "TLS listener failed to accept a connection; pausing 1 s");
+                    warn!(error = %err, "listener failed to accept a connection; pausing 1 s");
                     tokio::select! {
                         () = tokio::time::sleep(Duration::from_secs(1)) => continue,
                         () = &mut shutdown => break,
@@ -3591,72 +3699,97 @@ async fn serve_https(
         let watcher = graceful.watcher();
 
         tokio::spawn(async move {
-            let tls_stream =
-                match tokio::time::timeout(timeouts.handshake, acceptor.accept(stream)).await {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(err)) => {
-                        debug!(peer = %peer, error = %err, "TLS handshake failed");
-                        return;
-                    }
-                    Err(_) => {
-                        debug!(peer = %peer, "TLS handshake timed out");
-                        return;
-                    }
-                };
-
-            let service = hyper::service::service_fn(
-                move |mut request: Request<hyper::body::Incoming>| {
-                // The plain path's `into_make_service_with_connect_info`
-                // equivalent. Without it SHUTTER cannot tell two clients apart.
-                    request
-                        .extensions_mut()
-                        .insert(axum::extract::ConnectInfo(peer));
-                    let mut router = router.clone();
-                    async move { tower::Service::call(&mut router, request).await }
-                },
-            );
-
-            // The builder has to outlive the connection future it produces, so
-            // it gets its own binding rather than being a temporary in the
-            // same expression.
-            //
-            // The protocol comes from ALPN, not from sniffing the first bytes:
-            // the sniff is a read with no timeout of its own, so a client that
-            // finished the handshake and sent nothing was held forever. HTTP/2
-            // over TLS is only spoken after ALPN agrees on `h2`.
-            //
-            // The timer is what makes hyper's header timeout run at all: with
-            // none set, hyper skips its 30 s default without a word.
-            let h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
-            let builder = ConnBuilder::new(TokioExecutor::new());
-            let mut builder = if h2 { builder.http2_only() } else { builder.http1_only() };
-            builder
-                .http1()
-                .timer(TokioTimer::new())
-                .header_read_timeout(timeouts.header_read);
-            builder.http2().timer(TokioTimer::new());
-            let connection = builder.serve_connection(TokioIo::new(tls_stream), service);
-
-            if let Err(err) = watcher.watch(connection.into_owned()).await {
-                debug!(peer = %peer, error = %err, "TLS connection ended with an error");
+            match acceptor {
+                None => {
+                    serve_one(TokioIo::new(stream), false, router, peer, timeouts, watcher).await;
+                }
+                Some(acceptor) => {
+                    let tls_stream = match tokio::time::timeout(
+                        timeouts.handshake,
+                        acceptor.accept(stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(err)) => {
+                            debug!(peer = %peer, error = %err, "TLS handshake failed");
+                            return;
+                        }
+                        Err(_) => {
+                            debug!(peer = %peer, "TLS handshake timed out");
+                            return;
+                        }
+                    };
+                    let h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                    serve_one(TokioIo::new(tls_stream), h2, router, peer, timeouts, watcher).await;
+                }
             }
         });
     }
 
-    // A TLS connection that will not finish must not hold the process open
-    // forever — the streaming responses this path exists to protect are exactly
-    // the ones that can hang. `shutdown_timeout_ms` is the operator's stated
-    // bound on that, and this is where it is honoured.
     if tokio::time::timeout(drain_timeout, graceful.shutdown())
         .await
         .is_err()
     {
         warn!(
             timeout_ms = drain_timeout.as_millis(),
-            "TLS graceful shutdown exceeded shutdown_timeout_ms; closing remaining connections"
+            "graceful shutdown exceeded shutdown_timeout_ms; closing remaining connections"
         );
     }
     Ok(())
+}
+
+/// One accepted connection, served to its end.
+async fn serve_one<I>(
+    io: I,
+    h2: bool,
+    router: axum::Router,
+    peer: SocketAddr,
+    timeouts: ConnTimeouts,
+    watcher: hyper_util::server::graceful::Watcher,
+) where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioTimer};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+
+    let service = hyper::service::service_fn(move |mut request: Request<hyper::body::Incoming>| {
+        // What `into_make_service_with_connect_info` would do. Without it
+        // SHUTTER cannot tell two clients apart.
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        let mut router = router.clone();
+        async move { tower::Service::call(&mut router, request).await }
+    });
+
+    // The builder has to outlive the connection future it produces, so it gets
+    // its own binding rather than being a temporary in the same expression.
+    //
+    // The protocol is pinned, never sniffed (see `serve_connections`), and the
+    // timer is what makes hyper's header timeout run at all: with none set,
+    // hyper skips its 30 s default without a word.
+    let builder = ConnBuilder::new(TokioExecutor::new());
+    let mut builder = if h2 { builder.http2_only() } else { builder.http1_only() };
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(timeouts.header_read);
+    builder.http2().timer(TokioTimer::new());
+    let connection = builder.serve_connection(io, service);
+
+    if let Err(err) = watcher.watch(connection.into_owned()).await {
+        debug!(peer = %peer, error = %err, "connection ended with an error");
+    }
+}
+
+// A request task isolates panics, but must not outlive its HTTP future.
+struct AbortRequestOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortRequestOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> Response {
@@ -3671,8 +3804,19 @@ async fn dispatch(State(state): State<RuntimeState>, request: Request<Body>) -> 
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|connect| connect.0.ip());
 
-    match tokio::task::spawn(dispatch_inner(state, peer, request)).await {
-        Ok(response) => response,
+    let task = tokio::task::spawn(crate::access_log::scope(dispatch_inner(
+        state, peer, request,
+    )));
+    let _cancel = AbortRequestOnDrop(task.abort_handle());
+    match task.await {
+        Ok((mut response, who)) => {
+            if let Some(who) = who {
+                response
+                    .extensions_mut()
+                    .insert(crate::access_log::Principal(who));
+            }
+            response
+        }
         Err(join_err) => {
             let msg = if join_err.is_panic() {
                 let payload = join_err.into_panic();
@@ -3961,7 +4105,7 @@ async fn dispatch_routed(
                             &world,
                             streaming_runtime,
                             page.as_str(),
-                            identity.principal().map(|who| &who.id),
+                            identity.principal(),
                         )
                     })
                     .unwrap_or_default();
@@ -4321,12 +4465,11 @@ async fn dispatch_routed(
         }
     }
 
-    // UPLOADS · 15.1 — stored bytes back out. A `GET`, no session required by
-    // default, and deliberately *not* guarded here: the id is a content hash,
-    // which is derived from bytes the holder already has and is therefore not a
-    // capability. An app with private files has to gate this the way it gates a
-    // FORGE row, and `uploads::store`'s docs say so rather than leaving the
-    // opposite assumption to be made quietly.
+    // UPLOADS · 15.1 — stored bytes back out. The id is a content hash —
+    // derived from bytes the holder already has, so not a capability — and was
+    // served to anyone who asked until 2026-10-30. Now the bucket's declared
+    // read rule decides against who is asking (`uploads::serve`): the uploader
+    // only, unless the bucket says otherwise.
     if let Some(upload_id) = crate::uploads::serve_id(path.as_str()) {
         if method != HttpMethod::Get && method != HttpMethod::Head {
             return ResponsePayload::new(
@@ -4358,15 +4501,19 @@ async fn dispatch_routed(
         ) {
             return refusal;
         }
-        let if_none_match = request
-            .headers()
-            .get(axum::http::header::IF_NONE_MATCH)
-            .and_then(|value| value.to_str().ok());
+        // Who is asking — the middleware's answer if it already ran.
+        let identity = match resolved_identity.take() {
+            Some(identity) => identity,
+            None => state.live.identity(request.headers()).await,
+        };
+        let reader = identity.principal().map(|who| who.id.to_string());
         return crate::uploads::serve(
             substrate.as_ref(),
-            &uploads.project_dir,
+            &uploads.registry,
+            &uploads.data_dir,
             upload_id,
-            if_none_match,
+            reader.as_deref(),
+            request.headers(),
         )
         .await;
     }
@@ -4930,16 +5077,34 @@ async fn dispatch_routed(
             // topic — so what this adds is the case derivation cannot reach: a
             // route over global data that should still require signing in. See
             // `RouteAuth` for why it is authored rather than derived.
-            let gated = streaming_runtime
+            //
+            // R1a · `admits` is the one rule every door applies; a signed-in
+            // caller without a required role is refused here with a 403.
+            let admission = streaming_runtime
                 .manifest
                 .routes
                 .get(route_pattern.as_str())
-                .is_some_and(|route| !route.auth.allows_anonymous());
-            if gated && identity.principal().is_none() {
+                .map_or(dom_render_compiler::manifest::schema::Admission::Allowed, |route| {
+                    route
+                        .auth
+                        .admits(identity.principal().map(|who| who.roles.as_slice()))
+                });
+            if admission == dom_render_compiler::manifest::schema::Admission::Forbidden {
                 debug!(
                     target: "albedo.auth",
                     route = %route_pattern,
-                    "anonymous request refused by the route's `auth = \"required\"`"
+                    "signed-in request refused: it holds none of the route's required roles"
+                );
+                if state.request_timings {
+                    crate::timing::print_request(method.as_str(), &path, started.elapsed());
+                }
+                return crate::handlers::auth_gate::refuse_forbidden();
+            }
+            if admission == dom_render_compiler::manifest::schema::Admission::Anonymous {
+                debug!(
+                    target: "albedo.auth",
+                    route = %route_pattern,
+                    "anonymous request refused by the route's `auth` declaration"
                 );
                 if state.request_timings {
                     crate::timing::print_request(method.as_str(), &path, started.elapsed());
@@ -5196,6 +5361,19 @@ async fn run_form_action_route(
 ) -> Response {
     let (mut parts, body) = request.into_parts();
 
+    // Read from headers alone, so it is known before the body is: the
+    // multipart decode below needs it to check a token before storing a file.
+    let session_id = crate::render::csrf::read_session_cookie(&parts.headers)
+        .or_else(|| {
+            parts
+                .headers
+                .get(ACTION_SESSION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                .map(SessionId::new)
+        })
+        .unwrap_or_else(SessionId::random);
+
     // UPLOADS · 15.1 — the multipart pre-stage.
     //
     // 🔑 **This normalises rather than forks.** A multipart body's file parts
@@ -5216,6 +5394,22 @@ async fn run_form_action_route(
             let Some(uploads) = uploads else {
                 return crate::uploads::refusal(&crate::uploads::UploadError::NoBucketsDeclared);
             };
+            // A6 · the CSRF rule `dispatch_action` applies below, asked early
+            // enough that a forged submit stores nothing: the header if there
+            // is one (and it decides — a wrong header is not rescued by the
+            // body), else a `_csrf` field ahead of the first file. See
+            // `uploads::Genuine`.
+            let csrf = world.csrf.as_ref();
+            let check = move |token: &str| csrf.validate(session_id, token).is_ok();
+            let genuine = match parts
+                .headers
+                .get(crate::handlers::action::CSRF_HEADER)
+                .and_then(|value| value.to_str().ok())
+            {
+                Some(token) if check(token) => crate::uploads::Genuine::Yes,
+                Some(_) => return crate::uploads::refusal(&crate::uploads::UploadError::Forged),
+                None => crate::uploads::Genuine::Pending(&check),
+            };
             let stream = futures_util::TryStreamExt::map_err(
                 body.into_data_stream(),
                 std::io::Error::other,
@@ -5225,8 +5419,9 @@ async fn run_form_action_route(
                 &boundary,
                 &crate::uploads::UploadContext {
                     registry: &uploads.registry,
-                    project_dir: &uploads.project_dir,
+                    data_dir: &uploads.data_dir,
                     principal: principal.principal().map(|who| who.id.to_string()),
+                    genuine,
                 },
             )
             .await
@@ -5258,17 +5453,6 @@ async fn run_form_action_route(
             Err(err) => return RuntimeError::RequestBodyRead(err.to_string()).into_response(),
         },
     };
-
-    let session_id = crate::render::csrf::read_session_cookie(&parts.headers)
-        .or_else(|| {
-            parts
-                .headers
-                .get(ACTION_SESSION_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
-                .map(SessionId::new)
-        })
-        .unwrap_or_else(SessionId::random);
 
     let query = parts.uri.query().map(str::to_string);
     let ctx = RequestContext::new(
@@ -5425,7 +5609,7 @@ fn resolve_route_topics(
     world: &RenderWorld,
     streaming: &Arc<StreamingAppState>,
     page_path: &str,
-    principal: Option<&dom_render_compiler::auth::PrincipalId>,
+    principal: Option<&dom_render_compiler::auth::Principal>,
 ) -> Option<Vec<dom_render_compiler::runtime::TopicGrant>> {
     Some(resolve_route_topics_detailed(world, streaming, page_path, None, principal)?.0)
 }
@@ -5532,8 +5716,9 @@ fn resolve_route_topics_detailed(
     // AUTH item 5 P1 · the *lane's* principal, not the tab's session. A lane
     // that is not signed in resolves no identity-keyed topic and is therefore
     // granted none, which is what makes "cannot name it" an enforcement rather
-    // than a description.
-    principal: Option<&dom_render_compiler::auth::PrincipalId>,
+    // than a description. The whole principal, because R1a's role gate reads
+    // its roles as well as its id.
+    principal: Option<&dom_render_compiler::auth::Principal>,
 ) -> Option<(
     Vec<dom_render_compiler::runtime::TopicGrant>,
     Vec<ResolvedPartition>,
@@ -5569,14 +5754,22 @@ fn resolve_route_topics_detailed(
     // path gives at its own gate: a refusal must cost nothing, and warming a
     // partition out of FORGE for a lane that may not have it is work done on
     // behalf of a request already refused.
-    if !route.auth.allows_anonymous() && principal.is_none() {
+    //
+    // R1a · the same `admits` the render and the action doors call, so a role
+    // gate means one thing on every door.
+    let admission = route
+        .auth
+        .admits(principal.map(|who| who.roles.as_slice()));
+    if admission != dom_render_compiler::manifest::schema::Admission::Allowed {
         debug!(
             target: "albedo.auth",
             route = %pattern,
-            "anonymous lane refused by the route's `auth = \"required\"`"
+            ?admission,
+            "lane refused by the route's `auth` declaration"
         );
         return None;
     }
+    let principal = principal.map(|who| &who.id);
 
     // PRISM · the same resolver the render path calls, over the same matched
     // params. A spec whose param the route did not match, or whose key is
@@ -5671,9 +5864,13 @@ impl crate::handlers::phosphor::RouteAuthority for WorldRouteAuthority<'_> {
             .source_reader
             .get()
             .map(|reader| reader.registry().as_ref());
-        let principal = identity.principal().map(|who| &who.id);
-        let (grants, partitions, sources) =
-            resolve_route_topics_detailed(&self.world, streaming, &page, registry, principal)?;
+        let (grants, partitions, sources) = resolve_route_topics_detailed(
+            &self.world,
+            streaming,
+            &page,
+            registry,
+            identity.principal(),
+        )?;
         if !partitions.is_empty() {
             crate::topics::TopicWarmer::warm(&self.live, &partitions).await;
         }
@@ -5837,35 +6034,6 @@ async fn shutdown_signal() {
     }
 }
 
-/// Resolves `shutdown_timeout_ms` after the shutdown signal fires — never
-/// before it.
-///
-/// 🪤 **`shutdown_timeout_ms` was dead on arrival.** It is read from the
-/// environment, validated `must be > 0`, defaulted to 5 000 ms, and threaded
-/// all the way into `shutdown_signal`, whose parameter was named `_timeout`
-/// and never read. A hung streaming connection could block shutdown forever
-/// while a config field advertised a bound. Same shape as the five defects in
-/// `77fcc87`: **a fact fully computed, and nothing consuming it.**
-///
-/// This is the consumer. Racing it against the serve future is what turns the
-/// config value into an actual deadline: the drain gets `timeout` to finish,
-/// then the server returns regardless.
-async fn drain_deadline(mut shutdown_rx: watch::Receiver<bool>, timeout: Duration) {
-    loop {
-        // Scoped so the `Ref` is dropped before the await below it.
-        let fired = *shutdown_rx.borrow();
-        if fired {
-            break;
-        }
-        if shutdown_rx.changed().await.is_err() {
-            // The sender is gone, so the signal can never arrive. Parking is
-            // correct: firing here would cap the lifetime of a healthy server.
-            std::future::pending::<()>().await;
-        }
-    }
-    tokio::time::sleep(timeout).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5876,6 +6044,97 @@ mod tests {
     use bytes::Bytes;
     use tower::ServiceExt;
 
+    #[test]
+    fn external_database_acme_cache_server_path() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.forge.db_path = Some(data.path().join("forge.db").display().to_string());
+        config.server.tls.domains = vec!["app.example.com".into()];
+        let server = AlbedoServerBuilder::new(config).build().unwrap();
+        let mode = server.resolve_tls(&server.resolved_db_path()).unwrap();
+        let crate::tls::TlsMode::Acme { cache, .. } = mode else {
+            panic!("expected ACME")
+        };
+        assert_eq!(cache, data.path().join(crate::tls::DEFAULT_ACME_CACHE_DIR));
+    }
+
+    #[test]
+    fn external_database_acme_cache_full_boot_wiring() {
+        let project = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("src")).unwrap();
+        std::fs::write(
+            project.path().join("src/App.tsx"),
+            "export default function App() { return <div>cache</div>; }",
+        )
+        .unwrap();
+        let contract = dom_render_compiler::dev_contract::resolve_dev_contract(
+            &["--entry".into(), "src/App.tsx".into()],
+            project.path(),
+        )
+        .unwrap();
+        let mut opts = crate::boot::ProductionServerOptions::from_contract(&contract);
+        std::fs::create_dir_all(&opts.source_root).unwrap();
+        std::fs::create_dir_all(&opts.dist_dir).unwrap();
+        let manifest = dom_render_compiler::manifest::schema::RenderManifestV2::legacy_defaults();
+        std::fs::write(
+            opts.dist_dir.join("render-manifest.v2.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        opts.forge_db = Some(data.path().join("forge.db"));
+        opts.tls = crate::tls::TlsSettings {
+            domains: vec!["app.example.com".into()],
+            ..crate::tls::TlsSettings::default()
+        };
+        let server = crate::boot::boot_production_server(&opts).unwrap();
+        assert_eq!(server.resolved_db_path(), data.path().join("forge.db"));
+        assert_eq!(
+            server
+                .config
+                .server
+                .tls
+                .acme_cache
+                .as_deref()
+                .map(std::path::PathBuf::from),
+            Some(data.path().join(crate::tls::DEFAULT_ACME_CACHE_DIR))
+        );
+        let crate::tls::TlsMode::Acme { cache, .. } =
+            server.resolve_tls(&server.resolved_db_path()).unwrap()
+        else {
+            panic!("expected ACME")
+        };
+        assert_eq!(cache, data.path().join(crate::tls::DEFAULT_ACME_CACHE_DIR));
+
+        // Direct renderer startup must use the same resolved path for FORGE
+        // and TLS, including a project-relative database override.
+        let mut config = AppConfig::default();
+        config.renderer = Some(crate::config::RendererConfig {
+            artifacts_dir: opts.dist_dir.display().to_string(),
+            cache_ttl_ms: 1000,
+            cache_max_entries: 1,
+        });
+        config.forge.db_path = Some("data/forge.db".into());
+        config.server.tls = opts.tls;
+        let direct = AlbedoServerBuilder::new(config).build().unwrap();
+        assert_eq!(
+            direct.resolved_db_path(),
+            project.path().join("data/forge.db")
+        );
+        let crate::tls::TlsMode::Acme { cache, .. } =
+            direct.resolve_tls(&direct.resolved_db_path()).unwrap()
+        else {
+            panic!("expected ACME")
+        };
+        assert_eq!(
+            cache,
+            project
+                .path()
+                .join("data")
+                .join(crate::tls::DEFAULT_ACME_CACHE_DIR)
+        );
+    }
+
     /// An HTTPS connection that never finishes its handshake, or finishes it
     /// and never sends a request, is closed instead of held forever.
     ///
@@ -5884,22 +6143,7 @@ mod tests {
     /// descriptor.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_silent_https_connection_is_closed() {
-        use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-
-        /// Everything the server sends until it closes, or `None` if it is
-        /// still open when `window` ends.
-        async fn until_closed(stream: &mut (impl AsyncRead + Unpin), window: Duration) -> Option<Vec<u8>> {
-            let mut seen = Vec::new();
-            let mut buf = [0u8; 1024];
-            let deadline = tokio::time::Instant::now() + window;
-            loop {
-                match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
-                    Err(_) => return None,
-                    Ok(Ok(0) | Err(_)) => return Some(seen),
-                    Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
-                }
-            }
-        }
+        use tokio::io::AsyncWriteExt;
 
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
         let cert = fixtures.join("localhost-cert.pem");
@@ -5909,14 +6153,14 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let router = axum::Router::new().route("/", axum::routing::get(|| async { "served" }));
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let timeouts = TlsTimeouts {
+        let timeouts = ConnTimeouts {
             handshake: Duration::from_millis(300),
             header_read: Duration::from_millis(300),
         };
-        let server = tokio::spawn(serve_https(
+        let server = tokio::spawn(serve_connections(
             listener,
             router,
-            tls,
+            Some(tls),
             async {
                 let _ = stopped.await;
             },
@@ -6028,68 +6272,165 @@ mod tests {
         let _ = server.await;
     }
 
-    /// 🔴 **`shutdown_timeout_ms` was read, validated, defaulted and threaded
-    /// into a parameter named `_timeout` that was never used.** These three
-    /// tests are the consumer's regression guard — the defect they pin is not
-    /// "shutdown is wrong" but "a fully computed fact reaches nothing", which
-    /// is this project's signature shape and passes every type check.
+    /// Everything the server sends on `stream` until it closes, or `None` if it
+    /// is still open when `window` ends.
+    async fn until_closed(
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
+        window: Duration,
+    ) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+                Err(_) => return None,
+                Ok(Ok(0) | Err(_)) => return Some(seen),
+                Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    /// A plain-HTTP connection that says nothing — or stops halfway through its
+    /// headers — is closed, and a prompt request is still answered.
     ///
-    /// Signals themselves cannot be tested here: this rig is Windows and
-    /// delivers no SIGTERM. What *is* testable is the half that consumes the
-    /// config, and it is the half that was dead.
-    #[tokio::test(start_paused = true)]
-    async fn the_drain_deadline_consumes_shutdown_timeout_ms() {
-        let (tx, rx) = watch::channel(false);
-        let started = tokio::time::Instant::now();
-        tx.send(true).expect("receiver is alive");
+    /// 🔴 Before (2026-10-30): plain HTTP was `axum::serve`, with no hyper timer
+    /// and a version sniff that reads with no timeout. Both sockets stayed open,
+    /// each holding a task and a file descriptor — behind a proxy, the path
+    /// most deployments use. Watched failing with the timer removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_plain_http_connection_is_closed() {
+        use tokio::io::AsyncWriteExt;
 
-        drain_deadline(rx, Duration::from_millis(5_000)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "served" }));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let timeouts = ConnTimeouts {
+            handshake: Duration::from_millis(300),
+            header_read: Duration::from_millis(300),
+        };
+        let server = tokio::spawn(serve_connections(
+            listener,
+            router,
+            None,
+            async {
+                let _ = stopped.await;
+            },
+            Duration::from_secs(1),
+            timeouts,
+        ));
 
+        // Connected, nothing sent.
+        let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connects");
         assert!(
-            started.elapsed() >= Duration::from_millis(5_000),
-            "the deadline resolved in {:?}, so shutdown_timeout_ms is not being read",
-            started.elapsed()
+            until_closed(&mut silent, Duration::from_secs(5)).await.is_some(),
+            "a connection that sent nothing was held open"
         );
+
+        // Half a request line, then nothing — slowloris.
+        let mut slow = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        slow.write_all(b"GET / HTTP/1.1\r\nhost: loc").await.expect("writes");
+        assert!(
+            until_closed(&mut slow, Duration::from_secs(5)).await.is_some(),
+            "a connection that stopped mid-headers was held open"
+        );
+
+        // A prefix that could still be the HTTP/2 preface: the old sniff waited
+        // here for more bytes, with no timeout at all.
+        let mut maybe_h2 = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        maybe_h2.write_all(b"PRI").await.expect("writes");
+        assert!(
+            until_closed(&mut maybe_h2, Duration::from_secs(5)).await.is_some(),
+            "a connection that sent part of the HTTP/2 preface was held open"
+        );
+
+        // Control: a prompt request is answered, and with the peer attached.
+        let mut prompt = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        prompt
+            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+            .await
+            .expect("writes");
+        let answer = until_closed(&mut prompt, Duration::from_secs(5))
+            .await
+            .expect("the response completes");
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.ends_with("served"), "{answer}");
+
+        let _ = stop.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
     }
 
-    /// 🪤 The failure mode that matters more than a late drain: an early one.
-    /// If this future resolved before the signal, the `select!` in `serve`
-    /// would end a **healthy** server after `shutdown_timeout_ms` — five
-    /// seconds after boot, by default.
-    #[tokio::test(start_paused = true)]
-    async fn the_drain_deadline_never_fires_before_the_shutdown_signal() {
-        let (_tx, rx) = watch::channel(false);
+    /// `shutdown_timeout_ms` bounds the drain: a response that never finishes
+    /// cannot hold the process open past it — and nothing fires before the
+    /// signal, which would end a healthy server.
+    ///
+    /// Moved here from three tests of `drain_deadline`, which existed only to
+    /// bound `axum::serve` from outside and went with it. The defect they pinned
+    /// ("read, validated, defaulted and threaded into a parameter nobody used")
+    /// is pinned on the loop that consumes the value now.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_timeout_ms_bounds_the_drain_and_nothing_fires_before_it() {
+        use tokio::io::AsyncWriteExt;
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(3_600),
-            drain_deadline(rx, Duration::from_millis(5_000)),
-        )
-        .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let router = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "served" }))
+            .route(
+                "/hang",
+                axum::routing::get(|| async {
+                    // A body that never ends, like a live-update stream.
+                    Body::from_stream(futures_util::stream::pending::<
+                        Result<Bytes, std::io::Error>,
+                    >())
+                }),
+            );
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let drain = Duration::from_millis(600);
+        let server = tokio::spawn(serve_connections(
+            listener,
+            router,
+            None,
+            async {
+                let _ = stopped.await;
+            },
+            drain,
+            CONNECTION_TIMEOUTS,
+        ));
 
+        // Longer than the drain bound, with no signal: still serving.
+        tokio::time::sleep(drain * 2).await;
+        let mut prompt = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        prompt
+            .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+            .await
+            .expect("writes");
+        let answer = until_closed(&mut prompt, Duration::from_secs(5))
+            .await
+            .expect("answered");
         assert!(
-            result.is_err(),
-            "the deadline fired without a shutdown signal — this would cap the \
-             lifetime of every healthy server at shutdown_timeout_ms"
+            String::from_utf8_lossy(&answer).ends_with("served"),
+            "the server stopped serving without a shutdown signal"
         );
-    }
 
-    /// The same guarantee on the other branch: a dropped sender means the
-    /// signal can never arrive, so parking is correct and firing is not.
-    #[tokio::test(start_paused = true)]
-    async fn a_dropped_shutdown_sender_does_not_trigger_the_deadline() {
-        let (tx, rx) = watch::channel(false);
-        drop(tx);
+        // A response in flight that will never finish.
+        let mut hanging = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        hanging
+            .write_all(b"GET /hang HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .expect("writes");
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(3_600),
-            drain_deadline(rx, Duration::from_millis(5_000)),
-        )
-        .await;
-
+        let signalled = tokio::time::Instant::now();
+        let _ = stop.send(());
+        let finished = tokio::time::timeout(Duration::from_secs(10), server).await;
+        assert!(finished.is_ok(), "a hanging response held shutdown open");
+        let took = signalled.elapsed();
         assert!(
-            result.is_err(),
-            "a dropped sender resolved the deadline; the shutdown path must park, \
-             not fire"
+            took >= drain && took < drain + Duration::from_secs(2),
+            "the drain took {took:?}, not about shutdown_timeout_ms ({drain:?})"
         );
     }
 
@@ -6221,6 +6562,46 @@ mod tests {
             response.headers()
         );
         assert!(response.headers().contains_key("ratelimit-limit"));
+    }
+
+    /// A2 · a prober sharing an address with real traffic is never rationed —
+    /// the flood below is the one that gets `/ping` refused — and readiness
+    /// turns 503 the moment shutdown begins, while health stays 200: draining
+    /// is a reason to stop sending traffic, not to restart the process.
+    #[tokio::test]
+    async fn probes_skip_the_limiter_and_readiness_drops_when_shutdown_begins() {
+        let server = rationed_server();
+        let peer: SocketAddr = "198.51.100.9:4444".parse().unwrap();
+        for _ in 0..1_000 {
+            let response = server
+                .router()
+                .oneshot(get(crate::health::READY_PATH, Some(peer)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "a probe was rationed");
+        }
+        let health = server
+            .router()
+            .oneshot(get(crate::health::HEALTH_PATH, Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        server.shutdown.send_replace(true);
+        let ready = server
+            .router()
+            .oneshot(get(crate::health::READY_PATH, Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(ready.into_body(), 1024).await.unwrap();
+        assert_eq!(body, r#"{"status":"draining"}"#);
+        let health = server
+            .router()
+            .oneshot(get(crate::health::HEALTH_PATH, Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK, "draining is not dead");
     }
 
     /// The limiter is actually on the request path. Not "the module compiles" —

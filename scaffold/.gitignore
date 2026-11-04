@@ -13,8 +13,12 @@ dist/
 # here, so committing it publishes them.
 forge.db
 forge.db-*
+# A restore waiting for the next start, and the databases restores replaced.
+forge.db.*
 # Files your users upload.
 /uploads/
+# `albedo db backup` snapshots: a copy of all of the above.
+/backups/
 # The certificate store for `albedo serve --domain`: your ACME account key and
 # your site's TLS private key.
 .albedo-acme/

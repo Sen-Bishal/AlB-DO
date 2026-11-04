@@ -557,11 +557,33 @@ pub struct AuthDeclaration {
     /// the refusal it gave before.
     #[serde(default)]
     pub login: Option<String>,
+
+    /// R1a · the roles this app grants, e.g. `["admin", "payroll"]`.
+    ///
+    /// Declared, not inferred from what routes ask for: a route naming a role
+    /// nobody declared is a typo until proven otherwise, and boot refuses it.
+    /// Only a declared role counts when a principal is resolved, so removing one
+    /// here revokes it everywhere without touching a row — and declaring it again
+    /// restores it. A config edit can narrow access; it cannot destroy data.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 /// Why an `auth` block was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSchemaError {
+    /// R1a · a role name outside `^[a-z][a-z0-9_-]{0,31}$`.
+    InvalidRole {
+        /// The offending name.
+        role: String,
+    },
+    /// R1a · the same role declared twice.
+    DuplicateRole {
+        /// The repeated name.
+        role: String,
+    },
+    /// R1a · roles declared with no provider, so nobody could ever hold one.
+    RolesWithoutProviders,
     /// A provider name is not usable in a URL path segment or a `Principal`.
     InvalidName {
         /// The offending name.
@@ -655,6 +677,19 @@ pub enum AuthSchemaError {
 impl std::fmt::Display for AuthSchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidRole { role } => write!(
+                f,
+                "auth role `{role}`: a role name must match [a-z][a-z0-9_-]{{0,31}} — it is \
+                 stored, joined into lists and named in routes, so it gets no punctuation"
+            ),
+            Self::DuplicateRole { role } => {
+                write!(f, "auth role `{role}` is declared more than once")
+            }
+            Self::RolesWithoutProviders => write!(
+                f,
+                "auth declares `roles` but no `providers` — nobody can sign in, so nobody could \
+                 ever hold a role. Declare a provider, or remove `roles`"
+            ),
             Self::InvalidName { name } => write!(
                 f,
                 "auth provider `{name}`: a provider name appears in a login URL and on every \
@@ -848,6 +883,9 @@ pub struct AuthRegistry {
     /// The app's sign-in route, validated. `None` means a gated route answers
     /// `401` rather than redirecting.
     pub login_path: Option<String>,
+    /// R1a · the declared roles, validated and sorted. The only roles a
+    /// resolved principal is ever credited with.
+    pub roles: Vec<String>,
 }
 
 impl AuthRegistry {
@@ -862,7 +900,14 @@ impl AuthRegistry {
             session_cookie: DEFAULT_SESSION_COOKIE.to_string(),
             providers: Vec::new(),
             login_path: None,
+            roles: Vec::new(),
         }
+    }
+
+    /// Whether `role` is one this app declared.
+    #[must_use]
+    pub fn declares_role(&self, role: &str) -> bool {
+        self.roles.binary_search_by(|declared| declared.as_str().cmp(role)).is_ok()
     }
 
     /// Whether this app has any way to authenticate anyone.
@@ -1036,6 +1081,21 @@ impl AuthDeclaration {
             None => None,
         };
 
+        let mut roles = Vec::with_capacity(self.roles.len());
+        for role in &self.roles {
+            if !is_valid_role_name(role) {
+                return Err(AuthSchemaError::InvalidRole { role: role.clone() });
+            }
+            if roles.contains(role) {
+                return Err(AuthSchemaError::DuplicateRole { role: role.clone() });
+            }
+            roles.push(role.clone());
+        }
+        if !roles.is_empty() && providers.is_empty() {
+            return Err(AuthSchemaError::RolesWithoutProviders);
+        }
+        roles.sort();
+
         Ok(AuthRegistry {
             session_ttl,
             session_cookie,
@@ -1054,6 +1114,7 @@ impl AuthDeclaration {
             // but it becomes a `Location` header either way, and one rule with two
             // spellings is how the looser spelling gets found.
             login_path,
+            roles,
         })
     }
 }
@@ -1397,6 +1458,20 @@ fn require_https(provider: &str, field: &'static str, raw: &str) -> Result<Url, 
         });
     }
     Ok(url)
+}
+
+/// R1a · `^[a-z][a-z0-9_-]{0,31}$`. Stricter than a provider name on purpose: a
+/// role is joined with `,` by the resolution query, named in route modules, and
+/// may become part of a query instance's identity in R2.
+#[must_use]
+pub fn is_valid_role_name(role: &str) -> bool {
+    let bytes = role.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 32
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-')
 }
 
 /// Cookie names are RFC 6265 tokens, and the `__Host-` prefix carries
@@ -2009,5 +2084,66 @@ mod tests {
                 "{hostile:?} must not lower into a Location header"
             );
         }
+    }
+
+    /// R1a · declared roles reach the registry, sorted, so the set every gate
+    /// checks against is the same on every machine.
+    #[test]
+    fn declared_roles_reach_the_registry() {
+        let block = decl(serde_json::json!({
+            "providers": { "password": {} },
+            "roles": ["payroll", "admin", "hr"]
+        }));
+        let registry = block.lower().expect("lowers");
+        assert_eq!(registry.roles, vec!["admin", "hr", "payroll"]);
+        assert!(registry.declares_role("payroll"));
+        assert!(!registry.declares_role("finance"));
+    }
+
+    /// No `roles` key is the common case and must lower to no roles.
+    #[test]
+    fn no_declared_roles_lowers_to_none() {
+        let block = decl(serde_json::json!({ "providers": { "password": {} } }));
+        assert!(block.lower().expect("lowers").roles.is_empty());
+    }
+
+    /// A role name is joined with `,` by the resolution query and may become key
+    /// material later, so it is held to a strict alphabet. Each of these would
+    /// otherwise reach the database.
+    #[test]
+    fn a_role_name_outside_the_alphabet_is_refused() {
+        for bad in ["", "Admin", "1st", "pay roll", "a,b", "röle", &"r".repeat(33)] {
+            let block = decl(serde_json::json!({
+                "providers": { "password": {} },
+                "roles": [bad]
+            }));
+            assert!(
+                matches!(block.lower(), Err(AuthSchemaError::InvalidRole { .. })),
+                "{bad:?} must not lower"
+            );
+        }
+    }
+
+    #[test]
+    fn a_duplicate_role_is_refused() {
+        let block = decl(serde_json::json!({
+            "providers": { "password": {} },
+            "roles": ["admin", "admin"]
+        }));
+        assert!(matches!(
+            block.lower(),
+            Err(AuthSchemaError::DuplicateRole { .. })
+        ));
+    }
+
+    /// Roles with no provider: nobody can sign in, so nobody can hold one. The
+    /// same "only the pair is wrong" mistake `auth = "required"` refuses.
+    #[test]
+    fn roles_without_providers_are_refused() {
+        let block = decl(serde_json::json!({ "roles": ["admin"] }));
+        assert!(matches!(
+            block.lower(),
+            Err(AuthSchemaError::RolesWithoutProviders)
+        ));
     }
 }

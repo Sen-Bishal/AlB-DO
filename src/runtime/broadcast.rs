@@ -138,7 +138,7 @@ use tokio::sync::mpsc;
 /// the [`BroadcastRegistry`] pushes already-encoded
 /// [`OpcodeFrame`] bytes (one per write) which the WT layer
 /// forwards verbatim to stream slot 2 (patches).
-pub type BroadcastSender = mpsc::Sender<Vec<u8>>;
+pub type BroadcastSender = mpsc::Sender<bytes::Bytes>;
 
 /// Column projection · the fields of a topic's rows one subscription may
 /// receive. Shared (`Arc`) because every tab on a route carries the same set,
@@ -692,7 +692,22 @@ impl BroadcastRegistry {
         // path, where a collision is a build-time fact that
         // `check_topic_slot_ids` reports with both names, not a per-call error
         // every caller would have to invent a recovery for.
-        self.slot_ids.entry(slot_id.0).or_insert_with(|| topic.clone());
+        let _reservation = self
+            .slot_ids
+            .entry(slot_id.0)
+            .or_insert_with(|| topic.clone());
+        self.insert_topic(topic, initial, identity)
+    }
+
+    // Callers hold the slot reservation until the name is visible. Registration
+    // and eviction always lock slot_ids before topics, never in reverse order.
+    fn insert_topic(
+        &self,
+        topic: String,
+        initial: Vec<u8>,
+        identity: TopicIdentity,
+    ) -> Arc<BroadcastTopic> {
+        let slot_id = broadcast_slot_id(&topic);
         let entry = self
             .topics
             .entry(topic.clone())
@@ -731,17 +746,8 @@ impl BroadcastRegistry {
         if let Some(existing) = self.topics.get(&topic) {
             return Ok(existing.clone());
         }
-        let slot_id = broadcast_slot_id(&topic);
-        if let Some(holder) = self.slot_ids.get(&slot_id.0) {
-            if holder.value() != &topic {
-                return Err(BroadcastError::SlotIdCollision {
-                    topic,
-                    existing: holder.value().clone(),
-                    slot: slot_id.0,
-                });
-            }
-        }
-        Ok(self.topic_with_identity(topic, initial, TopicIdentity::Static))
+        let _reservation = self.guard_slot_id(&topic)?;
+        Ok(self.insert_topic(topic, initial, TopicIdentity::Static))
     }
 
     /// Mint (or resolve) one **partition** of a collection.
@@ -771,8 +777,8 @@ impl BroadcastRegistry {
         if let Some(existing) = self.topics.get(&name) {
             return Ok(existing.clone());
         }
-        self.guard_slot_id(&name)?;
-        Ok(self.topic_with_identity(
+        let _reservation = self.guard_slot_id(&name)?;
+        Ok(self.insert_topic(
             name,
             initial,
             TopicIdentity::Partition { collection, key },
@@ -841,9 +847,9 @@ impl BroadcastRegistry {
                 published: true,
             });
         }
-        self.guard_slot_id(&name)?;
+        let _reservation = self.guard_slot_id(&name)?;
         Ok(ExternalWarm {
-            topic: self.topic_with_identity(
+            topic: self.insert_topic(
                 name,
                 value,
                 TopicIdentity::External { source, route, url },
@@ -886,19 +892,25 @@ impl BroadcastRegistry {
             .collect()
     }
 
-    /// Refuse a name whose wire slot is held by a different name.
-    fn guard_slot_id(&self, topic: &str) -> Result<(), BroadcastError> {
-        let slot_id = broadcast_slot_id(topic);
-        if let Some(holder) = self.slot_ids.get(&slot_id.0) {
-            if holder.value() != topic {
-                return Err(BroadcastError::SlotIdCollision {
+    /// Reserve the wire slot until the caller has inserted the topic.
+    fn guard_slot_id(
+        &self,
+        topic: &str,
+    ) -> Result<dashmap::mapref::one::RefMut<'_, u32, String>, BroadcastError> {
+        use dashmap::mapref::entry::Entry;
+
+        let slot = broadcast_slot_id(topic).0;
+        match self.slot_ids.entry(slot) {
+            Entry::Occupied(holder) if holder.get() != topic => {
+                Err(BroadcastError::SlotIdCollision {
                     topic: topic.to_string(),
-                    existing: holder.value().clone(),
-                    slot: slot_id.0,
-                });
+                    existing: holder.get().clone(),
+                    slot,
+                })
             }
+            Entry::Occupied(holder) => Ok(holder.into_ref()),
+            Entry::Vacant(entry) => Ok(entry.insert(topic.to_string())),
         }
-        Ok(())
     }
 
     /// Drop a partition that nothing is watching, releasing its wire slot.
@@ -914,22 +926,25 @@ impl BroadcastRegistry {
     /// garbage-collected with the `Arc`. It cannot corrupt anything, because the
     /// authoritative copy was never in memory to begin with.
     pub fn drop_if_idle(&self, topic: &str) -> bool {
-        let evictable = match self.topics.get(topic) {
-            Some(entry) => entry.identity.is_evictable() && entry.subscribers.is_empty(),
-            None => false,
+        use dashmap::mapref::entry::Entry;
+
+        // Keep the reservation until the name is gone. A colliding registration
+        // cannot observe a free slot while the old topic still resolves.
+        let Entry::Occupied(reservation) = self.slot_ids.entry(broadcast_slot_id(topic).0) else {
+            return false;
         };
-        if !evictable {
+        if reservation.get() != topic {
             return false;
         }
-        // Remove the slot claim first: while the name is still present, a
-        // concurrent `try_topic` for a colliding name is correctly refused. The
-        // reverse order would open a window where the slot is free but the name
-        // still resolves.
-        let slot_id = broadcast_slot_id(topic);
-        self.slot_ids
-            .remove_if(&slot_id.0, |_, holder| holder == topic);
-        self.topics.remove(topic);
-        true
+        let removed = self.topics.remove_if(topic, |_, entry| {
+            entry.identity.is_evictable() && entry.subscribers.is_empty()
+        });
+        if removed.is_some() {
+            reservation.remove();
+            true
+        } else {
+            false
+        }
     }
 
     /// Bytes currently held by evictable (partition) topics.
@@ -1256,7 +1271,9 @@ impl BroadcastRegistry {
             component_id: None,
             instructions: vec![instruction],
         };
-        let encoded = encode_frame(&frame)?;
+        // Encoded once, into a buffer every subscriber shares: handing it to N
+        // channels is N reference-count bumps, not N copies.
+        let encoded = bytes::Bytes::from(encode_frame(&frame)?);
 
         let report = self.fan_out(topic, &topic_entry, &frame, &encoded);
         drop(guard);
@@ -1304,12 +1321,20 @@ impl BroadcastRegistry {
     /// A projected frame that fails to encode is **not** replaced by the whole
     /// one; that subscriber is dropped like a refused send and resubscribes
     /// from a fresh, projected seed.
+    ///
+    /// # No copy per subscriber
+    ///
+    /// Frames are [`bytes::Bytes`]: the whole frame and each projected one are
+    /// built once, and every subscriber's channel receives a handle to the same
+    /// buffer. Until 2026-10-30 the channels carried `Vec<u8>`, so each send
+    /// was `encoded.to_vec()` — inside the topic's lock — and an update to a
+    /// whole collection, re-read in full, was copied once per open tab.
     fn fan_out(
         &self,
         topic: &str,
         topic_entry: &BroadcastTopic,
         frame: &OpcodeFrame,
-        encoded: &[u8],
+        encoded: &bytes::Bytes,
     ) -> BroadcastDelivery {
         let mut report = BroadcastDelivery::default();
         let mut to_remove: Vec<SessionId> = Vec::new();
@@ -1320,7 +1345,7 @@ impl BroadcastRegistry {
             }
             _ => None,
         };
-        let mut projected: std::collections::HashMap<Columns, Option<Vec<u8>>> =
+        let mut projected: std::collections::HashMap<Columns, Option<bytes::Bytes>> =
             std::collections::HashMap::new();
 
         for entry in topic_entry.subscribers.iter() {
@@ -1344,9 +1369,10 @@ impl BroadcastRegistry {
                             }],
                         })
                         .ok()
+                        .map(bytes::Bytes::from)
                     })
                     .clone(),
-                _ => Some(encoded.to_vec()),
+                _ => Some(encoded.clone()),
             };
             let Some(bytes) = bytes else {
                 report.dropped_closed.push(session);
@@ -1600,10 +1626,39 @@ mod tests {
     use super::*;
     use crate::ir::wire::decode_frame;
 
-    fn drain_into_vec(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
+    /// #13 · one frame, every subscriber, one buffer.
+    ///
+    /// 🔴 The channels carried `Vec<u8>` and each send was `encoded.to_vec()`
+    /// inside the topic's lock, so an update to a whole collection — re-read in
+    /// full — was copied once per open tab.
+    #[test]
+    fn every_subscriber_receives_the_same_buffer_not_a_copy() {
+        let registry = BroadcastRegistry::new();
+        registry.topic("feed", b"[]".to_vec());
+        let mut receivers = Vec::new();
+        for _ in 0..3 {
+            let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
+            registry.subscribe(SessionId::random(), "feed", tx).unwrap();
+            receivers.push(rx);
+        }
+        let report = registry
+            .write_topic("feed", br#"[{"id":1,"body":"a long enough row"}]"#.to_vec())
+            .unwrap();
+        assert_eq!(report.delivered, 3);
+        let frames: Vec<bytes::Bytes> = receivers
+            .iter_mut()
+            .map(|rx| rx.try_recv().expect("a frame"))
+            .collect();
+        assert!(
+            frames.windows(2).all(|pair| pair[0].as_ptr() == pair[1].as_ptr()),
+            "each subscriber got its own copy of the frame"
+        );
+    }
+
+    fn drain_into_vec(rx: &mut mpsc::Receiver<bytes::Bytes>) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         while let Ok(payload) = rx.try_recv() {
-            out.push(payload);
+            out.push(payload.to_vec());
         }
         out
     }
@@ -1801,6 +1856,83 @@ mod tests {
         // The slot is free again: a different name that hashes there is now
         // accepted rather than refused by a claim nobody holds.
         assert!(registry.try_topic("messages:42", b"[]".to_vec()).is_ok());
+    }
+
+    #[test]
+    fn concurrent_colliding_partition_registrations_never_both_succeed() {
+        use std::sync::Barrier;
+
+        for iteration in 0..1024 {
+            let registry = BroadcastRegistry::new();
+            let start = Barrier::new(2);
+            let (a, b) = std::thread::scope(|scope| {
+                let register = |name: &str| {
+                    start.wait();
+                    registry
+                        .try_topic_partition(name, "room".into(), name.into(), b"[]".to_vec())
+                        .is_ok()
+                };
+                let a = scope.spawn(move || register(COLLIDING_A));
+                let b = scope.spawn(move || register(COLLIDING_B));
+                (a.join().unwrap(), b.join().unwrap())
+            });
+            assert_ne!(
+                a, b,
+                "exactly one registration must win, iteration {iteration}"
+            );
+            assert_eq!(registry.dynamic_topic_count(), 1, "iteration {iteration}");
+        }
+    }
+
+    #[test]
+    fn concurrent_guarded_registration_paths_share_the_slot_reservation() {
+        use std::sync::Barrier;
+
+        for iteration in 0..512 {
+            let registry = BroadcastRegistry::new();
+            let start = Barrier::new(2);
+            let (a, b) = std::thread::scope(|scope| {
+                let a = scope.spawn(|| {
+                    start.wait();
+                    registry.try_topic(COLLIDING_A, b"[]".to_vec()).is_ok()
+                });
+                let b = scope.spawn(|| {
+                    start.wait();
+                    registry
+                        .try_topic_external(
+                            COLLIDING_B,
+                            "source".into(),
+                            "route".into(),
+                            "https://example.test/".into(),
+                            b"[]".to_vec(),
+                        )
+                        .is_ok()
+                });
+                (a.join().unwrap(), b.join().unwrap())
+            });
+            assert_ne!(
+                a, b,
+                "exactly one guarded path must win, iteration {iteration}"
+            );
+            assert_eq!(registry.topic_count(), 1);
+        }
+    }
+
+    #[test]
+    fn releasing_a_partition_allows_a_colliding_name_to_register() {
+        let registry = BroadcastRegistry::new();
+        registry
+            .try_topic_partition(COLLIDING_A, "room".into(), "80939".into(), b"[]".to_vec())
+            .unwrap();
+        assert!(registry
+            .try_topic_partition(COLLIDING_B, "room".into(), "1016344".into(), b"[]".to_vec())
+            .is_err());
+        assert!(registry.drop_if_idle(COLLIDING_A));
+        assert!(registry
+            .try_topic_partition(COLLIDING_B, "room".into(), "1016344".into(), b"[]".to_vec())
+            .is_ok());
+        assert!(registry.get(COLLIDING_A).is_none());
+        assert_eq!(registry.dynamic_topic_count(), 1);
     }
 
     /// A partition goes through the same collision guard as anything else —
@@ -2004,7 +2136,7 @@ mod tests {
     #[test]
     fn subscribe_to_unknown_topic_surfaces_typed_error() {
         let registry = BroadcastRegistry::new();
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(4);
         let err = registry
             .subscribe(SessionId::random(), "missing", tx)
             .unwrap_err();
@@ -2015,7 +2147,7 @@ mod tests {
     fn subscribe_returns_current_value_for_late_joiners() {
         let registry = BroadcastRegistry::new();
         registry.topic("seed", b"initial".to_vec());
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(4);
         let value = registry
             .subscribe(SessionId::random(), "seed", tx)
             .unwrap();
@@ -2027,8 +2159,8 @@ mod tests {
         let registry = BroadcastRegistry::new();
         let topic = registry.topic("counter", b"0".to_vec());
 
-        let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(8);
-        let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(8);
+        let (tx_a, mut rx_a) = mpsc::channel::<bytes::Bytes>(8);
+        let (tx_b, mut rx_b) = mpsc::channel::<bytes::Bytes>(8);
         let session_a = SessionId::random();
         let session_b = SessionId::random();
         registry.subscribe(session_a, "counter", tx_a).unwrap();
@@ -2069,7 +2201,7 @@ mod tests {
         let registry = BroadcastRegistry::new();
         registry.topic("alerts", b"[]".to_vec());
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(4);
         let session = SessionId::random();
         registry.subscribe(session, "alerts", tx).unwrap();
         drop(rx); // Receiver gone → sender closed.
@@ -2090,15 +2222,15 @@ mod tests {
         registry.topic("hot", b"0".to_vec());
 
         // Tiny channel for the slow consumer; large for the fast one.
-        let (tx_slow, _rx_slow) = mpsc::channel::<Vec<u8>>(1);
-        let (tx_fast, mut rx_fast) = mpsc::channel::<Vec<u8>>(64);
+        let (tx_slow, _rx_slow) = mpsc::channel::<bytes::Bytes>(1);
+        let (tx_fast, mut rx_fast) = mpsc::channel::<bytes::Bytes>(64);
         let slow = SessionId::random();
         let fast = SessionId::random();
         registry.subscribe(slow, "hot", tx_slow.clone()).unwrap();
         registry.subscribe(fast, "hot", tx_fast).unwrap();
 
         // Fill the slow channel so the next try_send returns Full.
-        tx_slow.try_send(b"prefill".to_vec()).unwrap();
+        tx_slow.try_send(bytes::Bytes::from_static(b"prefill")).unwrap();
 
         let report = registry.write_topic("hot", b"new".to_vec()).unwrap();
         assert_eq!(report.delivered, 1, "fast consumer must receive");
@@ -2124,7 +2256,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_send_drops_the_sessions_whole_subscription_so_its_channel_closes() {
         let registry = BroadcastRegistry::new();
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(1);
         let session = SessionId::random();
         let _ = registry.auto_subscribe(session, tx, &["busy".to_string(), "quiet".to_string()]);
         assert_eq!(registry.get("quiet").unwrap().subscriber_count(), 1);
@@ -2156,9 +2288,9 @@ mod tests {
         registry.topic("a", b"".to_vec());
         registry.topic("b", b"".to_vec());
 
-        let (tx_a1, _rx) = mpsc::channel::<Vec<u8>>(4);
-        let (tx_a2, _rx) = mpsc::channel::<Vec<u8>>(4);
-        let (tx_b1, _rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tx_a1, _rx) = mpsc::channel::<bytes::Bytes>(4);
+        let (tx_a2, _rx) = mpsc::channel::<bytes::Bytes>(4);
+        let (tx_b1, _rx) = mpsc::channel::<bytes::Bytes>(4);
         let s1 = SessionId::random();
         let s2 = SessionId::random();
         registry.subscribe(s1, "a", tx_a1).unwrap();
@@ -2182,8 +2314,8 @@ mod tests {
         let registry = BroadcastRegistry::new();
         registry.topic("t", b"".to_vec());
 
-        let (tx_first, mut rx_first) = mpsc::channel::<Vec<u8>>(4);
-        let (tx_second, mut rx_second) = mpsc::channel::<Vec<u8>>(4);
+        let (tx_first, mut rx_first) = mpsc::channel::<bytes::Bytes>(4);
+        let (tx_second, mut rx_second) = mpsc::channel::<bytes::Bytes>(4);
         let session = SessionId::random();
         registry.subscribe(session, "t", tx_first).unwrap();
         registry.subscribe(session, "t", tx_second).unwrap();
@@ -2198,7 +2330,7 @@ mod tests {
     async fn frame_id_advances_per_write_for_reassembly_correctness() {
         let registry = BroadcastRegistry::new();
         registry.topic("seq", b"".to_vec());
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
         registry.subscribe(SessionId::random(), "seq", tx).unwrap();
 
         registry.write_topic("seq", b"1".to_vec()).unwrap();
@@ -2281,7 +2413,7 @@ mod tests {
     async fn a_delta_write_ships_the_delta_alone_and_stores_the_snapshot() {
         let registry = BroadcastRegistry::new();
         let topic = registry.topic("guestbook", b"[]".to_vec());
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
         registry
             .subscribe(SessionId::random(), "guestbook", tx)
             .unwrap();
@@ -2328,7 +2460,7 @@ mod tests {
     async fn a_reconcile_update_ships_a_reconcile_list_alone() {
         let registry = BroadcastRegistry::new();
         let topic = registry.topic("guestbook", b"[]".to_vec());
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
         registry
             .subscribe(SessionId::random(), "guestbook", tx)
             .unwrap();
@@ -2367,7 +2499,7 @@ mod tests {
     async fn an_insert_update_ships_a_slot_insert_naming_its_anchor() {
         let registry = BroadcastRegistry::new();
         let topic = registry.topic("guestbook", b"[]".to_vec());
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
         registry
             .subscribe(SessionId::random(), "guestbook", tx)
             .unwrap();
@@ -2407,7 +2539,7 @@ mod tests {
     async fn an_empty_insert_degenerates_to_a_plain_slot_set() {
         let registry = BroadcastRegistry::new();
         registry.topic("t", b"[]".to_vec());
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
         registry.subscribe(SessionId::random(), "t", tx).unwrap();
 
         registry
@@ -2437,7 +2569,7 @@ mod tests {
     async fn an_empty_delta_degenerates_to_a_plain_slot_set() {
         let registry = BroadcastRegistry::new();
         registry.topic("t", b"".to_vec());
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
         registry.subscribe(SessionId::random(), "t", tx).unwrap();
 
         registry
@@ -2473,7 +2605,7 @@ mod tests {
         registry.topic("guestbook", b"[]".to_vec());
 
         // A write whose snapshot never reaches the wire.
-        let (early_tx, mut early_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (early_tx, mut early_rx) = mpsc::channel::<bytes::Bytes>(8);
         registry
             .subscribe(SessionId::random(), "guestbook", early_tx)
             .unwrap();
@@ -2492,7 +2624,7 @@ mod tests {
         );
 
         // …and a session that was not there for it.
-        let (late_tx, _late_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (late_tx, _late_rx) = mpsc::channel::<bytes::Bytes>(8);
         let seen = registry
             .subscribe(SessionId::random(), "guestbook", late_tx)
             .unwrap();
@@ -2625,7 +2757,7 @@ mod tests {
     async fn concurrent_writers_produce_a_replayable_delta_sequence() {
         let registry = Arc::new(BroadcastRegistry::new());
         registry.topic("race", b"".to_vec());
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(64);
         registry.subscribe(SessionId::random(), "race", tx).unwrap();
 
         // Each writer appends "wN" to a comma-joined value, deriving BOTH the
@@ -2689,7 +2821,7 @@ mod tests {
         let registry = BroadcastRegistry::new();
         // Seed one topic with a value; leave the other for auto-create.
         registry.topic("known", b"seed".to_vec());
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(4);
         let session = SessionId::random();
 
         let opcodes =
@@ -2724,7 +2856,7 @@ mod tests {
     #[tokio::test]
     async fn auto_subscribe_followup_write_reaches_the_subscriber() {
         let registry = BroadcastRegistry::new();
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
         let session = SessionId::random();
         let _ = registry.auto_subscribe(session, tx, &["live".to_string()]);
 
@@ -2767,7 +2899,7 @@ mod tests {
     fn a_granted_seed_carries_only_the_routes_columns() {
         let registry = BroadcastRegistry::new();
         registry.topic("waitlist", WAITLIST.to_vec());
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(8);
         let seed = registry.subscribe_granted(
             SessionId::random(),
             tx,
@@ -2784,7 +2916,7 @@ mod tests {
         }
         assert_eq!(seed.values, vec![("waitlist".to_string(), WAITLIST.to_vec())], "kept whole server-side");
 
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(8);
         let whole = registry.auto_subscribe(SessionId::random(), tx, &["waitlist".to_string()]);
         assert!(matches!(whole.as_slice(), [Instruction::SlotSet { value, .. }] if value == WAITLIST));
     }
@@ -2800,9 +2932,9 @@ mod tests {
                 columns,
             }]
         };
-        let (count_tx, mut count_rx) = mpsc::channel::<Vec<u8>>(8);
-        let (count2_tx, mut count2_rx) = mpsc::channel::<Vec<u8>>(8);
-        let (admin_tx, mut admin_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (count_tx, mut count_rx) = mpsc::channel::<bytes::Bytes>(8);
+        let (count2_tx, mut count2_rx) = mpsc::channel::<bytes::Bytes>(8);
+        let (admin_tx, mut admin_rx) = mpsc::channel::<bytes::Bytes>(8);
         registry.subscribe_granted(SessionId::random(), count_tx, &grant(Some(cols(&["id"]))));
         registry.subscribe_granted(SessionId::random(), count2_tx, &grant(Some(cols(&["id"]))));
         registry.subscribe_granted(SessionId::random(), admin_tx, &grant(None));
@@ -2821,7 +2953,7 @@ mod tests {
     fn a_list_delta_is_not_projected() {
         let registry = BroadcastRegistry::new();
         registry.topic("waitlist", b"[]".to_vec());
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
         registry.subscribe_granted(
             SessionId::random(),
             tx,
@@ -2849,7 +2981,7 @@ mod tests {
         let registry = BroadcastRegistry::new();
         registry.topic("waitlist", b"[]".to_vec());
         let session = SessionId::random();
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
         registry.subscribe_granted(
             session,
             tx.clone(),

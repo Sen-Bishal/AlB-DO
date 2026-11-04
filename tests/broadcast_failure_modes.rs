@@ -40,7 +40,7 @@ async fn concurrent_subscribers_all_receive_a_single_write() {
     let mut subscribe_set = JoinSet::new();
     for _ in 0..SUBSCRIBERS {
         let registry = registry.clone();
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
         receivers.push(rx);
         subscribe_set.spawn(async move {
             let session = SessionId::random();
@@ -75,7 +75,7 @@ async fn concurrent_cleanup_session_and_write_topic_do_not_deadlock() {
     let mut sessions = Vec::new();
     let mut receivers = Vec::new();
     for _ in 0..32 {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
         let session = SessionId::random();
         registry.subscribe(session, TOPIC, tx).unwrap();
         sessions.push(session);
@@ -123,13 +123,13 @@ async fn slow_consumer_dropped_does_not_block_thousand_fast_writes() {
     let registry = Arc::new(BroadcastRegistry::new());
     registry.topic(TOPIC, b"".to_vec());
 
-    let (slow_tx, _slow_rx) = mpsc::channel::<Vec<u8>>(1);
-    let (fast_tx, mut fast_rx) = mpsc::channel::<Vec<u8>>(2048);
+    let (slow_tx, _slow_rx) = mpsc::channel::<bytes::Bytes>(1);
+    let (fast_tx, mut fast_rx) = mpsc::channel::<bytes::Bytes>(2048);
     let slow_session = SessionId::random();
     let fast_session = SessionId::random();
     registry.subscribe(slow_session, TOPIC, slow_tx.clone()).unwrap();
     registry.subscribe(fast_session, TOPIC, fast_tx).unwrap();
-    slow_tx.try_send(b"prefill".to_vec()).unwrap(); // saturate slow channel
+    slow_tx.try_send(bytes::Bytes::from_static(b"prefill")).unwrap(); // saturate slow channel
 
     let mut total_drop_full = 0usize;
     for i in 0..1000_u32 {
@@ -156,7 +156,7 @@ async fn large_payload_broadcasts_round_trip_correctly() {
     // wire path handles big buffers without truncation.
     let registry = Arc::new(BroadcastRegistry::new());
     registry.topic(TOPIC, b"".to_vec());
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+    let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(4);
     registry.subscribe(SessionId::random(), TOPIC, tx).unwrap();
 
     let big_value: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
@@ -187,7 +187,7 @@ async fn write_storm_to_one_thousand_subscribers_delivers_every_event() {
     const WRITES: usize = 10;
     let mut receivers = Vec::with_capacity(SESSIONS);
     for _ in 0..SESSIONS {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(WRITES + 4);
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(WRITES + 4);
         registry.subscribe(SessionId::random(), TOPIC, tx).unwrap();
         receivers.push(rx);
     }
@@ -227,7 +227,7 @@ async fn subscriber_dropped_mid_subscribe_does_not_corrupt_reverse_index() {
     registry.topic(TOPIC, b"".to_vec());
 
     let session = SessionId::random();
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(4);
+    let (tx, rx) = mpsc::channel::<bytes::Bytes>(4);
     registry.subscribe(session, TOPIC, tx).unwrap();
     drop(rx); // simulates client disconnect before any write
 
@@ -250,7 +250,7 @@ async fn auto_subscribe_then_cleanup_session_releases_every_topic_subscription()
     // monotonically across reconnects.
     let registry = Arc::new(BroadcastRegistry::new());
     let session = SessionId::random();
-    let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+    let (tx, _rx) = mpsc::channel::<bytes::Bytes>(4);
     let topics: Vec<String> = (0..16).map(|i| format!("topic-{i}")).collect();
     let _ = registry.auto_subscribe(session, tx, &topics);
     for topic in &topics {

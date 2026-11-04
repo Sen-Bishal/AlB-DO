@@ -43,9 +43,11 @@
 #![warn(rustdoc::broken_intra_doc_links)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
+pub mod access_log;
 pub mod actions;
 pub mod api;
 pub mod auth;
+pub mod backups;
 pub mod boot;
 pub mod bundle_payload;
 pub mod config;
@@ -57,6 +59,7 @@ pub mod error;
 pub mod forge_db_path;
 pub mod forms;
 pub mod handlers;
+pub mod health;
 pub mod inspector;
 pub(crate) mod jobs;
 pub mod lifecycle;

@@ -71,7 +71,7 @@ async fn use_shared_slot_renders_current_topic_value_and_emits_set_text_ref() {
     broadcast.topic(TOPIC, seed.clone());
 
     let (slots, _session, _store) = fresh_session();
-    let (tx, _rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx, _rx) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
 
     let opts = RenderOptions { hook_compile: true };
     let out = render_entry_with_broadcast(
@@ -128,7 +128,7 @@ async fn render_auto_subscribes_session_so_follow_up_write_topic_delivers() {
     broadcast.topic(TOPIC, b"[]".to_vec());
 
     let (slots, _session, _store) = fresh_session();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
 
     let _ = render_entry_with_broadcast(
         &project,
@@ -165,7 +165,7 @@ async fn rendering_a_component_with_unknown_topic_auto_creates_it() {
     assert!(broadcast.get(TOPIC).is_none(), "topic must start absent");
 
     let (slots, _session, _store) = fresh_session();
-    let (tx, _rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx, _rx) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
 
     let _ = render_entry_with_broadcast(
         &project,
@@ -194,8 +194,8 @@ async fn two_sessions_rendering_same_component_both_receive_broadcast_writes() {
 
     let (slots_a, _, _) = fresh_session();
     let (slots_b, _, _) = fresh_session();
-    let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-    let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx_a, mut rx_a) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
+    let (tx_b, mut rx_b) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
 
     let _ = render_entry_with_broadcast(
         &project,

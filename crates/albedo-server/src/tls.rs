@@ -104,7 +104,7 @@ pub const ACME_STAGING_ENV: &str = "ALBEDO_ACME_STAGING";
 /// which anyone can set once and carry into production unnoticed.
 pub const PUBLIC_ORIGIN_ENV: &str = "ALBEDO_PUBLIC_ORIGIN";
 
-/// Default cache directory, relative to the project.
+/// Default cache directory, relative to the database directory.
 pub const DEFAULT_ACME_CACHE_DIR: &str = ".albedo-acme";
 
 /// The `tls` block of the server config.
@@ -190,6 +190,15 @@ fn is_truthy(raw: &str) -> bool {
 /// serve the site on the wrong scheme with no indication, which for an app
 /// with a login is indistinguishable from the auth being broken.
 pub fn resolve(settings: &TlsSettings, project_root: &Path) -> Result<TlsMode, String> {
+    resolve_for_data_dir(settings, project_root, project_root)
+}
+
+/// Resolve startup TLS against the same data directory as the database.
+pub(crate) fn resolve_for_data_dir(
+    settings: &TlsSettings,
+    project_root: &Path,
+    data_dir: &Path,
+) -> Result<TlsMode, String> {
     let cert = settings
         .cert_path
         .as_deref()
@@ -233,15 +242,7 @@ pub fn resolve(settings: &TlsSettings, project_root: &Path) -> Result<TlsMode, S
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
-            cache: settings
-                .acme_cache
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map_or_else(
-                    || project_root.join(DEFAULT_ACME_CACHE_DIR),
-                    |value| resolve_against(value, project_root),
-                ),
+            cache: resolve_acme_cache(settings.acme_cache.as_deref(), project_root, data_dir)?,
             staging: settings.acme_staging,
             domains,
         });
@@ -263,6 +264,70 @@ pub fn resolve(settings: &TlsSettings, project_root: &Path) -> Result<TlsMode, S
             cert: resolve_against(cert, project_root),
             key: resolve_against(key, project_root),
         }),
+    }
+}
+
+/// Pure default selection, shared by both startup paths.
+pub(crate) fn default_acme_cache(data_dir: &Path) -> PathBuf {
+    data_dir.join(DEFAULT_ACME_CACHE_DIR)
+}
+
+fn resolve_acme_cache(
+    explicit: Option<&str>,
+    project_root: &Path,
+    data_dir: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(resolve_against(value, project_root));
+    }
+    let default = default_acme_cache(data_dir);
+    let legacy = project_root.join(DEFAULT_ACME_CACHE_DIR);
+    if legacy == default || !cache_populated(&legacy)? {
+        return Ok(default);
+    }
+    let (cache, warning) = legacy_cache_choice(&legacy, &default, cache_populated(&default)?);
+    // Dev reloads reuse boot in the same process. Warn once, without touching
+    // key material; the operator decides when to move the existing cache.
+    static WARN_LEGACY_CACHE: std::sync::Once = std::sync::Once::new();
+    // The CLI installs tracing only when RUST_LOG is set. This startup
+    // diagnostic must also reach operators using the stock configuration.
+    WARN_LEGACY_CACHE.call_once(|| eprintln!("warning: {warning}"));
+    Ok(cache)
+}
+
+fn cache_populated(path: &Path) -> Result<bool, String> {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => match entries.next() {
+            None => Ok(false),
+            Some(Ok(_)) => Ok(true),
+            Some(Err(err)) => Err(format!(
+                "failed to inspect ACME cache '{}': {err}",
+                path.display()
+            )),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!(
+            "failed to inspect ACME cache '{}': {err}",
+            path.display()
+        )),
+    }
+}
+
+fn legacy_cache_choice(
+    legacy: &Path,
+    default: &Path,
+    default_populated: bool,
+) -> (PathBuf, String) {
+    if default_populated {
+        (default.to_path_buf(), format!(
+            "ACME caches are populated at both '{}' and '{}'; using '{}'. To use the legacy cache, set ALBEDO_ACME_CACHE to '{}'. No key material was moved.",
+            legacy.display(), default.display(), default.display(), legacy.display()
+        ))
+    } else {
+        (legacy.to_path_buf(), format!(
+            "using legacy ACME cache '{}' because '{}' is absent or empty. Move the complete cache to '{}' while the server is stopped, or set ALBEDO_ACME_CACHE to '{}'. No key material was moved.",
+            legacy.display(), default.display(), default.display(), legacy.display()
+        ))
     }
 }
 
@@ -883,6 +948,241 @@ mod tests {
             domains: domains.iter().map(|d| (*d).to_string()).collect(),
             ..TlsSettings::default()
         }
+    }
+
+    #[test]
+    fn external_database_cache_default_is_shared() {
+        let project = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        assert_eq!(
+            default_acme_cache(data.path()),
+            data.path().join(DEFAULT_ACME_CACHE_DIR)
+        );
+        let mode =
+            resolve_for_data_dir(&acme(&["app.example.com"]), project.path(), data.path()).unwrap();
+        let TlsMode::Acme { cache, .. } = mode else {
+            panic!("expected ACME")
+        };
+        assert_eq!(cache, default_acme_cache(data.path()));
+        assert!(!cache.exists(), "selection must not create a cache");
+    }
+
+    #[test]
+    fn legacy_cache_selection_preserves_every_byte() {
+        for (legacy_present, default_present, default_has_files) in [
+            (true, false, false),
+            (true, true, false),
+            (false, false, false),
+            (true, true, true),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let data = tempfile::tempdir().unwrap();
+            let legacy = project.path().join(DEFAULT_ACME_CACHE_DIR);
+            let default = default_acme_cache(data.path());
+            if legacy_present {
+                std::fs::create_dir(&legacy).unwrap();
+                std::fs::write(legacy.join("account"), b"old account bytes").unwrap();
+                std::fs::write(legacy.join("certificate"), b"old certificate bytes").unwrap();
+            }
+            if default_present {
+                std::fs::create_dir(&default).unwrap();
+                if default_has_files {
+                    std::fs::write(default.join("account"), b"new account bytes").unwrap();
+                    std::fs::write(default.join("certificate"), b"new certificate bytes").unwrap();
+                }
+            }
+            let mode =
+                resolve_for_data_dir(&acme(&["app.example.com"]), project.path(), data.path())
+                    .unwrap();
+            let TlsMode::Acme { cache, .. } = mode else {
+                panic!("expected ACME")
+            };
+            let use_legacy = legacy_present && !default_has_files;
+            assert_eq!(
+                cache,
+                if use_legacy {
+                    legacy.clone()
+                } else {
+                    default.clone()
+                }
+            );
+            if legacy_present {
+                assert_eq!(
+                    std::fs::read(legacy.join("account")).unwrap(),
+                    b"old account bytes"
+                );
+                assert_eq!(
+                    std::fs::read(legacy.join("certificate")).unwrap(),
+                    b"old certificate bytes"
+                );
+                assert_eq!(std::fs::read_dir(&legacy).unwrap().count(), 2);
+                let (_, warning) = legacy_cache_choice(&legacy, &default, default_has_files);
+                assert!(warning.contains(&legacy.display().to_string()), "{warning}");
+                assert!(
+                    warning.contains(&default.display().to_string()),
+                    "{warning}"
+                );
+                assert!(warning.contains("ALBEDO_ACME_CACHE"), "{warning}");
+                assert!(!warning.contains("account bytes"), "{warning}");
+                assert!(!warning.contains("certificate bytes"), "{warning}");
+            } else {
+                assert!(!legacy.exists());
+            }
+            assert_eq!(default.exists(), default_present);
+            if default_present {
+                assert_eq!(
+                    std::fs::read_dir(&default).unwrap().count(),
+                    if default_has_files { 2 } else { 0 }
+                );
+                if default_has_files {
+                    assert_eq!(
+                        std::fs::read(default.join("account")).unwrap(),
+                        b"new account bytes"
+                    );
+                    assert_eq!(
+                        std::fs::read(default.join("certificate")).unwrap(),
+                        b"new certificate bytes"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_warning_is_visible_once_without_tracing() {
+        const PROJECT_ENV: &str = "ALBEDO_TEST_LEGACY_CACHE_PROJECT";
+        const DATA_ENV: &str = "ALBEDO_TEST_LEGACY_CACHE_DATA";
+        if let Some(project) = std::env::var_os(PROJECT_ENV) {
+            let data = std::env::var_os(DATA_ENV).unwrap();
+            for _ in 0..2 {
+                resolve_for_data_dir(
+                    &acme(&["app.example.com"]),
+                    Path::new(&project),
+                    Path::new(&data),
+                )
+                .unwrap();
+            }
+            return;
+        }
+        for both_populated in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let data = tempfile::tempdir().unwrap();
+            std::fs::create_dir(project.path().join(DEFAULT_ACME_CACHE_DIR)).unwrap();
+            std::fs::write(
+                project.path().join(DEFAULT_ACME_CACHE_DIR).join("account"),
+                b"secret account bytes",
+            )
+            .unwrap();
+            if both_populated {
+                std::fs::create_dir(default_acme_cache(data.path())).unwrap();
+                std::fs::write(
+                    default_acme_cache(data.path()).join("certificate"),
+                    b"secret certificate bytes",
+                )
+                .unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tls::tests::legacy_warning_is_visible_once_without_tracing",
+                    "--nocapture",
+                ])
+                .env(PROJECT_ENV, project.path())
+                .env(DATA_ENV, data.path())
+                .env_remove("RUST_LOG")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let prefix = if both_populated {
+                "ACME caches are populated at both"
+            } else {
+                "using legacy ACME cache"
+            };
+            assert_eq!(stderr.matches(prefix).count(), 1, "{stderr}");
+            assert!(
+                stderr.contains(
+                    &project
+                        .path()
+                        .join(DEFAULT_ACME_CACHE_DIR)
+                        .display()
+                        .to_string()
+                ),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains(&default_acme_cache(data.path()).display().to_string()),
+                "{stderr}"
+            );
+            assert!(stderr.contains("ALBEDO_ACME_CACHE"), "{stderr}");
+            assert!(!stderr.contains("secret account bytes"), "{stderr}");
+            assert!(!stderr.contains("secret certificate bytes"), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn explicit_cache_wins_and_blank_cache_uses_the_default_rules() {
+        let project = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let legacy = project.path().join(DEFAULT_ACME_CACHE_DIR);
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("account"), b"old account bytes").unwrap();
+        let absolute = data.path().join("operator-cache");
+        for (explicit, expected) in [
+            (absolute.display().to_string(), absolute.clone()),
+            ("certs/acme".into(), project.path().join("certs/acme")),
+            ("".into(), legacy.clone()),
+            ("  ".into(), legacy.clone()),
+        ] {
+            let mut settings = acme(&["app.example.com"]);
+            settings.acme_cache = Some(explicit);
+            let TlsMode::Acme { cache, .. } =
+                resolve_for_data_dir(&settings, project.path(), data.path()).unwrap()
+            else {
+                panic!("expected ACME")
+            };
+            assert_eq!(cache, expected);
+        }
+        assert!(!absolute.exists());
+        assert_eq!(
+            std::fs::read(legacy.join("account")).unwrap(),
+            b"old account bytes"
+        );
+    }
+
+    #[test]
+    fn non_acme_and_explicit_modes_never_inspect_cache_directories() {
+        let project = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // read_dir on these paths fails. Modes that do not need a legacy check
+        // must still resolve, even with an explicit but unused ACME cache.
+        std::fs::write(
+            project.path().join(DEFAULT_ACME_CACHE_DIR),
+            b"not a directory",
+        )
+        .unwrap();
+        std::fs::write(default_acme_cache(data.path()), b"not a directory").unwrap();
+        assert_eq!(
+            resolve_for_data_dir(&TlsSettings::default(), project.path(), data.path()).unwrap(),
+            TlsMode::Disabled
+        );
+        let files = TlsSettings {
+            cert_path: Some("cert.pem".into()),
+            key_path: Some("key.pem".into()),
+            ..TlsSettings::default()
+        };
+        assert!(matches!(
+            resolve_for_data_dir(&files, project.path(), data.path()).unwrap(),
+            TlsMode::Files { .. }
+        ));
+        let mut explicit = acme(&["app.example.com"]);
+        explicit.acme_cache = Some("operator-cache".into());
+        assert!(resolve_for_data_dir(&explicit, project.path(), data.path()).is_ok());
+        assert!(
+            resolve_for_data_dir(&acme(&["app.example.com"]), project.path(), data.path())
+                .unwrap_err()
+                .contains("failed to inspect ACME cache")
+        );
     }
 
     /// The sentence the whole push is aimed at: one domain, nothing else.

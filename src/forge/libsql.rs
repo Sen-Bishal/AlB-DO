@@ -221,6 +221,76 @@ impl LibSqlSubstrate {
             .expect("substrate used after teardown")
     }
 
+    /// Write a point-in-time copy of this database to `dest`, check it, and
+    /// say what it holds.
+    ///
+    /// `VACUUM INTO` on a connection of its own: one read transaction, so the
+    /// copy is a single instant while the server keeps reading and writing
+    /// (WAL readers block nobody). Its own connection rather than `reader`,
+    /// which every live query shares and would wait behind the copy. Copying
+    /// the file instead is how SQLite backups go wrong: commits still in the
+    /// WAL are missing from it, and a copy that races a checkpoint is torn.
+    ///
+    /// The copy is then attached to the same connection — no second database
+    /// opened in this process — sealed to rollback-journal mode so it is one
+    /// self-contained file, `quick_check`ed, and counted. Nothing reports a
+    /// snapshot as taken before it has been read back.
+    ///
+    /// # Errors
+    /// [`SubstrateError::Backend`] when `dest` is not valid UTF-8, the copy
+    /// fails, or the copy does not check out.
+    pub async fn snapshot_into(&self, dest: &std::path::Path) -> Result<SnapshotFacts> {
+        let backend = |e: libsql::Error| SubstrateError::Backend(e.to_string());
+        let target = dest
+            .to_str()
+            .ok_or_else(|| {
+                SubstrateError::Backend(format!("{} is not a UTF-8 path", dest.display()))
+            })?
+            .to_owned();
+        let db = self
+            .conns
+            .db
+            .as_ref()
+            .expect("substrate used after teardown");
+        let conn = connect(db).await?;
+        conn.execute("VACUUM INTO ?1", [target.clone()])
+            .await
+            .map_err(backend)?;
+        conn.execute("ATTACH DATABASE ?1 AS snap", [target])
+            .await
+            .map_err(backend)?;
+        let facts = inspect_attached_snapshot(&conn).await;
+        // Detached even when the inspection failed, so the file is not held
+        // open by a connection that is about to be dropped anyway.
+        let _ = conn.execute("DETACH DATABASE snap", ()).await;
+        facts
+    }
+
+    /// Close `path` into a single self-contained file: switch it out of WAL,
+    /// which checkpoints every committed page into the main file and removes
+    /// the `-wal`/`-shm` beside it.
+    ///
+    /// For a database this process has finished with and is about to move —
+    /// renaming a WAL database away from its `-wal` loses whatever the WAL
+    /// held.
+    ///
+    /// # Errors
+    /// [`SubstrateError::Backend`] if the file cannot be opened or something
+    /// else still has it open (the journal mode cannot leave WAL then).
+    pub async fn seal(path: &std::path::Path) -> Result<()> {
+        let backend = |e: libsql::Error| SubstrateError::Backend(e.to_string());
+        let db = Builder::new_local(path).build().await.map_err(backend)?;
+        let conn = db.connect().map_err(backend)?;
+        let mode = first_text(&conn, "PRAGMA journal_mode = DELETE").await?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            return Err(SubstrateError::Backend(format!(
+                "{} is still in {mode} mode — another process has it open",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Open a throwaway database in a temporary directory, deleted when this
     /// substrate drops. For tests and scratch dev runs.
     ///
@@ -295,6 +365,96 @@ async fn connect(db: &Database) -> Result<Connection> {
         .await
         .map_err(|e| SubstrateError::Backend(e.to_string()))?;
     Ok(conn)
+}
+
+/// What a snapshot holds, read back out of the snapshot itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotFacts {
+    /// Rows per table, every table but SQLite's own.
+    pub tables: std::collections::BTreeMap<String, u64>,
+    /// Every upload id the snapshot's records point at, sorted, once each.
+    pub upload_ids: Vec<String>,
+}
+
+/// Seal, check and count the database attached as `snap`.
+async fn inspect_attached_snapshot(conn: &Connection) -> Result<SnapshotFacts> {
+    // Sealed first: a header that says WAL makes the file need a `-wal` and
+    // `-shm` beside it wherever it is later opened. Allowed here because this
+    // connection is the only one that has the copy open.
+    let mode = first_text(conn, "PRAGMA snap.journal_mode = DELETE").await?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err(SubstrateError::Backend(format!(
+            "the snapshot could not leave {mode} mode"
+        )));
+    }
+    let check = run_query(conn, "PRAGMA snap.quick_check", &[]).await?;
+    let verdicts: Vec<String> = check
+        .rows
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(SqlValue::Text(text)) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    if verdicts != ["ok"] {
+        return Err(SubstrateError::Backend(format!(
+            "the snapshot failed its integrity check: {}",
+            verdicts.join("; ")
+        )));
+    }
+
+    let names = run_query(
+        conn,
+        "SELECT name FROM snap.sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        &[],
+    )
+    .await?;
+    let mut facts = SnapshotFacts::default();
+    for row in &names.rows {
+        let Some(SqlValue::Text(name)) = row.get(0) else {
+            continue;
+        };
+        // The name came out of the file's own catalogue, so it is quoted
+        // rather than trusted to be a plain identifier.
+        let quoted = name.replace('"', "\"\"");
+        let counted = run_query(conn, &format!("SELECT count(*) FROM snap.\"{quoted}\""), &[]).await?;
+        let count = match counted.rows.first().and_then(|row| row.get(0)) {
+            Some(SqlValue::Integer(n)) => u64::try_from(*n).unwrap_or(0),
+            _ => 0,
+        };
+        facts.tables.insert(name.clone(), count);
+    }
+
+    let uploads = crate::upload::store::UPLOADS;
+    if facts.tables.contains_key(uploads) {
+        let ids = run_query(
+            conn,
+            &format!("SELECT DISTINCT upload_id FROM snap.{uploads} ORDER BY upload_id"),
+            &[],
+        )
+        .await?;
+        facts.upload_ids = ids
+            .rows
+            .iter()
+            .filter_map(|row| match row.get(0) {
+                Some(SqlValue::Text(id)) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+    }
+    Ok(facts)
+}
+
+/// The first column of the first row, as text.
+async fn first_text(conn: &Connection, sql: &str) -> Result<String> {
+    let rows = run_query(conn, sql, &[]).await?;
+    match rows.rows.first().and_then(|row| row.get(0)) {
+        Some(SqlValue::Text(text)) => Ok(text.clone()),
+        other => Err(SubstrateError::Backend(format!(
+            "`{sql}` answered {other:?}"
+        ))),
+    }
 }
 
 /// Lower a neutral [`SqlValue`] into libSQL's own value type.

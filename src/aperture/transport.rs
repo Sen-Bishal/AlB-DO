@@ -12,6 +12,11 @@ use async_trait::async_trait;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::sync::Arc;
 
+/// Maximum body buffered for one outbound response (8 MiB). The cache and
+/// QuickJS limits apply after transport buffering, so neither bounds this
+/// Rust allocation. Applies to declared sources, fetches and provider calls.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// A DNS resolver that refuses addresses the egress policy denies.
 ///
 /// **This is the only place the client learns an address**, which is the entire
@@ -130,7 +135,7 @@ impl Transport for ReqwestTransport {
             builder = builder.body(body.clone());
         }
 
-        let response = builder.send().await.map_err(send_error)?;
+        let mut response = builder.send().await.map_err(send_error)?;
 
         let status = response.status().as_u16();
         let etag = header_string(&response, "etag");
@@ -157,11 +162,31 @@ impl Transport for ReqwestTransport {
         let body = if status == 304 {
             Vec::new()
         } else {
-            response
-                .bytes()
+            // Reject a known oversize before allocating. Still count streamed
+            // bytes: chunked/EOF bodies have no length, and headers are not a
+            // substitute for enforcing the bound while receiving the body.
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES as u64)
+            {
+                return Err(ApertureError::ResponseTooLarge {
+                    limit: MAX_RESPONSE_BODY_BYTES,
+                });
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
                 .await
                 .map_err(|err| ApertureError::Transport(err.to_string()))?
-                .to_vec()
+            {
+                if chunk.len() > MAX_RESPONSE_BODY_BYTES - body.len() {
+                    return Err(ApertureError::ResponseTooLarge {
+                        limit: MAX_RESPONSE_BODY_BYTES,
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
+            body
         };
 
         Ok(WireResponse {
@@ -235,6 +260,121 @@ mod tests {
             matches!(err, ApertureError::Egress(_)),
             "a policy decision must not read as a network fault: {err}"
         );
+    }
+
+    // Exercise the real HTTP body reader with a local server. A small private
+    // client avoids machine-specific proxies; egress itself is tested above.
+    async fn local_response(head: String, body: Vec<u8>) -> Result<WireResponse, ApertureError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).await.unwrap() == 0 {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            let _ = socket.write_all(head.as_bytes()).await;
+            // Early refusal can close the socket before the fixture finishes.
+            let _ = socket.write_all(&body).await;
+        });
+        let transport = ReqwestTransport {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            transport.send(&WireRequest {
+                method: "GET".into(),
+                url: format!("http://{address}/"),
+                headers: Vec::new(),
+                body: None,
+            }),
+        )
+        .await
+        .expect("local response reader hung");
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn oversized_declared_response_is_refused_before_reading() {
+        let error = local_response(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8388609\r\nConnection: close\r\n\r\n".into(),
+            Vec::new(),
+        )
+        .await
+        .err()
+        .expect("oversized response was accepted");
+        assert!(
+            error.to_string().contains("response body exceeds"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_response_is_refused() {
+        let bytes = vec![b'x'; 8 * 1024 * 1024 + 1];
+        let mut body = format!("{:x}\r\n", bytes.len()).into_bytes();
+        body.extend(bytes);
+        body.extend(b"\r\n0\r\n\r\n");
+        let error = local_response(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".into(),
+            body,
+        )
+        .await
+        .err()
+        .expect("oversized response was accepted");
+        assert!(
+            error.to_string().contains("response body exceeds"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_response_without_a_length_is_refused() {
+        let error = local_response(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".into(),
+            vec![b'x'; 8 * 1024 * 1024 + 1],
+        )
+        .await
+        .err()
+        .expect("oversized response was accepted");
+        assert!(
+            error.to_string().contains("response body exceeds"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_at_the_limit_is_preserved() {
+        let body = vec![b'x'; 8 * 1024 * 1024];
+        let response = local_response(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ),
+            body.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn not_modified_does_not_read_or_reject_a_representation_length() {
+        let response = local_response(
+            "HTTP/1.1 304 Not Modified\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n"
+                .into(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 304);
+        assert!(response.body.is_empty());
     }
 
     fn assert_send_sync<T: Send + Sync>() {}

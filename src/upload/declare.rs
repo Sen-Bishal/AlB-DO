@@ -143,6 +143,63 @@ pub struct UploadDecl {
     /// Per-file ceiling, as `"5mb"` / `"900kb"` / a bare byte count.
     #[serde(default, rename = "maxBytes", alias = "max_bytes")]
     pub max_bytes: Option<String>,
+    /// Who may read a file back from `/_albedo/uploads/{id}`. `"owner"` when
+    /// omitted. See [`ReadRule`].
+    #[serde(default)]
+    pub read: ReadRule,
+}
+
+/// Who may read a stored file.
+///
+/// ## Why the framework decides this, and why `owner` is the default
+///
+/// The id is the SHA-256 of the bytes — derived from content anyone holding the
+/// file already has — so it is not a capability, and "the URL is unguessable"
+/// is the standard way upload stores leak. Until 2026-10-30 every file was
+/// served to anyone who asked for its id, which also told a prober whether a
+/// known file had ever been uploaded.
+///
+/// `src/middleware.ts` cannot close this on its own: it sees the id, not who
+/// uploaded it, and it can refuse but never grant. So the bucket says it, and
+/// the default is the closed one — the same stance as a FORGE row, which only
+/// its author may change unless the collection says `edit: "anyone"`.
+///
+/// A read the rule refuses answers exactly as a file that was never stored
+/// does, so the route no longer says whether a file exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadRule {
+    /// Only the signed-in user who uploaded it. An anonymous upload into such a
+    /// bucket is refused: nobody could ever read it back.
+    #[default]
+    Owner,
+    /// Anyone signed in.
+    SignedIn,
+    /// Anyone with the link — profile pictures, a public gallery.
+    Public,
+}
+
+impl ReadRule {
+    /// May `reader` read a file `owner` uploaded? Both are principal ids,
+    /// `None` when nobody was signed in.
+    #[must_use]
+    pub fn permits(self, reader: Option<&str>, owner: Option<&str>) -> bool {
+        match self {
+            Self::Public => true,
+            Self::SignedIn => reader.is_some(),
+            Self::Owner => reader.is_some() && reader == owner,
+        }
+    }
+
+    /// The spelling the config uses, for messages.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::SignedIn => "signed-in",
+            Self::Public => "public",
+        }
+    }
 }
 
 /// A validated bucket.
@@ -154,6 +211,8 @@ pub struct ResolvedBucket {
     pub accept: Vec<String>,
     /// Per-file ceiling in bytes.
     pub max_bytes: u64,
+    /// Who may read its files back.
+    pub read: ReadRule,
 }
 
 impl ResolvedBucket {
@@ -209,6 +268,16 @@ impl UploadRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.buckets.is_empty()
+    }
+
+    /// The read rule for files recorded under `bucket`.
+    ///
+    /// A bucket that is no longer declared keeps its files, and they are read
+    /// under the closed rule: removing a bucket from the config must never be
+    /// what makes its files public.
+    #[must_use]
+    pub fn read_rule(&self, bucket: &str) -> ReadRule {
+        self.bucket(bucket).map_or(ReadRule::Owner, |found| found.read)
     }
 
     /// The largest ceiling any bucket declared.
@@ -286,6 +355,7 @@ impl UploadRegistry {
                 name: name.clone(),
                 accept,
                 max_bytes,
+                read: decl.read,
             });
         }
         Ok(Self { buckets })
@@ -373,6 +443,47 @@ mod tests {
         assert_eq!(bucket.max_bytes, DEFAULT_MAX_BYTES);
         assert!(bucket.accepts("application/pdf"));
         assert!(bucket.accepts("image/png"));
+    }
+
+    /// Closed unless the bucket says otherwise, and a misspelt rule is a config
+    /// error — read as "owner" it would fail closed, but silently, and the
+    /// author would never learn their `"publc"` did nothing.
+    #[test]
+    fn a_bucket_is_readable_by_its_owner_unless_it_says_otherwise() {
+        let registry = UploadRegistry::from_declarations(&block(serde_json::json!({
+            "docs": {},
+            "team": { "read": "signed-in" },
+            "pictures": { "read": "public" },
+        })))
+        .expect("lowers");
+        assert_eq!(registry.read_rule("docs"), ReadRule::Owner);
+        assert_eq!(registry.read_rule("team"), ReadRule::SignedIn);
+        assert_eq!(registry.read_rule("pictures"), ReadRule::Public);
+        // A bucket removed from the config does not make its files readable.
+        assert_eq!(registry.read_rule("gone"), ReadRule::Owner);
+
+        let typo = serde_json::from_value::<BTreeMap<String, UploadDecl>>(
+            serde_json::json!({ "pictures": { "read": "publc" } }),
+        );
+        assert!(typo.is_err(), "a misspelt read rule must not parse");
+    }
+
+    #[test]
+    fn who_may_read_under_each_rule() {
+        let (ada, bob) = (Some("u_ada"), Some("u_bob"));
+        assert!(ReadRule::Owner.permits(ada, ada));
+        assert!(!ReadRule::Owner.permits(bob, ada));
+        assert!(!ReadRule::Owner.permits(None, ada));
+        // Nobody owns an anonymous upload, so nobody — signed in or not — reads
+        // it under `owner`.
+        assert!(!ReadRule::Owner.permits(None, None));
+        assert!(!ReadRule::Owner.permits(ada, None));
+
+        assert!(ReadRule::SignedIn.permits(bob, ada));
+        assert!(!ReadRule::SignedIn.permits(None, ada));
+
+        assert!(ReadRule::Public.permits(None, ada));
+        assert!(ReadRule::Public.permits(None, None));
     }
 
     #[test]

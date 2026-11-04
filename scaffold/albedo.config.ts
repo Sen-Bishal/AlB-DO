@@ -94,6 +94,10 @@ export default {
       password: {},
     },
     login: "/sign-in",
+    // Roles your app grants. Gate a route with
+    // `export const auth = { role: "admin" }`, read them as `user.roles`,
+    // and grant one with `albedo roles grant <email> admin`.
+    // roles: ["admin"],
   },
 
   // ── EMAIL ────────────────────────────────────────────────────────

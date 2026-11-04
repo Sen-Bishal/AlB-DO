@@ -190,6 +190,11 @@ pub struct Principal {
     /// by naming a claim `id`.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub claims: serde_json::Map<String, serde_json::Value>,
+    /// R1a · the roles this principal holds, sorted. As loaded from the store
+    /// this is every granted row; the server narrows it to the roles the `auth`
+    /// block declares before anything reads it (`AuthRuntime::resolve`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
 }
 
 impl Principal {
@@ -204,7 +209,20 @@ impl Principal {
             provider: provider.into(),
             providers: Vec::new(),
             claims: serde_json::Map::new(),
+            roles: Vec::new(),
         }
+    }
+
+    /// Keep only the roles `declared` names. `declared` must be sorted (the
+    /// lowered registry's list is).
+    pub fn retain_declared_roles(&mut self, declared: &[String]) {
+        self.roles.retain(|role| declared.binary_search(role).is_ok());
+    }
+
+    /// Whether this principal holds `role`.
+    #[must_use]
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|held| held == role)
     }
 
     /// What app code sees as `user` — in a page, an action, middleware and a
@@ -212,7 +230,7 @@ impl Principal {
     /// field present in a render and absent in the action that render's form
     /// posts to would be `undefined` in exactly one of them, silently.
     ///
-    /// `{ id, email, name, image, provider, providers }`. Absent profile fields
+    /// `{ id, email, name, image, provider, providers, roles }`. Absent profile fields
     /// are `null`, never missing, so `user.email ?? "…"` means the same thing
     /// whichever provider signed the person in.
     ///
@@ -233,6 +251,7 @@ impl Principal {
             // Empty for a principal nothing signed in — a job's, a webhook's.
             "provider": (!self.provider.is_empty()).then_some(&self.provider),
             "providers": self.providers,
+            "roles": self.roles,
         })
     }
 }
@@ -314,6 +333,7 @@ mod tests {
         let mut principal = Principal::new(PrincipalId::parse("u_7f3a").unwrap(), "github");
         principal.email = Some("ada@example.com".to_string());
         principal.providers = vec!["github".to_string(), "password".to_string()];
+        principal.roles = vec!["admin".to_string(), "payroll".to_string()];
         principal
             .claims
             .insert("login".to_string(), serde_json::json!("ada"));
@@ -326,8 +346,29 @@ mod tests {
                 "image": null,
                 "provider": "github",
                 "providers": ["github", "password"],
+                "roles": ["admin", "payroll"],
             })
         );
+    }
+
+    /// R1a · `roles` is always present — an empty list for someone holding none —
+    /// so `user.roles.includes("admin")` never throws on a principal without any.
+    #[test]
+    fn a_principal_without_roles_has_an_empty_roles_list() {
+        let principal = Principal::new(PrincipalId::parse("u_7f3a").unwrap(), "password");
+        assert_eq!(principal.user_value()["roles"], serde_json::json!([]));
+    }
+
+    /// R1a · a stored grant for a role the config no longer declares counts for
+    /// nothing — narrowed away before anything reads `user.roles`.
+    #[test]
+    fn only_declared_roles_survive() {
+        let mut principal = Principal::new(PrincipalId::parse("u_7f3a").unwrap(), "password");
+        principal.roles = vec!["admin".to_string(), "finance".to_string(), "payroll".to_string()];
+        principal.retain_declared_roles(&["admin".to_string(), "payroll".to_string()]);
+        assert_eq!(principal.roles, ["admin", "payroll"]);
+        assert!(principal.has_role("payroll"));
+        assert!(!principal.has_role("finance"));
     }
 
     #[test]

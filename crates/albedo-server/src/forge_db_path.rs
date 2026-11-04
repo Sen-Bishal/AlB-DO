@@ -66,6 +66,25 @@ pub fn resolve_forge_db_path(
     }
 }
 
+/// The directory the database lives in — and so where the rest of the app's
+/// *data*, as opposed to the app, lives beside it: uploaded files, and backups
+/// by default.
+///
+/// 🔴 Uploads used to sit under the project root while the database followed
+/// `ALBEDO_FORGE_DB`. In the shipped Docker image that put the database on the
+/// `/data` volume and every uploaded file in the container's own layer — gone
+/// at the next deploy, with the records still pointing at them. The shipped
+/// binary had the same split: database beside the executable, files inside the
+/// per-build unpack directory. The records and the bytes are one thing; they
+/// now live in one place.
+#[must_use]
+pub fn data_dir_for(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
 /// Read [`FORGE_DB_ENV`] from the real environment.
 ///
 /// Split out so [`resolve_forge_db_path`] stays pure and testable — reading the
@@ -134,6 +153,20 @@ mod tests {
         assert_eq!(
             resolve_forge_db_path(Some("data/forge.db"), None, &artifacts()),
             PathBuf::from("/srv/app").join("data/forge.db")
+        );
+    }
+
+    /// The container case the split broke: the volume holds the database, so
+    /// it must hold the files too.
+    #[test]
+    fn the_data_directory_is_wherever_the_database_is() {
+        assert_eq!(
+            data_dir_for(&resolve_forge_db_path(None, Some("/data/forge.db"), &artifacts())),
+            PathBuf::from("/data")
+        );
+        assert_eq!(
+            data_dir_for(&resolve_forge_db_path(None, None, &artifacts())),
+            PathBuf::from("/srv/app")
         );
     }
 

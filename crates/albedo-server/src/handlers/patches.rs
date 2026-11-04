@@ -105,7 +105,7 @@ pub async fn serve_patch_stream(
     resync: Option<&dyn RowProjector>,
 ) -> Response<Body> {
     let session = SessionId::random();
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(PATCH_CHANNEL_CAPACITY);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<bytes::Bytes>(PATCH_CHANNEL_CAPACITY);
 
     // Subscribe BEFORE anything else: `subscribe_granted` registers the sink
     // and reads each topic's value under that topic's linearization lock, so a
@@ -273,7 +273,7 @@ mod tests {
     async fn a_patch_event_carries_the_frame_verbatim() {
         let registry = BroadcastRegistry::new();
         registry.topic("guestbook", b"[]".to_vec());
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
         let initial = registry.auto_subscribe(SessionId::random(), tx, &["guestbook".to_string()]);
         let frame = dom_render_compiler::ir::opcode::OpcodeFrame {
             frame_id: 0,

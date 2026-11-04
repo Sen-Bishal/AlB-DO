@@ -42,6 +42,9 @@ pub enum RuntimeError {
     RequestBodyRead(String),
     #[error("request handling failed: {0}")]
     RequestHandling(String),
+    /// A durable action intent is owned by another live attempt.
+    #[error("action intent is already in progress; retry later")]
+    ActionInProgress,
     #[error("authentication failed: {0}")]
     Authentication(String),
     #[error("server startup failed: {0}")]
@@ -69,6 +72,7 @@ impl RuntimeError {
             Self::RouteNotFound { .. } => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::RequestBodyRead(_) | Self::RequestHandling(_) => StatusCode::BAD_REQUEST,
+            Self::ActionInProgress => StatusCode::CONFLICT,
             Self::Authentication(_) => StatusCode::UNAUTHORIZED,
             Self::ServerStartup(_) | Self::ServerRuntime(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

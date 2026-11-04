@@ -58,6 +58,7 @@ mod tests {
             metadata: BTreeMap::new(),
             principal: None,
             user: None,
+            roles: Vec::new(),
         }
     }
 

@@ -342,6 +342,14 @@ impl Limiter {
         self.proxies.len()
     }
 
+    /// The client a request came from: `peer`, or the address a trusted proxy
+    /// says it forwarded for. The rule [`Self::key`] rations by, exposed so the
+    /// access log names the same client.
+    #[must_use]
+    pub fn client_addr(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+        self.proxies.client_addr(peer, headers)
+    }
+
     /// Who this request is rationed as.
     ///
     /// A resolved principal wins outright; otherwise the address, run through the

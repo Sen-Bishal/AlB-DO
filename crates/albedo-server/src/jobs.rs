@@ -257,6 +257,21 @@ pub(crate) async fn write_enqueue(
     principal: Option<String>,
     now_ms: i64,
 ) -> Result<(), String> {
+    let request = prepare_enqueue(db, handle, intent, principal, now_ms).await?;
+    queue::enqueue(db, &request)
+        .await
+        .map(|_| ())
+        .map_err(|err| format!("enqueue('{}') failed: {err}", intent.name))
+}
+
+/// Validate the authored intent before entering the action's writer transaction.
+pub(crate) async fn prepare_enqueue(
+    db: &dyn DataSubstrate,
+    handle: &JobHandle,
+    intent: &dom_render_compiler::jobs::EnqueueIntent,
+    principal: Option<String>,
+    now_ms: i64,
+) -> Result<Enqueue, String> {
     // 15.3 · the one framework job app code may queue. Its argument is
     // validated HERE, at the trust boundary, so a bad address throws in the
     // action that wrote it instead of dead-lettering an hour later — and the
@@ -315,7 +330,7 @@ pub(crate) async fn write_enqueue(
         })?,
     };
 
-    let request = Enqueue {
+    Ok(Enqueue {
         // An id makes the enqueue idempotent. Without one a random id is minted,
         // so every call lands — the honest default: two calls with nothing to
         // tell them apart are two pieces of work.
@@ -329,11 +344,7 @@ pub(crate) async fn write_enqueue(
         run_at_ms: now_ms.saturating_add(delay_ms),
         max_attempts,
         fanout: false,
-    };
-    queue::enqueue(db, &request)
-        .await
-        .map(|_| ())
-        .map_err(|err| format!("enqueue('{}') failed: {err}", intent.name))
+    })
 }
 
 /// Queue one of the framework's own emails — the AUTH flows.
@@ -449,7 +460,12 @@ impl JobRunner {
             .await
             .ok()
             .flatten();
-        let principal = loaded.unwrap_or_else(|| Principal::new(id, ""));
+        let mut principal = loaded.unwrap_or_else(|| Principal::new(id, ""));
+        // R1a · the same narrowing a request gets: only declared roles count.
+        match self.live.auth() {
+            Some(auth) => principal.retain_declared_roles(&auth.registry().roles),
+            None => principal.roles.clear(),
+        }
         Arc::from(principal.user_value().to_string())
     }
 

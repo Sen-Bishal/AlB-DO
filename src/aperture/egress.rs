@@ -42,13 +42,20 @@ use url::Url;
 
 /// Which deployment the policy is enforcing for.
 ///
-/// `albedo dev` is permissive because a developer's machine legitimately talks
-/// to `localhost` — a mock API, a neighbouring container, a tunnel. `serve` is
-/// not, because the paywall is hosted compute and a tenant's `fetch()` must not
-/// be able to read the instance metadata endpoint.
+/// `albedo dev` is permissive about the *local* classes because a developer's
+/// machine legitimately talks to `localhost` — a mock API, a neighbouring
+/// container, a tunnel. `serve` is not, because a server's `fetch()` must not
+/// be able to reach its neighbours or read the instance metadata endpoint.
+///
+/// 🔴 Until 2026-10-30 dev skipped **every** address check — the metadata
+/// endpoint included. A dev box is as often a cloud VM or a codespace as a
+/// laptop, and nothing a developer runs locally lives at `169.254.169.254`.
+/// So dev still refuses what is never a development target: link-local (the
+/// metadata range), multicast and broadcast. See [`AddressClass::allowed_in_dev`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressMode {
-    /// Address-class denies are not enforced. Scheme rules still are.
+    /// Local classes (loopback, private, CGNAT, …) are allowed; link-local,
+    /// multicast and broadcast are still refused. Scheme rules still apply.
     Dev,
     /// Address-class denies are enforced for every non-declared host.
     Serve,
@@ -82,6 +89,19 @@ pub enum AddressClass {
 }
 
 impl AddressClass {
+    /// Whether `albedo dev` lets a `fetch()` reach this class.
+    ///
+    /// The local classes are what a developer's own services live on. Link-local
+    /// is the cloud metadata range — credentials on a cloud dev box — and
+    /// multicast and broadcast are never a request's destination.
+    #[must_use]
+    pub fn allowed_in_dev(self) -> bool {
+        !matches!(
+            self,
+            AddressClass::LinkLocal | AddressClass::Multicast | AddressClass::Broadcast
+        )
+    }
+
     /// A short human-readable name for the error message.
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -225,7 +245,36 @@ fn classify_v6(addr: Ipv6Addr) -> Option<AddressClass> {
     if segments[0] == 0x2001 && segments[1] == 0x0db8 {
         return Some(AddressClass::Documentation);
     }
+    // Translation prefixes carry an IPv4 address the network will connect to
+    // on the v6 sender's behalf, so the verdict is the embedded address's.
+    // Without these, `64:ff9b::a9fe:a9fe` reached `169.254.169.254` on any
+    // network with a NAT64 gateway — common on v6-only hosts — through an
+    // address no v4 check ever looked at.
+    //
+    // 64:ff9b::/96 — the well-known NAT64 prefix (RFC 6052): the v4 address is
+    // the last 32 bits.
+    if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        return classify_v4(embedded_v4(segments[6], segments[7]));
+    }
+    // 64:ff9b:1::/48 — local-use NAT64 (RFC 8215). An operator picks the prefix
+    // length, so where the v4 address sits is not knowable from here; the whole
+    // prefix is treated as the internal network it translates into.
+    if segments[..3] == [0x0064, 0xff9b, 0x0001] {
+        return Some(AddressClass::Private);
+    }
+    // 2002::/16 — 6to4 (RFC 3056): bits 16..48 are the v4 address of the site
+    // a relay forwards to.
+    if segments[0] == 0x2002 {
+        return classify_v4(embedded_v4(segments[1], segments[2]));
+    }
     None
+}
+
+/// The IPv4 address two v6 segments spell.
+fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
+    let [a, b] = high.to_be_bytes();
+    let [c, d] = low.to_be_bytes();
+    Ipv4Addr::new(a, b, c, d)
 }
 
 /// The egress decision for one deployment.
@@ -336,16 +385,17 @@ impl EgressPolicy {
     /// [`EgressDenial::Address`] when the address falls in a refused class and
     /// the host was not declared.
     pub fn check_address(&self, host: &str, addr: IpAddr) -> Result<(), EgressDenial> {
-        if self.mode == EgressMode::Dev || self.is_declared(host) {
+        if self.is_declared(host) {
             return Ok(());
         }
         match classify(addr) {
+            None => Ok(()),
+            Some(class) if self.mode == EgressMode::Dev && class.allowed_in_dev() => Ok(()),
             Some(class) => Err(EgressDenial::Address {
                 host: host.to_string(),
                 addr,
                 class,
             }),
-            None => Ok(()),
         }
     }
 
@@ -530,6 +580,56 @@ mod tests {
 
         let dev = EgressPolicy::new(EgressMode::Dev);
         assert!(dev.check_address("localhost", v4("127.0.0.1")).is_ok());
+        assert!(dev.check_address("db.local", v4("192.168.1.20")).is_ok());
+        assert!(dev.check_address("tailnet", v4("100.64.0.7")).is_ok());
+    }
+
+    /// 🔴 Dev used to skip every check, the metadata endpoint included — and a
+    /// dev box is as often a cloud VM as a laptop.
+    #[test]
+    fn dev_still_refuses_the_metadata_range() {
+        let dev = EgressPolicy::new(EgressMode::Dev);
+        for refused in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fe80::1]/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[64:ff9b::a9fe:a9fe]/",
+        ] {
+            assert!(
+                matches!(
+                    dev.check_url(&Url::parse(refused).expect("parses")),
+                    Err(EgressDenial::Address { class: AddressClass::LinkLocal, .. })
+                ),
+                "dev must refuse {refused}"
+            );
+        }
+        assert!(dev.check_address("metadata.example", v4("169.254.169.254")).is_err());
+    }
+
+    /// NAT64 and 6to4 addresses carry an IPv4 address the network connects to
+    /// on the sender's behalf; the verdict is that address's.
+    #[test]
+    fn translation_prefixes_are_judged_by_the_address_they_carry() {
+        // 64:ff9b::/96 — 169.254.169.254, 10.0.0.1, 127.0.0.1.
+        assert_eq!(classify(v4("64:ff9b::a9fe:a9fe")), Some(AddressClass::LinkLocal));
+        assert_eq!(classify(v4("64:ff9b::a00:1")), Some(AddressClass::Private));
+        assert_eq!(classify(v4("64:ff9b::7f00:1")), Some(AddressClass::Loopback));
+        // A public address behind NAT64 is public.
+        assert_eq!(classify(v4("64:ff9b::5db8:d822")), None);
+        // Local-use NAT64 — refused whole.
+        assert_eq!(classify(v4("64:ff9b:1::a9fe:a9fe")), Some(AddressClass::Private));
+        // 2002::/16 — 6to4 to 169.254.169.254, 192.168.0.1, and a public site.
+        assert_eq!(classify(v4("2002:a9fe:a9fe::1")), Some(AddressClass::LinkLocal));
+        assert_eq!(classify(v4("2002:c0a8:1::")), Some(AddressClass::Private));
+        assert_eq!(classify(v4("2002:5db8:d822::1")), None);
+
+        let serve = EgressPolicy::new(EgressMode::Serve);
+        for refused in ["http://[64:ff9b::a9fe:a9fe]/", "http://[2002:a9fe:a9fe::1]/"] {
+            assert!(
+                serve.check_url(&Url::parse(refused).unwrap()).is_err(),
+                "serve must refuse {refused}"
+            );
+        }
     }
 
     #[test]

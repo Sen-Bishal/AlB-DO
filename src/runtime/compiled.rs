@@ -322,6 +322,32 @@ pub struct ResolvedHandler {
     pub event_param: HandlerEventParam,
 }
 
+/// Refuse ambiguity across the entire dispatcher, including event handlers
+/// and named actions. Bare action names are still the public wire identity;
+/// until module-qualified identities land, duplicates must fail at build time.
+fn register_handler(
+    handlers: &mut HashMap<u32, ResolvedHandler>,
+    id: u32,
+    handler: ResolvedHandler,
+) -> Result<()> {
+    if let Some(previous) = handlers.get(&id) {
+        return Err(anyhow!(
+            "action dispatch id collision ({id}): {}::{} [{} #{}] conflicts with {}::{} [{} #{}]; \
+             rename a conflicting action or handler so each has a distinct wire id",
+            previous.module_spec,
+            previous.function_name,
+            previous.event_name,
+            previous.handler_idx,
+            handler.module_spec,
+            handler.function_name,
+            handler.event_name,
+            handler.handler_idx,
+        ));
+    }
+    handlers.insert(id, handler);
+    Ok(())
+}
+
 /// Phase P · Stream E.3 — CSS-module class maps + scoped CSS bodies
 /// owned by the project. Populated once at [`CompiledProject::wrap`]
 /// time by reading every `.module.css` file the project's modules
@@ -569,7 +595,8 @@ impl CompiledProject {
                         handler.handler_idx,
                     );
                     proxy_ids.push(proxy_id);
-                    handlers.insert(
+                    register_handler(
+                        &mut handlers,
                         proxy_id,
                         ResolvedHandler {
                             module_spec: module_spec.clone(),
@@ -579,7 +606,7 @@ impl CompiledProject {
                             body: handler.body.clone(),
                             event_param: handler.event_param.clone(),
                         },
-                    );
+                    )?;
                 }
 
                 components.insert(
@@ -652,7 +679,8 @@ impl CompiledProject {
                     (module_spec.clone(), synthetic_function.clone()),
                     synthetic_component,
                 );
-                handlers.insert(
+                register_handler(
+                    &mut handlers,
                     action_id,
                     ResolvedHandler {
                         module_spec: module_spec.clone(),
@@ -665,7 +693,7 @@ impl CompiledProject {
                         // shape is irrelevant here.
                         event_param: HandlerEventParam::None,
                     },
-                );
+                )?;
                 per_module.push(declaration.clone());
             }
             action_declarations.insert(module_spec.clone(), per_module);
@@ -3003,7 +3031,7 @@ pub fn render_entry_with_bindings(
 /// state and the client immediately starts receiving fan-outs over
 /// its WT patches lane.
 ///
-/// `subscriber_sender` is the same `mpsc::Sender<Vec<u8>>` that
+/// `subscriber_sender` is the same `mpsc::Sender<bytes::Bytes>` that
 /// feeds the session's `WT_STREAM_SLOT_PATCHES` writer — passing it
 /// here is what closes the loop between server-side broadcast writes
 /// and client-side patch application.

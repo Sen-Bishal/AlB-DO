@@ -39,6 +39,7 @@ fn build_manifest() -> RenderManifestV2 {
     for (id, name, rel) in [
         (0_u64, "Home", "routes/index.tsx"),
         (1, "Dash", "routes/dash.tsx"),
+        (2, "Payroll", "routes/payroll.tsx"),
     ] {
         let mut component = Component::new(ComponentId::new(id), name.to_string());
         component.file_path = fixture_root().join(rel).display().to_string();
@@ -131,4 +132,20 @@ fn the_gate_and_the_actions_it_governs_arrive_together() {
 
     let home = manifest.routes.get("/").expect("/ present");
     assert_eq!(home.auth, RouteAuth::Public);
+}
+
+/// R1a · a role requirement survives the real build, sorted, beside the actions
+/// it governs. Starting from the compiler's own output is the rule this file
+/// exists for: a gate fed a hand-written manifest proves nothing about a build.
+#[test]
+fn a_role_requirement_reaches_the_manifest_with_its_actions() {
+    let manifest = build_manifest();
+    let payroll = manifest.routes.get("/payroll").expect("/payroll present");
+
+    assert_eq!(
+        payroll.auth,
+        RouteAuth::Roles(vec!["hr".to_string(), "payroll".to_string()])
+    );
+    assert!(!payroll.auth.allows_anonymous());
+    assert_eq!(action_names(&manifest, "/payroll"), vec!["payroll_close".to_string()]);
 }

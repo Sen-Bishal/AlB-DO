@@ -163,6 +163,7 @@ mod tests {
             metadata: BTreeMap::new(),
             principal: None,
             user: None,
+            roles: Vec::new(),
         };
         let response = handler.handle(ctx).await.unwrap();
         assert_eq!(response.body.as_ref(), b"payload");

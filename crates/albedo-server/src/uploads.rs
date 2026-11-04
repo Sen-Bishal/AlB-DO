@@ -42,7 +42,7 @@
 use bytes::Bytes;
 use dom_render_compiler::forge::DataSubstrate;
 use dom_render_compiler::upload::store::{self, StoredUpload};
-use dom_render_compiler::upload::{sanitise_name, UploadRegistry};
+use dom_render_compiler::upload::{sanitise_name, ReadRule, UploadRegistry};
 use futures_util::Stream;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -79,6 +79,11 @@ pub enum UploadError {
         /// What the part claimed to be.
         offered: String,
     },
+    /// An anonymous upload into a bucket only its uploader may read.
+    SignInRequired {
+        /// The bucket.
+        bucket: String,
+    },
     /// A file part ran past its bucket's ceiling.
     FileTooLarge {
         /// The bucket.
@@ -105,6 +110,9 @@ pub enum UploadError {
         /// What the filesystem said.
         reason: String,
     },
+    /// A file part arrived before the submit showed a valid CSRF token, or the
+    /// token it showed was wrong. See [`Genuine`].
+    Forged,
 }
 
 impl fmt::Display for UploadError {
@@ -124,6 +132,12 @@ impl fmt::Display for UploadError {
                 f,
                 "`{bucket}` does not accept `{offered}`"
             ),
+            Self::SignInRequired { bucket } => write!(
+                f,
+                "sign in to upload to `{bucket}` — only the person who uploads a file there may \
+                 read it back, and a visitor who is not signed in is nobody. A bucket open to \
+                 anonymous uploads says `read: \"signed-in\"` or `read: \"public\"`"
+            ),
             Self::FileTooLarge { bucket, limit } => {
                 write!(f, "that file is over `{bucket}`'s {limit}-byte limit")
             }
@@ -132,6 +146,12 @@ impl fmt::Display for UploadError {
             Self::BodyTooLarge => write!(f, "that submit is too large"),
             Self::Malformed { reason } => write!(f, "the submit was not readable: {reason}"),
             Self::Io { .. } => write!(f, "the upload could not be stored"),
+            Self::Forged => write!(
+                f,
+                "CSRF validation failed: files are stored only after the submit's token is \
+                 checked, so the `x-albedo-csrf` header or the `_csrf` field must come before any \
+                 file field (the forms albedo renders put it first)"
+            ),
         }
     }
 }
@@ -159,10 +179,32 @@ impl MultipartForm {
 pub struct UploadContext<'a> {
     /// Declared buckets.
     pub registry: &'a UploadRegistry,
-    /// Project root — uploads land under `<project_dir>/uploads/`.
-    pub project_dir: &'a Path,
+    /// The data directory — uploads land under `<data_dir>/uploads/`, beside
+    /// the database that records them.
+    pub data_dir: &'a Path,
     /// Who is uploading, when anyone is signed in.
     pub principal: Option<String>,
+    /// Whether the submit has shown it is not forged.
+    pub genuine: Genuine<'a>,
+}
+
+/// Whether a submit has shown it is not a forgery — asked **before a file part
+/// is written**, not after the body.
+///
+/// 🔴 The action's CSRF check runs once the body is decoded, and decoding a
+/// multipart body *is* streaming its files to disk. So a forged cross-site
+/// submit was refused with every file it carried already stored and recorded.
+/// The token is in the body too, which is why this is a question asked during
+/// the stream rather than before it: the `x-albedo-csrf` header answers it up
+/// front, and otherwise a `_csrf` field must arrive — and pass — before the
+/// first file part. Browsers send fields in document order and both renderers
+/// make the token a form's first child, so a real form always qualifies; a
+/// file before the token is refused without a byte of it written.
+pub enum Genuine<'a> {
+    /// Already shown — a valid `x-albedo-csrf` header.
+    Yes,
+    /// Not yet. This checks a `_csrf` field's value.
+    Pending(&'a (dyn Fn(&str) -> bool + Sync)),
 }
 
 /// Decode a `multipart/form-data` body, streaming file parts to disk.
@@ -194,6 +236,7 @@ where
     let mut form = MultipartForm::default();
     let mut files_seen = 0usize;
     let mut body_seen = 0u64;
+    let mut genuine = matches!(context.genuine, Genuine::Yes);
 
     while let Some(mut field) = multipart
         .next_field()
@@ -217,6 +260,11 @@ where
         let content_type = field.content_type().map(ToString::to_string);
 
         if let Some(file_name) = file_name {
+            // First, before what the part is aiming at: a submit that is not
+            // genuine is refused as forged whatever bucket it named.
+            if !genuine {
+                return Err(UploadError::Forged);
+            }
             files_seen += 1;
             if files_seen > MAX_FILE_PARTS {
                 return Err(UploadError::TooManyFiles);
@@ -229,6 +277,15 @@ where
                     bucket: name.clone(),
                 }
             })?;
+
+            // An owner-only bucket keeps a file for whoever uploaded it, and an
+            // anonymous visitor is nobody: the file would be stored, and then
+            // readable by no one, forever. Refused before a byte is read.
+            if bucket.read == ReadRule::Owner && context.principal.is_none() {
+                return Err(UploadError::SignInRequired {
+                    bucket: bucket.name.clone(),
+                });
+            }
 
             let offered = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
             if !bucket.accepts(&offered) {
@@ -273,8 +330,18 @@ where
         // Lossy for the same reason `FormBody::decode` is lossy: a browser will
         // not send invalid UTF-8 in a text field, so a body that does is not a
         // browser and does not deserve a distinct error to probe.
-        form.fields
-            .insert(name, String::from_utf8_lossy(&text).into_owned());
+        let value = String::from_utf8_lossy(&text).into_owned();
+        if name == crate::render::csrf::CSRF_FIELD_NAME {
+            if let Genuine::Pending(check) = context.genuine {
+                // A wrong token is refused now, as the action would refuse it:
+                // nothing after it can make the submit genuine.
+                if !check(&value) {
+                    return Err(UploadError::Forged);
+                }
+                genuine = true;
+            }
+        }
+        form.fields.insert(name, value);
     }
 
     Ok(form)
@@ -292,7 +359,7 @@ async fn write_part(
     body_seen: &mut u64,
     body_ceiling: u64,
 ) -> Result<StoredUpload, UploadError> {
-    let upload_root = context.project_dir.join(store::UPLOAD_DIR);
+    let upload_root = context.data_dir.join(store::UPLOAD_DIR);
     let tmp_dir = upload_root.join(TMP_DIR);
     tokio::fs::create_dir_all(&tmp_dir)
         .await
@@ -356,7 +423,7 @@ async fn write_part(
     drop(file);
 
     let id = format!("{:x}", hasher.finalize());
-    let final_path = store::path_for(context.project_dir, &id).map_err(|err| UploadError::Io {
+    let final_path = store::path_for(context.data_dir, &id).map_err(|err| UploadError::Io {
         reason: err.to_string(),
     })?;
 
@@ -450,29 +517,47 @@ pub fn serve_id(path: &str) -> Option<&str> {
 ///   render inline.** The bytes are attacker-supplied and same-origin, which is the shape that
 ///   turns an upload store into stored XSS.
 /// - **`private, no-cache`, with the hash as the `ETag`.** The bytes never change, but who may
-///   read them can. A shared cache or CDN holding a copy would answer for the app, and
-///   `src/middleware.ts`, the place an app gates this route, would never see the request. So
-///   every read reaches the server, and a browser that already has the file gets a `304`
-///   instead of the bytes. An app whose uploads are public can set its own `cache-control`
-///   from middleware.
+///   read them can. A shared cache or CDN holding a copy would answer for the app, and neither
+///   the read rule below nor `src/middleware.ts` would see the request. So every read reaches
+///   the server, and a browser that already has the file gets a `304` instead of the bytes. An
+///   app whose uploads are public can set its own `cache-control` from middleware.
+///
+/// ## Who may read it
+///
+/// `reader` is the signed-in principal, if any, and the bucket's declared
+/// [`ReadRule`](dom_render_compiler::upload::ReadRule) decides — the uploader
+/// only, unless the bucket says `"signed-in"` or `"public"`
+/// ([`store::readable_by`]). A refused read is answered **exactly** as a file
+/// that was never stored: same status, same body, same headers. Anything else
+/// would turn the route into a test for whether a known file was ever uploaded.
+/// The check runs before the `304` too, or revalidation would be a way round it.
 pub async fn serve(
     db: &dyn DataSubstrate,
-    project_dir: &Path,
+    registry: &UploadRegistry,
+    data_dir: &Path,
     id: &str,
-    if_none_match: Option<&str>,
+    reader: Option<&str>,
+    headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::http::{header as h, StatusCode};
 
-    let Ok(Some(record)) = store::lookup(db, id).await else {
-        return axum::response::IntoResponse::into_response((
+    let not_found = || {
+        axum::response::IntoResponse::into_response((
             StatusCode::NOT_FOUND,
             [(h::CACHE_CONTROL, "no-store")],
             "no such upload",
-        ));
+        ))
+    };
+    let header = |name: h::HeaderName| headers.get(name).and_then(|value| value.to_str().ok());
+    let Ok(records) = store::records(db, id).await else {
+        return not_found();
+    };
+    let Some(record) = store::readable_by(&records, registry, reader).cloned() else {
+        return not_found();
     };
 
     let etag = format!("\"{id}\"");
-    if if_none_match.is_some_and(|header| etag_matches(header, &etag)) {
+    if header(h::IF_NONE_MATCH).is_some_and(|value| etag_matches(value, &etag)) {
         return axum::response::IntoResponse::into_response((
             StatusCode::NOT_MODIFIED,
             [
@@ -481,19 +566,19 @@ pub async fn serve(
             ],
         ));
     }
-    let Ok(path) = store::path_for(project_dir, id) else {
-        return axum::response::IntoResponse::into_response(StatusCode::NOT_FOUND);
+    let Ok(path) = store::path_for(data_dir, id) else {
+        return not_found();
     };
-    let Ok(bytes) = tokio::fs::read(&path).await else {
+    let opened = match tokio::fs::File::open(&path).await {
+        Ok(file) => file.metadata().await.map(|meta| (file, meta.len())),
+        Err(err) => Err(err),
+    };
+    let Ok((mut file, total)) = opened else {
         // A row with no file is a real inconsistency — a half-finished delete, a
         // restored database over an unrestored disk — and it is worth saying so
         // in the log rather than only answering 404.
         warn!(target: "albedo.uploads", upload = %id, "a recorded upload has no file on disk");
-        return axum::response::IntoResponse::into_response((
-            StatusCode::NOT_FOUND,
-            [(h::CACHE_CONTROL, "no-store")],
-            "no such upload",
-        ));
+        return not_found();
     };
 
     let disposition = if renders_inline_safely(&record.content_type) {
@@ -505,19 +590,169 @@ pub async fn serve(
         format!("attachment; filename=\"{}\"", record.original_name)
     };
 
-    axum::response::IntoResponse::into_response((
-        [
-            (h::CONTENT_TYPE, record.content_type.clone()),
-            (h::CACHE_CONTROL, UPLOAD_CACHE_CONTROL.to_string()),
-            (h::ETAG, etag),
-            (h::CONTENT_DISPOSITION, disposition),
-            (
-                h::HeaderName::from_static("x-content-type-options"),
-                "nosniff".to_string(),
-            ),
-        ],
-        bytes,
-    ))
+    // A range is honoured only for this exact file: `If-Range` naming another
+    // entity means the client's partial copy is of something else, so it gets
+    // the whole file instead. The id is the content hash, so a strong match is
+    // exact.
+    let range_applies = header(h::IF_RANGE).is_none_or(|value| value.trim() == etag);
+    let wanted = if range_applies {
+        header(h::RANGE).map_or(ByteRange::Whole, |value| parse_range(value, total))
+    } else {
+        ByteRange::Whole
+    };
+    let (status, start, length, content_range) = match wanted {
+        ByteRange::Whole => (StatusCode::OK, 0, total, None),
+        ByteRange::Part { start, end } => (
+            StatusCode::PARTIAL_CONTENT,
+            start,
+            end - start + 1,
+            Some(format!("bytes {start}-{end}/{total}")),
+        ),
+        ByteRange::Unsatisfiable => {
+            return axum::response::IntoResponse::into_response((
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [
+                    (h::CONTENT_RANGE, format!("bytes */{total}")),
+                    (h::CACHE_CONTROL, UPLOAD_CACHE_CONTROL.to_string()),
+                    (h::ETAG, etag),
+                ],
+            ));
+        }
+    };
+    if start > 0 {
+        use tokio::io::AsyncSeekExt;
+        if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+            return not_found();
+        }
+    }
+
+    let mut response = axum::response::Response::new(axum::body::Body::from_stream(
+        file_chunks(file, length),
+    ));
+    *response.status_mut() = status;
+    let response_headers = response.headers_mut();
+    let mut set = |name: h::HeaderName, value: String| {
+        if let Ok(value) = h::HeaderValue::from_str(&value) {
+            response_headers.insert(name, value);
+        }
+    };
+    set(h::CONTENT_TYPE, record.content_type.clone());
+    set(h::CONTENT_LENGTH, length.to_string());
+    set(h::ACCEPT_RANGES, "bytes".to_string());
+    set(h::CACHE_CONTROL, UPLOAD_CACHE_CONTROL.to_string());
+    set(h::ETAG, etag);
+    set(h::CONTENT_DISPOSITION, disposition);
+    set(h::HeaderName::from_static("x-content-type-options"), "nosniff".to_string());
+    if let Some(content_range) = content_range {
+        set(h::CONTENT_RANGE, content_range);
+    }
+    response
+}
+
+/// How much of a file a read gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteRange {
+    /// No usable `Range` — the whole file, `200`.
+    Whole,
+    /// Bytes `start..=end`, `206`.
+    Part {
+        /// First byte.
+        start: u64,
+        /// Last byte, inclusive.
+        end: u64,
+    },
+    /// A range that starts past the end — `416`.
+    Unsatisfiable,
+}
+
+/// Read a `Range` header against a file of `total` bytes.
+///
+/// One range, in any of the three forms (`a-b`, `a-`, `-n`) — what a media
+/// element asks for. A header this does not understand, or one asking for
+/// several ranges, is ignored and the whole file served: RFC 9110 lets a server
+/// do that, and it is always a correct answer, where a guess at a multipart
+/// byte-range response would not be.
+fn parse_range(header: &str, total: u64) -> ByteRange {
+    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+        return ByteRange::Whole;
+    };
+    if spec.contains(',') {
+        return ByteRange::Whole;
+    }
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return ByteRange::Whole;
+    };
+    let (first, last) = (first.trim(), last.trim());
+    let parse = |text: &str| text.parse::<u64>().ok();
+    match (first.is_empty(), last.is_empty()) {
+        // `-n`: the last n bytes.
+        (true, false) => match parse(last) {
+            Some(0) => ByteRange::Unsatisfiable,
+            Some(_) if total == 0 => ByteRange::Unsatisfiable,
+            Some(n) => ByteRange::Part {
+                start: total.saturating_sub(n),
+                end: total - 1,
+            },
+            None => ByteRange::Whole,
+        },
+        // `a-`: from a to the end.
+        (false, true) => match parse(first) {
+            Some(start) if start >= total => ByteRange::Unsatisfiable,
+            Some(start) => ByteRange::Part {
+                start,
+                end: total - 1,
+            },
+            None => ByteRange::Whole,
+        },
+        // `a-b`: an explicit span, clamped to the file.
+        (false, false) => match (parse(first), parse(last)) {
+            (Some(start), Some(end)) if start <= end => {
+                if start >= total {
+                    ByteRange::Unsatisfiable
+                } else {
+                    ByteRange::Part {
+                        start,
+                        end: end.min(total - 1),
+                    }
+                }
+            }
+            _ => ByteRange::Whole,
+        },
+        (true, true) => ByteRange::Whole,
+    }
+}
+
+/// Bytes read from disk as the response is sent.
+const READ_CHUNK: u64 = 64 * 1024;
+
+/// `length` bytes of `file`, from where it is positioned, in chunks of
+/// [`READ_CHUNK`].
+///
+/// 🔴 This was `tokio::fs::read` — the whole file into memory on every request,
+/// so a 500 MiB video cost 500 MiB per viewer. A read now holds one chunk.
+fn file_chunks(
+    file: tokio::fs::File,
+    length: u64,
+) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> {
+    futures_util::stream::unfold((file, length), |(mut file, remaining)| async move {
+        use tokio::io::AsyncReadExt;
+        if remaining == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; usize::try_from(remaining.min(READ_CHUNK)).unwrap_or(0)];
+        match file.read(&mut buffer).await {
+            // Shorter than its record: stop rather than promise bytes that are
+            // not there. The client sees a short body against its
+            // `Content-Length`, which is the truthful failure.
+            Ok(0) => None,
+            Ok(read) => {
+                buffer.truncate(read);
+                let left = remaining - read as u64;
+                Some((Ok(Bytes::from(buffer)), (file, left)))
+            }
+            Err(err) => Some((Err(err), (file, 0))),
+        }
+    })
 }
 
 /// Browsers may keep a copy, but must ask before using it; shared caches keep none.
@@ -593,6 +828,9 @@ pub fn refusal(error: &UploadError) -> axum::response::Response {
         | UploadError::BodyTooLarge
         | UploadError::FieldTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
         UploadError::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        UploadError::SignInRequired { .. } => StatusCode::UNAUTHORIZED,
+        // What the action's own CSRF refusal answers.
+        UploadError::Forged => StatusCode::FORBIDDEN,
         _ => StatusCode::BAD_REQUEST,
     };
     if let UploadError::Io { reason } = error {
@@ -617,6 +855,25 @@ pub fn boundary_of(content_type: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use dom_render_compiler::upload::UploadDecl;
+
+    /// The three forms a media element sends, clamped to the file; anything
+    /// else served whole, which is always a correct answer.
+    #[test]
+    fn a_range_header_is_read_as_one_span_or_ignored() {
+        let part = |start, end| ByteRange::Part { start, end };
+        assert_eq!(parse_range("bytes=0-3", 10), part(0, 3));
+        assert_eq!(parse_range("bytes=4-", 10), part(4, 9));
+        assert_eq!(parse_range("bytes=-3", 10), part(7, 9));
+        assert_eq!(parse_range("bytes=-30", 10), part(0, 9), "a suffix past the start is the whole file");
+        assert_eq!(parse_range("bytes=8-200", 10), part(8, 9), "the end is clamped");
+        assert_eq!(parse_range("bytes=10-", 10), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=12-20", 10), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-0", 10), ByteRange::Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-", 0), ByteRange::Unsatisfiable);
+        for ignored in ["bytes=0-1,4-5", "items=0-3", "bytes=5-2", "bytes=x-y", "bytes=-", "0-3"] {
+            assert_eq!(parse_range(ignored, 10), ByteRange::Whole, "{ignored}");
+        }
+    }
 
     fn registry(json: serde_json::Value) -> UploadRegistry {
         UploadRegistry::from_declarations(
@@ -674,11 +931,57 @@ mod tests {
             boundary,
             &UploadContext {
                 registry,
-                project_dir: dir,
+                data_dir: dir,
                 principal: Some("u_test".to_string()),
+                genuine: Genuine::Yes,
             },
         )
         .await
+    }
+
+    /// A6 · a file before the token is refused with nothing written, a wrong
+    /// token is refused, and the token first — the order real forms send — is
+    /// stored.
+    #[tokio::test]
+    async fn no_file_is_written_before_the_submit_shows_a_valid_token() {
+        let registry = registry(serde_json::json!({ "avatars": {} }));
+        let boundary = "albedotestboundary";
+        let check = |token: &str| token == "good";
+        let attempt = |dir: std::path::PathBuf, parts: Vec<(&'static str, Option<&'static str>, &'static str, &'static [u8])>| {
+            let registry = &registry;
+            async move {
+                decode_multipart(
+                    stream(body(boundary, &parts)),
+                    boundary,
+                    &UploadContext {
+                        registry,
+                        data_dir: &dir,
+                        principal: Some("u_test".to_string()),
+                        genuine: Genuine::Pending(&check),
+                    },
+                )
+                .await
+            }
+        };
+        let file = ("avatars", Some("a.bin"), "application/octet-stream", &b"forged bytes"[..]);
+        let stored = |dir: &Path| {
+            store::path_for(dir, &format!("{:x}", Sha256::digest(b"forged bytes")))
+                .unwrap()
+                .exists()
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let before = attempt(temp.path().to_path_buf(), vec![file, ("_csrf", None, "", b"good")]).await;
+        assert_eq!(before.unwrap_err(), UploadError::Forged);
+        assert!(!stored(temp.path()), "a file before the token reached disk");
+
+        let wrong = attempt(temp.path().to_path_buf(), vec![("_csrf", None, "", b"bad"), file]).await;
+        assert_eq!(wrong.unwrap_err(), UploadError::Forged);
+        assert!(!stored(temp.path()));
+
+        let first = attempt(temp.path().to_path_buf(), vec![("_csrf", None, "", b"good"), file]).await;
+        assert!(first.is_ok(), "{first:?}");
+        assert!(stored(temp.path()));
     }
 
     #[tokio::test]

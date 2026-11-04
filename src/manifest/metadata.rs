@@ -288,12 +288,60 @@ fn escape_html(value: &str) -> String {
 pub fn auth_from_const_expr(expr: &Expr) -> Result<RouteAuth, String> {
     match expr {
         Expr::Lit(Lit::Str(s)) => RouteAuth::parse(s.value.as_ref()),
-        _ => Err("`export const auth` must be a plain string literal — \"public\" or \
-                  \"required\". A computed value cannot be read at build time, and a route whose \
-                  gate cannot be read at build time would be served to everyone"
-            .to_string()),
+        // R1a · `{ role: "payroll" }` / `{ role: ["hr", "payroll"] }`.
+        Expr::Object(_) | Expr::Paren(_) | Expr::TsConstAssertion(_) | Expr::TsAs(_)
+        | Expr::TsSatisfies(_) => match strict_auth_literal(expr) {
+            Some(value) => RouteAuth::from_json(&value),
+            None => Err(COMPUTED_AUTH.to_string()),
+        },
+        _ => Err(COMPUTED_AUTH.to_string()),
     }
 }
+
+/// The literal value of an `auth` declaration, or `None` if **any** part of it
+/// is not a literal.
+///
+/// Not [`expr_to_json`]: that walker drops a non-literal element or property and
+/// keeps going, which is right for page metadata and wrong for a gate —
+/// `{ role: ["payroll", someVar] }` would lower to a gate on `payroll` alone,
+/// and a spread or a computed key would vanish. Here one unreadable piece
+/// refuses the whole declaration.
+fn strict_auth_literal(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Lit(Lit::Str(s)) => Some(Value::String(s.value.to_string())),
+        Expr::Paren(paren) => strict_auth_literal(&paren.expr),
+        Expr::TsConstAssertion(cast) => strict_auth_literal(&cast.expr),
+        Expr::TsAs(cast) => strict_auth_literal(&cast.expr),
+        Expr::TsSatisfies(cast) => strict_auth_literal(&cast.expr),
+        Expr::Array(arr) => arr
+            .elems
+            .iter()
+            .map(|elem| match elem {
+                Some(elem) if elem.spread.is_none() => strict_auth_literal(&elem.expr),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        Expr::Object(obj) => {
+            let mut map = Map::new();
+            for prop in &obj.props {
+                let PropOrSpread::Prop(prop) = prop else {
+                    return None;
+                };
+                let Prop::KeyValue(kv) = &**prop else {
+                    return None;
+                };
+                map.insert(prop_name_to_key(&kv.key)?, strict_auth_literal(&kv.value)?);
+            }
+            Some(Value::Object(map))
+        }
+        _ => None,
+    }
+}
+
+const COMPUTED_AUTH: &str = "`export const auth` must be a literal — \"public\", \"required\" or \
+     { role: \"…\" }. A computed value cannot be read at build time, and a route whose gate \
+     cannot be read at build time would be served to everyone";
 
 /// Lower a `export const metadata = { ... }` initializer into a
 /// [`RouteMetadata`]. A non-object (or empty) initializer yields the
@@ -725,5 +773,47 @@ mod tests {
         // cleanly.
         let fallback = render_head_metadata("/post", &RouteMetadata::default());
         assert_eq!(fallback, "<title>ALBEDO /post</title>");
+    }
+
+    fn route_auth(source: &str) -> Result<RouteAuth, String> {
+        let module = parse_module(source, Path::new("routes/page.tsx")).expect("module parses");
+        let (_, expr) = module
+            .module_constants
+            .iter()
+            .find(|(name, _)| name == "auth")
+            .expect("an auth constant");
+        auth_from_const_expr(expr)
+    }
+
+    /// R1a · the object forms read from real source, `as const` included.
+    #[test]
+    fn a_role_gate_reads_from_source() {
+        for source in [
+            r#"export const auth = { role: "payroll" };"#,
+            r#"export const auth = { role: ["payroll"] } as const;"#,
+            r#"export const auth = ({ "role": ["payroll"] });"#,
+        ] {
+            assert_eq!(
+                route_auth(source),
+                Ok(RouteAuth::Roles(vec!["payroll".to_string()])),
+                "{source}"
+            );
+        }
+    }
+
+    /// One unreadable piece refuses the whole gate. The lenient metadata walker
+    /// would drop `someRole` and gate on `payroll` alone, or drop a spread and
+    /// a computed key without a word.
+    #[test]
+    fn a_partly_computed_role_gate_is_refused() {
+        for source in [
+            r#"const someRole = "hr"; export const auth = { role: ["payroll", someRole] };"#,
+            r#"const extra = {}; export const auth = { role: "payroll", ...extra };"#,
+            r#"const k = "role"; export const auth = { [k]: "payroll" };"#,
+            r#"const role = "payroll"; export const auth = { role };"#,
+            r#"export const auth = { role: `pay${"roll"}` };"#,
+        ] {
+            assert!(route_auth(source).is_err(), "{source} must be refused");
+        }
     }
 }

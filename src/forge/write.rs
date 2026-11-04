@@ -53,13 +53,22 @@ use crate::forge::delta::{
 use crate::transforms::shared_slot_lists::RowProjection;
 use crate::forge::skeleton::{materialize_slot, EditRule, ForgeCollection, ForgeSchema, SortDir};
 use crate::auth::PrincipalId;
-use crate::forge::substrate::DataSubstrate;
+use crate::forge::substrate::{DataSubstrate, Transaction};
 use crate::forge::value::{Result, SqlValue, SubstrateError};
 use crate::ir::opcode::{ReconcileRow, RowKey, SlotChange};
 use crate::runtime::broadcast::{BroadcastRegistry, ListUpdate, TopicTransition};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PUBLICATION_COLLISIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Committed FORGE channels skipped because their wire slot belongs to another topic.
+#[must_use]
+pub fn publication_collisions() -> u64 {
+    PUBLICATION_COLLISIONS.load(Ordering::Relaxed)
+}
 
 /// One durable mutation requested by an action body.
 ///
@@ -254,7 +263,7 @@ fn build_append(collection: &str, record: &Map<String, Value>) -> Result<(String
 /// right tool *here* (unlike on `UPDATE`, where it reports post-update values
 /// and loses the origin partition — see [`read_partition`]): an insert has no
 /// "before", so the returned row is unambiguous.
-fn build_append_returning(
+pub(crate) fn build_append_returning(
     table: &str,
     key_column: &str,
     record: &Map<String, Value>,
@@ -612,7 +621,7 @@ async fn authorize_author(
 ///
 /// `OR REPLACE` because a stale record for a key would otherwise make the
 /// append fail; `AUTOINCREMENT` never reuses a key, so in practice there is none.
-async fn record_author(
+pub(crate) async fn record_author(
     tx: &dyn crate::forge::substrate::Transaction,
     slot: &ForgeCollection,
     key: Option<SqlValue>,
@@ -931,10 +940,18 @@ pub async fn apply_writes(
     if writes.is_empty() {
         return Ok(FanOut::default());
     }
+    // Refuse an unknown collection before taking the writer lock.
+    let slots = resolve_write_slots(schema, writes)?;
+    let tx = substrate.begin().await?;
+    let pending = stage_writes(tx.as_ref(), broadcast, &slots, writes, principal).await?;
+    tx.commit().await?;
+    pending.publish(substrate, broadcast, projector).await
+}
 
-    // Resolve every collection against the schema BEFORE opening the
-    // transaction: an unknown collection is an authoring error, and it should
-    // not cost a write lock or leave a half-built transaction to roll back.
+fn resolve_write_slots<'a>(
+    schema: &'a ForgeSchema,
+    writes: &[ForgeWrite],
+) -> Result<Vec<&'a ForgeCollection>> {
     let mut slots: Vec<&ForgeCollection> = Vec::new();
     for write in writes {
         let slot = schema.slot_for_topic(write.collection()).ok_or_else(|| {
@@ -948,13 +965,50 @@ pub async fn apply_writes(
         }
     }
 
+    Ok(slots)
+}
+
+/// Writes staged in a caller-owned transaction, awaiting post-commit publication.
+///
+/// Drop this value if the transaction is rolled back. Call [`Self::publish`]
+/// only after the enclosing transaction has committed successfully.
+pub struct PendingWrites<'a> {
+    touched: Vec<Touched<'a>>,
+    fan_out: FanOut,
+}
+
+/// Stage FORGE writes alongside the caller's other durable effects.
+///
+/// This function neither commits nor rolls back `tx`, and never publishes.
+/// The caller must roll back or drop the transaction if staging fails.
+///
+/// # Errors
+/// Returns a substrate error for invalid collections, unauthorized writes,
+/// malformed records, or failed statements.
+pub async fn apply_writes_in_transaction<'a>(
+    tx: &dyn Transaction,
+    broadcast: &BroadcastRegistry,
+    schema: &'a ForgeSchema,
+    writes: &[ForgeWrite],
+    principal: Option<&PrincipalId>,
+) -> Result<PendingWrites<'a>> {
+    let slots = resolve_write_slots(schema, writes)?;
+    stage_writes(tx, broadcast, &slots, writes, principal).await
+}
+
+async fn stage_writes<'a>(
+    tx: &dyn Transaction,
+    broadcast: &BroadcastRegistry,
+    slots: &[&'a ForgeCollection],
+    writes: &[ForgeWrite],
+    principal: Option<&PrincipalId>,
+) -> Result<PendingWrites<'a>> {
     // Channels touched by this action, accumulated as the writes are applied.
     // An `Append` knows its partition from its own record; `Update`/`Delete`
     // have to read it out of the row before they change it, so this cannot be
     // fully resolved before the transaction opens.
     let mut touched: Vec<Touched<'_>> = Vec::new();
 
-    let tx = substrate.begin().await?;
     for write in writes {
         // The slot is borrowed from the schema, resolved in `touched` above —
         // the collection name and key column reach SQL from here, never from the
@@ -963,20 +1017,14 @@ pub async fn apply_writes(
             .iter()
             .find(|slot| slot.topic == write.collection())
             .copied()
-            .expect("collection was resolved above");
+            .ok_or_else(|| SubstrateError::Backend("FORGE collection was not resolved".into()))?;
 
         // AUTH F1 · an append's owner is decided here, before anything is built.
         // `Cow::Borrowed` for every collection that is not identity-partitioned,
         // so the pre-AUTH path allocates nothing and behaves byte for byte as it
         // did. `Cow::Owned` only when the server injected the owner.
         let appended = match write {
-            ForgeWrite::Append { record, .. } => match authorize_append(slot, record, principal) {
-                Ok(record) => Some(record),
-                Err(err) => {
-                    let _ = tx.rollback().await;
-                    return Err(err);
-                }
-            },
+            ForgeWrite::Append { record, .. } => Some(authorize_append(slot, record, principal)?),
             _ => None,
         };
 
@@ -984,10 +1032,7 @@ pub async fn apply_writes(
         // already exists. Inside the transaction, so nothing can re-author the
         // row between the check and the statement.
         if let ForgeWrite::Update { key, .. } | ForgeWrite::Delete { key, .. } = write {
-            if let Err(err) = authorize_author(tx.as_ref(), slot, key, principal).await {
-                let _ = tx.rollback().await;
-                return Err(err);
-            }
+            authorize_author(tx, slot, key, principal).await?;
         }
 
         // Learn which channel(s) this write moves, before it moves them.
@@ -995,7 +1040,7 @@ pub async fn apply_writes(
             ForgeWrite::Append { record, .. } => {
                 append_partition(slot, appended.as_deref().unwrap_or(record)).map(|p| vec![p])
             }
-            ForgeWrite::Update { key, fields, .. } => match read_partition(tx.as_ref(), slot, key).await {
+            ForgeWrite::Update { key, fields, .. } => match read_partition(tx, slot, key).await {
                 // A partition-CHANGING update touches two channels: the row
                 // leaves one and arrives in the other, and each side's
                 // subscribers need to hear about their half. Naming it here is
@@ -1019,7 +1064,7 @@ pub async fn apply_writes(
                 },
                 Err(err) => Err(err),
             },
-            ForgeWrite::Delete { key, .. } => match read_partition(tx.as_ref(), slot, key).await {
+            ForgeWrite::Delete { key, .. } => match read_partition(tx, slot, key).await {
                 Ok(before) => match authorize_existing_row(slot, before.as_deref(), principal) {
                     Ok(()) => Ok(vec![before]),
                     Err(err) => Err(err),
@@ -1027,18 +1072,9 @@ pub async fn apply_writes(
                 Err(err) => Err(err),
             },
         };
-        let resolved = match resolved {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                let _ = tx.rollback().await;
-                return Err(err);
-            }
-        };
-        for partition in resolved {
-            if let Err(err) = note_touched(&mut touched, slot, partition) {
-                let _ = tx.rollback().await;
-                return Err(err);
-            }
+        let resolved = resolved?;
+        for partition in &resolved {
+            note_touched(&mut touched, slot, partition.clone())?;
         }
 
         // The channel(s) this write just resolved onto. An append records the row
@@ -1046,7 +1082,7 @@ pub async fn apply_writes(
         // which forces the fan-out to re-read rather than splice.
         let channels: Vec<String> = touched
             .iter()
-            .filter(|known| known.slot.topic == slot.topic)
+            .filter(|known| known.slot.topic == slot.topic && resolved.contains(&known.partition))
             .map(|known| known.channel.clone())
             .collect();
 
@@ -1056,29 +1092,14 @@ pub async fn apply_writes(
                 // collection carries the owner the server put there.
                 let record = appended.as_deref().unwrap_or(record);
                 let (sql, params, columns) =
-                    match build_append_returning(&slot.table, &slot.key_column, record) {
-                        Ok(built) => built,
-                        Err(err) => {
-                            let _ = tx.rollback().await;
-                            return Err(err);
-                        }
-                    };
-                let rows = match tx.query(&sql, &params).await {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        let _ = tx.rollback().await;
-                        return Err(err);
-                    }
-                };
+                    build_append_returning(&slot.table, &slot.key_column, record)?;
+                let rows = tx.query(&sql, &params).await?;
                 // ALB-02 · a signed-in append records its author. An
                 // identity-partitioned row already names its owner in its
                 // partition column. `RETURNING` lists the key first.
                 if let (Some(principal), false) = (principal, slot.identity_partitioned) {
                     let key = rows.rows.first().and_then(|row| row.get(0).cloned());
-                    if let Err(err) = record_author(tx.as_ref(), slot, key, principal).await {
-                        let _ = tx.rollback().await;
-                        return Err(err);
-                    }
+                    record_author(tx, slot, key, principal).await?;
                 }
                 // A substrate that does not honour `RETURNING` yields no row.
                 // That is not an error — it only costs the zero-query path, and
@@ -1090,27 +1111,14 @@ pub async fn apply_writes(
                     .and_then(|row| returned_record(&columns, row, &slot.fields));
                 for channel in &channels {
                     match &persisted {
-                        Some(record) => {
-                            record_outcome(&mut touched, channel, Some(record.clone()))
-                        }
+                        Some(record) => record_outcome(&mut touched, channel, Some(record.clone())),
                         None => record_outcome(&mut touched, channel, None),
                     }
                 }
             }
             _ => {
-                let (sql, params) = match build_statement(slot, write) {
-                    Ok(built) => built,
-                    Err(err) => {
-                        // Drop the whole action's writes: one malformed mutation
-                        // must not leave earlier ones committed.
-                        let _ = tx.rollback().await;
-                        return Err(err);
-                    }
-                };
-                if let Err(err) = tx.execute(&sql, &params).await {
-                    let _ = tx.rollback().await;
-                    return Err(err);
-                }
+                let (sql, params) = build_statement(slot, write)?;
+                tx.execute(&sql, &params).await?;
                 // ALB-02 · a removed row takes its authorship record with it.
                 if let ForgeWrite::Delete { key, .. } = write {
                     let forgotten = match key_to_sqlvalue(&slot.topic, &slot.key_column, key) {
@@ -1123,10 +1131,7 @@ pub async fn apply_writes(
                         }
                         Err(err) => Err(err),
                     };
-                    if let Err(err) = forgotten {
-                        let _ = tx.rollback().await;
-                        return Err(err);
-                    }
+                    forgotten?;
                 }
                 for channel in &channels {
                     record_outcome(&mut touched, channel, None);
@@ -1141,141 +1146,195 @@ pub async fn apply_writes(
     // that reached a thousand people be priced as if it reached none.
     let fan_out = FanOut {
         subscribers: touched.iter().fold(0u32, |total, touched| {
-            let lanes = u32::try_from(broadcast.subscriber_count(&touched.channel))
-                .unwrap_or(u32::MAX);
+            let lanes =
+                u32::try_from(broadcast.subscriber_count(&touched.channel)).unwrap_or(u32::MAX);
             total.saturating_add(lanes)
         }),
     };
 
-    tx.commit().await?;
+    Ok(PendingWrites { touched, fan_out })
+}
 
-    // Durable now — safe to tell the world.
-    for Touched {
-        slot,
-        partition,
-        channel,
-        appended,
-        mutated,
-    } in touched
-    {
-        // Both awaits happen HERE, outside the topic's critical section:
-        // `write_topic_delta`'s closure runs under that topic's lock, so
-        // awaiting in it would serialise every writer behind the slowest query
-        // — and a projector that reached for the topic's value would deadlock
-        // on the very lock it is running under. What survives into the closure
-        // is only the diff: pure, bounded by the collection size, and the one
-        // step that genuinely needs the pre-state it is replacing.
-        // PRISM § 6.2 · the write path stops re-running the query.
-        //
-        // An append already knows its record (from `RETURNING`) and its
-        // partition, and `PerRecord` proves the row's markup is a function of
-        // that record alone. So when nothing but appends touched this channel
-        // and the ordering places a new row at one end, the new value is the old
-        // one with the rows spliced in — a memcpy — and the rows are rendered
-        // from the records directly. Cost becomes O(1) in the partition size
-        // instead of O(rows in it).
-        //
-        // Every other shape (an update, a delete, an ordering that places rows
-        // by value, a substrate without `RETURNING`, a topic never materialised)
-        // falls back to the query. The fallback is always correct, so this can
-        // only ever cost time, never truth.
-        let splice_at_head = insert_at_head(slot);
-        let can_splice = !mutated && !appended.is_empty() && splice_at_head.is_some();
-        let spliced = if can_splice {
-            let at_head = splice_at_head.unwrap_or(false);
-            broadcast.get(&channel).and_then(|topic| {
-                // Read the cached bytes in place. Cloning them first would copy
-                // the whole partition just to derive the next version of it —
-                // the splice is exactly the operation that does not need to own
-                // its input.
-                topic.with_value(|previous| splice_appended(previous, &appended, at_head))
-            })
-        } else {
-            None
-        };
-        let bytes = match spliced {
-            Some(bytes) => bytes,
-            None => materialize_slot(substrate, slot, partition.as_deref()).await?,
-        };
+impl PendingWrites<'_> {
+    /// Publish the collections touched by a successfully committed transaction.
+    ///
+    /// # Errors
+    /// Returns a substrate error if post-commit rematerialization fails. The
+    /// enclosing transaction remains committed even when publication fails.
+    pub async fn publish(
+        self,
+        substrate: &dyn DataSubstrate,
+        broadcast: &BroadcastRegistry,
+        projector: Option<&dyn RowProjector>,
+    ) -> Result<FanOut> {
+        let Self { touched, fan_out } = self;
 
-        // Choose what to render. A `PerRecord` collection renders only the rows
-        // this write changed — each over a singleton collection, `O(1)` in the
-        // view size — because its row template is a proven function of its record
-        // alone (the transpile pre-pass classified it; see `RowProjection`). Every
-        // other class renders the whole view exactly as before. `partial` marks a
-        // render that covers only the changed keys: a reconcile needs every row,
-        // so if the classified fast path can't satisfy one it re-renders after the
-        // lock (`needs_whole` below).
-        let (rows, partial) = match projector {
-            Some(p) if p.projection_class(&slot.topic) == RowProjection::PerRecord => {
-                match render_changed_rows(p, slot, &channel, partition.as_deref(), broadcast, &bytes).await {
-                    // Changed rows attributed and rendered: the fast path.
-                    Some(changed) => (Some(changed), true),
-                    // No prior value to diff against, or unkeyable rows: fall back
-                    // to the whole view, which is always renderable and correct.
-                    None => (p.project_rows(&slot.topic, partition.as_deref(), &bytes).await, false),
-                }
-            }
-            Some(p) => (p.project_rows(&slot.topic, partition.as_deref(), &bytes).await, false),
-            None => (None, false),
-        };
-
-        // The channel, not the collection: a partitioned write fans out on its
-        // own partition's topic. `projection_class` / `project_rows` above stay
-        // keyed by `slot.topic`, because the row TEMPLATE belongs to the
-        // collection while the subscriber set belongs to the partition.
-        // Register the channel if this is the first anyone has heard of it. The
-        // `initial` argument is ignored when the topic already exists, so
-        // cloning the value unconditionally allocated a full copy of the
-        // partition and dropped it again on **every** write to a warm topic —
-        // the common case, and pure waste.
-        if broadcast.get(&channel).is_none() {
-            broadcast.topic(channel.clone(), bytes.clone());
-        }
-        // `needs_whole` is raised inside the closure when a partial render can't
-        // express the transition (a reorder, a mid-list insert, or a race that
-        // moved `previous` out from under the changed-set guess). The reconcile is
-        // then shipped after the lock, off the critical section.
-        let needs_whole = Cell::new(false);
-        let _ = broadcast.write_topic_delta(&channel, |previous| {
-            let update = match rows.as_ref() {
-                Some(rows) => row_update(slot, previous, &bytes, rows, partial, &needs_whole),
-                None => ListUpdate::None,
+        // Durable now — safe to tell the world.
+        for Touched {
+            slot,
+            partition,
+            channel,
+            appended,
+            mutated,
+        } in touched
+        {
+            // Both awaits happen HERE, outside the topic's critical section:
+            // `write_topic_delta`'s closure runs under that topic's lock, so
+            // awaiting in it would serialise every writer behind the slowest query
+            // — and a projector that reached for the topic's value would deadlock
+            // on the very lock it is running under. What survives into the closure
+            // is only the diff: pure, bounded by the collection size, and the one
+            // step that genuinely needs the pre-state it is replacing.
+            // PRISM § 6.2 · the write path stops re-running the query.
+            //
+            // An append already knows its record (from `RETURNING`) and its
+            // partition, and `PerRecord` proves the row's markup is a function of
+            // that record alone. So when nothing but appends touched this channel
+            // and the ordering places a new row at one end, the new value is the old
+            // one with the rows spliced in — a memcpy — and the rows are rendered
+            // from the records directly. Cost becomes O(1) in the partition size
+            // instead of O(rows in it).
+            //
+            // Every other shape (an update, a delete, an ordering that places rows
+            // by value, a substrate without `RETURNING`, a topic never materialised)
+            // falls back to the query. The fallback is always correct, so this can
+            // only ever cost time, never truth.
+            let splice_at_head = insert_at_head(slot);
+            let can_splice = !mutated && !appended.is_empty() && splice_at_head.is_some();
+            let spliced = if can_splice {
+                let at_head = splice_at_head.unwrap_or(false);
+                broadcast.get(&channel).and_then(|topic| {
+                    // Read the cached bytes in place. Cloning them first would copy
+                    // the whole partition just to derive the next version of it —
+                    // the splice is exactly the operation that does not need to own
+                    // its input.
+                    topic.with_value(|previous| splice_appended(previous, &appended, at_head))
+                })
+            } else {
+                None
             };
-            TopicTransition {
-                value: bytes.clone(),
-                update,
-            }
-        });
+            let bytes = match spliced {
+                Some(bytes) => bytes,
+                None => materialize_slot(substrate, slot, partition.as_deref()).await?,
+            };
 
-        // Rare, off-lock: the changed-only render could not satisfy a reconcile.
-        // Render the whole view now and ship the full ordered set so keyed anchors
-        // reach the new order. The `SlotSet` value already went out above, so a
-        // reload or late joiner is already correct; this repairs live rows.
-        if needs_whole.get() {
-            if let Some(p) = projector {
-                if let Some(whole) = p.project_rows(&slot.topic, partition.as_deref(), &bytes).await {
-                    let _ = broadcast.write_topic_delta(&channel, |_previous| TopicTransition {
-                        value: bytes.clone(),
-                        update: ListUpdate::Reconcile(reconcile_rows(&whole)),
-                    });
+            // Choose what to render. A `PerRecord` collection renders only the rows
+            // this write changed — each over a singleton collection, `O(1)` in the
+            // view size — because its row template is a proven function of its record
+            // alone (the transpile pre-pass classified it; see `RowProjection`). Every
+            // other class renders the whole view exactly as before. `partial` marks a
+            // render that covers only the changed keys: a reconcile needs every row,
+            // so if the classified fast path can't satisfy one it re-renders after the
+            // lock (`needs_whole` below).
+            let (rows, partial) = match projector {
+                Some(p) if p.projection_class(&slot.topic) == RowProjection::PerRecord => {
+                    match render_changed_rows(
+                        p,
+                        slot,
+                        &channel,
+                        partition.as_deref(),
+                        broadcast,
+                        &bytes,
+                    )
+                    .await
+                    {
+                        // Changed rows attributed and rendered: the fast path.
+                        Some(changed) => (Some(changed), true),
+                        // No prior value to diff against, or unkeyable rows: fall back
+                        // to the whole view, which is always renderable and correct.
+                        None => (
+                            p.project_rows(&slot.topic, partition.as_deref(), &bytes)
+                                .await,
+                            false,
+                        ),
+                    }
+                }
+                Some(p) => (
+                    p.project_rows(&slot.topic, partition.as_deref(), &bytes)
+                        .await,
+                    false,
+                ),
+                None => (None, false),
+            };
+
+            // The channel, not the collection: a partitioned write fans out on its
+            // own partition's topic. `projection_class` / `project_rows` above stay
+            // keyed by `slot.topic`, because the row TEMPLATE belongs to the
+            // collection while the subscriber set belongs to the partition.
+            // Register the channel if this is the first anyone has heard of it. The
+            // `initial` argument is ignored when the topic already exists, so
+            // cloning the value unconditionally allocated a full copy of the
+            // partition and dropped it again on **every** write to a warm topic —
+            // the common case, and pure waste.
+            if broadcast.get(&channel).is_none() {
+                let registered = partition.as_deref().map_or_else(
+                    || broadcast.try_topic(channel.clone(), bytes.clone()),
+                    |key| {
+                        broadcast.try_topic_partition(
+                            channel.clone(),
+                            slot.topic.as_str().into(),
+                            key.into(),
+                            bytes.clone(),
+                        )
+                    },
+                );
+                if let Err(error) = registered {
+                    // The transaction has committed: refuse only this channel,
+                    // and keep publishing any other channels touched by the write.
+                    PUBLICATION_COLLISIONS.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(%error, "FORGE publication skipped after commit");
+                    continue;
+                }
+            }
+            // `needs_whole` is raised inside the closure when a partial render can't
+            // express the transition (a reorder, a mid-list insert, or a race that
+            // moved `previous` out from under the changed-set guess). The reconcile is
+            // then shipped after the lock, off the critical section.
+            let needs_whole = Cell::new(false);
+            let _ = broadcast.write_topic_delta(&channel, |previous| {
+                let update = match rows.as_ref() {
+                    Some(rows) => row_update(slot, previous, &bytes, rows, partial, &needs_whole),
+                    None => ListUpdate::None,
+                };
+                TopicTransition {
+                    value: bytes.clone(),
+                    update,
+                }
+            });
+
+            // Rare, off-lock: the changed-only render could not satisfy a reconcile.
+            // Render the whole view now and ship the full ordered set so keyed anchors
+            // reach the new order. The `SlotSet` value already went out above, so a
+            // reload or late joiner is already correct; this repairs live rows.
+            if needs_whole.get() {
+                if let Some(p) = projector {
+                    if let Some(whole) = p
+                        .project_rows(&slot.topic, partition.as_deref(), &bytes)
+                        .await
+                    {
+                        let _ =
+                            broadcast.write_topic_delta(&channel, |_previous| TopicTransition {
+                                value: bytes.clone(),
+                                update: ListUpdate::Reconcile(reconcile_rows(&whole)),
+                            });
+                    }
                 }
             }
         }
+
+        // PRISM § 8 · the one cap. Swept here rather than inside the registry
+        // because this is where the bytes grew, and because the sweep has to run
+        // with no topic lock held — `write_topic_delta` holds one across its whole
+        // critical section, and reading every topic's length from inside that would
+        // deadlock against itself.
+        //
+        // Reclaiming an idle partition costs the next reader one query and nothing
+        // else: the substrate is the truth and the value is a cache. That is the
+        // whole licence for this, and it is why static topics are excluded.
+        broadcast.enforce_byte_budget(crate::runtime::broadcast::DEFAULT_TOPIC_VALUE_BUDGET);
+
+        Ok(fan_out)
     }
-
-    // PRISM § 8 · the one cap. Swept here rather than inside the registry
-    // because this is where the bytes grew, and because the sweep has to run
-    // with no topic lock held — `write_topic_delta` holds one across its whole
-    // critical section, and reading every topic's length from inside that would
-    // deadlock against itself.
-    //
-    // Reclaiming an idle partition costs the next reader one query and nothing
-    // else: the substrate is the truth and the value is a cache. That is the
-    // whole licence for this, and it is why static topics are excluded.
-    broadcast.enforce_byte_budget(crate::runtime::broadcast::DEFAULT_TOPIC_VALUE_BUDGET);
-
-    Ok(fan_out)
 }
 
 /// Render only the records a write changed, each over a **singleton** collection
@@ -1905,6 +1964,93 @@ mod tests {
 /// a component renders from reflects it afterwards.
 #[cfg(all(test, feature = "forge"))]
 mod substrate_tests {
+    #[tokio::test]
+    async fn caller_transaction_rolls_back_forge_and_jobs_and_defers_publication() {
+        use crate::jobs::queue::{self, Enqueue};
+
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        let schema = ForgeSchema::guestbook_default();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        for ddl in queue::ddl() {
+            db.migrate(&ddl).await.unwrap();
+        }
+        let broadcast = BroadcastRegistry::new();
+        hydrate_topics(&db, &broadcast, &schema).await.unwrap();
+        let before = broadcast.get("guestbook").unwrap().current_value();
+        let before_rows = db.query("SELECT * FROM guestbook", &[]).await.unwrap().rows;
+        let writes = [ForgeWrite::Append {
+            collection: "guestbook".into(),
+            record: json!({"author": "ada", "message": "atomic"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        }];
+        let job = Enqueue {
+            id: "action:job".into(),
+            name: "process".into(),
+            args: "{}".into(),
+            principal: None,
+            run_at_ms: 1,
+            max_attempts: 1,
+            fanout: false,
+        };
+
+        let tx = db.begin().await.unwrap();
+        let pending = apply_writes_in_transaction(tx.as_ref(), &broadcast, &schema, &writes, None)
+            .await
+            .unwrap();
+        assert!(queue::enqueue_in_transaction(tx.as_ref(), &job)
+            .await
+            .unwrap());
+        assert_eq!(broadcast.get("guestbook").unwrap().current_value(), before);
+        // The outer effect failed: neither the collection nor its queued work survives.
+        tx.rollback().await.unwrap();
+        drop(pending);
+        assert_eq!(
+            db.query("SELECT * FROM guestbook", &[]).await.unwrap().rows,
+            before_rows
+        );
+        assert!(db
+            .query("SELECT * FROM albedo_jobs", &[])
+            .await
+            .unwrap()
+            .rows
+            .is_empty());
+        assert_eq!(broadcast.get("guestbook").unwrap().current_value(), before);
+
+        let tx = db.begin().await.unwrap();
+        let pending = apply_writes_in_transaction(tx.as_ref(), &broadcast, &schema, &writes, None)
+            .await
+            .unwrap();
+        assert!(queue::enqueue_in_transaction(tx.as_ref(), &job)
+            .await
+            .unwrap());
+        tx.commit().await.unwrap();
+        assert_eq!(
+            db.query("SELECT * FROM guestbook", &[])
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            before_rows.len() + 1
+        );
+        assert_eq!(
+            db.query("SELECT * FROM albedo_jobs", &[])
+                .await
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        assert_eq!(broadcast.get("guestbook").unwrap().current_value(), before);
+        pending.publish(&db, &broadcast, None).await.unwrap();
+        assert_ne!(broadcast.get("guestbook").unwrap().current_value(), before);
+        assert!(
+            !queue::enqueue(&db, &job).await.unwrap(),
+            "the transaction seam preserves queue idempotence"
+        );
+    }
+
     /// **The safety argument for the whole zero-query path, asserted directly.**
     ///
     /// A spliced value must be byte-identical to what the query would have
@@ -1982,7 +2128,7 @@ mod substrate_tests {
         // delivery. Nothing about the *statement* changed.
         let mut sinks = Vec::new();
         for _ in 0..3 {
-            let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+            let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
             broadcast
                 .subscribe(SessionId::random(), "guestbook", tx)
                 .unwrap();
@@ -2294,6 +2440,73 @@ mod substrate_tests {
             .unwrap_or_default()
     }
 
+    #[tokio::test]
+    async fn cold_colliding_partitions_commit_without_cross_publication() {
+        use crate::runtime::broadcast::broadcast_slot_id;
+
+        let mut collection = partitioned_schema()
+            .slot_for_topic("messages")
+            .unwrap()
+            .clone();
+        collection.topic = "room".into();
+        collection.slot_id = broadcast_slot_id("room");
+        let schema = ForgeSchema::build(vec![collection]).unwrap();
+        let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        assert_eq!(
+            broadcast_slot_id("room:80939"),
+            broadcast_slot_id("room:1016344")
+        );
+
+        let collisions_before = publication_collisions();
+        for key in ["80939", "1016344"] {
+            apply_writes(
+                &db,
+                &broadcast,
+                &schema,
+                &[append("room", json!({"room": key, "body": key}))],
+                None,
+                None,
+            )
+            .await
+            .expect("the durable write succeeds even if publication collides");
+        }
+        let rows = db
+            .query("SELECT room FROM messages ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 2, "both writes committed");
+        assert!(
+            broadcast.get("room:1016344").is_none(),
+            "colliding channel was registered"
+        );
+        assert!(
+            publication_collisions() > collisions_before,
+            "the refusal is counted"
+        );
+        let holder = broadcast.get("room:80939").unwrap();
+        assert_eq!(
+            holder.version(),
+            1,
+            "the second write must not publish on the holder"
+        );
+        assert_eq!(rows_of(&broadcast, "room:80939")[0]["room"], "80939");
+        assert_eq!(broadcast.topic_count(), 1);
+        assert!(
+            broadcast.drop_if_idle("room:80939"),
+            "cold publication must retain partition identity"
+        );
+        assert!(broadcast
+            .try_topic_partition(
+                "room:1016344",
+                "room".into(),
+                "1016344".into(),
+                b"[]".to_vec()
+            )
+            .is_ok());
+    }
+
     /// An append fans out on **its own partition's channel** and nowhere else.
     /// Without this, one room's message lands in every room.
     #[tokio::test]
@@ -2354,6 +2567,166 @@ mod substrate_tests {
         let rows: Vec<Value> = serde_json::from_slice(&live).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1]["body"], "second");
+    }
+
+    async fn assert_partition_snapshots(
+        db: &dyn DataSubstrate,
+        broadcast: &BroadcastRegistry,
+        schema: &ForgeSchema,
+        rooms: &[&str],
+    ) {
+        let collection = schema.slot_for_topic("messages").unwrap();
+        for room in rooms {
+            let live = broadcast
+                .get(&format!("messages:{room}"))
+                .unwrap()
+                .current_value();
+            let queried = materialize_slot(db, collection, Some(room)).await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&live),
+                String::from_utf8_lossy(&queried),
+                "partition {room} must equal its query"
+            );
+        }
+    }
+
+    async fn assert_batch_appends_stay_in_their_partitions(rooms: &[&str]) {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let db = CountingSubstrate {
+            inner: LibSqlSubstrate::open_ephemeral().await.unwrap(),
+            queries: queries.clone(),
+        };
+        let schema = partitioned_schema();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        for room in rooms {
+            apply_writes(&db, &broadcast, &schema, &[msg(room, "seed")], None, None)
+                .await
+                .unwrap();
+        }
+
+        let writes: Vec<_> = rooms.iter().map(|room| msg(room, "new")).collect();
+        queries.store(0, AtomicOrdering::Relaxed);
+        apply_writes(&db, &broadcast, &schema, &writes, None, None)
+            .await
+            .unwrap();
+        assert_eq!(queries.load(AtomicOrdering::Relaxed), 0);
+        assert_partition_snapshots(&db, &broadcast, &schema, rooms).await;
+    }
+
+    #[tokio::test]
+    async fn batch_appends_to_warm_a_then_b_stay_in_their_partitions() {
+        assert_batch_appends_stay_in_their_partitions(&["a", "b"]).await;
+    }
+
+    #[tokio::test]
+    async fn batch_appends_to_warm_b_then_a_stay_in_their_partitions() {
+        assert_batch_appends_stay_in_their_partitions(&["b", "a"]).await;
+    }
+
+    #[tokio::test]
+    async fn batch_appends_to_three_warm_partitions_stay_in_their_partitions() {
+        assert_batch_appends_stay_in_their_partitions(&["a", "b", "c"]).await;
+    }
+
+    async fn assert_batch_mutation_only_rereads_its_partition(delete: bool) {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let db = CountingSubstrate {
+            inner: LibSqlSubstrate::open_ephemeral().await.unwrap(),
+            queries: queries.clone(),
+        };
+        let schema = partitioned_schema().open_to_anyone();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        apply_writes(&db, &broadcast, &schema, &[msg("b", "seed")], None, None)
+            .await
+            .unwrap();
+
+        // Exercise both orders: a later mutation must not disable an earlier
+        // append's splice, and a later append must not contaminate a mutation.
+        for append_first in [false, true] {
+            apply_writes(&db, &broadcast, &schema, &[msg("a", "seed")], None, None)
+                .await
+                .unwrap();
+            let key = rows_of(&broadcast, "messages:a").last().unwrap()["id"].clone();
+            let mutation = if delete {
+                ForgeWrite::Delete {
+                    collection: "messages".into(),
+                    key,
+                }
+            } else {
+                ForgeWrite::Update {
+                    collection: "messages".into(),
+                    key,
+                    fields: json!({ "body": "edited" }).as_object().unwrap().clone(),
+                }
+            };
+            let writes = if append_first {
+                vec![msg("b", "new"), mutation]
+            } else {
+                vec![mutation, msg("b", "new")]
+            };
+            queries.store(0, AtomicOrdering::Relaxed);
+            apply_writes(&db, &broadcast, &schema, &writes, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                queries.load(AtomicOrdering::Relaxed),
+                2,
+                "one partition lookup and one rematerialization of a; b must splice"
+            );
+            assert_partition_snapshots(&db, &broadcast, &schema, &["a", "b"]).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_update_only_rereads_its_partition() {
+        assert_batch_mutation_only_rereads_its_partition(false).await;
+    }
+
+    #[tokio::test]
+    async fn batch_delete_only_rereads_its_partition() {
+        assert_batch_mutation_only_rereads_its_partition(true).await;
+    }
+
+    #[tokio::test]
+    async fn batch_partition_move_rereads_both_sides_and_splices_an_unrelated_append() {
+        let queries = Arc::new(AtomicUsize::new(0));
+        let db = CountingSubstrate {
+            inner: LibSqlSubstrate::open_ephemeral().await.unwrap(),
+            queries: queries.clone(),
+        };
+        let schema = partitioned_schema().open_to_anyone();
+        bootstrap_schema(&db, &schema).await.unwrap();
+        let broadcast = BroadcastRegistry::new();
+        for room in ["a", "b", "c"] {
+            apply_writes(&db, &broadcast, &schema, &[msg(room, "seed")], None, None)
+                .await
+                .unwrap();
+        }
+        let key = rows_of(&broadcast, "messages:a")[0]["id"].clone();
+        queries.store(0, AtomicOrdering::Relaxed);
+        apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[
+                msg("c", "new"),
+                ForgeWrite::Update {
+                    collection: "messages".into(),
+                    key,
+                    fields: json!({ "room": "b" }).as_object().unwrap().clone(),
+                },
+            ],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(queries.load(AtomicOrdering::Relaxed), 3);
+        assert_partition_snapshots(&db, &broadcast, &schema, &["a", "b", "c"]).await;
+        assert!(rows_of(&broadcast, "messages:a").is_empty());
+        assert_eq!(rows_of(&broadcast, "messages:b").len(), 2);
     }
 
     /// The edge PRISM named up front: moving a row between partitions touches
@@ -2853,7 +3226,7 @@ mod substrate_tests {
         let broadcast = BroadcastRegistry::new();
         hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
             .subscribe(SessionId::random(), "guestbook", tx)
             .unwrap();
@@ -2955,7 +3328,7 @@ mod substrate_tests {
         let broadcast = BroadcastRegistry::new();
         hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
             .subscribe(SessionId::random(), "guestbook", tx)
             .unwrap();
@@ -3056,7 +3429,7 @@ mod substrate_tests {
         let broadcast = BroadcastRegistry::new();
         hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
             .subscribe(SessionId::random(), "guestbook", tx)
             .unwrap();
@@ -3124,7 +3497,7 @@ mod substrate_tests {
         let broadcast = BroadcastRegistry::new();
         hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
             .subscribe(SessionId::random(), "guestbook", tx)
             .unwrap();
@@ -3200,7 +3573,7 @@ mod substrate_tests {
         let broadcast = BroadcastRegistry::new();
         hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
             .subscribe(SessionId::random(), "guestbook", tx)
             .unwrap();

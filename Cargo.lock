@@ -1230,6 +1230,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode 2.0.1",
+ "bytes",
  "chrono",
  "core_affinity",
  "criterion",

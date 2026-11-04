@@ -166,6 +166,28 @@ pub fn refuse_anonymous_returning(
         .into_response()
 }
 
+/// R1a · refuse a **signed-in** request that lacks a role the route requires.
+///
+/// `403`, not `401`: signing in again would not help, so neither a redirect to
+/// the login route nor `WWW-Authenticate` is honest. The body names the rule and
+/// nothing about the route — not even which role — because the reader is by
+/// definition someone this page is not for.
+#[must_use]
+pub fn refuse_forbidden() -> Response {
+    let body = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">                <title>Not available</title></head><body>                <main><h1>Not available</h1>                <p>Your account does not have access to this page.</p>                </main></body></html>";
+    (
+        StatusCode::FORBIDDEN,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // Same reason as the 401: the answer depends on the session cookie.
+            (header::VARY, "Cookie"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

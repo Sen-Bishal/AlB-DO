@@ -415,7 +415,7 @@ mod tests {
 
     /// A tab on the page: subscribed to the topic, and asking for nothing else
     /// ever again.
-    fn viewer(registry: &BroadcastRegistry, topic: &str) -> mpsc::Receiver<Vec<u8>> {
+    fn viewer(registry: &BroadcastRegistry, topic: &str) -> mpsc::Receiver<bytes::Bytes> {
         let (tx, rx) = mpsc::channel(16);
         registry
             .subscribe(SessionId::random(), topic, tx)

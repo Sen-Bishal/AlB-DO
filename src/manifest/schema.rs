@@ -589,12 +589,13 @@ pub struct TierCNode {
 /// types, deliberately not merged — one of them can express a role and the other
 /// cannot.
 ///
-/// **There is no `Role` variant, and its absence is the point.** Roles do not
-/// exist in this system yet; `AUTH.md` § 8.1 records that RBAC is additive
-/// (`org.id` as one more key source) rather than architectural. A `Role(String)`
-/// here today would be a declaration nothing enforces — precisely the dead
-/// loaded variant deleted as F3 in the same audit that produced this field.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// **R1a · the `Roles` variant exists now because it is enforced.** This comment
+/// used to say its absence was the point: a `Role(String)` nothing enforced would
+/// have been the dead variant deleted as F3. It landed together with its
+/// enforcement at every door that enforces [`Self::Required`] — render, live
+/// lanes, actions, static export — all of which call [`Self::admits`], so the
+/// doors cannot disagree about what a role gate means.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteAuth {
     /// Anyone may render this route. The default, and the behaviour of every
@@ -604,6 +605,23 @@ pub enum RouteAuth {
     /// Only a request carrying a resolved principal may render this route. An
     /// anonymous request is refused **before** the render runs.
     Required,
+    /// R1a · a signed-in principal holding **at least one** of these roles.
+    /// Sorted and de-duplicated, never empty. Spelled
+    /// `export const auth = { role: "payroll" }` or `{ role: ["hr", "payroll"] }`.
+    Roles(Vec<String>),
+}
+
+/// What a route's gate says about one caller. The three outcomes are three
+/// different answers — `401` (or a sign-in redirect), `403`, and through — so a
+/// boolean would have to be reconstructed at every door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// The caller may proceed.
+    Allowed,
+    /// The gate needs a principal and there is none.
+    Anonymous,
+    /// Signed in, without a role the gate requires.
+    Forbidden,
 }
 
 impl RouteAuth {
@@ -617,15 +635,115 @@ impl RouteAuth {
             "public" => Ok(Self::Public),
             "required" => Ok(Self::Required),
             other => Err(format!(
-                "`export const auth` must be \"public\" or \"required\"; found \"{other}\""
+                "`export const auth` must be \"public\", \"required\" or {{ role: \"…\" }}; \
+                 found \"{other}\""
             )),
         }
     }
 
+    /// Read `export const auth` from its literal value: a string, or a
+    /// `{ role: "x" }` / `{ role: ["x", "y"] }` object.
+    ///
+    /// Role **names** are checked for shape here; whether the `auth` block
+    /// declares them is a question about the pair, answered at boot by
+    /// [`Self::check_declared`].
+    ///
+    /// # Errors
+    /// A message quoting what was found, for any other shape — an unreadable
+    /// gate must never read as public.
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
+        use serde_json::Value;
+        let object = match value {
+            Value::String(raw) => return Self::parse(raw),
+            Value::Object(object) => object,
+            other => {
+                return Err(format!(
+                    "`export const auth` must be \"public\", \"required\" or {{ role: \"…\" }}; \
+                     found {other}"
+                ))
+            }
+        };
+        if object.len() != 1 || !object.contains_key("role") {
+            return Err(format!(
+                "`export const auth` as an object takes exactly one key, `role` — \
+                 {{ role: \"payroll\" }} or {{ role: [\"hr\", \"payroll\"] }}; found {value}"
+            ));
+        }
+        let names: Vec<&Value> = match &object["role"] {
+            Value::Array(items) => items.iter().collect(),
+            single => vec![single],
+        };
+        let mut roles = Vec::with_capacity(names.len());
+        for name in names {
+            match name.as_str() {
+                Some(role) if crate::auth::declare::is_valid_role_name(role) => {
+                    roles.push(role.to_string());
+                }
+                _ => {
+                    return Err(format!(
+                        "`export const auth` role {name} is not a role name — roles match \
+                         [a-z][a-z0-9_-]{{0,31}}"
+                    ))
+                }
+            }
+        }
+        if roles.is_empty() {
+            return Err(
+                "`export const auth = { role: [] }` names no role, so nobody could ever pass it"
+                    .to_string(),
+            );
+        }
+        roles.sort();
+        roles.dedup();
+        Ok(Self::Roles(roles))
+    }
+
     /// Whether an anonymous request may render this route.
     #[must_use]
-    pub fn allows_anonymous(self) -> bool {
+    pub fn allows_anonymous(&self) -> bool {
         matches!(self, Self::Public)
+    }
+
+    /// **The rule every door applies.** `roles` is `None` for an anonymous
+    /// caller, and the caller's (declared-only) roles otherwise.
+    #[must_use]
+    pub fn admits(&self, roles: Option<&[String]>) -> Admission {
+        match (self, roles) {
+            (Self::Public, _) => Admission::Allowed,
+            (_, None) => Admission::Anonymous,
+            (Self::Required, Some(_)) => Admission::Allowed,
+            (Self::Roles(required), Some(held)) => {
+                if required.iter().any(|role| held.contains(role)) {
+                    Admission::Allowed
+                } else {
+                    Admission::Forbidden
+                }
+            }
+        }
+    }
+
+    /// Refuse a role the `auth` block does not declare.
+    ///
+    /// # Errors
+    /// A message naming every undeclared role.
+    pub fn check_declared(&self, declared: &[String]) -> Result<(), String> {
+        let Self::Roles(required) = self else {
+            return Ok(());
+        };
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|role| !declared.contains(role))
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "requires role(s) {missing:?}, which the `auth` block in albedo.config.ts does not \
+                 declare (declared: {declared:?}) — nobody could ever be granted them, so every \
+                 request would be refused. Declare them under `auth.roles`, or fix the spelling"
+            ))
+        }
     }
 }
 

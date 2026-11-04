@@ -104,7 +104,7 @@ async fn sse_handler(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let session = SessionId::random();
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
     let initial = state
         .broadcast
         .auto_subscribe(session, tx, &[TOPIC.to_string()]);
@@ -124,7 +124,7 @@ async fn sse_handler(
 
     let initial_stream = tokio_stream::iter(initial_events.into_iter().map(Ok));
 
-    let live_stream = ReceiverStream::new(rx).map(|payload: Vec<u8>| {
+    let live_stream = ReceiverStream::new(rx).map(|payload: bytes::Bytes| {
         // Each payload is one bincode-encoded `OpcodeFrame`. The
         // demo client unwraps and decodes; the production bakabox
         // runtime treats it identically.

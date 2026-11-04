@@ -1413,7 +1413,7 @@ impl<'a> ManifestBuilder<'a> {
         // Buffer = 16: deep enough to absorb the auto-subscribe
         // initial-SlotSet burst for projects with many topics, while
         // staying small enough that a runaway producer dies fast.
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
         let opts = RenderOptions { hook_compile: true };
 
         let output = render_entry_with_broadcast(

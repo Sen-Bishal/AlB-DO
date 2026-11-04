@@ -37,7 +37,7 @@
 //! caller supplies the id when it wants idempotence (a webhook delivery keyed by
 //! its event id) and gets a random one when it does not.
 
-use crate::forge::substrate::DataSubstrate;
+use crate::forge::substrate::{DataSubstrate, Transaction};
 use crate::forge::value::SqlValue;
 
 /// The table.
@@ -242,39 +242,59 @@ pub fn backoff_ms(attempts: u32, jitter: f64) -> i64 {
 /// # Errors
 /// [`QueueError::Substrate`] if the write is refused.
 pub async fn enqueue(db: &dyn DataSubstrate, request: &Enqueue) -> Result<bool> {
+    let (sql, params) = enqueue_statement(request);
+    let affected = db
+        .execute(&sql, &params)
+        .await
+        .map_err(|err| QueueError::Substrate(err.to_string()))?;
+    Ok(affected > 0)
+}
+
+/// Put work on the queue inside the caller's transaction.
+///
+/// The row becomes claimable only when that transaction commits. `Ok(false)`
+/// means the id already existed, just as for [`enqueue`].
+///
+/// # Errors
+/// Returns [`QueueError::Substrate`] if the statement is refused.
+pub async fn enqueue_in_transaction(tx: &dyn Transaction, request: &Enqueue) -> Result<bool> {
+    let (sql, params) = enqueue_statement(request);
+    let affected = tx
+        .execute(&sql, &params)
+        .await
+        .map_err(|err| QueueError::Substrate(err.to_string()))?;
+    Ok(affected > 0)
+}
+
+fn enqueue_statement(request: &Enqueue) -> (String, Vec<SqlValue>) {
     let state = if request.fanout {
         JobState::Fanout
     } else {
         JobState::Pending
     };
-    // `OR IGNORE` is the whole exactly-once mechanism: two processes racing the
-    // same tick both run this, and the primary key decides.
-    let affected = db
-        .execute(
-            &format!(
-                "INSERT OR IGNORE INTO {JOBS} \
-                 (id, name, args, principal, state, run_at, attempts, max_attempts, \
-                  lease_until, cursor, last_error, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, NULL, ?, ?)"
-            ),
-            &[
-                SqlValue::Text(request.id.clone()),
-                SqlValue::Text(request.name.clone()),
-                SqlValue::Text(request.args.clone()),
-                request
-                    .principal
-                    .clone()
-                    .map_or(SqlValue::Null, SqlValue::Text),
-                SqlValue::Text(state.as_str().to_string()),
-                SqlValue::Integer(request.run_at_ms),
-                SqlValue::Integer(i64::from(request.max_attempts)),
-                SqlValue::Integer(request.run_at_ms),
-                SqlValue::Integer(request.run_at_ms),
-            ],
-        )
-        .await
-        .map_err(|err| QueueError::Substrate(err.to_string()))?;
-    Ok(affected > 0)
+    // The primary key arbitrates repeated ids in either execution seam.
+    (
+        format!(
+            "INSERT OR IGNORE INTO {JOBS} \
+             (id, name, args, principal, state, run_at, attempts, max_attempts, \
+              lease_until, cursor, last_error, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, NULL, ?, ?)"
+        ),
+        vec![
+            SqlValue::Text(request.id.clone()),
+            SqlValue::Text(request.name.clone()),
+            SqlValue::Text(request.args.clone()),
+            request
+                .principal
+                .clone()
+                .map_or(SqlValue::Null, SqlValue::Text),
+            SqlValue::Text(state.as_str().to_string()),
+            SqlValue::Integer(request.run_at_ms),
+            SqlValue::Integer(i64::from(request.max_attempts)),
+            SqlValue::Integer(request.run_at_ms),
+            SqlValue::Integer(request.run_at_ms),
+        ],
+    )
 }
 
 /// Take the oldest runnable row, or `None`.

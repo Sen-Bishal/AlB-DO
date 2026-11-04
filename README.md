@@ -163,7 +163,13 @@ cd my-app && albedo dev
   redirect or rewrite a request. It cannot grant one: the route's own gate runs
   after it.
 - Declared `uploads` buckets with type and size limits. A handler receives a
-  content-addressed reference, never the bytes.
+  content-addressed reference, never the bytes. Each bucket says who may read
+  its files back — `read: "owner"` (the default), `"signed-in"` or
+  `"public"` — and a refused read looks exactly like a missing file. Files are
+  streamed, with byte ranges for media.
+- `albedo import <collection> <file.jsonl> --author-email <field>` brings rows
+  from another system in as appends with their owners recorded, so each row
+  stays editable by the user it belongs to.
 
 ### Calling the outside world
 
@@ -172,11 +178,18 @@ cd my-app && albedo dev
   replays it against a durable journal, so a completed call is not repeated.
 - A declared `sources` block makes a remote endpoint a topic: it refreshes,
   paints like any other slot, and generates types into `.albedo/sources.d.ts`.
-- An **egress policy enforced inside the DNS resolver**, so a declared allowlist
-  cannot be walked around by DNS rebinding, by an IP-literal URL, or by a
-  redirect (redirects are refused outright).
+- An **egress policy enforced inside the DNS resolver**: a `fetch()` to a
+  private, loopback or link-local address — the cloud metadata endpoint among
+  them, in every spelling (IPv4-mapped, NAT64, 6to4) — is refused unless its
+  host is declared as a source `base`. Being inside the resolver, it cannot be
+  walked around by DNS rebinding, by an IP-literal URL, or by a redirect
+  (redirects are refused outright). It is **not** an allowlist of public hosts:
+  an undeclared public host is reachable. `albedo dev` allows loopback and
+  private addresses so local services work, and still refuses the metadata
+  range.
 - Response caching, single-flight coalescing, conditional requests, derived
   idempotency keys, a per-host upstream budget, and a request deadline.
+  Outbound response bodies are limited to 8 MiB, including streamed responses.
 
 ### Operations
 
@@ -188,6 +201,14 @@ cd my-app && albedo dev
   drain within a deadline.
 - Prometheus metrics on a separate listener (`ALBEDO_METRICS_ADDR`).
 - Correct client addresses behind a load balancer (`ALBEDO_TRUSTED_PROXIES`).
+- Backups: `albedo db backup` snapshots the database and its uploaded files,
+  checked as it is taken; `albedo db restore latest` checks one and stages it,
+  and the server applies it on its next start, keeping the database it replaced.
+  `ALBEDO_BACKUP_DIR` schedules them.
+- Probes: `/_albedo/health` (the process answers) and `/_albedo/ready` (503
+  while shutting down or when the database does not answer).
+- Access log: `ALBEDO_ACCESS_LOG=json` writes one JSON line per request, named
+  by the `x-request-id` every response carries.
 
 ---
 
@@ -202,7 +223,7 @@ commented one. The top-level blocks:
 | `forge` | Collections: fields, ordering, `partition_by`, optional `seed` |
 | `auth` | Session lifetime and cookie, providers, and the sign-in route (`login`) |
 | `email` | Sender, provider, API key (`{ env: "NAME" }`), templates |
-| `uploads` | Buckets: accepted types and size limits |
+| `uploads` | Buckets: accepted types, size limits, and who may read (`read`) |
 | `sources` | External HTTP endpoints read as topics |
 
 Secrets are declared as `{ env: "VARIABLE" }` and read at boot, never written
@@ -219,7 +240,11 @@ into the config file.
 | `ALBEDO_ACME_CONTACT` | Let's Encrypt account contact (`--acme-contact`) |
 | `ALBEDO_ACME_CACHE` | Where the ACME account and certificates are cached (`--acme-cache`) |
 | `ALBEDO_ACME_STAGING` | Use the Let's Encrypt staging CA — rehearse with this first (`--acme-staging`) |
-| `ALBEDO_FORGE_DB` | Path of the database file, e.g. on a mounted volume |
+| `ALBEDO_FORGE_DB` | Path of the database file, e.g. on a mounted volume. Uploaded files are kept beside it, in `uploads/` |
+| `ALBEDO_BACKUP_DIR` | Take scheduled backups into this directory (relative = beside the database; off when unset) |
+| `ALBEDO_BACKUP_EVERY` | How often: seconds, or `30m`, `6h`, `1d` (default `1d`, at least a minute) |
+| `ALBEDO_BACKUP_KEEP` | How many backups to keep (default 14) |
+| `ALBEDO_ACCESS_LOG` | `json` for one line per request on stdout; `off` (default) |
 | `ALBEDO_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges whose `X-Forwarded-For` is believed |
 | `ALBEDO_INSTANCES` | Number of processes sharing app-wide rate budgets (default 1) |
 | `ALBEDO_METRICS_ADDR` | Serve Prometheus metrics on this address (off when unset) |
@@ -242,6 +267,8 @@ into the config file.
 - **Auth providers:** passkeys (WebAuthn), delegated JWT providers (the Clerk
   and Auth0 presets) and custom resolver modules are not supported. Declaring
   one fails the build.
+- **Action names must be unique across modules.** Duplicate names or wire ID
+  collisions fail the build and name both handlers.
 - **Outbound calls are not batched.** Three independent `fetch()` calls in one
   handler cost three round trips.
 - **Email** is sent through an HTTP provider; SMTP is not supported.

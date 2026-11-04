@@ -182,7 +182,8 @@ pub(crate) fn boot_production_server_reusing(
 fn absolutise_tls(
     settings: crate::tls::TlsSettings,
     project_dir: &std::path::Path,
-) -> crate::tls::TlsSettings {
+    data_dir: &std::path::Path,
+) -> Result<crate::tls::TlsSettings, String> {
     let rebase = |value: Option<String>| {
         value.map(|raw| {
             let path = PathBuf::from(raw.trim());
@@ -193,28 +194,91 @@ fn absolutise_tls(
             }
         })
     };
-    // 🔴 The ACME cache must be pinned to the project even when nobody named
-    // it. This boot path carries no renderer config, so the server's own
-    // fallback would resolve the default against the **process working
-    // directory** — and a restart from elsewhere would find no account, re-issue
-    // from scratch, and walk into Let's Encrypt's 5-duplicates-per-week limit.
-    // That is a lockout measured in days, from a path that merely looked
-    // harmless. Same class as `forge.db`, worse consequence.
-    let acme_cache = rebase(settings.acme_cache).or_else(|| {
-        Some(
-            project_dir
-                .join(crate::tls::DEFAULT_ACME_CACHE_DIR)
-                .display()
-                .to_string(),
-        )
-    });
+    let mode = crate::tls::resolve_for_data_dir(&settings, project_dir, data_dir)?;
+    let acme_cache = match mode {
+        crate::tls::TlsMode::Acme { cache, .. } => Some(cache.display().to_string()),
+        _ => rebase(settings.acme_cache.clone()).or_else(|| {
+            Some(
+                crate::tls::default_acme_cache(data_dir)
+                    .display()
+                    .to_string(),
+            )
+        }),
+    };
 
-    crate::tls::TlsSettings {
+    Ok(crate::tls::TlsSettings {
         cert_path: rebase(settings.cert_path),
         key_path: rebase(settings.key_path),
         acme_cache,
         ..settings
+    })
+}
+
+/// Refuse to boot over uploads left where this server no longer looks.
+///
+/// They lived under the project root until 2026-10-30, whatever the database's
+/// location. Where those differ, a server that simply looked in the new place
+/// would answer every existing file with a 404 while its records still named
+/// them — a quiet loss that is in fact a folder in the wrong place. Records
+/// point at files by content id alone, so moving the folder is the whole fix.
+///
+/// 🔴 Decided by the files, not the directory: this once passed as soon as the
+/// new directory *existed*, so a deploy script that pre-created it, or a move
+/// that stopped half-way, booted into 404s (found by review 2026-10-30). Every
+/// file in the old store must be in the new one, at the same size; copies left
+/// behind by a finished move are harmless and pass.
+fn refuse_stranded_uploads(
+    project_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> Result<(), RuntimeError> {
+    use dom_render_compiler::upload::store::{is_upload_id, path_for};
+    let store = dom_render_compiler::upload::UPLOAD_DIR;
+    let (old, new) = (project_dir.join(store), data_dir.join(store));
+    let same = match (project_dir.canonicalize(), data_dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => old == new,
+    };
+    if same {
+        return Ok(());
     }
+    let Ok(fans) = std::fs::read_dir(&old) else {
+        return Ok(());
+    };
+    let mut stranded = 0usize;
+    for fan in fans.flatten() {
+        let Ok(files) = std::fs::read_dir(fan.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let id = format!(
+                "{}{}",
+                fan.file_name().to_string_lossy(),
+                file.file_name().to_string_lossy()
+            );
+            // The in-flight temp directory and its parts are not stored files.
+            if !is_upload_id(&id) {
+                continue;
+            }
+            let size = |path: &std::path::Path| std::fs::metadata(path).map(|meta| meta.len()).ok();
+            let moved = path_for(data_dir, &id)
+                .ok()
+                .and_then(|there| size(&there))
+                .is_some_and(|there| Some(there) == size(&file.path()));
+            if !moved {
+                stranded += 1;
+            }
+        }
+    }
+    if stranded == 0 {
+        return Ok(());
+    }
+    Err(RuntimeError::ServerStartup(format!(
+        "{stranded} uploaded file(s) are in {} but not in {}, where this server keeps them — \
+         beside its database. Move the folder's contents there and start again: records name \
+         files by content alone, so the move is the whole migration.",
+        old.display(),
+        new.display()
+    )))
 }
 
 fn boot_inner(
@@ -267,6 +331,18 @@ fn boot_inner(
         ))
     })?;
 
+    let configured_db = opts
+        .forge_db
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let db_path = crate::forge_db_path::resolve_forge_db_path(
+        configured_db.as_deref(),
+        crate::forge_db_path::forge_db_env().as_deref(),
+        // The resolver climbs from <project>/.albedo/dist, not source_root.
+        &opts.dist_dir,
+    );
+    let data_dir = crate::forge_db_path::data_dir_for(&db_path);
+
     let mut app_config = AppConfig {
         server: ServerConfig {
             host: opts.host.clone(),
@@ -280,7 +356,8 @@ fn boot_inner(
             // path carries no renderer config, so the server could not derive
             // the project from an artifacts directory and a relative path
             // would fall back to the process CWD.
-            tls: absolutise_tls(opts.tls.clone(), &opts.project_dir),
+            tls: absolutise_tls(opts.tls.clone(), &opts.project_dir, &data_dir)
+                .map_err(RuntimeError::ServerStartup)?,
             ..ServerConfig::default()
         },
         renderer: None,
@@ -292,20 +369,7 @@ fn boot_inner(
         // finished absolute path — otherwise the default falls back to a
         // CWD-relative `forge.db`, which is the bug being fixed.
         forge: ForgeConfig {
-            db_path: Some(match &opts.forge_db {
-                Some(path) => path.display().to_string(),
-                None => crate::forge_db_path::resolve_forge_db_path(
-                    None,
-                    crate::forge_db_path::forge_db_env().as_deref(),
-                    // `dist_dir`, not `source_root`: the resolver climbs two
-                    // levels to reach the project from `<project>/.albedo/dist`,
-                    // and `source_root` is `<project>/src` — climbing from
-                    // there would put the database inside `src/`.
-                    &opts.dist_dir,
-                )
-                .display()
-                .to_string(),
-            }),
+            db_path: Some(db_path.display().to_string()),
         },
     };
     // The environment's timeouts and WebTransport settings. Host and port are
@@ -435,9 +499,11 @@ fn boot_inner(
     // opened. Checked after the registry is lowered (it is what "are there
     // providers" asks) and before the listener binds, so a route nobody could
     // ever reach fails the boot instead of serving a permanent refusal.
-    if let Err(problems) =
-        dom_render_compiler::manifest::validate_route_auth(&compiled, !auth_registry.is_empty())
-    {
+    if let Err(problems) = dom_render_compiler::manifest::validate_route_auth(
+        &compiled,
+        !auth_registry.is_empty(),
+        &auth_registry.roles,
+    ) {
         return Err(RuntimeError::ServerStartup(format!(
             "route `auth` declarations cannot be satisfied:\n  - {}",
             problems.join("\n  - ")
@@ -630,11 +696,13 @@ fn boot_inner(
     // AUTH · same placement, same reason: after `with_live_runtime`, so a dev
     // reload carries the identity path onto the runtime it is actually reusing.
     builder = builder.with_auth_registry(auth_registry);
-    // UPLOADS · the project root travels with the registry because every stored
-    // path is built from it. Absolutised upstream for the same reason
-    // `forge.db` is: a shipped binary must not write its uploads wherever it
-    // happened to be launched from.
-    builder = builder.with_uploads(upload_registry, opts.project_dir.clone());
+    // UPLOADS · the data directory travels with the registry because every
+    // stored path is built from it: the database's directory, so the files
+    // ride the same volume as the records naming them. See `data_dir_for`.
+    if !upload_registry.is_empty() {
+        refuse_stranded_uploads(&opts.project_dir, &data_dir)?;
+    }
+    builder = builder.with_uploads(upload_registry, data_dir.clone());
     // Where actions may redirect, and the signed inbound webhooks. Both lowered
     // here so a bad entry — or a webhook secret whose variable is unset — stops
     // the boot by name instead of refusing requests later for a reason nobody
@@ -658,7 +726,7 @@ fn boot_inner(
     // TLS mode is known.
     if let Some(config) = email_config {
         builder = builder
-            .with_email(config, opts.project_dir.clone(), opts.dev_mode)
+            .with_email(config, &opts.project_dir, data_dir.clone(), opts.dev_mode)
             .map_err(RuntimeError::ServerStartup)?;
     }
 
@@ -690,6 +758,54 @@ mod tests {
     use crate::tls::{TlsSettings, DEFAULT_ACME_CACHE_DIR};
     use std::path::{Path, PathBuf};
 
+    #[test]
+    fn external_database_acme_cache_boot_path() {
+        let project = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let settings = TlsSettings {
+            domains: vec!["app.example.com".into()],
+            ..TlsSettings::default()
+        };
+        let resolved = absolutise_tls(settings, project.path(), data.path()).unwrap();
+        assert_eq!(
+            resolved.acme_cache.as_deref().map(PathBuf::from),
+            Some(data.path().join(DEFAULT_ACME_CACHE_DIR))
+        );
+    }
+
+    /// Found by review 2026-10-30: an existing (empty) new directory passed the
+    /// check while every file sat in the old place. Now the files decide — a
+    /// partial move refuses, a finished one boots even with copies left behind.
+    #[test]
+    fn stranded_uploads_are_decided_by_the_files_not_the_directory() {
+        use dom_render_compiler::upload::store::path_for;
+        let project = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let id = "ab".repeat(32);
+        let old = path_for(project.path(), &id).unwrap();
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"bytes").unwrap();
+        let refused = |why: &str| {
+            assert!(
+                super::refuse_stranded_uploads(project.path(), data.path()).is_err(),
+                "{why}"
+            );
+        };
+
+        refused("nothing moved yet");
+        std::fs::create_dir_all(data.path().join(dom_render_compiler::upload::UPLOAD_DIR)).unwrap();
+        refused("an empty new directory is not a migration");
+        let new = path_for(data.path(), &id).unwrap();
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::write(&new, b"byt").unwrap();
+        refused("a truncated copy is not a migration");
+        std::fs::write(&new, b"bytes").unwrap();
+        assert!(
+            super::refuse_stranded_uploads(project.path(), data.path()).is_ok(),
+            "a finished move with the old copy left behind must boot"
+        );
+    }
+
     /// 🔴 The third appearance of one bug: a persistence path that defaults to
     /// the **process working directory**. `forge.db` did it, module sources did
     /// it, and here the consequence is the worst of the three — losing the ACME
@@ -698,7 +814,12 @@ mod tests {
     /// lockout measured in days.
     #[test]
     fn the_acme_cache_defaults_into_the_project_not_the_shell() {
-        let resolved = absolutise_tls(TlsSettings::default(), Path::new("/srv/app"));
+        let resolved = absolutise_tls(
+            TlsSettings::default(),
+            Path::new("/srv/app"),
+            Path::new("/srv/app"),
+        )
+        .unwrap();
         assert_eq!(
             resolved.acme_cache.as_deref().map(PathBuf::from),
             Some(PathBuf::from("/srv/app").join(DEFAULT_ACME_CACHE_DIR)),
@@ -714,7 +835,8 @@ mod tests {
             acme_cache: Some("certs/acme".into()),
             ..TlsSettings::default()
         };
-        let resolved = absolutise_tls(settings, Path::new("/srv/app"));
+        let resolved =
+            absolutise_tls(settings, Path::new("/srv/app"), Path::new("/srv/app")).unwrap();
         assert_eq!(
             resolved.acme_cache.as_deref().map(PathBuf::from),
             Some(PathBuf::from("/srv/app").join("certs/acme"))
@@ -729,7 +851,8 @@ mod tests {
             acme_cache: Some("/data/acme".into()),
             ..TlsSettings::default()
         };
-        let resolved = absolutise_tls(settings, Path::new("/srv/app"));
+        let resolved =
+            absolutise_tls(settings, Path::new("/srv/app"), Path::new("/srv/app")).unwrap();
         assert_eq!(resolved.acme_cache.as_deref(), Some("/data/acme"));
     }
 }

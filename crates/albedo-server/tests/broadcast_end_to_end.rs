@@ -47,8 +47,8 @@ async fn two_sessions_subscribed_to_same_topic_both_receive_writes() {
     let topic = broadcast.topic("chat:room-1", b"[]".to_vec());
     assert_eq!(topic.slot_id(), broadcast_slot_id("chat:room-1"));
 
-    let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-    let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx_a, mut rx_a) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
+    let (tx_b, mut rx_b) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
     let session_a = SessionId::random();
     let session_b = SessionId::random();
     let seed_a = broadcast.subscribe(session_a, "chat:room-1", tx_a).unwrap();
@@ -82,7 +82,7 @@ async fn late_joiner_gets_current_value_via_subscribe_return() {
         .write_topic("cursor:doc-7", b"{\"x\":42,\"y\":7}".to_vec())
         .unwrap_or_else(|err| panic!("write should succeed without subscribers: {err:?}"));
 
-    let (tx, _rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx, _rx) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
     let value = broadcast
         .subscribe(SessionId::random(), "cursor:doc-7", tx)
         .unwrap();
@@ -95,7 +95,7 @@ async fn cleanup_session_removes_subscription_so_subsequent_writes_skip_it() {
     let broadcast = server.broadcast();
     broadcast.topic("alerts", b"[]".to_vec());
 
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
     let session = SessionId::random();
     broadcast.subscribe(session, "alerts", tx).unwrap();
 
@@ -121,8 +121,8 @@ async fn multiple_topics_isolated_per_session() {
     broadcast.topic("topic-a", b"".to_vec());
     broadcast.topic("topic-b", b"".to_vec());
 
-    let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
-    let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx_a, mut rx_a) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
+    let (tx_b, mut rx_b) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
     let session = SessionId::random();
     broadcast.subscribe(session, "topic-a", tx_a).unwrap();
     broadcast.subscribe(session, "topic-b", tx_b).unwrap();
@@ -150,7 +150,7 @@ async fn broadcast_registry_is_shared_across_clones_of_the_arc() {
     assert!(Arc::ptr_eq(&broadcast_a, &broadcast_b));
 
     broadcast_a.topic("shared", b"".to_vec());
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
     broadcast_b
         .subscribe(SessionId::random(), "shared", tx)
         .unwrap();

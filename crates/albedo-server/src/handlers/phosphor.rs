@@ -179,7 +179,8 @@ pub(crate) enum TrunkEvent {
         /// `Some` targets one joining tab (its seed/resync); `None` is a
         /// live broadcast every tab on the route applies.
         nonce: Option<String>,
-        frame: Vec<u8>,
+        /// Shared with every other lane the registry fanned the same frame to.
+        frame: bytes::Bytes,
     },
 }
 
@@ -195,10 +196,10 @@ struct RouteSub {
     /// locks). Dropping the `RouteSub` drops this sender; together with
     /// `cleanup_session` pruning the registry's clones, that closes the
     /// circuit channel and ends the forwarder.
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<bytes::Bytes>,
     /// The circuit channel's receiver, held until the forwarder is started
     /// (the start-gate). `None` once spawned.
-    pending_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    pending_rx: Option<mpsc::Receiver<bytes::Bytes>>,
     refs: usize,
 }
 
@@ -600,7 +601,7 @@ async fn subscribe_routes(
                     if routes.len() >= MAX_ROUTES_PER_LANE {
                         return Err(StatusCode::TOO_MANY_REQUESTS);
                     }
-                    let (tx, rx) = mpsc::channel::<Vec<u8>>(CIRCUIT_CHANNEL_CAPACITY);
+                    let (tx, rx) = mpsc::channel::<bytes::Bytes>(CIRCUIT_CHANNEL_CAPACITY);
                     routes.insert(
                         add.p.clone(),
                         RouteSub {
@@ -692,6 +693,7 @@ async fn subscribe_routes(
 /// is full — the browser is not draining, and a silently-dropped seed would
 /// strand a tab stale on a healthy-looking connection.
 fn push_or_kill(lane: &Arc<Lane>, route: &str, nonce: Option<String>, frame: Vec<u8>) {
+    let frame = bytes::Bytes::from(frame);
     let event = TrunkEvent::Patch {
         route: Arc::from(route),
         nonce,
@@ -705,7 +707,7 @@ fn push_or_kill(lane: &Arc<Lane>, route: &str, nonce: Option<String>, frame: Vec
 /// The circuit's forwarder: drain the registry sink into the trunk, tagging
 /// each frame with the route. Started only after the seed is on the trunk
 /// (the start-gate). A full trunk kills the lane — see the module docs.
-fn spawn_forwarder(route: Arc<str>, mut rx: mpsc::Receiver<Vec<u8>>, lane: Arc<Lane>) {
+fn spawn_forwarder(route: Arc<str>, mut rx: mpsc::Receiver<bytes::Bytes>, lane: Arc<Lane>) {
     tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             let event = TrunkEvent::Patch {

@@ -275,6 +275,10 @@ test-support = []
 
 [dependencies]
 async-trait.workspace        = true
+# Live-update frames are `Bytes`, so one encoded frame fans out to every
+# subscriber as a reference-count bump rather than a copy each. Already in the
+# lock file through tokio and hyper.
+bytes.workspace              = true
 # APERTURE · A2 — `join_all` over the requests one suspension staged. Already in
 # the lock file via albedo-server; no new vendor cost.
 futures-util.workspace       = true

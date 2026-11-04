@@ -65,6 +65,10 @@ use swc_ecma_visit::VisitMutWith;
 
 const MODULE_RECORD_FLAG: &str = "__albedo_is_module_record";
 pub(crate) const MODULE_MISSING_MARKER: &str = "__ALBEDO_MODULE_MISSING__:";
+
+/// Native stack, in bytes, JS on one engine may use before recursion is a
+/// `stack overflow` error — see `ensure_initialized`.
+pub const JS_STACK_LIMIT: usize = 512 * 1024;
 const INVALID_ENTRY_EXPORT_MARKER: &str = "__ALBEDO_INVALID_ENTRY_EXPORT__:";
 
 #[derive(Debug, Deserialize)]
@@ -353,6 +357,14 @@ impl QuickJsEngine {
     /// [`Self::confine`] before the engine serves anything else.
     pub fn take_interrupted(&mut self) -> bool {
         self.interrupted.replace(false)
+    }
+
+    /// Cap the memory this engine's JS may hold, in bytes — see
+    /// [`crate::runtime::arena::ArenaControl::set_memory_limit`] for why the
+    /// allocator enforces it rather than QuickJS. Defaults to
+    /// [`crate::runtime::arena::DEFAULT_MEMORY_LIMIT`].
+    pub fn set_memory_limit(&mut self, bytes: usize) {
+        self.arena.set_memory_limit(bytes);
     }
 
     /// Run `f` inside this engine's context, initialising the engine first.
@@ -1144,6 +1156,13 @@ impl QuickJsEngine {
         let runtime = self.runtime.get_or_insert_with(|| {
             let runtime = Runtime::new_with_alloc(ArenaAllocator::new(arena))
                 .expect("QuickJS runtime creation failed");
+            // How deep JS may recurse before it gets a `stack overflow` error.
+            // QuickJS's default is 1 MiB — and Windows gives a process's main
+            // thread 1 MiB of stack *in total*, where `albedo build`, boot-time
+            // island renders and `albedo test` run engines. Recursion there
+            // overflowed the native stack before QuickJS's check fired, and the
+            // whole process died. Half the smallest stack an engine runs on.
+            runtime.set_max_stack_size(JS_STACK_LIMIT);
             // Installed once, on the runtime — which outlives every realm
             // rebuild — so a confined engine keeps it.
             runtime.set_interrupt_handler(Some(Box::new(move || {
@@ -1289,10 +1308,10 @@ impl QuickJsEngine {
     /// at ≈2.7 ms against 2.0 ms with no npm at all.
     ///
     /// # Errors
-    /// Propagates a rebuild or replay failure. An engine whose replay failed is
-    /// left initialised but **incompletely populated**, which is why the caller
-    /// (the pool) treats the error as fatal to that worker rather than serving
-    /// the next request on it.
+    /// Propagates a rebuild or replay failure. The rebuild rolls back to the
+    /// previous context, which still holds the prior request's state. The pool
+    /// must replace that engine before serving another request; rollback is
+    /// recovery of the engine's structure, not successful confinement.
     pub fn confine(&mut self) -> RuntimeResult<()> {
         let mut outcome = ReplayOutcome::default();
         // The ledger is moved out for the duration so the replay can borrow the
@@ -5800,6 +5819,69 @@ mod prelude_equivalence {
 #[cfg(test)]
 mod tests {
     use super::compile_module_script_for_quickjs;
+
+    /// #8 · a script that allocates without end gets an error, and the process
+    /// — every other request on it — is untouched.
+    ///
+    /// 🔴 Before: no limit took effect anywhere (QuickJS's own check lives in
+    /// the allocator this engine replaces), so this loop held hundreds of MiB
+    /// and would have taken whatever it was given.
+    #[test]
+    fn a_script_that_eats_memory_gets_an_error_and_the_engine_survives() {
+        let mut engine = super::QuickJsEngine::new();
+        engine.set_memory_limit(32 * 1024 * 1024);
+        let ate = engine
+            .with_ctx(|ctx| {
+                // ~320 MiB of numbers, ten times the limit, held until the end.
+                ctx.eval::<(), _>(
+                    "(() => { const held = []; \
+                     for (let i = 0; i < 160; i++) { held.push(new Array(1 << 17).fill(i + 0.5)); } \
+                     return held.length; })()",
+                )
+                .map_err(|err| super::describe_js_error(&ctx, &err))
+            })
+            .expect("the engine runs");
+        let message = ate.expect_err("the script allocated past the limit and nothing stopped it");
+        assert!(message.contains("out of memory"), "{message}");
+        assert!(engine.arena_stats().refused_allocs > 0);
+
+        // The same engine still answers.
+        engine.collect_garbage();
+        let after = engine
+            .with_ctx(|ctx| ctx.eval::<i32, _>("[1, 2, 3].map((n) => n * 2).reduce((a, b) => a + b)"))
+            .expect("the engine runs")
+            .expect("a small script runs after the refusal");
+        assert_eq!(after, 12);
+    }
+
+    /// #8 · recursion without end is a JS error on the thread an engine runs
+    /// on, never a crashed process — on the smallest stack one gets, which is
+    /// Windows' 1 MiB main thread (`albedo build`, boot, `albedo test`).
+    ///
+    /// 🔴 Before: QuickJS's default limit was the whole 1 MiB, so the native
+    /// stack overflowed first and the process died with it.
+    #[test]
+    fn unbounded_recursion_is_an_error_not_a_dead_process() {
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut engine = super::QuickJsEngine::new();
+                engine
+                    .with_ctx(|ctx| {
+                        ctx.eval::<i32, _>("function down(n) { return down(n + 1) + 1; } down(0)")
+                            .map_err(|err| super::describe_js_error(&ctx, &err))
+                    })
+                    .expect("the engine runs")
+            })
+            .expect("spawns")
+            .join()
+            .expect("the thread survived");
+        let message = outcome.expect_err("unbounded recursion returned a value");
+        assert!(
+            message.contains("stack overflow") || message.contains("Maximum call stack size exceeded"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn test_compile_module_rewrites_import_declarations_to_runtime_requires() {

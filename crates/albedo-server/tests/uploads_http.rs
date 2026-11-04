@@ -24,7 +24,7 @@
 
 use albedo_server::{boot_production_server, ProductionServerOptions};
 use dom_render_compiler::upload::store::{self, StoredUpload};
-use dom_render_compiler::upload::UploadDecl;
+use dom_render_compiler::upload::{ReadRule, UploadDecl};
 use reqwest::StatusCode;
 use std::collections::BTreeMap;
 use std::fs;
@@ -90,6 +90,9 @@ async fn stored_bytes_are_reachable_and_the_guards_hold() {
         UploadDecl {
             accept: Some(vec!["image/png".to_string()]),
             max_bytes: Some("1mb".to_string()),
+            // Anonymous reads below: this test is about the route and its
+            // headers. Who may read is `upload_read_rules_http.rs`.
+            read: ReadRule::Public,
         },
     );
 
@@ -216,6 +219,53 @@ async fn stored_bytes_are_reachable_and_the_guards_hold() {
         "a browser that has the file pays a 304, not the bytes"
     );
     assert!(revalidated.bytes().await.expect("body").is_empty());
+
+    // ── 2b · ranges, streamed ──
+    // 🔴 Was `tokio::fs::read` and no `Range`: the whole file in memory per
+    // request, and Safari will not play a video it cannot range over.
+    assert_eq!(
+        headers.get("accept-ranges").and_then(|v| v.to_str().ok()),
+        Some("bytes"),
+        "a client has to be told it may ask for ranges"
+    );
+    let total = bytes.len();
+    let ranged = |range: &'static str| {
+        client
+            .get(format!("{base}/_albedo/uploads/{id}"))
+            .header("range", range)
+            .send()
+    };
+    let head = ranged("bytes=0-3").await.expect("responds");
+    assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        head.headers().get("content-range").and_then(|v| v.to_str().ok()),
+        Some(format!("bytes 0-3/{total}").as_str())
+    );
+    assert_eq!(head.bytes().await.expect("body").as_ref(), &bytes[..4]);
+    let tail = ranged("bytes=-5").await.expect("responds");
+    assert_eq!(tail.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(tail.bytes().await.expect("body").as_ref(), &bytes[total - 5..]);
+    let past = client
+        .get(format!("{base}/_albedo/uploads/{id}"))
+        .header("range", format!("bytes={total}-"))
+        .send()
+        .await
+        .expect("responds");
+    assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        past.headers().get("content-range").and_then(|v| v.to_str().ok()),
+        Some(format!("bytes */{total}").as_str())
+    );
+    // A partial copy of some other entity gets the whole file, not a splice.
+    let stale = client
+        .get(format!("{base}/_albedo/uploads/{id}"))
+        .header("range", "bytes=0-3")
+        .header("if-range", "\"someone-else\"")
+        .send()
+        .await
+        .expect("responds");
+    assert_eq!(stale.status(), StatusCode::OK);
+    assert_eq!(stale.bytes().await.expect("body").len(), total);
 
     // ── 3 · the guards ──
     // Every one of these would be a filesystem read if the id alphabet were a

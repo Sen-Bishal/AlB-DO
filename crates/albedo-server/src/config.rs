@@ -122,6 +122,42 @@ impl AppConfig {
             self.server.metrics_addr = (!addr.is_empty()).then(|| addr.to_string());
         }
 
+        // One format, named, so a second can be added without a value that
+        // used to mean something else.
+        if let Some(format) = lookup(&format!("{prefix}ACCESS_LOG")) {
+            self.server.access_log = match format.trim() {
+                "json" => true,
+                "" | "off" => false,
+                other => {
+                    return Err(RuntimeError::InvalidConfig(format!(
+                        "{prefix}ACCESS_LOG is '{other}': the access log format is `json`, or `off`"
+                    )))
+                }
+            };
+        }
+
+        // Empty unsets, as for the metrics address.
+        if let Some(dir) = lookup(&format!("{prefix}BACKUP_DIR")) {
+            let dir = dir.trim();
+            self.server.backup.dir = (!dir.is_empty()).then(|| dir.to_string());
+        }
+        if let Some(every) = lookup(&format!("{prefix}BACKUP_EVERY")) {
+            self.server.backup.every_secs =
+                parse_backup_interval(&format!("{prefix}BACKUP_EVERY"), &every)?;
+        }
+        if let Some(keep) = lookup(&format!("{prefix}BACKUP_KEEP")) {
+            self.server.backup.keep = keep
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| {
+                    RuntimeError::InvalidConfig(format!(
+                        "failed to parse {prefix}BACKUP_KEEP value '{keep}': expected a whole number of at least 1"
+                    ))
+                })?;
+        }
+
         if let Some(enabled) = lookup(&format!("{prefix}WEBTRANSPORT_ENABLED")) {
             self.server.webtransport.enabled = parse_bool_env(
                 format!("{prefix}WEBTRANSPORT_ENABLED").as_str(),
@@ -213,6 +249,13 @@ pub struct ServerConfig {
     /// [`crate::metrics`] for why this is a second address and not a route.
     #[serde(default)]
     pub metrics_addr: Option<String>,
+    /// Scheduled backups of the data directory. See [`crate::backups`].
+    #[serde(default)]
+    pub backup: BackupSettings,
+    /// `ALBEDO_ACCESS_LOG=json` — one line per request on stdout. See
+    /// [`crate::access_log`].
+    #[serde(default)]
+    pub access_log: bool,
 }
 
 impl Default for ServerConfig {
@@ -225,8 +268,78 @@ impl Default for ServerConfig {
             webtransport: WebTransportConfig::default(),
             tls: crate::tls::TlsSettings::default(),
             metrics_addr: None,
+            backup: BackupSettings::default(),
+            access_log: false,
         }
     }
+}
+
+/// `ALBEDO_BACKUP_DIR`, `ALBEDO_BACKUP_EVERY`, `ALBEDO_BACKUP_KEEP`.
+///
+/// Environment, not `albedo.config`: where backups go is a property of the
+/// machine — which volume, which mount — and the same app ships to staging
+/// and production with different answers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupSettings {
+    /// Where snapshots go. `None` schedules nothing. A relative path resolves
+    /// against the data directory (the database's), so `backups` means
+    /// "beside the data" in a container and in a checkout alike.
+    #[serde(default)]
+    pub dir: Option<String>,
+    /// Seconds between snapshots.
+    #[serde(default = "default_backup_every_secs")]
+    pub every_secs: u64,
+    /// Snapshots kept; older ones are deleted after each new one.
+    #[serde(default = "default_backup_keep")]
+    pub keep: usize,
+}
+
+impl Default for BackupSettings {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            every_secs: default_backup_every_secs(),
+            keep: default_backup_keep(),
+        }
+    }
+}
+
+const fn default_backup_every_secs() -> u64 {
+    24 * 60 * 60
+}
+
+const fn default_backup_keep() -> usize {
+    14
+}
+
+/// `90`, `30m`, `6h`, `1d` → seconds. At least a minute: a snapshot copies
+/// the whole database, and one every few seconds is a load generator.
+fn parse_backup_interval(key: &str, raw: &str) -> Result<u64, RuntimeError> {
+    let raw = raw.trim();
+    let (digits, unit) = raw.split_at(raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len()));
+    let scale = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        _ => 0,
+    };
+    let secs = digits
+        .parse::<u64>()
+        .ok()
+        .filter(|_| scale > 0)
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(|| {
+            RuntimeError::InvalidConfig(format!(
+                "failed to parse {key} value '{raw}': expected a number of seconds or e.g. 30m, 6h, 1d"
+            ))
+        })?;
+    if secs < 60 {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "{key} is '{raw}': backups may be at most once a minute"
+        )));
+    }
+    Ok(secs)
 }
 
 impl ServerConfig {
@@ -599,6 +712,38 @@ mod tests {
             .apply_tuning_env_overrides_from("ALBEDO_", env(&[("ALBEDO_METRICS_ADDR", "9091")]))
             .unwrap_err();
         assert!(err.to_string().contains("ALBEDO_METRICS_ADDR"), "{err}");
+    }
+
+    #[test]
+    fn backups_come_from_the_environment_and_refuse_a_nonsense_schedule() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.server.backup.dir, None, "off until a directory is named");
+
+        config
+            .apply_tuning_env_overrides_from(
+                "ALBEDO_",
+                env(&[
+                    ("ALBEDO_BACKUP_DIR", "/data/backups"),
+                    ("ALBEDO_BACKUP_EVERY", "6h"),
+                    ("ALBEDO_BACKUP_KEEP", "28"),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(config.server.backup.dir.as_deref(), Some("/data/backups"));
+        assert_eq!(config.server.backup.every_secs, 6 * 60 * 60);
+        assert_eq!(config.server.backup.keep, 28);
+
+        let refused: [&'static [(&'static str, &'static str)]; 3] = [
+            &[("ALBEDO_BACKUP_EVERY", "5s")],
+            &[("ALBEDO_BACKUP_EVERY", "6 hours")],
+            &[("ALBEDO_BACKUP_KEEP", "0")],
+        ];
+        for case in refused {
+            let err = config
+                .apply_tuning_env_overrides_from("ALBEDO_", env(case))
+                .unwrap_err();
+            assert!(err.to_string().contains(case[0].0), "{case:?}: {err}");
+        }
     }
 
     #[test]

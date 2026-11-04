@@ -19,10 +19,15 @@
 //!   that already has a file revalidates for a `304`. (Not `immutable`: that let shared caches
 //!   answer for the app, past any middleware gating the read.)
 //! - **the id is not a capability.** It is derived from content anyone holding the file already has,
-//!   so it must not be treated as an unguessable token. Anything private needs an authorization
-//!   check on the read, exactly as a FORGE row does. This is written down because the opposite
-//!   assumption — "the URL is unguessable, therefore it is private" — is the standard way upload
-//!   stores leak.
+//!   so it must not be treated as an unguessable token. Every read is checked against the bucket's
+//!   declared [`ReadRule`](crate::upload::ReadRule) — the uploader only, unless the bucket says
+//!   `"signed-in"` or `"public"` — exactly as a FORGE row is checked against its author. This is
+//!   written down because the opposite assumption — "the URL is unguessable, therefore it is
+//!   private" — is the standard way upload stores leak, and this store made it until 2026-10-30.
+//!
+//! The bytes are shared; the records are not. Two people who upload the same
+//! file get one file on disk and one record each, so each keeps their own name,
+//! type and ownership of it.
 //!
 //! The hash is computed **while streaming**, so nothing is buffered to hash it.
 //!
@@ -175,14 +180,19 @@ pub fn collection() -> crate::forge::ForgeCollection {
                  principal TEXT, \
                  created_at TIMESTAMP NOT NULL)"
             ),
-            // Content-addressed ⇒ the same bytes in the same bucket are one
-            // row. Not `(upload_id)` alone: the same file legitimately belongs
-            // to two buckets with different accept lists and different
-            // lifetimes, and collapsing those would make deleting one delete
-            // the other's record.
+            // One row per (bytes, bucket, uploader). Not `(upload_id)` alone:
+            // the same file legitimately belongs to two buckets with different
+            // accept lists, read rules and lifetimes. And not `(upload_id,
+            // bucket)`, which this was until 2026-10-30: under `INSERT OR
+            // IGNORE` the second person to upload the same bytes got no row at
+            // all, so they could neither read their own file under an owner
+            // rule nor attach it to an email, and their filename and type were
+            // never kept. The bytes on disk are still shared — dedup is the
+            // file, not the record.
+            format!("DROP INDEX IF EXISTS {UPLOADS}_identity"),
             format!(
-                "CREATE UNIQUE INDEX IF NOT EXISTS {UPLOADS}_identity \
-                 ON {UPLOADS} (upload_id, bucket)"
+                "CREATE UNIQUE INDEX IF NOT EXISTS {UPLOADS}_owner_identity \
+                 ON {UPLOADS} (upload_id, bucket, COALESCE(principal, ''))"
             ),
             // The read every serve does.
             format!("CREATE INDEX IF NOT EXISTS {UPLOADS}_upload_id ON {UPLOADS} (upload_id)"),
@@ -245,13 +255,18 @@ pub async fn record(
     Ok(())
 }
 
-/// Look a stored file up by id.
+/// Every record of a stored file, oldest first — one per bucket and uploader.
+///
+/// All of them, because who may have a file depends on which record they can
+/// claim: a reader's own record, or one in a bucket open to them. This was a
+/// `LIMIT 1` with no `ORDER BY`, which made the answer to "whose file is this"
+/// whichever row SQLite happened to return.
 ///
 /// # Errors
 /// [`UploadStoreError::Substrate`] if the read fails;
 /// [`UploadStoreError::MalformedId`] before touching the substrate if the id is
 /// not one of ours.
-pub async fn lookup(db: &dyn DataSubstrate, id: &str) -> Result<Option<StoredUpload>> {
+pub async fn records(db: &dyn DataSubstrate, id: &str) -> Result<Vec<StoredUpload>> {
     if !is_upload_id(id) {
         return Err(UploadStoreError::MalformedId);
     }
@@ -259,41 +274,68 @@ pub async fn lookup(db: &dyn DataSubstrate, id: &str) -> Result<Option<StoredUpl
         .query(
             &format!(
                 "SELECT upload_id, bucket, content_type, byte_size, original_name, principal \
-                 FROM {UPLOADS} WHERE upload_id = ?1 LIMIT 1"
+                 FROM {UPLOADS} WHERE upload_id = ?1 ORDER BY id"
             ),
             &[SqlValue::Text(id.to_string())],
         )
         .await
         .map_err(|err| UploadStoreError::Substrate(err.to_string()))?;
 
-    let Some(row) = rows.rows.first() else {
-        return Ok(None);
+    Ok(rows
+        .rows
+        .iter()
+        .map(|row| {
+            let text = |index: usize| -> String {
+                row.get(index)
+                    .and_then(|value| match value {
+                        SqlValue::Text(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+            StoredUpload {
+                id: text(0),
+                bucket: text(1),
+                content_type: text(2),
+                byte_size: row
+                    .get(3)
+                    .and_then(|value| match value {
+                        SqlValue::Integer(n) => u64::try_from(*n).ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                original_name: text(4),
+                principal: match row.get(5) {
+                    Some(SqlValue::Text(text)) => Some(text.clone()),
+                    _ => None,
+                },
+            }
+        })
+        .collect())
+}
+
+/// The record `reader` may read this file through, under `registry`'s rules —
+/// their own record first, so they get back the name and type they uploaded it
+/// with; otherwise the oldest record whose bucket lets them read it.
+///
+/// `None` when no record does. A caller answers that exactly as it answers a
+/// file that was never stored, so the route does not say which it was.
+#[must_use]
+pub fn readable_by<'a>(
+    records: &'a [StoredUpload],
+    registry: &crate::upload::UploadRegistry,
+    reader: Option<&str>,
+) -> Option<&'a StoredUpload> {
+    let permitted = |record: &&StoredUpload| {
+        registry
+            .read_rule(&record.bucket)
+            .permits(reader, record.principal.as_deref())
     };
-    let text = |index: usize| -> String {
-        row.get(index)
-            .and_then(|value| match value {
-                SqlValue::Text(text) => Some(text.clone()),
-                _ => None,
-            })
-            .unwrap_or_default()
-    };
-    Ok(Some(StoredUpload {
-        id: text(0),
-        bucket: text(1),
-        content_type: text(2),
-        byte_size: row
-            .get(3)
-            .and_then(|value| match value {
-                SqlValue::Integer(n) => u64::try_from(*n).ok(),
-                _ => None,
-            })
-            .unwrap_or(0),
-        original_name: text(4),
-        principal: match row.get(5) {
-            Some(SqlValue::Text(text)) => Some(text.clone()),
-            _ => None,
-        },
-    }))
+    records
+        .iter()
+        .filter(permitted)
+        .find(|record| reader.is_some() && record.principal.as_deref() == reader)
+        .or_else(|| records.iter().find(permitted))
 }
 
 #[cfg(test)]
@@ -341,15 +383,84 @@ mod tests {
         assert_eq!(sanitise_name(&"x".repeat(500)).len(), 120);
     }
 
-    /// The same bytes in two buckets are two records with two lifetimes; the
-    /// same bytes in one bucket are one.
+    /// The same bytes in two buckets are two records with two lifetimes, and
+    /// the same bytes from two uploaders are two records with two owners; the
+    /// same bytes from one uploader into one bucket are one.
     #[test]
-    fn the_uniqueness_rule_is_the_pair_and_not_the_hash_alone() {
+    fn the_uniqueness_rule_is_bytes_bucket_and_uploader() {
         let ddl = collection().migrations.join(" ");
         assert!(
-            ddl.contains("(upload_id, bucket)"),
-            "the unique index must be the pair: {ddl}"
+            ddl.contains("(upload_id, bucket, COALESCE(principal, ''))"),
+            "the unique index must name the uploader: {ddl}"
         );
+        // The old pair index is dropped, or it would keep refusing the second
+        // uploader's row on every database created before the change.
+        assert!(ddl.contains("DROP INDEX IF EXISTS albedo_uploads_identity"), "{ddl}");
+    }
+
+    fn stored(bucket: &str, principal: Option<&str>, name: &str) -> StoredUpload {
+        StoredUpload {
+            id: "a".repeat(64),
+            bucket: bucket.to_string(),
+            content_type: "application/json".to_string(),
+            byte_size: 2,
+            original_name: name.to_string(),
+            principal: principal.map(str::to_string),
+        }
+    }
+
+    fn registry(json: serde_json::Value) -> crate::upload::UploadRegistry {
+        crate::upload::UploadRegistry::from_declarations(
+            &serde_json::from_value(json).expect("parses"),
+        )
+        .expect("lowers")
+    }
+
+    #[test]
+    fn a_reader_gets_their_own_record_or_one_they_may_read_or_nothing() {
+        let registry = registry(serde_json::json!({
+            "docs": {},
+            "team": { "read": "signed-in" },
+            "pictures": { "read": "public" },
+        }));
+
+        // Two people uploaded the same bytes into an owner-only bucket.
+        let shared = [
+            stored("docs", Some("u_ada"), "ada.json"),
+            stored("docs", Some("u_bob"), "bob.json"),
+        ];
+        let name = |reader| readable_by(&shared, &registry, reader).map(|r| r.original_name.as_str());
+        assert_eq!(name(Some("u_ada")), Some("ada.json"));
+        assert_eq!(name(Some("u_bob")), Some("bob.json"));
+        assert_eq!(name(Some("u_eve")), None);
+        assert_eq!(name(None), None);
+
+        // Signed-in and public buckets, oldest record first.
+        let team = [stored("team", Some("u_ada"), "plan.json")];
+        assert!(readable_by(&team, &registry, Some("u_bob")).is_some());
+        assert!(readable_by(&team, &registry, None).is_none());
+        let pictures = [stored("pictures", None, "cat.json")];
+        assert!(readable_by(&pictures, &registry, None).is_some());
+
+        // A file in a public bucket and an owner bucket is readable through the
+        // public record — but its owner still gets their own name back.
+        let both = [
+            stored("pictures", Some("u_bob"), "public-copy.json"),
+            stored("docs", Some("u_ada"), "private-copy.json"),
+        ];
+        assert_eq!(
+            readable_by(&both, &registry, Some("u_ada")).map(|r| r.original_name.as_str()),
+            Some("private-copy.json")
+        );
+        assert_eq!(
+            readable_by(&both, &registry, None).map(|r| r.original_name.as_str()),
+            Some("public-copy.json")
+        );
+
+        // A bucket the config no longer declares is read as owner-only.
+        let orphaned = [stored("removed", Some("u_ada"), "old.json")];
+        assert!(readable_by(&orphaned, &registry, None).is_none());
+        assert!(readable_by(&orphaned, &registry, Some("u_ada")).is_some());
     }
 
     /// The table is framework-owned, so it must sit under the reserved prefix

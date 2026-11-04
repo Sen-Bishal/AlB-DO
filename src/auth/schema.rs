@@ -75,9 +75,11 @@ pub const ACCOUNTS: &str = "albedo_accounts";
 pub const SESSIONS: &str = "albedo_sessions";
 /// Passkey public keys and password hashes.
 pub const CREDENTIALS: &str = "albedo_credentials";
+/// R1a · granted roles, one row per (principal, role).
+pub const ROLES: &str = "albedo_roles";
 
 /// Every reserved collection name, for error messages that list them.
-pub const RESERVED_COLLECTIONS: &[&str] = &[USERS, ACCOUNTS, SESSIONS, CREDENTIALS];
+pub const RESERVED_COLLECTIONS: &[&str] = &[USERS, ACCOUNTS, SESSIONS, CREDENTIALS, ROLES];
 
 /// Whether a collection name belongs to AUTH.
 ///
@@ -88,14 +90,14 @@ pub fn is_reserved(name: &str) -> bool {
     name.starts_with(RESERVED_PREFIX)
 }
 
-/// The four collections, in a stable order.
+/// The auth collections, in a stable order.
 ///
 /// Built fresh on each call rather than held in a `static` because
-/// [`ForgeCollection`] owns its strings; the cost is four small allocations at
+/// [`ForgeCollection`] owns its strings; the cost is a few small allocations at
 /// boot, once.
 #[must_use]
 pub fn collections() -> Vec<ForgeCollection> {
-    vec![users(), accounts(), sessions(), credentials()]
+    vec![users(), accounts(), sessions(), credentials(), roles()]
 }
 
 /// Add the auth tables to an app's schema.
@@ -300,6 +302,42 @@ pub fn credentials() -> ForgeCollection {
     collection
 }
 
+/// R1a · roles granted to a principal.
+///
+/// Only roles the `auth` block declares count when a principal is resolved
+/// (`AuthRuntime::resolve` filters), so a row for a role the config no longer
+/// names is inert rather than deleted. `granted_by` records who granted it —
+/// `cli` today, a principal id once the app can grant (R1b).
+#[must_use]
+pub fn roles() -> ForgeCollection {
+    let mut collection = ForgeCollection::new(
+        ROLES,
+        ROLES,
+        format!("SELECT id, granted_at, granted_by, principal, role FROM {ROLES} ORDER BY id"),
+        "id",
+        Box::new([
+            format!(
+                "CREATE TABLE IF NOT EXISTS {ROLES} (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 principal TEXT NOT NULL, \
+                 role TEXT NOT NULL, \
+                 granted_by TEXT, \
+                 granted_at TIMESTAMP NOT NULL)"
+            ),
+            // The resolution query reads a principal's roles on every
+            // authenticated request; this index is that read, and its
+            // uniqueness makes a repeated grant a no-op.
+            format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {ROLES}_principal_role \
+                 ON {ROLES} (principal, role)"
+            ),
+        ]),
+        Box::new([]),
+    );
+    collection.partition_by = Some("principal".to_string());
+    collection
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +449,21 @@ mod tests {
             !ddl.contains("CREATE UNIQUE INDEX IF NOT EXISTS albedo_users_email"),
             "email must not be unique — two providers may report one address: {ddl}"
         );
+    }
+
+    /// R1a · one row per (principal, role). The unique index is what makes a
+    /// repeated grant a no-op instead of a duplicate that a revoke would then
+    /// have to find twice.
+    #[test]
+    fn roles_are_unique_per_principal_and_role() {
+        let roles = roles();
+        assert_eq!(roles.topic, ROLES);
+        let ddl = roles.migrations.join(" ");
+        assert!(
+            ddl.contains("CREATE UNIQUE INDEX") && ddl.contains("(principal, role)"),
+            "missing the uniqueness that makes a grant idempotent: {ddl}"
+        );
+        assert!(collections().iter().any(|collection| collection.topic == ROLES));
     }
 
     /// Every migration must be re-runnable, because they run on every boot.

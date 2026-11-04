@@ -40,7 +40,7 @@ pub mod declare;
 pub mod store;
 
 pub use declare::{
-    is_valid_bucket_name, ResolvedBucket, UploadDecl, UploadRegistry, UploadSchemaError,
+    is_valid_bucket_name, ReadRule, ResolvedBucket, UploadDecl, UploadRegistry, UploadSchemaError,
     DEFAULT_MAX_BYTES, MAX_DECLARABLE_BYTES,
 };
 pub use store::{

@@ -83,6 +83,14 @@ const HEADER_SIZE: usize = ALLOC_ALIGN;
 
 const DEFAULT_PERSISTENT_CAP: usize = 16 * 1024 * 1024;
 
+/// The most system memory one engine's JS may hold at once — see
+/// [`ArenaControl::set_memory_limit`].
+///
+/// 256 MiB: two orders of magnitude over what a page render or an action uses
+/// (the guardrail tests settle at a few MiB), and small enough that a pool of
+/// engines on a 4 GiB host survives one of them running away.
+pub const DEFAULT_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+
 #[inline]
 fn round_up(size: usize) -> usize {
     (size + ALLOC_ALIGN - 1) & !(ALLOC_ALIGN - 1)
@@ -189,6 +197,10 @@ pub struct ArenaControl {
     system_live_bytes: AtomicUsize,
     /// High-water mark of `system_live_bytes`.
     system_peak_bytes: AtomicUsize,
+    /// The ceiling on `system_live_bytes`. See [`Self::set_memory_limit`].
+    memory_limit: AtomicUsize,
+    /// Allocations refused because they would have crossed `memory_limit`.
+    refused_allocs: AtomicUsize,
     /// The thread that first allocated through this arena.
     ///
     /// The module header claims one arena is touched by exactly one thread for its whole
@@ -213,6 +225,8 @@ pub struct ArenaStats {
     pub dealloc_calls: usize,
     pub fallback_allocs: usize,
     pub persistent_grew_in_request: usize,
+    /// Allocations refused at the memory limit.
+    pub refused_allocs: usize,
 }
 
 impl ArenaControl {
@@ -227,6 +241,8 @@ impl ArenaControl {
             persistent_grew_in_request: AtomicUsize::new(0),
             system_live_bytes: AtomicUsize::new(0),
             system_peak_bytes: AtomicUsize::new(0),
+            memory_limit: AtomicUsize::new(DEFAULT_MEMORY_LIMIT),
+            refused_allocs: AtomicUsize::new(0),
             owner: OnceLock::new(),
         })
     }
@@ -261,6 +277,35 @@ impl ArenaControl {
         Self::new(DEFAULT_PERSISTENT_CAP)
     }
 
+    /// Cap the system memory this engine's JS may hold at `bytes`.
+    ///
+    /// 🔴 **Enforced here because nothing else enforces it.** QuickJS has
+    /// `JS_SetMemoryLimit`, but the check lives in QuickJS's *default*
+    /// allocator, and this engine installs its own: rquickjs's glue for a
+    /// custom allocator never reads the limit. Calling `set_memory_limit` on the
+    /// runtime would have looked like the fix and changed nothing — one
+    /// `new Array(1e9)` in app or npm code could still grow the process until
+    /// the OS killed it, taking every other request with it.
+    ///
+    /// An allocation that would cross the line returns null, which QuickJS turns
+    /// into an `out of memory` error in the script that asked. The process
+    /// survives, and the script's garbage goes back on the next collection.
+    /// The persistent region is not counted: it is bounded by its own cap.
+    pub fn set_memory_limit(&self, bytes: usize) {
+        self.memory_limit.store(bytes, Relaxed);
+    }
+
+    /// Would `more` bytes cross the limit? Counts the refusal when it would.
+    #[inline]
+    fn over_limit(&self, more: usize) -> bool {
+        let over = self.system_live_bytes.load(Relaxed).saturating_add(more)
+            > self.memory_limit.load(Relaxed);
+        if over {
+            self.refused_allocs.fetch_add(1, Relaxed);
+        }
+        over
+    }
+
     /// Enter request mode: fresh allocations become QuickJS-managed system blocks.
     pub fn begin_request(&self) {
         self.in_request.store(true, Relaxed);
@@ -292,6 +337,7 @@ impl ArenaControl {
             dealloc_calls: self.dealloc_calls.load(Relaxed),
             fallback_allocs: self.fallback_allocs.load(Relaxed),
             persistent_grew_in_request: self.persistent_grew_in_request.load(Relaxed),
+            refused_allocs: self.refused_allocs.load(Relaxed),
         }
     }
 
@@ -322,6 +368,9 @@ impl ArenaControl {
 
     /// System allocation, tracked in the request-time live-bytes gauge.
     fn alloc_system(&self, usable: usize, zero: bool) -> *mut u8 {
+        if self.over_limit(usable) {
+            return ptr::null_mut();
+        }
         let user = system_alloc(usable, zero);
         if !user.is_null() {
             let live = self.system_live_bytes.fetch_add(usable, Relaxed) + usable;
@@ -372,6 +421,11 @@ impl ArenaControl {
         let old_usable = read_header(user);
 
         if !self.is_persistent(user) {
+            // A growth that would cross the limit fails like any refused realloc:
+            // null, with the old block untouched and still owned by the caller.
+            if new_usable > old_usable && self.over_limit(new_usable - old_usable) {
+                return ptr::null_mut();
+            }
             // System block: a real realloc, with the live-bytes gauge adjusted by the delta.
             let fresh = system_realloc(user, old_usable, new_usable);
             if !fresh.is_null() {

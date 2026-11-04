@@ -230,6 +230,8 @@ nul
 # not for open-source users. Contains private memory (strategy, brand, personal).
 /.claude/
 /_claude-migration/
+# oh-my-codex session state, logs, and metrics
+/.omx/
 
 # Local/installer scripting artifacts (superseded by npm distribution)
 /*.ps1

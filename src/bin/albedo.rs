@@ -218,6 +218,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
         // 15.2 · the app's own tests, against the server `serve` runs and the
         // renderers the build uses — see `albedo_server::test_runner`.
         "test" => run_test_command(&args[2..]),
+        // Rows from another system, written as appends with their authors —
+        // see `dom_render_compiler::forge::import`.
+        "import" => run_import_command(&args[2..]),
+        // Snapshots of the data directory, and the restore the next boot
+        // applies — see `dom_render_compiler::forge::backup`.
+        "db" => run_db_command(&args[2..]),
+        // R1a · grant, revoke and list the roles `auth.roles` declares, in the
+        // database `serve` uses.
+        "roles" => run_roles_command(&args[2..]),
         // 15.3 · `albedo email test <address>` — one real send through the
         // configured provider, answered in the terminal.
         "email" => run_email_command(&args[2..]),
@@ -1246,6 +1255,27 @@ fn run_shipped_app(
         );
     }
 
+    // `db` is the one command a shipped app answers besides serving: backup
+    // and restore have to run where the data is, and in a container that is
+    // the only binary there. The project is the one it carries.
+    if user_args.first().map(String::as_str) == Some("db") {
+        let mut forwarded: Vec<String> = user_args[1..].to_vec();
+        if forwarded.is_empty() {
+            return run_db_command(&forwarded);
+        }
+        forwarded.push(project.display().to_string());
+        return run_db_command(&forwarded);
+    }
+    // R1a · `roles` likewise: an operator grants a role where the database is.
+    if user_args.first().map(String::as_str) == Some("roles") {
+        let mut forwarded: Vec<String> = user_args[1..].to_vec();
+        if forwarded.is_empty() {
+            return run_roles_command(&forwarded);
+        }
+        forwarded.push(project.display().to_string());
+        return run_roles_command(&forwarded);
+    }
+
     // The positional project directory is ours to decide; everything else the
     // operator typed (`--host`, `--port`) still applies.
     let mut forwarded: Vec<String> = vec![project.display().to_string()];
@@ -1805,11 +1835,24 @@ EXPOSE 3000
 
 # The database lives on a volume. Without one it would sit in the container's
 # writable layer, and every new container would start with an empty database.
-# Name the volume so it survives `docker rm`:
+# Uploaded files sit beside it, in /data/uploads. Name the volume so it
+# survives `docker rm`:
 #
 #   docker run -v albedo-data:/data -p 3000:3000 <image>
 ENV ALBEDO_FORGE_DB=/data/forge.db
 VOLUME /data
+
+# A checked snapshot of the database and uploads, daily, keeping 14. On the
+# same volume, so it covers a bad deploy or a bad write — not a lost disk:
+# copy /data/backups somewhere else for that. Restore with
+#   docker exec <container> /app/albedo-app db restore latest
+# then restart the container. Set ALBEDO_BACKUP_DIR= (empty) to turn off.
+ENV ALBEDO_BACKUP_DIR=/data/backups
+
+# One JSON line per request on stdout — `docker logs` and every log shipper
+# read it as-is. Paths only, never query strings (they carry sign-in tokens).
+# Each response's `x-request-id` names its line. Set it to `off` to stop.
+ENV ALBEDO_ACCESS_LOG=json
 
 # How long a shutdown may spend finishing in-flight requests. `docker stop`
 # sends SIGTERM and kills the container after its own grace period (10s by
@@ -1842,8 +1885,11 @@ ENV ALBEDO_SHUTDOWN_TIMEOUT_MS=5000
 # addresses of your load balancers: it decides whose `X-Forwarded-For` the rate
 # limiter believes.
 
+# The server's own readiness probe, not `/`: a home page behind sign-in
+# redirects, and a slow or broken one would get a healthy container killed.
+# 503 while draining for a shutdown, or when the database does not answer.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- "http://127.0.0.1:${ALBEDO_SERVER_PORT}/" >/dev/null 2>&1 || exit 1
+  CMD wget -qO- "http://127.0.0.1:${ALBEDO_SERVER_PORT}/_albedo/ready" >/dev/null 2>&1 || exit 1
 
 # The shipped executable serves the app it carries; it takes `--host` and
 # `--port` and no subcommands. `sh -c` expands the ENV above, and `exec` makes
@@ -1869,9 +1915,13 @@ target/tmp
 *.albedo-bin.exe
 .albedo-app-*
 # The database and its WAL/SHM sidecars. A shipped WAL is a torn half
-# transaction, and the container mounts its own volume anyway.
+# transaction, and the container mounts its own volume anyway. Uploads and
+# backups are copies of your users' data, which no image should carry.
 forge.db
 forge.db-*
+forge.db.*
+uploads
+backups
 # Secrets. The builder stage copies the whole context, so anything here would
 # sit in an image layer and could reach the payload. The container gets its
 # keys from `-e` / your platform's secret store at run time, never from a file.
@@ -1882,7 +1932,7 @@ forge.db-*
 **/*.key
 **/*.p12
 **/*.pfx
-.albedo-acme
+**/.albedo-acme
 **/*.log
 **/.DS_Store
 **/Thumbs.db
@@ -1915,6 +1965,13 @@ kill_timeout = "10s"
   ALBEDO_SERVER_HOST = "0.0.0.0"
   ALBEDO_SERVER_PORT = "3000"
   ALBEDO_FORGE_DB = "/data/forge.db"
+  # A checked snapshot of the database and uploads, daily, keeping 14, on the
+  # same volume — so size the volume for it. It covers a bad deploy or write,
+  # not a lost volume (Fly's volume snapshots cover that). Restore with
+  # `fly ssh console -C "/app/albedo-app db restore latest"`, then restart.
+  ALBEDO_BACKUP_DIR = "/data/backups"
+  # One JSON line per request on stdout, which `fly logs` shows as-is.
+  ALBEDO_ACCESS_LOG = "json"
   ALBEDO_SHUTDOWN_TIMEOUT_MS = "5000"
   # The address browsers use. Fly terminates TLS at its edge (`force_https`
   # below) and serves every app at `<app>.fly.dev`. Change this when you attach
@@ -1942,7 +1999,9 @@ kill_timeout = "10s"
   grace_period = "10s"
   interval = "30s"
   method = "GET"
-  path = "/"
+  # The server's readiness probe: `/` may sit behind sign-in, and goes 503
+  # while a machine drains so the proxy stops routing to it first.
+  path = "/_albedo/ready"
   timeout = "5s"
 
 # Fly scrapes this into its managed Prometheus (Grafana at fly-metrics.net).
@@ -2117,6 +2176,15 @@ fn boot_and_run_production_server(
     runtime
         .block_on(server.run_with_ready(move |report| {
             print_boot_report(report);
+            // Said when it is off, too: an unbacked-up production database is
+            // a choice, and it should be one somebody saw.
+            match &report.backups {
+                Some(plan) => print_kv("backups", plan),
+                None => print_warn(
+                    "backups are off — set ALBEDO_BACKUP_DIR to snapshot the database daily \
+                     (`albedo db backup` takes one now)",
+                ),
+            }
             print_ok(format!(
                 "serving · {}",
                 style_256(&banner_url, ACCENT_SOFT, true)
@@ -4342,7 +4410,7 @@ _albedo_completions() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local commands="init dev build ship serve files budget doctor test email run completions help"
+    local commands="init dev build ship serve files budget doctor test import db email run completions help"
 
     case "$prev" in
         albedo)
@@ -4409,6 +4477,8 @@ _albedo() {
         'budget:Evaluate the tier budget against the current build'
         'doctor:Report what the build already knows about itself'
         'test:Run the test files against the app server'
+        'import:Write rows from another system with their authors'
+        'db:Back up the data, list backups, or restore one'
         'email:Send a test email through the configured provider'
         'run:Run a sub-mode (e.g. run dev)'
         'completions:Emit shell completion script to stdout'
@@ -4490,7 +4560,7 @@ _albedo "$@"
 "#;
 
 const COMPLETIONS_FISH: &str = r#"# albedo fish completions
-set -l albedo_commands init dev build ship serve files budget doctor test email run completions help
+set -l albedo_commands init dev build ship serve files budget doctor test import db email run completions help
 
 # Disable file completions for the main command
 complete -c albedo -f
@@ -4504,6 +4574,8 @@ complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a serve       -d
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a budget      -d 'Evaluate the tier budget against the current build'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a doctor      -d 'Report what the build already knows about itself'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a test        -d 'Run the test files against the app server'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a import      -d 'Write rows from another system with their authors'
+complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a db          -d 'Back up the data, list backups, or restore one'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a email       -d 'Send a test email through the configured provider'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a run         -d 'Run a sub-mode'
 complete -c albedo -n "__fish_use_subcommand $albedo_commands" -a completions -d 'Emit shell completion script to stdout'
@@ -4551,7 +4623,7 @@ Register-ArgumentCompleter -Native -CommandName @('albedo', 'albedo.exe') -Scrip
     $tokens = $commandAst.CommandElements
     $nTokens = $tokens.Count
 
-    $commands = @('init','dev','build','ship','serve','files','budget','doctor','test','email','run','completions','help')
+    $commands = @('init','dev','build','ship','serve','files','budget','doctor','test','import','db','email','run','completions','help')
     $devFlags = @('--config','--entry','--host','--port','--no-hmr','--strict','--verbose','--open','--prod','--no-budget')
 
     if ($nTokens -le 2) {
@@ -4627,6 +4699,9 @@ fn print_help() {
     print_command("budget", "[dir]", "check the tier budget");
     print_command("doctor", "[dir]", "report what the build knows about itself");
     print_command("test", "[dir]", "run the app's *.test.tsx files");
+    print_command("import", "<collection> <file>", "write rows from another system, with their authors");
+    print_command("db", "backup | backups | restore", "snapshot the data, list snapshots, restore one");
+    print_command("roles", "grant | revoke | list", "give people the roles the app declares");
     print_command("email test", "<address> [dir]", "send one real email to check the provider");
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
@@ -4864,6 +4939,917 @@ fn print_test_file(project_dir: &Path, report: &albedo_server::test_runner::File
             }
         }
     }
+}
+
+/// `albedo import <collection> <file.jsonl> [dir] [--author-email <field> | --author-id <field>]`.
+///
+/// Writes rows from another system into a FORGE collection the way an append
+/// writes them — with their authors — so they stay editable by the people who
+/// own them. See `dom_render_compiler::forge::import` for why a plain SQL insert
+/// leaves rows nobody can ever change.
+fn run_import_command(raw_args: &[String]) -> Result<(), String> {
+    use dom_render_compiler::auth::PrincipalId;
+    use dom_render_compiler::forge::import::{import_rows, ImportRow};
+
+    if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") || raw_args.len() < 2 {
+        print_import_help();
+        return if raw_args.len() < 2 && !raw_args.iter().any(|a| a == "--help" || a == "-h") {
+            Err("`albedo import` needs a collection and a file: albedo import invoices invoices.jsonl".to_string())
+        } else {
+            Ok(())
+        };
+    }
+
+    let collection = raw_args[0].clone();
+    let file = PathBuf::from(&raw_args[1]);
+    let mut author_email: Option<String> = None;
+    let mut author_id: Option<String> = None;
+    let mut forwarded = Vec::new();
+    let mut idx = 2;
+    while idx < raw_args.len() {
+        match raw_args[idx].as_str() {
+            "--author-email" | "--author-id" => {
+                let field = raw_args
+                    .get(idx + 1)
+                    .ok_or_else(|| format!("{} needs the name of a field in each row", raw_args[idx]))?
+                    .clone();
+                if raw_args[idx] == "--author-email" {
+                    author_email = Some(field);
+                } else {
+                    author_id = Some(field);
+                }
+                idx += 2;
+            }
+            _ => {
+                forwarded.push(raw_args[idx].clone());
+                idx += 1;
+            }
+        }
+    }
+    if author_email.is_some() && author_id.is_some() {
+        return Err("name the author once: --author-email or --author-id, not both".to_string());
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let contract = resolve_dev_contract(&forwarded, &cwd)?;
+    let text = std::fs::read_to_string(&file)
+        .map_err(|err| format!("could not read {}: {err}", file.display()))?;
+
+    // Every line, parsed before anything is opened: a file with a bad line is
+    // refused whole, with the line named.
+    let author_field = author_email.as_deref().or(author_id.as_deref());
+    let mut parsed = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line_no = index + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|err| format!("{} line {line_no}: not JSON: {err}", file.display()))?;
+        let serde_json::Value::Object(mut record) = value else {
+            return Err(format!(
+                "{} line {line_no}: each line is one JSON object, one row",
+                file.display()
+            ));
+        };
+        let author = match author_field {
+            Some(field) => match record.remove(field) {
+                Some(serde_json::Value::String(who)) if !who.trim().is_empty() => Some(who),
+                None | Some(serde_json::Value::Null) => None,
+                Some(other) => {
+                    return Err(format!(
+                        "{} line {line_no}: `{field}` names the row's author and must be a string, \
+                         not {other}",
+                        file.display()
+                    ))
+                }
+            },
+            None => None,
+        };
+        parsed.push((line_no, record, author));
+    }
+    if parsed.is_empty() {
+        return Err(format!("{} has no rows", file.display()));
+    }
+
+    let db_path = albedo_server::forge_db_path::resolve_forge_db_path(
+        None,
+        albedo_server::forge_db_path::forge_db_env().as_deref(),
+        &contract.project_dir.join(".albedo").join("dist"),
+    );
+
+    print_boot_banner();
+    print_section("import");
+    print_kv("collection", &collection);
+    print_kv("from", file.display());
+    print_kv("database", db_path.display());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to start a runtime: {err}"))?;
+    let (summary, unauthored) = runtime.block_on(async {
+        use dom_render_compiler::forge::{skeleton, LibSqlSubstrate};
+
+        // Checked for drift and bootstrapped the way `serve` does, so an import
+        // never writes into a table the server would then refuse to boot against.
+        let schema = serve_schema(&contract)?;
+        let substrate = LibSqlSubstrate::open_local(&db_path)
+            .await
+            .map_err(|err| format!("could not open {}: {err}", db_path.display()))?;
+        dom_render_compiler::forge::drift::evolve_schema(&substrate, &schema)
+            .await
+            .map_err(|err| format!("FORGE: {err}"))?;
+        skeleton::bootstrap_schema(&substrate, &schema)
+            .await
+            .map_err(|err| format!("FORGE: schema bootstrap failed: {err}"))?;
+
+        // Authors → principals. Every name is resolved before a row is written,
+        // and one that does not resolve stops the import: a row given the wrong
+        // owner, or none, cannot be fixed by anyone afterwards.
+        let principals = if author_field.is_some() {
+            if contract.auth.providers.is_empty() {
+                return Err(
+                    "this app declares no `auth` block, so it has no users to own rows".to_string(),
+                );
+            }
+            Some(user_principals(&substrate).await?)
+        } else {
+            None
+        };
+        let mut rows = Vec::with_capacity(parsed.len());
+        let mut unauthored = 0usize;
+        let mut unresolved: Vec<String> = Vec::new();
+        for (line, record, author) in parsed {
+            let principal = match (&author, &principals) {
+                (Some(who), Some(users)) => {
+                    let found = if author_email.is_some() {
+                        let key = dom_render_compiler::auth::normalize_email(who)
+                            .unwrap_or_else(|| who.trim().to_ascii_lowercase());
+                        match users.by_email.get(&key).map(Vec::as_slice) {
+                            Some([only]) => Some(only.clone()),
+                            Some(many) if many.len() > 1 => {
+                                unresolved.push(format!(
+                                    "line {line}: {who} belongs to {} accounts — name the owner \
+                                     with --author-id instead",
+                                    many.len()
+                                ));
+                                None
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        users.ids.contains(who.as_str()).then(|| who.clone())
+                    };
+                    match found {
+                        Some(id) => Some(PrincipalId::parse(&id).map_err(|err| err.to_string())?),
+                        None => {
+                            if !unresolved.iter().any(|seen| seen.contains(who.as_str())) {
+                                unresolved.push(format!("line {line}: no user {who}"));
+                            }
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    unauthored += 1;
+                    None
+                }
+            };
+            rows.push(ImportRow {
+                line,
+                record,
+                author: principal,
+            });
+        }
+        if !unresolved.is_empty() {
+            let shown = unresolved.iter().take(10).cloned().collect::<Vec<_>>().join("\n  ");
+            return Err(format!(
+                "{} author(s) did not resolve, so nothing was imported — users must exist before \
+                 the rows they own (sign them up, or import them first):\n  {shown}{}",
+                unresolved.len(),
+                if unresolved.len() > 10 { "\n  …" } else { "" }
+            ));
+        }
+        let summary = import_rows(&substrate, &schema, &collection, &rows)
+            .await
+            .map_err(|err| format!("{}: {err} — nothing was imported", file.display()))?;
+        Ok::<_, String>((summary, unauthored))
+    })?;
+
+    print_kv("rows", summary.rows);
+    print_kv("authored", summary.authored);
+    if unauthored > 0 {
+        print_warn(format!(
+            "{unauthored} row(s) have no author, so no request may change them unless `{collection}` \
+             says `edit: \"anyone\"`{}",
+            if author_field.is_some() {
+                String::new()
+            } else {
+                " — name the owner of each row with --author-email or --author-id".to_string()
+            }
+        ));
+    }
+    print_ok(format!(
+        "imported {} row(s) into `{collection}`. A server already running shows them after it \
+         restarts.",
+        summary.rows
+    ));
+    Ok(())
+}
+
+/// The schema `serve` boots with: the app's collections, plus the framework
+/// tables its config turns on.
+fn serve_schema(
+    contract: &ResolvedDevContract,
+) -> Result<dom_render_compiler::forge::ForgeSchema, String> {
+    use dom_render_compiler::forge::ForgeSchema;
+    let mut schema = if contract.forge.is_empty() {
+        ForgeSchema::empty()
+    } else {
+        ForgeSchema::from_declarations(&contract.forge)
+            .map_err(|err| format!("invalid `forge` block in albedo.config: {err}"))?
+    };
+    if !contract.auth.providers.is_empty() {
+        schema = dom_render_compiler::auth::schema::augment(&schema)
+            .map_err(|err| format!("AUTH tables cannot join the schema: {err}"))?;
+    }
+    if !contract.uploads.is_empty() {
+        schema = dom_render_compiler::upload::store::augment(&schema)
+            .map_err(|err| format!("the uploads table cannot join the schema: {err}"))?;
+    }
+    Ok(schema)
+}
+
+/// Where `albedo db backup` writes when `ALBEDO_BACKUP_DIR` names nothing.
+const DEFAULT_BACKUP_DIR: &str = albedo_server::backups::DEFAULT_DIR;
+
+const DB_USAGE: &str = "\
+usage: albedo db <command> [dir]
+
+  backup  [--to <path>]        snapshot the database and its uploads, checked as it is taken
+  backups [--to <path>]        list the snapshots, newest first
+  restore <snapshot | latest>  check a snapshot and stage it — the server applies it when it
+                               next starts, and keeps the database it replaces
+          [--allow-missing-uploads]  stage even if the backup lost files its records name
+
+Snapshots go to --to, else ALBEDO_BACKUP_DIR, else backups/ beside the database.";
+
+/// `albedo db backup | backups | restore` — see `dom_render_compiler::forge::backup`.
+fn run_db_command(raw_args: &[String]) -> Result<(), String> {
+    let wants_help = raw_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"));
+    let Some(command) = raw_args.first().filter(|_| !wants_help) else {
+        println!("{DB_USAGE}");
+        return Ok(());
+    };
+    let rest = &raw_args[1..];
+    match command.as_str() {
+        "backup" => run_db_backup(rest),
+        "backups" | "list" => run_db_list(rest),
+        "restore" => run_db_restore(rest),
+        other => Err(format!("unknown `albedo db` command '{other}'\n\n{DB_USAGE}")),
+    }
+}
+
+/// An app's database, the directory beside it, and where its backups go.
+struct DbTarget {
+    contract: ResolvedDevContract,
+    db_path: PathBuf,
+    data_dir: PathBuf,
+    backups_dir: PathBuf,
+}
+
+/// Resolve the app from `args` (a project dir and `--config`), with `--to`
+/// taken out first. The database path is the one `serve` resolves.
+fn db_target(args: &[String]) -> Result<DbTarget, String> {
+    let mut to: Option<String> = None;
+    let mut forwarded = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--to" {
+            to = Some(iter.next().ok_or("--to needs a directory")?.clone());
+        } else {
+            forwarded.push(arg.clone());
+        }
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let contract = resolve_dev_contract(&forwarded, &cwd)?;
+    let db_path = albedo_server::forge_db_path::resolve_forge_db_path(
+        None,
+        albedo_server::forge_db_path::forge_db_env().as_deref(),
+        &contract.project_dir.join(".albedo").join("dist"),
+    );
+    let data_dir = albedo_server::forge_db_path::data_dir_for(&db_path);
+    let backups_dir = match to {
+        Some(dir) => cwd.join(dir),
+        None => {
+            let configured = std::env::var("ALBEDO_BACKUP_DIR").ok();
+            let named = configured.as_deref().map(str::trim).filter(|dir| !dir.is_empty());
+            albedo_server::backups::resolve_dir(named.unwrap_or(DEFAULT_BACKUP_DIR), &data_dir)
+        }
+    };
+    Ok(DbTarget {
+        contract,
+        db_path,
+        data_dir,
+        backups_dir,
+    })
+}
+
+fn current_thread_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to start a runtime: {err}"))
+}
+
+/// `1.2 MB`-style sizes for a terminal.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn run_db_backup(args: &[String]) -> Result<(), String> {
+    let target = db_target(args)?;
+    // `open_local` creates a missing file, which would make this "back up" an
+    // empty database it had just invented at the wrong path.
+    if !target.db_path.is_file() {
+        return Err(format!(
+            "there is no database at {} — nothing to back up. If it lives elsewhere, set \
+             ALBEDO_FORGE_DB to its path.",
+            target.db_path.display()
+        ));
+    }
+    print_section("backup");
+    print_kv("database", target.db_path.display());
+    print_kv("to", target.backups_dir.display());
+
+    let snapshot = current_thread_runtime()?.block_on(async {
+        let substrate = dom_render_compiler::forge::LibSqlSubstrate::open_local(&target.db_path)
+            .await
+            .map_err(|err| format!("could not open {}: {err}", target.db_path.display()))?;
+        dom_render_compiler::forge::backup::take(&substrate, &target.data_dir, &target.backups_dir)
+            .await
+            .map_err(|err| err.to_string())
+    })?;
+
+    let manifest = &snapshot.manifest;
+    let uploads = &manifest.uploads;
+    print_kv("snapshot", snapshot.dir.display());
+    print_kv(
+        "rows",
+        format!("{} across {} tables", manifest.rows(), manifest.tables.len()),
+    );
+    print_kv(
+        "uploads",
+        format!(
+            "{} files, {}{}",
+            uploads.files,
+            human_bytes(uploads.bytes),
+            if uploads.linked > 0 {
+                format!(" ({} unchanged since the last snapshot)", uploads.linked)
+            } else {
+                String::new()
+            }
+        ),
+    );
+    print_kv("database", human_bytes(manifest.database.bytes));
+    for (what, ids) in [("missing from", &uploads.missing), ("damaged in", &uploads.damaged)] {
+        if !ids.is_empty() {
+            print_warn(format!(
+                "{} upload file(s) are {what} the live store, so they are not in this backup — \
+                 listed in its manifest.json",
+                ids.len()
+            ));
+        }
+    }
+    if !uploads.earlier_damaged.is_empty() {
+        print_warn(format!(
+            "{} file(s) in the previous backup no longer match their contents — the backup disk \
+             is losing bytes. This backup copied them fresh; the earlier one is still damaged.",
+            uploads.earlier_damaged.len()
+        ));
+    }
+    let name = snapshot
+        .dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Named as it was run: in a container that is the shipped app, not `albedo`.
+    let program = std::env::args()
+        .next()
+        .and_then(|argv0| {
+            Path::new(&argv0)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.to_ascii_lowercase().starts_with("albedo"))
+        .map_or_else(|| "albedo".to_string(), |name| format!("./{name}"));
+    print_ok(format!(
+        "backup taken and checked. Restore it with `{program} db restore {name}`."
+    ));
+    if target.backups_dir.starts_with(&target.data_dir) {
+        println!(
+            "    {} it is on the same disk as the database: copy {} elsewhere to survive losing that disk.",
+            style_256("·", MUTED, false),
+            target.backups_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_db_list(args: &[String]) -> Result<(), String> {
+    let target = db_target(args)?;
+    let snapshots = dom_render_compiler::forge::backup::list(&target.backups_dir);
+    print_section("backups");
+    print_kv("in", target.backups_dir.display());
+    if snapshots.is_empty() {
+        print_warn("no backups here yet — take one with `albedo db backup`");
+        return Ok(());
+    }
+    for snapshot in &snapshots {
+        let name = snapshot
+            .dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let manifest = &snapshot.manifest;
+        println!(
+            "    {}  {} rows · {} files · {}",
+            style(&name, "1"),
+            manifest.rows(),
+            manifest.uploads.files,
+            human_bytes(manifest.database.bytes + manifest.uploads.bytes)
+        );
+    }
+    Ok(())
+}
+
+const ROLES_USAGE: &str = "\
+usage: albedo roles <command> [dir]
+
+  grant  <email | user id> <role>  give someone a role `auth.roles` declares
+  revoke <email | user id> <role>  take it away
+  list   [--role <role>]           every grant, or one role's
+
+A role the config does not declare is refused, except to revoke or list grants
+left over from a role it no longer declares.
+
+A change applies to the next request, action or live connection. A page that is
+already open with live updates keeps them until it reconnects.";
+
+/// `albedo roles grant | revoke | list` — R1a. Writes the database `serve` reads.
+fn run_roles_command(raw_args: &[String]) -> Result<(), String> {
+    let wants_help = raw_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"));
+    let Some(command) = raw_args.first().filter(|_| !wants_help) else {
+        println!("{ROLES_USAGE}");
+        return Ok(());
+    };
+    let rest = &raw_args[1..];
+    match command.as_str() {
+        "grant" | "revoke" => {
+            let [who, role, project @ ..] = rest else {
+                return Err(format!(
+                    "`albedo roles {command}` needs a person and a role\n\n{ROLES_USAGE}"
+                ));
+            };
+            run_roles_change(command == "grant", who, role, project)
+        }
+        "list" => run_roles_list(rest),
+        other => Err(format!("unknown `albedo roles` command '{other}'\n\n{ROLES_USAGE}")),
+    }
+}
+
+/// The app (for its declared roles) and the database `serve` uses.
+fn roles_target(
+    project: &[String],
+) -> Result<(DbTarget, dom_render_compiler::auth::AuthRegistry), String> {
+    let target = db_target(project)?;
+    // `open_local` creates a missing file — a grant into an empty database at
+    // the wrong path would report success and change nothing anyone reads.
+    if !target.db_path.is_file() {
+        return Err(format!(
+            "there is no database at {} — start the app once so it creates one, or set \
+             ALBEDO_FORGE_DB to its path.",
+            target.db_path.display()
+        ));
+    }
+    let registry = target
+        .contract
+        .auth
+        .lower()
+        .map_err(|err| format!("the `auth` block in albedo.config.ts: {err}"))?;
+    Ok((target, registry))
+}
+
+/// Open the database and make sure the roles table exists — an app that has not
+/// booted since roles arrived has every other auth table but this one.
+async fn roles_db(path: &Path) -> Result<dom_render_compiler::forge::LibSqlSubstrate, String> {
+    use dom_render_compiler::forge::DataSubstrate;
+    let db = dom_render_compiler::forge::LibSqlSubstrate::open_local(path)
+        .await
+        .map_err(|err| format!("could not open {}: {err}", path.display()))?;
+    for statement in dom_render_compiler::auth::schema::roles().migrations.iter() {
+        db.execute(statement, &[])
+            .await
+            .map_err(|err| format!("could not prepare the roles table: {err}"))?;
+    }
+    Ok(db)
+}
+
+/// An email or a user id, to exactly one principal.
+async fn roles_person(
+    db: &dom_render_compiler::forge::LibSqlSubstrate,
+    who: &str,
+) -> Result<dom_render_compiler::auth::PrincipalId, String> {
+    use dom_render_compiler::auth::{PrincipalId, PRINCIPAL_ID_PREFIX};
+    if who.starts_with(PRINCIPAL_ID_PREFIX) {
+        if let Ok(id) = PrincipalId::parse(who) {
+            return dom_render_compiler::auth::store::load_principal(db, &id)
+                .await
+                .map_err(|err| err.to_string())?
+                .map(|principal| principal.id)
+                .ok_or_else(|| format!("there is no account `{id}`"));
+        }
+    }
+    let found = dom_render_compiler::auth::store::principals_with_email(db, who)
+        .await
+        .map_err(|err| err.to_string())?;
+    match found.as_slice() {
+        [] => Err(format!("nobody has an account with `{who}`")),
+        [one] => Ok(one.clone()),
+        many => Err(format!(
+            "`{who}` is the email of {} accounts — name one by its id: {}",
+            many.len(),
+            many.iter().map(PrincipalId::as_str).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+fn run_roles_change(grant: bool, who: &str, role: &str, project: &[String]) -> Result<(), String> {
+    use dom_render_compiler::auth::store::{grant_role, revoke_role, GrantOutcome};
+    let (target, registry) = roles_target(project)?;
+    // An undeclared role is never granted. It is revoked only when the person
+    // still holds a leftover row of it, from a role the config used to declare:
+    // otherwise `revoke pat payrol` would print a green "nothing changed" while
+    // `payroll` stays granted.
+    let declared = registry.declares_role(role);
+    let undeclared = || {
+        format!(
+            "`{role}` is not a role this app declares — `auth.roles` in albedo.config.ts \
+             lists {:?}",
+            registry.roles
+        )
+    };
+    if grant && !declared {
+        return Err(undeclared());
+    }
+    print_section(if grant { "grant role" } else { "revoke role" });
+    print_kv("database", target.db_path.display());
+    let message = current_thread_runtime()?.block_on(async {
+        let db = roles_db(&target.db_path).await?;
+        let id = roles_person(&db, who).await?;
+        if grant {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX));
+            match grant_role(&db, &id, role, Some("cli"), now_ms)
+                .await
+                .map_err(|err| err.to_string())?
+            {
+                GrantOutcome::Granted => Ok(format!("{who} ({id}) now holds `{role}`")),
+                GrantOutcome::AlreadyHeld => {
+                    Ok(format!("{who} ({id}) already holds `{role}` — nothing changed"))
+                }
+                GrantOutcome::NoSuchPrincipal => Err(format!("there is no account `{id}`")),
+            }
+        } else {
+            let removed = revoke_role(&db, &id, role).await.map_err(|err| err.to_string())?;
+            match (removed, declared) {
+                (true, true) => Ok(format!("{who} ({id}) no longer holds `{role}`")),
+                (true, false) => Ok(format!(
+                    "removed {who}'s ({id}) leftover grant of `{role}` — the config no longer \
+                     declares it, so it counted for nothing"
+                )),
+                (false, true) => Ok(format!("{who} ({id}) did not hold `{role}` — nothing changed")),
+                (false, false) => Err(format!(
+                    "{} — and {who} ({id}) holds no leftover grant of it. Check the spelling.",
+                    undeclared()
+                )),
+            }
+        }
+    })?;
+    print_ok(message);
+    Ok(())
+}
+
+fn run_roles_list(args: &[String]) -> Result<(), String> {
+    let mut role: Option<String> = None;
+    let mut project = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--role" {
+            role = Some(iter.next().ok_or("--role needs a role name")?.clone());
+        } else {
+            project.push(arg.clone());
+        }
+    }
+    let (target, registry) = roles_target(&project)?;
+    let grants = current_thread_runtime()?.block_on(async {
+        let db = roles_db(&target.db_path).await?;
+        dom_render_compiler::auth::store::role_grants(&db, role.as_deref())
+            .await
+            .map_err(|err| err.to_string())
+    })?;
+    // A filter on an undeclared role answers only when there are leftovers to
+    // show; an empty answer to a typo would read as "nobody holds it".
+    if let Some(role) = role.as_deref() {
+        if !registry.declares_role(role) && grants.is_empty() {
+            return Err(format!(
+                "`{role}` is not a role this app declares — `auth.roles` in albedo.config.ts \
+                 lists {:?} — and no leftover grants of it exist. Check the spelling.",
+                registry.roles
+            ));
+        }
+    }
+    print_section("roles");
+    print_kv("database", target.db_path.display());
+    print_kv(
+        "declared",
+        if registry.roles.is_empty() {
+            "none".to_string()
+        } else {
+            registry.roles.join(", ")
+        },
+    );
+    if grants.is_empty() {
+        print_warn("no roles granted yet — `albedo roles grant <email> <role>` grants one");
+        return Ok(());
+    }
+    for grant in &grants {
+        // A row for a role the config no longer declares counts for nothing.
+        let inert = if registry.declares_role(&grant.role) {
+            ""
+        } else {
+            "  (not declared — counts for nothing)"
+        };
+        println!(
+            "    {}  {}  {}{inert}",
+            style(&grant.role, "1"),
+            grant.email.as_deref().unwrap_or("-"),
+            grant.principal
+        );
+    }
+    Ok(())
+}
+
+fn run_db_restore(args: &[String]) -> Result<(), String> {
+    use dom_render_compiler::forge::backup;
+
+    // The first positional is the snapshot; a flag's value is not a positional.
+    let mut which: Option<String> = None;
+    let mut rest = Vec::new();
+    let mut allow_missing_uploads = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--allow-missing-uploads" {
+            allow_missing_uploads = true;
+        } else if matches!(arg.as_str(), "--to" | "--config") {
+            rest.push(arg.clone());
+            rest.extend(iter.next().cloned());
+        } else if which.is_none() && !arg.starts_with('-') {
+            which = Some(arg.clone());
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let Some(which) = which else {
+        return Err(format!(
+            "which snapshot? `albedo db restore latest`, or a name from `albedo db backups`\n\n{DB_USAGE}"
+        ));
+    };
+    let target = db_target(&rest)?;
+
+    // A path, a name under the backups directory, or `latest`.
+    let snapshot = if which == "latest" {
+        backup::list(&target.backups_dir)
+            .into_iter()
+            .next()
+            .map(|snapshot| snapshot.dir)
+            .ok_or_else(|| format!("there are no backups in {}", target.backups_dir.display()))?
+    } else if Path::new(&which).is_dir() {
+        PathBuf::from(&which)
+    } else {
+        target.backups_dir.join(&which)
+    };
+
+    print_section("restore");
+    print_kv("snapshot", snapshot.display());
+    print_kv("into", target.db_path.display());
+
+    let schema = serve_schema(&target.contract)?;
+    let (live, staged) = current_thread_runtime()?.block_on(async {
+        // What is there now, for the comparison below — only if it exists, so
+        // a restore onto a fresh machine does not first create an empty file.
+        //
+        // 🔴 Best effort, and never a precondition. A damaged live database is
+        // the commonest reason to restore, and this used to `?` out of the
+        // restore on exactly that ("file is not a database"), with a healthy
+        // backup in hand. The backup is checked strictly; the thing it
+        // replaces is only described.
+        let live = if target.db_path.is_file() {
+            let read = async {
+                let substrate =
+                    dom_render_compiler::forge::LibSqlSubstrate::open_local(&target.db_path)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                table_counts(&substrate).await
+            };
+            match read.await {
+                Ok(counts) => Some(counts),
+                Err(err) => {
+                    print_warn(format!(
+                        "the current database could not be read ({err}), so there is nothing to \
+                         compare against. Restoring anyway — it is kept beside the restored one."
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let staged = backup::stage_restore(
+            &snapshot,
+            &target.db_path,
+            &target.data_dir,
+            &schema,
+            allow_missing_uploads,
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        Ok::<_, String>((live, staged))
+    })?;
+
+    let manifest = &staged.manifest;
+    print_kv("taken", &manifest.taken_at);
+    let mut tables: Vec<&String> = manifest.tables.keys().collect();
+    if let Some(live) = &live {
+        tables.extend(live.keys().filter(|name| !manifest.tables.contains_key(*name)));
+    }
+    for table in tables {
+        let then = manifest.tables.get(table).copied().unwrap_or(0);
+        let now = live.as_ref().map(|live| live.get(table).copied().unwrap_or(0));
+        // Empty then and now says nothing; every table that changes is shown.
+        if then == 0 && now.unwrap_or(0) == 0 {
+            continue;
+        }
+        let line = match now {
+            Some(now) if now != then => format!("{then} rows (now {now})"),
+            _ => format!("{then} rows"),
+        };
+        print_kv(table, line);
+    }
+    print_kv(
+        "uploads",
+        format!(
+            "{} restored, {} repaired, {} already present and checked",
+            staged.uploads_added, staged.uploads_repaired, staged.uploads_present
+        ),
+    );
+    if !staged.uploads_unavailable.is_empty() {
+        print_warn(format!(
+            "{} upload file(s) the restored records point at exist nowhere — they will answer 404: \
+             {}",
+            staged.uploads_unavailable.len(),
+            staged.uploads_unavailable.join(", ")
+        ));
+    }
+    if staged.replaced_earlier_stage {
+        print_warn("this replaced a restore that was already staged and not yet applied");
+    }
+    print_ok(format!(
+        "staged and checked. The server applies it the next time it starts — restart it now. The \
+         database it replaces is kept beside it as {}.before-restore-…",
+        target
+            .db_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    Ok(())
+}
+
+/// Rows per table, every table but SQLite's own.
+async fn table_counts(
+    substrate: &dyn dom_render_compiler::forge::DataSubstrate,
+) -> Result<std::collections::BTreeMap<String, u64>, String> {
+    use dom_render_compiler::forge::value::SqlValue;
+    let names = substrate
+        .query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            &[],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    let mut counts = std::collections::BTreeMap::new();
+    for row in &names.rows {
+        let Some(SqlValue::Text(name)) = row.get(0) else {
+            continue;
+        };
+        let quoted = name.replace('"', "\"\"");
+        let counted = substrate
+            .query(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
+            .await
+            .map_err(|err| err.to_string())?;
+        if let Some(SqlValue::Integer(n)) = counted.rows.first().and_then(|row| row.get(0)) {
+            counts.insert(name.clone(), u64::try_from(*n).unwrap_or(0));
+        }
+    }
+    Ok(counts)
+}
+
+/// Every user's principal, and the principals each email belongs to.
+struct UserPrincipals {
+    ids: std::collections::HashSet<String>,
+    by_email: std::collections::HashMap<String, Vec<String>>,
+}
+
+async fn user_principals(
+    substrate: &dyn dom_render_compiler::forge::DataSubstrate,
+) -> Result<UserPrincipals, String> {
+    use dom_render_compiler::forge::value::SqlValue;
+    let rows = substrate
+        .query(
+            &format!(
+                "SELECT principal, email FROM {}",
+                dom_render_compiler::auth::schema::USERS
+            ),
+            &[],
+        )
+        .await
+        .map_err(|err| format!("could not read the users table: {err}"))?;
+    let mut users = UserPrincipals {
+        ids: std::collections::HashSet::new(),
+        by_email: std::collections::HashMap::new(),
+    };
+    for row in &rows.rows {
+        let Some(SqlValue::Text(principal)) = row.get(0) else {
+            continue;
+        };
+        users.ids.insert(principal.clone());
+        if let Some(SqlValue::Text(email)) = row.get(1) {
+            let key = dom_render_compiler::auth::normalize_email(email)
+                .unwrap_or_else(|| email.trim().to_ascii_lowercase());
+            users.by_email.entry(key).or_default().push(principal.clone());
+        }
+    }
+    Ok(users)
+}
+
+fn print_import_help() {
+    print_banner();
+    print_section("import");
+    println!(
+        "  {}  {}",
+        style("usage", "2"),
+        style(
+            "albedo import <collection> <file.jsonl> [dir] [--author-email <field> | --author-id <field>]",
+            "1"
+        )
+    );
+    print_option("--author-email <field>", "each row's owner, by the email of an existing user");
+    print_option("--author-id <field>", "each row's owner, by principal id");
+    print_option("--config <FILE>", "explicit albedo config");
+    println!();
+    for line in [
+        "writes one JSON object per line into a declared collection, as appends",
+        "with their authors — so each row stays changeable by the user who owns",
+        "it. A row inserted any other way has no author, and no request may",
+        "ever update or remove it.",
+        "",
+        "A row may carry the declared fields and `id` (to keep the source's ids).",
+        "Timestamps take epoch milliseconds or RFC 3339. The whole file is one",
+        "transaction: a bad line, or an author with no user, imports nothing.",
+    ] {
+        println!("  {}", style(line, "2"));
+    }
+    println!();
 }
 
 fn print_test_help() {
@@ -5374,9 +6360,13 @@ REF=${OTHER}
             // The database and its WAL/SHM sidecars, wherever `forge.db_path` puts it.
             db.to_string(),
             format!("{db}-*"),
+            // A staged restore and the databases restores replaced.
+            format!("{db}.*"),
             // Uploaded bytes live under the project root — anchored, so an app's
             // own `src/uploads/` component folder is not swept up with them.
             format!("/{}/", dom_render_compiler::upload::UPLOAD_DIR),
+            // `albedo db backup`'s default directory: a copy of all of the above.
+            format!("/{DEFAULT_BACKUP_DIR}/"),
             // The ACME account key and issued certificates.
             format!("{}/", albedo_server::tls::DEFAULT_ACME_CACHE_DIR),
             // A shipped binary, its staging file, and its unpacked tree.
@@ -5561,6 +6551,12 @@ REF=${OTHER}
         assert!(dockerfile.contains("ALBEDO_SERVER_HOST=0.0.0.0"));
         assert!(dockerfile.contains("ALBEDO_SERVER_PORT=3000"));
         assert!(dockerfile.contains("HEALTHCHECK"));
+        // The server's probe — never `/`, which the app owns and may gate.
+        assert!(dockerfile.contains(&format!(
+            "${{ALBEDO_SERVER_PORT}}{}\"",
+            albedo_server::health::READY_PATH
+        )));
+        assert!(dockerfile.contains("ENV ALBEDO_BACKUP_DIR=/data/backups"));
         assert!(dockerfile.contains("EXPOSE 3000"));
 
         // 🔴 This used to assert `COPY --from=builder /workspace/.albedo/dist`,
@@ -5605,6 +6601,8 @@ REF=${OTHER}
         assert!(toml.contains("dockerfile = \"Dockerfile\""));
         assert!(toml.contains("internal_port = 3000"));
         assert!(toml.contains("[[http_service.checks]]"));
+        assert!(toml.contains(&format!("path = \"{}\"", albedo_server::health::READY_PATH)));
+        assert!(toml.contains("ALBEDO_BACKUP_DIR = \"/data/backups\""));
     }
 
     #[test]
@@ -5899,6 +6897,13 @@ REF=${OTHER}
                 && dockerfile.contains("VOLUME /data"),
             "the database must be on a volume, not in the container's writable layer"
         );
+    }
+
+    #[test]
+    fn docker_context_excludes_nested_acme_caches() {
+        let ignore = build_dockerignore_template();
+        assert!(ignore.lines().any(|line| line == "**/.albedo-acme"));
+        assert!(!ignore.lines().any(|line| line == ".albedo-acme"));
     }
 
     /// 🪤 The fly target inherits the Dockerfile, so it inherits the stop

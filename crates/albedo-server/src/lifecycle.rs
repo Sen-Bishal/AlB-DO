@@ -39,6 +39,11 @@ pub struct RequestContext {
     /// the page that posted to it rendered with. Set with [`principal`](Self::principal)
     /// by [`with_identity`](Self::with_identity) so the two cannot disagree.
     pub user: Option<Value>,
+    /// R1a · the roles the principal holds, already narrowed to the declared
+    /// set. Empty when anonymous. What the action door checks a role gate
+    /// against — typed, rather than read back out of `user`, which is
+    /// presentation.
+    pub roles: Vec<String>,
 }
 
 impl RequestContext {
@@ -51,7 +56,12 @@ impl RequestContext {
         body: Bytes,
     ) -> Self {
         Self {
-            request_id: Uuid::new_v4().to_string(),
+            // The id the access log wrote and the response carries, so a
+            // handler's own error log names the same request.
+            request_id: headers
+                .get(crate::access_log::REQUEST_ID_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map_or_else(|| Uuid::new_v4().to_string(), str::to_string),
             method,
             path,
             query: parse_query_string(query_string),
@@ -61,6 +71,7 @@ impl RequestContext {
             metadata: BTreeMap::new(),
             principal: None,
             user: None,
+            roles: Vec::new(),
         }
     }
 
@@ -70,6 +81,7 @@ impl RequestContext {
     pub fn with_identity(mut self, principal: Option<&dom_render_compiler::auth::Principal>) -> Self {
         self.principal = principal.map(|who| who.id.clone());
         self.user = principal.map(dom_render_compiler::auth::Principal::user_value);
+        self.roles = principal.map(|who| who.roles.clone()).unwrap_or_default();
         self
     }
 

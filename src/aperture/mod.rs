@@ -59,6 +59,7 @@
 //! the design that would be a CVE rather than a bug, and it is closed by
 //! construction rather than by review.
 
+pub mod admission;
 pub mod bindings;
 pub mod cache;
 pub mod client;

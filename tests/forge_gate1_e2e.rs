@@ -42,7 +42,7 @@ async fn seeded_guestbook_rows_render_into_ssr_html() {
     let project = CompiledProject::load_from_dir(fixture()).expect("fixture compiles");
     let store = Arc::new(SlotStore::new());
     let slots = SessionSlotView::new(SessionId::random(), store);
-    let (tx, _rx) = mpsc::channel::<Vec<u8>>(16);
+    let (tx, _rx) = mpsc::channel::<bytes::Bytes>(16);
     let opts = RenderOptions { hook_compile: true };
 
     let out = render_entry_with_broadcast(

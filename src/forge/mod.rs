@@ -47,6 +47,8 @@ pub mod bindings;
 pub mod declare;
 pub mod delta;
 pub mod drift;
+/// `albedo import` — rows from elsewhere, written as appends with their authors.
+pub mod import;
 // A recording test double. Test and bench builds only.
 #[cfg(any(test, feature = "test-support"))]
 pub mod mem;
@@ -59,6 +61,9 @@ pub mod write;
 
 #[cfg(feature = "forge")]
 pub mod libsql;
+/// `albedo db backup` / `restore` — snapshots of the data directory.
+#[cfg(feature = "forge")]
+pub mod backup;
 
 pub use delta::{
     appended_rows, classify_positioned_insert, diff_records, project_changes,

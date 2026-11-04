@@ -23,7 +23,7 @@ const WEBTRANSPORT_STREAM_COUNT: usize = 4;
 pub struct WebTransportSessionHandle {
     pub session_id: Uuid,
     pub remote_addr: SocketAddr,
-    pub stream_senders: [mpsc::Sender<Vec<u8>>; WEBTRANSPORT_STREAM_COUNT],
+    pub stream_senders: [mpsc::Sender<bytes::Bytes>; WEBTRANSPORT_STREAM_COUNT],
 }
 
 #[derive(Clone, Default)]
@@ -69,7 +69,7 @@ impl WebTransportSessionRegistry {
         &self,
         session_id: Uuid,
         stream_slot: u8,
-    ) -> Option<mpsc::Sender<Vec<u8>>> {
+    ) -> Option<mpsc::Sender<bytes::Bytes>> {
         if (stream_slot as usize) >= WEBTRANSPORT_STREAM_COUNT {
             return None;
         }
@@ -100,7 +100,7 @@ impl WebTransportSessionRegistry {
             handle.stream_senders[stream_slot as usize].clone()
         };
 
-        sender.send(payload).await.map_err(|_| {
+        sender.send(bytes::Bytes::from(payload)).await.map_err(|_| {
             RuntimeError::ServerRuntime(format!(
                 "WT stream slot {} channel closed for session '{}'",
                 stream_slot, session_id
@@ -320,7 +320,7 @@ async fn handle_connecting(
 fn spawn_stream_writers(
     connection: Connection,
     stream_buffer_capacity: usize,
-) -> [mpsc::Sender<Vec<u8>>; WEBTRANSPORT_STREAM_COUNT] {
+) -> [mpsc::Sender<bytes::Bytes>; WEBTRANSPORT_STREAM_COUNT] {
     let (control_tx, control_rx) = mpsc::channel(stream_buffer_capacity);
     let (shell_tx, shell_rx) = mpsc::channel(stream_buffer_capacity);
     let (patch_tx, patch_rx) = mpsc::channel(stream_buffer_capacity);
@@ -334,7 +334,7 @@ fn spawn_stream_writers(
     [control_tx, shell_tx, patch_tx, prefetch_tx]
 }
 
-fn spawn_stream_writer(connection: Connection, stream_slot: u8, mut rx: mpsc::Receiver<Vec<u8>>) {
+fn spawn_stream_writer(connection: Connection, stream_slot: u8, mut rx: mpsc::Receiver<bytes::Bytes>) {
     tokio::spawn(async move {
         let mut stream = match connection.open_uni().await {
             Ok(stream) => stream,
@@ -357,7 +357,7 @@ fn spawn_stream_writer(connection: Connection, stream_slot: u8, mut rx: mpsc::Re
         debug!(stream_slot, "webtransport stream opened");
 
         while let Some(payload) = rx.recv().await {
-            if let Err(err) = write_framed_payload(&mut stream, payload.as_slice()).await {
+            if let Err(err) = write_framed_payload(&mut stream, &payload).await {
                 warn!(stream_slot, error = %err, "failed to write WT payload");
                 break;
             }
@@ -370,11 +370,11 @@ fn spawn_stream_writer(connection: Connection, stream_slot: u8, mut rx: mpsc::Re
 }
 
 async fn enqueue_control_message(
-    sender: &mpsc::Sender<Vec<u8>>,
+    sender: &mpsc::Sender<bytes::Bytes>,
     payload: Vec<u8>,
 ) -> Result<(), RuntimeError> {
     sender
-        .send(payload)
+        .send(bytes::Bytes::from(payload))
         .await
         .map_err(|_| RuntimeError::ServerRuntime("WT control stream channel closed".to_string()))
 }

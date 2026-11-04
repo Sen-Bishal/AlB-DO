@@ -128,7 +128,7 @@ async fn broadcast_fans_out_slot_set_opcode_to_subscribed_session() {
     // helper drains the topic's initial value into `Vec<Instruction>`
     // and arms the channel for future writes.
     let listener_session = SessionId::random();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(CHANNEL_CAPACITY);
     let _initial = broadcast.auto_subscribe(listener_session, tx, &["counter".to_string()]);
 
     // Different session invokes the action — broadcasts are

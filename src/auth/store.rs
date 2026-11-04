@@ -26,7 +26,7 @@
 //!   leaves two live sessions for one login if the process dies between them.
 
 use crate::auth::principal::{Principal, PrincipalId};
-use crate::auth::schema::{ACCOUNTS, CREDENTIALS, SESSIONS, USERS};
+use crate::auth::schema::{ACCOUNTS, CREDENTIALS, ROLES, SESSIONS, USERS};
 use crate::auth::session::{SessionRecord, SessionRejection, SessionToken, TokenHash};
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::{Row, SqlValue, SubstrateError};
@@ -115,7 +115,9 @@ pub async fn resolve_session(
             &format!(
                 "SELECT s.principal, s.provider, s.expires_at, u.email, u.name, u.image, \
                  (SELECT group_concat(a.provider, ',') FROM {ACCOUNTS} a \
-                  WHERE a.principal = s.principal) \
+                  WHERE a.principal = s.principal), \
+                 (SELECT group_concat(r.role, ',') FROM {ROLES} r \
+                  WHERE r.principal = s.principal) \
                  FROM {SESSIONS} s JOIN {USERS} u ON u.principal = s.principal \
                  WHERE s.token_hash = ?1"
             ),
@@ -161,6 +163,8 @@ pub async fn resolve_session(
         // on the session row or calling the provider again. Neither is worth it
         // for a field nothing in the authorization path reads.
         claims: JsonMap::new(),
+        // R1a · every granted row; the server narrows to the declared roles.
+        roles: provider_list(optional_text_at(row, 7).as_deref()),
     })))
 }
 
@@ -477,7 +481,7 @@ pub async fn principals_after(
 /// [`StoreError`] on substrate failure.
 pub async fn delete_principal(db: &dyn DataSubstrate, principal: &PrincipalId) -> Result<()> {
     let tx = db.begin().await?;
-    for table in [SESSIONS, CREDENTIALS, ACCOUNTS, USERS] {
+    for table in [SESSIONS, CREDENTIALS, ACCOUNTS, ROLES, USERS] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE principal = ?1"),
             &[SqlValue::Text(principal.as_str().to_string())],
@@ -678,13 +682,16 @@ fn build_principal(id: PrincipalId, provider: &str, profile: &ProviderProfile) -
         provider: provider.to_string(),
         providers: Vec::new(),
         claims: profile.claims.clone(),
+        roles: Vec::new(),
     }
 }
 
-/// A `group_concat` of provider names, as a sorted, de-duplicated list.
+/// A `group_concat` of provider (or role) names, as a sorted, de-duplicated list.
 ///
-/// A comma is safe as the separator because a provider name cannot contain one
-/// — [`crate::auth::is_valid_provider_name`] admits only an identifier alphabet.
+/// A comma is safe as the separator because neither name can contain one —
+/// [`crate::auth::is_valid_provider_name`] and
+/// [`crate::auth::declare::is_valid_role_name`] admit only identifier alphabets,
+/// and the CLI refuses an undeclared role before it reaches the table.
 fn provider_list(concatenated: Option<&str>) -> Vec<String> {
     let mut providers: Vec<String> = concatenated
         .unwrap_or_default()
@@ -712,7 +719,9 @@ pub async fn load_principal(db: &dyn DataSubstrate, id: &PrincipalId) -> Result<
             &format!(
                 "SELECT u.email, u.name, u.image, \
                  (SELECT group_concat(a.provider, ',') FROM {ACCOUNTS} a \
-                  WHERE a.principal = u.principal) \
+                  WHERE a.principal = u.principal), \
+                 (SELECT group_concat(r.role, ',') FROM {ROLES} r \
+                  WHERE r.principal = u.principal) \
                  FROM {USERS} u WHERE u.principal = ?1"
             ),
             &[SqlValue::Text(id.as_str().to_string())],
@@ -729,7 +738,174 @@ pub async fn load_principal(db: &dyn DataSubstrate, id: &PrincipalId) -> Result<
         provider: String::new(),
         providers: provider_list(optional_text_at(row, 3).as_deref()),
         claims: JsonMap::new(),
+        roles: provider_list(optional_text_at(row, 4).as_deref()),
     }))
+}
+
+/// What [`grant_role`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantOutcome {
+    /// The principal holds the role now and did not before.
+    Granted,
+    /// It already held it; nothing changed.
+    AlreadyHeld,
+    /// No such principal. Nothing written: a grant to nobody would be inherited
+    /// by whatever later carries that id — a restore, for one.
+    NoSuchPrincipal,
+}
+
+/// R1a · grant `role` to `principal`.
+///
+/// The caller validates `role` against the declared set first; this function
+/// stores what it is given. `granted_by` is `cli` from the command line, a
+/// principal id once the app can grant (R1b).
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn grant_role(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+    role: &str,
+    granted_by: Option<&str>,
+    now_ms: i64,
+) -> Result<GrantOutcome> {
+    let tx = db.begin().await?;
+    let exists = tx
+        .query(
+            &format!("SELECT 1 FROM {USERS} WHERE principal = ?1"),
+            &[SqlValue::Text(principal.as_str().to_string())],
+        )
+        .await?;
+    if exists.rows.is_empty() {
+        tx.commit().await?;
+        return Ok(GrantOutcome::NoSuchPrincipal);
+    }
+    let inserted = tx
+        .execute(
+            &format!(
+                "INSERT OR IGNORE INTO {ROLES} (principal, role, granted_by, granted_at) \
+                 VALUES (?1, ?2, ?3, ?4)"
+            ),
+            &[
+                SqlValue::Text(principal.as_str().to_string()),
+                SqlValue::Text(role.to_string()),
+                optional_param(granted_by),
+                SqlValue::Integer(now_ms),
+            ],
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(if inserted == 0 {
+        GrantOutcome::AlreadyHeld
+    } else {
+        GrantOutcome::Granted
+    })
+}
+
+/// R1a · revoke `role` from `principal`. `true` when a grant was removed.
+///
+/// Takes effect at the principal's next resolution: there is no principal
+/// cache, so the next request, action or lane sees it gone.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn revoke_role(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+    role: &str,
+) -> Result<bool> {
+    let removed = db
+        .execute(
+            &format!("DELETE FROM {ROLES} WHERE principal = ?1 AND role = ?2"),
+            &[
+                SqlValue::Text(principal.as_str().to_string()),
+                SqlValue::Text(role.to_string()),
+            ],
+        )
+        .await?;
+    Ok(removed > 0)
+}
+
+/// One stored grant, with the holder's email for a human reading a listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleGrant {
+    /// Who holds it.
+    pub principal: PrincipalId,
+    /// Their best-known email, if any.
+    pub email: Option<String>,
+    /// The role.
+    pub role: String,
+    /// Who granted it (`cli`, or a principal id).
+    pub granted_by: Option<String>,
+    /// When, in epoch milliseconds.
+    pub granted_at: i64,
+}
+
+/// R1a · every stored grant, or only `role`'s, ordered by role then principal.
+///
+/// Stored grants, not effective ones: a row for a role the config no longer
+/// declares is listed here (so an operator can see and clean it up) even though
+/// it counts for nothing at resolution.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure or a corrupt row.
+pub async fn role_grants(db: &dyn DataSubstrate, role: Option<&str>) -> Result<Vec<RoleGrant>> {
+    let (filter, params) = match role {
+        Some(role) => ("WHERE r.role = ?1", vec![SqlValue::Text(role.to_string())]),
+        None => ("", Vec::new()),
+    };
+    let rows = db
+        .query(
+            &format!(
+                "SELECT r.principal, u.email, r.role, r.granted_by, r.granted_at \
+                 FROM {ROLES} r LEFT JOIN {USERS} u ON u.principal = r.principal \
+                 {filter} ORDER BY r.role, r.principal"
+            ),
+            &params,
+        )
+        .await?;
+    rows.rows
+        .iter()
+        .map(|row| {
+            Ok(RoleGrant {
+                principal: PrincipalId::parse(text_at(row, 0, "roles.principal")?)
+                    .map_err(|err| StoreError::Corrupt(err.to_string()))?,
+                email: optional_text_at(row, 1),
+                role: text_at(row, 2, "roles.role")?,
+                granted_by: optional_text_at(row, 3),
+                granted_at: int_at(row, 4, "roles.granted_at")?,
+            })
+        })
+        .collect()
+}
+
+/// R1a · every principal whose stored email matches `email`, ignoring case.
+///
+/// More than one is possible and legitimate — email is deliberately not unique
+/// (two providers may report one address) — so the caller decides what an
+/// ambiguous answer means. The CLI refuses it and asks for an id.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure or a corrupt row.
+pub async fn principals_with_email(
+    db: &dyn DataSubstrate,
+    email: &str,
+) -> Result<Vec<PrincipalId>> {
+    let rows = db
+        .query(
+            &format!(
+                "SELECT principal FROM {USERS} WHERE lower(email) = lower(?1) ORDER BY principal"
+            ),
+            &[SqlValue::Text(email.to_string())],
+        )
+        .await?;
+    rows.rows
+        .iter()
+        .map(|row| {
+            PrincipalId::parse(text_at(row, 0, "users.principal")?)
+                .map_err(|err| StoreError::Corrupt(err.to_string()))
+        })
+        .collect()
 }
 
 /// What connecting a provider identity to a signed-in principal did.

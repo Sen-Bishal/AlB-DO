@@ -189,6 +189,9 @@ pub struct RuntimeGauges {
     pub broadcast_topics: usize,
     pub aperture: Option<dom_render_compiler::aperture::MetricsSnapshot>,
     pub shutter_degraded_decisions: u64,
+    /// `(scheduled, last success in Unix seconds, failures)` — see
+    /// [`crate::backups::BackupStatus::read`].
+    pub backups: (bool, f64, u64),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -294,12 +297,29 @@ pub fn render(http: &HttpMetrics, runtime: &RuntimeGauges) -> String {
 
     gauge(&mut out, "albedo_phosphor_lanes_open", "Open PHOSPHOR lanes.", runtime.phosphor_lanes as f64);
     gauge(&mut out, "albedo_broadcast_topics", "Registered broadcast topics.", runtime.broadcast_topics as f64);
+    #[cfg(feature = "forge")]
+    counter(
+        &mut out,
+        "albedo_forge_publication_collisions_total",
+        "Committed FORGE channels skipped because their wire slot belongs to another topic.",
+        dom_render_compiler::forge::write::publication_collisions(),
+    );
     counter(
         &mut out,
         "albedo_shutter_degraded_decisions_total",
         "Rate-limit decisions made while SHUTTER's table was at capacity.",
         runtime.shutter_degraded_decisions,
     );
+
+    // The alert every deployment wants is `time() - last_success > 2 days`.
+    // `scheduled` is always present, so "nothing is backing this up" is a
+    // value a rule can see rather than a missing series.
+    let (scheduled, last_success, failures) = runtime.backups;
+    gauge(&mut out, "albedo_backups_scheduled", "1 when ALBEDO_BACKUP_DIR schedules backups.", f64::from(u8::from(scheduled)));
+    if scheduled {
+        gauge(&mut out, "albedo_backup_last_success_timestamp_seconds", "When the newest backup was taken; 0 if none has been.", last_success);
+        counter(&mut out, "albedo_backup_failures_total", "Scheduled backups that failed.", failures);
+    }
 
     if let Some(aperture) = runtime.aperture {
         counter(&mut out, "albedo_aperture_upstream_requests_total", "Outbound requests put on the wire.", aperture.upstream_requests);
@@ -374,12 +394,26 @@ pub async fn serve(
             }
         }),
     );
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
+    // The app's own connection loop, not `axum::serve`: a scraper port is still
+    // a port, and `axum::serve` holds a connection that says nothing open
+    // forever (no header timer). A scrape is one short request, so the drain is
+    // short too.
+    crate::server::serve_connections(
+        listener,
+        router,
+        None,
+        async move {
             let _ = shutdown.wait_for(|fired| *fired).await;
-        })
-        .await
+        },
+        METRICS_DRAIN,
+        crate::server::CONNECTION_TIMEOUTS,
+    )
+    .await
+    .map_err(|err| std::io::Error::other(err.to_string()))
 }
+
+/// How long an in-flight scrape may finish after shutdown begins.
+const METRICS_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
@@ -389,6 +423,21 @@ mod tests {
         text.lines()
             .find(|line| line.starts_with(prefix))
             .unwrap_or_else(|| panic!("no line starting `{prefix}` in:\n{text}"))
+    }
+
+    #[cfg(feature = "forge")]
+    #[test]
+    fn forge_publication_collisions_are_exposed_as_a_counter() {
+        let text = render(&HttpMetrics::new(), &RuntimeGauges::default());
+        assert!(text.contains("# TYPE albedo_forge_publication_collisions_total counter"));
+        let sample = line(&text, "albedo_forge_publication_collisions_total ");
+        let value = sample
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(value <= dom_render_compiler::forge::write::publication_collisions());
     }
 
     #[test]
@@ -439,9 +488,11 @@ mod tests {
                 stale_on_error: 0,
                 throttled: 0,
             }),
+            backups: (true, 1_700_000_000.0, 0),
             ..Default::default()
         };
         let text = render(&http, &runtime);
+        assert!(text.contains("albedo_backup_last_success_timestamp_seconds 1700000000"));
         let mut typed = std::collections::HashSet::new();
         for l in text.lines() {
             if let Some(rest) = l.strip_prefix("# TYPE ") {

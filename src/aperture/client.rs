@@ -53,6 +53,11 @@ pub enum ApertureError {
     Egress(EgressDenial),
     /// The upstream could not be reached, or the transport failed.
     Transport(String),
+    /// The upstream body exceeded the transport's buffer ceiling.
+    ResponseTooLarge {
+        /// Maximum accepted response body bytes.
+        limit: usize,
+    },
     /// The request exceeded its timeout.
     Timeout {
         /// The configured limit that was exceeded.
@@ -77,6 +82,9 @@ impl std::fmt::Display for ApertureError {
             ApertureError::InvalidUrl(url) => write!(f, "aperture: could not parse URL `{url}`"),
             ApertureError::Egress(denial) => write!(f, "aperture: {denial}"),
             ApertureError::Transport(msg) => write!(f, "aperture: transport failure: {msg}"),
+            ApertureError::ResponseTooLarge { limit } => {
+                write!(f, "aperture: response body exceeds {limit} bytes")
+            }
             ApertureError::Timeout { after } => {
                 write!(f, "aperture: request timed out after {after:?}")
             }
@@ -156,7 +164,8 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
     /// A3 (APERTURE § 14) and belongs above this seam.
     ///
     /// # Errors
-    /// Any transport-level failure, as [`ApertureError::Transport`].
+    /// Transport failure or a refused body exceeding the transport limit
+    /// ([`ApertureError::ResponseTooLarge`]).
     async fn send(&self, request: &WireRequest) -> Result<WireResponse, ApertureError>;
 }
 

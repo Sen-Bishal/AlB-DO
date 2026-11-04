@@ -46,7 +46,7 @@ use crate::renderer_runtime::RENDER_MANIFEST_FILENAME;
 use crate::server::AlbedoServer;
 use axum::body::{to_bytes, Body};
 use axum::http::{header, HeaderMap, Request, StatusCode};
-use dom_render_compiler::manifest::schema::{RenderManifestV2, RouteAuth, RouteManifest};
+use dom_render_compiler::manifest::schema::{RenderManifestV2, RouteManifest};
 use dom_render_compiler::runtime::SessionId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -391,9 +391,9 @@ fn route_reasons(route: &RouteManifest) -> Vec<String> {
                 .to_string(),
         );
     }
-    if route.auth == RouteAuth::Required {
+    if !route.auth.allows_anonymous() {
         reasons.push(
-            "`export const auth = \"required\"` — a static host cannot check who is asking"
+            "`export const auth` gates this route — a static host cannot check who is asking"
                 .to_string(),
         );
     }
@@ -803,7 +803,7 @@ enum Source<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dom_render_compiler::manifest::schema::{HtmlShell, RouteActionEntry};
+    use dom_render_compiler::manifest::schema::{HtmlShell, RouteActionEntry, RouteAuth};
 
     fn route(path: &str) -> RouteManifest {
         RouteManifest {
@@ -845,6 +845,17 @@ mod tests {
     #[test]
     fn a_plain_static_route_is_not_refused() {
         assert!(manifest_refusals(&manifest(vec![route("/"), route("/about")])).is_empty());
+    }
+
+    #[test]
+    fn a_role_gate_alone_prevents_static_export() {
+        let mut payroll = route("/payroll");
+        payroll.auth = RouteAuth::Roles(vec!["hr".to_string(), "payroll".to_string()]);
+        let refusals = manifest_refusals(&manifest(vec![route("/"), payroll]));
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(refusals[0].subject, "/payroll");
+        assert_eq!(refusals[0].reasons.len(), 1);
+        assert!(refusals[0].reasons[0].contains("auth"));
     }
 
     #[test]

@@ -88,7 +88,14 @@ pub type FormActionIds = std::collections::HashSet<u32>;
 /// *derive* the route default. Taking the restrictive one means a public form
 /// starts answering 401, which is loud, immediate, and in the same breath tells
 /// you two routes are sharing a handler.
-pub type GatedActionIds = std::collections::HashSet<u32>;
+///
+/// R1a · each id maps to the gate of **every** route that declares it, and a
+/// caller must satisfy all of them — the same restrictive rule, extended from
+/// "any declaring route requires a principal" to "every declaring route's roles".
+pub type GatedActionIds = std::collections::HashMap<
+    u32,
+    Vec<dom_render_compiler::manifest::schema::RouteAuth>,
+>;
 
 /// Request header carrying the per-session CSRF token on every action
 /// POST. The client runtime reads the token from
@@ -391,16 +398,35 @@ async fn dispatch_action(
     // After the CSRF check, deliberately: a request that is not genuine should
     // be refused as forged whatever it was aiming at, and keeping this second
     // preserves *the CSRF check always runs* as an unqualified sentence.
-    if gated_actions.contains(&envelope.action_id) && ctx.principal.is_none() {
-        warn!(
-            action_id = envelope.action_id,
-            "anonymous dispatch refused: this action is declared on a route with \
-             `auth = \"required\"`",
-        );
-        return Err(error_response(
-            StatusCode::UNAUTHORIZED,
-            "this action is only available to signed-in users".to_string(),
-        ));
+    if let Some(gates) = gated_actions.get(&envelope.action_id) {
+        use dom_render_compiler::manifest::schema::Admission;
+        let held = ctx.principal.as_ref().map(|_| ctx.roles.as_slice());
+        // Anonymous wins: a stranger is told to sign in, not that a role is
+        // missing, whichever declaring route happens to be consulted first.
+        let (anonymous, forbidden) = gates.iter().fold((false, false), |(a, f), gate| {
+            let admission = gate.admits(held);
+            (a || admission == Admission::Anonymous, f || admission == Admission::Forbidden)
+        });
+        if anonymous {
+            warn!(
+                action_id = envelope.action_id,
+                "anonymous dispatch refused: this action is declared on a gated route",
+            );
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "this action is only available to signed-in users".to_string(),
+            ));
+        }
+        if forbidden {
+            warn!(
+                action_id = envelope.action_id,
+                "dispatch refused: the caller holds none of a declaring route's required roles",
+            );
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "your account does not have access to this action".to_string(),
+            ));
+        }
     }
 
     let handler = match registry.get(&envelope.action_id) {
@@ -415,6 +441,17 @@ async fn dispatch_action(
 
     let mut instructions = match handler.handle(ctx, envelope, slots.clone()).await {
         Ok(out) => out,
+        Err(crate::error::RuntimeError::ActionInProgress) => {
+            let mut response = error_response(
+                StatusCode::CONFLICT,
+                "action intent is already in progress; retry later".to_string(),
+            );
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("60"),
+            );
+            return Err(response);
+        }
         Err(err) => {
             warn!(action_id = envelope.action_id, error = %err, "action handler failed");
             if let Some(reg) = overlay {
@@ -532,6 +569,7 @@ mod tests {
             metadata: Default::default(),
             principal: None,
             user: None,
+            roles: Vec::new(),
         }
     }
 
@@ -575,7 +613,9 @@ mod tests {
 
     /// The `action_id`s of routes declared `auth = "required"`.
     fn gated_actions(ids: &[u32]) -> GatedActionIds {
-        ids.iter().copied().collect()
+        ids.iter()
+            .map(|id| (*id, vec![dom_render_compiler::manifest::schema::RouteAuth::Required]))
+            .collect()
     }
 
     /// The dispatcher tests below don't exercise CSRF, but every action

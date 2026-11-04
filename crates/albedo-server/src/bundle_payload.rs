@@ -277,6 +277,22 @@ pub fn should_ship(relative_path: &str) -> bool {
         return false;
     }
 
+    // Your users' data, where it lives when the database sits at the project
+    // root: their uploaded files, and `albedo db backup`'s snapshots — a full
+    // copy of everything. Anchored to the root, so an app's own
+    // `src/uploads/` component folder still ships.
+    //
+    // 🔴 A stopgap on a denylist: a database or store at any other path still
+    // travels. The real boundary is a payload built from what the runtime
+    // reads, not from what the project directory happens to contain.
+    if matches!(
+        segments.first(),
+        Some(&first) if first == dom_render_compiler::upload::UPLOAD_DIR
+            || first == crate::backups::DEFAULT_DIR
+    ) {
+        return false;
+    }
+
     // 🪤 A shipped binary run inside its own project leaves its unpacked tree
     // beside itself, named for the build. Shipping again would embed a whole
     // copy of the previous build — the app twice, growing every release, and
@@ -709,6 +725,19 @@ mod tests {
         assert!(!should_ship("forge.db"));
         assert!(!should_ship("forge.db-wal"));
         assert!(!should_ship("forge.db-shm"));
+        assert!(!should_ship("forge.db.restore-pending"));
+        assert!(!should_ship("forge.db.before-restore-2026-10-30T12-00-00Z"));
+    }
+
+    /// Users' files and the backups that copy them are data, not app: neither
+    /// belongs in an artifact that gets uploaded, retained and redistributed.
+    /// An app's own `src/uploads/` folder is source and still ships.
+    #[test]
+    fn uploads_and_backups_do_not_travel() {
+        assert!(!should_ship("uploads/ab/cdef"));
+        assert!(!should_ship("backups/2026-10-30T12-00-00Z/manifest.json"));
+        assert!(!should_ship("backups/2026-10-30T12-00-00Z/uploads/ab/cdef"));
+        assert!(should_ship("src/uploads/Uploader.tsx"));
     }
 
     /// 🪤 Whole segments, not substrings: a component legitimately named
