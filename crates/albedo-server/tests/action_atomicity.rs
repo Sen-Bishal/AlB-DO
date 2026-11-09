@@ -30,6 +30,7 @@ export const save = action(({ form }) => {
   append("guestbook", { author: "action", message: form.message });
   return { ok: "saved" };
 });
+export const noop = action(() => { return { ok: "unchanged" }; });
 export default function Page() { return <p>actions</p>; }
 "#;
 
@@ -42,12 +43,18 @@ export const save = action(async ({ form }) => {
   enqueue("later", { message: result.message }, { delay: "1d" });
   return { ok: "saved" };
 });
+export const valid_queue = action(({ form }) => {
+  append("guestbook", { author: "action", message: form.message });
+  enqueue("later", { message: form.message }, { delay: "1d" });
+  return { ok: "saved" };
+});
 export const invalid_queue = action(() => {
   append("guestbook", { author: "action", message: "must roll back" });
   enqueue("later", { message: "also rolls back" }, { delay: "1d" });
   enqueue("undeclared", {});
   return { ok: "must not complete" };
 });
+export const noop = action(() => { return { ok: "unchanged" }; });
 export default function Page() { return <p>actions</p>; }
 "#;
 
@@ -209,6 +216,31 @@ fn request(csrf: &CsrfRegistry, action: &str, intent: &str, message: &str) -> Re
             encode_action_envelope(&envelope).expect("envelope"),
         ))
         .expect("request")
+}
+
+fn tokenless_request(csrf: &CsrfRegistry, action: &str, peer: u16) -> Request<Body> {
+    let session = SessionId::random();
+    let envelope = ActionEnvelope {
+        action_id: allocate_form_action_id(action),
+        event_kind: 3,
+        payload: serde_json::to_vec(&json!({ "message": "tokenless" })).expect("payload"),
+    };
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/_albedo/action")
+        .header("x-albedo-session", session.to_string())
+        .header("x-albedo-csrf", csrf.token_for(session))
+        .body(Body::from(
+            encode_action_envelope(&envelope).expect("envelope"),
+        ))
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [10, (peer >> 8) as u8, peer as u8, 7],
+            4000,
+        ))));
+    request
 }
 
 async fn dispatch(router: Router, request: Request<Body>) -> (StatusCode, Vec<u8>) {
@@ -491,4 +523,105 @@ async fn pure_rust_actions_also_replay_without_repeating_the_write() {
     .await;
     assert_ne!(status, StatusCode::OK, "corrupt replay must fail closed");
     assert_eq!(count(&server.db, "guestbook").await, 1);
+}
+
+#[tokio::test]
+async fn tokenless_no_effect_actions_leave_no_admission_rows() {
+    for pooled in [false, true] {
+        let server = start(pooled, None).await;
+        for peer in 0..200 {
+            let (status, body) = dispatch(
+                server.router.clone(),
+                tokenless_request(&server.csrf, "noop", peer),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        }
+        let admissions = count(&server.db, "albedo_action_admissions").await;
+        let results = count(&server.db, "albedo_workflow_results").await;
+        assert_eq!((admissions, results), (0, 0), "pooled={pooled}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokenless_no_effect_action_does_not_wait_for_the_writer() {
+    for pooled in [false, true] {
+        let server = start(pooled, None).await;
+        // This substrate has its own connection: BEGIN IMMEDIATE blocks the
+        // server's writer through SQLite, rather than a shared Rust mutex.
+        let tx = server.db.begin().await.expect("hold database write lock");
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            server
+                .router
+                .clone()
+                .oneshot(tokenless_request(&server.csrf, "noop", 0)),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        tx.rollback().await.expect("release write lock");
+        let response = response
+            .expect("tokenless no-op must not wait for the writer")
+            .expect("HTTP response");
+        assert_eq!(response.status(), StatusCode::OK, "pooled={pooled}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "pooled={pooled}: {elapsed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tokenless_writes_and_jobs_stay_atomic() {
+    let server = start(true, None).await;
+    let (status, body) = dispatch(
+        server.router.clone(),
+        tokenless_request(&server.csrf, "invalid_queue", 0),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(String::from_utf8_lossy(&body).contains("does not declare"));
+    assert_eq!(count(&server.db, "guestbook").await, 0);
+    assert_eq!(count(&server.db, "albedo_jobs").await, 0);
+    assert_eq!(count(&server.db, "albedo_workflow_results").await, 0);
+}
+
+#[tokio::test]
+async fn tokenless_writes_and_jobs_commit_together() {
+    let server = start(true, None).await;
+    let (status, body) = dispatch(
+        server.router.clone(),
+        tokenless_request(&server.csrf, "valid_queue", 0),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(count(&server.db, "guestbook").await, 1);
+    assert_eq!(count(&server.db, "albedo_jobs").await, 1);
+    assert_eq!(count(&server.db, "albedo_action_admissions").await, 0);
+    assert_eq!(count(&server.db, "albedo_workflow_results").await, 0);
+}
+
+#[tokio::test]
+async fn tokenless_enqueue_storage_failure_rolls_back_staged_writes() {
+    let server = start(true, None).await;
+    server
+        .db
+        .migrate(
+            "CREATE TRIGGER reject_job BEFORE INSERT ON albedo_jobs \
+             BEGIN SELECT RAISE(ABORT, 'job rejected'); END",
+        )
+        .await
+        .expect("install enqueue fault");
+    let (status, body) = dispatch(
+        server.router.clone(),
+        tokenless_request(&server.csrf, "valid_queue", 0),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(String::from_utf8_lossy(&body).contains("job rejected"));
+    assert_eq!(count(&server.db, "guestbook").await, 0);
+    assert_eq!(count(&server.db, "albedo_jobs").await, 0);
+    assert_eq!(count(&server.db, "albedo_action_admissions").await, 0);
+    assert_eq!(count(&server.db, "albedo_workflow_results").await, 0);
 }

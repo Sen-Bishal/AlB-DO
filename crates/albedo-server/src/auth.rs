@@ -178,6 +178,16 @@ impl AuthRuntime {
     /// `SameSite` having any say, which is the protection the cookie form is
     /// chosen for. API clients get a token through a login endpoint, not by
     /// borrowing this one.
+    /// R1b · the presented session cookie's hash, without touching the
+    /// database — what a live open registers under before it resolves.
+    #[must_use]
+    pub fn presented_hash(&self, headers: &HeaderMap) -> Option<TokenHash> {
+        if self.registry.is_empty() {
+            return None;
+        }
+        self.presented_token(headers).map(|token| token.hash())
+    }
+
     fn presented_token(&self, headers: &HeaderMap) -> Option<SessionToken> {
         let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
         let value = dom_render_compiler::auth::read_cookie(raw, &self.registry.session_cookie)?;

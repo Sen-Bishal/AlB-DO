@@ -381,6 +381,24 @@ async fn a_role_gated_route_admits_only_holders_on_every_door() {
             );
         }
 
+        // Negotiation hints and a guessed transport session must not bypass
+        // the render gate that precedes the WebTransport bridge.
+        let mut request = client
+            .get(format!("{base}/payroll"))
+            .header("x-albedo-wt-session", "00000000-0000-0000-0000-000000000001")
+            .header("x-albedo-wt-prefer", "webtransport")
+            .header("x-forwarded-proto", "h3");
+        if let Some(cookies) = &cookies {
+            request = request.header("cookie", cookies);
+        }
+        let response = request.send().await.expect("transport-hinted page");
+        assert_eq!(response.status(), page, "{who}: transport-hinted gate");
+        if page == StatusCode::FORBIDDEN {
+            assert_eq!(response.headers()["vary"], "Cookie");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert!(!response.text().await.expect("refusal body").contains("payroll"));
+        }
+
         // ── the live lane, with the public route as the control ──
         let (ok, denied) = subscribe(&client, &base, cookies.as_deref(), &["/", "/payroll"]).await;
         assert_eq!(ok, lane_ok, "{who}: the live lane grants");

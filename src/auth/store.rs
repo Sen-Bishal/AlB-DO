@@ -26,9 +26,11 @@
 //!   leaves two live sessions for one login if the process dies between them.
 
 use crate::auth::principal::{Principal, PrincipalId};
-use crate::auth::schema::{ACCOUNTS, CREDENTIALS, ROLES, SESSIONS, USERS};
+use crate::auth::schema::{
+    ACCOUNTS, AUTHORITY, AUTHORITY_CLOCK, CREDENTIALS, ROLES, SESSIONS, USERS,
+};
 use crate::auth::session::{SessionRecord, SessionRejection, SessionToken, TokenHash};
-use crate::forge::substrate::DataSubstrate;
+use crate::forge::substrate::{DataSubstrate, Transaction};
 use crate::forge::value::{Row, SqlValue, SubstrateError};
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
@@ -117,7 +119,8 @@ pub async fn resolve_session(
                  (SELECT group_concat(a.provider, ',') FROM {ACCOUNTS} a \
                   WHERE a.principal = s.principal), \
                  (SELECT group_concat(r.role, ',') FROM {ROLES} r \
-                  WHERE r.principal = s.principal) \
+                  WHERE r.principal = s.principal), \
+                 (SELECT x.epoch FROM {AUTHORITY} x WHERE x.principal = s.principal) \
                  FROM {SESSIONS} s JOIN {USERS} u ON u.principal = s.principal \
                  WHERE s.token_hash = ?1"
             ),
@@ -165,6 +168,10 @@ pub async fn resolve_session(
         claims: JsonMap::new(),
         // R1a · every granted row; the server narrows to the declared roles.
         roles: provider_list(optional_text_at(row, 7).as_deref()),
+        // R1b · read in the same snapshot as the roles, so a connection's
+        // admitted epoch always describes the roles it was admitted with.
+        authority_epoch: optional_int_at(row, 8).unwrap_or(0),
+        session_expires_at: Some(expires_at),
     })))
 }
 
@@ -361,13 +368,49 @@ pub async fn revoke_session(db: &dyn DataSubstrate, token: &TokenHash) -> Result
 ///
 /// # Errors
 /// [`StoreError`] on substrate failure.
-pub async fn revoke_all_sessions(db: &dyn DataSubstrate, principal: &PrincipalId) -> Result<u64> {
-    Ok(db
-        .execute(
-            &format!("DELETE FROM {SESSIONS} WHERE principal = ?1"),
-            &[SqlValue::Text(principal.as_str().to_string())],
+///
+/// R1b · returns the hashes it deleted, read in the same transaction. A caller
+/// closing live connections closes exactly these — never "every connection of
+/// this principal", which would also catch a session minted after this commit.
+pub async fn revoke_all_sessions(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+) -> Result<Vec<TokenHash>> {
+    let tx = db.begin().await?;
+    let deleted = delete_sessions_returning(
+        tx.as_ref(),
+        "principal = ?1",
+        &[SqlValue::Text(principal.as_str().to_string())],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(deleted)
+}
+
+/// R1b · delete the sessions matching `filter` and return their hashes, inside
+/// the caller's transaction. Select-then-delete under `BEGIN IMMEDIATE` sees no
+/// interleaved insert, so the returned set is exactly what went.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure or a non-text hash.
+pub async fn delete_sessions_returning(
+    tx: &dyn Transaction,
+    filter: &str,
+    params: &[SqlValue],
+) -> Result<Vec<TokenHash>> {
+    let rows = tx
+        .query(
+            &format!("SELECT token_hash FROM {SESSIONS} WHERE {filter}"),
+            params,
         )
-        .await?)
+        .await?;
+    let mut hashes = Vec::with_capacity(rows.rows.len());
+    for row in &rows.rows {
+        hashes.push(TokenHash::from_stored(text_at(row, 0, "sessions.token_hash")?));
+    }
+    tx.execute(&format!("DELETE FROM {SESSIONS} WHERE {filter}"), params)
+        .await?;
+    Ok(hashes)
 }
 
 /// Drop sessions whose expiry has passed.
@@ -479,8 +522,13 @@ pub async fn principals_after(
 
 /// # Errors
 /// [`StoreError`] on substrate failure.
+///
+/// R1b · the principal's authority row is **bumped, not deleted**, in the same
+/// transaction, so a running server's sweep closes their live connections. The
+/// row stays as a tombstone.
 pub async fn delete_principal(db: &dyn DataSubstrate, principal: &PrincipalId) -> Result<()> {
     let tx = db.begin().await?;
+    bump_authority_in_transaction(tx.as_ref(), principal, crate::aperture::now_ms()).await?;
     for table in [SESSIONS, CREDENTIALS, ACCOUNTS, ROLES, USERS] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE principal = ?1"),
@@ -683,6 +731,8 @@ fn build_principal(id: PrincipalId, provider: &str, profile: &ProviderProfile) -
         providers: Vec::new(),
         claims: profile.claims.clone(),
         roles: Vec::new(),
+        authority_epoch: 0,
+        session_expires_at: None,
     }
 }
 
@@ -721,7 +771,8 @@ pub async fn load_principal(db: &dyn DataSubstrate, id: &PrincipalId) -> Result<
                  (SELECT group_concat(a.provider, ',') FROM {ACCOUNTS} a \
                   WHERE a.principal = u.principal), \
                  (SELECT group_concat(r.role, ',') FROM {ROLES} r \
-                  WHERE r.principal = u.principal) \
+                  WHERE r.principal = u.principal), \
+                 (SELECT x.epoch FROM {AUTHORITY} x WHERE x.principal = u.principal) \
                  FROM {USERS} u WHERE u.principal = ?1"
             ),
             &[SqlValue::Text(id.as_str().to_string())],
@@ -739,6 +790,10 @@ pub async fn load_principal(db: &dyn DataSubstrate, id: &PrincipalId) -> Result<
         providers: provider_list(optional_text_at(row, 3).as_deref()),
         claims: JsonMap::new(),
         roles: provider_list(optional_text_at(row, 4).as_deref()),
+        authority_epoch: optional_int_at(row, 5).unwrap_or(0),
+        // Sessionless: nothing here expires, and nothing here is a live
+        // connection (R1b § 2).
+        session_expires_at: None,
     }))
 }
 
@@ -769,7 +824,48 @@ pub async fn grant_role(
     granted_by: Option<&str>,
     now_ms: i64,
 ) -> Result<GrantOutcome> {
+    Ok(grant_role_changed(db, principal, role, granted_by, now_ms).await?.0)
+}
+
+/// [`grant_role`], also returning the principal's new authority epoch when the
+/// grant actually changed something — what an in-process caller closes stale
+/// live connections against.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn grant_role_changed(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+    role: &str,
+    granted_by: Option<&str>,
+    now_ms: i64,
+) -> Result<(GrantOutcome, Option<i64>)> {
     let tx = db.begin().await?;
+    match grant_role_in_transaction(tx.as_ref(), principal, role, granted_by, now_ms).await {
+        Ok(result) => {
+            tx.commit().await?;
+            Ok(result)
+        }
+        Err(err) => {
+            let _ = tx.rollback().await;
+            Err(err)
+        }
+    }
+}
+
+/// R1b · the grant, inside a caller's transaction (T-0027 runs it in the action
+/// commit). An actual grant bumps the authority epoch in the same transaction;
+/// an idempotent one changes nothing and keeps the original provenance.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn grant_role_in_transaction(
+    tx: &dyn Transaction,
+    principal: &PrincipalId,
+    role: &str,
+    granted_by: Option<&str>,
+    now_ms: i64,
+) -> Result<(GrantOutcome, Option<i64>)> {
     let exists = tx
         .query(
             &format!("SELECT 1 FROM {USERS} WHERE principal = ?1"),
@@ -777,8 +873,7 @@ pub async fn grant_role(
         )
         .await?;
     if exists.rows.is_empty() {
-        tx.commit().await?;
-        return Ok(GrantOutcome::NoSuchPrincipal);
+        return Ok((GrantOutcome::NoSuchPrincipal, None));
     }
     let inserted = tx
         .execute(
@@ -794,12 +889,11 @@ pub async fn grant_role(
             ],
         )
         .await?;
-    tx.commit().await?;
-    Ok(if inserted == 0 {
-        GrantOutcome::AlreadyHeld
-    } else {
-        GrantOutcome::Granted
-    })
+    if inserted == 0 {
+        return Ok((GrantOutcome::AlreadyHeld, None));
+    }
+    let (epoch, _) = bump_authority_in_transaction(tx, principal, now_ms).await?;
+    Ok((GrantOutcome::Granted, Some(epoch)))
 }
 
 /// R1a · revoke `role` from `principal`. `true` when a grant was removed.
@@ -814,7 +908,44 @@ pub async fn revoke_role(
     principal: &PrincipalId,
     role: &str,
 ) -> Result<bool> {
-    let removed = db
+    Ok(revoke_role_changed(db, principal, role).await?.is_some())
+}
+
+/// [`revoke_role`], returning the new authority epoch when a grant was removed.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn revoke_role_changed(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+    role: &str,
+) -> Result<Option<i64>> {
+    let tx = db.begin().await?;
+    match revoke_role_in_transaction(tx.as_ref(), principal, role, crate::aperture::now_ms()).await
+    {
+        Ok(result) => {
+            tx.commit().await?;
+            Ok(result)
+        }
+        Err(err) => {
+            let _ = tx.rollback().await;
+            Err(err)
+        }
+    }
+}
+
+/// R1b · the revoke, inside a caller's transaction. Bumps the epoch only when a
+/// grant was actually removed.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn revoke_role_in_transaction(
+    tx: &dyn Transaction,
+    principal: &PrincipalId,
+    role: &str,
+    now_ms: i64,
+) -> Result<Option<i64>> {
+    let removed = tx
         .execute(
             &format!("DELETE FROM {ROLES} WHERE principal = ?1 AND role = ?2"),
             &[
@@ -823,7 +954,166 @@ pub async fn revoke_role(
             ],
         )
         .await?;
-    Ok(removed > 0)
+    if removed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(bump_authority_in_transaction(tx, principal, now_ms).await?.0))
+}
+
+/// R1b · allocate the next clock `seq` and bump `principal`'s epoch, in the
+/// caller's transaction. Returns `(epoch, seq)`.
+///
+/// The clock row is never deleted, so `seq` never repeats even when authority
+/// rows are; `BEGIN IMMEDIATE` serialises writers across processes.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure, or when the clock row is missing.
+pub async fn bump_authority_in_transaction(
+    tx: &dyn Transaction,
+    principal: &PrincipalId,
+    now_ms: i64,
+) -> Result<(i64, i64)> {
+    let bumped = tx
+        .execute(
+            &format!("UPDATE {AUTHORITY_CLOCK} SET seq = seq + 1 WHERE id = 1"),
+            &[],
+        )
+        .await?;
+    if bumped != 1 {
+        return Err(StoreError::Corrupt(format!("{AUTHORITY_CLOCK} has no clock row")));
+    }
+    let seq_rows = tx
+        .query(&format!("SELECT seq FROM {AUTHORITY_CLOCK} WHERE id = 1"), &[])
+        .await?;
+    let seq = seq_rows
+        .rows
+        .first()
+        .map(|row| int_at(row, 0, "authority_clock.seq"))
+        .transpose()?
+        .ok_or_else(|| StoreError::Corrupt(format!("{AUTHORITY_CLOCK} has no clock row")))?;
+    let who = SqlValue::Text(principal.as_str().to_string());
+    tx.execute(
+        &format!(
+            "INSERT INTO {AUTHORITY} (principal, epoch, seq, changed_at) VALUES (?1, 1, ?2, ?3) \
+             ON CONFLICT(principal) DO UPDATE SET epoch = epoch + 1, seq = excluded.seq, \
+             changed_at = excluded.changed_at"
+        ),
+        &[who.clone(), SqlValue::Integer(seq), SqlValue::Integer(now_ms)],
+    )
+    .await?;
+    let epoch_rows = tx
+        .query(
+            &format!("SELECT epoch FROM {AUTHORITY} WHERE principal = ?1"),
+            std::slice::from_ref(&who),
+        )
+        .await?;
+    let epoch = epoch_rows
+        .rows
+        .first()
+        .map(|row| int_at(row, 0, "authority.epoch"))
+        .transpose()?
+        .ok_or_else(|| StoreError::Corrupt("authority row vanished in its transaction".into()))?;
+    Ok((epoch, seq))
+}
+
+/// One authority change the sweep reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityChange {
+    /// Whose authority changed.
+    pub principal: String,
+    /// Their epoch after the change.
+    pub epoch: i64,
+    /// The clock value of the change.
+    pub seq: i64,
+}
+
+/// R1b · every principal whose authority changed after `seq`, in `seq` order.
+/// One row per principal (coalesced), which is enough: closing compares
+/// "admitted below this epoch".
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn authority_changes_after(
+    db: &dyn DataSubstrate,
+    seq: i64,
+) -> Result<Vec<AuthorityChange>> {
+    let rows = db
+        .query(
+            &format!("SELECT principal, epoch, seq FROM {AUTHORITY} WHERE seq > ?1 ORDER BY seq"),
+            &[SqlValue::Integer(seq)],
+        )
+        .await?;
+    rows.rows
+        .iter()
+        .map(|row| {
+            Ok(AuthorityChange {
+                principal: text_at(row, 0, "authority.principal")?,
+                epoch: int_at(row, 1, "authority.epoch")?,
+                seq: int_at(row, 2, "authority.seq")?,
+            })
+        })
+        .collect()
+}
+
+/// R1b · the clock's current value — the sweep's starting watermark, read
+/// before the server accepts any connection.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure or a missing clock row.
+pub async fn authority_clock(db: &dyn DataSubstrate) -> Result<i64> {
+    let rows = db
+        .query(&format!("SELECT seq FROM {AUTHORITY_CLOCK} WHERE id = 1"), &[])
+        .await?;
+    rows.rows
+        .first()
+        .map(|row| int_at(row, 0, "authority_clock.seq"))
+        .transpose()?
+        .ok_or_else(|| StoreError::Corrupt(format!("{AUTHORITY_CLOCK} has no clock row")))
+}
+
+/// What a live connection's re-validation reads (R1b § 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveCheck {
+    /// The session row exists, belongs to the principal, and has not expired.
+    pub session_live: bool,
+    /// The principal's current authority epoch (0 with no row).
+    pub epoch: i64,
+}
+
+/// R1b · one indexed query: is `token`'s session still live, and what is
+/// `principal`'s epoch now?
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn live_check(
+    db: &dyn DataSubstrate,
+    token: &TokenHash,
+    principal: &PrincipalId,
+    now_ms: i64,
+) -> Result<LiveCheck> {
+    let rows = db
+        .query(
+            &format!(
+                "SELECT \
+                 (SELECT COUNT(*) FROM {SESSIONS} WHERE token_hash = ?1 AND principal = ?2 \
+                  AND expires_at > ?3), \
+                 (SELECT epoch FROM {AUTHORITY} WHERE principal = ?2)"
+            ),
+            &[
+                SqlValue::Text(token.as_str().to_string()),
+                SqlValue::Text(principal.as_str().to_string()),
+                SqlValue::Integer(now_ms),
+            ],
+        )
+        .await?;
+    let row = rows
+        .rows
+        .first()
+        .ok_or_else(|| StoreError::Corrupt("live check returned no row".into()))?;
+    Ok(LiveCheck {
+        session_live: optional_int_at(row, 0).unwrap_or(0) > 0,
+        epoch: optional_int_at(row, 1).unwrap_or(0),
+    })
 }
 
 /// One stored grant, with the holder's email for a human reading a listing.
@@ -993,10 +1283,14 @@ pub async fn link_account(
 }
 
 /// What disconnecting a provider did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnlinkOutcome {
-    /// Disconnected; the number of *other* sessions it had opened, now ended.
-    Unlinked { sessions_ended: u64 },
+    /// Disconnected; the number of *other* sessions it had opened, now ended,
+    /// and (R1b) exactly which ones, for closing their live connections.
+    Unlinked {
+        sessions_ended: u64,
+        ended: Vec<TokenHash>,
+    },
     /// Refused: it is the only way this principal can sign in, and removing it
     /// would lock the account with its data inside.
     LastMethod,
@@ -1050,17 +1344,17 @@ pub async fn unlink_account(
         &[who.clone(), which.clone()],
     )
     .await?;
-    let sessions_ended = tx
-        .execute(
-            &format!(
-                "DELETE FROM {SESSIONS} WHERE principal = ?1 AND provider = ?2 \
-                 AND token_hash <> ?3"
-            ),
-            &[who, which, SqlValue::Text(keep.as_str().to_string())],
-        )
-        .await?;
+    let ended = delete_sessions_returning(
+        tx.as_ref(),
+        "principal = ?1 AND provider = ?2 AND token_hash <> ?3",
+        &[who, which, SqlValue::Text(keep.as_str().to_string())],
+    )
+    .await?;
     tx.commit().await?;
-    Ok(UnlinkOutcome::Unlinked { sessions_ended })
+    Ok(UnlinkOutcome::Unlinked {
+        sessions_ended: ended.len() as u64,
+        ended,
+    })
 }
 
 fn optional_param(value: Option<&str>) -> SqlValue {
@@ -1076,6 +1370,13 @@ pub(crate) fn text_at(row: &Row, idx: usize, what: &str) -> Result<String> {
 
 pub(crate) fn optional_text_at(row: &Row, idx: usize) -> Option<String> {
     row.get(idx).and_then(SqlValue::as_str).map(str::to_string)
+}
+
+pub(crate) fn optional_int_at(row: &Row, idx: usize) -> Option<i64> {
+    match row.get(idx) {
+        Some(SqlValue::Integer(value)) => Some(*value),
+        _ => None,
+    }
 }
 
 pub(crate) fn int_at(row: &Row, idx: usize, what: &str) -> Result<i64> {

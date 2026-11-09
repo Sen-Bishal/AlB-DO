@@ -63,6 +63,7 @@ pub mod health;
 pub mod inspector;
 pub(crate) mod jobs;
 pub mod lifecycle;
+pub mod live_authority;
 pub mod metrics;
 pub(crate) mod middleware;
 pub mod redirects;

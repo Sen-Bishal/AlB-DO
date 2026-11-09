@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use dom_render_compiler::ir::opcode::InternTableKind;
 use dom_render_compiler::manifest::schema::{
-    HydrationMode, RenderManifestV2, RouteManifest, TierBNode,
+    Admission, HydrationMode, RenderManifestV2, RouteManifest, TierBNode,
 };
 use dom_render_compiler::runtime::pipeline::{FourLaneRuntimePipeline, RuntimePipelineError};
 use dom_render_compiler::runtime::webtransport::{
@@ -87,6 +87,20 @@ pub struct StreamingAppState {
     dev_mode: bool,
     /// Hot reload within dev mode: whether the page gets the HMR client.
     hmr: bool,
+    /// R1b · the live-connection registry and the substrate re-validation
+    /// reads, so a WT bridge can bind its session to an identity. `None` (tests,
+    /// the undispatched standalone entry) leaves WT sessions unbound-and-ungated
+    /// as before: those entries carry no identity to bind.
+    live_authority: Option<LiveAuthorityWiring>,
+}
+
+/// R1b · what the WT bridge needs to bind a session.
+#[derive(Clone)]
+pub struct LiveAuthorityWiring {
+    /// The registry.
+    pub registry: Arc<crate::live_authority::LiveRegistry>,
+    /// The substrate, filled at boot.
+    pub db: Arc<std::sync::OnceLock<Arc<dyn dom_render_compiler::forge::DataSubstrate>>>,
 }
 
 impl StreamingAppState {
@@ -108,7 +122,15 @@ impl StreamingAppState {
             islands: crate::render::islands::IslandServices::default(),
             dev_mode: false,
             hmr: false,
+            live_authority: None,
         }
+    }
+
+    /// R1b · wire the live-connection registry (production).
+    #[must_use]
+    pub fn with_live_authority(mut self, wiring: LiveAuthorityWiring) -> Self {
+        self.live_authority = Some(wiring);
+        self
     }
 
     /// Enable dev mode on this streaming state so `build_stream` injects the
@@ -388,7 +410,7 @@ pub async fn streaming_handler(
     // pattern, so an exact-path lookup only resolves static routes. Dynamic
     // routes flow through `streaming_handler_with_match` instead, which
     // carries the matched pattern + params resolved by `CompiledRouter`.
-    serve_manifest_route(app, req, path, HashMap::new(), None).await
+    serve_manifest_route(app, req, path, HashMap::new(), None, None).await
 }
 
 /// Dispatch-path entry for the manifest-streaming arm. The caller has already
@@ -416,7 +438,7 @@ pub async fn streaming_handler_with_match(
         );
     }
     let principal = identity.principal().cloned();
-    serve_manifest_route(app, req, route_pattern, params, principal).await
+    serve_manifest_route(app, req, route_pattern, params, principal, Some(identity)).await
 }
 
 /// Shared body of the streaming handler. `route_pattern` is the manifest key to
@@ -437,6 +459,9 @@ async fn serve_manifest_route(
     // The whole principal, not only its id: the id keys topics, and the rest is
     // what a component reads as `user.email` and `user.providers`.
     principal: Option<dom_render_compiler::auth::Principal>,
+    // R1b · the whole identity (principal + token), for binding a WT session.
+    // `None` on the standalone entry, as `principal` is.
+    identity: Option<crate::auth::Identity>,
 ) -> Response {
     let path = req.uri().path().to_string();
     let negotiated_transport = negotiate_transport(&req, &app.transport);
@@ -444,6 +469,20 @@ async fn serve_manifest_route(
     let Some(route) = app.manifest.routes.get(route_pattern.as_str()) else {
         return not_found_response();
     };
+
+    // These handlers are also public standalone entry points. Enforce the
+    // gate before any transport bridge or render, even without the dispatcher
+    // that normally resolves identity and supplies configured login redirects.
+    match route
+        .auth
+        .admits(principal.as_ref().map(|who| who.roles.as_slice()))
+    {
+        Admission::Allowed => {}
+        Admission::Anonymous => {
+            return crate::handlers::auth_gate::refuse_anonymous(&route_pattern, None, false);
+        }
+        Admission::Forbidden => return crate::handlers::auth_gate::refuse_forbidden(),
+    }
 
     let transport_config = app.transport.clone();
     let mut response_transport = negotiated_transport;
@@ -467,14 +506,23 @@ async fn serve_manifest_route(
     if negotiated_transport == NegotiatedTransport::WebTransport {
         match maybe_webtransport_session_id(&req) {
             Some(session_id) => {
-                match stream_route_over_webtransport(
-                    route.clone(),
-                    ctx.clone(),
-                    app.clone(),
-                    session_id,
-                )
-                .await
-                {
+                // R1b · bind (or check) the session's identity before the bridge
+                // touches anything keyed by its UUID. A refusal falls back to
+                // SSE, which runs its own registration.
+                let bound = bind_webtransport_session(&app, session_id, identity.as_ref()).await;
+                let streamed = match bound {
+                    Ok(()) => {
+                        stream_route_over_webtransport(
+                            route.clone(),
+                            ctx.clone(),
+                            app.clone(),
+                            session_id,
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err),
+                };
+                match streamed {
                     Ok(()) => {
                         // `debug`, not `info`: this fires on every streamed
                         // route, so at `info` it buries the once-per-boot and
@@ -1245,6 +1293,27 @@ const WT_ASYNC_DRAIN_SLEEP_MS: u64 = 5;
 /// `StreamingAppState::with_pipeline`) and a `TierBOpcodeRegistry`
 /// (set on `SharedRenderServices.opcode_registry`). Without these the
 /// function errors out so the caller falls back to SSE.
+/// R1b · bind a WT session to the bridging request's identity. A no-op when the
+/// live registry is not wired (tests, the undispatched standalone entry).
+async fn bind_webtransport_session(
+    app: &StreamingAppState,
+    session_id: Uuid,
+    identity: Option<&crate::auth::Identity>,
+) -> Result<(), String> {
+    let (Some(wiring), Some(sessions)) =
+        (app.live_authority.as_ref(), app.webtransport_sessions.as_ref())
+    else {
+        return Ok(());
+    };
+    let anonymous = crate::auth::Identity::Anonymous;
+    let identity = identity.unwrap_or(&anonymous);
+    let db = wiring.db.get().cloned();
+    sessions
+        .bind(session_id, identity, &wiring.registry, db.as_deref())
+        .await
+        .map(|_| ())
+}
+
 async fn stream_route_over_webtransport(
     route: RouteManifest,
     ctx: TierBRequestContext,
@@ -2018,6 +2087,93 @@ mod tests {
         }
     }
 
+    fn role_gate_app(
+        auth: dom_render_compiler::manifest::schema::RouteAuth,
+    ) -> Arc<StreamingAppState> {
+        let mut route = route_manifest();
+        route.auth = auth;
+        route.tier_b.clear();
+        route.shell.body_open = "<body>PAYROLL SECRET".into();
+        let mut manifest = RenderManifestV2::legacy_defaults();
+        manifest.routes.insert("/stream".into(), route);
+        Arc::new(StreamingAppState::new(
+            Arc::new(manifest),
+            SharedRenderServices::default(),
+            StreamingTransportConfig::new(true, 443),
+            None,
+        ))
+    }
+
+    fn role_gate_request() -> Request {
+        Request::builder()
+            .uri("/stream")
+            .header(WT_SESSION_HEADER, "00000000-0000-0000-0000-000000000001")
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn standalone_streaming_never_serves_gated_content_to_anonymous_callers() {
+        use dom_render_compiler::manifest::schema::RouteAuth;
+        for (auth, expected) in [
+            (RouteAuth::Public, StatusCode::OK),
+            (RouteAuth::Required, StatusCode::UNAUTHORIZED),
+            (
+                RouteAuth::Roles(vec!["payroll".into()]),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let response = streaming_handler(State(role_gate_app(auth)), role_gate_request())
+                .await
+                .into_response();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                body.windows(b"PAYROLL SECRET".len())
+                    .any(|w| w == b"PAYROLL SECRET"),
+                expected == StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_dispatched_streaming_applies_role_admission_before_the_transport_bridge() {
+        use dom_render_compiler::auth::{Principal, PrincipalId, SessionToken};
+        use dom_render_compiler::manifest::schema::RouteAuth;
+        for (held, expected) in [
+            (Vec::new(), StatusCode::FORBIDDEN),
+            (vec!["payroll".to_string()], StatusCode::OK),
+        ] {
+            let mut principal = Principal::new(PrincipalId::mint(), "password");
+            principal.roles = held;
+            let identity = crate::auth::Identity::Authenticated {
+                principal: Box::new(principal),
+                token: SessionToken::mint().hash(),
+            };
+            let response = streaming_handler_with_match(
+                role_gate_app(RouteAuth::Roles(vec!["payroll".into()])),
+                role_gate_request(),
+                "/stream".into(),
+                HashMap::new(),
+                identity,
+            )
+            .await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                body.windows(b"PAYROLL SECRET".len())
+                    .any(|w| w == b"PAYROLL SECRET"),
+                expected == StatusCode::OK
+            );
+        }
+    }
+
     #[test]
     fn test_negotiate_transport_prefers_sse_when_wt_disabled() {
         let req = test_request(
@@ -2311,6 +2467,9 @@ mod tests {
             session_id,
             remote_addr: "127.0.0.1:4433".parse().unwrap(),
             stream_senders: [control_tx, shell_tx, patch_tx, prefetch_tx],
+            binding: Default::default(),
+            gate: Default::default(),
+            connection: None,
         });
 
         // Build a minimal pipeline with one async-capable component so
@@ -2441,6 +2600,9 @@ mod tests {
             session_id,
             remote_addr: "127.0.0.1:4433".parse().unwrap(),
             stream_senders: [control_tx, shell_tx, patch_tx, prefetch_tx],
+            binding: Default::default(),
+            gate: Default::default(),
+            connection: None,
         });
 
         // Build a pipeline + opcode registry just so
@@ -2566,6 +2728,9 @@ mod tests {
             session_id,
             remote_addr: "127.0.0.1:4433".parse().unwrap(),
             stream_senders: [control_tx, shell_tx, patch_tx, prefetch_tx],
+            binding: Default::default(),
+            gate: Default::default(),
+            connection: None,
         });
 
         let graph = ComponentGraph::new();
@@ -2645,6 +2810,9 @@ mod tests {
             session_id,
             remote_addr: "127.0.0.1:4433".parse().unwrap(),
             stream_senders: [control_tx, shell_tx, patch_tx, prefetch_tx],
+            binding: Default::default(),
+            gate: Default::default(),
+            connection: None,
         });
 
         let app = StreamingAppState::new(

@@ -256,9 +256,26 @@ pub struct Lane {
     /// a session row reaches the lane on its own. So every revocation ends the
     /// lanes it covers — see [`PhosphorState::end_lanes_where`].
     principal: crate::auth::Identity,
+    /// R1b · this lane's live-registry entry. `None` only for lanes built
+    /// without a registry (unit tests). Closing it kills the lane and drops its
+    /// subscriptions; every patch handoff and every subscribe checks it.
+    live: Option<Arc<crate::live_authority::LiveEntry>>,
 }
 
 impl Lane {
+    /// R1b · whether the lane's authority has been revoked.
+    fn revoked(&self) -> bool {
+        self.live.as_ref().is_some_and(|entry| !entry.admits())
+    }
+
+    /// Drop every route subscription this lane holds.
+    fn drop_routes(&self) {
+        let routes = std::mem::take(&mut *self.routes.lock().expect("phosphor route table poisoned"));
+        for (_, sub) in routes {
+            sub.registry.cleanup_session(sub.session);
+        }
+    }
+
     /// AUTH · R2 — who this lane belongs to.
     ///
     /// The value [`RouteAuthority::authorize_route`] will consult in P1, when a
@@ -349,6 +366,9 @@ pub async fn serve_trunk(
     // holds the request headers and the live runtime, and one resolution per
     // request is what keeps a page and its live lane from disagreeing.
     principal: crate::auth::Identity,
+    // R1b · the lane's registry handle, already re-validated by the caller.
+    // Owned by the trunk stream, so the entry lives exactly as long as the lane.
+    live: Option<crate::live_authority::LiveHandle>,
 ) -> Response<Body> {
     if phosphor.lanes.len() >= MAX_LANES {
         let mut response = Response::new(Body::from("phosphor lane limit reached"));
@@ -369,8 +389,20 @@ pub async fn serve_trunk(
         budget: Mutex::new(TokenBucket::new()),
         identity,
         principal,
+        live: live.as_ref().map(|handle| handle.entry().clone()),
     });
-    phosphor.lanes.insert(lane_id.clone(), lane);
+    if let Some(handle) = &live {
+        // Closing kills the lane at once and drops its subscriptions, polled or
+        // not. A `Weak` keeps the entry from holding the lane alive.
+        let weak = Arc::downgrade(&lane);
+        handle.entry().on_close(move || {
+            if let Some(lane) = weak.upgrade() {
+                lane.kill.notify_one();
+                lane.drop_routes();
+            }
+        });
+    }
+    phosphor.lanes.insert(lane_id.clone(), lane.clone());
 
     // Dev events merge straight from the registries' broadcast channels —
     // they fan out per-subscriber already, so they never touch the trunk
@@ -384,6 +416,7 @@ pub async fn serve_trunk(
 
     let stream = async_stream::stream! {
         let _guard = guard;
+        let _live = live;
         let mut event_id: u64 = 0;
 
         yield Ok::<_, Infallible>(
@@ -399,6 +432,10 @@ pub async fn serve_trunk(
                     let Some(TrunkEvent::Patch { route, nonce, frame }) = event else {
                         break; // every sender dropped — lane torn down
                     };
+                    // R1b · handoff admission: the load right before the yield.
+                    if lane.revoked() {
+                        break;
+                    }
                     event_id += 1;
                     yield Ok::<_, Infallible>(patch_event(&route, nonce.as_deref(), &frame, event_id));
                 }
@@ -588,6 +625,12 @@ async fn subscribe_routes(
             outcome.denied.push(add.p);
             continue;
         };
+        // R1b · the lane may have been revoked during that await. Its identity
+        // is stale, so nothing it authorized may be installed.
+        if lane.revoked() {
+            outcome.denied.push(add.p);
+            continue;
+        }
 
         // ── step 2: circuit + atomic seed snapshot, under the table lock ──
         let (seed_instructions, seed_values, start_gate) = {
@@ -653,6 +696,14 @@ async fn subscribe_routes(
                     push_or_kill(lane, &add.p, add.n.clone(), frame);
                 }
             }
+        }
+
+        // R1b · a revocation that landed while this subscribe was installing
+        // (the close hook may have run before step 2) leaves nothing behind.
+        if lane.revoked() {
+            lane.drop_routes();
+            outcome.denied.push(add.p);
+            continue;
         }
 
         // ── step 5: open the gate ──
@@ -796,6 +847,7 @@ mod tests {
                 budget: Mutex::new(TokenBucket::new()),
                 identity: None,
                 principal: crate::auth::Identity::Anonymous,
+                live: None,
             }),
             rx,
         )
@@ -829,6 +881,7 @@ mod tests {
                 budget: Mutex::new(TokenBucket::new()),
                 identity: None,
                 principal: identity,
+                live: None,
             });
             state.lanes.insert(name.to_string(), lane);
         }
@@ -1116,6 +1169,7 @@ mod tests {
             DevTap::none(),
             None,
             crate::auth::Identity::Anonymous,
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1153,6 +1207,7 @@ mod tests {
                     budget: Mutex::new(TokenBucket::new()),
                     identity: None,
                     principal: crate::auth::Identity::Anonymous,
+                    live: None,
                 }),
             );
         }
@@ -1161,6 +1216,7 @@ mod tests {
             DevTap::none(),
             None,
             crate::auth::Identity::Anonymous,
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

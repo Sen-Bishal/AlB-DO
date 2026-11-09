@@ -19,11 +19,39 @@ use uuid::Uuid;
 
 const WEBTRANSPORT_STREAM_COUNT: usize = 4;
 
+/// R1b · the QUIC application close code for a session whose authority ended.
+pub const WT_CLOSE_REVOKED: u32 = 0x4152; // "AR"
+
+/// R1b · who a WT session belongs to. A session is accepted before any HTTP
+/// bridge names an identity, so it starts unbound; the first bridge binds it.
+#[derive(Default)]
+pub enum WtBinding {
+    /// No bridge yet. Only control traffic (`stream_open`, `session_init`,
+    /// keep-alives) may be written.
+    #[default]
+    Unbound,
+    /// Bound by the first bridge. `token` is `None` for an anonymous bridge.
+    Bound {
+        /// The binding identity's session token hash.
+        token: Option<dom_render_compiler::auth::session::TokenHash>,
+        /// The session's live-registry entry. Owned here, so it lives exactly
+        /// as long as the QUIC session, not the bridge request.
+        live: crate::live_authority::LiveHandle,
+    },
+}
+
 #[derive(Clone)]
 pub struct WebTransportSessionHandle {
     pub session_id: Uuid,
     pub remote_addr: SocketAddr,
     pub stream_senders: [mpsc::Sender<bytes::Bytes>; WEBTRANSPORT_STREAM_COUNT],
+    /// R1b · the identity binding (ownership checks on bind).
+    pub binding: Arc<Mutex<WtBinding>>,
+    /// R1b · the bound session's live entry, set once on the first bind. The
+    /// protected writers read it lock-free on every frame.
+    pub gate: Arc<std::sync::OnceLock<Arc<crate::live_authority::LiveEntry>>>,
+    /// R1b · the connection, so a revocation can close it from the server side.
+    pub connection: Option<Connection>,
 }
 
 #[derive(Clone, Default)]
@@ -106,6 +134,70 @@ impl WebTransportSessionRegistry {
                 stream_slot, session_id
             ))
         })
+    }
+
+    /// R1b · bind `session_id` to `identity` on its first bridge, or check a
+    /// later bridge presents the same identity. Returns the session's live entry,
+    /// re-validated, when it admits; an error refuses the bridge.
+    ///
+    /// Binding once is what makes the UUID safe to trust downstream (the CSRF
+    /// table, the broadcast subscription, the output senders): a second bridge
+    /// presenting the same UUID under another identity is refused here, before
+    /// any of those are touched.
+    pub async fn bind(
+        &self,
+        session_id: Uuid,
+        identity: &crate::auth::Identity,
+        live: &Arc<crate::live_authority::LiveRegistry>,
+        db: Option<&dyn dom_render_compiler::forge::DataSubstrate>,
+    ) -> Result<Arc<crate::live_authority::LiveEntry>, String> {
+        let (binding, gate, connection) = {
+            let sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "WT session registry lock poisoned".to_string())?;
+            let handle = sessions
+                .get(&session_id)
+                .ok_or_else(|| format!("WT session '{session_id}' not found"))?;
+            (handle.binding.clone(), handle.gate.clone(), handle.connection.clone())
+        };
+        let presented = identity.token().cloned();
+        let (entry, fresh) = {
+            let mut slot = binding
+                .lock()
+                .map_err(|_| "WT binding lock poisoned".to_string())?;
+            match &*slot {
+                WtBinding::Bound { token, live } => {
+                    if *token != presented {
+                        return Err("WT session is bound to another identity".to_string());
+                    }
+                    (live.entry().clone(), false)
+                }
+                WtBinding::Unbound => {
+                    let handle = live.register(crate::live_authority::LiveKind::WebTransport, identity);
+                    let entry = handle.entry().clone();
+                    let _ = gate.set(entry.clone());
+                    *slot = WtBinding::Bound {
+                        token: presented,
+                        live: handle,
+                    };
+                    (entry, true)
+                }
+            }
+        };
+        if fresh {
+            if let Some(connection) = connection {
+                entry.on_close(move || {
+                    connection.close(WT_CLOSE_REVOKED.into(), b"authority revoked");
+                });
+            }
+            live.revalidate(&entry, db).await;
+        }
+        if entry.admits() {
+            Ok(entry)
+        } else {
+            Err("WT session authority is no longer valid".to_string())
+        }
     }
 
     pub async fn send_json<T: Serialize + ?Sized>(
@@ -256,12 +348,18 @@ async fn handle_connecting(
     })?;
     let session_id = Uuid::new_v4();
     let remote_addr = connection.remote_address();
-    let stream_senders = spawn_stream_writers(connection.clone(), stream_buffer_capacity);
+    let binding = Arc::new(Mutex::new(WtBinding::Unbound));
+    let gate = Arc::new(std::sync::OnceLock::new());
+    let stream_senders =
+        spawn_stream_writers(connection.clone(), stream_buffer_capacity, gate.clone());
 
     sessions.insert(WebTransportSessionHandle {
         session_id,
         remote_addr,
         stream_senders: stream_senders.clone(),
+        binding: binding.clone(),
+        gate,
+        connection: Some(connection.clone()),
     });
 
     info!(
@@ -298,6 +396,9 @@ async fn handle_connecting(
     connection.closed().await;
     keepalive_task.abort();
     sessions.remove(&session_id);
+    // R1b · the live entry lives as long as the QUIC session: drop it now.
+    let ended = binding.lock().map(|mut slot| std::mem::take(&mut *slot));
+    drop(ended);
     if let Some(broadcast) = broadcast.as_ref() {
         // Eager broadcast cleanup keeps the subscriber map tight
         // even when a session never wrote (so lazy pruning during
@@ -320,21 +421,34 @@ async fn handle_connecting(
 fn spawn_stream_writers(
     connection: Connection,
     stream_buffer_capacity: usize,
+    gate: Arc<std::sync::OnceLock<Arc<crate::live_authority::LiveEntry>>>,
 ) -> [mpsc::Sender<bytes::Bytes>; WEBTRANSPORT_STREAM_COUNT] {
     let (control_tx, control_rx) = mpsc::channel(stream_buffer_capacity);
     let (shell_tx, shell_rx) = mpsc::channel(stream_buffer_capacity);
     let (patch_tx, patch_rx) = mpsc::channel(stream_buffer_capacity);
     let (prefetch_tx, prefetch_rx) = mpsc::channel(stream_buffer_capacity);
 
-    spawn_stream_writer(connection.clone(), WT_STREAM_SLOT_CONTROL, control_rx);
-    spawn_stream_writer(connection.clone(), WT_STREAM_SLOT_SHELL, shell_rx);
-    spawn_stream_writer(connection.clone(), WT_STREAM_SLOT_PATCHES, patch_rx);
-    spawn_stream_writer(connection, WT_STREAM_SLOT_PREFETCH, prefetch_rx);
+    // R1b · control traffic is unbound protocol traffic and is never gated;
+    // shell, patches and prefetch carry route data and are.
+    spawn_stream_writer(connection.clone(), WT_STREAM_SLOT_CONTROL, control_rx, None);
+    spawn_stream_writer(connection.clone(), WT_STREAM_SLOT_SHELL, shell_rx, Some(gate.clone()));
+    spawn_stream_writer(connection.clone(), WT_STREAM_SLOT_PATCHES, patch_rx, Some(gate.clone()));
+    spawn_stream_writer(connection, WT_STREAM_SLOT_PREFETCH, prefetch_rx, Some(gate));
 
     [control_tx, shell_tx, patch_tx, prefetch_tx]
 }
 
-fn spawn_stream_writer(connection: Connection, stream_slot: u8, mut rx: mpsc::Receiver<bytes::Bytes>) {
+/// Test seam (R1b AC 11): pause a protected writer after it dequeues a frame and
+/// before its admission load. `reached` fires, then it waits on `release`.
+pub static WRITER_PAUSE: std::sync::OnceLock<Arc<crate::live_authority::Pause>> =
+    std::sync::OnceLock::new();
+
+fn spawn_stream_writer(
+    connection: Connection,
+    stream_slot: u8,
+    mut rx: mpsc::Receiver<bytes::Bytes>,
+    gate: Option<Arc<std::sync::OnceLock<Arc<crate::live_authority::LiveEntry>>>>,
+) {
     tokio::spawn(async move {
         let mut stream = match connection.open_uni().await {
             Ok(stream) => stream,
@@ -357,6 +471,19 @@ fn spawn_stream_writer(connection: Connection, stream_slot: u8, mut rx: mpsc::Re
         debug!(stream_slot, "webtransport stream opened");
 
         while let Some(payload) = rx.recv().await {
+            if let Some(gate) = &gate {
+                if let Some(pause) = WRITER_PAUSE.get() {
+                    pause.reached.notify_one();
+                    pause.release.notified().await;
+                }
+                // R1b · handoff admission, at the final writer: the load right
+                // before the frame reaches the QUIC send stream.
+                // Unbound (`None`) admits nothing; bound, one atomic load.
+                let admitted = gate.get().is_some_and(|entry| entry.admits());
+                if !admitted {
+                    continue;
+                }
+            }
             if let Err(err) = write_framed_payload(&mut stream, &payload).await {
                 warn!(stream_slot, error = %err, "failed to write WT payload");
                 break;

@@ -375,3 +375,52 @@ async fn leftover_grants_of_an_undeclared_role_can_be_cleaned_up() {
     }
     assert_eq!(roles_of(&db_path, &id).await, ["payroll"]);
 }
+
+/// Upgrading an existing app must create the new table without losing its
+/// accounts or changing which database the operator selected.
+#[tokio::test]
+async fn role_commands_upgrade_a_database_without_the_roles_table() {
+    use dom_render_compiler::forge::DataSubstrate;
+    let (home, _work, app, db_path, id) = role_rig().await;
+    {
+        let db = LibSqlSubstrate::open_local(&db_path).await.expect("db");
+        db.execute("DROP TABLE albedo_roles", &[])
+            .await
+            .expect("simulate pre-role schema");
+    }
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "grant", id.as_str(), "payroll"]));
+    assert!(ok, "legacy database upgrade failed\n{text}");
+    assert_eq!(roles_of(&db_path, &id).await, ["payroll"]);
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "list", "--role", "payroll"]));
+    assert!(ok && text.contains(id.as_str()), "{text}");
+}
+
+/// A leftover grant is only permission to clean it up. It must neither allow
+/// a new grant nor turn a revoke for another person into a successful no-op.
+#[tokio::test]
+async fn leftover_cleanup_is_scoped_to_the_holder_and_never_allows_grant() {
+    let (home, _work, app, db_path, id) = role_rig().await;
+    let other = {
+        let db = LibSqlSubstrate::open_local(&db_path).await.expect("db");
+        dom_render_compiler::auth::store::grant_role(&db, &id, "retired", Some("cli"), NOW)
+            .await
+            .expect("leftover grant");
+        person(&db, "other", "other@example.com").await
+    };
+    for args in [
+        vec!["roles", "grant", id.as_str(), "retired"],
+        vec!["roles", "grant", other.as_str(), "retired"],
+        vec!["roles", "revoke", other.as_str(), "retired"],
+    ] {
+        let (ok, text) = run(albedo(home.path(), &app, &db_path).args(&args));
+        assert!(!ok && text.contains("retired"), "{args:?}\n{text}");
+        assert_eq!(roles_of(&db_path, &id).await, ["retired"]);
+        assert!(roles_of(&db_path, &other).await.is_empty());
+    }
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "revoke", id.as_str(), "retired"]));
+    assert!(ok && text.contains("leftover"), "{text}");
+    assert!(roles_of(&db_path, &id).await.is_empty());
+}

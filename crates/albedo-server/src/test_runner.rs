@@ -322,9 +322,37 @@ struct Host {
     jars: HashMap<String, Jar>,
     next_jar: u32,
     auth_cookie: String,
+    /// R1b · `grantRole` / `revokeRole`.
+    roles: crate::server::RoleControl,
 }
 
 impl Host {
+    /// `grantRole(user, role)` / `revokeRole(user, role)`. The principal comes
+    /// from the jar's current session, never from the email (emails are not
+    /// unique).
+    fn role(&mut self, payload: &Value) -> Result<Value, String> {
+        let jar = str_field(payload, "jar")?.to_string();
+        let role = str_field(payload, "role")?.to_string();
+        let grant = payload.get("grant").and_then(Value::as_bool).unwrap_or(true);
+        let call = if grant { "grantRole" } else { "revokeRole" };
+        let auth_cookie = self.auth_cookie.clone();
+        let Some(token) = self.jar(&jar)?.cookies.get(&auth_cookie).cloned() else {
+            return Err(format!("{call}(user, \"{role}\"): that user is signed out"));
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{auth_cookie}={token}")
+                .parse()
+                .map_err(|_| format!("{call}: the session cookie is not a header value"))?,
+        );
+        let roles = self.roles.clone();
+        self.runtime
+            .block_on(async move { roles.change(&headers, &role, grant).await })
+            .map(|_| Value::Null)
+            .map_err(|err| format!("{call}(user, \"{}\"): {err}", str_field(payload, "role").unwrap_or("")))
+    }
+
     fn jar(&mut self, id: &str) -> Result<&mut Jar, String> {
         self.jars
             .get_mut(id)
@@ -541,6 +569,7 @@ impl TestHost for Host {
             "jar" => Ok(Value::String(self.new_jar())),
             "request" => self.navigate(&payload),
             "auth" => self.auth(&payload),
+            "role" => self.role(&payload),
             "render" => self.renderers.borrow_mut().render(&payload),
             other => Err(format!("albedo test has no host call '{other}'")),
         }
@@ -686,6 +715,7 @@ fn run_file(
             .map_err(|err| format!("the app did not boot: {err}"))?;
         let router = server.router();
         let csrf = server.csrf_registry();
+        let roles = server.role_control();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let serving = runtime.spawn(server.run_until(
@@ -718,6 +748,7 @@ fn run_file(
             jars: HashMap::new(),
             next_jar: 0,
             auth_cookie: auth_cookie.to_string(),
+            roles,
         }));
         let filter = opts.name_filter.as_deref();
         for (index, case) in cases.iter().enumerate() {

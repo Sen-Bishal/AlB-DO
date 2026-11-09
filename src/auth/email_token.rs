@@ -31,9 +31,9 @@
 //! `albedo_` prefix still reserves both names, so an app cannot declare them.
 
 use crate::auth::principal::PrincipalId;
-use crate::auth::schema::{ACCOUNTS, CREDENTIALS, SESSIONS, USERS};
-use crate::auth::session::SessionToken;
-use crate::auth::store::{optional_text_at, text_at, StoreError};
+use crate::auth::schema::{ACCOUNTS, CREDENTIALS, USERS};
+use crate::auth::session::{SessionToken, TokenHash};
+use crate::auth::store::{delete_sessions_returning, optional_text_at, text_at, StoreError};
 use crate::forge::substrate::DataSubstrate;
 use crate::forge::value::SqlValue;
 
@@ -302,6 +302,25 @@ pub async fn reset_password(
     secret_hash: &str,
     now_ms: i64,
 ) -> Result<bool> {
+    Ok(reset_password_ending(db, principal, provider, email, secret_hash, now_ms)
+        .await?
+        .is_some())
+}
+
+/// [`reset_password`], returning (R1b) exactly the session hashes it deleted —
+/// `None` when it changed nothing. The caller closes those sessions' live
+/// connections after this returns, and only those.
+///
+/// # Errors
+/// [`StoreError`] on substrate failure.
+pub async fn reset_password_ending(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+    provider: &str,
+    email: &str,
+    secret_hash: &str,
+    now_ms: i64,
+) -> Result<Option<Vec<TokenHash>>> {
     let who = SqlValue::Text(principal.as_str().to_string());
     let tx = db.begin().await?;
     let updated = tx
@@ -365,7 +384,7 @@ pub async fn reset_password(
         }
         if !claimed {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(None);
         }
         tx.execute(
             &format!(
@@ -381,8 +400,9 @@ pub async fn reset_password(
         )
         .await?;
     }
-    tx.execute(
-        &format!("DELETE FROM {SESSIONS} WHERE principal = ?1"),
+    let ended = delete_sessions_returning(
+        tx.as_ref(),
+        "principal = ?1",
         &[SqlValue::Text(principal.as_str().to_string())],
     )
     .await?;
@@ -395,7 +415,7 @@ pub async fn reset_password(
     )
     .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Some(ended))
 }
 
 /// The principal that has proven `email`, if any — the earliest, if several.
@@ -433,6 +453,10 @@ pub struct MagicLinked {
     /// An unverified password account for this address was taken over — its
     /// password deleted and its sessions ended. See [`resolve_magic_link`].
     pub took_over: bool,
+    /// R1b · every session hash the takeover deleted, committed. Close these
+    /// sessions' live connections **whatever `took_over` says** — the deletes
+    /// happened on the target even if a racing request's account won.
+    pub ended: Vec<TokenHash>,
 }
 
 /// Resolve the principal a magic link for `email` signs in as, creating or
@@ -471,7 +495,7 @@ pub async fn resolve_magic_link(
     use crate::auth::store::{lookup_account, upsert_principal, ProviderProfile};
 
     if let Some(principal) = lookup_account(db, magic_provider, email).await? {
-        return Ok(MagicLinked { principal, took_over: false });
+        return Ok(MagicLinked { principal, took_over: false, ended: Vec::new() });
     }
 
     let (target, took_over) = match verified_principal(db, email).await? {
@@ -488,7 +512,11 @@ pub async fn resolve_magic_link(
             ..ProviderProfile::default()
         };
         let principal = upsert_principal(db, magic_provider, email, &profile, now_ms).await?;
-        return Ok(MagicLinked { principal: principal.id, took_over: false });
+        return Ok(MagicLinked {
+            principal: principal.id,
+            took_over: false,
+            ended: Vec::new(),
+        });
     };
 
     let who = SqlValue::Text(target.as_str().to_string());
@@ -506,6 +534,7 @@ pub async fn resolve_magic_link(
         ],
     )
     .await?;
+    let mut ended = Vec::new();
     if took_over {
         // Every way in that nobody proved goes: each credential (password,
         // passkey), each other account row (a "trojan identifier" a squatter
@@ -522,27 +551,49 @@ pub async fn resolve_magic_link(
             &[who.clone(), SqlValue::Text(magic_provider.to_string())],
         )
         .await?;
-        tx.execute(
-            &format!("DELETE FROM {SESSIONS} WHERE principal = ?1"),
-            std::slice::from_ref(&who),
-        )
-        .await?;
+        ended =
+            delete_sessions_returning(tx.as_ref(), "principal = ?1", std::slice::from_ref(&who))
+                .await?;
         tx.execute(
             &format!("DELETE FROM {EMAIL_TOKENS} WHERE principal = ?1"),
             std::slice::from_ref(&who),
         )
         .await?;
     }
-    tx.commit().await?;
 
     // Re-read rather than trust the insert: under a race the other request's
     // row is the one that stands, and it is the one to sign in as.
-    let principal = lookup_account(db, magic_provider, email).await?.ok_or_else(|| {
-        StoreError::Corrupt("a magic-link account was linked but cannot be read back".into())
-    })?;
+    //
+    // R1b · read **inside** the transaction, before commit: a failure here rolls
+    // the deletes back too, so there is never a committed deletion whose hashes
+    // did not reach the caller. `BEGIN IMMEDIATE` means this read sees every
+    // committed writer before us plus our own insert — the same owner a
+    // post-commit read would have found.
+    let owner = tx
+        .query(
+            &format!("SELECT principal FROM {ACCOUNTS} WHERE provider = ?1 AND subject = ?2"),
+            &[
+                SqlValue::Text(magic_provider.to_string()),
+                SqlValue::Text(email.to_string()),
+            ],
+        )
+        .await?;
+    let principal = owner
+        .rows
+        .first()
+        .and_then(|row| row.get(0))
+        .and_then(SqlValue::as_str)
+        .map(PrincipalId::parse)
+        .transpose()
+        .map_err(|err| StoreError::Corrupt(err.to_string()))?
+        .ok_or_else(|| {
+            StoreError::Corrupt("a magic-link account was linked but cannot be read back".into())
+        })?;
+    tx.commit().await?;
     Ok(MagicLinked {
         took_over: took_over && principal == target,
         principal,
+        ended,
     })
 }
 

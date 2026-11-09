@@ -142,6 +142,7 @@ jobs:
           Compress-Archive -Path "stage/$name" -DestinationPath "dist/$name.zip" -Force
           $binary = (Resolve-Path $env:BIN).Path
           wix build installer/windows/AlBDO.wxs `
+            -arch x64 `
             -d "Version=$env:VERSION" `
             -d "BinaryPath=$binary" `
             -o "dist/AlBDO-$env:VERSION-x64.msi"

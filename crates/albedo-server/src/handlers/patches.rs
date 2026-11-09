@@ -104,6 +104,24 @@ pub async fn serve_patch_stream(
     grants: &[TopicGrant],
     resync: Option<&dyn RowProjector>,
 ) -> Response<Body> {
+    serve_patch_stream_live(broadcast, grants, resync, None).await
+}
+
+/// R1b · [`serve_patch_stream`] for a registered live connection.
+///
+/// `live` is the connection's registry handle. The stream owns it, so the entry
+/// lives exactly as long as the connection; every protected frame is handed off
+/// only after a load of the entry's state saw `Live` ([`LiveEntry::admits`]),
+/// and the stream ends when the entry closes. Closing also drops the broadcast
+/// subscription, whether or not the stream is ever polled again.
+///
+/// [`LiveEntry::admits`]: crate::live_authority::LiveEntry::admits
+pub async fn serve_patch_stream_live(
+    broadcast: Arc<BroadcastRegistry>,
+    grants: &[TopicGrant],
+    resync: Option<&dyn RowProjector>,
+    live: Option<crate::live_authority::LiveHandle>,
+) -> Response<Body> {
     let session = SessionId::random();
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<bytes::Bytes>(PATCH_CHANNEL_CAPACITY);
 
@@ -122,6 +140,19 @@ pub async fn serve_patch_stream(
         values: seed_values,
     } = broadcast.subscribe_granted(session, sender, grants);
 
+    // R1b · the cleanup guard exists from the moment the subscription does —
+    // before the resync await below — so an open cancelled during the resync
+    // drops the subscription instead of leaking it. (It used to be built after.)
+    let guard = SubscriptionGuard {
+        broadcast: broadcast.clone(),
+        session,
+    };
+    if let Some(live) = &live {
+        // Closing ends the subscription now, not at the next poll.
+        let broadcast = broadcast.clone();
+        live.entry().on_close(move || broadcast.cleanup_session(session));
+    }
+
     let seed = (!initial.is_empty())
         .then(|| OpcodeFrame {
             frame_id: 0,
@@ -139,32 +170,47 @@ pub async fn serve_patch_stream(
         None => None,
     };
 
-    // Built HERE, outside the generator body, and moved in. A `stream!` body
-    // does not run until the stream is first polled, so a guard constructed
-    // *inside* it would never exist for a connection that is dropped before
-    // its first poll — a client that opens the lane and vanishes would stay
-    // subscribed for the life of the process. Moved in at construction, the
-    // generator owns it from the start and dropping the stream always
-    // unsubscribes.
-    let guard = SubscriptionGuard { broadcast, session };
-
+    // The guard (built above, outside the generator body) is moved in. A
+    // `stream!` body does not run until the stream is first polled, so a guard
+    // constructed *inside* it would never exist for a connection that is
+    // dropped before its first poll — a client that opens the lane and vanishes
+    // would stay subscribed for the life of the process. Moved in at
+    // construction, the generator owns it from the start and dropping the
+    // stream always unsubscribes. The live handle rides the same way.
     let stream = async_stream::stream! {
         let _guard = guard;
+        let live = live;
+        let admits = |live: &Option<crate::live_authority::LiveHandle>| {
+            live.as_ref().is_none_or(|handle| handle.entry().admits())
+        };
         let mut event_id: u64 = 0;
 
         // `retry:` first, so a client dropped mid-stream already knows the
-        // cadence to come back on.
+        // cadence to come back on. Not protected: it carries no data.
         yield Ok::<_, Infallible>(SseEvent::default().retry(RECONNECT_DELAY).comment("open"));
 
         if let Some(bytes) = seed {
+            if !admits(&live) {
+                return;
+            }
             event_id += 1;
             yield Ok::<_, Infallible>(patch_event(&bytes, event_id));
         }
         if let Some(bytes) = resync_frame {
+            if !admits(&live) {
+                return;
+            }
             event_id += 1;
             yield Ok::<_, Infallible>(patch_event(&bytes, event_id));
         }
+        // No per-frame select on the close: closing runs the hook installed
+        // above, which drops this connection's senders from every topic, so
+        // `recv()` returns `None` and the loop ends on its own.
         while let Some(bytes) = receiver.recv().await {
+            // Handoff admission: one atomic load immediately before the yield.
+            if !admits(&live) {
+                break;
+            }
             event_id += 1;
             yield Ok::<_, Infallible>(patch_event(&bytes, event_id));
         }

@@ -205,6 +205,8 @@ pub struct OAuthRequest<'a> {
     pub session: dom_render_compiler::runtime::SessionId,
     /// The submitted form. Empty for the two `GET` legs.
     pub body: bytes::Bytes,
+    /// R1b - open live connections, so a rotation closes the old token's.
+    pub(crate) live: &'a crate::live_authority::LiveRegistry,
 }
 
 /// Run one leg.
@@ -565,7 +567,16 @@ async fn open_session(
     };
 
     let token = match minted {
-        Ok(token) => token,
+        Ok(token) => {
+            // R1b · the rotation committed: close the old token's connections.
+            if let Some(old) = request.identity.token() {
+                let closed = request.live.close_tokens(std::slice::from_ref(old));
+                if closed > 0 {
+                    tracing::debug!(target: "albedo.auth", closed, "rotated session's live connections closed");
+                }
+            }
+            token
+        }
         Err(err) => {
             warn!(target: "albedo.auth", %err, "session creation failed");
             return refusal(

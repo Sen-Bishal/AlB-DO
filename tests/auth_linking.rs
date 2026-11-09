@@ -177,7 +177,13 @@ async fn disconnecting_ends_its_other_sessions_and_keeps_the_one_asking() {
     let outcome = unlink_account(&db, &principal.id, "google", &google_here.hash())
         .await
         .unwrap();
-    assert_eq!(outcome, UnlinkOutcome::Unlinked { sessions_ended: 1 });
+    assert_eq!(
+        outcome,
+        UnlinkOutcome::Unlinked {
+            sessions_ended: 1,
+            ended: vec![google_elsewhere.hash()],
+        }
+    );
 
     assert!(resolve_session(&db, &google_elsewhere, NOW + 1)
         .await

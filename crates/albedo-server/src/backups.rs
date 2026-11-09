@@ -17,6 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+#[cfg(feature = "forge")]
 use std::sync::Arc;
 use std::time::Duration;
 

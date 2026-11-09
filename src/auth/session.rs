@@ -124,6 +124,13 @@ impl TokenHash {
         Self(hex)
     }
 
+    /// R1b · a hash read back from `albedo_sessions.token_hash`. Not a hashing
+    /// step: the value already is one.
+    #[must_use]
+    pub fn from_stored(hex: String) -> Self {
+        Self(hex)
+    }
+
     /// As it appears in a SQL parameter.
     #[must_use]
     pub fn as_str(&self) -> &str {

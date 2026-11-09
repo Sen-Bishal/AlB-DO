@@ -102,6 +102,10 @@ tower.workspace = true
 # not by `build()`. A test that never binds a listener sees no auth at all, so
 # it would prove the endpoints 404 and call that a pass.
 reqwest.workspace = true
+# R1b (T-0026) only: `tests/webtransport_authority.rs` drives the WT listener with
+# a real quinn client, which needs a self-signed certificate made at test time.
+# Already in the lockfile (via rustls-acme); default features = crypto + pem + ring.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [[bin]]
 name = "albedo"

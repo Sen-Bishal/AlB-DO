@@ -153,6 +153,76 @@ pub(crate) struct LiveRuntime {
     /// mode and port; `Some(None)` when nothing configures one. Never from a
     /// request's `Host` header. See [`crate::email::resolve_link_origin`].
     app_origin: Arc<std::sync::OnceLock<Option<String>>>,
+    /// R1b - every open live connection (PHOSPHOR, SSE, WT), so a session end
+    /// or a role change can close what was admitted under the old authority.
+    /// Persistent: a dev reload must not forget open connections.
+    pub(crate) live_authority: Arc<crate::live_authority::LiveRegistry>,
+}
+
+/// R1b · grant or revoke a role in process, closing the principal's stale live
+/// connections at once (no sweep tick). The operator path: no grant policy, but
+/// an undeclared role is refused, as the CLI refuses it.
+#[derive(Clone)]
+pub struct RoleControl {
+    live: LiveRuntime,
+}
+
+impl RoleControl {
+    /// Change `role` for whoever `headers`' session cookie resolves to.
+    ///
+    /// # Errors
+    /// A message naming what is wrong: no auth, a signed-out session, an
+    /// undeclared role, or a store failure.
+    pub async fn change(
+        &self,
+        headers: &axum::http::HeaderMap,
+        role: &str,
+        grant: bool,
+    ) -> Result<bool, String> {
+        let auth = self
+            .live
+            .auth()
+            .cloned()
+            .ok_or_else(|| "this app declares no `auth` block".to_string())?;
+        if !auth.registry().roles.iter().any(|declared| declared == role) {
+            return Err(format!(
+                "`{role}` is not a role this app declares (declared: {})",
+                if auth.registry().roles.is_empty() {
+                    "none".to_string()
+                } else {
+                    auth.registry().roles.join(", ")
+                }
+            ));
+        }
+        let crate::auth::Identity::Authenticated { principal, .. } = auth.resolve(headers).await
+        else {
+            return Err("that user is not signed in".to_string());
+        };
+        let db = auth.substrate().as_ref();
+        let epoch = if grant {
+            dom_render_compiler::auth::store::grant_role_changed(
+                db,
+                &principal.id,
+                role,
+                Some("test"),
+                crate::auth::now_ms(),
+            )
+            .await
+            .map_err(|err| err.to_string())?
+            .1
+        } else {
+            dom_render_compiler::auth::store::revoke_role_changed(db, &principal.id, role)
+                .await
+                .map_err(|err| err.to_string())?
+        };
+        // After the commit: close what was admitted below the new epoch.
+        if let Some(epoch) = epoch {
+            self.live
+                .live_authority
+                .close_principal_below(principal.id.as_str(), epoch);
+        }
+        Ok(epoch.is_some())
+    }
 }
 
 /// What the request path needs to accept a file.
@@ -186,6 +256,7 @@ impl LiveRuntime {
             redirects: Arc::new(std::sync::OnceLock::new()),
             webhooks: Arc::new(std::sync::OnceLock::new()),
             app_origin: Arc::new(std::sync::OnceLock::new()),
+            live_authority: Arc::new(crate::live_authority::LiveRegistry::new()),
         }
     }
 
@@ -233,6 +304,17 @@ impl LiveRuntime {
     ///
     /// Before boot installs a runtime, everybody is anonymous — which is the
     /// same answer an app with no declared providers gets, and the safe one.
+    /// R1b · register a live open under its presented cookie **before**
+    /// resolving it, so the resolution below is the open's read.
+    fn register_live(
+        &self,
+        kind: crate::live_authority::LiveKind,
+        headers: &axum::http::HeaderMap,
+    ) -> crate::live_authority::LiveHandle {
+        let presented = self.auth.get().and_then(|auth| auth.presented_hash(headers));
+        self.live_authority.register_presented(kind, presented)
+    }
+
     async fn identity(&self, headers: &axum::http::HeaderMap) -> crate::auth::Identity {
         let identity = match self.auth.get() {
             Some(auth) => auth.resolve(headers).await,
@@ -588,7 +670,11 @@ impl CompiledProjectActionAdapter {
             }
             return Ok(());
         };
-        let claim = claim.ok_or_else(|| error("missing durable action admission".to_string()))?;
+        // A tokenless action has no result to replay. Without durable effects
+        // it must not contend for the database writer at all.
+        if claim.is_none() && writes.is_empty() && queued.is_empty() {
+            return Ok(());
+        }
         let mut jobs_to_write = Vec::with_capacity(queued.len());
         for intent in queued {
             let jobs = self
@@ -607,15 +693,21 @@ impl CompiledProjectActionAdapter {
                 .map_err(&error)?,
             );
         }
-        let bytes = instructions
-            .to_vec()
-            .wire_encode()
-            .map_err(|e| error(e.to_string()))?;
+        let bytes = if claim.is_some() {
+            instructions
+                .to_vec()
+                .wire_encode()
+                .map_err(|e| error(e.to_string()))?
+        } else {
+            Vec::new()
+        };
         let tx = db.begin().await.map_err(|e| error(e.to_string()))?;
-        claim
-            .check(tx.as_ref(), dom_render_compiler::aperture::now_ms())
-            .await
-            .map_err(|e| error(e.to_string()))?;
+        if let Some(claim) = claim {
+            claim
+                .check(tx.as_ref(), dom_render_compiler::aperture::now_ms())
+                .await
+                .map_err(|e| error(e.to_string()))?;
+        }
         let pending = dom_render_compiler::forge::write::apply_writes_in_transaction(
             tx.as_ref(),
             self.live.broadcast.as_ref(),
@@ -630,10 +722,12 @@ impl CompiledProjectActionAdapter {
                 .await
                 .map_err(|e| error(e.to_string()))?;
         }
-        claim
-            .complete(tx.as_ref(), &bytes, dom_render_compiler::aperture::now_ms())
-            .await
-            .map_err(|e| error(e.to_string()))?;
+        if let Some(claim) = claim {
+            claim
+                .complete(tx.as_ref(), &bytes, dom_render_compiler::aperture::now_ms())
+                .await
+                .map_err(|e| error(e.to_string()))?;
+        }
         tx.commit().await.map_err(|e| error(e.to_string()))?;
         if !queued.is_empty() {
             if let Some(jobs) = self.live.jobs() {
@@ -704,7 +798,7 @@ impl CompiledProjectActionAdapter {
 
         let identity = workflow_identity(self.action_id, ctx.principal.as_ref(), envelope);
         let substrate = self.live.forge_substrate.get();
-        let claim = if let Some(db) = substrate {
+        let claim = if let Some(db) = substrate.filter(|_| identity.resumable) {
             // JSON key ordering and transport-only form fields do not change an
             // intention. Bind all authored inputs as well as the event kind.
             let mut payload = serde_json::from_slice::<serde_json::Value>(&envelope.payload).ok();
@@ -2109,7 +2203,12 @@ impl AlbedoServerBuilder {
                 project: self.reactive_project.clone(),
             })
             .with_dev_mode(dev_mode_enabled)
-            .with_hmr(hmr_enabled);
+            .with_hmr(hmr_enabled)
+            // R1b · WT bridges bind their session to an identity here.
+            .with_live_authority(crate::handlers::streaming::LiveAuthorityWiring {
+                registry: self.live.live_authority.clone(),
+                db: self.live.forge_substrate.clone(),
+            });
             let state = match pipeline_binding.take() {
                 Some((pipeline, handle)) => {
                     let pipeline = pipeline.with_slot_store(slot_store.clone());
@@ -2650,6 +2749,15 @@ impl AlbedoServer {
         self.state.world().csrf.clone()
     }
 
+    /// R1b · a handle for changing roles in process — what `albedo test`'s
+    /// `grantRole` / `revokeRole` use. Taken before `run_until` consumes the
+    /// server; the auth runtime it reads is installed during boot.
+    pub fn role_control(&self) -> RoleControl {
+        RoleControl {
+            live: self.state.live.clone(),
+        }
+    }
+
     /// Phase M.1 · access the dev error overlay registry. `None`
     /// when the server was built without dev mode enabled. Userland
     /// integration code (a file watcher, an external linter, etc.)
@@ -2995,6 +3103,17 @@ impl AlbedoServer {
                         )));
                     if providers > 0 {
                         info!("AUTH: {providers} provider(s) declared; sessions enabled");
+                        // R1b · the authority sweep: CLI role changes (another
+                        // process) and session expiry close live connections
+                        // within one tick. The watermark is read here — before
+                        // WT or HTTP accept anything — so a restart closes
+                        // nothing; an unreadable clock fails the boot.
+                        crate::live_authority::start_sweep(
+                            self.state.live.live_authority.clone(),
+                            Arc::clone(substrate),
+                        )
+                        .await
+                        .map_err(RuntimeError::ServerStartup)?;
                     }
                 }
                 // Declaring providers with no substrate is not a warning, it is
@@ -4073,6 +4192,13 @@ async fn dispatch_routed(
         // signed-in user would see their rows on load and then never see an
         // update to them — live data that is silently only-on-reload, which is
         // the worst shape of all because it looks like it works.
+        // R1b · register under the presented cookie first, then resolve: the
+        // resolution is the open's read, so no second query (see
+        // `live_authority`). Dropping the handle on any early return closes and
+        // unregisters it.
+        let live = state
+            .live
+            .register_live(crate::live_authority::LiveKind::Sse, request.headers());
         let identity = state.live.identity(request.headers()).await;
         if let Err(refusal) = ration(
             state,
@@ -4115,12 +4241,26 @@ async fn dispatch_routed(
                 // holding the lock.
                 let projector_arc = reconnecting.then(|| state.live.projector()).flatten();
                 let projector = projector_arc.as_deref();
+                // R1b · admit on the resolution above; the explicit query runs
+                // only if a role-change scan raced it. A closed entry still gets
+                // today's empty stream (no protected frames).
+                let substrate = state.live.forge_substrate.get().cloned();
+                let admitted = state
+                    .live
+                    .live_authority
+                    .admit(&live, &identity, substrate.as_deref())
+                    .await
+                    .admitted();
                 match streaming_runtime.broadcast() {
-                    Some(broadcast) => {
-                        crate::handlers::serve_patch_stream(broadcast.clone(), &grants, projector)
-                            .await
-                            .into_response()
-                    }
+                    Some(broadcast) if admitted => crate::handlers::patches::serve_patch_stream_live(
+                        broadcast.clone(),
+                        &grants,
+                        projector,
+                        Some(live),
+                    )
+                    .await
+                    .into_response(),
+                    Some(_) => empty_patch_stream().await,
                     // No registry wired: nothing can ever publish, so an empty
                     // stream is the truthful answer, not an error.
                     None => empty_patch_stream().await,
@@ -4148,6 +4288,10 @@ async fn dispatch_routed(
         // not the tab. Resolved here, at trunk open, so every route the lane
         // subscribes to over its lifetime is judged against one identity rather
         // than re-resolved per subscribe.
+        // R1b · register under the presented cookie, then resolve (the read).
+        let live = state
+            .live
+            .register_live(crate::live_authority::LiveKind::Phosphor, request.headers());
         let principal = state.live.identity(request.headers()).await;
 
         // Rationed against the principal when there is one — a trunk is per
@@ -4178,11 +4322,22 @@ async fn dispatch_routed(
         } else {
             crate::handlers::phosphor::DevTap::none()
         };
+        // R1b · admit on that resolution. A lane refused here still opens (the
+        // client gets its `hello`) but is closed: it receives no patches and
+        // every subscribe on it is denied, so the browser reconnects and
+        // resolves what its cookie is worth now.
+        let substrate = state.live.forge_substrate.get().cloned();
+        state
+            .live
+            .live_authority
+            .admit(&live, &principal, substrate.as_deref())
+            .await;
         let response = crate::handlers::phosphor::serve_trunk(
             state.phosphor.clone(),
             dev,
             identity,
             principal,
+            Some(live),
         )
         .await;
         if state.request_timings {
@@ -4597,6 +4752,7 @@ async fn dispatch_routed(
                 csrf: world.csrf.as_ref(),
                 session,
                 body,
+                live: state.live.live_authority.as_ref(),
             },
         )
         .await;
@@ -4724,6 +4880,7 @@ async fn dispatch_routed(
                 email: state.live.email().cloned(),
                 jobs: state.live.jobs().cloned(),
                 phosphor: state.phosphor.as_ref(),
+                live: state.live.live_authority.as_ref(),
             },
         )
         .await;

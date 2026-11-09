@@ -722,6 +722,12 @@ declare module "albedo/test" {
   export function signIn(email: string, password: string): User;
   export function signOut(user: User): void;
 
+  // Grant or revoke a role the app declares, as an operator would with
+  // `albedo roles`. The user is found by their current session, not their
+  // email. Live connections they hold close at once.
+  export function grantRole(user: User, role: string): void;
+  export function revokeRole(user: User, role: string): void;
+
   interface Matchers {
     toBe(expected: unknown): void;
     toEqual(expected: unknown): void;

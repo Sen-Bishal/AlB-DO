@@ -285,7 +285,7 @@ async fn revoking_everywhere_kills_every_device_at_once() {
     let killed = revoke_all_sessions(&db, &principal.id)
         .await
         .expect("revoke all");
-    assert_eq!(killed, 3);
+    assert_eq!(killed.len(), 3);
 
     for token in &tokens {
         assert!(
@@ -360,7 +360,13 @@ async fn deleting_a_principal_takes_their_sessions_with_it() {
         "a deleted account's session still resolves"
     );
 
-    for table in schema::RESERVED_COLLECTIONS {
+    // R1b · the authority row is a deliberate tombstone (bumped, never
+    // deleted) so a running server's sweep closes the deleted user's live
+    // connections; the clock is global and has no principal column.
+    for table in schema::RESERVED_COLLECTIONS
+        .iter()
+        .filter(|table| ![schema::AUTHORITY, schema::AUTHORITY_CLOCK].contains(table))
+    {
         let count = db
             .query(
                 &format!("SELECT COUNT(*) FROM {table} WHERE principal = ?1"),
@@ -374,6 +380,18 @@ async fn deleting_a_principal_takes_their_sessions_with_it() {
             "`{table}` kept a row for a deleted principal"
         );
     }
+    let tombstone = db
+        .query(
+            &format!("SELECT epoch FROM {} WHERE principal = ?1", schema::AUTHORITY),
+            &[SqlValue::Text(principal.id.as_str().to_string())],
+        )
+        .await
+        .expect("authority");
+    assert_eq!(
+        tombstone.rows[0].get(0),
+        Some(&SqlValue::Integer(1)),
+        "deleting a principal must bump their authority epoch"
+    );
 }
 
 /// A session whose user row vanished is reported distinctly in our logs, and

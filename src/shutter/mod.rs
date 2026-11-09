@@ -12,9 +12,15 @@
 //! it, none of which a general-purpose limiter can provide because none of them
 //! are expressible without owning the compiler and the router:
 //!
-//! 1. **[`cost`] — the weight is derived, not typed.** A path-and-IP limiter cannot know that this request is a cached render and that one is a write fanning out to five hundred lanes, so every number it enforces is a guess. Ours is a by-product of facts the build already established.
-//! 2. **[`Key`] — the subject is the principal, not the address.** IP is a proxy for identity that CGNAT and cloud egress made a bad one. AUTH just landed, so the limiter can ration the *actor*.
-//! 3. **[`Shutter`] — the table degrades instead of exhausting.** See below; this is the failure mode that takes real limiters down.
+//! 1. **[`cost`] — the weight is derived, not typed.** A path-and-IP limiter cannot know that this
+//!    request is a cached render and that one is a write fanning out to five hundred lanes, so
+//!    every number it enforces is a guess. Ours is a by-product of facts the build already
+//!    established.
+//! 2. **[`Key`] — the subject is the principal, not the address.** IP is a proxy for identity that
+//!    CGNAT and cloud egress made a bad one. AUTH just landed, so the limiter can ration the
+//!    *actor*.
+//! 3. **[`Shutter`] — the table degrades instead of exhausting.** See below; this is the failure
+//!    mode that takes real limiters down.
 //!
 //! ## Memory is bounded, and bounding it costs nothing
 //!
@@ -341,8 +347,11 @@ impl Limits {
         // "safety check" that forces the limits it validates to be loose is
         // worse than none.
         let fan_out_ceiling = compress_fanout(u32::MAX);
-        self.write
-            .check_weight(OperationClass::Write.base_weight().saturating_add(fan_out_ceiling))?;
+        self.write.check_weight(
+            OperationClass::Write
+                .base_weight()
+                .saturating_add(fan_out_ceiling),
+        )?;
 
         for (quota, class) in [
             (&self.static_read, OperationClass::StaticRead),
@@ -386,11 +395,11 @@ impl Verdict {
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self.decision {
             Decision::Admit { .. } => None,
-            Decision::Refuse { retry_after, .. } => {
-                Some(retry_after.as_secs().saturating_add(
-                    u64::from(retry_after.subsec_nanos() > 0),
-                ))
-            }
+            Decision::Refuse { retry_after, .. } => Some(
+                retry_after
+                    .as_secs()
+                    .saturating_add(u64::from(retry_after.subsec_nanos() > 0)),
+            ),
         }
     }
 }
@@ -574,9 +583,14 @@ impl Shutter {
     /// Three things keep that from being the new bug, and all three are
     /// deliberate:
     ///
-    /// 1. **Only failures are charged to the account.** A correct password is admitted while there is any budget left, so a legitimate user racing an attacker still gets in. That is [`Self::note_credential_failure`], called after the check — never before.
-    /// 2. **The account bucket is generous and the caller bucket is tight.** Making the account bucket strict would optimise for the attack that needs a thousand addresses over the one that needs none.
-    /// 3. **Passkeys remove the premise.** There is no password to stuff, which is a large part of why `AUTH.md` § 6.2 makes them the default rather than an option.
+    /// 1. **Only failures are charged to the account.** A correct password is admitted while there
+    ///    is any budget left, so a legitimate user racing an attacker still gets in. That is
+    ///    [`Self::note_credential_failure`], called after the check — never before.
+    /// 2. **The account bucket is generous and the caller bucket is tight.** Making the account
+    ///    bucket strict would optimise for the attack that needs a thousand addresses over the one
+    ///    that needs none.
+    /// 3. **Passkeys remove the premise.** There is no password to stuff, which is a large part of
+    ///    why `AUTH.md` § 6.2 makes them the default rather than an option.
     ///
     /// Charges the caller's bucket and only *peeks* the account's, so asking the
     /// question never itself counts against the victim.
@@ -732,8 +746,9 @@ impl Shutter {
             };
         }
 
-        let (caller_ok, _) =
-            self.with_cell(caller, |cell| cell.peek(&caller_quota, now, caller_cost.weight));
+        let (caller_ok, _) = self.with_cell(caller, |cell| {
+            cell.peek(&caller_quota, now, caller_cost.weight)
+        });
         if !caller_ok {
             // Refuses without charging — `charge` never charges a refusal.
             return self.charge(caller, caller_cost);
@@ -862,9 +877,15 @@ mod tests {
             .take(32)
             .collect();
 
-        let shared = colliders.iter().filter(|key| key.slot() == victim.slot()).count();
+        let shared = colliders
+            .iter()
+            .filter(|key| key.slot() == victim.slot())
+            .count();
         // By chance, about 32 / 8 192 of them would share it.
-        assert!(shared < 4, "{shared} of 32 precomputed keys share the victim's overflow cell");
+        assert!(
+            shared < 4,
+            "{shared} of 32 precomputed keys share the victim's overflow cell"
+        );
     }
 
     /// The defaults must be able to admit the heaviest operation they can
@@ -885,12 +906,7 @@ mod tests {
             limits.check_admits_heaviest(),
             Err(QuotaError::WeightExceedsBurst { .. })
         ));
-        assert!(Shutter::with(
-            limits,
-            Arc::new(ManualClock::new()) as Arc<dyn Clock>,
-            16
-        )
-        .is_err());
+        assert!(Shutter::with(limits, Arc::new(ManualClock::new()) as Arc<dyn Clock>, 16).is_err());
     }
 
     /// 🔑 The property the per-caller bucket cannot give: a third party's budget
@@ -901,7 +917,10 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let shutter = shutter(&clock);
         shutter
-            .set_upstream_quota("api.test", Quota::with_burst(5, Duration::from_secs(60), 5).unwrap())
+            .set_upstream_quota(
+                "api.test",
+                Quota::with_burst(5, Duration::from_secs(60), 5).unwrap(),
+            )
             .unwrap();
 
         // Admission, then the charge the client makes when the call leaves.
@@ -913,7 +932,10 @@ mod tests {
                     && shutter.upstream_charge("api.test").is_admitted()
             })
             .count();
-        assert_eq!(admitted, 5, "twenty distinct callers share the upstream's five");
+        assert_eq!(
+            admitted, 5,
+            "twenty distinct callers share the upstream's five"
+        );
 
         // Control: another host has its own budget.
         assert!(shutter
@@ -926,7 +948,10 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let shutter = shutter(&clock);
         shutter
-            .set_upstream_quota("api.test", Quota::with_burst(1, Duration::from_secs(60), 1).unwrap())
+            .set_upstream_quota(
+                "api.test",
+                Quota::with_burst(1, Duration::from_secs(60), 1).unwrap(),
+            )
             .unwrap();
         let me = caller(1, OperationClass::Outbound);
 
@@ -948,7 +973,10 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let shutter = shutter(&clock);
         shutter
-            .set_upstream_quota("api.test", Quota::with_burst(12, Duration::from_secs(60), 12).unwrap())
+            .set_upstream_quota(
+                "api.test",
+                Quota::with_burst(12, Duration::from_secs(60), 12).unwrap(),
+            )
             .unwrap();
         let greedy = caller(1, OperationClass::Outbound);
 
@@ -959,7 +987,10 @@ mod tests {
                 admitted += 1;
             }
         }
-        assert!(admitted < 12, "the caller's own budget ran out first ({admitted})");
+        assert!(
+            admitted < 12,
+            "the caller's own budget ran out first ({admitted})"
+        );
         let left = 12 - admitted;
         let others = (2..40u8)
             .filter(|n| {
@@ -969,7 +1000,10 @@ mod tests {
                     && shutter.upstream_charge("api.test").is_admitted()
             })
             .count();
-        assert_eq!(others, left, "the greedy caller's refusals left the upstream's budget intact");
+        assert_eq!(
+            others, left,
+            "the greedy caller's refusals left the upstream's budget intact"
+        );
     }
 
     /// A caller-less charge — the refresh loop's — spends the same host budget a
@@ -980,7 +1014,10 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let shutter = shutter(&clock);
         shutter
-            .set_upstream_quota("api.test", Quota::with_burst(3, Duration::from_secs(60), 3).unwrap())
+            .set_upstream_quota(
+                "api.test",
+                Quota::with_burst(3, Duration::from_secs(60), 3).unwrap(),
+            )
             .unwrap();
         for _ in 0..3 {
             assert!(shutter.upstream_charge("api.test").is_admitted());
@@ -1011,7 +1048,11 @@ mod tests {
             .collect();
         let admitted: usize = instances
             .iter()
-            .map(|s| (0..100).filter(|_| s.upstream_charge("api.test").is_admitted()).count())
+            .map(|s| {
+                (0..100)
+                    .filter(|_| s.upstream_charge("api.test").is_admitted())
+                    .count()
+            })
             .sum();
         assert_eq!(admitted, 12, "four shares of twelve");
 
@@ -1022,17 +1063,25 @@ mod tests {
         clock.advance(Duration::from_secs(20));
         let refilled: usize = instances
             .iter()
-            .map(|s| (0..100).filter(|_| s.upstream_charge("api.test").is_admitted()).count())
+            .map(|s| {
+                (0..100)
+                    .filter(|_| s.upstream_charge("api.test").is_admitted())
+                    .count()
+            })
             .sum();
         assert_eq!(refilled, 4, "20 s of a 12/min budget, across all instances");
 
         // Per-caller budgets are NOT split: each instance still gives one caller
         // its full burst.
         let visitor = caller(7, OperationClass::Read);
-        assert!(instances[0].charge(&visitor, Cost::flat(OperationClass::Read)).is_admitted());
+        assert!(instances[0]
+            .charge(&visitor, Cost::flat(OperationClass::Read))
+            .is_admitted());
         assert_eq!(
             (0..200)
-                .filter(|_| instances[1].charge(&visitor, Cost::flat(OperationClass::Read)).is_admitted())
+                .filter(|_| instances[1]
+                    .charge(&visitor, Cost::flat(OperationClass::Read))
+                    .is_admitted())
                 .count(),
             50,
             "the read burst is 100 units at weight 2 on every instance"
@@ -1049,9 +1098,21 @@ mod tests {
         )
         .unwrap();
         let err = s
-            .set_upstream_quota("api.test", Quota::with_burst(4, Duration::from_secs(60), 4).unwrap())
+            .set_upstream_quota(
+                "api.test",
+                Quota::with_burst(4, Duration::from_secs(60), 4).unwrap(),
+            )
             .unwrap_err();
-        assert!(matches!(err, QuotaError::CannotPartition { burst: 4, instances: 8 }), "{err}");
+        assert!(
+            matches!(
+                err,
+                QuotaError::CannotPartition {
+                    burst: 4,
+                    instances: 8
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1061,7 +1122,10 @@ mod tests {
         let cost = Cost::flat(OperationClass::Credential);
 
         // Exhaust one caller.
-        while shutter.charge(&caller(1, OperationClass::Credential), cost).is_admitted() {}
+        while shutter
+            .charge(&caller(1, OperationClass::Credential), cost)
+            .is_admitted()
+        {}
         // A different caller is untouched.
         assert!(shutter
             .charge(&caller(2, OperationClass::Credential), cost)
@@ -1093,7 +1157,10 @@ mod tests {
         let shutter = shutter(&clock);
 
         while shutter
-            .charge(&caller(1, OperationClass::Read), Cost::flat(OperationClass::Read))
+            .charge(
+                &caller(1, OperationClass::Read),
+                Cost::flat(OperationClass::Read),
+            )
             .is_admitted()
         {}
         assert!(shutter
@@ -1151,7 +1218,9 @@ mod tests {
         let verdict = shutter.charge(&key, cost);
         assert!(!verdict.is_admitted());
 
-        let wait = verdict.retry_after_secs().expect("a refusal reports a wait");
+        let wait = verdict
+            .retry_after_secs()
+            .expect("a refusal reports a wait");
         clock.advance(Duration::from_secs(wait));
         assert!(shutter.charge(&key, cost).is_admitted());
     }
@@ -1213,8 +1282,13 @@ mod tests {
         // A run of successes must never exhaust the victim's account budget,
         // however many there are.
         for round in 0..500 {
-            let verdict =
-                shutter.credential_attempt(&caller(u8::try_from(round % 200).unwrap(), OperationClass::Credential), "ada@example.com");
+            let verdict = shutter.credential_attempt(
+                &caller(
+                    u8::try_from(round % 200).unwrap(),
+                    OperationClass::Credential,
+                ),
+                "ada@example.com",
+            );
             assert!(
                 verdict.is_admitted(),
                 "a successful login was refused at round {round} — success is being charged"
@@ -1232,7 +1306,10 @@ mod tests {
 
         for round in 0..1_000 {
             shutter.credential_attempt(
-                &caller(u8::try_from(round % 250).unwrap(), OperationClass::Credential),
+                &caller(
+                    u8::try_from(round % 250).unwrap(),
+                    OperationClass::Credential,
+                ),
                 "ada@example.com",
             );
         }
@@ -1317,8 +1394,8 @@ mod tests {
     #[test]
     fn the_degraded_path_is_not_a_bypass() {
         let clock = Arc::new(ManualClock::new());
-        let shutter =
-            Shutter::with(Limits::default(), Arc::clone(&clock) as Arc<dyn Clock>, 8).expect("limits");
+        let shutter = Shutter::with(Limits::default(), Arc::clone(&clock) as Arc<dyn Clock>, 8)
+            .expect("limits");
 
         // Fill the exact table with indebted cells so nothing can be evicted.
         for i in 0..8u32 {
@@ -1371,7 +1448,9 @@ mod tests {
         assert_eq!(shutter.tracked_keys(), 0);
 
         // The recreated cell behaves exactly as the swept one would have.
-        let after: Vec<bool> = (0..5).map(|_| shutter.charge(&key, cost).is_admitted()).collect();
+        let after: Vec<bool> = (0..5)
+            .map(|_| shutter.charge(&key, cost).is_admitted())
+            .collect();
         assert_eq!(after, vec![true; 5]);
     }
 

@@ -564,6 +564,20 @@
     call('auth', { jar: user.jar, kind: 'logout' });
   }
 
+  function roleChange(name, grant, user, role) {
+    if (!(user instanceof User)) {
+      throw new TypeError(name + '(user, role) takes a user from signUp() or signIn() — got ' + fmt(user));
+    }
+    if (typeof role !== 'string' || role.length === 0) {
+      throw new TypeError(name + '(user, role) takes a role name — got ' + fmt(role));
+    }
+    call('role', { jar: user.jar, role: role, grant: grant });
+  }
+
+  function grantRole(user, role) { roleChange('grantRole', true, user, role); }
+
+  function revokeRole(user, role) { roleChange('revokeRole', false, user, role); }
+
   function visit(path, options) {
     options = options || {};
     if (typeof path !== 'string' || path[0] !== '/') {
@@ -808,5 +822,7 @@
     signUp: signUp,
     signIn: signIn,
     signOut: signOut,
+    grantRole: grantRole,
+    revokeRole: revokeRole,
   });
 })();

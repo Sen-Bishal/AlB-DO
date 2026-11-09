@@ -5465,10 +5465,19 @@ async fn roles_db(path: &Path) -> Result<dom_render_compiler::forge::LibSqlSubst
     let db = dom_render_compiler::forge::LibSqlSubstrate::open_local(path)
         .await
         .map_err(|err| format!("could not open {}: {err}", path.display()))?;
-    for statement in dom_render_compiler::auth::schema::roles().migrations.iter() {
-        db.execute(statement, &[])
-            .await
-            .map_err(|err| format!("could not prepare the roles table: {err}"))?;
+    // R1b · the authority tables too: a grant from here bumps the epoch a
+    // running server's sweep reads, whichever of the two touched the db first.
+    use dom_render_compiler::auth::schema as auth_schema;
+    for collection in [
+        auth_schema::roles(),
+        auth_schema::authority(),
+        auth_schema::authority_clock(),
+    ] {
+        for statement in collection.migrations.iter() {
+            db.execute(statement, &[])
+                .await
+                .map_err(|err| format!("could not prepare the roles tables: {err}"))?;
+        }
     }
     Ok(db)
 }

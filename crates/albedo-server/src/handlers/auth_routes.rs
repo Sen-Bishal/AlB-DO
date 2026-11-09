@@ -201,18 +201,20 @@ pub struct AuthRequest<'a> {
     /// The live lanes, so a revoked session stops receiving live data at once
     /// rather than when its tab closes.
     pub(crate) phosphor: &'a crate::handlers::PhosphorState,
+    /// R1b · every open live connection (PHOSPHOR, SSE, WT).
+    pub(crate) live: &'a crate::live_authority::LiveRegistry,
 }
 
-/// End every live lane `principal` has open — after its sessions were revoked.
-pub(crate) fn end_lanes_of(
+/// R1b · close the live connections of exactly the sessions a store call
+/// deleted. Call **after** the commit, and only when it succeeded: a session
+/// minted after the commit is not in `deleted`, so its connections survive.
+pub(crate) fn close_deleted_sessions(
     request: &AuthRequest<'_>,
-    principal: &dom_render_compiler::auth::PrincipalId,
+    deleted: &[dom_render_compiler::auth::session::TokenHash],
 ) {
-    let ended = request
-        .phosphor
-        .end_lanes_where(|identity| identity.principal().is_some_and(|p| &p.id == principal));
-    if ended > 0 {
-        debug!(target: "albedo.auth", ended, "live lanes of a revoked account ended");
+    let closed = request.live.close_tokens(deleted);
+    if closed > 0 {
+        debug!(target: "albedo.auth", closed, "live connections of ended sessions closed");
     }
 }
 
@@ -302,14 +304,12 @@ async fn unlink(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) -
         store::unlink_account(request.auth.substrate().as_ref(), &principal.id, provider, token)
             .await;
     match outcome {
-        Ok(UnlinkOutcome::Unlinked { sessions_ended }) => {
-            let ended = request.phosphor.end_lanes_where(|identity| {
-                identity.token() != Some(token)
-                    && identity
-                        .principal()
-                        .is_some_and(|who| who.id == principal.id && who.provider == provider)
-            });
-            debug!(target: "albedo.auth", provider, sessions_ended, ended, "sign-in method disconnected");
+        Ok(UnlinkOutcome::Unlinked {
+            sessions_ended,
+            ended,
+        }) => {
+            close_deleted_sessions(&request, &ended);
+            debug!(target: "albedo.auth", provider, sessions_ended, "sign-in method disconnected");
             see_other(back)
         }
         Ok(UnlinkOutcome::LastMethod) => refusal(
@@ -566,12 +566,14 @@ async fn login(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) ->
 async fn logout(request: &AuthRequest<'_>, back: &ReturnPath) -> Response<Body> {
     if let Some(token) = request.identity.token() {
         match store::revoke_session(request.auth.substrate().as_ref(), token).await {
-            Ok(rows) => debug!(target: "albedo.auth", rows, "session revoked"),
+            Ok(rows) => {
+                debug!(target: "albedo.auth", rows, "session revoked");
+                // R1b · only after a successful delete: a failed one ended
+                // nothing, so it closes nothing.
+                close_deleted_sessions(request, std::slice::from_ref(token));
+            }
             Err(err) => warn!(target: "albedo.auth", %err, "session revocation failed"),
         }
-        request
-            .phosphor
-            .end_lanes_where(|identity| identity.token() == Some(token));
     }
 
     // The cookie is cleared whether or not the revocation succeeded. Those are
@@ -593,10 +595,12 @@ async fn logout(request: &AuthRequest<'_>, back: &ReturnPath) -> Response<Body> 
 async fn logout_all(request: &AuthRequest<'_>, back: &ReturnPath) -> Response<Body> {
     if let Some(principal) = request.identity.principal() {
         match store::revoke_all_sessions(request.auth.substrate().as_ref(), &principal.id).await {
-            Ok(rows) => debug!(target: "albedo.auth", rows, "every session revoked"),
+            Ok(deleted) => {
+                debug!(target: "albedo.auth", rows = deleted.len(), "every session revoked");
+                close_deleted_sessions(request, &deleted);
+            }
             Err(err) => warn!(target: "albedo.auth", %err, "revoking every session failed"),
         }
-        end_lanes_of(request, &principal.id);
     }
     let mut response = see_other(back);
     set_cookie(&mut response, &request.auth.clear_cookie());
@@ -632,7 +636,15 @@ pub(crate) async fn open_session(
     };
 
     let token = match minted {
-        Ok(token) => token,
+        Ok(token) => {
+            // R1b · rotation committed: the old token's live connections were
+            // admitted under a session that no longer exists. The new token's
+            // connections do not exist yet; a failed rotation never gets here.
+            if let Some(old) = request.identity.token() {
+                close_deleted_sessions(request, std::slice::from_ref(old));
+            }
+            token
+        }
         Err(err) => {
             warn!(target: "albedo.auth", %err, "session creation failed");
             return refusal(

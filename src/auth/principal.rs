@@ -195,6 +195,15 @@ pub struct Principal {
     /// block declares before anything reads it (`AuthRuntime::resolve`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// R1b · the authority epoch [`Self::roles`] were read at. Internal: never
+    /// serialised, never in [`Self::user_value`]. A live connection admitted at
+    /// this epoch closes once the principal's epoch moves past it.
+    #[serde(skip)]
+    pub authority_epoch: i64,
+    /// R1b · when the session this principal was resolved from expires, in
+    /// epoch ms. `None` for a sessionless principal (a job's, a webhook's).
+    #[serde(skip)]
+    pub session_expires_at: Option<i64>,
 }
 
 impl Principal {
@@ -210,6 +219,8 @@ impl Principal {
             providers: Vec::new(),
             claims: serde_json::Map::new(),
             roles: Vec::new(),
+            authority_epoch: 0,
+            session_expires_at: None,
         }
     }
 

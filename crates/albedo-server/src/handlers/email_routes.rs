@@ -336,18 +336,18 @@ pub(crate) async fn reset(request: &AuthRequest<'_>, form: &FormBody) -> Respons
     let Some((principal, redeemed)) = redeem(db, Purpose::PasswordReset, &token, &provider.name).await else {
         return refusal(StatusCode::GONE, LINK_DEAD, &root);
     };
-    match email_token::reset_password(db, &principal, &provider.name, &redeemed.email, &secret, now_ms())
+    match email_token::reset_password_ending(db, &principal, &provider.name, &redeemed.email, &secret, now_ms())
         .await
     {
-        Ok(true) => {}
-        Ok(false) => return refusal(StatusCode::GONE, LINK_DEAD, &root),
+        // A reset ended every session of the account; R1b · exactly those
+        // sessions' live connections close, after the commit.
+        Ok(Some(ended)) => crate::handlers::auth_routes::close_deleted_sessions(request, &ended),
+        Ok(None) => return refusal(StatusCode::GONE, LINK_DEAD, &root),
         Err(err) => {
             warn!(target: "albedo.auth", %err, "password reset failed");
             return refusal(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Try again.", &root);
         }
     }
-    // A reset ended every session of the account; its open lanes go with them.
-    crate::handlers::auth_routes::end_lanes_of(request, &principal);
     // Clicking the link proved the mailbox.
     note_verified(db, &principal, &redeemed.email).await;
     debug!(target: "albedo.auth", principal = %principal, "password reset");
@@ -424,8 +424,10 @@ pub(crate) async fn magic_signin(request: &AuthRequest<'_>, form: &FormBody) -> 
             return refusal(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Try again.", &root);
         }
     };
+    // R1b · whatever `took_over` ended up saying, the deletes it reports were
+    // committed; their connections close here, before anything else can fail.
+    crate::handlers::auth_routes::close_deleted_sessions(request, &linked.ended);
     if linked.took_over {
-        crate::handlers::auth_routes::end_lanes_of(request, &linked.principal);
         warn!(
             target: "albedo.auth",
             principal = %linked.principal,

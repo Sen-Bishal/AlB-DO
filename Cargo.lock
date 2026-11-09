@@ -75,6 +75,7 @@ dependencies = [
  "quinn",
  "rand 0.8.5",
  "ratatui",
+ "rcgen",
  "reqwest",
  "rquickjs",
  "rustls 0.23.37",

@@ -77,9 +77,16 @@ pub const SESSIONS: &str = "albedo_sessions";
 pub const CREDENTIALS: &str = "albedo_credentials";
 /// R1a · granted roles, one row per (principal, role).
 pub const ROLES: &str = "albedo_roles";
+/// R1b · one row per principal whose authority changed: `epoch` bumps on every
+/// actual role change (and on deletion), `seq` is the clock value of the last one.
+pub const AUTHORITY: &str = "albedo_authority";
+/// R1b · the single-row clock `seq` is allocated from. Never deleted, so the
+/// high-water mark cannot fall when a principal's authority row goes.
+pub const AUTHORITY_CLOCK: &str = "albedo_authority_clock";
 
 /// Every reserved collection name, for error messages that list them.
-pub const RESERVED_COLLECTIONS: &[&str] = &[USERS, ACCOUNTS, SESSIONS, CREDENTIALS, ROLES];
+pub const RESERVED_COLLECTIONS: &[&str] =
+    &[USERS, ACCOUNTS, SESSIONS, CREDENTIALS, ROLES, AUTHORITY, AUTHORITY_CLOCK];
 
 /// Whether a collection name belongs to AUTH.
 ///
@@ -97,7 +104,15 @@ pub fn is_reserved(name: &str) -> bool {
 /// boot, once.
 #[must_use]
 pub fn collections() -> Vec<ForgeCollection> {
-    vec![users(), accounts(), sessions(), credentials(), roles()]
+    vec![
+        users(),
+        accounts(),
+        sessions(),
+        credentials(),
+        roles(),
+        authority(),
+        authority_clock(),
+    ]
 }
 
 /// Add the auth tables to an app's schema.
@@ -338,6 +353,46 @@ pub fn roles() -> ForgeCollection {
     collection
 }
 
+/// R1b · per-principal authority epoch. A live connection admitted at epoch
+/// `e` is closed once the principal's row says anything above `e`. The `seq`
+/// index is the server's sweep read (`seq > watermark ORDER BY seq`).
+#[must_use]
+pub fn authority() -> ForgeCollection {
+    let mut collection = ForgeCollection::new(
+        AUTHORITY,
+        AUTHORITY,
+        format!("SELECT changed_at, epoch, principal, seq FROM {AUTHORITY} ORDER BY principal"),
+        "principal",
+        Box::new([
+            format!(
+                "CREATE TABLE IF NOT EXISTS {AUTHORITY} (                 principal TEXT PRIMARY KEY,                  epoch INTEGER NOT NULL,                  seq INTEGER NOT NULL,                  changed_at TIMESTAMP NOT NULL)"
+            ),
+            format!("CREATE INDEX IF NOT EXISTS {AUTHORITY}_seq ON {AUTHORITY} (seq)"),
+        ]),
+        Box::new([]),
+    );
+    collection.partition_by = Some("principal".to_string());
+    collection
+}
+
+/// R1b · the authority clock: exactly one row, `id = 1`.
+#[must_use]
+pub fn authority_clock() -> ForgeCollection {
+    ForgeCollection::new(
+        AUTHORITY_CLOCK,
+        AUTHORITY_CLOCK,
+        format!("SELECT id, seq FROM {AUTHORITY_CLOCK} ORDER BY id"),
+        "id",
+        Box::new([
+            format!(
+                "CREATE TABLE IF NOT EXISTS {AUTHORITY_CLOCK} (                 id INTEGER PRIMARY KEY CHECK (id = 1),                  seq INTEGER NOT NULL)"
+            ),
+            format!("INSERT OR IGNORE INTO {AUTHORITY_CLOCK} (id, seq) VALUES (1, 0)"),
+        ]),
+        Box::new([]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,7 +437,11 @@ mod tests {
     /// scan — and, for [`SESSIONS`], what makes revocation a delta.
     #[test]
     fn every_collection_is_partitioned_by_principal() {
-        for collection in collections() {
+        // The clock is one global row, not a per-principal relation.
+        for collection in collections()
+            .into_iter()
+            .filter(|c| c.topic != AUTHORITY_CLOCK)
+        {
             assert_eq!(
                 collection.partition_by.as_deref(),
                 Some("principal"),
@@ -472,7 +531,7 @@ mod tests {
         for collection in collections() {
             for statement in collection.migrations.iter() {
                 assert!(
-                    statement.contains("IF NOT EXISTS"),
+                    statement.contains("IF NOT EXISTS") || statement.contains("INSERT OR IGNORE"),
                     "`{}` has a migration that cannot survive a second boot: {statement}",
                     collection.topic
                 );
@@ -483,6 +542,16 @@ mod tests {
     /// The query's column list is what the wire carries, so it must name
     /// exactly the columns the DDL creates — a mismatch is a runtime error on
     /// the first read rather than a build failure.
+    #[test]
+    fn the_authority_tables_are_reserved_and_the_clock_cannot_be_lowered() {
+        assert!(is_reserved(AUTHORITY) && is_reserved(AUTHORITY_CLOCK));
+        let clock = authority_clock().migrations.join(" ");
+        assert!(clock.contains("CHECK (id = 1)"), "{clock}");
+        let authority = authority().migrations.join(" ");
+        assert!(authority.contains("principal TEXT PRIMARY KEY"), "{authority}");
+        assert!(authority.contains("ON albedo_authority (seq)"), "{authority}");
+    }
+
     #[test]
     fn every_selected_column_exists_in_the_ddl() {
         for collection in collections() {

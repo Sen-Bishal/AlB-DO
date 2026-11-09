@@ -105,6 +105,80 @@ test("misnames a field", () => {
     assert!(text.contains("2 failed"), "{text}");
 }
 
+/// R1b (T-0026) · AC 12 — `grantRole` / `revokeRole` from `albedo/test`.
+///
+/// Falsifier 7: on the pre-T-0026 tree `grantRole` is not exported, so the
+/// first role test fails with it undefined.
+#[test]
+fn a_test_can_grant_and_revoke_a_role() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let app = init(home.path(), work.path(), "app");
+    for scaffold_test in [
+        "src/routes/guestbook.test.tsx",
+        "src/routes/sign-in.test.tsx",
+        "src/components/Hero.test.tsx",
+    ] {
+        std::fs::remove_file(app.join(scaffold_test)).unwrap();
+    }
+    let config_path = app.join("albedo.config.ts");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    let declared = config.replacen("login: \"/sign-in\",", "login: \"/sign-in\",\n    roles: [\"payroll\"],", 1);
+    assert_ne!(declared, config, "the scaffold config changed shape");
+    std::fs::write(config_path, declared).unwrap();
+    write(
+        &app,
+        "src/routes/payroll.tsx",
+        r#"export const auth = { role: "payroll" };
+
+export default function Payroll() {
+  return <main><h1>the payroll room</h1></main>;
+}
+"#,
+    );
+    write(
+        &app,
+        "src/routes/roles.test.tsx",
+        r#"import { test, expect, visit, signUp, signOut, grantRole, revokeRole } from "albedo/test";
+
+test("a role opens the gate and revoking it closes it again", () => {
+  const ada = signUp("ada@example.com", "correct horse battery");
+  expect(visit("/payroll", { as: ada }).status).toBe(403);
+  grantRole(ada, "payroll");
+  expect(visit("/payroll", { as: ada })).toContain("the payroll room");
+  revokeRole(ada, "payroll");
+  expect(visit("/payroll", { as: ada }).status).toBe(403);
+});
+
+test("an undeclared role fails, naming it", () => {
+  const grace = signUp("grace@example.com", "correct horse battery");
+  let message = "";
+  try { grantRole(grace, "nope"); } catch (error) { message = String(error); }
+  expect(message).toContain("nope");
+});
+
+test("a signed-out user cannot be granted a role", () => {
+  const sam = signUp("sam@example.com", "correct horse battery");
+  signOut(sam);
+  let message = "";
+  try { grantRole(sam, "payroll"); } catch (error) { message = String(error); }
+  expect(message).toContain("signed out");
+});
+
+test("the role goes to the session's own user, no one else", () => {
+  const first = signUp("twin@example.com", "correct horse battery");
+  const second = signUp("twin+b@example.com", "correct horse battery");
+  grantRole(second, "payroll");
+  expect(visit("/payroll", { as: first }).status).toBe(403);
+  expect(visit("/payroll", { as: second }).status).toBe(200);
+});
+"#,
+    );
+    let (ok, text) = run(albedo(home.path(), &app).arg("test"), "albedo test");
+    assert!(ok, "albedo test failed\n{text}");
+    assert!(text.contains("4 passed"), "{text}");
+}
+
 /// `src/middleware.ts` and `export const auth = "required"` answer a test's
 /// `visit()` exactly as they answer a browser — because the request goes
 /// through the router `serve` binds.
