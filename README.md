@@ -21,13 +21,13 @@ silently does nothing.
 Download the build for your platform from the
 [releases page](https://github.com/Sen-Bishal/AlB-DO/releases):
 
-| Platform            | File |
-|---------------------|------|
-| Windows x64         | `AlBDO-<version>-x64.msi` (per-user installer, adds `albedo` to `PATH`) or the `.zip` |
-| macOS Intel         | `albedo-<version>-x86_64-apple-darwin.tar.gz` |
-| macOS Apple Silicon | `albedo-<version>-aarch64-apple-darwin.tar.gz` |
-| Linux x64           | `albedo-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64         | `albedo-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| Platform    | File |
+|-------------|------|
+| Windows x64 | `AlBDO-<version>-x64.msi` (per-user installer, adds `albedo` to `PATH`) or the `.zip` |
+| Linux x64   | `albedo-<version>-x86_64-unknown-linux-gnu.tar.gz` (glibc 2.35+: Ubuntu 22.04, Debian 12 or newer) |
+
+macOS builds are not available yet. This is an early release: it works, it has
+rough edges, and [Limitations](#limitations) lists the ones we know about.
 
 Every file has a `.sha256` beside it. The archives contain the `albedo` binary
 and shell completions; put the binary on your `PATH`, then check it:

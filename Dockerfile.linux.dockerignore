@@ -8,6 +8,9 @@ target
 node_modules
 graphify-out
 development-plan
+AlB-DO
+brag-output
+.ua
 *.pdf
 *.docx
 forge.db

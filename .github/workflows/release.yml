@@ -1,12 +1,12 @@
 name: Release
 
-# A release is a tag. `v1.2.3` builds `albedo` 1.2.3 for every platform below
-# and opens a DRAFT GitHub release with the artifacts attached; publishing it is
-# a human decision.
+# A release is a tag. `v1.2.3` builds `albedo` 1.2.3 for Windows x64 and
+# Linux x64 and opens a DRAFT pre-release with the artifacts attached;
+# publishing it is a human decision. macOS is not built yet.
 #
-# Run it by hand (Actions -> Release -> Run workflow) to rehearse: every target
-# is built, smoke-tested and packaged, the MSI included, and the artifacts are
-# kept on the run. Nothing is published.
+# Run it by hand (Actions -> Release -> Run workflow) to rehearse: both
+# targets are built, smoke-tested and packaged, the MSI included, and the
+# artifacts are kept on the run. Nothing is published.
 
 on:
   push:
@@ -24,40 +24,29 @@ env:
   RUSTUP_TOOLCHAIN: stable
 
 jobs:
-  build:
-    name: Build · ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            os:     windows-latest
-            cross:  false
-          - target: x86_64-apple-darwin
-            os:     macos-15-intel
-            cross:  false
-          - target: aarch64-apple-darwin
-            os:     macos-latest
-            cross:  false
-          - target: x86_64-unknown-linux-gnu
-            os:     ubuntu-22.04
-            cross:  false
-          - target: aarch64-unknown-linux-gnu
-            os:     ubuntu-22.04
-            cross:  true
-
+  # Built inside Debian 12 rather than on the runner's own Ubuntu, so the binary
+  # needs at most glibc 2.35 and runs on Ubuntu 22.04+, Debian 12+ and the
+  # `debian:bookworm-slim` image `albedo ship --target docker` writes. A binary
+  # built on a newer runner refuses to start on all three.
+  build-linux:
+    name: Build · x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm
+    env:
+      TARGET: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # `ring` and some swc crates want a C/C++ toolchain and cmake.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake clang
+          rustup toolchain install stable --profile minimal
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: linux-x64
 
       # The binary reports CARGO_PKG_VERSION. A tag that disagrees would ship an
       # artifact named one version that calls itself another. A rehearsal has no
@@ -72,81 +61,116 @@ jobs:
           fi
           echo "VERSION=$CRATE" >> "$GITHUB_ENV"
 
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --locked
-
       - name: Build
-        shell: bash
-        run: |
-          TOOL=cargo
-          [ "${{ matrix.cross }}" = "true" ] && TOOL=cross
-          $TOOL build --release --locked --target "${{ matrix.target }}" -p albedo-server --bin albedo
+        run: cargo build --release --locked -p albedo-server --bin albedo
 
-      - name: Resolve binary path
-        shell: bash
-        run: |
-          EXT=""
-          [ "${{ runner.os }}" = "Windows" ] && EXT=".exe"
-          echo "BIN=target/${{ matrix.target }}/release/albedo${EXT}" >> "$GITHUB_ENV"
-
-      # Run the binary we are about to ship — through qemu for the cross build —
-      # and make it say its own version. A binary that cannot start never
-      # reaches an archive.
+      # Run the binary we are about to ship. One that cannot start, or cannot
+      # make and build a new app, never reaches an archive.
       - name: Smoke test and generate completions
         shell: bash
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            run() { cross run --release --locked --target "${{ matrix.target }}" -p albedo-server --bin albedo -- "$@"; }
-          else
-            run() { "$BIN" "$@"; }
-          fi
-          ACTUAL=$(run --version)
+          BIN="$PWD/target/release/albedo"
+          ACTUAL=$("$BIN" --version)
           if [ "$ACTUAL" != "albedo $VERSION" ]; then
             echo "::error::the binary reports '$ACTUAL', expected 'albedo $VERSION'"
             exit 1
           fi
+          export ALBEDO_NO_TUI=1 NO_COLOR=1
+          SMOKE=$(mktemp -d)
+          "$BIN" init "$SMOKE/app"
+          (cd "$SMOKE/app" && "$BIN" build)
           mkdir -p stage/completions
-          run completions bash       > stage/completions/albedo.bash
-          run completions zsh        > stage/completions/_albedo
-          run completions fish       > stage/completions/albedo.fish
-          run completions powershell > stage/completions/_albedo.ps1
+          "$BIN" completions bash       > stage/completions/albedo.bash
+          "$BIN" completions zsh        > stage/completions/_albedo
+          "$BIN" completions fish       > stage/completions/albedo.fish
+          "$BIN" completions powershell > stage/completions/_albedo.ps1
 
-      - name: Package (macOS, Linux)
-        if: runner.os != 'Windows'
+      - name: Package
         shell: bash
         run: |
-          NAME="albedo-${VERSION}-${{ matrix.target }}"
-          mkdir -p "stage/$NAME"
-          cp "$BIN" "stage/$NAME/albedo"
+          NAME="albedo-${VERSION}-${TARGET}"
+          mkdir -p "stage/$NAME" dist
+          cp target/release/albedo "stage/$NAME/albedo"
           chmod 755 "stage/$NAME/albedo"
           cp -R stage/completions "stage/$NAME/completions"
           cp LICENSE.md README.md "stage/$NAME/"
-          mkdir -p dist
           tar -C stage -czf "dist/$NAME.tar.gz" "$NAME"
-          (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: albedo-linux-x64
+          path: dist/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Build · x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64
+
+      - name: Check the tag matches the crate version
+        shell: bash
+        run: |
+          CRATE=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$CRATE" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $CRATE"
+            exit 1
+          fi
+          echo "VERSION=$CRATE" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked -p albedo-server --bin albedo
+
+      - name: Smoke test and generate completions
+        shell: bash
+        run: |
+          BIN="$PWD/target/release/albedo.exe"
+          ACTUAL=$("$BIN" --version | tr -d '\r')
+          if [ "$ACTUAL" != "albedo $VERSION" ]; then
+            echo "::error::the binary reports '$ACTUAL', expected 'albedo $VERSION'"
+            exit 1
+          fi
+          export ALBEDO_NO_TUI=1 NO_COLOR=1
+          SMOKE="$RUNNER_TEMP/albedo-smoke"
+          "$BIN" init "$SMOKE/app"
+          (cd "$SMOKE/app" && "$BIN" build)
+          mkdir -p stage/completions
+          "$BIN" completions bash       > stage/completions/albedo.bash
+          "$BIN" completions zsh        > stage/completions/_albedo
+          "$BIN" completions fish       > stage/completions/albedo.fish
+          "$BIN" completions powershell > stage/completions/_albedo.ps1
 
       - name: Install WiX Toolset
-        if: runner.os == 'Windows'
         run: dotnet tool install --global wix --version 5.0.2
 
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
+      - name: Package
         shell: pwsh
         run: |
-          $name = "albedo-$env:VERSION-${{ matrix.target }}"
+          $name = "albedo-$env:VERSION-$env:TARGET"
+          $bin  = "target/release/albedo.exe"
           New-Item -ItemType Directory -Force -Path "stage/$name", dist | Out-Null
-          Copy-Item $env:BIN "stage/$name/albedo.exe"
+          Copy-Item $bin "stage/$name/albedo.exe"
           Copy-Item -Recurse stage/completions "stage/$name/completions"
           Copy-Item LICENSE.md, README.md "stage/$name/"
           Compress-Archive -Path "stage/$name" -DestinationPath "dist/$name.zip" -Force
-          $binary = (Resolve-Path $env:BIN).Path
           wix build installer/windows/AlBDO.wxs `
             -arch x64 `
             -d "Version=$env:VERSION" `
-            -d "BinaryPath=$binary" `
+            -d "BinaryPath=$((Resolve-Path $bin).Path)" `
             -o "dist/AlBDO-$env:VERSION-x64.msi"
           if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+          Remove-Item dist/*.wixpdb -ErrorAction SilentlyContinue
           Get-ChildItem dist -File | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($_.Name)" | Out-File -Encoding ascii "$($_.FullName).sha256"
@@ -155,13 +179,13 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: albedo-${{ matrix.target }}
+          name: albedo-windows-x64
           path: dist/*
           if-no-files-found: error
 
   release:
     name: Publish release (draft)
-    needs: build
+    needs: [build-linux, build-windows]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
@@ -176,18 +200,21 @@ jobs:
         with:
           files: dist/*
           draft: true
+          prerelease: true
           generate_release_notes: true
           name: AlBDO ${{ github.ref_name }}
           body: |
+            An early build. It works, it has rough edges, and the README's
+            Limitations section lists the ones we know about. Issues welcome.
+
             ## Installation
 
-            | Platform            | Download |
-            |---------------------|----------|
-            | Windows x64         | `AlBDO-<version>-x64.msi` (installer) or `albedo-<version>-x86_64-pc-windows-msvc.zip` |
-            | macOS Intel         | `albedo-<version>-x86_64-apple-darwin.tar.gz` |
-            | macOS Apple Silicon | `albedo-<version>-aarch64-apple-darwin.tar.gz` |
-            | Linux x64           | `albedo-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-            | Linux arm64         | `albedo-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+            | Platform    | Download |
+            |-------------|----------|
+            | Windows x64 | `AlBDO-<version>-x64.msi` (per-user installer, adds `albedo` to `PATH`) or `albedo-<version>-x86_64-pc-windows-msvc.zip` |
+            | Linux x64   | `albedo-<version>-x86_64-unknown-linux-gnu.tar.gz` (glibc 2.35+: Ubuntu 22.04, Debian 12 or newer) |
+
+            macOS builds are not available yet.
 
             Every file has a `.sha256` beside it. Archives contain the `albedo`
             binary and shell completions under `completions/`.

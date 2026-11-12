@@ -97,10 +97,12 @@ when you are deliberately committing work in progress.
 
 - A release is a tag. Bump `version` in the root `Cargo.toml`, then push
   `vX.Y.Z` with the same number — the workflow refuses a tag that disagrees.
-- `.github/workflows/release.yml` builds `albedo` for Windows x64, macOS
-  (Intel and Apple Silicon) and Linux (x64 and arm64), makes each binary report
-  its own version before packaging it, builds the Windows MSI, and opens a
-  **draft** release. Publishing the draft is a maintainer's decision.
+- `.github/workflows/release.yml` builds `albedo` for Windows x64 and Linux x64
+  (inside Debian 12, so it runs on glibc 2.35+). Each binary must report its
+  own version and create and build a fresh `albedo init` app before it is
+  packaged; then the workflow builds the Windows MSI and opens a **draft**
+  pre-release. Publishing the draft is a maintainer's decision. macOS is not
+  built yet.
 - Rehearse a release without tagging: Actions → Release → Run workflow. Every
   target is built and packaged and the artifacts stay on the run; nothing is
   published.

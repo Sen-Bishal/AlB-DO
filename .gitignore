@@ -288,3 +288,22 @@ crates/albedo-node/*.tgz
 # Output of `docker build -f Dockerfile.linux --target export` — the
 # linux/amd64 runtime `ship --target docker` needs. Build output, never committed.
 dist-linux/
+
+# ── LOCAL-ONLY MATERIAL (untracked 2026-11-12) ───────────────────────
+#
+# Same rule as /development-plan/ above: the remote carries the code, what
+# `albedo` needs to build and run, and the public docs listed there. Beta
+# documents, launch videos, idea notes, the commit ledger and tool state stay
+# on the machine that made them.
+/*.docx
+/*.pdf
+/IDEA.md
+/brag-output/
+/src/commits/
+/.seecode/
+/.ua/
+/AGENTS.md
+# An accidental nested clone of this repository, once tracked as a gitlink.
+/AlB-DO/
+# Release packaging scratch (`.github/workflows/release.yml` stages here).
+/stage/
