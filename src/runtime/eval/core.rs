@@ -2327,8 +2327,11 @@ impl ComponentProject {
         let mut specifier_to_id: HashMap<String, ComponentId> = HashMap::new();
         let mut next_id: u64 = 0;
 
+        // Sorted for the same reason as `scanner.rs`: `next_id` is assigned in
+        // walk order, and the filesystem — not the project — decides that.
         for entry in WalkDir::new(&root)
             .follow_links(true)
+            .sort_by_file_name()
             .into_iter()
             .filter_map(|entry| entry.ok())
         {

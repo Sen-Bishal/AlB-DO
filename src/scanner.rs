@@ -54,8 +54,13 @@ impl ProjectScanner {
         let mut components = Vec::new();
         let mut failures = Vec::new();
 
+        // Sorted: components are numbered in scan order, and a directory's
+        // listing order belongs to the filesystem (NTFS alphabetical, ext4 hash
+        // order). Unsorted, one project got different component ids on Windows
+        // and Linux — the golden manifest test failed on ubuntu/macos CI only.
         for entry in WalkDir::new(path)
             .follow_links(true)
+            .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
         {
