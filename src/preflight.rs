@@ -218,11 +218,13 @@ pub fn portable_module_paths(manifest: Option<&RenderManifestV2>) -> Option<Fail
         .components
         .iter()
         .filter(|component| {
-            let path = std::path::Path::new(component.module_path.as_str());
-            // A backslash is checked separately from `is_absolute`: a *relative*
+            // A backslash is checked separately: a *relative*
             // `src\components\App.jsx` is portable nowhere either, because
-            // `Path` on Linux reads the whole thing as one filename.
-            path.is_absolute() || component.module_path.contains('\\')
+            // `Path` on Linux reads the whole thing as one filename. Absolute is
+            // judged for every platform at once (`B:/proj/…` is relative to
+            // Linux's `Path`), since the artifact may be served on any of them.
+            crate::manifest::portable_path::is_absolute_on_any_platform(&component.module_path)
+                || component.module_path.contains('\\')
         })
         .map(|component| {
             format!(

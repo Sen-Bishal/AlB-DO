@@ -88,7 +88,13 @@ pub fn validate_entry_path(path: &str) -> Result<(), String> {
         ));
     }
     let candidate = Path::new(path);
-    if candidate.is_absolute() {
+    // 🪤 `Path::is_absolute` answers for the host OS only: on Linux
+    // `C:/Windows/…` is a relative path, and on Windows `/etc/passwd` has no
+    // prefix. A payload must mean the same thing wherever it is extracted, so a
+    // root or a drive letter is refused on every platform.
+    if candidate.is_absolute()
+        || dom_render_compiler::manifest::portable_path::is_absolute_on_any_platform(path)
+    {
         return Err(format!("payload entry '{path}' is an absolute path"));
     }
     for component in candidate.components() {

@@ -37,7 +37,7 @@ pub fn portable_module_path(file_path: &str, root: Option<&Path>) -> Option<Stri
     let normalized = file_path.replace('\\', "/");
     let path = Path::new(normalized.as_str());
 
-    let relative = if path.is_absolute() {
+    let relative = if is_absolute_on_any_platform(normalized.as_str()) {
         // `strip_prefix` is a component-wise comparison, so it is not fooled by
         // a trailing slash or a differing separator on either side — but it
         // *is* literal about `.` and `..`, hence the lexical tidy below.
@@ -75,11 +75,30 @@ pub fn portable_module_path(file_path: &str, root: Option<&Path>) -> Option<Stri
 pub fn resolve_portable_module_path(module_path: &str, root: &Path) -> PathBuf {
     let normalized = module_path.replace('\\', "/");
     let path = Path::new(normalized.as_str());
-    if path.is_absolute() {
+    if is_absolute_on_any_platform(normalized.as_str()) {
         path.to_path_buf()
     } else {
         root.join(path)
     }
+}
+
+/// Whether `path` names a location on **some** machine's filesystem rather than
+/// a spot relative to a project: rooted (`/srv/app`, `\\server\share`), or
+/// carrying a drive letter (`C:/…`, `C:\…`, drive-relative `C:foo`).
+///
+/// 🪤 Not `Path::is_absolute`, which answers for the platform it runs on: on
+/// Linux `B:/app/src/App.jsx` is *relative*, so a Windows-built path sailed
+/// through on Linux and macOS CI — and on Windows `/srv/app` is not absolute
+/// either. An artifact is built on one OS and served on another, so the
+/// question "does this name a host directory" has to have one answer
+/// everywhere.
+#[must_use]
+pub fn is_absolute_on_any_platform(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    normalized.starts_with('/')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || Path::new(normalized.as_str()).is_absolute()
 }
 
 /// Strip `root` from `path` comparing components case-insensitively.

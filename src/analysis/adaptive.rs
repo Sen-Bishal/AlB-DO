@@ -43,7 +43,20 @@ const MARGIN_DENOMINATOR: usize = 10;
 /// right direction. Small graphs amortize thread spawn poorly, so they stay
 /// serial.
 pub fn should_parallelize(total_items: usize, item_size_bytes: usize) -> bool {
-    let workers = num_cpus::get();
+    should_parallelize_on(total_items, item_size_bytes, num_cpus::get())
+}
+
+/// [`should_parallelize`] for an explicit worker count, so the decision can be
+/// tested for the machines it runs on rather than the one the test runs on.
+///
+/// 🪤 Fewer than two items, or fewer than two workers, is always serial. The
+/// cost model's `total_items / workers` truncates, so on a 2–4 core machine
+/// (every CI runner) one item's work rounded to **zero** and a singleton "won"
+/// against itself run serially — the tests only passed on a many-core rig.
+fn should_parallelize_on(total_items: usize, item_size_bytes: usize, workers: usize) -> bool {
+    if total_items < 2 || workers < 2 {
+        return false;
+    }
     let work_per_item = item_size_bytes * WORK_PER_BYTE;
 
     let sequential_cost = total_items * work_per_item;
@@ -59,44 +72,64 @@ mod tests {
     /// The two cases the old `GranularityController` test asserted, kept
     /// verbatim so the collapse is provably behavior-preserving at the
     /// boundaries anyone had written down.
+    /// The two cases the old `GranularityController` test asserted, on the
+    /// 8- and 16-core machines they were written on. On 4 cores ten 100-byte
+    /// items *do* clear the margin (2×1000 + 4×1000 < 8000), so the old
+    /// unparameterised form was a statement about the test machine.
     #[test]
     fn test_should_parallelize() {
-        assert!(!should_parallelize(10, 100));
-        assert!(should_parallelize(1000, 1000));
+        for workers in [8, 16] {
+            assert!(!should_parallelize_on(10, 100, workers), "{workers} workers");
+            assert!(should_parallelize_on(1000, 1000, workers), "{workers} workers");
+        }
     }
 
-    /// Re-implements the pre-collapse expression *literally* — including
-    /// `self`-free access to the same globals — and asserts agreement across a
-    /// sweep. This is the regression guard for the refactor itself: it fails if
-    /// anyone "tidies" the integer division into float math.
+    /// Re-implements the pre-collapse expression *literally* and asserts
+    /// agreement across a sweep, for every machine size CI and the dev rig
+    /// have. This is the regression guard for the refactor itself: it fails if
+    /// anyone "tidies" the integer division into float math. The one deliberate
+    /// departure — fewer than two items or workers is serial — is excluded
+    /// here and pinned by `empty_and_singleton_inputs_stay_serial`.
     #[test]
     fn threshold_is_unchanged_by_the_collapse() {
-        fn original(total_items: usize, item_size_bytes: usize) -> bool {
+        fn original(total_items: usize, item_size_bytes: usize, workers: usize) -> bool {
             let parallelism_overhead = 1000;
             let estimated_work_per_item = item_size_bytes * 10;
 
             let sequential_cost = total_items * estimated_work_per_item;
-            let parallel_cost = (total_items / num_cpus::get()) * estimated_work_per_item
-                + (num_cpus::get() * parallelism_overhead);
+            let parallel_cost =
+                (total_items / workers) * estimated_work_per_item + (workers * parallelism_overhead);
 
             parallel_cost < (sequential_cost * 8 / 10)
         }
 
-        for total_items in [0, 1, 2, 4, 8, 15, 16, 17, 32, 64, 128, 1_000, 10_000] {
-            for item_size_bytes in [1, 8, 64, 100, 256, 1_000, 4_096] {
-                assert_eq!(
-                    should_parallelize(total_items, item_size_bytes),
-                    original(total_items, item_size_bytes),
-                    "disagreement at total_items={total_items}, item_size_bytes={item_size_bytes}"
-                );
+        for workers in [2, 3, 4, 8, 16, 32] {
+            for total_items in [2, 4, 8, 15, 16, 17, 32, 64, 128, 1_000, 10_000] {
+                for item_size_bytes in [1, 8, 64, 100, 256, 1_000, 4_096] {
+                    assert_eq!(
+                        should_parallelize_on(total_items, item_size_bytes, workers),
+                        original(total_items, item_size_bytes, workers),
+                        "disagreement at total_items={total_items}, \
+                         item_size_bytes={item_size_bytes}, workers={workers}"
+                    );
+                }
             }
         }
     }
 
-    /// An empty graph must never pay for threads.
+    /// An empty graph, a single item, or a single core must never pay for
+    /// threads — on any machine. Before the guard, `(1, 1_000)` parallelised on
+    /// 2–4 cores because `1 / workers` truncated the item's work to zero.
     #[test]
     fn empty_and_singleton_inputs_stay_serial() {
-        assert!(!should_parallelize(0, 1_000));
-        assert!(!should_parallelize(1, 1_000));
+        for workers in [1, 2, 3, 4, 8, 16, 64] {
+            for item_size_bytes in [1, 1_000, 4_096, 1 << 20] {
+                assert!(!should_parallelize_on(0, item_size_bytes, workers));
+                assert!(!should_parallelize_on(1, item_size_bytes, workers));
+            }
+        }
+        for total_items in [2, 100, 10_000] {
+            assert!(!should_parallelize_on(total_items, 4_096, 1), "one core is serial");
+        }
     }
 }

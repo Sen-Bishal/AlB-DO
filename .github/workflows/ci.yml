@@ -63,12 +63,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # --no-fail-fast: without it cargo stops at the first failing test binary,
+      # every binary after it never runs, and their failures stay invisible
+      # (14 Nov 2026: one compile error hid 12 cross-platform failures).
       - name: Test compiler
-        run: cargo test -p dom-render-compiler
+        run: cargo test -p dom-render-compiler --no-fail-fast
 
-      - name: Test server
+      # Windows only: advisory until T-0040. libSQL-era native aborts
+      # (0xc0000005) hit 2-3 of 50 server test binaries per full run on Windows,
+      # even at --test-threads=1; Linux and macOS have never shown one. The step
+      # still runs and still shows red in the job, it just cannot fail the run.
+      # Remove the continue-on-error line when T-0040 closes.
+      - name: Test server${{ matrix.os == 'windows-latest' && ' (advisory on Windows until T-0040)' || '' }}
         if: ${{ !cancelled() }}
-        run: cargo test -p albedo-server
+        continue-on-error: ${{ matrix.os == 'windows-latest' }}
+        run: cargo test -p albedo-server --no-fail-fast
 
   # Releases are built by the stable compiler (see release.yml). This catches a
   # change that only nightly accepts before a tag does.

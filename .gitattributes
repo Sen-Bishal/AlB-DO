@@ -9,6 +9,14 @@
 # is exactly how a CRLF blob slips into history and makes Windows and
 # Linux CI disagree on the same commit.
 * text=auto
+# scaffold/ and assets/ are compiled into the binary with include_str!, so their
+# checkout bytes ARE the binary's bytes. Without a pinned eol, a Windows CI or
+# release build (core.autocrlf=true) embedded CRLF and `albedo init` wrote
+# different files than the Linux build of the same commit
+# (build_artifact_local_data failed on windows-latest only). Listed BEFORE the
+# binary patterns below so `*.ico binary` etc. still win (later lines override).
+scaffold/** text eol=lf
+assets/**   text eol=lf
 
 # Binary assets: never apply EOL conversion or attempt a text diff.
 *.ico   binary
