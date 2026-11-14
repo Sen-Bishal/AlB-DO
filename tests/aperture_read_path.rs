@@ -72,7 +72,13 @@ fn spec_from_source(source: &str) -> SourceTopicSpec {
     )
     .expect("parses");
     let function = parsed.functions.get("Component").expect("component");
-    let bindings = extract_shared_slot_hooks(function, &parsed.imports).expect("extracts");
+    let bindings = extract_shared_slot_hooks(
+        function,
+        &parsed.imports,
+        &parsed.shared_slot_sites,
+        &parsed.shared_slot_keys,
+    )
+    .expect("extracts");
     let binding = bindings.first().expect("one binding");
     let TopicSpec::Source {
         source,

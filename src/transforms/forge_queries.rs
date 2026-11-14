@@ -796,6 +796,38 @@ pub fn enforce_project(
 /// a consumer rejects by its own message when the boundary did not run.
 #[must_use]
 pub fn legacy_shared_slot_sites(resolved: &Module) -> HashSet<u32> {
+    legacy_shared_slot_index(resolved).sites
+}
+
+/// What a legacy partition read's key is, **by binding** (Design 4): the value
+/// of `<collection>.where({ <column>: <value> })` traced to the entry
+/// component's first parameter, carrying the field read off it. This is the
+/// classifier's own provenance, handed to the legacy extractor so the two
+/// cannot disagree about `{ params: route }` → `route.id`, a whole `props` →
+/// `props.params.id`, or `{ user: actor }` → `actor.id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyKey {
+    /// A route param, by name: `params.id`, `route.id`, `props.params.id`.
+    Param(String),
+    /// A field of the principal: `user.id`, `actor.id`, `props.user.id`. Only
+    /// `id` is a valid partition key; the extractor refuses any other field
+    /// with its own message.
+    Principal(String),
+}
+
+/// [`legacy_shared_slot_sites`] plus, for each legacy partition read, its key
+/// by binding — keyed by the **value expression's** start offset, so a consumer
+/// looks it up from the expression it is already holding.
+#[derive(Debug, Clone, Default)]
+pub struct LegacySiteIndex {
+    pub sites: HashSet<u32>,
+    pub keys: HashMap<u32, LegacyKey>,
+}
+
+/// [`legacy_shared_slot_sites`], with each partition read's key by binding. The
+/// module must already have been through SWC's resolver.
+#[must_use]
+pub fn legacy_shared_slot_index(resolved: &Module) -> LegacySiteIndex {
     let mut collections: HashSet<Id> = HashSet::new();
     let mut hooks: HashSet<Id> = HashSet::new();
     for item in &resolved.body {
@@ -832,10 +864,11 @@ pub fn legacy_shared_slot_sites(resolved: &Module) -> HashSet<u32> {
     let mut finder = LegacySites {
         collections,
         hooks,
-        sites: HashSet::new(),
+        props: PropBindings::from_module(resolved),
+        index: LegacySiteIndex::default(),
     };
     resolved.visit_with(&mut finder);
-    finder.sites
+    finder.index
 }
 
 /// [`legacy_shared_slot_sites`] for a module that has not been resolved: resolves
@@ -843,18 +876,25 @@ pub fn legacy_shared_slot_sites(resolved: &Module) -> HashSet<u32> {
 /// same as the caller's.
 #[must_use]
 pub fn legacy_shared_slot_sites_unresolved(module: &Module) -> HashSet<u32> {
+    legacy_shared_slot_index_unresolved(module).sites
+}
+
+/// [`legacy_shared_slot_index`] for a module that has not been resolved.
+#[must_use]
+pub fn legacy_shared_slot_index_unresolved(module: &Module) -> LegacySiteIndex {
     let globals = Globals::new();
     GLOBALS.set(&globals, || {
         let mut resolved = module.clone();
         resolved.visit_mut_with(&mut resolver(Mark::new(), Mark::new(), true));
-        legacy_shared_slot_sites(&resolved)
+        legacy_shared_slot_index(&resolved)
     })
 }
 
 struct LegacySites {
     collections: HashSet<Id>,
     hooks: HashSet<Id>,
-    sites: HashSet<u32>,
+    props: PropBindings,
+    index: LegacySiteIndex,
 }
 
 impl Visit for LegacySites {
@@ -864,7 +904,8 @@ impl Visit for LegacySites {
                 if self.hooks.contains(&hook.to_id()) {
                     if let Some(first) = call.args.first() {
                         if first.spread.is_none() && self.legacy_arg(&first.expr) {
-                            self.sites.insert(call.span.lo.0);
+                            self.index.sites.insert(call.span.lo.0);
+                            self.record_key(&first.expr);
                         }
                     }
                 }
@@ -875,6 +916,71 @@ impl Visit for LegacySites {
 }
 
 impl LegacySites {
+    /// For `<collection>.where({ <column>: <value> })`, record `<value>`'s key by
+    /// binding. A value that is not a route param or the principal records
+    /// nothing; the extractor then judges it by its own rules.
+    fn record_key(&mut self, arg: &Expr) {
+        let Expr::Call(call) = unwrap(arg) else {
+            return;
+        };
+        let [only] = call.args.as_slice() else {
+            return;
+        };
+        let Expr::Object(obj) = unwrap(&only.expr) else {
+            return;
+        };
+        let [PropOrSpread::Prop(prop)] = obj.props.as_slice() else {
+            return;
+        };
+        let Prop::KeyValue(kv) = &**prop else {
+            return;
+        };
+        if let Some(key) = self.bound_key(&kv.value) {
+            self.index.keys.insert(kv.value.span().lo.0, key);
+        }
+    }
+
+    /// `<route>.<field>`, `<principal>.<field>`, or `<props>.params|user.<field>`,
+    /// where each root is the entry component's parameter **by binding**.
+    fn bound_key(&self, value: &Expr) -> Option<LegacyKey> {
+        let Expr::Member(outer) = unwrap(value) else {
+            return None;
+        };
+        let MemberProp::Ident(field) = &outer.prop else {
+            return None;
+        };
+        let field = field.sym.to_string();
+        match unwrap(&outer.obj) {
+            Expr::Ident(root) => {
+                let id = root.to_id();
+                if self.props.route.contains(&id) {
+                    Some(LegacyKey::Param(field))
+                } else if self.props.principal.contains(&id) {
+                    Some(LegacyKey::Principal(field))
+                } else {
+                    None
+                }
+            }
+            Expr::Member(inner) => {
+                let Expr::Ident(root) = unwrap(&inner.obj) else {
+                    return None;
+                };
+                let MemberProp::Ident(via) = &inner.prop else {
+                    return None;
+                };
+                if !self.props.whole.contains(&root.to_id()) {
+                    return None;
+                }
+                match via.sym.as_ref() {
+                    "params" => Some(LegacyKey::Param(field)),
+                    "user" => Some(LegacyKey::Principal(field)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// `<collection>` or `<collection>.where({ <one key>: <value> })`.
     fn legacy_arg(&self, expr: &Expr) -> bool {
         match unwrap(expr) {

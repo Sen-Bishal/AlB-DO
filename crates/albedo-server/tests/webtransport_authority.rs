@@ -44,12 +44,8 @@ async fn listener() -> Listener {
     let key_path = dir.path().join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
     std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-    let port = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    // Port 0, read back after binding: probing for a free port and binding it
+    // later raced the other tests in this binary (os error 10048 on Windows).
     let config = WebTransportConfig {
         enabled: true,
         cert_path: Some(cert_path.display().to_string()),
@@ -57,7 +53,13 @@ async fn listener() -> Listener {
         ..WebTransportConfig::default()
     };
     let sessions = WebTransportSessionRegistry::default();
-    let runtime = WebTransportRuntime::bind_with_registry(addr, &config, sessions.clone()).unwrap();
+    let runtime = WebTransportRuntime::bind_with_registry(
+        "127.0.0.1:0".parse().unwrap(),
+        &config,
+        sessions.clone(),
+    )
+    .unwrap();
+    let addr = runtime.local_addr().unwrap();
     let (shutdown, rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         let _ = runtime.run(rx).await;

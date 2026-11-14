@@ -582,6 +582,7 @@ impl CompiledProject {
                     function,
                     &module.imports,
                     &module.shared_slot_sites,
+                    &module.shared_slot_keys,
                 )
                     .map_err(|err: SharedSlotExtractError| {
                         anyhow!(

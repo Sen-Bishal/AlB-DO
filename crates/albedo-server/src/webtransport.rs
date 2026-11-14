@@ -249,6 +249,16 @@ pub struct WebTransportRuntime {
 }
 
 impl WebTransportRuntime {
+    /// The address the endpoint is actually bound to. Bind to port 0 and read
+    /// this back, instead of probing for a free port and binding it afterwards:
+    /// the probe-then-bind gap is a race whenever anything else binds in parallel.
+    ///
+    /// # Errors
+    /// The OS could not report the socket's address.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+
     pub fn bind(addr: SocketAddr, config: &WebTransportConfig) -> Result<Self, RuntimeError> {
         Self::bind_with_registry(addr, config, WebTransportSessionRegistry::default())
     }

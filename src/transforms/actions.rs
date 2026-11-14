@@ -514,6 +514,7 @@ mod tests {
             module_constants: Vec::new(),
             action_declarations: Vec::new(),
             shared_slot_sites: Default::default(),
+            shared_slot_keys: Default::default(),
         };
 
         for item in module.body {

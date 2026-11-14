@@ -59,6 +59,13 @@ pub struct ParsedModule {
     /// extractor acts only on these, so a parameter that shadows a collection is
     /// not a FORGE subscription.
     pub shared_slot_sites: std::collections::HashSet<u32>,
+    /// Each legacy partition read's key **by binding**, keyed by the value
+    /// expression's start offset
+    /// ([`crate::transforms::forge_queries::legacy_shared_slot_index`]). The
+    /// extractor prefers this to the spelling `params.x` / `user.id`, so an
+    /// aliased prop the classifier accepted is lowered the same way.
+    pub shared_slot_keys:
+        std::collections::HashMap<u32, crate::transforms::forge_queries::LegacyKey>,
 }
 
 pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
@@ -66,8 +73,10 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
     // 9.1a · computed here because the walk below consumes `module.body`.
     let component_exports =
         crate::runtime::implied_default::exported_component_names(&module.body);
-    let shared_slot_sites =
-        crate::transforms::forge_queries::legacy_shared_slot_sites_unresolved(&module);
+    let crate::transforms::forge_queries::LegacySiteIndex {
+        sites: shared_slot_sites,
+        keys: shared_slot_keys,
+    } = crate::transforms::forge_queries::legacy_shared_slot_index_unresolved(&module);
     let mut parsed = ParsedModule {
         imports: HashMap::new(),
         functions: HashMap::new(),
@@ -76,6 +85,7 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
         module_constants: Vec::new(),
         action_declarations: Vec::new(),
         shared_slot_sites,
+        shared_slot_keys,
     };
     let mut synthetic_index = 0usize;
 

@@ -63,7 +63,7 @@
 
 use crate::runtime::eval::{ComponentFunction, ImportBinding};
 use std::collections::HashMap;
-use swc_common::DUMMY_SP;
+use swc_common::{Spanned, DUMMY_SP};
 use swc_ecma_ast::{
     BlockStmtOrExpr, CallExpr, Callee, Decl, Expr, ExprOrSpread, ExprStmt, ForStmt, Ident, IfStmt,
     ImportSpecifier, Lit, MemberExpr, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem,
@@ -379,24 +379,30 @@ pub fn extract_shared_slot_hooks(
     function: &ComponentFunction,
     imports: &HashMap<String, ImportBinding>,
     sites: &std::collections::HashSet<u32>,
+    keys: &SiteKeys,
 ) -> Result<Vec<SharedSlotBinding>, SharedSlotExtractError> {
     let mut out = Vec::new();
     for stmt in &function.body_stmts {
-        visit_stmt_top_level(stmt, imports, sites, &mut out)?;
+        visit_stmt_top_level(stmt, imports, sites, keys, &mut out)?;
     }
     Ok(out)
 }
+
+/// Each legacy partition read's key by binding, from the classifier
+/// ([`crate::transforms::forge_queries::LegacySiteIndex::keys`]).
+pub type SiteKeys = HashMap<u32, crate::transforms::forge_queries::LegacyKey>;
 
 fn visit_stmt_top_level(
     stmt: &Stmt,
     imports: &HashMap<String, ImportBinding>,
     sites: &std::collections::HashSet<u32>,
+    keys: &SiteKeys,
     out: &mut Vec<SharedSlotBinding>,
 ) -> Result<(), SharedSlotExtractError> {
     match stmt {
         Stmt::Decl(Decl::Var(var)) => {
             for decl in &var.decls {
-                try_extract_from_var_declarator(decl, imports, sites, out)?;
+                try_extract_from_var_declarator(decl, imports, sites, keys, out)?;
             }
             Ok(())
         }
@@ -420,7 +426,7 @@ fn visit_stmt_top_level(
         }
         Stmt::Block(block) => {
             for inner in &block.stmts {
-                visit_stmt_top_level(inner, imports, sites, out)?;
+                visit_stmt_top_level(inner, imports, sites, keys, out)?;
             }
             Ok(())
         }
@@ -432,6 +438,7 @@ fn try_extract_from_var_declarator(
     decl: &VarDeclarator,
     imports: &HashMap<String, ImportBinding>,
     sites: &std::collections::HashSet<u32>,
+    keys: &SiteKeys,
     out: &mut Vec<SharedSlotBinding>,
 ) -> Result<(), SharedSlotExtractError> {
     let Some(init) = &decl.init else { return Ok(()) };
@@ -452,7 +459,7 @@ fn try_extract_from_var_declarator(
         return Ok(());
     }
 
-    let spec = extract_topic_spec(call, &binding_name, imports, sites)?;
+    let spec = extract_topic_spec(call, &binding_name, imports, sites, keys)?;
     let binding_name = binding_name.ok_or(SharedSlotExtractError::UnsupportedDestructurePattern)?;
 
     out.push(SharedSlotBinding {
@@ -505,6 +512,7 @@ fn extract_topic_spec(
     binding_name: &Option<String>,
     imports: &HashMap<String, ImportBinding>,
     sites: &std::collections::HashSet<u32>,
+    keys: &SiteKeys,
 ) -> Result<TopicSpec, SharedSlotExtractError> {
     let first = call.args.first().ok_or_else(|| {
         SharedSlotExtractError::MissingTopicArgument { binding_name: binding_name.clone() }
@@ -528,7 +536,7 @@ fn extract_topic_spec(
         // are `<ident>.<method>(<object>)`, so the receiver's *import* decides
         // which, never the method name. A source route may legitimately be
         // called `where`.
-        Expr::Call(inner) => extract_call_spec(inner, binding_name, imports, site),
+        Expr::Call(inner) => extract_call_spec(inner, binding_name, imports, site, keys),
         _ => Err(SharedSlotExtractError::NonStringLiteralTopic {
             binding_name: binding_name.clone(),
         }),
@@ -575,6 +583,7 @@ fn extract_call_spec(
     binding_name: &Option<String>,
     imports: &HashMap<String, ImportBinding>,
     site: bool,
+    keys: &SiteKeys,
 ) -> Result<TopicSpec, SharedSlotExtractError> {
     let unsupported = || SharedSlotExtractError::NonStringLiteralTopic {
         binding_name: binding_name.clone(),
@@ -592,7 +601,7 @@ fn extract_call_spec(
     if source_for_ident(receiver.sym.as_ref(), imports).is_some() {
         extract_source(call, member, binding_name, imports)
     } else {
-        extract_partition(call, binding_name, imports, site)
+        extract_partition(call, binding_name, imports, site, keys)
     }
 }
 
@@ -699,6 +708,7 @@ fn extract_partition(
     binding_name: &Option<String>,
     imports: &HashMap<String, ImportBinding>,
     site: bool,
+    keys: &SiteKeys,
 ) -> Result<TopicSpec, SharedSlotExtractError> {
     let unsupported = || SharedSlotExtractError::NonStringLiteralTopic {
         binding_name: binding_name.clone(),
@@ -754,15 +764,36 @@ fn extract_partition(
     Ok(TopicSpec::Partition {
         collection,
         column,
-        key: extract_key_source(&entry.value, binding_name)?,
+        key: extract_key_source(&entry.value, binding_name, keys)?,
     })
 }
 
 /// Lower the value side of `.where({ column: <here> })`.
+///
+/// The classifier's answer **by binding** comes first (`{ params: route }` →
+/// `route.id`, a whole `props` → `props.params.id`, `{ user: actor }` →
+/// `actor.id`), so a read it accepted as legacy is never refused here for its
+/// spelling. Without one — a module nobody classified — the spelling
+/// `params.x` / `user.id` is the rule, as before.
 fn extract_key_source(
     expr: &Expr,
     binding_name: &Option<String>,
+    keys: &SiteKeys,
 ) -> Result<KeySource, SharedSlotExtractError> {
+    use crate::transforms::forge_queries::LegacyKey;
+    match keys.get(&expr.span().lo.0) {
+        Some(LegacyKey::Param(field)) => return Ok(KeySource::Param(field.clone())),
+        // Same rule as the spelled form below: only `id` passes the
+        // partition-key alphabet.
+        Some(LegacyKey::Principal(field)) if field == "id" => return Ok(KeySource::Identity),
+        Some(LegacyKey::Principal(_)) => {
+            return Err(SharedSlotExtractError::UnsupportedIdentityField {
+                binding_name: binding_name.clone(),
+                found: describe_expr(expr),
+            })
+        }
+        None => {}
+    }
     if let Expr::Member(member) = unwrap_parens(expr) {
         if let (Expr::Ident(base), MemberProp::Ident(field)) =
             (unwrap_parens(&member.obj), &member.prop)
@@ -1183,13 +1214,25 @@ mod tests {
     fn extract_or_panic(source: &str) -> Vec<SharedSlotBinding> {
         let parsed = parse(source);
         let function = function_named(&parsed, "Component");
-        extract_shared_slot_hooks(function, &parsed.imports, &parsed.shared_slot_sites).expect("extraction")
+        extract_shared_slot_hooks(
+            function,
+            &parsed.imports,
+            &parsed.shared_slot_sites,
+            &parsed.shared_slot_keys,
+        )
+        .expect("extraction")
     }
 
     fn extract_err(source: &str) -> SharedSlotExtractError {
         let parsed = parse(source);
         let function = function_named(&parsed, "Component");
-        extract_shared_slot_hooks(function, &parsed.imports, &parsed.shared_slot_sites).expect_err("expected extraction error")
+        extract_shared_slot_hooks(
+            function,
+            &parsed.imports,
+            &parsed.shared_slot_sites,
+            &parsed.shared_slot_keys,
+        )
+        .expect_err("expected extraction error")
     }
 
     #[test]

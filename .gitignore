@@ -135,6 +135,10 @@ yarn.lock
 *.pem
 *.key
 secrets.toml
+# Self-signed test-only TLS pair, compiled into tls.rs tests by include_str!.
+# Without it the server crate's tests do not build on a clean checkout (CI).
+# See crates/albedo-server/tests/fixtures/tls/README.md.
+!/crates/albedo-server/tests/fixtures/tls/*.pem
 
 # Custom build scripts output
 /build/

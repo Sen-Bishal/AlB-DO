@@ -66,6 +66,27 @@ fn an_aliased_principal_prop_keeps_its_legacy_identity_key() {
     partition_binding("{ user: actor }", "actor.id", KeySource::Identity);
 }
 
+/// The binding hand-off must not widen what a principal key may be: through an
+/// alias, a field other than `id` is refused with the same identity-field message
+/// as the spelled `user.email`, not lowered and not misreported as unsupported.
+#[test]
+fn an_aliased_principal_field_other_than_id_is_still_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Page.tsx"),
+        "import { useSharedSlot } from 'albedo';\nimport { messages } from 'albedo/forge';\nexport default function Page({ user: actor }) { const rows = useSharedSlot(messages.where({ room: actor.email })); return <p>{rows.length}</p>; }",
+    )
+    .unwrap();
+    let err = match CompiledProject::load_from_dir(dir.path()) {
+        Ok(_) => panic!("actor.email must not become a partition key"),
+        Err(err) => format!("{err:#}"),
+    };
+    assert!(
+        err.contains("`actor.email` cannot be a partition key"),
+        "{err}"
+    );
+}
+
 #[derive(Default)]
 struct HookArguments(Vec<(String, bool)>);
 
