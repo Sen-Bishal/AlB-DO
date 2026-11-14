@@ -3546,6 +3546,17 @@ fn run_prod_build_with_budget(
         ));
     }
 
+    // Q1a · every value use of an `albedo/forge` collection is classified before
+    // anything compiles or renders. A misuse, or a new-style query (lowered, but
+    // nothing runs it before Q1b), stops the build here — the first error, with
+    // the call site in source coordinates.
+    dom_render_compiler::transforms::forge_queries::enforce_project(
+        &contract.root,
+        &contract.project_dir,
+        &contract.forge,
+        Some(&contract.project_dir.join(".albedo").join("query-report.txt")),
+    )?;
+
     // `quiet` (dev hot reload) does the whole build silently so a save prints a
     // single "reloaded in Xms" line — the presentation below is suppressed, but
     // warnings and errors still surface.

@@ -424,3 +424,147 @@ async fn leftover_cleanup_is_scoped_to_the_holder_and_never_allows_grant() {
     assert!(ok && text.contains("leftover"), "{text}");
     assert!(roles_of(&db_path, &id).await.is_empty());
 }
+
+#[tokio::test]
+async fn authority_tables_upgrade_in_both_cli_and_server_bootstrap_orders() {
+    use dom_render_compiler::auth::store::{authority_changes_after, authority_clock};
+    use dom_render_compiler::forge::DataSubstrate;
+
+    for server_first in [false, true] {
+        let (home, _work, app, db_path, id) = role_rig().await;
+        let tables = schema::augment(&ForgeSchema::build(Vec::new()).unwrap()).unwrap();
+        {
+            let db = LibSqlSubstrate::open_local(&db_path).await.unwrap();
+            db.execute("DROP TABLE albedo_authority", &[])
+                .await
+                .unwrap();
+            db.execute("DROP TABLE albedo_authority_clock", &[])
+                .await
+                .unwrap();
+            if server_first {
+                bootstrap_schema(&db, &tables).await.unwrap();
+                assert_eq!(authority_clock(&db).await.unwrap(), 0);
+            }
+        }
+        let (ok, text) = run(albedo(home.path(), &app, &db_path).args([
+            "roles",
+            "grant",
+            id.as_str(),
+            "payroll",
+        ]));
+        assert!(ok, "server_first={server_first}: {text}");
+        {
+            let db = LibSqlSubstrate::open_local(&db_path).await.unwrap();
+            assert_eq!(authority_clock(&db).await.unwrap(), 1);
+            bootstrap_schema(&db, &tables).await.unwrap();
+            bootstrap_schema(&db, &tables).await.unwrap();
+            assert_eq!(authority_clock(&db).await.unwrap(), 1);
+            let changes = authority_changes_after(&db, 0).await.unwrap();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].principal, id.as_str());
+            assert_eq!((changes[0].epoch, changes[0].seq), (1, 1));
+            assert_eq!(
+                load_principal(&db, &id).await.unwrap().unwrap().roles,
+                ["payroll"]
+            );
+        }
+        let (ok, text) =
+            run(albedo(home.path(), &app, &db_path).args(["roles", "grant", id.as_str(), "hr"]));
+        assert!(ok, "second grant: {text}");
+        let db = LibSqlSubstrate::open_local(&db_path).await.unwrap();
+        bootstrap_schema(&db, &tables).await.unwrap();
+        assert_eq!(authority_clock(&db).await.unwrap(), 2);
+        assert_eq!(
+            load_principal(&db, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .authority_epoch,
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_locked_database_fails_loudly_then_concurrent_cli_changes_get_unique_sequences() {
+    use dom_render_compiler::auth::store::{authority_changes_after, authority_clock};
+    use dom_render_compiler::forge::DataSubstrate;
+    use std::process::Stdio;
+
+    let (home, _work, app, db_path, ada) = role_rig().await;
+    let db = LibSqlSubstrate::open_local(&db_path).await.unwrap();
+    let bob = person(&db, "bob", "bob@example.com").await;
+    let cat = person(&db, "cat", "cat@example.com").await;
+    let transaction = db.begin().await.unwrap();
+    let mut blocked = albedo(home.path(), &app, &db_path)
+        .args(["roles", "grant", ada.as_str(), "payroll"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if blocked.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            blocked.kill().unwrap();
+            let _ = blocked.wait();
+            panic!("CLI did not report the held write lock within 15 seconds");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let output = blocked.wait_with_output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a CLI must not claim an uncommitted write: {text}"
+    );
+    assert!(
+        text.to_ascii_lowercase().contains("locked") || text.to_ascii_lowercase().contains("busy"),
+        "failure must identify contention: {text}"
+    );
+    assert_eq!(authority_clock(&db).await.unwrap(), 0);
+    assert!(authority_changes_after(&db, 0).await.unwrap().is_empty());
+    assert!(load_principal(&db, &ada)
+        .await
+        .unwrap()
+        .unwrap()
+        .roles
+        .is_empty());
+    transaction.rollback().await.unwrap();
+
+    let ids = [ada, bob, cat];
+    let mut children = Vec::new();
+    for id in &ids {
+        children.push(
+            albedo(home.path(), &app, &db_path)
+                .args(["roles", "grant", id.as_str(), "payroll"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "concurrent CLI failed: {output:?}");
+    }
+    let changes = authority_changes_after(&db, 0).await.unwrap();
+    assert_eq!(authority_clock(&db).await.unwrap(), 3);
+    assert_eq!(
+        changes.iter().map(|change| change.seq).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert!(changes.iter().all(|change| change.epoch == 1));
+    for id in &ids {
+        assert_eq!(
+            load_principal(&db, id).await.unwrap().unwrap().roles,
+            ["payroll"]
+        );
+    }
+}

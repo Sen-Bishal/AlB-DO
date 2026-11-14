@@ -357,6 +357,7 @@ fn register_handler(
 /// `<style>` blocks into each route's shell.
 #[derive(Debug, Clone, Default)]
 pub struct CssModuleRegistry {
+    root: PathBuf,
     /// Project-relative path of the `.module.css` file → its scoped
     /// output (class map + rewritten CSS). The key is normalised
     /// with `/` separators so dedup works across components that
@@ -405,6 +406,43 @@ impl CssModuleRegistry {
             }
         }
         out
+    }
+
+    /// `QuickJS` module records from the class maps used by rendering and CSS emission.
+    ///
+    /// # Errors
+    /// A class map could not be serialized or its module record could not be compiled.
+    pub fn module_records(
+        &self,
+    ) -> crate::runtime::engine::RuntimeResult<Vec<(String, String, u64)>> {
+        use crate::runtime::engine::{stable_source_hash, RuntimeError};
+        use crate::runtime::quickjs_engine::compile_module_script_for_quickjs;
+
+        let mut files: Vec<_> = self.files.iter().collect();
+        files.sort_by_key(|(key, _)| *key);
+        files.into_iter().map(|(key, scoped)| {
+            // JSON.parse preserves class names such as __proto__ as own properties.
+            let map = serde_json::to_string(&scoped.class_map)
+                .and_then(|json| serde_json::to_string(&json))
+                .map_err(|err| RuntimeError::init(format!("CSS module '{key}': {err}")))?;
+            let source = format!("export default Object.freeze(JSON.parse({map}));");
+            let script = compile_module_script_for_quickjs(key, &source)?;
+            let key_json = serde_json::to_string(key)
+                .map_err(|err| RuntimeError::init(format!("CSS module key: {err}")))?;
+            let absolute = self.root.join(key).to_string_lossy().replace('\\', "/");
+            let absolute_json = serde_json::to_string(&absolute)
+                .map_err(|err| RuntimeError::init(format!("CSS module path: {err}")))?;
+            // Render artifacts can use project-relative paths while the registry
+            // is source-root-relative. The resolver already supports absolute keys.
+            // Alias classification also gives namespace imports the record itself.
+            let script = format!(
+                "{script}\nglobalThis.__ALBEDO_MODULES[{absolute_json}] = globalThis.__ALBEDO_MODULES[{key_json}];\n\
+                 globalThis.__ALBEDO_NPM_ALIASES[{key_json}] = {key_json};\n\
+                 globalThis.__ALBEDO_NPM_ALIASES[{absolute_json}] = {absolute_json};"
+            );
+            let hash = stable_source_hash(&script);
+            Ok((key.clone(), script, hash))
+        }).collect()
     }
 
     /// Phase P · E.3 — total number of distinct CSS-module files
@@ -540,7 +578,11 @@ impl CompiledProject {
                 // calls as a list of (binding_name, topic) records.
                 // Compile-time failure here propagates as an
                 // `anyhow!` so misuse blocks the build.
-                let shared_slot_bindings = extract_shared_slot_hooks(function, &module.imports)
+                let shared_slot_bindings = extract_shared_slot_hooks(
+                    function,
+                    &module.imports,
+                    &module.shared_slot_sites,
+                )
                     .map_err(|err: SharedSlotExtractError| {
                         anyhow!(
                             "shared-slot extraction failed in \
@@ -898,13 +940,45 @@ impl CompiledProject {
     /// name. The render manifest identifies a Tier-C node by component name
     /// (and carries an absolute `module_path` that won't match the project's
     /// relative module specs); this finds the spec `build_reactive_payload`
-    /// (and `resolve_entry`) actually keys on. First match wins.
+    /// (and `resolve_entry`) actually keys on.
+    ///
+    /// ⚠️ **Ambiguous when two modules export a component with this name** —
+    /// "first match" is the first key of a `HashMap`, which differs between
+    /// processes (T-0044: one route got another's shared-slot metadata on ~45%
+    /// of boots). Prefer [`Self::module_spec_for`], which also takes the
+    /// module path; this remains for callers that only have a name, and
+    /// returns `None` rather than guessing when the name is shared.
     #[must_use]
     pub fn module_spec_for_component(&self, function_name: &str) -> Option<&str> {
+        let mut matches = self
+            .components
+            .keys()
+            .filter(|(_, name)| name == function_name)
+            .map(|(spec, _)| spec.as_str());
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    /// T-0044 · the render-entry spec for the component `function_name`
+    /// defined in `module_path` (the manifest's absolute path, or any path that
+    /// ends in the project-relative spec). Among the specs that export that
+    /// name, the one that is a path suffix of `module_path` wins — the longest
+    /// such suffix, so `b/a.tsx` beats `a.tsx` for `…/b/a.tsx`. Separators are
+    /// normalised; ASCII case is ignored on Windows only, so case-distinct
+    /// modules on case-sensitive hosts keep separate identities.
+    #[must_use]
+    pub fn module_spec_for(&self, module_path: &str, function_name: &str) -> Option<&str> {
+        let path = component_path_key(module_path, cfg!(windows));
         self.components
             .keys()
-            .find(|(_, name)| name == function_name)
+            .filter(|(_, name)| name == function_name)
             .map(|(spec, _)| spec.as_str())
+            .filter(|spec| {
+                let spec = component_path_key(spec, cfg!(windows));
+                let spec = spec.trim_start_matches("./");
+                path == spec || path.ends_with(&format!("/{spec}"))
+            })
+            .max_by_key(|spec| spec.len())
     }
 
     /// Total count of registered handlers — for diagnostic surfaces.
@@ -3365,12 +3439,30 @@ fn resolve_project_npm(
 }
 
 fn build_css_module_registry(project: &ComponentProject) -> CssModuleRegistry {
-    let mut registry = CssModuleRegistry::default();
     let root = project.root().to_path_buf();
+    let mut registry = CssModuleRegistry {
+        root: root.clone(),
+        ..CssModuleRegistry::default()
+    };
 
     for (module_spec, parsed) in project.modules() {
-        for (binding_name, import_binding) in &parsed.imports {
-            if !is_css_module_path(&import_binding.source) {
+        let mut imports: Vec<_> = parsed
+            .imports
+            .iter()
+            .map(|(binding, import)| (binding.clone(), import.source.clone()))
+            .collect();
+        // The binding map omits namespace and side-effect imports. Keep those
+        // files in the same registry so QuickJS and route CSS emission see them too.
+        if let Some(source) = project.module_source(module_spec) {
+            imports.extend(
+                crate::bundler::npm::scan_relative_imports(source)
+                    .into_iter()
+                    .filter(|source| is_css_module_path(source))
+                    .map(|source| (source.clone(), source)),
+            );
+        }
+        for (binding_name, source) in imports {
+            if !is_css_module_path(&source) {
                 continue;
             }
             // Resolve the import source relative to the module's
@@ -3380,7 +3472,7 @@ fn build_css_module_registry(project: &ComponentProject) -> CssModuleRegistry {
             let module_parent = Path::new(module_spec)
                 .parent()
                 .unwrap_or_else(|| Path::new(""));
-            let raw_path = module_parent.join(&import_binding.source);
+            let raw_path = module_parent.join(&source);
             let file_key = normalize_path_key(&raw_path);
             let abs_path = root.join(&raw_path);
             if !registry.files.contains_key(&file_key) {
@@ -3395,7 +3487,7 @@ fn build_css_module_registry(project: &ComponentProject) -> CssModuleRegistry {
                 .bindings
                 .entry(module_spec.clone())
                 .or_default()
-                .insert(binding_name.clone(), file_key);
+                .insert(binding_name, file_key);
         }
     }
 
@@ -3425,4 +3517,34 @@ fn normalize_path_key(path: &Path) -> String {
         }
     }
     parts.join("/")
+}
+
+// Windows paths fold ASCII case; other hosts may have case-distinct modules.
+fn component_path_key(path: &str, case_insensitive: bool) -> String {
+    let normalized = path.replace('\\', "/");
+    if case_insensitive {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+#[cfg(test)]
+mod component_identity_tests {
+    use super::component_path_key;
+
+    #[test]
+    fn component_path_case_folding_is_platform_specific() {
+        let lower = r"C:\app\routes\page.tsx";
+        let upper = "C:/app/routes/Page.tsx";
+        assert_eq!(
+            component_path_key(lower, true),
+            component_path_key(upper, true)
+        );
+        assert_ne!(
+            component_path_key(lower, false),
+            component_path_key(upper, false)
+        );
+        assert_eq!(component_path_key(lower, false), "C:/app/routes/page.tsx");
+    }
 }

@@ -213,11 +213,12 @@ pub struct QuickJsEnginePool {
 }
 
 /// The pool-wide installs a replacement engine needs to be interchangeable with
-/// the rest: the latest npm set and the latest render warm-up set. Each is
+/// the rest: the latest npm, CSS and render warm-up sets. Each is
 /// replaced wholesale, because every build hands the pool the complete list.
 #[derive(Default)]
 struct Provision {
     npm: Vec<NpmArtifactRegistration>,
+    css: Vec<NpmArtifactRegistration>,
     warm: Vec<WarmupComponent>,
     /// Test-only: make the next replacement panic, which nothing in production
     /// can be relied on to do on demand.
@@ -626,7 +627,20 @@ impl QuickJsEnginePool {
             return 0;
         }
         lock_provision(&self.provision).npm = artifacts.to_vec();
+        self.install_module_records(artifacts)
+    }
 
+    /// Install the registry's CSS records before render warm-up, retaining them
+    /// for replacement engines. Like npm installation, this runs only at boot.
+    pub fn install_css_modules(&self, records: &[NpmArtifactRegistration]) -> usize {
+        lock_provision(&self.provision).css = records.to_vec();
+        self.install_module_records(records)
+    }
+
+    fn install_module_records(&self, artifacts: &[NpmArtifactRegistration]) -> usize {
+        if artifacts.is_empty() {
+            return 0;
+        }
         let workers: Vec<Worker> = {
             let mut idle = self.idle.lock().expect("engine pool idle mutex poisoned");
             std::mem::take(&mut *idle)
@@ -717,7 +731,7 @@ impl Drop for QuickJsEnginePool {
 }
 
 fn lock_provision(provision: &Mutex<Provision>) -> std::sync::MutexGuard<'_, Provision> {
-    // Held only to swap or clone two vectors; a poisoned lock still holds a
+    // Held only to swap or clone registration vectors; a poisoned lock still holds a
     // complete value, and a replacement engine needs it more than it needs purity.
     provision.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -726,11 +740,15 @@ fn lock_provision(provision: &Mutex<Provision>) -> std::sync::MutexGuard<'_, Pro
 /// the npm bundles registered, then the render path warmed — the order
 /// [`QuickJsEnginePool::install_npm_bundles`] documents.
 fn provisioned_engine(provision: &Mutex<Provision>) -> QuickJsEngine {
-    let (npm, warm) = {
+    let (npm, css, warm) = {
         let provision = lock_provision(provision);
         #[cfg(test)]
         assert!(!provision.fail_replacement, "test: replacement provisioning fails");
-        (provision.npm.clone(), provision.warm.clone())
+        (
+            provision.npm.clone(),
+            provision.css.clone(),
+            provision.warm.clone(),
+        )
     };
     let mut engine = QuickJsEngine::new();
     engine.set_deadline(Some(Instant::now() + ENGINE_MAINTENANCE_TIMEOUT));
@@ -740,6 +758,11 @@ fn provisioned_engine(provision: &Mutex<Provision>) -> QuickJsEngine {
         register_npm_artifacts(&mut engine, &npm),
         0,
         "replacement engine could not register the pool's npm bundles"
+    );
+    assert_eq!(
+        register_npm_artifacts(&mut engine, &css),
+        0,
+        "replacement engine could not register the pool's CSS modules"
     );
     warm_render_targets(&mut engine, &warm);
     assert!(
@@ -959,6 +982,105 @@ mod tests {
     // preloads them itself. So `import clsx from "clsx"` in a per-request
     // component threw `__ALBEDO_MODULE_MISSING__` and the component silently
     // vanished from an HTTP 200 page.
+
+    #[test]
+    fn css_records_survive_replacement_provisioning() {
+        let script = r#"globalThis.__ALBEDO_MODULES["src/page.module.css"] = Object.defineProperty({ default: Object.freeze({ label: "label_test" }) }, "__albedo_is_module_record", { value: true });"#;
+        let provision = Mutex::new(Provision {
+            css: vec![("src/page.module.css".into(), script.into(), 48)],
+            ..Provision::default()
+        });
+        let mut engine = provisioned_engine(&provision);
+        let result = engine.load_module(
+            "src/probe.tsx",
+            r#"import styles from './page.module.css'; export const label = styles.label;"#,
+        );
+        assert!(result.is_ok(), "replacement lost CSS records: {result:?}");
+        engine
+            .load_precompiled_module(
+                "__css_assert",
+                r#"
+            const record = globalThis.__ALBEDO_MODULES["src/page.module.css"];
+            if (record.default.label !== "label_test" || !Object.isFrozen(record.default)) {
+                throw new Error("CSS class map changed");
+            }
+        "#,
+                49,
+            )
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn css_registry_records_reach_all_workers_and_replacements() {
+        use dom_render_compiler::runtime::CompiledProject;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/css_modules/single_card");
+        let compiled = CompiledProject::load_from_dir(root).unwrap();
+        let records = compiled.css_modules().module_records().unwrap();
+        let expected = compiled
+            .css_modules()
+            .scoped_class_for("Component.tsx", "styles", "card")
+            .unwrap()
+            .to_string();
+        let pool = QuickJsEnginePool::with_size(3);
+        assert_eq!(pool.install_npm_bundles(&fake_npm_artifacts()), 0);
+        assert_eq!(pool.install_css_modules(&records), 0);
+        for round in 0..2 {
+            // Hold every worker at once so a LIFO idle stack cannot hide a
+            // worker which missed installation or replacement provisioning.
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let checks = (0..3).map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let expected = expected.clone();
+                pool.with_engine(move |engine| {
+                    barrier.wait();
+                    engine
+                        .load_module(
+                            "probe.tsx",
+                            r#"
+                        import packageValue from 'testpkg';
+                        import styles from './Component.module.css';
+                        import * as ns from './Component.module.css';
+                        import './Component.module.css';
+                        export const card = styles.card;
+                        export const same = styles === ns.default;
+                    "#,
+                        )
+                        .map_err(|err| err.to_string())?;
+                    let expected = serde_json::to_string(&expected).unwrap();
+                    let probe = format!(
+                        r#"
+                        const record = globalThis.__ALBEDO_MODULES["Component.module.css"];
+                        const probe = globalThis.__ALBEDO_MODULES["probe.tsx"];
+                        if (probe.card !== {expected} || !probe.same ||
+                            record.default.nope !== undefined || !Object.isFrozen(record.default) ||
+                            Object.getPrototypeOf(record.default) !== Object.prototype) {{
+                            throw new Error("CSS record contract changed");
+                        }}
+                    "#
+                    );
+                    engine
+                        .load_precompiled_module("__css_contract", &probe, 48)
+                        .map_err(|err| err.to_string())
+                })
+            });
+            for check in futures_util::future::join_all(checks).await {
+                check.unwrap().unwrap();
+            }
+            if round == 0 {
+                let panic = pool
+                    .with_engine(|_| -> () { panic!("replace CSS engine") })
+                    .await;
+                assert!(matches!(panic, Err(EnginePoolError::WorkerLost)));
+            }
+        }
+        assert!(pool.replacements() >= 1);
+        // Each original worker ran a factory before its first confinement;
+        // replay may cache that factory, so later checkouts need not rebuild.
+        assert!(pool.confinement_counts().0 >= 3);
+        assert_eq!(pool.confinement_counts().1, 0);
+    }
 
     /// A factory + alias pair, in the shape the npm bundler emits.
     fn fake_npm_artifacts() -> Vec<NpmArtifactRegistration> {

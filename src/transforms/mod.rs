@@ -24,6 +24,7 @@ pub mod actions;
 pub mod column_reads;
 pub mod css_modules;
 pub mod events;
+pub mod forge_queries;
 pub mod form;
 pub mod hooks;
 pub mod link;

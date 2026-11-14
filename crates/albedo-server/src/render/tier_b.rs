@@ -1308,6 +1308,7 @@ mod tests {
     fn node() -> TierBNode {
         TierBNode {
             component_id: "Feature".to_string(),
+            component_key: None,
             placeholder_id: "__b_feature".to_string(),
             render_fn: "render::Feature".to_string(),
             static_props: json!({"title":"x"}),

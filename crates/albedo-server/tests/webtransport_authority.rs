@@ -21,7 +21,9 @@ use dom_render_compiler::auth::store::{
 };
 use dom_render_compiler::forge::skeleton::{bootstrap_schema, ForgeSchema};
 use dom_render_compiler::forge::{DataSubstrate, LibSqlSubstrate};
-use dom_render_compiler::runtime::webtransport::{WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES};
+use dom_render_compiler::runtime::webtransport::{
+    WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES, WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
+};
 use quinn::rustls;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,20 +93,23 @@ async fn read_frame(stream: &mut quinn::RecvStream) -> Option<Vec<u8>> {
 
 /// Accept the four uni streams; return (control, patches), keyed by the slot
 /// each announces in its `stream_open` frame.
-async fn streams(connection: &quinn::Connection) -> (quinn::RecvStream, quinn::RecvStream) {
-    let mut control = None;
-    let mut patches = None;
+async fn all_streams(connection: &quinn::Connection) -> Vec<quinn::RecvStream> {
+    let mut streams: Vec<Option<quinn::RecvStream>> = (0..4).map(|_| None).collect();
     for _ in 0..4 {
         let mut stream = connection.accept_uni().await.unwrap();
         let open: serde_json::Value =
             serde_json::from_slice(&read_frame(&mut stream).await.unwrap()).unwrap();
-        match open["stream_slot"].as_u64().unwrap() as u8 {
-            WT_STREAM_SLOT_CONTROL => control = Some(stream),
-            WT_STREAM_SLOT_PATCHES => patches = Some(stream),
-            _ => {}
-        }
+        let slot = open["stream_slot"].as_u64().unwrap() as usize;
+        streams[slot] = Some(stream);
     }
-    (control.unwrap(), patches.unwrap())
+    streams.into_iter().map(Option::unwrap).collect()
+}
+
+async fn streams(connection: &quinn::Connection) -> (quinn::RecvStream, quinn::RecvStream) {
+    let mut streams = all_streams(connection).await;
+    let patches = streams.remove(WT_STREAM_SLOT_PATCHES as usize);
+    let control = streams.remove(WT_STREAM_SLOT_CONTROL as usize);
+    (control, patches)
 }
 
 async fn session_id(control: &mut quinn::RecvStream) -> uuid::Uuid {
@@ -155,9 +160,9 @@ async fn revocation_closes_the_session() {
     let mallory = signed_in(db.as_ref(), "mallory").await;
 
     let connection = connect(&listener).await;
-    let (mut control, mut patches) = streams(&connection).await;
+    let mut streams = all_streams(&connection).await;
     // Control traffic flows before any binding.
-    let id = session_id(&mut control).await;
+    let id = session_id(&mut streams[WT_STREAM_SLOT_CONTROL as usize]).await;
     assert!(listener.sessions.has(&id));
 
     let entry = listener
@@ -183,24 +188,29 @@ async fn revocation_closes_the_session() {
     );
 
     // A protected frame, queued while live, paused before its admission load.
-    let sender = listener
-        .sessions
-        .stream_sender(id, WT_STREAM_SLOT_PATCHES)
-        .unwrap();
-    sender
-        .send(bytes::Bytes::from_static(b"secret-payroll-frame"))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
-        .await
-        .expect("writer reached its gate");
+    for slot in [
+        WT_STREAM_SLOT_SHELL,
+        WT_STREAM_SLOT_PATCHES,
+        WT_STREAM_SLOT_PREFETCH,
+    ] {
+        listener
+            .sessions
+            .stream_sender(id, slot)
+            .unwrap()
+            .send(bytes::Bytes::from_static(b"secret-payroll-frame"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("each protected writer reached its gate");
+    }
 
     // Revoke: logout of ada's session.
     let Identity::Authenticated { token, .. } = &ada else {
         unreachable!()
     };
     assert_eq!(live.close_tokens(std::slice::from_ref(token)), 1);
-    pause.release.notify_one();
+    pause.release.notify_waiters();
 
     let reason = tokio::time::timeout(Duration::from_secs(5), connection.closed())
         .await
@@ -212,11 +222,21 @@ async fn revocation_closes_the_session() {
         other => panic!("closed for another reason: {other:?}"),
     }
     // The paused frame never reached the wire.
-    let leaked = tokio::time::timeout(Duration::from_millis(500), read_frame(&mut patches)).await;
-    assert!(
-        !matches!(leaked, Ok(Some(ref bytes)) if bytes == b"secret-payroll-frame"),
-        "a frame admitted after the close was sent"
-    );
+    for slot in [
+        WT_STREAM_SLOT_SHELL,
+        WT_STREAM_SLOT_PATCHES,
+        WT_STREAM_SLOT_PREFETCH,
+    ] {
+        let leaked = tokio::time::timeout(
+            Duration::from_millis(500),
+            read_frame(&mut streams[slot as usize]),
+        )
+        .await;
+        assert!(
+            !matches!(leaked, Ok(Some(ref bytes)) if bytes == b"secret-payroll-frame"),
+            "stream slot {slot} sent a frame admitted after the close"
+        );
+    }
 
     // The session is removed and its live entry with it.
     for _ in 0..50 {
@@ -230,4 +250,278 @@ async fn revocation_closes_the_session() {
         "the closed session stayed registered"
     );
     assert!(live.is_empty(), "the live entry outlived the QUIC session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_while_a_bridge_revalidates_refuses_the_binding() {
+    use albedo_server::live_authority::Checkpoint;
+    use dom_render_compiler::auth::store::revoke_session;
+
+    let listener = listener().await;
+    let db = store().await;
+    let live = Arc::new(LiveRegistry::new());
+    let ada = signed_in(db.as_ref(), "gap").await;
+    let connection = connect(&listener).await;
+    let (mut control, _patches) = streams(&connection).await;
+    let id = session_id(&mut control).await;
+    let pause = live.pause_at(Checkpoint::BeforeRevalidate);
+    let mut binding = Box::pin(listener.sessions.bind(id, &ada, &live, Some(db.as_ref())));
+    tokio::select! {
+        _ = &mut binding => panic!("binding did not pause"),
+        _ = pause.reached.notified() => {},
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("binding was not reached"),
+    }
+    let token = ada.token().unwrap();
+    assert_eq!(revoke_session(db.as_ref(), token).await.unwrap(), 1);
+    assert_eq!(live.close_tokens(std::slice::from_ref(token)), 1);
+    pause.release.notify_one();
+    assert!(binding.await.is_err(), "closed binding was promoted");
+    tokio::time::timeout(Duration::from_secs(5), connection.closed())
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        if !listener.sessions.has(&id) && live.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!listener.sessions.has(&id));
+    assert!(live.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_revalidation_database_closes_the_quic_session() {
+    let listener = listener().await;
+    let db = store().await;
+    let live = Arc::new(LiveRegistry::new());
+    let ada = signed_in(db.as_ref(), "missing-db").await;
+    let connection = connect(&listener).await;
+    let (mut control, _patches) = streams(&connection).await;
+    let id = session_id(&mut control).await;
+    assert!(listener.sessions.bind(id, &ada, &live, None).await.is_err());
+    let reason = tokio::time::timeout(Duration::from_secs(5), connection.closed())
+        .await
+        .unwrap();
+    assert!(
+        matches!(reason, quinn::ConnectionError::ApplicationClosed(close)
+        if close.error_code == quinn::VarInt::from_u32(WT_CLOSE_REVOKED))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anonymous_binding_needs_no_database_and_survives_unrelated_invalidation() {
+    let listener = listener().await;
+    let live = Arc::new(LiveRegistry::new());
+    let connection = connect(&listener).await;
+    let (mut control, _patches) = streams(&connection).await;
+    let id = session_id(&mut control).await;
+    let entry = listener
+        .sessions
+        .bind(id, &Identity::Anonymous, &live, None)
+        .await
+        .unwrap();
+    assert!(entry.admits());
+    assert_eq!(live.close_principal_below("unrelated", 99), 0);
+    assert_eq!(
+        live.close_tokens(&[dom_render_compiler::auth::session::TokenHash::of(
+            "unrelated"
+        )]),
+        0
+    );
+    assert_eq!(live.close_expired(i64::MAX), 0);
+    assert!(entry.admits());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), connection.closed())
+            .await
+            .is_err()
+    );
+    connection.close(0u32.into(), b"test complete");
+    for _ in 0..50 {
+        if !listener.sessions.has(&id) && live.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!listener.sessions.has(&id));
+    assert!(live.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_the_first_binding_closes_its_opening_entry() {
+    use albedo_server::live_authority::Checkpoint;
+
+    let listener = listener().await;
+    let db = store().await;
+    let live = Arc::new(LiveRegistry::new());
+    let ada = signed_in(db.as_ref(), "cancelled-bridge").await;
+    let connection = connect(&listener).await;
+    let (mut control, _patches) = streams(&connection).await;
+    let id = session_id(&mut control).await;
+    let pause = live.pause_at(Checkpoint::BeforeRevalidate);
+    let mut binding = Box::pin(listener.sessions.bind(id, &ada, &live, Some(db.as_ref())));
+    tokio::select! {
+        _ = &mut binding => panic!("binding did not pause"),
+        _ = pause.reached.notified() => {},
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("binding was not reached"),
+    }
+    drop(binding);
+    let closed = tokio::time::timeout(Duration::from_secs(1), connection.closed()).await;
+    connection.close(0u32.into(), b"test complete");
+    assert!(
+        closed.is_ok(),
+        "cancelled bind retained an Opening entry and a live QUIC session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authenticated_uuid_cannot_switch_tokens_or_become_anonymous() {
+    let listener = listener().await;
+    let db = store().await;
+    let live = Arc::new(LiveRegistry::new());
+    let first = signed_in(db.as_ref(), "same-principal").await;
+    let second = signed_in(db.as_ref(), "same-principal").await;
+    assert_eq!(
+        first.principal().unwrap().id,
+        second.principal().unwrap().id
+    );
+    assert_ne!(first.token(), second.token());
+    let connection = connect(&listener).await;
+    let (mut control, _patches) = streams(&connection).await;
+    let id = session_id(&mut control).await;
+    let entry = listener
+        .sessions
+        .bind(id, &first, &live, Some(db.as_ref()))
+        .await
+        .unwrap();
+    assert!(listener
+        .sessions
+        .bind(id, &second, &live, Some(db.as_ref()))
+        .await
+        .is_err());
+    assert!(listener
+        .sessions
+        .bind(id, &Identity::Anonymous, &live, None)
+        .await
+        .is_err());
+    assert!(
+        entry.admits(),
+        "a refused rebind closed the legitimate owner"
+    );
+    assert_eq!(live.len(), 1);
+    connection.close(0u32.into(), b"test complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anonymous_uuid_cannot_be_claimed_by_an_authenticated_bridge() {
+    let listener = listener().await;
+    let db = store().await;
+    let live = Arc::new(LiveRegistry::new());
+    let identity = signed_in(db.as_ref(), "claim-public").await;
+    let connection = connect(&listener).await;
+    let (mut control, _patches) = streams(&connection).await;
+    let id = session_id(&mut control).await;
+    let entry = listener
+        .sessions
+        .bind(id, &Identity::Anonymous, &live, None)
+        .await
+        .unwrap();
+    assert!(listener
+        .sessions
+        .bind(id, &identity, &live, Some(db.as_ref()))
+        .await
+        .is_err());
+    assert!(entry.admits());
+    assert_eq!(live.len(), 1);
+    connection.close(0u32.into(), b"test complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_role_epoch_change_closes_only_the_old_binding_after_bind_returns() {
+    use dom_render_compiler::auth::store::grant_role_changed;
+
+    let listener = listener().await;
+    let db = store().await;
+    let live = Arc::new(LiveRegistry::new());
+    let old = signed_in(db.as_ref(), "role-owner").await;
+    let old_connection = connect(&listener).await;
+    let (mut control, _patches) = streams(&old_connection).await;
+    let old_id = session_id(&mut control).await;
+    listener
+        .sessions
+        .bind(old_id, &old, &live, Some(db.as_ref()))
+        .await
+        .unwrap();
+    let (_, epoch) = grant_role_changed(
+        db.as_ref(),
+        &old.principal().unwrap().id,
+        "payroll",
+        None,
+        albedo_server::auth::now_ms(),
+    )
+    .await
+    .unwrap();
+    let current = signed_in(db.as_ref(), "role-owner").await;
+    let new_connection = connect(&listener).await;
+    let (mut new_control, _new_patches) = streams(&new_connection).await;
+    let new_id = session_id(&mut new_control).await;
+    let fresh = listener
+        .sessions
+        .bind(new_id, &current, &live, Some(db.as_ref()))
+        .await
+        .unwrap();
+    assert_eq!(
+        live.close_principal_below(old.principal().unwrap().id.as_str(), epoch.unwrap()),
+        1
+    );
+    let reason = tokio::time::timeout(Duration::from_secs(5), old_connection.closed())
+        .await
+        .unwrap();
+    assert!(
+        matches!(reason, quinn::ConnectionError::ApplicationClosed(close) if close.error_code == quinn::VarInt::from_u32(WT_CLOSE_REVOKED))
+    );
+    assert!(fresh.admits());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), new_connection.closed())
+            .await
+            .is_err()
+    );
+    new_connection.close(0u32.into(), b"test complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn competing_bridges_cannot_steal_a_binding_awaiting_revalidation() {
+    use albedo_server::live_authority::Checkpoint;
+
+    let listener = listener().await;
+    let db = store().await;
+    let live = Arc::new(LiveRegistry::new());
+    let owner = signed_in(db.as_ref(), "binding-owner").await;
+    let attacker = signed_in(db.as_ref(), "binding-attacker").await;
+    let connection = connect(&listener).await;
+    let (mut control, _patches) = streams(&connection).await;
+    let id = session_id(&mut control).await;
+    let pause = live.pause_at(Checkpoint::BeforeRevalidate);
+    let mut binding = Box::pin(listener.sessions.bind(id, &owner, &live, Some(db.as_ref())));
+    tokio::select! {
+        _ = &mut binding => panic!("binding did not pause"),
+        _ = pause.reached.notified() => {},
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("binding was not reached"),
+    }
+    assert!(listener
+        .sessions
+        .bind(id, &attacker, &live, Some(db.as_ref()))
+        .await
+        .is_err());
+    assert!(
+        listener
+            .sessions
+            .bind(id, &owner, &live, Some(db.as_ref()))
+            .await
+            .is_err(),
+        "an unfinished owner binding admitted a second bridge"
+    );
+    assert_eq!(live.len(), 1);
+    pause.release.notify_one();
+    assert!(binding.await.unwrap().admits());
+    connection.close(0u32.into(), b"test complete");
 }

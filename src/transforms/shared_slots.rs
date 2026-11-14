@@ -378,10 +378,11 @@ impl std::error::Error for SharedSlotExtractError {}
 pub fn extract_shared_slot_hooks(
     function: &ComponentFunction,
     imports: &HashMap<String, ImportBinding>,
+    sites: &std::collections::HashSet<u32>,
 ) -> Result<Vec<SharedSlotBinding>, SharedSlotExtractError> {
     let mut out = Vec::new();
     for stmt in &function.body_stmts {
-        visit_stmt_top_level(stmt, imports, &mut out)?;
+        visit_stmt_top_level(stmt, imports, sites, &mut out)?;
     }
     Ok(out)
 }
@@ -389,12 +390,13 @@ pub fn extract_shared_slot_hooks(
 fn visit_stmt_top_level(
     stmt: &Stmt,
     imports: &HashMap<String, ImportBinding>,
+    sites: &std::collections::HashSet<u32>,
     out: &mut Vec<SharedSlotBinding>,
 ) -> Result<(), SharedSlotExtractError> {
     match stmt {
         Stmt::Decl(Decl::Var(var)) => {
             for decl in &var.decls {
-                try_extract_from_var_declarator(decl, imports, out)?;
+                try_extract_from_var_declarator(decl, imports, sites, out)?;
             }
             Ok(())
         }
@@ -418,7 +420,7 @@ fn visit_stmt_top_level(
         }
         Stmt::Block(block) => {
             for inner in &block.stmts {
-                visit_stmt_top_level(inner, imports, out)?;
+                visit_stmt_top_level(inner, imports, sites, out)?;
             }
             Ok(())
         }
@@ -429,6 +431,7 @@ fn visit_stmt_top_level(
 fn try_extract_from_var_declarator(
     decl: &VarDeclarator,
     imports: &HashMap<String, ImportBinding>,
+    sites: &std::collections::HashSet<u32>,
     out: &mut Vec<SharedSlotBinding>,
 ) -> Result<(), SharedSlotExtractError> {
     let Some(init) = &decl.init else { return Ok(()) };
@@ -442,7 +445,14 @@ fn try_extract_from_var_declarator(
         _ => None,
     };
 
-    let spec = extract_topic_spec(call, &binding_name, imports)?;
+    // R5-7 · a read of a name the module imports from `albedo/forge`, which the
+    // classifier did not count (the name is a parameter or local here), is the
+    // author's ordinary JavaScript: no subscription, no error.
+    if is_shadowed_forge_read(call, imports, sites) {
+        return Ok(());
+    }
+
+    let spec = extract_topic_spec(call, &binding_name, imports, sites)?;
     let binding_name = binding_name.ok_or(SharedSlotExtractError::UnsupportedDestructurePattern)?;
 
     out.push(SharedSlotBinding {
@@ -459,20 +469,56 @@ fn try_extract_from_var_declarator(
 /// collection reference.
 const FORGE_BINDINGS_MODULE: &str = "albedo/forge";
 
+/// `useSharedSlot(<name>)` or `useSharedSlot(<name>.where(…))` where `<name>` is
+/// spelled like an `albedo/forge` import, but the call is not a legacy site: the
+/// name is shadowed here, so the read is not FORGE's.
+fn is_shadowed_forge_read(
+    call: &CallExpr,
+    imports: &HashMap<String, ImportBinding>,
+    sites: &std::collections::HashSet<u32>,
+) -> bool {
+    if sites.contains(&call.span.lo.0) {
+        return false;
+    }
+    let Some(first) = call.args.first() else {
+        return false;
+    };
+    match unwrap_parens(&first.expr) {
+        Expr::Ident(ident) => collection_for_ident(ident.sym.as_ref(), imports).is_some(),
+        Expr::Call(inner) => match &inner.callee {
+            Callee::Expr(callee) => match unwrap_parens(callee.as_ref()) {
+                Expr::Member(member) => matches!(
+                    unwrap_parens(&member.obj),
+                    Expr::Ident(receiver)
+                        if collection_for_ident(receiver.sym.as_ref(), imports).is_some()
+                ),
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn extract_topic_spec(
     call: &CallExpr,
     binding_name: &Option<String>,
     imports: &HashMap<String, ImportBinding>,
+    sites: &std::collections::HashSet<u32>,
 ) -> Result<TopicSpec, SharedSlotExtractError> {
     let first = call.args.first().ok_or_else(|| {
         SharedSlotExtractError::MissingTopicArgument { binding_name: binding_name.clone() }
     })?;
+    // R5-7 · a FORGE read counts only where the classifier counted it: a
+    // collection named by a shadowing parameter is ordinary JS, not a subscription.
+    let site = sites.contains(&call.span.lo.0);
     match unwrap_parens(&first.expr) {
         // `useSharedSlot("guestbook")` — the original surface, unchanged.
         Expr::Lit(Lit::Str(s)) => Ok(TopicSpec::Static(s.value.to_string())),
         // `useSharedSlot(guestbook)` — a whole collection. Same topic the string
         // form names, reached without spelling it.
         Expr::Ident(ident) => collection_for_ident(ident.sym.as_ref(), imports)
+            .filter(|_| site)
             .map(TopicSpec::Static)
             .ok_or_else(|| SharedSlotExtractError::NonStringLiteralTopic {
                 binding_name: binding_name.clone(),
@@ -482,7 +528,7 @@ fn extract_topic_spec(
         // are `<ident>.<method>(<object>)`, so the receiver's *import* decides
         // which, never the method name. A source route may legitimately be
         // called `where`.
-        Expr::Call(inner) => extract_call_spec(inner, binding_name, imports),
+        Expr::Call(inner) => extract_call_spec(inner, binding_name, imports, site),
         _ => Err(SharedSlotExtractError::NonStringLiteralTopic {
             binding_name: binding_name.clone(),
         }),
@@ -528,6 +574,7 @@ fn extract_call_spec(
     call: &CallExpr,
     binding_name: &Option<String>,
     imports: &HashMap<String, ImportBinding>,
+    site: bool,
 ) -> Result<TopicSpec, SharedSlotExtractError> {
     let unsupported = || SharedSlotExtractError::NonStringLiteralTopic {
         binding_name: binding_name.clone(),
@@ -545,7 +592,7 @@ fn extract_call_spec(
     if source_for_ident(receiver.sym.as_ref(), imports).is_some() {
         extract_source(call, member, binding_name, imports)
     } else {
-        extract_partition(call, binding_name, imports)
+        extract_partition(call, binding_name, imports, site)
     }
 }
 
@@ -651,6 +698,7 @@ fn extract_partition(
     call: &CallExpr,
     binding_name: &Option<String>,
     imports: &HashMap<String, ImportBinding>,
+    site: bool,
 ) -> Result<TopicSpec, SharedSlotExtractError> {
     let unsupported = || SharedSlotExtractError::NonStringLiteralTopic {
         binding_name: binding_name.clone(),
@@ -664,6 +712,10 @@ fn extract_partition(
         return Err(unsupported());
     }
     let Expr::Ident(receiver) = unwrap_parens(&member.obj) else { return Err(unsupported()) };
+    // R5-7 · only a read the classifier counted as legacy is extracted.
+    if !site {
+        return Err(unsupported());
+    }
     let collection = collection_for_ident(receiver.sym.as_ref(), imports).ok_or_else(unsupported)?;
 
     // Exactly one argument, an object literal with exactly one `key: value`
@@ -798,10 +850,14 @@ pub fn rewrite_shared_slot_topic_args(module: &mut Module) {
     };
     let collections = forge_collection_locals(module);
     let sources = import_locals(module, SOURCE_BINDINGS_MODULE);
+    // R5-7 · fold only the FORGE reads the classifier counted as legacy. The
+    // module is resolved by now (the transpile pipeline runs the resolver first).
+    let sites = crate::transforms::forge_queries::legacy_shared_slot_sites(module);
     module.visit_mut_with(&mut TopicArgRewriter {
         hook_local,
         collections,
         sources,
+        sites,
     });
 }
 
@@ -890,12 +946,17 @@ struct TopicArgRewriter {
     hook_local: String,
     collections: HashMap<String, String>,
     sources: HashMap<String, String>,
+    /// R5-7 · the legacy FORGE reads (see `forge_queries::legacy_shared_slot_sites`).
+    sites: std::collections::HashSet<u32>,
 }
 
 impl TopicArgRewriter {
     /// The replacement for this call's topic argument, or `None` to leave it be.
     fn folded_arg(&self, call: &CallExpr, binding: &str) -> Option<Expr> {
         let arg = unwrap_parens(&call.args.first()?.expr);
+        // A FORGE read is folded only where the classifier counted it as legacy;
+        // a shadowing parameter of the same name is left alone.
+        let legacy = self.sites.contains(&call.span.lo.0);
         match arg {
             // Already evaluable — and the shape every existing app uses.
             Expr::Lit(Lit::Str(_)) => None,
@@ -904,6 +965,7 @@ impl TopicArgRewriter {
             Expr::Ident(ident) => self
                 .collections
                 .get(ident.sym.as_ref())
+                .filter(|_| legacy)
                 .map(|collection| string_expr(collection)),
             // A partition or a declared source route: only the render knows the
             // resolved topic, so both defer to the host through the *same*
@@ -911,7 +973,8 @@ impl TopicArgRewriter {
             // data exactly like a partition does, which is what keeps the naming
             // rule in one place (PRISM invariant 5).
             Expr::Call(inner)
-                if self.is_where_on_collection(inner) || self.is_source_route_call(inner) =>
+                if (self.is_where_on_collection(inner) && legacy)
+                    || self.is_source_route_call(inner) =>
             {
                 Some(topic_lookup_expr(binding))
             }
@@ -954,7 +1017,7 @@ impl VisitMut for TopicArgRewriter {
         let binding = binding.id.sym.to_string();
         let Some(init) = &mut decl.init else { return };
         let Expr::Call(call) = init.as_mut() else { return };
-        if !callee_is_ident(call, &self.hook_local) {
+        if !self.sites.contains(&call.span.lo.0) && !callee_is_ident(call, &self.hook_local) {
             return;
         }
         if let Some(folded) = self.folded_arg(call, &binding) {
@@ -1009,9 +1072,6 @@ fn is_use_shared_slot_call(call: &CallExpr, imports: &HashMap<String, ImportBind
     let Callee::Expr(callee) = &call.callee else { return false };
     let Expr::Ident(ident) = callee.as_ref() else { return false };
     let name = ident.sym.to_string();
-    if name != "useSharedSlot" {
-        return false;
-    }
     imports
         .get(&name)
         .map(|b| b.source == "albedo" && b.export_name == "useSharedSlot")
@@ -1123,13 +1183,13 @@ mod tests {
     fn extract_or_panic(source: &str) -> Vec<SharedSlotBinding> {
         let parsed = parse(source);
         let function = function_named(&parsed, "Component");
-        extract_shared_slot_hooks(function, &parsed.imports).expect("extraction")
+        extract_shared_slot_hooks(function, &parsed.imports, &parsed.shared_slot_sites).expect("extraction")
     }
 
     fn extract_err(source: &str) -> SharedSlotExtractError {
         let parsed = parse(source);
         let function = function_named(&parsed, "Component");
-        extract_shared_slot_hooks(function, &parsed.imports).expect_err("expected extraction error")
+        extract_shared_slot_hooks(function, &parsed.imports, &parsed.shared_slot_sites).expect_err("expected extraction error")
     }
 
     #[test]
@@ -1423,6 +1483,16 @@ mod tests {
         /// rendered as a comparable label.
         fn folded_arg(source: &str) -> String {
             let mut module = parse_tsx(source);
+            // The pipeline resolves before it folds (R5-7): do the same here.
+            let globals = swc_common::Globals::new();
+            swc_common::GLOBALS.set(&globals, || {
+                use swc_ecma_visit::VisitMutWith as _;
+                module.visit_mut_with(&mut swc_ecma_transforms_base::resolver(
+                    swc_common::Mark::new(),
+                    swc_common::Mark::new(),
+                    true,
+                ));
+            });
             rewrite_shared_slot_topic_args(&mut module);
 
             struct Find(Option<String>);

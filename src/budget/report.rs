@@ -358,6 +358,7 @@ mod tests {
     fn tier_b_node(name: &str) -> TierBNode {
         TierBNode {
             component_id: name.to_string(),
+            component_key: None,
             placeholder_id: format!("ph-{name}"),
             render_fn: format!("{name}.render"),
             static_props: serde_json::Value::Null,
@@ -375,6 +376,7 @@ mod tests {
     fn tier_c_node(name: &str) -> TierCNode {
         TierCNode {
             component_id: name.to_string(),
+            component_key: None,
             placeholder_id: format!("ph-{name}"),
             bundle_path: format!("_albedo/wrappers/{name}.mjs"),
             initial_props: serde_json::Value::Null,

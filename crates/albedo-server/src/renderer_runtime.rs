@@ -147,6 +147,34 @@ pub fn island_plan_key(component_name: &str) -> String {
     format!("island:{component_name}")
 }
 
+/// T-0044 · manifest components by identity. A node names its component by
+/// function name (`component_id`), which is ambiguous when two modules export
+/// the same name (`export default function Page()` in every route); such a
+/// node also carries `component_key`, the component's manifest id, and that
+/// wins. A node with no key has a unique name, so the name lookup is exact.
+struct ComponentIndex<'a> {
+    by_name: HashMap<&'a str, &'a ComponentManifestEntry>,
+    by_key: HashMap<u64, &'a ComponentManifestEntry>,
+    all: &'a [ComponentManifestEntry],
+}
+
+impl<'a> ComponentIndex<'a> {
+    fn new(components: &'a [ComponentManifestEntry]) -> Self {
+        Self {
+            by_name: components.iter().map(|c| (c.name.as_str(), c)).collect(),
+            by_key: components.iter().map(|c| (c.id, c)).collect(),
+            all: components,
+        }
+    }
+
+    fn get(&self, name: &str, key: Option<u64>) -> Option<&'a ComponentManifestEntry> {
+        match key {
+            Some(key) => self.by_key.get(&key).copied(),
+            None => self.by_name.get(name).copied(),
+        }
+    }
+}
+
 /// The props an island is rendered from at boot: what its parent passed, plus
 /// each request prop it reads, as an anonymous request with no route params
 /// would supply it (`params: {}`, `user: null`).
@@ -481,12 +509,7 @@ impl RendererRuntime {
 
         // Phase 1 — gather island metadata from the manifest (immutable borrows
         // only), so phase 2 is free to take `&mut self.renderer` to render.
-        let by_name: HashMap<&str, &ComponentManifestEntry> = self
-            .manifest
-            .components
-            .iter()
-            .map(|c| (c.name.as_str(), c))
-            .collect();
+        let index = ComponentIndex::new(&self.manifest.components);
 
         let mut routes: Vec<(String, Vec<IslandMeta>)> = Vec::new();
         for (path, route) in &self.manifest.routes {
@@ -501,7 +524,7 @@ impl RendererRuntime {
                 if route_claimed.is_some_and(|c| c.contains(&node.placeholder_id)) {
                     continue;
                 }
-                let Some(component) = by_name.get(node.component_id.as_str()) else {
+                let Some(component) = index.get(&node.component_id, node.component_key) else {
                     continue;
                 };
                 let Some(module) = self
@@ -518,7 +541,10 @@ impl RendererRuntime {
                     source: module.code.clone(),
                     trigger: trigger_from_mode(node.hydration_mode),
                     props: node.initial_props.clone(),
-                    component_name: node.component_id.clone(),
+                    component_name: dom_render_compiler::manifest::schema::qualified_component_name(
+                        &node.component_id,
+                        node.component_key,
+                    ),
                     dynamic_prop_keys: node.dynamic_prop_keys.clone(),
                 });
             }
@@ -728,6 +754,7 @@ impl RendererRuntime {
         ));
 
         let mut blocks = HashMap::new();
+        let index = ComponentIndex::new(&self.manifest.components);
 
         for (path, route) in &self.manifest.routes {
             let mut placeholders = Vec::new();
@@ -749,8 +776,15 @@ impl RendererRuntime {
                 }
                 // The manifest names the component; resolve it to the render-entry
                 // spec the compiled project keys on (its absolute `module_path`
-                // won't match the project-relative module specs).
-                let Some(entry) = compiled.module_spec_for_component(&node.component_id) else {
+                // won't match the project-relative module specs). T-0044: by
+                // module path as well as name, so two same-named islands in
+                // different modules each find their own entry.
+                let Some(entry) = index
+                    .get(&node.component_id, node.component_key)
+                    .and_then(|component| {
+                        compiled.module_spec_for(&component.module_path, &component.name)
+                    })
+                else {
                     continue;
                 };
 
@@ -832,12 +866,7 @@ impl RendererRuntime {
         &self,
         compiled: Option<&dom_render_compiler::runtime::CompiledProject>,
     ) -> crate::render::tier_b::TierBRenderPlan {
-        let by_name: HashMap<&str, &ComponentManifestEntry> = self
-            .manifest
-            .components
-            .iter()
-            .map(|c| (c.name.as_str(), c))
-            .collect();
+        let index = ComponentIndex::new(&self.manifest.components);
 
         // Island client-reference boundary (RSC-style). Every Tier-C island,
         // keyed by its module path, maps to the empty placeholder the server
@@ -846,39 +875,45 @@ impl RendererRuntime {
         // reference stub (see `add_component_to_plan`) so island code never runs
         // in the pool engines — only the boundary is emitted, then filled by the
         // serve-time island pass, exactly as a Tier-A parent's island child is.
-        let island_modules = self.island_client_reference_map(&by_name);
+        let island_modules = self.island_client_reference_map(&index);
 
         let mut plan = crate::render::tier_b::TierBRenderPlan::new();
         for route in self.manifest.routes.values() {
             for node in &route.tier_b {
                 self.add_component_to_plan(
                     &mut plan,
-                    &by_name,
+                    &index,
                     &island_modules,
                     compiled,
                     &node.render_fn,
                     &node.component_id,
+                    node.component_key,
                 );
             }
 
             // Route boundaries (`error.tsx` / `loading.tsx`) are rendered on the
             // request path through the same pooled registry when a Tier-B node
             // throws or times out, so they need boot-built plans too. Keyed by
-            // the bare component name (the registry is called with that name);
-            // no collision with the `render::*`-shaped Tier-B keys.
-            if let Some(name) = route.error_component.as_deref() {
-                self.add_component_to_plan(&mut plan, &by_name, &island_modules, compiled, name, name);
-            }
-            if let Some(name) = route.loading_component.as_deref() {
-                self.add_component_to_plan(&mut plan, &by_name, &island_modules, compiled, name, name);
-            }
-
+            // the component name the route stores (the registry is called with
+            // that name); no collision with the `render::*`-shaped Tier-B keys.
+            // T-0045: a name shared by two modules is stored as `Name#<id>`,
+            // so two `export default function Error()` files get two plans.
+            //
             // Slice 3 — a route exporting `generateMetadata` needs its leaf
-            // module in the pool so the request path can evaluate the export.
-            // Registered under the bare component name, the same key the serve
-            // path calls `call_metadata` with.
-            if let Some(name) = route.dynamic_metadata.as_deref() {
-                self.add_component_to_plan(&mut plan, &by_name, &island_modules, compiled, name, name);
+            // module in the pool so the request path can evaluate the export,
+            // registered the same way; the serve path calls `call_metadata`
+            // with that name.
+            for stored in [
+                route.error_component.as_deref(),
+                route.loading_component.as_deref(),
+                route.dynamic_metadata.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let (name, key) =
+                    dom_render_compiler::manifest::schema::split_qualified_component_name(stored);
+                self.add_component_to_plan(&mut plan, &index, &island_modules, compiled, stored, name, key);
             }
 
             // Every island, under its own key, so a request whose props differ
@@ -895,11 +930,15 @@ impl RendererRuntime {
             for node in &route.tier_c {
                 self.add_component_to_plan(
                     &mut plan,
-                    &by_name,
+                    &index,
                     &no_client_references,
                     compiled,
-                    &island_plan_key(&node.component_id),
+                    &island_plan_key(&dom_render_compiler::manifest::schema::qualified_component_name(
+                        &node.component_id,
+                        node.component_key,
+                    )),
                     &node.component_id,
+                    node.component_key,
                 );
             }
         }
@@ -911,14 +950,11 @@ impl RendererRuntime {
     /// its place. Sourced from `route.tier_c` across all routes (the single
     /// tiering source of truth); an island mounted in several routes resolves to
     /// the same deterministic placeholder id, so first-writer-wins is exact.
-    fn island_client_reference_map(
-        &self,
-        by_name: &HashMap<&str, &ComponentManifestEntry>,
-    ) -> HashMap<String, String> {
+    fn island_client_reference_map(&self, index: &ComponentIndex<'_>) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for route in self.manifest.routes.values() {
             for node in &route.tier_c {
-                if let Some(component) = by_name.get(node.component_id.as_str()) {
+                if let Some(component) = index.get(&node.component_id, node.component_key) {
                     map.entry(component.module_path.clone())
                         .or_insert_with(|| node.placeholder_id.clone());
                 }
@@ -936,16 +972,17 @@ impl RendererRuntime {
     fn add_component_to_plan(
         &self,
         plan: &mut crate::render::tier_b::TierBRenderPlan,
-        by_name: &HashMap<&str, &ComponentManifestEntry>,
+        index: &ComponentIndex<'_>,
         island_modules: &HashMap<String, String>,
         compiled: Option<&dom_render_compiler::runtime::CompiledProject>,
         key: &str,
         component_name: &str,
+        component_key: Option<u64>,
     ) {
         if plan.contains_key(key) {
             return;
         }
-        let Some(component) = by_name.get(component_name) else {
+        let Some(component) = index.get(component_name, component_key) else {
             tracing::warn!(
                 target: "albedo.renderer",
                 key = %key,
@@ -961,7 +998,7 @@ impl RendererRuntime {
         //
         // Deliberately NOT keyed off `component.module_path`: the manifest's is
         // absolute, while the compiled project keys on project-relative specs —
-        // `module_spec_for_component` is the bridge (the same one
+        // `module_spec_for` is the bridge (the same one
         // `build_reactive_blocks` uses).
         // PRISM · the partitioned bindings ride along from the same lookup. Boot
         // can precompute the spec but not the topic: a partition's identity
@@ -970,7 +1007,7 @@ impl RendererRuntime {
         // the same reason: boot knows the spec, and only the request knows the
         // params that turn it into a topic.
         let (shared_topics, shared_partitions, shared_sources) = match compiled {
-            Some(project) => match project.module_spec_for_component(component_name) {
+            Some(project) => match project.module_spec_for(&component.module_path, &component.name) {
                 Some(spec) => (
                     project.shared_slot_topics_for_entry(spec),
                     project.shared_slot_partitions_for_entry(spec),
@@ -1073,11 +1110,12 @@ impl RendererRuntime {
         let mut stamp_specs = HashMap::new();
         if let Some(project) = compiled {
             for (specifier, _) in &modules {
-                if let Some(component) = by_name
-                    .values()
+                if let Some(component) = index
+                    .all
+                    .iter()
                     .find(|candidate| &candidate.module_path == specifier)
                 {
-                    if let Some(spec) = project.module_spec_for_component(component.name.as_str()) {
+                    if let Some(spec) = project.module_spec_for(&component.module_path, &component.name) {
                         stamp_specs.insert(specifier.clone(), spec.to_string());
                     }
                 }
@@ -1258,6 +1296,149 @@ struct RuntimeModuleSourceEntry {
 mod tests {
     use super::{merge_island_blocks, RouteHydration};
     use std::collections::HashMap;
+
+    fn identity_component(id: u64, path: &str) -> super::ComponentManifestEntry {
+        super::ComponentManifestEntry {
+            id,
+            name: "Page".to_string(),
+            module_path: path.to_string(),
+            tier: dom_render_compiler::manifest::schema::Tier::B,
+            weight_bytes: 0,
+            priority: 0.0,
+            dependencies: Vec::new(),
+            can_defer: false,
+            hydration_mode: super::HydrationMode::None,
+        }
+    }
+
+    fn identity_route() -> dom_render_compiler::manifest::schema::RouteManifest {
+        serde_json::from_value(serde_json::json!({
+            "route": "/identity",
+            "shell": {"doctype_and_head": "", "body_open": "", "body_close": "", "shim_script": ""},
+            "tier_a_root": [], "tier_b": [], "tier_c": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn identity_index_unknown_key_never_falls_back_to_a_matching_name() {
+        let components = vec![
+            identity_component(0, "zero.tsx"),
+            identity_component(7, "other.tsx"),
+        ];
+        let index = super::ComponentIndex::new(&components);
+        assert_eq!(index.get("Page", Some(0)).unwrap().module_path, "zero.tsx");
+        assert_eq!(index.get("Page", Some(7)).unwrap().module_path, "other.tsx");
+        assert!(index.get("Page", Some(u64::MAX)).is_none());
+        assert!(index.get("Missing", None).is_none());
+        // Manifests predating component_key retain their last-by-name behavior.
+        assert_eq!(index.get("Page", None).unwrap().module_path, "other.tsx");
+        let unique = &components[..1];
+        assert_eq!(
+            super::ComponentIndex::new(unique)
+                .get("Page", None)
+                .unwrap()
+                .id,
+            0
+        );
+    }
+
+    #[test]
+    fn identity_plans_keep_duplicate_modules_topics_and_stamps_separate() {
+        use dom_render_compiler::manifest::schema::{qualified_component_name, RenderManifestV2};
+        use dom_render_compiler::runtime::CompiledProject;
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live.tsx").to_string_lossy().into_owned();
+        let still = dir.path().join("still.tsx").to_string_lossy().into_owned();
+        let live_source = r#"import { useSharedSlot } from "albedo";
+export default function Page() {
+    const rows = useSharedSlot("identity-rows");
+    return <ul>{rows.map(row => <li key={row.id}>{row.author}</li>)}</ul>;
+}"#;
+        let still_source = "export default async function Page() { return <p>still-own</p>; }";
+        std::fs::write(&live, live_source).unwrap();
+        std::fs::write(&still, still_source).unwrap();
+        let compiled = CompiledProject::load_from_dir(dir.path()).unwrap();
+        let mut manifest = RenderManifestV2::legacy_defaults();
+        // Zero is a valid component id, rather than a sentinel for a missing key.
+        manifest.components = vec![identity_component(0, &live), identity_component(7, &still)];
+        let mut route = identity_route();
+        for id in [0, 7] {
+            route.tier_b.push(serde_json::from_value(serde_json::json!({
+                "component_id": "Page", "component_key": id,
+                "placeholder_id": format!("b-{id}"),
+                "render_fn": format!("render::{}", qualified_component_name("Page", Some(id))),
+                "static_props": {}, "dynamic_prop_keys": [], "data_deps": [],
+                "tier_a_children": [], "position": {"parent_placeholder": null, "slot": "body", "order": id},
+                "timeout_ms": 1000, "fallback_html": null
+            })).unwrap());
+            route.tier_c.push(
+                serde_json::from_value(serde_json::json!({
+                    "component_id": "Page", "component_key": id,
+                    "placeholder_id": format!("c-{id}"), "bundle_path": format!("/{id}.js"),
+                    "initial_props": {}, "hydration_mode": "immediate",
+                    "position": {"parent_placeholder": null, "slot": "body", "order": id}
+                }))
+                .unwrap(),
+            );
+        }
+        manifest.routes.insert(route.route.clone(), route);
+        let sources = HashMap::from([
+            (live.clone(), live_source.to_string()),
+            (still.clone(), still_source.to_string()),
+        ]);
+        let mut renderer = super::ServerRenderer::new(
+            super::QuickJsEngine::new(),
+            &super::BootstrapPayload::default(),
+        )
+        .unwrap();
+        renderer
+            .register_manifest_modules(&manifest, &sources)
+            .unwrap();
+        let mut runtime = super::RendererRuntime {
+            manifest,
+            renderer,
+            client_npm: super::ClientNpmGraph::default(),
+            island_ssr_failures: Vec::new(),
+        };
+        for _ in 0..2 {
+            let plans = runtime.build_tier_b_render_plan(Some(&compiled));
+            assert_eq!(plans.len(), 4, "both Tier B and island plans survive");
+            for (id, path, topic) in [(0, &live, true), (7, &still, false)] {
+                let qualified = qualified_component_name("Page", Some(id));
+                for key in [
+                    format!("render::{qualified}"),
+                    super::island_plan_key(&qualified),
+                ] {
+                    let plan = &plans[&key];
+                    assert_eq!(&plan.entry, path);
+                    assert_eq!(plan.modules.len(), 1);
+                    assert_eq!(&plan.modules[0].0, path);
+                    assert_eq!(&plan.modules[0].1, &sources[path]);
+                    assert_eq!(
+                        plan.shared_topics,
+                        if topic {
+                            vec!["identity-rows".to_string()]
+                        } else {
+                            Vec::new()
+                        }
+                    );
+                    assert_eq!(plan.stamp_specs.len(), 1);
+                    assert_eq!(
+                        plan.stamp_specs[path],
+                        compiled.module_spec_for(path, "Page").unwrap()
+                    );
+                }
+            }
+            let references = runtime.island_client_reference_map(&super::ComponentIndex::new(
+                &runtime.manifest.components,
+            ));
+            assert_eq!(references[&live], "c-0");
+            assert_eq!(references[&still], "c-7");
+            // Reordering the manifest cannot change key-based lookup or topic ownership.
+            runtime.manifest.components.reverse();
+        }
+    }
 
     fn block(placeholders: &[(&str, &str)], scripts: &str) -> RouteHydration {
         RouteHydration {

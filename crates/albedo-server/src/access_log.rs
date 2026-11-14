@@ -5,8 +5,10 @@
 //! request at all. Asked "what happened to request X", an operator had nothing
 //! to search.
 //!
-//! - **One line per response head**, from the outermost layer, so a 429, a
-//!   probe and a dispatch panic's 500 are logged like a 200.
+//! - **One line per response**, from the outermost layer, so a 429, a
+//!   probe and a dispatch panic's 500 are logged like a 200. Tier-B bodies
+//!   finish their line at body end/drop so render errors are included; `ms`
+//!   still measures time to the response head.
 //! - **`x-request-id` on every response**, logged or not: the caller's own when
 //!   it is a plausible id (a proxy's id threads straight through), otherwise
 //!   minted. It is the one thing a user's bug report and a log line share, and
@@ -25,12 +27,13 @@ use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Request};
 use axum::response::Response;
+use futures_util::StreamExt;
 
 /// The header the id rides in, both ways.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -61,6 +64,44 @@ pub async fn scope<F: std::future::Future>(dispatch: F) -> (F::Output, Option<St
 /// The principal [`scope`] found, carried out to the log on the response.
 #[derive(Debug, Clone)]
 pub struct Principal(pub String);
+
+/// Shared with a streaming body: its render runs after dispatch returned.
+#[derive(Clone, Default)]
+pub(crate) struct RenderErrors(Arc<Mutex<Vec<String>>>);
+
+impl RenderErrors {
+    pub(crate) fn note(&self, message: &str) {
+        let mut errors = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        if !errors.iter().any(|error| error == message) {
+            errors.push(message.to_string());
+        }
+    }
+}
+
+/// Logs even if the client drops an unfinished body. Ordinary responses keep
+/// their response-head log; Tier-B bodies wait so their errors can be included.
+struct PendingLine {
+    text: String,
+    errors: Option<RenderErrors>,
+}
+
+impl Drop for PendingLine {
+    fn drop(&mut self) {
+        if let Some(errors) = &self.errors {
+            let errors = errors.0.lock().unwrap_or_else(|err| err.into_inner());
+            if !errors.is_empty() {
+                self.text.truncate(self.text.len().saturating_sub(2));
+                let _ = write!(
+                    self.text,
+                    ",\"render_error\":{}}}\n",
+                    json(&errors.join("\n"))
+                );
+            }
+        }
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(self.text.as_bytes());
+    }
+}
 
 /// What the layer needs.
 pub struct AccessLog {
@@ -109,6 +150,9 @@ pub async fn layer(
             peer.map(|peer| log.limiter.client_addr(peer, request.headers()));
         (request.method().clone(), request.uri().path().to_string(), client)
     });
+    if log.enabled {
+        request.extensions_mut().insert(RenderErrors::default());
+    }
     let started = Instant::now();
     let mut response = next.run(request).await;
     if let Some(value) = header {
@@ -126,10 +170,20 @@ pub async fn layer(
             client,
             who,
         );
-        // One write per line, under the lock, so lines from concurrent
-        // requests never interleave mid-line.
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(text.as_bytes());
+        let errors = response.extensions().get::<RenderErrors>().cloned();
+        let pending = PendingLine { text, errors };
+        if pending.errors.is_some() {
+            let (parts, body) = response.into_parts();
+            let stream = async_stream::stream! {
+                let _pending = pending;
+                let mut body = body.into_data_stream();
+                while let Some(chunk) = body.next().await {
+                    yield chunk;
+                }
+            };
+            response = Response::from_parts(parts, Body::from_stream(stream));
+        }
+        // Otherwise `pending` drops here, under one stdout lock per line.
     }
     response
 }
@@ -233,5 +287,162 @@ mod tests {
         assert_eq!(civil_from_days(20_391), (2025, 10, 30));
         let now = chrono_free_now();
         assert_eq!(now.len(), "2026-10-30T13:45:01.123Z".len(), "{now}");
+    }
+
+    const BODY_LOG_CHILD: &str = "ALBEDO_TEST_ACCESS_BODY_CHILD";
+    const LATE_ERROR: &str = "deferred \"render\" error\nsecond line";
+
+    async fn diagnostic_body(request: Request<Body>) -> Response {
+        let errors = request.extensions().get::<RenderErrors>().unwrap().clone();
+        let healthy = request.uri().path() == "/healthy";
+        let body_errors = errors.clone();
+        let stream = async_stream::stream! {
+            yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"shell"));
+            if !healthy {
+                body_errors.note(LATE_ERROR);
+                body_errors.note(LATE_ERROR);
+            }
+            yield Ok(bytes::Bytes::from_static(b"tail"));
+        };
+        let mut response = Response::new(Body::from_stream(stream));
+        response.extensions_mut().insert(errors);
+        response
+    }
+
+    fn body_log_router() -> axum::Router {
+        let log = Arc::new(AccessLog {
+            enabled: true,
+            limiter: Arc::new(crate::shutter::Limiter::with(
+                dom_render_compiler::shutter::Shutter::new().unwrap(),
+                crate::shutter::TrustedProxies::none(),
+            )),
+        });
+        axum::Router::new()
+            .fallback(diagnostic_body)
+            .layer(axum::middleware::from_fn(move |request, next| {
+                layer(log.clone(), request, next)
+            }))
+    }
+
+    async fn body_log_response(router: &axum::Router, id: &str, path: &str) -> Response {
+        use tower::ServiceExt;
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(REQUEST_ID_HEADER, id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    // Stdout is process-wide. An exact-test child captures the real logger's
+    // writes without redirecting a handle used by unrelated parallel tests.
+    fn captured_body_lines(test_name: &str) -> Vec<serde_json::Value> {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture", "--format", "terse"])
+            .env(BODY_LOG_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn deferred_body_error_is_logged_once_without_cross_request_bleed() {
+        if std::env::var_os(BODY_LOG_CHILD).is_some() {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let router = body_log_router();
+                    let response = body_log_response(&router, "late", "/error?token=private").await;
+                    let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(bytes.as_ref(), b"shelltail");
+                    let healthy = body_log_response(&router, "healthy", "/healthy").await;
+                    let bytes = axum::body::to_bytes(healthy.into_body(), 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(bytes.as_ref(), b"shelltail");
+                });
+            return;
+        }
+        let lines = captured_body_lines(
+            "access_log::tests::deferred_body_error_is_logged_once_without_cross_request_bleed",
+        );
+        assert_eq!(
+            lines.len(),
+            2,
+            "one completed access line per request: {lines:?}"
+        );
+        assert_eq!(lines[0]["id"], "late");
+        assert_eq!(lines[0]["status"], 200);
+        assert_eq!(lines[0]["path"], "/error");
+        assert_eq!(lines[0]["render_error"], LATE_ERROR);
+        assert_eq!(lines[1]["id"], "healthy");
+        assert!(lines[1].get("render_error").is_none(), "{lines:?}");
+    }
+
+    #[test]
+    fn dropping_a_partly_consumed_body_logs_its_observed_render_error_once() {
+        if std::env::var_os(BODY_LOG_CHILD).is_some() {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let response = body_log_response(&body_log_router(), "dropped", "/error").await;
+                    let mut stream = response.into_body().into_data_stream();
+                    assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"shell");
+                    assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"tail");
+                    // Do not poll EOF: the consumer can leave after any chunk.
+                    drop(stream);
+                });
+            return;
+        }
+        let lines = captured_body_lines(
+            "access_log::tests::dropping_a_partly_consumed_body_logs_its_observed_render_error_once",
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["id"], "dropped");
+        assert_eq!(lines[0]["render_error"], LATE_ERROR);
+    }
+
+    #[test]
+    fn dropping_an_unpolled_body_still_logs_one_access_line() {
+        if std::env::var_os(BODY_LOG_CHILD).is_some() {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let response =
+                        body_log_response(&body_log_router(), "unpolled", "/error").await;
+                    drop(response);
+                });
+            return;
+        }
+        let lines = captured_body_lines(
+            "access_log::tests::dropping_an_unpolled_body_still_logs_one_access_line",
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["id"], "unpolled");
+        assert!(
+            lines[0].get("render_error").is_none(),
+            "an unrun render cannot fail"
+        );
     }
 }

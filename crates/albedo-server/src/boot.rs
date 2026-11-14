@@ -292,6 +292,17 @@ fn boot_inner(
         )));
     }
 
+    // Q1a · the same boundary `albedo build` enforces, against the source this
+    // server is about to load: a prebuilt `dist` must not outlive a source tree
+    // that now holds a refused FORGE read.
+    dom_render_compiler::transforms::forge_queries::enforce_project(
+        &opts.source_root,
+        &opts.project_dir,
+        &opts.forge,
+        None,
+    )
+    .map_err(RuntimeError::ServerStartup)?;
+
     let renderer = RendererRuntime::from_artifacts_dir(opts.dist_dir.clone())?;
 
     // Every URL in the manifest becomes a GET route whose dispatch

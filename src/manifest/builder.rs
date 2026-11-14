@@ -86,6 +86,16 @@ pub struct ComponentTierMetadata {
     pub effect_profile: EffectProfile,
 }
 
+/// T-0045 · one layout in a route's chain, resolved once from its file path.
+/// The manifest still records layouts by name (`RouteManifest.layout_chain`);
+/// the builder renders, walks and reads them by `id`, because a name is not
+/// unique — every layout file may export `function Layout()`.
+#[derive(Debug, Clone)]
+struct LayoutRef {
+    id: ComponentId,
+    name: String,
+}
+
 pub struct ManifestBuilder<'a> {
     graph: &'a ComponentGraph,
     components: HashMap<ComponentId, Component>,
@@ -218,6 +228,9 @@ impl<'a> ManifestBuilder<'a> {
         // a hole for them during `traverse`'s `render_static` calls.
         let island_names = self.deferred_component_names();
         let _island_guard = crate::runtime::eval::core::install_island_skip_set(&island_names);
+        // T-0045 · same-named deferred components are keyed by module, not name.
+        let _island_identity_guard =
+            crate::runtime::eval::core::install_island_identities(self.island_identity_table());
 
         // …but "anchored at its own placeholder" only lands the island back in
         // the right place when that placeholder is a sibling of the root. An
@@ -246,7 +259,8 @@ impl<'a> ManifestBuilder<'a> {
         // or the island renders twice (once in its wrapper, once at the end).
         for node in &mut tier_c {
             if node.position.parent_placeholder.is_none()
-                && route_island_map.contains_key(&node.component_id)
+                && route_island_map
+                    .contains_key(&self.node_island_key(&node.component_id, node.component_key))
             {
                 node.position.parent_placeholder = Some(ROUTE_ISLAND_PARENT.to_string());
             }
@@ -260,7 +274,8 @@ impl<'a> ManifestBuilder<'a> {
         // shell, exactly as before.
         for node in &mut tier_b {
             if node.position.parent_placeholder.is_none()
-                && route_island_map.contains_key(&node.component_id)
+                && route_island_map
+                    .contains_key(&self.node_island_key(&node.component_id, node.component_key))
             {
                 node.position.parent_placeholder = Some(ROUTE_ISLAND_PARENT.to_string());
             }
@@ -278,7 +293,9 @@ impl<'a> ManifestBuilder<'a> {
         // reads as "no props" — the pre-4.8 behaviour, unchanged.
         let island_props = crate::runtime::eval::core::take_island_props();
         for node in &mut tier_c {
-            if let Some(props) = island_props.get(&node.component_id) {
+            if let Some(props) =
+                island_props.get(&self.node_island_key(&node.component_id, node.component_key))
+            {
                 node.initial_props = props.clone();
             }
         }
@@ -328,6 +345,7 @@ impl<'a> ManifestBuilder<'a> {
 
         let shell = self.build_shell(
             route,
+            root_component,
             assets,
             &tier_a_root,
             &tier_b,
@@ -339,6 +357,23 @@ impl<'a> ManifestBuilder<'a> {
         );
 
         // Everything the route's live lanes may carry: one walk, three lists.
+        // T-0045 · layouts render inside `build_shell` (`wrap_in_layouts`), after
+        // the drain above, so their islands' props arrive only now. Drain again
+        // and attach them to the layout-island nodes. Without this they were
+        // dropped (`initial_props: null`) — and left in the channel for the
+        // NEXT route's drain to hand to whichever island shared the key.
+        let layout_props = crate::runtime::eval::core::take_island_props();
+        for node in &mut tier_c {
+            if node.position.parent_placeholder.as_deref() != Some(LAYOUT_ISLAND_PARENT) {
+                continue;
+            }
+            if let Some(props) =
+                layout_props.get(&self.node_island_key(&node.component_id, node.component_key))
+            {
+                node.initial_props = props.clone();
+            }
+        }
+
         let RouteReads {
             topics: shared_slot_topics,
             partitions: shared_slot_partitions,
@@ -358,7 +393,7 @@ impl<'a> ManifestBuilder<'a> {
             shared_slot_sources,
             shared_slot_columns,
             action_ids,
-            layout_chain,
+            layout_chain: layout_chain.iter().map(|layout| layout.name.clone()).collect(),
             error_component,
             loading_component,
             metadata,
@@ -391,7 +426,8 @@ impl<'a> ManifestBuilder<'a> {
         module
             .functions
             .contains_key("generateMetadata")
-            .then(|| component.name.clone())
+            .then(|| self.boundary_name(root_component))
+            .flatten()
     }
 
     /// AUTH § 4 — read the route leaf component's `export const auth = "…"`.
@@ -469,7 +505,7 @@ impl<'a> ManifestBuilder<'a> {
             .iter()
             .find(|r| r.url_path == route)?;
         let rel = discovered.error_boundary.as_ref()?;
-        self.component_name_for_rel_path(rel.as_path())
+        self.boundary_name(self.component_id_for_rel_path(rel.as_path())?)
     }
 
     /// Phase P · Stream E.2 — same shape as `error_component_for_route`
@@ -480,7 +516,7 @@ impl<'a> ManifestBuilder<'a> {
             .iter()
             .find(|r| r.url_path == route)?;
         let rel = discovered.loading.as_ref()?;
-        self.component_name_for_rel_path(rel.as_path())
+        self.boundary_name(self.component_id_for_rel_path(rel.as_path())?)
     }
 
     /// Collect the TS-action handler names + wire IDs **this route's leaf
@@ -544,16 +580,40 @@ impl<'a> ManifestBuilder<'a> {
     /// discovery entry and translating each `layout_chain` path into
     /// the matching component name. Skips entries that don't resolve
     /// — graceful for projects without file-based routing.
-    fn layout_chain_for_route(&self, route: &str) -> Vec<String> {
+    fn layout_chain_for_route(&self, route: &str) -> Vec<LayoutRef> {
         let Some(discovered) = self.discovered_routes.iter().find(|r| r.url_path == route) else {
             return Vec::new();
         };
 
+        // T-0045 · resolve each layout file to its component *once*, by path,
+        // and carry the id. Every later step used to look the layout up again
+        // by name, and two `export default function Layout()` files made that
+        // lookup pick whichever came first — `/admin` lost its own layout.
         discovered
             .layout_chain
             .iter()
-            .filter_map(|layout_rel| self.component_name_for_rel_path(layout_rel.as_path()))
+            .filter_map(|layout_rel| self.component_id_for_rel_path(layout_rel.as_path()))
+            .filter_map(|id| {
+                let component = self.components.get(&id)?;
+                Some(LayoutRef {
+                    id,
+                    name: component.name.clone(),
+                })
+            })
             .collect()
+    }
+
+    /// T-0045 · the name a route boundary (`error.tsx`, `loading.tsx`, a
+    /// `generateMetadata` leaf) is registered under: qualified with its id when
+    /// another component shares its function name, exactly like a Tier B node's
+    /// plan key, so two `export default function Error()` files don't share one
+    /// render plan.
+    fn boundary_name(&self, id: ComponentId) -> Option<String> {
+        let component = self.components.get(&id)?;
+        Some(crate::manifest::schema::qualified_component_name(
+            &component.name,
+            self.shared_name_key(component),
+        ))
     }
 
     /// Map a `routes/...` relative path back to a component name by
@@ -568,17 +628,17 @@ impl<'a> ManifestBuilder<'a> {
     /// strings are stored relative to the workspace. Without these
     /// constraints, HashMap iteration order would let any deeper
     /// `layout.tsx` win against the root needle.
-    fn component_name_for_rel_path(&self, rel: &Path) -> Option<String> {
+    fn component_id_for_rel_path(&self, rel: &Path) -> Option<ComponentId> {
         let needle = rel.to_string_lossy().replace('\\', "/");
         let absolute_suffix = format!("/routes/{}", needle);
         let relative_suffix = format!("routes/{}", needle);
-        for component in self.components.values() {
+        for (id, component) in &self.components {
             let normalised = component.file_path.replace('\\', "/");
             if normalised.ends_with(absolute_suffix.as_str())
                 || normalised == relative_suffix
                 || normalised.ends_with(&format!("/{}", relative_suffix))
             {
-                return Some(component.name.clone());
+                return Some(*id);
             }
         }
         None
@@ -598,8 +658,13 @@ impl<'a> ManifestBuilder<'a> {
             };
 
             if metadata.tier == Tier::C {
+                // T-0045 · keyed like the node that reads it, so two islands
+                // named `Counter` in different modules keep their own chunk.
                 chunks.insert(
-                    component.name.clone(),
+                    crate::manifest::schema::qualified_component_name(
+                        &component.name,
+                        self.shared_name_key(component),
+                    ),
                     format!(
                         "/_albedo/chunks/{}.{}.js",
                         slugify(component.name.as_str()),
@@ -698,11 +763,12 @@ impl<'a> ManifestBuilder<'a> {
     fn build_shell(
         &self,
         route: &str,
+        root_component: ComponentId,
         assets: &AssetManifest,
         tier_a_root: &[RenderedNode],
         tier_b: &[TierBNode],
         tier_c: &[TierCNode],
-        layout_chain: &[String],
+        layout_chain: &[LayoutRef],
         layout_island_map: &std::collections::HashMap<String, String>,
         metadata: &RouteMetadata,
         dynamic_metadata: bool,
@@ -762,7 +828,13 @@ impl<'a> ManifestBuilder<'a> {
         // ships exactly once per route. Concatenated into one
         // `<style>` block to minimise extra requests and avoid a
         // FOUC between Tier-A render and Tier-B hydration.
-        let scoped_css = self.collect_scoped_module_css_for_route(tier_a_root, tier_b, tier_c);
+        let scoped_css = self.collect_scoped_module_css_for_route(
+            root_component,
+            layout_chain,
+            tier_a_root,
+            tier_b,
+            tier_c,
+        );
         if !scoped_css.is_empty() {
             doctype_and_head.push_str("<style data-albedo-css-modules>");
             doctype_and_head.push_str(&scoped_css);
@@ -809,6 +881,8 @@ impl<'a> ManifestBuilder<'a> {
     /// `.module.css` (the common case for back-compat routes).
     fn collect_scoped_module_css_for_route(
         &self,
+        root_component: ComponentId,
+        layout_chain: &[LayoutRef],
         tier_a_root: &[RenderedNode],
         tier_b: &[TierBNode],
         tier_c: &[TierCNode],
@@ -826,8 +900,21 @@ impl<'a> ManifestBuilder<'a> {
         // then to a project-relative spec via the same shape
         // `CompiledProject::wrap` uses.
         let mut module_specs: BTreeSet<String> = BTreeSet::new();
+        // A sibling's module CSS may contain global selectors, so shared names
+        // must be resolved within this route's graph, not the whole project.
+        // Include layout roots exactly as the route-read walk does.
+        let mut reachable = HashSet::new();
+        let mut stack = vec![root_component];
+        stack.extend(layout_chain.iter().map(|layout| layout.id));
+        while let Some(id) = stack.pop() {
+            if reachable.insert(id) {
+                stack.extend(self.sorted_children(id));
+            }
+        }
         let mut record = |component_name: &str| {
-            if let Some(component) = self.components.values().find(|c| c.name == component_name) {
+            for component in self.components.values().filter(|component| {
+                component.name == component_name && reachable.contains(&component.id)
+            }) {
                 if let Some(spec) =
                     self.component_entry_for_project(component, compiled.root.as_path())
                 {
@@ -882,16 +969,14 @@ impl<'a> ManifestBuilder<'a> {
     /// silently non-live once grants stopped being global.
     ///
     /// Sorted and deduplicated so the manifest is byte-stable across builds.
-    fn collect_route_reads(&self, root: ComponentId, layout_chain: &[String]) -> RouteReads {
+    fn collect_route_reads(&self, root: ComponentId, layout_chain: &[LayoutRef]) -> RouteReads {
         let Some(compiled) = self.compiled_render_project.as_ref() else {
             return RouteReads::default();
         };
 
         let mut stack = vec![root];
         for layout in layout_chain {
-            if let Some((id, _)) = self.components.iter().find(|(_, c)| &c.name == layout) {
-                stack.push(*id);
-            }
+            stack.push(layout.id);
         }
 
         let mut visited: HashSet<ComponentId> = HashSet::new();
@@ -981,7 +1066,7 @@ impl<'a> ManifestBuilder<'a> {
         &self,
         leaf_html: String,
         route: &str,
-        layout_chain: &[String],
+        layout_chain: &[LayoutRef],
         layout_island_map: &std::collections::HashMap<String, String>,
     ) -> String {
         use crate::runtime::eval::LAYOUT_CHILDREN_SENTINEL;
@@ -997,8 +1082,9 @@ impl<'a> ManifestBuilder<'a> {
             crate::runtime::eval::core::install_island_placeholders(layout_island_map);
 
         let mut accumulated = leaf_html;
-        for layout_name in layout_chain.iter().rev() {
-            let Some(layout_html) = self.render_layout_html(layout_name, route) else {
+        for layout in layout_chain.iter().rev() {
+            let layout_name = &layout.name;
+            let Some(layout_html) = self.render_layout_html(layout.id, route) else {
                 // 🔴 `tracing::warn!` was the ONLY report of this, and this file
                 // already documents why that reaches nobody: the build and the
                 // serve are separate processes, and a log line exists only when
@@ -1064,8 +1150,8 @@ impl<'a> ManifestBuilder<'a> {
     /// Resolve a layout component name to its statically-rendered
     /// HTML. Returns `None` when the component isn't registered or
     /// rendering fails — caller's job to decide what to do with that.
-    fn render_layout_html(&self, layout_name: &str, route: &str) -> Option<String> {
-        let component = self.components.values().find(|c| c.name == layout_name)?;
+    fn render_layout_html(&self, layout_id: ComponentId, route: &str) -> Option<String> {
+        let component = self.components.get(&layout_id)?;
         let props = serde_json::json!({ "route": route });
         match self.render_static_component_html_with_props(component, &props) {
             Ok(html) => Some(html),
@@ -1094,7 +1180,7 @@ impl<'a> ManifestBuilder<'a> {
     /// it out of the `<children />` slot — its anchor is the inline div instead.
     fn collect_layout_islands(
         &self,
-        layout_chain: &[String],
+        layout_chain: &[LayoutRef],
         order_counter: &mut u32,
         assets: &AssetManifest,
     ) -> (Vec<TierCNode>, std::collections::HashMap<String, String>) {
@@ -1103,15 +1189,8 @@ impl<'a> ManifestBuilder<'a> {
         let mut emitted: HashSet<ComponentId> = HashSet::new();
         let mut visited: HashSet<ComponentId> = HashSet::new();
 
-        for layout_name in layout_chain {
-            let Some(layout_id) = self
-                .components
-                .iter()
-                .find(|(_, c)| &c.name == layout_name)
-                .map(|(id, _)| *id)
-            else {
-                continue;
-            };
+        for layout in layout_chain {
+            let layout_id = layout.id;
 
             // Depth-first walk of the layout's render subtree. Recurse through
             // Tier-A/Tier-B so an island nested inside the layout's static markup
@@ -1135,7 +1214,7 @@ impl<'a> ManifestBuilder<'a> {
                             order_counter,
                             assets,
                         );
-                        map.insert(node.component_id.clone(), node.placeholder_id.clone());
+                        map.insert(self.island_key(id), node.placeholder_id.clone());
                         nodes.push(node);
                     }
                     Some(Tier::A) | Some(Tier::B) => {
@@ -1190,7 +1269,7 @@ impl<'a> ManifestBuilder<'a> {
                     let component = self.component_or_panic(id);
                     let prefix = if tier == Tier::B { 'b' } else { 'c' };
                     map.insert(
-                        component.name.clone(),
+                        self.island_key(id),
                         format!(
                             "__{prefix}_{}_{}",
                             slugify(component.name.as_str()),
@@ -1355,10 +1434,15 @@ impl<'a> ManifestBuilder<'a> {
             .map(|(html, bytes)| (Some(html), bytes))
             .unwrap_or_else(|| (None, Vec::new()));
 
+        let component_key = self.shared_name_key(component);
         TierBNode {
             component_id: component.name.clone(),
+            component_key,
             placeholder_id,
-            render_fn: format!("render::{}", component.name),
+            render_fn: format!(
+                "render::{}",
+                crate::manifest::schema::qualified_component_name(&component.name, component_key)
+            ),
             static_props: json!({
                 "component_id": component.id.as_u64(),
                 "component_name": component.name,
@@ -1394,6 +1478,18 @@ impl<'a> ManifestBuilder<'a> {
     /// those when real requests come in. The subscriber sender is a
     /// dummy `mpsc::Sender` whose receiver is dropped; broadcast
     /// fan-out uses `try_send` so this never blocks.
+    /// T-0044 · `Some(id)` when another component in this build has the same
+    /// function name, so the bare name can't identify it at serve time.
+    fn shared_name_key(&self, component: &Component) -> Option<u64> {
+        let shared = self
+            .components
+            .values()
+            .filter(|other| other.name == component.name)
+            .nth(1)
+            .is_some();
+        shared.then(|| component.id.as_u64())
+    }
+
     fn render_tier_b_inline(&self, component: &Component) -> Option<(String, Vec<u8>)> {
         let compiled = self.compiled_render_project.as_ref()?;
         let entry = self.component_entry_for_project(component, compiled.root.as_path())?;
@@ -1463,12 +1559,19 @@ impl<'a> ManifestBuilder<'a> {
 
         let bundle_path = assets
             .chunks
-            .get(component.name.as_str())
+            .get(
+                crate::manifest::schema::qualified_component_name(
+                    &component.name,
+                    self.shared_name_key(component),
+                )
+                .as_str(),
+            )
             .cloned()
             .unwrap_or_else(|| format!("/_albedo/chunks/{}.js", slugify(component.name.as_str())));
 
         TierCNode {
             component_id: component.name.clone(),
+            component_key: self.shared_name_key(component),
             placeholder_id: format!(
                 "__c_{}_{}",
                 slugify(component.name.as_str()),
@@ -1776,8 +1879,71 @@ impl<'a> ManifestBuilder<'a> {
         self.components
             .iter()
             .filter(|(id, _)| matches!(self.tier_of(**id), Some(Tier::B) | Some(Tier::C)))
-            .map(|(_, component)| component.name.clone())
+            .map(|(id, _)| self.island_key(*id))
             .collect()
+    }
+
+    /// T-0045 · the key a deferred component is known by in the evaluator's
+    /// island skip set, placeholder maps and props channel: its bare name when
+    /// the name is unique (unchanged output), else `name` + U+001F + its module
+    /// path, which [`Self::island_identity_table`] teaches the evaluator to
+    /// resolve.
+    fn island_key(&self, id: ComponentId) -> String {
+        let Some(component) = self.components.get(&id) else {
+            return String::new();
+        };
+        match self.shared_name_key(component) {
+            Some(_) => format!(
+                "{}{}{}",
+                component.name,
+                char::from(0x1f),
+                self.island_module_path(component)
+            ),
+            None => component.name.clone(),
+        }
+    }
+
+    /// [`Self::island_key`] from a lowered node's `(component_id, component_key)`.
+    fn node_island_key(&self, name: &str, component_key: Option<u64>) -> String {
+        match component_key {
+            Some(key) => self.island_key(ComponentId::new(key)),
+            None => name.to_string(),
+        }
+    }
+
+    /// The component's module path as the evaluator spells it: relative to the
+    /// compiled render root when there is one, else the scanned path.
+    fn island_module_path(&self, component: &Component) -> String {
+        let path = self
+            .compiled_render_project
+            .as_ref()
+            .and_then(|compiled| self.component_entry_for_project(component, compiled.root.as_path()))
+            .unwrap_or_else(|| component.file_path.clone());
+        crate::runtime::eval::core::island_module_path_key(&path)
+    }
+
+    /// `function name → [(module path, island key)]` for every
+    /// component whose name another component shares. Empty for an app with
+    /// no such collision, which leaves the evaluator on bare names.
+    fn island_identity_table(&self) -> std::collections::HashMap<String, Vec<(String, String)>> {
+        let mut table: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        let mut ids: Vec<ComponentId> = self.components.keys().copied().collect();
+        ids.sort_unstable_by_key(|id| id.as_u64());
+        for id in ids {
+            // Static modules must participate in exact-path matching too: a
+            // longer static path can end in a deferred module's path. Its own
+            // key stays out of the skip set, so it still renders normally.
+            let component = &self.components[&id];
+            if self.shared_name_key(component).is_none() {
+                continue;
+            }
+            table
+                .entry(component.name.clone())
+                .or_default()
+                .push((self.island_module_path(component), self.island_key(id)));
+        }
+        table
     }
 
     fn sorted_children(&self, id: ComponentId) -> Vec<ComponentId> {
@@ -2603,8 +2769,11 @@ mod tests {
         let assets = AssetManifest::default();
         let mut order = 0u32;
 
-        let (nodes, map) =
-            builder.collect_layout_islands(&["RootLayout".to_string()], &mut order, &assets);
+        let chain = [super::LayoutRef {
+            id: layout_id,
+            name: "RootLayout".to_string(),
+        }];
+        let (nodes, map) = builder.collect_layout_islands(&chain, &mut order, &assets);
 
         assert_eq!(nodes.len(), 1, "the layout's Tier-C island is lifted");
         let node = &nodes[0];

@@ -139,7 +139,7 @@ export default function Payroll() {
     write(
         &app,
         "src/routes/roles.test.tsx",
-        r#"import { test, expect, visit, signUp, signOut, grantRole, revokeRole } from "albedo/test";
+        r#"import { test, expect, visit, signUp, signIn, signOut, grantRole, revokeRole } from "albedo/test";
 
 test("a role opens the gate and revoking it closes it again", () => {
   const ada = signUp("ada@example.com", "correct horse battery");
@@ -172,11 +172,53 @@ test("the role goes to the session's own user, no one else", () => {
   expect(visit("/payroll", { as: first }).status).toBe(403);
   expect(visit("/payroll", { as: second }).status).toBe(200);
 });
+
+test("a signed-in jar grants and revokes the same principal across sessions", () => {
+  const original = signUp("sessions@example.com", "correct horse battery");
+  const current = signIn("sessions@example.com", "correct horse battery");
+  signOut(original);
+  grantRole(current, "payroll");
+  grantRole(current, "payroll");
+  expect(visit("/payroll", { as: current }).status).toBe(200);
+  revokeRole(current, "payroll");
+  revokeRole(current, "payroll");
+  expect(visit("/payroll", { as: current }).status).toBe(403);
+});
+
+test("revoking through a signed-out jar fails without affecting another jar", () => {
+  const ended = signUp("ended@example.com", "correct horse battery");
+  const active = signUp("active@example.com", "correct horse battery");
+  grantRole(active, "payroll");
+  signOut(ended);
+  let message = "";
+  try { revokeRole(ended, "payroll"); } catch (error) { message = String(error); }
+  expect(message).toContain("revokeRole");
+  expect(message).toContain("signed out");
+  expect(visit("/payroll", { as: active }).status).toBe(200);
+});
+
+test("both helpers reject a forged user and malformed roles", () => {
+  const user = signUp("arguments@example.com", "correct horse battery");
+  for (const change of [grantRole, revokeRole]) {
+    let message = "";
+    try { change({ email: user.email, jar: user.jar }, "payroll"); } catch (error) { message = String(error); }
+    expect(message).toContain("user from signUp() or signIn()");
+    for (const role of ["", null, 42]) {
+      message = "";
+      try { change(user, role); } catch (error) { message = String(error); }
+      expect(message).toContain("role name");
+    }
+    message = "";
+    try { change(user, "payroll\nnope"); } catch (error) { message = String(error); }
+    expect(message).toContain("not a role this app declares");
+  }
+  expect(visit("/payroll", { as: user }).status).toBe(403);
+});
 "#,
     );
     let (ok, text) = run(albedo(home.path(), &app).arg("test"), "albedo test");
     assert!(ok, "albedo test failed\n{text}");
-    assert!(text.contains("4 passed"), "{text}");
+    assert!(text.contains("7 passed"), "{text}");
 }
 
 /// `src/middleware.ts` and `export const auth = "required"` answer a test's

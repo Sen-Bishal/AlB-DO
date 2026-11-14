@@ -52,6 +52,7 @@ pub mod import;
 // A recording test double. Test and bench builds only.
 #[cfg(any(test, feature = "test-support"))]
 pub mod mem;
+pub mod query;
 pub mod reserve;
 pub mod skeleton;
 pub mod substrate;

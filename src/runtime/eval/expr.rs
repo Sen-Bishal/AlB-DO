@@ -54,6 +54,11 @@ pub struct ParsedModule {
     /// (C.2 ships the `broadcast()` builtin that makes that
     /// interpretation useful end-to-end).
     pub action_declarations: Vec<crate::transforms::actions::ActionDeclaration>,
+    /// R5-7 · the legacy `useSharedSlot` reads of this module, by call position
+    /// ([`crate::transforms::forge_queries::legacy_shared_slot_sites`]). The
+    /// extractor acts only on these, so a parameter that shadows a collection is
+    /// not a FORGE subscription.
+    pub shared_slot_sites: std::collections::HashSet<u32>,
 }
 
 pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
@@ -61,6 +66,8 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
     // 9.1a · computed here because the walk below consumes `module.body`.
     let component_exports =
         crate::runtime::implied_default::exported_component_names(&module.body);
+    let shared_slot_sites =
+        crate::transforms::forge_queries::legacy_shared_slot_sites_unresolved(&module);
     let mut parsed = ParsedModule {
         imports: HashMap::new(),
         functions: HashMap::new(),
@@ -68,6 +75,7 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
         component_exports,
         module_constants: Vec::new(),
         action_declarations: Vec::new(),
+        shared_slot_sites,
     };
     let mut synthetic_index = 0usize;
 

@@ -528,6 +528,16 @@ impl LiveRegistry {
         }
         self.publish(entry, identity);
         self.checkpoint(Checkpoint::BeforeGenerationCheck).await;
+        // Middleware may have held this open past expiry before publish put
+        // its deadline in the sweep's index. Never promote that stale read.
+        if entry
+            .admitted
+            .get()
+            .is_some_and(|admitted| admitted.expires_at <= crate::auth::now_ms())
+        {
+            entry.close();
+            return Admission::Refused;
+        }
         if self.generation() == handle.generation {
             return if entry.promote() {
                 Admission::Fast
@@ -564,6 +574,12 @@ impl LiveRegistry {
                     && admitted.expires_at > now =>
             {
                 self.checkpoint(Checkpoint::BeforePromote).await;
+                // The query (or admission work) can itself outlast the
+                // session. Its earlier timestamp cannot authorize promotion.
+                if admitted.expires_at <= crate::auth::now_ms() {
+                    entry.close();
+                    return false;
+                }
                 entry.promote()
             }
             Ok(_) => {
@@ -1125,6 +1141,395 @@ mod tests {
         drop(b);
         assert!(registry.by_token.is_empty() && registry.by_principal.is_empty());
         assert_eq!(registry.with_token.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn an_open_delayed_past_expiry_is_not_admitted() {
+        let registry = Arc::new(LiveRegistry::new());
+        // The request resolved while valid, then middleware held the open
+        // past expiry. Until publish, the sweep has no expiry to close.
+        let identity = authed("u_delayed", "delayed", 0, crate::auth::now_ms() - 1);
+        let handle = registry.register_presented(LiveKind::Sse, identity.token().cloned());
+        assert_eq!(registry.close_expired(crate::auth::now_ms()), 0);
+        assert_eq!(
+            registry.admit(&handle, &identity, None).await,
+            Admission::Refused,
+            "middleware delay admitted an already expired session"
+        );
+        assert!(handle.entry().is_closed());
+    }
+
+    #[tokio::test]
+    async fn expiry_during_revalidation_cannot_promote_the_open() {
+        let db = store().await;
+        let (mut identity, _) = signed_in(db.as_ref(), "delayed").await;
+        if let Identity::Authenticated { principal, .. } = &mut identity {
+            principal.session_expires_at = Some(crate::auth::now_ms() + 150);
+        }
+        let registry = Arc::new(LiveRegistry::new());
+        let handle = registry.register(LiveKind::WebTransport, &identity);
+        let pause = registry.pause_at(Checkpoint::BeforePromote);
+        let entry = handle.entry().clone();
+        let opening = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.revalidate(&entry, Some(db.as_ref())).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("revalidation reached promote");
+        tokio::time::sleep(std::time::Duration::from_millis(175)).await;
+        pause.release.notify_one();
+        assert!(
+            !opening.await.unwrap(),
+            "expired while revalidation was pending"
+        );
+        assert!(handle.entry().is_closed());
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_a_missing_clock() {
+        let db = store().await;
+        db.execute("DELETE FROM albedo_authority_clock", &[])
+            .await
+            .unwrap();
+        let registry = Arc::new(LiveRegistry::new());
+        let error = start_sweep(registry, db)
+            .await
+            .expect_err("missing clock must fail startup");
+        assert!(error.contains("authority clock"));
+    }
+
+    #[tokio::test]
+    async fn a_restart_watermark_spares_current_connections() {
+        let db = store().await;
+        let (identity, id) = signed_in(db.as_ref(), "restart").await;
+        grant_role_changed(db.as_ref(), &id, "payroll", None, 0)
+            .await
+            .unwrap();
+        let registry = Arc::new(LiveRegistry::new());
+        let current = match identity {
+            Identity::Authenticated {
+                mut principal,
+                token,
+            } => {
+                principal.authority_epoch = 1;
+                Identity::Authenticated { principal, token }
+            }
+            _ => unreachable!(),
+        };
+        let handle = registry.register(LiveKind::Phosphor, &current);
+        assert!(registry.revalidate(handle.entry(), Some(db.as_ref())).await);
+        let watermark = store::authority_clock(db.as_ref()).await.unwrap();
+        let (next, outcome) = registry.sweep_tick(db.as_ref(), watermark).await;
+        outcome.unwrap();
+        assert_eq!(next, watermark);
+        assert!(handle.entry().admits());
+        revoke_role_changed(db.as_ref(), &id, "payroll")
+            .await
+            .unwrap();
+        let (next, outcome) = registry.sweep_tick(db.as_ref(), watermark).await;
+        outcome.unwrap();
+        assert!(next > watermark);
+        assert!(handle.entry().is_closed());
+    }
+
+    async fn identity_for_token(
+        db: &dyn DataSubstrate,
+        token: &dom_render_compiler::auth::session::SessionToken,
+    ) -> Identity {
+        let resolved = store::resolve_session(db, token, crate::auth::now_ms())
+            .await
+            .unwrap();
+        Identity::Authenticated {
+            principal: Box::new(resolved.principal().unwrap().clone()),
+            token: token.hash(),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_end_and_role_change_registration_gaps_fail_closed_for_every_kind() {
+        for kind in [LiveKind::Sse, LiveKind::Phosphor, LiveKind::WebTransport] {
+            for after_registration in [false, true] {
+                for event in ["role", "logout", "logout-all", "unlink", "rotation"] {
+                    let db = store().await;
+                    let (_, id) = signed_in(db.as_ref(), "gap-user").await;
+                    grant_role_changed(db.as_ref(), &id, "payroll", None, 0)
+                        .await
+                        .unwrap();
+                    let token = create_session(
+                        db.as_ref(),
+                        &id,
+                        "password",
+                        crate::auth::now_ms(),
+                        86_400_000,
+                    )
+                    .await
+                    .unwrap();
+                    let identity = identity_for_token(db.as_ref(), &token).await;
+                    let initiator = create_session(
+                        db.as_ref(),
+                        &id,
+                        "password",
+                        crate::auth::now_ms(),
+                        86_400_000,
+                    )
+                    .await
+                    .unwrap();
+                    if event == "unlink" {
+                        db.execute("INSERT INTO albedo_accounts (principal, provider, subject, created_at) VALUES (?1, 'google', 'gap-google', ?2)", &[
+                                dom_render_compiler::forge::value::SqlValue::Text(id.as_str().to_string()),
+                                dom_render_compiler::forge::value::SqlValue::Integer(crate::auth::now_ms()),
+                            ]).await.unwrap();
+                    }
+                    let registry = Arc::new(LiveRegistry::new());
+                    let handle = after_registration.then(|| registry.register(kind, &identity));
+                    let paused_open = if let Some(handle) = &handle {
+                        let pause = registry.pause_at(Checkpoint::BeforeRevalidate);
+                        let entry = handle.entry().clone();
+                        let registry = registry.clone();
+                        let db = db.clone();
+                        let task = tokio::spawn(async move {
+                            registry.revalidate(&entry, Some(db.as_ref())).await
+                        });
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            pause.reached.notified(),
+                        )
+                        .await
+                        .unwrap();
+                        Some((pause, task))
+                    } else {
+                        None
+                    };
+                    let mut replacement = None;
+                    match event {
+                        "role" => {
+                            let epoch = revoke_role_changed(db.as_ref(), &id, "payroll")
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            registry.close_principal_below(id.as_str(), epoch);
+                        }
+                        "logout" => {
+                            store::revoke_session(db.as_ref(), &token.hash())
+                                .await
+                                .unwrap();
+                            registry.close_tokens(&[token.hash()]);
+                        }
+                        "logout-all" => {
+                            let deleted = revoke_all_sessions(db.as_ref(), &id).await.unwrap();
+                            registry.close_tokens(&deleted);
+                        }
+                        "unlink" => {
+                            let outcome = store::unlink_account(
+                                db.as_ref(),
+                                &id,
+                                "password",
+                                &initiator.hash(),
+                            )
+                            .await
+                            .unwrap();
+                            let store::UnlinkOutcome::Unlinked { ended, .. } = outcome else {
+                                panic!("unlink did not run")
+                            };
+                            assert!(ended.contains(&token.hash()));
+                            registry.close_tokens(&ended);
+                        }
+                        "rotation" => {
+                            replacement = Some(
+                                store::rotate_session(
+                                    db.as_ref(),
+                                    &token.hash(),
+                                    &id,
+                                    "password",
+                                    crate::auth::now_ms(),
+                                    86_400_000,
+                                )
+                                .await
+                                .unwrap(),
+                            );
+                            registry.close_tokens(&[token.hash()]);
+                        }
+                        _ => unreachable!(),
+                    }
+                    if let Some((pause, task)) = paused_open {
+                        pause.release.notify_one();
+                        assert!(
+                            !tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                                .await
+                                .unwrap()
+                                .unwrap(),
+                            "{kind:?} {event} after register admitted stale identity"
+                        );
+                        assert!(handle.as_ref().unwrap().entry().is_closed());
+                        registry.clear_pause(Checkpoint::BeforeRevalidate);
+                    } else {
+                        let stale = registry.register(kind, &identity);
+                        assert!(
+                            !registry.revalidate(stale.entry(), Some(db.as_ref())).await,
+                            "{kind:?} {event} before register admitted stale identity"
+                        );
+                        assert!(stale.entry().is_closed());
+                    }
+                    let fresh_token = if let Some(replacement) = replacement {
+                        replacement
+                    } else if event == "unlink" {
+                        initiator
+                    } else {
+                        create_session(
+                            db.as_ref(),
+                            &id,
+                            "password",
+                            crate::auth::now_ms(),
+                            86_400_000,
+                        )
+                        .await
+                        .unwrap()
+                    };
+                    let fresh_identity = identity_for_token(db.as_ref(), &fresh_token).await;
+                    let fresh = registry.register(kind, &fresh_identity);
+                    assert!(
+                        registry.revalidate(fresh.entry(), Some(db.as_ref())).await,
+                        "{kind:?} {event} rejected positive control"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_deleted_token_scans_spare_fresh_and_unlink_initiator_on_every_kind() {
+        for kind in [LiveKind::Sse, LiveKind::Phosphor, LiveKind::WebTransport] {
+            for unlink in [false, true] {
+                let db = store().await;
+                let (identity, id) = signed_in(db.as_ref(), "late-scan").await;
+                let initiator = create_session(
+                    db.as_ref(),
+                    &id,
+                    "password",
+                    crate::auth::now_ms(),
+                    86_400_000,
+                )
+                .await
+                .unwrap();
+                let registry = Arc::new(LiveRegistry::new());
+                let old = registry.register(kind, &identity);
+                assert!(registry.revalidate(old.entry(), Some(db.as_ref())).await);
+                let initiating_identity = identity_for_token(db.as_ref(), &initiator).await;
+                let initiating = registry.register(kind, &initiating_identity);
+                assert!(
+                    registry
+                        .revalidate(initiating.entry(), Some(db.as_ref()))
+                        .await
+                );
+                let deleted = if unlink {
+                    db.execute("INSERT INTO albedo_accounts (principal, provider, subject, created_at) VALUES (?1, 'google', 'late-google', ?2)", &[
+                            dom_render_compiler::forge::value::SqlValue::Text(id.as_str().to_string()),
+                            dom_render_compiler::forge::value::SqlValue::Integer(crate::auth::now_ms()),
+                        ]).await.unwrap();
+                    let store::UnlinkOutcome::Unlinked { ended, .. } =
+                        store::unlink_account(db.as_ref(), &id, "password", &initiator.hash())
+                            .await
+                            .unwrap()
+                    else {
+                        panic!("unlink did not run")
+                    };
+                    ended
+                } else {
+                    revoke_all_sessions(db.as_ref(), &id).await.unwrap()
+                };
+                // Commit finished; the scan is held while a new login opens.
+                let fresh_token = create_session(
+                    db.as_ref(),
+                    &id,
+                    "google",
+                    crate::auth::now_ms(),
+                    86_400_000,
+                )
+                .await
+                .unwrap();
+                let fresh_identity = identity_for_token(db.as_ref(), &fresh_token).await;
+                let fresh = registry.register(kind, &fresh_identity);
+                assert!(registry.revalidate(fresh.entry(), Some(db.as_ref())).await);
+                let anonymous = registry.register(kind, &Identity::Anonymous);
+                assert!(registry.revalidate(anonymous.entry(), None).await);
+                assert_eq!(registry.close_tokens(&deleted), if unlink { 1 } else { 2 });
+                assert_eq!(
+                    registry.close_tokens(&deleted),
+                    0,
+                    "duplicate scan reclosed entries"
+                );
+                assert!(old.entry().is_closed());
+                assert_eq!(initiating.entry().admits(), unlink);
+                assert!(
+                    fresh.entry().admits(),
+                    "late {kind:?} scan killed new login"
+                );
+                assert!(anonymous.entry().admits());
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_invalidations_hook_install_and_drop_fire_each_hook_once() {
+        for _ in 0..16 {
+            let registry = Arc::new(LiveRegistry::new());
+            let counter = Arc::new(AtomicUsize::new(0));
+            let handles: Vec<_> = (0..24)
+                .map(|index| {
+                    let kind =
+                        [LiveKind::Sse, LiveKind::Phosphor, LiveKind::WebTransport][index % 3];
+                    let handle =
+                        registry.register(kind, &authed("u_race", "race-token", 0, i64::MAX - 1));
+                    handle.entry().promote();
+                    let counter = counter.clone();
+                    handle.entry().on_close(move || {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    });
+                    handle
+                })
+                .collect();
+            let entries: Vec<_> = handles
+                .iter()
+                .map(|handle| handle.entry().clone())
+                .collect();
+            let barrier = Arc::new(std::sync::Barrier::new(9));
+            std::thread::scope(|scope| {
+                for worker in 0..8 {
+                    let barrier = barrier.clone();
+                    let registry = registry.clone();
+                    let counter = counter.clone();
+                    let entries = &entries;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        if worker < 4 {
+                            for _ in 0..8 {
+                                registry.close_tokens(&[TokenHash::of("race-token")]);
+                                registry.close_principal_below("u_race", 1);
+                                registry.close_expired(i64::MAX);
+                            }
+                        } else {
+                            for entry in entries {
+                                let counter = counter.clone();
+                                entry.on_close(move || {
+                                    counter.fetch_add(1, Ordering::SeqCst);
+                                });
+                            }
+                        }
+                    });
+                }
+                barrier.wait();
+                drop(handles);
+            });
+            assert_eq!(counter.load(Ordering::SeqCst), 24 * 5);
+            assert!(entries
+                .iter()
+                .all(|entry| entry.is_closed() && !entry.promote()));
+            assert!(registry.is_empty());
+            assert!(registry.by_token.is_empty() && registry.by_principal.is_empty());
+            assert!(registry.expiries.lock().unwrap().is_empty());
+            assert_eq!(registry.with_token.load(Ordering::Relaxed), 0);
+        }
     }
 
     /// Cost probe (not a gate): `cargo test --release -p albedo-server --lib

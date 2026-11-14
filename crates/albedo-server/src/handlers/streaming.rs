@@ -21,7 +21,7 @@ use dom_render_compiler::runtime::webtransport::{
 };
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{debug, warn};
@@ -92,6 +92,9 @@ pub struct StreamingAppState {
     /// the undispatched standalone entry) leaves WT sessions unbound-and-ungated
     /// as before: those entries carry no identity to bind.
     live_authority: Option<LiveAuthorityWiring>,
+    /// CLI diagnostics are once per route pattern/message for this server,
+    /// independent of tracing and shared by concurrent requests.
+    render_errors_seen: Arc<Mutex<HashSet<(String, String)>>>,
 }
 
 /// R1b · what the WT bridge needs to bind a session.
@@ -123,6 +126,7 @@ impl StreamingAppState {
             dev_mode: false,
             hmr: false,
             live_authority: None,
+            render_errors_seen: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -563,7 +567,10 @@ async fn serve_manifest_route(
     let feedback = crate::forms::FormFeedback::read(req.headers());
     let expire_feedback = feedback.is_some();
 
-    let stream = build_stream(route, ctx, app, response_transport, page_session, feedback);
+    let render_errors = req.extensions().get::<crate::access_log::RenderErrors>().cloned();
+    let stream = build_stream(
+        route, ctx, app, response_transport, page_session, feedback, render_errors.clone(),
+    );
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -590,9 +597,13 @@ async fn serve_manifest_route(
         response = response.header("alt-svc", alt_svc);
     }
 
-    response
+    let mut response = response
         .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| Response::new(Body::from("failed to build streaming response")))
+        .unwrap_or_else(|_| Response::new(Body::from("failed to build streaming response")));
+    if let Some(errors) = render_errors {
+        response.extensions_mut().insert(errors);
+    }
+    response
 }
 
 fn webtransport_capability_response(
@@ -682,6 +693,8 @@ async fn render_route_boundary(
 struct TierBResolveCtx<'a> {
     app: &'a Arc<StreamingAppState>,
     ctx: &'a TierBRequestContext,
+    route: &'a str,
+    render_errors: Option<&'a crate::access_log::RenderErrors>,
     error_component: Option<String>,
     loading_component: Option<String>,
     island_fills: std::sync::Arc<Vec<(String, String)>>,
@@ -762,17 +775,28 @@ async fn resolve_tier_b_node(
             (InjectionChunk::success(&node, fill(html)), installs)
         }
         Ok(Err(err)) => {
-            // Logged before anything is decided about the response. Without
-            // this a throwing Tier-B node with no `error.tsx` produced a blank
-            // placeholder and **nothing anywhere** — the diagnostic chain the
-            // error carries for exactly this purpose was built and then dropped
-            // on the floor.
-            warn!(
-                target: "albedo.render",
-                node = %node.placeholder_id,
-                error = %err,
-                "tier-B component failed to render"
-            );
+            let message = err.to_string();
+            if let Some(errors) = shared.render_errors {
+                errors.note(&message);
+            }
+            let first = shared
+                .app
+                .render_errors_seen
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert((shared.route.to_string(), message.clone()));
+            if first {
+                // Like the boot report, authors must see this without RUST_LOG.
+                // JSON escaping keeps thrown newlines/control codes on one line.
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(
+                    out,
+                    "  ! render error on {}: {}",
+                    json!(shared.route),
+                    json!(message)
+                );
+            }
             // The component threw. Render the route's `error.tsx` boundary and
             // use its HTML; only if there is no boundary (or it too fails) do we
             // fall back to the blank error stub.
@@ -854,6 +878,7 @@ fn build_stream(
     negotiated_transport: NegotiatedTransport,
     page_session: dom_render_compiler::runtime::SessionId,
     feedback: Option<crate::forms::FormFeedback>,
+    render_errors: Option<crate::access_log::RenderErrors>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
     use dom_render_compiler::manifest::metadata::{
         lower_metadata_object, render_head_metadata, DYNAMIC_HEAD_MARKER,
@@ -905,6 +930,8 @@ fn build_stream(
         let shared = TierBResolveCtx {
             app: &app,
             ctx: &ctx,
+            route: &route.route,
+            render_errors: render_errors.as_ref(),
             error_component,
             loading_component,
             island_fills,
@@ -1324,6 +1351,7 @@ async fn stream_route_over_webtransport(
         .webtransport_sessions
         .as_ref()
         .ok_or_else(|| "webtransport session registry unavailable".to_string())?;
+    let live = sessions.bound_entry(session_id);
 
     let pipeline = app
         .pipeline()
@@ -1398,9 +1426,22 @@ async fn stream_route_over_webtransport(
                     &route.shared_slot_columns,
                     &route.shared_slot_topics,
                 );
+                if let Some(entry) = &live {
+                    if !entry.admits() {
+                        return Err("WT session authority is no longer valid".to_string());
+                    }
+                    let broadcast = broadcast.clone();
+                    entry.on_close(move || broadcast.cleanup_session(page_session));
+                }
                 let initial = broadcast
                     .subscribe_granted(page_session, patches_sender, &grants)
                     .instructions;
+                // Close can run its cleanup between the precheck and install.
+                // Remove that late subscription even if QUIC teardown finished.
+                if live.as_ref().is_some_and(|entry| !entry.admits()) {
+                    broadcast.cleanup_session(page_session);
+                    return Err("WT session authority is no longer valid".to_string());
+                }
                 if !initial.is_empty() {
                     let frame = dom_render_compiler::ir::opcode::OpcodeFrame {
                         frame_id: 0,
@@ -1858,6 +1899,7 @@ mod tests {
     fn tier_b_node() -> TierBNode {
         TierBNode {
             component_id: "Feature".to_string(),
+            component_key: None,
             placeholder_id: "__b_feature".to_string(),
             render_fn: "render::Feature".to_string(),
             static_props: json!({}),
@@ -2085,6 +2127,41 @@ mod tests {
             metadata: Default::default(),
             dynamic_metadata: None,
         }
+    }
+
+    #[tokio::test]
+    async fn deferred_tier_b_error_is_reported_after_the_shell() {
+        let route = route_manifest();
+        assert!(!painted_inline(&route.tier_b[0]));
+        let app = Arc::new(StreamingAppState::new(
+            Arc::new(RenderManifestV2::legacy_defaults()),
+            SharedRenderServices::default(),
+            StreamingTransportConfig::new(false, 443),
+            None,
+        ));
+        let stream = build_stream(
+            route,
+            TierBRequestContext {
+                path: "/stream".into(),
+                ..Default::default()
+            },
+            app.clone(),
+            NegotiatedTransport::Sse,
+            dom_render_compiler::runtime::SessionId::random(),
+            None,
+            Some(crate::access_log::RenderErrors::default()),
+        );
+        futures_util::pin_mut!(stream);
+        let shell = stream.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&shell).contains("<!doctype html>"));
+        assert!(app.render_errors_seen.lock().unwrap().is_empty());
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&chunk).contains("null,'error'"));
+        let seen = app.render_errors_seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (route, message) = seen.iter().next().unwrap();
+        assert_eq!(route, "/stream");
+        assert!(message.contains("no Tier-B renderer is configured"));
     }
 
     fn role_gate_app(
@@ -2843,4 +2920,122 @@ mod tests {
             Some("/_albedo/wt")
         );
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_wt_bridge_paused_before_subscription_installs_nothing_after_close() {
+        use crate::render::tier_b::StubTierBOpcodeRegistry;
+        use dom_render_compiler::graph::ComponentGraph;
+        use dom_render_compiler::manifest::schema::Tier;
+        use dom_render_compiler::runtime::pipeline::FourLaneRuntimePipeline;
+        use dom_render_compiler::runtime::scheduler::SchedulerConfig;
+        use dom_render_compiler::runtime::BroadcastRegistry;
+        use dom_render_compiler::types::{Component, ComponentAnalysis, ComponentId};
+        use std::collections::HashMap;
+
+        let session_id = Uuid::new_v4();
+        let registry = WebTransportSessionRegistry::default();
+
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        let (shell_tx, mut shell_rx) = mpsc::channel(1);
+        shell_tx
+            .send(bytes::Bytes::from_static(b"pause-shell"))
+            .await
+            .unwrap();
+        let (patch_tx, _patch_rx) = mpsc::channel(8);
+        let (prefetch_tx, _prefetch_rx) = mpsc::channel(8);
+
+        registry.insert(WebTransportSessionHandle {
+            session_id,
+            remote_addr: "127.0.0.1:4433".parse().unwrap(),
+            stream_senders: [control_tx, shell_tx, patch_tx, prefetch_tx],
+            binding: Default::default(),
+            gate: Default::default(),
+            connection: None,
+        });
+
+        // Build a pipeline + opcode registry just so
+        // `stream_route_over_webtransport` clears its prerequisite
+        // checks; the test's assertion is about the C.4 auto-subscribe
+        // path, not the Tier-B / pipeline behaviour.
+        let graph = ComponentGraph::new();
+        let id = graph.add_component(Component::new(ComponentId::new(0), "Feature".to_string()));
+        let mut analyses = HashMap::new();
+        analyses.insert(
+            id,
+            ComponentAnalysis {
+                id,
+                priority: 1.0,
+                estimated_time_ms: 1.0,
+                phase: 0.1,
+                topological_level: 0,
+            },
+        );
+        let pipeline = FourLaneRuntimePipeline::new(
+            &graph,
+            analyses,
+            HashMap::from([(id, Tier::B)]),
+            &[],
+            SchedulerConfig::default(),
+            32,
+        )
+        .expect("pipeline must build");
+
+        let services = SharedRenderServices {
+            opcode_registry: Some(Arc::new(StubTierBOpcodeRegistry)),
+            ..SharedRenderServices::default()
+        };
+
+        // Pre-seed the topic so the auto-subscribe initial frame
+        // carries a meaningful current value (not the `b"null"`
+        // default).
+        let broadcast = Arc::new(BroadcastRegistry::new());
+        let seed_bytes = serde_json::to_vec(&serde_json::json!(["alpha", "beta"])).unwrap();
+        broadcast.topic("chat:lobby", seed_bytes.clone());
+
+        let app = Arc::new(
+            StreamingAppState::new(
+                Arc::new(RenderManifestV2::legacy_defaults()),
+                services,
+                StreamingTransportConfig::new(true, 443),
+                Some(registry.clone()),
+            )
+            .with_pipeline(pipeline, tokio::runtime::Handle::current())
+            .with_broadcast(broadcast.clone()),
+        );
+
+        // Route manifest that references one shared topic — Stream B
+        // populates this field at build time from
+        // `CompiledProject::shared_slot_topics()`.
+        let mut route = route_manifest();
+        route.shared_slot_topics = vec!["chat:lobby".to_string()];
+
+        let ctx = TierBRequestContext {
+            path: "/stream".to_string(),
+            ..TierBRequestContext::default()
+        };
+
+        let live = Arc::new(crate::live_authority::LiveRegistry::new());
+        let entry = registry
+            .bind(session_id, &crate::auth::Identity::Anonymous, &live, None)
+            .await
+            .unwrap();
+        let mut bridge = Box::pin(stream_route_over_webtransport(route, ctx, app, session_id));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut bridge)
+                .await
+                .is_err(),
+            "full shell channel must pause the bridge before subscription"
+        );
+        assert_eq!(broadcast.get("chat:lobby").unwrap().subscriber_count(), 0);
+        entry.close();
+        shell_rx.recv().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), bridge)
+            .await
+            .unwrap();
+        assert_eq!(
+            broadcast.get("chat:lobby").unwrap().subscriber_count(),
+            0,
+            "a bridge that resumes after close installed a topic subscription"
+        );
+    }
+
 }

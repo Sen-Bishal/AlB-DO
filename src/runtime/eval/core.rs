@@ -1880,6 +1880,135 @@ fn placeholder_tier(placeholder_id: &str) -> char {
     }
 }
 
+/// `function name → [(module path, island key)]`; see [`install_island_identities`].
+pub(crate) type IslandIdentityTable = std::collections::HashMap<String, Vec<(String, String)>>;
+
+thread_local! {
+    /// Owned, not a borrowed pointer: the installed table lives in this slot
+    /// (behind an `Rc`, so a lookup can hold it without keeping the cell
+    /// borrowed while it walks imports), and the guard owns the table it
+    /// displaced. No `unsafe` and no lifetime contract with the caller.
+    static ISLAND_IDENTITIES: RefCell<Option<std::rc::Rc<IslandIdentityTable>>> =
+        const { RefCell::new(None) };
+}
+
+/// T-0045 · install the table that tells same-named components apart:
+/// `function name → [(module path, island key)]`, holding only names that two
+/// or more components share. While it is installed, a component tag whose
+/// resolved `(module, function)` is in the table is looked up in the skip set,
+/// the placeholder map and the props channel by its island key instead of its
+/// bare name — so `components/a/Counter` and `components/b/Counter` on one
+/// route get their own anchor and their own props. Unique names never appear
+/// here and keep their bare-name keys, byte for byte.
+///
+/// Scoped: the returned guard restores whatever was installed before it when it
+/// drops — on return or during unwinding — so nested installs stack. The guard
+/// is `!Send` (it holds an `Rc`), so it cannot be dropped on another thread.
+pub(crate) fn install_island_identities(table: IslandIdentityTable) -> IslandIdentityGuard {
+    let installed = std::rc::Rc::new(table);
+    let previous = ISLAND_IDENTITIES.with(|cell| cell.replace(Some(installed)));
+    IslandIdentityGuard { previous }
+}
+
+#[must_use = "the table is uninstalled when the guard drops"]
+pub(crate) struct IslandIdentityGuard {
+    previous: Option<std::rc::Rc<IslandIdentityTable>>,
+}
+
+impl Drop for IslandIdentityGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        ISLAND_IDENTITIES.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
+/// The table installed on this thread, if any.
+fn installed_island_identities() -> Option<std::rc::Rc<IslandIdentityTable>> {
+    ISLAND_IDENTITIES.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(test)]
+mod island_identity_storage_tests {
+    use super::{install_island_identities, installed_island_identities, IslandIdentityTable};
+
+    fn table(key: &str) -> IslandIdentityTable {
+        IslandIdentityTable::from([(
+            "Counter".to_string(),
+            vec![("components/a/Counter.tsx".to_string(), key.to_string())],
+        )])
+    }
+
+    fn current_key() -> Option<String> {
+        installed_island_identities().map(|t| t["Counter"][0].1.clone())
+    }
+
+    #[test]
+    fn nested_installs_stack_and_restore_in_order() {
+        assert_eq!(current_key(), None);
+        let outer = install_island_identities(table("outer"));
+        assert_eq!(current_key().as_deref(), Some("outer"));
+        {
+            let _inner = install_island_identities(table("inner"));
+            assert_eq!(current_key().as_deref(), Some("inner"));
+        }
+        assert_eq!(current_key().as_deref(), Some("outer"));
+        drop(outer);
+        assert_eq!(current_key(), None);
+    }
+
+    #[test]
+    fn unwinding_through_an_install_restores_the_previous_table() {
+        let _outer = install_island_identities(table("outer"));
+        let result = std::panic::catch_unwind(|| {
+            let _inner = install_island_identities(table("inner"));
+            assert_eq!(current_key().as_deref(), Some("inner"));
+            panic!("render failed mid-route");
+        });
+        assert!(result.is_err());
+        assert_eq!(current_key().as_deref(), Some("outer"));
+    }
+
+    #[test]
+    fn a_held_table_outlives_its_guard_without_dangling() {
+        let guard = install_island_identities(table("held"));
+        let held = installed_island_identities().unwrap();
+        drop(guard);
+        assert_eq!(current_key(), None);
+        assert_eq!(held["Counter"][0].1, "held");
+    }
+
+    #[test]
+    fn each_thread_sees_only_its_own_installation() {
+        let _here = install_island_identities(table("main"));
+        let there = std::thread::spawn(current_key).join().unwrap();
+        assert_eq!(there, None);
+        assert_eq!(current_key().as_deref(), Some("main"));
+    }
+}
+
+/// The module-path spelling both sides of [`install_island_identities`] use:
+/// forward slashes, no leading `./`, ASCII case folded on Windows only (a
+/// case-sensitive host can hold `Counter.tsx` and `counter.tsx` side by side).
+pub(crate) fn island_module_path_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let trimmed = normalized.trim_start_matches("./");
+    if cfg!(windows) {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `true` when `spec` names the module at `rel` — equal, or `rel` is a whole
+/// trailing path of `spec` (`/abs/app/components/a/Counter.tsx` vs
+/// `components/a/Counter.tsx`). Both already through [`island_module_path_key`].
+fn island_module_matches(spec: &str, rel: &str) -> bool {
+    spec == rel
+        || spec
+            .strip_suffix(rel)
+            .is_some_and(|head| head.ends_with('/'))
+}
+
 /// Return the inline placeholder id for a deferred child (Tier-B or a Tier-C
 /// island) by name, when a map is installed and contains it. `None` everywhere
 /// else — so a component outside any installed map keeps the historical
@@ -5565,7 +5694,11 @@ impl ComponentProject {
             // position. Both a layout (no `<children />` slot to fall back to)
             // and a route (a nested island would otherwise be hoisted out of the
             // element that wraps it) install one.
-            if island_skip_contains(&tag) {
+            // T-0045 · the key this tag is known by: its bare name, unless the
+            // name is shared and the installed identity table resolves it to
+            // its own module.
+            let island_key = self.island_key(module_spec, &tag);
+            if island_skip_contains(&island_key) {
                 // Capture what the parent passed before dropping the subtree.
                 // This is the only moment the island's props exist: the island
                 // itself is rendered later, standalone, from a module path — by
@@ -5593,10 +5726,10 @@ impl ComponentProject {
                             props.insert(name, unwrap_html_markers(&value));
                         }
                     }
-                    push_island_props(&tag, Value::Object(props));
+                    push_island_props(&island_key, Value::Object(props));
                 }
 
-                if let Some(placeholder_id) = island_placeholder_for(&tag) {
+                if let Some(placeholder_id) = island_placeholder_for(&island_key) {
                     // Emit RAW (no escaping): the serve path string-replaces this
                     // exact div, and placeholder ids are always
                     // `__<tier>_<slug>_<id>` (no markup-significant chars), so
@@ -5889,6 +6022,49 @@ impl ComponentProject {
         };
 
         Ok(format!("{element_html}{error_span_suffix}"))
+    }
+
+    /// T-0045 · the key a component tag is known by in the island skip set,
+    /// placeholder map and props channel. The bare tag, except when an identity
+    /// table is installed and the tag resolves — through the same import
+    /// binding [`Self::render_component_ref`] follows — to a `(module,
+    /// function)` the table lists.
+    fn island_key(&self, module_spec: &str, tag: &str) -> String {
+        let resolved = (|| {
+            let table = installed_island_identities()?;
+            let (target, local) = self.component_target(module_spec, tag)?;
+            let candidates = table.get(&local)?;
+            let spec = island_module_path_key(&target);
+            // A project-relative path can itself end in another module's path.
+            // Prefer equality, then the most specific absolute-path suffix.
+            candidates
+                .iter()
+                .find(|(rel, _)| spec == *rel)
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .filter(|(rel, _)| island_module_matches(&spec, rel))
+                        .max_by_key(|(rel, _)| rel.len())
+                })
+                .map(|(_, key)| key.clone())
+        })();
+        resolved.unwrap_or_else(|| tag.to_string())
+    }
+
+    /// `(module spec, function name)` a component tag renders, or `None` when
+    /// the import doesn't resolve.
+    fn component_target(&self, module_spec: &str, tag: &str) -> Option<(String, String)> {
+        let module = self.modules.get(module_spec)?;
+        let Some(binding) = module.imports.get(tag) else {
+            return Some((module_spec.to_string(), tag.to_string()));
+        };
+        let target = self.resolve_import(module_spec, &binding.source)?;
+        let local = if binding.export_name == "default" {
+            self.modules.get(&target)?.default_export.clone()?
+        } else {
+            binding.export_name.clone()
+        };
+        Some((target, local))
     }
 
     fn render_component_ref(

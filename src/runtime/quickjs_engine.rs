@@ -21,7 +21,7 @@ use swc_common::{
 };
 use swc_ecma_ast::{
     Decl, ExportSpecifier, ImportDecl, ImportSpecifier, Module, ModuleDecl, ModuleExportName,
-    ModuleItem, Pat,
+    ModuleItem, ObjectPatProp, Pat,
 };
 use swc_ecma_codegen::{text_writer::JsWriter, Config as CodegenConfig, Emitter};
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
@@ -3884,6 +3884,47 @@ fn compile_legacy_expression_module(
     build_module_record_script(specifier, &statements, &exports)
 }
 
+// Visit binding positions only: property keys and default expressions do not
+// introduce exports. Recursion preserves the declaration's binding order.
+fn collect_export_binding_names(
+    pattern: &Pat,
+    names: &mut Vec<String>,
+    module: &str,
+) -> RuntimeResult<()> {
+    match pattern {
+        Pat::Ident(binding) => names.push(binding.id.sym.to_string()),
+        Pat::Object(object) => {
+            for property in &object.props {
+                match property {
+                    ObjectPatProp::KeyValue(property) => {
+                        collect_export_binding_names(&property.value, names, module)?;
+                    }
+                    ObjectPatProp::Assign(property) => names.push(property.key.id.sym.to_string()),
+                    ObjectPatProp::Rest(rest) => {
+                        collect_export_binding_names(&rest.arg, names, module)?;
+                    }
+                }
+            }
+        }
+        Pat::Array(array) => {
+            for element in array.elems.iter().flatten() {
+                collect_export_binding_names(element, names, module)?;
+            }
+        }
+        Pat::Assign(assign) => collect_export_binding_names(&assign.left, names, module)?,
+        Pat::Rest(rest) => collect_export_binding_names(&rest.arg, names, module)?,
+        Pat::Expr(_) | Pat::Invalid(_) => {
+            return Err(RuntimeError::load(
+                LoadErrorKind::UnsupportedSyntax,
+                format!(
+                    "unsupported export pattern in {module}; only identifier bindings are supported"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn compile_exporting_module(specifier: &str, source: &str) -> RuntimeResult<String> {
     let lowered = lower_module_to_statements(specifier, source, &rewrite_import_declaration)?;
     build_module_record_script(specifier, &lowered.statements, &lowered.export_assignments)
@@ -3976,18 +4017,15 @@ fn lower_module_to_statements(
                             statements.push(decl_source);
                         }
 
+                        let mut export_names = Vec::new();
                         for decl in var_decl.decls {
-                            let export_name = match decl.name {
-                                Pat::Ident(binding_ident) => binding_ident.id.sym.to_string(),
-                                _ => {
-                                    return Err(RuntimeError::load(
-                                        LoadErrorKind::UnsupportedSyntax,
-                                        format!(
-                                            "unsupported export pattern in module '{specifier}'; only identifier bindings are supported"
-                                        ),
-                                    ));
-                                }
-                            };
+                            collect_export_binding_names(
+                                &decl.name,
+                                &mut export_names,
+                                &format!("module '{specifier}'"),
+                            )?;
+                        }
+                        for export_name in export_names {
                             let export_key = js_string_literal(&export_name, specifier)?;
                             export_assignments
                                 .push(format!("__albedo_exports[{export_key}] = {export_name};"));
@@ -4754,19 +4792,11 @@ fn compile_npm_esm_module(
                         }
                         Decl::Var(var_decl) => {
                             for declarator in var_decl.decls {
-                                match declarator.name {
-                                    Pat::Ident(binding_ident) => {
-                                        export_names.push(binding_ident.id.sym.to_string());
-                                    }
-                                    _ => {
-                                        return Err(RuntimeError::load(
-                                            LoadErrorKind::UnsupportedSyntax,
-                                            format!(
-                                                "unsupported export pattern in npm module '{key}'; only identifier bindings are supported"
-                                            ),
-                                        ));
-                                    }
-                                }
+                                collect_export_binding_names(
+                                    &declarator.name,
+                                    &mut export_names,
+                                    &format!("npm module '{key}'"),
+                                )?;
                             }
                         }
                         other => {
@@ -5102,7 +5132,7 @@ fn transpile_module_source_for_quickjs(
     })
 }
 
-fn syntax_for_specifier(specifier: &str) -> Syntax {
+pub(crate) fn syntax_for_specifier(specifier: &str) -> Syntax {
     match Path::new(specifier)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -5127,7 +5157,7 @@ fn syntax_for_specifier(specifier: &str) -> Syntax {
     }
 }
 
-fn parse_module_with_fallback(
+pub(crate) fn parse_module_with_fallback(
     specifier: &str,
     source: &str,
     preferred_syntax: Syntax,
@@ -5337,6 +5367,7 @@ fn strip_export_default_prefix(source: &str) -> Option<String> {
 fn is_framework_runtime_import(source: &str) -> bool {
     matches!(source, "react" | "react-dom" | "albedo")
         || source == FORGE_BINDINGS_MODULE
+        || source == crate::transforms::forge_queries::QUERY_MODULE
         || source == SOURCE_BINDINGS_MODULE
         || source == crate::middleware::MIDDLEWARE_MODULE
         || source == crate::jobs::JOBS_MODULE
@@ -5368,6 +5399,22 @@ fn forge_collection_stub(collection: &str) -> String {
     );
     let escaped = message.replace('\\', "\\\\").replace('\'', "\\'");
     format!("{{ where: function() {{ throw new Error('{escaped}'); }} }}")
+}
+
+/// What an `albedo/query` helper (`or`, `optional`, `count`, …) binds to at run
+/// time. T-0033 · Q1a: the helpers are types only and mean something only inside
+/// a query chain's arguments, which the early refusal boundary
+/// (`transforms::forge_queries::enforce_project`) refuses before anything runs.
+/// So the one import that reaches here is a helper imported and never used — it
+/// must load (no `MODULE_MISSING`), and the binding is a tripwire that names its
+/// cause if anything ever calls it.
+fn query_helper_stub(helper: &str) -> String {
+    let message = format!(
+        "`{helper}` from \"albedo/query\" only means something inside a query chain's \
+         arguments; new-style queries run from Q1b"
+    );
+    let escaped = message.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("function() {{ throw new Error('{escaped}'); }}")
 }
 
 /// What an `albedo/sources` name binds to when it survives the transpile fold.
@@ -5591,6 +5638,7 @@ action: globalThis.action, Fragment: (globalThis.h && globalThis.h.Fragment) }";
 
     let bindings_stub: Option<fn(&str) -> String> = match import_decl.src.value.as_ref() {
         FORGE_BINDINGS_MODULE => Some(forge_collection_stub),
+        crate::transforms::forge_queries::QUERY_MODULE => Some(query_helper_stub),
         SOURCE_BINDINGS_MODULE => Some(source_route_stub),
         _ => None,
     };
@@ -5820,6 +5868,26 @@ mod prelude_equivalence {
 mod tests {
     use super::compile_module_script_for_quickjs;
 
+    #[test]
+    fn invalid_export_binding_patterns_keep_the_existing_diagnostic() {
+        use swc_common::DUMMY_SP;
+        use swc_ecma_ast::{Expr, Invalid, Pat};
+
+        for pattern in [
+            Pat::Invalid(Invalid { span: DUMMY_SP }),
+            Pat::Expr(Box::new(Expr::Invalid(Invalid { span: DUMMY_SP }))),
+        ] {
+            for module in ["module 'local.js'", "npm module 'npm:bindings@1/index.js'"] {
+                let error = super::collect_export_binding_names(&pattern, &mut Vec::new(), module)
+                    .expect_err("non-binding AST node stays refused");
+                assert_eq!(
+                    error.to_string(),
+                    format!("LoadError[unsupported_syntax]: unsupported export pattern in {module}; only identifier bindings are supported")
+                );
+            }
+        }
+    }
+
     /// #8 · a script that allocates without end gets an error, and the process
     /// — every other request on it — is untouched.
     ///
@@ -6025,6 +6093,30 @@ mod tests {
         assert!(
             compiled.contains("data-albedo-slot") && compiled.contains("__albedo_topic"),
             "and the read must still be anchored for live paint; got: {compiled}"
+        );
+    }
+
+    /// T-0033 · R3-4: a helper imported from `albedo/query` and never used loads
+    /// (no module lookup, no `MODULE_MISSING`) and binds to a tripwire.
+    #[test]
+    fn an_unused_albedo_query_import_is_bound_rather_than_loaded() {
+        let source = r#"
+            import { count, or } from "albedo/query";
+            export default function Page() {
+                return <span>ok</span>;
+            }
+        "#;
+        let compiled = compile_module_script_for_quickjs("routes/page.tsx", source).unwrap();
+        // The tripwire's message names the module; a lookup would be a require
+        // or an import of it.
+        assert!(
+            !compiled.contains("__albedo_require(\"albedo/query\")")
+                && !compiled.contains("} from \"albedo/query\""),
+            "the specifier must never reach a module lookup; got: {compiled}"
+        );
+        assert!(
+            compiled.contains("only means something inside a query chain"),
+            "got: {compiled}"
         );
     }
 

@@ -513,6 +513,7 @@ mod tests {
             component_exports: Vec::new(),
             module_constants: Vec::new(),
             action_declarations: Vec::new(),
+            shared_slot_sites: Default::default(),
         };
 
         for item in module.body {

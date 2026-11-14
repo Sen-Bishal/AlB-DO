@@ -649,12 +649,20 @@ pub fn run_tests(
                     server.source_root.display()
                 )
             })?;
-    let npm: Vec<(String, String, u64)> = compiled
+    let mut npm: Vec<(String, String, u64)> = compiled
         .npm_bundles()
         .iter()
         .flat_map(|bundle| bundle.artifacts.iter())
         .map(|artifact| (artifact.key.clone(), artifact.script.clone(), artifact.source_hash))
         .collect();
+    // Both the render engine and each file's test realm need these records:
+    // importing a component loads its CSS before render() reaches the host.
+    npm.extend(
+        compiled
+            .css_modules()
+            .module_records()
+            .map_err(|err| err.to_string())?,
+    );
     drop(compiled);
     let renderers = Rc::new(RefCell::new(Renderers::load(server, &npm)?));
     let auth_cookie = server
@@ -840,5 +848,130 @@ mod tests {
             })
             .collect();
         assert_eq!(found, vec!["src/components/Card.test.tsx", "tests/flow.spec.ts"]);
+    }
+
+    #[cfg(feature = "forge")]
+    #[tokio::test]
+    async fn role_control_uses_sessions_when_provider_accounts_share_an_email() {
+        use crate::config::AppConfig;
+        use crate::server::AlbedoServerBuilder;
+        use dom_render_compiler::auth::declare::{AuthDeclaration, ProviderDecl};
+        use dom_render_compiler::auth::{schema, store};
+        use dom_render_compiler::forge::skeleton::{bootstrap_schema, ForgeSchema};
+        use dom_render_compiler::forge::LibSqlSubstrate;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let db_path = scratch.path().join("same email.db");
+        let auth_schema = schema::augment(&ForgeSchema::build(Vec::new()).unwrap()).unwrap();
+        let now = crate::auth::now_ms();
+        let (first_id, first_token, second_id, second_token) = {
+            let db = LibSqlSubstrate::open_local(&db_path).await.unwrap();
+            bootstrap_schema(&db, &auth_schema).await.unwrap();
+            let profile = store::ProviderProfile {
+                email: Some("shared@example.com".to_string()),
+                ..Default::default()
+            };
+            let first = store::upsert_principal(&db, "password", "first", &profile, now)
+                .await
+                .unwrap();
+            let second = store::upsert_principal(&db, "passkey", "second", &profile, now)
+                .await
+                .unwrap();
+            assert_ne!(first.id, second.id);
+            assert_eq!(first.email, second.email);
+            assert_eq!(first.email.as_deref(), Some("shared@example.com"));
+            let first_token = store::create_session(&db, &first.id, "password", now, 60_000)
+                .await
+                .unwrap();
+            let second_token = store::create_session(&db, &second.id, "passkey", now, 60_000)
+                .await
+                .unwrap();
+            (first.id, first_token, second.id, second_token)
+        };
+        let declaration = AuthDeclaration {
+            providers: BTreeMap::from([
+                ("password".to_string(), ProviderDecl::default()),
+                ("passkey".to_string(), ProviderDecl::default()),
+            ]),
+            roles: vec!["payroll".to_string()],
+            ..Default::default()
+        };
+        let mut config = AppConfig::default();
+        config.server.host = "127.0.0.1".to_string();
+        config.server.port = 0;
+        config.forge.db_path = Some(db_path.display().to_string());
+        let server = AlbedoServerBuilder::new(config)
+            .with_auth_registry(declaration.lower().unwrap())
+            .with_forge_schema(auth_schema)
+            .build()
+            .unwrap();
+        let roles = server.role_control();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.run_until(
+            move |_| {
+                let _ = ready_tx.send(());
+            },
+            async move {
+                let _ = stop_rx.await;
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // These are the cookie headers Host::role builds from each jar. The
+        // public signUp helper cannot create this cross-provider fixture.
+        let headers = |token: &dom_render_compiler::auth::session::SessionToken| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                format!(
+                    "{}={}",
+                    dom_render_compiler::auth::DEFAULT_SESSION_COOKIE,
+                    token.expose_for_cookie()
+                )
+                .parse()
+                .unwrap(),
+            );
+            headers
+        };
+        let first = headers(&first_token);
+        let second = headers(&second_token);
+        assert!(roles.change(&first, "payroll", true).await.unwrap());
+        assert!(
+            !roles.change(&second, "payroll", false).await.unwrap(),
+            "the second account revoked the first account's grant through their shared email"
+        );
+        assert!(roles.change(&second, "payroll", true).await.unwrap());
+        assert!(roles.change(&first, "payroll", false).await.unwrap());
+        assert!(!roles.change(&first, "payroll", false).await.unwrap());
+        assert!(!roles.change(&second, "payroll", true).await.unwrap());
+
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(roles);
+        // Reopen only after the server has stopped, preserving this rig's
+        // single-substrate lifetime rule.
+        let db = LibSqlSubstrate::open_local(&db_path).await.unwrap();
+        assert!(store::load_principal(&db, &first_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .roles
+            .is_empty());
+        assert_eq!(
+            store::load_principal(&db, &second_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .roles,
+            vec!["payroll".to_string()]
+        );
     }
 }

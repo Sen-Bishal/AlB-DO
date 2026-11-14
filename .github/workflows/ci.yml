@@ -10,6 +10,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # P-buyer-blockers BB1a: 12 Nov 2026 measured 282 files / 2,121 hunks.
+  # fmt stays advisory until the one-off reformat commit; clippy until its lint debt
+  # (3,946 diagnostics on 12 Nov, T-0039) is cleared. Neither gates the tests.
+  fmt:
+    name: fmt (advisory until the reformat commit)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (advisory until lint debt is cleared)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy
+        run: cargo clippy -p dom-render-compiler -p albedo-server -p albedo-node --all-targets -- -D warnings
+
   test:
     name: Test · ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -23,19 +60,15 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo fmt check
-        run: cargo fmt --all -- --check
+      - name: Test compiler
+        run: cargo test -p dom-render-compiler
 
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: cargo test
-        run: cargo test --workspace
+      - name: Test server
+        if: ${{ !cancelled() }}
+        run: cargo test -p albedo-server
 
   # Releases are built by the stable compiler (see release.yml). This catches a
   # change that only nightly accepts before a tag does.

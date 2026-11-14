@@ -471,4 +471,276 @@ mod tests {
             "a disconnected client must not stay subscribed"
         );
     }
+
+    struct PausedProjection {
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl RowProjector for PausedProjection {
+        async fn project_rows(
+            &self,
+            _collection: &str,
+            _partition: Option<&str>,
+            _value: &[u8],
+        ) -> Option<dom_render_compiler::forge::RenderedRows> {
+            self.reached.notify_one();
+            self.release.notified().await;
+            Some(
+                [("1".to_string(), "<li>private</li>".to_string())]
+                    .into_iter()
+                    .collect(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_resync_open_removes_both_registrations() {
+        use crate::auth::Identity;
+        use crate::live_authority::{LiveKind, LiveRegistry};
+
+        let broadcast = Arc::new(BroadcastRegistry::new());
+        broadcast.topic("guestbook", b"[]".to_vec());
+        let registry = Arc::new(LiveRegistry::new());
+        let handle = registry.register(LiveKind::Sse, &Identity::Anonymous);
+        assert!(registry.revalidate(handle.entry(), None).await);
+        let projector = PausedProjection {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        };
+        let grants = [TopicGrant::whole("guestbook")];
+        let mut opening = Box::pin(serve_patch_stream_live(
+            broadcast.clone(),
+            &grants,
+            Some(&projector),
+            Some(handle),
+        ));
+        tokio::select! {
+            _ = &mut opening => panic!("projection did not pause"),
+            _ = projector.reached.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("projection was not reached"),
+        }
+        assert_eq!(registry.len(), 1);
+        assert_eq!(broadcast.get("guestbook").unwrap().subscriber_count(), 1);
+        drop(opening);
+        assert!(
+            registry.is_empty(),
+            "cancelled open retained its live handle"
+        );
+        assert_eq!(broadcast.get("guestbook").unwrap().subscriber_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn closing_during_resync_cleans_up_without_polling_and_gates_the_seed() {
+        use crate::auth::Identity;
+        use crate::live_authority::{LiveKind, LiveRegistry};
+
+        let broadcast = Arc::new(BroadcastRegistry::new());
+        broadcast.topic("guestbook", b"[]".to_vec());
+        let registry = Arc::new(LiveRegistry::new());
+        let handle = registry.register(LiveKind::Sse, &Identity::Anonymous);
+        assert!(registry.revalidate(handle.entry(), None).await);
+        let entry = handle.entry().clone();
+        let projector = PausedProjection {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        };
+        let grants = [TopicGrant::whole("guestbook")];
+        let mut opening = Box::pin(serve_patch_stream_live(
+            broadcast.clone(),
+            &grants,
+            Some(&projector),
+            Some(handle),
+        ));
+        tokio::select! {
+            _ = &mut opening => panic!("projection did not pause"),
+            _ = projector.reached.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("projection was not reached"),
+        }
+        assert!(entry.close());
+        assert_eq!(
+            broadcast.get("guestbook").unwrap().subscriber_count(),
+            0,
+            "close must remove the subscription before the open is polled again"
+        );
+        projector.release.notify_one();
+        let response = opening.await;
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), 16_384),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            body.contains("retry:"),
+            "unprotected opening event still flows"
+        );
+        assert!(
+            !body.contains("event: patch"),
+            "seed or resync escaped after close: {body}"
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_sse_frames_stop_at_close_without_disturbing_other_readers() {
+        use crate::auth::Identity;
+        use crate::live_authority::{LiveKind, LiveRegistry};
+        use dom_render_compiler::auth::principal::{Principal, PrincipalId};
+        use dom_render_compiler::auth::session::TokenHash;
+        use futures_util::StreamExt;
+
+        let registry = Arc::new(LiveRegistry::new());
+        let broadcast = Arc::new(BroadcastRegistry::new());
+        broadcast.topic("guestbook", b"initial".to_vec());
+        let identity = |name: &str| {
+            let mut principal = Principal::new(PrincipalId::parse(name).unwrap(), "password");
+            principal.session_expires_at = Some(i64::MAX - 1);
+            Identity::Authenticated {
+                principal: Box::new(principal),
+                token: TokenHash::of(name),
+            }
+        };
+        let stale = registry.register(LiveKind::Sse, &identity("u_stale"));
+        let other = registry.register(LiveKind::Sse, &identity("u_other"));
+        let anonymous = registry.register(LiveKind::Sse, &Identity::Anonymous);
+        for handle in [&stale, &other, &anonymous] {
+            assert!(handle.entry().promote());
+        }
+        let entry = stale.entry().clone();
+        let grants = [TopicGrant::whole("guestbook")];
+        let mut stale_body = serve_patch_stream_live(broadcast.clone(), &grants, None, Some(stale))
+            .await
+            .into_body()
+            .into_data_stream();
+        let mut other_body = serve_patch_stream_live(broadcast.clone(), &grants, None, Some(other))
+            .await
+            .into_body()
+            .into_data_stream();
+        let mut anonymous_body =
+            serve_patch_stream_live(broadcast.clone(), &grants, None, Some(anonymous))
+                .await
+                .into_body()
+                .into_data_stream();
+        // Poll through the opening comment and seed, then leave the next
+        // protected frame queued immediately before the body's admission load.
+        for body in [&mut stale_body, &mut other_body, &mut anonymous_body] {
+            for _ in 0..2 {
+                tokio::time::timeout(Duration::from_secs(5), body.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        let before = broadcast
+            .write_topic("guestbook", b"queued".to_vec())
+            .unwrap();
+        assert_eq!(before.delivered, 3);
+        assert_eq!(registry.close_principal_below("u_stale", 1), 1);
+        assert!(entry.is_closed());
+        assert_eq!(broadcast.get("guestbook").unwrap().subscriber_count(), 2);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), stale_body.next())
+                .await
+                .unwrap()
+                .is_none(),
+            "queued frame escaped after close"
+        );
+        assert_eq!(registry.close_principal_below("u_stale", 1), 0);
+        // C and the anonymous public reader must each receive every queued
+        // publication once, despite sharing B's topic and invalidation scan.
+        let after = broadcast
+            .write_topic("guestbook", b"after".to_vec())
+            .unwrap();
+        assert_eq!(after.delivered, 2);
+        for body in [&mut other_body, &mut anonymous_body] {
+            for (id, value) in [(2, b"queued".as_slice()), (3, b"after".as_slice())] {
+                let bytes = tokio::time::timeout(Duration::from_secs(5), body.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let event = std::str::from_utf8(&bytes).unwrap();
+                assert!(event.contains(&format!("id: {id}\n")), "{event}");
+                let data = event
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap();
+                let wire = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .unwrap();
+                let (frame, _) = decode_frame(&wire).unwrap();
+                assert!(matches!(frame.instructions.as_slice(),
+                    [Instruction::SlotSet { value: actual, .. }] if actual == value));
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), body.next())
+                    .await
+                    .is_err(),
+                "duplicate protected frame received"
+            );
+        }
+        drop(stale_body);
+        drop(other_body);
+        drop(anonymous_body);
+        assert!(registry.is_empty());
+        assert_eq!(broadcast.get("guestbook").unwrap().subscriber_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_wide_resync_removes_every_topic_subscription() {
+        use crate::auth::Identity;
+        use crate::live_authority::{LiveKind, LiveRegistry};
+
+        let registry = Arc::new(LiveRegistry::new());
+        let broadcast = Arc::new(BroadcastRegistry::new());
+        let grants: Vec<_> = (0..256)
+            .map(|i| {
+                let topic = format!("topic_{i}");
+                broadcast.topic(&topic, b"[]".to_vec());
+                TopicGrant::whole(topic)
+            })
+            .collect();
+        let handle = registry.register(LiveKind::Sse, &Identity::Anonymous);
+        assert!(handle.entry().promote());
+        let projector = PausedProjection {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        };
+        let mut opening = Box::pin(serve_patch_stream_live(
+            broadcast.clone(),
+            &grants,
+            Some(&projector),
+            Some(handle),
+        ));
+        tokio::select! {
+            _ = &mut opening => panic!("projection did not pause"),
+            _ = projector.reached.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("projection was not reached"),
+        }
+        for i in 0..256 {
+            assert_eq!(
+                broadcast
+                    .get(&format!("topic_{i}"))
+                    .unwrap()
+                    .subscriber_count(),
+                1
+            );
+        }
+        drop(opening);
+        assert!(registry.is_empty());
+        for i in 0..256 {
+            assert_eq!(
+                broadcast
+                    .get(&format!("topic_{i}"))
+                    .unwrap()
+                    .subscriber_count(),
+                0
+            );
+        }
+    }
 }

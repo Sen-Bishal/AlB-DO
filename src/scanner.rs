@@ -126,6 +126,13 @@ impl ProjectScanner {
     pub fn build_compiler(&self, components: Vec<ParsedComponent>) -> RenderCompiler {
         let mut compiler = RenderCompiler::new();
         let mut component_map: HashMap<String, ComponentId> = HashMap::new();
+        // T-0045 · each parsed file's own id, in `components` order. The name
+        // map above holds only the LAST component per name, so two modules
+        // exporting `Page` (or `Counter`) used to collapse into one: every
+        // `Page`'s import edges landed on the last `Page`, and the path index
+        // filed `components/a/Counter.tsx` under some other `Counter`.
+        let mut ids: Vec<ComponentId> = Vec::with_capacity(components.len());
+        let mut name_count: HashMap<String, usize> = HashMap::new();
 
         for parsed in &components {
             let mut component = Component::new(ComponentId::new(0), parsed.name.clone());
@@ -151,22 +158,19 @@ impl ProjectScanner {
 
             let id = compiler.add_component(component);
             component_map.insert(parsed.name.clone(), id);
+            *name_count.entry(parsed.name.clone()).or_default() += 1;
+            ids.push(id);
         }
 
         // Path-keyed index of every node by its normalized module path. This is
         // what lets a component depend on a *non-component* module (data/util)
         // it imports by a name that matches no component name.
         let mut path_map: HashMap<String, ComponentId> = HashMap::new();
-        for parsed in &components {
-            if let Some(&id) = component_map.get(&parsed.name) {
-                path_map.insert(normalize_specifier(&parsed.file_path), id);
-            }
+        for (parsed, &id) in components.iter().zip(&ids) {
+            path_map.insert(normalize_specifier(&parsed.file_path), id);
         }
 
-        for parsed in &components {
-            let Some(&from_id) = component_map.get(&parsed.name) else {
-                continue;
-            };
+        for (parsed, &from_id) in components.iter().zip(&ids) {
 
             // Primary: resolve each import specifier to a file PATH relative to
             // the importer, then look it up in the path-keyed index. Catches
@@ -182,9 +186,17 @@ impl ProjectScanner {
             // Fallback: the legacy name match (import binding name == component
             // name). Kept for bare/aliased specifiers that don't resolve to a
             // project file path; union with the path edges is idempotent.
+            // T-0045: only when the name is unique — a shared name would be a
+            // guess, and a wrong edge is worse than a missing one (the path
+            // edges above already cover every relative import).
             for import in &parsed.imports {
+                if name_count.get(import).copied() != Some(1) {
+                    continue;
+                }
                 if let Some(&to_id) = component_map.get(import) {
-                    compiler.add_dependency(from_id, to_id).ok();
+                    if to_id != from_id {
+                        compiler.add_dependency(from_id, to_id).ok();
+                    }
                 }
             }
         }
@@ -396,5 +408,57 @@ mod tests {
         assert!(message.contains("Broken.jsx"));
 
         fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// T-0045 · two route modules both exporting `Page`, each importing its own
+    /// `Counter` (a third `Counter` exists elsewhere). Each `Page` must depend
+    /// on exactly the `Counter` its file imports. Before: the name-keyed map
+    /// collapsed same-named components, so one `Page` had no edges and the
+    /// other had the wrong `Counter`.
+    #[test]
+    fn same_named_components_keep_their_own_dependency_edges() {
+        let parser = ComponentParser::new();
+        let counter = |label: &str| {
+            format!(
+                "export default function Counter() {{ return <button>{label}</button>; }}"
+            )
+        };
+        let page = |path: &str| {
+            format!(
+                "import Counter from \"{path}\";\nexport default function Page() {{ return <main><Counter /></main>; }}"
+            )
+        };
+        let mut parsed = Vec::new();
+        for (source, file) in [
+            (counter("a"), "src/components/a/Counter.tsx"),
+            (counter("b"), "src/components/b/Counter.tsx"),
+            (counter("root"), "src/components/Counter.tsx"),
+            (page("../components/a/Counter"), "src/routes/islanda.tsx"),
+            (page("../components/b/Counter"), "src/routes/islandb.tsx"),
+        ] {
+            parsed.extend(parser.parse_source(&source, file).unwrap());
+        }
+
+        let compiler = ProjectScanner::new().build_compiler(parsed);
+        let graph = compiler.graph();
+        let node = |file: &str| {
+            graph
+                .components()
+                .into_iter()
+                .find(|c| c.file_path == file)
+                .unwrap_or_else(|| panic!("{file} has a node"))
+        };
+        for (route, own) in [
+            ("src/routes/islanda.tsx", "src/components/a/Counter.tsx"),
+            ("src/routes/islandb.tsx", "src/components/b/Counter.tsx"),
+        ] {
+            let deps: Vec<String> = graph
+                .get_dependencies(&node(route).id)
+                .into_iter()
+                .filter_map(|id| graph.get(&id))
+                .map(|c| c.file_path)
+                .collect();
+            assert_eq!(deps, vec![own.to_string()], "{route} depends on {deps:?}");
+        }
     }
 }

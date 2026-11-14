@@ -34,7 +34,7 @@ use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_ast::{
     BlockStmtOrExpr, CallExpr, Callee, Expr, ExprOrSpread, Ident, IdentName, ImportSpecifier,
     JSXAttr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElement, JSXElementChild, JSXExpr,
-    JSXExprContainer, Lit, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, Pat, Str,
+    JSXExprContainer, Id, Lit, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, Pat, Str,
     VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
@@ -317,12 +317,13 @@ pub fn mark_shared_slot_lists(module: &mut Module) {
 
 /// `local_binding -> topic` for every `const X = useSharedSlot("T")` whose
 /// `useSharedSlot` resolves to the `albedo` import.
-fn collect_shared_slot_idents(module: &Module) -> HashMap<String, SlotAnchor> {
+fn collect_shared_slot_idents(module: &Module) -> HashMap<Id, SlotAnchor> {
     let Some(local_name) = use_shared_slot_local_name(module) else {
         return HashMap::new();
     };
     let mut collector = SlotDeclCollector {
         local_name,
+        sites: crate::transforms::forge_queries::legacy_shared_slot_sites(module),
         collections: crate::transforms::shared_slots::forge_collection_locals(module),
         sources: crate::transforms::shared_slots::source_locals(module),
         out: HashMap::new(),
@@ -360,6 +361,9 @@ fn use_shared_slot_local_name(module: &Module) -> Option<String> {
 }
 
 struct SlotDeclCollector {
+    /// R5-7 · the legacy `useSharedSlot` reads of the (resolved) module. A FORGE
+    /// read that is not one of them is a shadowing name, not a list anchor.
+    sites: std::collections::HashSet<u32>,
     local_name: String,
     /// `local -> export name` for `albedo/forge` imports, so a `.where()`
     /// receiver resolves to its collection through the same alias rule the
@@ -368,7 +372,26 @@ struct SlotDeclCollector {
     /// `local -> export name` for `albedo/sources` imports, the APERTURE half
     /// of the same rule.
     sources: HashMap<String, String>,
-    out: HashMap<String, SlotAnchor>,
+    out: HashMap<Id, SlotAnchor>,
+}
+
+impl SlotDeclCollector {
+    /// True for `useSharedSlot(<forge read>)` whose call the classifier did not
+    /// count as legacy: the name it reads is a shadowing binding.
+    fn shadowed_forge_read(&self, init: &Expr) -> bool {
+        let Expr::Call(call) = init else {
+            return false;
+        };
+        let Some(first) = call.args.first() else {
+            return false;
+        };
+        let forge = match first.expr.as_ref() {
+            Expr::Ident(ident) => self.collections.contains_key(ident.sym.as_ref()),
+            Expr::Call(inner) => where_receiver(inner, &self.collections).is_some(),
+            _ => false,
+        };
+        forge && !self.sites.contains(&call.span.lo.0)
+    }
 }
 
 impl Visit for SlotDeclCollector {
@@ -381,8 +404,11 @@ impl Visit for SlotDeclCollector {
                 &self.local_name,
                 &self.collections,
                 &self.sources,
+                matches!(init.as_ref(), Expr::Call(call) if self.sites.contains(&call.span.lo.0)),
             ) {
-                self.out.insert(binding, anchor);
+                if !self.shadowed_forge_read(init) {
+                    self.out.insert(name.id.to_id(), anchor);
+                }
             }
         }
         decl.visit_children_with(self);
@@ -442,6 +468,7 @@ fn shared_slot_topic(
     local_name: &str,
     collections: &HashMap<String, String>,
     sources: &HashMap<String, String>,
+    legacy: bool,
 ) -> Option<SlotAnchor> {
     let Expr::Call(CallExpr { callee: Callee::Expr(callee), args, .. }) = expr else {
         return None;
@@ -449,7 +476,7 @@ fn shared_slot_topic(
     let Expr::Ident(id) = callee.as_ref() else {
         return None;
     };
-    if id.sym.as_ref() != local_name {
+    if !legacy && id.sym.as_ref() != local_name {
         return None;
     }
     match args.first()?.expr.as_ref() {
@@ -522,7 +549,7 @@ fn where_receiver(call: &CallExpr, collections: &HashMap<String, String>) -> Opt
 }
 
 struct ListAnchorMarker {
-    idents: HashMap<String, SlotAnchor>,
+    idents: HashMap<Id, SlotAnchor>,
 }
 
 impl VisitMut for ListAnchorMarker {
@@ -559,7 +586,7 @@ pub fn mark_shared_slot_scalars(module: &mut Module) {
 }
 
 struct ScalarSlotMarker {
-    idents: HashMap<String, SlotAnchor>,
+    idents: HashMap<Id, SlotAnchor>,
 }
 
 impl VisitMut for ScalarSlotMarker {
@@ -618,7 +645,7 @@ struct ScalarSite {
 ///
 /// JSX whitespace-only text between children is skipped, so the formatting
 /// `<span>\n  {value}\n</span>` counts as a lone read.
-fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, SlotAnchor>) -> Option<ScalarSite> {
+fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<Id, SlotAnchor>) -> Option<ScalarSite> {
     let mut found: Option<ScalarSite> = None;
     for child in &el.children {
         match child {
@@ -632,11 +659,11 @@ fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, SlotAnchor>) 
                     return None;
                 };
                 let (root, path) = split_member_chain(expr)?;
-                let anchor = idents.get(root)?.clone();
+                let anchor = idents.get(&root.to_id())?.clone();
                 if found.is_some() {
                     return None;
                 }
-                found = Some(ScalarSite { anchor, root: root.to_string(), path });
+                found = Some(ScalarSite { anchor, root: root.sym.to_string(), path });
             }
             _ => return None,
         }
@@ -649,9 +676,9 @@ fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<String, SlotAnchor>) 
 /// `None` for anything else, including a computed member anywhere in the chain
 /// — one computed link makes the whole path unstampable, not just its own
 /// segment.
-fn split_member_chain(expr: &Expr) -> Option<(&str, Vec<String>)> {
+fn split_member_chain(expr: &Expr) -> Option<(&Ident, Vec<String>)> {
     match expr {
-        Expr::Ident(ident) => Some((ident.sym.as_ref(), Vec::new())),
+        Expr::Ident(ident) => Some((ident, Vec::new())),
         Expr::Member(member) => {
             let MemberProp::Ident(prop) = &member.prop else {
                 return None;
@@ -815,7 +842,7 @@ pub const SLOT_TEXT_FN: &str = "__albedo_slot_text";
 /// The anchor when `expr` is `IDENT.map(...)` and `IDENT` is a shared-slot binding.
 fn map_over_shared_slot(
     expr: &Expr,
-    idents: &HashMap<String, SlotAnchor>,
+    idents: &HashMap<Id, SlotAnchor>,
 ) -> Option<SlotAnchor> {
     let Expr::Call(CallExpr { callee: Callee::Expr(callee), .. }) = expr else {
         return None;
@@ -832,7 +859,7 @@ fn map_over_shared_slot(
     let Expr::Ident(obj) = member.obj.as_ref() else {
         return None;
     };
-    idents.get(obj.sym.as_ref()).cloned()
+    idents.get(&obj.to_id()).cloned()
 }
 
 /// How a shared-slot row template depends on its collection — the compile-time
@@ -921,14 +948,22 @@ pub fn classify_shared_slot_lists_source(
     let fm = cm.new_source_file(FileName::Custom(specifier.to_string()).into(), source.to_string());
     let mut parser = Parser::new(syntax, StringInput::from(&*fm), None);
     match parser.parse_module() {
-        Ok(module) => classify_shared_slot_lists(&module),
+        Ok(mut module) => {
+            let globals = swc_common::Globals::new();
+            swc_common::GLOBALS.set(&globals, || {
+                module.visit_mut_with(&mut swc_ecma_transforms_base::resolver(
+                    swc_common::Mark::new(), swc_common::Mark::new(), false,
+                ));
+                classify_shared_slot_lists(&module)
+            })
+        },
         Err(_) => HashMap::new(),
     }
 }
 
 struct RowProjectionClassifier {
     /// `local binding -> anchor`, as in [`ListAnchorMarker`].
-    idents: HashMap<String, SlotAnchor>,
+    idents: HashMap<Id, SlotAnchor>,
     /// `topic -> class`.
     out: HashMap<String, RowProjection>,
 }
@@ -968,7 +1003,7 @@ impl Visit for RowProjectionClassifier {
 /// partition of it, so one class for all of them is not an approximation.
 fn map_call_binding(
     call: &CallExpr,
-    idents: &HashMap<String, SlotAnchor>,
+    idents: &HashMap<Id, SlotAnchor>,
 ) -> Option<(String, String)> {
     let Callee::Expr(callee) = &call.callee else {
         return None;
@@ -985,7 +1020,7 @@ fn map_call_binding(
     let Expr::Ident(obj) = member.obj.as_ref() else {
         return None;
     };
-    let key = match idents.get(obj.sym.as_ref())? {
+    let key = match idents.get(&obj.to_id())? {
         SlotAnchor::Literal(topic) => topic.clone(),
         SlotAnchor::Deferred { collection, .. } => collection.clone(),
         // APERTURE · an external topic is value-consumed: an arbitrary JSON body

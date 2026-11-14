@@ -926,6 +926,181 @@ mod tests {
         }
     }
 
+    async fn registered_trunk() -> (
+        Arc<PhosphorState>,
+        Arc<crate::live_authority::LiveRegistry>,
+        Arc<crate::live_authority::LiveEntry>,
+        Arc<Lane>,
+        Response<Body>,
+    ) {
+        use crate::live_authority::{LiveKind, LiveRegistry};
+
+        let phosphor = Arc::new(PhosphorState::new());
+        let registry = Arc::new(LiveRegistry::new());
+        let identity = crate::auth::Identity::Anonymous;
+        let handle = registry.register(LiveKind::Phosphor, &identity);
+        assert!(handle.entry().promote());
+        let entry = handle.entry().clone();
+        let response = serve_trunk(
+            phosphor.clone(),
+            DevTap::none(),
+            None,
+            identity,
+            Some(handle),
+        )
+        .await;
+        let lane_id = phosphor.lanes.iter().next().unwrap().key().clone();
+        let lane = phosphor.get(&lane_id).unwrap();
+        (phosphor, registry, entry, lane, response)
+    }
+
+    struct PausedAuthority {
+        inner: StaticAuthority,
+        pause: Arc<crate::live_authority::Pause>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouteAuthority for PausedAuthority {
+        async fn authorize_route(
+            &self,
+            identity: &crate::auth::Identity,
+            path: &str,
+        ) -> Option<Vec<TopicGrant>> {
+            self.pause.reached.notify_one();
+            self.pause.release.notified().await;
+            self.inner.authorize_route(identity, path).await
+        }
+
+        fn registry(&self) -> Arc<BroadcastRegistry> {
+            self.inner.registry()
+        }
+
+        fn projector(&self) -> Option<Arc<dyn RowProjector>> {
+            self.inner.projector()
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_during_authorization_denies_without_installing_a_subscription() {
+        let (phosphor, registry, entry, lane, response) = registered_trunk().await;
+        let pause = Arc::new(crate::live_authority::Pause::default());
+        let authority = Arc::new(PausedAuthority {
+            inner: authority(&[("/g", &["g"])]),
+            pause: pause.clone(),
+        });
+        let pending = {
+            let lane = lane.clone();
+            let authority = authority.clone();
+            tokio::spawn(async move {
+                subscribe_routes(&lane, authority.as_ref(), add("/g", None, false)).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .unwrap();
+        entry.close();
+        pause.release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.denied, vec!["/g"]);
+        assert!(outcome.ok.is_empty());
+        assert_eq!(authority.inner.registry.topic_count(), 0);
+        assert!(lane.routes.lock().unwrap().is_empty());
+        drop(response);
+        assert_eq!(phosphor.lane_count(), 0);
+        assert!(registry.is_empty());
+    }
+
+    struct PausedProjector {
+        pause: Arc<crate::live_authority::Pause>,
+    }
+
+    #[async_trait::async_trait]
+    impl RowProjector for PausedProjector {
+        async fn project_rows(
+            &self,
+            collection: &str,
+            partition: Option<&str>,
+            value: &[u8],
+        ) -> Option<dom_render_compiler::forge::RenderedRows> {
+            self.pause.reached.notify_one();
+            self.pause.release.notified().await;
+            TwoRows.project_rows(collection, partition, value).await
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_during_resync_cleans_the_subscription_without_polling_the_trunk() {
+        let (phosphor, registry, entry, lane, response) = registered_trunk().await;
+        let pause = Arc::new(crate::live_authority::Pause::default());
+        let mut authority = authority(&[("/g", &["g"])]);
+        authority.projector = Some(Arc::new(PausedProjector {
+            pause: pause.clone(),
+        }));
+        authority.registry.topic("g", br#"[{"id":1}]"#.to_vec());
+        let authority = Arc::new(authority);
+        let pending = {
+            let lane = lane.clone();
+            let authority = authority.clone();
+            tokio::spawn(async move {
+                subscribe_routes(&lane, authority.as_ref(), add("/g", None, true)).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .unwrap();
+        assert_eq!(authority.registry.get("g").unwrap().subscriber_count(), 1);
+        entry.close();
+        assert_eq!(authority.registry.get("g").unwrap().subscriber_count(), 0);
+        assert!(lane.routes.lock().unwrap().is_empty());
+        pause.release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.denied, vec!["/g"]);
+        assert!(outcome.ok.is_empty());
+        assert_eq!(authority.registry.get("g").unwrap().subscriber_count(), 0);
+        drop(response);
+        assert_eq!(phosphor.lane_count(), 0);
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_queued_patch_is_not_handed_to_the_body_after_revocation() {
+        let (phosphor, registry, entry, lane, response) = registered_trunk().await;
+        let mut body = response.into_body().into_data_stream();
+        let hello = body.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&hello).contains("event: hello"));
+        let authority = authority(&[("/g", &["g"])]);
+        subscribe_routes(&lane, &authority, add("/g", None, false))
+            .await
+            .unwrap();
+        // The seed is queued while the body is held before its next poll.
+        assert_eq!(lane.trunk.capacity(), TRUNK_CHANNEL_CAPACITY - 1);
+        entry.close();
+        // Isolate the handoff gate from the independent kill-notification
+        // guard: only the queued patch is ready when the body resumes.
+        tokio::time::timeout(Duration::from_secs(5), lane.kill.notified())
+            .await
+            .unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .unwrap();
+        assert!(
+            next.is_none(),
+            "a queued protected patch escaped after close"
+        );
+        assert_eq!(authority.registry.get("g").unwrap().subscriber_count(), 0);
+        drop(body);
+        assert_eq!(phosphor.lane_count(), 0);
+        assert!(registry.is_empty());
+    }
+
     /// The ordering proof, observed: subscribe, then write. The trunk must
     /// carry the nonce-tagged seed FIRST and the live frame after — even
     /// though the write raced in through the circuit channel.

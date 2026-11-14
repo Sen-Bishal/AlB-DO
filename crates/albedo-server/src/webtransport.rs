@@ -40,6 +40,19 @@ pub enum WtBinding {
     },
 }
 
+// The QUIC session owns the handle before the first bridge awaits its read.
+// If that bridge is cancelled, close the pending binding rather than leaving
+// an Opening entry that no later bridge can finish.
+struct PendingBinding(Option<Arc<crate::live_authority::LiveEntry>>);
+
+impl Drop for PendingBinding {
+    fn drop(&mut self) {
+        if let Some(entry) = self.0.take() {
+            entry.close();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WebTransportSessionHandle {
     pub session_id: Uuid,
@@ -84,6 +97,14 @@ impl WebTransportSessionRegistry {
             .lock()
             .map(|sessions| sessions.contains_key(session_id))
             .unwrap_or(false)
+    }
+
+    pub(crate) fn bound_entry(
+        &self,
+        session_id: Uuid,
+    ) -> Option<Arc<crate::live_authority::LiveEntry>> {
+        let sessions = self.sessions.lock().ok()?;
+        sessions.get(&session_id)?.gate.get().cloned()
     }
 
     /// Phase P · Stream C.4 — clone the raw `mpsc::Sender` for one
@@ -186,12 +207,14 @@ impl WebTransportSessionRegistry {
             }
         };
         if fresh {
+            let mut pending = PendingBinding(Some(entry.clone()));
             if let Some(connection) = connection {
                 entry.on_close(move || {
                     connection.close(WT_CLOSE_REVOKED.into(), b"authority revoked");
                 });
             }
             live.revalidate(&entry, db).await;
+            pending.0 = None;
         }
         if entry.admits() {
             Ok(entry)

@@ -1904,6 +1904,14 @@ impl AlbedoServerBuilder {
             ..SharedRenderServices::default()
         };
 
+        let css_records = self
+            .reactive_project
+            .as_deref()
+            .map(|project| project.css_modules().module_records())
+            .transpose()
+            .map_err(|err| RuntimeError::ServerStartup(format!("CSS module records: {err}")))?
+            .unwrap_or_default();
+
         // A2 · the renderer's OWN engine needs the project's npm bundles too.
         //
         // 🪤 This is a third engine, and it was the one nobody wired. The pool
@@ -1916,6 +1924,11 @@ impl AlbedoServerBuilder {
         if let (Some(runtime), Some(project)) =
             (renderer.as_mut(), self.reactive_project.as_deref())
         {
+            if runtime.install_npm_bundles(&css_records) != 0 {
+                return Err(RuntimeError::ServerStartup(
+                    "CSS module records failed to install on the renderer".into(),
+                ));
+            }
             let artifacts: Vec<(String, String, u64)> = project
                 .npm_bundles()
                 .iter()
@@ -1966,6 +1979,11 @@ impl AlbedoServerBuilder {
             // through `CompiledProject`, which is where `preload_npm_bundles`
             // lives. That is why actions could import a package and a
             // per-request component could not.
+            if pool.install_css_modules(&css_records) != 0 {
+                return Err(RuntimeError::ServerStartup(
+                    "CSS module records failed to install on the render pool".into(),
+                ));
+            }
             if let Some(project) = self.reactive_project.as_deref() {
                 let artifacts: Vec<crate::engine_pool::NpmArtifactRegistration> = project
                     .npm_bundles()

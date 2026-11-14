@@ -218,11 +218,12 @@ pub fn is_bare_npm_specifier(specifier: &str) -> bool {
     {
         return false;
     }
-    // `albedo/forge` and `albedo/sources` are the generated binding modules:
-    // types only, no runtime record, folded away by the transpile. Resolving
-    // either through node_modules would look for a package that deliberately
-    // does not exist.
+    // `albedo/forge` and `albedo/sources` are the generated binding modules, and
+    // `albedo/query` the query helpers (T-0033 · R3-4): types only, no runtime
+    // record. Resolving any of them through node_modules would look for a
+    // package that deliberately does not exist.
     if matches!(s, "react" | "react-dom" | "albedo" | "albedo/forge")
+        || s == crate::transforms::forge_queries::QUERY_MODULE
         || s == crate::transforms::shared_slots::SOURCE_BINDINGS_MODULE
         || s == crate::middleware::MIDDLEWARE_MODULE
         || s == crate::jobs::JOBS_MODULE
@@ -2232,6 +2233,8 @@ mod tests {
         // transpile, and no package by either name exists to resolve.
         assert!(!is_bare_npm_specifier("albedo/forge"));
         assert!(!is_bare_npm_specifier("albedo/sources"));
+        // T-0033 · R3-4: the query helpers are types only too.
+        assert!(!is_bare_npm_specifier("albedo/query"));
         assert!(!is_bare_npm_specifier("styles.css"));
         assert!(!is_bare_npm_specifier("https://cdn.example/x.js"));
     }

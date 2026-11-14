@@ -498,6 +498,35 @@ pub struct RenderedNode {
     pub position: DomPosition,
 }
 
+/// T-0044 · the name a component's render plans are keyed by: the bare
+/// function name when it's unique in the manifest (`component_key` is `None`),
+/// `Name#<id>` when another component shares it. Both the manifest builder
+/// (`TierBNode::render_fn`) and the server's island plan keys go through this,
+/// so the key a plan is stored under and the key a request asks for can't
+/// drift apart.
+#[must_use]
+pub fn qualified_component_name(name: &str, component_key: Option<u64>) -> String {
+    match component_key {
+        Some(key) => format!("{name}#{key}"),
+        None => name.to_string(),
+    }
+}
+
+/// T-0045 · the inverse of [`qualified_component_name`]: `"Error#7"` →
+/// `("Error", Some(7))`, `"Error"` → `("Error", None)`. Route boundaries are
+/// stored qualified on the route, and the server needs the bare name and the
+/// key back to find the component.
+#[must_use]
+pub fn split_qualified_component_name(qualified: &str) -> (&str, Option<u64>) {
+    match qualified.rsplit_once('#') {
+        Some((name, key)) => match key.parse::<u64>() {
+            Ok(key) => (name, Some(key)),
+            Err(_) => (qualified, None),
+        },
+        None => (qualified, None),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TierBNode {
     pub component_id: String,
@@ -527,11 +556,23 @@ pub struct TierBNode {
     /// runtime wire format — no schema drift possible.
     #[serde(default)]
     pub initial_opcode_frame: Vec<u8>,
+    /// T-0044 · the [`ComponentManifestEntry::id`] of this node's component,
+    /// set **only when another component in the manifest has the same name**
+    /// (`export default function Page()` in two routes). `component_id` is the
+    /// bare function name and is ambiguous then; this is what the runtime
+    /// looks the component up by. `None` means the name is unique, so a
+    /// manifest without duplicates is byte-identical to one written before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_key: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TierCNode {
     pub component_id: String,
+    /// T-0044 · see [`TierBNode::component_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_key: Option<u64>,
     pub placeholder_id: String,
     pub bundle_path: String,
     pub initial_props: Value,

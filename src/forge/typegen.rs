@@ -11,11 +11,12 @@
 //!
 //! ## What the types buy that a runtime check cannot
 //!
-//! The generated `Collection<Row, PartitionCol>` types `.where` as
-//! `Record<PartitionCol, string>`, and an unpartitioned collection gets
-//! `never` — so `guestbook.where({ … })` is a **red squiggle in the editor**,
-//! before any build runs. A misspelled collection is caught the same way,
-//! because this file is the single source of which collections exist.
+//! A misspelled collection is a red squiggle before any build runs, because this
+//! file is the single source of which collections exist. Since T-0033 (Q1a) a
+//! collection also carries the typed query chain, and only a partitioned one
+//! carries the legacy `useSharedSlot(c.where({ col: v }))` overload — see
+//! [`SHARED_SHAPES`]. (The `Record<never, …>` this used to describe blocked
+//! nothing: `Record<never, T>` is `{}`.)
 //!
 //! ## Determinism
 //!
@@ -67,39 +68,7 @@ pub fn emit_forge_dts(declarations: &BTreeMap<String, CollectionDecl>) -> String
          // editor knows what your data looks like.\n\n",
     );
 
-    // The shared shapes. `PartitionCol` is `never` for an unpartitioned
-    // collection, which is what makes `.where` on one uncallable: `Record<never,
-    // string>` has no satisfying argument.
-    out.push_str(
-        "declare module \"albedo/forge\" {\n\
-         \x20 /** One partition of a collection, selected by its partition column. */\n\
-         \x20 export interface Partition<Row> {\n\
-         \x20   readonly __row?: Row;\n\
-         \x20 }\n\n\
-         \x20 /**\n\
-         \x20  * A declared FORGE collection.\n\
-         \x20  *\n\
-         \x20  * An UNPARTITIONED collection is read whole:\n\
-         \x20  *   `useSharedSlot(collection)`\n\
-         \x20  *\n\
-         \x20  * A PARTITIONED one is read one partition at a time:\n\
-         \x20  *   `useSharedSlot(collection.where({ col: params.id }))`\n\
-         \x20  *\n\
-         \x20  * and has no whole-collection value at all — reading it whole is\n\
-         \x20  * refused at `albedo build`, because it would fan every write out to\n\
-         \x20  * every subscriber (the cost `partition_by` exists to remove) and\n\
-         \x20  * cross every partition at once. Before 2026-09-02 this comment said\n\
-         \x20  * the opposite, and the read it advertised served HTTP 200 with the\n\
-         \x20  * reading component missing.\n\
-         \x20  *\n\
-         \x20  * `PartitionCol` is `never` when the collection declares no\n\
-         \x20  * `partition_by`, which is what makes `.where` uncallable on it.\n\
-         \x20  */\n\
-         \x20 export interface Collection<Row, PartitionCol extends string = never> {\n\
-         \x20   readonly __row?: Row;\n\
-         \x20   where(key: Record<PartitionCol, string | number>): Partition<Row>;\n\
-         \x20 }\n\n",
-    );
+    out.push_str(SHARED_SHAPES);
 
     for (name, decl) in declarations {
         let key = decl.key.clone().unwrap_or_else(|| "id".to_string());
@@ -112,19 +81,154 @@ pub fn emit_forge_dts(declarations: &BTreeMap<String, CollectionDecl>) -> String
         }
         out.push_str("  }\n\n");
 
-        let partition = match &decl.partition_by {
-            Some(column) => format!(", \"{column}\""),
-            None => String::new(),
-        };
-        out.push_str(&format!(
-            "  export const {name}: Collection<{}{partition}>;\n\n",
-            row_type_name(name)
-        ));
+        // T-0033 · R3-2: only a partitioned collection gets the legacy
+        // `.where({ <partition col>: … })` overload, and it accepts exactly that
+        // key. An unpartitioned one has only the query chain.
+        match &decl.partition_by {
+            Some(column) => out.push_str(&format!(
+                "  export const {name}: PartitionedCollection<{}, \"{column}\">;\n\n",
+                row_type_name(name)
+            )),
+            None => out.push_str(&format!(
+                "  export const {name}: Collection<{}>;\n\n",
+                row_type_name(name)
+            )),
+        }
     }
 
-    out.push_str("}\n");
+    out.push_str("}\n\n");
+    out.push_str(QUERY_HELPERS);
     out
 }
+
+/// The shapes every collection shares (T-0033 · Q1a, Design 10).
+///
+/// - `Collection<Row>` reads whole (`useSharedSlot(c)`, via the `__row`
+///   phantom the scaffold's `SharedSlotSource` matches) or through the query
+///   chain: `where` → `orderBy` → `limit | first | count | groupBy`, or `get`.
+/// - `Query<Row>` is a `PromiseLike<Row[]>` with **no `__row`**, so TypeScript's
+///   weak-type check refuses it as a `useSharedSlot` source: live new-style
+///   queries arrive with Q3.
+/// - `PartitionedCollection<Row, Col>` adds the legacy overload first, typed so
+///   only the exact `{ Col: v }` key matches (`K & Record<Exclude<keyof K, Col>,
+///   never>`); anything wider falls through to the query chain. Before Q1a the
+///   comment here claimed `Record<never, …>` made `.where` uncallable on an
+///   unpartitioned collection; `Record<never, T>` is `{}`, so it never did.
+/// - Number columns accept a string too, and booleans `"true"`/`"false"`: route
+///   params are text, and coercion (Design 7) decides what reaches SQL.
+const SHARED_SHAPES: &str = r#"declare module "albedo/forge" {
+  /** One partition of a collection, selected by its partition column. */
+  export interface Partition<Row> {
+    readonly __row?: Row;
+  }
+
+  /** What a column accepts in a predicate: route params are text, so numbers and booleans take strings too. */
+  export type Value<T> = T extends number ? number | string : T extends boolean ? boolean | string : T;
+
+  /** `{ not: null }`, `{ in: [...] }`, or one or two range bounds. */
+  export type Operators<T> =
+    | { not: null }
+    | { in: readonly T[] }
+    | { lt?: T; lte?: T; gt?: T; gte?: T };
+
+  /** `optional(x)` from "albedo/query": the term applies only when `x` is not null. */
+  export interface Optional<T> {
+    readonly __optional: T;
+  }
+
+  /** A predicate: each column equals a value (`null` → IS NULL), or is tested by operators. */
+  export type Where<Row> = {
+    [K in keyof Row]?: Value<Row[K]> | null | Optional<Value<NonNullable<Row[K]>>> | Operators<Value<NonNullable<Row[K]>>>;
+  };
+
+  /** `or(a, b, …)` from "albedo/query": any branch matches. */
+  export interface Or {
+    readonly __or: true;
+  }
+
+  /** An aggregate from "albedo/query" (`count()`, `sum("col")`, …) producing `V`. */
+  export interface Aggregate<V> {
+    readonly __aggregate: V;
+  }
+
+  /** One row of a `groupBy`: the group column and each aggregate by its alias. */
+  export type Group<Row, K extends keyof Row, A> = { [P in K]: Row[P] } & {
+    [P in keyof A]: A[P] extends Aggregate<infer V> ? V : never;
+  };
+
+  /** A query. Awaiting it reads the rows; it is not a `useSharedSlot` source. */
+  export interface Query<Row> extends PromiseLike<Row[]> {
+    where(predicate: Where<Row> | Or): Query<Row>;
+    orderBy(column: keyof Row & string, direction?: "asc" | "desc"): Ordered<Row>;
+    limit(n: number): PromiseLike<Row[]>;
+    first(): PromiseLike<Row | null>;
+    count(): PromiseLike<number>;
+    groupBy<K extends keyof Row & string, A extends Record<string, Aggregate<unknown>>>(
+      column: K,
+      aggregates: A,
+    ): PromiseLike<Group<Row, K, A>[]>;
+  }
+
+  /** A sorted query. */
+  export interface Ordered<Row> extends PromiseLike<Row[]> {
+    orderBy(column: keyof Row & string, direction?: "asc" | "desc"): Ordered<Row>;
+    limit(n: number): PromiseLike<Row[]>;
+    first(): PromiseLike<Row | null>;
+  }
+
+  /**
+   * Every key of every member of a union, not only the keys they share:
+   * `keyof ({ a: 1 } | { a: 1; b: 2 })` is just `"a"`, which is why the exact
+   * partition check distributes over the union (review finding 3).
+   */
+  export type AllKeys<K> = K extends unknown ? keyof K : never;
+
+  /** A declared FORGE collection: `useSharedSlot(collection)`, or a query chain. */
+  export interface Collection<Row> {
+    readonly __row?: Row;
+    where(predicate: Where<Row> | Or): Query<Row>;
+    get(key: number | string): PromiseLike<Row | null>;
+    orderBy(column: keyof Row & string, direction?: "asc" | "desc"): Ordered<Row>;
+    limit(n: number): PromiseLike<Row[]>;
+    first(): PromiseLike<Row | null>;
+    count(): PromiseLike<number>;
+    groupBy<K extends keyof Row & string, A extends Record<string, Aggregate<unknown>>>(
+      column: K,
+      aggregates: A,
+    ): PromiseLike<Group<Row, K, A>[]>;
+  }
+
+  /**
+   * A collection with `partition_by`. Read live one partition at a time:
+   *   `useSharedSlot(collection.where({ col: params.id }))`
+   * — reading it whole is refused at `albedo build`. Any other `.where` is a
+   * query, which is not a `useSharedSlot` source.
+   */
+  export interface PartitionedCollection<Row, PartitionCol extends string>
+    extends Omit<Collection<Row>, "where"> {
+    where<K extends Record<PartitionCol, string | number>>(
+      key: K & Record<Exclude<AllKeys<K>, PartitionCol>, never>,
+    ): Partition<Row> & Query<Row>;
+    where(predicate: Where<Row> | Or): Query<Row>;
+  }
+
+"#;
+
+/// The `albedo/query` helpers: types only, meaningful inside a chain's
+/// arguments (a collection may itself be named `count`, so they live apart).
+const QUERY_HELPERS: &str = r#"declare module "albedo/query" {
+  import type { Aggregate, Optional, Or } from "albedo/forge";
+  /** Any of two to four predicates matches. */
+  export function or(a: object, b: object, c?: object, d?: object): Or;
+  /** The term applies only when `value` is not null or undefined. */
+  export function optional<T>(value: T | null | undefined): Optional<NonNullable<T>>;
+  export function count(): Aggregate<number>;
+  export function sum(column: string): Aggregate<number | null>;
+  export function avg(column: string): Aggregate<number | null>;
+  export function min(column: string): Aggregate<number | string | null>;
+  export function max(column: string): Aggregate<number | string | null>;
+}
+"#;
 
 /// `messages` → `MessagesRow`. Deterministic and collision-free for the
 /// identifier alphabet a collection name is already restricted to.
@@ -182,16 +286,19 @@ mod tests {
         assert!(dts.contains("message: string;"), "{dts}");
     }
 
-    /// The point of the whole file: `.where` on an unpartitioned collection must
-    /// be uncallable, and `Record<never, …>` is what makes it so.
+    /// T-0033 · Design 10 / R3-2 (replaces the `never` test, which asserted a
+    /// protection `Record<never, …>` never gave): an unpartitioned collection
+    /// gets the query chain and no legacy overload. What the types accept and
+    /// refuse is proven by `tsc` in `tests/forge_query_typegen.rs`.
     #[test]
-    fn an_unpartitioned_collection_gets_never_so_where_cannot_be_called() {
+    fn an_unpartitioned_collection_gets_the_query_chain_and_no_legacy_overload() {
         let dts = emit(&[("guestbook", decl(&[("author", FieldType::Text)], None))]);
         assert!(
             dts.contains("export const guestbook: Collection<GuestbookRow>;"),
-            "no partition argument means the default `never`: {dts}"
+            "{dts}"
         );
-        assert!(dts.contains("PartitionCol extends string = never"), "{dts}");
+        assert!(dts.contains("export interface Query<Row> extends PromiseLike<Row[]>"), "{dts}");
+        assert!(dts.contains("declare module \"albedo/query\""), "{dts}");
     }
 
     #[test]
@@ -204,7 +311,7 @@ mod tests {
             ),
         )]);
         assert!(
-            dts.contains("export const messages: Collection<MessagesRow, \"room\">;"),
+            dts.contains("export const messages: PartitionedCollection<MessagesRow, \"room\">;"),
             "{dts}"
         );
     }
