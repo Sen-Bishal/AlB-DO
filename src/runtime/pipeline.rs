@@ -1267,6 +1267,28 @@ mod tests {
         frame.instructions
     }
 
+    /// Drains until `done` holds, letting the resolver's worker thread
+    /// run between attempts. A fixed sleep raced on loaded CI runners
+    /// (ubuntu, 14 Nov 2026: 20 ms was not enough with ~1700 tests in
+    /// parallel), so wait for the condition itself, bounded at 5 s.
+    fn drain_until(
+        pipeline: &FourLaneRuntimePipeline,
+        runtime: &tokio::runtime::Runtime,
+        mut done: impl FnMut(&FourLaneRuntimePipeline, &[LaneRenderedChunk]) -> bool,
+    ) -> Vec<LaneRenderedChunk> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut shipped = Vec::new();
+        loop {
+            shipped.extend(pipeline.drain_opcode_chunks());
+            if done(pipeline, &shipped) || std::time::Instant::now() >= deadline {
+                return shipped;
+            }
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            });
+        }
+    }
+
     #[test]
     fn enqueue_async_island_emits_placeholder_chunk() {
         let (pipeline, _runtime) = build_async_pipeline();
@@ -1307,18 +1329,10 @@ mod tests {
         // Drain the placeholder so it doesn't show up in the next drain.
         let _ = pipeline.drain_opcode_chunks();
 
-        // Drive the spawned resolver to completion. `block_on` returning
-        // a stable value of `Vec::new()` lets the runtime tick the
-        // spawned task; after the await point the task has already sent
-        // its resolution into the pipeline's mpsc.
-        // Give the worker thread a tick to await the resolver and send
-        // its resolution through the mpsc channel.
-        runtime.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        });
-
-        let chunks = pipeline.drain_opcode_chunks();
-        assert_eq!(chunks.len(), 1, "patch frame must ship on the next drain");
+        // Wait for the worker thread to run the resolver and send its
+        // resolution; every drain until then ships nothing.
+        let chunks = drain_until(&pipeline, &runtime, |_, shipped| !shipped.is_empty());
+        assert_eq!(chunks.len(), 1, "exactly one patch frame must ship");
         let instructions = decoded_instructions(&chunks[0]);
         assert_eq!(instructions.len(), 2, "Patch + one resolved Create");
         match &instructions[0] {
@@ -1357,14 +1371,11 @@ mod tests {
         // Drain placeholder; this is the Placeholder chunk from enqueue.
         let _ = pipeline.drain_opcode_chunks();
 
-        // Drive the resolver to completion.
-        // Give the worker thread a tick to await the resolver and send
-        // its resolution through the mpsc channel.
-        runtime.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        });
-
-        let chunks = pipeline.drain_opcode_chunks();
+        // Wait until the resolution has actually landed and been
+        // consumed (the pending entry is removed only when a drain
+        // receives it). Without this the empty-drain check below could
+        // pass merely because the resolver had not run yet.
+        let chunks = drain_until(&pipeline, &runtime, |p, _| p.pending_async_count() == 0);
         assert!(
             chunks.is_empty(),
             "cancelled resolution must not ship a Patch; got {} chunks",

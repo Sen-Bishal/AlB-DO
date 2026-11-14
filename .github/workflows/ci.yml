@@ -66,14 +66,18 @@ jobs:
       # --no-fail-fast: without it cargo stops at the first failing test binary,
       # every binary after it never runs, and their failures stay invisible
       # (14 Nov 2026: one compile error hid 12 cross-platform failures).
-      - name: Test compiler
+      #
+      # Windows only: both test steps are advisory until T-0040. libSQL-era
+      # native aborts (0xc0000005) hit 2-3 of 50 server test binaries per full
+      # run on Windows, even at --test-threads=1, and compiler binaries too
+      # (auth_password_flow on run 81, jobs_queue locally); Linux and macOS have
+      # never shown one. The steps still run and still show red in the job, they
+      # just cannot fail the run. Remove both continue-on-error lines when T-0040
+      # closes.
+      - name: Test compiler${{ matrix.os == 'windows-latest' && ' (advisory on Windows until T-0040)' || '' }}
+        continue-on-error: ${{ matrix.os == 'windows-latest' }}
         run: cargo test -p dom-render-compiler --no-fail-fast
 
-      # Windows only: advisory until T-0040. libSQL-era native aborts
-      # (0xc0000005) hit 2-3 of 50 server test binaries per full run on Windows,
-      # even at --test-threads=1; Linux and macOS have never shown one. The step
-      # still runs and still shows red in the job, it just cannot fail the run.
-      # Remove the continue-on-error line when T-0040 closes.
       - name: Test server${{ matrix.os == 'windows-latest' && ' (advisory on Windows until T-0040)' || '' }}
         if: ${{ !cancelled() }}
         continue-on-error: ${{ matrix.os == 'windows-latest' }}
