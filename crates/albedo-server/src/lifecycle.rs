@@ -127,7 +127,7 @@ impl ResponseBody {
                 let stream = stream::iter(
                     chunks
                         .into_iter()
-                        .map(|chunk| Ok::<Bytes, Infallible>(chunk)),
+                        .map(Ok::<Bytes, Infallible>),
                 );
                 Body::from_stream(stream)
             }

@@ -221,6 +221,7 @@ fn counter_second_render_reflects_persisted_slot_value() {
 // ── Stage 1 · multi-hook (slot id allocation) ────────────────────────
 
 #[test]
+#[allow(non_snake_case, reason = "names the JS hook it tests")]
 fn multi_hook_component_allocates_one_slot_per_useState_in_source_order() {
     let project = compile("multi_hook");
     let store = Arc::new(SlotStore::new());

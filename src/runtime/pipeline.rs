@@ -488,10 +488,10 @@ impl FourLaneRuntimePipeline {
     pub fn run_column_analysis_pass(&mut self) {
         if should_parallelize(self.columns.len(), std::mem::size_of::<u64>()) {
             self.columns.parallel_lane_column_pass(
-                |pass| recompute_lane_source_hashes(pass),
-                |pass| recompute_lane_source_hashes(pass),
-                |pass| recompute_lane_source_hashes(pass),
-                |pass| recompute_lane_source_hashes(pass),
+                recompute_lane_source_hashes,
+                recompute_lane_source_hashes,
+                recompute_lane_source_hashes,
+                recompute_lane_source_hashes,
             );
         } else {
             for lane in 0..LANE_COUNT {
@@ -910,8 +910,7 @@ fn recompute_lane_source_hashes(pass: LaneColumnPass<'_>) {
         phases,
         ..
     } = pass;
-    let len = source_hashes.len();
-    for i in 0..len {
+    for (i, source_hash) in source_hashes.iter_mut().enumerate() {
         let mut hasher = FxHasher::default();
         effects.get(i).copied().unwrap_or(0).hash(&mut hasher);
         priorities
@@ -926,7 +925,7 @@ fn recompute_lane_source_hashes(pass: LaneColumnPass<'_>) {
             .unwrap_or(0.0)
             .to_bits()
             .hash(&mut hasher);
-        source_hashes[i] = hasher.finish();
+        *source_hash = hasher.finish();
     }
 }
 

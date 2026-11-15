@@ -307,8 +307,7 @@ mod tests {
             Vec::new(),
         )
         .await
-        .err()
-        .expect("oversized response was accepted");
+        .expect_err("oversized response was accepted");
         assert!(
             error.to_string().contains("response body exceeds"),
             "{error}"
@@ -326,8 +325,7 @@ mod tests {
             body,
         )
         .await
-        .err()
-        .expect("oversized response was accepted");
+        .expect_err("oversized response was accepted");
         assert!(
             error.to_string().contains("response body exceeds"),
             "{error}"
@@ -341,8 +339,7 @@ mod tests {
             vec![b'x'; 8 * 1024 * 1024 + 1],
         )
         .await
-        .err()
-        .expect("oversized response was accepted");
+        .expect_err("oversized response was accepted");
         assert!(
             error.to_string().contains("response body exceeds"),
             "{error}"

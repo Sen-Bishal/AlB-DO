@@ -81,7 +81,7 @@ fn ctrnitas_pilot_provable_vs_actual() {
     let mut agree = 0usize;
     let mut conservative = 0usize;
     let mut unsound = 0usize;
-    println!("\n{:<46} {:<15} {:<15} {}", "case", "classifier", "truth", "verdict");
+    println!("\n{:<46} {:<15} {:<15} verdict", "case", "classifier", "truth");
     println!("{}", "-".repeat(96));
     for (name, src, truth) in corpus() {
         let got = classify_shared_slot_lists_source("C.tsx", &src)

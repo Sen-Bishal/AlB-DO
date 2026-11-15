@@ -590,7 +590,7 @@ impl EffectCollector {
     fn expr_handler_client_safe(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Arrow(arrow) => !arrow_hits_server_boundary(arrow, &self.local_safety),
-            Expr::Fn(func) => func.function.body.as_ref().map_or(true, |body| {
+            Expr::Fn(func) => func.function.body.as_ref().is_none_or(|body| {
                 let mut scan = ServerBoundaryScan::new(&self.local_safety);
                 body.visit_with(&mut scan);
                 !scan.found
@@ -754,7 +754,7 @@ fn is_server_boundary_call(name: &str) -> bool {
         "https.get",
         "https.request",
     ];
-    SERVER_IO.iter().any(|candidate| *candidate == name)
+    SERVER_IO.contains(&name)
 }
 
 /// Scans a local definition's body for a direct server boundary and records the
@@ -1153,7 +1153,7 @@ fn is_async_call(name: &str) -> bool {
         "setTimeout",
         "queueMicrotask",
     ];
-    ASYNC_CALLS.iter().any(|candidate| *candidate == name)
+    ASYNC_CALLS.contains(&name)
 }
 
 fn is_io_call(name: &str) -> bool {
@@ -1175,7 +1175,7 @@ fn is_io_call(name: &str) -> bool {
         "sessionStorage.getItem",
         "sessionStorage.setItem",
     ];
-    IO_CALLS.iter().any(|candidate| *candidate == name)
+    IO_CALLS.contains(&name)
 }
 
 fn is_side_effect_call(name: &str) -> bool {
@@ -1190,7 +1190,7 @@ fn is_side_effect_call(name: &str) -> bool {
         "history.pushState",
         "window.location.assign",
     ];
-    SIDE_EFFECT_CALLS.iter().any(|candidate| *candidate == name)
+    SIDE_EFFECT_CALLS.contains(&name)
 }
 
 #[cfg(test)]

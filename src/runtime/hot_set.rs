@@ -9,18 +9,15 @@ pub const HOT_SET_MAX: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum RenderPriority {
     Low = 0,
+    #[default]
     Normal = 1,
     High = 2,
     Critical = 3,
 }
 
-impl Default for RenderPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum HotSetError {

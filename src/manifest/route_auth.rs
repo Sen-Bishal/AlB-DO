@@ -50,7 +50,7 @@ pub fn validate_route_auth(
     // Sorted so a multi-route failure reads the same on every machine — the
     // module map is a `HashMap`, and an unstable error order makes a build
     // failure look different run to run for no reason.
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_by_key(|(a, _)| *a);
 
     for (entry, module) in entries {
         let Some((_, expr)) = module

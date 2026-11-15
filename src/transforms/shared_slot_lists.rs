@@ -275,7 +275,7 @@ fn next_tag(html: &str, from: usize) -> Option<Tag> {
     }
     let end = end?;
 
-    if rest.starts_with("</") {
+    if let Some(after_slash) = rest.strip_prefix("</") {
         // A void element (`<input>`, `<br>`, `<img>`, …) never incremented the
         // depth — its open tag is classified `void_or_self_closing` below — so
         // its *close* tag must not decrement it either. This matters because the
@@ -285,7 +285,7 @@ fn next_tag(html: &str, from: usize) -> Option<Tag> {
         // the depth hit zero mid-row, the row was collected truncated, and every
         // following row was lost — the silent row-drop behind form-in-list-row on
         // the whole-view / `ReconcileList` extraction path.
-        let close_name = tag_name(&rest[2..]);
+        let close_name = tag_name(after_slash);
         let kind = if crate::runtime::eval::component::is_void_tag(&close_name) {
             TagKind::Ignorable
         } else {
@@ -725,7 +725,7 @@ fn fold_read_through_slot_text(el: &mut JSXElement, root: &str, path: &str) {
         let JSXExpr::Expr(expr) = &mut container.expr else {
             continue;
         };
-        *expr = Box::new(slot_text_call(root, path));
+        **expr = slot_text_call(root, path);
     }
 }
 
@@ -1989,6 +1989,7 @@ mod scalar_marker_tests {
     /// Same import discipline as the list marker: a user function that merely
     /// shares the name is not the hook.
     #[test]
+    #[allow(non_snake_case, reason = "names the JS hook it tests")]
     fn a_useSharedSlot_not_imported_from_albedo_is_ignored() {
         let src = "import { useSharedSlot } from \"./mine\"; \
              export default function L() { \

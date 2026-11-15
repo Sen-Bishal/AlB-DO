@@ -97,13 +97,12 @@ impl ContextPool {
     /// — which is the entire point: a suspended workflow holds this across its
     /// round trip while the runtime thread serves everyone else.
     async fn checkout(&self) -> Checkout<'_> {
-        let permit = self
+        self
             .permits
             .acquire()
             .await
             .expect("pool open")
             .forget();
-        let _ = permit;
         let index = self.idle.lock().expect("idle").pop().expect("permit implies idle");
         Checkout { pool: self, index }
     }

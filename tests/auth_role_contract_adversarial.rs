@@ -97,7 +97,7 @@ fn declaration_enforces_ascii_and_exact_length_boundaries() {
     .expect("declaration");
     assert_eq!(
         valid.lower().expect("32 bytes accepted").roles,
-        [maximum.clone()]
+        std::slice::from_ref(&maximum)
     );
     for role in [
         format!("{maximum}z"),

@@ -170,16 +170,6 @@ enum EvalOutcome {
     Threw,
 }
 
-impl EvalOutcome {
-    fn label(self) -> &'static str {
-        match self {
-            EvalOutcome::NotRun => "—",
-            EvalOutcome::Ran => "runs",
-            EvalOutcome::Threw => "THREW",
-        }
-    }
-}
-
 struct Probe {
     project: String,
     specifier: String,
@@ -621,7 +611,7 @@ fn render_report(probes: &[Probe]) -> String {
         .iter()
         .filter(|p| p.outcome == Outcome::Loaded)
         .collect();
-    heavy.sort_by(|a, b| b.artifacts.cmp(&a.artifacts));
+    heavy.sort_by_key(|probe| std::cmp::Reverse(probe.artifacts));
     heavy.dedup_by(|a, b| a.specifier == b.specifier);
     out.push_str("| package | files |\n|---|---:|\n");
     for probe in heavy.iter().take(15) {
@@ -665,7 +655,7 @@ fn generate_npm_coverage_manifest() {
             .unwrap_or("unknown")
             .to_string();
         let mut sites: BTreeMap<String, u32> = BTreeMap::new();
-        scan_sources(&dir, &dir, &mut sites);
+        scan_sources(&dir, &mut sites);
         eprintln!("{name}: {} distinct specifiers", sites.len());
         projects.push(serde_json::json!({
             "project": name,
@@ -709,7 +699,7 @@ fn collect_projects(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
 ///
 /// `node_modules` and build output are skipped: the question is what *the
 /// project's own code* imports.
-fn scan_sources(root: &Path, dir: &Path, sites: &mut BTreeMap<String, u32>) {
+fn scan_sources(dir: &Path, sites: &mut BTreeMap<String, u32>) {
     const SKIP: [&str; 8] = [
         "node_modules", ".git", "dist", "build", ".next", "out", "coverage", ".turbo",
     ];
@@ -723,7 +713,7 @@ fn scan_sources(root: &Path, dir: &Path, sites: &mut BTreeMap<String, u32>) {
             if SKIP.contains(&name.as_str()) {
                 continue;
             }
-            scan_sources(root, &path, sites);
+            scan_sources(&path, sites);
             continue;
         }
         let is_source = matches!(

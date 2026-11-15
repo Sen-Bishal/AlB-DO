@@ -492,11 +492,10 @@ fn parse_head(head: &[u8]) -> (u16, Option<usize>, bool) {
         let value = value.trim();
         match name.as_str() {
             "content-length" => content_length = value.parse::<usize>().ok(),
-            "transfer-encoding" => {
-                if value.to_ascii_lowercase().contains("chunked") {
+            "transfer-encoding"
+                if value.to_ascii_lowercase().contains("chunked") => {
                     chunked = true;
                 }
-            }
             _ => {}
         }
     }
@@ -735,15 +734,12 @@ fn bench_endpoint(
                 } else {
                     do_request(addr, &host_header, &spec, timeout)
                 };
-                match result {
-                    Ok((status, ttfb, total, _bytes)) => {
-                        if (200..400).contains(&status) {
-                            ok += 1;
-                        }
-                        ttfbs.push(dur_ms(ttfb));
-                        totals.push(dur_ms(total));
+                if let Ok((status, ttfb, total, _bytes)) = result {
+                    if (200..400).contains(&status) {
+                        ok += 1;
                     }
-                    Err(_) => {}
+                    ttfbs.push(dur_ms(ttfb));
+                    totals.push(dur_ms(total));
                 }
             }
             (ttfbs, totals, ok, done)

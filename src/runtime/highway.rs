@@ -199,13 +199,13 @@ impl HighwayPlan {
         while start > 0
             && deps
                 .get(start.saturating_sub(1))
-                .map_or(false, |entry| entry.dependent.as_u64() == key)
+                .is_some_and(|entry| entry.dependent.as_u64() == key)
         {
             start = start.saturating_sub(1);
         }
 
         let mut end = anchor.saturating_add(1);
-        while deps.get(end).map_or(false, |entry| entry.dependent.as_u64() == key) {
+        while deps.get(end).is_some_and(|entry| entry.dependent.as_u64() == key) {
             end = end.saturating_add(1);
         }
 

@@ -714,7 +714,7 @@ impl Visit for NamespaceUses<'_> {
                 MemberProp::Computed(computed) => string_literal(&computed.expr),
                 MemberProp::PrivateName(_) => None,
             };
-            if name.as_deref().map_or(true, |name| name == self.export) {
+            if name.as_deref().is_none_or(|name| name == self.export) {
                 self.found.push(member.span);
             }
             // The computed name may itself contain a predicate access.
@@ -1627,7 +1627,7 @@ impl PropBindings {
                 | ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(swc_ecma_ast::ExportDecl {
                     decl,
                     ..
-                })) => out.from_decl(decl),
+                })) => out.collect_decl(decl),
                 ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(default)) => {
                     if let swc_ecma_ast::DefaultDecl::Fn(function) = &default.decl {
                         if let Some(first) = function.function.params.first() {
@@ -1636,7 +1636,7 @@ impl PropBindings {
                     }
                 }
                 ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(default)) => {
-                    out.from_expr(&default.expr);
+                    out.collect_expr(&default.expr);
                 }
                 _ => {}
             }
@@ -1644,7 +1644,7 @@ impl PropBindings {
         out
     }
 
-    fn from_decl(&mut self, decl: &Decl) {
+    fn collect_decl(&mut self, decl: &Decl) {
         match decl {
             Decl::Fn(function) => {
                 if let Some(first) = function.function.params.first() {
@@ -1654,7 +1654,7 @@ impl PropBindings {
             Decl::Var(var) => {
                 for declarator in &var.decls {
                     if let Some(init) = &declarator.init {
-                        self.from_expr(init);
+                        self.collect_expr(init);
                     }
                 }
             }
@@ -1662,7 +1662,7 @@ impl PropBindings {
         }
     }
 
-    fn from_expr(&mut self, expr: &Expr) {
+    fn collect_expr(&mut self, expr: &Expr) {
         match unwrap(expr) {
             Expr::Arrow(arrow) => {
                 if let Some(first) = arrow.params.first() {

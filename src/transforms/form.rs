@@ -699,13 +699,12 @@ fn visit_expr_for_jsx(expr: &Expr, sink: &mut Vec<FormExtract>, in_list: bool) {
         // extractor at all — without it they were absent from `FormActionIds`
         // (so a tokenless submit was mis-phrased "action" not "form action") as
         // well as from the error-span manifest.
-        Expr::Call(call) => {
-            if is_list_map_call(call) {
+        Expr::Call(call)
+            if is_list_map_call(call) => {
                 for arg in &call.args {
                     visit_expr_for_jsx(&arg.expr, sink, true);
                 }
             }
-        }
         _ => {}
     }
 }
@@ -911,7 +910,7 @@ fn read_field_from_element(element: &JSXElement) -> Option<FormField> {
     }
 
     let name = name?;
-    let final_kind = predetermined_kind.unwrap_or_else(|| match input_type.as_str() {
+    let final_kind = predetermined_kind.unwrap_or(match input_type.as_str() {
         "number" | "range" => FormFieldKind::Number,
         "checkbox" => FormFieldKind::Boolean,
         "file" => FormFieldKind::File,

@@ -969,6 +969,7 @@ impl RendererRuntime {
     /// missing is logged and skipped (it then surfaces as the registry's loud
     /// "no plan" error at request time rather than rendering wrong HTML).
     /// Idempotent per `key`.
+    #[allow(clippy::too_many_arguments, reason = "private; plan accumulators by reference")]
     fn add_component_to_plan(
         &self,
         plan: &mut crate::render::tier_b::TierBRenderPlan,

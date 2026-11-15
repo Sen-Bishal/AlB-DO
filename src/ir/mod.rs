@@ -37,11 +37,10 @@ use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;
 use crate::parser::ParsedComponent;
 use crate::types::{ComponentAnalysis, ComponentId};
-use ahash::AHasher;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 /// Bumped from "1.0" → "1.1" in cycle 2 of the SoA IR refactor: the
@@ -121,9 +120,11 @@ impl CanonicalIrDocument {
             CANONICAL_HASH_SEEDS.2,
             CANONICAL_HASH_SEEDS.3,
         );
-        let mut hasher: AHasher = state.build_hasher();
-        encoded.hash(&mut hasher);
-        hasher.finish()
+        // std's `BuildHasher::hash_one`, spelled out: it is defined as
+        // build_hasher + hash + finish, so the value is unchanged. ahash's
+        // inherent `RandomState::hash_one` may specialise, and this hash must
+        // stay stable.
+        BuildHasher::hash_one(&state, &encoded)
     }
 
     pub fn normalize(&mut self) {
@@ -258,7 +259,7 @@ pub(crate) fn build_canonical_components_and_edges_from_graph(
     let mut edges = Vec::new();
 
     let mut graph_components = graph.components();
-    graph_components.sort_by(|left, right| left.id.as_u64().cmp(&right.id.as_u64()));
+    graph_components.sort_by_key(|left| left.id.as_u64());
 
     for component in graph_components {
         modules_by_path

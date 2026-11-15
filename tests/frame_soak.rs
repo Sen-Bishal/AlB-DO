@@ -94,7 +94,7 @@ fn pipeline_tick_frame_soak_1m_frames_no_growth() {
     let mut rng = Lehmer64(0xDEAD_BEEF_1234_5678);
     for _ in 0..FRAME_COUNT {
         for slot in 0..len {
-            if rng.next() % DIRTY_BASIS == 0 {
+            if rng.next().is_multiple_of(DIRTY_BASIS) {
                 pipeline.mark_column_dirty(slot);
             }
         }
@@ -124,7 +124,7 @@ fn pipeline_tick_frame_soak_smoke_10k_frames() {
     let mut rng = Lehmer64(0xC0FFEE_u64);
     for _ in 0..10_000 {
         for slot in 0..len {
-            if rng.next() % DIRTY_BASIS == 0 {
+            if rng.next().is_multiple_of(DIRTY_BASIS) {
                 pipeline.mark_column_dirty(slot);
             }
         }

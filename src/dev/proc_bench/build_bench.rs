@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 /// One buildable project under test. `clean` removes all build outputs
-/// + incremental cache so the next `build` is genuinely cold; `build`
+/// and the incremental cache so the next `build` is genuinely cold; `build`
 /// runs one build and errors if it fails (a failed build's timing is
 /// meaningless and must abort the run).
 pub trait BuildWorkload {

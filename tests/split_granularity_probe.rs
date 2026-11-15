@@ -497,7 +497,7 @@ fn how_much_of_a_tier_c_component_is_static() {
         return;
     }
 
-    let mut rows: Vec<Row> = corpora.iter().flat_map(|c| measure(c)).collect();
+    let mut rows: Vec<Row> = corpora.iter().flat_map(measure).collect();
     if rows.is_empty() {
         eprintln!("SKIP: no Tier-C components analysable");
         return;

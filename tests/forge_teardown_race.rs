@@ -1,6 +1,25 @@
 //! The libSQL teardown crash — `0xc0000005 STATUS_ACCESS_VIOLATION` — and the
 //! measurements that say what actually causes it.
 //!
+//! # ✅ RESOLVED 14 Nov 2026 (T-0040) — read this before the history below
+//!
+//! A stack captured in-process (a vectored exception handler printing a
+//! backtrace) put the fault in `sqlite3_close_v2` ← `local::Connection::drop`
+//! inside `drop_glue<LibsqlConnection>`. libsql 0.6.0 closes every local
+//! connection **twice**: `LibsqlConnection::drop` disconnects, then its
+//! `local::Connection` field drops and disconnects again. The second close
+//! reads the freed `sqlite3` struct, which faults only once the Windows heap
+//! has released that page. Co-liveness mattered only because a bigger heap
+//! releases more pages. The fix is `forge::libsql::ClosedOnceConnection`.
+//!
+//! Measured on the dev rig, 40 runs each: `probe_i` 0/40, `probe_a` 0/40,
+//! `thirty_simultaneous_teardowns` 0/40 with the fix; `probe_i` 12/40 with the
+//! fix's two fields swapped (the double close restored). `probe_i` is now a
+//! normal test; the rest stay ignored as the record of the investigation.
+//!
+//! Everything below is the September investigation, kept as written. Its
+//! "must stay ignored" rule predates CI's `--no-fail-fast`.
+//!
 //! # 🛑 EVERY PROBE HERE IS `#[ignore]`d, AND MUST STAY THAT WAY
 //!
 //! They reproduce a **process abort**, at up to 70%. A crash does not fail one
@@ -69,6 +88,21 @@ use dom_render_compiler::forge::substrate::DataSubstrate;
 /// Substrates per run. 30 is where the signal is strong; 1 is clean everywhere.
 const WIDTH: usize = 30;
 
+/// Held by every non-ignored test that opens ephemeral substrates.
+/// [`an_ephemeral_substrate_deletes_its_directory_on_drop`] counts `forge-*`
+/// directories in the shared temp dir, so a test opening thirty of them on a
+/// parallel thread made it read eleven "leaks" from eight drops (14 Nov 2026,
+/// once `probe_i` stopped being ignored).
+static TEMP_DIR_COUNTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn temp_dir_turn() -> std::sync::MutexGuard<'static, ()> {
+    // A test that panicked holding the lock poisoned it; the lock guards no
+    // data, so the next test may still take its turn.
+    TEMP_DIR_COUNTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn multi_thread(workers: usize) -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
@@ -88,14 +122,21 @@ async fn open_one() -> LibSqlSubstrate {
     substrate
 }
 
-// ── co-live = 30 · these crash ────────────────────────────────────────────
+// ── co-live = 30 · these crashed before T-0040 ────────────────────────────
 
 /// 30 held open, then dropped **one at a time on one fresh OS thread**. No
 /// overlap anywhere, and the highest crash rate in the table — the row that
 /// refutes "overlapping teardowns".
-#[ignore = "reproduces a process abort (28/40) — run deliberately with --ignored"]
+///
+/// **The regression test for T-0040, so it is not ignored.** With the
+/// double close back (the `ClosedOnceConnection` fields swapped), it crashed
+/// 12/40 on Windows. A crash shows as this binary exiting `0xc0000005`, which
+/// fails the run now that CI passes `--no-fail-fast` (the other binaries still
+/// run) and Windows gates. Linux and macOS never faulted on the double close,
+/// so there it only proves the teardown works.
 #[test]
 fn probe_i_batch_open_then_drop_all_on_one_os_thread() {
+    let _turn = temp_dir_turn();
     multi_thread(8).block_on(async {
         let mut live = Vec::new();
         for _ in 0..WIDTH {
@@ -232,6 +273,7 @@ fn probe_h_drop_on_dedicated_os_thread() {
 /// time — is clean in every measurement above.
 #[test]
 fn an_ephemeral_substrate_deletes_its_directory_on_drop() {
+    let _turn = temp_dir_turn();
     let before = leaked_dirs();
     multi_thread(2).block_on(async {
         for _ in 0..8 {

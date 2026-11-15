@@ -84,7 +84,9 @@ fn a_rule_broken_inside_an_imported_predicate_is_named_at_the_import_with_its_ho
 
 #[test]
 fn an_imported_predicate_used_any_other_way_anywhere_is_refused_and_its_queries_dropped() {
-    let cases: &[(&[(&str, &str)], &str, &str)] = &[
+    /// Files, the expected refusal, and what it must name.
+    type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str);
+    let cases: &[Case<'_>] = &[
         (
             &[("lib/preds.ts", "export const open = { status: \"open\" };\nopen.status = \"closed\";\n")],
             "src/lib/preds.ts:2:1",

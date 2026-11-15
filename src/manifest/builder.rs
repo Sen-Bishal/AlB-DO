@@ -666,9 +666,9 @@ impl<'a> ManifestBuilder<'a> {
                         self.shared_name_key(component),
                     ),
                     format!(
-                        "/_albedo/chunks/{}.{}.js",
+                        "/_albedo/chunks/{}.{:016x}.js",
                         slugify(component.name.as_str()),
-                        format!("{:016x}", component.source_hash)
+                        component.source_hash
                     ),
                 );
             }
@@ -708,7 +708,7 @@ impl<'a> ManifestBuilder<'a> {
     /// this is a latent bug being closed before something depends on it.
     pub fn build_build_id(&self) -> String {
         let mut components = self.components.values().collect::<Vec<_>>();
-        components.sort_by(|left, right| left.id.as_u64().cmp(&right.id.as_u64()));
+        components.sort_by_key(|left| left.id.as_u64());
 
         // Slash-normalize first so the prefix scan and the emitted basis agree
         // on separators regardless of host platform.
@@ -760,6 +760,7 @@ impl<'a> ManifestBuilder<'a> {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments, reason = "private; one route's inputs, threaded once")]
     fn build_shell(
         &self,
         route: &str,
@@ -1289,6 +1290,7 @@ impl<'a> ManifestBuilder<'a> {
         map
     }
 
+    #[allow(clippy::too_many_arguments, reason = "private recursive walk; accumulators by reference")]
     fn traverse(
         &self,
         id: ComponentId,
@@ -2434,16 +2436,15 @@ fn next_order(counter: &mut u32) -> u32 {
 /// production manifest emit identical bootstrap script payloads.
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in chunks.by_ref() {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let (chunks, rem) = input.as_chunks::<3>();
+    for chunk in chunks {
         let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
         out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
         out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
         out.push(ALPHABET[(n & 0x3f) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = (rem[0] as u32) << 16;

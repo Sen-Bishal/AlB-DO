@@ -298,7 +298,10 @@ mod tests {
     use crate::aperture::declare::{RouteDecl, SourceDecl};
     use std::collections::BTreeMap;
 
-    fn registry(sources: &[(&str, &str, &[(&str, &str, Option<&str>)])]) -> SourceRegistry {
+    /// One source fixture: name, base URL, and its (method, path, body) calls.
+    type SourceFixture<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str, Option<&'a str>)]);
+
+    fn registry(sources: &[SourceFixture<'_>]) -> SourceRegistry {
         let declarations: BTreeMap<String, SourceDecl> = sources
             .iter()
             .map(|(name, base, routes)| {
@@ -329,7 +332,7 @@ mod tests {
         SourceRegistry::from_declarations(&declarations, |_| None).expect("lowers")
     }
 
-    fn emit(sources: &[(&str, &str, &[(&str, &str, Option<&str>)])]) -> String {
+    fn emit(sources: &[SourceFixture<'_>]) -> String {
         emit_sources_dts(&registry(sources))
     }
 
@@ -481,7 +484,7 @@ mod tests {
     /// one is a permanent spurious diff.
     #[test]
     fn emission_is_byte_identical_across_runs() {
-        let sources: &[(&str, &str, &[(&str, &str, Option<&str>)])] = &[
+        let sources: &[SourceFixture<'_>] = &[
             (
                 "github",
                 "https://api.github.com",

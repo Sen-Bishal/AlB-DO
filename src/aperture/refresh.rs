@@ -209,7 +209,7 @@ impl RefreshLoop {
             let schedule = self.lock_due();
             watched
                 .iter()
-                .filter(|topic| schedule.get(&topic.topic).map_or(true, |at| *at <= now))
+                .filter(|topic| schedule.get(&topic.topic).is_none_or(|at| *at <= now))
                 .map(|topic| ResolvedSource {
                     topic: topic.topic.clone(),
                     url: topic.url.to_string(),

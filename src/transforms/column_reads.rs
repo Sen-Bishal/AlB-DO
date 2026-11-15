@@ -165,6 +165,9 @@ const ROW_CALLBACKS: &[&str] = &[
 /// Methods that read no field and return something other than rows.
 const OPAQUE_READS: &[&str] = &["includes", "indexOf", "lastIndexOf"];
 
+/// A callback body, deferred until its parameters are bound.
+type WalkCallback<'a> = Box<dyn Fn(&mut Walk) + 'a>;
+
 struct Walk {
     tracked: HashMap<String, Role>,
     fields: BTreeSet<String>,
@@ -424,7 +427,7 @@ impl Walk {
     /// rows. A callback passed by name (`rows.map(renderRow)`) cannot be read
     /// from here, so it is unbounded.
     fn callback(&mut self, callback: &Expr, row_params: &[usize]) {
-        let (params, body): (Vec<&Pat>, Box<dyn Fn(&mut Walk) + '_>) = match unwrap(callback) {
+        let (params, body): (Vec<&Pat>, WalkCallback<'_>) = match unwrap(callback) {
             Expr::Arrow(arrow) => (
                 arrow.params.iter().collect(),
                 Box::new(move |walk: &mut Walk| match &*arrow.body {

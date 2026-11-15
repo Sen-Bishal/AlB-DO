@@ -943,7 +943,7 @@ impl<'a> Lowering<'a> {
         if dest.is_empty() || dest.starts_with('#') || dest.starts_with('/') || has_scheme(dest) {
             return Ok(dest.to_string());
         }
-        let split = dest.find(|ch| ch == '?' || ch == '#').unwrap_or(dest.len());
+        let split = dest.find(['?', '#']).unwrap_or(dest.len());
         let (target, suffix) = dest.split_at(split);
         let links_to_markdown = Path::new(target)
             .extension()

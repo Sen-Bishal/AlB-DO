@@ -448,7 +448,7 @@ impl QuickJsEngine {
             runtime.set_gc_threshold(REBUILD_GC_THRESHOLD);
         }
 
-        let outcome = (|| -> RuntimeResult<()> {
+        let outcome = {
             // 🔑 **Build, then swap — never drop, then build.**
             //
             // The first version dropped the context up front, so a replay that
@@ -478,7 +478,7 @@ impl QuickJsEngine {
                     Err(err)
                 }
             }
-        })();
+        };
         if let Some(runtime) = self.runtime.as_ref() {
             runtime.set_gc_threshold(self.gc_threshold);
         }
@@ -1437,6 +1437,12 @@ impl QuickJsEngine {
         (self.ledger.resident_bytes(), self.bytecode.resident_bytes())
     }
 
+}
+
+impl Default for QuickJsEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RuntimeEngine for QuickJsEngine {
@@ -4198,7 +4204,7 @@ fn resolve_relative_module(
     ];
     modules.keys().find(|key| {
         let normalized_key = key.replace('\\', "/");
-        candidates.iter().any(|candidate| normalized_key == *candidate)
+        candidates.contains(&normalized_key)
     }).cloned()
 }
 
@@ -5097,11 +5103,13 @@ fn transpile_module_source_for_quickjs(
             crate::transforms::stable_ids::stamp_stable_ids(&mut module, spec);
         }
 
-        let mut jsx_options = JsxOptions::default();
-        jsx_options.runtime = Some(JsxRuntime::Classic);
-        jsx_options.pragma = Some("h".to_string());
-        jsx_options.pragma_frag = Some("h.Fragment".to_string());
-        jsx_options.development = Some(false);
+        let jsx_options = JsxOptions {
+            runtime: Some(JsxRuntime::Classic),
+            pragma: Some("h".to_string()),
+            pragma_frag: Some("h.Fragment".to_string()),
+            development: Some(false),
+            ..JsxOptions::default()
+        };
         module.visit_mut_with(&mut jsx(
             source_map.clone(),
             None::<SingleThreadedComments>,

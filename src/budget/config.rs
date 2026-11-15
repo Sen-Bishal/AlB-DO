@@ -40,6 +40,7 @@ pub const DEFAULT_TIER_B_BUNDLE_MAX_KB_PER_COMPONENT: u32 = 1;
 /// Fully-resolved budget shape after defaults + file overlay. Pass
 /// this to [`crate::budget::evaluate_budget`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub struct TierBudget {
     #[serde(default)]
     pub defaults: BudgetDefaults,
@@ -47,14 +48,6 @@ pub struct TierBudget {
     pub routes: BTreeMap<String, RouteBudget>,
 }
 
-impl Default for TierBudget {
-    fn default() -> Self {
-        Self {
-            defaults: BudgetDefaults::default(),
-            routes: BTreeMap::new(),
-        }
-    }
-}
 
 impl TierBudget {
     /// Returns the resolved budget for `route_path`, layering any

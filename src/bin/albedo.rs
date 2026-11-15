@@ -731,14 +731,11 @@ fn print_foreign_layout_notice(contract: &ResolvedDevContract) {
         return;
     }
     print_kv("layout", style_256(layout, ACCENT_SOFT, true));
-    print_warn(format!(
-        "{}",
-        style(
+    print_warn(style(
             "root and entry were inferred. ALBEDO discovers routes from `routes/`, so this \
              framework's own routes are NOT in the build — run `albedo doctor` to see which.",
             "2"
-        )
-    ));
+        ).to_string());
 }
 
 /// Route-shaped files that ALBEDO's own convention did not pick up.
@@ -2771,6 +2768,7 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
 /// a confident dashboard for a server that does not exist. This lane runs
 /// whenever stdout is a TTY, which is every interactive user, so a message that
 /// only survives the piped path is a message nobody reads.
+#[allow(clippy::too_many_arguments, reason = "the dev dashboard's start-up inputs, passed once")]
 fn run_dev_dashboard(
     mode: tui::dev::Mode,
     url: String,
@@ -6462,7 +6460,7 @@ REF=${OTHER}
         // A single header line far past the per-line cap (no newline) must be
         // rejected, not buffered without bound.
         let mut input = b"GET / HTTP/1.1\r\nX-Flood: ".to_vec();
-        input.extend(std::iter::repeat(b'A').take(MAX_REQUEST_LINE_BYTES + 1024));
+        input.extend(std::iter::repeat_n(b'A', MAX_REQUEST_LINE_BYTES + 1024));
         let err = parse_head(&input).expect_err("overlong header line must error");
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }

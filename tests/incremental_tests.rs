@@ -118,7 +118,7 @@ fn test_cache_persistence() {
 
     // Load cache in new instance
     {
-        let mut cache = incremental::IncrementalCache::new(temp_dir.path());
+        let cache = incremental::IncrementalCache::new(temp_dir.path());
         cache.load().unwrap();
 
         assert!(cache.has_cached_component(types::ComponentId::new(1)));

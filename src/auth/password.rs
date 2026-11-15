@@ -92,7 +92,7 @@ pub const MAX_EMAIL_BYTES: usize = 254;
 fn params() -> &'static Params {
     static PARAMS: OnceLock<Params> = OnceLock::new();
     PARAMS.get_or_init(|| {
-        Params::new(19_456, 2, 1, None).unwrap_or_else(|_| Params::DEFAULT)
+        Params::new(19_456, 2, 1, None).unwrap_or(Params::DEFAULT)
     })
 }
 

@@ -267,7 +267,7 @@ fn valid_intern_tables() -> Vec<Vec<u8>> {
 fn action_envelope_decoder_never_panics() {
     hammer(
         "decode_action_envelope",
-        |b| decode_action_envelope(b),
+        decode_action_envelope,
         &valid_action_envelopes(),
         0xAC71_04E5_E01B_2244,
     );
@@ -275,14 +275,14 @@ fn action_envelope_decoder_never_panics() {
 
 #[test]
 fn frame_decoder_never_panics() {
-    hammer("decode_frame", |b| decode_frame(b), &valid_frames(), 0xF2A3_E5C1_0B47_9D6E);
+    hammer("decode_frame", decode_frame, &valid_frames(), 0xF2A3_E5C1_0B47_9D6E);
 }
 
 #[test]
 fn intern_table_decoder_never_panics() {
     hammer(
         "decode_intern_table",
-        |b| decode_intern_table(b),
+        decode_intern_table,
         &valid_intern_tables(),
         0x17E2_88C4_55AA_3300,
     );

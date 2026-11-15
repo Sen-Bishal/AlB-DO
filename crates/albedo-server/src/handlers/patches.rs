@@ -154,7 +154,7 @@ pub async fn serve_patch_stream_live(
     }
 
     let seed = (!initial.is_empty())
-        .then(|| OpcodeFrame {
+        .then_some(OpcodeFrame {
             frame_id: 0,
             component_id: None,
             instructions: initial,

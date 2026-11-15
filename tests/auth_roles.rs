@@ -150,7 +150,7 @@ async fn an_email_can_name_several_principals() {
     let (ada, _) = person(&db, "ada", "ada@example.com").await;
     assert_eq!(
         principals_with_email(&db, "ADA@example.com").await.expect("lookup"),
-        [ada.id.clone()],
+        std::slice::from_ref(&ada.id),
         "email matching ignores case"
     );
     let (other, _) = person(&db, "ada-2", "ada@example.com").await;

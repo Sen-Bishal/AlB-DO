@@ -60,7 +60,7 @@ fn mean_ms(samples: &[f64]) -> f64 {
 
 /// Median, because a single GC pause in 60 reps moves a mean by more than any
 /// optimisation on this page would.
-fn median_ms(samples: &mut Vec<f64>) -> f64 {
+fn median_ms(samples: &mut [f64]) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
     samples[samples.len() / 2]
 }

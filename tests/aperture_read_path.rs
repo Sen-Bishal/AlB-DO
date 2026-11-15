@@ -174,7 +174,7 @@ fn the_boot_check_catches_a_call_the_declaration_cannot_serve() {
         route: "repo".to_string(),
         args: vec!["name".to_string(), "owner".to_string()],
     };
-    assert!(validate_source_bindings(&[good.clone()], &registry).is_ok());
+    assert!(validate_source_bindings(std::slice::from_ref(&good), &registry).is_ok());
 
     let missing = SourceBinding {
         args: vec!["owner".to_string()],

@@ -313,6 +313,7 @@ pub fn read_session_cookie(headers: &HeaderMap) -> Option<SessionId> {
 ///     tokens guard against.
 ///   * No `Domain` — also required by `__Host-`, and the half of the
 ///     prefix that actually closes sibling-subdomain cookie tossing.
+///
 /// The cookie is session-scoped (no `Max-Age` / `Expires`) so it
 /// rolls when the browser closes — matches the lifetime semantics
 /// of the in-memory `CsrfRegistry`.

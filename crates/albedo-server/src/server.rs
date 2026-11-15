@@ -690,7 +690,7 @@ impl CompiledProjectActionAdapter {
                     crate::auth::now_ms(),
                 )
                 .await
-                .map_err(&error)?,
+                .map_err(error)?,
             );
         }
         let bytes = if claim.is_some() {
@@ -2127,10 +2127,10 @@ impl AlbedoServerBuilder {
         // concurrent request path never touches the QuickJS engine.
         // Declared out here so the island failures survive the block that
         // computes them — they are boot output, not render output.
-        let mut island_ssr_failures: Vec<crate::renderer_runtime::IslandRenderFailure> = Vec::new();
-        let mut static_render_failures: Vec<
+        let island_ssr_failures: Vec<crate::renderer_runtime::IslandRenderFailure>;
+        let static_render_failures: Vec<
             dom_render_compiler::manifest::schema::StaticRenderFailure,
-        > = Vec::new();
+        >;
         let route_hydration = Arc::new({
             // Step 3 (binding mode) · build the fine-grained reactive blocks
             // FIRST (immutable borrow). For routes whose Tier-C component is
@@ -2923,11 +2923,13 @@ impl AlbedoServer {
         F: FnOnce(&BootReport) + Send + 'static,
         S: std::future::Future<Output = ()> + Send + 'static,
     {
-        let mut report = BootReport::default();
         // Decided at build time, surfaced here — this is the only path out to
         // the author.
-        report.island_ssr_failures = self.island_ssr_failures.clone();
-        report.static_render_failures = self.static_render_failures.clone();
+        let mut report = BootReport {
+            island_ssr_failures: self.island_ssr_failures.clone(),
+            static_render_failures: self.static_render_failures.clone(),
+            ..BootReport::default()
+        };
         // TLS persistence uses this path even when the FORGE feature is off.
         let db_path = self.resolved_db_path();
         // FORGE — open the durable substrate exactly once, before the listener
@@ -4030,6 +4032,7 @@ fn public_origin_for(state: &RuntimeState, headers: &HeaderMap) -> String {
 /// and must not — an indexed session query per image on the page is a real cost
 /// for an answer that branch never reads. An asset therefore rations by address,
 /// which is the correct subject for an unauthenticated byte stream anyway.
+#[allow(clippy::result_large_err, reason = "Err is the HTTP response itself, returned early")]
 fn ration(
     state: &RuntimeState,
     peer: Option<IpAddr>,
@@ -4330,8 +4333,7 @@ async fn dispatch_routed(
         // dev browser holds exactly one connection. Inert in production: the
         // registries are `None`, so the flag has nothing to stream.
         let wants_dev = crate::routing::parse_query_string(query.as_deref())
-            .get("dev")
-            .is_some();
+            .contains_key("dev");
         let dev = if wants_dev {
             crate::handlers::phosphor::DevTap {
                 errors: state.dev_error_registry.clone(),
@@ -4897,7 +4899,6 @@ async fn dispatch_routed(
                 caller,
                 email: state.live.email().cloned(),
                 jobs: state.live.jobs().cloned(),
-                phosphor: state.phosphor.as_ref(),
                 live: state.live.live_authority.as_ref(),
             },
         )

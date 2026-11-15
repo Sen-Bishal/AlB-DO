@@ -478,7 +478,7 @@ fn measure_tier_distribution_across_corpora() {
             .map(|r| (reasons[reason_index(*r)], *r))
             .filter(|(n, _)| *n > 0)
             .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0));
+        ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         let _ = writeln!(out, "\n| reason (ranked) | n | share |\n|---|---:|---:|");
         for (n, reason) in ranked {

@@ -390,9 +390,8 @@ impl WebTransportMuxer {
             .collect::<Vec<_>>();
         selected.sort_unstable_by_key(|frame| frame.sequence);
 
-        let mut expected = 0_u64;
         let mut output = String::new();
-        for frame in selected {
+        for (expected, frame) in (0_u64..).zip(selected) {
             if frame.sequence != expected {
                 return Err(WebTransportError::SequenceGap {
                     stream_id,
@@ -411,7 +410,6 @@ impl WebTransportMuxer {
                     });
                 }
             }
-            expected += 1;
         }
         Ok(output)
     }
@@ -439,9 +437,8 @@ impl WebTransportMuxer {
             .collect::<Vec<_>>();
         selected.sort_unstable_by_key(|frame| frame.sequence);
 
-        let mut expected = 0_u64;
         let mut output = Vec::new();
-        for frame in selected {
+        for (expected, frame) in (0_u64..).zip(selected) {
             if frame.sequence != expected {
                 return Err(WebTransportError::SequenceGap {
                     stream_id,
@@ -460,7 +457,6 @@ impl WebTransportMuxer {
                     });
                 }
             }
-            expected += 1;
         }
         Ok(output)
     }

@@ -242,6 +242,7 @@ pub struct Lane {
     /// The session cookie's id, when the browser presented one. Unused for
     /// authorization today (every topic is public); it is the accounting key
     /// per-identity caps and item-4 authz attach to.
+    #[allow(dead_code, reason = "the key per-identity caps attach to; not read yet")]
     identity: Option<SessionId>,
     /// AUTH · R2 — **who** this lane belongs to, resolved at trunk open.
     ///

@@ -91,9 +91,9 @@ impl Drop for PendingLine {
             let errors = errors.0.lock().unwrap_or_else(|err| err.into_inner());
             if !errors.is_empty() {
                 self.text.truncate(self.text.len().saturating_sub(2));
-                let _ = write!(
+                let _ = writeln!(
                     self.text,
-                    ",\"render_error\":{}}}\n",
+                    ",\"render_error\":{}}}",
                     json(&errors.join("\n"))
                 );
             }

@@ -167,8 +167,7 @@ impl JobsPlan {
                         .map_err(|err| err.to_string())
                 })
                 .await
-                .map_err(|err| err.to_string())?
-                .map_err(|err| err)?;
+                .map_err(|err| err.to_string())??;
 
             let pending = match pass {
                 JobRun::Completed { effects, .. } => return Ok(effects),
@@ -548,7 +547,7 @@ impl JobRunner {
             self.drain(now, &shutdown).await;
 
             self.passes = self.passes.wrapping_add(1);
-            if self.passes % SWEEP_EVERY == 0 {
+            if self.passes.is_multiple_of(SWEEP_EVERY) {
                 if let Err(err) =
                     queue::sweep_done(self.db.as_ref(), now - DONE_RETENTION_MS).await
                 {

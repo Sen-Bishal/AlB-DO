@@ -279,7 +279,7 @@ fn confinement_does_not_grow_the_persistent_arena() {
     }
 
     const WINDOW: usize = 40;
-    let mut measure = |engine: &mut QuickJsEngine| -> f64 {
+    let measure = |engine: &mut QuickJsEngine| -> f64 {
         let before = engine.arena_stats().persistent_used;
         for _ in 0..WINDOW {
             engine.confine().expect("confine");

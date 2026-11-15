@@ -89,7 +89,7 @@ pub fn wanted(descriptor: &QueryDescriptor, schema: &CollectionSchema) -> Vec<In
         .unwrap_or(0);
     let mut out = Vec::new();
     for mask in 0..(1u16 << optional) {
-        let present = |t: &&Term| t.optional_slot.map_or(true, |s| mask & (1 << s) != 0);
+        let present = |t: &&Term| t.optional_slot.is_none_or(|s| mask & (1 << s) != 0);
         let terms: Vec<&Term> = descriptor.terms.iter().filter(present).collect();
         if let Some(spec) = for_terms(&terms, descriptor, schema) {
             out.push(spec);

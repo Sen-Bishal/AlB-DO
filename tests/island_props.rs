@@ -42,7 +42,7 @@ fn fixture_root() -> PathBuf {
 /// the parser sets `is_interactive` / `effect_profile` and the tiering actually
 /// classifies `Badge` as Tier C. Hand-registering `Component`s skips the parse
 /// and everything lands in Tier A, which would make this file assert nothing.
-fn build_manifest_for(root: &PathBuf) -> RenderManifestV2 {
+fn build_manifest_for(root: &std::path::Path) -> RenderManifestV2 {
     let scanner = ProjectScanner::new();
     let compiler = scanner.scan_and_build(root).expect("scan");
     let result = compiler.optimize().expect("optimize");

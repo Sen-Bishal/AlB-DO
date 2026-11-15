@@ -44,7 +44,6 @@ use dom_render_compiler::types::{Component, ComponentId};
 use dom_render_compiler::RenderCompiler;
 use napi::bindgen_prelude::{AsyncTask, Error, Result, Task};
 use napi_derive::napi;
-use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
@@ -52,8 +51,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-static LAST_CACHE_METRICS: Lazy<Mutex<CacheMetrics>> =
-    Lazy::new(|| Mutex::new(CacheMetrics::default()));
+static LAST_CACHE_METRICS: std::sync::LazyLock<Mutex<CacheMetrics>> =
+    std::sync::LazyLock::new(|| Mutex::new(CacheMetrics::default()));
 
 /// Options for the [`analyze_project`] call.
 #[napi(object)]
@@ -125,7 +124,7 @@ impl Task for OptimizeManifestTask {
     }
 }
 
-/// Scans `project_path` for JSX/TSX components, runs the full AlBDO compilation
+/// Scans `project_path` for JSX/TSX components, runs the full `AlBDO` compilation
 /// pipeline, and returns a serialized `RenderManifestV2`.
 ///
 /// The call is async — compilation runs on a Rust thread pool and resolves as a

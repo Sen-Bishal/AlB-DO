@@ -133,7 +133,7 @@ fn next_use_id() -> String {
     let mut digits = String::new();
     let mut value = n;
     loop {
-        let digit = u32::from(value % 36);
+        let digit = value % 36;
         digits.insert(
             0,
             char::from_digit(digit, 36).expect("digit < 36 is representable"),
@@ -1925,65 +1925,6 @@ impl Drop for IslandIdentityGuard {
 /// The table installed on this thread, if any.
 fn installed_island_identities() -> Option<std::rc::Rc<IslandIdentityTable>> {
     ISLAND_IDENTITIES.with(|cell| cell.borrow().clone())
-}
-
-#[cfg(test)]
-mod island_identity_storage_tests {
-    use super::{install_island_identities, installed_island_identities, IslandIdentityTable};
-
-    fn table(key: &str) -> IslandIdentityTable {
-        IslandIdentityTable::from([(
-            "Counter".to_string(),
-            vec![("components/a/Counter.tsx".to_string(), key.to_string())],
-        )])
-    }
-
-    fn current_key() -> Option<String> {
-        installed_island_identities().map(|t| t["Counter"][0].1.clone())
-    }
-
-    #[test]
-    fn nested_installs_stack_and_restore_in_order() {
-        assert_eq!(current_key(), None);
-        let outer = install_island_identities(table("outer"));
-        assert_eq!(current_key().as_deref(), Some("outer"));
-        {
-            let _inner = install_island_identities(table("inner"));
-            assert_eq!(current_key().as_deref(), Some("inner"));
-        }
-        assert_eq!(current_key().as_deref(), Some("outer"));
-        drop(outer);
-        assert_eq!(current_key(), None);
-    }
-
-    #[test]
-    fn unwinding_through_an_install_restores_the_previous_table() {
-        let _outer = install_island_identities(table("outer"));
-        let result = std::panic::catch_unwind(|| {
-            let _inner = install_island_identities(table("inner"));
-            assert_eq!(current_key().as_deref(), Some("inner"));
-            panic!("render failed mid-route");
-        });
-        assert!(result.is_err());
-        assert_eq!(current_key().as_deref(), Some("outer"));
-    }
-
-    #[test]
-    fn a_held_table_outlives_its_guard_without_dangling() {
-        let guard = install_island_identities(table("held"));
-        let held = installed_island_identities().unwrap();
-        drop(guard);
-        assert_eq!(current_key(), None);
-        assert_eq!(held["Counter"][0].1, "held");
-    }
-
-    #[test]
-    fn each_thread_sees_only_its_own_installation() {
-        let _here = install_island_identities(table("main"));
-        let there = std::thread::spawn(current_key).join().unwrap();
-        assert_eq!(there, None);
-        assert_eq!(current_key().as_deref(), Some("main"));
-    }
 }
 
 /// The module-path spelling both sides of [`install_island_identities`] use:
@@ -4905,7 +4846,7 @@ impl ComponentProject {
                 Expr::Arrow(arrow) => (
                     arrow.params.iter().map(param_from_pat).collect(),
                     match &*arrow.body {
-                        BlockStmtOrExpr::Expr(expr) => CallbackBody::Expr(&**expr),
+                        BlockStmtOrExpr::Expr(expr) => CallbackBody::Expr(expr),
                         BlockStmtOrExpr::BlockStmt(block) => CallbackBody::Stmts(&block.stmts[..]),
                     },
                 ),
@@ -6852,4 +6793,63 @@ pub fn render_from_components_dir(
 ) -> Result<String> {
     let project = ComponentProject::load_from_dir(components_root)?;
     project.render_entry(entry_module, props)
+}
+
+#[cfg(test)]
+mod island_identity_storage_tests {
+    use super::{install_island_identities, installed_island_identities, IslandIdentityTable};
+
+    fn table(key: &str) -> IslandIdentityTable {
+        IslandIdentityTable::from([(
+            "Counter".to_string(),
+            vec![("components/a/Counter.tsx".to_string(), key.to_string())],
+        )])
+    }
+
+    fn current_key() -> Option<String> {
+        installed_island_identities().map(|t| t["Counter"][0].1.clone())
+    }
+
+    #[test]
+    fn nested_installs_stack_and_restore_in_order() {
+        assert_eq!(current_key(), None);
+        let outer = install_island_identities(table("outer"));
+        assert_eq!(current_key().as_deref(), Some("outer"));
+        {
+            let _inner = install_island_identities(table("inner"));
+            assert_eq!(current_key().as_deref(), Some("inner"));
+        }
+        assert_eq!(current_key().as_deref(), Some("outer"));
+        drop(outer);
+        assert_eq!(current_key(), None);
+    }
+
+    #[test]
+    fn unwinding_through_an_install_restores_the_previous_table() {
+        let _outer = install_island_identities(table("outer"));
+        let result = std::panic::catch_unwind(|| {
+            let _inner = install_island_identities(table("inner"));
+            assert_eq!(current_key().as_deref(), Some("inner"));
+            panic!("render failed mid-route");
+        });
+        assert!(result.is_err());
+        assert_eq!(current_key().as_deref(), Some("outer"));
+    }
+
+    #[test]
+    fn a_held_table_outlives_its_guard_without_dangling() {
+        let guard = install_island_identities(table("held"));
+        let held = installed_island_identities().unwrap();
+        drop(guard);
+        assert_eq!(current_key(), None);
+        assert_eq!(held["Counter"][0].1, "held");
+    }
+
+    #[test]
+    fn each_thread_sees_only_its_own_installation() {
+        let _here = install_island_identities(table("main"));
+        let there = std::thread::spawn(current_key).join().unwrap();
+        assert_eq!(there, None);
+        assert_eq!(current_key().as_deref(), Some("main"));
+    }
 }

@@ -123,6 +123,7 @@ pub const CSRF_HEADER: &str = "x-albedo-csrf";
 /// The success response is `200` with
 /// `content-type: application/octet-stream`; bakabox's client
 /// dispatcher feeds the bytes straight into `applyFrameBytes`.
+#[allow(clippy::too_many_arguments, reason = "the HTTP door's inputs, passed through once")]
 pub async fn run_action_request(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,
@@ -188,6 +189,7 @@ pub async fn run_action_request(
 /// so the JS path could migrate onto this URL without changing what it does with
 /// the answer. Everything else gets the redirect, because everything else is a
 /// browser. See [`crate::forms::negotiate`].
+#[allow(clippy::too_many_arguments, reason = "the form door's inputs, passed through once")]
 pub async fn run_form_action_request(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,
@@ -302,6 +304,8 @@ const SUBMIT_EVENT_KIND: u8 = 2;
 /// Splitting it out this way is what keeps the CSRF rule *one* rule: when the
 /// no-JS path arrived it inherited the gate rather than growing its own, so
 /// there is no second place where a token could be treated as optional.
+#[allow(clippy::too_many_arguments, reason = "the one dispatch both doors share")]
+#[allow(clippy::result_large_err, reason = "Err is the HTTP response itself, returned early")]
 async fn dispatch_action(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,

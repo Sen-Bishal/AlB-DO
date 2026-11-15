@@ -300,11 +300,11 @@ fn pluralize(count: usize) -> &'static str {
 }
 
 trait TierLabel {
-    fn as_str(self) -> &'static str;
+    fn as_str(&self) -> &'static str;
 }
 
 impl TierLabel for Tier {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Tier::A => "A",
             Tier::B => "B",

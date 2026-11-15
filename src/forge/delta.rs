@@ -578,7 +578,7 @@ pub fn classify_positioned_insert(
     if !prev_rows
         .iter()
         .map(|(key, _)| key.as_str())
-        .eq(survivors.into_iter())
+        .eq(survivors)
     {
         return None;
     }

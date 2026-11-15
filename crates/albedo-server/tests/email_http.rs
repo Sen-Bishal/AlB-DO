@@ -362,9 +362,22 @@ async fn reset_verify_and_magic_link_work_end_to_end() {
     assert!(session_cookie(&login).is_none());
     assert!(login.text().await.unwrap().contains("Confirm your email"));
     // …and a fresh link is sent, which VOIDS the first one.
-    let second = wait_for_mail(&app, "ada@example.com", "Confirm your email", 1).await;
-    let (stale, fresh) = (token_in(&first), token_in(&second));
-    assert_ne!(stale, fresh);
+    // Wait for the second link, then take it as "the one that is not the
+    // first". Not `matching[1]`: the outbox is ordered by file mtime, and a
+    // retried delivery rewrites its file, so under full-suite load on Windows
+    // (14 Nov 2026) the first mail sorted second and both tokens matched.
+    wait_for_mail(&app, "ada@example.com", "Confirm your email", 1).await;
+    let stale = token_in(&first);
+    let confirms: Vec<String> = read_outbox(&app)
+        .iter()
+        .filter(|m| m.to.contains("ada@example.com") && m.subject.contains("Confirm your email"))
+        .map(token_in)
+        .collect();
+    assert_eq!(confirms.len(), 2, "exactly two confirmation links: {confirms:?}");
+    let fresh = confirms
+        .into_iter()
+        .find(|token| *token != stale)
+        .expect("the second link carries a new token, not the first one again");
 
     // The mailbox budget: a burst of three, all spent on ada. A fourth link
     // is not sent — and the response does not say so.

@@ -362,7 +362,7 @@ fn resolve_exports_subpath(exports: &serde_json::Value, subpath: &str) -> Option
             && subpath.starts_with(prefix)
             && subpath.ends_with(suffix)
         {
-            let better = best.map_or(true, |(len, _, _)| prefix.len() > len);
+            let better = best.is_none_or(|(len, _, _)| prefix.len() > len);
             if better {
                 if let Some(capture) =
                     subpath.get(prefix.len()..subpath.len().saturating_sub(suffix.len()))

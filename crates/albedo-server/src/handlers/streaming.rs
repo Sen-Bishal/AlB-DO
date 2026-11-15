@@ -1083,6 +1083,7 @@ fn build_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments, reason = "private; one route's shell inputs")]
 fn build_shell_chunk(
     route: &RouteManifest,
     negotiated_transport: NegotiatedTransport,

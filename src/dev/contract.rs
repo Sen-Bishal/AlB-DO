@@ -399,16 +399,13 @@ impl DevHmrConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HmrTransport {
+    #[default]
     Sse,
     WebSocket,
 }
 
-impl Default for HmrTransport {
-    fn default() -> Self {
-        Self::Sse
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -420,18 +417,15 @@ pub struct HotSetRegistration {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HotSetPriority {
     Low,
+    #[default]
     Normal,
     High,
     Critical,
 }
 
-impl Default for HotSetPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -473,6 +467,7 @@ impl StaticSliceConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct DevCliOptions {
     pub root_override: Option<PathBuf>,
     /// The **project** directory — where `albedo.config.*` is looked for and
@@ -499,23 +494,6 @@ pub struct DevCliOptions {
     pub print_contract: bool,
 }
 
-impl Default for DevCliOptions {
-    fn default() -> Self {
-        Self {
-            root_override: None,
-            project_dir_override: None,
-            config_path: None,
-            entry_override: None,
-            host_override: None,
-            port_override: None,
-            no_hmr: false,
-            open: false,
-            strict: false,
-            verbose: false,
-            print_contract: false,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ResolvedDevContract {

@@ -2651,7 +2651,9 @@ mod tests {
                 .collect()
         };
 
-        let cases: Vec<(Vec<(&str, &str)>, Vec<(&str, &str)>, Vec<SlotChange>)> = vec![
+        /// Rows before, rows after, and the slot changes expected between them.
+        type ListCase<'a> = (Vec<(&'a str, &'a str)>, Vec<(&'a str, &'a str)>, Vec<SlotChange>);
+        let cases: Vec<ListCase<'_>> = vec![
             // Append — the guestbook case.
             (
                 vec![("1", "ada"), ("2", "alan")],

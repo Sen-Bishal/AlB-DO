@@ -366,7 +366,10 @@ mod tests {
     use crate::forge::declare::{CollectionDecl, FieldSpec, FieldType};
     use std::collections::BTreeMap;
 
-    fn schema(pairs: &[(&str, &[(&str, FieldType)], Option<&str>)]) -> ForgeSchema {
+    /// One collection fixture: name, fields, and its partition key.
+    type CollectionFixture<'a> = (&'a str, &'a [(&'a str, FieldType)], Option<&'a str>);
+
+    fn schema(pairs: &[CollectionFixture<'_>]) -> ForgeSchema {
         let mut declarations: BTreeMap<String, CollectionDecl> = BTreeMap::new();
         for (name, fields, partition_by) in pairs {
             declarations.insert(

@@ -77,7 +77,7 @@ fn optional_slots(descriptor: &QueryDescriptor) -> u32 {
 
 fn present(term: &Term, mask: u8) -> bool {
     term.optional_slot
-        .map_or(true, |slot| mask & (1 << slot) != 0)
+        .is_none_or(|slot| mask & (1 << slot) != 0)
 }
 
 struct Binder {

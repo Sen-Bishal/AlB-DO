@@ -710,10 +710,13 @@ mod tests {
         spec_schema_of(&[("messages", fields, None)])
     }
 
+    /// One collection: its topic, fields, and optional `partition_by`.
+    type SpecCollection<'a> = (&'a str, &'a [(&'a str, FieldSpec)], Option<&'a str>);
+
     /// The general form: any number of collections, each with its own fields and
     /// optional `partition_by`. Needed because the all-or-nothing property is
     /// about what one collection's refusal does to *another* collection.
-    fn spec_schema_of(collections: &[(&str, &[(&str, FieldSpec)], Option<&str>)]) -> ForgeSchema {
+    fn spec_schema_of(collections: &[SpecCollection<'_>]) -> ForgeSchema {
         let mut declarations = BTreeMap::new();
         for (topic, fields, partition_by) in collections {
             declarations.insert(

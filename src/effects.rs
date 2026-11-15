@@ -107,6 +107,10 @@ pub struct TieringInputs {
 ///   `render_component_ref` returns `Err`, the error propagates to the top of the static render,
 ///   and every ancestor's markup goes with it. QuickJS carries the npm graph and renders the same
 ///   component correctly, which is what the tier below is for.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each flag is one documented proof above; a facts struct is T-0039 follow-up"
+)]
 pub fn decide_tier_and_hydration(
     effects: EffectProfile,
     has_event_handler: bool,

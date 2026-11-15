@@ -55,7 +55,7 @@ const SYNTHETIC_CATCH_PARAM: &str = "__albedo_caught";
 /// parses a string that already arrived. `await` on a non-promise is the
 /// identity in JS anyway — the difference is only *when*, and a body with no
 /// event loop has no other work to interleave.
-pub fn strip_await(stmts: &mut Vec<Stmt>) {
+pub fn strip_await(stmts: &mut [Stmt]) {
     let mut folder = AwaitStripper;
     for stmt in stmts.iter_mut() {
         stmt.visit_mut_with(&mut folder);
@@ -79,7 +79,7 @@ impl VisitMut for AwaitStripper {
 }
 
 /// Prepend the suspend re-throw to every `catch` in a handler body.
-pub fn guard_userland_catches(stmts: &mut Vec<Stmt>) {
+pub fn guard_userland_catches(stmts: &mut [Stmt]) {
     let mut folder = CatchGuard;
     for stmt in stmts.iter_mut() {
         stmt.visit_mut_with(&mut folder);
@@ -225,7 +225,7 @@ pub fn body_calls_fetch(stmts: &[Stmt]) -> bool {
 /// belong together: the `await` strip is what makes the source parse, and the
 /// catch guard is what makes the resulting throw survive the author's own error
 /// handling. Missing either one produces a body that *looks* fine.
-pub fn lower_handler_body(stmts: &mut Vec<Stmt>) -> Result<(), WorkflowLoweringError> {
+pub fn lower_handler_body(stmts: &mut [Stmt]) -> Result<(), WorkflowLoweringError> {
     if body_calls_fetch(stmts) && find_return_in_finally(stmts) {
         return Err(WorkflowLoweringError::ReturnInFinally);
     }

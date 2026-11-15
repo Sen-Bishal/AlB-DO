@@ -67,20 +67,15 @@ jobs:
       # every binary after it never runs, and their failures stay invisible
       # (14 Nov 2026: one compile error hid 12 cross-platform failures).
       #
-      # Windows only: both test steps are advisory until T-0040. libSQL-era
-      # native aborts (0xc0000005) hit 2-3 of 50 server test binaries per full
-      # run on Windows, even at --test-threads=1, and compiler binaries too
-      # (auth_password_flow on run 81, jobs_queue locally); Linux and macOS have
-      # never shown one. The steps still run and still show red in the job, they
-      # just cannot fail the run. Remove both continue-on-error lines when T-0040
-      # closes.
-      - name: Test compiler${{ matrix.os == 'windows-latest' && ' (advisory on Windows until T-0040)' || '' }}
-        continue-on-error: ${{ matrix.os == 'windows-latest' }}
+      # Both steps gate on every OS. Until 14 Nov 2026 they were advisory on
+      # Windows: libsql 0.6.0 closes each connection twice, and the second close
+      # aborted 2-3 test binaries per run with 0xc0000005 (T-0040, fixed in
+      # src/forge/libsql.rs, ClosedOnceConnection).
+      - name: Test compiler
         run: cargo test -p dom-render-compiler --no-fail-fast
 
-      - name: Test server${{ matrix.os == 'windows-latest' && ' (advisory on Windows until T-0040)' || '' }}
+      - name: Test server
         if: ${{ !cancelled() }}
-        continue-on-error: ${{ matrix.os == 'windows-latest' }}
         run: cargo test -p albedo-server --no-fail-fast
 
   # Releases are built by the stable compiler (see release.yml). This catches a

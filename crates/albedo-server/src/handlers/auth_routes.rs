@@ -198,9 +198,6 @@ pub struct AuthRequest<'a> {
     pub(crate) email: Option<std::sync::Arc<crate::email::EmailRuntime>>,
     /// 15.3 · the job queue, which is what actually sends.
     pub(crate) jobs: Option<crate::jobs::JobHandle>,
-    /// The live lanes, so a revoked session stops receiving live data at once
-    /// rather than when its tab closes.
-    pub(crate) phosphor: &'a crate::handlers::PhosphorState,
     /// R1b · every open live connection (PHOSPHOR, SSE, WT).
     pub(crate) live: &'a crate::live_authority::LiveRegistry,
 }
@@ -308,7 +305,7 @@ async fn unlink(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) -
             sessions_ended,
             ended,
         }) => {
-            close_deleted_sessions(&request, &ended);
+            close_deleted_sessions(request, &ended);
             debug!(target: "albedo.auth", provider, sessions_ended, "sign-in method disconnected");
             see_other(back)
         }

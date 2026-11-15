@@ -1782,9 +1782,7 @@ impl CompiledProject {
             .filter(|(_, module)| module.default_export.is_none())
             .filter_map(|(spec, module)| {
                 let route = crate::manifest::route_path_from_component(spec)?;
-                served
-                    .iter()
-                    .any(|s| *s == route)
+                served.contains(&route)
                     .then(|| (route, spec.clone(), module.component_exports.clone()))
             })
             .collect();

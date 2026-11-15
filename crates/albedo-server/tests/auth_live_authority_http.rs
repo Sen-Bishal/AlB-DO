@@ -5,7 +5,7 @@
 //! 1. logout vs SSE — the stream stayed open;
 //! 2. sign-in rotation vs SSE — the old token's stream stayed open;
 //! 3. expiry vs SSE — the stream outlived the session;
-//! 4/5. CLI revoke vs a PHOSPHOR trunk and an SSE stream — both kept going.
+//! 4. (and 5.) CLI revoke vs a PHOSPHOR trunk and an SSE stream — both kept going.
 //!
 //! Every closing assertion has a positive control beside it: another session,
 //! an anonymous stream, a connection opened after the change.

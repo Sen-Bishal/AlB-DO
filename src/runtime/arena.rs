@@ -153,6 +153,9 @@ impl Region {
     /// makes the invariant hold regardless, and `debug_assert_owning_thread` now checks
     /// the property itself rather than asserting it in prose.
     #[inline]
+    // `fetch_update` was renamed `try_update` in Rust 1.95; the new name is
+    // past this crate's rust-version (1.88), so keep the old one.
+    #[allow(deprecated, reason = "try_update is stable only since 1.95")]
     fn bump(&self, total: usize) -> Option<usize> {
         let off = self
             .top

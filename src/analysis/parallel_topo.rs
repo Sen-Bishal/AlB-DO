@@ -437,7 +437,7 @@ mod critical_path_shape {
     /// distinct: the existing `test_critical_path` uses uniform ones, where
     /// picking any longest-by-length path passes.
     #[test]
-    fn the_walk_picks_the_HEAVIEST_path_not_merely_a_long_one() {
+    fn the_walk_picks_the_heaviest_path_not_merely_a_long_one() {
         let graph = ComponentGraph::new();
         let root = graph.add_component(Component::new(ComponentId::new(0), "root".to_string()));
         let cheap = graph.add_component(Component::new(ComponentId::new(0), "cheap".to_string()));

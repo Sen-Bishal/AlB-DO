@@ -561,8 +561,8 @@ mod tests {
         assert_eq!(report.frames_pushed, LANE_COUNT);
         assert_eq!(report.lane_patches, [1, 1, 1, 1]);
 
-        for lane in 0..LANE_COUNT {
-            assert_eq!(report.lane_bytes[lane], PATCH_RECORD_BYTES);
+        for (lane, &bytes) in report.lane_bytes.iter().enumerate() {
+            assert_eq!(bytes, PATCH_RECORD_BYTES);
             assert_eq!(arena.lane_dirty_indices(lane).len(), 1);
             assert_eq!(arena.lane_patch_bytes(lane).len(), PATCH_RECORD_BYTES);
         }

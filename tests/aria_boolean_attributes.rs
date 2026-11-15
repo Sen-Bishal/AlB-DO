@@ -26,7 +26,7 @@
 //!
 //! Radix wires **every** compound component's accessibility through boolean
 //! `aria-*` props, so the blast radius is the whole shadcn/UI layer, and `useId`
-//! + `asChild` were built specifically to make that wiring work. A hand-built
+//! and `asChild` were built specifically to make that wiring work. A hand-built
 //! props object would have proven the attribute loop and nothing about the path
 //! that actually produces those props: real `Slot` spreads `slotProps`, merges
 //! the child's props over them in `mergeProps`, and puts the result back through

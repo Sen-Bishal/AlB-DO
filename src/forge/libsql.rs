@@ -56,35 +56,23 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 /// makes the delete succeed: measured 2026-09-02, 30 substrates opened and
 /// dropped, directory count delta **0**.
 ///
-/// 🔴 **NOT fixed: the `0xc0000005 STATUS_ACCESS_VIOLATION`.** See
-/// `tests/forge_teardown_race.rs` for the measurements. Two plausible fixes were
-/// built and both were **refuted by their own measurement**: a process-wide
-/// teardown mutex (9/30 crashes with it, i.e. no effect) and a dedicated
-/// teardown thread with the handles shipped to it (20/40). They are not in the
-/// tree, because an unproven mechanism left in place is indistinguishable from a
-/// fix to the next reader.
-///
-/// 🔑 **What is now known about the real variable**, and it is not what the
-/// earlier diagnosis recorded: the crash needs **many substrates open at the
-/// same time**, and then a teardown. It does *not* need the teardowns to
-/// overlap — 30 substrates dropped strictly one at a time on a single dedicated
-/// OS thread still crash 28/40 — and it does not care which thread drops them.
-/// Interleaving open/drop so only one is ever live is clean at 0/40 in every
-/// configuration tried.
-///
-/// ⚠️ **Production keeps one substrate per process**, which is why this has only
-/// ever been seen in test binaries. That is a reason it stays open, not a reason
-/// it is harmless: the crash aborts the process, so `cargo test` dies at that
-/// binary and every binary after it never runs, while the truncated log ends in
-/// `ok`.
+/// ✅ **Fixed 14 Nov 2026 (T-0040): the `0xc0000005 STATUS_ACCESS_VIOLATION`.**
+/// It was libsql 0.6.0 closing every local connection twice. See
+/// [`ClosedOnceConnection`] for the mechanism, the captured stack and the fix,
+/// and `tests/forge_teardown_race.rs` for the before and after counts. The
+/// earlier reading, that it needed many substrates *co-live*, was a symptom: a
+/// bigger heap gives the Windows heap more pages to release, and the second
+/// close only faults on a released page. The teardown mutex and dedicated
+/// teardown thread tried in September could not help, because one thread
+/// closing one handle twice is enough.
 struct Connections {
     /// Reads only. WAL readers never block the writer, never block each other,
     /// and never take the write lock.
-    reader: Option<Connection>,
+    reader: Option<ClosedOnceConnection>,
     /// The one writer. Every write and transaction holds this mutex for its
     /// duration, which is what makes "one writer at a time" true *before*
     /// SQLite has to enforce it.
-    writer: Option<Arc<Mutex<Connection>>>,
+    writer: Option<Arc<Mutex<ClosedOnceConnection>>>,
     /// The database the connections were opened from.
     ///
     /// ⚠️ **Retained on principle, not on evidence.** `open_local` used to let
@@ -214,7 +202,7 @@ impl LibSqlSubstrate {
     /// The writer mutex.
     ///
     /// See [`Self::reader`] for why the `expect` is unreachable.
-    fn writer(&self) -> &Arc<Mutex<Connection>> {
+    fn writer(&self) -> &Arc<Mutex<ClosedOnceConnection>> {
         self.conns
             .writer
             .as_ref()
@@ -280,7 +268,7 @@ impl LibSqlSubstrate {
     pub async fn seal(path: &std::path::Path) -> Result<()> {
         let backend = |e: libsql::Error| SubstrateError::Backend(e.to_string());
         let db = Builder::new_local(path).build().await.map_err(backend)?;
-        let conn = db.connect().map_err(backend)?;
+        let conn = ClosedOnceConnection::new(db.connect().map_err(backend)?).await?;
         let mode = first_text(&conn, "PRAGMA journal_mode = DELETE").await?;
         if !mode.eq_ignore_ascii_case("delete") {
             return Err(SubstrateError::Backend(format!(
@@ -350,15 +338,74 @@ impl Drop for LibSqlSubstrate {
     }
 }
 
+/// A libSQL connection that is closed exactly once.
+///
+/// # The bug this exists for (T-0040)
+///
+/// libsql 0.6.0 closes a local connection **twice**. `LibsqlConnection`'s
+/// `Drop` calls `disconnect()`, and then its `conn` field — a
+/// `local::Connection` — drops and calls `disconnect()` again. Each call
+/// closes the handle if it holds the last clone, and both do, so
+/// `sqlite3_close_v2` runs on a handle the first call already freed. Upstream
+/// later made the second call harmless by nulling the handle after closing;
+/// 0.6.0 does not.
+///
+/// The second close reads freed memory. That only faults once the heap has
+/// handed the page back to the OS, which the Windows heap does far more
+/// readily than glibc or macOS. That is why the abort was Windows-only and
+/// needed many substrates open at once (a bigger heap releases more pages at
+/// teardown). Captured 14 Nov 2026: the faulting frame is
+/// `sqlite3SafetyCheckSickOrOk` ← `sqlite3_close_v2` ← `local::Connection::drop`
+/// inside `drop_glue<LibsqlConnection>`. Off the test rig it is worse than a
+/// crash. If the freed memory already belongs to another live connection, the
+/// second close shuts that connection.
+///
+/// # The fix
+///
+/// `last_owner` is a prepared statement, and a libSQL statement holds its own
+/// clone of the connection. While it lives, neither of `conn`'s two closes
+/// holds the last clone, so both do nothing. It is declared after `conn`, so
+/// it drops last. Its clone is then the only one left, and it closes the
+/// handle once. The statement is never stepped, so it holds no lock and blocks
+/// no journal-mode change, `DETACH` or checkpoint.
+///
+/// Remove this when libsql is upgraded past the double close.
+pub(crate) struct ClosedOnceConnection {
+    /// Dropped first: its two closes see `last_owner`'s clone and do nothing.
+    conn: Connection,
+    /// Dropped second: holds the last clone and closes the handle once.
+    #[allow(dead_code, reason = "held only for when it drops; never read")]
+    last_owner: libsql::Statement,
+}
+
+impl ClosedOnceConnection {
+    async fn new(conn: Connection) -> Result<Self> {
+        let last_owner = conn
+            .prepare("SELECT 1")
+            .await
+            .map_err(|e| SubstrateError::Backend(e.to_string()))?;
+        Ok(Self { conn, last_owner })
+    }
+}
+
+impl std::ops::Deref for ClosedOnceConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
 /// Open a connection with the busy timeout applied.
 ///
 /// Every connection this substrate hands out goes through here, so no code
 /// path can accidentally get a zero-timeout connection that fails fast under
-/// contention.
-async fn connect(db: &Database) -> Result<Connection> {
+/// contention, or one that is closed twice (see [`ClosedOnceConnection`]).
+async fn connect(db: &Database) -> Result<ClosedOnceConnection> {
     let conn = db
         .connect()
         .map_err(|e| SubstrateError::Backend(e.to_string()))?;
+    let conn = ClosedOnceConnection::new(conn).await?;
     // `PRAGMA busy_timeout` reports the value it set, so it is a *query*:
     // libSQL's `execute` rejects any statement that returns rows.
     conn.query(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}"), ())
@@ -593,7 +640,7 @@ struct LibSqlTransaction {
     /// Never read — holding it *is* the point: it is what serialises writers
     /// in-process so SQLite never has two to arbitrate between. Dropped on
     /// commit/rollback, which hands the writer to the next queued claimant.
-    _writer: OwnedMutexGuard<Connection>,
+    _writer: OwnedMutexGuard<ClosedOnceConnection>,
 }
 
 #[async_trait]

@@ -9,7 +9,11 @@ members = [
 [workspace.package]
 version      = "1.0.0"
 edition      = "2021"
-rust-version = "1.77.0"
+# 1.88: the floor the dependency tree declares (ratatui 0.30's crates, darling
+# 0.23, napi-build); the code itself needs 1.82 (`Option::is_none_or`). Was
+# "1.77.0", which nothing here builds on. Floor taken from the dependencies'
+# declarations, not from a build with a 1.88 toolchain (14 Nov 2026).
+rust-version = "1.88.0"
 authors      = ["Bishal Sen <bishalsenpersonal@gmail.com>"]
 license      = "MIT"
 repository   = "https://github.com/Sen-Bishal/AlB-DO"

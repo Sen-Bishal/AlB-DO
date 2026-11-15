@@ -9,6 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 // - Keep standalone benchmark gates (TTFB, hydration, server CPU) as release blockers.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
@@ -21,17 +22,6 @@ pub struct AppConfig {
     pub forge: ForgeConfig,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            renderer: None,
-            layouts: Vec::new(),
-            routes: Vec::new(),
-            forge: ForgeConfig::default(),
-        }
-    }
-}
 
 /// Where the durable substrate lives.
 ///

@@ -935,7 +935,7 @@ fn client_use_id_matches_the_server_golden() {
         let _ = marker;
     }
     let mut rest = golden.as_str();
-    while let Some(at) = rest.find(|c| c == 'i' || c == 'f') {
+    while let Some(at) = rest.find(['i', 'f']) {
         let tail = &rest[at..];
         let value = tail
             .strip_prefix("id=\"")
@@ -1909,8 +1909,8 @@ fn server_render(package: &str, source: &str) -> Option<Vec<String>> {
 /// `useId`-derived aria attribute the server wrote is rewritten under the user.
 ///
 /// Both sides run the SAME package source — the server through
-/// `bundle_npm_dependency` + QuickJS, the client through `build_client_npm_graph`
-/// + `assets/albedo-client.js` — so this exercises two independent bundlers and
+/// `bundle_npm_dependency` and QuickJS, the client through `build_client_npm_graph`
+/// and `assets/albedo-client.js` — so this exercises two independent bundlers and
 /// two independent renderers against one library.
 ///
 /// `#[ignore]`d because it reads an external corpus at
