@@ -2,7 +2,7 @@
 //!
 //! Measures the **elapsed time from `boot_production_server` entry
 //! to a ready `AlbedoServer` instance**: `RendererRuntime::from_artifacts_dir`
-//! (manifest + module source loading + QuickJS engine warm-up + cache
+//! (manifest + module source loading + `QuickJS` engine warm-up + cache
 //! priming) plus `CompiledProject::load_from_dir` (parse every
 //! `.tsx`, Phase K metadata extraction) plus the
 //! `AlbedoServerBuilder::build` finalize pass.
@@ -14,7 +14,7 @@
 //!
 //! Reference: `next start` for a 10-route Next.js app typically
 //! takes 1–3 seconds to ready depending on bundle size. ALBEDO's
-//! cold start is dominated by SWC parse + QuickJS warm-up; the
+//! cold start is dominated by SWC parse + `QuickJS` warm-up; the
 //! number below is the load-cost on the user's machine.
 //!
 //! Cold start is genuinely one-shot work — `sample_size(10)` keeps
@@ -22,7 +22,7 @@
 //! meaningful confidence intervals.
 //!
 //! Reproduce with:
-//!   cargo bench --bench parity_cold_start
+//!   cargo bench --bench `parity_cold_start`
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::path::PathBuf;

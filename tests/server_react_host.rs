@@ -5,13 +5,13 @@
 //! Tier C Phase 2 taught the *browser* to bind a package's `import 'react'` to
 //! Albedo's own runtime. The server still bound it to the real React in
 //! `node_modules` — and real React's `forwardRef` returns an **object**, while
-//! the QuickJS `h` shim can only call functions. An object fell through to the
+//! the `QuickJS` `h` shim can only call functions. An object fell through to the
 //! shim's tag-name branch and emitted the literal text `<[object Object]>` into
 //! the page. Every React component library rendered as garbage server-side while
 //! working perfectly once JavaScript ran.
 //!
 //! 🔑 **The fix is one table for both hosts** (`runtime::react_host`): the
-//! QuickJS prelude and `/_albedo/npm-runtime.js` install the *same* generated
+//! `QuickJS` prelude and `/_albedo/npm-runtime.js` install the *same* generated
 //! records, so `forwardRef` returns the same kind of thing on both sides. That
 //! is also the precondition for hydration **adopting** the server's DOM rather
 //! than replacing it.
@@ -79,7 +79,7 @@ fn write_slot_package(root: &Path) {
     .unwrap();
     std::fs::write(
         pkg.join("index.js"),
-        r#"
+        r"
 import * as React from 'react';
 
 function getElementRef(element) {
@@ -129,7 +129,7 @@ export const Slot = React.forwardRef(function (props, forwardedRef) {
 export const Relabel = function (props) {
   return React.cloneElement(props.children, undefined, props.label);
 };
-"#,
+",
     )
     .unwrap();
 }

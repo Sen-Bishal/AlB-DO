@@ -48,7 +48,7 @@ pub fn hoist_head_tags_from_body(body: &str) -> (String, RouteMetadata) {
                 continue;
             }
         }
-        let len = rest.chars().next().map(char::len_utf8).unwrap_or(1);
+        let len = rest.chars().next().map_or(1, char::len_utf8);
         out.push_str(&rest[..len]);
         rest = &rest[len..];
     }
@@ -133,7 +133,7 @@ fn parse_attrs(mut rest: &str) -> Vec<(String, String)> {
         let name = rest[..name_end].trim().to_ascii_lowercase();
         rest = rest[name_end..].trim_start();
         if name.is_empty() {
-            let len = rest.chars().next().map(char::len_utf8).unwrap_or(1);
+            let len = rest.chars().next().map_or(1, char::len_utf8);
             rest = &rest[len..];
             continue;
         }
@@ -364,9 +364,7 @@ fn expr_to_json(expr: &Expr) -> Option<Value> {
             let quasi = &tpl.quasis[0];
             let text = quasi
                 .cooked
-                .as_ref()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| quasi.raw.to_string());
+                .as_ref().map_or_else(|| quasi.raw.to_string(), std::string::ToString::to_string);
             Some(Value::String(text))
         }
         Expr::Array(arr) => {

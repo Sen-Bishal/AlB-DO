@@ -83,6 +83,7 @@ pub fn coerce(
 }
 
 /// Coerce an `in` array: each element alone, under the same rule.
+///
 /// Route-param elements that don't fit are dropped; code elements error.
 /// The result is the JSON text bound to `json_each(?)` — or `None` when no
 /// element survives (no match).

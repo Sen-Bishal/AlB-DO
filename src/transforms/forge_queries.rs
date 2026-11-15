@@ -143,7 +143,7 @@ pub struct Classification {
 }
 
 impl Classification {
-    fn extend(&mut self, other: Classification) {
+    fn extend(&mut self, other: Self) {
         self.queries.extend(other.queries);
         self.diagnostics.extend(other.diagnostics);
         self.legacy += other.legacy;
@@ -535,9 +535,8 @@ fn imported_strays(
                                 Diagnostic {
                                     at: at(span),
                                     message: format!(
-                                        "re-exporting `{}` is refused: it is a predicate a query \
-                                         reads, so import it from its home module where it's used",
-                                        name
+                                        "re-exporting `{name}` is refused: it is a predicate a query \
+                                         reads, so import it from its home module where it's used"
                                     ),
                                 },
                             ));
@@ -725,7 +724,7 @@ impl Visit for NamespaceUses<'_> {
     }
 }
 
-fn stray_reason(role: Role) -> &'static str {
+const fn stray_reason(role: Role) -> &'static str {
     match role {
         Role::CallArg => "passed to a function",
         Role::MemberWrite => "written to outside a query",
@@ -1377,7 +1376,7 @@ fn render(source: &str, edits: &[Edit], lo: usize, hi: usize) -> String {
 
 type SpanKey = (u32, u32);
 
-fn key(span: Span) -> SpanKey {
+const fn key(span: Span) -> SpanKey {
     (span.lo.0, span.hi.0)
 }
 
@@ -1855,7 +1854,7 @@ fn string_literal(expr: &Expr) -> Option<String> {
         Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => tpl.quasis[0]
             .cooked
             .as_ref()
-            .map(|cooked| cooked.to_string()),
+            .map(std::string::ToString::to_string),
         _ => None,
     }
 }
@@ -1905,7 +1904,7 @@ enum Node<'s> {
 }
 
 impl<'s> Node<'s> {
-    fn stmt(self) -> Option<&'s Stmt> {
+    const fn stmt(self) -> Option<&'s Stmt> {
         match self {
             Node::Stmt(stmt) | Node::Item(ModuleItem::Stmt(stmt)) => Some(stmt),
             Node::Item(_) => None,
@@ -2028,7 +2027,7 @@ impl Pass<'_> {
         }
     }
 
-    fn offset(&self, pos: swc_common::BytePos) -> usize {
+    const fn offset(&self, pos: swc_common::BytePos) -> usize {
         (pos.0 - self.file_start) as usize
     }
 
@@ -2942,15 +2941,12 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
         }
         self.next_param += 1;
         self.provenance.push(self.pass.provenance(value));
-        match &self.path {
-            Some((base, keys)) => self.sources.push(Source::Path {
-                base: *base,
-                keys: keys.clone(),
-            }),
-            None => {
-                self.values.push(Value::Expr(value));
-                self.sources.push(Source::Span(value.span()));
-            }
+        if let Some((base, keys)) = &self.path { self.sources.push(Source::Path {
+            base: *base,
+            keys: keys.clone(),
+        }); } else {
+            self.values.push(Value::Expr(value));
+            self.sources.push(Source::Span(value.span()));
         }
         param
     }
@@ -2964,15 +2960,12 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
         self.next_param += 1;
         self.provenance
             .push(self.pass.provenance(&Expr::Ident(ident.clone())));
-        match &self.path {
-            Some((base, keys)) => self.sources.push(Source::Path {
-                base: *base,
-                keys: keys.clone(),
-            }),
-            None => {
-                self.values.push(Value::Ident(ident));
-                self.sources.push(Source::Span(ident.span));
-            }
+        if let Some((base, keys)) = &self.path { self.sources.push(Source::Path {
+            base: *base,
+            keys: keys.clone(),
+        }); } else {
+            self.values.push(Value::Ident(ident));
+            self.sources.push(Source::Span(ident.span));
         }
         param
     }

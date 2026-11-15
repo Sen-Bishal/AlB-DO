@@ -542,12 +542,9 @@ async fn render_through_server(
                     .unwrap_or("(no content type)")
             ));
         }
-        let html = match String::from_utf8(fetched.body) {
-            Ok(html) => html,
-            Err(_) => {
-                reasons.push("the page is not UTF-8".to_string());
-                String::new()
-            }
+        let html = if let Ok(html) = String::from_utf8(fetched.body) { html } else {
+            reasons.push("the page is not UTF-8".to_string());
+            String::new()
         };
         let html = html.replacen(&live_bootstrap, &blank_bootstrap, 1);
         if html.contains(&token) {

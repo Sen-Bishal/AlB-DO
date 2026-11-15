@@ -104,22 +104,21 @@ impl IncrementalCache {
                 for (id, deps) in cache.dependency_graph {
                     self.dependency_graph.insert(id, deps);
                 }
-                *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = true;
+                *self.loaded.write().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
                 Ok(())
             }
             Err(e) => {
                 eprintln!(
-                    "Warning: Failed to deserialize cache, starting fresh: {}",
-                    e
+                    "Warning: Failed to deserialize cache, starting fresh: {e}"
                 );
-                *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = true;
+                *self.loaded.write().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
                 Ok(())
             }
         }
     }
 
     fn ensure_loaded(&self) {
-        if !*self.loaded.read().unwrap_or_else(|e| e.into_inner()) {
+        if !*self.loaded.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
             let _ = self.load();
         }
     }
@@ -127,7 +126,7 @@ impl IncrementalCache {
     fn get_or_load_component(&self, id: ComponentId) -> Option<CachedAnalysis> {
         self.ensure_loaded();
 
-        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
             if let Some(cached) = data.component_cache.get(&id) {
                 return Some(cached.clone());
             }
@@ -143,7 +142,7 @@ impl IncrementalCache {
     fn get_or_load_file_hash(&self, path: &PathBuf) -> Option<FileHash> {
         self.ensure_loaded();
 
-        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
             if let Some(&hash) = data.file_hashes.get(path) {
                 return Some(hash);
             }
@@ -159,7 +158,7 @@ impl IncrementalCache {
     fn get_or_load_file_components(&self, path: &PathBuf) -> Option<HashSet<ComponentId>> {
         self.ensure_loaded();
 
-        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
             if let Some(ids) = data.file_to_components.get(path) {
                 return Some(ids.clone());
             }
@@ -247,7 +246,7 @@ impl IncrementalCache {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to hash file {:?}: {}", path, e);
+                    eprintln!("Warning: Failed to hash file {path:?}: {e}");
                 }
             }
         }
@@ -255,10 +254,10 @@ impl IncrementalCache {
 
         let tracked_files: Vec<PathBuf> = {
             let mut files = Vec::new();
-            for entry in self.file_hashes.iter() {
+            for entry in &self.file_hashes {
                 files.push(entry.key().clone());
             }
-            if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(|e| e.into_inner()) {
+            if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
                 for path in data.file_hashes.keys() {
                     if !self.file_hashes.contains_key(path) {
                         files.push(path.clone());
@@ -281,10 +280,10 @@ impl IncrementalCache {
         }
     }
     pub fn invalidate_component(&self, id: ComponentId, reason: InvalidationReason) {
-        self.invalidated.insert(id, reason.clone());
+        self.invalidated.insert(id, reason);
         self.component_cache.remove(&id);
         if let Some(dependents) = self.get_dependents(id) {
-            for dependent_id in dependents.iter() {
+            for dependent_id in &dependents {
                 if !self.invalidated.contains_key(dependent_id) {
                     self.invalidate_component(*dependent_id, InvalidationReason::DependencyChanged);
                 }
@@ -294,7 +293,7 @@ impl IncrementalCache {
     fn get_dependents(&self, id: ComponentId) -> Option<HashSet<ComponentId>> {
         let mut dependents = HashSet::new();
 
-        for entry in self.dependency_graph.iter() {
+        for entry in &self.dependency_graph {
             if entry.value().contains(&id) {
                 dependents.insert(*entry.key());
             }
@@ -312,7 +311,7 @@ impl IncrementalCache {
 
         for path in &changes.changed_files {
             if let Some(component_ids) = self.get_or_load_file_components(path) {
-                for id in component_ids.iter() {
+                for id in &component_ids {
                     self.invalidate_component(*id, InvalidationReason::FileChanged);
                 }
             }
@@ -320,7 +319,7 @@ impl IncrementalCache {
 
         for path in &changes.deleted_files {
             if let Some(component_ids) = self.get_or_load_file_components(path) {
-                for id in component_ids.iter() {
+                for id in &component_ids {
                     self.invalidate_component(*id, InvalidationReason::Deleted);
                 }
             }
@@ -413,11 +412,11 @@ pub struct ChangeSet {
 }
 
 impl ChangeSet {
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.changed_files.is_empty() && self.new_files.is_empty() && self.deleted_files.is_empty()
     }
 
-    pub fn total_changes(&self) -> usize {
+    pub const fn total_changes(&self) -> usize {
         self.changed_files.len() + self.new_files.len() + self.deleted_files.len()
     }
 }
@@ -432,7 +431,7 @@ pub struct CacheStats {
 
 /// `xxh3_64` content hash — stable across Rust versions, process runs, and
 /// platforms. Unlike `DefaultHasher`, this is deterministic: same bytes →
-/// same hash. Cycle 2 of the SoA IR refactor swapped the previous FNV-1a
+/// same hash. Cycle 2 of the `SoA` IR refactor swapped the previous FNV-1a
 /// byte loop for `xxh3_64`, which is SIMD-aware and ~3-5× faster on modern
 /// hardware while remaining a fixed-seed, allocation-free function. The
 /// hash space (64 bits) is unchanged so the on-wire `source_hash` field

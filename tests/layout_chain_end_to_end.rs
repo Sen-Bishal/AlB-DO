@@ -310,7 +310,7 @@ fn route_manifest_carries_error_component_from_discovery() {
     );
 }
 
-/// Stream E.2 — same shape as the error_component test, for
+/// Stream E.2 — same shape as the `error_component` test, for
 /// `loading.tsx`. Loading + error are independent (a route can have
 /// one but not the other), so this is a separate assertion.
 #[test]

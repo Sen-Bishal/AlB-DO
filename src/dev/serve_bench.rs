@@ -49,10 +49,10 @@ pub enum Method {
 }
 
 impl Method {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Method::Get => "GET",
-            Method::Post => "POST",
+            Self::Get => "GET",
+            Self::Post => "POST",
         }
     }
 }
@@ -335,7 +335,7 @@ fn build_request_bytes(spec: &RequestSpec, host_header: &str, keep_alive: bool) 
 /// CLOSE mode: one request/response over a fresh connection, read to
 /// EOF. Works for any framing (`Content-Length` or chunked) since the
 /// server closes the socket at the end. Returns
-/// (status, ttfb, total, body_bytes).
+/// (status, ttfb, total, `body_bytes`).
 fn do_request(
     addr: std::net::SocketAddr,
     host_header: &str,
@@ -473,7 +473,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 /// Parse the status code + body-framing signals from the header block.
-/// Returns (status, content_length, is_chunked).
+/// Returns (status, `content_length`, `is_chunked`).
 fn parse_head(head: &[u8]) -> (u16, Option<usize>, bool) {
     let text = String::from_utf8_lossy(head);
     let mut lines = text.split("\r\n");

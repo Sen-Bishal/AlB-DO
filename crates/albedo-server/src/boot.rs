@@ -396,8 +396,7 @@ fn boot_inner(
     // the pure-Rust interpreter (counter + broadcast tests) and additionally
     // runs loops/`try`/array methods that the pure-Rust path rejects.
     let action_engine_pool_size = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+        .map_or(1, std::num::NonZero::get);
 
     // The app's declared collections, lowered and validated here so a malformed
     // `forge` block fails the boot with the offending collection named, rather
@@ -575,7 +574,7 @@ fn boot_inner(
     // the reason they are there: a relay on a private address is refused by
     // `check_address` unless it is declared, and the `email` block declares it.
     let mut auth_egress_hosts = auth_registry.egress_hosts();
-    if let Some(host) = email_config.as_ref().and_then(|config| config.egress_host()) {
+    if let Some(host) = email_config.as_ref().and_then(dom_render_compiler::email::EmailConfig::egress_host) {
         auth_egress_hosts.insert(host);
     }
     let source_reader = if opts.sources.is_empty() && auth_egress_hosts.is_empty() {
@@ -737,7 +736,7 @@ fn boot_inner(
     // TLS mode is known.
     if let Some(config) = email_config {
         builder = builder
-            .with_email(config, &opts.project_dir, data_dir.clone(), opts.dev_mode)
+            .with_email(config, &opts.project_dir, data_dir, opts.dev_mode)
             .map_err(RuntimeError::ServerStartup)?;
     }
 

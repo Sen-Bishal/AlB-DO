@@ -194,7 +194,7 @@ impl BuildWorkload for CommandBuildWorkload {
         } else {
             Err(format!(
                 "build command exited with {}",
-                status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+                status.code().map_or_else(|| "signal".into(), |c| c.to_string())
             ))
         }
     }

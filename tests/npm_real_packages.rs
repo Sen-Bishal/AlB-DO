@@ -164,7 +164,7 @@ fn date_fns_formats_through_root_import() {
 }
 
 /// The whole production loop with real zod: `CompiledProject::wrap` discovers
-/// and bundles the dependency, the QuickJS render preloads it, and an action
+/// and bundles the dependency, the `QuickJS` render preloads it, and an action
 /// handler validates through `z` (seeded as an npm import binding). This is
 /// the Gate 1 verification line — "TSX with `import { z } from "zod"` and an
 /// action handler" — running end-to-end.

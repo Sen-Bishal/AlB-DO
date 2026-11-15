@@ -13,7 +13,7 @@
 //! rotation in Stage 1 because the session id itself rotates per
 //! browser session.
 //!
-//! Not a replacement for SameSite cookies or origin checks — this is
+//! Not a replacement for `SameSite` cookies or origin checks — this is
 //! defence in depth, not the only line.
 //!
 //! ## Lifetime
@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 pub use dom_render_compiler::transforms::form::CSRF_FIELD_NAME;
 
 /// Cookie name that carries the per-session id between requests.
+///
 /// The streaming handler mints one on first visit (Set-Cookie); the
 /// browser auto-attaches it to every subsequent request including
 /// form action POSTs. Both the page-render path and the action

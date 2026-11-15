@@ -18,7 +18,7 @@
 //! Factories are registered eagerly (cheap — a function definition) but run
 //! lazily and memoized on first `__albedo_require_record` access, with the
 //! record **published before the factory body runs**. That is exactly Node's
-//! CommonJS cycle discipline: an import cycle observes a partially-initialized
+//! `CommonJS` cycle discipline: an import cycle observes a partially-initialized
 //! record instead of deadlocking or recursing forever, so no topological sort
 //! is needed and real-world ESM graphs (date-fns is ~250 reachable files) load
 //! in any order.
@@ -68,7 +68,7 @@ pub enum NpmBundleError {
     /// The specifier names a **Node built-in**, not a package.
     ///
     /// 🔑 **Diagnosis, not a resolution failure.** The old message —
-    /// *"npm package 'crypto' not found in node_modules"* — sent a reader
+    /// *"npm package 'crypto' not found in `node_modules`"* — sent a reader
     /// hunting for a dependency they never had (`TODO.md` 9.5 names that
     /// sentence). The reason comes from [`crate::runtime::node_builtins`] and
     /// says which of the two futures the built-in has: a host capability that
@@ -334,8 +334,7 @@ fn resolve_exports_subpath(exports: &serde_json::Value, subpath: &str) -> Option
     // root subpath only.
     let is_subpath_map = exports
         .as_object()
-        .map(|map| map.keys().all(|key| key.starts_with('.')))
-        .unwrap_or(false);
+        .is_some_and(|map| map.keys().all(|key| key.starts_with('.')));
 
     if !is_subpath_map {
         if subpath == "." {
@@ -416,7 +415,7 @@ fn probe_file(base: &Path) -> Option<PathBuf> {
 fn probe_file_inner(base: &Path, depth: u8) -> Option<PathBuf> {
     let base = &normalize_path(base);
     if base.is_file() {
-        return Some(base.to_path_buf());
+        return Some(base.clone());
     }
     for ext in ["js", "mjs", "cjs", "json"] {
         let mut candidate = base.as_os_str().to_owned();
@@ -503,7 +502,7 @@ fn directory_entry_target(dir: &Path) -> Option<String> {
 /// file whose extension is `.js` (the `.m` is part of the *basename*) and the
 /// old classifier called it CJS. The CJS lowering wraps source verbatim in a
 /// `function(module, exports, require, …)` IIFE — so `export function clsx(){}`
-/// landed inside a function body and QuickJS answered *"unsupported keyword:
+/// landed inside a function body and `QuickJS` answered *"unsupported keyword:
 /// export"*. **The lowering was innocent; the label was wrong.**
 ///
 /// 🔑 **Provenance alone would not have been enough.** Marking only the entry
@@ -686,7 +685,7 @@ fn resolve_bare_entry(
             }
         })?
     } else if subpath != "." {
-        subpath.clone()
+        subpath
     } else {
         manifest
             .module
@@ -731,9 +730,7 @@ fn resolve_from_file(
 /// Canonical record key for a file inside a package.
 fn record_key(package: &ResolvedPackage, file: &Path) -> String {
     let relative = file
-        .strip_prefix(&package.dir)
-        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| file.to_string_lossy().replace('\\', "/"));
+        .strip_prefix(&package.dir).map_or_else(|_| file.to_string_lossy().replace('\\', "/"), |rel| rel.to_string_lossy().replace('\\', "/"));
     format!("npm:{}@{}/{}", package.name, package.version, relative)
 }
 
@@ -1180,13 +1177,13 @@ pub struct ShakeOptions {
 impl ShakeOptions {
     /// Build an option set from an externals table and a define set.
     #[must_use]
-    pub fn new(externals: BTreeMap<String, ExternalTarget>, defines: Defines) -> Self {
+    pub const fn new(externals: BTreeMap<String, ExternalTarget>, defines: Defines) -> Self {
         Self { externals, defines }
     }
 
     /// The externals table, for callers that need to emit matching host records.
     #[must_use]
-    pub fn externals(&self) -> &BTreeMap<String, ExternalTarget> {
+    pub const fn externals(&self) -> &BTreeMap<String, ExternalTarget> {
         &self.externals
     }
 }
@@ -1704,7 +1701,7 @@ impl Visit for RequireCollector {
 /// trap this type exists to prevent — see [`scan_deferred_loads`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LoadForm {
-    /// `require("x")` — CommonJS.
+    /// `require("x")` — `CommonJS`.
     Require,
     /// `import("x")` — a dynamic ESM import.
     DynamicImport,
@@ -1804,7 +1801,7 @@ impl Visit for DeferredLoadCollector {
 /// The one form that carries no ambiguity is [`LoadForm::Require`] **in project
 /// source**: `require` is a parameter of the CJS factory wrapper
 /// (`function(module, exports, require, …)`), never a global. Neither the
-/// QuickJS prelude nor `assets/albedo-client.js` defines one, so a `require` an
+/// `QuickJS` prelude nor `assets/albedo-client.js` defines one, so a `require` an
 /// author writes is a `ReferenceError` on the server render path *and* in the
 /// browser. There is no configuration in which it works.
 ///
@@ -1966,7 +1963,7 @@ pub fn bundle_npm_dependency(
                 None => {}
             }
             let (dep_package, dep_path) = resolve_from_file(&package, &path, &raw)?;
-            resolve_map.insert(raw.clone(), record_key(&dep_package, &dep_path));
+            resolve_map.insert(raw, record_key(&dep_package, &dep_path));
             queue.push((dep_package, dep_path));
         }
 

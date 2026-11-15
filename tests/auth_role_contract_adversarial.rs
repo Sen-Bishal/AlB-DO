@@ -64,7 +64,7 @@ fn duplicate_literal_keys_follow_javascript_but_never_hide_computed_fragments() 
 #[test]
 fn boot_rejects_empty_computed_and_undeclared_gates_from_real_modules() {
     for (expression, expected) in [
-        (r#"{ role: [] }"#, "names no role"),
+        (r"{ role: [] }", "names no role"),
         (r#"{ role: "finance" }"#, "finance"),
         (r#"{ role: ["payroll", roleName] }"#, "literal"),
     ] {

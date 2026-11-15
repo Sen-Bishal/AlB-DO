@@ -7,14 +7,14 @@
 //!        - `BindEvent { stable_id, event_id, proxy_id }` per `on*` handler
 //!        - `SetTextRef { stable_id, slot_id }` per `{slot}` read in JSX
 //!
-//!   2. A server-side ActionHandler registration per handler, keyed by
+//!   2. A server-side `ActionHandler` registration per handler, keyed by
 //!      `proxy_id`. Invoking the handler must execute the handler body
 //!      against the session slot store and produce `SlotSet` opcodes
 //!      for every `setX(...)` call inside.
 //!
 //! The corpus stages risk per the sprint plan:
 //!   - Stage 1: literal `useState(N)` only, no closures over outer scope.
-//!     Counter, multi_hook, string_state.
+//!     Counter, `multi_hook`, `string_state`.
 //!   - Stage 2 (deferred): closures over component props.
 //!   - Stage 3 (deferred): closures over module-level constants.
 //!

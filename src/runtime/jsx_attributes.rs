@@ -8,7 +8,7 @@
 //! | renderer | site |
 //! |---|---|
 //! | pure-Rust (Tier A/B static) | [`crate::runtime::eval::component`] |
-//! | QuickJS `h` (Tier B per-request, Tier C island SSR) | the `h` shim's attribute loop |
+//! | `QuickJS` `h` (Tier B per-request, Tier C island SSR) | the `h` shim's attribute loop |
 //! | `assets/albedo-client.js` (hydration + client updates) | `applyProp` |
 //!
 //! Hydration *adopts* the server's DOM on the strength of that agreement. A
@@ -19,7 +19,7 @@
 //! place and the other two are *derived* from it:
 //!
 //! * the pure-Rust renderer calls [`jsx_attribute_name`] directly;
-//! * the QuickJS prelude is **generated** from [`JSX_ATTRIBUTE_RENAMES`] by
+//! * the `QuickJS` prelude is **generated** from [`JSX_ATTRIBUTE_RENAMES`] by
 //!   [`build_jsx_attribute_table_script`];
 //! * `albedo-client.js` is hand-written JavaScript that cannot be generated, so
 //!   a test asserts its table is set-equal to this one. That test is the only
@@ -30,7 +30,7 @@
 //! 🔑 **The mapping is keyed on the attribute name alone.** `strokeWidth` is
 //! meaningless on a `<div>` and `fillRule` is meaningless outside SVG, so no
 //! renderer has to know whether it is inside an `<svg>` subtree to decide the
-//! spelling. That matters because the QuickJS `h` is **eager and depth-first** —
+//! spelling. That matters because the `QuickJS` `h` is **eager and depth-first** —
 //! a child is stringified before its parent exists, so a context flag could not
 //! work there even if we wanted one. Element *creation* is still
 //! context-sensitive (`createElementNS` on the client), but that is a separate
@@ -306,7 +306,7 @@ pub fn safe_attribute_value<'a>(attribute_name: &str, value: &'a str) -> &'a str
 
 /// [`is_script_url`] + [`BLOCKED_URL`] as a JavaScript function expression
 /// `function(v){…}` returning the string to emit, for the renderers that run JS:
-/// the QuickJS `h` shim and the list templater's row thunks.
+/// the `QuickJS` `h` shim and the list templater's row thunks.
 ///
 /// Regex-free on purpose: some of this code is inlined raw into a classic
 /// `<script>`, where the inline-script escaper's `</` rewrite can corrupt a regex

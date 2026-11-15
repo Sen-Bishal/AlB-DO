@@ -266,7 +266,7 @@ fn lower(column: &str, value: &Value, spec: Option<&FieldSpec>) -> Result<Value,
     }
 }
 
-fn type_name(ty: FieldType) -> &'static str {
+const fn type_name(ty: FieldType) -> &'static str {
     match ty {
         FieldType::Text => "text",
         FieldType::Int => "int",

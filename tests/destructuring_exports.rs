@@ -94,7 +94,7 @@ binding_case!(local_nested_default_and_declarators, npm_nested_default_and_decla
     "ns.first + ',' + ns.leaf + ',' + ns.plain", "first,leaf,plain:4,6,7");
 
 /// Prepare with `albedo init target/t0037-openai-probe`, then install openai
-/// there. This uses the real CLI action door and never contacts OpenAI.
+/// there. This uses the real CLI action door and never contacts `OpenAI`.
 #[test]
 #[ignore = "requires the debug albedo binary and npm-installed openai fixture"]
 fn openai_client_action_against_local_mock() {

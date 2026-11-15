@@ -88,15 +88,13 @@ impl WebTransportSessionRegistry {
     pub fn count(&self) -> usize {
         self.sessions
             .lock()
-            .map(|sessions| sessions.len())
-            .unwrap_or(0)
+            .map_or(0, |sessions| sessions.len())
     }
 
     pub fn has(&self, session_id: &Uuid) -> bool {
         self.sessions
             .lock()
-            .map(|sessions| sessions.contains_key(session_id))
-            .unwrap_or(false)
+            .is_ok_and(|sessions| sessions.contains_key(session_id))
     }
 
     pub(crate) fn bound_entry(
@@ -144,15 +142,14 @@ impl WebTransportSessionRegistry {
                 RuntimeError::ServerRuntime("WT session registry lock poisoned".to_string())
             })?;
             let handle = sessions.get(&session_id).ok_or_else(|| {
-                RuntimeError::ServerRuntime(format!("WT session '{}' not found", session_id))
+                RuntimeError::ServerRuntime(format!("WT session '{session_id}' not found"))
             })?;
             handle.stream_senders[stream_slot as usize].clone()
         };
 
         sender.send(bytes::Bytes::from(payload)).await.map_err(|_| {
             RuntimeError::ServerRuntime(format!(
-                "WT stream slot {} channel closed for session '{}'",
-                stream_slot, session_id
+                "WT stream slot {stream_slot} channel closed for session '{session_id}'"
             ))
         })
     }
@@ -594,8 +591,7 @@ fn load_cert_chain(
 ) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>, RuntimeError> {
     let cert_file = std::fs::File::open(Path::new(cert_path)).map_err(|err| {
         RuntimeError::InvalidConfig(format!(
-            "failed to open webtransport.cert_path '{}': {err}",
-            cert_path
+            "failed to open webtransport.cert_path '{cert_path}': {err}"
         ))
     })?;
     let mut cert_reader = BufReader::new(cert_file);
@@ -603,8 +599,7 @@ fn load_cert_chain(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| {
             RuntimeError::InvalidConfig(format!(
-                "failed to parse PEM certificates from '{}': {err}",
-                cert_path
+                "failed to parse PEM certificates from '{cert_path}': {err}"
             ))
         })
 }
@@ -614,22 +609,19 @@ fn load_private_key(
 ) -> Result<rustls_pki_types::PrivateKeyDer<'static>, RuntimeError> {
     let key_file = std::fs::File::open(Path::new(key_path)).map_err(|err| {
         RuntimeError::InvalidConfig(format!(
-            "failed to open webtransport.key_path '{}': {err}",
-            key_path
+            "failed to open webtransport.key_path '{key_path}': {err}"
         ))
     })?;
     let mut key_reader = BufReader::new(key_file);
     let key = rustls_pemfile::private_key(&mut key_reader).map_err(|err| {
         RuntimeError::InvalidConfig(format!(
-            "failed to parse PEM private key from '{}': {err}",
-            key_path
+            "failed to parse PEM private key from '{key_path}': {err}"
         ))
     })?;
 
     key.ok_or_else(|| {
         RuntimeError::InvalidConfig(format!(
-            "no private key found in webtransport.key_path '{}'",
-            key_path
+            "no private key found in webtransport.key_path '{key_path}'"
         ))
     })
 }

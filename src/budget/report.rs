@@ -44,7 +44,7 @@ pub enum ViolationKind {
 impl ViolationKind {
     /// Short tag rendered in the pretty formatter and as the JSON
     /// label. Stable so tooling can grep for them.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::TierAMaxComponentsPerRoute => "tier-a count",
             Self::TierBMaxKbPerRoute => "tier-b route weight",
@@ -55,7 +55,7 @@ impl ViolationKind {
     }
 
     /// Unit string for the ceiling values — `"count"` or `"KB"`.
-    pub fn unit(self) -> &'static str {
+    pub const fn unit(self) -> &'static str {
         match self {
             Self::TierAMaxComponentsPerRoute | Self::TierCMaxConcurrentFetchesPerRoute => "count",
             Self::TierBMaxKbPerRoute
@@ -85,7 +85,7 @@ pub struct BudgetReport {
 }
 
 impl BudgetReport {
-    pub fn is_ok(&self) -> bool {
+    pub const fn is_ok(&self) -> bool {
         self.violations.is_empty()
     }
 }
@@ -104,7 +104,7 @@ pub struct RouteSummary {
 /// Evaluate `manifest` against `budget`. Pure function — no IO, no
 /// allocation surprises beyond the obvious. Routes are walked in the
 /// order [`RenderManifestV2.routes`] iterates (`HashMap` order is
-/// not stable, so the formatter sorts route_summaries before
+/// not stable, so the formatter sorts `route_summaries` before
 /// printing).
 pub fn evaluate_budget(manifest: &RenderManifestV2, budget: &TierBudget) -> BudgetReport {
     let weights = component_weight_index(manifest);
@@ -186,7 +186,7 @@ pub fn evaluate_budget(manifest: &RenderManifestV2, budget: &TierBudget) -> Budg
     }
 }
 
-/// Name → weight_bytes lookup. Built once per evaluation rather
+/// Name → `weight_bytes` lookup. Built once per evaluation rather
 /// than per-route so the per-component cap check is O(1) per node.
 fn component_weight_index(manifest: &RenderManifestV2) -> HashMap<String, u64> {
     let mut map = HashMap::with_capacity(manifest.components.len());

@@ -32,7 +32,7 @@
 //!   which is what the **live `albedo serve` path** actually invokes.
 //!
 //! 🪤 **If those two disagree, the failure is silent in the worst direction:**
-//! preflight sees a default and passes the build, then QuickJS finds no
+//! preflight sees a default and passes the build, then `QuickJS` finds no
 //! `.default` on the record and the route serves nothing. One definition, called
 //! twice, is the only shape that cannot drift — the same correction item 13.4
 //! made to the docker target, where a hand-maintained list shadowed a function

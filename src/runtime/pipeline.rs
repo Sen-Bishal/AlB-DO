@@ -216,7 +216,7 @@ impl FourLaneRuntimePipeline {
     ///
     /// Prefer [`Self::require_runtime_handle`] at call sites that genuinely
     /// need to spawn — the typed error path is part of the contract.
-    pub fn runtime_handle(&self) -> Option<&tokio::runtime::Handle> {
+    pub const fn runtime_handle(&self) -> Option<&tokio::runtime::Handle> {
         self.runtime_handle.as_ref()
     }
 
@@ -374,7 +374,7 @@ impl FourLaneRuntimePipeline {
         self.highway
             .lanes
             .get(lane)
-            .map(|plan| plan.flattened_components())
+            .map(super::highway::HighwayLanePlan::flattened_components)
             .unwrap_or_default()
     }
 
@@ -479,7 +479,7 @@ impl FourLaneRuntimePipeline {
 
     /// Recomputes per-slot `source_hashes` for every lane by folding the
     /// hot scheduling columns (`effects`, `priorities`, `phases`) into a
-    /// stable FxHash digest. Picks the rayon fan-out path when
+    /// stable `FxHash` digest. Picks the rayon fan-out path when
     /// [`should_parallelize`] expects parallelism to amortize, otherwise
     /// drives each lane serially via `lane_column_pass_mut`.
     ///
@@ -541,19 +541,19 @@ impl FourLaneRuntimePipeline {
 
     /// Read-only access to the frame arena's lane patch buffers, used by
     /// transports that want to forward the raw bytes after a `tick_frame`.
-    pub fn frame_arena(&self) -> &FrameArena {
+    pub const fn frame_arena(&self) -> &FrameArena {
         &self.frame_arena
     }
 
-    pub fn columns(&self) -> &IrColumns {
+    pub const fn columns(&self) -> &IrColumns {
         &self.columns
     }
 
-    pub fn dirty_bitmap(&self) -> &DirtyBitmap {
+    pub const fn dirty_bitmap(&self) -> &DirtyBitmap {
         &self.dirty_bitmap
     }
 
-    pub fn frame_metrics(&self) -> &FrameMetrics {
+    pub const fn frame_metrics(&self) -> &FrameMetrics {
         &self.frame_metrics
     }
 
@@ -635,17 +635,14 @@ impl FourLaneRuntimePipeline {
             suspense_id,
         }])?;
 
-        match self.pending_placeholder_emissions.lock() {
-            Ok(mut queue) => queue.push((suspense_id, placeholder_chunk)),
-            Err(_) => {
-                // Lock poisoning would mean an earlier tick panicked while
-                // holding it. Drop the placeholder rather than panic again;
-                // the island's Future will still resolve and surface a
-                // (now-orphan) Patch which `drain_async_patch_chunks`
-                // tolerates by skipping unknown suspense ids.
-                self.pending_placeholders.remove(&suspense_id);
-                return Err(RuntimePipelineError::MissingRuntimeHandle);
-            }
+        if let Ok(mut queue) = self.pending_placeholder_emissions.lock() { queue.push((suspense_id, placeholder_chunk)) } else {
+            // Lock poisoning would mean an earlier tick panicked while
+            // holding it. Drop the placeholder rather than panic again;
+            // the island's Future will still resolve and surface a
+            // (now-orphan) Patch which `drain_async_patch_chunks`
+            // tolerates by skipping unknown suspense ids.
+            self.pending_placeholders.remove(&suspense_id);
+            return Err(RuntimePipelineError::MissingRuntimeHandle);
         }
 
         let tx = self.async_tx.clone();
@@ -670,7 +667,7 @@ impl FourLaneRuntimePipeline {
     /// affects the *pending* async side of the bookkeeping.
     pub fn cancel_pending_async_for(&self, stable_id: StableId) -> usize {
         let mut marked = 0;
-        for entry in self.pending_placeholders.iter() {
+        for entry in &self.pending_placeholders {
             if entry.value().stable_id == stable_id
                 && !entry.value().cancelled.swap(true, Ordering::Relaxed)
             {
@@ -708,8 +705,7 @@ impl FourLaneRuntimePipeline {
             let cancelled = self
                 .pending_placeholders
                 .remove(&resolution.suspense_id)
-                .map(|(_, record)| record.cancelled.load(Ordering::Relaxed))
-                .unwrap_or(true);
+                .is_none_or(|(_, record)| record.cancelled.load(Ordering::Relaxed));
 
             if cancelled {
                 continue;
@@ -764,7 +760,7 @@ impl FourLaneRuntimePipeline {
     /// (always [`crate::runtime::webtransport::WT_STREAM_SLOT_PATCHES`]
     /// for opcode emission), not the highway lane that produced it.
     /// Routing through [`WTStreamRouter::route_component_chunk`] keeps
-    /// the patch_sequence counters in lockstep with the muxer so a later
+    /// the `patch_sequence` counters in lockstep with the muxer so a later
     /// `mux_lane_chunks` builds well-attributed `WebTransportFrame`s.
     ///
     /// The highway lane (0..3) is an internal scheduling detail. Once a
@@ -882,7 +878,7 @@ impl FourLaneRuntimePipeline {
     /// client can treat slot 0 as pure-text and slot 2 as pure-binary,
     /// avoiding a per-message kind discriminator.
     ///
-    /// Centralising the frame_id allocation and wire encoding in one
+    /// Centralising the `frame_id` allocation and wire encoding in one
     /// place keeps the contract `(instructions) -> chunk` provable; the
     /// bootstrap and patch paths are byte-identical past the
     /// instruction-vector boundary.
@@ -916,7 +912,7 @@ impl FourLaneRuntimePipeline {
 }
 
 /// Per-lane source-hash recompute. Folds `effects`, `priorities`, and
-/// `phases` (bit-cast to u32) into FxHash so any mutation in those columns
+/// `phases` (bit-cast to u32) into `FxHash` so any mutation in those columns
 /// flips the slot's `source_hash` and the next reconcile pass picks it up.
 fn recompute_lane_source_hashes(pass: LaneColumnPass<'_>) {
     let LaneColumnPass {

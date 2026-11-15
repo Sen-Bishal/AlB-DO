@@ -69,7 +69,7 @@ const DONE_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const SWEEP_EVERY: u32 = 64;
 
 /// A project's jobs, ready to run.
-pub(crate) struct JobsPlan {
+pub struct JobsPlan {
     entry: Arc<str>,
     decl: Arc<JobsDecl>,
     modules: Arc<Vec<(String, String)>>,
@@ -214,7 +214,7 @@ impl JobsPlan {
 /// about what a valid job name is — an action calling `enqueue()` and a job body
 /// calling it. Two answers to that question is two behaviours for one typo.
 #[derive(Clone)]
-pub(crate) struct JobHandle {
+pub struct JobHandle {
     wake: Arc<Notify>,
     /// `None` for an app with no `src/jobs.ts`; every `enqueue()` is then a
     /// refusal, which is correct — there is nothing it could name.
@@ -249,7 +249,7 @@ impl JobHandle {
 ///
 /// # Errors
 /// The name is not declared, the delay is unreadable, or the write is refused.
-pub(crate) async fn write_enqueue(
+pub async fn write_enqueue(
     db: &dyn DataSubstrate,
     handle: &JobHandle,
     intent: &dom_render_compiler::jobs::EnqueueIntent,
@@ -264,7 +264,7 @@ pub(crate) async fn write_enqueue(
 }
 
 /// Validate the authored intent before entering the action's writer transaction.
-pub(crate) async fn prepare_enqueue(
+pub async fn prepare_enqueue(
     db: &dyn DataSubstrate,
     handle: &JobHandle,
     intent: &dom_render_compiler::jobs::EnqueueIntent,
@@ -354,7 +354,7 @@ pub(crate) async fn prepare_enqueue(
 ///
 /// # Errors
 /// The row could not be written.
-pub(crate) async fn queue_email(
+pub async fn queue_email(
     db: &dyn DataSubstrate,
     handle: &JobHandle,
     message: dom_render_compiler::email::Message,
@@ -419,7 +419,7 @@ struct Scheduled {
 }
 
 /// Everything the loop needs, so the spawned task owns one value.
-pub(crate) struct JobRunner {
+pub struct JobRunner {
     /// `None` for an app with no `src/jobs.ts`. The built-ins still run.
     plan: Option<JobsPlan>,
     db: Arc<dyn DataSubstrate>,

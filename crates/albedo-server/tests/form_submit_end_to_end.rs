@@ -383,7 +383,7 @@ async fn cookie_session_round_trips_into_action_handler() {
 /// CSRF wire path share the same hash family. If someone refactors
 /// either the server's `form_action_id` or the compiler's
 /// `allocate_form_action_id`, this test catches the drift before
-/// production silently routes to the wrong action_id.
+/// production silently routes to the wrong `action_id`.
 #[test]
 fn action_id_parity_across_compiler_and_server() {
     let server_side = form_action_id(ACTION_NAME);

@@ -145,7 +145,7 @@ pub fn npm_imports(compiled: &CompiledProject) -> Option<Failure> {
 ///
 /// `require` is a **parameter of the CJS factory wrapper**
 /// (`function(module, exports, require, …)`) that `bundler::npm` emits around a
-/// package's own files — never a global. Neither the QuickJS prelude nor
+/// package's own files — never a global. Neither the `QuickJS` prelude nor
 /// `assets/albedo-client.js` defines one, so a `require` an author writes in
 /// project source is a `ReferenceError` on the server render path *and* in the
 /// browser. There is no configuration in which it works, and no specifier that

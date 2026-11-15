@@ -50,8 +50,7 @@ pub enum GraphSource {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn priority_to_albedo(priority: f64) -> f32 {
@@ -59,7 +58,7 @@ fn priority_to_albedo(priority: f64) -> f32 {
     // map to a slightly lower albedo (more of the render budget is spent here
     // rather than reflected back). Clamp into [0.2, 0.95] so every node
     // visualizes as a reasonable disc.
-    let raw = 1.0 - (priority.clamp(0.0, 4.0) / 4.0) * 0.5;
+    let raw = (priority.clamp(0.0, 4.0) / 4.0).mul_add(-0.5, 1.0);
     raw.clamp(0.2, 0.95) as f32
 }
 

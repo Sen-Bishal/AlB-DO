@@ -57,11 +57,11 @@ pub enum CacheScope {
 impl CacheScope {
     fn tag(&self) -> String {
         match self {
-            CacheScope::Public => "public".to_string(),
-            CacheScope::App => "app".to_string(),
+            Self::Public => "public".to_string(),
+            Self::App => "app".to_string(),
             // The principal is length-prefixed so that a principal literally
             // named `x\0y` cannot be made to collide with two shorter ones.
-            CacheScope::Principal(id) => format!("user:{}:{id}", id.len()),
+            Self::Principal(id) => format!("user:{}:{id}", id.len()),
         }
     }
 }
@@ -105,7 +105,7 @@ pub struct Validators {
 impl Validators {
     /// Whether there is anything to make a request conditional with.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.etag.is_none() && self.last_modified.is_none()
     }
 
@@ -205,7 +205,7 @@ impl ResponseCache {
 
     /// The configured byte budget.
     #[must_use]
-    pub fn budget(&self) -> usize {
+    pub const fn budget(&self) -> usize {
         self.budget
     }
 

@@ -29,7 +29,7 @@ use swc_ecma_transforms_base::resolver;
 
 const MAX_MODULE_SIZE: usize = 10 * 1024 * 1024; // 10 MB limit
 
-/// QuickJS's own default GC threshold, restored after every rebuild.
+/// `QuickJS`'s own default GC threshold, restored after every rebuild.
 ///
 /// Named rather than re-derived so the restore cannot drift from what the
 /// runtime started with.
@@ -51,9 +51,9 @@ const REBUILD_GC_THRESHOLD: usize = 64 * 1024 * 1024;
 /// engine carries the prelude, the npm bundles and every Tier-B component.
 ///
 /// The forced pass bought nothing a request needs. Since the arena redesign,
-/// request memory is freed per block by QuickJS's refcounting, so acyclic garbage
+/// request memory is freed per block by `QuickJS`'s refcounting, so acyclic garbage
 /// is gone the moment it is dropped; only *cycles* wait for a collector, and
-/// QuickJS runs its own when allocation crosses [`DEFAULT_GC_THRESHOLD`]. So the
+/// `QuickJS` runs its own when allocation crosses [`DEFAULT_GC_THRESHOLD`]. So the
 /// boundary now collects only when request-time memory has actually grown by
 /// this much since the last collection — which a request that creates no cycles
 /// never does — keeping outstanding request memory bounded by a fixed slack
@@ -108,7 +108,7 @@ struct MiddlewareStaged {
 
 /// A plain, writable, enumerable, configurable data property — with every
 /// attribute *applied*, which rquickjs's `Property` builder does not do: it sets
-/// the attribute bits without the `HAS_*` bits that make QuickJS honour them, so
+/// the attribute bits without the `HAS_*` bits that make `QuickJS` honour them, so
 /// redefining an accessor through it produces a read-only property.
 struct HostDataProperty<'js>(rquickjs::Value<'js>);
 
@@ -173,7 +173,7 @@ fn middleware_refusal(entry: &str, hook: &str) -> RuntimeError {
 /// a completed job pass carries them and a completed middleware pass has nothing
 /// to carry. The `fetch()` half is still shared, and still runs through the same
 /// prologue.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobRun {
     /// The body settled.
     Completed {
@@ -198,7 +198,7 @@ pub enum JobRun {
 }
 
 /// 15.6 · one pass of a middleware — [`QuickJsEngine::eval_middleware`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MiddlewareRun {
     /// The body settled. The value is its raw return, `null` for nothing.
     Completed(serde_json::Value),
@@ -235,7 +235,7 @@ impl RawMiddlewarePending {
     }
 }
 
-/// Number of leading renders that run in persistent (non-reset) mode so QuickJS can
+/// Number of leading renders that run in persistent (non-reset) mode so `QuickJS` can
 /// allocate its lazily-created, data-dependent runtime-global infrastructure (shape and
 /// atom tables) into the persistent region before request-scoped reset is enabled.
 ///
@@ -338,7 +338,7 @@ impl QuickJsEngine {
     /// userland `try`/`catch` cannot absorb it; the call that was running
     /// returns an error and the engine is usable again.
     ///
-    /// The check rides QuickJS's own interrupt poll (every few thousand
+    /// The check rides `QuickJS`'s own interrupt poll (every few thousand
     /// operations), so a script under its deadline pays one `Instant::now()`
     /// per poll and nothing per operation.
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
@@ -361,7 +361,7 @@ impl QuickJsEngine {
 
     /// Cap the memory this engine's JS may hold, in bytes — see
     /// [`crate::runtime::arena::ArenaControl::set_memory_limit`] for why the
-    /// allocator enforces it rather than QuickJS. Defaults to
+    /// allocator enforces it rather than `QuickJS`. Defaults to
     /// [`crate::runtime::arena::DEFAULT_MEMORY_LIMIT`].
     pub fn set_memory_limit(&mut self, bytes: usize) {
         self.arena.set_memory_limit(bytes);
@@ -486,7 +486,7 @@ impl QuickJsEngine {
         outcome
     }
 
-    /// Raise the runtime's GC threshold — the live-bytes mark at which QuickJS
+    /// Raise the runtime's GC threshold — the live-bytes mark at which `QuickJS`
     /// stops and collects.
     ///
     /// # Why an embedder would, and why albedo especially
@@ -512,7 +512,7 @@ impl QuickJsEngine {
         }
     }
 
-    /// Snapshot of the request-scoped bump arena that backs the QuickJS runtime.
+    /// Snapshot of the request-scoped bump arena that backs the `QuickJS` runtime.
     pub fn arena_stats(&self) -> ArenaStats {
         self.arena.stats()
     }
@@ -524,17 +524,17 @@ impl QuickJsEngine {
         let _ = self.ensure_initialized();
     }
 
-    pub fn is_initialized(&self) -> bool {
+    pub const fn is_initialized(&self) -> bool {
         self.initialized
     }
 
     /// Enter explicit warm-up mode: until [`Self::end_warmup`], every render and
     /// handler eval runs in persistent (non-reset) arena mode regardless of how
     /// many operations have already run. Use this to warm an engine with a known
-    /// set of components whose interned QuickJS state (shapes/atoms) must live in
+    /// set of components whose interned `QuickJS` state (shapes/atoms) must live in
     /// the persistent region before the engine starts serving request-scoped work.
     /// See [`ARENA_WARMUP_RENDERS`] for the implicit, counter-based alternative.
-    pub fn begin_warmup(&mut self) {
+    pub const fn begin_warmup(&mut self) {
         self.force_persistent = true;
     }
 
@@ -548,7 +548,7 @@ impl QuickJsEngine {
     }
 
     /// A1 · host-object bridge — run a TSX event handler / server `action()`
-    /// body under QuickJS and collect the slot-write and broadcast effects it
+    /// body under `QuickJS` and collect the slot-write and broadcast effects it
     /// produced, in source order.
     ///
     /// Unlike [`RuntimeEngine::render_component`], which lowers a component to
@@ -929,8 +929,7 @@ impl QuickJsEngine {
         }
         let pending = staged.pending;
         let journal_len = serde_json::from_str::<Vec<serde_json::Value>>(journal_json)
-            .map(|steps| steps.len())
-            .unwrap_or(0);
+            .map_or(0, |steps| steps.len());
 
         match settled {
             Err(rquickjs::Error::WouldBlock) if !pending.is_empty() => Ok(JobRun::Suspended {
@@ -1075,8 +1074,7 @@ impl QuickJsEngine {
         }
         let pending = staged.pending;
         let journal_len = serde_json::from_str::<Vec<serde_json::Value>>(journal_json)
-            .map(|steps| steps.len())
-            .unwrap_or(0);
+            .map_or(0, |steps| steps.len());
 
         match settled {
             Err(rquickjs::Error::WouldBlock) if !pending.is_empty() => Ok(MiddlewareRun::Suspended {
@@ -1245,8 +1243,7 @@ impl QuickJsEngine {
             return Err(RuntimeError::load(
                 LoadErrorKind::EngineFailure,
                 format!(
-                    "Module '{specifier}' exceeds maximum size limit of {} bytes",
-                    MAX_MODULE_SIZE
+                    "Module '{specifier}' exceeds maximum size limit of {MAX_MODULE_SIZE} bytes"
                 ),
             ));
         }
@@ -1381,7 +1378,7 @@ impl QuickJsEngine {
     /// **static half** of the dirty bit. Tracked in Rust, never in the realm:
     /// see [`ModuleLedger::holds_third_party`].
     #[must_use]
-    pub fn holds_third_party_code(&self) -> bool {
+    pub const fn holds_third_party_code(&self) -> bool {
         self.ledger.holds_third_party()
     }
 
@@ -1421,13 +1418,13 @@ impl QuickJsEngine {
 
     /// Counters describing what confinement has actually done here.
     #[must_use]
-    pub fn confinement_stats(&self) -> crate::runtime::confinement::ConfinementStats {
+    pub const fn confinement_stats(&self) -> crate::runtime::confinement::ConfinementStats {
         self.ledger.stats()
     }
 
     /// Number of registrations the replay ledger holds.
     #[must_use]
-    pub fn ledger_len(&self) -> usize {
+    pub const fn ledger_len(&self) -> usize {
         self.ledger.len()
     }
 
@@ -1550,10 +1547,10 @@ fn build_prelude_fragments(bootstrap: &BootstrapPayload) -> Vec<PreludeFragment>
             "the sealed intrinsics",
             crate::runtime::confinement::build_sealed_intrinsics_script(),
         ),
-        PreludeFragment::new("the form contract", build_form_contract_script().to_string()),
+        PreludeFragment::new("the form contract", build_form_contract_script()),
         PreludeFragment::new(
             "the markup contract",
-            build_markup_contract_script().to_string(),
+            build_markup_contract_script(),
         ),
         PreludeFragment::new(
             "the JSX attribute table",
@@ -2226,16 +2223,16 @@ globalThis.__ALBEDO_EVAL_JOB = function(entry, name, argsJson, userJson) {{
 /// Turn an `rquickjs::Error` into something a human can act on.
 ///
 /// 🪤 **`{err}` on an rquickjs error prints the literal string "Exception
-/// generated by QuickJS" and nothing else.** The thrown value stays pending on
+/// generated by `QuickJS`" and nothing else.** The thrown value stays pending on
 /// the context and has to be claimed with [`Ctx::catch`], so every JS failure in
-/// this engine — a missing global, a syntax form QuickJS rejects, a package's own
+/// this engine — a missing global, a syntax form `QuickJS` rejects, a package's own
 /// `throw` — surfaced through the load path as the *same* sentence.
 ///
 /// Found while measuring npm coverage (`TODO.md` item 9.0): the evaluation stage
 /// reported twenty-three distinct failures across the Radix/shadcn layer and
 /// every one of them read identically, which makes a count and no diagnosis.
 /// This is the same defect item 9.5 names for resolution errors — *"npm package
-/// 'crypto' not found in node_modules"* sends a reader hunting for a dependency
+/// 'crypto' not found in `node_modules`"* sends a reader hunting for a dependency
 /// they never had — one layer down, at execution.
 ///
 /// The message is the exception's own `message`, plus the first stack frame when
@@ -2284,7 +2281,7 @@ fn describe_js_error(ctx: &Ctx<'_>, err: &rquickjs::Error) -> String {
 ///    (`__ALBEDO_NPM_ALIASES["zod"] = key`). Registration is cheap; nothing runs until first use.
 /// 2. **`__albedo_require_record`** — the npm linker. Memoized through `__ALBEDO_MODULES`; the
 ///    record is **published before the factory body runs**, so import cycles observe a
-///    partially-initialized record (Node's CommonJS discipline) instead of recursing forever.
+///    partially-initialized record (Node's `CommonJS` discipline) instead of recursing forever.
 /// 3. **Import-binding helpers** (`__albedo_import_default` / `_namespace` / `_named`) — what
 ///    compiled `import` statements call. For an npm specifier they apply real ESM semantics
 ///    (`default` is the `default` property, a namespace/named import sees the record itself). For
@@ -2314,14 +2311,14 @@ pub(crate) fn build_npm_runtime_helpers_script() -> String {
 /// implementations"* shape this codebase has already paid for once. There is
 /// one implementation and two callers.
 ///
-/// Nothing in here touches QuickJS, the filesystem, or any server capability:
+/// Nothing in here touches `QuickJS`, the filesystem, or any server capability:
 /// it is table lookups and one `Object.create`. The pieces that *are*
 /// server-specific — project-module resolution, the component-aware default
 /// unwrapping in `__albedo_require` — live in
 /// [`build_quickjs_module_helpers_script`] next door.
 ///
 /// The record is published **before** the factory body runs, which is Node's
-/// CommonJS cycle discipline: an import cycle observes a partially-initialized
+/// `CommonJS` cycle discipline: an import cycle observes a partially-initialized
 /// record instead of recursing forever, so no topological sort is needed and
 /// load order is irrelevant.
 pub fn npm_record_linker_script() -> String {
@@ -2525,7 +2522,7 @@ fn build_form_contract_script() -> String {
 /// (`shared_slot_lists`' "void elements with explicit close tags do not
 /// truncate a row"). And `<children />` was worse than a byte difference: the
 /// pure-Rust renderer lowers it to the sentinel `wrap_in_layouts` substitutes,
-/// so a layout rendered through QuickJS emitted a literal `<children></children>`
+/// so a layout rendered through `QuickJS` emitted a literal `<children></children>`
 /// element and dropped the entire page body it was supposed to receive.
 ///
 /// Both constants cross as *values* from Rust. There is one spelling of each
@@ -2579,7 +2576,7 @@ pub fn build_markup_contract_script() -> String {
     )
 }
 
-fn build_builtin_runtime_helpers_script() -> &'static str {
+const fn build_builtin_runtime_helpers_script() -> &'static str {
     r#"
 if (typeof globalThis.h !== 'function') {
   // Text content and attribute values are escaped DIFFERENTLY, and both must
@@ -4064,8 +4061,7 @@ fn lower_module_to_statements(
                         return Err(RuntimeError::load(
                             LoadErrorKind::UnsupportedSyntax,
                             format!(
-                                "unsupported export declaration '{:?}' in module '{specifier}'",
-                                other
+                                "unsupported export declaration '{other:?}' in module '{specifier}'"
                             ),
                         ));
                     }
@@ -4125,8 +4121,7 @@ fn lower_module_to_statements(
                     return Err(RuntimeError::load(
                         LoadErrorKind::UnsupportedSyntax,
                         format!(
-                            "unsupported module declaration '{:?}' in module '{specifier}'",
-                            unsupported
+                            "unsupported module declaration '{unsupported:?}' in module '{specifier}'"
                         ),
                     ));
                 }
@@ -4463,7 +4458,7 @@ fn rewrite_import_for_client_with_modules(
 /// **memoised and lazy**: the factory for a file runs at most once, on first
 /// access, and the record is published before the body runs so an import cycle
 /// inside the package observes a partially-initialized record rather than
-/// recursing — Node's CommonJS discipline, unchanged from the server.
+/// recursing — Node's `CommonJS` discipline, unchanged from the server.
 ///
 /// A demanded name that the bundler could not resolve is a **build error**, not
 /// an `undefined` binding discovered when the island first renders. The bundler
@@ -4635,7 +4630,7 @@ pub fn compile_client_island_module_with_npm(
 pub(crate) enum NpmModuleFormat {
     /// An ES module — imports/exports are rewritten onto the record linker.
     Esm,
-    /// A CommonJS module — wrapped with `module`/`exports`/`require` shims;
+    /// A `CommonJS` module — wrapped with `module`/`exports`/`require` shims;
     /// the record gets `default = module.exports` plus copied named props
     /// (Node's CJS→ESM interop shape).
     Cjs,
@@ -4726,11 +4721,11 @@ fn compile_npm_esm_module(
                             ImportSpecifier::Named(named_specifier) => {
                                 let local = named_specifier.local.sym.to_string();
                                 let binding = match named_specifier.imported.as_ref() {
-                                    None => local.clone(),
+                                    None => local,
                                     Some(ModuleExportName::Ident(imported_ident))
                                         if imported_ident.sym == named_specifier.local.sym =>
                                     {
-                                        local.clone()
+                                        local
                                     }
                                     Some(imported_name) => {
                                         let property =
@@ -4946,7 +4941,7 @@ fn compile_npm_cjs_module(
     resolve: &HashMap<String, String>,
 ) -> RuntimeResult<String> {
     let key_literal = js_string_literal(key, key)?;
-    let dir = key.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(key);
+    let dir = key.rsplit_once('/').map_or(key, |(dir, _)| dir);
     let dir_literal = js_string_literal(dir, key)?;
     let map_literal = serde_json::to_string(resolve).map_err(|err| {
         RuntimeError::load(
@@ -5039,12 +5034,12 @@ fn build_npm_factory_script(
 /// `None` for a server module that simply has no anchor spec — so "no spec"
 /// never meant "browser", and a pass gated on it would fire in the wrong place.
 /// `thunk_children` emits a call to `__albedo_t`, which exists only in the
-/// QuickJS prelude; shipped to the browser it is a `ReferenceError` that takes
+/// `QuickJS` prelude; shipped to the browser it is a `ReferenceError` that takes
 /// the whole island down. Named, so the next host-specific pass has somewhere
 /// obvious to ask.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TranspileTarget {
-    /// The QuickJS server renderer, whose `h` is eager.
+    /// The `QuickJS` server renderer, whose `h` is eager.
     Server,
     /// A Tier-C island, executed by `assets/albedo-client.js`, whose `h`
     /// already builds vnodes lazily and needs no deferral.
@@ -5144,7 +5139,7 @@ pub(crate) fn syntax_for_specifier(specifier: &str) -> Syntax {
     match Path::new(specifier)
         .extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .as_deref()
     {
         Some("ts") => Syntax::Typescript(TsSyntax {
@@ -5212,7 +5207,7 @@ fn parse_module_with_syntax(
         .map_err(|err| {
             RuntimeError::load(
                 LoadErrorKind::UnsupportedSyntax,
-                format!("failed to parse module '{specifier}': {:?}", err),
+                format!("failed to parse module '{specifier}': {err:?}"),
             )
         })
 }
@@ -5237,7 +5232,7 @@ fn parse_module(specifier: &str, source: &str) -> RuntimeResult<Module> {
     parser.parse_module().map_err(|err| {
         RuntimeError::load(
             LoadErrorKind::UnsupportedSyntax,
-            format!("failed to parse module '{specifier}': {:?}", err),
+            format!("failed to parse module '{specifier}': {err:?}"),
         )
     })
 }
@@ -5334,7 +5329,7 @@ fn slice_source(source: &str, span: Span, specifier: &str) -> RuntimeResult<Stri
         ));
     }
 
-    source.get(start..end).map(|slice| slice.to_string()).ok_or_else(|| {
+    source.get(start..end).map(std::string::ToString::to_string).ok_or_else(|| {
         RuntimeError::load(
             LoadErrorKind::EngineFailure,
             format!(
@@ -5370,7 +5365,7 @@ fn strip_export_default_prefix(source: &str) -> Option<String> {
 /// to the global shims installed by [`build_builtin_runtime_helpers_script`].
 /// A1 · host-object bridge: routing these imports through `__albedo_require`
 /// throws `MODULE_MISSING` at load, which is exactly why a real TSX hook
-/// component could not render under QuickJS before. Binding them to globals
+/// component could not render under `QuickJS` before. Binding them to globals
 /// instead is what makes `import { useState } from "react"` load and run.
 fn is_framework_runtime_import(source: &str) -> bool {
     matches!(source, "react" | "react-dom" | "albedo")
@@ -5508,11 +5503,11 @@ fn rewrite_import_declaration(
             ImportSpecifier::Named(named_specifier) => {
                 let local = named_specifier.local.sym.to_string();
                 let binding = match named_specifier.imported.as_ref() {
-                    None => local.clone(),
+                    None => local,
                     Some(ModuleExportName::Ident(imported_ident))
                         if imported_ident.sym == named_specifier.local.sym =>
                     {
-                        local.clone()
+                        local
                     }
                     Some(imported_name) => {
                         let property = module_export_name_to_property(imported_name, specifier)?;

@@ -139,8 +139,7 @@ fn tsc_version() -> String {
         return "tsc not available (ALBEDO_TSC unset)".into();
     };
     let out = Command::new("node").arg(&tsc).arg("--version").output();
-    out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|e| format!("tsc failed to start: {e}"))
+    out.map_or_else(|e| format!("tsc failed to start: {e}"), |o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
 #[test]

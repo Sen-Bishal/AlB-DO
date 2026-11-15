@@ -193,7 +193,7 @@ impl ReadRule {
 
     /// The spelling the config uses, for messages.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Owner => "owner",
             Self::SignedIn => "signed-in",
@@ -266,7 +266,7 @@ impl UploadRegistry {
 
     /// Whether this app declared any bucket at all.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.buckets.is_empty()
     }
 

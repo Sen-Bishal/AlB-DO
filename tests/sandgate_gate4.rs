@@ -124,7 +124,7 @@ fn probe_bool(engine: &mut QuickJsEngine, expr: &str) -> bool {
     probe(engine, expr) == "true"
 }
 
-fn invocation<'a>(env: &'a serde_json::Map<String, serde_json::Value>) -> HandlerInvocation<'a> {
+fn invocation(env: &serde_json::Map<String, serde_json::Value>) -> HandlerInvocation<'_> {
     HandlerInvocation {
         body: "1 + 1",
         is_block: false,
@@ -143,7 +143,7 @@ fn invocation<'a>(env: &'a serde_json::Map<String, serde_json::Value>) -> Handle
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The exact package body from gate 2's open row.
-const FORGER: &str = r#"
+const FORGER: &str = r"
 var real = JSON.stringify;
 JSON.stringify = function (value) {
   if (Array.isArray(value)) {
@@ -154,7 +154,7 @@ JSON.stringify = function (value) {
   return real.apply(JSON, arguments);
 };
 module.exports = { tag: 'forger' };
-"#;
+";
 
 /// 🔴 **Gate 2, row 3 — inverted.** This assertion was `assert!(forged)` there.
 ///
@@ -215,10 +215,10 @@ fn the_control_holds_the_patch_is_live_during_the_handler() {
 // 2 · the payload hook, refused
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TOJSON_HOOK: &str = r#"
+const TOJSON_HOOK: &str = r"
 Object.prototype.toJSON = function () { return { hijacked: true }; };
 module.exports = { tag: 'tojson' };
-"#;
+";
 
 /// The residual the sealed holder alone cannot close: `stringify` consults
 /// `toJSON` on any **object** it encodes, and an effect's *payload* is an
@@ -251,7 +251,7 @@ fn a_tojson_hook_on_object_prototype_refuses_the_handler_loudly() {
 // 3 · the holder itself
 // ─────────────────────────────────────────────────────────────────────────────
 
-const HOLDER_ATTACKER: &str = r#"
+const HOLDER_ATTACKER: &str = r"
 var out = {};
 // 🪤 The first version of this compared the holder's captured `stringify`
 // against `JSON.stringify` while the latter was still pristine — they are the
@@ -280,7 +280,7 @@ out.mutated = (function () {
 })();
 globalThis.__attack_report = out;
 module.exports = { tag: 'holder' };
-"#;
+";
 
 /// Every route a package has to take the sealed intrinsics away from us.
 ///
@@ -316,7 +316,7 @@ fn the_sealed_holder_cannot_be_replaced_redefined_deleted_or_mutated() {
 // 4 · THE FINDING — the effect builtins were never reachable
 // ─────────────────────────────────────────────────────────────────────────────
 
-const REACHER: &str = r#"
+const REACHER: &str = r"
 var names = ['append', 'update', 'remove', '__albedo_emit', '__albedo_rec', '__albedo_S'];
 var found = [];
 for (var i = 0; i < names.length; i++) {
@@ -329,7 +329,7 @@ globalThis.__reachable_builtins = found.join(',');
 // check that nothing was.
 try { globalThis.broadcast('albedo_users', { role: 'admin' }); } catch (e) {}
 module.exports = { tag: 'reacher' };
-"#;
+";
 
 /// 🔑 **Why provenance is a diagnostic here and not a defence.**
 ///
@@ -376,11 +376,11 @@ fn a_packages_factory_cannot_reach_any_effect_builtin() {
 // 5 · provenance, proven where it exists
 // ─────────────────────────────────────────────────────────────────────────────
 
-const WITNESS: &str = r#"
+const WITNESS: &str = r"
 globalThis.__origin_during_factory = globalThis.__albedo_sealed.currentOrigin();
 globalThis.__depth_during_factory = globalThis.__albedo_sealed.originDepth();
 module.exports = { tag: 'witness' };
-"#;
+";
 
 /// The linker's `enterModule`/`exitModule` bracket does identify the running
 /// module — and unwinds afterwards, so a later effect is not mis-attributed to
@@ -410,7 +410,7 @@ fn provenance_names_the_module_whose_body_is_running_and_unwinds_after() {
 // 6 · the probe must not be answerable by the thing it probes
 // ─────────────────────────────────────────────────────────────────────────────
 
-const LYING_HOOK: &str = r#"
+const LYING_HOOK: &str = r"
 // A `toJSON` that hides from anyone who reads it off the prototype itself, and
 // appears for `JSON.stringify`, whose lookup uses the *value* as the receiver.
 Object.defineProperty(Object.prototype, 'toJSON', {
@@ -421,7 +421,7 @@ Object.defineProperty(Object.prototype, 'toJSON', {
   }
 });
 module.exports = { tag: 'liar' };
-"#;
+";
 
 /// 🔴 **Found in review, not by the first version of this gate.**
 ///

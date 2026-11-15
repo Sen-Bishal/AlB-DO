@@ -358,7 +358,7 @@ fn unquote(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-fn heading_rank(level: HeadingLevel) -> u8 {
+const fn heading_rank(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
         HeadingLevel::H2 => 2,
@@ -369,7 +369,7 @@ fn heading_rank(level: HeadingLevel) -> u8 {
     }
 }
 
-fn heading_tag(rank: u8) -> &'static str {
+const fn heading_tag(rank: u8) -> &'static str {
     match rank {
         1 => "h1",
         2 => "h2",
@@ -381,7 +381,7 @@ fn heading_tag(rank: u8) -> &'static str {
 }
 
 /// `(data-kind, visible label)` for a GitHub alert.
-fn callout(kind: BlockQuoteKind) -> (&'static str, &'static str) {
+const fn callout(kind: BlockQuoteKind) -> (&'static str, &'static str) {
     match kind {
         BlockQuoteKind::Note => ("note", "Note"),
         BlockQuoteKind::Tip => ("tip", "Tip"),
@@ -589,7 +589,7 @@ impl<'a> Lowering<'a> {
                 let rank = heading_rank(level);
                 let mut element_attrs = Vec::new();
                 if !classes.is_empty() {
-                    let classes: Vec<String> = classes.iter().map(|class| class.to_string()).collect();
+                    let classes: Vec<String> = classes.iter().map(std::string::ToString::to_string).collect();
                     element_attrs.push(("className", js_string(&classes.join(" "))));
                 }
                 self.heading = Some(Heading {
@@ -1053,9 +1053,7 @@ impl<'a> Lowering<'a> {
         // author's directory layout to anyone holding the binary.
         let origin = self
             .file
-            .split_once("/routes/")
-            .map(|(_, tail)| format!("routes/{tail}"))
-            .unwrap_or_else(|| self.file.to_string());
+            .split_once("/routes/").map_or_else(|| self.file.to_string(), |(_, tail)| format!("routes/{tail}"));
         let mut module = format!(
             "// Lowered from {origin} by ALB'DO (src/markdown.rs). Edit the Markdown: this \
              module is rebuilt on every build and never written to the project.\n"

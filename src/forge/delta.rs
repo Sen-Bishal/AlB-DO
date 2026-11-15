@@ -74,7 +74,7 @@ pub struct RenderedRows {
 
 impl RenderedRows {
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { rows: Vec::new() }
     }
 
@@ -100,12 +100,12 @@ impl RenderedRows {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.rows.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
@@ -546,26 +546,23 @@ pub fn classify_positioned_insert(
     let mut survivors: Vec<&str> = Vec::with_capacity(prev_rows.len());
 
     for (key, record) in &next_rows {
-        match prev_index.get(key.as_str()) {
-            Some(previous_record) => {
-                // (2) a survivor whose record changed is an update, not an insert.
-                if *previous_record != *record {
-                    return None;
-                }
-                // The first survivor after the run began is the anchor.
-                if !keys.is_empty() && !run_closed {
-                    before = Some(key.clone());
-                    run_closed = true;
-                }
-                survivors.push(key.as_str());
+        if let Some(previous_record) = prev_index.get(key.as_str()) {
+            // (2) a survivor whose record changed is an update, not an insert.
+            if *previous_record != *record {
+                return None;
             }
-            None => {
-                // (4) a new key after the run closed is a second run.
-                if run_closed {
-                    return None;
-                }
-                keys.push(key.clone());
+            // The first survivor after the run began is the anchor.
+            if !keys.is_empty() && !run_closed {
+                before = Some(key.clone());
+                run_closed = true;
             }
+            survivors.push(key.as_str());
+        } else {
+            // (4) a new key after the run closed is a second run.
+            if run_closed {
+                return None;
+            }
+            keys.push(key.clone());
         }
     }
 

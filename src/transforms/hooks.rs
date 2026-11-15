@@ -67,7 +67,7 @@ pub enum HookExtractError {
 impl std::fmt::Display for HookExtractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HookExtractError::HookInsideConditional { hook_idx_so_far, location } => write!(
+            Self::HookInsideConditional { hook_idx_so_far, location } => write!(
                 f,
                 "useState invoked inside a conditional ({location}); hooks must run unconditionally \
                  (would have been hook #{hook_idx_so_far} in source order)",
@@ -151,11 +151,9 @@ fn try_extract_from_var_declarator(
     }
     let initial = call
         .args
-        .first()
-        .map(|spread| (*spread.expr).clone())
-        .unwrap_or_else(|| Expr::Lit(swc_ecma_ast::Lit::Null(swc_ecma_ast::Null {
+        .first().map_or_else(|| Expr::Lit(swc_ecma_ast::Lit::Null(swc_ecma_ast::Null {
             span: Default::default(),
-        })));
+        })), |spread| (*spread.expr).clone());
     let (value_name, setter_name) = destructure_names(&decl.name);
     let Some(value_name) = value_name else { return };
 
@@ -206,8 +204,7 @@ fn is_use_state_call(call: &CallExpr, imports: &HashMap<String, ImportBinding>) 
     }
     imports
         .get(&name)
-        .map(|b| b.source == "react" && b.export_name == "useState")
-        .unwrap_or(false)
+        .is_some_and(|b| b.source == "react" && b.export_name == "useState")
 }
 
 fn check_no_hook_calls_in_stmt(
@@ -237,14 +234,13 @@ fn stmt_contains_hook_call(stmt: &Stmt, imports: &HashMap<String, ImportBinding>
         Stmt::Decl(Decl::Var(var)) => var.decls.iter().any(|d| {
             d.init
                 .as_ref()
-                .map(|e| expr_contains_hook_call(e, imports))
-                .unwrap_or(false)
+                .is_some_and(|e| expr_contains_hook_call(e, imports))
         }),
         Stmt::Expr(ExprStmt { expr, .. }) => expr_contains_hook_call(expr, imports),
         Stmt::Block(block) => block.stmts.iter().any(|s| stmt_contains_hook_call(s, imports)),
         Stmt::If(IfStmt { cons, alt, .. }) => {
             stmt_contains_hook_call(cons, imports)
-                || alt.as_ref().map(|a| stmt_contains_hook_call(a, imports)).unwrap_or(false)
+                || alt.as_ref().is_some_and(|a| stmt_contains_hook_call(a, imports))
         }
         Stmt::For(ForStmt { body, .. }) => stmt_contains_hook_call(body, imports),
         Stmt::While(node) => stmt_contains_hook_call(&node.body, imports),
@@ -252,8 +248,7 @@ fn stmt_contains_hook_call(stmt: &Stmt, imports: &HashMap<String, ImportBinding>
         Stmt::Return(node) => node
             .arg
             .as_ref()
-            .map(|e| expr_contains_hook_call(e, imports))
-            .unwrap_or(false),
+            .is_some_and(|e| expr_contains_hook_call(e, imports)),
         _ => false,
     }
 }

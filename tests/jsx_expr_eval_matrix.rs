@@ -102,14 +102,12 @@ fn jsx_expr_matrix_renders_every_case_to_expected_html() {
         }
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "JSX expr matrix: {}/{} cases failed\n\n{}\n",
-            failures.len(),
-            cases.len(),
-            failures.join("\n\n")
-        );
-    }
+    assert!(failures.is_empty(), 
+        "JSX expr matrix: {}/{} cases failed\n\n{}\n",
+        failures.len(),
+        cases.len(),
+        failures.join("\n\n")
+    );
 }
 
 /// Phase J shell-stamping contract: every host element the renderer emits

@@ -118,13 +118,13 @@ pub fn content_type_for_path(path: &Path) -> &'static str {
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("html") | Some("htm") => "text/html; charset=utf-8",
-        Some("js") | Some("mjs") => "application/javascript; charset=utf-8",
+        Some("html" | "htm") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "application/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("json") => "application/json; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
         Some("avif") => "image/avif",
@@ -133,7 +133,7 @@ pub fn content_type_for_path(path: &Path) -> &'static str {
         Some("woff2") => "font/woff2",
         Some("ttf") => "font/ttf",
         Some("otf") => "font/otf",
-        Some("txt") | Some("md") => "text/plain; charset=utf-8",
+        Some("txt" | "md") => "text/plain; charset=utf-8",
         Some("xml") => "application/xml; charset=utf-8",
         Some("wasm") => "application/wasm",
         _ => "application/octet-stream",

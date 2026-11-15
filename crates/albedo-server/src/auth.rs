@@ -68,7 +68,7 @@ impl Identity {
 
     /// This session's token hash, for rotation and logout.
     #[must_use]
-    pub fn token(&self) -> Option<&TokenHash> {
+    pub const fn token(&self) -> Option<&TokenHash> {
         match self {
             Self::Anonymous => None,
             Self::Authenticated { token, .. } => Some(token),
@@ -85,7 +85,7 @@ impl Identity {
     /// question (*did this route read `user`?*), which the compiler already
     /// knows from `shared_slot_partitions_for_entry`.
     #[must_use]
-    pub fn varies_response(&self) -> bool {
+    pub const fn varies_response(&self) -> bool {
         matches!(self, Self::Authenticated { .. })
     }
 }
@@ -113,7 +113,7 @@ impl AuthRuntime {
 
     /// The lowered `auth` block.
     #[must_use]
-    pub fn registry(&self) -> &AuthRegistry {
+    pub const fn registry(&self) -> &AuthRegistry {
         &self.registry
     }
 

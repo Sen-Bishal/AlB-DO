@@ -43,7 +43,7 @@ pub enum StaticSliceEligibilityKind {
 }
 
 impl StaticSliceEligibilityKind {
-    pub fn reason(self) -> Option<&'static str> {
+    pub const fn reason(self) -> Option<&'static str> {
         match self {
             Self::Eligible => None,
             Self::NotTierA => Some("component_tier_is_not_a"),

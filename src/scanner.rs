@@ -62,7 +62,7 @@ impl ProjectScanner {
             .follow_links(true)
             .sort_by_file_name()
             .into_iter()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
         {
             let file_path = entry.path();
 

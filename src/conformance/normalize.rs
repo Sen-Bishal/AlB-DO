@@ -28,7 +28,7 @@ pub enum Normalization {
     /// Not semantic in HTML, and the divergence is structural rather than
     /// accidental: the pure-Rust renderer rewrites an attribute in the
     /// author's position (`action="action:x"` becomes `data-albedo-action` in
-    /// place), while the QuickJS shim is bottom-up and can only append. The
+    /// place), while the `QuickJS` shim is bottom-up and can only append. The
     /// attribute *set* is compared exactly — a missing, extra, or wrong-valued
     /// attribute still diverges.
     AttributeOrder,
@@ -53,8 +53,8 @@ pub enum Normalization {
 impl fmt::Display for Normalization {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Normalization::AttributeOrder => "attribute-order",
-            Normalization::ReactiveAnchorWrapper => "reactive-anchor-wrapper",
+            Self::AttributeOrder => "attribute-order",
+            Self::ReactiveAnchorWrapper => "reactive-anchor-wrapper",
         })
     }
 }
@@ -99,19 +99,16 @@ pub fn strip_reactive_anchors(html: &str) -> String {
         let body_start = start + ANCHOR_PREFIX.len() + quote + ANCHOR_SUFFIX.len();
         let body = &rest[body_start..];
 
-        match find_matching_span_close(body) {
-            Some((inner_end, after_close)) => {
-                // Recurse into the body so nested anchors unwrap too.
-                out.push_str(&strip_reactive_anchors(&body[..inner_end]));
-                rest = &body[after_close..];
-            }
-            None => {
-                // Unbalanced markup: emit the remainder verbatim rather than
-                // inventing structure. The comparison will fail, which is the
-                // correct outcome for markup we cannot parse.
-                out.push_str(body);
-                return out;
-            }
+        if let Some((inner_end, after_close)) = find_matching_span_close(body) {
+            // Recurse into the body so nested anchors unwrap too.
+            out.push_str(&strip_reactive_anchors(&body[..inner_end]));
+            rest = &body[after_close..];
+        } else {
+            // Unbalanced markup: emit the remainder verbatim rather than
+            // inventing structure. The comparison will fail, which is the
+            // correct outcome for markup we cannot parse.
+            out.push_str(body);
+            return out;
         }
     }
 }
@@ -165,7 +162,7 @@ pub fn canonicalize_attribute_order(html: &str) -> String {
 
     while idx < bytes.len() {
         if bytes[idx] != b'<' {
-            let next = html[idx..].find('<').map(|off| idx + off).unwrap_or(bytes.len());
+            let next = html[idx..].find('<').map_or(bytes.len(), |off| idx + off);
             out.push_str(&html[idx..next]);
             idx = next;
             continue;
@@ -176,7 +173,7 @@ pub fn canonicalize_attribute_order(html: &str) -> String {
         // Comments pass through whole — the layout-children sentinel is one,
         // and a `>` inside a comment must not be read as a tag end.
         if tail.starts_with("<!--") {
-            let end = tail.find("-->").map(|off| off + 3).unwrap_or(tail.len());
+            let end = tail.find("-->").map_or(tail.len(), |off| off + 3);
             out.push_str(&tail[..end]);
             idx += end;
             continue;

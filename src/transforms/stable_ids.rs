@@ -1,4 +1,4 @@
-//! Stamp `data-albedo-id` anchors into JSX so the **QuickJS** renderer produces
+//! Stamp `data-albedo-id` anchors into JSX so the **`QuickJS`** renderer produces
 //! markup bakabox can address.
 //!
 //! ## The bug this exists to close
@@ -6,7 +6,7 @@
 //! Two renderers produce Tier-B markup. The pure-Rust one
 //! ([`crate::runtime::eval::core`]) stamps every host element with
 //! `data-albedo-id = fnv1a_32("{module_spec}#{counter}")`, pre-order, and emits
-//! the `BindEvent` / `SetTextRef` opcodes that reference those ids. The QuickJS
+//! the `BindEvent` / `SetTextRef` opcodes that reference those ids. The `QuickJS`
 //! one — the request path for every Tier-B component — stamped **nothing**, so
 //! the chunk it injected carried no anchors at all. The inline opcode frame then
 //! named ids that existed nowhere in the document, `_requireNode` threw, and the
@@ -49,7 +49,7 @@
 //!   intrinsic: both renderers lower it to a sentinel comment and neither allocates an id for it.
 //!   Stamping it advanced this side's counter and not the evaluator's, so in any layout with markup
 //!   **after** the sentinel — a footer, a closing `</nav>`'s siblings — every subsequent element was
-//!   numbered one step ahead on the QuickJS side. The two renders stayed byte-identical up to the
+//!   numbered one step ahead on the `QuickJS` side. The two renders stayed byte-identical up to the
 //!   sentinel and disagreed on every id after it, which is the worst version of this bug: it looks
 //!   fine in a diff of the opening markup.
 
@@ -65,7 +65,7 @@ use swc_ecma_visit::{VisitMut, VisitMutWith};
 /// `DEFAULT_ANCHOR_ATTRIBUTE` in `assets/albedo-runtime.js`.
 const ALBEDO_ID_ATTR: &str = "data-albedo-id";
 
-/// The per-render allocator installed by the QuickJS bootstrap. Takes the
+/// The per-render allocator installed by the `QuickJS` bootstrap. Takes the
 /// module spec, returns the next id and advances the shared counter.
 pub const STABLE_ID_FN: &str = "__albedo_stable_id";
 

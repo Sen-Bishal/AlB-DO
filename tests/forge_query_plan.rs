@@ -70,9 +70,7 @@ fn bind(params: &[ParamSpec], binds: &[u16], values: &[(&str, Value)], lo_hi: (V
                 ParamRole::RangeHi => lo_hi.1,
                 _ => values
                     .iter()
-                    .find(|(c, _)| *c == spec.column)
-                    .map(|(_, v)| *v)
-                    .unwrap_or_else(|| panic!("no value for {}", spec.column)),
+                    .find(|(c, _)| *c == spec.column).map_or_else(|| panic!("no value for {}", spec.column), |(_, v)| *v),
             };
             match value {
                 Value::Text(t) | Value::Json(t) => libsql::Value::Text(t.to_string()),

@@ -301,7 +301,7 @@ export const root = createRoot;",
 ///
 /// 🔑 The value is not that the import fails; it already failed. It is that the
 /// failure says what is true. The old sentence — *"npm package 'fs' not found
-/// in node_modules (searched upward from …)"* — sent a reader hunting for a
+/// in `node_modules` (searched upward from …)"* — sent a reader hunting for a
 /// dependency they never had, which is the defect `TODO.md` 9.5 names.
 #[test]
 fn a_node_builtin_is_named_at_both_doors() {
@@ -496,7 +496,7 @@ fn the_browser_npm_runtime_is_valid_javascript() {
     );
 }
 
-/// The linker the browser gets and the linker QuickJS installs are the same
+/// The linker the browser gets and the linker `QuickJS` installs are the same
 /// string. Two hand-written copies of a module linker is the *"three paint-rule
 /// implementations"* shape this codebase has already paid for once.
 #[test]
@@ -544,7 +544,7 @@ fn react_children_matches_reacts_empty_slot_rules() {
             panic!("records script must evaluate: {detail}");
         }
         ctx.eval::<String, _>(
-            r#"
+            r"
             const C = globalThis.__albedo_Children;
             const kids = ['a', null, 'b'];
             JSON.stringify({
@@ -571,7 +571,7 @@ fn react_children_matches_reacts_empty_slot_rules() {
                 try { C.only(['a', 'b']); return false; } catch (_e) { return true; }
               })(),
             });
-            "#,
+            ",
         )
         .expect("Children scenario")
     });

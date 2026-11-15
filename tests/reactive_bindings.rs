@@ -11,7 +11,7 @@
 //!     touched, and it is the SAME server-rendered node).
 //!
 //! Following the repo's JS-test discipline (`tests/client_hydration.rs`), the
-//! driver runs under QuickJS against a compact DOM shim. A focused bakabox VM
+//! driver runs under `QuickJS` against a compact DOM shim. A focused bakabox VM
 //! stub stands in for the full opcode patcher exactly as the DOM shim stands in
 //! for a real DOM: it implements the same `SetTextRef` / `BindEvent` / `SlotSet`
 //! contract the production `albedo-runtime.js` bakabox does.
@@ -37,7 +37,7 @@ fn hook_fixture(name: &str) -> PathBuf {
 // A minimal DOM (element/text nodes with stable identity, synchronous event
 // dispatch, a `fetch` spy to assert "zero round-trip" as a hard invariant) plus
 // a focused bakabox VM stub implementing the three opcodes binding mode uses.
-const DOM_AND_VM: &str = r#"
+const DOM_AND_VM: &str = r"
 globalThis.__net = 0;
 globalThis.fetch = function () { globalThis.__net++; return {}; };
 globalThis.console = { error: function () {}, debug: function () {} };
@@ -183,7 +183,7 @@ globalThis.makeVm = function (doc) {
   };
   return vm;
 };
-"#;
+";
 
 const SCENARIO: &str = r#"
 var payload = globalThis.__PAYLOAD;
@@ -365,7 +365,7 @@ fn class_name_slot_drives_fine_grained_attr_patch() {
 // Derived rung: a `{n * 2}` expression alongside a bare `{n}` read. The bare
 // read patches via the slot directly; the derived expression is recomputed
 // client-side from state whenever `n` changes. Exercises the real driver makeVm.
-const DERIVED_SCENARIO: &str = r#"
+const DERIVED_SCENARIO: &str = r"
 var payload = globalThis.__PAYLOAD;
 var btnId = payload.events[0].stableId;
 var rawId = payload.texts[0].stableId;
@@ -399,7 +399,7 @@ JSON.stringify({
   after2: after2,
   network: globalThis.__net,
 });
-"#;
+";
 
 #[test]
 fn derived_expression_recomputes_from_state_on_change() {
@@ -682,7 +682,7 @@ fn dynamic_conditional_branch_falls_back_to_island() {
 // reads the array slot and joins a per-item HTML template. Clicking "add"
 // appends an item locally; the client regenerates the list's innerHTML from
 // state, growing the DOM — data-driven structural reactivity, zero network.
-const LIST_SCENARIO: &str = r#"
+const LIST_SCENARIO: &str = r"
 var payload = globalThis.__PAYLOAD;
 var btnId = payload.events[0].stableId;
 var list = payload.derived[0];          // the html:true list binding
@@ -715,7 +715,7 @@ JSON.stringify({
   sameNode: body.childNodes[1].childNodes[0] === globalThis.__wrap,
   network: globalThis.__net,
 });
-"#;
+";
 
 #[test]
 fn keyed_list_rerenders_innerhtml_with_zero_network() {
@@ -805,7 +805,7 @@ fn keyed_list_rerenders_innerhtml_with_zero_network() {
 // carries an explicit key, so it lowers to a `lists` binding (not a `derived`
 // html thunk): the SSR rows are `data-albedo-key`-stamped, the wrapper is a
 // `SetListRef` anchor, and appending drives keyed reconciliation (`ReconcileList`).
-const KEYED_LIST_SCENARIO: &str = r#"
+const KEYED_LIST_SCENARIO: &str = r"
 var payload = globalThis.__PAYLOAD;
 var btnId = payload.events[0].stableId;
 var lb = payload.lists[0];
@@ -829,7 +829,7 @@ button.__dispatch('click');             // setItems([...items, {id:3,label:'c'}]
 var afterAdd = wrapper.innerHTML;        // reconciled rows for [a,b,c]
 
 JSON.stringify({ afterInstall: afterInstall, afterAdd: afterAdd, network: globalThis.__net });
-"#;
+";
 
 #[test]
 fn keyed_list_with_key_prop_drives_reconcile_sink() {

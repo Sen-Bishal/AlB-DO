@@ -3,7 +3,7 @@
 //! ## Why this is compiled, not evaluated
 //!
 //! The matcher is the one part of a middleware that runs on **every** request,
-//! including every image on every page. Evaluating it in QuickJS would put an
+//! including every image on every page. Evaluating it in `QuickJS` would put an
 //! engine checkout in front of each of those; reading it out of the AST at build
 //! time puts a few string comparisons there instead, and a path the matcher
 //! rejects never reaches an engine at all.
@@ -69,7 +69,7 @@ pub struct Matcher {
 impl Matcher {
     /// The matcher a middleware with no `config.matcher` gets: everything.
     #[must_use]
-    pub fn all() -> Self {
+    pub const fn all() -> Self {
         Self { patterns: None }
     }
 

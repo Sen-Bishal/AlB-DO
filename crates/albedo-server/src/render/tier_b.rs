@@ -38,9 +38,9 @@ impl RenderError {
     /// path. Logs and the dev overlay use `Display` (the full chain) instead.
     pub fn user_message(&self) -> String {
         match self {
-            RenderError::RegistryFailure { thrown_message, .. } => thrown_message.clone(),
-            RenderError::DataFetchFailure { message, .. } => message.clone(),
-            RenderError::MissingDynamicProp { .. } | RenderError::StaticPropsNotObject { .. } => {
+            Self::RegistryFailure { thrown_message, .. } => thrown_message.clone(),
+            Self::DataFetchFailure { message, .. } => message.clone(),
+            Self::MissingDynamicProp { .. } | Self::StaticPropsNotObject { .. } => {
                 self.to_string()
             }
         }
@@ -563,7 +563,7 @@ pub type TierBRenderPlan = HashMap<String, TierBEntryPlan>;
 /// The island's real code never runs in the pool engines (the server graph);
 /// its module is swapped for this stub, whose default export renders only the
 /// framework's canonical empty island placeholder (`__albedo_island_placeholder`
-/// in the QuickJS prelude). The serve-time island fill pass then replaces that
+/// in the `QuickJS` prelude). The serve-time island fill pass then replaces that
 /// placeholder with the island's standalone SSR markup + `data-albedo-island`
 /// marker — the identical treatment a Tier-A parent's island child receives, so
 /// both renderers converge on one island representation.
@@ -584,14 +584,14 @@ return globalThis.__albedo_island_placeholder({placeholder_id:?}, props); }});"
 }
 
 /// Production Tier-B render registry: resolves async/server Tier-B components to
-/// real HTML by rendering them through the warmed QuickJS [`engine pool`], the
+/// real HTML by rendering them through the warmed `QuickJS` [`engine pool`], the
 /// same warmed/concurrent/arena engines that execute `action()` calls.
 ///
 /// Replaces the old stub registry (which returned an empty `<section>`,
 /// so every Tier-B node — async server components AND legit interactive Tier-B —
 /// rendered nothing on `albedo serve`). Each `call` checks out an engine, loads
 /// the component's module graph (idempotent after the first checkout), and runs
-/// `render_component_with_host`, whose `MaybePromise::finish` drives the QuickJS
+/// `render_component_with_host`, whose `MaybePromise::finish` drives the `QuickJS`
 /// job queue so an `async function Page()` is awaited on the server before its
 /// HTML is lowered.
 ///

@@ -136,7 +136,7 @@ fn derive_hash_suffix(module_id: &str) -> String {
     hex[..HASH_LEN].to_string()
 }
 
-fn find_comment_end(bytes: &[u8], start: usize) -> usize {
+const fn find_comment_end(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     while i + 1 < bytes.len() {
         if bytes[i] == b'*' && bytes[i + 1] == b'/' {
@@ -156,11 +156,11 @@ fn read_identifier(bytes: &[u8], start: usize) -> (String, usize) {
     (name, end)
 }
 
-fn is_ident_start(byte: Option<u8>) -> bool {
+const fn is_ident_start(byte: Option<u8>) -> bool {
     matches!(byte, Some(b) if b.is_ascii_alphabetic() || b == b'_' || b == b'-')
 }
 
-fn is_ident_continue(byte: u8) -> bool {
+const fn is_ident_continue(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
 }
 

@@ -132,7 +132,7 @@ fn strip_prefix_ignoring_case(path: &Path, root: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(windows))]
-fn strip_prefix_ignoring_case(_path: &Path, _root: &Path) -> Option<PathBuf> {
+const fn strip_prefix_ignoring_case(_path: &Path, _root: &Path) -> Option<PathBuf> {
     None
 }
 

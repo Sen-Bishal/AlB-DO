@@ -20,7 +20,7 @@ pub fn build_precompiled_runtime_modules_artifact(
         let Some(source) = module_sources.get(&component.module_path) else {
             skipped.push(PrecompiledRuntimeModuleSkip {
                 component_id: component.id,
-                module_path: component.module_path.clone(),
+                module_path: component.module_path,
                 source_hash: 0,
                 reason: "missing_source".to_string(),
             });

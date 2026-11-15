@@ -139,8 +139,7 @@ async fn editing_the_middleware_under_albedo_dev_reloads_it_and_a_broken_edit_ke
     eventually("the middleware to stop running", &log, || async {
         reqwest::get(format!("{base}/guestbook"))
             .await
-            .map(|r| r.status().is_success() && r.headers().get("x-version").is_none())
-            .unwrap_or(false)
+            .is_ok_and(|r| r.status().is_success() && r.headers().get("x-version").is_none())
     })
     .await;
 }

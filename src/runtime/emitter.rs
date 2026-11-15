@@ -1,6 +1,6 @@
 //! Phase B — Opcode Emitter.
 //!
-//! Bridge between the SoA [`IrColumns`] column store and the Phase A opcode
+//! Bridge between the `SoA` [`IrColumns`] column store and the Phase A opcode
 //! wire format. Walks lane-sorted column slices, generates [`OpcodeFrame`]s
 //! containing DOM-mutation [`Instruction`]s, encodes them via [`WireEncode`],
 //! and routes the binary payload to the WebTransport muxer as

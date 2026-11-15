@@ -149,7 +149,7 @@ impl std::error::Error for PrincipalIdError {}
 ///
 /// **One shape, whoever minted it** — `AUTH.md` invariant 2.1. Only [`Self::id`]
 /// is guaranteed, because it is the only field every provider has: a passkey
-/// login carries no email, a GitHub token may carry no name, an enterprise IdP
+/// login carries no email, a GitHub token may carry no name, an enterprise `IdP`
 /// may carry neither.
 ///
 /// [`Self::claims`] is the provider's raw payload, passed through rather than
@@ -157,7 +157,7 @@ impl std::error::Error for PrincipalIdError {}
 /// ever exist, which of its claims matter — so instead the shape is preserved
 /// and typed per provider by the generated `.d.ts`, the same way
 /// [`aperture::typegen`](crate::aperture::typegen) types a source response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
     /// The id we minted. Stable across provider swaps for the same human, and
     /// always inside the partition-key alphabet — see the module docs.

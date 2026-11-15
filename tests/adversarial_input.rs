@@ -143,13 +143,11 @@ fn assert_no_panic<T>(
     let outcome = std::panic::catch_unwind(|| decoder(input));
     std::panic::set_hook(prev);
 
-    if outcome.is_err() {
-        panic!(
-            "{label} PANICKED on adversarial input ({} bytes): {:02x?}",
-            input.len(),
-            input
-        );
-    }
+    assert!(outcome.is_ok(), 
+        "{label} PANICKED on adversarial input ({} bytes): {:02x?}",
+        input.len(),
+        input
+    );
 }
 
 /// Hammer a decoder with: pure random bytes, mutated valid seeds, and a curated
@@ -302,11 +300,11 @@ fn intern_table_decoder_never_panics() {
 fn bincode_varint(n: u64) -> Vec<u8> {
     if n <= 250 {
         vec![n as u8]
-    } else if n <= u64::from(u16::MAX) {
+    } else if u16::try_from(n).is_ok() {
         let mut v = vec![251];
         v.extend_from_slice(&(n as u16).to_le_bytes());
         v
-    } else if n <= u64::from(u32::MAX) {
+    } else if u32::try_from(n).is_ok() {
         let mut v = vec![252];
         v.extend_from_slice(&(n as u32).to_le_bytes());
         v

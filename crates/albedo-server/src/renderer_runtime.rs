@@ -41,7 +41,7 @@ pub struct RendererRuntime {
     /// per-island bindings that reach into them. Built once by
     /// [`RendererRuntime::build_hydration_blocks`] on the boot thread; read-only
     /// afterwards, which is what lets the concurrent request path serve a chunk
-    /// without touching QuickJS.
+    /// without touching `QuickJS`.
     client_npm: ClientNpmGraph,
     /// Islands whose SSR render threw, collected during
     /// [`RendererRuntime::build_hydration_blocks`] so the CLI can print them.
@@ -59,7 +59,7 @@ pub struct IslandRenderFailure {
     /// The island's module path, as the author wrote it on disk.
     pub module_path: String,
     /// The renderer's error, verbatim. Usually the component's own message —
-    /// "DialogTrigger must be used within Dialog" — which is the most useful
+    /// "`DialogTrigger` must be used within Dialog" — which is the most useful
     /// thing anyone can be told, and is lost entirely if this is summarised.
     pub error: String,
 }
@@ -69,7 +69,7 @@ pub struct IslandRenderFailure {
 /// island's SSR output stamped with `data-albedo-island`) and emits
 /// `closing_scripts` (the client runtime + per-island IIFEs + payload +
 /// bootstrap) before `</body>`. Computing this at boot keeps the `!Send`
-/// QuickJS render off the concurrent request path.
+/// `QuickJS` render off the concurrent request path.
 ///
 /// An island whose props this request decides is rendered again on the request
 /// path instead — through the engine pool or the compiled project, never the
@@ -204,7 +204,7 @@ pub(crate) fn boot_island_props(
 /// Binding mode needs at least one text/attr/derived/list binding driven by at
 /// least one client handler; anything else falls back to A3. The boot pass and
 /// the request pass ask the same question, so it is asked here once.
-pub(crate) fn is_serve_wireable(
+pub(crate) const fn is_serve_wireable(
     payload: &dom_render_compiler::runtime::compiled::ReactivePayload,
 ) -> bool {
     (!payload.texts.is_empty()
@@ -260,7 +260,7 @@ fn escape_inline_script(js: &str) -> String {
     js.replace("</", "<\\/")
 }
 
-fn trigger_from_mode(mode: HydrationMode) -> HydrationTrigger {
+const fn trigger_from_mode(mode: HydrationMode) -> HydrationTrigger {
     match mode {
         HydrationMode::LazyInteraction | HydrationMode::OnInteraction => {
             HydrationTrigger::Interaction
@@ -391,7 +391,7 @@ impl RendererRuntime {
     // The engine is still rendered *to* at boot, by `render_island_html`, keyed
     // by island module path — that is the shape a QuickJS render actually takes.
 
-    /// Render one component through this runtime's QuickJS renderer — the
+    /// Render one component through this runtime's `QuickJS` renderer — the
     /// engine island SSR uses — with `props_json` and an optional host seed
     /// (`{ state, shared }`).
     ///
@@ -425,7 +425,7 @@ impl RendererRuntime {
         self.renderer.revalidate_tag(tag);
     }
 
-    pub fn manifest(&self) -> &RenderManifestV2 {
+    pub const fn manifest(&self) -> &RenderManifestV2 {
         &self.manifest
     }
 
@@ -459,7 +459,7 @@ impl RendererRuntime {
     /// The client npm chunks this build emitted. Empty until
     /// [`Self::build_hydration_blocks`] has run, and empty afterwards for a
     /// project whose islands import no package.
-    pub fn client_npm(&self) -> &ClientNpmGraph {
+    pub const fn client_npm(&self) -> &ClientNpmGraph {
         &self.client_npm
     }
 
@@ -810,7 +810,7 @@ impl RendererRuntime {
                 // Fill the empty Tier-C placeholder with the Phase K HTML — the
                 // SAME render the binding frame was emitted from, so its
                 // `data-albedo-id` stamps line up with every BindEvent/SetTextRef.
-                placeholders.push((node.placeholder_id.clone(), payload.html.clone()));
+                placeholders.push((node.placeholder_id.clone(), payload.html));
                 installs.push((node.placeholder_id.clone(), install));
                 request_islands.insert(
                     node.placeholder_id.clone(),
@@ -1266,7 +1266,7 @@ fn project_root_for_artifacts(artifacts_dir: &Path) -> PathBuf {
         .map_or_else(|| artifacts_dir.to_path_buf(), Path::to_path_buf)
 }
 
-fn assert_optional_artifact_present(_path: &Path) {
+const fn assert_optional_artifact_present(_path: &Path) {
     // Presence checks are best-effort for now; full integrity enforcement is handled by
     // standalone pipeline verification.
 }

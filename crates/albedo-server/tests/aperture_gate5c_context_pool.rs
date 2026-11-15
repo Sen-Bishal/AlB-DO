@@ -9,7 +9,7 @@
 //! byte for byte the blocking host function gate 5 exists to rule out.
 //!
 //! `APERTURE-CONTINUATIONS.md` § 2 named the fix and priced it as a guess: make
-//! the pool a pool of **contexts** rather than engines, because a QuickJS
+//! the pool a pool of **contexts** rather than engines, because a `QuickJS`
 //! `Runtime` can host many `Context`s and a paused generator only needs its own
 //! context, not its own runtime. This gate is the measurement that guess was
 //! standing in for, and it is the decision point for the whole direction:
@@ -51,9 +51,9 @@ const ENGINE_POOL_SIZE: usize = 2;
 /// A job to run against one context, on the runtime's own thread.
 type Job = Box<dyn FnOnce(&Context) + Send>;
 
-/// One QuickJS runtime, many contexts, all on a single thread.
+/// One `QuickJS` runtime, many contexts, all on a single thread.
 ///
-/// The thread is not incidental. `rquickjs::Runtime` is not `Sync` and QuickJS
+/// The thread is not incidental. `rquickjs::Runtime` is not `Sync` and `QuickJS`
 /// serialises execution per runtime anyway, so the honest model is: **the
 /// runtime is a thread, and contexts are the things a workflow holds.** That is
 /// precisely the split the design needs — a suspended workflow keeps its
@@ -167,7 +167,7 @@ impl Occupancy {
 
 /// The workflow body, as the `async_to_generator` lowering would leave it: it
 /// yields its request and resumes with the answer.
-const BODY: &str = r#"
+const BODY: &str = r"
 globalThis.__start = function () {
   globalThis.__gen = (function* () {
     const answer = yield 'GET /charge';
@@ -179,7 +179,7 @@ globalThis.__resume = function (value) {
   const step = globalThis.__gen.next(value);
   return String(step.value) + '|' + String(step.done);
 };
-"#;
+";
 
 // ── § 1 · does a paused generator survive its neighbours? ───────────────────
 

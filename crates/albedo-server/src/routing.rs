@@ -18,7 +18,7 @@ pub enum HttpMethod {
 }
 
 impl HttpMethod {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
@@ -44,8 +44,7 @@ impl TryFrom<&Method> for HttpMethod {
             Method::HEAD => Ok(Self::Head),
             Method::OPTIONS => Ok(Self::Options),
             _ => Err(RuntimeError::InvalidConfig(format!(
-                "unsupported HTTP method '{}'",
-                value
+                "unsupported HTTP method '{value}'"
             ))),
         }
     }
@@ -424,8 +423,7 @@ fn compile_layout_targets(
         for normalized_path in normalize_route_paths(&layout.path)? {
             if !seen_paths.insert(normalized_path.clone()) {
                 return Err(RuntimeError::InvalidConfig(format!(
-                    "duplicate normalized layout path '{}'",
-                    normalized_path
+                    "duplicate normalized layout path '{normalized_path}'"
                 )));
             }
 

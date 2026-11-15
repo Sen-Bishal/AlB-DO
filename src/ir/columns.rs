@@ -100,15 +100,14 @@ impl StringInterner {
     pub fn resolve(&self, id: StringId) -> &str {
         self.storage
             .get(id.0 as usize)
-            .map(String::as_str)
-            .unwrap_or("")
+            .map_or("", String::as_str)
     }
 
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.storage.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.storage.is_empty()
     }
 }
@@ -123,7 +122,7 @@ pub mod effect_bits {
     pub const SIDE_EFFECTS: u8 = 1 << 3;
 
     #[inline]
-    pub fn pack(profile: EffectProfile) -> u8 {
+    pub const fn pack(profile: EffectProfile) -> u8 {
         let mut bits: u8 = 0;
         if profile.hooks {
             bits |= HOOKS;
@@ -141,7 +140,7 @@ pub mod effect_bits {
     }
 
     #[inline]
-    pub fn unpack(bits: u8) -> EffectProfile {
+    pub const fn unpack(bits: u8) -> EffectProfile {
         EffectProfile {
             hooks: (bits & HOOKS) != 0,
             asynchronous: (bits & ASYNC) != 0,
@@ -334,11 +333,11 @@ impl IrColumns {
     }
 
     // ── Core column accessors ────────────────────────
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.ids.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.ids.is_empty()
     }
 
@@ -398,7 +397,7 @@ impl IrColumns {
         &self.modules
     }
 
-    pub fn strings(&self) -> &StringInterner {
+    pub const fn strings(&self) -> &StringInterner {
         &self.strings
     }
 
@@ -410,7 +409,7 @@ impl IrColumns {
 
     /// Cumulative lane-start positions. `offsets[lane]..offsets[lane + 1]`
     /// is the contiguous column range owned by `lane`.
-    pub fn lane_offsets(&self) -> [u32; LANE_COUNT + 1] {
+    pub const fn lane_offsets(&self) -> [u32; LANE_COUNT + 1] {
         self.lane_offsets
     }
 
@@ -485,15 +484,13 @@ impl IrColumns {
     pub fn symbol_at(&self, idx: u32) -> &str {
         self.symbols
             .get(idx as usize)
-            .map(|sid| self.strings.resolve(*sid))
-            .unwrap_or("")
+            .map_or("", |sid| self.strings.resolve(*sid))
     }
 
     pub fn module_path_at(&self, idx: u32) -> &str {
         self.module_paths
             .get(idx as usize)
-            .map(|sid| self.strings.resolve(*sid))
-            .unwrap_or("")
+            .map_or("", |sid| self.strings.resolve(*sid))
     }
 
     /// Returns the column position of a component by its id.
@@ -501,7 +498,7 @@ impl IrColumns {
         self.id_to_index.get(&id).copied()
     }
 
-    /// Materializes a single component into the AoS shape.
+    /// Materializes a single component into the `AoS` shape.
     ///
     /// Allocates; use column accessors directly in hot paths.
     pub fn component_at(&self, idx: u32) -> Option<CanonicalIrComponent> {
@@ -542,7 +539,7 @@ impl IrColumns {
     /// Builds columns from a list of parsed components.
     ///
     /// Equivalent to `Self::from_canonical(&build_canonical_ir_from_parsed(..))`,
-    /// but goes through the shared AoS builder exactly once to keep the two
+    /// but goes through the shared `AoS` builder exactly once to keep the two
     /// paths guaranteed-equivalent.
     pub fn from_parsed(components: &[ParsedComponent]) -> Self {
         let (modules, components, edges) =
@@ -903,13 +900,13 @@ impl IrColumns {
         self.module_paths = permute(&self.module_paths, &old_idx_at_new);
         self.lane_ids = permute(&assignments, &old_idx_at_new);
 
-        for slot in self.edge_from.iter_mut() {
+        for slot in &mut self.edge_from {
             let old = *slot as usize;
             if let Some(&new_idx) = new_idx_of_old.get(old) {
                 *slot = new_idx;
             }
         }
-        for slot in self.edge_to.iter_mut() {
+        for slot in &mut self.edge_to {
             let old = *slot as usize;
             if let Some(&new_idx) = new_idx_of_old.get(old) {
                 *slot = new_idx;
@@ -979,7 +976,7 @@ impl IrColumns {
     /// Materializes the column store back into the serialization-shaped
     /// [`CanonicalIrDocument`].
     ///
-    /// This is the only place where the AoS form is produced at runtime,
+    /// This is the only place where the `AoS` form is produced at runtime,
     /// and it runs exclusively on the JSON export path.
     pub fn to_canonical(&self) -> CanonicalIrDocument {
         let modules = self

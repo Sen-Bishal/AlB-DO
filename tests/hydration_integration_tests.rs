@@ -106,7 +106,7 @@ fn test_hydration_no_js_for_tier_a_only_route() {
 
     assert_eq!(result.html, "<main><p>hello</p></main>");
     assert_eq!(result.hydration_payload, "{}");
-    assert!(result.head_tags.is_empty());
+    assert_eq!(result.head_tags, [] as [std::string::String; 0]);
 }
 
 // A3.2 — a Tier-C route now ships the client runtime plus a self-registering
@@ -372,11 +372,10 @@ globalThis.requestIdleCallback=function(cb){{cb();}};\
 globalThis.setTimeout=function(cb){{cb();}};\
 globalThis.console={{error:function(){{globalThis.__errors.push('err');}}}};\
 globalThis.document={{\
-getElementById:function(id){{if(id==='{payload_id}'){{return {{textContent:globalThis.__payload}};}}return null;}},\
+getElementById:function(id){{if(id==='{HYDRATION_PAYLOAD_ELEMENT_ID}'){{return {{textContent:globalThis.__payload}};}}return null;}},\
 querySelector:function(){{return {{addEventListener:function(_ev,cb){{cb();}}}};}}\
 }};\
-globalThis.__ALBEDO_HYDRATE_ISLAND=function(island){{if(island.component_id===31){{throw new Error('boom');}}globalThis.__calls.push(island.component_id);}};",
-            payload_id = HYDRATION_PAYLOAD_ELEMENT_ID
+globalThis.__ALBEDO_HYDRATE_ISLAND=function(island){{if(island.component_id===31){{throw new Error('boom');}}globalThis.__calls.push(island.component_id);}};"
         );
 
         ctx.eval::<(), _>(setup.as_str())
@@ -561,7 +560,7 @@ fn test_a3_3_ssr_stamps_island_marker_and_hydrates_end_to_end() {
         .expect("render should succeed");
 
     // A3.3 core assertion: the island marker is in the SSR HTML.
-    let expected_marker = format!("data-albedo-island=\"{}\"", ISLAND_ID);
+    let expected_marker = format!("data-albedo-island=\"{ISLAND_ID}\"");
     assert!(
         result.html.contains(&expected_marker),
         "SSR HTML must carry the island marker for the bootstrap to find it: got {:?}",
@@ -594,21 +593,20 @@ fn test_a3_3_ssr_stamps_island_marker_and_hydrates_end_to_end() {
         ctx.eval::<(), _>(island_script.as_str()).expect("island script should evaluate");
 
         // Wire the payload so the bootstrap can verify the checksum.
-        let setup = format!("globalThis.__payloadText = {};", payload_json);
+        let setup = format!("globalThis.__payloadText = {payload_json};");
         ctx.eval::<(), _>(setup.as_str()).expect("payload setup should evaluate");
 
         // Build the DOM tree that matches the SSR output (button with island marker).
         let dom_setup = format!(
-            r#"
+            r"
 var body = document.createElement('div');
 var button = document.createElement('button');
-button.setAttribute('data-albedo-island', '{id}');
+button.setAttribute('data-albedo-island', '{ISLAND_ID}');
 button.appendChild(document.createTextNode('count: 5'));
 body.appendChild(button);
 globalThis.__domRoot = body;
 globalThis.__button = button;
-"#,
-            id = ISLAND_ID
+"
         );
         ctx.eval::<(), _>(dom_setup.as_str()).expect("DOM setup should evaluate");
 
@@ -626,12 +624,12 @@ globalThis.__button = button;
         ctx.eval::<(), _>("globalThis.__button.__dispatch('click');")
             .expect("second click should dispatch");
 
-        ctx.eval::<String, _>(r#"JSON.stringify({
+        ctx.eval::<String, _>(r"JSON.stringify({
   hydrated: globalThis.__button.getAttribute('data-albedo-hydrated'),
   text: globalThis.__button.firstChild.nodeValue,
   sameNode: globalThis.__domRoot.firstChild === globalThis.__button,
   network: globalThis.__net,
-})"#)
+})")
             .expect("summary should serialize")
     });
 
@@ -759,7 +757,7 @@ fn tier_c_island_containing_a_link_renders_instead_of_an_empty_placeholder() {
 
     // The whole point: the placeholder is not empty, so the bootstrap has a node.
     assert!(
-        result.html.contains(&format!("data-albedo-island=\"{}\"", ISLAND_ID)),
+        result.html.contains(&format!("data-albedo-island=\"{ISLAND_ID}\"")),
         "island marker must be present or hydration can never find the node: got {:?}",
         result.html
     );

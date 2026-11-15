@@ -30,7 +30,7 @@ const PHOSPHOR_JS: &str = include_str!("../../../../assets/phosphor.js");
 const CLIENT_JS: &str = include_str!("../../../../assets/albedo-client.js");
 
 /// Tier C · Phase 2 — the browser-side npm runtime: the record linker (the
-/// **same** Rust-generated string the server's QuickJS prelude installs) plus
+/// **same** Rust-generated string the server's `QuickJS` prelude installs) plus
 /// the host modules that stand in for `react` and `react/jsx-runtime`, plus an
 /// inert frozen `process`.
 ///

@@ -2,7 +2,7 @@
 //!
 //! One struct rather than one parameter per name, because every name added here
 //! has to reach BOTH executors — the pure-Rust interpreter's environment and the
-//! QuickJS handler script — through the same chain of calls, and the two must
+//! `QuickJS` handler script — through the same chain of calls, and the two must
 //! bind it identically or a body works under one and not the other. A new
 //! request-scoped name is a field here and one line in each executor, not a
 //! parameter threaded through every `invoke_action_*` again.
@@ -14,7 +14,7 @@
 use serde_json::Value;
 
 /// The request-scoped names an action body reads: `user` and `origin`.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequestBindings {
     /// `user` — [`Principal::user_value`](crate::auth::Principal::user_value).
     /// `None` is an anonymous request, and binds `null`.

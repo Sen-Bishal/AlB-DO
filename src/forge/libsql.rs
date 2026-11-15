@@ -194,7 +194,7 @@ impl LibSqlSubstrate {
     /// `expect` cannot fire: the `Option` is `None` only after
     /// [`Connections::close`], which runs during drop, after which `self` is
     /// unreachable.
-    fn reader(&self) -> &Connection {
+    const fn reader(&self) -> &Connection {
         self.conns
             .reader
             .as_ref()
@@ -204,7 +204,7 @@ impl LibSqlSubstrate {
     /// The writer mutex.
     ///
     /// See [`Self::reader`] for why the `expect` is unreachable.
-    fn writer(&self) -> &Arc<Mutex<Connection>> {
+    const fn writer(&self) -> &Arc<Mutex<Connection>> {
         self.conns
             .writer
             .as_ref()
@@ -310,8 +310,7 @@ impl LibSqlSubstrate {
         // leaked directory is untidy rather than load-bearing.
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |since| since.as_nanos());
         let unique = format!(
             "forge-{}-{stamp}-{}",
             std::process::id(),

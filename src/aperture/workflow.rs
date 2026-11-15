@@ -8,7 +8,7 @@
 //! ## Why the loop is here and not inside the dispatch
 //!
 //! `invoke_action_quickjs_pass` is synchronous and resolving a request is not,
-//! so a loop written inside it would hold a QuickJS engine across the round trip.
+//! so a loop written inside it would hold a `QuickJS` engine across the round trip.
 //! That is invariant 2.6, and gate 5 priced the difference at 403.9 ms against
 //! 52.7 ms with a peak of 2 engines in flight against 16 — a gap no pool size
 //! closes, because under the blocking shape *the engine is the thing waiting*.
@@ -63,8 +63,7 @@ pub const DEFAULT_WORKFLOW_DEADLINE: Duration = Duration::from_secs(30);
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Where a workflow's log is written down, if anywhere.
@@ -451,8 +450,7 @@ pub async fn resolve_pending(
                     // the call that caused it — the egress refusal's shape.
                     Err(reason) => StepOutcome::Failed(reason.clone()),
                 }
-            })
-            .collect::<Vec<_>>(),
+            }),
     )
     .await;
 

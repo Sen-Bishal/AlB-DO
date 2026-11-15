@@ -27,7 +27,7 @@ pub enum WireError {
 ///   little-endian. Choosing it here means the JS decoder reads bytes in the
 ///   same order they were written without per-field swaps.
 /// - **Variable-length integers**: most opcode fields are small `u16`/`u32`
-///   IDs (TagId, AttrId, StableId). Varint shrinks the average frame by ~30%
+///   IDs (`TagId`, `AttrId`, `StableId`). Varint shrinks the average frame by ~30%
 ///   versus fixed-width encoding without costing the decoder anything that
 ///   matters at frame sizes we ship (sub-kilobyte typical).
 /// - **No limit**: the encode side trusts its own output — frames we build are

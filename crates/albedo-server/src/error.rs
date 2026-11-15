@@ -54,7 +54,7 @@ pub enum RuntimeError {
 }
 
 impl RuntimeError {
-    pub fn status_code(&self) -> StatusCode {
+    pub const fn status_code(&self) -> StatusCode {
         match self {
             Self::InvalidConfig(_)
             | Self::ConfigIo { .. }

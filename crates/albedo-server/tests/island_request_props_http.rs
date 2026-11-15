@@ -304,7 +304,7 @@ async fn every_island_renders_its_own_requests_params_and_user() {
     // for this request, not that one beside the boot render's.
     let counter = page(&client, &base, "/counter/7", None).await;
     assert_eq!(counter.matches("__albedoReactive.boot(").count(), 1, "{counter}");
-    assert!(counter.contains(r#"counter 7<\/p>"#), "the install carries this request's markup");
+    assert!(counter.contains(r"counter 7<\/p>"), "the install carries this request's markup");
 
     // An A3 island hydrates from the props on its root, which are this
     // request's; the payload's are the boot render's, shared by every visitor.

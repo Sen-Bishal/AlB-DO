@@ -65,7 +65,7 @@ impl FromFormPayload for ValidatedLogin {
     }
 }
 
-/// Minimal RequestContext stub matching the shape the actions
+/// Minimal `RequestContext` stub matching the shape the actions
 /// module's own unit tests use. Action handlers under test don't
 /// read the request body here, so an empty `Bytes` is fine.
 fn ctx() -> RequestContext {

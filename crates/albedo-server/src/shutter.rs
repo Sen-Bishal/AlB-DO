@@ -175,7 +175,7 @@ impl TrustedProxies {
 
     /// Trust these networks. [`Self::new`] is this with full-length prefixes.
     #[must_use]
-    pub fn from_ranges(entries: Vec<TrustedRange>) -> Self {
+    pub const fn from_ranges(entries: Vec<TrustedRange>) -> Self {
         Self { entries }
     }
 
@@ -185,13 +185,13 @@ impl TrustedProxies {
 
     /// How many addresses are trusted.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether nothing is trusted — the default.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -330,7 +330,7 @@ impl Limiter {
     /// Build from parts. Tests inject a `ManualClock`
     /// through the [`Shutter`]; nothing in production does.
     #[must_use]
-    pub fn with(shutter: Shutter, proxies: TrustedProxies) -> Self {
+    pub const fn with(shutter: Shutter, proxies: TrustedProxies) -> Self {
         Self { shutter, proxies }
     }
 
@@ -338,7 +338,7 @@ impl Limiter {
     /// `X-Forwarded-For`. Reported at boot, because zero behind a balancer is a
     /// misconfiguration whose only symptom is over-strict limiting.
     #[must_use]
-    pub fn trusted_proxies(&self) -> usize {
+    pub const fn trusted_proxies(&self) -> usize {
         self.proxies.len()
     }
 
@@ -393,7 +393,7 @@ impl Limiter {
     /// The underlying limiter, for the login endpoints' two-bucket path and for
     /// diagnostics.
     #[must_use]
-    pub fn shutter(&self) -> &Shutter {
+    pub const fn shutter(&self) -> &Shutter {
         &self.shutter
     }
 }
@@ -512,7 +512,7 @@ where
         refused: Arc::clone(&refused),
     };
     let value = OUTBOUND.scope(scope, future).await;
-    let refusal = refused.lock().map(|mut slot| slot.take()).unwrap_or(None);
+    let refusal = refused.lock().map_or(None, |mut slot| slot.take());
     (value, refusal)
 }
 

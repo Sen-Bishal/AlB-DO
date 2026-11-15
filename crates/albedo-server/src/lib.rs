@@ -1,6 +1,6 @@
 //! # albedo-server
 //!
-//! Axum-based HTTP runtime for AlBDO compiled JSX/TSX applications.
+//! Axum-based HTTP runtime for `AlBDO` compiled JSX/TSX applications.
 //!
 //! Consumes a [`RenderManifestV2`] produced by `dom-render-compiler` and wires it into
 //! a production-ready axum server with a radix router, streaming support, WebTransport

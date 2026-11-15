@@ -41,7 +41,7 @@ pub struct ParsedModule {
     /// than say "no `export default`" about a file that exports two.
     pub component_exports: Vec<String>,
     /// Stage 3 — top-level `const/let/var X = expr` declarations whose
-    /// init isn't a function. Order preserved (Vec, not HashMap) so a
+    /// init isn't a function. Order preserved (Vec, not `HashMap`) so a
     /// forward-referenced const sees prior ones during sequential eval.
     /// Imported names live in `imports`; only declared-in-this-module
     /// bindings show up here.
@@ -141,13 +141,11 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
                     if let DefaultDecl::Fn(fn_expr) = default_decl.decl {
                         let name = fn_expr
                             .ident
-                            .as_ref()
-                            .map(|ident| ident.sym.to_string())
-                            .unwrap_or_else(|| {
+                            .as_ref().map_or_else(|| {
                                 let generated = format!("__default_{synthetic_index}");
                                 synthetic_index += 1;
                                 generated
-                            });
+                            }, |ident| ident.sym.to_string());
                         parsed
                             .functions
                             .insert(name.clone(), function_from_function(&fn_expr.function)?);
@@ -161,13 +159,11 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
                     Expr::Fn(fn_expr) => {
                         let name = fn_expr
                             .ident
-                            .as_ref()
-                            .map(|ident| ident.sym.to_string())
-                            .unwrap_or_else(|| {
+                            .as_ref().map_or_else(|| {
                                 let generated = format!("__default_{synthetic_index}");
                                 synthetic_index += 1;
                                 generated
-                            });
+                            }, |ident| ident.sym.to_string());
                         parsed
                             .functions
                             .insert(name.clone(), function_from_function(&fn_expr.function)?);

@@ -4,14 +4,14 @@
 //!
 //! An npm package's `import … from 'react'` cannot bind to the real React —
 //! neither of Albedo's renderers speaks React's component protocol. The browser
-//! runtime builds vnodes; the QuickJS `h` shim builds HTML strings **eagerly**.
+//! runtime builds vnodes; the `QuickJS` `h` shim builds HTML strings **eagerly**.
 //! What they *do* share is the set of global names they expose (`h`, `useState`,
 //! `useEffect`, `useRef`, `useMemo`, `useCallback`, `createContext`,
 //! `useContext`), which is exactly the surface a package reaches for.
 //!
 //! 🔑 **So one table serves both hosts**, and the record a package binds to is
 //! generated from it by [`build_host_module_records_script`] — emitted into the
-//! browser's `/_albedo/npm-runtime.js` and into the QuickJS prelude from the
+//! browser's `/_albedo/npm-runtime.js` and into the `QuickJS` prelude from the
 //! same function. A package therefore gets the *same* `forwardRef` on both
 //! sides, which is the precondition for hydration adopting the server's DOM
 //! instead of replacing it.
@@ -25,7 +25,7 @@
 //!
 //! Three exports cannot share a body, and all three for the same underlying
 //! reason: **the browser's element is a vnode (`value.__vnode === true`) and the
-//! server's is an `AlbedoHtml`** — finished HTML, because the QuickJS `h` is
+//! server's is an `AlbedoHtml`** — finished HTML, because the `QuickJS` `h` is
 //! eager.
 //!
 //! | export | browser | server |
@@ -360,7 +360,7 @@ const REACT_HOST: HostModule = HostModule {
 const JSX_RUNTIME_HOST: HostModule = HostModule {
     specifiers: &["react/jsx-runtime", "react/jsx-dev-runtime"],
     record_key: "albedo:host/react-jsx-runtime",
-    prelude: r#"
+    prelude: r"
   var __albedo_jsx_has_own = Object.prototype.hasOwnProperty;
 
   function __albedo_jsx(type, config, key) {
@@ -399,7 +399,7 @@ const JSX_RUNTIME_HOST: HostModule = HostModule {
     }
     return globalThis.h(type, props, children);
   }
-"#,
+",
     exports: &[
         ("jsx", "__albedo_jsx"),
         ("jsxs", "__albedo_jsx"),
@@ -427,7 +427,7 @@ const JSX_RUNTIME_HOST: HostModule = HostModule {
 /// `createPortal` is the second export whose implementation cannot be shared
 /// between the two runtimes (`isValidElement` is the first), so it routes
 /// through a global each defines for itself — a vnode in
-/// `assets/albedo-client.js`, empty markup in the QuickJS prelude.
+/// `assets/albedo-client.js`, empty markup in the `QuickJS` prelude.
 const REACT_DOM_HOST: HostModule = HostModule {
     specifiers: &["react-dom"],
     record_key: "albedo:host/react-dom",
@@ -474,7 +474,7 @@ pub const REFUSED_MODULES: &[RefusedModule] = &[
 /// The factory registrations for every host module, as JavaScript.
 ///
 /// Evaluated by both runtimes: the browser gets it inside
-/// `/_albedo/npm-runtime.js`, QuickJS gets it in its prelude right after the
+/// `/_albedo/npm-runtime.js`, `QuickJS` gets it in its prelude right after the
 /// record linker. Idempotent — re-evaluating is a no-op — because both runtimes
 /// install their preludes per context and a second install must not clobber a
 /// live record.

@@ -103,7 +103,7 @@ impl ForgeWrite {
     /// The collection this write targets — the topic that must be
     /// rematerialised once it commits.
     #[must_use]
-    pub fn collection(&self) -> &str {
+    pub const fn collection(&self) -> &str {
         match self {
             Self::Append { collection, .. }
             | Self::Update { collection, .. }
@@ -1086,56 +1086,53 @@ async fn stage_writes<'a>(
             .map(|known| known.channel.clone())
             .collect();
 
-        match write {
-            ForgeWrite::Append { record, .. } => {
-                // The authorized record, which for an identity-partitioned
-                // collection carries the owner the server put there.
-                let record = appended.as_deref().unwrap_or(record);
-                let (sql, params, columns) =
-                    build_append_returning(&slot.table, &slot.key_column, record)?;
-                let rows = tx.query(&sql, &params).await?;
-                // ALB-02 · a signed-in append records its author. An
-                // identity-partitioned row already names its owner in its
-                // partition column. `RETURNING` lists the key first.
-                if let (Some(principal), false) = (principal, slot.identity_partitioned) {
-                    let key = rows.rows.first().and_then(|row| row.get(0).cloned());
-                    record_author(tx, slot, key, principal).await?;
-                }
-                // A substrate that does not honour `RETURNING` yields no row.
-                // That is not an error — it only costs the zero-query path, and
-                // the fan-out falls back to re-reading (`reserve.rs:266` records
-                // the same defensive posture).
-                let persisted = rows
-                    .rows
-                    .first()
-                    .and_then(|row| returned_record(&columns, row, &slot.fields));
-                for channel in &channels {
-                    match &persisted {
-                        Some(record) => record_outcome(&mut touched, channel, Some(record.clone())),
-                        None => record_outcome(&mut touched, channel, None),
-                    }
+        if let ForgeWrite::Append { record, .. } = write {
+            // The authorized record, which for an identity-partitioned
+            // collection carries the owner the server put there.
+            let record = appended.as_deref().unwrap_or(record);
+            let (sql, params, columns) =
+                build_append_returning(&slot.table, &slot.key_column, record)?;
+            let rows = tx.query(&sql, &params).await?;
+            // ALB-02 · a signed-in append records its author. An
+            // identity-partitioned row already names its owner in its
+            // partition column. `RETURNING` lists the key first.
+            if let (Some(principal), false) = (principal, slot.identity_partitioned) {
+                let key = rows.rows.first().and_then(|row| row.get(0).cloned());
+                record_author(tx, slot, key, principal).await?;
+            }
+            // A substrate that does not honour `RETURNING` yields no row.
+            // That is not an error — it only costs the zero-query path, and
+            // the fan-out falls back to re-reading (`reserve.rs:266` records
+            // the same defensive posture).
+            let persisted = rows
+                .rows
+                .first()
+                .and_then(|row| returned_record(&columns, row, &slot.fields));
+            for channel in &channels {
+                match &persisted {
+                    Some(record) => record_outcome(&mut touched, channel, Some(record.clone())),
+                    None => record_outcome(&mut touched, channel, None),
                 }
             }
-            _ => {
-                let (sql, params) = build_statement(slot, write)?;
-                tx.execute(&sql, &params).await?;
-                // ALB-02 · a removed row takes its authorship record with it.
-                if let ForgeWrite::Delete { key, .. } = write {
-                    let forgotten = match key_to_sqlvalue(&slot.topic, &slot.key_column, key) {
-                        Ok(key) => {
-                            tx.execute(
-                                "DELETE FROM albedo_row_authors WHERE collection = ?1 AND row_key = ?2",
-                                &[SqlValue::Text(slot.table.clone()), key],
-                            )
-                            .await
-                        }
-                        Err(err) => Err(err),
-                    };
-                    forgotten?;
-                }
-                for channel in &channels {
-                    record_outcome(&mut touched, channel, None);
-                }
+        } else {
+            let (sql, params) = build_statement(slot, write)?;
+            tx.execute(&sql, &params).await?;
+            // ALB-02 · a removed row takes its authorship record with it.
+            if let ForgeWrite::Delete { key, .. } = write {
+                let forgotten = match key_to_sqlvalue(&slot.topic, &slot.key_column, key) {
+                    Ok(key) => {
+                        tx.execute(
+                            "DELETE FROM albedo_row_authors WHERE collection = ?1 AND row_key = ?2",
+                            &[SqlValue::Text(slot.table.clone()), key],
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err),
+                };
+                forgotten?;
+            }
+            for channel in &channels {
+                record_outcome(&mut touched, channel, None);
             }
         }
     }

@@ -1,2 +1,12 @@
 avoid-breaking-exported-api = true
 msrv = "1.88.0"
+
+# Tests may unwrap, expect, panic and index: in a test that IS the assertion,
+# and a failure there is a test failure, not a crash in shipped code. These
+# keep `unwrap_used`, `expect_used`, `panic` and `indexing_slicing` (denied or
+# warned in the crate roots) aimed at the code that ships.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true

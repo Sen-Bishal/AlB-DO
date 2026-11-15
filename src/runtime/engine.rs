@@ -115,7 +115,7 @@ pub struct BootstrapLibrary {
 
 /// Stable 64-bit content hash of a source string.
 ///
-/// Cycle 2 (SoA IR refactor) — uses `xxh3_64` for SIMD-accelerated throughput
+/// Cycle 2 (`SoA` IR refactor) — uses `xxh3_64` for SIMD-accelerated throughput
 /// (~3-5× FNV-1a on modern CPUs) while preserving determinism across
 /// processes, Rust versions, and platforms. The implementation intentionally
 /// matches `parser::hash_source` and `incremental::hash_file_bytes` so that
@@ -233,7 +233,7 @@ impl ManifestSentinelRing {
         }
     }
 
-    pub fn slot_count(&self) -> usize {
+    pub const fn slot_count(&self) -> usize {
         self.slots.len()
     }
 

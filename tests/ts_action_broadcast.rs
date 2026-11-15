@@ -289,7 +289,7 @@ async fn second_invoke_of_increment_continues_from_first_write() {
             serde_json::from_slice(&topic.current_value()).unwrap();
         assert_eq!(
             value.as_f64(),
-            Some(expected as f64),
+            Some(f64::from(expected)),
             "after {expected} invocation(s), counter should be {expected}"
         );
     }

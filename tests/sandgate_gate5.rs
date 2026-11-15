@@ -123,7 +123,7 @@ fn a_confined_engine_renders_byte_identically_with_no_recipe_from_the_caller() {
 // 5.1 · the leak closes through `confine()` alone
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PEEKER: &str = r#"
+const PEEKER: &str = r"
 if (!globalThis.__stolen) {
   globalThis.__stolen = [];
   var realH = globalThis.h;
@@ -133,11 +133,11 @@ if (!globalThis.__stolen) {
   };
 }
 module.exports = { tag: 'installed' };
-"#;
+";
 
-const VICTIM: &str = r#"export default function V(props) {
+const VICTIM: &str = r"export default function V(props) {
     return <b data-secret={props.secret}>{props.secret}</b>;
-}"#;
+}";
 
 const READBACK: &str = r#"export default function R() {
     return <pre>{(globalThis.__stolen || []).join(" ~ ")}</pre>;
@@ -189,10 +189,10 @@ fn the_cross_request_leak_closes_through_confine_alone() {
 // 5.2 · the behaviour change, observed rather than discovered
 // ─────────────────────────────────────────────────────────────────────────────
 
-const COUNTER: &str = r#"
+const COUNTER: &str = r"
 var calls = 0;
 module.exports = { tag: 'counter', next: function () { calls = calls + 1; return calls; } };
-"#;
+";
 
 const COUNTER_ROUTE: &str = r#"import { next } from "counter";
 export default function C() { return <b>{String(next())}</b>; }"#;
@@ -323,7 +323,7 @@ fn confinement_does_not_grow_the_persistent_arena() {
 /// takes it *for the right entries*: npm artifacts yes, project modules no.
 ///
 /// 🔑 The count is pinned to the ledger's own composition rather than to a
-/// literal, because "bytecode_hits > 0" is the vacuous version of this
+/// literal, because "`bytecode_hits` > 0" is the vacuous version of this
 /// assertion — it passes with one artifact out of fifty-five compiled.
 #[test]
 fn npm_artifacts_replay_from_bytecode_and_project_modules_do_not() {
@@ -372,7 +372,7 @@ fn npm_artifacts_replay_from_bytecode_and_project_modules_do_not() {
 // 5.5 · nothing is confined for free
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NO_NPM_ROUTE: &str = r#"export default function P() { return <b>hi</b>; }"#;
+const NO_NPM_ROUTE: &str = r"export default function P() { return <b>hi</b>; }";
 
 /// The dirty bit is what the pool gates on. An app with no npm must report
 /// false, or every request on every project pays for a rebuild that protects
@@ -458,7 +458,7 @@ fn a_failed_rebuild_rolls_back_to_the_realm_that_was_working() {
 // 5.7 · registration is not execution
 // ─────────────────────────────────────────────────────────────────────────────
 
-const IDLE_ROUTE: &str = r#"export default function I() { return <b>no packages here</b>; }"#;
+const IDLE_ROUTE: &str = r"export default function I() { return <b>no packages here</b>; }";
 
 /// 📏 **Registration is not execution — and the narrow window in which that
 /// helps.**

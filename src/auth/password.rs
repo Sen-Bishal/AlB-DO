@@ -213,7 +213,7 @@ pub fn absorb_timing(presented: &str) {
 ///
 /// # Errors
 /// [`PasswordError::TooShort`] or [`PasswordError::TooLong`].
-pub fn check_policy(plaintext: &str) -> Result<(), PasswordError> {
+pub const fn check_policy(plaintext: &str) -> Result<(), PasswordError> {
     if plaintext.len() < MIN_PASSWORD_BYTES {
         return Err(PasswordError::TooShort);
     }

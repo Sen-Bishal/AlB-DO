@@ -40,10 +40,10 @@ struct StaticRenderProject {
     project: ComponentProject,
 }
 
-/// Phase P · CompiledProject wrapped around the same source tree the
+/// Phase P · `CompiledProject` wrapped around the same source tree the
 /// Phase J render project uses. Held alongside `static_render_project`
 /// so the builder can pre-render Tier-B components with full Phase K
-/// hook compile (BindEvent + SetTextRef + initial SlotSet) at build
+/// hook compile (`BindEvent` + `SetTextRef` + initial `SlotSet`) at build
 /// time, embedding the result into the manifest.
 struct CompiledRenderProject {
     root: PathBuf,
@@ -105,7 +105,7 @@ pub struct ManifestBuilder<'a> {
     static_render_project: Option<StaticRenderProject>,
     /// Phase P · Phase K render path. Built from the same source tree
     /// as `static_render_project` when possible. `None` when
-    /// CompiledProject construction fails (e.g. parse error in a
+    /// `CompiledProject` construction fails (e.g. parse error in a
     /// component); falls back to Phase J static render.
     compiled_render_project: Option<CompiledRenderProject>,
     /// Phase P · file-based-routing discovery, when `<root>/routes/`
@@ -496,7 +496,7 @@ impl<'a> ManifestBuilder<'a> {
     /// Phase P · Stream E.2 — resolve `routes/.../error.tsx` (if any)
     /// for `route` to a component name the streaming handler can
     /// render when a Tier-C node fails. `discover_routes_from_components`
-    /// returns the file path; component_name_for_rel_path translates
+    /// returns the file path; `component_name_for_rel_path` translates
     /// to the registered component's name. `None` when no error.tsx
     /// covers this route.
     fn error_component_for_route(&self, route: &str) -> Option<String> {
@@ -624,19 +624,19 @@ impl<'a> ManifestBuilder<'a> {
     /// begin at `/routes/<rel>` so a needle of `layout.tsx` matches
     /// only `<root>/routes/layout.tsx` and NOT `<root>/routes/nested/layout.tsx`.
     /// A second pass accepts a bare-relative match (`routes/<rel>`
-    /// without a leading slash) for projects whose file_path
+    /// without a leading slash) for projects whose `file_path`
     /// strings are stored relative to the workspace. Without these
-    /// constraints, HashMap iteration order would let any deeper
+    /// constraints, `HashMap` iteration order would let any deeper
     /// `layout.tsx` win against the root needle.
     fn component_id_for_rel_path(&self, rel: &Path) -> Option<ComponentId> {
         let needle = rel.to_string_lossy().replace('\\', "/");
-        let absolute_suffix = format!("/routes/{}", needle);
-        let relative_suffix = format!("routes/{}", needle);
+        let absolute_suffix = format!("/routes/{needle}");
+        let relative_suffix = format!("routes/{needle}");
         for (id, component) in &self.components {
             let normalised = component.file_path.replace('\\', "/");
             if normalised.ends_with(absolute_suffix.as_str())
                 || normalised == relative_suffix
-                || normalised.ends_with(&format!("/{}", relative_suffix))
+                || normalised.ends_with(&format!("/{relative_suffix}"))
             {
                 return Some(*id);
             }
@@ -876,7 +876,7 @@ impl<'a> ManifestBuilder<'a> {
     /// route. Walks every TIer-A / Tier-B / Tier-C node on the
     /// route, resolves each to its `module_spec`, and accumulates
     /// the file-keyed scoped CSS from the project's registry. Dedup
-    /// happens at the file_key level inside `scoped_css_for_module`,
+    /// happens at the `file_key` level inside `scoped_css_for_module`,
     /// so a single file imported from multiple components emits
     /// once. Empty string when no component on the route imports a
     /// `.module.css` (the common case for back-compat routes).
@@ -1140,7 +1140,7 @@ impl<'a> ManifestBuilder<'a> {
                         error: "Add `<children />` where the route's content belongs."
                             .to_string(),
                     });
-                accumulated = format!("{}{}", layout_html, accumulated);
+                accumulated = format!("{layout_html}{accumulated}");
                 continue;
             }
             accumulated = layout_html.replace(LAYOUT_CHILDREN_SENTINEL, &accumulated);
@@ -1218,7 +1218,7 @@ impl<'a> ManifestBuilder<'a> {
                         map.insert(self.island_key(id), node.placeholder_id.clone());
                         nodes.push(node);
                     }
-                    Some(Tier::A) | Some(Tier::B) => {
+                    Some(Tier::A | Tier::B) => {
                         for child in self.sorted_children(id) {
                             stack.push(child);
                         }
@@ -1411,7 +1411,7 @@ impl<'a> ManifestBuilder<'a> {
                     ));
                     self.collect_tier_a_children(child, parent_placeholder, output, order_counter);
                 }
-                Some(Tier::B) | Some(Tier::C) | None => {}
+                Some(Tier::B | Tier::C) | None => {}
             }
         }
     }
@@ -1432,9 +1432,7 @@ impl<'a> ManifestBuilder<'a> {
         // Falls back to `None` + the existing fallback_html if the
         // compile path isn't available or render errors transiently.
         let (initial_html, initial_opcode_frame) = self
-            .render_tier_b_inline(component)
-            .map(|(html, bytes)| (Some(html), bytes))
-            .unwrap_or_else(|| (None, Vec::new()));
+            .render_tier_b_inline(component).map_or_else(|| (None, Vec::new()), |(html, bytes)| (Some(html), bytes));
 
         let component_key = self.shared_name_key(component);
         TierBNode {
@@ -1710,7 +1708,7 @@ impl<'a> ManifestBuilder<'a> {
     /// produced `<section ...>asChild );}</section>` — every tag gone, and the
     /// closing `);}` of the source file rendered into the browser. There is no
     /// reading of "strip everything between angle brackets" that recovers
-    /// markup, so it is deleted rather than repaired. The QuickJS `h` shim has
+    /// markup, so it is deleted rather than repaired. The `QuickJS` `h` shim has
     /// refused this class outright since it was written (`typeof type !==
     /// 'string'` throws): visible corruption is the one outcome worse than a
     /// named failure, and this path had no equivalent guard.
@@ -1880,7 +1878,7 @@ impl<'a> ManifestBuilder<'a> {
     fn deferred_component_names(&self) -> std::collections::HashSet<String> {
         self.components
             .iter()
-            .filter(|(id, _)| matches!(self.tier_of(**id), Some(Tier::B) | Some(Tier::C)))
+            .filter(|(id, _)| matches!(self.tier_of(**id), Some(Tier::B | Tier::C)))
             .map(|(id, _)| self.island_key(*id))
             .collect()
     }
@@ -1931,7 +1929,7 @@ impl<'a> ManifestBuilder<'a> {
         let mut table: std::collections::HashMap<String, Vec<(String, String)>> =
             std::collections::HashMap::new();
         let mut ids: Vec<ComponentId> = self.components.keys().copied().collect();
-        ids.sort_unstable_by_key(|id| id.as_u64());
+        ids.sort_unstable_by_key(super::super::types::ComponentId::as_u64);
         for id in ids {
             // Static modules must participate in exact-path matching too: a
             // longer static path can end in a deferred module's path. Its own
@@ -1963,20 +1961,20 @@ impl<'a> ManifestBuilder<'a> {
                     .is_some_and(|component| component.is_module_only)
             })
             .collect::<Vec<_>>();
-        children.sort_unstable_by_key(|component_id| component_id.as_u64());
+        children.sort_unstable_by_key(super::super::types::ComponentId::as_u64);
         children
     }
 
     fn component_or_panic(&self, id: ComponentId) -> &Component {
         self.components
             .get(&id)
-            .unwrap_or_else(|| panic!("missing component '{:?}' while building manifest", id))
+            .unwrap_or_else(|| panic!("missing component '{id:?}' while building manifest"))
     }
 
     fn metadata_or_panic(&self, id: ComponentId) -> &ComponentTierMetadata {
         self.metadata
             .get(&id)
-            .unwrap_or_else(|| panic!("missing tier metadata for component '{:?}'", id))
+            .unwrap_or_else(|| panic!("missing tier metadata for component '{id:?}'"))
     }
 }
 
@@ -2415,7 +2413,7 @@ fn default_shim_script(enable_wt_bootstrap: bool) -> String {
     script
 }
 
-fn stream_slot_label(slot: u8) -> &'static str {
+const fn stream_slot_label(slot: u8) -> &'static str {
     match slot {
         WT_STREAM_SLOT_CONTROL => WTRenderMode::Control.as_str(),
         WT_STREAM_SLOT_SHELL => WTRenderMode::Shell.as_str(),
@@ -2425,7 +2423,7 @@ fn stream_slot_label(slot: u8) -> &'static str {
     }
 }
 
-fn next_order(counter: &mut u32) -> u32 {
+const fn next_order(counter: &mut u32) -> u32 {
     let current = *counter;
     *counter = counter.saturating_add(1);
     current
@@ -2439,7 +2437,7 @@ fn base64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let (chunks, rem) = input.as_chunks::<3>();
     for chunk in chunks {
-        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
         out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
         out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
@@ -2447,14 +2445,14 @@ fn base64_encode(input: &[u8]) -> String {
     }
     match rem.len() {
         1 => {
-            let n = (rem[0] as u32) << 16;
+            let n = u32::from(rem[0]) << 16;
             out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
             out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
             out.push('=');
             out.push('=');
         }
         2 => {
-            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
             out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
             out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
             out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
@@ -2504,7 +2502,7 @@ fn hoist_head_from_nodes(
         hoist_into(&mut node.html, &mut merged);
     }
     for node in tier_b.iter_mut() {
-        for child in node.tier_a_children.iter_mut() {
+        for child in &mut node.tier_a_children {
             hoist_into(&mut child.html, &mut merged);
         }
         if let Some(html) = node.initial_html.as_mut() {

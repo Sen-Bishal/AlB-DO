@@ -447,7 +447,7 @@ fn string_literal(expr: &Expr) -> Option<String> {
         Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => tpl.quasis[0]
             .cooked
             .as_ref()
-            .map(|cooked| cooked.to_string()),
+            .map(std::string::ToString::to_string),
         _ => None,
     }
 }

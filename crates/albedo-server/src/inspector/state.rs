@@ -52,15 +52,13 @@ impl InspectorState {
         self.events_tx.subscribe()
     }
 
-    pub fn metrics(&self) -> &Arc<MetricsAggregator> {
+    pub const fn metrics(&self) -> &Arc<MetricsAggregator> {
         &self.metrics
     }
 
     pub fn graph_snapshot(&self) -> GraphSnapshot {
         self.graph
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|_| GraphSnapshot::empty())
+            .read().map_or_else(|_| GraphSnapshot::empty(), |guard| guard.clone())
     }
 
     pub fn set_graph(&self, snapshot: GraphSnapshot) {
@@ -82,8 +80,7 @@ impl InspectorState {
     pub fn lane_utilization(&self) -> [f32; 4] {
         self.lane_utilization
             .lock()
-            .map(|guard| *guard)
-            .unwrap_or([0.0; 4])
+            .map_or([0.0; 4], |guard| *guard)
     }
 }
 

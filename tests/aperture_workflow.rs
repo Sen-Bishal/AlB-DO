@@ -3,7 +3,7 @@
 //! The unit tests in `runtime::quickjs_engine` drive the suspend protocol with a
 //! hand-written body. This gate starts from **TSX a user could have written**
 //! and proves the whole chain: the extractor keeps the `async` arrow, the
-//! workflow lowering strips the `await`s that would otherwise be a SyntaxError,
+//! workflow lowering strips the `await`s that would otherwise be a `SyntaxError`,
 //! the engine suspends with the request staged, and the same action completes on
 //! the next pass with its effects intact.
 //!

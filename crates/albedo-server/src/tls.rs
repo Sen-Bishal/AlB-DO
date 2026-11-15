@@ -152,9 +152,7 @@ impl TlsSettings {
                 .unwrap_or_default(),
             acme_contact: std::env::var(ACME_CONTACT_ENV).ok(),
             acme_cache: std::env::var(ACME_CACHE_ENV).ok(),
-            acme_staging: std::env::var(ACME_STAGING_ENV)
-                .ok()
-                .is_some_and(|raw| is_truthy(&raw)),
+            acme_staging: std::env::var(ACME_STAGING_ENV).is_ok_and(|raw| is_truthy(&raw)),
         }
     }
 

@@ -15,7 +15,7 @@
 //!
 //! ## Why any of this is needed
 //!
-//! Before this, an action reached the server as a bincode `ActionEnvelope` POSTed
+//! Before this, an action reached the server as a bincode `ActionEnvelope` `POSTed`
 //! by `assets/albedo-link-forms.js` — which means **the page's only write path
 //! ran through JavaScript.** A form on a Tier-B route rendered without an
 //! `action` attribute at all (the renderer replaced it with
@@ -185,7 +185,7 @@ impl FormBody {
 
     /// Whether anything was submitted at all.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
 
@@ -289,7 +289,7 @@ impl ReturnPath {
         }
         // `//host` and `/\host` are protocol-relative: same-origin by inspection,
         // cross-origin in every browser.
-        if matches!(bytes.next(), Some(b'/') | Some(b'\\')) {
+        if matches!(bytes.next(), Some(b'/' | b'\\')) {
             return None;
         }
         // A control character in a `Location` value is header injection. ASCII

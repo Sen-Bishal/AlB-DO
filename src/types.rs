@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct ComponentId(u64);
 
 impl ComponentId {
-    pub fn new(id: u64) -> Self {
+    pub const fn new(id: u64) -> Self {
         Self(id)
     }
 
-    pub fn as_u64(&self) -> u64 {
+    pub const fn as_u64(&self) -> u64 {
         self.0
     }
 }
@@ -75,8 +75,8 @@ pub struct Component {
     /// a preference: Tier-A markup is baked by `runtime::eval` walking the AST,
     /// and that walk has no `node_modules`. A component baked that way does not
     /// degrade — the render raises, and the error takes the whole Tier-A subtree
-    /// it was nested in with it. QuickJS has npm and renders it correctly, so
-    /// the component is served from a tier that reaches QuickJS.
+    /// it was nested in with it. `QuickJS` has npm and renders it correctly, so
+    /// the component is served from a tier that reaches `QuickJS`.
     ///
     /// Defaults to `false` so existing manifests deserialize unchanged.
     #[serde(default)]
@@ -178,7 +178,7 @@ pub struct ComponentAnalysis {
 }
 
 impl ComponentAnalysis {
-    pub fn new(id: ComponentId) -> Self {
+    pub const fn new(id: ComponentId) -> Self {
         Self {
             id,
             priority: 0.0,
@@ -237,7 +237,7 @@ pub struct IdGenerator {
 }
 
 impl IdGenerator {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             counter: AtomicU64::new(0),
         }

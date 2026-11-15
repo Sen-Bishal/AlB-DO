@@ -8,7 +8,7 @@
 //! Phase A0 deliberately stops below the engine. Nothing here is reachable from
 //! a handler body, `bridge.rs` is untouched, and no global named `fetch` is
 //! installed. That is not an accident of sequencing — it is what makes gates 3
-//! and 6 unambiguous. They run against this module with no QuickJS involved, so
+//! and 6 unambiguous. They run against this module with no `QuickJS` involved, so
 //! a failure is in the cache or the coalescer and nowhere else.
 //!
 //! ## The [`Transport`] seam
@@ -79,22 +79,22 @@ pub enum ApertureError {
 impl std::fmt::Display for ApertureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ApertureError::InvalidUrl(url) => write!(f, "aperture: could not parse URL `{url}`"),
-            ApertureError::Egress(denial) => write!(f, "aperture: {denial}"),
-            ApertureError::Transport(msg) => write!(f, "aperture: transport failure: {msg}"),
-            ApertureError::ResponseTooLarge { limit } => {
+            Self::InvalidUrl(url) => write!(f, "aperture: could not parse URL `{url}`"),
+            Self::Egress(denial) => write!(f, "aperture: {denial}"),
+            Self::Transport(msg) => write!(f, "aperture: transport failure: {msg}"),
+            Self::ResponseTooLarge { limit } => {
                 write!(f, "aperture: response body exceeds {limit} bytes")
             }
-            ApertureError::Timeout { after } => {
+            Self::Timeout { after } => {
                 write!(f, "aperture: request timed out after {after:?}")
             }
-            ApertureError::Throttled { host, retry_after } => write!(
+            Self::Throttled { host, retry_after } => write!(
                 f,
                 "aperture: this app's budget for `{host}` is spent; nothing was sent (next call \
                  admitted in {:.1}s)",
                 retry_after.as_secs_f64()
             ),
-            ApertureError::DanglingRevalidation => write!(
+            Self::DanglingRevalidation => write!(
                 f,
                 "aperture: upstream returned 304 but the cached entry was evicted mid-flight"
             ),
@@ -365,7 +365,7 @@ impl ApertureClient {
 
     /// Override the per-request timeout.
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
@@ -378,7 +378,7 @@ impl ApertureClient {
 
     /// The shared response cache.
     #[must_use]
-    pub fn cache(&self) -> &Arc<ResponseCache> {
+    pub const fn cache(&self) -> &Arc<ResponseCache> {
         &self.cache
     }
 
@@ -390,7 +390,7 @@ impl ApertureClient {
     /// behind an `Arc` and has no interior mutability, so nothing reached
     /// through here can widen the allowlist at runtime.
     #[must_use]
-    pub fn policy(&self) -> &Arc<EgressPolicy> {
+    pub const fn policy(&self) -> &Arc<EgressPolicy> {
         &self.policy
     }
 
@@ -698,7 +698,7 @@ pub struct CountingTransport {
 impl CountingTransport {
     /// A transport that answers every request with `response`.
     #[must_use]
-    pub fn always(response: WireResponse) -> Self {
+    pub const fn always(response: WireResponse) -> Self {
         Self {
             responses: std::sync::Mutex::new(Vec::new()),
             default: std::sync::Mutex::new(Some(response)),
@@ -725,7 +725,7 @@ impl CountingTransport {
     /// Make each response take `delay`, so a coalescing test has a window in
     /// which followers can actually pile up behind the leader.
     #[must_use]
-    pub fn with_delay(mut self, delay: Duration) -> Self {
+    pub const fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
         self
     }

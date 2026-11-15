@@ -505,8 +505,7 @@ fn file_stem(path: &Path) -> Option<&str> {
 fn has_route_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ROUTE_EXTENSIONS.iter().any(|allowed| allowed == &ext))
-        .unwrap_or(false)
+        .is_some_and(|ext| ROUTE_EXTENSIONS.iter().any(|allowed| allowed == &ext))
 }
 
 fn is_visible_path(rel_path: &Path) -> bool {

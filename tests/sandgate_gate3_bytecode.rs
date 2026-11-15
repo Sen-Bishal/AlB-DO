@@ -9,7 +9,7 @@
 //!
 //! ## What this measures, and what it deliberately does not
 //!
-//! This is a question about **QuickJS**, not about our engine wiring, so it runs
+//! This is a question about **`QuickJS`**, not about our engine wiring, so it runs
 //! against a bare `Runtime`/`Context` rather than `QuickJsEngine`. Registering a
 //! module is either:
 //!
@@ -34,7 +34,7 @@
 //! cargo test --release --test sandgate_gate3_bytecode -- --ignored --nocapture
 //! ```
 //!
-//! ⚠️ **Release only.** A debug build measures rustc's inlining, not QuickJS.
+//! ⚠️ **Release only.** A debug build measures rustc's inlining, not `QuickJS`.
 
 // AUDITED EXCEPTION — `Module::load` is `unsafe` because QuickJS will happily
 // read malformed bytecode into a live realm. Here the bytes come from

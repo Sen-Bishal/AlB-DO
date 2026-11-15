@@ -1,4 +1,4 @@
-//! The static (Tier A) evaluator's array methods, checked against QuickJS.
+//! The static (Tier A) evaluator's array methods, checked against `QuickJS`.
 //!
 //! 🔴 Until 2026-09-29 the evaluator modelled `map` and `join` and nothing else:
 //! every other array method — `find`, `filter`, `findIndex`, `flatMap` —
@@ -7,7 +7,7 @@
 //! `pages.findIndex(...)` shipped an empty pager with the build green.
 //!
 //! Two properties are pinned here:
-//! 1. Each supported method gives the markup QuickJS gives — the engine that
+//! 1. Each supported method gives the markup `QuickJS` gives — the engine that
 //!    runs real JavaScript is the reference, not this file's idea of it.
 //! 2. An unsupported method, a function passed by name, and a read of a
 //!    constant that failed to evaluate are ERRORS that name the call, never
@@ -166,9 +166,9 @@ fn refusal(component: &str) -> String {
 #[test]
 fn an_unsupported_array_method_is_refused_by_name() {
     let err = refusal(
-        r#"export default function Probe() {
+        r"export default function Probe() {
   return <p>{[3, 1].entries()}</p>;
-}"#,
+}",
     );
     assert!(err.contains("`.entries()` on an array is not supported"), "{err}");
 }
@@ -210,10 +210,10 @@ export default function Probe() {
 #[test]
 fn reading_a_constant_that_failed_to_evaluate_raises_its_reason() {
     let local = refusal(
-        r#"const pages = [1, 2].entries();
+        r"const pages = [1, 2].entries();
 export default function Probe() {
   return <p>{pages}</p>;
-}"#,
+}",
     );
     assert!(local.contains("`pages` could not be evaluated"), "{local}");
     assert!(local.contains("`.entries()` on an array is not supported"), "{local}");
@@ -243,10 +243,10 @@ fn a_constant_that_failed_but_is_never_read_does_not_break_the_render() {
     write(
         dir.path(),
         "Probe.tsx",
-        r#"const unused = [1].entries();
+        r"const unused = [1].entries();
 export default function Probe() {
   return <p>fine</p>;
-}"#,
+}",
     );
     let project = CompiledProject::load_from_dir(dir.path()).expect("compiles");
     assert!(render_static(&project, "Probe.tsx").unwrap().contains("fine"));

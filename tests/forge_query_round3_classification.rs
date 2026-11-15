@@ -66,11 +66,10 @@ fn collection_aliases_parens_and_crlf_keep_real_and_shadowed_sites_distinct() {
             .len(),
         1
     );
-    assert!(project
+    assert_eq!(project
         .component_meta("B.tsx", "B")
         .unwrap()
-        .shared_slots
-        .is_empty());
+        .shared_slots, [] as [dom_render_compiler::transforms::SharedSlotBinding; 0]);
 }
 
 #[test]
@@ -115,7 +114,7 @@ impl Visit for Anchors {
 
 #[test]
 fn shadowed_collection_result_does_not_inherit_another_functions_list_anchor() {
-    let source = r#"import { useSharedSlot } from 'albedo';
+    let source = r"import { useSharedSlot } from 'albedo';
 import { messages } from 'albedo/forge';
 export function Real() {
   const rows = useSharedSlot(messages);
@@ -125,7 +124,7 @@ export function Local(messages) {
   const rows = useSharedSlot(messages);
   return <ol>{rows.map(row => <li key={row.id}>{row.body}</li>)}</ol>;
 }
-"#;
+";
     let globals = Globals::new();
     GLOBALS.set(&globals, || {
         let mut module = parse(source);
@@ -144,7 +143,7 @@ export function Local(messages) {
 
 #[test]
 fn shadowed_collection_result_does_not_inherit_another_functions_scalar_anchor() {
-    let source = r#"import { useSharedSlot } from 'albedo';
+    let source = r"import { useSharedSlot } from 'albedo';
 import { messages } from 'albedo/forge';
 export function Real() {
   const value = useSharedSlot(messages);
@@ -155,7 +154,7 @@ export function Local(messages) {
   const value = useSharedSlot(messages);
   return <em>{value}</em>;
 }
-"#;
+";
     let globals = Globals::new();
     GLOBALS.set(&globals, || {
         let mut module = parse(source);
@@ -174,7 +173,7 @@ export function Local(messages) {
 
 #[test]
 fn source_projection_does_not_merge_a_shadowed_collections_same_named_result() {
-    let source = r#"import { useSharedSlot } from 'albedo';
+    let source = r"import { useSharedSlot } from 'albedo';
 import { messages } from 'albedo/forge';
 export function Real() {
   const rows = useSharedSlot(messages);
@@ -184,7 +183,7 @@ export function Local(messages) {
   const rows = useSharedSlot(messages);
   return <ol>{rows.map(row => <li key={row.id}>{rows.length}</li>)}</ol>;
 }
-"#;
+";
     let projections = classify_shared_slot_lists_source("Page.tsx", source);
     assert_eq!(projections.get("messages"), Some(&RowProjection::PerRecord));
 }

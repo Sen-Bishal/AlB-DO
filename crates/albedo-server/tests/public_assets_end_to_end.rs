@@ -1,6 +1,6 @@
 //! Phase N · public/ static asset serving end-to-end.
 //!
-//! Boots an AlbedoServer with one `with_public_dir(..)` mount, fires
+//! Boots an `AlbedoServer` with one `with_public_dir(..)` mount, fires
 //! axum oneshot requests for the canonical hit / miss / traversal
 //! cases, and asserts the response shape.
 

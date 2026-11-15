@@ -9,8 +9,7 @@ fn verify_production_components_exist() {
     let path = Path::new(PRODUCTION_COMPONENTS_DIR);
     assert!(
         path.exists(),
-        "Production components directory not found: {}",
-        PRODUCTION_COMPONENTS_DIR
+        "Production components directory not found: {PRODUCTION_COMPONENTS_DIR}"
     );
 
     let required_files = [
@@ -28,8 +27,7 @@ fn verify_production_components_exist() {
         let file_path = path.join(file);
         assert!(
             file_path.exists(),
-            "Required production file missing: {}",
-            file
+            "Required production file missing: {file}"
         );
     }
 }
@@ -118,7 +116,7 @@ fn test_production_baseline_compilation() {
         "    Total Weight:     {:.2} KB",
         result.metrics.total_weight_kb
     );
-    println!("    Compile Time:     {:?}", duration);
+    println!("    Compile Time:     {duration:?}");
     println!("    Parallel Batches: {}", result.parallel_batches.len());
     println!(
         "    Critical Path:    {} components",
@@ -158,7 +156,7 @@ fn test_production_cache_effectiveness() {
     let cold_time = start.elapsed();
 
     compiler1.save_cache().unwrap();
-    println!("    Time: {:?}", cold_time);
+    println!("    Time: {cold_time:?}");
 
     drop(compiler1);
 
@@ -169,15 +167,15 @@ fn test_production_cache_effectiveness() {
     compiler2.optimize_incremental(&files).unwrap();
     let warm_time = start.elapsed();
 
-    println!("    Time: {:?}", warm_time);
+    println!("    Time: {warm_time:?}");
 
     let speedup = cold_time.as_secs_f64() / warm_time.as_secs_f64();
 
     if let Some(stats) = compiler2.cache_stats() {
         println!("\n  PERFORMANCE METRICS");
-        println!("    Cold Start:       {:?}", cold_time);
-        println!("    Warm Start:       {:?}", warm_time);
-        println!("    Speedup:          {:.2}x", speedup);
+        println!("    Cold Start:       {cold_time:?}");
+        println!("    Warm Start:       {warm_time:?}");
+        println!("    Speedup:          {speedup:.2}x");
         println!("    Cache Hit Rate:   {:.1}%", stats.cache_hit_rate * 100.0);
         println!("    Cached Components: {}/{}", stats.total_cached, 8);
 
@@ -196,7 +194,7 @@ fn test_production_cache_effectiveness() {
             "every production component should be cached after a cold run"
         );
 
-        println!("\n  [OK] PASSED - Cache providing {:.2}x speedup", speedup);
+        println!("\n  [OK] PASSED - Cache providing {speedup:.2}x speedup");
     }
 }
 
@@ -218,7 +216,7 @@ fn test_production_cache_persistence() {
 
         assert!(cache_file.exists(), "Cache file should exist");
         let size = std::fs::metadata(&cache_file).unwrap().len();
-        println!("    [OK] Cache saved: {} bytes", size);
+        println!("    [OK] Cache saved: {size} bytes");
     }
 
     println!("\n  SESSION 2: Load from disk");
@@ -233,7 +231,7 @@ fn test_production_cache_persistence() {
 
         if let Some(stats) = compiler.cache_stats() {
             println!("    [OK] Cache loaded successfully");
-            println!("    Compile time: {:?}", load_time);
+            println!("    Compile time: {load_time:?}");
             println!("    Hit rate: {:.1}%", stats.cache_hit_rate * 100.0);
             println!("    Components from cache: {}", stats.total_cached);
 
@@ -263,7 +261,7 @@ fn test_production_dependency_graph() {
         if !comp.imports.is_empty() {
             println!("    {} →", comp.name);
             for import in &comp.imports {
-                println!("      ↳ {}", import);
+                println!("      ↳ {import}");
                 has_dependencies = true;
             }
         }
@@ -315,7 +313,7 @@ fn test_production_realistic_workflow() {
     compiler1.optimize_incremental(&files).unwrap();
     let step1_time = start.elapsed();
     compiler1.save_cache().unwrap();
-    println!("    Time: {:?}\n", step1_time);
+    println!("    Time: {step1_time:?}\n");
 
     drop(compiler1);
 
@@ -351,12 +349,12 @@ fn test_production_realistic_workflow() {
         let avg_speedup = step1_time.as_secs_f64() / avg_warm_time;
 
         println!("  WORKFLOW SUMMARY");
-        println!("    Cold start:        {:?}", step1_time);
+        println!("    Cold start:        {step1_time:?}");
         println!(
             "    Avg warm start:    {:.2?}",
             std::time::Duration::from_secs_f64(avg_warm_time)
         );
-        println!("    Average speedup:   {:.2}x", avg_speedup);
+        println!("    Average speedup:   {avg_speedup:.2}x");
         println!(
             "    Cache efficiency:  {:.1}%",
             stats.cache_hit_rate * 100.0
@@ -401,7 +399,7 @@ fn test_production_component_structure() {
     for expected in &expected_components {
         let found = components.iter().any(|c| c.name == *expected);
         println!("    {} {}", if found { "[OK]" } else { "[!!]" }, expected);
-        assert!(found, "Production component '{}' should be found", expected);
+        assert!(found, "Production component '{expected}' should be found");
     }
 
     println!("\n  COMPONENT DETAILS");
@@ -437,7 +435,7 @@ fn test_production_optimization_metrics() {
     let compile_time = start.elapsed();
 
     println!("  COMPILATION METRICS");
-    println!("    Time:              {:?}", compile_time);
+    println!("    Time:              {compile_time:?}");
     println!("    Components:        {}", result.metrics.total_components);
     println!(
         "    Total Weight:      {:.2} KB",
@@ -473,7 +471,7 @@ fn test_production_optimization_metrics() {
     } else {
         0.0
     };
-    println!("    Improvement:       {:.1}%", improvement_pct);
+    println!("    Improvement:       {improvement_pct:.1}%");
     println!(
         "    Critical Path:     {}/{} components",
         result.critical_path.len(),

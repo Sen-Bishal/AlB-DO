@@ -24,9 +24,7 @@ impl Drop for Server {
 }
 
 fn binary() -> PathBuf {
-    std::env::var_os("ALBEDO_TEST_BINARY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_albedo")))
+    std::env::var_os("ALBEDO_TEST_BINARY").map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_albedo")), PathBuf::from)
 }
 
 fn albedo(home: &Path, cwd: &Path) -> Command {

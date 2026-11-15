@@ -33,7 +33,7 @@ pub const FORGE_DB_ENV: &str = "ALBEDO_FORGE_DB";
 /// 1. `configured` — an explicit `forge.db_path` in the config file. The
 ///    operator said it; nothing should second-guess it.
 /// 2. `ALBEDO_FORGE_DB` — the container seam. An env var is what a Dockerfile,
-///    a systemd unit or a PaaS can set without rewriting the app's config.
+///    a systemd unit or a `PaaS` can set without rewriting the app's config.
 /// 3. `<project>/forge.db`, where the project is derived from `artifacts_dir`.
 ///    This is the case that used to be CWD-relative.
 ///

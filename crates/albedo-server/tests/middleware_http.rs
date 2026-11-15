@@ -500,7 +500,7 @@ export default function middleware(request) {
 
     // One spinning request per engine: `serve` sizes the pool to the host's
     // parallelism, and so does this.
-    let engines = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let engines = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let spinning = Instant::now();
     let spins = futures_util::future::join_all(
         (0..engines).map(|_| as_visitor("/spin")),

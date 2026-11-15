@@ -22,7 +22,7 @@
 //! That last part is not an aesthetic preference. A wrapper was the first
 //! attempt, and `tests/renderer_conformance.rs` rejected it: the wrapper exists
 //! only in the pure-Rust render, so its id landed in an opcode frame that the
-//! server ships alongside **QuickJS**-rendered Tier-B markup, where that node
+//! server ships alongside **`QuickJS`**-rendered Tier-B markup, where that node
 //! does not exist. Every id in a frame has to exist in the markup that gets
 //! served, and a template keeps that true by not inventing a node at all.
 

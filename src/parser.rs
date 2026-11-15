@@ -21,7 +21,7 @@ impl ComponentParser {
 
     pub fn parse_file(&self, path: &Path) -> Result<Vec<ParsedComponent>> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| CompilerError::AnalysisFailed(format!("Failed to read file: {}", e)))?;
+            .map_err(|e| CompilerError::AnalysisFailed(format!("Failed to read file: {e}")))?;
 
         self.parse_source(&content, path.to_str().unwrap_or("unknown"))
     }
@@ -51,7 +51,7 @@ impl ComponentParser {
 
         let module = parser
             .parse_module()
-            .map_err(|e| CompilerError::AnalysisFailed(format!("Parse error: {:?}", e)))?;
+            .map_err(|e| CompilerError::AnalysisFailed(format!("Parse error: {e:?}")))?;
 
         let source_hash = hash_source(source);
         let mut visitor = ComponentVisitor::new(filename.to_string(), source_hash);
@@ -172,7 +172,7 @@ struct ComponentVisitor {
 }
 
 impl ComponentVisitor {
-    fn new(file_path: String, source_hash: u64) -> Self {
+    const fn new(file_path: String, source_hash: u64) -> Self {
         Self {
             file_path,
             source_hash,
@@ -332,7 +332,7 @@ impl Visit for ComponentVisitor {
     fn visit_fn_decl(&mut self, func: &FnDecl) {
         let name = func.ident.sym.to_string();
 
-        if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+        if name.chars().next().is_some_and(char::is_uppercase) {
             let estimated_size = name.len() * 50 + 200;
             let analysis = self.analyze_function(&func.function);
             self.push_component(name, estimated_size, false, analysis);
@@ -342,7 +342,7 @@ impl Visit for ComponentVisitor {
     fn visit_var_decl(&mut self, var: &VarDecl) {
         for decl in &var.decls {
             if let Some(name) = decl.name.as_ident().map(|i| i.sym.to_string()) {
-                if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                if name.chars().next().is_some_and(char::is_uppercase) {
                     if let Some(init) = &decl.init {
                         let is_component = matches!(&**init, Expr::Arrow(_) | Expr::Fn(_));
                         if is_component {
@@ -877,7 +877,7 @@ pub const PRINCIPAL_IDENT: &str = "user";
 /// record whether a binding is used in component position, in an expression, or
 /// at all. So a Tier-A component sharing a file with an npm import is pushed off
 /// Tier A even if its own JSX never touches it. That is the right direction to
-/// be wrong in: a component that did not need QuickJS renders identically
+/// be wrong in: a component that did not need `QuickJS` renders identically
 /// through it, while the other error is a page that silently loses its markup.
 ///
 /// Type-only imports are already excluded upstream by `visit_import_decl`, so
@@ -1060,7 +1060,7 @@ struct ServerBoundaryScan<'a> {
 }
 
 impl<'a> ServerBoundaryScan<'a> {
-    fn new(local_safety: &'a HashMap<String, bool>) -> Self {
+    const fn new(local_safety: &'a HashMap<String, bool>) -> Self {
         Self {
             local_safety,
             found: false,
@@ -1125,7 +1125,7 @@ fn is_hook_call(name: &str) -> bool {
     if !name.starts_with("use") || name.len() <= 3 {
         return false;
     }
-    name.chars().nth(3).is_some_and(|ch| ch.is_uppercase())
+    name.chars().nth(3).is_some_and(char::is_uppercase)
 }
 
 /// The effect hooks — `useEffect`/`useLayoutEffect`/`useInsertionEffect` — are a

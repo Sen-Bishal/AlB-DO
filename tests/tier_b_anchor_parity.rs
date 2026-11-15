@@ -1,14 +1,14 @@
 //! The two renderers must agree on `data-albedo-id`.
 //!
 //! A Tier-B component's opcode frame is built by the **pure-Rust** renderer at
-//! build time; the markup a request actually serves is rendered by **QuickJS**.
+//! build time; the markup a request actually serves is rendered by **`QuickJS`**.
 //! The frame addresses elements by `stable_id`, so if the two renderers number
 //! elements differently — or one of them does not number them at all — every
 //! `BindEvent` in the frame targets an element that does not exist,
 //! `_requireNode` throws, and the whole frame is dropped. No Tier-B `onClick`
 //! fires, and nothing anywhere says why.
 //!
-//! That is what shipped: QuickJS emitted no anchors whatsoever. It stayed hidden
+//! That is what shipped: `QuickJS` emitted no anchors whatsoever. It stayed hidden
 //! because the only Tier-B components in existence were whole routes or
 //! form-driven ones, and a `<form action="…">` binds by attribute through
 //! `link-forms.js` without ever touching a `BindEvent`.
@@ -107,7 +107,7 @@ fn both_renderers_number_the_same_elements_the_same_way() {
 }
 
 /// The consequence, stated as the thing that actually broke: the element a
-/// `BindEvent` names has to exist in the markup QuickJS serves.
+/// `BindEvent` names has to exist in the markup `QuickJS` serves.
 #[test]
 fn the_bindevent_target_exists_in_the_quickjs_markup() {
     let (_, opcodes) = rust_render("fetching_handler");

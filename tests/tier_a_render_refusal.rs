@@ -21,7 +21,7 @@
 //! `tracing::warn!` on the path reaches nobody, because the shipped CLI installs
 //! a subscriber only under `RUST_LOG`.
 //!
-//! The QuickJS renderer has refused this class since it was written: its `h`
+//! The `QuickJS` renderer has refused this class since it was written: its `h`
 //! shim throws on `typeof type !== 'string'` precisely because visible
 //! corruption is the one outcome worse than a named failure. The pure-Rust path
 //! had no equivalent guard.
@@ -35,7 +35,7 @@
 //!    the `BootReport`).
 //! 2. **The tiering** — a component importing npm never reaches that path at
 //!    all, because it is no longer eligible for Tier A. It is served from Tier
-//!    B, which renders through QuickJS, which has the npm graph.
+//!    B, which renders through `QuickJS`, which has the npm graph.
 
 use dom_render_compiler::effects::{decide_tier_and_hydration, TieringInputs, TieringReason};
 use dom_render_compiler::manifest::schema::{HydrationMode, RenderManifestV2, Tier};
@@ -187,7 +187,7 @@ fn a_pure_component_that_imports_npm_is_never_tier_a() {
 /// Tier C is where npm demonstrably works — adding a `useState` to a broken
 /// Radix component was all it took to make it render — but Tier C is also the
 /// tier that sends the component to the browser. This component asked for none
-/// of that. Tier B reaches the same QuickJS renderer from the server, which is
+/// of that. Tier B reaches the same `QuickJS` renderer from the server, which is
 /// the only thing actually missing at Tier A.
 #[test]
 fn tiering_up_for_npm_does_not_ship_an_island() {

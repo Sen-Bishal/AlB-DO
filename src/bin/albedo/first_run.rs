@@ -1,6 +1,6 @@
 //! First-run detection.
 //!
-//! On the very first invocation after installation AlBDO prints a one-time
+//! On the very first invocation after installation `AlBDO` prints a one-time
 //! welcome and writes a marker file to `~/.albdo/.initialized`. Every later
 //! invocation skips this entirely — the check is a single `Path::exists` call,
 //! so there is no measurable overhead on the hot path.

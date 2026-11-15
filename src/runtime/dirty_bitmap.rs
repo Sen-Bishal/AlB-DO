@@ -1,6 +1,6 @@
-//! Atomic bitmap dirty-tracking for the SoA IR column store.
+//! Atomic bitmap dirty-tracking for the `SoA` IR column store.
 //!
-//! Cycle 2 of the SoA IR refactor replaces the per-component
+//! Cycle 2 of the `SoA` IR refactor replaces the per-component
 //! [`SentinelRing`](super::hot_set::SentinelRing) linked list with a flat
 //! `Box<[AtomicU64]>` indexed by column position. Each bit is one component
 //! slot in [`IrColumns`](crate::ir::columns::IrColumns):
@@ -48,7 +48,7 @@ impl DirtyBitmap {
         }
     }
 
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         self.capacity
     }
 

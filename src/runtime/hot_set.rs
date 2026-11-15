@@ -87,7 +87,7 @@ impl HotSetRegistry {
         self.entries.is_empty()
     }
 
-    pub fn max_size(&self) -> usize {
+    pub const fn max_size(&self) -> usize {
         self.max_size
     }
 
@@ -97,7 +97,7 @@ impl HotSetRegistry {
             .iter()
             .map(|entry| *entry.key())
             .collect::<Vec<_>>();
-        ids.sort_unstable_by_key(|id| id.as_u64());
+        ids.sort_unstable_by_key(super::super::types::ComponentId::as_u64);
         ids
     }
 }
@@ -110,7 +110,7 @@ pub struct RingDrainStats {
 }
 
 impl RingDrainStats {
-    fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             drained: 0,
             pushed: 0,
@@ -121,7 +121,7 @@ impl RingDrainStats {
 
 /// Lock-free dirty tracker for the hot-set.
 ///
-/// Cycle 2 of the SoA IR refactor replaced the prior `NonNull`-based
+/// Cycle 2 of the `SoA` IR refactor replaced the prior `NonNull`-based
 /// `CachePadded<RingNode>` linked list with a flat
 /// [`DirtyBitmap`](crate::runtime::dirty_bitmap::DirtyBitmap) addressed by
 /// slot index. The struct keeps the historical `SentinelRing` name and
@@ -172,11 +172,11 @@ impl SentinelRing {
         self.rebuild(ids.as_slice())
     }
 
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.id_for.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.id_for.is_empty()
     }
 

@@ -12,7 +12,7 @@
 //! purpose is to be cheap."* That reason is still correct, so this is not that
 //! path. A file part is read chunk by chunk straight into a temp file, hashed as
 //! it goes, and the bytes are never all in memory at once — not in a `Vec`, not
-//! in a `Bytes`, and above all not in the QuickJS arena.
+//! in a `Bytes`, and above all not in the `QuickJS` arena.
 //!
 //! What an action body receives is the **id**, as the field's value. A text
 //! field decodes to its text; a file field decodes to its id. The action ABI is

@@ -217,7 +217,7 @@ impl CollectionSchema {
 }
 
 /// Why a descriptor is refused. Positions are added by the caller (the
-/// classification pass knows file:line:column; this module doesn't).
+/// classification pass knows <file:line:column>; this module doesn't).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QueryError {
     #[error("`{collection}` has no column `{column}` (declared: {declared})")]
@@ -520,7 +520,7 @@ pub fn valid_alias(alias: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-pub(crate) fn type_name(ty: FieldType) -> &'static str {
+pub(crate) const fn type_name(ty: FieldType) -> &'static str {
     match ty {
         FieldType::Text => "text",
         FieldType::Int => "int",

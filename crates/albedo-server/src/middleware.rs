@@ -46,7 +46,7 @@ use crate::engine_pool::QuickJsEnginePool;
 
 /// A project's middleware, ready to run: what the build found, the modules it
 /// loads, and the pool it loads them on.
-pub(crate) struct MiddlewarePlan {
+pub struct MiddlewarePlan {
     entry: Arc<str>,
     matcher: Matcher,
     modules: Arc<Vec<(String, String)>>,
@@ -231,7 +231,7 @@ impl MiddlewarePlan {
 }
 
 /// What a middleware's `fetch()` goes out through, and what it is charged to.
-pub(crate) struct Outbound<'a> {
+pub struct Outbound<'a> {
     /// `None` only on a server built without one; a `fetch()` then fails loudly.
     pub client: Option<&'a dom_render_compiler::aperture::ApertureClient>,
     /// Charge one outbound call to this URL — the caller's bucket and the
@@ -240,7 +240,7 @@ pub(crate) struct Outbound<'a> {
 }
 
 /// Why a middleware produced no decision.
-pub(crate) enum RunError {
+pub enum RunError {
     /// It failed — threw, timed out, diverged, or returned something invalid.
     Failed(String),
     /// A `fetch()` was over the caller's outbound budget.
@@ -269,13 +269,13 @@ fn in_scope(path: &str) -> bool {
 
 /// Whether a request path is a framework lane — the lanes a rewrite may not
 /// start from, because their branch has already been chosen by the request line.
-pub(crate) fn is_framework_path(path: &str) -> bool {
+pub fn is_framework_path(path: &str) -> bool {
     let decoded = dom_render_compiler::middleware::matcher::percent_decode_path(path);
     decoded == "/_albedo" || decoded.starts_with("/_albedo/")
 }
 
 /// The object `middleware(request, …)` receives.
-pub(crate) fn request_json(
+pub fn request_json(
     method: &str,
     path: &str,
     query: Option<&str>,
@@ -334,7 +334,7 @@ pub(crate) fn request_json(
 }
 
 /// `user` as every render sees it — `Principal::user_value`, or `null`.
-pub(crate) fn user_json(identity: &crate::auth::Identity) -> String {
+pub fn user_json(identity: &crate::auth::Identity) -> String {
     match identity.principal() {
         Some(principal) => principal.user_value().to_string(),
         None => "null".to_string(),
@@ -342,7 +342,7 @@ pub(crate) fn user_json(identity: &crate::auth::Identity) -> String {
 }
 
 /// A decision that ends the request, as a response.
-pub(crate) fn terminal_response(outcome: &Outcome) -> Option<Response<Body>> {
+pub fn terminal_response(outcome: &Outcome) -> Option<Response<Body>> {
     let mut response = match outcome {
         Outcome::Redirect {
             location, status, ..
@@ -382,7 +382,7 @@ pub(crate) fn terminal_response(outcome: &Outcome) -> Option<Response<Body>> {
 /// **The middleware wins** over a header the route set, except `set-cookie`,
 /// which is appended: a middleware that sets `cache-control` means it, and a
 /// cookie set by a route must not be erased by an unrelated one.
-pub(crate) fn stamp(target: &mut HeaderMap, headers: &Headers) {
+pub fn stamp(target: &mut HeaderMap, headers: &Headers) {
     for (name, values) in headers {
         let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
             continue;
@@ -407,7 +407,7 @@ pub(crate) fn stamp(target: &mut HeaderMap, headers: &Headers) {
 /// The response for a middleware that failed. Loud on the terminal — `tracing`
 /// reaches nobody without `RUST_LOG`, which is how island SSR failed silently
 /// three times — and generic on the wire.
-pub(crate) fn failure_response(message: &str) -> Response<Body> {
+pub fn failure_response(message: &str) -> Response<Body> {
     eprintln!("albedo: {message}");
     tracing::error!(target: "albedo.middleware", error = %message, "middleware failed");
     let mut response = Response::new(Body::from("middleware failed"));

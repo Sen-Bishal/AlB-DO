@@ -114,6 +114,7 @@ pub struct ReactiveDerivedBinding {
 }
 
 /// One keyed `{arr.map(item => <li key={…}>…)}` list bound to reactive slots.
+///
 /// The client recomputes `rows_thunk(state)` — an array of `{ key, html }` in
 /// order — whenever a `dep_slots` slot changes, and drives the delta sink's
 /// keyed reconciliation (`SetListRef` + `ReconcileList`) against the wrapper
@@ -174,10 +175,10 @@ pub struct CompiledComponent {
     pub function_name: String,
     pub hooks: Vec<HookBinding>,
     pub handlers: Vec<HandlerExtract>,
-    /// Map from useState value-binding name → its allocated SlotId.
+    /// Map from useState value-binding name → its allocated `SlotId`.
     /// Slot ids are deterministic: `fnv1a_32("{module}::{fn}#{hook_idx}")`.
     pub value_slots: HashMap<String, SlotId>,
-    /// Map from useState setter-binding name → the same SlotId as the
+    /// Map from useState setter-binding name → the same `SlotId` as the
     /// value (a setter writes the slot the value reads from).
     pub setter_slots: HashMap<String, SlotId>,
     /// Handler proxy ids in source order; index parallel to `handlers`.
@@ -382,7 +383,7 @@ impl CssModuleRegistry {
     ) -> Option<&str> {
         let file_key = self.bindings.get(module_spec)?.get(binding)?;
         let scoped = self.files.get(file_key)?;
-        scoped.class_map.get(class_name).map(|s| s.as_str())
+        scoped.class_map.get(class_name).map(std::string::String::as_str)
     }
 
     /// Phase P · E.3 — every CSS-module file's scoped CSS body
@@ -476,7 +477,7 @@ pub struct CompiledProject {
     css_modules: CssModuleRegistry,
     /// A2 · npm dependencies discovered across the project's modules,
     /// bundled once at wrap time. Each bundle is a set of lazy-factory
-    /// artifacts the QuickJS render/action paths preload (idempotent by
+    /// artifacts the `QuickJS` render/action paths preload (idempotent by
     /// source hash) so `import { z } from "zod"` links at module-load
     /// time. A bare import that fails to resolve is *not* an error here —
     /// the engine throws a loud `MODULE_MISSING` naming the specifier the
@@ -493,7 +494,7 @@ pub struct CompiledProject {
     deferred_module_loads: Vec<(String, DeferredLoad)>,
     /// P6 · form-action field manifest: `action_id → (action_name, declared
     /// field names)`. Built once at wrap time from every
-    /// `<form action="action:NAME">`'s compile-time field set. The QuickJS
+    /// `<form action="action:NAME">`'s compile-time field set. The `QuickJS`
     /// action dispatcher consults it to project a handler's `{ error: {...} }`
     /// return onto the form's pre-allocated `data-albedo-error` spans — the
     /// form's field set is the schema, so the runtime never guesses which spans
@@ -805,7 +806,7 @@ impl CompiledProject {
     /// Underlying Phase-J project; useful for callers that need access
     /// to component scanning, patch reports, or any of the pre-K API.
     #[must_use]
-    pub fn project(&self) -> &ComponentProject {
+    pub const fn project(&self) -> &ComponentProject {
         &self.project
     }
 
@@ -827,7 +828,7 @@ impl CompiledProject {
     /// even a typo.
     ///
     /// 🔑 The resolver had always produced a good message
-    /// (*"npm package 'clsx' not found in node_modules (searched upward from
+    /// (*"npm package 'clsx' not found in `node_modules` (searched upward from
     /// …)"*). It went to `tracing::warn!`, which has no subscriber unless
     /// `RUST_LOG` is set — so the diagnosis existed and could not be read. Third
     /// instance of that shape after `project_silent_island_death`.
@@ -893,7 +894,7 @@ impl CompiledProject {
     /// registry. Render reads class maps via a thread-local install
     /// of this `&CssModuleRegistry`; the manifest builder reads
     /// scoped CSS bodies for per-route `<style>` injection.
-    pub fn css_modules(&self) -> &CssModuleRegistry {
+    pub const fn css_modules(&self) -> &CssModuleRegistry {
         &self.css_modules
     }
 
@@ -912,7 +913,7 @@ impl CompiledProject {
     /// declaring `export const auth` is one, because the declaration has to be
     /// found before anything knows to look for it.
     #[must_use]
-    pub fn modules(
+    pub const fn modules(
         &self,
     ) -> &std::collections::HashMap<String, crate::runtime::eval::ParsedModule> {
         self.project.modules()
@@ -1853,7 +1854,7 @@ impl CompiledProject {
 
     /// Phase P · Stream C.1 — iterate every TS-side action across
     /// every module in the project, yielding `(module_spec, action)`
-    /// pairs. Order is module-iteration order (HashMap, not stable
+    /// pairs. Order is module-iteration order (`HashMap`, not stable
     /// across runs); within each module declarations are in source
     /// order.
     pub fn action_declarations_iter(&self) -> impl Iterator<Item = (&str, &ActionDeclaration)> {
@@ -1868,7 +1869,7 @@ impl CompiledProject {
     /// registered N actions" without iterating.
     #[must_use]
     pub fn action_declaration_count(&self) -> usize {
-        self.action_declarations.values().map(|v| v.len()).sum()
+        self.action_declarations.values().map(std::vec::Vec::len).sum()
     }
 
     /// Dispatch an [`ActionEnvelope`] against the registered handler.
@@ -2004,7 +2005,7 @@ impl CompiledProject {
     }
 
     /// A1 · host-object bridge — dispatch an action by running its handler
-    /// body under **QuickJS** instead of the pure-Rust interpreter.
+    /// body under **`QuickJS`** instead of the pure-Rust interpreter.
     ///
     /// Same lookup + slot contract as [`Self::invoke_action`], but the body
     /// runs in a full JS engine: loops, `try`/`catch`, array methods, and
@@ -2445,7 +2446,7 @@ impl CompiledProject {
     }
 
     /// A1 · host-object bridge (render side) — render an entry component under
-    /// **QuickJS** with its host objects exposed.
+    /// **`QuickJS`** with its host objects exposed.
     ///
     /// The symmetric counterpart to [`Self::invoke_action_quickjs`]: where that
     /// runs a *handler* body in the real engine, this runs the component's
@@ -2902,7 +2903,7 @@ fn jsx_node_to_html_js(node: &Expr, parts: &mut Vec<String>, buf: &mut String) -
                 }
             }
             JSXElementChild::JSXElement(el) => {
-                jsx_node_to_html_js(&Expr::JSXElement(el.clone()), parts, buf)?
+                jsx_node_to_html_js(&Expr::JSXElement(el.clone()), parts, buf)?;
             }
             JSXElementChild::JSXFragment(frag) => {
                 for c in &frag.children {
@@ -3025,7 +3026,7 @@ fn jsx_node_to_html_js(node: &Expr, parts: &mut Vec<String>, buf: &mut String) -
 ///     `SetTextRef { stable_id, slot_id }` for every slot-bound expression in a text-child
 ///     position.
 ///
-/// Build the `host.shared` seed a QuickJS render resolves `useSharedSlot`
+/// Build the `host.shared` seed a `QuickJS` render resolves `useSharedSlot`
 /// against: `topic -> the topic's current value`.
 ///
 /// The JS shim reads `host.shared[topic]` (see `quickjs_engine`), so a topic

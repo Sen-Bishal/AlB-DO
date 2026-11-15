@@ -95,26 +95,26 @@ impl AddressClass {
     /// is the cloud metadata range — credentials on a cloud dev box — and
     /// multicast and broadcast are never a request's destination.
     #[must_use]
-    pub fn allowed_in_dev(self) -> bool {
+    pub const fn allowed_in_dev(self) -> bool {
         !matches!(
             self,
-            AddressClass::LinkLocal | AddressClass::Multicast | AddressClass::Broadcast
+            Self::LinkLocal | Self::Multicast | Self::Broadcast
         )
     }
 
     /// A short human-readable name for the error message.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
-            AddressClass::Loopback => "loopback",
-            AddressClass::LinkLocal => "link-local (cloud metadata range)",
-            AddressClass::Private => "private",
-            AddressClass::SharedAddress => "carrier-grade NAT",
-            AddressClass::Unspecified => "unspecified",
-            AddressClass::Multicast => "multicast",
-            AddressClass::Broadcast => "broadcast",
-            AddressClass::Benchmarking => "benchmarking",
-            AddressClass::Documentation => "documentation",
+            Self::Loopback => "loopback",
+            Self::LinkLocal => "link-local (cloud metadata range)",
+            Self::Private => "private",
+            Self::SharedAddress => "carrier-grade NAT",
+            Self::Unspecified => "unspecified",
+            Self::Multicast => "multicast",
+            Self::Broadcast => "broadcast",
+            Self::Benchmarking => "benchmarking",
+            Self::Documentation => "documentation",
         }
     }
 }
@@ -144,12 +144,12 @@ pub enum EgressDenial {
 impl std::fmt::Display for EgressDenial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EgressDenial::Scheme { scheme } => write!(
+            Self::Scheme { scheme } => write!(
                 f,
                 "egress refused: scheme `{scheme}` is not permitted (only http and https)"
             ),
-            EgressDenial::NoHost => write!(f, "egress refused: URL has no host"),
-            EgressDenial::Address { host, addr, class } => write!(
+            Self::NoHost => write!(f, "egress refused: URL has no host"),
+            Self::Address { host, addr, class } => write!(
                 f,
                 "egress refused: `{host}` resolves to {addr}, which is {}. \
                  Declare the host as a source `base` in albedo.config.ts if this is intended.",
@@ -187,7 +187,7 @@ pub fn classify(addr: IpAddr) -> Option<AddressClass> {
     }
 }
 
-fn classify_v4(addr: Ipv4Addr) -> Option<AddressClass> {
+const fn classify_v4(addr: Ipv4Addr) -> Option<AddressClass> {
     let [a, b, ..] = addr.octets();
     if addr.is_loopback() {
         return Some(AddressClass::Loopback);
@@ -271,7 +271,7 @@ fn classify_v6(addr: Ipv6Addr) -> Option<AddressClass> {
 }
 
 /// The IPv4 address two v6 segments spell.
-fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
+const fn embedded_v4(high: u16, low: u16) -> Ipv4Addr {
     let [a, b] = high.to_be_bytes();
     let [c, d] = low.to_be_bytes();
     Ipv4Addr::new(a, b, c, d)
@@ -320,7 +320,7 @@ impl EgressPolicy {
 
     /// The mode this policy enforces.
     #[must_use]
-    pub fn mode(&self) -> EgressMode {
+    pub const fn mode(&self) -> EgressMode {
         self.mode
     }
 

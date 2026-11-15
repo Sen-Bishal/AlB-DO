@@ -53,7 +53,7 @@ pub fn should_parallelize(total_items: usize, item_size_bytes: usize) -> bool {
 /// cost model's `total_items / workers` truncates, so on a 2–4 core machine
 /// (every CI runner) one item's work rounded to **zero** and a singleton "won"
 /// against itself run serially — the tests only passed on a many-core rig.
-fn should_parallelize_on(total_items: usize, item_size_bytes: usize, workers: usize) -> bool {
+const fn should_parallelize_on(total_items: usize, item_size_bytes: usize, workers: usize) -> bool {
     if total_items < 2 || workers < 2 {
         return false;
     }

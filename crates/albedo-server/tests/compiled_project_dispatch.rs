@@ -296,15 +296,15 @@ async fn compiled_counter_persists_across_two_action_invocations() {
     }
 }
 
-/// A1 · the QuickJS action path, end-to-end through the HTTP route.
+/// A1 · the `QuickJS` action path, end-to-end through the HTTP route.
 ///
 /// Same fixture, same POST, same wire assertions as
 /// `compiled_counter_dispatch_increments_slot_through_http_action_route` — but
 /// the server is built with `.with_quickjs_action_engine_pool(..)`, so the
-/// adapter runs the handler body on a pooled QuickJS engine instead of the
+/// adapter runs the handler body on a pooled `QuickJS` engine instead of the
 /// pure-Rust interpreter. Identical `SlotSet` output proves parity on the wire;
 /// the only difference is the executor underneath. This is the proof gate for
-/// flipping the server adapter onto QuickJS.
+/// flipping the server adapter onto `QuickJS`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compiled_counter_dispatch_via_quickjs_pool_matches_pure_rust_wire() {
     let project = Arc::new(

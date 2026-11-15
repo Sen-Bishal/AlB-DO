@@ -23,7 +23,7 @@ pub enum HydrationMode {
 }
 
 impl HydrationMode {
-    pub fn into_streaming(self) -> Self {
+    pub const fn into_streaming(self) -> Self {
         match self {
             Self::Immediate => Self::Immediate,
             Self::LazyViewport | Self::OnVisible => Self::LazyViewport,
@@ -59,7 +59,7 @@ pub struct WTStreamSlot {
 /// 🪤 This type exists because the failure used to be *invisible and worse than
 /// absent*. `render_static` fell back to scraping the component's own source
 /// file for text between `<` and `>`, which emitted the tail of the file
-/// (`);}`) into the served HTML and dropped every tag. The QuickJS `h` shim
+/// (`);}`) into the served HTML and dropped every tag. The `QuickJS` `h` shim
 /// already refuses that class of outcome outright — see its `typeof type !==
 /// 'string'` throw — on the grounds that visible corruption is the one result
 /// worse than a named failure. The Rust path had no such guard.
@@ -207,7 +207,7 @@ impl RenderManifestV2 {
 }
 
 /// Per-route streaming schedule produced at compile time.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteManifest {
     pub route: String,
     pub shell: HtmlShell,
@@ -333,14 +333,14 @@ pub struct RouteMetadata {
 }
 
 impl RouteMetadata {
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.title.is_none() && self.description.is_none() && self.meta.is_empty()
     }
 
     /// Layer `other` on top of `self` (last-writer-wins): any scalar
     /// `other` sets overrides; meta tags append. This is how the static
     /// base composes with the dynamic and JSX-hoisted overrides.
-    pub fn merge(&mut self, other: RouteMetadata) {
+    pub fn merge(&mut self, other: Self) {
         if other.title.is_some() {
             self.title = other.title;
         }
@@ -422,7 +422,7 @@ impl PartitionKeySource {
     /// that reconstruct a `params` object for a re-render depend on it being
     /// absent rather than empty.
     #[must_use]
-    pub fn route_param(&self) -> Option<&str> {
+    pub const fn route_param(&self) -> Option<&str> {
         match self {
             Self::RouteParam(name) => Some(name.as_str()),
             Self::Identity => None,
@@ -475,12 +475,13 @@ impl SourceArgSpec {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            SourceArgSpec::Param { name, .. } | SourceArgSpec::Literal { name, .. } => name,
+            Self::Param { name, .. } | Self::Literal { name, .. } => name,
         }
     }
 }
 
 /// Phase P · one TS-authored action handler discovered on a route.
+///
 /// `action_id` is `FNV-1a-32(name)` — the same hash the form
 /// extractor's `allocate_form_action_id` produces, so the wire
 /// envelope's `action_id` looks the route up directly.
@@ -490,7 +491,7 @@ pub struct RouteActionEntry {
     pub action_id: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RenderedNode {
     pub component_id: String,
     pub placeholder_id: String,
@@ -527,7 +528,7 @@ pub fn split_qualified_component_name(qualified: &str) -> (&str, Option<u64>) {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TierBNode {
     pub component_id: String,
     pub placeholder_id: String,
@@ -567,7 +568,7 @@ pub struct TierBNode {
     pub component_key: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TierCNode {
     pub component_id: String,
     /// T-0044 · see [`TierBNode::component_key`].
@@ -741,7 +742,7 @@ impl RouteAuth {
 
     /// Whether an anonymous request may render this route.
     #[must_use]
-    pub fn allows_anonymous(&self) -> bool {
+    pub const fn allows_anonymous(&self) -> bool {
         matches!(self, Self::Public)
     }
 
@@ -795,7 +796,7 @@ pub struct DomPosition {
     pub order: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DataDep {
     pub key: String,
     pub source: DataSource,
@@ -822,7 +823,7 @@ pub struct DataDep {
 /// If "just run a query" is genuinely needed, it goes through a declared
 /// collection so it inherits partitioning and naming — the same answer PRISM
 /// gives for topics.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataSource {
     HttpFetch {
@@ -876,7 +877,7 @@ pub struct ComponentManifestEntry {
     pub hydration_mode: HydrationMode,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VendorChunk {
     pub chunk_name: String,
     pub packages: Vec<String>,

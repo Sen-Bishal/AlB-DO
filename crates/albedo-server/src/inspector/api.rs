@@ -92,28 +92,25 @@ fn render_sse_event(event: &RenderEvent) -> SseEvent {
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> Response<Body> {
-    match serde_json::to_vec(value) {
-        Ok(bytes) => {
-            let mut response = Response::new(Body::from(bytes));
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("no-store"),
-            );
-            response
-        }
-        Err(_) => {
-            let mut response = Response::new(Body::from("{\"error\":\"serialize_failed\"}"));
-            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-            response
-        }
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        let mut response = Response::new(Body::from(bytes));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        );
+        response
+    } else {
+        let mut response = Response::new(Body::from("{\"error\":\"serialize_failed\"}"));
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        response
     }
 }
 

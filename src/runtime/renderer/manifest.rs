@@ -34,7 +34,7 @@ fn escape_inline_script(js: &str) -> String {
 /// (which may legally contain `>`), and injects before the first unquoted `>`.
 /// If the HTML doesn't start with an element tag the string is returned as-is.
 pub fn inject_island_marker(html: &str, component_id: u64) -> String {
-    let marker = format!(" data-albedo-island=\"{}\"", component_id);
+    let marker = format!(" data-albedo-island=\"{component_id}\"");
     let bytes = html.as_bytes();
     if bytes.is_empty() || bytes[0] != b'<' {
         return html.to_string();
@@ -219,7 +219,7 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         self.engine.load_precompiled_module(key, script, source_hash)
     }
 
-    pub fn module_registry(&self) -> &ModuleRegistry {
+    pub const fn module_registry(&self) -> &ModuleRegistry {
         &self.module_registry
     }
 
@@ -358,7 +358,7 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
             let module = self.module_registry.module(specifier).ok_or_else(|| {
                 crate::runtime::engine::RuntimeError::load(
                     crate::runtime::engine::LoadErrorKind::ModuleMissing,
-                    format!("module missing during load: '{}'", specifier),
+                    format!("module missing during load: '{specifier}'"),
                 )
             })?;
 
@@ -412,7 +412,7 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
             let module = self.module_registry.module(specifier).ok_or_else(|| {
                 crate::runtime::engine::RuntimeError::load(
                     crate::runtime::engine::LoadErrorKind::ModuleMissing,
-                    format!("module missing during load: '{}'", specifier),
+                    format!("module missing during load: '{specifier}'"),
                 )
             })?;
 
@@ -569,7 +569,7 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         Ok(normalized_props)
     }
 
-    fn next_invalidation_version(&mut self) -> u64 {
+    const fn next_invalidation_version(&mut self) -> u64 {
         self.invalidation_version_clock = self.invalidation_version_clock.wrapping_add(1);
         self.invalidation_version_clock
     }

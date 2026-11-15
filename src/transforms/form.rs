@@ -7,7 +7,7 @@
 //!
 //! At render time the runtime emits an HTML `<form>` decorated with
 //! `data-albedo-action="NAME"` so the client-side runtime can
-//! intercept the submit event, serialize the FormData as a JSON
+//! intercept the submit event, serialize the `FormData` as a JSON
 //! object, and POST an `ActionEnvelope` to `/_albedo/action`. The
 //! envelope's `action_id` is `fnv1a_32(NAME)`; the payload is the
 //! JSON bytes.
@@ -473,7 +473,8 @@ pub const FEEDBACK_ENDPOINTS: [&str; 5] = [
 pub const ENDPOINT_FEEDBACK_KEY: &str = "form-endpoint:";
 
 /// An endpoint sink, with `{id}` for its id and `{anchor}` for its element id.
-/// One spelling, handed to the QuickJS shim as a value so the two renderers
+///
+/// One spelling, handed to the `QuickJS` shim as a value so the two renderers
 /// cannot drift. Its head is the `<span data-albedo-id="N" data-albedo-error`
 /// [`fill_form_feedback`] writes into.
 pub const ENDPOINT_FEEDBACK_SPAN: &str =
@@ -584,7 +585,7 @@ pub fn form_ok_span(action_name: &str) -> String {
 
 /// Every feedback sink a form-action form reserves: one error span per
 /// declared field, then the success span. The single source of this markup —
-/// the pure-Rust renderer and the QuickJS seed both call it, so the nodes
+/// the pure-Rust renderer and the `QuickJS` seed both call it, so the nodes
 /// `runtime::form_result::project_form_result` addresses exist on every path
 /// with the same ids, and [`fill_form_feedback`] can find them.
 pub fn form_feedback_spans(action_name: &str, fields: &[String]) -> String {

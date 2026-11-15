@@ -44,7 +44,7 @@ pub struct SlotStore {
     /// across an `.await`.
     values: DashMap<(SessionId, SlotId), Vec<u8>>,
     /// Pending dirty keys. Writes push here; drains move every entry
-    /// into a SlotSet vector and clear the set. `FxHashSet` because
+    /// into a `SlotSet` vector and clear the set. `FxHashSet` because
     /// hashing here is on the hot path.
     dirty: Mutex<FxHashSet<(SessionId, SlotId)>>,
     /// Each session's last read or write, in milliseconds since `born`.
@@ -94,7 +94,7 @@ impl SlotStore {
     /// Writes a new value into the slot and records it as dirty so the
     /// next [`Self::drain_set_instructions`] call ships a `SlotSet`
     /// opcode. Idempotent: writing the same key twice between drains
-    /// produces one `SlotSet` carrying the final value (HashSet dedup).
+    /// produces one `SlotSet` carrying the final value (`HashSet` dedup).
     pub fn write(&self, session: SessionId, slot_id: SlotId, value: Vec<u8>) {
         self.values.insert((session, slot_id), value);
         self.touch(session);
@@ -198,12 +198,12 @@ pub struct SessionSlotView {
 
 impl SessionSlotView {
     #[must_use]
-    pub fn new(session_id: SessionId, store: Arc<SlotStore>) -> Self {
+    pub const fn new(session_id: SessionId, store: Arc<SlotStore>) -> Self {
         Self { session_id, store }
     }
 
     #[must_use]
-    pub fn session_id(&self) -> SessionId {
+    pub const fn session_id(&self) -> SessionId {
         self.session_id
     }
 
@@ -221,7 +221,7 @@ impl SessionSlotView {
     }
 
     #[must_use]
-    pub fn store(&self) -> &Arc<SlotStore> {
+    pub const fn store(&self) -> &Arc<SlotStore> {
         &self.store
     }
 }

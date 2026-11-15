@@ -1,4 +1,4 @@
-//! 🔴 **These tests assert what an npm package can do to a QuickJS realm it
+//! 🔴 **These tests assert what an npm package can do to a `QuickJS` realm it
 //! shares.** They document the leak executably, because the finding is easy to
 //! state, easy to disbelieve, and expensive to re-derive.
 //!
@@ -33,7 +33,7 @@
 //! warmed, and reused for the process's life — the arena discipline requires it
 //! (`ARENA_WARMUP_RENDERS`). `install_npm_bundles` registers the project's
 //! packages on **every** engine in that pool, and the same engines serve Tier-B
-//! renders *and* QuickJS actions. Before confinement, one JS realm therefore
+//! renders *and* `QuickJS` actions. Before confinement, one JS realm therefore
 //! spanned every request and every principal.
 //!
 //! ## What that falsifies
@@ -142,13 +142,13 @@ fn the_global_parameter_is_a_redundant_alias() {
     let html = run_package_during_a_render(
         &mut engine,
         "reach",
-        r#"
+        r"
         var viaParam = (typeof global !== 'undefined');
         var viaIntrinsic = (typeof globalThis !== 'undefined');
         var viaFunction = false;
         try { viaFunction = (Function('return this')() === globalThis); } catch (e) {}
         module.exports = { tag: JSON.stringify({ viaParam: viaParam, viaIntrinsic: viaIntrinsic, viaFunction: viaFunction }) };
-        "#,
+        ",
     );
     assert!(html.contains(r#""viaParam":true"#), "{html}");
     assert!(
@@ -166,7 +166,7 @@ fn a_package_can_read_a_later_renders_props() {
     run_package_during_a_render(
         &mut engine,
         "peeker",
-        r#"
+        r"
         if (!globalThis.__stolen) {
           globalThis.__stolen = [];
           var realH = globalThis.h;
@@ -176,13 +176,13 @@ fn a_package_can_read_a_later_renders_props() {
           };
         }
         module.exports = { tag: 'installed' };
-        "#,
+        ",
     );
 
     engine
         .load_module(
             "routes/victim.tsx",
-            r#"export default function V(props) { return <b data-secret={props.secret}>{props.secret}</b>; }"#,
+            r"export default function V(props) { return <b data-secret={props.secret}>{props.secret}</b>; }",
         )
         .expect("victim loads");
     engine
@@ -237,7 +237,7 @@ fn a_package_can_no_longer_forge_a_durable_write_into_someone_elses_handler() {
     run_package_during_a_render(
         &mut engine,
         "forger",
-        r#"
+        r"
         var real = JSON.stringify;
         JSON.stringify = function (value) {
           if (Array.isArray(value)) {
@@ -248,7 +248,7 @@ fn a_package_can_no_longer_forge_a_durable_write_into_someone_elses_handler() {
           return real.apply(JSON, arguments);
         };
         module.exports = { tag: 'forger' };
-        "#,
+        ",
     );
 
     // A later handler whose body cannot write anything at all.
@@ -292,7 +292,7 @@ fn the_realms_intrinsics_and_host_globals_are_all_writable() {
     let html = run_package_during_a_render(
         &mut engine,
         "mutator",
-        r#"
+        r"
         var results = {};
         results.arrayPrototype = (function () {
           try { Array.prototype.__poked = 1; return Array.prototype.__poked === 1; } catch (e) { return false; }
@@ -307,7 +307,7 @@ fn the_realms_intrinsics_and_host_globals_are_all_writable() {
           try { globalThis.__ALBEDO_MODULES.__poked = 1; return true; } catch (e) { return false; }
         })();
         module.exports = { tag: JSON.stringify(results) };
-        "#,
+        ",
     );
     for surface in [
         "arrayPrototype",

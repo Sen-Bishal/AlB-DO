@@ -6,7 +6,7 @@ pub struct TopologicalSorter<'a> {
 }
 
 impl<'a> TopologicalSorter<'a> {
-    pub fn new(graph: &'a ComponentGraph) -> Self {
+    pub const fn new(graph: &'a ComponentGraph) -> Self {
         Self { graph }
     }
     pub fn sort(&self) -> Result<Vec<Vec<ComponentId>>> {
@@ -74,8 +74,8 @@ impl<'a> TopologicalSorter<'a> {
         // Sort each level by priority (highest first)
         for level in &mut levels {
             level.sort_by(|a, b| {
-                let priority_a = analyses.get(a).map(|a| a.priority).unwrap_or(0.0);
-                let priority_b = analyses.get(b).map(|a| a.priority).unwrap_or(0.0);
+                let priority_a = analyses.get(a).map_or(0.0, |a| a.priority);
+                let priority_b = analyses.get(b).map_or(0.0, |a| a.priority);
                 priority_b.partial_cmp(&priority_a).unwrap()
             });
         }
@@ -146,8 +146,7 @@ fn find_longest_path_from(
 
     let node_time = analyses
         .get(&node)
-        .map(|a| a.estimated_time_ms)
-        .unwrap_or(0.0);
+        .map_or(0.0, |a| a.estimated_time_ms);
 
     let dependents = graph.get_dependents(&node);
 

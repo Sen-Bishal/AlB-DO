@@ -66,7 +66,7 @@ pub fn print_tier_report(report: &TierReport, root: &str, measured: &MeasuredByt
         "  {} {}  {}",
         style_256("▸", ACCENT, true),
         style("tiers", "1"),
-        style(&format!("— {}", root), "2")
+        style(&format!("— {root}"), "2")
     );
 
     if report.components.is_empty() {

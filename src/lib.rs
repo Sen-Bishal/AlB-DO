@@ -48,7 +48,7 @@
     clippy::todo
 )]
 #![warn(clippy::expect_used)]
-#![warn(clippy::integer_arithmetic)]
+#![warn(clippy::arithmetic_side_effects)]
 #![warn(rustdoc::broken_intra_doc_links)]
 #![warn(rustdoc::missing_crate_level_docs)]
 #![warn(rustdoc::invalid_codeblock_attributes)]
@@ -114,7 +114,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-/// The primary facade for the AlBDO compilation pipeline.
+/// The primary facade for the `AlBDO` compilation pipeline.
 ///
 /// Owns a [`ComponentGraph`] and an optional [`IncrementalCache`]. Drives analysis,
 /// scheduling, manifest generation, and bundle emission in a single API surface.
@@ -212,7 +212,7 @@ impl RenderCompiler {
     }
 
     /// Returns a shared reference to the underlying [`ComponentGraph`].
-    pub fn graph(&self) -> &ComponentGraph {
+    pub const fn graph(&self) -> &ComponentGraph {
         &self.graph
     }
 
@@ -291,7 +291,7 @@ impl RenderCompiler {
     /// pretty-printed JSON string.
     ///
     /// The JSON export path is the only runtime call site that materializes
-    /// the AoS [`ir::CanonicalIrDocument`] shape.
+    /// the `AoS` [`ir::CanonicalIrDocument`] shape.
     pub fn export_canonical_ir_json(&self) -> Result<String> {
         let columns = self.optimize_canonical_ir_columns()?;
         let document = columns.to_canonical();
@@ -494,14 +494,14 @@ impl RenderCompiler {
 
                 let new_analyses = self.run_analysis()?;
 
-                for id in invalidated.iter() {
+                for id in &invalidated {
                     if let Some(analysis) = new_analyses.get(id) {
                         analyses.insert(*id, analysis.clone());
 
                         if let Some(component) = self.graph.get_component(*id) {
                             let file_path = PathBuf::from(&component.file_path);
                             if let Err(e) =
-                                cache.cache_analysis(component.clone(), analysis.clone(), file_path)
+                                cache.cache_analysis(component, analysis.clone(), file_path)
                             {
                                 tracing::warn!("Failed to cache component {:?}: {}", id, e);
                             }
@@ -516,7 +516,7 @@ impl RenderCompiler {
                             if let Some(analysis) = new_analyses.get(&comp_id) {
                                 analyses.insert(comp_id, analysis.clone());
                                 if let Err(e) = cache.cache_analysis(
-                                    component.clone(),
+                                    component,
                                     analysis.clone(),
                                     file_path,
                                 ) {
@@ -533,7 +533,7 @@ impl RenderCompiler {
 
             for comp_id in self.graph.component_ids() {
                 if let Some(component) = self.graph.get_component(comp_id) {
-                    cache.update_dependencies(comp_id, component.dependencies.clone());
+                    cache.update_dependencies(comp_id, component.dependencies);
                 }
             }
 
@@ -598,7 +598,7 @@ impl RenderCompiler {
 
     /// Returns a snapshot of cache performance metrics, or `None` if caching is disabled.
     pub fn cache_stats(&self) -> Option<incremental::CacheStats> {
-        self.cache.as_ref().map(|c| c.get_stats())
+        self.cache.as_ref().map(incremental::IncrementalCache::get_stats)
     }
 
     fn build_tier_report(&self, options: &manifest::ManifestOptions) -> TierReport {

@@ -91,7 +91,7 @@ pub enum LiveState {
 }
 
 impl LiveState {
-    fn from_u8(value: u8) -> Self {
+    const fn from_u8(value: u8) -> Self {
         match value {
             0 => Self::Opening,
             1 => Self::Live,
@@ -166,7 +166,7 @@ impl LiveEntry {
 
     /// The transport.
     #[must_use]
-    pub fn kind(&self) -> LiveKind {
+    pub const fn kind(&self) -> LiveKind {
         self.kind
     }
 
@@ -240,7 +240,7 @@ pub struct LiveHandle {
 impl LiveHandle {
     /// The entry.
     #[must_use]
-    pub fn entry(&self) -> &Arc<LiveEntry> {
+    pub const fn entry(&self) -> &Arc<LiveEntry> {
         &self.entry
     }
 }
@@ -288,7 +288,7 @@ pub enum Admission {
 impl Admission {
     /// Whether the entry is live.
     #[must_use]
-    pub fn admitted(self) -> bool {
+    pub const fn admitted(self) -> bool {
         !matches!(self, Self::Refused)
     }
 }
@@ -312,7 +312,7 @@ mod smallvec_lite {
                 self.0.swap_remove(at);
             }
         }
-        pub fn is_empty(&self) -> bool {
+        pub const fn is_empty(&self) -> bool {
             self.0.is_empty()
         }
         pub fn snapshot(&self) -> Vec<u64> {

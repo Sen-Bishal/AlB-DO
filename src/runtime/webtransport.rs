@@ -18,14 +18,14 @@ pub enum FramePayload {
 }
 
 impl FramePayload {
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         match self {
             Self::Text(s) => s.len(),
             Self::Binary(b) => b.len(),
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         match self {
             Self::Text(s) => s.is_empty(),
             Self::Binary(b) => b.is_empty(),
@@ -94,7 +94,7 @@ pub struct WTComponentStream {
 }
 
 impl WTComponentStream {
-    pub fn new(component_id: ComponentId, stream_slot: u8, render_mode: WTRenderMode) -> Self {
+    pub const fn new(component_id: ComponentId, stream_slot: u8, render_mode: WTRenderMode) -> Self {
         Self {
             component_id,
             stream_slot,
@@ -191,7 +191,7 @@ impl WTStreamRouter {
             .map(|entry| entry.patch_sequence())
     }
 
-    pub fn stream_slot_for(tier: Tier, render_mode: WTRenderMode) -> u8 {
+    pub const fn stream_slot_for(tier: Tier, render_mode: WTRenderMode) -> u8 {
         match render_mode {
             WTRenderMode::Control => WT_STREAM_SLOT_CONTROL,
             WTRenderMode::Shell => match tier {
@@ -477,7 +477,7 @@ impl WebTransportMuxer {
         }
     }
 
-    fn stream_for_route_chunk(&self, kind: RouteStreamChunkKind) -> usize {
+    const fn stream_for_route_chunk(&self, kind: RouteStreamChunkKind) -> usize {
         match kind {
             RouteStreamChunkKind::ShellHtml => WT_STREAM_SLOT_SHELL as usize,
             RouteStreamChunkKind::DeferredHtml | RouteStreamChunkKind::HydrationPayload => {

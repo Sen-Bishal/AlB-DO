@@ -1,7 +1,7 @@
 //! What does confinement actually cost? — the number TODO 10.0 is missing.
 //!
 //! 10.0 rejects "a realm per request" on the grounds that it "kills the warm
-//! arena/interning design". That reads QuickJS's ownership backwards: the
+//! arena/interning design". That reads `QuickJS`'s ownership backwards: the
 //! **arena, atom table and shape table belong to the `Runtime`**; the
 //! **intrinsics and globals belong to the `Context`**. Dropping only the context
 //! discards precisely the mutable surface a package can poison and keeps
@@ -19,7 +19,7 @@
 //! ```
 //!
 //! ⚠️ **Release only.** A debug build measures rustc's inlining choices, not
-//! QuickJS.
+//! `QuickJS`.
 
 #![cfg(feature = "forge")]
 

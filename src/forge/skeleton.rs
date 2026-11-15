@@ -220,7 +220,7 @@ impl ForgeCollection {
 
     /// Attach the declared [`EditRule`], same shape as the two above.
     #[must_use]
-    pub fn with_edit(mut self, edit: EditRule) -> Self {
+    pub const fn with_edit(mut self, edit: EditRule) -> Self {
         self.edit = edit;
         self
     }
@@ -568,7 +568,7 @@ pub async fn bootstrap_schema(
 ) -> crate::forge::value::Result<()> {
     substrate.migrate(crate::forge::write::AUTHORS_DDL).await?;
     for collection in schema.collections() {
-        for ddl in collection.migrations.iter() {
+        for ddl in &collection.migrations {
             substrate.migrate(ddl).await?;
         }
         if collection.seed.is_empty() {
@@ -585,7 +585,7 @@ pub async fn bootstrap_schema(
             .and_then(SqlValue::as_i64)
             .unwrap_or(0);
         if count == 0 {
-            for row in collection.seed.iter() {
+            for row in &collection.seed {
                 substrate.execute(&row.sql, &row.params).await?;
             }
         }

@@ -11,7 +11,7 @@
 //!   the way a browser gets it.
 //! * **`render(<Card />)`** renders through the renderer the app uses for that
 //!   component's tier: the build's Tier-A renderer ([`TierARenderer`], the very
-//!   function that bakes pages) or the server's QuickJS renderer for Tier B
+//!   function that bakes pages) or the server's `QuickJS` renderer for Tier B
 //!   and C. A component test therefore asserts against markup a visitor gets.
 //! * **`signUp()` / `signIn()`** post to the app's own password endpoints.
 //!

@@ -94,7 +94,7 @@ fn concurrent_project_classification_has_stable_ids_and_no_shared_call_sites() {
     let handles: Vec<_> = (0..8).map(|i| std::thread::spawn(move || {
         let source = format!("import {{ invoices }} from 'albedo/forge'; invoices.where({{ owner: '{i}' }}).count();");
         let result = project(&[("page.tsx", &source)]);
-        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.diagnostics, [] as [dom_render_compiler::transforms::forge_queries::Diagnostic; 0]);
         assert_eq!(result.queries.len(), 1);
         result.queries[0].canonical.id.clone()
     })).collect();

@@ -4,7 +4,7 @@
 //! ## The defect this exists to remove
 //!
 //! Every Node built-in that reached the resolver produced *"npm package 'crypto'
-//! not found in node_modules (searched upward from …)"*, which sends a reader
+//! not found in `node_modules` (searched upward from …)"*, which sends a reader
 //! hunting for a dependency they never had. `TODO.md` item 9.5 names that
 //! sentence specifically. The built-ins are not missing packages; they are a
 //! host runtime Albedo does not provide, and the error should say so.

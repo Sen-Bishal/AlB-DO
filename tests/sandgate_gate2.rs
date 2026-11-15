@@ -44,9 +44,9 @@ use dom_render_compiler::runtime::quickjs_engine::QuickJsEngine;
 use dom_render_compiler::runtime::{HandlerEffect, HandlerInvocation};
 use std::path::Path;
 
-const VICTIM: &str = r#"export default function V(props) {
+const VICTIM: &str = r"export default function V(props) {
     return <b data-secret={props.secret}>{props.secret}</b>;
-}"#;
+}";
 
 const READBACK: &str = r#"export default function R() {
     return <pre>{(globalThis.__stolen || []).join(" ~ ")}</pre>;
@@ -122,7 +122,7 @@ fn run_package(engine: &mut QuickJsEngine, pkg: &Package) -> String {
 // The two that confinement CAN close — both read across a request boundary.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PEEKER: &str = r#"
+const PEEKER: &str = r"
 if (!globalThis.__stolen) {
   globalThis.__stolen = [];
   var realH = globalThis.h;
@@ -132,7 +132,7 @@ if (!globalThis.__stolen) {
   };
 }
 module.exports = { tag: 'installed' };
-"#;
+";
 
 /// Counterpart to `a_package_can_read_a_later_renders_props`.
 ///
@@ -189,7 +189,7 @@ fn a_rebuild_closes_the_cross_request_props_leak() {
     );
 }
 
-const FORGER: &str = r#"
+const FORGER: &str = r"
 var real = JSON.stringify;
 JSON.stringify = function (value) {
   if (Array.isArray(value)) {
@@ -200,7 +200,7 @@ JSON.stringify = function (value) {
   return real.apply(JSON, arguments);
 };
 module.exports = { tag: 'forger' };
-"#;
+";
 
 fn forged_write(engine: &mut QuickJsEngine) -> bool {
     let env = serde_json::Map::new();
@@ -360,7 +360,7 @@ fn a_rebuild_does_not_help_when_the_victim_imports_the_package() {
 // The two that confinement CANNOT close. Asserted as unchanged, on purpose.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MUTATOR: &str = r#"
+const MUTATOR: &str = r"
 var results = {};
 results.arrayPrototype = (function () {
   try { Array.prototype.__poked = 1; return Array.prototype.__poked === 1; } catch (e) { return false; }
@@ -375,7 +375,7 @@ results.moduleTable = (function () {
   try { globalThis.__ALBEDO_MODULES.__poked = 1; return true; } catch (e) { return false; }
 })();
 module.exports = { tag: JSON.stringify(results) };
-"#;
+";
 
 /// 🔑 **The limit of the whole approach, pinned as a test.**
 ///
@@ -404,13 +404,13 @@ fn a_rebuild_does_not_freeze_anything() {
     }
 }
 
-const REACH: &str = r#"
+const REACH: &str = r"
 var viaParam = (typeof global !== 'undefined');
 var viaIntrinsic = (typeof globalThis !== 'undefined');
 var viaFunction = false;
 try { viaFunction = (Function('return this')() === globalThis); } catch (e) {}
 module.exports = { tag: JSON.stringify({ viaParam: viaParam, viaIntrinsic: viaIntrinsic, viaFunction: viaFunction }) };
-"#;
+";
 
 /// The realm is still reachable three ways after a rebuild — as it must be, in
 /// any conforming JS realm. Recorded so gate 2.1's "all four must fail" is not

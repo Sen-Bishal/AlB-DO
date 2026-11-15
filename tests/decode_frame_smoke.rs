@@ -11,7 +11,7 @@ fn decode_b64(s: &str) -> Vec<u8> {
     let mut out = Vec::new();
     for chunk in chars.chunks(4) {
         let mut n: u32 = 0;
-        for &c in chunk { n = (n << 6) | (c as u32); }
+        for &c in chunk { n = (n << 6) | u32::from(c); }
         let pad_in_chunk = if chunk.len() < 4 { 4 - chunk.len() } else { 0 };
         n <<= 6 * pad_in_chunk;
         let bytes_in = 3 - pad_in_chunk;

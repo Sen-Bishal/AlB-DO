@@ -161,7 +161,7 @@ fn snapshot_artifacts(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut files = BTreeMap::new();
     for entry in WalkDir::new(root)
         .into_iter()
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_file())
     {
         let rel = entry

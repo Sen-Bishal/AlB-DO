@@ -1,7 +1,7 @@
 //! Phase P · Stream G — First Contentful Paint byte budget.
 //!
 //! Measures the **bytes shipped on first byte** for a 10-route static
-//! ALBEDO site: doctype + head + body_open + every Tier-A node's HTML
+//! ALBEDO site: doctype + head + `body_open` + every Tier-A node's HTML
 //! inlined into the shell, per route, averaged. This is what the
 //! browser parses to its first paint.
 //!
@@ -11,7 +11,7 @@
 //! JS, so the shell IS the page until any island hydrates.
 //!
 //! Reproduce with:
-//!   cargo bench --bench parity_fcp_bytes
+//!   cargo bench --bench `parity_fcp_bytes`
 //!
 //! Output: prints per-route + mean bytes to stderr; the Criterion
 //! timing measures the manifest-build pass for reference.
@@ -58,7 +58,7 @@ fn build_ten_route_manifest() -> dom_render_compiler::manifest::schema::RenderMa
 }
 
 /// Total bytes the browser receives on first paint for one route:
-/// doctype_and_head + body_open + body_close + shim_script.
+/// `doctype_and_head` + `body_open` + `body_close` + `shim_script`.
 ///
 /// `body_open` after Stream B carries the inlined Tier-A HTML
 /// (placeholders for Tier-B), so this is the actual FCP payload.

@@ -62,7 +62,7 @@ impl IndexSpec {
     /// True when `self`'s columns are a left prefix of `other`'s (same columns,
     /// same directions), so `other` serves every query `self` would.
     #[must_use]
-    pub fn is_prefix_of(&self, other: &IndexSpec) -> bool {
+    pub fn is_prefix_of(&self, other: &Self) -> bool {
         self.table == other.table
             && self.columns.len() <= other.columns.len()
             && self.columns.iter().zip(&other.columns).all(|(a, b)| a == b)

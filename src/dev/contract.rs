@@ -457,8 +457,7 @@ impl StaticSliceConfig {
             }
             if !seen.insert(trimmed.to_string()) {
                 return Err(format!(
-                    "static_slice.opt_out contains duplicate component '{}'",
-                    trimmed
+                    "static_slice.opt_out contains duplicate component '{trimmed}'"
                 ));
             }
         }
@@ -819,9 +818,7 @@ pub fn resolve_dev_contract(
                 project_dir.display(),
                 loaded
                     .config_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| DEV_CONFIG_JSON.to_string())
+                    .as_ref().map_or_else(|| DEV_CONFIG_JSON.to_string(), |p| p.display().to_string())
             )
         })?
     };
@@ -1213,9 +1210,7 @@ fn load_dev_config(cwd: &Path, explicit_path: Option<&Path>) -> Result<LoadedDev
             cwd.join(path)
         };
         let project_dir = full_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| cwd.to_path_buf());
+            .parent().map_or_else(|| cwd.to_path_buf(), Path::to_path_buf);
         let config = parse_dev_config_file(&full_path)?;
         return Ok(LoadedDevConfig {
             config,
@@ -1297,8 +1292,7 @@ fn parse_dev_config_file(path: &Path) -> Result<DevConfig, String> {
             Ok(config)
         }
         _ => Err(format!(
-            "unsupported config extension '.{}'; use .json or .ts",
-            extension
+            "unsupported config extension '.{extension}'; use .json or .ts"
         )),
     }
 }
@@ -1557,7 +1551,7 @@ const fn default_true() -> bool {
     true
 }
 
-fn default_root() -> &'static str {
+const fn default_root() -> &'static str {
     // Phase N+ — file-based routes live under `src/routes/`, so the
     // dev contract's source root is `src/` (not `src/components/`,
     // which was the pre-Phase-N convention). Existing projects that

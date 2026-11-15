@@ -2,7 +2,7 @@
 //!
 //! `frame_tick_n1000_dirty100` runs the RAF tick against 1000 components
 //! with 100 dirty slots per frame — the target working-set size from the
-//! SoA plan. The bench measures the full `FourLaneRuntimePipeline::tick_frame`
+//! `SoA` plan. The bench measures the full `FourLaneRuntimePipeline::tick_frame`
 //! path, including bitmap drain, lane partitioning, rayon fan-out, patch
 //! emission, and WebTransport sequence allocation.
 //!

@@ -479,9 +479,9 @@ async fn dispatch_action(
 /// Wire-encode a handler's instructions as the binary `OpcodeFrame` the client
 /// frame applier consumes.
 ///
-/// Action responses don't share frame_ids with the WT patches stream — each is a
+/// Action responses don't share `frame_ids` with the WT patches stream — each is a
 /// self-contained `OpcodeFrame` per the Phase-D wire amendment. The `frame_id`
-/// here is `0`: bakabox's `applyFrameBytes` doesn't currently key on frame_id
+/// here is `0`: bakabox's `applyFrameBytes` doesn't currently key on `frame_id`
 /// for HTTP responses (no multi-message reassembly), so the value is bookkeeping
 /// only.
 fn frame_response(

@@ -226,11 +226,11 @@ fn a_locally_bound_append_is_not_a_forge_write() {
 #[test]
 fn a_static_component_is_unaffected() {
     let decision = decide(
-        r#"
+        r"
         export default function Hero() {
           return <h1>ALBEDO</h1>;
         }
-        "#,
+        ",
     );
     assert_eq!(decision.tier, Tier::A);
     assert_eq!(decision.reason, TieringReason::PureStaticEligible);

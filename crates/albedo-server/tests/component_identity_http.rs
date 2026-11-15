@@ -54,14 +54,14 @@ export default function Page() {
 }
 "#;
 
-const BETA: &str = r#"export default async function Page() {
+const BETA: &str = r"export default async function Page() {
   return (
     <section>
       <p>beta-own</p>
     </section>
   );
 }
-"#;
+";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn same_named_route_components_render_their_own_code_and_data() {

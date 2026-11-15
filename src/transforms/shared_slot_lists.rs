@@ -1,4 +1,4 @@
-//! B2 · shared-slot list anchor marker — a Tier-B (QuickJS) transpile pre-pass.
+//! B2 · shared-slot list anchor marker — a Tier-B (`QuickJS`) transpile pre-pass.
 //!
 //! For `{IDENT.map(...)}` where `IDENT` is a `useSharedSlot("topic")` binding,
 //! this stamps the enclosing JSX element with `data-albedo-list-slot="topic"`.
@@ -82,7 +82,7 @@ pub const SLOT_PATH_ATTR: &str = "data-albedo-slot-path";
 
 /// Attribute carrying a row's reconciliation identity, stamped from the
 /// author's `key={…}` by the two SSR renderers
-/// (`runtime::eval::component::render_attrs` and the QuickJS `h` shim).
+/// (`runtime::eval::component::render_attrs` and the `QuickJS` `h` shim).
 ///
 /// Named here, beside the anchor attribute, because the pair is one contract:
 /// the anchor says "this element is a keyed list bound to topic T" and the key
@@ -575,6 +575,7 @@ impl VisitMut for ListAnchorMarker {
 }
 
 /// Stamp every element holding a **scalar** shared-slot read with [`SLOT_ATTR`].
+///
 /// The companion to [`mark_shared_slot_lists`]; a no-op when the module imports
 /// no `albedo` `useSharedSlot` or binds none of its results into JSX text.
 pub fn mark_shared_slot_scalars(module: &mut Module) {
@@ -802,7 +803,7 @@ fn topic_lookup_call(binding: &str) -> Expr {
 
 /// `__albedo_slot_text(<binding>)`, or `__albedo_slot_text(<binding>, "a.b")`
 /// for a projection — the engine-side half of the paint rule, named once here
-/// and defined once in the QuickJS hook prelude.
+/// and defined once in the `QuickJS` hook prelude.
 ///
 /// The path is a **string literal in the same spelling the attribute carries**,
 /// so the text SSR renders and the projection the client walks come from one
@@ -835,6 +836,7 @@ fn slot_text_call(root: &str, path: &str) -> Expr {
 }
 
 /// Name of the render-side formatter the marker folds a stamped read into.
+///
 /// Defined in `runtime::quickjs_engine`'s hook prelude; only Tier-B ever sees
 /// it, because this pass runs only in that engine's transpile.
 pub const SLOT_TEXT_FN: &str = "__albedo_slot_text";
@@ -897,7 +899,7 @@ impl RowProjection {
     /// across `.map()` calls in one module, or across the modules of one render
     /// plan.
     #[must_use]
-    pub fn min(self, other: Self) -> Self {
+    pub const fn min(self, other: Self) -> Self {
         use RowProjection::{PerRecord, PositionStable, WholeView};
         match (self, other) {
             (WholeView, _) | (_, WholeView) => WholeView,
@@ -1116,7 +1118,7 @@ fn pat_ident_name(pat: &Pat) -> Option<String> {
 /// server-rendered HTML differ when some other row changes?"*. Both SSR
 /// renderers drop `on*` props before markup — `render_attrs` in
 /// `runtime::eval::component` skips every name starting with `on`, and the
-/// QuickJS `h` shim drops function-valued props — so a handler body cannot
+/// `QuickJS` `h` shim drops function-valued props — so a handler body cannot
 /// reach the row's HTML and therefore cannot make it depend on the collection.
 /// Counting it anyway put the extremely common mutable-list row
 /// (`<li>{p.name}<button onClick={() => setCart(cart.filter(…))}/></li>`) on

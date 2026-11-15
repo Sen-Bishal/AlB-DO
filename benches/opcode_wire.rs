@@ -6,13 +6,13 @@
 //!   3. Decode throughput (ns/op)
 //!
 //! Run with:
-//!   cargo bench --bench opcode_wire
+//!   cargo bench --bench `opcode_wire`
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use dom_render_compiler::ir::opcode::*;
+use dom_render_compiler::ir::opcode::{OpcodeFrame, Instruction, TagId, StableId, AttrId, EventId, ProxyId, SlotId, SuspenseId};
 use dom_render_compiler::ir::wire;
 
-/// Builds a realistic OpcodeFrame representing a small component tree:
+/// Builds a realistic `OpcodeFrame` representing a small component tree:
 ///   <div class="app">
 ///     <h1>Hello, world!</h1>
 ///     <button onclick=proxy(1)>Click me</button>
@@ -95,10 +95,10 @@ fn bench_encode(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("encode");
     group.bench_function("bincode_opcode_frame", |b| {
-        b.iter(|| wire::encode_frame(black_box(&frame)).unwrap())
+        b.iter(|| wire::encode_frame(black_box(&frame)).unwrap());
     });
     group.bench_function("json_opcode_payload", |b| {
-        b.iter(|| serde_json::to_vec(black_box(&json_val)).unwrap())
+        b.iter(|| serde_json::to_vec(black_box(&json_val)).unwrap());
     });
     group.finish();
 }
@@ -115,10 +115,10 @@ fn bench_decode(c: &mut Criterion) {
         b.iter(|| {
             let (frame, _) = wire::decode_frame(black_box(&bincode_bytes)).unwrap();
             frame
-        })
+        });
     });
     group.bench_function("json_opcode_payload", |b| {
-        b.iter(|| serde_json::from_slice::<serde_json::Value>(black_box(&json_bytes)).unwrap())
+        b.iter(|| serde_json::from_slice::<serde_json::Value>(black_box(&json_bytes)).unwrap());
     });
     group.finish();
 }
@@ -133,13 +133,13 @@ fn bench_roundtrip(c: &mut Criterion) {
             let bytes = wire::encode_frame(black_box(&frame)).unwrap();
             let (decoded, _) = wire::decode_frame(black_box(&bytes)).unwrap();
             decoded
-        })
+        });
     });
     group.bench_function("json_serialize_deserialize", |b| {
         b.iter(|| {
             let bytes = serde_json::to_vec(black_box(&json_val)).unwrap();
             let _: serde_json::Value = serde_json::from_slice(black_box(&bytes)).unwrap();
-        })
+        });
     });
     group.finish();
 }

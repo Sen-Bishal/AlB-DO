@@ -53,13 +53,11 @@ fn encode_and_lock_fixture() -> Vec<u8> {
             fs::create_dir_all(parent).expect("must create fixture directory");
         }
         fs::write(&path, &bytes).expect("must write fixture file");
-        if !update_mode() {
-            panic!(
-                "bakabox conformance fixture was missing at {}; it has been \
-                 generated. Re-run the test to verify, then commit the file.",
-                path.display()
-            );
-        }
+        assert!(update_mode(), 
+            "bakabox conformance fixture was missing at {}; it has been \
+             generated. Re-run the test to verify, then commit the file.",
+            path.display()
+        );
         return bytes;
     }
 

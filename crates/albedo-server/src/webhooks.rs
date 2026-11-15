@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Receive one delivery for `hook`.
-pub(crate) async fn receive(
+pub async fn receive(
     hook: &Webhook,
     method: &str,
     headers: &HeaderMap,

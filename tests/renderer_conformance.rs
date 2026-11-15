@@ -411,7 +411,7 @@ fn the_corpus_contains_byte_identical_agreement() {
     );
 }
 
-/// Cases whose opcode frame addresses an id the QuickJS markup lacks.
+/// Cases whose opcode frame addresses an id the `QuickJS` markup lacks.
 ///
 /// **Empty, and that is a result rather than an oversight.** The reactive
 /// anchor wrappers do shift ids in hook-compile mode, and the obvious inference
@@ -432,7 +432,7 @@ const UNADDRESSABLE: &[(&str, &str, &str)] = &[];
 ///
 /// The other gate compares markup to markup. This one asks the question that
 /// actually breaks pages: a Tier-B component's frame is emitted by the
-/// evaluator at build time and its markup is rendered by QuickJS at request
+/// evaluator at build time and its markup is rendered by `QuickJS` at request
 /// time, so "the two renders look alike" is not the same claim as "the frame
 /// can find its nodes". A single missing id costs the **whole frame** — every
 /// handler on the page — and logs nothing.
@@ -528,9 +528,7 @@ fn external_corpora_report_the_coverage_frontier() {
         }
         let name = dir
             .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| raw_dir.to_string());
+            .and_then(|p| p.file_name()).map_or_else(|| raw_dir.to_string(), |n| n.to_string_lossy().to_string());
         match whole_project_corpus(&name, &dir) {
             Some(corpus) => corpora.push(corpus),
             None => eprintln!("  skipped (did not compile): {}", dir.display()),

@@ -57,7 +57,7 @@ impl ApiResponse {
 
     /// Empty response with the supplied status — handy for 204, 404, etc.
     #[must_use]
-    pub fn status(status: StatusCode) -> Self {
+    pub const fn status(status: StatusCode) -> Self {
         Self {
             status,
             headers: BTreeMap::new(),

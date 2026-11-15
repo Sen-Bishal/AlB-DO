@@ -66,7 +66,7 @@ pub struct SchedulerFrameStats {
 }
 
 impl SchedulerFrameStats {
-    fn new(analyzer_chunk_limit: usize) -> Self {
+    const fn new(analyzer_chunk_limit: usize) -> Self {
         Self {
             hot_set_rendered: 0,
             hot_set_dropped: 0,

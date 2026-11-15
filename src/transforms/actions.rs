@@ -95,7 +95,7 @@ pub enum BroadcastReads {
 ///
 /// Matches the identifier by name because that is what the runtime does too:
 /// `broadcast` is a free identifier in an action body (a global shim under
-/// QuickJS, a builtin in the interpreter), not an import. Strictly tighter than
+/// `QuickJS`, a builtin in the interpreter), not an import. Strictly tighter than
 /// the substring test it replaces, which fired on the word appearing in a
 /// comment.
 #[must_use]
@@ -360,8 +360,7 @@ fn is_action_call(call: &CallExpr, imports: &HashMap<String, ImportBinding>) -> 
     }
     imports
         .get(&local)
-        .map(|b| b.source == "albedo" && b.export_name == "action")
-        .unwrap_or(false)
+        .is_some_and(|b| b.source == "albedo" && b.export_name == "action")
 }
 
 /// Peel `(expr)` wrappers, plus TS-only `as`/`satisfies`/`as const`,

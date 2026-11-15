@@ -270,8 +270,8 @@ async fn logout_while_a_bridge_revalidates_refuses_the_binding() {
     let mut binding = Box::pin(listener.sessions.bind(id, &ada, &live, Some(db.as_ref())));
     tokio::select! {
         _ = &mut binding => panic!("binding did not pause"),
-        _ = pause.reached.notified() => {},
-        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("binding was not reached"),
+        () = pause.reached.notified() => {},
+        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("binding was not reached"),
     }
     let token = ada.token().unwrap();
     assert_eq!(revoke_session(db.as_ref(), token).await.unwrap(), 1);
@@ -363,8 +363,8 @@ async fn cancelling_the_first_binding_closes_its_opening_entry() {
     let mut binding = Box::pin(listener.sessions.bind(id, &ada, &live, Some(db.as_ref())));
     tokio::select! {
         _ = &mut binding => panic!("binding did not pause"),
-        _ = pause.reached.notified() => {},
-        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("binding was not reached"),
+        () = pause.reached.notified() => {},
+        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("binding was not reached"),
     }
     drop(binding);
     let closed = tokio::time::timeout(Duration::from_secs(1), connection.closed()).await;
@@ -506,8 +506,8 @@ async fn competing_bridges_cannot_steal_a_binding_awaiting_revalidation() {
     let mut binding = Box::pin(listener.sessions.bind(id, &owner, &live, Some(db.as_ref())));
     tokio::select! {
         _ = &mut binding => panic!("binding did not pause"),
-        _ = pause.reached.notified() => {},
-        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("binding was not reached"),
+        () = pause.reached.notified() => {},
+        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("binding was not reached"),
     }
     assert!(listener
         .sessions

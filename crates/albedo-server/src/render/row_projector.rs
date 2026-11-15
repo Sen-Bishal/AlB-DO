@@ -1,5 +1,5 @@
 //! S4 · the render half of the delta beam — FORGE's [`RowProjector`], backed by
-//! the same pooled QuickJS engines that serve Tier-B requests.
+//! the same pooled `QuickJS` engines that serve Tier-B requests.
 //!
 //! A `SlotDelta`'s payload has to be *the* markup SSR produces for that row.
 //! Not equivalent markup — the same bytes, from the same template, or the page
@@ -59,7 +59,7 @@ pub struct PooledRowProjector {
 
 impl PooledRowProjector {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         pool: Arc<crate::engine_pool::QuickJsEnginePool>,
         plan: TierBRenderPlan,
         form_error_spans: serde_json::Map<String, Value>,

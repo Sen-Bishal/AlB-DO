@@ -61,7 +61,7 @@ impl From<&str> for SqlValue {
 
 impl SqlValue {
     /// Borrow as `i64` when this is an [`SqlValue::Integer`].
-    pub fn as_i64(&self) -> Option<i64> {
+    pub const fn as_i64(&self) -> Option<i64> {
         match self {
             Self::Integer(v) => Some(*v),
             _ => None,
@@ -86,7 +86,7 @@ pub struct Row {
 
 impl Row {
     /// Build a row from its ordered column values.
-    pub fn new(values: Vec<SqlValue>) -> Self {
+    pub const fn new(values: Vec<SqlValue>) -> Self {
         Self { values }
     }
 

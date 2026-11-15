@@ -23,7 +23,7 @@ impl EffectProfile {
         Self::default()
     }
 
-    pub fn join(self, other: Self) -> Self {
+    pub const fn join(self, other: Self) -> Self {
         Self {
             hooks: self.hooks || other.hooks,
             asynchronous: self.asynchronous || other.asynchronous,
@@ -54,9 +54,9 @@ pub enum TieringReason {
     /// The component imports npm, and **Tier A has no npm**. Tier-A markup is
     /// baked by the pure-Rust evaluator walking the AST; that walk resolves only
     /// relative specifiers, so a bare import raises and takes the whole Tier-A
-    /// subtree's markup with it. QuickJS has the npm graph and renders the same
+    /// subtree's markup with it. `QuickJS` has the npm graph and renders the same
     /// component correctly, so the component is served from a tier that reaches
-    /// QuickJS. It ships no client JS for this reason alone.
+    /// `QuickJS`. It ships no client JS for this reason alone.
     NpmDependency,
 }
 
@@ -105,13 +105,13 @@ pub struct TieringInputs {
 ///   `parser::imports_unresolvable_specifier`. The second tier *impossibility*, and the harsher of
 ///   the two: `reads_principal` baked at Tier A renders the wrong branch, whereas this raises —
 ///   `render_component_ref` returns `Err`, the error propagates to the top of the static render,
-///   and every ancestor's markup goes with it. QuickJS carries the npm graph and renders the same
+///   and every ancestor's markup goes with it. `QuickJS` carries the npm graph and renders the same
 ///   component correctly, which is what the tier below is for.
 #[allow(
     clippy::too_many_arguments,
     reason = "each flag is one documented proof above; a facts struct is T-0039 follow-up"
 )]
-pub fn decide_tier_and_hydration(
+pub const fn decide_tier_and_hydration(
     effects: EffectProfile,
     has_event_handler: bool,
     client_interactive: bool,

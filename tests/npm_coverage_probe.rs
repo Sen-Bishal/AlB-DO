@@ -187,7 +187,7 @@ struct Probe {
     eval_detail: String,
 }
 
-/// Evaluate a bundle's entry module in a **fresh** QuickJS engine.
+/// Evaluate a bundle's entry module in a **fresh** `QuickJS` engine.
 ///
 /// 🔑 **Fresh per specifier, deliberately.** `__albedo_require_record` memoizes
 /// through `__ALBEDO_MODULES`, and a package's top-level side effects would

@@ -1,21 +1,21 @@
 //! Persistent warmup arena + QuickJS-managed request memory (Movement III, redesigned).
 //!
-//! QuickJS allocates *everything* — every object, string, shape and atom — through a
+//! `QuickJS` allocates *everything* — every object, string, shape and atom — through a
 //! single `JSMallocFunctions` table. This module supplies that table. It splits memory by
-//! LIFETIME, but defers request-time lifetime management to QuickJS itself:
+//! LIFETIME, but defers request-time lifetime management to `QuickJS` itself:
 //!
 //! * **persistent region** — a bump arena for warmup/bootstrap state (builtins, loaded
-//!   modules, the runtime-global tables QuickJS grows once during warmup). Never freed
+//!   modules, the runtime-global tables `QuickJS` grows once during warmup). Never freed
 //!   while the engine lives; reclaimed wholesale when the engine drops.
 //! * **request-time memory** — everything a render/handler allocates after warmup goes to
-//!   the *system allocator* and is freed per-block by QuickJS's own refcount + cycle
+//!   the *system allocator* and is freed per-block by `QuickJS`'s own refcount + cycle
 //!   collector via [`ArenaControl::dealloc`].
 //!
 //! ## Why not a resettable request region?
 //!
 //! An earlier design bump-allocated request memory into a second region and reclaimed it
 //! in O(1) by resetting a cursor at the request boundary. That is only sound if nothing
-//! the runtime still references lives in the region by request end — but QuickJS interns
+//! the runtime still references lives in the region by request end — but `QuickJS` interns
 //! long-lived **shapes** (hidden classes) and **atoms** (property-name strings) through
 //! the same allocation path *during* the request, keyed off the per-request object shapes
 //! and property names it sees. Those interned structures stay reachable from the
@@ -28,11 +28,11 @@
 //! object has a shape the empty-props (`{}`) warmup never created. There is no general way
 //! to pre-intern every shape/atom an arbitrary app will produce (data-dependent keys,
 //! conditional render paths), so warmup tricks can only ever be patchwork. The correct
-//! model is to let QuickJS — which tracks each block's true lifetime — own request memory.
+//! model is to let `QuickJS` — which tracks each block's true lifetime — own request memory.
 //! The persistent bump still pays off for the one-time warmup state that genuinely never
 //! frees.
 //!
-//! Single-threaded by construction: a QuickJS `Runtime` is not `Send`, and the engine
+//! Single-threaded by construction: a `QuickJS` `Runtime` is not `Send`, and the engine
 //! drives allocation and the `begin_request`/`end_request` control points from that one
 //! thread. Counters use relaxed atomics purely so the handle stays `Send + Sync`.
 //!
@@ -74,7 +74,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::thread::ThreadId;
 
-/// QuickJS's largest scalar is a `u64`, so every block must be 8-byte aligned.
+/// `QuickJS`'s largest scalar is a `u64`, so every block must be 8-byte aligned.
 const ALLOC_ALIGN: usize = std::mem::align_of::<u64>();
 /// Each block is prefixed with its usable size so the static `usable_size` can recover
 /// it from a bare pointer. One `usize` is already `ALLOC_ALIGN` wide, so the header keeps
@@ -92,7 +92,7 @@ const DEFAULT_PERSISTENT_CAP: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
 
 #[inline]
-fn round_up(size: usize) -> usize {
+const fn round_up(size: usize) -> usize {
     (size + ALLOC_ALIGN - 1) & !(ALLOC_ALIGN - 1)
 }
 
@@ -139,7 +139,7 @@ impl Region {
     }
 
     #[inline]
-    fn contains(&self, addr: usize) -> bool {
+    const fn contains(&self, addr: usize) -> bool {
         addr >= self.base && addr < self.base + self.cap
     }
 
@@ -177,13 +177,13 @@ impl Drop for Region {
 }
 
 /// Shared arena state. The engine holds one `Arc` to drive the request boundary and read
-/// stats; QuickJS's runtime holds another (inside the [`ArenaAllocator`] it owns) for the
+/// stats; `QuickJS`'s runtime holds another (inside the [`ArenaAllocator`] it owns) for the
 /// allocation callbacks. The persistent region outlives every allocation because it is
 /// only freed when the last `Arc` drops.
 pub struct ArenaControl {
     persistent: Region,
     /// When true, fresh allocations are request-time and routed to the system allocator
-    /// (QuickJS owns their lifetime, freeing each via `dealloc`). When false (warmup /
+    /// (`QuickJS` owns their lifetime, freeing each via `dealloc`). When false (warmup /
     /// bootstrap), they bump the persistent region.
     in_request: AtomicBool,
 
@@ -192,11 +192,11 @@ pub struct ArenaControl {
     dealloc_calls: AtomicUsize,
     /// Persistent-region overflow that spilled to the system allocator.
     fallback_allocs: AtomicUsize,
-    /// A persistent block QuickJS grew while serving a request (rare — warmup state is
+    /// A persistent block `QuickJS` grew while serving a request (rare — warmup state is
     /// normally stable). Kept persistent so it never moves into freeable memory.
     persistent_grew_in_request: AtomicUsize,
     /// Outstanding request-time (system) bytes. Returns to its baseline after each render
-    /// once QuickJS frees the render's garbage — the steady-state health signal.
+    /// once `QuickJS` frees the render's garbage — the steady-state health signal.
     system_live_bytes: AtomicUsize,
     /// High-water mark of `system_live_bytes`.
     system_peak_bytes: AtomicUsize,
@@ -282,15 +282,15 @@ impl ArenaControl {
 
     /// Cap the system memory this engine's JS may hold at `bytes`.
     ///
-    /// 🔴 **Enforced here because nothing else enforces it.** QuickJS has
-    /// `JS_SetMemoryLimit`, but the check lives in QuickJS's *default*
+    /// 🔴 **Enforced here because nothing else enforces it.** `QuickJS` has
+    /// `JS_SetMemoryLimit`, but the check lives in `QuickJS`'s *default*
     /// allocator, and this engine installs its own: rquickjs's glue for a
     /// custom allocator never reads the limit. Calling `set_memory_limit` on the
     /// runtime would have looked like the fix and changed nothing — one
     /// `new Array(1e9)` in app or npm code could still grow the process until
     /// the OS killed it, taking every other request with it.
     ///
-    /// An allocation that would cross the line returns null, which QuickJS turns
+    /// An allocation that would cross the line returns null, which `QuickJS` turns
     /// into an `out of memory` error in the script that asked. The process
     /// survives, and the script's garbage goes back on the next collection.
     /// The persistent region is not counted: it is bounded by its own cap.
@@ -314,7 +314,7 @@ impl ArenaControl {
         self.in_request.store(true, Relaxed);
     }
 
-    /// Leave request mode. No region is reset: request memory is owned by QuickJS and
+    /// Leave request mode. No region is reset: request memory is owned by `QuickJS` and
     /// freed per-block via [`Self::dealloc`] (refcount + the cycle collector the engine
     /// runs before this call). Resetting a region here is exactly the unsound step the
     /// old design took — see the module docs.
@@ -480,13 +480,13 @@ impl ArenaControl {
     }
 }
 
-/// The `Allocator` QuickJS owns. Cloning shares the same [`ArenaControl`].
+/// The `Allocator` `QuickJS` owns. Cloning shares the same [`ArenaControl`].
 pub struct ArenaAllocator {
     control: Arc<ArenaControl>,
 }
 
 impl ArenaAllocator {
-    pub fn new(control: Arc<ArenaControl>) -> Self {
+    pub const fn new(control: Arc<ArenaControl>) -> Self {
         Self { control }
     }
 }
@@ -522,7 +522,7 @@ unsafe impl Allocator for ArenaAllocator {
 }
 
 #[inline]
-unsafe fn read_header(user: *mut u8) -> usize {
+const unsafe fn read_header(user: *mut u8) -> usize {
     (user.sub(HEADER_SIZE) as *const usize).read()
 }
 
@@ -545,7 +545,7 @@ fn system_alloc(usable: usize, zero: bool) -> *mut u8 {
         return ptr::null_mut();
     }
     unsafe {
-        (base as *mut usize).write(usable);
+        base.cast::<usize>().write(usable);
         base.add(HEADER_SIZE)
     }
 }
@@ -566,7 +566,7 @@ unsafe fn system_realloc(user: *mut u8, old_usable: usize, new_usable: usize) ->
     if fresh.is_null() {
         return ptr::null_mut();
     }
-    (fresh as *mut usize).write(new_usable);
+    fresh.cast::<usize>().write(new_usable);
     fresh.add(HEADER_SIZE)
 }
 

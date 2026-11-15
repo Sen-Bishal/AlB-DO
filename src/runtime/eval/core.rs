@@ -55,7 +55,7 @@ thread_local! {
     static IMPORT_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Bakabox reads anchors from `data-albedo-id` (DEFAULT_ANCHOR_ATTRIBUTE
+/// Bakabox reads anchors from `data-albedo-id` (`DEFAULT_ANCHOR_ATTRIBUTE`
 /// in `assets/albedo-runtime.js`). Keep these in sync.
 pub const ALBEDO_ID_ATTR: &str = "data-albedo-id";
 
@@ -381,7 +381,7 @@ fn mark_structural_fallback() {
 /// mode can't represent — the signal for `build_reactive_payload` to fall back
 /// to the A3 island path. Cleared at the start of each render.
 pub fn phase_k_structural_fallback_required() -> bool {
-    STRUCTURAL_FALLBACK.with(|cell| cell.get())
+    STRUCTURAL_FALLBACK.with(std::cell::Cell::get)
 }
 
 /// Analyse a JSX expression for a derived binding, substituting any resolvable
@@ -887,7 +887,7 @@ struct RenderKState {
     /// reserved for an unset/sentinel id elsewhere in the substrate).
     /// `drain_phase_k_opcodes` prepends a single
     /// `InitInternTable { kind: Event, entries: ... }` opcode so
-    /// bakabox can resolve the event_id every `BindEvent` references.
+    /// bakabox can resolve the `event_id` every `BindEvent` references.
     event_intern: HashMap<String, u16>,
     event_intern_order: Vec<String>,
     /// Render-scoped attribute intern table, symmetric to the event one.
@@ -908,7 +908,7 @@ struct ComponentScope {
     /// Map from setter-binding name (`setN`) → slot id whose value is
     /// overwritten when the setter is called.
     setter_slots: HashMap<String, SlotId>,
-    /// Handler proxy_ids in source order. Indexed by `handlers_emitted`
+    /// Handler `proxy_ids` in source order. Indexed by `handlers_emitted`
     /// as the renderer encounters JSX `on*` attributes.
     proxy_ids: Vec<u32>,
     /// Cursor into `proxy_ids` advanced as handlers are emitted.
@@ -1112,7 +1112,7 @@ fn push_form_action_scope(action_name: String) {
 }
 
 /// Pop the most recent form-action scope. Idempotent on an empty
-/// stack — defensive for early-return paths in eval_jsx_element that
+/// stack — defensive for early-return paths in `eval_jsx_element` that
 /// might skip the push (none today, but kept safe by construction).
 fn pop_form_action_scope() {
     FORM_ACTION_STACK.with(|stack| {
@@ -1172,7 +1172,7 @@ thread_local! {
 }
 
 fn install_phase_k_project(project: &CompiledProject) -> PhaseKProjectGuard {
-    let previous = PHASE_K_PROJECT.with(|cell| cell.replace(Some(project as *const _)));
+    let previous = PHASE_K_PROJECT.with(|cell| cell.replace(Some(std::ptr::from_ref(project))));
     PhaseKProjectGuard { previous }
 }
 
@@ -1337,7 +1337,7 @@ fn strict_equals(left: &Value, right: &Value) -> bool {
     }
 }
 
-/// JavaScript's ToIntegerOrInfinity, with `NaN` as `0`.
+/// JavaScript's `ToIntegerOrInfinity`, with `NaN` as `0`.
 fn integer_or_zero(value: &Value) -> f64 {
     let n = to_number(value);
     if n.is_nan() {
@@ -1367,7 +1367,7 @@ fn flatten(items: &[Value], depth: f64) -> Vec<Value> {
     out
 }
 
-/// JavaScript's ToString, for the places JavaScript applies it — `+` with a
+/// JavaScript's `ToString`, for the places JavaScript applies it — `+` with a
 /// string, a template literal, `String(x)`, a string method's arguments.
 ///
 /// It differs from [`value_to_string`] in one place: an array joins with `,`.
@@ -1381,7 +1381,7 @@ fn js_string(value: &Value) -> String {
     }
 }
 
-/// JavaScript's ToPrimitive: arrays and objects become their string form, and
+/// JavaScript's `ToPrimitive`: arrays and objects become their string form, and
 /// everything else is already primitive.
 fn to_primitive(value: &Value) -> Value {
     match value {
@@ -1390,10 +1390,10 @@ fn to_primitive(value: &Value) -> Value {
     }
 }
 
-/// JavaScript's whitespace for `trim` and number parsing: WhiteSpace plus
-/// LineTerminator. Not `char::is_whitespace`, which counts U+0085 and misses
+/// JavaScript's whitespace for `trim` and number parsing: `WhiteSpace` plus
+/// `LineTerminator`. Not `char::is_whitespace`, which counts U+0085 and misses
 /// U+FEFF — both the other way round from JavaScript.
-fn is_js_whitespace(c: char) -> bool {
+const fn is_js_whitespace(c: char) -> bool {
     matches!(
         c,
         '\t' | '\n'
@@ -1413,7 +1413,7 @@ fn is_js_whitespace(c: char) -> bool {
     )
 }
 
-/// JavaScript's StringToNumber: `NaN` for anything that is not a numeric
+/// JavaScript's `StringToNumber`: `NaN` for anything that is not a numeric
 /// literal, `0` for blank. Rust's `f64::from_str` accepts `inf`, `NaN` and
 /// `infinity` in any case, which JavaScript does not, so the spelling is
 /// checked before it is parsed.
@@ -1429,7 +1429,7 @@ fn string_to_number(s: &str) -> f64 {
             }
             return digits
                 .chars()
-                .fold(0.0, |n, c| n * f64::from(radix) + f64::from(c.to_digit(radix).unwrap_or(0)));
+                .fold(0.0, |n, c| f64::mul_add(n, f64::from(radix), f64::from(c.to_digit(radix).unwrap_or(0))));
         }
     }
     let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
@@ -1445,7 +1445,7 @@ fn string_to_number(s: &str) -> f64 {
     s.parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// JavaScript's ToNumber, `NaN` included. [`to_number`] maps every failure to
+/// JavaScript's `ToNumber`, `NaN` included. [`to_number`] maps every failure to
 /// `0` because a `Value` cannot hold a NaN, which is right for the arithmetic
 /// that renders and wrong for a comparison: `"abc" >= 0` is false in
 /// JavaScript, and `0 >= 0` is not.
@@ -1462,12 +1462,12 @@ fn js_number(value: &Value) -> f64 {
     }
 }
 
-/// JavaScript's ToInt32 — the operand of every bitwise operator.
+/// JavaScript's `ToInt32` — the operand of every bitwise operator.
 fn to_int32(value: &Value) -> i32 {
     to_uint32(value) as i32
 }
 
-/// JavaScript's ToUint32 — `>>>`, and a shift's count.
+/// JavaScript's `ToUint32` — `>>>`, and a shift's count.
 fn to_uint32(value: &Value) -> u32 {
     let n = js_number(value);
     if !n.is_finite() {
@@ -1515,7 +1515,7 @@ fn js_compare(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
 /// `typeof` of a value the evaluator holds. `None` for `null`: the evaluator
 /// holds `null` and `undefined` as one value, and `typeof` is the operator
 /// whose whole answer is which of the two it is.
-fn typeof_value(value: &Value) -> Option<&'static str> {
+const fn typeof_value(value: &Value) -> Option<&'static str> {
     match value {
         Value::Bool(_) => Some("boolean"),
         Value::Number(_) => Some("number"),
@@ -1525,7 +1525,7 @@ fn typeof_value(value: &Value) -> Option<&'static str> {
     }
 }
 
-/// `typeof` of a global the evaluator does not bind but QuickJS — the engine
+/// `typeof` of a global the evaluator does not bind but `QuickJS` — the engine
 /// a static render must agree with — does. A name that is neither declared
 /// nor one of these is `undefined`, exactly as in JavaScript.
 fn global_typeof(name: &str) -> Option<&'static str> {
@@ -1615,7 +1615,7 @@ fn parse_int(input: &str, radix: Option<&Value>) -> f64 {
         digits.parse::<f64>().unwrap_or(f64::NAN)
     } else {
         digits.chars().fold(0.0, |n, c| {
-            n * f64::from(radix) + f64::from(c.to_digit(radix as u32).unwrap_or(0))
+            f64::mul_add(n, f64::from(radix), f64::from(c.to_digit(radix as u32).unwrap_or(0)))
         })
     };
     if negative {
@@ -1662,7 +1662,7 @@ fn parse_float(input: &str) -> f64 {
     s[..i].parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// JavaScript's GetSubstitution for a string pattern, which has no captures:
+/// JavaScript's `GetSubstitution` for a string pattern, which has no captures:
 /// `$$` is `$`, `$&` the match, `` $` `` what precedes it, `$'` what follows
 /// it, and every other `$` — `$1` included — is literal.
 fn substitute(template: &str, matched: &str, before: &str, after: &str) -> String {
@@ -1763,7 +1763,7 @@ thread_local! {
 pub(crate) fn install_phase_k_css_modules(
     registry: &crate::runtime::compiled::CssModuleRegistry,
 ) -> PhaseKCssModulesGuard {
-    let previous = PHASE_K_CSS_MODULES.with(|cell| cell.replace(Some(registry as *const _)));
+    let previous = PHASE_K_CSS_MODULES.with(|cell| cell.replace(Some(std::ptr::from_ref(registry))));
     PhaseKCssModulesGuard { previous }
 }
 
@@ -1801,7 +1801,7 @@ thread_local! {
 /// every other render path leaves it unset and inlines as before. RAII guard
 /// restores the previous installation on drop, mirroring the Phase K stack.
 pub(crate) fn install_island_skip_set(set: &std::collections::HashSet<String>) -> IslandSkipGuard {
-    let previous = PHASE_K_ISLAND_SKIP.with(|cell| cell.replace(Some(set as *const _)));
+    let previous = PHASE_K_ISLAND_SKIP.with(|cell| cell.replace(Some(std::ptr::from_ref(set))));
     IslandSkipGuard { previous }
 }
 
@@ -1850,7 +1850,7 @@ thread_local! {
 pub(crate) fn install_island_placeholders(
     map: &std::collections::HashMap<String, String>,
 ) -> IslandPlaceholderGuard {
-    let previous = ISLAND_PLACEHOLDERS.with(|cell| cell.replace(Some(map as *const _)));
+    let previous = ISLAND_PLACEHOLDERS.with(|cell| cell.replace(Some(std::ptr::from_ref(map))));
     IslandPlaceholderGuard { previous }
 }
 
@@ -1976,7 +1976,7 @@ fn island_placeholder_for(name: &str) -> Option<String> {
 pub(crate) fn install_phase_k_broadcast(
     broadcast: &crate::runtime::broadcast::BroadcastRegistry,
 ) -> PhaseKBroadcastGuard {
-    let previous = PHASE_K_BROADCAST.with(|cell| cell.replace(Some(broadcast as *const _)));
+    let previous = PHASE_K_BROADCAST.with(|cell| cell.replace(Some(std::ptr::from_ref(broadcast))));
     PhaseKBroadcastGuard { previous }
 }
 
@@ -2145,7 +2145,7 @@ fn snapshot_captured_props_into_slots(scope: &ComponentScope, props: &Value) {
 /// Detect whether the expression in a JSX text-position child is a
 /// bare slot-bound identifier (e.g. `{n}` for `const [n, setN] =
 /// useState(0)`, or `{messages}` for `const messages =
-/// useSharedSlot("topic")`). Returns the SlotId when so, signalling
+/// useSharedSlot("topic")`). Returns the `SlotId` when so, signalling
 /// that the renderer should emit a `SetTextRef` binding for the
 /// containing element so bakabox re-applies the value when a future
 /// `SlotSet` for this id arrives — whether from per-session writes
@@ -2179,7 +2179,7 @@ fn phase_k_detect_slot_text_read(expr: &swc_ecma_ast::Expr) -> Option<SlotId> {
 
 /// Render-scoped event interner. Allocates ids in first-appearance
 /// order starting at 1; id 0 is reserved as a sentinel. Bakabox
-/// resolves event_id → name through the `InitInternTable` opcode the
+/// resolves `event_id` → name through the `InitInternTable` opcode the
 /// drain step prepends, so the id only needs to be unique within one
 /// render frame.
 fn phase_k_event_id_for(event_name: &str) -> crate::ir::opcode::EventId {
@@ -2240,7 +2240,7 @@ pub struct ComponentProject {
     source_hashes: HashMap<String, u64>,
     /// Raw module source, keyed by specifier. Retained (rather than dropped
     /// after parse) so the A1 host-object bridge can feed a component's
-    /// original TSX through the QuickJS engine's own transpile + load pipeline
+    /// original TSX through the `QuickJS` engine's own transpile + load pipeline
     /// for a `render_entry_quickjs` render. Kept in lock-step with `modules`
     /// across `load_from_dir` and `patch`.
     sources: HashMap<String, String>,
@@ -2274,7 +2274,7 @@ impl ComponentProject {
             .follow_links(true)
             .sort_by_file_name()
             .into_iter()
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
         {
             let path = entry.path();
             if !path.is_file() {
@@ -2321,7 +2321,7 @@ impl ComponentProject {
     }
 
     /// Raw TSX/JSX source for a module specifier, if known. Used by the A1
-    /// host-object render bridge to load a component into the QuickJS engine.
+    /// host-object render bridge to load a component into the `QuickJS` engine.
     pub fn module_source(&self, specifier: &str) -> Option<&str> {
         let spec = normalize_slashes(specifier);
         self.sources.get(&spec).map(String::as_str)
@@ -2439,8 +2439,7 @@ impl ComponentProject {
                 Path::new(spec)
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .map(|stem| stem.eq_ignore_ascii_case(name))
-                    .unwrap_or(false)
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case(name))
             })
             .map(|(_, &id)| id)
     }
@@ -2468,7 +2467,7 @@ impl ComponentProject {
         &self.root
     }
 
-    pub fn modules(&self) -> &HashMap<String, ParsedModule> {
+    pub const fn modules(&self) -> &HashMap<String, ParsedModule> {
         &self.modules
     }
 
@@ -2556,7 +2555,7 @@ impl ComponentProject {
     /// statements. Setter calls inside the body translate to slot
     /// writes; identifier reads of slot-bound names translate to slot
     /// reads. Returns the explicit `Vec<Instruction>` from the body
-    /// (the body itself rarely emits anything explicit — the SlotSet
+    /// (the body itself rarely emits anything explicit — the `SlotSet`
     /// opcodes come from `SessionSlotView::drain_pending` afterwards).
     /// `form_payload` is the action envelope's decoded JSON payload — the
     /// submitted form fields — bound into the body's scope as `form`.
@@ -2758,12 +2757,12 @@ impl ComponentProject {
         let module = self
             .modules
             .get(module_spec)
-            .ok_or_else(|| anyhow!("module '{}' not loaded", module_spec))?;
+            .ok_or_else(|| anyhow!("module '{module_spec}' not loaded"))?;
         let local = if export_name == "default" {
             module
                 .default_export
                 .clone()
-                .ok_or_else(|| anyhow!("module '{}' has no default export", module_spec))?
+                .ok_or_else(|| anyhow!("module '{module_spec}' has no default export"))?
         } else {
             export_name.to_string()
         };
@@ -2785,12 +2784,10 @@ impl ComponentProject {
         let module = self
             .modules
             .get(module_spec)
-            .ok_or_else(|| anyhow!("module '{}' not loaded", module_spec))?;
+            .ok_or_else(|| anyhow!("module '{module_spec}' not loaded"))?;
         let function = module.functions.get(function_name).ok_or_else(|| {
             anyhow!(
-                "function '{}' missing in module '{}'",
-                function_name,
-                module_spec
+                "function '{function_name}' missing in module '{module_spec}'"
             )
         })?;
 
@@ -3140,15 +3137,12 @@ impl ComponentProject {
                 // member callee path.
                 Ok(map.get(prop_name).cloned().unwrap_or(Value::Null))
             }
-            Value::Array(items) => match prop_name {
-                "length" => Ok(json_int(items.len() as i64)),
-                _ => {
-                    // Numeric string indexing: `arr["0"]` matches JS semantics.
-                    if let Some(idx) = canonical_index(prop_name) {
-                        return Ok(items.get(idx).cloned().unwrap_or(Value::Null));
-                    }
-                    Ok(Value::Null)
+            Value::Array(items) => if prop_name == "length" { Ok(json_int(items.len() as i64)) } else {
+                // Numeric string indexing: `arr["0"]` matches JS semantics.
+                if let Some(idx) = canonical_index(prop_name) {
+                    return Ok(items.get(idx).cloned().unwrap_or(Value::Null));
                 }
+                Ok(Value::Null)
             },
             // UTF-16 code units, as JavaScript counts: `"😀".length` is 2, and
             // `s[i]` is one unit. Counting `char`s disagreed on every string
@@ -3177,9 +3171,7 @@ impl ComponentProject {
         for (i, quasi) in tpl.quasis.iter().enumerate() {
             let text = quasi
                 .cooked
-                .as_ref()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| quasi.raw.to_string());
+                .as_ref().map_or_else(|| quasi.raw.to_string(), std::string::ToString::to_string);
             result.push_str(&text);
             if i < tpl.exprs.len() {
                 let val = self.eval_expr(module_spec, &tpl.exprs[i], env)?;
@@ -3199,10 +3191,10 @@ impl ComponentProject {
         match bin.op {
             BinaryOp::LogicalAnd => {
                 let left = self.eval_expr(module_spec, &bin.left, env)?;
-                if !is_truthy(&left) {
-                    Ok(left)
-                } else {
+                if is_truthy(&left) {
                     self.eval_expr(module_spec, &bin.right, env)
+                } else {
+                    Ok(left)
                 }
             }
             BinaryOp::LogicalOr => {
@@ -3738,8 +3730,7 @@ impl ComponentProject {
 
                 // classnames / clsx — flatten args into a class string.
                 let is_classnames = import
-                    .map(|b| is_classnames_source(&b.source))
-                    .unwrap_or(false);
+                    .is_some_and(|b| is_classnames_source(&b.source));
                 if is_classnames {
                     let mut classes = Vec::new();
                     for arg in &call.args {
@@ -3758,8 +3749,7 @@ impl ComponentProject {
                 // render its initial value instead of vanishing.
                 let is_react_use_state = fn_name == "useState"
                     && import
-                        .map(|b| b.source == "react" && b.export_name == "useState")
-                        .unwrap_or(false);
+                        .is_some_and(|b| b.source == "react" && b.export_name == "useState");
                 if is_react_use_state {
                     let initial = match call.args.first() {
                         Some(arg) if arg.spread.is_none() => {
@@ -3777,8 +3767,7 @@ impl ComponentProject {
                 // why that pair is the one the client can also re-derive.
                 let is_react_use_id = fn_name == "useId"
                     && import
-                        .map(|b| b.source == "react" && b.export_name == "useId")
-                        .unwrap_or(false);
+                        .is_some_and(|b| b.source == "react" && b.export_name == "useId");
                 if is_react_use_id {
                     return Ok(Value::String(next_use_id()));
                 }
@@ -3798,8 +3787,7 @@ impl ComponentProject {
                 // through to the generic call path as before.
                 let is_react_use_memo = fn_name == "useMemo"
                     && import
-                        .map(|b| b.source == "react" && b.export_name == "useMemo")
-                        .unwrap_or(false);
+                        .is_some_and(|b| b.source == "react" && b.export_name == "useMemo");
                 if is_react_use_memo {
                     if let Some(arg) = call.args.first() {
                         if arg.spread.is_none() {
@@ -4213,7 +4201,7 @@ impl ComponentProject {
                             let radix = radix as u32;
                             let mut digits = String::new();
                             let (sign, mut value) = if int < 0 {
-                                ("-", (-(int as i128)) as u128)
+                                ("-", (-i128::from(int)) as u128)
                             } else {
                                 ("", int as u128)
                             };
@@ -4221,10 +4209,10 @@ impl ComponentProject {
                                 digits.push('0');
                             }
                             while value > 0 {
-                                let d = (value % radix as u128) as u32;
+                                let d = (value % u128::from(radix)) as u32;
                                 let ch = std::char::from_digit(d, radix).unwrap_or('0');
                                 digits.insert(0, ch);
-                                value /= radix as u128;
+                                value /= u128::from(radix);
                             }
                             Value::String(format!("{sign}{digits}"))
                         } else {
@@ -5182,8 +5170,7 @@ impl ComponentProject {
 
         let updater_arg = call.args.get(1).ok_or_else(|| {
             anyhow!(
-                "broadcast('{}', updater) requires an updater closure as its second parameter",
-                topic
+                "broadcast('{topic}', updater) requires an updater closure as its second parameter"
             )
         })?;
         if updater_arg.spread.is_some() {
@@ -5301,8 +5288,7 @@ impl ComponentProject {
                 let params: Vec<ParamBinding> = arrow.params.iter().map(param_from_pat).collect();
                 let mut env = parent_env.clone();
                 let index_val = serde_json::Number::from_f64(index as f64)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null);
+                    .map_or(Value::Null, Value::Number);
                 let args = Value::Array(vec![arg.clone(), index_val]);
                 bind_params_positional(&params, &args, &mut env);
                 // 🔴 A block body went through `eval_body_stmts`, which returns
@@ -5328,8 +5314,7 @@ impl ComponentProject {
                     .collect();
                 let mut env = parent_env.clone();
                 let index_val = serde_json::Number::from_f64(index as f64)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null);
+                    .map_or(Value::Null, Value::Number);
                 let args = Value::Array(vec![arg.clone(), index_val]);
                 bind_params_positional(&params, &args, &mut env);
                 if let Some(body) = &fn_expr.function.body {
@@ -5511,33 +5496,29 @@ impl ComponentProject {
                                 );
                             if let Some(name) = value_name {
                                 if let Some(slot_id) = phase_k_slot_for_value(&name) {
-                                    let value = match phase_k_read_slot_value(slot_id) {
-                                        Some(bytes) => serde_json::from_slice::<Value>(&bytes)
-                                            .unwrap_or(Value::Null),
-                                        None => {
-                                            // First read for this slot — seed it from
-                                            // the initial expression so the state
-                                            // persists across re-renders.
-                                            let initial_expr = phase_k_current_hook_initial(&name);
-                                            let initial_value = initial_expr
-                                                .as_ref()
-                                                .map(|expr| {
-                                                    self.eval_expr(module_spec, expr, env)
-                                                        .unwrap_or(Value::Null)
-                                                })
-                                                .unwrap_or(Value::Null);
-                                            if let Ok(bytes) = serde_json::to_vec(&initial_value) {
-                                                phase_k_write_slot_value(slot_id, bytes);
-                                                // Drain immediately — first-render
-                                                // initialisations are not user-visible
-                                                // mutations, they shouldn't show up
-                                                // in the response opcode frame as a
-                                                // SlotSet. Drop the pending entries
-                                                // by draining and ignoring.
-                                                drain_initial_slot_writes();
-                                            }
-                                            initial_value
+                                    let value = if let Some(bytes) = phase_k_read_slot_value(slot_id) { serde_json::from_slice::<Value>(&bytes)
+                                    .unwrap_or(Value::Null) } else {
+                                        // First read for this slot — seed it from
+                                        // the initial expression so the state
+                                        // persists across re-renders.
+                                        let initial_expr = phase_k_current_hook_initial(&name);
+                                        let initial_value = initial_expr
+                                            .as_ref()
+                                            .map_or(Value::Null, |expr| {
+                                                self.eval_expr(module_spec, expr, env)
+                                                    .unwrap_or(Value::Null)
+                                            });
+                                        if let Ok(bytes) = serde_json::to_vec(&initial_value) {
+                                            phase_k_write_slot_value(slot_id, bytes);
+                                            // Drain immediately — first-render
+                                            // initialisations are not user-visible
+                                            // mutations, they shouldn't show up
+                                            // in the response opcode frame as a
+                                            // SlotSet. Drop the pending entries
+                                            // by draining and ignoring.
+                                            drain_initial_slot_writes();
                                         }
+                                        initial_value
                                     };
                                     env.insert(name.clone(), value);
                                     if let Some(setter) = setter_name {
@@ -5596,7 +5577,7 @@ impl ComponentProject {
 
         let original_tag = match &element.opening.name {
             JSXElementName::Ident(ident) => ident.sym.to_string(),
-            _ => return Err(anyhow!("unsupported JSX tag in module '{}'", module_spec)),
+            _ => return Err(anyhow!("unsupported JSX tag in module '{module_spec}'")),
         };
 
         // Phase P · Stream E.1 — `<children />` is the layout-wrap
@@ -5625,7 +5606,7 @@ impl ComponentProject {
         let (tag, link_rewrite) = if original_tag == "Link" {
             ("a".to_string(), true)
         } else {
-            (original_tag.clone(), false)
+            (original_tag, false)
         };
 
         if is_component_tag(&tag) {
@@ -5779,18 +5760,14 @@ impl ComponentProject {
         //
         // We don't override an explicit user-supplied `data-albedo-id`,
         // which lets test harnesses or static fragments pin a known id.
-        let stable_id = match attrs
+        let stable_id = if let Some(existing) = attrs
             .iter()
             .find(|(name, _)| name == ALBEDO_ID_ATTR)
             .and_then(|(_, value)| value.as_str())
-            .and_then(|s| s.parse::<u32>().ok())
-        {
-            Some(existing) => existing,
-            None => {
-                let id = next_element_stable_id(module_spec);
-                attrs.push((ALBEDO_ID_ATTR.to_string(), Value::String(id.to_string())));
-                id
-            }
+            .and_then(|s| s.parse::<u32>().ok()) { existing } else {
+            let id = next_element_stable_id(module_spec);
+            attrs.push((ALBEDO_ID_ATTR.to_string(), Value::String(id.to_string())));
+            id
         };
 
         // Phase K · emit BindEvent for every JSX `on*` handler attached
@@ -6020,7 +5997,7 @@ impl ComponentProject {
         let module = self
             .modules
             .get(module_spec)
-            .ok_or_else(|| anyhow!("module '{}' not loaded", module_spec))?;
+            .ok_or_else(|| anyhow!("module '{module_spec}' not loaded"))?;
 
         if let Some(import_binding) = module.imports.get(component) {
             if import_binding.source == "react" {
@@ -6048,7 +6025,7 @@ impl ComponentProject {
     /// authored order the instant it becomes a `Value`, and `{height,
     /// backgroundColor, margin, flex}` comes back out alphabetized. CSS is
     /// order-sensitive (`{ margin: 0, marginTop: 4 }` and its reverse are
-    /// different rules), and the QuickJS shim sees a real JS object, which
+    /// different rules), and the `QuickJS` shim sees a real JS object, which
     /// *does* keep insertion order. Lowering the literal here, while the AST is
     /// still in hand, is what lets the two renderers agree byte-for-byte.
     ///
@@ -6210,7 +6187,7 @@ impl ComponentProject {
 
         // Are both branches safe to pre-render and toggle wholesale?
         let branches_static =
-            is_static_branch(true_branch) && false_branch.map(is_static_branch).unwrap_or(true);
+            is_static_branch(true_branch) && false_branch.is_none_or(is_static_branch);
 
         let active_truthy = is_truthy(&self.eval_expr(module_spec, cond, env)?);
 
@@ -6451,23 +6428,20 @@ impl ComponentProject {
                     let JSXExpr::Expr(expr) = &container.expr else {
                         continue;
                     };
-                    match phase_k_collect_slot_deps(expr) {
-                        Some((resolved, expr_deps)) => {
-                            for (name, slot) in expr_deps {
-                                if !deps.iter().any(|(existing, _)| existing == &name) {
-                                    deps.push((name, slot));
-                                }
+                    if let Some((resolved, expr_deps)) = phase_k_collect_slot_deps(expr) {
+                        for (name, slot) in expr_deps {
+                            if !deps.iter().any(|(existing, _)| existing == &name) {
+                                deps.push((name, slot));
                             }
-                            parts.push(TextTemplatePart::Dynamic(resolved));
                         }
-                        None => {
-                            // Reads no slot, so it cannot change client-side.
-                            // Freeze the text it produced rather than shipping an
-                            // expression the client has no scope to evaluate.
-                            let value = self.eval_expr(module_spec, expr, env)?;
-                            if !matches!(value, Value::Null | Value::Bool(false)) {
-                                parts.push(TextTemplatePart::Frozen(value_to_string(&value)));
-                            }
+                        parts.push(TextTemplatePart::Dynamic(resolved));
+                    } else {
+                        // Reads no slot, so it cannot change client-side.
+                        // Freeze the text it produced rather than shipping an
+                        // expression the client has no scope to evaluate.
+                        let value = self.eval_expr(module_spec, expr, env)?;
+                        if !matches!(value, Value::Null | Value::Bool(false)) {
+                            parts.push(TextTemplatePart::Frozen(value_to_string(&value)));
                         }
                     }
                 }
@@ -6486,7 +6460,7 @@ impl ComponentProject {
     /// Render a JSX child list to HTML.
     ///
     /// Expression children are escaped unless they are markup this renderer
-    /// produced; [`push_expression_child`] owns that rule and QuickJS's
+    /// produced; [`push_expression_child`] owns that rule and `QuickJS`'s
     /// `__albedo_push_children` is the same rule on the other side of the
     /// language boundary. This used to take an `escape_expr_children: bool`
     /// that both call sites passed `false`, so the escaping branch was
@@ -6655,7 +6629,7 @@ impl ComponentProject {
             .find(|(const_name, _)| const_name == &local)?
             .clone();
 
-        let depth = IMPORT_DEPTH.with(|d| d.get());
+        let depth = IMPORT_DEPTH.with(std::cell::Cell::get);
         if depth >= MAX_IMPORT_DEPTH {
             tracing::warn!(
                 target: "albedo::eval",
@@ -6763,7 +6737,7 @@ fn content_child_count(children: &[swc_ecma_ast::JSXElementChild]) -> usize {
         .count()
 }
 
-fn statement_kind(stmt: &swc_ecma_ast::Stmt) -> &'static str {
+const fn statement_kind(stmt: &swc_ecma_ast::Stmt) -> &'static str {
     use swc_ecma_ast::{Decl, Stmt};
     match stmt {
         Stmt::For(_) => "for",

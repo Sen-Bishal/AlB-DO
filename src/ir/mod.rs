@@ -9,7 +9,7 @@
 //!
 //! Hot-path consumers — reconcile, dirty-scan, lane routing — read the
 //! column store directly.
-//! Dated - 18th April 2026 - BshL
+//! Dated - 18th April 2026 - `BshL`
 
 pub mod action;
 pub mod columns;
@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-/// Bumped from "1.0" → "1.1" in cycle 2 of the SoA IR refactor: the
+/// Bumped from "1.0" → "1.1" in cycle 2 of the `SoA` IR refactor: the
 /// `source_hash` algorithm switched from FNV-1a to `xxh3_64`. The JSON
 /// shape of `CanonicalIrDocument` is unchanged; only the numeric value of
 /// `source_hash` fields rotates. Consumers that compare against persisted
@@ -164,14 +164,14 @@ pub fn build_canonical_ir_columns_from_graph(
     IrColumns::from_graph(graph, analyses)
 }
 
-/// Convenience AoS builder — produces the serialization-shaped document
+/// Convenience `AoS` builder — produces the serialization-shaped document
 /// directly. Prefer the column variants for runtime consumers; this wrapper
 /// exists for ergonomics in tests and the JSON export path.
 pub fn build_canonical_ir_from_parsed(components: &[ParsedComponent]) -> CanonicalIrDocument {
     build_canonical_ir_columns_from_parsed(components).to_canonical()
 }
 
-/// Convenience AoS builder — see [`build_canonical_ir_from_parsed`].
+/// Convenience `AoS` builder — see [`build_canonical_ir_from_parsed`].
 pub fn build_canonical_ir_from_graph(
     graph: &ComponentGraph,
     analyses: &HashMap<ComponentId, ComponentAnalysis>,

@@ -130,7 +130,7 @@ pub fn build_render_manifest_v2(
     let critical_path = result
         .critical_path
         .iter()
-        .map(|id| id.as_u64())
+        .map(super::types::ComponentId::as_u64)
         .collect::<Vec<u64>>();
 
     let manifest_builder = ManifestBuilder::new_in(
@@ -195,7 +195,7 @@ fn build_batch_index(result: &OptimizationResult) -> HashMap<u64, usize> {
     map
 }
 
-fn tiering_inputs_from_options(options: &ManifestOptions) -> TieringInputs {
+const fn tiering_inputs_from_options(options: &ManifestOptions) -> TieringInputs {
     TieringInputs {
         tier_a_inline_max_bytes: options.tier_a_inline_max_bytes,
         tier_c_split_min_bytes: options.tier_c_split_min_bytes,
@@ -218,7 +218,7 @@ fn entry_component_for_route(
         .find(is_renderable)
         .or_else(|| {
             let mut ids = graph.component_ids();
-            ids.sort_unstable_by_key(|id| id.as_u64());
+            ids.sort_unstable_by_key(super::types::ComponentId::as_u64);
             ids.into_iter().find(is_renderable)
         })
 }
@@ -230,7 +230,7 @@ fn entry_components_for_routes(
     let mut route_map: BTreeMap<String, ComponentId> = BTreeMap::new();
 
     let mut component_ids = graph.component_ids();
-    component_ids.sort_unstable_by_key(|id| id.as_u64());
+    component_ids.sort_unstable_by_key(super::types::ComponentId::as_u64);
 
     for id in component_ids {
         if !graph.get_dependents(&id).is_empty() {
@@ -304,7 +304,7 @@ pub(crate) fn route_path_from_component(file_path: &str) -> Option<String> {
         return Some("/".to_string());
     }
 
-    Some(format!("/{}", route))
+    Some(format!("/{route}"))
 }
 
 fn compute_priority(
@@ -315,12 +315,10 @@ fn compute_priority(
     let id = component.id.as_u64();
     let critical_score = critical_index
         .get(&id)
-        .map(|idx| 1000.0 - (*idx as f64))
-        .unwrap_or(0.0);
+        .map_or(0.0, |idx| 1000.0 - (*idx as f64));
     let batch_score = batch_index
         .get(&id)
-        .map(|idx| 100.0 - (*idx as f64))
-        .unwrap_or(0.0);
+        .map_or(0.0, |idx| 100.0 - (*idx as f64));
     let fold_bonus = if component.is_above_fold { 20.0 } else { 0.0 };
     let interaction_bonus = if component.is_interactive { 10.0 } else { 0.0 };
 

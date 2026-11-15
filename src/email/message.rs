@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// Most recipients one message may carry across `to`, `cc` and `bcc`.
 ///
-/// Every provider caps this (Resend 50, Postmark 50, SendGrid 1000 per
+/// Every provider caps this (Resend 50, Postmark 50, `SendGrid` 1000 per
 /// personalization) and a message over the lowest cap would fail at send time.
 /// Refusing at queue time is the same answer, earlier.
 pub const MAX_RECIPIENTS: usize = 50;

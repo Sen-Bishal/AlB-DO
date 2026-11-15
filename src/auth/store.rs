@@ -247,23 +247,20 @@ pub async fn upsert_principal(
         )
         .await;
 
-    match account {
-        Ok(_) => {
-            tx.commit().await?;
-            Ok(build_principal(minted, provider, profile))
-        }
-        Err(_) => {
-            // We lost the race. Roll back our half-built human and adopt the
-            // winner's — the alternative is two principals for one person, with
-            // the loser owning rows nobody can reach.
-            tx.rollback().await?;
-            let winner = lookup_account(db, provider, subject).await?.ok_or_else(|| {
-                StoreError::Corrupt(format!(
-                    "insert into {ACCOUNTS} for ({provider}, <subject>) failed but no row exists"
-                ))
-            })?;
-            Ok(build_principal(winner, provider, profile))
-        }
+    if account.is_ok() {
+        tx.commit().await?;
+        Ok(build_principal(minted, provider, profile))
+    } else {
+        // We lost the race. Roll back our half-built human and adopt the
+        // winner's — the alternative is two principals for one person, with
+        // the loser owning rows nobody can reach.
+        tx.rollback().await?;
+        let winner = lookup_account(db, provider, subject).await?.ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "insert into {ACCOUNTS} for ({provider}, <subject>) failed but no row exists"
+            ))
+        })?;
+        Ok(build_principal(winner, provider, profile))
     }
 }
 
@@ -687,7 +684,7 @@ pub async fn lookup_credential(
 
 /// What a provider told us about a human, already projected out of its own
 /// claim shape by the provider's `claimMap`.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderProfile {
     /// Best-known email. Not an identifier.
     pub email: Option<String>,

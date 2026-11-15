@@ -129,8 +129,8 @@ async fn an_operator_grants_lists_and_revokes_roles() {
         assert!(!ok, "{args:?} must fail\n{text}");
         assert!(text.contains(needle), "{args:?} must name `{needle}`\n{text}");
     }
-    assert!(roles_of(&db_path, &bob_1).await.is_empty());
-    assert!(roles_of(&db_path, &bob_2).await.is_empty());
+    assert_eq!(roles_of(&db_path, &bob_1).await, [] as [std::string::String; 0]);
+    assert_eq!(roles_of(&db_path, &bob_2).await, [] as [std::string::String; 0]);
 
     // ── the ambiguous email, resolved by id ──
     let (ok, text) = run(albedo(home.path(), &app, &db_path).args([
@@ -157,7 +157,7 @@ async fn an_operator_grants_lists_and_revokes_roles() {
         "payroll",
     ]));
     assert!(ok, "revoke\n{text}");
-    assert!(roles_of(&db_path, &ada).await.is_empty());
+    assert_eq!(roles_of(&db_path, &ada).await, [] as [std::string::String; 0]);
     assert_eq!(roles_of(&db_path, &bob_2).await, ["hr"]);
 }
 
@@ -244,7 +244,7 @@ async fn concurrent_cli_grants_are_unique_and_persist_after_restart() {
         .args(["roles", "grant", "ADA@EXAMPLE.COM", "payroll"])
         .output()
         .expect("second CLI");
-    assert!(second.status.success(), "{:?}", second);
+    assert!(second.status.success(), "{second:?}");
     assert!(first.wait().expect("first exits").success());
     assert_eq!(roles_of(&db_path, &id).await, ["payroll"]);
     let (ok, text) =
@@ -257,7 +257,7 @@ async fn concurrent_cli_grants_are_unique_and_persist_after_restart() {
         "payroll",
     ]));
     assert!(ok, "{text}");
-    assert!(roles_of(&db_path, &id).await.is_empty());
+    assert_eq!(roles_of(&db_path, &id).await, [] as [std::string::String; 0]);
     drop(work);
 }
 
@@ -291,7 +291,7 @@ async fn shipped_binary_forwards_role_changes_and_list() {
     assert!(ok && text.contains(id.as_str()), "shipped list\n{text}");
     let (ok, text) = run(shipped().args(["roles", "revoke", id.as_str(), "hr"]));
     assert!(ok, "shipped revoke\n{text}");
-    assert!(roles_of(&db_path, &id).await.is_empty());
+    assert_eq!(roles_of(&db_path, &id).await, [] as [std::string::String; 0]);
 }
 
 
@@ -307,7 +307,7 @@ async fn malformed_requests_and_missing_database_do_not_write_grants() {
         let (ok, text) = run(albedo(home.path(), &app, &db_path).args(&args));
         assert!(!ok, "malformed request {args:?} succeeded\n{text}");
     }
-    assert!(roles_of(&db_path, &id).await.is_empty());
+    assert_eq!(roles_of(&db_path, &id).await, [] as [std::string::String; 0]);
     let missing = db_path.with_file_name("missing.db");
     let (ok, text) = run(albedo(home.path(), &app, &missing).args([
         "roles", "grant", id.as_str(), "payroll",
@@ -417,12 +417,12 @@ async fn leftover_cleanup_is_scoped_to_the_holder_and_never_allows_grant() {
         let (ok, text) = run(albedo(home.path(), &app, &db_path).args(&args));
         assert!(!ok && text.contains("retired"), "{args:?}\n{text}");
         assert_eq!(roles_of(&db_path, &id).await, ["retired"]);
-        assert!(roles_of(&db_path, &other).await.is_empty());
+        assert_eq!(roles_of(&db_path, &other).await, [] as [std::string::String; 0]);
     }
     let (ok, text) =
         run(albedo(home.path(), &app, &db_path).args(["roles", "revoke", id.as_str(), "retired"]));
     assert!(ok && text.contains("leftover"), "{text}");
-    assert!(roles_of(&db_path, &id).await.is_empty());
+    assert_eq!(roles_of(&db_path, &id).await, [] as [std::string::String; 0]);
 }
 
 #[tokio::test]
@@ -529,13 +529,12 @@ async fn a_locked_database_fails_loudly_then_concurrent_cli_changes_get_unique_s
         "failure must identify contention: {text}"
     );
     assert_eq!(authority_clock(&db).await.unwrap(), 0);
-    assert!(authority_changes_after(&db, 0).await.unwrap().is_empty());
-    assert!(load_principal(&db, &ada)
+    assert_eq!(authority_changes_after(&db, 0).await.unwrap(), [] as [dom_render_compiler::auth::store::AuthorityChange; 0]);
+    assert_eq!(load_principal(&db, &ada)
         .await
         .unwrap()
         .unwrap()
-        .roles
-        .is_empty());
+        .roles, [] as [std::string::String; 0]);
     transaction.rollback().await.unwrap();
 
     let ids = [ada, bob, cat];

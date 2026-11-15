@@ -161,15 +161,14 @@ pub fn normalize_jsx_text(value: &str) -> Option<String> {
 pub fn is_component_tag(tag: &str) -> bool {
     tag.chars()
         .next()
-        .map(|c| c.is_ascii_uppercase())
-        .unwrap_or(false)
+        .is_some_and(|c| c.is_ascii_uppercase())
 }
 
 /// The key that tags an evaluator value as ALREADY-RENDERED MARKUP.
 ///
 /// The evaluator's `Value` is `serde_json::Value` — a foreign type with no room
 /// for a new variant — so "this string is HTML, not text" rides the same way a
-/// `Date` does: a one-key object. QuickJS draws the same distinction with the
+/// `Date` does: a one-key object. `QuickJS` draws the same distinction with the
 /// `AlbedoHtml` wrapper in `quickjs_engine`'s `h()` shim, and the two renderers
 /// must agree on *which* children get escaped or they emit different bytes for
 /// the same component.
@@ -248,7 +247,7 @@ pub fn escape_html(value: &str) -> String {
 /// Append one JSX expression child to `out`, escaping it unless it is markup
 /// this renderer produced.
 ///
-/// The Rust half of QuickJS's `__albedo_push_children`, and it must stay the
+/// The Rust half of `QuickJS`'s `__albedo_push_children`, and it must stay the
 /// same rule: arrays flatten, `null`/`false` render nothing, an already-rendered
 /// value passes through verbatim, and **everything else is escaped**. Anything
 /// that reached here as data — props, a route param, a FORGE column, a fetched
@@ -287,7 +286,7 @@ pub fn escape_attr(value: &str) -> String {
 /// * `children` — the element's content, rendered between the tags.
 ///
 /// This is the single Rust-side definition; every HTML-emitting path consults it
-/// (`render_attrs` here, the list templater in `runtime::compiled`). The QuickJS
+/// (`render_attrs` here, the list templater in `runtime::compiled`). The `QuickJS`
 /// shim carries its own copy because it lives on the other side of a language
 /// boundary — `runtime::quickjs_engine`'s `__albedo_is_reserved_prop` must be
 /// kept in lockstep with this list, or SSR and CSR emit different attributes for
@@ -378,7 +377,7 @@ pub fn render_attrs(attrs: &[(String, Value)]) -> String {
 ///
 /// This is the single spelling of the set. The pure-Rust renderer reads it
 /// through [`is_void_tag`], the list templater in `runtime::compiled` reads it
-/// directly, and the QuickJS `h()` shim receives it as *data* on
+/// directly, and the `QuickJS` `h()` shim receives it as *data* on
 /// `__ALBEDO_MARKUP_CONTRACT` rather than restating it in JS. Three copies of
 /// this list is three chances for one renderer to close a tag the other leaves
 /// open — which is precisely the drift the conformance harness exists to catch.
@@ -455,7 +454,7 @@ const CSS_VENDOR_PREFIXES: &[&str] = &["Webkit", "ms", "Moz", "O"];
 ///
 /// This is the single spelling of the set, in exactly the sense
 /// [`HTML_VOID_ELEMENTS`] is one: the pure-Rust renderer reads it through
-/// [`is_unitless_style_property`], and the QuickJS `h()` shim receives it as
+/// [`is_unitless_style_property`], and the `QuickJS` `h()` shim receives it as
 /// *data* on `__ALBEDO_MARKUP_CONTRACT` rather than restating it in JS. Two
 /// copies would be two chances for one renderer to emit `flex:1` where the
 /// other emits `flex:1px` — a divergence a browser would render differently,
@@ -566,7 +565,7 @@ pub fn is_truthy(val: &Value) -> bool {
     match val {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
         Value::String(s) => !s.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
     }
@@ -604,8 +603,7 @@ pub fn lit_to_value(lit: &swc_ecma_ast::Lit) -> Value {
         swc_ecma_ast::Lit::Str(str_lit) => Value::String(str_lit.value.to_string()),
         swc_ecma_ast::Lit::Bool(bool_lit) => Value::Bool(bool_lit.value),
         swc_ecma_ast::Lit::Num(num) => serde_json::Number::from_f64(num.value)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+            .map_or(Value::Null, Value::Number),
         swc_ecma_ast::Lit::Null(_) => Value::Null,
         _ => Value::Null,
     }
@@ -631,7 +629,7 @@ pub fn value_to_string(value: &Value) -> String {
             // else falls through to JSON for visibility.
             if let Some(ms) = object
                 .get("__albedo_date__")
-                .and_then(|v| v.as_f64())
+                .and_then(serde_json::Value::as_f64)
             {
                 return format_date_iso(ms);
             }
@@ -667,8 +665,7 @@ pub fn make_date_value(ms: f64) -> Value {
     map.insert(
         "__albedo_date__".to_string(),
         serde_json::Number::from_f64(ms)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+            .map_or(Value::Null, Value::Number),
     );
     Value::Object(map)
 }
@@ -677,7 +674,7 @@ pub fn date_value_ms(value: &Value) -> Option<f64> {
     value
         .as_object()
         .and_then(|m| m.get("__albedo_date__"))
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
 }
 
 /// Coerce a runtime `Value` to an f64 the way JS's arithmetic operators
@@ -705,8 +702,7 @@ pub fn json_num(value: f64) -> Value {
         return Value::Number(serde_json::Number::from(value as i64));
     }
     serde_json::Number::from_f64(value)
-        .map(Value::Number)
-        .unwrap_or(Value::Null)
+        .map_or(Value::Null, Value::Number)
 }
 
 pub fn json_int(value: i64) -> Value {
@@ -714,7 +710,7 @@ pub fn json_int(value: i64) -> Value {
 }
 
 pub fn arg_num(args: &[Value], index: usize) -> f64 {
-    args.get(index).map(to_number).unwrap_or(0.0)
+    args.get(index).map_or(0.0, to_number)
 }
 
 fn format_date_iso(ms: f64) -> String {
@@ -727,12 +723,11 @@ fn format_date_iso(ms: f64) -> String {
     }
     let (y, mo, d, h, mi, s) = epoch_seconds_to_ymd_hms(secs);
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        y, mo, d, h, mi, s, millis
+        "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z"
     )
 }
 
-fn epoch_seconds_to_ymd_hms(mut secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+const fn epoch_seconds_to_ymd_hms(mut secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let day_secs: i64 = 86_400;
     let mut days = secs.div_euclid(day_secs);
     secs = secs.rem_euclid(day_secs);

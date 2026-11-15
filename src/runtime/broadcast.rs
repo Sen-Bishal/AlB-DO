@@ -14,7 +14,7 @@
 //! - **Topics, not sessions.** A topic (`"chat:room-42"`) is global.
 //!   Sessions subscribe to topics, not the other way round.
 //! - **Wire reuse.** Fan-out emits `Instruction::SlotSet` wrapped in an
-//!   `OpcodeFrame`; the client can't tell whether a SlotSet came from a
+//!   `OpcodeFrame`; the client can't tell whether a `SlotSet` came from a
 //!   per-session write or a broadcast — it just applies the value to
 //!   the slot. Since S4 a fan-out MAY carry a second instruction, see
 //!   the delta lane below.
@@ -291,10 +291,10 @@ impl TopicIdentity {
     /// The single place the "is it safe to forget this?" question is answered,
     /// so no caller has to re-derive the rule from the variant.
     #[must_use]
-    pub fn is_evictable(&self) -> bool {
+    pub const fn is_evictable(&self) -> bool {
         matches!(
             self,
-            TopicIdentity::Partition { .. } | TopicIdentity::External { .. }
+            Self::Partition { .. } | Self::External { .. }
         )
     }
 }
@@ -365,7 +365,7 @@ impl BroadcastTopic {
         &self.name
     }
 
-    pub fn slot_id(&self) -> SlotId {
+    pub const fn slot_id(&self) -> SlotId {
         self.slot_id
     }
 
@@ -412,7 +412,7 @@ impl BroadcastTopic {
 
     /// PRISM · what this topic is — static, or one partition of a collection.
     #[must_use]
-    pub fn identity(&self) -> &TopicIdentity {
+    pub const fn identity(&self) -> &TopicIdentity {
         &self.identity
     }
 
@@ -536,12 +536,13 @@ pub struct BroadcastDelivery {
 }
 
 impl BroadcastDelivery {
-    pub fn drop_count(&self) -> usize {
+    pub const fn drop_count(&self) -> usize {
         self.dropped_full.len() + self.dropped_closed.len()
     }
 }
 
 /// Errors that can surface from the broadcast write path.
+///
 /// Wire-encode failure is the only error here that isn't recoverable
 /// at the caller level — every other condition (no subscribers, full
 /// channel, closed channel) is reported through
@@ -616,7 +617,7 @@ pub fn check_topic_slot_ids(topics: &[String]) -> Result<(), Vec<String>> {
 #[derive(Debug, Default)]
 pub struct BroadcastRegistry {
     /// Topic name → topic state. `Arc<BroadcastTopic>` so handlers
-    /// can hand-off a topic reference without holding a DashMap
+    /// can hand-off a topic reference without holding a `DashMap`
     /// entry guard across `.await` points.
     topics: DashMap<String, Arc<BroadcastTopic>>,
     /// Reverse index: session → set of topics that session is
@@ -1094,7 +1095,7 @@ impl BroadcastRegistry {
 
     /// Subscribe `session` to `topic` with a sink (typically the
     /// session's WT patches-lane sender). Returns the topic's
-    /// current value so the caller can ship an initial SlotSet to
+    /// current value so the caller can ship an initial `SlotSet` to
     /// the freshly-joined client.
     ///
     /// A second subscribe for the same `(session, topic)` replaces
@@ -1239,20 +1240,17 @@ impl BroadcastRegistry {
         // coalesces away (a fully-cancelling delta, an empty insert run) has
         // described no row transition at all, and falls back to the snapshot
         // rather than fanning out an empty frame.
-        let instruction = match list_instruction(topic_entry.slot_id, update) {
-            Some(list_op) => {
-                // The snapshot is stored, not sent: `guard` takes it whole
-                // instead of a clone, so a large collection is moved rather
-                // than memcpy'd on the hot path.
-                *guard = value;
-                list_op
-            }
-            None => {
-                *guard = value.clone();
-                Instruction::SlotSet {
-                    slot_id: topic_entry.slot_id,
-                    value,
-                }
+        let instruction = if let Some(list_op) = list_instruction(topic_entry.slot_id, update) {
+            // The snapshot is stored, not sent: `guard` takes it whole
+            // instead of a clone, so a large collection is moved rather
+            // than memcpy'd on the hot path.
+            *guard = value;
+            list_op
+        } else {
+            *guard = value.clone();
+            Instruction::SlotSet {
+                slot_id: topic_entry.slot_id,
+                value,
             }
         };
 
@@ -1348,7 +1346,7 @@ impl BroadcastRegistry {
         let mut projected: std::collections::HashMap<Columns, Option<bytes::Bytes>> =
             std::collections::HashMap::new();
 
-        for entry in topic_entry.subscribers.iter() {
+        for entry in &topic_entry.subscribers {
             let session = *entry.key();
             let columns = snapshot.and_then(|_| {
                 topic_entry
@@ -1557,17 +1555,14 @@ pub fn coalesce_changes(changes: Vec<SlotChange>) -> Vec<SlotChange> {
     let mut order: Vec<SlotChange> = Vec::with_capacity(changes.len());
     let mut seen: FxHashMap<(RowKey, Vec<u8>), usize> = FxHashMap::default();
     for change in changes {
-        match seen.get(&(change.key.clone(), change.payload.clone())) {
-            Some(&index) => {
-                // Saturating: a weight overflow would flip a sign and turn an
-                // insert into a retraction. Clamping is wrong too, but it is
-                // wrong in the direction that keeps the row on the page.
-                order[index].weight = order[index].weight.saturating_add(change.weight);
-            }
-            None => {
-                seen.insert((change.key.clone(), change.payload.clone()), order.len());
-                order.push(change);
-            }
+        if let Some(&index) = seen.get(&(change.key.clone(), change.payload.clone())) {
+            // Saturating: a weight overflow would flip a sign and turn an
+            // insert into a retraction. Clamping is wrong too, but it is
+            // wrong in the direction that keeps the row on the page.
+            order[index].weight = order[index].weight.saturating_add(change.weight);
+        } else {
+            seen.insert((change.key.clone(), change.payload.clone()), order.len());
+            order.push(change);
         }
     }
 

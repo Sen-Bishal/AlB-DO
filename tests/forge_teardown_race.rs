@@ -225,7 +225,7 @@ fn probe_e_single_threaded_one_at_a_time() {
         });
 }
 
-/// Interleaved, multi_thread runtime with a single worker.
+/// Interleaved, `multi_thread` runtime with a single worker.
 #[ignore = "part of the crash matrix; only meaningful beside the rows above"]
 #[test]
 fn probe_f_multithread_one_worker() {

@@ -29,7 +29,7 @@ impl Drop for Running {
 
 fn scaffold(home: &Path, work: &Path) -> std::path::PathBuf {
     let output = command(home, work).args(["init", "app"]).output().unwrap();
-    assert!(output.status.success(), "{:?}", output);
+    assert!(output.status.success(), "{output:?}");
     work.join("app")
 }
 

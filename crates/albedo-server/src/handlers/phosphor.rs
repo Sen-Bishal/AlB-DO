@@ -221,7 +221,7 @@ impl TokenBucket {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last).as_secs_f64();
         self.last = now;
-        self.tokens = (self.tokens + elapsed * SUBSCRIBE_REFILL_PER_SEC).min(SUBSCRIBE_BURST);
+        self.tokens = elapsed.mul_add(SUBSCRIBE_REFILL_PER_SEC, self.tokens).min(SUBSCRIBE_BURST);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -283,7 +283,7 @@ impl Lane {
     /// topic's identity can contain a principal and "may this connection name
     /// it" stops being answerable from the path alone.
     #[must_use]
-    pub fn principal(&self) -> &crate::auth::Identity {
+    pub const fn principal(&self) -> &crate::auth::Identity {
         &self.principal
     }
 }
@@ -317,7 +317,7 @@ impl PhosphorState {
     /// its kill future, and `notify_one` leaves a permit the next poll takes.
     pub fn end_lanes_where(&self, revoked: impl Fn(&crate::auth::Identity) -> bool) -> usize {
         let mut ended = 0;
-        for lane in self.lanes.iter() {
+        for lane in &self.lanes {
             if revoked(&lane.principal) {
                 lane.kill.notify_one();
                 ended += 1;
@@ -343,7 +343,7 @@ pub struct DevTap {
 }
 
 impl DevTap {
-    pub fn none() -> Self {
+    pub const fn none() -> Self {
         Self {
             errors: None,
             hmr: None,
@@ -443,7 +443,7 @@ pub async fn serve_trunk(
                 Some(dev_event) = dev_stream.next() => {
                     yield Ok::<_, Infallible>(dev_event);
                 }
-                _ = kill.notified() => {
+                () = kill.notified() => {
                     // Backpressure kill: the browser cannot drain the shared
                     // stream. End loudly; the owner reconnects with resync.
                     break;
@@ -555,7 +555,7 @@ pub struct AddRoute {
     pub resync: bool,
 }
 
-#[derive(Debug, Default, Serialize, PartialEq)]
+#[derive(Debug, Default, Serialize, PartialEq, Eq)]
 pub struct SubscribeOutcome {
     pub ok: Vec<String>,
     pub denied: Vec<String>,
@@ -636,28 +636,25 @@ async fn subscribe_routes(
         // ── step 2: circuit + atomic seed snapshot, under the table lock ──
         let (seed_instructions, seed_values, start_gate) = {
             let mut routes = lane.routes.lock().expect("phosphor route table poisoned");
-            let sub = match routes.get_mut(&add.p) {
-                Some(existing) => {
-                    existing.refs += 1;
-                    existing
+            let sub = if let Some(existing) = routes.get_mut(&add.p) {
+                existing.refs += 1;
+                existing
+            } else {
+                if routes.len() >= MAX_ROUTES_PER_LANE {
+                    return Err(StatusCode::TOO_MANY_REQUESTS);
                 }
-                None => {
-                    if routes.len() >= MAX_ROUTES_PER_LANE {
-                        return Err(StatusCode::TOO_MANY_REQUESTS);
-                    }
-                    let (tx, rx) = mpsc::channel::<bytes::Bytes>(CIRCUIT_CHANNEL_CAPACITY);
-                    routes.insert(
-                        add.p.clone(),
-                        RouteSub {
-                            session: SessionId::random(),
-                            registry: authority.registry(),
-                            sender: tx,
-                            pending_rx: Some(rx),
-                            refs: 1,
-                        },
-                    );
-                    routes.get_mut(&add.p).expect("just inserted")
-                }
+                let (tx, rx) = mpsc::channel::<bytes::Bytes>(CIRCUIT_CHANNEL_CAPACITY);
+                routes.insert(
+                    add.p.clone(),
+                    RouteSub {
+                        session: SessionId::random(),
+                        registry: authority.registry(),
+                        sender: tx,
+                        pending_rx: Some(rx),
+                        refs: 1,
+                    },
+                );
+                routes.get_mut(&add.p).expect("just inserted")
             };
             // Re-subscribing an existing session with the same sender is a
             // sink replacement with itself — a no-op registration that still

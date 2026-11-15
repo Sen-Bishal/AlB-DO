@@ -77,6 +77,7 @@ pub enum OverlayEvent {
 }
 
 /// Shared registry one server instance threads through `RuntimeState`.
+///
 /// Subsystems that produce errors call `report` with their kind +
 /// message; the overlay handler subscribes via `subscribe` and pushes
 /// events out via SSE.
@@ -184,8 +185,7 @@ fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

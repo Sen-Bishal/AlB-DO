@@ -54,7 +54,7 @@ pub struct RenderEvent {
 }
 
 impl RenderEvent {
-    pub fn cascade_count(&self) -> usize {
+    pub const fn cascade_count(&self) -> usize {
         self.cascade_children.len()
     }
 }

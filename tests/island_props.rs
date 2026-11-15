@@ -76,7 +76,7 @@ fn the_parents_props_reach_the_island_node() {
     let props = &badge_node(&manifest).initial_props;
 
     assert_eq!(
-        props.get("start").and_then(|v| v.as_f64()),
+        props.get("start").and_then(serde_json::value::Value::as_f64),
         Some(41.0),
         "`start={{41}}` must survive the parent render; got {props}"
     );
@@ -106,7 +106,7 @@ fn event_handler_attributes_are_not_captured_as_props() {
         .initial_props;
 
     // Captured at all — or the absence below would prove nothing.
-    assert_eq!(props.get("step").and_then(|v| v.as_f64()), Some(3.0), "got {props}");
+    assert_eq!(props.get("step").and_then(serde_json::value::Value::as_f64), Some(3.0), "got {props}");
     assert!(
         props.get("onBump").is_none(),
         "`onBump` is a handler and must not be captured as a prop; got {props}"
@@ -175,7 +175,7 @@ fn the_hydration_payload_seeds_the_island_with_its_captured_props() {
         .expect("Badge island in the payload");
 
     assert_eq!(
-        island.props.get("start").and_then(|v| v.as_f64()),
+        island.props.get("start").and_then(serde_json::value::Value::as_f64),
         Some(41.0),
         "the client must mount from the same props the server rendered; got {}",
         island.props
@@ -209,7 +209,7 @@ fn an_island_under_a_tier_b_parent_also_receives_its_props() {
         .expect("Ticker must be a Tier-C island");
 
     assert_eq!(
-        ticker.initial_props.get("seed").and_then(|v| v.as_f64()),
+        ticker.initial_props.get("seed").and_then(serde_json::value::Value::as_f64),
         Some(7.0),
         "`seed={{7}}` was passed by an async (Tier-B) parent and must survive \
          the same way a static parent's props do; got {}",
@@ -244,7 +244,7 @@ fn an_island_with_no_props_is_unchanged() {
     for node in islands {
         assert!(
             node.initial_props.is_null()
-                || node.initial_props.as_object().is_some_and(|o| o.is_empty()),
+                || node.initial_props.as_object().is_some_and(serde_json::map::Map::is_empty),
             "`{}` is passed nothing, so it must carry no props — not the \
              identity blob `initial_props` used to hold; got {}",
             node.component_id,

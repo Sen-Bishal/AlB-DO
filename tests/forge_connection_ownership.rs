@@ -159,7 +159,7 @@ fn a_statement_can_outlive_its_connection() {
             let db = database(&root, "statement", n).await;
             let conn = db.connect().expect("connect");
             conn.execute("CREATE TABLE t (v BLOB)", ()).await.expect("table");
-            let mut statement = conn
+            let statement = conn
                 .prepare("INSERT INTO t VALUES (zeroblob(131072))")
                 .await
                 .expect("prepare");

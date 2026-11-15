@@ -77,7 +77,7 @@ impl FrameArena {
         }
     }
 
-    pub fn scratch_capacity(&self) -> usize {
+    pub const fn scratch_capacity(&self) -> usize {
         self.scratch_indices.capacity()
     }
 
@@ -190,23 +190,23 @@ impl FrameMetrics {
         self.samples.len()
     }
 
-    pub fn total_ticks(&self) -> u64 {
+    pub const fn total_ticks(&self) -> u64 {
         self.total_ticks
     }
 
-    pub fn total_dirty(&self) -> u64 {
+    pub const fn total_dirty(&self) -> u64 {
         self.total_dirty
     }
 
-    pub fn total_frames_pushed(&self) -> u64 {
+    pub const fn total_frames_pushed(&self) -> u64 {
         self.total_frames_pushed
     }
 
-    pub fn total_lane_bytes(&self) -> [u64; LANE_COUNT] {
+    pub const fn total_lane_bytes(&self) -> [u64; LANE_COUNT] {
         self.total_lane_bytes
     }
 
-    pub fn max_total_ns(&self) -> u128 {
+    pub const fn max_total_ns(&self) -> u128 {
         self.max_total_ns
     }
 
@@ -255,7 +255,7 @@ impl FrameMetrics {
     }
 }
 
-/// End-to-end reconciliation tick — the FINAL OBJECTIVE of the SoA plan.
+/// End-to-end reconciliation tick — the FINAL OBJECTIVE of the `SoA` plan.
 ///
 /// The call order inside this function mirrors the plan, one line per stage:
 ///
@@ -396,7 +396,7 @@ pub fn frame_tick(
 }
 
 /// Widen `[usize; LANE_COUNT]` to `[u64; 4]` for the observer surface. The
-/// LaneObserver wire shape is fixed at 4 lanes so the inspector never has to
+/// `LaneObserver` wire shape is fixed at 4 lanes so the inspector never has to
 /// handle a size-mismatched array.
 fn lane_report_u64s(input: &[usize; LANE_COUNT]) -> [u64; 4] {
     let mut out = [0_u64; 4];
@@ -465,7 +465,7 @@ fn build_lane_patch_buf(indices: &[u32], hashes: &[u64], buf: &mut Vec<u8>) -> u
     buf.len()
 }
 
-fn split_patch_bufs_mut(bufs: &mut [Vec<u8>; LANE_COUNT]) -> [&mut Vec<u8>; LANE_COUNT] {
+const fn split_patch_bufs_mut(bufs: &mut [Vec<u8>; LANE_COUNT]) -> [&mut Vec<u8>; LANE_COUNT] {
     let (head0, rest0) = bufs.split_at_mut(1);
     let (head1, rest1) = rest0.split_at_mut(1);
     let (head2, head3) = rest1.split_at_mut(1);

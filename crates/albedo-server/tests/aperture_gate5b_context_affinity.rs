@@ -9,7 +9,7 @@
 //!
 //! The premise gate 5 was argued from (`APERTURE.md` § 5.4, *"the engine cannot
 //! `await`"*) turned out to be false: `the_engine_drives_generators_and_resumes_them_with_a_value`
-//! shows QuickJS pausing a body, handing the pause point to Rust, and resuming
+//! shows `QuickJS` pausing a body, handing the pause point to Rust, and resuming
 //! it with a value. The real constraint is that the engine cannot **block**, and
 //! those are different. Suspension without replay is therefore available, and it
 //! deletes the entire replay tax — R1's N+1 body runs, R2's determinism

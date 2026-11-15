@@ -199,6 +199,7 @@ pub fn publish_render(name: &str, module_spec: &str, started_at: Instant) {
 }
 
 /// Forwards a frame report to the installed [`LaneObserver`], if any.
+///
 /// Called from [`super::frame::frame_tick`] after it computes its
 /// [`super::frame::FrameReport`]. Cheap when no observer is installed
 /// (single `OnceLock::get`).

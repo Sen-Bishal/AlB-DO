@@ -195,7 +195,7 @@ impl SharedSlotBinding {
     /// the registry wants this: a partition cannot be named before its key
     /// exists, so those paths must skip it rather than invent one.
     #[must_use]
-    pub fn static_topic(&self) -> Option<&str> {
+    pub const fn static_topic(&self) -> Option<&str> {
         match &self.spec {
             TopicSpec::Static(topic) => Some(topic.as_str()),
             // A source is excluded even when every argument is a literal. Its
@@ -867,7 +867,7 @@ fn describe_expr(expr: &Expr) -> String {
 // against the route's params — the same single resolver the subscribe path
 // uses. Nothing mints a topic string in JS.
 
-/// Fold `useSharedSlot`'s topic argument into a form the QuickJS shim can
+/// Fold `useSharedSlot`'s topic argument into a form the `QuickJS` shim can
 /// evaluate. See the module-level note above.
 ///
 /// Self-contained: reads the module's own imports, so the transpile caller does
@@ -1105,8 +1105,7 @@ fn is_use_shared_slot_call(call: &CallExpr, imports: &HashMap<String, ImportBind
     let name = ident.sym.to_string();
     imports
         .get(&name)
-        .map(|b| b.source == "albedo" && b.export_name == "useSharedSlot")
-        .unwrap_or(false)
+        .is_some_and(|b| b.source == "albedo" && b.export_name == "useSharedSlot")
 }
 
 fn check_no_shared_slot_calls_in_stmt(
@@ -1136,8 +1135,7 @@ fn stmt_contains_shared_slot_call(stmt: &Stmt, imports: &HashMap<String, ImportB
         Stmt::Decl(Decl::Var(var)) => var.decls.iter().any(|d| {
             d.init
                 .as_ref()
-                .map(|e| expr_contains_shared_slot_call(e, imports))
-                .unwrap_or(false)
+                .is_some_and(|e| expr_contains_shared_slot_call(e, imports))
         }),
         Stmt::Expr(ExprStmt { expr, .. }) => expr_contains_shared_slot_call(expr, imports),
         Stmt::Block(block) => block
@@ -1148,8 +1146,7 @@ fn stmt_contains_shared_slot_call(stmt: &Stmt, imports: &HashMap<String, ImportB
             stmt_contains_shared_slot_call(cons, imports)
                 || alt
                     .as_ref()
-                    .map(|a| stmt_contains_shared_slot_call(a, imports))
-                    .unwrap_or(false)
+                    .is_some_and(|a| stmt_contains_shared_slot_call(a, imports))
         }
         Stmt::For(ForStmt { body, .. }) => stmt_contains_shared_slot_call(body, imports),
         Stmt::While(node) => stmt_contains_shared_slot_call(&node.body, imports),
@@ -1157,8 +1154,7 @@ fn stmt_contains_shared_slot_call(stmt: &Stmt, imports: &HashMap<String, ImportB
         Stmt::Return(node) => node
             .arg
             .as_ref()
-            .map(|e| expr_contains_shared_slot_call(e, imports))
-            .unwrap_or(false),
+            .is_some_and(|e| expr_contains_shared_slot_call(e, imports)),
         _ => false,
     }
 }

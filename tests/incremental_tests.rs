@@ -168,17 +168,16 @@ fn test_cache_stats() {
 
     // Add some cached components
     for i in 0..10 {
-        let file_path = temp_dir.path().join(format!("comp{}.tsx", i));
+        let file_path = temp_dir.path().join(format!("comp{i}.tsx"));
         fs::write(
             &file_path,
             format!(
-                "export default function Component{}() {{ return null; }}",
-                i
+                "export default function Component{i}() {{ return null; }}"
             ),
         )
         .unwrap();
 
-        let comp = types::Component::new(types::ComponentId::new(i), format!("Component{}", i));
+        let comp = types::Component::new(types::ComponentId::new(i), format!("Component{i}"));
         let analysis = types::ComponentAnalysis::new(types::ComponentId::new(i));
 
         cache.cache_analysis(comp, analysis, file_path).unwrap();

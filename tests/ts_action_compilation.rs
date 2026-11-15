@@ -84,7 +84,7 @@ fn synthetic_component_for_each_action_is_reachable_via_component_meta() {
         assert!(component.value_slots.is_empty());
         assert!(component.setter_slots.is_empty());
         assert!(component.handlers.is_empty());
-        assert!(component.shared_slots.is_empty());
+        assert_eq!(component.shared_slots, [] as [dom_render_compiler::transforms::SharedSlotBinding; 0]);
     }
 }
 

@@ -49,11 +49,11 @@ pub enum ColumnReads {
 
 impl ColumnReads {
     /// Widen `self` to also cover `other`. `All` absorbs everything.
-    pub fn merge(&mut self, other: &ColumnReads) {
+    pub fn merge(&mut self, other: &Self) {
         match (&mut *self, other) {
-            (ColumnReads::All, _) => {}
-            (_, ColumnReads::All) => *self = ColumnReads::All,
-            (ColumnReads::Only(mine), ColumnReads::Only(theirs)) => {
+            (Self::All, _) => {}
+            (_, Self::All) => *self = Self::All,
+            (Self::Only(mine), Self::Only(theirs)) => {
                 mine.extend(theirs.iter().cloned());
             }
         }
@@ -430,14 +430,14 @@ impl Walk {
         let (params, body): (Vec<&Pat>, WalkCallback<'_>) = match unwrap(callback) {
             Expr::Arrow(arrow) => (
                 arrow.params.iter().collect(),
-                Box::new(move |walk: &mut Walk| match &*arrow.body {
+                Box::new(move |walk: &mut Self| match &*arrow.body {
                     BlockStmtOrExpr::BlockStmt(block) => block.visit_with(walk),
                     BlockStmtOrExpr::Expr(expr) => expr.visit_with(walk),
                 }),
             ),
             Expr::Fn(function) => (
                 function.function.params.iter().map(|param| &param.pat).collect(),
-                Box::new(move |walk: &mut Walk| {
+                Box::new(move |walk: &mut Self| {
                     if let Some(body) = &function.function.body {
                         body.visit_with(walk);
                     }

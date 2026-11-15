@@ -26,7 +26,7 @@
 //! only alongside that one.
 //!
 //! Reproduce with:
-//!   cargo bench --bench parity_hydration_bytes
+//!   cargo bench --bench `parity_hydration_bytes`
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use dom_render_compiler::ir::opcode::{
@@ -35,7 +35,7 @@ use dom_render_compiler::ir::opcode::{
 use dom_render_compiler::ir::wire::encode_frame;
 
 /// Synthesise the opcode frame Phase K emits for a useState counter
-/// — one BindEvent (click → setter), one SetTextRef (count display).
+/// — one `BindEvent` (click → setter), one `SetTextRef` (count display).
 /// Same shape Stream B's `render_tier_b_inline` produces for a
 /// useState component at build time.
 fn counter_frame() -> OpcodeFrame {
@@ -60,8 +60,8 @@ fn counter_frame() -> OpcodeFrame {
     }
 }
 
-/// A form-action component: one BindEvent (submit) + a couple of
-/// SetText opcodes for field-error spans. Phase L stamps these.
+/// A form-action component: one `BindEvent` (submit) + a couple of
+/// `SetText` opcodes for field-error spans. Phase L stamps these.
 fn form_frame() -> OpcodeFrame {
     OpcodeFrame {
         frame_id: 0,
@@ -84,7 +84,7 @@ fn form_frame() -> OpcodeFrame {
     }
 }
 
-/// A list-rendering component: more SetText / Append opcodes, fewer
+/// A list-rendering component: more `SetText` / Append opcodes, fewer
 /// event bindings. Representative of a chat message list or feed.
 fn list_frame() -> OpcodeFrame {
     let mut instructions = vec![Instruction::BindEvent {
@@ -116,7 +116,7 @@ fn list_frame() -> OpcodeFrame {
 fn report_island_bytes(label: &str, frame: &OpcodeFrame) {
     let encoded = encode_frame(frame).expect("encode frame");
     let opcode_bytes = encoded.len();
-    eprintln!("  {label:<10} opcodes {ops:>4} B", ops = opcode_bytes);
+    eprintln!("  {label:<10} opcodes {opcode_bytes:>4} B");
 }
 
 fn print_hydration_summary() {

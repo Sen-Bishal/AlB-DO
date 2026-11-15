@@ -7,7 +7,7 @@ pub struct WeightEstimator {
 }
 
 impl WeightEstimator {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             base_component_weight: 500.0,
             import_weight: 100.0,
@@ -18,8 +18,8 @@ impl WeightEstimator {
     pub fn estimate(&self, component: &ParsedComponent) -> f64 {
         let mut weight = self.base_component_weight;
 
-        weight += component.imports.len() as f64 * self.import_weight;
-        weight += component.props.len() as f64 * self.prop_weight;
+        weight = (component.imports.len() as f64).mul_add(self.import_weight, weight);
+        weight = (component.props.len() as f64).mul_add(self.prop_weight, weight);
         weight += component.estimated_size as f64;
 
         if component.is_default_export {

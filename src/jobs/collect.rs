@@ -9,7 +9,7 @@
 //! ## Why a collector rather than a return value
 //!
 //! Because the alternative is silent. Without an installed collector,
-//! [`record`] answers `false` and the caller raises "enqueue() was called but
+//! [`record`] answers `false` and the caller raises "`enqueue()` was called but
 //! nothing is collecting" — the same discipline `record_forge_write` uses. A
 //! builtin that quietly dropped the intent would make a body that *looks* like
 //! it queued work produce nothing at all, which is the failure class this

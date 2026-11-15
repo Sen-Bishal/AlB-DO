@@ -672,15 +672,12 @@ pub(crate) async fn open_session(
 /// "sign-in does not stick", which is loud enough, rather than as a panic that
 /// takes the connection with it.
 fn set_cookie(response: &mut Response<Body>, value: &str) {
-    match value.parse() {
-        Ok(header) => {
-            response.headers_mut().append(header::SET_COOKIE, header);
-        }
-        Err(_) => warn!(
-            target: "albedo.auth",
-            "could not build the session cookie header; sign-in will not persist"
-        ),
-    }
+    if let Ok(header) = value.parse() {
+        response.headers_mut().append(header::SET_COOKIE, header);
+    } else { warn!(
+        target: "albedo.auth",
+        "could not build the session cookie header; sign-in will not persist"
+    ); }
 }
 
 /// A refusal a browser can read.

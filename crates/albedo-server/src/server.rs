@@ -592,11 +592,11 @@ struct CompiledProjectActionAdapter {
     project: Arc<dom_render_compiler::runtime::CompiledProject>,
     action_id: u32,
     /// A1 · *scaffolding* — when `Some`, `handle()` routes the action through
-    /// the QuickJS executor (`invoke_action_quickjs_with_broadcast`) on a pooled
+    /// the `QuickJS` executor (`invoke_action_quickjs_with_broadcast`) on a pooled
     /// engine instead of the pure-Rust `invoke_action_with_broadcast`. Currently
     /// wired but left `None` by `register_compiled_project` so the default path
     /// is unchanged; flipping it on is remaining slice #1 of the A1 bridge (see
-    /// `engine_pool` module docs + `project_a1_bridge`). The QuickJS path unlocks
+    /// `engine_pool` module docs + `project_a1_bridge`). The `QuickJS` path unlocks
     /// loops/`try`/array methods in action bodies that the pure-Rust path rejects.
     engine_pool: Option<Arc<crate::engine_pool::QuickJsEnginePool>>,
     /// The broadcast registry, FORGE substrate handle, and row projector — all
@@ -806,9 +806,7 @@ impl CompiledProjectActionAdapter {
                 fields.remove("_csrf");
                 fields.remove("_albedo_return");
             }
-            let canonical = payload
-                .map(|v| v.to_string().into_bytes())
-                .unwrap_or_else(|| envelope.payload.clone());
+            let canonical = payload.map_or_else(|| envelope.payload.clone(), |v| v.to_string().into_bytes());
             let mut digest = Sha256::new();
             digest.update(self.action_id.to_le_bytes());
             digest.update([envelope.event_kind]);
@@ -1162,7 +1160,7 @@ struct RenderWorld {
     /// On the world rather than the process so a dev reload that edits the file
     /// swaps it with everything else.
     middleware_plan: Option<Arc<crate::middleware::MiddlewarePlan>>,
-    /// 15.7 · the QuickJS pool this world's adapters check out from, held here
+    /// 15.7 · the `QuickJS` pool this world's adapters check out from, held here
     /// only so a metrics scrape can read it. On the world because a dev reload
     /// builds a new pool with the new world.
     engine_pool: Option<Arc<crate::engine_pool::QuickJsEnginePool>>,
@@ -1239,15 +1237,12 @@ fn bind_inspector(inspector: &Arc<InspectorState>, world: &RenderWorld) {
         .as_ref()
         .map(|streaming| streaming.manifest.as_ref());
     let publisher = InspectorPublisher::new(inspector.clone());
-    match manifest {
-        Some(manifest) => {
-            inspector.set_graph(InspectorGraphSnapshot::from_manifest(manifest));
-            crate::inspector::publisher::attach(publisher.with_manifest(manifest));
-        }
-        None => {
-            inspector.set_graph(InspectorGraphSnapshot::empty());
-            crate::inspector::publisher::attach(publisher);
-        }
+    if let Some(manifest) = manifest {
+        inspector.set_graph(InspectorGraphSnapshot::from_manifest(manifest));
+        crate::inspector::publisher::attach(publisher.with_manifest(manifest));
+    } else {
+        inspector.set_graph(InspectorGraphSnapshot::empty());
+        crate::inspector::publisher::attach(publisher);
     }
 }
 
@@ -1255,7 +1250,7 @@ pub struct AlbedoServerBuilder {
     config: AppConfig,
     handlers: HashMap<String, SharedHandler>,
     /// Phase-F — API handler registry. Distinct from `handlers` so
-    /// dispatch can pick the right call path; same handler_id namespace
+    /// dispatch can pick the right call path; same `handler_id` namespace
     /// so a route's `handler` field resolves to whichever registry the
     /// user populated.
     api_handlers: HashMap<String, SharedApiHandler>,
@@ -1318,10 +1313,10 @@ pub struct AlbedoServerBuilder {
     /// registry (topic values + subscribers) and the already-open substrate
     /// rather than stranding them. See [`LiveRuntime`].
     live: LiveRuntime,
-    /// A1 · optional pool of warmed QuickJS engines. When set (via
+    /// A1 · optional pool of warmed `QuickJS` engines. When set (via
     /// [`Self::with_quickjs_action_engine_pool`]), every adapter built by a
     /// *subsequent* [`Self::register_compiled_project`] runs its action bodies
-    /// through the QuickJS executor instead of the pure-Rust interpreter,
+    /// through the `QuickJS` executor instead of the pure-Rust interpreter,
     /// unlocking loops/`try`/array methods in handler bodies. `None` keeps the
     /// pure-Rust path. Order matters: enable the pool before registering the
     /// project, since the adapter captures the pool handle at registration.
@@ -1407,7 +1402,7 @@ impl AlbedoServerBuilder {
         self
     }
 
-    /// A1 · route compiled action bodies through a pool of warmed QuickJS
+    /// A1 · route compiled action bodies through a pool of warmed `QuickJS`
     /// engines instead of the pure-Rust interpreter. Spawns `size` engine
     /// threads (each warmed before this returns), so call it once, at boot.
     ///
@@ -1416,7 +1411,7 @@ impl AlbedoServerBuilder {
     /// handle at registration time, so projects registered earlier keep the
     /// pure-Rust path. A `size` of 0 is treated as 1.
     ///
-    /// The QuickJS path runs the same broadcast-aware executor and ships the
+    /// The `QuickJS` path runs the same broadcast-aware executor and ships the
     /// identical `SlotSet` wire shape as the pure-Rust path (proven at parity in
     /// `compiled_project_dispatch.rs`), but additionally tolerates JS the
     /// pure-Rust evaluator rejects (loops, `try`/`catch`, array methods).
@@ -1565,7 +1560,7 @@ impl AlbedoServerBuilder {
     /// Toggle for the error overlay + HMR surface mounted at
     /// `/_albedo/dev/*`. Off unless enabled.
     #[must_use]
-    pub fn with_dev_mode(mut self, enabled: bool) -> Self {
+    pub const fn with_dev_mode(mut self, enabled: bool) -> Self {
         self.dev_mode_enabled = Some(enabled);
         self
     }
@@ -1596,19 +1591,19 @@ impl AlbedoServerBuilder {
     /// framework JS, dev SSE streams, and the WT transport are skipped so the
     /// log is pure ALBEDO numbers. See [`crate::timing`].
     #[must_use]
-    pub fn with_request_timings(mut self, enabled: bool) -> Self {
+    pub const fn with_request_timings(mut self, enabled: bool) -> Self {
         self.request_timings_enabled = enabled;
         self
     }
 
     /// Mount the dev inspector at `/__albedo`. Off unless enabled; `albedo dev`
     /// enables it, `albedo serve` does not.
-    pub fn with_hmr(mut self, enabled: bool) -> Self {
+    pub const fn with_hmr(mut self, enabled: bool) -> Self {
         self.hmr_enabled = Some(enabled);
         self
     }
 
-    pub fn with_inspector(mut self, enabled: bool) -> Self {
+    pub const fn with_inspector(mut self, enabled: bool) -> Self {
         self.inspector_enabled = Some(enabled);
         self
     }
@@ -1665,7 +1660,7 @@ impl AlbedoServerBuilder {
     /// (`render_entry_with_bindings`) and dispatch (this builder
     /// method) so the slot ids, proxy ids, and handler bodies all line
     /// up. Multiple `CompiledProject`s can coexist by calling this
-    /// method repeatedly — proxy_id collisions are vanishingly
+    /// method repeatedly — `proxy_id` collisions are vanishingly
     /// unlikely (FNV-1a-32 over `{module}::{fn}::{event}#{idx}`) but
     /// later registrations win.
     pub fn register_compiled_project(
@@ -2041,7 +2036,7 @@ impl AlbedoServerBuilder {
             let form_error_spans = self
                 .reactive_project
                 .as_deref()
-                .map(|project| project.form_feedback_span_seed())
+                .map(dom_render_compiler::runtime::CompiledProject::form_feedback_span_seed)
                 .unwrap_or_default();
             // S4 · the same pool, plan and error spans back FORGE's row
             // projector, so a delta's row markup comes off the identical
@@ -2051,7 +2046,7 @@ impl AlbedoServerBuilder {
             let project_readers = self
                 .reactive_project
                 .as_deref()
-                .map(|project| project.collection_reader_counts())
+                .map(dom_render_compiler::runtime::CompiledProject::collection_reader_counts)
                 .unwrap_or_default();
             self.live.install_projector(Arc::new(
                 crate::render::PooledRowProjector::new(
@@ -2295,8 +2290,7 @@ impl AlbedoServerBuilder {
                     && !has_layout_handlers
                     && streaming_runtime
                         .as_ref()
-                        .map(|runtime| runtime.manifest.routes.contains_key(route.path.as_str()))
-                        .unwrap_or(false);
+                        .is_some_and(|runtime| runtime.manifest.routes.contains_key(route.path.as_str()));
 
             // Phase-F: a route's `handler` may resolve to either a
             // page `RouteHandler` or an API `ApiHandler`. Build fails
@@ -2478,7 +2472,7 @@ impl AlbedoServerBuilder {
             // Phase L · same Arc the streaming state holds, so
             // tokens minted during page render are the ones the
             // action dispatcher validates against.
-            csrf: csrf_registry.clone(),
+            csrf: csrf_registry,
             form_action_ids: Arc::new(self.form_action_ids),
             gated_action_ids: Arc::new(gated_action_ids),
             layouts: Arc::new(self.layouts),
@@ -3402,7 +3396,7 @@ impl AlbedoServer {
                 let scheduled = self
                     .jobs_plan
                     .as_ref()
-                    .map_or(0, |plan| plan.scheduled_count());
+                    .map_or(0, super::jobs::JobsPlan::scheduled_count);
                 for statement in dom_render_compiler::jobs::queue::ddl() {
                     substrate.migrate(&statement).await.map_err(|err| {
                         RuntimeError::ServerStartup(format!(
@@ -4568,7 +4562,7 @@ async fn dispatch_routed(
                     session_cookie.as_deref(),
                     world.request_timeout,
                     crate::middleware::Outbound {
-                        client: state.live.aperture_client().map(|client| client.as_ref()),
+                        client: state.live.aperture_client().map(std::convert::AsRef::as_ref),
                         admit: &admit,
                     },
                 )
@@ -5859,7 +5853,7 @@ async fn lane_page_after_middleware(
             session_cookie.as_deref(),
             world.request_timeout,
             crate::middleware::Outbound {
-                client: state.live.aperture_client().map(|client| client.as_ref()),
+                client: state.live.aperture_client().map(std::convert::AsRef::as_ref),
                 admit: &admit,
             },
         )
@@ -6097,8 +6091,7 @@ fn should_use_manifest_streaming(
     world
         .streaming_runtime
         .as_ref()
-        .map(|runtime| runtime.manifest.routes.contains_key(manifest_key))
-        .unwrap_or(false)
+        .is_some_and(|runtime| runtime.manifest.routes.contains_key(manifest_key))
 }
 
 async fn apply_layout_handlers(
@@ -6154,8 +6147,7 @@ fn response_is_html(response: &ResponsePayload) -> bool {
     response
         .headers
         .get("content-type")
-        .map(|value| value.to_ascii_lowercase().starts_with("text/html"))
-        .unwrap_or(false)
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html"))
 }
 
 /// Resolves when the process is asked to stop.

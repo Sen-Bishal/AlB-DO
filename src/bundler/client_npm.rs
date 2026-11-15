@@ -13,7 +13,7 @@
 //! alias table, and `__albedo_require_record` — emitted as separate
 //! content-hashed assets. That format is plain JS with nothing server-specific
 //! in it, factories stay lazy, and the linker itself is *the same Rust-generated
-//! string the QuickJS prelude installs* ([`npm_record_linker_script`]), so the
+//! string the `QuickJS` prelude installs* ([`npm_record_linker_script`]), so the
 //! two sides cannot drift.
 //!
 //! ## Chunking: one chunk per package, unioned across the whole build
@@ -110,13 +110,13 @@ pub fn client_shake_options() -> ShakeOptions {
 ///   `react-dom` is imported all over the Radix layer, and refusing it here
 ///   would turn 79.6% measured npm coverage into a build error for every action
 ///   that merely imports something Radix-shaped. Loading is not rendering.
-/// * The defines are the same, and they have to be: the QuickJS prelude already
+/// * The defines are the same, and they have to be: the `QuickJS` prelude already
 ///   sets `process.env.NODE_ENV = 'production'`, so folding against any other
 ///   value would emit a branch whose dependency was never bundled.
 ///
 /// 🔑 **Why the server externalises `react` at all.** Not as an optimisation —
 /// as the only way it can render. Real React's `forwardRef`/`memo` return
-/// *objects*, and the QuickJS `h` shim can only call functions; an object falls
+/// *objects*, and the `QuickJS` `h` shim can only call functions; an object falls
 /// through to its tag-name branch and emits the literal text
 /// `<[object Object]>`. There is no case in which the real React on the server
 /// produced correct output, so this cannot regress one.
@@ -186,7 +186,7 @@ pub struct ClientNpmChunk {
 impl ClientNpmChunk {
     /// Transferred size of this chunk, in bytes.
     #[must_use]
-    pub fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.script.len()
     }
 }
@@ -260,7 +260,7 @@ impl ClientNpmGraph {
     /// `true` when no island imports npm at all — the common case today, and the
     /// signal to emit no runtime or chunk tags.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
 }

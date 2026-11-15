@@ -271,7 +271,7 @@ async fn ends_within(stream: &mut reqwest::Response, within: Duration) -> bool {
         match tokio::time::timeout(left, stream.chunk()).await {
             Err(_) => return false,
             Ok(Ok(Some(_))) => continue,
-            Ok(Ok(None)) | Ok(Err(_)) => return true,
+            Ok(Ok(None) | Err(_)) => return true,
         }
     }
 }

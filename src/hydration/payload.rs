@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const HYDRATION_PAYLOAD_VERSION: &str = "1.0";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HydrationIslandPayload {
     pub component_id: u64,
     pub module_path: String,
@@ -22,7 +22,7 @@ pub struct HydrationIslandPayload {
     pub props: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HydrationPayload {
     pub version: String,
     pub checksum: String,

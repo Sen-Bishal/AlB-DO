@@ -11,7 +11,7 @@ pub struct ParallelTopologicalSorter<'a> {
 }
 
 impl<'a> ParallelTopologicalSorter<'a> {
-    pub fn new(graph: &'a ComponentGraph) -> Self {
+    pub const fn new(graph: &'a ComponentGraph) -> Self {
         Self { graph }
     }
 

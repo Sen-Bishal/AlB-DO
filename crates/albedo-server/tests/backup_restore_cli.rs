@@ -163,12 +163,11 @@ async fn a_restore_staged_while_serving_lands_on_the_next_start() {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let taken = fs::read_dir(app.join("scheduled"))
-                .map(|entries| {
+                .is_ok_and(|entries| {
                     entries
                         .flatten()
                         .any(|entry| entry.path().join("manifest.json").is_file())
-                })
-                .unwrap_or(false);
+                });
             if taken {
                 break;
             }

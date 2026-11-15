@@ -40,13 +40,13 @@ pub struct SessionSlots {
 impl SessionSlots {
     /// Constructs a view bound to `session_id` against `store`.
     #[must_use]
-    pub fn new(session_id: SessionId, store: Arc<SlotStore>) -> Self {
+    pub const fn new(session_id: SessionId, store: Arc<SlotStore>) -> Self {
         Self { session_id, store }
     }
 
     /// Returns the session this view is scoped to.
     #[must_use]
-    pub fn session_id(&self) -> SessionId {
+    pub const fn session_id(&self) -> SessionId {
         self.session_id
     }
 
@@ -55,7 +55,7 @@ impl SessionSlots {
     /// `SessionSlotView` (the dom-render-compiler-side equivalent of
     /// `SessionSlots`) that the compiled handler executes against.
     #[must_use]
-    pub fn store(&self) -> &Arc<SlotStore> {
+    pub const fn store(&self) -> &Arc<SlotStore> {
         &self.store
     }
 

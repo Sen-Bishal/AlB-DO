@@ -13,7 +13,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::sync::Arc;
 
 /// Maximum body buffered for one outbound response (8 MiB). The cache and
-/// QuickJS limits apply after transport buffering, so neither bounds this
+/// `QuickJS` limits apply after transport buffering, so neither bounds this
 /// Rust allocation. Applies to declared sources, fetches and provider calls.
 pub const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 
@@ -32,7 +32,7 @@ pub struct ApertureResolver {
 impl ApertureResolver {
     /// A resolver enforcing `policy`.
     #[must_use]
-    pub fn new(policy: Arc<EgressPolicy>) -> Self {
+    pub const fn new(policy: Arc<EgressPolicy>) -> Self {
         Self { policy }
     }
 }

@@ -154,7 +154,7 @@ impl Cost {
     /// commits, so this is the real blast radius and not an estimate. See the
     /// module docs for why it is compressed.
     #[must_use]
-    pub fn fan_out(class: OperationClass, subscribers: u32) -> Self {
+    pub const fn fan_out(class: OperationClass, subscribers: u32) -> Self {
         let base = class.base_weight();
         let fanout = compress_fanout(subscribers);
         Self {
@@ -179,7 +179,7 @@ impl Cost {
     /// Zero subscribers is a real answer, not a missing one: a write nobody is
     /// watching costs its base and nothing more.
     #[must_use]
-    pub fn surcharge(class: OperationClass, subscribers: u32) -> Self {
+    pub const fn surcharge(class: OperationClass, subscribers: u32) -> Self {
         let fanout = compress_fanout(subscribers);
         Self {
             class,
@@ -228,7 +228,7 @@ impl Cost {
 /// Bounded above by 32 for any `u32`, which is what keeps a derived weight
 /// inside a sane burst without anyone tuning it.
 #[must_use]
-pub fn compress_fanout(subscribers: u32) -> u32 {
+pub const fn compress_fanout(subscribers: u32) -> u32 {
     match subscribers {
         0 | 1 => 0,
         n => n.ilog2(),
@@ -256,7 +256,7 @@ pub fn compress_fanout(subscribers: u32) -> u32 {
 /// describing the running system. Compare the standing "three implementations of
 /// the paint rule" trap — same shape, and this is the cut that prevents it.
 #[must_use]
-pub fn classify_route(route: &crate::manifest::schema::RouteManifest) -> OperationClass {
+pub const fn classify_route(route: &crate::manifest::schema::RouteManifest) -> OperationClass {
     if route.shared_slot_topics.is_empty()
         && route.shared_slot_partitions.is_empty()
         && route.shared_slot_sources.is_empty()
@@ -268,7 +268,7 @@ pub fn classify_route(route: &crate::manifest::schema::RouteManifest) -> Operati
 }
 
 #[must_use]
-pub fn classify(effects: EffectProfile, writes_forge: bool, calls_aperture: bool) -> OperationClass {
+pub const fn classify(effects: EffectProfile, writes_forge: bool, calls_aperture: bool) -> OperationClass {
     // Ordered most-restrictive-first: an action that both writes and calls out
     // answers to the outbound limit, because the third party's quota is the
     // scarcer resource and the one whose exhaustion we cannot undo.

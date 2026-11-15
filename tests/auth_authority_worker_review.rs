@@ -190,10 +190,9 @@ async fn saturated_clock_or_epoch_fails_without_half_applying_a_role() {
                 .unwrap(),
             before_authority
         );
-        assert!(store::role_grants(&db, Some("new"))
+        assert_eq!(store::role_grants(&db, Some("new"))
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap(), [] as [dom_render_compiler::auth::store::RoleGrant; 0]);
         let existing = store::role_grants(&db, Some("existing")).await.unwrap();
         assert_eq!(existing[0].granted_by.as_deref(), Some("original"));
         assert_eq!(existing[0].granted_at, NOW);
@@ -243,10 +242,9 @@ async fn process_exit_before_commit_leaves_no_role_or_authority_change_after_reo
             .authority_epoch,
         1
     );
-    assert!(store::role_grants(&reopened, Some("uncommitted"))
+    assert_eq!(store::role_grants(&reopened, Some("uncommitted"))
         .await
-        .unwrap()
-        .is_empty());
+        .unwrap(), [] as [dom_render_compiler::auth::store::RoleGrant; 0]);
     let original = store::role_grants(&reopened, Some("existing"))
         .await
         .unwrap();

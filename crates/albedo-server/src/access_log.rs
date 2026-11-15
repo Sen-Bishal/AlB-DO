@@ -71,7 +71,7 @@ pub(crate) struct RenderErrors(Arc<Mutex<Vec<String>>>);
 
 impl RenderErrors {
     pub(crate) fn note(&self, message: &str) {
-        let mut errors = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        let mut errors = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !errors.iter().any(|error| error == message) {
             errors.push(message.to_string());
         }
@@ -88,7 +88,7 @@ struct PendingLine {
 impl Drop for PendingLine {
     fn drop(&mut self) {
         if let Some(errors) = &self.errors {
-            let errors = errors.0.lock().unwrap_or_else(|err| err.into_inner());
+            let errors = errors.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if !errors.is_empty() {
                 self.text.truncate(self.text.len().saturating_sub(2));
                 let _ = writeln!(

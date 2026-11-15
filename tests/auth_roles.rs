@@ -59,7 +59,7 @@ async fn resolved_roles(db: &LibSqlSubstrate, token: &SessionToken) -> Vec<Strin
 async fn granted_roles_reach_the_resolved_session_and_the_job_path() {
     let db = booted().await;
     let (ada, token) = person(&db, "ada", "ada@example.com").await;
-    assert!(resolved_roles(&db, &token).await.is_empty());
+    assert_eq!(resolved_roles(&db, &token).await, [] as [std::string::String; 0]);
 
     for role in ["payroll", "admin"] {
         assert_eq!(
@@ -100,7 +100,7 @@ async fn granting_to_an_unknown_principal_is_refused() {
         grant_role(&db, &stranger, "admin", Some("cli"), NOW).await.expect("grant"),
         GrantOutcome::NoSuchPrincipal
     );
-    assert!(role_grants(&db, None).await.expect("list").is_empty());
+    assert_eq!(role_grants(&db, None).await.expect("list"), [] as [dom_render_compiler::auth::store::RoleGrant; 0]);
 }
 
 /// Revocation takes effect on the very next resolution — there is no cache to
@@ -159,10 +159,9 @@ async fn an_email_can_name_several_principals() {
     let mut expected = vec![ada.id, other.id];
     expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     assert_eq!(found, expected);
-    assert!(principals_with_email(&db, "nobody@example.com")
+    assert_eq!(principals_with_email(&db, "nobody@example.com")
         .await
-        .expect("lookup")
-        .is_empty());
+        .expect("lookup"), [] as [dom_render_compiler::auth::PrincipalId; 0]);
 }
 
 /// Erasing a person erases their grants. A role row outliving its principal is

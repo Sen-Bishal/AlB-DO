@@ -54,7 +54,7 @@ impl ActionEventKind {
     /// for unknown values rather than failing — userland handlers
     /// inspect `event_kind` directly when they need strictness.
     #[must_use]
-    pub fn from_wire(byte: u8) -> Self {
+    pub const fn from_wire(byte: u8) -> Self {
         match byte {
             0 => Self::Click,
             1 => Self::Input,

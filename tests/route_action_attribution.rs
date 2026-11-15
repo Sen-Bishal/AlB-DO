@@ -128,7 +128,7 @@ fn the_gate_and_the_actions_it_governs_arrive_together() {
     let dash = manifest.routes.get("/dash").expect("/dash present");
 
     assert_eq!(dash.auth, RouteAuth::Required);
-    assert!(!dash.action_ids.is_empty());
+    assert_ne!(dash.action_ids, [] as [dom_render_compiler::manifest::schema::RouteActionEntry; 0]);
 
     let home = manifest.routes.get("/").expect("/ present");
     assert_eq!(home.auth, RouteAuth::Public);

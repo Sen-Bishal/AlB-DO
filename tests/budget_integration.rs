@@ -35,7 +35,7 @@ fn default_budget_passes_against_components_fixture() {
         "default ceilings should accept the small fixture set; got violations: {:?}",
         report.violations
     );
-    assert!(!report.route_summaries.is_empty());
+    assert_ne!(report.route_summaries, [] as [dom_render_compiler::budget::report::RouteSummary; 0]);
 }
 
 #[test]

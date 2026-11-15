@@ -1,8 +1,8 @@
-//! A1 · host-object bridge — running TSX **handlers** under QuickJS.
+//! A1 · host-object bridge — running TSX **handlers** under `QuickJS`.
 //!
 //! SSR already runs through [`crate::runtime::quickjs_engine::QuickJsEngine`]
 //! (`ServerRenderer<QuickJsEngine>` is the live `albedo serve` path). What did
-//! *not* run through QuickJS were event handlers and server `action()` bodies:
+//! *not* run through `QuickJS` were event handlers and server `action()` bodies:
 //! those went through the pure-Rust [`crate::runtime::eval`] interpreter, which
 //! models only a subset of JS. A handler with a `for`/`while`/`try`, an array
 //! method, or any construct the interpreter rejects could not execute.
@@ -49,7 +49,7 @@ const REQUEST_BOUND_NAMES: [&str; 4] = ["event", "form", "user", "origin"];
 /// broadcast fan-out intends (see [`crate::runtime::broadcast`]). The
 /// distinction is preserved here so the server layer can *also* route a
 /// [`HandlerEffect::Broadcast`] to the topic registry for cross-session
-/// fan-out; the pure-Rust SlotSet lowering is only the current session's view.
+/// fan-out; the pure-Rust `SlotSet` lowering is only the current session's view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandlerEffect {
     /// A `setX(value)` call: write the JSON-encoded `value` to `slot_id`.
@@ -112,37 +112,37 @@ impl HandlerEffect {
     #[must_use]
     pub fn into_instruction(self) -> Option<Instruction> {
         match self {
-            HandlerEffect::SlotSet { slot_id, value } => {
+            Self::SlotSet { slot_id, value } => {
                 Some(Instruction::SlotSet { slot_id, value })
             }
-            HandlerEffect::Broadcast { slot_id, value, .. } => {
+            Self::Broadcast { slot_id, value, .. } => {
                 Some(Instruction::SlotSet { slot_id, value })
             }
-            HandlerEffect::ForgeAppend { .. }
-            | HandlerEffect::ForgeUpdate { .. }
-            | HandlerEffect::ForgeDelete { .. }
+            Self::ForgeAppend { .. }
+            | Self::ForgeUpdate { .. }
+            | Self::ForgeDelete { .. }
             // Nothing happens in this session: the row is written after the body
             // returns and the work runs later, elsewhere.
-            | HandlerEffect::Enqueue { .. } => None,
+            | Self::Enqueue { .. } => None,
         }
     }
 
     /// The slot id this effect writes, when it writes one.
     #[must_use]
-    pub fn slot_id(&self) -> Option<SlotId> {
+    pub const fn slot_id(&self) -> Option<SlotId> {
         match self {
-            HandlerEffect::SlotSet { slot_id, .. } | HandlerEffect::Broadcast { slot_id, .. } => {
+            Self::SlotSet { slot_id, .. } | Self::Broadcast { slot_id, .. } => {
                 Some(*slot_id)
             }
-            HandlerEffect::ForgeAppend { .. }
-            | HandlerEffect::ForgeUpdate { .. }
-            | HandlerEffect::ForgeDelete { .. }
-            | HandlerEffect::Enqueue { .. } => None,
+            Self::ForgeAppend { .. }
+            | Self::ForgeUpdate { .. }
+            | Self::ForgeDelete { .. }
+            | Self::Enqueue { .. } => None,
         }
     }
 }
 
-/// A handler ready to run under QuickJS.
+/// A handler ready to run under `QuickJS`.
 ///
 /// Borrows everything; build one per dispatch. `body` is JS source already
 /// stripped of TS/JSX (the same SWC pipeline the engine uses for modules

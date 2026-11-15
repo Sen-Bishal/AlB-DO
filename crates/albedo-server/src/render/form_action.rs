@@ -112,7 +112,7 @@ where
 
     /// Returns the action name this handler was constructed with.
     /// Exposed for diagnostics and for the server builder to derive
-    /// the matching action_id at registration time.
+    /// the matching `action_id` at registration time.
     pub fn action_name(&self) -> &str {
         &self.action_name
     }

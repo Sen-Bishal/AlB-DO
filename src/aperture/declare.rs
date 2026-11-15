@@ -536,7 +536,7 @@ impl SourceCredentials {
 
     /// Whether no source declared a credential.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
@@ -662,7 +662,7 @@ impl SourceRegistry {
 
     /// What a bare `fetch()` to each declared source carries.
     #[must_use]
-    pub fn credentials(&self) -> &SourceCredentials {
+    pub const fn credentials(&self) -> &SourceCredentials {
         &self.credentials
     }
 

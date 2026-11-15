@@ -4,7 +4,7 @@
 //!
 //! There are two renderers over the same source. The pure-Rust evaluator
 //! ([`crate::runtime::eval`]) renders *and records provenance* — bindings,
-//! slots, topics, tiering. QuickJS renders arbitrary JS correctly. They serve
+//! slots, topics, tiering. `QuickJS` renders arbitrary JS correctly. They serve
 //! disjoint paths, so nothing forces them to agree, and when they disagree the
 //! failure is invisible: a `BindEvent` names an id that is not in the served
 //! markup, `_requireNode` throws, bakabox drops the **entire** opcode frame,
@@ -80,9 +80,9 @@ pub enum Contract {
 }
 
 impl Contract {
-    pub fn render_options(self) -> RenderOptions {
+    pub const fn render_options(self) -> RenderOptions {
         RenderOptions {
-            hook_compile: matches!(self, Contract::Reactive),
+            hook_compile: matches!(self, Self::Reactive),
         }
     }
 }
@@ -90,8 +90,8 @@ impl Contract {
 impl fmt::Display for Contract {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Contract::Structural => "structural",
-            Contract::Reactive => "reactive",
+            Self::Structural => "structural",
+            Self::Reactive => "reactive",
         })
     }
 }
@@ -118,14 +118,14 @@ pub enum Verdict {
     },
 
     /// The evaluator refused, naming a construct it does not model. Correct
-    /// behaviour — the component belongs on QuickJS — and the raw material of
+    /// behaviour — the component belongs on `QuickJS` — and the raw material of
     /// the coverage frontier.
     EvaluatorDeclined { construct: String },
 
     /// The evaluator failed in a way that is *not* a declared refusal. A defect.
     EvaluatorFaulted { reason: String },
 
-    /// QuickJS could not render it. Not a parity result: it says nothing about
+    /// `QuickJS` could not render it. Not a parity result: it says nothing about
     /// whether the two agree. Recorded so it cannot be silently dropped.
     QuickJsFaulted { reason: String },
 
@@ -136,32 +136,32 @@ pub enum Verdict {
 
 impl Verdict {
     /// Whether this verdict should fail the gate.
-    pub fn is_failure(&self) -> bool {
+    pub const fn is_failure(&self) -> bool {
         matches!(
             self,
-            Verdict::Diverge { .. } | Verdict::EvaluatorFaulted { .. }
+            Self::Diverge { .. } | Self::EvaluatorFaulted { .. }
         )
     }
 
     /// Whether the two renderers were actually compared. `false` for every
     /// verdict that is about the harness or one renderer alone — the honest
     /// denominator for "what fraction agrees" counts only these.
-    pub fn is_comparison(&self) -> bool {
+    pub const fn is_comparison(&self) -> bool {
         matches!(
             self,
-            Verdict::Identical | Verdict::Equivalent { .. } | Verdict::Diverge { .. }
+            Self::Identical | Self::Equivalent { .. } | Self::Diverge { .. }
         )
     }
 
-    pub fn label(&self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self {
-            Verdict::Identical => "identical",
-            Verdict::Equivalent { .. } => "equivalent",
-            Verdict::Diverge { .. } => "DIVERGE",
-            Verdict::EvaluatorDeclined { .. } => "declined",
-            Verdict::EvaluatorFaulted { .. } => "EVALUATOR-FAULT",
-            Verdict::QuickJsFaulted { .. } => "quickjs-fault",
-            Verdict::NotComparable { .. } => "not-comparable",
+            Self::Identical => "identical",
+            Self::Equivalent { .. } => "equivalent",
+            Self::Diverge { .. } => "DIVERGE",
+            Self::EvaluatorDeclined { .. } => "declined",
+            Self::EvaluatorFaulted { .. } => "EVALUATOR-FAULT",
+            Self::QuickJsFaulted { .. } => "quickjs-fault",
+            Self::NotComparable { .. } => "not-comparable",
         }
     }
 }
@@ -220,14 +220,12 @@ fn window(text: &str, at: usize) -> String {
         .char_indices()
         .rev()
         .nth(20)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+        .map_or(0, |(i, _)| i);
     let end = text
         .char_indices()
         .skip_while(|(i, _)| *i < at)
         .nth(60)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
+        .map_or(text.len(), |(i, _)| i);
     text[start..end].to_string()
 }
 
@@ -462,11 +460,11 @@ pub fn compare_markup(rust: &str, quickjs: &str, contract: Contract) -> Verdict 
 }
 
 /// Render the entry in hook-compile mode and report which ids its opcode frame
-/// names that the QuickJS markup does not contain.
+/// names that the `QuickJS` markup does not contain.
 ///
 /// This is the failure mode stated directly, and it is **not** implied by
 /// markup equality. A build-time Tier-B render pairs a frame emitted by the
-/// evaluator with markup served, at request time, by QuickJS
+/// evaluator with markup served, at request time, by `QuickJS`
 /// (`manifest::builder::render_tier_b_inline` produces the frame;
 /// `render::tier_b` produces the markup). If the two number elements
 /// differently, `_requireNode` throws on the first missing id and bakabox drops
@@ -505,7 +503,7 @@ pub fn frame_addressability(
 }
 
 /// The `stable_id` an instruction addresses, when it addresses one.
-fn instruction_stable_id(instruction: &crate::ir::opcode::Instruction) -> Option<u32> {
+const fn instruction_stable_id(instruction: &crate::ir::opcode::Instruction) -> Option<u32> {
     use crate::ir::opcode::Instruction as I;
     match instruction {
         I::SetText { stable_id, .. }

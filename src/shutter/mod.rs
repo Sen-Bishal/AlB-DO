@@ -809,7 +809,7 @@ impl Shutter {
     fn evict_sample(&self, sample: usize) {
         let now = self.inner.clock.now();
         let mut doomed = Vec::new();
-        for entry in self.inner.exact.iter() {
+        for entry in &self.inner.exact {
             if entry.value().is_replenished(now) {
                 doomed.push(entry.key().clone());
                 if doomed.len() >= sample {

@@ -88,8 +88,7 @@ fn island_props_for(manifest: &RenderManifestV2, component_name: &str) -> serde_
         .values()
         .flat_map(|route| route.tier_c.iter())
         .find(|node| node.component_id == component_name)
-        .map(|node| node.initial_props.clone())
-        .unwrap_or(serde_json::Value::Null)
+        .map_or(serde_json::Value::Null, |node| node.initial_props.clone())
 }
 
 fn collect_reachable(

@@ -8,7 +8,7 @@ pub struct ComponentAnalyzer<'a> {
 }
 
 impl<'a> ComponentAnalyzer<'a> {
-    pub fn new(graph: &'a ComponentGraph) -> Self {
+    pub const fn new(graph: &'a ComponentGraph) -> Self {
         Self { graph }
     }
     pub fn analyze(&self) -> Result<HashMap<ComponentId, ComponentAnalysis>> {
@@ -69,7 +69,7 @@ impl<'a> ComponentAnalyzer<'a> {
             let dependencies = self.graph.get_dependencies(&component.id);
             for dep_id in dependencies {
                 if let Some(dep_comp) = self.graph.get(&dep_id) {
-                    phase += 2.0 * PI * (dep_comp.weight / total_weight);
+                    phase = (2.0 * PI).mul_add(dep_comp.weight / total_weight, phase);
                 }
             }
 
@@ -78,7 +78,7 @@ impl<'a> ComponentAnalyzer<'a> {
 
         phases
     }
-    pub fn graph(&self) -> &ComponentGraph {
+    pub const fn graph(&self) -> &ComponentGraph {
         self.graph
     }
 }

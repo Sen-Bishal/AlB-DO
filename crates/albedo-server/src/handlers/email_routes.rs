@@ -139,12 +139,9 @@ pub async fn run_email_page(page: EmailPage, request: PageRequest<'_>) -> Respon
 
     // The form's CSRF token is bound to the tab session. A browser arriving from
     // an email client often has none yet, so one is minted and set here.
-    let (session, minted) = match request.session {
-        Some(session) => (session, None),
-        None => {
-            let session = SessionId::random();
-            (session, Some(crate::render::csrf::build_session_set_cookie(session)))
-        }
+    let (session, minted) = if let Some(session) = request.session { (session, None) } else {
+        let session = SessionId::random();
+        (session, Some(crate::render::csrf::build_session_set_cookie(session)))
     };
     let csrf = crate::render::csrf::csrf_hidden_input_html(&request.csrf.token_for(session));
     let hidden = format!(

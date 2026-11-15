@@ -33,7 +33,7 @@
 //! password is low-entropy, so the defence against a stolen database is making
 //! each guess expensive. A session token is 256 bits of CSPRNG output, so there
 //! is no dictionary to slow down — and because it is verified on *every
-//! authenticated request*, a deliberately slow hash there is a DoS vector we
+//! authenticated request*, a deliberately slow hash there is a `DoS` vector we
 //! would be building ourselves. Reaching for Argon2 here would look more careful
 //! and be strictly worse.
 
@@ -127,7 +127,7 @@ impl TokenHash {
     /// R1b · a hash read back from `albedo_sessions.token_hash`. Not a hashing
     /// step: the value already is one.
     #[must_use]
-    pub fn from_stored(hex: String) -> Self {
+    pub const fn from_stored(hex: String) -> Self {
         Self(hex)
     }
 
@@ -176,7 +176,7 @@ impl SessionRecord {
     /// is what keeps a caller that fetched a row by some other path — a test, a
     /// device list, a future admin screen — from treating it as live.
     #[must_use]
-    pub fn is_live_at(&self, now: i64) -> bool {
+    pub const fn is_live_at(&self, now: i64) -> bool {
         self.expires_at > now
     }
 }

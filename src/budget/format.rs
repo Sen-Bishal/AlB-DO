@@ -63,9 +63,7 @@ fn append_violation(out: &mut String, violation: &BudgetViolation) {
     if violation.kind == ViolationKind::TierBBundleKbPerComponent {
         let component = violation
             .top_contributors
-            .first()
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| "<component>".to_string());
+            .first().map_or_else(|| "<component>".to_string(), |c| c.name.clone());
         let suggested_kb = (violation.actual as f64 / 1024.0).ceil() as u32;
         out.push_str(&format!(
             "    hint    Move heavy imports in {component} to Tier-C, or raise \

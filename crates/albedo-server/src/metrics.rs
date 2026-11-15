@@ -166,7 +166,7 @@ pub async fn record_http(
     Response::from_parts(parts, body)
 }
 
-fn method_label(method: &Method) -> &'static str {
+const fn method_label(method: &Method) -> &'static str {
     match *method {
         Method::GET => "GET",
         Method::POST => "POST",
@@ -220,8 +220,7 @@ pub fn render(http: &HttpMetrics, runtime: &RuntimeGauges) -> String {
     let start = http
         .started_at
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+        .map_or(0.0, |d| d.as_secs_f64());
     gauge(&mut out, "process_start_time_seconds", "Start time of the process since the Unix epoch.", start);
     process_gauges(&mut out);
 

@@ -126,13 +126,13 @@ fn reexport_star_whitespace_and_comments_cannot_bypass_the_project_census() {
         "import * as all from './preds'; export { all as box };",
     ] {
         let result = project(("lib/reexport.ts", body));
-        if !result.queries.is_empty() {
-            missed.push(body);
-        } else {
+        if result.queries.is_empty() {
             assert!(result
                 .diagnostics
                 .iter()
                 .any(|d| d.at.module == "src/lib/reexport.ts"));
+        } else {
+            missed.push(body);
         }
     }
     assert!(missed.is_empty(), "re-exports bypassed census: {missed:?}");

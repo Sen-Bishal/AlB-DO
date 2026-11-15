@@ -340,7 +340,7 @@ fn the_client_graph_emits_one_chunk_per_package() {
             failure.module_path, failure.specifier, failure.reason
         );
     }
-    let total: usize = graph.chunks().iter().map(|chunk| chunk.bytes()).sum();
+    let total: usize = graph.chunks().iter().map(dom_render_compiler::bundler::client_npm::ClientNpmChunk::bytes).sum();
     eprintln!("client npm: {} B across {} chunks", total, graph.chunks().len());
     for chunk in graph.chunks() {
         eprintln!("    · {:>8} B  {}  {}", chunk.bytes(), chunk.package, chunk.url);

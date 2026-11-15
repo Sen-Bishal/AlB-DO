@@ -41,7 +41,7 @@
 //!    removes that boundary rather than defending it.
 //! 2. **It is keyed by the script's content hash**, so a dev reload that
 //!    changes a module simply misses and recompiles.
-//! 3. **Version lock is automatic.** Bytecode is tied to the exact QuickJS
+//! 3. **Version lock is automatic.** Bytecode is tied to the exact `QuickJS`
 //!    build; because nothing is persisted, a rebuilt binary cannot meet a stale
 //!    artifact.
 //!
@@ -94,7 +94,7 @@ const BYTECODE_STORE_CAP_BYTES: usize = 64 * 1024 * 1024;
 /// Measured: 517 KB of bytecode for the Radix corpus plus the prelude. A pool
 /// sizes itself to the machine's parallelism, so a per-engine cache multiplies
 /// that by 8-16 — 4 to 8 MB of identical bytes. Sharing is sound because
-/// QuickJS bytecode carries its own atom table: the bytes have no affinity to
+/// `QuickJS` bytecode carries its own atom table: the bytes have no affinity to
 /// the realm or the runtime that produced them, only to the engine *build*, and
 /// nothing here is persisted across builds.
 static BYTECODE_STORE: LazyLock<Mutex<BytecodeStore>> =
@@ -129,7 +129,7 @@ impl BytecodeStore {
     }
 
     /// The bytes for `key`, if compiled. Returns an owned handle so the caller
-    /// can drop the lock before touching QuickJS.
+    /// can drop the lock before touching `QuickJS`.
     fn get(&self, key: u64) -> Option<Arc<Vec<u8>>> {
         self.compiled.get(&key).map(Arc::clone)
     }
@@ -141,7 +141,7 @@ fn store() -> MutexGuard<'static, BytecodeStore> {
     // half-written entry.
     BYTECODE_STORE
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Whether a registration came from the application or from `node_modules`.
@@ -161,8 +161,8 @@ pub enum Origin {
 impl Origin {
     /// True for code the project did not author.
     #[must_use]
-    pub fn is_third_party(self) -> bool {
-        matches!(self, Origin::ThirdParty)
+    pub const fn is_third_party(self) -> bool {
+        matches!(self, Self::ThirdParty)
     }
 }
 
@@ -225,8 +225,7 @@ impl BytecodeCache {
     pub fn from_env() -> Self {
         Self {
             enabled: std::env::var("ALBEDO_SANDGATE_BYTECODE")
-                .map(|value| value != "0")
-                .unwrap_or(true),
+                .map_or(true, |value| value != "0"),
         }
     }
 
@@ -258,7 +257,7 @@ impl BytecodeCache {
 
     /// Whether the bytecode fast path is armed for this engine.
     #[must_use]
-    pub fn is_enabled(&self) -> bool {
+    pub const fn is_enabled(&self) -> bool {
         self.enabled
     }
 }
@@ -320,13 +319,13 @@ impl ModuleLedger {
 
     /// How many registrations the ledger holds.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True when nothing has been registered.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -340,7 +339,7 @@ impl ModuleLedger {
     /// (gate 3.1); trusting a package's own account of whether it ran costs
     /// the guarantee.
     #[must_use]
-    pub fn holds_third_party(&self) -> bool {
+    pub const fn holds_third_party(&self) -> bool {
         self.third_party_registered
     }
 
@@ -352,7 +351,7 @@ impl ModuleLedger {
 
     /// Counters for what confinement has done.
     #[must_use]
-    pub fn stats(&self) -> ConfinementStats {
+    pub const fn stats(&self) -> ConfinementStats {
         self.stats
     }
 
@@ -381,7 +380,7 @@ impl ModuleLedger {
         // `BYTECODE_STORE_CAP_BYTES` is what bounds it.
     }
 
-    pub(crate) fn note_confinement(&mut self, outcome: ReplayOutcome) {
+    pub(crate) const fn note_confinement(&mut self, outcome: ReplayOutcome) {
         self.stats.confinements += 1;
         self.stats.replayed_entries += outcome.replayed;
         self.stats.bytecode_hits += outcome.bytecode_hits;
@@ -446,7 +445,7 @@ impl PreludeFragment {
 /// (`tests/sandgate_confine_cost.rs`) — which is what makes it worth the check.
 ///
 /// # Errors
-/// Propagates the underlying QuickJS error. A *compile* failure is not an
+/// Propagates the underlying `QuickJS` error. A *compile* failure is not an
 /// error: the fragment falls back to source and stays there.
 pub(crate) fn eval_prelude_fragment(
     ctx: &rquickjs::Ctx<'_>,
@@ -500,7 +499,7 @@ pub(crate) fn eval_prelude_fragment(
 /// project module's script splices the author's own statements into an IIFE, so
 /// promoting it to strict module source could change the meaning of code
 /// somebody wrote — for a share of a cost that was never the problem.
-fn eligible_for_bytecode(entry: &LedgerEntry) -> bool {
+const fn eligible_for_bytecode(entry: &LedgerEntry) -> bool {
     entry.origin.is_third_party()
 }
 
@@ -509,7 +508,7 @@ fn eligible_for_bytecode(entry: &LedgerEntry) -> bool {
 /// Returns `true` when the bytecode path served it.
 ///
 /// # Errors
-/// Propagates the underlying QuickJS error. A *compile* failure is not an
+/// Propagates the underlying `QuickJS` error. A *compile* failure is not an
 /// error — it demotes the script to source replay permanently.
 pub(crate) fn replay_entry(
     ctx: &rquickjs::Ctx<'_>,
@@ -814,7 +813,7 @@ pub fn build_sealed_intrinsics_script() -> String {
 /// integrity. Split out so the handler path and any future boundary use the
 /// same probe rather than two spellings of it.
 #[must_use]
-pub fn integrity_probe_expression() -> &'static str {
+pub const fn integrity_probe_expression() -> &'static str {
     "globalThis.__albedo_sealed.integrity()"
 }
 

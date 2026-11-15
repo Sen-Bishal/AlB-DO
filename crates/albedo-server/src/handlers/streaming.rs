@@ -141,7 +141,7 @@ impl StreamingAppState {
     /// error-overlay + HMR client scripts. Wired by the server builder from its
     /// `dev_mode_enabled` flag; `albedo serve` leaves it off.
     #[must_use]
-    pub fn with_dev_mode(mut self, dev_mode: bool) -> Self {
+    pub const fn with_dev_mode(mut self, dev_mode: bool) -> Self {
         self.dev_mode = dev_mode;
         self
     }
@@ -149,7 +149,7 @@ impl StreamingAppState {
     /// Inject the hot-reload client with the dev scripts. Only read when dev
     /// mode is on.
     #[must_use]
-    pub fn with_hmr(mut self, hmr: bool) -> Self {
+    pub const fn with_hmr(mut self, hmr: bool) -> Self {
         self.hmr = hmr;
         self
     }
@@ -196,7 +196,7 @@ impl StreamingAppState {
     /// registry, used by the streaming handler's WT path and by
     /// tests that want to seed topic values before the session
     /// connects.
-    pub fn broadcast(
+    pub const fn broadcast(
         &self,
     ) -> Option<&Arc<dom_render_compiler::runtime::BroadcastRegistry>> {
         self.broadcast.as_ref()
@@ -218,7 +218,7 @@ impl StreamingAppState {
     /// Returns the shared CSRF registry handle. Used by the
     /// streaming handler to mint or look up tokens per request, and
     /// exposed for tests that want to pre-populate tokens.
-    pub fn csrf(&self) -> &Arc<crate::render::csrf::CsrfRegistry> {
+    pub const fn csrf(&self) -> &Arc<crate::render::csrf::CsrfRegistry> {
         &self.csrf
     }
 
@@ -244,14 +244,14 @@ impl StreamingAppState {
 
     /// Returns the shared pipeline handle, or `None` when no pipeline is
     /// bound.
-    pub fn pipeline(&self) -> Option<&SharedPipeline> {
+    pub const fn pipeline(&self) -> Option<&SharedPipeline> {
         self.pipeline.as_ref()
     }
 
     /// Returns `true` if an opcode pipeline has been bound. Used by the
     /// streaming handler to choose between the binary opcode path and the
     /// legacy JSON tier-B render.
-    pub fn has_pipeline(&self) -> bool {
+    pub const fn has_pipeline(&self) -> bool {
         self.pipeline.is_some()
     }
 }
@@ -390,7 +390,7 @@ enum NegotiatedTransport {
 }
 
 impl NegotiatedTransport {
-    fn as_header_value(self) -> &'static str {
+    const fn as_header_value(self) -> &'static str {
         match self {
             Self::WebTransport => "webtransport",
             Self::Sse => "sse",
@@ -508,55 +508,52 @@ async fn serve_manifest_route(
         };
 
     if negotiated_transport == NegotiatedTransport::WebTransport {
-        match maybe_webtransport_session_id(&req) {
-            Some(session_id) => {
-                // R1b · bind (or check) the session's identity before the bridge
-                // touches anything keyed by its UUID. A refusal falls back to
-                // SSE, which runs its own registration.
-                let bound = bind_webtransport_session(&app, session_id, identity.as_ref()).await;
-                let streamed = match bound {
-                    Ok(()) => {
-                        stream_route_over_webtransport(
-                            route.clone(),
-                            ctx.clone(),
-                            app.clone(),
-                            session_id,
-                        )
-                        .await
-                    }
-                    Err(err) => Err(err),
-                };
-                match streamed {
-                    Ok(()) => {
-                        // `debug`, not `info`: this fires on every streamed
-                        // route, so at `info` it buries the once-per-boot and
-                        // once-per-session lines someone turned logging on for.
-                        debug!(
-                            session_id = %session_id,
-                            route = %path,
-                            transport = "webtransport",
-                            "route streamed over webtransport"
-                        );
-                        return webtransport_ack_response(&transport_config);
-                    }
-                    Err(err) => {
-                        warn!(
-                            session_id = %session_id,
-                            route = %path,
-                            error = %err,
-                            "webtransport stream bridge failed; falling back to sse"
-                        );
-                        response_transport = NegotiatedTransport::Sse;
-                    }
+        if let Some(session_id) = maybe_webtransport_session_id(&req) {
+            // R1b · bind (or check) the session's identity before the bridge
+            // touches anything keyed by its UUID. A refusal falls back to
+            // SSE, which runs its own registration.
+            let bound = bind_webtransport_session(&app, session_id, identity.as_ref()).await;
+            let streamed = match bound {
+                Ok(()) => {
+                    stream_route_over_webtransport(
+                        route.clone(),
+                        ctx.clone(),
+                        app.clone(),
+                        session_id,
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            };
+            match streamed {
+                Ok(()) => {
+                    // `debug`, not `info`: this fires on every streamed
+                    // route, so at `info` it buries the once-per-boot and
+                    // once-per-session lines someone turned logging on for.
+                    debug!(
+                        session_id = %session_id,
+                        route = %path,
+                        transport = "webtransport",
+                        "route streamed over webtransport"
+                    );
+                    return webtransport_ack_response(&transport_config);
+                }
+                Err(err) => {
+                    warn!(
+                        session_id = %session_id,
+                        route = %path,
+                        error = %err,
+                        "webtransport stream bridge failed; falling back to sse"
+                    );
+                    response_transport = NegotiatedTransport::Sse;
                 }
             }
-            None => {
-                warn!(
-                    route = %path,
-                    "webtransport negotiated without session id header; falling back to sse"
-                );
-                response_transport = NegotiatedTransport::Sse;
-            }
+        } else {
+            warn!(
+                route = %path,
+                "webtransport negotiated without session id header; falling back to sse"
+            );
+            response_transport = NegotiatedTransport::Sse;
         }
     }
 
@@ -617,8 +614,7 @@ fn webtransport_capability_response(
         "active_sessions": app
             .webtransport_sessions
             .as_ref()
-            .map(WebTransportSessionRegistry::count)
-            .unwrap_or(0),
+            .map_or(0, WebTransportSessionRegistry::count),
     });
 
     let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
@@ -783,7 +779,7 @@ async fn resolve_tier_b_node(
                 .app
                 .render_errors_seen
                 .lock()
-                .unwrap_or_else(|err| err.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert((shared.route.to_string(), message.clone()));
             if first {
                 // Like the boot report, authors must see this without RUST_LOG.
@@ -867,7 +863,7 @@ async fn resolve_tier_b_node(
 /// *is* a request now, so dynamic props are no longer a disqualifier. It also
 /// makes the painted markup strictly fresher than the build-time seed it
 /// supersedes, which could be stale for a collection that had gained rows.
-fn painted_inline(node: &TierBNode) -> bool {
+const fn painted_inline(node: &TierBNode) -> bool {
     node.data_deps.is_empty()
 }
 
@@ -902,9 +898,7 @@ fn build_stream(
         // same `ctx.path` the return field was stamped with, so feedback issued
         // for another page paints nothing.
         let feedback: std::sync::Arc<[(u32, String)]> = feedback
-            .as_ref()
-            .map(|carried| carried.entries_for(&ctx.path).into())
-            .unwrap_or_else(|| std::sync::Arc::from(Vec::new()));
+            .as_ref().map_or_else(|| std::sync::Arc::from(Vec::new()), |carried| carried.entries_for(&ctx.path).into());
 
         // Route boundary component names (`error.tsx` / `loading.tsx`), if any,
         // and the island fill data — hoisted above the shell because the inline
@@ -1811,7 +1805,7 @@ fn transport_hint_script(
 /// — and shipped to the client as `__ALBEDO_LIVE__`. A new live surface can
 /// never again need a matching edit in a selector string on the other side of
 /// the wire.
-pub(crate) fn route_needs_live_lane(route: &RouteManifest) -> bool {
+pub(crate) const fn route_needs_live_lane(route: &RouteManifest) -> bool {
     // A broadcast topic the route reads — scalar or list, it is the same
     // question, and it is exactly what auto-subscribe keys on.
     if !route.shared_slot_topics.is_empty() {

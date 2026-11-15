@@ -78,34 +78,34 @@ impl FieldType {
     /// but the declared name survives in `PRAGMA table_info`, which is what lets
     /// [`drift`](crate::forge::drift) catch a `bool` retyped to an `int` and
     /// what makes the table legible to someone opening it in a SQL shell.
-    fn sql_type(self) -> &'static str {
+    const fn sql_type(self) -> &'static str {
         match self {
-            FieldType::Text => "TEXT",
-            FieldType::Int => "INTEGER",
-            FieldType::Real => "REAL",
-            FieldType::Bool => "BOOLEAN",
-            FieldType::Timestamp => "TIMESTAMP",
+            Self::Text => "TEXT",
+            Self::Int => "INTEGER",
+            Self::Real => "REAL",
+            Self::Bool => "BOOLEAN",
+            Self::Timestamp => "TIMESTAMP",
         }
     }
 
     /// The spelling an author writes in the `forge` block.
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
-            FieldType::Text => "text",
-            FieldType::Int => "int",
-            FieldType::Real => "real",
-            FieldType::Bool => "bool",
-            FieldType::Timestamp => "timestamp",
+            Self::Text => "text",
+            Self::Int => "int",
+            Self::Real => "real",
+            Self::Bool => "bool",
+            Self::Timestamp => "timestamp",
         }
     }
 
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
-            "text" => FieldType::Text,
-            "int" => FieldType::Int,
-            "real" => FieldType::Real,
-            "bool" => FieldType::Bool,
-            "timestamp" => FieldType::Timestamp,
+            "text" => Self::Text,
+            "int" => Self::Int,
+            "real" => Self::Real,
+            "bool" => Self::Bool,
+            "timestamp" => Self::Timestamp,
             _ => return None,
         })
     }
@@ -128,7 +128,7 @@ pub struct FieldSpec {
 
 impl FieldSpec {
     #[must_use]
-    pub fn new(ty: FieldType) -> Self {
+    pub const fn new(ty: FieldType) -> Self {
         Self {
             ty,
             nullable: false,
@@ -136,7 +136,7 @@ impl FieldSpec {
     }
 
     #[must_use]
-    pub fn nullable(ty: FieldType) -> Self {
+    pub const fn nullable(ty: FieldType) -> Self {
         Self { ty, nullable: true }
     }
 
@@ -276,7 +276,7 @@ impl CollectionDecl {
             if *column == key {
                 return Err(ForgeSchemaError::KeyIsAlsoAField {
                     topic: topic.to_string(),
-                    key: key.clone(),
+                    key,
                 });
             }
         }
@@ -339,7 +339,7 @@ impl CollectionDecl {
         if let Some(column) = &self.partition_by {
             let mut index_columns = vec![column.clone()];
             let mut name_parts = vec![table.clone(), column.clone()];
-            for sort in parse_order_by(&query).iter() {
+            for sort in &parse_order_by(&query) {
                 if &sort.column == column {
                     continue;
                 }
@@ -402,7 +402,7 @@ impl CollectionDecl {
         // query would fail at materialisation — a boot error is better than a
         // dead topic.
         let mut terms = Vec::with_capacity(parsed.len());
-        for term in parsed.iter() {
+        for term in &parsed {
             if term.column != key && !self.fields.contains_key(&term.column) {
                 return Err(ForgeSchemaError::InvalidOrderBy {
                     topic: topic.to_string(),

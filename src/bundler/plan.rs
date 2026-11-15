@@ -153,7 +153,7 @@ fn build_vendor_chunk_index(chunks: &[VendorChunkPlan]) -> BTreeMap<String, Vec<
     index
 }
 
-fn rewrite_action_sort_key(action: &RewriteAction) -> (u64, u8, &str, &str) {
+const fn rewrite_action_sort_key(action: &RewriteAction) -> (u64, u8, &str, &str) {
     match action {
         RewriteAction::WrapModule {
             component_id,

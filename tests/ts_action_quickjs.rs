@@ -1,4 +1,4 @@
-//! A1 · host-object bridge — actions through QuickJS.
+//! A1 · host-object bridge — actions through `QuickJS`.
 //!
 //! `CompiledProject::invoke_action_quickjs` runs a handler body in the real JS
 //! engine instead of the pure-Rust interpreter. This gate asserts **parity**

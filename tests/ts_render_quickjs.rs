@@ -1,4 +1,4 @@
-//! A1 · host-object bridge — renders through QuickJS.
+//! A1 · host-object bridge — renders through `QuickJS`.
 //!
 //! `CompiledProject::render_entry_quickjs` runs a component's *render* in the
 //! real JS engine instead of the pure-Rust interpreter, with the host objects
@@ -8,7 +8,7 @@
 //! render-side symmetric counterpart to `invoke_action_quickjs`.
 //!
 //! These gates assert: (1) a real `import { useState } from "react"` component
-//! renders its initial under QuickJS; (2) a slot value seeds the render so it
+//! renders its initial under `QuickJS`; (2) a slot value seeds the render so it
 //! reflects current state; (3) a render body using `Array.map` — which the
 //! pure-Rust evaluator does not model — renders correctly; (4) captured props
 //! are snapshotted into the slot store so a follow-up action reads them.

@@ -20,7 +20,7 @@
 //!    reaper + leases + TTL + three counters.
 //!
 //! Run with:
-//!   cargo bench --bench prism_partitions
+//!   cargo bench --bench `prism_partitions`
 //!
 //! Deliberately `harness = false` with a plain `main`: criterion measures one
 //! expression many times, which is the wrong instrument for "compare these two

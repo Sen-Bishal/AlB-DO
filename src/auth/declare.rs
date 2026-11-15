@@ -32,7 +32,7 @@
 //! | kind | covers | what the author supplies |
 //! |---|---|---|
 //! | [`ProviderKind::OAuth`] | any OAuth 2.0 server | the two endpoints |
-//! | [`ProviderKind::Oidc`] | any OIDC-compliant IdP | an issuer; endpoints come from `.well-known` |
+//! | [`ProviderKind::Oidc`] | any OIDC-compliant `IdP` | an issuer; endpoints come from `.well-known` |
 //! | [`ProviderKind::Delegated`] | anything that issues a verifiable token | JWKS + issuer + a claim map |
 //! | [`ProviderKind::Custom`] | everything else, including auth that predates us | a module returning a principal |
 //!
@@ -129,12 +129,12 @@ pub enum ProviderKind {
     /// OAuth 2.0 where **we** perform the code exchange. Endpoints come from a
     /// preset or are declared outright.
     OAuth,
-    /// OpenID Connect where **we** perform the code exchange, and the endpoints
+    /// `OpenID` Connect where **we** perform the code exchange, and the endpoints
     /// come from the issuer's `.well-known/openid-configuration`. One reader
-    /// covers every compliant IdP.
+    /// covers every compliant `IdP`.
     Oidc,
     /// A third party owns the record and issues a token; we verify it against
-    /// their JWKS and project the claims. Clerk, Auth0, WorkOS, Supabase, or any
+    /// their JWKS and project the claims. Clerk, Auth0, `WorkOS`, Supabase, or any
     /// JWT issuer at all.
     Delegated,
     /// Author-supplied code returns a principal. The escape hatch that makes the
@@ -423,7 +423,7 @@ pub fn is_rooted_app_path(raw: &str) -> bool {
     if bytes.next() != Some(b'/') {
         return false;
     }
-    if matches!(bytes.next(), Some(b'/') | Some(b'\\')) {
+    if matches!(bytes.next(), Some(b'/' | b'\\')) {
         return false;
     }
     !raw.bytes()
@@ -912,7 +912,7 @@ impl AuthRegistry {
 
     /// Whether this app has any way to authenticate anyone.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
 

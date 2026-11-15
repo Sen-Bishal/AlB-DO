@@ -103,12 +103,11 @@ async fn storage_failure_rolls_back_the_grant_and_allows_a_retry() {
         error.to_string().contains("role storage refused"),
         "{error}"
     );
-    assert!(load_principal(&db, &id)
+    assert_eq!(load_principal(&db, &id)
         .await
         .expect("load")
         .expect("exists")
-        .roles
-        .is_empty());
+        .roles, [] as [std::string::String; 0]);
     db.execute("DROP TRIGGER reject_role", &[])
         .await
         .expect("remove failure");
@@ -192,12 +191,11 @@ async fn killed_role_writer_leaves_no_uncommitted_grant_after_restart() {
     let db = LibSqlSubstrate::open_local(&path)
         .await
         .expect("reopen after crash");
-    assert!(load_principal(&db, &id)
+    assert_eq!(load_principal(&db, &id)
         .await
         .expect("load")
         .expect("principal survives")
-        .roles
-        .is_empty());
+        .roles, [] as [std::string::String; 0]);
     assert_eq!(
         grant_role(&db, &id, "payroll", Some("cli"), 1002)
             .await

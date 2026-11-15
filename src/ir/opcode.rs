@@ -66,7 +66,7 @@ pub enum RangeError {
 
 impl InstructionRange {
     /// Constructs a range, rejecting `start > end`.
-    pub fn try_new(start: u32, end: u32) -> Result<Self, RangeError> {
+    pub const fn try_new(start: u32, end: u32) -> Result<Self, RangeError> {
         if start > end {
             return Err(RangeError::StartAfterEnd { start, end });
         }
@@ -74,22 +74,22 @@ impl InstructionRange {
     }
 
     #[inline]
-    pub fn start(&self) -> u32 {
+    pub const fn start(&self) -> u32 {
         self.start
     }
 
     #[inline]
-    pub fn end(&self) -> u32 {
+    pub const fn end(&self) -> u32 {
         self.end
     }
 
     #[inline]
-    pub fn len(&self) -> u32 {
+    pub const fn len(&self) -> u32 {
         self.end - self.start
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.start == self.end
     }
 }

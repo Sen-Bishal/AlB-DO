@@ -15,9 +15,7 @@ impl Drop for Server {
 }
 
 fn albedo(home: &Path, cwd: &Path) -> Command {
-    let binary = std::env::var_os("ALBEDO_TEST_BINARY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_albedo")));
+    let binary = std::env::var_os("ALBEDO_TEST_BINARY").map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_albedo")), PathBuf::from);
     let mut command = Command::new(binary);
     command
         .current_dir(cwd)
@@ -55,49 +53,49 @@ fn app() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     write(
         &app,
         "src/routes/withcss/[id].tsx",
-        r#"
+        r"
 import styles from './page.module.css';
 export default function CssUnusedPage({ params }) {
   if (params.id === 'bad') throw new Error('expected-bad');
   return <p>ok-withcss-{params.id}</p>;
 }
-"#,
+",
     );
     write(
         &app,
         "src/routes/withcss/error.tsx",
-        r#"
+        r"
 export default function CssUnusedError({ error }) {
   return <p>css-boundary:{error.message}</p>;
 }
-"#,
+",
     );
     write(
         &app,
         "src/routes/used/[id].tsx",
-        r#"
+        r"
 import styles from '../withcss/page.module.css';
 export default function CssUsedPage({ params }) {
   return <p className={styles.label} data-missing={styles.nope === undefined ? 'undefined' : 'present'}>used-css-{params.id}</p>;
 }
-"#,
+",
     );
     write(
         &app,
         "src/routes/static.tsx",
-        r#"
+        r"
 import styles from './withcss/page.module.css';
 export default function CssStaticPage() {
   return <p className={styles.label}>static-css-control</p>;
 }
-"#,
+",
     );
     write(
         &app,
         "src/routes/withoutcss/[id].tsx",
-        r#"
+        r"
 export default function CssFreePage({ params }) { return <p>css-free-{params.id}</p>; }
-"#,
+",
     );
     write(
         &app,
@@ -107,12 +105,12 @@ export default function CssFreePage({ params }) { return <p>css-free-{params.id}
     write(
         &app,
         "src/routes/namespace/[id].tsx",
-        r#"
+        r"
 import * as styles from './only.module.css';
 export default function CssNamespacePage({ params }) {
   return <p className={styles.default.label}>namespace-css-{params.id}</p>;
 }
-"#,
+",
     );
     write(
         &app,
@@ -122,10 +120,10 @@ export default function CssNamespacePage({ params }) {
     write(
         &app,
         "src/routes/sideeffect/[id].tsx",
-        r#"
+        r"
 import './only.module.css';
 export default function CssSideEffectPage({ params }) { return <p>side-effect-css-{params.id}</p>; }
-"#,
+",
     );
     (home, work, app)
 }
@@ -333,14 +331,14 @@ fn albedo_test_component_imports_css_module() {
     write(
         &app,
         "src/components/CssCounter.tsx",
-        r#"
+        r"
 import { useState } from 'albedo';
 import styles from '../routes/withcss/page.module.css';
 export default function CssCounter() {
   const [count, setCount] = useState(7);
   return <button className={styles.label} onClick={() => setCount(count + 1)}>css-counter-{count}</button>;
 }
-"#,
+",
     );
     write(
         &app,

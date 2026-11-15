@@ -14,7 +14,7 @@
 //! form, and APERTURE's egress check was correct while nothing routed to it. So
 //! this test binds a listener and asks for bytes.
 //!
-//! ## Why it stores through the API rather than by POSTing a form
+//! ## Why it stores through the API rather than by `POSTing` a form
 //!
 //! A multipart submit needs a compiled action to submit *to*, which means a
 //! manifest fixture with an action registry — a large amount of scaffolding for

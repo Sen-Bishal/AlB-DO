@@ -75,7 +75,7 @@ export default function SignIn() {
 /// out, which is the point: edit what the renderers emit and this fixture
 /// follows, instead of quietly testing a stale copy of the markup. That the
 /// renderers *do* emit them for a plain same-origin POST form is pinned in the
-/// compiler crate — `transforms::form`'s unit tests, the QuickJS shim's parity
+/// compiler crate — `transforms::form`'s unit tests, the `QuickJS` shim's parity
 /// tests, and the `plain_post_form` conformance fixture, which renders it
 /// through both renderers and compares bytes.
 fn sign_in_html() -> String {

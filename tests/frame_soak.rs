@@ -2,7 +2,7 @@
 //!
 //! Drives the pipeline's owned [`DirtyBitmap`] under a randomized dirty
 //! ratio and asserts the [`FrameArena`] never grows its backing storage —
-//! the authoritative leak-detection on the SoA reconcile substrate.
+//! the authoritative leak-detection on the `SoA` reconcile substrate.
 //!
 //! `#[ignore]`'d by default because a million ticks takes several seconds
 //! in release and is not appropriate for the default CI gate. Run with:

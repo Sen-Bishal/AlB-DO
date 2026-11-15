@@ -114,7 +114,7 @@ fn a_confined_request_costs_what_gate_3_1_projected() {
 
     let (render_mean, render_median) = time(REPS, || {
         let out = plain.render_component("routes/p.tsx", props).expect("render");
-        assert!(!out.html.is_empty());
+        assert_ne!(out.html, "");
     });
     let (confine_mean, confine_median) = time(REPS, || plain.confine().expect("confine"));
 

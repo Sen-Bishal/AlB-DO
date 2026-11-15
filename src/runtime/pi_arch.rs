@@ -61,7 +61,7 @@ impl Default for PiArchKernel {
 }
 
 impl PiArchKernel {
-    pub fn new(weights: LagrangeWeights) -> Self {
+    pub const fn new(weights: LagrangeWeights) -> Self {
         Self { weights }
     }
 
@@ -103,9 +103,7 @@ impl PiArchKernel {
             angular_phase_distance(message.phase_result.phase, target.phase) / PI.max(f64::EPSILON);
         let priority_delta = (target.priority - message.phase_result.priority).abs();
 
-        (self.weights.phase * phase_distance)
-            + (self.weights.priority * priority_delta)
-            + (self.weights.load * lane_load)
+        self.weights.load.mul_add(lane_load, self.weights.priority.mul_add(priority_delta, self.weights.phase * phase_distance))
     }
 }
 

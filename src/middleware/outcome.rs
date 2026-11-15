@@ -66,7 +66,7 @@ pub type Headers = BTreeMap<String, Vec<String>>;
 impl Outcome {
     /// The headers every outcome carries.
     #[must_use]
-    pub fn headers(&self) -> &Headers {
+    pub const fn headers(&self) -> &Headers {
         match self {
             Self::Next { headers }
             | Self::Redirect { headers, .. }

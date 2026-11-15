@@ -15,10 +15,10 @@ fn write(root: &Path, rel: &str, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-const LAYOUT: &str = r#"export default function RootLayout({ route }) {
+const LAYOUT: &str = r"export default function RootLayout({ route }) {
   return <main data-route={route}><children /></main>;
 }
-"#;
+";
 
 #[test]
 fn a_long_markdown_page_ships_as_escaped_tier_a_markup_inside_its_layout() {

@@ -154,7 +154,7 @@ impl ModuleRegistry {
                 if !self.modules.contains_key(specifier) {
                     return Err(crate::runtime::engine::RuntimeError::load(
                         LoadErrorKind::ModuleMissing,
-                        format!("module missing: '{}'", specifier),
+                        format!("module missing: '{specifier}'"),
                     ));
                 }
             }
@@ -187,7 +187,7 @@ impl ModuleRegistry {
         if !self.modules.contains_key(entry) {
             return Err(crate::runtime::engine::RuntimeError::load(
                 LoadErrorKind::ModuleMissing,
-                format!("entry module missing: '{}'", entry),
+                format!("entry module missing: '{entry}'"),
             ));
         }
 
@@ -213,8 +213,7 @@ impl ModuleRegistry {
             return Err(crate::runtime::engine::RuntimeError::load(
                 LoadErrorKind::DependencyCycle,
                 format!(
-                    "dependency cycle detected while visiting module '{}'",
-                    current
+                    "dependency cycle detected while visiting module '{current}'"
                 ),
             ));
         }
@@ -222,7 +221,7 @@ impl ModuleRegistry {
         let module = self.modules.get(current).ok_or_else(|| {
             crate::runtime::engine::RuntimeError::load(
                 LoadErrorKind::ModuleMissing,
-                format!("module missing: '{}'", current),
+                format!("module missing: '{current}'"),
             )
         })?;
         visiting.insert(current.to_string());
@@ -283,7 +282,7 @@ pub struct RouteRenderRequest {
     /// for this render. `None` renders from each hook's initial (the prior
     /// behaviour); `Some` lets the SSR render reflect the session's current
     /// slot-store / broadcast values. The engine ignores it unless it supports
-    /// host objects (QuickJS does).
+    /// host objects (`QuickJS` does).
     pub host_json: Option<String>,
 }
 

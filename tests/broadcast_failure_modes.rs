@@ -55,8 +55,8 @@ async fn concurrent_subscribers_all_receive_a_single_write() {
         .write_topic(TOPIC, b"broadcast".to_vec())
         .expect("write");
     assert_eq!(report.delivered, SUBSCRIBERS);
-    assert!(report.dropped_full.is_empty());
-    assert!(report.dropped_closed.is_empty());
+    assert_eq!(report.dropped_full, [] as [dom_render_compiler::runtime::SessionId; 0]);
+    assert_eq!(report.dropped_closed, [] as [dom_render_compiler::runtime::SessionId; 0]);
 
     for mut rx in receivers {
         let payload = rx.recv().await.expect("each subscriber receives");

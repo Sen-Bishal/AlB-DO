@@ -34,7 +34,7 @@ fn long_unicode_path_and_canonical_windows_path_have_identical_call_sites() {
     fs::write(nested.join("page.tsx"), "import { items } from 'albedo/forge';\r\nitems.count();\r\n").unwrap();
     let first = classify_project(&src, &root, &declarations()).unwrap();
     let second = classify_project(&fs::canonicalize(&src).unwrap(), &root, &declarations()).unwrap();
-    assert!(first.diagnostics.is_empty());
+    assert_eq!(first.diagnostics, [] as [dom_render_compiler::transforms::forge_queries::Diagnostic; 0]);
     assert_eq!(first.queries.len(), 1);
     assert_eq!(first.queries[0].at, second.queries[0].at);
     assert_eq!(first.queries[0].canonical.id, second.queries[0].canonical.id);

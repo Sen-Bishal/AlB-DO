@@ -1,4 +1,4 @@
-//! The QuickJS realm one test file runs in.
+//! The `QuickJS` realm one test file runs in.
 //!
 //! It is a [`QuickJsEngine`] — the same prelude, the same `h`, the same module
 //! compiler as the realm that renders a page — with three things added:

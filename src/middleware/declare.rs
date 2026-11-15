@@ -197,9 +197,7 @@ fn string_literal(expr: &Expr) -> Option<String> {
             Some(
                 quasi
                     .cooked
-                    .as_ref()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| quasi.raw.to_string()),
+                    .as_ref().map_or_else(|| quasi.raw.to_string(), std::string::ToString::to_string),
             )
         }
         _ => None,

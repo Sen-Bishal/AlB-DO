@@ -127,7 +127,7 @@ impl Fixture {
 
 /// Tiny render-manifest-v2 with one Tier-A route at `/`. Schema-faithful
 /// enough that `RendererRuntime::from_artifacts_dir` deserialises it and warms
-/// QuickJS without complaint.
+/// `QuickJS` without complaint.
 ///
 /// It did *not* warm without complaint until 2026-08-04: the boot ran a
 /// per-route pre-render keyed by URL path, which cannot resolve to a module and

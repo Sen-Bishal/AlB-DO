@@ -25,7 +25,7 @@
 //! Flipping both call sites to `true` made `xs.map(x => <li/>)` render as
 //! `&lt;li&gt;a&lt;/li&gt;` — an expression child whose value is a mapped JSX
 //! array arrives as ALREADY-RENDERED markup. The evaluator now carries that
-//! distinction the way QuickJS's `h()` shim does, via a marker
+//! distinction the way `QuickJS`'s `h()` shim does, via a marker
 //! (`component::make_html_value` / `AlbedoHtml`), and `map_iteration` below is
 //! the case that fails if the distinction is ever dropped again.
 
@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 /// Every character the two escape rules disagree about, in one value: `<`, `>`
 /// and `&` must be escaped in text; `"` and `'` must NOT be (neither can
-/// terminate a text node, and escaping them would diverge from QuickJS, which
+/// terminate a text node, and escaping them would diverge from `QuickJS`, which
 /// leaves them alone too).
 const HOSTILE: &str = "<script>alert(1)</script> & \"quoted\" 'single'";
 

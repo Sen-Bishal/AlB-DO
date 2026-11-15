@@ -84,8 +84,7 @@ impl HighwayPlan {
             for component_id in level {
                 let Some(analysis) = analyses.get(component_id) else {
                     return Err(CompilerError::AnalysisFailed(format!(
-                        "missing analysis for component {:?} while building 4-lane topology",
-                        component_id
+                        "missing analysis for component {component_id:?} while building 4-lane topology"
                     )));
                 };
 

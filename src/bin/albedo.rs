@@ -735,7 +735,7 @@ fn print_foreign_layout_notice(contract: &ResolvedDevContract) {
             "root and entry were inferred. ALBEDO discovers routes from `routes/`, so this \
              framework's own routes are NOT in the build — run `albedo doctor` to see which.",
             "2"
-        ).to_string());
+        ).clone());
 }
 
 /// Route-shaped files that ALBEDO's own convention did not pick up.
@@ -1454,10 +1454,9 @@ fn configure_ship_binary(contract: &ResolvedDevContract) -> Result<(), String> {
             .map_err(|err| format!("failed to make '{}' executable: {err}", output.display()))?;
     }
 
-    let runtime_bytes = std::fs::metadata(&exe).map(|meta| meta.len()).unwrap_or(0);
+    let runtime_bytes = std::fs::metadata(&exe).map_or(0, |meta| meta.len());
     let total = std::fs::metadata(&output)
-        .map(|meta| meta.len())
-        .unwrap_or(0);
+        .map_or(0, |meta| meta.len());
 
     print_ok("one file, runtime and app");
     print_kv("output", output.display());
@@ -1898,7 +1897,7 @@ CMD ["sh", "-c", "exec /app/albedo-app --host ${ALBEDO_SERVER_HOST} --port ${ALB
 }
 
 fn build_dockerignore_template() -> String {
-    r#".git
+    r".git
 .gitignore
 node_modules
 target/debug
@@ -1933,7 +1932,7 @@ backups
 **/*.log
 **/.DS_Store
 **/Thumbs.db
-"#
+"
     .to_string()
 }
 
@@ -2237,7 +2236,7 @@ fn run_files_command(raw_args: &[String]) -> Result<(), String> {
     println!();
     print_ok(format!(
         "serving · {}",
-        style_256(&format!("http://{}", addr), ACCENT_SOFT, true)
+        style_256(&format!("http://{addr}"), ACCENT_SOFT, true)
     ));
     println!(
         "    {} {}",
@@ -2296,7 +2295,7 @@ fn parse_serve_args(raw_args: &[String]) -> Result<ServeOptions, String> {
                 if value.trim().is_empty() {
                     return Err("--host must not be empty".to_string());
                 }
-                host = value.to_string();
+                host = value.clone();
             }
             "--port" => {
                 idx += 1;
@@ -2469,7 +2468,7 @@ fn content_type_for_path(path: &Path) -> &'static str {
         Some("json") => "application/json; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
         Some("ico") => "image/x-icon",
@@ -2557,9 +2556,7 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
             "config",
             contract
                 .config_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "(defaults)".to_string()),
+                .as_ref().map_or_else(|| "(defaults)".to_string(), |path| path.display().to_string()),
         );
         print_kv("strict", contract.strict);
     }
@@ -3011,7 +3008,7 @@ fn bind_dev_listener(
                 continue;
             }
             Err(err) => {
-                return Err(format!("failed to bind dev server on {}: {}", addr, err));
+                return Err(format!("failed to bind dev server on {addr}: {err}"));
             }
         }
     }
@@ -3109,7 +3106,7 @@ fn print_scan_failure_details(failures: &[ScanFailure], verbose: bool) {
 /// Hard ceiling on the total bytes of an HTTP request head the dev server will
 /// read from one connection. Without it, a client that opens a socket and sends
 /// an endless header stream (no terminating blank line) drives `read_line` to
-/// grow a `String` until the process is out of memory — a single-connection DoS.
+/// grow a `String` until the process is out of memory — a single-connection `DoS`.
 /// 64 KiB is orders of magnitude above any legitimate head (a browser sends a
 /// few KiB) yet bounds the worst case to a harmless transient buffer.
 const MAX_REQUEST_HEAD_BYTES: u64 = 64 * 1024;
@@ -3220,15 +3217,14 @@ fn collect_stylesheets(root: &Path) -> Vec<Stylesheet> {
     let mut css_files = WalkDir::new(root)
         .follow_links(true)
         .into_iter()
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| entry.path().is_file())
         .filter(|entry| {
             entry
                 .path()
                 .extension()
                 .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("css"))
-                .unwrap_or(false)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("css"))
         })
         .filter(|entry| {
             !entry
@@ -3240,9 +3236,7 @@ fn collect_stylesheets(root: &Path) -> Vec<Stylesheet> {
         .map(|entry| {
             let path = entry.path().to_path_buf();
             let reach = path
-                .strip_prefix(&routes_dir)
-                .map(directory_url_prefix)
-                .unwrap_or_else(|_| "/".to_string());
+                .strip_prefix(&routes_dir).map_or_else(|_| "/".to_string(), directory_url_prefix);
             (reach, path)
         })
         .collect::<Vec<_>>();
@@ -3299,7 +3293,7 @@ fn inject_global_css_into_shells(
 ) -> usize {
     let sheets = collect_stylesheets(root);
     let mut touched = 0usize;
-    for (route_path, route) in manifest.routes.iter_mut() {
+    for (route_path, route) in &mut manifest.routes {
         let css = css_for_route(&sheets, route_path);
         if css.trim().is_empty() {
             continue;
@@ -4388,7 +4382,7 @@ fn albedo_link_forms_template() -> String {
 }
 
 fn run_completions_command(raw_args: &[String]) -> Result<(), String> {
-    let shell = raw_args.first().map(|s| s.as_str()).unwrap_or("");
+    let shell = raw_args.first().map_or("", std::string::String::as_str);
     let script = match shell {
         "bash" => COMPLETIONS_BASH,
         "zsh" => COMPLETIONS_ZSH,
@@ -5091,40 +5085,34 @@ fn run_import_command(raw_args: &[String]) -> Result<(), String> {
         let mut unauthored = 0usize;
         let mut unresolved: Vec<String> = Vec::new();
         for (line, record, author) in parsed {
-            let principal = match (&author, &principals) {
-                (Some(who), Some(users)) => {
-                    let found = if author_email.is_some() {
-                        let key = dom_render_compiler::auth::normalize_email(who)
-                            .unwrap_or_else(|| who.trim().to_ascii_lowercase());
-                        match users.by_email.get(&key).map(Vec::as_slice) {
-                            Some([only]) => Some(only.clone()),
-                            Some(many) if many.len() > 1 => {
-                                unresolved.push(format!(
-                                    "line {line}: {who} belongs to {} accounts — name the owner \
-                                     with --author-id instead",
-                                    many.len()
-                                ));
-                                None
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        users.ids.contains(who.as_str()).then(|| who.clone())
-                    };
-                    match found {
-                        Some(id) => Some(PrincipalId::parse(&id).map_err(|err| err.to_string())?),
-                        None => {
-                            if !unresolved.iter().any(|seen| seen.contains(who.as_str())) {
-                                unresolved.push(format!("line {line}: no user {who}"));
-                            }
+            let principal = if let (Some(who), Some(users)) = (&author, &principals) {
+                let found = if author_email.is_some() {
+                    let key = dom_render_compiler::auth::normalize_email(who)
+                        .unwrap_or_else(|| who.trim().to_ascii_lowercase());
+                    match users.by_email.get(&key).map(Vec::as_slice) {
+                        Some([only]) => Some(only.clone()),
+                        Some(many) if many.len() > 1 => {
+                            unresolved.push(format!(
+                                "line {line}: {who} belongs to {} accounts — name the owner \
+                                 with --author-id instead",
+                                many.len()
+                            ));
                             None
                         }
+                        _ => None,
                     }
-                }
-                _ => {
-                    unauthored += 1;
+                } else {
+                    users.ids.contains(who.as_str()).then(|| who.clone())
+                };
+                if let Some(id) = found { Some(PrincipalId::parse(&id).map_err(|err| err.to_string())?) } else {
+                    if !unresolved.iter().any(|seen| seen.contains(who.as_str())) {
+                        unresolved.push(format!("line {line}: no user {who}"));
+                    }
                     None
                 }
+            } else {
+                unauthored += 1;
+                None
             };
             rows.push(ImportRow {
                 line,
@@ -5253,13 +5241,10 @@ fn db_target(args: &[String]) -> Result<DbTarget, String> {
         &contract.project_dir.join(".albedo").join("dist"),
     );
     let data_dir = albedo_server::forge_db_path::data_dir_for(&db_path);
-    let backups_dir = match to {
-        Some(dir) => cwd.join(dir),
-        None => {
-            let configured = std::env::var("ALBEDO_BACKUP_DIR").ok();
-            let named = configured.as_deref().map(str::trim).filter(|dir| !dir.is_empty());
-            albedo_server::backups::resolve_dir(named.unwrap_or(DEFAULT_BACKUP_DIR), &data_dir)
-        }
+    let backups_dir = if let Some(dir) = to { cwd.join(dir) } else {
+        let configured = std::env::var("ALBEDO_BACKUP_DIR").ok();
+        let named = configured.as_deref().map(str::trim).filter(|dir| !dir.is_empty());
+        albedo_server::backups::resolve_dir(named.unwrap_or(DEFAULT_BACKUP_DIR), &data_dir)
     };
     Ok(DbTarget {
         contract,
@@ -5482,7 +5467,7 @@ async fn roles_db(path: &Path) -> Result<dom_render_compiler::forge::LibSqlSubst
         auth_schema::authority(),
         auth_schema::authority_clock(),
     ] {
-        for statement in collection.migrations.iter() {
+        for statement in &collection.migrations {
             db.execute(statement, &[])
                 .await
                 .map_err(|err| format!("could not prepare the roles tables: {err}"))?;
@@ -6176,7 +6161,7 @@ where
     F: FnOnce() -> R,
 {
     if !supports_color() {
-        eprintln!("  · {}", label);
+        eprintln!("  · {label}");
         return f();
     }
 
@@ -6452,7 +6437,7 @@ REF=${OTHER}
         assert!(line.starts_with("GET /x"));
         assert_eq!(headers.get("host").map(String::as_str), Some("localhost"));
         assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
-        assert!(leftover.is_empty());
+        assert_eq!(leftover, [] as [u8; 0]);
     }
 
     #[test]

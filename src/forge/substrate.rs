@@ -9,7 +9,7 @@ use crate::forge::value::{Result, Rows, SqlValue};
 /// The compiler's escape-analysis pass (Pillar 1) infers a schema and a
 /// set of content-addressed queries; the serve path pre-resolves those
 /// queries through a `DataSubstrate` into component props *before* the
-/// synchronous QuickJS render, and routes durable-action writes back
+/// synchronous `QuickJS` render, and routes durable-action writes back
 /// through it. Any backend — libSQL for Phase 0, BYO-Postgres later, an
 /// edge KV further out — implements this one trait. "The database is a
 /// tier the compiler emits," and this is where that tier bottoms out.

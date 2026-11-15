@@ -85,7 +85,7 @@ impl OAuthRoute {
     /// The one method this leg answers. `start`/`callback` are navigations and
     /// must be `GET`; `link` changes an account and is a CSRF-checked `POST`.
     #[must_use]
-    pub fn method(self) -> &'static str {
+    pub const fn method(self) -> &'static str {
         match self {
             Self::Start | Self::Callback => "GET",
             Self::Link => "POST",
@@ -776,15 +776,12 @@ fn see_other_to(url: &str) -> Response<Body> {
 /// Append a `Set-Cookie`, dropping it rather than panicking if it will not
 /// parse — the same reasoning as `auth_routes::set_cookie`.
 fn set_cookie(response: &mut Response<Body>, value: &str) {
-    match value.parse() {
-        Ok(header) => {
-            response.headers_mut().append(header::SET_COOKIE, header);
-        }
-        Err(_) => warn!(
-            target: "albedo.auth",
-            "could not build an oauth cookie header; the sign-in will not complete"
-        ),
-    }
+    if let Ok(header) = value.parse() {
+        response.headers_mut().append(header::SET_COOKIE, header);
+    } else { warn!(
+        target: "albedo.auth",
+        "could not build an oauth cookie header; the sign-in will not complete"
+    ); }
 }
 
 /// Turn a flow error into a page.

@@ -87,7 +87,7 @@ pub enum HandlerBody {
 
 /// Walk every JSX element in a component function body and extract
 /// the `on*` handlers attached to host (lowercase-tag) elements. The
-/// returned vector is in source-traversal order; handler_idx is the
+/// returned vector is in source-traversal order; `handler_idx` is the
 /// vector index.
 pub fn extract_handlers_in_function(stmts: &[Stmt]) -> Vec<HandlerExtract> {
     // Resolve bare-identifier handlers (`onClick={inc}`) against the component's

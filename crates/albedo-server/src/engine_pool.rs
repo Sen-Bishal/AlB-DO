@@ -1,4 +1,4 @@
-//! A1 · server-side QuickJS engine pool — *scaffolding*.
+//! A1 · server-side `QuickJS` engine pool — *scaffolding*.
 //!
 //! # Why this module exists
 //!
@@ -59,12 +59,12 @@ use tokio::sync::{oneshot, Semaphore};
 /// construction so its request-scoped arena promotes out of persistent mode.
 /// The engine enables O(1) per-render reset only after its internal
 /// `ARENA_WARMUP_RENDERS` (8) renders have populated the persistent region with
-/// QuickJS's lazily-allocated global tables; we run a small margin past that so
+/// `QuickJS`'s lazily-allocated global tables; we run a small margin past that so
 /// the first real checkout is already in request-scoped mode.
 const POOL_WARMUP_RENDERS: u32 = 10;
 
 /// Number of warm-up renders per component in [`warm_render_targets`]. The first
-/// render interns the component's QuickJS shapes/atoms into the persistent region;
+/// render interns the component's `QuickJS` shapes/atoms into the persistent region;
 /// the rest are cheap confirmation that the now-warm path is stable.
 const RENDER_WARMUP_REPS: u32 = 2;
 
@@ -318,7 +318,7 @@ impl QuickJsEnginePool {
     /// process, and enough of them took out the pool. `serve` sets this to the
     /// request timeout: past that point nobody is waiting for the answer.
     #[must_use]
-    pub fn with_job_budget(mut self, budget: std::time::Duration) -> Self {
+    pub const fn with_job_budget(mut self, budget: std::time::Duration) -> Self {
         self.job_budget = Some(budget);
         self
     }
@@ -344,13 +344,13 @@ impl QuickJsEnginePool {
 
     /// Whether this pool confines realms between checkouts.
     #[must_use]
-    pub fn confines(&self) -> bool {
+    pub const fn confines(&self) -> bool {
         self.confine_after_use
     }
 
     /// Number of engines in the pool.
     #[must_use]
-    pub fn size(&self) -> usize {
+    pub const fn size(&self) -> usize {
         self.size
     }
 
@@ -840,30 +840,27 @@ fn engine_worker_loop(
                 true
             }
         };
-        match std::panic::catch_unwind(AssertUnwindSafe(|| provisioned_engine(provision))) {
-            Ok(fresh) => {
-                let previous = std::mem::replace(&mut engine, fresh);
-                if panicked {
-                    // A panic may have unwound through inconsistent runtime
-                    // state; dropping that runtime can abort the process.
-                    std::mem::forget(previous);
-                } else {
-                    // A returned replay error leaves a valid, dirty context.
-                    // Reclaim it rather than leaking on every reset failure.
-                    drop(previous);
-                }
-                replacements.fetch_add(1, Ordering::Relaxed);
+        if let Ok(fresh) = std::panic::catch_unwind(AssertUnwindSafe(|| provisioned_engine(provision))) {
+            let previous = std::mem::replace(&mut engine, fresh);
+            if panicked {
+                // A panic may have unwound through inconsistent runtime
+                // state; dropping that runtime can abort the process.
+                std::mem::forget(previous);
+            } else {
+                // A returned replay error leaves a valid, dirty context.
+                // Reclaim it rather than leaking on every reset failure.
+                drop(previous);
             }
-            Err(_) => {
-                eprintln!(
-                    "albedo: replacing the engine failed; this engine thread is \
-                     stopping and its pool slot will be retired"
-                );
-                if panicked {
-                    std::mem::forget(engine);
-                }
-                return;
+            replacements.fetch_add(1, Ordering::Relaxed);
+        } else {
+            eprintln!(
+                "albedo: replacing the engine failed; this engine thread is \
+                 stopping and its pool slot will be retired"
+            );
+            if panicked {
+                std::mem::forget(engine);
             }
+            return;
         }
         finished = Instant::now();
     }
@@ -873,12 +870,12 @@ fn engine_worker_loop(
 /// first checkout.
 ///
 /// Two layers of warmth:
-/// 1. `prewarm()` — installs the built-in runtime helpers and constructs the QuickJS
+/// 1. `prewarm()` — installs the built-in runtime helpers and constructs the `QuickJS`
 ///    runtime/context (makes `is_initialized()` true).
 /// 2. Drive [`POOL_WARMUP_RENDERS`] representative handler evals so the request-scoped arena
 ///    promotes out of persistent mode and enables O(1) reset. The warmup body is deliberately broad
 ///    — a loop, a `try`/`catch`, an array method, a setter call, and an updater-form `broadcast` —
-///    so the QuickJS shape/atom tables for the common handler-script machinery are allocated into
+///    so the `QuickJS` shape/atom tables for the common handler-script machinery are allocated into
 ///    the persistent region during these renders rather than on a real request. The evals are pure
 ///    (no `SlotStore`/`BroadcastRegistry`); the collected effects are discarded.
 ///
@@ -923,7 +920,7 @@ fn warm_engine(engine: &mut QuickJsEngine) {
 /// Warm one engine's *render* path with a known component set, in persistent
 /// arena mode. Each component's module graph is loaded and the component rendered
 /// a few times inside an explicit [`QuickJsEngine::begin_warmup`] /
-/// [`QuickJsEngine::end_warmup`] bracket, so its stable lazily-interned QuickJS
+/// [`QuickJsEngine::end_warmup`] bracket, so its stable lazily-interned `QuickJS`
 /// state (element/attribute atoms, hidden-class shapes, the render-entry closure)
 /// lands in the persistent region instead of being re-interned through the system
 /// allocator on every request. This is now a *performance* optimization, not a

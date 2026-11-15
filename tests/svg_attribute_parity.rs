@@ -10,14 +10,14 @@
 //! wrong.
 //!
 //! Three renderers emit these: the pure-Rust one (Tier A/B static markup),
-//! the QuickJS `h` shim (Tier B per-request, Tier C island SSR), and
+//! the `QuickJS` `h` shim (Tier B per-request, Tier C island SSR), and
 //! `assets/albedo-client.js` (hydration and client updates). The first two are
-//! required to agree **byte-for-byte** — the QuickJS shim's own comment says so
+//! required to agree **byte-for-byte** — the `QuickJS` shim's own comment says so
 //! about the void-element spelling — because hydration *adopts* the server's
 //! DOM rather than rebuilding it.
 //!
 //! Until `runtime::jsx_attributes` existed the rule lived in three places: a
-//! `match` in Rust, a ternary chain in the QuickJS prelude, and a pair of `if`s
+//! `match` in Rust, a ternary chain in the `QuickJS` prelude, and a pair of `if`s
 //! in the client. **None of the three had the SVG half**, so hand-authored SVG
 //! in a Tier-A component had been shipping inert attributes since Tier A
 //! existed. This test starts from what the renderers actually produce, which is

@@ -5,7 +5,7 @@
 //! and renders components that import from them. Covers the module-system
 //! surface real packages exercise: conditional `exports` maps, named/default/
 //! namespace imports, `export … from` / `export * from` re-export chains,
-//! exported classes, a CommonJS dependency consumed from ESM, a JSON module,
+//! exported classes, a `CommonJS` dependency consumed from ESM, a JSON module,
 //! and an import cycle (which must resolve CJS-style, not recurse forever).
 
 use dom_render_compiler::bundler::npm::{bundle_npm_dependency, NpmDependencyBundle};
@@ -87,12 +87,12 @@ fn esm_package_with_reexport_chain_renders_through_component() {
     );
     write(
         &pkg.join("src").join("acc.js"),
-        r#"
+        r"
             export class Accumulator {
                 constructor(start) { this.total = start; }
                 add(n) { this.total += n; return this; }
             }
-        "#,
+        ",
     );
 
     let bundle = bundle_npm_dependency(dir.path(), "mathkit", &server_options()).expect("bundle mathkit");
@@ -121,7 +121,7 @@ fn esm_package_with_reexport_chain_renders_through_component() {
     );
 }
 
-/// A CommonJS dependency consumed from an ESM entry: `module.exports`
+/// A `CommonJS` dependency consumed from an ESM entry: `module.exports`
 /// interop must expose both the default and copied named exports.
 #[test]
 fn cjs_dependency_interops_with_esm_entry() {
@@ -217,7 +217,7 @@ fn json_module_exposes_default_and_named() {
 /// partially-initialized record instead of recursing forever. As in CJS, a
 /// back-reference accessed **at call time through a namespace import** works
 /// (the record has been filled by then); a *destructured* back-reference would
-/// snapshot `undefined` — the same trade CommonJS makes.
+/// snapshot `undefined` — the same trade `CommonJS` makes.
 #[test]
 fn import_cycle_resolves_lazily() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -301,7 +301,7 @@ fn subpath_export_bundles_independently() {
 }
 
 /// A package importing another package: the bare specifier inside the first
-/// package's file resolves through the node_modules walk-up, and both
+/// package's file resolves through the `node_modules` walk-up, and both
 /// packages' records land under their own versioned keys.
 #[test]
 fn transitive_package_dependency_resolves() {
@@ -354,9 +354,9 @@ fn transitive_package_dependency_resolves() {
 }
 
 /// Slice 3 — the full production path: `CompiledProject::wrap` discovers the
-/// bare import, bundles it from the project's own `node_modules`, the QuickJS
+/// bare import, bundles it from the project's own `node_modules`, the `QuickJS`
 /// render preloads it, and an action handler referencing the imported
-/// function executes under QuickJS with the binding seeded.
+/// function executes under `QuickJS` with the binding seeded.
 #[test]
 fn compiled_project_discovers_bundles_and_dispatches_with_npm_import() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -469,7 +469,7 @@ fn compiled_project_discovers_bundles_and_dispatches_with_npm_import() {
 
 /// The A1 follow-up this work unlocks: a project component importing another
 /// project component now links at load time (the legacy `__albedo_require`
-/// became a global), so parent→child composition renders under QuickJS.
+/// became a global), so parent→child composition renders under `QuickJS`.
 #[test]
 fn project_child_component_import_now_links() {
     let mut engine = engine();
@@ -477,7 +477,7 @@ fn project_child_component_import_now_links() {
     engine
         .load_module(
             "components/Badge.tsx",
-            r#"export default function Badge(props) { return <em>{props.label}</em>; }"#,
+            r"export default function Badge(props) { return <em>{props.label}</em>; }",
         )
         .expect("child loads");
     engine

@@ -58,7 +58,7 @@ pub struct TemplatesDecl {
 impl TemplatesDecl {
     /// The override for `kind`, if the app declared one.
     #[must_use]
-    pub fn get(&self, kind: AuthEmail) -> Option<&TemplateOverride> {
+    pub const fn get(&self, kind: AuthEmail) -> Option<&TemplateOverride> {
         match kind {
             AuthEmail::PasswordReset => self.password_reset.as_ref(),
             AuthEmail::VerifyEmail => self.verify_email.as_ref(),

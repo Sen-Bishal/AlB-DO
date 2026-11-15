@@ -10,13 +10,13 @@
 //!      equals `broadcast_slot_id("chat:lobby")` — i.e. the same id
 //!      future `write_topic` calls fan out as `SlotSet` opcodes.
 //!   3. The session is auto-subscribed; a follow-up `write_topic`
-//!      delivers a SlotSet to the session's mpsc receiver.
+//!      delivers a `SlotSet` to the session's mpsc receiver.
 //!   4. The initial-state opcodes prepended by
 //!      `render_entry_with_broadcast` carry the topic's current value
 //!      so the bakabox dispatch order (`SlotSet` first, then
 //!      `SetTextRef`) leaves the DOM coherent.
 //!
-//! Bakabox is a dumb client — it can't tell a per-session SlotSet
+//! Bakabox is a dumb client — it can't tell a per-session `SlotSet`
 //! from a broadcast one. This test verifies that fact at the wire
 //! level: the same opcodes flow through the same machinery, just
 //! authored server-side via a different store.

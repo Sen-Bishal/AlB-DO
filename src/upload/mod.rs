@@ -15,7 +15,7 @@
 //! - **Bytes never enter the JS engine.** A multipart file part streams to disk, hashed as it goes,
 //!   and the action body sees the resulting id as the field's value — exactly as a text field's
 //!   value is its text. The action ABI does not change, no new JS type exists, and a 5 MiB photo
-//!   never touches the QuickJS arena.
+//!   never touches the `QuickJS` arena.
 //!
 //! ## Module map
 //!

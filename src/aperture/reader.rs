@@ -252,13 +252,13 @@ impl SourceReader {
 
     /// The lowered registry.
     #[must_use]
-    pub fn registry(&self) -> &Arc<SourceRegistry> {
+    pub const fn registry(&self) -> &Arc<SourceRegistry> {
         &self.registry
     }
 
     /// The underlying client, for metrics.
     #[must_use]
-    pub fn client(&self) -> &Arc<ApertureClient> {
+    pub const fn client(&self) -> &Arc<ApertureClient> {
         &self.client
     }
 
@@ -313,7 +313,7 @@ impl SourceReader {
         if serde_json::from_slice::<serde::de::IgnoredAny>(&outcome.response.body).is_err() {
             return Err(SourceReadError::NotJson {
                 topic: resolved.topic.clone(),
-                content_type: outcome.response.content_type.clone(),
+                content_type: outcome.response.content_type,
             });
         }
 

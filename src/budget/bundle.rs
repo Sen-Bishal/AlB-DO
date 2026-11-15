@@ -99,8 +99,8 @@ impl ComponentBundleSummary {
     /// Maps are excluded — they ride alongside the wrapper in dev
     /// but are off the critical hydration path in production builds
     /// (the user's browser fetches them lazily on demand from
-    /// DevTools, not on first paint).
-    pub fn budget_bytes(&self) -> u64 {
+    /// `DevTools`, not on first paint).
+    pub const fn budget_bytes(&self) -> u64 {
         self.wrapper_bytes
     }
 }

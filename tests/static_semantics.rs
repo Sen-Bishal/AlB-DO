@@ -1,5 +1,5 @@
 //! The static (Tier A) evaluator's operators, string methods and calls,
-//! checked against QuickJS.
+//! checked against `QuickJS`.
 //!
 //! 🔴 Until 2026-10-07:
 //! - `===`, `==`, `!==` and `!=` compared the *string forms* of their operands,
@@ -16,7 +16,7 @@
 //!
 //! Every one rendered as nothing, or as the wrong thing, with the build green.
 //! Two properties are pinned here, as in `static_array_methods.rs`:
-//! 1. Each supported construct renders what QuickJS renders.
+//! 1. Each supported construct renders what `QuickJS` renders.
 //! 2. Each unsupported one is an ERROR that names it, never an empty render.
 
 use dom_render_compiler::runtime::engine::{BootstrapPayload, RuntimeEngine};
@@ -95,7 +95,7 @@ fn lines(html: &str) -> Vec<String> {
     out
 }
 
-/// Every supported construct, each on its own labelled line. QuickJS's harness
+/// Every supported construct, each on its own labelled line. `QuickJS`'s harness
 /// loads the entry alone, so everything it needs is declared in it.
 const PROBE: &str = r#"
 const items = [{ n: 3, t: "a" }, { n: 1, t: "b" }];
@@ -152,7 +152,7 @@ export default function Probe() {
 }
 "#;
 
-/// What QuickJS renders, written out — so an engine regression cannot make
+/// What `QuickJS` renders, written out — so an engine regression cannot make
 /// both sides agree on nothing.
 const EXPECTED: [&str; 22] = [
     "strict:false,true,true,true,false",
@@ -220,18 +220,18 @@ fn unmodelled_constructs_are_refused_by_name() {
         (r#"<p>{"Hello".replace(/l/g, "L")}</p>"#, "regular expression `/l/g`"),
         (r#"<p>{"b".localeCompare("a")}</p>"#, "`.localeCompare()`"),
         (r#"<p>{"a".match("a")}</p>"#, "`.match()`, which takes a regular expression"),
-        (r#"<p>{String([] instanceof Array)}</p>"#, "`instanceof`"),
-        (r#"<p>{Math.random()}</p>"#, "`Math.random()`"),
-        (r#"<p>{Math.hypot(3, 4)}</p>"#, "`Math.hypot()`"),
-        (r#"<p>{(1234).toLocaleString()}</p>"#, "`.toLocaleString()` on a number"),
-        (r#"<p>{1 / 0}</p>"#, "produces Infinity"),
+        (r"<p>{String([] instanceof Array)}</p>", "`instanceof`"),
+        (r"<p>{Math.random()}</p>", "`Math.random()`"),
+        (r"<p>{Math.hypot(3, 4)}</p>", "`Math.hypot()`"),
+        (r"<p>{(1234).toLocaleString()}</p>", "`.toLocaleString()` on a number"),
+        (r"<p>{1 / 0}</p>", "produces Infinity"),
         (r#"<p>{"abc" * 2}</p>"#, "produces NaN"),
-        (r#"<p>{format(1)}</p>"#, "calling `format()`"),
-        (r#"<p>{new Map().size}</p>"#, "`new Map()`"),
-        (r#"<p>{[1][0].foo()}</p>"#, "`.foo()` on a number"),
-        (r#"<p>{({ a: 1 }).foo()}</p>"#, "calling `.foo()` on an object"),
+        (r"<p>{format(1)}</p>", "calling `format()`"),
+        (r"<p>{new Map().size}</p>", "`new Map()`"),
+        (r"<p>{[1][0].foo()}</p>", "`.foo()` on a number"),
+        (r"<p>{({ a: 1 }).foo()}</p>", "calling `.foo()` on an object"),
         (r#"<p>{"x".repeat(-1)}</p>"#, "RangeError"),
-        (r#"<p>{[...5].length}</p>"#, "not iterable"),
+        (r"<p>{[...5].length}</p>", "not iterable"),
         (r#"<p>{"a".split(null).length}</p>"#, "null-or-undefined argument"),
     ];
     for (jsx, expected) in cases {
@@ -246,10 +246,10 @@ fn unmodelled_constructs_are_refused_by_name() {
 #[test]
 fn typeof_of_a_null_or_undefined_value_is_refused_not_guessed() {
     let err = refusal(
-        r#"const none = null;
+        r"const none = null;
 export default function Probe() {
   return <p>{typeof none}</p>;
-}"#,
+}",
     );
     assert!(err.contains("`typeof` of a value that is null or undefined"), "{err}");
 }
@@ -301,12 +301,12 @@ export default function Probe() {
 #[test]
 fn unbounded_recursion_in_a_helper_is_stopped() {
     let err = refusal(
-        r#"function forever(n) {
+        r"function forever(n) {
   return forever(n + 1);
 }
 export default function Probe() {
   return <p>{forever(0)}</p>;
-}"#,
+}",
     );
     assert!(err.contains("nested more than 32 calls deep"), "{err}");
 }

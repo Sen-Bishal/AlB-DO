@@ -62,7 +62,7 @@ impl ProviderKind {
     }
 
     /// The default API base. `None` for [`Self::Log`], which has no network.
-    fn default_endpoint(self) -> Option<&'static str> {
+    const fn default_endpoint(self) -> Option<&'static str> {
         match self {
             Self::Resend => Some("https://api.resend.com"),
             Self::Postmark => Some("https://api.postmarkapp.com"),

@@ -244,7 +244,7 @@ pub enum WorkflowLoweringError {
 impl std::fmt::Display for WorkflowLoweringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WorkflowLoweringError::ReturnInFinally => write!(
+            Self::ReturnInFinally => write!(
                 f,
                 "a `return` inside `finally` discards an in-flight throw, which would silently \
                  swallow an outbound call's suspension and run the rest of this action on \

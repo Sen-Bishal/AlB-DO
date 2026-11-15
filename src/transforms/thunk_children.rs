@@ -60,7 +60,7 @@ use swc_ecma_ast::{
 };
 use swc_ecma_visit::{VisitMut, VisitMutWith};
 
-/// The runtime helper that marks a deferred child. Defined in the QuickJS
+/// The runtime helper that marks a deferred child. Defined in the `QuickJS`
 /// prelude next to `h`.
 const THUNK_HELPER: &str = "__albedo_t";
 

@@ -53,15 +53,15 @@ pub enum StepKind {
 
 impl StepKind {
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            StepKind::Fetch => "fetch",
+            Self::Fetch => "fetch",
         }
     }
 }
 
 /// How a step ended.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
     /// The act completed and this is what the body sees on every later pass.
     Completed(Value),
@@ -74,7 +74,7 @@ pub enum StepOutcome {
 }
 
 /// One recorded act.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     /// Position in the log. Equal to the index in [`Journal::steps`] — carried
     /// explicitly because it is the idempotency key, not a vector offset.
@@ -119,21 +119,21 @@ pub enum JournalError {
 impl std::fmt::Display for JournalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            JournalError::OutOfOrder { expected, got } => write!(
+            Self::OutOfOrder { expected, got } => write!(
                 f,
                 "aperture: journal step {got} arrived out of order (expected {expected}); \
                  the log is append-only and its index is the idempotency key"
             ),
-            JournalError::StepCap { cap } => write!(
+            Self::StepCap { cap } => write!(
                 f,
                 "aperture: workflow exceeded its step cap of {cap} outbound calls"
             ),
-            JournalError::AlreadySettled { index } => write!(
+            Self::AlreadySettled { index } => write!(
                 f,
                 "aperture: journal step {index} already has an outcome; overwriting it would \
                  change an answer the body has already been given"
             ),
-            JournalError::Diverged {
+            Self::Diverged {
                 index,
                 recorded,
                 replayed,
@@ -151,7 +151,7 @@ impl std::fmt::Display for JournalError {
 impl std::error::Error for JournalError {}
 
 /// The append-only log of one workflow.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Journal {
     workflow_id: String,
     build_id: String,
@@ -178,7 +178,7 @@ impl Journal {
 
     /// Override the step cap (tests, and a future per-app setting).
     #[must_use]
-    pub fn with_step_cap(mut self, cap: usize) -> Self {
+    pub const fn with_step_cap(mut self, cap: usize) -> Self {
         self.step_cap = cap;
         self
     }
@@ -195,12 +195,12 @@ impl Journal {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.steps.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.steps.is_empty()
     }
 

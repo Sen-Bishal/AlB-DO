@@ -370,7 +370,7 @@ fn as_bool(expr: &Expr) -> Option<bool> {
     }
 }
 
-fn bool_lit(value: bool) -> Expr {
+const fn bool_lit(value: bool) -> Expr {
     Expr::Lit(Lit::Bool(Bool {
         span: DUMMY_SP,
         value,

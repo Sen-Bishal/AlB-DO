@@ -20,7 +20,7 @@
 //! numbers below tell you where it ends up.
 //!
 //! Reproduce with:
-//!   cargo bench --bench parity_action_roundtrip
+//!   cargo bench --bench `parity_action_roundtrip`
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope};

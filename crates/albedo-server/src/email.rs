@@ -65,7 +65,7 @@ pub struct HttpMailer {
 impl HttpMailer {
     /// Build one.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         config: EmailConfig,
         key: String,
         client: Arc<OnceLock<Arc<ApertureClient>>>,
@@ -299,7 +299,7 @@ impl EmailRuntime {
 
     /// The lowered block.
     #[must_use]
-    pub fn config(&self) -> &EmailConfig {
+    pub const fn config(&self) -> &EmailConfig {
         &self.config
     }
 

@@ -60,8 +60,8 @@ async fn two_sessions_subscribed_to_same_topic_both_receive_writes() {
         .write_topic("chat:room-1", br#"[{"from":"alice","text":"hi"}]"#.to_vec())
         .unwrap();
     assert_eq!(report.delivered, 2);
-    assert!(report.dropped_full.is_empty());
-    assert!(report.dropped_closed.is_empty());
+    assert_eq!(report.dropped_full, [] as [dom_render_compiler::runtime::SessionId; 0]);
+    assert_eq!(report.dropped_closed, [] as [dom_render_compiler::runtime::SessionId; 0]);
 
     let payload_a = rx_a.recv().await.expect("session A receives a frame");
     let payload_b = rx_b.recv().await.expect("session B receives a frame");
