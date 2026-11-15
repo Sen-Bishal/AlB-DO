@@ -286,7 +286,10 @@ bytes.workspace              = true
 # APERTURE · A2 — `join_all` over the requests one suspension staged. Already in
 # the lock file via albedo-server; no new vendor cost.
 futures-util.workspace       = true
-libsql                       = { version = "0.6", optional = true }
+# Local databases only, so `core` and nothing else: the default features add
+# replication, remote (hrana over HTTP) and TLS, none of which FORGE uses.
+# 0.10 (from 0.6): 0.6 closed every local connection twice — T-0040.
+libsql                       = { version = "0.10", optional = true, default-features = false, features = ["core"] }
 crossbeam.workspace          = true
 core_affinity.workspace      = true
 dashmap.workspace            = true

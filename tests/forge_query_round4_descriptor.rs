@@ -98,7 +98,7 @@ async fn bound_text_and_maximum_in_array_execute_exactly_on_libsql() {
         .build()
         .await
         .unwrap();
-    let conn = dom_render_compiler::forge::libsql::ClosedOnceConnection::new(db.connect().unwrap()).await.unwrap();
+    let conn = db.connect().unwrap();
     conn.execute(
         "CREATE TABLE item_rows(item_key INTEGER PRIMARY KEY, label TEXT, n INTEGER)",
         (),

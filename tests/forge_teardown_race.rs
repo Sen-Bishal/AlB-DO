@@ -1,7 +1,7 @@
 //! The libSQL teardown crash — `0xc0000005 STATUS_ACCESS_VIOLATION` — and the
 //! measurements that say what actually causes it.
 //!
-//! # ✅ RESOLVED 14 Nov 2026 (T-0040) — read this before the history below
+//! # ✅ RESOLVED 14-15 Nov 2026 (T-0040) — read this before the history below
 //!
 //! A stack captured in-process (a vectored exception handler printing a
 //! backtrace) put the fault in `sqlite3_close_v2` ← `local::Connection::drop`
@@ -10,12 +10,13 @@
 //! `local::Connection` field drops and disconnects again. The second close
 //! reads the freed `sqlite3` struct, which faults only once the Windows heap
 //! has released that page. Co-liveness mattered only because a bigger heap
-//! releases more pages. The fix is `forge::libsql::ClosedOnceConnection`.
+//! releases more pages. The fix is libsql 0.10, which nulls the handle after
+//! closing (an in-repo wrapper bridged it for a day; see `forge::libsql`).
 //!
-//! Measured on the dev rig, 40 runs each: `probe_i` 0/40, `probe_a` 0/40,
-//! `thirty_simultaneous_teardowns` 0/40 with the fix; `probe_i` 12/40 with the
-//! fix's two fields swapped (the double close restored). `probe_i` is now a
-//! normal test; the rest stay ignored as the record of the investigation.
+//! Measured on the dev rig, 15 Nov: libsql 0.6.0 `probe_i` 13/20 crashed;
+//! libsql 0.10.0 `probe_i` 0/40, `probe_a` 0/20, `thirty_simultaneous_teardowns`
+//! 0/20. `probe_i` is now a normal test; the rest stay ignored as the record of
+//! the investigation. Every-ordering cases: `tests/forge_connection_ownership.rs`.
 //!
 //! Everything below is the September investigation, kept as written. Its
 //! "must stay ignored" rule predates CI's `--no-fail-fast`.
@@ -128,9 +129,8 @@ async fn open_one() -> LibSqlSubstrate {
 /// overlap anywhere, and the highest crash rate in the table — the row that
 /// refutes "overlapping teardowns".
 ///
-/// **The regression test for T-0040, so it is not ignored.** With the
-/// double close back (the `ClosedOnceConnection` fields swapped), it crashed
-/// 12/40 on Windows. A crash shows as this binary exiting `0xc0000005`, which
+/// **The regression test for T-0040, so it is not ignored.** On libsql 0.6.0
+/// it crashed 13/20 on Windows; on 0.10.0, 0/40. A crash shows as this binary exiting `0xc0000005`, which
 /// fails the run now that CI passes `--no-fail-fast` (the other binaries still
 /// run) and Windows gates. Linux and macOS never faulted on the double close,
 /// so there it only proves the teardown works.

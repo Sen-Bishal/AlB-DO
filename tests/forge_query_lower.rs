@@ -56,7 +56,7 @@ fn lowered(column: &str) -> (String, FieldType) {
 
 /// What Q1b's executor does with one equality argument, counting statements.
 struct Harness {
-    conn: dom_render_compiler::forge::libsql::ClosedOnceConnection,
+    conn: libsql::Connection,
     statements: usize,
 }
 
@@ -120,7 +120,7 @@ fn rust_ids(column: &str, bound: &SqlValue) -> Vec<i64> {
 async fn falsifier_3_rust_coercion_decides_what_reaches_sql() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = libsql::Builder::new_local(dir.path().join("f3.db")).build().await.expect("open");
-    let conn = dom_render_compiler::forge::libsql::ClosedOnceConnection::new(db.connect().expect("connect")).await.expect("connect");
+    let conn = db.connect().expect("connect");
     conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, n INTEGER, t TEXT)", ())
         .await
         .expect("table");

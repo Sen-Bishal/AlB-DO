@@ -106,7 +106,7 @@ async fn every_optional_mask_returns_exact_intersection_and_hostile_text_stays_b
         .build()
         .await
         .unwrap();
-    let conn = dom_render_compiler::forge::libsql::ClosedOnceConnection::new(db.connect().unwrap()).await.unwrap();
+    let conn = db.connect().unwrap();
     conn.execute("CREATE TABLE item_rows(item_key INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, label TEXT)", ()).await.unwrap();
     for bits in 0..8_i64 {
         conn.execute(

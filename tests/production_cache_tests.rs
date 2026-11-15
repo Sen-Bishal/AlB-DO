@@ -343,7 +343,10 @@ fn test_production_realistic_workflow() {
         step1_time.as_secs_f64() / step3_time.as_secs_f64()
     );
 
-    if let Some(stats) = compiler3.cache_stats() {
+    {
+        let stats = compiler3
+            .cache_stats()
+            .expect("a compiler built with a cache dir reports cache stats");
         let avg_warm_time = (step2_time + step3_time).as_secs_f64() / 2.0;
         let avg_speedup = step1_time.as_secs_f64() / avg_warm_time;
 
@@ -359,8 +362,16 @@ fn test_production_realistic_workflow() {
             stats.cache_hit_rate * 100.0
         );
 
-        assert!(step2_time < step1_time, "Warm starts should be faster");
-        assert!(step3_time < step1_time, "Subsequent runs should be faster");
+        // Reported, not asserted, for the same reason as above: one
+        // sub-millisecond sample per step measures the runner (15 Nov 2026,
+        // ubuntu-latest: cold 0.79 ms, warm 1.23 ms). The guarantee is that
+        // the third run is served from the cache the first one saved.
+        assert!(
+            stats.cache_hit_rate > 0.7,
+            "a warm workflow run should be served from the cache, got {:.1}%",
+            stats.cache_hit_rate * 100.0
+        );
+        assert_eq!(stats.total_cached, 8, "every production component stays cached");
 
         println!("\n  [OK] PASSED - Realistic workflow optimized");
     }
