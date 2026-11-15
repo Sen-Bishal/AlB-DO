@@ -6,9 +6,8 @@ use super::metadata::{
 };
 use super::schema::{
     AssetManifest, DataDep, DataSource, DomPosition, HtmlShell, HydrationMode, PartitionKeySource,
-    PartitionTopicSpec, RouteAuth, SourceTopicSpec, StaticRenderFailure,
-    RenderedNode, RouteActionEntry, RouteManifest, RouteMetadata, Tier, TierBNode, TierCNode,
-    WTStreamSlot,
+    PartitionTopicSpec, RenderedNode, RouteActionEntry, RouteAuth, RouteManifest, RouteMetadata,
+    SourceTopicSpec, StaticRenderFailure, Tier, TierBNode, TierCNode, WTStreamSlot,
 };
 use crate::effects::EffectProfile;
 use crate::graph::ComponentGraph;
@@ -22,12 +21,12 @@ use crate::runtime::compiled::{
 use crate::runtime::eval::ComponentProject;
 use crate::runtime::session::SessionId;
 use crate::runtime::slot_store::{SessionSlotView, SlotStore};
-use crate::transforms::column_reads::{column_key, column_reads, ColumnReads};
-use crate::transforms::form::allocate_form_action_id;
 use crate::runtime::webtransport::{
     WTRenderMode, WTStreamRouter, WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES,
     WT_STREAM_SLOT_PREFETCH, WT_STREAM_SLOT_SHELL,
 };
+use crate::transforms::column_reads::{column_key, column_reads, ColumnReads};
+use crate::transforms::form::allocate_form_action_id;
 use crate::types::{Component, ComponentId};
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -393,7 +392,10 @@ impl<'a> ManifestBuilder<'a> {
             shared_slot_sources,
             shared_slot_columns,
             action_ids,
-            layout_chain: layout_chain.iter().map(|layout| layout.name.clone()).collect(),
+            layout_chain: layout_chain
+                .iter()
+                .map(|layout| layout.name.clone())
+                .collect(),
             error_component,
             loading_component,
             metadata,
@@ -408,7 +410,10 @@ impl<'a> ManifestBuilder<'a> {
         if !route_needs_client_runtime(&manifest) {
             manifest.shell.shim_script.clear();
             manifest.shell.doctype_and_head =
-                manifest.shell.doctype_and_head.replacen(TIER_B_INJECT_BOOTSTRAP, "", 1);
+                manifest
+                    .shell
+                    .doctype_and_head
+                    .replacen(TIER_B_INJECT_BOOTSTRAP, "", 1);
         }
         manifest
     }
@@ -693,12 +698,11 @@ impl<'a> ManifestBuilder<'a> {
     /// platform-native (`manifest::mod` copies it straight into
     /// `ComponentManifestEntry.module_path`, and the renderer depends on that),
     /// so hashing it raw made the id vary by:
-    ///   * **checkout location** — the same tree at `A:\albedo` and
-    ///     `C:\Development\ALKMY\AlB-DO` produced different ids. This is what
-    ///     silently invalidated the `manifest_v2_test_app_components` golden when
-    ///     the repo moved.
-    ///   * **platform separators** — `\` on Windows vs `/` elsewhere, so the same
-    ///     commit hashed differently on a dev box and Linux CI.
+    ///   * **checkout location** — the same tree at `A:\albedo` and `C:\Development\ALKMY\AlB-DO`
+    ///     produced different ids. This is what silently invalidated the
+    ///     `manifest_v2_test_app_components` golden when the repo moved.
+    ///   * **platform separators** — `\` on Windows vs `/` elsewhere, so the same commit hashed
+    ///     differently on a dev box and Linux CI.
     ///
     /// Both are fixed here rather than papered over in the golden: an id that
     /// changes when nothing about the program changed cannot be used to key a
@@ -760,7 +764,10 @@ impl<'a> ManifestBuilder<'a> {
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments, reason = "private; one route's inputs, threaded once")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private; one route's inputs, threaded once"
+    )]
     fn build_shell(
         &self,
         route: &str,
@@ -1137,8 +1144,7 @@ impl<'a> ManifestBuilder<'a> {
                         kind: crate::manifest::schema::RenderFailureKind::LayoutWithoutChildren,
                         component: layout_name.clone(),
                         module_path: String::new(),
-                        error: "Add `<children />` where the route's content belongs."
-                            .to_string(),
+                        error: "Add `<children />` where the route's content belongs.".to_string(),
                     });
                 accumulated = format!("{layout_html}{accumulated}");
                 continue;
@@ -1290,7 +1296,10 @@ impl<'a> ManifestBuilder<'a> {
         map
     }
 
-    #[allow(clippy::too_many_arguments, reason = "private recursive walk; accumulators by reference")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private recursive walk; accumulators by reference"
+    )]
     fn traverse(
         &self,
         id: ComponentId,
@@ -1432,7 +1441,8 @@ impl<'a> ManifestBuilder<'a> {
         // Falls back to `None` + the existing fallback_html if the
         // compile path isn't available or render errors transiently.
         let (initial_html, initial_opcode_frame) = self
-            .render_tier_b_inline(component).map_or_else(|| (None, Vec::new()), |(html, bytes)| (Some(html), bytes));
+            .render_tier_b_inline(component)
+            .map_or_else(|| (None, Vec::new()), |(html, bytes)| (Some(html), bytes));
 
         let component_key = self.shared_name_key(component);
         TierBNode {
@@ -1693,7 +1703,8 @@ impl<'a> ManifestBuilder<'a> {
         render_tier_a_html(
             self.compiled_render_project.as_ref(),
             self.static_render_project.as_ref(),
-            self.resolve_component_path(component.file_path.as_str()).as_deref(),
+            self.resolve_component_path(component.file_path.as_str())
+                .as_deref(),
             component.file_path.as_str(),
             props,
         )
@@ -1917,7 +1928,9 @@ impl<'a> ManifestBuilder<'a> {
         let path = self
             .compiled_render_project
             .as_ref()
-            .and_then(|compiled| self.component_entry_for_project(component, compiled.root.as_path()))
+            .and_then(|compiled| {
+                self.component_entry_for_project(component, compiled.root.as_path())
+            })
             .unwrap_or_else(|| component.file_path.clone());
         crate::runtime::eval::core::island_module_path_key(&path)
     }
@@ -2390,10 +2403,14 @@ pub(crate) fn route_needs_client_runtime(route: &RouteManifest) -> bool {
         "data-albedo-tier",
     ];
     let shell = &route.shell;
-    [shell.doctype_and_head.as_str(), shell.body_open.as_str(), shell.body_close.as_str()]
-        .into_iter()
-        .chain(route.tier_a_root.iter().map(|node| node.html.as_str()))
-        .any(|html| CLIENT_MARKERS.iter().any(|marker| html.contains(marker)))
+    [
+        shell.doctype_and_head.as_str(),
+        shell.body_open.as_str(),
+        shell.body_close.as_str(),
+    ]
+    .into_iter()
+    .chain(route.tier_a_root.iter().map(|node| node.html.as_str()))
+    .any(|html| CLIENT_MARKERS.iter().any(|marker| html.contains(marker)))
 }
 
 fn default_shim_script(enable_wt_bootstrap: bool) -> String {
@@ -2599,8 +2616,7 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_shim_script, longest_common_dir_prefix, stream_slot_label,
-        TIER_B_INJECT_BOOTSTRAP,
+        default_shim_script, longest_common_dir_prefix, stream_slot_label, TIER_B_INJECT_BOOTSTRAP,
     };
     use crate::runtime::webtransport::{
         WT_STREAM_SLOT_CONTROL, WT_STREAM_SLOT_PATCHES, WT_STREAM_SLOT_PREFETCH,
@@ -2626,7 +2642,10 @@ mod tests {
     #[test]
     fn the_same_tree_at_a_different_location_reduces_identically() {
         let a = strip(&["/home/me/proj/src/App.tsx", "/home/me/proj/src/ui/Btn.tsx"]);
-        let b = strip(&["C:/Development/thing/src/App.tsx", "C:/Development/thing/src/ui/Btn.tsx"]);
+        let b = strip(&[
+            "C:/Development/thing/src/App.tsx",
+            "C:/Development/thing/src/ui/Btn.tsx",
+        ]);
         assert_eq!(a, b);
     }
 
@@ -2635,7 +2654,10 @@ mod tests {
     /// two different trees.
     #[test]
     fn common_prefix_cuts_at_a_directory_boundary_not_mid_segment() {
-        assert_eq!(strip(&["/tmp/ab/x.tsx", "/tmp/ac/y.tsx"]), vec!["ab/x.tsx", "ac/y.tsx"]);
+        assert_eq!(
+            strip(&["/tmp/ab/x.tsx", "/tmp/ac/y.tsx"]),
+            vec!["ab/x.tsx", "ac/y.tsx"]
+        );
     }
 
     #[test]
@@ -2798,8 +2820,7 @@ mod tests {
         );
 
         // A layout with no island lifts nothing — no spurious blocks.
-        let (empty_nodes, empty_map) =
-            builder.collect_layout_islands(&[], &mut order, &assets);
+        let (empty_nodes, empty_map) = builder.collect_layout_islands(&[], &mut order, &assets);
         assert!(empty_nodes.is_empty() && empty_map.is_empty());
     }
 

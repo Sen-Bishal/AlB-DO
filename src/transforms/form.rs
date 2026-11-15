@@ -137,10 +137,10 @@ pub const INTENT_MARKER_ATTR: &str = "data-albedo-intent";
 ///
 /// Per render is exactly the right granularity, and it falls out for free:
 ///
-/// * a no-JS resubmit (`F5` → *resend?*) replays this same hidden field, so the
-///   workflow **resumes** rather than starting a second one;
-/// * a second deliberate submit arrives from a fresh page render with a fresh
-///   token, so it is correctly a **new** intention;
+/// * a no-JS resubmit (`F5` → *resend?*) replays this same hidden field, so the workflow
+///   **resumes** rather than starting a second one;
+/// * a second deliberate submit arrives from a fresh page render with a fresh token, so it is
+///   correctly a **new** intention;
 /// * the client runtime reuses it across its own network retries.
 ///
 /// The author writes nothing. That is the difference between this and every
@@ -217,17 +217,15 @@ pub fn form_action_name(action_attr: &str) -> Option<&str> {
 ///
 /// ## The rule, and why each half of it
 ///
-/// - **POST only.** A GET form puts its fields in the URL, so a token emitted
-///   there would land in the history, the `Referer` and the access log — the
-///   leak the token exists to prevent. A GET form is also not a mutation, so
-///   there is nothing to forge.
-/// - **Same-origin only**, meaning an absent `action` (the browser resolves it
-///   to the current URL) or one that is a **rooted path**. 🔑 An absolute or
-///   protocol-relative `action` is refused *specifically* because emitting the
-///   token there would hand this session's CSRF token to a third-party origin on
-///   the next submit — a token-disclosure bug introduced by the very mechanism
-///   meant to stop forgery. `//evil.example` is a URL, not a path, which is why
-///   the `//` case is rejected rather than treated as rooted.
+/// - **POST only.** A GET form puts its fields in the URL, so a token emitted there would land in
+///   the history, the `Referer` and the access log — the leak the token exists to prevent. A GET
+///   form is also not a mutation, so there is nothing to forge.
+/// - **Same-origin only**, meaning an absent `action` (the browser resolves it to the current URL)
+///   or one that is a **rooted path**. 🔑 An absolute or protocol-relative `action` is refused
+///   *specifically* because emitting the token there would hand this session's CSRF token to a
+///   third-party origin on the next submit — a token-disclosure bug introduced by the very
+///   mechanism meant to stop forgery. `//evil.example` is a URL, not a path, which is why the `//`
+///   case is rejected rather than treated as rooted.
 ///
 /// Both renderers ask this one function, for the reason the "served-markup
 /// contract" section above exists: the CSRF input had two spellings once
@@ -490,7 +488,10 @@ pub const FEEDBACK_ENDPOINT_ROOT: &str = "/_albedo/auth";
 #[must_use]
 pub fn feedback_endpoint(action: &str) -> Option<&'static str> {
     let path = action.trim().split(['?', '#']).next().unwrap_or("");
-    FEEDBACK_ENDPOINTS.iter().copied().find(|endpoint| *endpoint == path)
+    FEEDBACK_ENDPOINTS
+        .iter()
+        .copied()
+        .find(|endpoint| *endpoint == path)
 }
 
 /// The id of the sink a refusal from `endpoint` is carried into.
@@ -503,7 +504,9 @@ pub fn allocate_endpoint_feedback_id(endpoint: &str) -> u32 {
 /// lands, so the sentence is on screen rather than below the fold.
 #[must_use]
 pub fn endpoint_feedback_anchor(endpoint: &str) -> String {
-    let rest = endpoint.strip_prefix(FEEDBACK_ENDPOINT_ROOT).unwrap_or(endpoint);
+    let rest = endpoint
+        .strip_prefix(FEEDBACK_ENDPOINT_ROOT)
+        .unwrap_or(endpoint);
     format!("albedo-feedback{}", rest.replace('/', "-"))
 }
 
@@ -548,9 +551,18 @@ mod endpoint_feedback_tests {
         let id = allocate_endpoint_feedback_id(endpoint);
         let html = format!("<form>{}</form>", endpoint_feedback_span(endpoint));
         let filled = fill_form_feedback(&html, &[(id, "Wrong <password>".to_string())]);
-        assert!(filled.contains(">Wrong &lt;password&gt;</span>"), "{filled}");
-        assert_eq!(endpoint_feedback_anchor(endpoint), "albedo-feedback-password-login");
-        assert!(filled.contains("id=\"albedo-feedback-password-login\""), "{filled}");
+        assert!(
+            filled.contains(">Wrong &lt;password&gt;</span>"),
+            "{filled}"
+        );
+        assert_eq!(
+            endpoint_feedback_anchor(endpoint),
+            "albedo-feedback-password-login"
+        );
+        assert!(
+            filled.contains("id=\"albedo-feedback-password-login\""),
+            "{filled}"
+        );
     }
 }
 
@@ -614,8 +626,12 @@ pub fn fill_form_feedback(html: &str, entries: &[(u32, String)]) -> String {
         }
         for marker in ["data-albedo-error", "data-albedo-ok"] {
             let head = format!("<span data-albedo-id=\"{id}\" {marker}");
-            let Some(start) = out.find(&head) else { continue };
-            let Some(tag_len) = out[start..].find('>') else { break };
+            let Some(start) = out.find(&head) else {
+                continue;
+            };
+            let Some(tag_len) = out[start..].find('>') else {
+                break;
+            };
             let body = start + tag_len + 1;
             if out[body..].starts_with("</span>") {
                 out.insert_str(body, &escape_attribute_value(text));
@@ -700,12 +716,11 @@ fn visit_expr_for_jsx(expr: &Expr, sink: &mut Vec<FormExtract>, in_list: bool) {
         // extractor at all — without it they were absent from `FormActionIds`
         // (so a tokenless submit was mis-phrased "action" not "form action") as
         // well as from the error-span manifest.
-        Expr::Call(call)
-            if is_list_map_call(call) => {
-                for arg in &call.args {
-                    visit_expr_for_jsx(&arg.expr, sink, true);
-                }
+        Expr::Call(call) if is_list_map_call(call) => {
+            for arg in &call.args {
+                visit_expr_for_jsx(&arg.expr, sink, true);
             }
+        }
         _ => {}
     }
 }
@@ -999,8 +1014,14 @@ mod contract_tests {
             Some("POST")
         ));
         // Case and surrounding space are the author's, not the rule's.
-        assert!(plain_form_needs_hidden_inputs(Some("/submit"), Some("post")));
-        assert!(plain_form_needs_hidden_inputs(Some(" /submit "), Some(" Post ")));
+        assert!(plain_form_needs_hidden_inputs(
+            Some("/submit"),
+            Some("post")
+        ));
+        assert!(plain_form_needs_hidden_inputs(
+            Some(" /submit "),
+            Some(" Post ")
+        ));
         // No action at all resolves to the current URL, which is same-origin.
         assert!(plain_form_needs_hidden_inputs(None, Some("post")));
         assert!(plain_form_needs_hidden_inputs(Some(""), Some("post")));
@@ -1027,7 +1048,10 @@ mod contract_tests {
             );
         }
         // GET, however same-origin.
-        assert!(!plain_form_needs_hidden_inputs(Some("/search"), Some("get")));
+        assert!(!plain_form_needs_hidden_inputs(
+            Some("/search"),
+            Some("get")
+        ));
         assert!(!plain_form_needs_hidden_inputs(Some("/search"), None));
     }
 
@@ -1043,9 +1067,7 @@ mod contract_tests {
     fn the_fused_prefix_is_exactly_its_parts() {
         assert_eq!(
             FORM_HIDDEN_INPUTS,
-            format!(
-                "{CSRF_PLACEHOLDER_INPUT}{RETURN_PLACEHOLDER_INPUT}{INTENT_PLACEHOLDER_INPUT}"
-            )
+            format!("{CSRF_PLACEHOLDER_INPUT}{RETURN_PLACEHOLDER_INPUT}{INTENT_PLACEHOLDER_INPUT}")
         );
     }
 
@@ -1067,7 +1089,10 @@ mod contract_tests {
         assert!(filled.contains(&format!("name=\"{CSRF_FIELD_NAME}\" value=\"tok\"")));
         assert!(filled.contains(&format!("name=\"{RETURN_FIELD_NAME}\" value=\"/mine\"")));
         assert!(filled.contains(&format!("name=\"{INTENT_FIELD_NAME}\" value=\"i-1\"")));
-        assert!(!filled.contains("value=\"\""), "nothing may stay empty: {filled}");
+        assert!(
+            !filled.contains("value=\"\""),
+            "nothing may stay empty: {filled}"
+        );
     }
 
     /// A query string is the common case and it is full of ampersands. Left
@@ -1182,10 +1207,7 @@ mod tests {
 
     fn parse_body(source: &str) -> Vec<Stmt> {
         let cm: Rc<SourceMap> = Rc::new(SourceMap::default());
-        let fm = cm.new_source_file(
-            FileName::Custom("t.jsx".into()).into(),
-            source.to_string(),
-        );
+        let fm = cm.new_source_file(FileName::Custom("t.jsx".into()).into(), source.to_string());
         let mut parser = Parser::new(
             Syntax::Es(EsSyntax {
                 jsx: true,
@@ -1343,13 +1365,22 @@ mod tests {
             ],
         );
         // The sink is filled, escaped; the unrelated node sharing the id is not.
-        assert!(out.contains("role=\"status\">You're &lt;in&gt;</span>"), "{out}");
-        assert!(out.starts_with(&format!("<p data-albedo-id=\"{ok_id}\">x</p>")), "{out}");
+        assert!(
+            out.contains("role=\"status\">You're &lt;in&gt;</span>"),
+            "{out}"
+        );
+        assert!(
+            out.starts_with(&format!("<p data-albedo-id=\"{ok_id}\">x</p>")),
+            "{out}"
+        );
         // An empty entry and an unknown id change nothing.
         assert!(out.contains("data-albedo-error=\"email\"></span>"), "{out}");
         assert!(!out.contains("nowhere"));
         // A sink that already has content is never written into.
-        assert_eq!(fill_form_feedback(&out, &[(ok_id, "twice".to_string())]), out);
+        assert_eq!(
+            fill_form_feedback(&out, &[(ok_id, "twice".to_string())]),
+            out
+        );
     }
 
     #[test]
@@ -1376,7 +1407,10 @@ mod tests {
         );
         let forms = extract_forms_in_function(&stmts);
         assert_eq!(forms.len(), 1);
-        assert!(!forms[0].in_list, "a form outside any .map() must not be in_list");
+        assert!(
+            !forms[0].in_list,
+            "a form outside any .map() must not be in_list"
+        );
     }
 
     /// The form-in-list-row case. Before this, `.map()` was not descended at

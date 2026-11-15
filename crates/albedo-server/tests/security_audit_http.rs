@@ -6,9 +6,8 @@
 //! positive control beside every refusal so a dead lane or a broken action
 //! cannot pass for a fix.
 //!
-//! - **ALB-01** · a public route's live lane carried the rows of a collection
-//!   only an `auth = "required"` route reads (every route was granted every
-//!   topic).
+//! - **ALB-01** · a public route's live lane carried the rows of a collection only an `auth =
+//!   "required"` route reads (every route was granted every topic).
 //! - **ALB-02** · any visitor could remove any row of a collection that is not
 //!   identity-partitioned.
 //! - **ALB-03** · a stored `javascript:` URL rendered into an `href` verbatim.
@@ -58,7 +57,11 @@ fn output(cmd: &mut Command, what: &str) -> (Output, String) {
 
 fn run_ok(cmd: &mut Command, what: &str) -> String {
     let (out, text) = output(cmd, what);
-    assert!(out.status.success(), "{what} failed ({:?})\n{text}", out.status.code());
+    assert!(
+        out.status.success(),
+        "{what} failed ({:?})\n{text}",
+        out.status.code()
+    );
     text
 }
 
@@ -127,7 +130,10 @@ export default function Links() {
 fn project() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     let home = tempfile::tempdir().expect("temp home");
     let work = tempfile::tempdir().expect("temp workdir");
-    run_ok(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     let app = work.path().join("app");
 
     let config_path = app.join("albedo.config.ts");
@@ -136,7 +142,10 @@ fn project() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
         "forge: {{\n    staff_notes: {{ fields: {{ note: \"text\" }}, seed: [{{ note: \"{SECRET}\" }}] }},\n    \
          notices: {{ fields: {{ body: \"text\" }}, seed: [{{ body: \"{NOTICE}\" }}] }},\n"
     );
-    assert!(config.contains("forge: {"), "the starter config declares a forge block");
+    assert!(
+        config.contains("forge: {"),
+        "the starter config declares a forge block"
+    );
     fs::write(&config_path, config.replacen("forge: {", &collections, 1)).expect("config");
 
     write(&app, "src/routes/staff.tsx", STAFF);
@@ -161,8 +170,14 @@ async fn serve(home: &Path, app: &Path) -> (Server, String) {
     let server = Server { child };
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_err() {
-        assert!(Instant::now() < deadline, "albedo serve never answered on {base}");
+    while reqwest::get(format!("{base}/_albedo/runtime.js"))
+        .await
+        .is_err()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "albedo serve never answered on {base}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     (server, base)
@@ -203,7 +218,9 @@ async fn lane_bytes(base: &str, page: &str) -> Vec<u8> {
 }
 
 fn carries(bytes: &[u8], marker: &str) -> bool {
-    bytes.windows(marker.len()).any(|window| window == marker.as_bytes())
+    bytes
+        .windows(marker.len())
+        .any(|window| window == marker.as_bytes())
 }
 
 /// What a browser holds after loading `/links`: its tab cookie and the hidden
@@ -248,7 +265,13 @@ async fn arrive(base: &str) -> Visitor {
     }
 }
 
-async fn act(base: &str, visitor: &Visitor, cookie: &str, action: &str, fields: &[(&str, &str)]) -> StatusCode {
+async fn act(
+    base: &str,
+    visitor: &Visitor,
+    cookie: &str,
+    action: &str,
+    fields: &[(&str, &str)],
+) -> StatusCode {
     let mut form = vec![
         ("_csrf", visitor.csrf.as_str()),
         ("_albedo_return", visitor.return_path.as_str()),
@@ -289,7 +312,10 @@ fn row_id(html: &str, message: &str) -> Option<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_audits_live_findings_stay_fixed() {
     let (home, _work, app) = project();
-    run_ok(albedo(home.path(), &app).args(["build", "."]), "albedo build");
+    run_ok(
+        albedo(home.path(), &app).args(["build", "."]),
+        "albedo build",
+    );
     let (_server, base) = serve(home.path(), &app).await;
 
     // ── ALB-01 · a public lane carries only its own route's topics ─────────
@@ -312,26 +338,57 @@ async fn the_audits_live_findings_stay_fixed() {
 
     // ── ALB-03 · a stored script URL never reaches an href ─────────────────
     let alice = arrive(&base).await;
-    act(&base, &alice, &alice.cookie, "add_link", &[
-        ("author", " JaVa\tScRiPt:alert(document.cookie)"),
-        ("message", "HOSTILE-ROW"),
-    ])
+    act(
+        &base,
+        &alice,
+        &alice.cookie,
+        "add_link",
+        &[
+            ("author", " JaVa\tScRiPt:alert(document.cookie)"),
+            ("message", "HOSTILE-ROW"),
+        ],
+    )
     .await;
-    act(&base, &alice, &alice.cookie, "add_link", &[
-        ("author", "https://alice.example/"),
-        ("message", "ALICE-ROW"),
-    ])
+    act(
+        &base,
+        &alice,
+        &alice.cookie,
+        "add_link",
+        &[
+            ("author", "https://alice.example/"),
+            ("message", "ALICE-ROW"),
+        ],
+    )
     .await;
     let page = links_page(&base).await;
-    assert!(page.contains(":HOSTILE-ROW<"), "control: the row was written\n{page}");
-    assert!(!page.contains("alert(document.cookie)"), "the payload reached the page\n{page}");
-    assert!(page.contains("ALBEDO blocked a javascript: URL"), "replaced, not dropped\n{page}");
-    assert!(page.contains(r#"href="https://alice.example/""#), "an ordinary URL is untouched");
+    assert!(
+        page.contains(":HOSTILE-ROW<"),
+        "control: the row was written\n{page}"
+    );
+    assert!(
+        !page.contains("alert(document.cookie)"),
+        "the payload reached the page\n{page}"
+    );
+    assert!(
+        page.contains("ALBEDO blocked a javascript: URL"),
+        "replaced, not dropped\n{page}"
+    );
+    assert!(
+        page.contains(r#"href="https://alice.example/""#),
+        "an ordinary URL is untouched"
+    );
 
     // ── ALB-02 · a stranger cannot remove someone else's row ───────────────
     let alice_row = row_id(&page, "ALICE-ROW").expect("alice's row id is on the page");
     let mallory = arrive(&base).await;
-    let refused = act(&base, &mallory, &mallory.cookie, "drop_link", &[("id", &alice_row)]).await;
+    let refused = act(
+        &base,
+        &mallory,
+        &mallory.cookie,
+        "drop_link",
+        &[("id", &alice_row)],
+    )
+    .await;
     assert!(
         links_page(&base).await.contains(":ALICE-ROW<"),
         "a stranger removed another visitor's row (status {refused})"
@@ -352,16 +409,30 @@ async fn the_audits_live_findings_stay_fixed() {
         .send()
         .await
         .expect("register answers");
-    let session = cookie_named(&registered, "__Host-albedo_session=").expect("registering signs in");
+    let session =
+        cookie_named(&registered, "__Host-albedo_session=").expect("registering signs in");
     let signed_in = format!("{}; {session}", author.cookie);
-    act(&base, &author, &signed_in, "add_link", &[
-        ("author", "https://author.example/"),
-        ("message", "OWNED-ROW"),
-    ])
+    act(
+        &base,
+        &author,
+        &signed_in,
+        "add_link",
+        &[
+            ("author", "https://author.example/"),
+            ("message", "OWNED-ROW"),
+        ],
+    )
     .await;
     let page = links_page(&base).await;
     let owned = row_id(&page, "OWNED-ROW").expect("the author's row id is on the page");
-    let refused = act(&base, &author, &signed_in, "drop_link", &[("id", &alice_row)]).await;
+    let refused = act(
+        &base,
+        &author,
+        &signed_in,
+        "drop_link",
+        &[("id", &alice_row)],
+    )
+    .await;
     assert!(
         links_page(&base).await.contains(":ALICE-ROW<"),
         "a signed-in stranger removed an anonymous row (status {refused})"
@@ -387,8 +458,14 @@ fn ship_never_packs_a_secret() {
         albedo(home.path(), &app).args(["ship", ".", "--target", "binary"]),
         "albedo ship (refused)",
     );
-    assert!(!out.status.success(), "a key in public/ must stop the ship:\n{text}");
-    assert!(text.contains("public/.env"), "the refusal names the file:\n{text}");
+    assert!(
+        !out.status.success(),
+        "a key in public/ must stop the ship:\n{text}"
+    );
+    assert!(
+        text.contains("public/.env"),
+        "the refusal names the file:\n{text}"
+    );
     fs::remove_file(app.join("public/.env")).unwrap();
 
     // The root .env is where it belongs, and it stays there.
@@ -407,7 +484,9 @@ fn ship_never_packs_a_secret() {
         .unwrap_or_else(|| panic!("ship wrote no binary:\n{text}"));
     let bytes = fs::read(&binary).unwrap();
     assert!(
-        !bytes.windows(KEY.len()).any(|window| window == KEY.as_bytes()),
+        !bytes
+            .windows(KEY.len())
+            .any(|window| window == KEY.as_bytes()),
         "the shipped binary carries the .env key in plain text"
     );
 }
@@ -422,7 +501,10 @@ fn ship_never_packs_a_secret() {
 fn each_route_is_granted_exactly_the_topics_it_renders() {
     let home = tempfile::tempdir().expect("temp home");
     let work = tempfile::tempdir().expect("temp workdir");
-    run_ok(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     let app = work.path().join("app");
 
     let config_path = app.join("albedo.config.ts");
@@ -458,7 +540,10 @@ fn each_route_is_granted_exactly_the_topics_it_renders() {
     );
     let layout_path = app.join("src/routes/layout.tsx");
     let layout = fs::read_to_string(&layout_path).expect("layout");
-    assert!(layout.contains("<children />"), "the starter layout has a children slot");
+    assert!(
+        layout.contains("<children />"),
+        "the starter layout has a children slot"
+    );
     fs::write(
         &layout_path,
         format!(
@@ -468,7 +553,10 @@ fn each_route_is_granted_exactly_the_topics_it_renders() {
     )
     .expect("layout");
 
-    run_ok(albedo(home.path(), &app).args(["build", "."]), "albedo build");
+    run_ok(
+        albedo(home.path(), &app).args(["build", "."]),
+        "albedo build",
+    );
     let manifest: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(app.join(".albedo/dist/render-manifest.v2.json")).expect("manifest"),
     )
@@ -489,7 +577,11 @@ fn each_route_is_granted_exactly_the_topics_it_renders() {
         serde_json::from_value(entry["shared_slot_topics"].clone()).expect("a topic list")
     };
 
-    assert_eq!(topics("/"), vec!["alerts"], "the layout's reader, and nothing a sibling page reads");
+    assert_eq!(
+        topics("/"),
+        vec!["alerts"],
+        "the layout's reader, and nothing a sibling page reads"
+    );
     assert_eq!(topics("/guestbook"), vec!["alerts", "guestbook"]);
     assert_eq!(
         topics("/nested"),
@@ -582,7 +674,10 @@ async fn read_for(response: &mut reqwest::Response, window: Duration) -> (usize,
 async fn a_lane_carries_only_the_columns_its_page_renders() {
     let home = tempfile::tempdir().expect("temp home");
     let work = tempfile::tempdir().expect("temp workdir");
-    run_ok(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     let app = work.path().join("app");
     let config_path = app.join("albedo.config.ts");
     let config = fs::read_to_string(&config_path).expect("config");
@@ -601,7 +696,10 @@ async fn a_lane_carries_only_the_columns_its_page_renders() {
     write(&app, "src/routes/count.tsx", COUNT);
     write(&app, "src/routes/names.tsx", NAMES);
     write(&app, "src/routes/admin.tsx", ADMIN);
-    run_ok(albedo(home.path(), &app).args(["build", "."]), "albedo build");
+    run_ok(
+        albedo(home.path(), &app).args(["build", "."]),
+        "albedo build",
+    );
     let (_server, base) = serve(home.path(), &app).await;
 
     // ── the seed ──
@@ -610,10 +708,22 @@ async fn a_lane_carries_only_the_columns_its_page_renders() {
     let (count_frames, count_seed) = read_for(&mut count, Duration::from_millis(800)).await;
     let (_, names_seed) = read_for(&mut names, Duration::from_millis(800)).await;
     assert!(count_frames > 0, "control: /count's lane seeds");
-    assert!(carries(&names_seed, "Ada"), "control: /names is sent the names it renders");
-    assert!(!carries(&names_seed, PRIVATE_EMAIL), "/names was sent an email it never renders");
-    assert!(!carries(&count_seed, PRIVATE_EMAIL), "/count was sent an email it never renders");
-    assert!(!carries(&count_seed, "Ada"), "/count renders a number, not names");
+    assert!(
+        carries(&names_seed, "Ada"),
+        "control: /names is sent the names it renders"
+    );
+    assert!(
+        !carries(&names_seed, PRIVATE_EMAIL),
+        "/names was sent an email it never renders"
+    );
+    assert!(
+        !carries(&count_seed, PRIVATE_EMAIL),
+        "/count was sent an email it never renders"
+    );
+    assert!(
+        !carries(&count_seed, "Ada"),
+        "/count renders a number, not names"
+    );
 
     // The pages themselves never carried it either.
     for page in ["/count", "/names"] {
@@ -625,7 +735,10 @@ async fn a_lane_carries_only_the_columns_its_page_renders() {
             .text()
             .await
             .expect("html");
-        assert!(!html.contains(PRIVATE_EMAIL), "{page}'s HTML carries an email");
+        assert!(
+            !html.contains(PRIVATE_EMAIL),
+            "{page}'s HTML carries an email"
+        );
     }
 
     // ── a later write ──
@@ -640,22 +753,43 @@ async fn a_lane_carries_only_the_columns_its_page_renders() {
         .post(format!("{base}/_albedo/action/join"))
         .header("cookie", &cookie)
         .form(&[
-            ("_csrf", hidden_field(&html, "_csrf").expect("csrf").as_str()),
-            ("_albedo_return", hidden_field(&html, "_albedo_return").expect("return").as_str()),
+            (
+                "_csrf",
+                hidden_field(&html, "_csrf").expect("csrf").as_str(),
+            ),
+            (
+                "_albedo_return",
+                hidden_field(&html, "_albedo_return")
+                    .expect("return")
+                    .as_str(),
+            ),
             ("name", "Eve"),
             ("email", "eve-private@probe.test"),
         ])
         .send()
         .await
         .expect("join answers");
-    assert!(joined.status().is_redirection() || joined.status().is_success(), "join: {}", joined.status());
+    assert!(
+        joined.status().is_redirection() || joined.status().is_success(),
+        "join: {}",
+        joined.status()
+    );
 
     let (count_after, count_live) = read_for(&mut count, Duration::from_millis(1500)).await;
     let (_, names_live) = read_for(&mut names, Duration::from_millis(1500)).await;
     assert!(count_after > 0, "control: the write reached /count's lane");
-    assert!(carries(&names_live, "Eve"), "control: the write reached /names with the new name");
-    assert!(!carries(&names_live, "eve-private"), "/names was sent the new email");
-    assert!(!carries(&count_live, "eve-private"), "/count was sent the new email");
+    assert!(
+        carries(&names_live, "Eve"),
+        "control: the write reached /names with the new name"
+    );
+    assert!(
+        !carries(&names_live, "eve-private"),
+        "/names was sent the new email"
+    );
+    assert!(
+        !carries(&count_live, "eve-private"),
+        "/count was sent the new email"
+    );
     assert!(!carries(&count_live, "Eve"), "/count was sent the new name");
 }
 
@@ -744,7 +878,12 @@ async fn phosphor_as(base: &str, page: &str, cookie: &str) -> (Vec<String>, Vec<
         .unwrap_or_else(|err| panic!("subscribe JSON ({err}): {outcome}"));
     let denied = outcome["denied"]
         .as_array()
-        .map(|items| items.iter().filter_map(|p| p.as_str().map(str::to_string)).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|p| p.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut text = String::new();
@@ -754,8 +893,12 @@ async fn phosphor_as(base: &str, page: &str, cookie: &str) -> (Vec<String>, Vec<
     }
     let mut frames = Vec::new();
     for line in text.lines() {
-        let Some(data) = line.strip_prefix("data:") else { continue };
-        let Ok(envelope) = serde_json::from_str::<serde_json::Value>(data.trim()) else { continue };
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(envelope) = serde_json::from_str::<serde_json::Value>(data.trim()) else {
+            continue;
+        };
         if let Some(frame) = envelope["f"].as_str() {
             if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(frame) {
                 frames.extend(decoded);
@@ -819,7 +962,10 @@ async fn a_middleware_refusal_also_closes_the_live_lanes() {
     .expect("config");
     write(&app, "src/middleware.ts", ROLE_MIDDLEWARE);
     write(&app, "src/routes/payroll.tsx", PAYROLL_PAGE);
-    run_ok(albedo(home.path(), &app).args(["build", "."]), "albedo build");
+    run_ok(
+        albedo(home.path(), &app).args(["build", "."]),
+        "albedo build",
+    );
     let (_server, base) = serve(home.path(), &app).await;
 
     let admin = signed_in_as(&base, ADMIN_EMAIL).await;
@@ -827,7 +973,11 @@ async fn a_middleware_refusal_also_closes_the_live_lanes() {
 
     // The page itself: refused to staff, served to the admin.
     let (status, _) = payroll_page(&base, &staff).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "control: the middleware refuses staff the page");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "control: the middleware refuses staff the page"
+    );
     let (status, html) = payroll_page(&base, &admin).await;
     assert_eq!(status, StatusCode::OK, "control: the admin gets the page");
     assert!(html.contains(PAYROLL), "control: the page renders the row");
@@ -844,15 +994,34 @@ async fn a_middleware_refusal_also_closes_the_live_lanes() {
 
     // The PHOSPHOR lane.
     let (denied, frames) = phosphor_as(&base, "/payroll", &admin).await;
-    assert!(denied.is_empty(), "control: the admin's subscribe is granted ({denied:?})");
-    assert!(carries(&frames, PAYROLL), "control: the admin's trunk is seeded with payroll");
+    assert!(
+        denied.is_empty(),
+        "control: the admin's subscribe is granted ({denied:?})"
+    );
+    assert!(
+        carries(&frames, PAYROLL),
+        "control: the admin's trunk is seeded with payroll"
+    );
     let (denied, frames) = phosphor_as(&base, "/payroll", &staff).await;
-    assert_eq!(denied, vec!["/payroll".to_string()], "staff's subscribe to /payroll is denied");
-    assert!(!carries(&frames, PAYROLL), "staff's trunk carried payroll the middleware refused them");
+    assert_eq!(
+        denied,
+        vec!["/payroll".to_string()],
+        "staff's subscribe to /payroll is denied"
+    );
+    assert!(
+        !carries(&frames, PAYROLL),
+        "staff's trunk carried payroll the middleware refused them"
+    );
 
     // A public route stays live for staff: the gate refuses a page, it does
     // not switch the lanes off.
     let (denied, frames) = phosphor_as(&base, "/notices", &staff).await;
-    assert!(denied.is_empty(), "control: staff may subscribe to /notices ({denied:?})");
-    assert!(carries(&frames, NOTICE), "control: staff's /notices trunk is seeded");
+    assert!(
+        denied.is_empty(),
+        "control: staff may subscribe to /notices ({denied:?})"
+    );
+    assert!(
+        carries(&frames, NOTICE),
+        "control: staff's /notices trunk is seeded"
+    );
 }

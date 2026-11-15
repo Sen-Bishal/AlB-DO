@@ -100,9 +100,9 @@ pub fn scope_module_css(module_id: &str, css_source: &str) -> ScopedCssModule {
         // `{...}` and are handled by the `depth > 0` early-out.
         if depth == 0 && ch == b'.' && is_ident_start(bytes.get(i + 1).copied()) {
             let (name, end) = read_identifier(bytes, i + 1);
-            class_map.entry(name.clone()).or_insert_with(|| {
-                format!("{name}_{hash}")
-            });
+            class_map
+                .entry(name.clone())
+                .or_insert_with(|| format!("{name}_{hash}"));
             scoped_css.push('.');
             scoped_css.push_str(&name);
             scoped_css.push('_');

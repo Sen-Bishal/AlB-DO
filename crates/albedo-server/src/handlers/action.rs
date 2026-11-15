@@ -12,12 +12,11 @@
 //! click, and input alike. The token reaches the server by one of two
 //! channels:
 //!
-//! * the [`CSRF_HEADER`] request header, which the client runtime
-//!   attaches to every action POST. This is the only channel click and
-//!   input actions have: their bincode payload carries no field for a
-//!   token, but a header rides alongside any body.
-//! * the `_csrf` field of a form submit's JSON payload — the hidden
-//!   input the renderers stamp and the streaming handler fills.
+//! * the [`CSRF_HEADER`] request header, which the client runtime attaches to every action POST.
+//!   This is the only channel click and input actions have: their bincode payload carries no field
+//!   for a token, but a header rides alongside any body.
+//! * the `_csrf` field of a form submit's JSON payload — the hidden input the renderers stamp and
+//!   the streaming handler fills.
 //!
 //! The header is consulted first; a form without it falls back to its
 //! payload field. Whichever channel supplies the token, it is validated
@@ -92,10 +91,8 @@ pub type FormActionIds = std::collections::HashSet<u32>;
 /// R1a · each id maps to the gate of **every** route that declares it, and a
 /// caller must satisfy all of them — the same restrictive rule, extended from
 /// "any declaring route requires a principal" to "every declaring route's roles".
-pub type GatedActionIds = std::collections::HashMap<
-    u32,
-    Vec<dom_render_compiler::manifest::schema::RouteAuth>,
->;
+pub type GatedActionIds =
+    std::collections::HashMap<u32, Vec<dom_render_compiler::manifest::schema::RouteAuth>>;
 
 /// Request header carrying the per-session CSRF token on every action
 /// POST. The client runtime reads the token from
@@ -123,7 +120,10 @@ pub const CSRF_HEADER: &str = "x-albedo-csrf";
 /// The success response is `200` with
 /// `content-type: application/octet-stream`; bakabox's client
 /// dispatcher feeds the bytes straight into `applyFrameBytes`.
-#[allow(clippy::too_many_arguments, reason = "the HTTP door's inputs, passed through once")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the HTTP door's inputs, passed through once"
+)]
 pub async fn run_action_request(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,
@@ -189,7 +189,10 @@ pub async fn run_action_request(
 /// so the JS path could migrate onto this URL without changing what it does with
 /// the answer. Everything else gets the redirect, because everything else is a
 /// browser. See [`crate::forms::negotiate`].
-#[allow(clippy::too_many_arguments, reason = "the form door's inputs, passed through once")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the form door's inputs, passed through once"
+)]
 pub async fn run_form_action_request(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,
@@ -243,7 +246,9 @@ pub async fn run_form_action_request(
         // `return { redirect }` — the browser is sent where the action said,
         // already checked against `redirects` by the action adapter. The
         // no-JS answer to a `Navigate` is the `303` a browser follows itself.
-        Ok(instructions) if wants == Wants::Redirect && navigate_target(&instructions).is_some() => {
+        Ok(instructions)
+            if wants == Wants::Redirect && navigate_target(&instructions).is_some() =>
+        {
             let url = navigate_target(&instructions).unwrap_or_default();
             Response::builder()
                 .status(StatusCode::SEE_OTHER)
@@ -269,10 +274,13 @@ pub async fn run_form_action_request(
             // it lands on at the form, not at the top of the page.
             Wants::Redirect => match FormFeedback::from_frame(&return_path, &instructions) {
                 Some(feedback) => {
-                    let anchor = dom_render_compiler::transforms::form::form_feedback_anchor(action_name);
+                    let anchor =
+                        dom_render_compiler::transforms::form::form_feedback_anchor(action_name);
                     let mut response = see_other(&return_path.at_anchor(&anchor));
                     if let Ok(cookie) = axum::http::HeaderValue::from_str(&feedback.set_cookie()) {
-                        response.headers_mut().append(axum::http::header::SET_COOKIE, cookie);
+                        response
+                            .headers_mut()
+                            .append(axum::http::header::SET_COOKIE, cookie);
                     }
                     response
                 }
@@ -286,10 +294,13 @@ pub async fn run_form_action_request(
 /// Where an action's `Navigate` sends the browser, if it emitted one — the last,
 /// as the client applies them in order and the last one wins.
 fn navigate_target(instructions: &[dom_render_compiler::ir::opcode::Instruction]) -> Option<&str> {
-    instructions.iter().rev().find_map(|instruction| match instruction {
-        dom_render_compiler::ir::opcode::Instruction::Navigate { url } => Some(url.as_str()),
-        _ => None,
-    })
+    instructions
+        .iter()
+        .rev()
+        .find_map(|instruction| match instruction {
+            dom_render_compiler::ir::opcode::Instruction::Navigate { url } => Some(url.as_str()),
+            _ => None,
+        })
 }
 
 /// `ActionEventKind::Submit` — mirrored from
@@ -304,8 +315,14 @@ const SUBMIT_EVENT_KIND: u8 = 2;
 /// Splitting it out this way is what keeps the CSRF rule *one* rule: when the
 /// no-JS path arrived it inherited the gate rather than growing its own, so
 /// there is no second place where a token could be treated as optional.
-#[allow(clippy::too_many_arguments, reason = "the one dispatch both doors share")]
-#[allow(clippy::result_large_err, reason = "Err is the HTTP response itself, returned early")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the one dispatch both doors share"
+)]
+#[allow(
+    clippy::result_large_err,
+    reason = "Err is the HTTP response itself, returned early"
+)]
 async fn dispatch_action(
     registry: &ActionRegistry,
     csrf: &CsrfRegistry,
@@ -409,7 +426,10 @@ async fn dispatch_action(
         // missing, whichever declaring route happens to be consulted first.
         let (anonymous, forbidden) = gates.iter().fold((false, false), |(a, f), gate| {
             let admission = gate.admits(held);
-            (a || admission == Admission::Anonymous, f || admission == Admission::Forbidden)
+            (
+                a || admission == Admission::Anonymous,
+                f || admission == Admission::Forbidden,
+            )
         });
         if anonymous {
             warn!(
@@ -526,10 +546,10 @@ fn error_response(status: StatusCode, message: String) -> Response<Body> {
 /// Try to read a `_csrf` string field out of a JSON-encoded payload.
 ///
 /// Returns:
-///   * `Some(token)` when the payload parses as a JSON object that
-///     carries a string-valued `_csrf` field.
-///   * `None` when the payload is not JSON, is JSON but not an
-///     object, or is an object that doesn't carry `_csrf`.
+///   * `Some(token)` when the payload parses as a JSON object that carries a string-valued `_csrf`
+///     field.
+///   * `None` when the payload is not JSON, is JSON but not an object, or is an object that doesn't
+///     carry `_csrf`.
 ///
 /// `None` means "no token was presented" and nothing more. It used to
 /// double as "so this isn't a form action, skip the check", which made
@@ -583,7 +603,8 @@ mod tests {
     /// way (see `normalize_headers`).
     fn ctx_with_csrf_header(token: &str) -> RequestContext {
         let mut ctx = ctx();
-        ctx.headers.insert(CSRF_HEADER.to_string(), token.to_string());
+        ctx.headers
+            .insert(CSRF_HEADER.to_string(), token.to_string());
         ctx
     }
 
@@ -618,7 +639,12 @@ mod tests {
     /// The `action_id`s of routes declared `auth = "required"`.
     fn gated_actions(ids: &[u32]) -> GatedActionIds {
         ids.iter()
-            .map(|id| (*id, vec![dom_render_compiler::manifest::schema::RouteAuth::Required]))
+            .map(|id| {
+                (
+                    *id,
+                    vec![dom_render_compiler::manifest::schema::RouteAuth::Required],
+                )
+            })
             .collect()
     }
 
@@ -693,7 +719,10 @@ mod tests {
         assert_eq!(consumed, bytes.len());
         assert!(matches!(
             frame.instructions[0],
-            Instruction::Create { stable_id: StableId(42), .. }
+            Instruction::Create {
+                stable_id: StableId(42),
+                ..
+            }
         ));
     }
 
@@ -1319,7 +1348,10 @@ mod tests {
             .expect("the feedback rides a cookie")
             .to_str()
             .unwrap();
-        assert!(cookie.starts_with(crate::forms::FEEDBACK_COOKIE), "{cookie}");
+        assert!(
+            cookie.starts_with(crate::forms::FEEDBACK_COOKIE),
+            "{cookie}"
+        );
         assert!(cookie.contains("You%27re+on+the+list."), "{cookie}");
     }
 
@@ -1603,7 +1635,8 @@ mod tests {
     async fn an_ungated_action_still_dispatches_anonymously() {
         let csrf_registry = CsrfRegistry::new();
         let (ctx, slots) = authed(&csrf_registry);
-        let registry = echoing_registry("public_write", Arc::new(std::sync::Mutex::new(Vec::new())));
+        let registry =
+            echoing_registry("public_write", Arc::new(std::sync::Mutex::new(Vec::new())));
         let id = allocate_form_action_id("public_write");
 
         let response = run_action_request(

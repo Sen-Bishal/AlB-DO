@@ -17,9 +17,10 @@
 //! - **The provider name already belongs in the URL.** `auth::declare` says so — a provider name is
 //!   validated against the path-segment alphabet precisely because it appears here.
 //! - **A credential attempt is its own rate-limit class.** `OperationClass::Credential` and
-//!   SHUTTER's two-bucket [`credential_attempt`](dom_render_compiler::shutter::Shutter::credential_attempt)
-//!   exist for exactly this path; reaching them from inside the generic action dispatcher would mean
-//!   a special case in the one place that must not have any.
+//!   SHUTTER's two-bucket
+//!   [`credential_attempt`](dom_render_compiler::shutter::Shutter::credential_attempt) exist for
+//!   exactly this path; reaching them from inside the generic action dispatcher would mean a
+//!   special case in the one place that must not have any.
 //!
 //! ## They still ride the general form seam
 //!
@@ -84,7 +85,11 @@ pub(crate) async fn hash_password_off_runtime(password: &str) -> Result<String, 
     let password = password.to_owned();
     run_kdf(move || hash_password(&password))
         .await
-        .unwrap_or_else(|| Err(PasswordError::Kdf("the hashing task did not finish".to_string())))
+        .unwrap_or_else(|| {
+            Err(PasswordError::Kdf(
+                "the hashing task did not finish".to_string(),
+            ))
+        })
 }
 
 /// [`verify_password`] off the async workers. A task that dies verifies nothing.
@@ -228,7 +233,11 @@ pub async fn run_auth_route(route: AuthRoute, request: AuthRequest<'_>) -> Respo
         Ok(form) => form,
         Err(err) => {
             warn!(target: "albedo.auth", %err, "rejecting malformed auth submit");
-            return refusal(StatusCode::BAD_REQUEST, &err.to_string(), &ReturnPath::root());
+            return refusal(
+                StatusCode::BAD_REQUEST,
+                &err.to_string(),
+                &ReturnPath::root(),
+            );
         }
     };
     let back = form.return_path();
@@ -297,9 +306,13 @@ async fn unlink(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) -
             back,
         );
     };
-    let outcome =
-        store::unlink_account(request.auth.substrate().as_ref(), &principal.id, provider, token)
-            .await;
+    let outcome = store::unlink_account(
+        request.auth.substrate().as_ref(),
+        &principal.id,
+        provider,
+        token,
+    )
+    .await;
     match outcome {
         Ok(UnlinkOutcome::Unlinked {
             sessions_ended,
@@ -344,11 +357,7 @@ fn declares(auth: &AuthRuntime, kind: ProviderKind) -> Option<&ResolvedProvider>
 }
 
 /// `POST /_albedo/auth/password/register`.
-async fn register(
-    request: &AuthRequest<'_>,
-    form: &FormBody,
-    back: &ReturnPath,
-) -> Response<Body> {
+async fn register(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) -> Response<Body> {
     let Some(declared) = declares(request.auth, ProviderKind::Password) else {
         return refusal(
             StatusCode::NOT_FOUND,
@@ -504,7 +513,8 @@ async fn login(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) ->
         return crate::shutter::too_many_requests(&verdict);
     }
 
-    let found = store::lookup_credential(request.auth.substrate().as_ref(), &provider, &email).await;
+    let found =
+        store::lookup_credential(request.auth.substrate().as_ref(), &provider, &email).await;
     let credential = match found {
         Ok(Some(credential)) => credential,
         Ok(None) => {
@@ -539,7 +549,13 @@ async fn login(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) ->
     if declared.verify_email
         && !email_routes::is_verified(request.auth, &credential.principal, &email).await
     {
-        return email_routes::unverified_login(request, declared, credential.principal, email, back);
+        return email_routes::unverified_login(
+            request,
+            declared,
+            credential.principal,
+            email,
+            back,
+        );
     }
 
     debug!(
@@ -659,7 +675,10 @@ pub(crate) async fn open_session(
         .unwrap_or_else(|| back.clone());
     let mut response = see_other(&back);
     set_cookie(&mut response, &request.auth.set_cookie(&token));
-    set_cookie(&mut response, &crate::handlers::auth_gate::forget_destination());
+    set_cookie(
+        &mut response,
+        &crate::handlers::auth_gate::forget_destination(),
+    );
     response
 }
 
@@ -674,10 +693,12 @@ pub(crate) async fn open_session(
 fn set_cookie(response: &mut Response<Body>, value: &str) {
     if let Ok(header) = value.parse() {
         response.headers_mut().append(header::SET_COOKIE, header);
-    } else { warn!(
-        target: "albedo.auth",
-        "could not build the session cookie header; sign-in will not persist"
-    ); }
+    } else {
+        warn!(
+            target: "albedo.auth",
+            "could not build the session cookie header; sign-in will not persist"
+        );
+    }
 }
 
 /// A refusal a browser can read.
@@ -806,15 +827,29 @@ mod tests {
             }
         });
 
-        assert!(verify_password_off_runtime(&stored, password).await, "the right password verifies");
-        assert!(!verify_password_off_runtime(&stored, "wrong password").await, "a wrong one does not");
+        assert!(
+            verify_password_off_runtime(&stored, password).await,
+            "the right password verifies"
+        );
+        assert!(
+            !verify_password_off_runtime(&stored, "wrong password").await,
+            "a wrong one does not"
+        );
         absorb_timing_off_runtime(password).await;
-        let hashed = hash_password_off_runtime(password).await.expect("hashes off the runtime");
-        assert!(verify_password(&hashed, password), "the off-runtime hash is a real hash");
+        let hashed = hash_password_off_runtime(password)
+            .await
+            .expect("hashes off the runtime");
+        assert!(
+            verify_password(&hashed, password),
+            "the off-runtime hash is a real hash"
+        );
         let during = ticks.load(Ordering::Relaxed);
         ticker.abort();
 
-        assert!(during >= 10, "the runtime ran other work {during} times while hashing");
+        assert!(
+            during >= 10,
+            "the runtime ran other work {during} times while hashing"
+        );
     }
 
     fn navigating() -> HeaderMap {
@@ -841,10 +876,16 @@ mod tests {
             answered.headers()[header::LOCATION],
             "/account/sign-in#albedo-feedback-password-login"
         );
-        let cookie = answered.headers()[header::SET_COOKIE].to_str().unwrap().to_string();
+        let cookie = answered.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_string();
         let sink =
             dom_render_compiler::transforms::form::allocate_endpoint_feedback_id(login).to_string();
-        assert!(cookie.starts_with(crate::forms::FEEDBACK_COOKIE), "{cookie}");
+        assert!(
+            cookie.starts_with(crate::forms::FEEDBACK_COOKIE),
+            "{cookie}"
+        );
         assert!(cookie.contains(&format!("{sink}=That+email")), "{cookie}");
 
         // A program asked: its answer is the status code.
@@ -868,7 +909,11 @@ mod tests {
     #[test]
     fn only_a_refusal_is_carried_back() {
         let back = ReturnPath::parse("/account").unwrap();
-        let ok = into_form_feedback(see_other(&back), "/_albedo/auth/password/login", &navigating());
+        let ok = into_form_feedback(
+            see_other(&back),
+            "/_albedo/auth/password/login",
+            &navigating(),
+        );
         assert_eq!(ok.status(), StatusCode::SEE_OTHER);
         assert!(ok.headers().get(header::SET_COOKIE).is_none());
     }
@@ -891,7 +936,10 @@ mod tests {
             match_auth_route("/_albedo/auth/logout-all"),
             Some(AuthRoute::LogoutAll)
         );
-        assert_eq!(match_auth_route("/_albedo/auth/unlink"), Some(AuthRoute::Unlink));
+        assert_eq!(
+            match_auth_route("/_albedo/auth/unlink"),
+            Some(AuthRoute::Unlink)
+        );
         assert_eq!(
             match_auth_route("/_albedo/auth/password/set"),
             Some(AuthRoute::PasswordSet)

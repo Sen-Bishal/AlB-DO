@@ -87,7 +87,9 @@ mod tests {
         let home = Path::new("/somewhere/home");
         assert_eq!(
             marker_path_in(home),
-            Path::new("/somewhere/home").join(".albdo").join(".initialized")
+            Path::new("/somewhere/home")
+                .join(".albdo")
+                .join(".initialized")
         );
     }
 
@@ -105,7 +107,10 @@ mod tests {
         mark_initialized_in(home.path());
 
         assert!(marker_path_in(home.path()).is_file());
-        assert!(!is_first_run_in(home.path()), "the marker must end the first run");
+        assert!(
+            !is_first_run_in(home.path()),
+            "the marker must end the first run"
+        );
     }
 
     #[test]
@@ -122,7 +127,10 @@ mod tests {
     #[test]
     fn marking_initialized_creates_the_missing_parent_directory() {
         let home = tempfile::tempdir().expect("temp home");
-        assert!(!home.path().join(".albdo").exists(), "precondition: no .albdo yet");
+        assert!(
+            !home.path().join(".albdo").exists(),
+            "precondition: no .albdo yet"
+        );
 
         mark_initialized_in(home.path());
 

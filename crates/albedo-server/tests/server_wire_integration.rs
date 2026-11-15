@@ -3,13 +3,12 @@
 //! Asserts that the opcode pipeline, when bound to a `StreamingAppState`,
 //! produces the binary frame shape that the bakabox client expects:
 //!
-//! - Bootstrap intern table chunk lands on
-//!   `WT_STREAM_SLOT_CONTROL` (=0) with `FramePayload::Binary`, and the
-//!   bytes round-trip cleanly through [`decode_frame`].
-//! - Marking a component dirty and driving one tick yields at least one
-//!   patch chunk on `WT_STREAM_SLOT_PATCHES` (=2), also `FramePayload::Binary`.
-//! - The decoded `OpcodeFrame.instructions` are well-formed (non-empty,
-//!   the shape Phase C's hand-rolled JS decoder will need to handle).
+//! - Bootstrap intern table chunk lands on `WT_STREAM_SLOT_CONTROL` (=0) with
+//!   `FramePayload::Binary`, and the bytes round-trip cleanly through [`decode_frame`].
+//! - Marking a component dirty and driving one tick yields at least one patch chunk on
+//!   `WT_STREAM_SLOT_PATCHES` (=2), also `FramePayload::Binary`.
+//! - The decoded `OpcodeFrame.instructions` are well-formed (non-empty, the shape Phase C's
+//!   hand-rolled JS decoder will need to handle).
 //!
 //! This is the gate that says "bytes flow"; Phase C's JS decoder will hang
 //! its own conformance tests off the same frame shapes.
@@ -136,7 +135,11 @@ async fn pipeline_tick_emits_binary_patch_chunks_on_dirty_components() {
 
     // Mark every component dirty; one per lane → one chunk per lane.
     {
-        let pipeline = state.pipeline().expect("pipeline must be bound").lock().unwrap();
+        let pipeline = state
+            .pipeline()
+            .expect("pipeline must be bound")
+            .lock()
+            .unwrap();
         for id in &ids {
             assert!(
                 pipeline.mark_component_dirty(*id),
@@ -153,8 +156,7 @@ async fn pipeline_tick_emits_binary_patch_chunks_on_dirty_components() {
 
     for chunk in &chunks {
         assert_eq!(
-            chunk.lane as u8,
-            WT_STREAM_SLOT_PATCHES,
+            chunk.lane as u8, WT_STREAM_SLOT_PATCHES,
             "patch chunks must route to slot {WT_STREAM_SLOT_PATCHES}"
         );
         match &chunk.payload {
@@ -185,8 +187,7 @@ async fn bootstrap_intern_chunk_round_trips_through_decoder() {
         .expect("classifier classifies every string, so the chunk must be Some");
 
     assert_eq!(
-        chunk.lane as u8,
-        WT_STREAM_SLOT_PATCHES,
+        chunk.lane as u8, WT_STREAM_SLOT_PATCHES,
         "bootstrap intern chunks must ride the binary patches stream \
          (slot {WT_STREAM_SLOT_PATCHES}) so slot 0 stays pure JSON for \
          session envelopes"
@@ -207,13 +208,10 @@ async fn bootstrap_intern_chunk_round_trips_through_decoder() {
         "bootstrap frame must carry InitInternTable instructions"
     );
     assert!(
-        decoded
-            .instructions
-            .iter()
-            .any(|instr| matches!(
-                instr,
-                dom_render_compiler::ir::opcode::Instruction::InitInternTable { .. }
-            )),
+        decoded.instructions.iter().any(|instr| matches!(
+            instr,
+            dom_render_compiler::ir::opcode::Instruction::InitInternTable { .. }
+        )),
         "bootstrap frame must contain at least one InitInternTable instruction"
     );
 }

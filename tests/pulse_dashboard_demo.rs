@@ -40,8 +40,7 @@ fn pulse_dashboard_renders_use_state_initial_value() {
     // The useState shim must bind `count = 0`; the bare `{count}`
     // interpolation should render the literal `0`, not an empty slot.
     assert!(
-        html.contains("value: <strong data-albedo-id=\"")
-            && html.contains(">0</strong>"),
+        html.contains("value: <strong data-albedo-id=\"") && html.contains(">0</strong>"),
         "Counter's `{{count}}` must render 0, got: {html}"
     );
     // Second useState in the same component: `label = \"idle\"`.
@@ -65,11 +64,23 @@ fn pulse_dashboard_renders_new_date_to_iso_string() {
 fn pulse_dashboard_renders_to_fixed_precision_numbers() {
     let html = render_dashboard();
     // StatusPill: `(svc.p99_ms).toFixed(1)` for each service.
-    assert!(html.contains("12.3ms"), "edge p99 must show toFixed(1) = 12.3ms");
-    assert!(html.contains("47.9ms"), "render p99 must show toFixed(1) = 47.9ms");
-    assert!(html.contains("9.4ms"), "stitch p99 must show toFixed(1) = 9.4ms");
+    assert!(
+        html.contains("12.3ms"),
+        "edge p99 must show toFixed(1) = 12.3ms"
+    );
+    assert!(
+        html.contains("47.9ms"),
+        "render p99 must show toFixed(1) = 47.9ms"
+    );
+    assert!(
+        html.contains("9.4ms"),
+        "stitch p99 must show toFixed(1) = 9.4ms"
+    );
     // LatencyTable: `.toFixed(2)` and `Math.floor(...)`.
-    assert!(html.contains(">12.35</td>"), "edge p99 toFixed(2) must round to 12.35");
+    assert!(
+        html.contains(">12.35</td>"),
+        "edge p99 toFixed(2) must round to 12.35"
+    );
     assert!(html.contains(">12</td>"), "edge floor must be 12");
     assert!(html.contains(">47</td>"), "render floor must be 47");
 }

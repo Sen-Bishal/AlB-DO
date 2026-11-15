@@ -164,12 +164,15 @@ impl OAuthRuntime {
             return Ok(cached.clone());
         }
 
-        let response = fetch(client, &OutboundRequest {
-            method: "GET",
-            url: discovery_url,
-            headers: vec![("accept".to_string(), "application/json".to_string())],
-            body: None,
-        })
+        let response = fetch(
+            client,
+            &OutboundRequest {
+                method: "GET",
+                url: discovery_url,
+                headers: vec![("accept".to_string(), "application/json".to_string())],
+                body: None,
+            },
+        )
         .await?;
 
         let endpoints = OAuthEndpoints::from_discovery_document(&response)?;
@@ -273,7 +276,13 @@ async fn link_start(provider: &ResolvedProvider, request: &OAuthRequest<'_>) -> 
         .and_then(|value| value.to_str().ok());
     let form = match FormBody::decode(content_type, request.body.as_ref()) {
         Ok(form) => form,
-        Err(err) => return refusal(StatusCode::BAD_REQUEST, &err.to_string(), &ReturnPath::root()),
+        Err(err) => {
+            return refusal(
+                StatusCode::BAD_REQUEST,
+                &err.to_string(),
+                &ReturnPath::root(),
+            )
+        }
     };
     let back = form.return_path();
     let token_valid = form
@@ -593,7 +602,10 @@ async fn open_session(
         .unwrap_or_else(|| back.clone());
     let mut response = see_other(&back);
     set_cookie(&mut response, &request.auth.set_cookie(&token));
-    set_cookie(&mut response, &crate::handlers::auth_gate::forget_destination());
+    set_cookie(
+        &mut response,
+        &crate::handlers::auth_gate::forget_destination(),
+    );
     response
 }
 
@@ -778,10 +790,12 @@ fn see_other_to(url: &str) -> Response<Body> {
 fn set_cookie(response: &mut Response<Body>, value: &str) {
     if let Ok(header) = value.parse() {
         response.headers_mut().append(header::SET_COOKIE, header);
-    } else { warn!(
-        target: "albedo.auth",
-        "could not build an oauth cookie header; the sign-in will not complete"
-    ); }
+    } else {
+        warn!(
+            target: "albedo.auth",
+            "could not build an oauth cookie header; the sign-in will not complete"
+        );
+    }
 }
 
 /// Turn a flow error into a page.
@@ -949,7 +963,10 @@ mod tests {
         .set_cookie();
         let clear = PendingFlow::clear_cookie();
         for attribute in ["Path=/", "HttpOnly", "Secure", "SameSite=Lax"] {
-            assert!(set.contains(attribute) && clear.contains(attribute), "{attribute}");
+            assert!(
+                set.contains(attribute) && clear.contains(attribute),
+                "{attribute}"
+            );
         }
         assert!(clear.contains("Max-Age=0"));
     }

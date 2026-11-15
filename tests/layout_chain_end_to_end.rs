@@ -4,16 +4,14 @@
 //! and two leaf routes (`/` and `/nested`). Builds a manifest and
 //! asserts the wrap pass:
 //!
-//!   1. A route under a single layout has the layout's HTML wrapping
-//!      its leaf content, with the `<children />` intrinsic replaced
-//!      by the leaf HTML in place (no double-render, no escaping).
-//!   2. A nested route has BOTH layouts applied, outer wrapping
-//!      inner, leaf at the deepest point.
-//!   3. The renderer's `<children />` intrinsic emits a stable
-//!      sentinel comment; the wrap pass `str::replace`s it without
-//!      touching neighbouring HTML.
-//!   4. A project with no `routes/layout.tsx` produces shell HTML
-//!      identical to pre-E.1 (regression guard).
+//!   1. A route under a single layout has the layout's HTML wrapping its leaf content, with the
+//!      `<children />` intrinsic replaced by the leaf HTML in place (no double-render, no
+//!      escaping).
+//!   2. A nested route has BOTH layouts applied, outer wrapping inner, leaf at the deepest point.
+//!   3. The renderer's `<children />` intrinsic emits a stable sentinel comment; the wrap pass
+//!      `str::replace`s it without touching neighbouring HTML.
+//!   4. A project with no `routes/layout.tsx` produces shell HTML identical to pre-E.1 (regression
+//!      guard).
 //!
 //! The fixture lives at `tests/fixtures/layouts/`. Each layout uses
 //! `<children />` (lowercase, self-closing) as the substitution
@@ -129,7 +127,10 @@ fn nested_route_applies_outer_layout_then_inner_layout_then_leaf() {
     let body = route.shell.body_open.as_str();
 
     assert!(body.contains("layout-root"), "outer layout absent: {body}");
-    assert!(body.contains("layout-nested"), "inner layout absent: {body}");
+    assert!(
+        body.contains("layout-nested"),
+        "inner layout absent: {body}"
+    );
 
     let placeholder = format!("__SLOT___a_nestedhome_{}", 3);
     assert!(
@@ -170,7 +171,10 @@ fn each_layout_render_receives_the_route_it_wraps() {
 
     let root = manifest.routes["/"].shell.body_open.as_str();
     assert!(root.contains(r#"data-route="/""#), "{root}");
-    assert!(!root.contains("aria-current"), "`/` is not `/nested`: {root}");
+    assert!(
+        !root.contains("aria-current"),
+        "`/` is not `/nested`: {root}"
+    );
 
     let nested = manifest.routes["/nested"].shell.body_open.as_str();
     assert!(nested.contains(r#"data-route="/nested""#), "{nested}");
@@ -354,11 +358,7 @@ fn route_manifest_has_none_for_error_loading_when_fixture_omits_them() {
         &result,
         &ManifestOptions::default(),
     );
-    let route = manifest
-        .routes
-        .values()
-        .next()
-        .expect("at least one route");
+    let route = manifest.routes.values().next().expect("at least one route");
     assert!(
         route.error_component.is_none(),
         "no error.tsx means error_component must be None; got {:?}",
@@ -370,4 +370,3 @@ fn route_manifest_has_none_for_error_loading_when_fixture_omits_them() {
         route.loading_component
     );
 }
-

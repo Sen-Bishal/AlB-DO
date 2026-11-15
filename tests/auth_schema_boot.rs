@@ -4,14 +4,12 @@
 //! `src/auth/schema.rs` asserts what the DDL *says*. This asserts what libSQL
 //! *does* with it, which is a different question in three places that matter:
 //!
-//! - A `UNIQUE` index only prevents a duplicate if the database enforces it. The
-//!   `(provider, subject)` constraint is what makes a first login idempotent
-//!   under a race, and a test that only greps the DDL string cannot tell a real
-//!   constraint from a typo'd one.
-//! - SQLite treats NULLs as *distinct* in a `UNIQUE` index. `albedo_credentials`
-//!   relies on that — every password row has a NULL `credential_id` — and it is
-//!   the kind of dialect behaviour that should be pinned by a test rather than
-//!   remembered.
+//! - A `UNIQUE` index only prevents a duplicate if the database enforces it. The `(provider,
+//!   subject)` constraint is what makes a first login idempotent under a race, and a test that only
+//!   greps the DDL string cannot tell a real constraint from a typo'd one.
+//! - SQLite treats NULLs as *distinct* in a `UNIQUE` index. `albedo_credentials` relies on that —
+//!   every password row has a NULL `credential_id` — and it is the kind of dialect behaviour that
+//!   should be pinned by a test rather than remembered.
 //! - The migrations run on every boot, so running them twice must be a no-op.
 //!
 //! Feature-gated on `forge` because it needs the libSQL backend.

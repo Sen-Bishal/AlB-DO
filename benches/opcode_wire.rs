@@ -9,7 +9,9 @@
 //!   cargo bench --bench `opcode_wire`
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use dom_render_compiler::ir::opcode::{OpcodeFrame, Instruction, TagId, StableId, AttrId, EventId, ProxyId, SlotId, SuspenseId};
+use dom_render_compiler::ir::opcode::{
+    AttrId, EventId, Instruction, OpcodeFrame, ProxyId, SlotId, StableId, SuspenseId, TagId,
+};
 use dom_render_compiler::ir::wire;
 
 /// Builds a realistic `OpcodeFrame` representing a small component tree:
@@ -24,22 +26,73 @@ fn sample_frame() -> OpcodeFrame {
         frame_id: 1,
         component_id: Some(42),
         instructions: vec![
-            Instruction::Create { tag_id: TagId(0), stable_id: StableId(1) },    // div
-            Instruction::SetAttr { stable_id: StableId(1), attr_id: AttrId(0), value: b"app".to_vec() },
-            Instruction::Create { tag_id: TagId(1), stable_id: StableId(2) },    // h1
-            Instruction::SetText { stable_id: StableId(2), text: b"Hello, world!".to_vec() },
-            Instruction::Append { parent_id: StableId(1), child_id: StableId(2) },
-            Instruction::Create { tag_id: TagId(2), stable_id: StableId(3) },    // button
-            Instruction::SetText { stable_id: StableId(3), text: b"Click me".to_vec() },
-            Instruction::BindEvent { stable_id: StableId(3), event_id: EventId(0), proxy_id: ProxyId(1) },
-            Instruction::Append { parent_id: StableId(1), child_id: StableId(3) },
-            Instruction::Create { tag_id: TagId(0), stable_id: StableId(4) },    // div
-            Instruction::SetAttr { stable_id: StableId(4), attr_id: AttrId(1), value: b"counter".to_vec() },
-            Instruction::BindSlot { stable_id: StableId(4), slot_id: SlotId(0) },
-            Instruction::SetText { stable_id: StableId(4), text: b"0".to_vec() },
-            Instruction::Append { parent_id: StableId(1), child_id: StableId(4) },
-            Instruction::Placeholder { stable_id: StableId(5), suspense_id: SuspenseId(100) },
-            Instruction::Append { parent_id: StableId(1), child_id: StableId(5) },
+            Instruction::Create {
+                tag_id: TagId(0),
+                stable_id: StableId(1),
+            }, // div
+            Instruction::SetAttr {
+                stable_id: StableId(1),
+                attr_id: AttrId(0),
+                value: b"app".to_vec(),
+            },
+            Instruction::Create {
+                tag_id: TagId(1),
+                stable_id: StableId(2),
+            }, // h1
+            Instruction::SetText {
+                stable_id: StableId(2),
+                text: b"Hello, world!".to_vec(),
+            },
+            Instruction::Append {
+                parent_id: StableId(1),
+                child_id: StableId(2),
+            },
+            Instruction::Create {
+                tag_id: TagId(2),
+                stable_id: StableId(3),
+            }, // button
+            Instruction::SetText {
+                stable_id: StableId(3),
+                text: b"Click me".to_vec(),
+            },
+            Instruction::BindEvent {
+                stable_id: StableId(3),
+                event_id: EventId(0),
+                proxy_id: ProxyId(1),
+            },
+            Instruction::Append {
+                parent_id: StableId(1),
+                child_id: StableId(3),
+            },
+            Instruction::Create {
+                tag_id: TagId(0),
+                stable_id: StableId(4),
+            }, // div
+            Instruction::SetAttr {
+                stable_id: StableId(4),
+                attr_id: AttrId(1),
+                value: b"counter".to_vec(),
+            },
+            Instruction::BindSlot {
+                stable_id: StableId(4),
+                slot_id: SlotId(0),
+            },
+            Instruction::SetText {
+                stable_id: StableId(4),
+                text: b"0".to_vec(),
+            },
+            Instruction::Append {
+                parent_id: StableId(1),
+                child_id: StableId(4),
+            },
+            Instruction::Placeholder {
+                stable_id: StableId(5),
+                suspense_id: SuspenseId(100),
+            },
+            Instruction::Append {
+                parent_id: StableId(1),
+                child_id: StableId(5),
+            },
         ],
     }
 }

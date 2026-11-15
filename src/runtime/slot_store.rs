@@ -84,7 +84,10 @@ impl SlotStore {
     /// computing the hash before the read.
     #[must_use]
     pub fn read(&self, session: SessionId, slot_id: SlotId) -> Option<Vec<u8>> {
-        let value = self.values.get(&(session, slot_id)).map(|entry| entry.clone());
+        let value = self
+            .values
+            .get(&(session, slot_id))
+            .map(|entry| entry.clone());
         if value.is_some() {
             self.touch(session);
         }
@@ -127,7 +130,8 @@ impl SlotStore {
         if gone.is_empty() {
             return 0;
         }
-        self.values.retain(|(session, _), _| !gone.contains(session));
+        self.values
+            .retain(|(session, _), _| !gone.contains(session));
         if let Ok(mut dirty) = self.dirty.lock() {
             dirty.retain(|(session, _)| !gone.contains(session));
         }
@@ -143,8 +147,11 @@ impl SlotStore {
     pub fn drain_set_instructions(&self, session: SessionId) -> Vec<Instruction> {
         let keys: Vec<(SessionId, SlotId)> = match self.dirty.lock() {
             Ok(mut dirty) => {
-                let session_keys: Vec<(SessionId, SlotId)> =
-                    dirty.iter().filter(|(s, _)| *s == session).copied().collect();
+                let session_keys: Vec<(SessionId, SlotId)> = dirty
+                    .iter()
+                    .filter(|(s, _)| *s == session)
+                    .copied()
+                    .collect();
                 for key in &session_keys {
                     dirty.remove(key);
                 }
@@ -307,7 +314,11 @@ mod tests {
         store.write(session, slot(1), b"new".to_vec());
 
         let drained = store.drain_set_instructions(session);
-        assert_eq!(drained.len(), 1, "HashSet dedup must coalesce repeated writes");
+        assert_eq!(
+            drained.len(),
+            1,
+            "HashSet dedup must coalesce repeated writes"
+        );
         match &drained[0] {
             Instruction::SlotSet { value, .. } => assert_eq!(value, b"new"),
             other => panic!("expected SlotSet, got {other:?}"),
@@ -348,7 +359,10 @@ mod tests {
         assert_eq!(store.evict_seen_before(500), 1);
 
         assert!(store.read(idle, slot(1)).is_none());
-        assert!(store.drain_set_instructions(idle).is_empty(), "no dirty entry outlives its session");
+        assert!(
+            store.drain_set_instructions(idle).is_empty(),
+            "no dirty entry outlives its session"
+        );
         assert_eq!(store.read(active, slot(1)), Some(b"active".to_vec()));
         assert_eq!(store.len(), 1);
     }
@@ -365,7 +379,11 @@ mod tests {
         let _ = store.read(session, slot(1));
         let seen = *store.last_seen.get(&session).unwrap();
         assert!(seen >= 5, "the read restamped the session: {seen}");
-        assert_eq!(store.evict_seen_before(1), 0, "read after the cutoff, so it stays");
+        assert_eq!(
+            store.evict_seen_before(1),
+            0,
+            "read after the cutoff, so it stays"
+        );
     }
 
     #[test]

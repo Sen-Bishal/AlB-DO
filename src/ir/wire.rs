@@ -23,21 +23,19 @@ pub enum WireError {
 ///
 /// Knobs and why they are pinned:
 ///
-/// - **Little-endian**: bakabox runs on the browser, which is overwhelmingly
-///   little-endian. Choosing it here means the JS decoder reads bytes in the
-///   same order they were written without per-field swaps.
-/// - **Variable-length integers**: most opcode fields are small `u16`/`u32`
-///   IDs (`TagId`, `AttrId`, `StableId`). Varint shrinks the average frame by ~30%
-///   versus fixed-width encoding without costing the decoder anything that
-///   matters at frame sizes we ship (sub-kilobyte typical).
-/// - **No limit**: the encode side trusts its own output — frames we build are
-///   bounded by construction and the WebTransport muxer budgets them at the
-///   transport layer ([`crate::runtime::webtransport`]). The *decode* side is a
-///   different story: it consumes attacker-controlled bytes, so it does NOT
-///   inherit this no-limit config (see [`decode_config`]). Splitting the two
-///   keeps the on-wire bytes of every valid frame byte-identical — the limit is
-///   a decode-time acceptance bound, not a serialization knob — so the
-///   conformance contract below is unaffected.
+/// - **Little-endian**: bakabox runs on the browser, which is overwhelmingly little-endian.
+///   Choosing it here means the JS decoder reads bytes in the same order they were written without
+///   per-field swaps.
+/// - **Variable-length integers**: most opcode fields are small `u16`/`u32` IDs (`TagId`, `AttrId`,
+///   `StableId`). Varint shrinks the average frame by ~30% versus fixed-width encoding without
+///   costing the decoder anything that matters at frame sizes we ship (sub-kilobyte typical).
+/// - **No limit**: the encode side trusts its own output — frames we build are bounded by
+///   construction and the WebTransport muxer budgets them at the transport layer
+///   ([`crate::runtime::webtransport`]). The *decode* side is a different story: it consumes
+///   attacker-controlled bytes, so it does NOT inherit this no-limit config (see
+///   [`decode_config`]). Splitting the two keeps the on-wire bytes of every valid frame
+///   byte-identical — the limit is a decode-time acceptance bound, not a serialization knob — so
+///   the conformance contract below is unaffected.
 ///
 /// Any change to **this** (encode) configuration is a wire-format break and
 /// MUST be accompanied by a bump of
@@ -319,7 +317,10 @@ mod tests {
                 Instruction::PatchInternTable {
                     kind: InternTableKind::Attr,
                     ops: vec![
-                        InternPatchOp::Set { id: 0, value: "class".to_string() },
+                        InternPatchOp::Set {
+                            id: 0,
+                            value: "class".to_string(),
+                        },
                         InternPatchOp::Remove { id: 1 },
                     ],
                 },

@@ -150,7 +150,8 @@ pub async fn serve_patch_stream_live(
     if let Some(live) = &live {
         // Closing ends the subscription now, not at the next poll.
         let broadcast = broadcast.clone();
-        live.entry().on_close(move || broadcast.cleanup_session(session));
+        live.entry()
+            .on_close(move || broadcast.cleanup_session(session));
     }
 
     let seed = (!initial.is_empty())
@@ -347,7 +348,8 @@ mod tests {
     #[tokio::test]
     async fn opening_the_stream_subscribes_the_connection_to_the_routes_topics() {
         let broadcast = Arc::new(BroadcastRegistry::new());
-        let response = serve_patch_stream(broadcast.clone(), &[TopicGrant::whole("guestbook")], None).await;
+        let response =
+            serve_patch_stream(broadcast.clone(), &[TopicGrant::whole("guestbook")], None).await;
         assert_eq!(response.status(), 200);
 
         let topic = broadcast
@@ -378,7 +380,8 @@ mod tests {
     #[tokio::test]
     async fn a_write_after_connect_reaches_the_subscribed_connection() {
         let broadcast = Arc::new(BroadcastRegistry::new());
-        let _response = serve_patch_stream(broadcast.clone(), &[TopicGrant::whole("guestbook")], None).await;
+        let _response =
+            serve_patch_stream(broadcast.clone(), &[TopicGrant::whole("guestbook")], None).await;
 
         let report = broadcast
             .write_topic("guestbook", br#"[{"id":1}]"#.to_vec())
@@ -402,8 +405,14 @@ mod tests {
         ) -> Option<dom_render_compiler::forge::RenderedRows> {
             (collection == "guestbook").then(|| {
                 [
-                    ("1".to_string(), "<li data-albedo-key=\"1\">ada</li>".to_string()),
-                    ("2".to_string(), "<li data-albedo-key=\"2\">alan</li>".to_string()),
+                    (
+                        "1".to_string(),
+                        "<li data-albedo-key=\"1\">ada</li>".to_string(),
+                    ),
+                    (
+                        "2".to_string(),
+                        "<li data-albedo-key=\"2\">alan</li>".to_string(),
+                    ),
                 ]
                 .into_iter()
                 .collect()
@@ -460,7 +469,8 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_stream_unsubscribes_the_connection() {
         let broadcast = Arc::new(BroadcastRegistry::new());
-        let response = serve_patch_stream(broadcast.clone(), &[TopicGrant::whole("guestbook")], None).await;
+        let response =
+            serve_patch_stream(broadcast.clone(), &[TopicGrant::whole("guestbook")], None).await;
         assert_eq!(broadcast.get("guestbook").unwrap().subscriber_count(), 1);
 
         drop(response);

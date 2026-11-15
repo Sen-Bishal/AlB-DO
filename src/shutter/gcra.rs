@@ -156,7 +156,8 @@ impl Quota {
         if burst == 0 {
             return Err(QuotaError::ZeroBurst);
         }
-        let period_nanos = u64::try_from(period.as_nanos()).map_err(|_| QuotaError::UnusablePeriod)?;
+        let period_nanos =
+            u64::try_from(period.as_nanos()).map_err(|_| QuotaError::UnusablePeriod)?;
         if period_nanos == 0 {
             return Err(QuotaError::UnusablePeriod);
         }
@@ -545,7 +546,10 @@ mod tests {
         );
         // Even stacked on an already-exhausted cell, the wait is bounded.
         let debt = cell.debit(&quota, 0, u32::MAX);
-        assert!(debt <= quota.tolerance.saturating_mul(2), "debt {debt} is unbounded");
+        assert!(
+            debt <= quota.tolerance.saturating_mul(2),
+            "debt {debt} is unbounded"
+        );
 
         // And it recovers on the ordinary schedule rather than never.
         assert!(cell.charge(&quota, debt, 1).is_admitted());
@@ -559,7 +563,11 @@ mod tests {
         let quota = quota(10, 3);
         let cell = Cell::new();
         assert!(cell.charge(&quota, 0, 3).is_admitted());
-        assert_eq!(cell.tat(), quota.tolerance, "the cell should be exactly full");
+        assert_eq!(
+            cell.tat(),
+            quota.tolerance,
+            "the cell should be exactly full"
+        );
 
         let after = cell.debit(&quota, 0, 2);
         assert_eq!(
@@ -660,7 +668,10 @@ mod tests {
         // more. Only ~0.02 units have actually been earned, so this must admit
         // none.
         let admitted = (0..10)
-            .filter(|_| cell.charge(&quota, end_of_window + SEC / 500, 1).is_admitted())
+            .filter(|_| {
+                cell.charge(&quota, end_of_window + SEC / 500, 1)
+                    .is_admitted()
+            })
             .count();
         assert_eq!(
             admitted, 0,

@@ -283,14 +283,16 @@ impl QueryDescriptor {
 
     fn validate(&self, schema: &CollectionSchema) -> Result<(), QueryError> {
         let known = |column: &str| -> Result<FieldType, QueryError> {
-            schema.column_type(column).ok_or_else(|| QueryError::UnknownColumn {
-                collection: schema.name.clone(),
-                column: column.to_string(),
-                declared: std::iter::once(schema.key.as_str())
-                    .chain(schema.fields.keys().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            })
+            schema
+                .column_type(column)
+                .ok_or_else(|| QueryError::UnknownColumn {
+                    collection: schema.name.clone(),
+                    column: column.to_string(),
+                    declared: std::iter::once(schema.key.as_str())
+                        .chain(schema.fields.keys().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                })
         };
         let check_term = |term: &Term| -> Result<(), QueryError> {
             let ty = known(&term.column)?;
@@ -435,8 +437,11 @@ impl QueryDescriptor {
             }
             group.sort_by_key(|branch| branch.iter().map(shape_key).collect::<Vec<_>>());
         }
-        self.or_groups
-            .sort_by_key(|g| g.iter().map(|b| b.iter().map(shape_key).collect::<Vec<_>>()).collect::<Vec<_>>());
+        self.or_groups.sort_by_key(|g| {
+            g.iter()
+                .map(|b| b.iter().map(shape_key).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        });
 
         // Renumber in canonical traversal order: terms, then OR groups, then the
         // `get` key.
@@ -466,12 +471,20 @@ impl QueryDescriptor {
             }
         }
 
-        let max_authored = authored_params.iter().copied().max().map_or(0, |m| m as usize + 1);
+        let max_authored = authored_params
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| m as usize + 1);
         let mut slot_map = vec![u16::MAX; max_authored];
         for (canonical, authored) in authored_params.iter().enumerate() {
             slot_map[*authored as usize] = canonical as u16;
         }
-        let max_optional = authored_optional.iter().copied().max().map_or(0, |m| m as usize + 1);
+        let max_optional = authored_optional
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| m as usize + 1);
         let mut optional_map = vec![u8::MAX; max_optional];
         for (canonical, authored) in authored_optional.iter().enumerate() {
             optional_map[*authored as usize] = canonical as u8;

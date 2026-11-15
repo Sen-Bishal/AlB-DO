@@ -1040,7 +1040,10 @@ async fn public_streams_without_providers_survive_unrelated_authority_changes() 
     };
     let app = cli_app();
     let mut manifest: serde_json::Value = serde_json::from_str(&manifest_json()).unwrap();
-    manifest["routes"].as_object_mut().unwrap().remove("/payroll");
+    manifest["routes"]
+        .as_object_mut()
+        .unwrap()
+        .remove("/payroll");
     fs::write(
         rig.project.join(".albedo/dist/render-manifest.v2.json"),
         manifest.to_string(),

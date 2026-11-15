@@ -111,8 +111,11 @@ async fn the_oauth_legs_are_reachable_and_the_redirect_is_guarded() {
     let dist_dir = project_dir.join(".albedo").join("dist");
     fs::create_dir_all(&source_root).expect("src dir");
     fs::create_dir_all(dist_dir.join("_albedo")).expect("dist dir");
-    fs::write(source_root.join("Home.tsx"), "export default function Home(){}")
-        .expect("write Home.tsx");
+    fs::write(
+        source_root.join("Home.tsx"),
+        "export default function Home(){}",
+    )
+    .expect("write Home.tsx");
     fs::write(dist_dir.join("render-manifest.v2.json"), manifest_json()).expect("write manifest");
     fs::write(
         dist_dir.join("_albedo").join("runtime.js"),
@@ -190,7 +193,9 @@ async fn the_oauth_legs_are_reachable_and_the_redirect_is_guarded() {
     // provider, a preset with endpoints, and no route to any of it. Before this
     // work the answer here was a 404 from the page router.
     let start = client
-        .get(format!("{base}/_albedo/auth/oauth/github/start?next=/dashboard"))
+        .get(format!(
+            "{base}/_albedo/auth/oauth/github/start?next=/dashboard"
+        ))
         .send()
         .await
         .expect("start responds");
@@ -212,8 +217,14 @@ async fn the_oauth_legs_are_reachable_and_the_redirect_is_guarded() {
     assert_eq!(authorize.path(), "/login/oauth/authorize");
 
     let params: BTreeMap<String, String> = authorize.query_pairs().into_owned().collect();
-    assert_eq!(params.get("client_id").map(String::as_str), Some("test-client-id"));
-    assert_eq!(params.get("response_type").map(String::as_str), Some("code"));
+    assert_eq!(
+        params.get("client_id").map(String::as_str),
+        Some("test-client-id")
+    );
+    assert_eq!(
+        params.get("response_type").map(String::as_str),
+        Some("code")
+    );
     assert_eq!(
         params.get("code_challenge_method").map(String::as_str),
         Some("S256"),
@@ -272,7 +283,9 @@ async fn the_oauth_legs_are_reachable_and_the_redirect_is_guarded() {
     // no cookie, so there is nothing to compare, and the request must not be
     // treated as a sign-in.
     let orphan = client
-        .get(format!("{base}/_albedo/auth/oauth/github/callback?code=x&state=y"))
+        .get(format!(
+            "{base}/_albedo/auth/oauth/github/callback?code=x&state=y"
+        ))
         .send()
         .await
         .expect("callback responds");

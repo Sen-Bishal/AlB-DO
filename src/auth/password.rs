@@ -24,9 +24,9 @@
 //!    raising the cost politically possible.
 //! 2. **The salt is per row and never reused**, so two people with the same password have unrelated
 //!    hashes and one rainbow table buys nothing.
-//! 3. **The plaintext is never held longer than a stack frame** and never written anywhere. There is
-//!    no "password" column, no audit trail of attempts carrying the input, and no log line in this
-//!    module that takes the presented value.
+//! 3. **The plaintext is never held longer than a stack frame** and never written anywhere. There
+//!    is no "password" column, no audit trail of attempts carrying the input, and no log line in
+//!    this module that takes the presented value.
 //!
 //! ## The two attacks this module is shaped by
 //!
@@ -52,7 +52,9 @@
 //! leave the person unable to log in and unable to find out why. It is written
 //! down here rather than discovered later.
 
-use argon2::password_hash::{PasswordHash as PhcHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    PasswordHash as PhcHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::rngs::OsRng as RandOsRng;
 use rand::RngCore;
@@ -91,9 +93,7 @@ pub const MAX_EMAIL_BYTES: usize = 254;
 /// parameters, so old passwords keep verifying and new ones get the new cost.
 fn params() -> &'static Params {
     static PARAMS: OnceLock<Params> = OnceLock::new();
-    PARAMS.get_or_init(|| {
-        Params::new(19_456, 2, 1, None).unwrap_or(Params::DEFAULT)
-    })
+    PARAMS.get_or_init(|| Params::new(19_456, 2, 1, None).unwrap_or(Params::DEFAULT))
 }
 
 /// The configured hasher.
@@ -125,10 +125,7 @@ impl std::fmt::Display for PasswordError {
                 f,
                 "password must be at least {MIN_PASSWORD_BYTES} characters"
             ),
-            Self::TooLong => write!(
-                f,
-                "password must be at most {MAX_PASSWORD_BYTES} bytes"
-            ),
+            Self::TooLong => write!(f, "password must be at most {MAX_PASSWORD_BYTES} bytes"),
             Self::InvalidEmail => write!(f, "that does not look like an email address"),
             Self::Kdf(what) => write!(f, "password hashing failed: {what}"),
         }
@@ -342,7 +339,10 @@ mod tests {
     #[test]
     fn an_oversized_presented_password_is_refused_before_the_kdf_runs() {
         let stored = hash_password("correct horse battery").expect("hashes");
-        assert!(!verify_password(&stored, &"a".repeat(MAX_PASSWORD_BYTES + 1)));
+        assert!(!verify_password(
+            &stored,
+            &"a".repeat(MAX_PASSWORD_BYTES + 1)
+        ));
     }
 
     /// A corrupt or empty stored hash is a refusal, never a panic and never an
@@ -388,7 +388,11 @@ mod tests {
             "ada lovelace@example.com",
             "ada@example.com\r\nBcc: evil@example.com",
         ] {
-            assert_eq!(normalize_email(raw), None, "`{raw}` must not be an account key");
+            assert_eq!(
+                normalize_email(raw),
+                None,
+                "`{raw}` must not be an account key"
+            );
         }
         assert_eq!(normalize_email(&format!("{}@e.com", "a".repeat(300))), None);
     }

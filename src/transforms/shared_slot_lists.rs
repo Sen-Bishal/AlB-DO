@@ -30,13 +30,13 @@
 use crate::forge::delta::RenderedRows;
 use std::collections::HashMap;
 use swc_common::{sync::Lrc, FileName, SourceMap, DUMMY_SP};
-use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_ast::{
-    BlockStmtOrExpr, CallExpr, Callee, Expr, ExprOrSpread, Ident, IdentName, ImportSpecifier,
+    BlockStmtOrExpr, CallExpr, Callee, Expr, ExprOrSpread, Id, Ident, IdentName, ImportSpecifier,
     JSXAttr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElement, JSXElementChild, JSXExpr,
-    JSXExprContainer, Id, Lit, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, Pat, Str,
+    JSXExprContainer, Lit, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, Pat, Str,
     VarDeclarator,
 };
+use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 /// Attribute a shared-slot list container is stamped with. The value is the
@@ -127,7 +127,9 @@ pub fn extract_keyed_rows(html: &str, topic: &str) -> Option<RenderedRows> {
     while let Some(tag) = next_tag(html, cursor) {
         cursor = tag.end;
         match tag.kind {
-            TagKind::Open { void_or_self_closing } => {
+            TagKind::Open {
+                void_or_self_closing,
+            } => {
                 if depth == 0 {
                     if void_or_self_closing {
                         collect_row(html, tag.start, tag.end, &mut rows);
@@ -218,7 +220,9 @@ fn unescape_attr_value(value: &str) -> String {
 
 #[derive(Debug, Clone, Copy)]
 enum TagKind {
-    Open { void_or_self_closing: bool },
+    Open {
+        void_or_self_closing: bool,
+    },
     Close,
     /// Comment, doctype, or processing instruction — no effect on nesting.
     Ignorable,
@@ -251,11 +255,19 @@ fn next_tag(html: &str, from: usize) -> Option<Tag> {
 
     if rest.starts_with("<!--") {
         let end = rest.find("-->").map(|at| start + at + 3)?;
-        return Some(Tag { start, end, kind: TagKind::Ignorable });
+        return Some(Tag {
+            start,
+            end,
+            kind: TagKind::Ignorable,
+        });
     }
     if rest.starts_with("<!") || rest.starts_with("<?") {
         let end = start + rest.find('>')? + 1;
-        return Some(Tag { start, end, kind: TagKind::Ignorable });
+        return Some(Tag {
+            start,
+            end,
+            kind: TagKind::Ignorable,
+        });
     }
 
     // Find the `>` that ends this tag, skipping any inside a quoted value.
@@ -294,12 +306,16 @@ fn next_tag(html: &str, from: usize) -> Option<Tag> {
         return Some(Tag { start, end, kind });
     }
     let name = tag_name(&rest[1..]);
-    let self_closing = html[start..end].trim_end_matches('>').trim_end().ends_with('/');
+    let self_closing = html[start..end]
+        .trim_end_matches('>')
+        .trim_end()
+        .ends_with('/');
     Some(Tag {
         start,
         end,
         kind: TagKind::Open {
-            void_or_self_closing: self_closing || crate::runtime::eval::component::is_void_tag(&name),
+            void_or_self_closing: self_closing
+                || crate::runtime::eval::component::is_void_tag(&name),
         },
     })
 }
@@ -440,10 +456,7 @@ enum SlotAnchor {
     /// [`RowProjection::WholeView`], and every write re-renders the entire
     /// partition — measured at 4.9× a small room's write cost before this
     /// carried the name.
-    Deferred {
-        binding: String,
-        collection: String,
-    },
+    Deferred { binding: String, collection: String },
     /// APERTURE · one declared external resource, `ops.status(…)`.
     ///
     /// Deferred exactly as a partition is — the topic is minted per request, so
@@ -470,7 +483,12 @@ fn shared_slot_topic(
     sources: &HashMap<String, String>,
     legacy: bool,
 ) -> Option<SlotAnchor> {
-    let Expr::Call(CallExpr { callee: Callee::Expr(callee), args, .. }) = expr else {
+    let Expr::Call(CallExpr {
+        callee: Callee::Expr(callee),
+        args,
+        ..
+    }) = expr
+    else {
         return None;
     };
     let Expr::Ident(id) = callee.as_ref() else {
@@ -664,7 +682,11 @@ fn sole_shared_slot_read(el: &JSXElement, idents: &HashMap<Id, SlotAnchor>) -> O
                 if found.is_some() {
                     return None;
                 }
-                found = Some(ScalarSite { anchor, root: root.sym.to_string(), path });
+                found = Some(ScalarSite {
+                    anchor,
+                    root: root.sym.to_string(),
+                    path,
+                });
             }
             _ => return None,
         }
@@ -740,7 +762,10 @@ fn slot_attr(anchor: &SlotAnchor) -> JSXAttrOrSpread {
 fn slot_path_attr(path: &str) -> JSXAttrOrSpread {
     JSXAttrOrSpread::JSXAttr(JSXAttr {
         span: DUMMY_SP,
-        name: JSXAttrName::Ident(IdentName { span: DUMMY_SP, sym: SLOT_PATH_ATTR.into() }),
+        name: JSXAttrName::Ident(IdentName {
+            span: DUMMY_SP,
+            sym: SLOT_PATH_ATTR.into(),
+        }),
         value: Some(JSXAttrValue::Lit(Lit::Str(Str {
             span: DUMMY_SP,
             value: path.into(),
@@ -772,7 +797,10 @@ fn anchor_attr(attr: &str, anchor: &SlotAnchor) -> JSXAttrOrSpread {
     };
     JSXAttrOrSpread::JSXAttr(JSXAttr {
         span: DUMMY_SP,
-        name: JSXAttrName::Ident(IdentName { span: DUMMY_SP, sym: attr.into() }),
+        name: JSXAttrName::Ident(IdentName {
+            span: DUMMY_SP,
+            sym: attr.into(),
+        }),
         value: Some(value),
     })
 }
@@ -842,11 +870,12 @@ fn slot_text_call(root: &str, path: &str) -> Expr {
 pub const SLOT_TEXT_FN: &str = "__albedo_slot_text";
 
 /// The anchor when `expr` is `IDENT.map(...)` and `IDENT` is a shared-slot binding.
-fn map_over_shared_slot(
-    expr: &Expr,
-    idents: &HashMap<Id, SlotAnchor>,
-) -> Option<SlotAnchor> {
-    let Expr::Call(CallExpr { callee: Callee::Expr(callee), .. }) = expr else {
+fn map_over_shared_slot(expr: &Expr, idents: &HashMap<Id, SlotAnchor>) -> Option<SlotAnchor> {
+    let Expr::Call(CallExpr {
+        callee: Callee::Expr(callee),
+        ..
+    }) = expr
+    else {
         return None;
     };
     let Expr::Member(member) = callee.as_ref() else {
@@ -921,7 +950,10 @@ pub fn classify_shared_slot_lists(module: &Module) -> HashMap<String, RowProject
     if idents.is_empty() {
         return HashMap::new();
     }
-    let mut classifier = RowProjectionClassifier { idents, out: HashMap::new() };
+    let mut classifier = RowProjectionClassifier {
+        idents,
+        out: HashMap::new(),
+    };
     module.visit_with(&mut classifier);
     classifier.out
 }
@@ -943,22 +975,33 @@ pub fn classify_shared_slot_lists_source(
     use std::path::Path;
     let syntax = match Path::new(specifier).extension().and_then(|e| e.to_str()) {
         Some("ts") => Syntax::Typescript(TsSyntax::default()),
-        Some("tsx") => Syntax::Typescript(TsSyntax { tsx: true, ..Default::default() }),
-        _ => Syntax::Es(EsSyntax { jsx: true, ..Default::default() }),
+        Some("tsx") => Syntax::Typescript(TsSyntax {
+            tsx: true,
+            ..Default::default()
+        }),
+        _ => Syntax::Es(EsSyntax {
+            jsx: true,
+            ..Default::default()
+        }),
     };
     let cm: Lrc<SourceMap> = Default::default();
-    let fm = cm.new_source_file(FileName::Custom(specifier.to_string()).into(), source.to_string());
+    let fm = cm.new_source_file(
+        FileName::Custom(specifier.to_string()).into(),
+        source.to_string(),
+    );
     let mut parser = Parser::new(syntax, StringInput::from(&*fm), None);
     match parser.parse_module() {
         Ok(mut module) => {
             let globals = swc_common::Globals::new();
             swc_common::GLOBALS.set(&globals, || {
                 module.visit_mut_with(&mut swc_ecma_transforms_base::resolver(
-                    swc_common::Mark::new(), swc_common::Mark::new(), false,
+                    swc_common::Mark::new(),
+                    swc_common::Mark::new(),
+                    false,
                 ));
                 classify_shared_slot_lists(&module)
             })
-        },
+        }
         Err(_) => HashMap::new(),
     }
 }
@@ -1003,10 +1046,7 @@ impl Visit for RowProjectionClassifier {
 ///
 /// The row template is a property of the collection, identical across every
 /// partition of it, so one class for all of them is not an approximation.
-fn map_call_binding(
-    call: &CallExpr,
-    idents: &HashMap<Id, SlotAnchor>,
-) -> Option<(String, String)> {
+fn map_call_binding(call: &CallExpr, idents: &HashMap<Id, SlotAnchor>) -> Option<(String, String)> {
     let Callee::Expr(callee) = &call.callee else {
         return None;
     };
@@ -1175,9 +1215,15 @@ mod classify_tests {
     /// pre-pass classifier runs on, before resolver/type-strip.
     pub(super) fn parse_tsx(source: &str) -> Module {
         let cm: Lrc<SourceMap> = Default::default();
-        let fm = cm.new_source_file(FileName::Custom("test.tsx".into()).into(), source.to_string());
+        let fm = cm.new_source_file(
+            FileName::Custom("test.tsx".into()).into(),
+            source.to_string(),
+        );
         let mut parser = Parser::new(
-            Syntax::Typescript(TsSyntax { tsx: true, ..Default::default() }),
+            Syntax::Typescript(TsSyntax {
+                tsx: true,
+                ..Default::default()
+            }),
             StringInput::from(&*fm),
             None,
         );
@@ -1253,10 +1299,7 @@ mod classify_tests {
 
     #[test]
     fn a_named_callback_cannot_be_proven_and_is_whole_view() {
-        assert_eq!(
-            classify("entries.map(renderRow)"),
-            RowProjection::WholeView,
-        );
+        assert_eq!(classify("entries.map(renderRow)"), RowProjection::WholeView,);
     }
 
     #[test]
@@ -1332,7 +1375,9 @@ mod classify_tests {
         "#;
         let module = parse_tsx(source);
         assert_eq!(
-            *classify_shared_slot_lists(&module).get("guestbook").unwrap(),
+            *classify_shared_slot_lists(&module)
+                .get("guestbook")
+                .unwrap(),
             RowProjection::PositionStable,
         );
     }
@@ -1509,7 +1554,10 @@ mod partition_anchor_tests {
             }
             "#,
         );
-        assert!(out.contains("__albedo_topic(\"status\")"), "anchored; got {out}");
+        assert!(
+            out.contains("__albedo_topic(\"status\")"),
+            "anchored; got {out}"
+        );
         assert!(
             out.contains(r#"data-albedo-slot-path="state""#),
             "the anchor is the topic; the path says which member of it this \
@@ -1531,7 +1579,10 @@ mod partition_anchor_tests {
             }
             "#,
         );
-        assert!(out.contains(r#"data-albedo-slot-path="build.commit""#), "got {out}");
+        assert!(
+            out.contains(r#"data-albedo-slot-path="build.commit""#),
+            "got {out}"
+        );
     }
 
     /// A bare read carries no path attribute at all — every app written before
@@ -1547,7 +1598,10 @@ mod partition_anchor_tests {
             }
             "#,
         );
-        assert!(out.contains(r#"data-albedo-slot="lobby:counter""#), "got {out}");
+        assert!(
+            out.contains(r#"data-albedo-slot="lobby:counter""#),
+            "got {out}"
+        );
         assert!(!out.contains("data-albedo-slot-path"), "got {out}");
     }
 
@@ -1584,7 +1638,10 @@ mod partition_anchor_tests {
             "#,
         );
         assert!(!out.contains("data-albedo-slot-path"), "got {out}");
-        assert!(out.contains(r#"data-albedo-slot="t""#), "the real read still anchors; got {out}");
+        assert!(
+            out.contains(r#"data-albedo-slot="t""#),
+            "the real read still anchors; got {out}"
+        );
     }
 
     /// The stamped read is folded through the render-side formatter, so SSR
@@ -1722,7 +1779,11 @@ mod extract_tests {
             </ul>";
         let rows = extract_keyed_rows(html, "t").unwrap();
 
-        assert_eq!(rows.len(), 2, "the nested <li> must not be mistaken for a row");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the nested <li> must not be mistaken for a row"
+        );
         assert_eq!(
             rows["1"],
             "<li data-albedo-key=\"1\"><ul><li>nested</li></ul><span>x</span></li>"
@@ -1736,7 +1797,10 @@ mod extract_tests {
         let html = "<ul data-albedo-list-slot=\"t\">\
             <li data-albedo-key=\"1\" title=\"a > b\">ada</li></ul>";
         let rows = extract_keyed_rows(html, "t").unwrap();
-        assert_eq!(rows["1"], "<li data-albedo-key=\"1\" title=\"a > b\">ada</li>");
+        assert_eq!(
+            rows["1"],
+            "<li data-albedo-key=\"1\" title=\"a > b\">ada</li>"
+        );
     }
 
     /// Void and self-closing elements have no closing tag; treating them as
@@ -1843,7 +1907,11 @@ mod extract_tests {
         let html = format!("<ol data-albedo-list-slot=\"board\">{body}</ol>");
 
         let rows = extract_keyed_rows(&html, "board").expect("anchor parses");
-        assert_eq!(rows.len(), 4, "every form-bearing row must survive the scan");
+        assert_eq!(
+            rows.len(),
+            4,
+            "every form-bearing row must survive the scan"
+        );
         // Each row must come back whole — a truncated row loses its `</form></li>`.
         for k in ["4", "2", "3", "1"] {
             let outer = rows.get(k).unwrap_or_else(|| panic!("row {k} missing"));
@@ -1891,8 +1959,12 @@ mod scalar_marker_tests {
         impl Visit for Collect {
             fn visit_jsx_element(&mut self, el: &JSXElement) {
                 for a in &el.opening.attrs {
-                    let JSXAttrOrSpread::JSXAttr(a) = a else { continue };
-                    let JSXAttrName::Ident(name) = &a.name else { continue };
+                    let JSXAttrOrSpread::JSXAttr(a) = a else {
+                        continue;
+                    };
+                    let JSXAttrName::Ident(name) = &a.name else {
+                        continue;
+                    };
                     if name.sym.as_ref() != self.attr {
                         continue;
                     }
@@ -1903,7 +1975,10 @@ mod scalar_marker_tests {
                 el.visit_children_with(self);
             }
         }
-        let mut c = Collect { attr, out: Vec::new() };
+        let mut c = Collect {
+            attr,
+            out: Vec::new(),
+        };
         module.visit_with(&mut c);
         c.out
     }

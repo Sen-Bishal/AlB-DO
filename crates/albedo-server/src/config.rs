@@ -8,8 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 //   selective hydration).
 // - Keep standalone benchmark gates (TTFB, hydration, server CPU) as release blockers.
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
@@ -21,7 +20,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub forge: ForgeConfig,
 }
-
 
 /// Where the durable substrate lives.
 ///
@@ -39,7 +37,6 @@ pub struct ForgeConfig {
 }
 
 impl AppConfig {
-
     pub fn apply_env_overrides(&mut self, prefix: &str) -> Result<(), RuntimeError> {
         let lookup = |key: &str| std::env::var(key).ok();
         self.apply_bind_env_overrides_from(prefix, lookup)?;
@@ -623,7 +620,12 @@ mod tests {
     use super::*;
 
     fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
-        move |key| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| (*v).to_string())
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_string())
+        }
     }
 
     #[test]
@@ -658,10 +660,16 @@ mod tests {
         config
             .apply_bind_env_overrides_from(
                 "ALBEDO_",
-                env(&[("ALBEDO_SERVER_PORT", "9999"), ("ALBEDO_SERVER_HOST", "0.0.0.0")]),
+                env(&[
+                    ("ALBEDO_SERVER_PORT", "9999"),
+                    ("ALBEDO_SERVER_HOST", "0.0.0.0"),
+                ]),
             )
             .unwrap();
-        assert_eq!((config.server.host.as_str(), config.server.port), ("0.0.0.0", 9999));
+        assert_eq!(
+            (config.server.host.as_str(), config.server.port),
+            ("0.0.0.0", 9999)
+        );
     }
 
     #[test]
@@ -674,9 +682,15 @@ mod tests {
             forge: ForgeConfig::default(),
         };
         let err = config
-            .apply_tuning_env_overrides_from("ALBEDO_", env(&[("ALBEDO_REQUEST_TIMEOUT_MS", "15s")]))
+            .apply_tuning_env_overrides_from(
+                "ALBEDO_",
+                env(&[("ALBEDO_REQUEST_TIMEOUT_MS", "15s")]),
+            )
             .unwrap_err();
-        assert!(err.to_string().contains("ALBEDO_REQUEST_TIMEOUT_MS"), "{err}");
+        assert!(
+            err.to_string().contains("ALBEDO_REQUEST_TIMEOUT_MS"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -685,7 +699,10 @@ mod tests {
         assert_eq!(config.server.metrics_socket_addr().unwrap(), None);
 
         config
-            .apply_tuning_env_overrides_from("ALBEDO_", env(&[("ALBEDO_METRICS_ADDR", "0.0.0.0:9091")]))
+            .apply_tuning_env_overrides_from(
+                "ALBEDO_",
+                env(&[("ALBEDO_METRICS_ADDR", "0.0.0.0:9091")]),
+            )
             .unwrap();
         assert_eq!(
             config.server.metrics_socket_addr().unwrap(),
@@ -707,7 +724,10 @@ mod tests {
     #[test]
     fn backups_come_from_the_environment_and_refuse_a_nonsense_schedule() {
         let mut config = AppConfig::default();
-        assert_eq!(config.server.backup.dir, None, "off until a directory is named");
+        assert_eq!(
+            config.server.backup.dir, None,
+            "off until a directory is named"
+        );
 
         config
             .apply_tuning_env_overrides_from(

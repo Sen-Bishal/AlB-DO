@@ -4,12 +4,12 @@
 //! single `JSMallocFunctions` table. This module supplies that table. It splits memory by
 //! LIFETIME, but defers request-time lifetime management to `QuickJS` itself:
 //!
-//! * **persistent region** — a bump arena for warmup/bootstrap state (builtins, loaded
-//!   modules, the runtime-global tables `QuickJS` grows once during warmup). Never freed
-//!   while the engine lives; reclaimed wholesale when the engine drops.
-//! * **request-time memory** — everything a render/handler allocates after warmup goes to
-//!   the *system allocator* and is freed per-block by `QuickJS`'s own refcount + cycle
-//!   collector via [`ArenaControl::dealloc`].
+//! * **persistent region** — a bump arena for warmup/bootstrap state (builtins, loaded modules, the
+//!   runtime-global tables `QuickJS` grows once during warmup). Never freed while the engine lives;
+//!   reclaimed wholesale when the engine drops.
+//! * **request-time memory** — everything a render/handler allocates after warmup goes to the
+//!   *system allocator* and is freed per-block by `QuickJS`'s own refcount + cycle collector via
+//!   [`ArenaControl::dealloc`].
 //!
 //! ## Why not a resettable request region?
 //!
@@ -40,12 +40,11 @@
 //! invariants up, which is a poor place for an allocator's soundness to live. Both are
 //! now enforced rather than asserted:
 //!
-//! * `Region::bump` and the `realloc` top-of-region fast path are single atomic
-//!   read-modify-writes, so neither hands two callers the same address even if the
-//!   one-thread property stops holding.
-//! * [`ArenaControl::debug_assert_owning_thread`] pins the arena to the first thread
-//!   that allocates through it and fires on the second, so the property is *checked*
-//!   in every debug build rather than believed.
+//! * `Region::bump` and the `realloc` top-of-region fast path are single atomic read-modify-writes,
+//!   so neither hands two callers the same address even if the one-thread property stops holding.
+//! * [`ArenaControl::debug_assert_owning_thread`] pins the arena to the first thread that allocates
+//!   through it and fires on the second, so the property is *checked* in every debug build rather
+//!   than believed.
 //!
 //! Neither change fixes the intermittent `0xc0000005` recorded in
 //! `development-plan/ACCESS_VIOLATION.md` — that file's § 4 says plainly that these two
@@ -58,7 +57,6 @@
 // in safe Rust. Every `unsafe` block here carries a `// Safety:` argument naming the
 // invariant it relies on.
 #![allow(unsafe_code)]
-
 // An allocator is pointer arithmetic by nature: it stores region bases as integers,
 // reconstructs pointers from them, and offsets within blocks. These casts and the
 // offset math are intrinsic here (and provenance-correct on every supported target via
@@ -603,7 +601,10 @@ mod tests {
         ctl.begin_request();
         let mut a = ArenaAllocator::new(ctl.clone());
         let scoped = a.alloc(32);
-        assert!(!ctl.is_persistent(scoped), "request alloc must be a system block");
+        assert!(
+            !ctl.is_persistent(scoped),
+            "request alloc must be a system block"
+        );
         assert!(ctl.stats().system_live_bytes >= 32);
         assert!(ctl.stats().system_peak_bytes >= 32);
 
@@ -744,7 +745,10 @@ mod tests {
     fn a_zero_size_allocation_is_never_classified_as_foreign_memory() {
         let ctl = ArenaControl::new(HEADER_SIZE);
         assert_eq!(ctl.persistent.cap, HEADER_SIZE);
-        assert_eq!(ctl.persistent.top.load(Relaxed), ctl.persistent.cap - HEADER_SIZE);
+        assert_eq!(
+            ctl.persistent.top.load(Relaxed),
+            ctl.persistent.cap - HEADER_SIZE
+        );
 
         let p = alloc(&ctl, 0);
         assert!(!p.is_null());

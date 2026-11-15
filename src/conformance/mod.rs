@@ -137,10 +137,7 @@ pub enum Verdict {
 impl Verdict {
     /// Whether this verdict should fail the gate.
     pub const fn is_failure(&self) -> bool {
-        matches!(
-            self,
-            Self::Diverge { .. } | Self::EvaluatorFaulted { .. }
-        )
+        matches!(self, Self::Diverge { .. } | Self::EvaluatorFaulted { .. })
     }
 
     /// Whether the two renderers were actually compared. `false` for every
@@ -300,7 +297,10 @@ pub fn classify_evaluator_error(message: &str) -> Verdict {
     const STATIC_REFUSAL: &str = " is not supported by the static renderer";
     if let Some(at) = message.find(STATIC_REFUSAL) {
         let named = &message[..at];
-        let named = named.rsplit("could not be evaluated: ").next().unwrap_or(named);
+        let named = named
+            .rsplit("could not be evaluated: ")
+            .next()
+            .unwrap_or(named);
         let named = named.split(" (supported:").next().unwrap_or(named);
         return Verdict::EvaluatorDeclined {
             construct: format!("static: {}", named.trim()),
@@ -603,7 +603,11 @@ impl ConformanceReport {
         let faulted = self.count(|v| matches!(v, Verdict::EvaluatorFaulted { .. }));
         let qjs = self.count(|v| matches!(v, Verdict::QuickJsFaulted { .. }));
         let unset = self.count(|v| matches!(v, Verdict::NotComparable { .. }));
-        let compared = self.outcomes.iter().filter(|o| o.verdict.is_comparison()).count();
+        let compared = self
+            .outcomes
+            .iter()
+            .filter(|o| o.verdict.is_comparison())
+            .count();
 
         let mut out = String::new();
         out.push_str("RENDERER CONFORMANCE\n");
@@ -669,7 +673,8 @@ mod tests {
     /// shipping a wrapper to a user with no client code to remove it.
     #[test]
     fn a_reactive_anchor_is_not_forgiven_under_the_structural_contract() {
-        let with = "<ul><span data-albedo-id=\"1\" style=\"display:contents\"><li>a</li></span></ul>";
+        let with =
+            "<ul><span data-albedo-id=\"1\" style=\"display:contents\"><li>a</li></span></ul>";
         let without = "<ul><li>a</li></ul>";
         assert!(matches!(
             compare_markup(with, without, Contract::Structural),

@@ -5,18 +5,17 @@
 //! Two invariants in this tree were written down and then never checked, and both
 //! decayed in the same way — silently, because nothing could observe them:
 //!
-//! * **`unsafe_code`.** `[workspace.lints.rust]` declared `unsafe_code = "forbid"`
-//!   while no crate carried `[lints] workspace = true`, so the strongest lint in the
-//!   manifest applied to nothing at all. The tree meanwhile contained real `unsafe`
-//!   in the arena allocator and the evaluator. The lint is now `deny` and every
-//!   crate opts in, which makes the exceptions *expressible* — this fence is what
-//!   keeps them *few*.
+//! * **`unsafe_code`.** `[workspace.lints.rust]` declared `unsafe_code = "forbid"` while no crate
+//!   carried `[lints] workspace = true`, so the strongest lint in the manifest applied to nothing
+//!   at all. The tree meanwhile contained real `unsafe` in the arena allocator and the evaluator.
+//!   The lint is now `deny` and every crate opts in, which makes the exceptions *expressible* —
+//!   this fence is what keeps them *few*.
 //! * **`RenderManifestV2` is "the compiler's only output the server consumes."**
-//!   `crates/albedo-server` in fact reaches into thirteen compiler modules. Three of
-//!   them are compile-time modules. That is not automatically wrong — some of it is
-//!   deliberate shared vocabulary, the "one spelling, in Rust" rule the renderer
-//!   conformance work established — but the difference between a considered
-//!   exception and an accident has to live somewhere a reviewer cannot skip.
+//!   `crates/albedo-server` in fact reaches into thirteen compiler modules. Three of them are
+//!   compile-time modules. That is not automatically wrong — some of it is deliberate shared
+//!   vocabulary, the "one spelling, in Rust" rule the renderer conformance work established — but
+//!   the difference between a considered exception and an accident has to live somewhere a reviewer
+//!   cannot skip.
 //!
 //! ## The shape, and where it comes from
 //!
@@ -36,7 +35,13 @@ use std::path::{Path, PathBuf};
 /// Every `.rs` file under `dir`, recursively. Build artifacts and vendored trees are
 /// skipped: this walks *our* source, and `target/` alone would otherwise dwarf it.
 fn rust_files(dir: &Path) -> Vec<PathBuf> {
-    const SKIP: &[&str] = &["target", "node_modules", ".git", "graphify-out", "_claude-migration"];
+    const SKIP: &[&str] = &[
+        "target",
+        "node_modules",
+        ".git",
+        "graphify-out",
+        "_claude-migration",
+    ];
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return out;
@@ -127,7 +132,10 @@ fn unsafe_code_exceptions_are_exactly_the_audited_list() {
     }
     found.sort();
 
-    let mut expected: Vec<String> = UNSAFE_EXCEPTIONS.iter().map(|(f, _)| (*f).to_owned()).collect();
+    let mut expected: Vec<String> = UNSAFE_EXCEPTIONS
+        .iter()
+        .map(|(f, _)| (*f).to_owned())
+        .collect();
     expected.sort();
 
     assert_eq!(

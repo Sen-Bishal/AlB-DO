@@ -206,10 +206,10 @@ pub fn ddl() -> Vec<String> {
 #[must_use]
 pub fn fire_id(name: &str, tick_ms: i64) -> String {
     use chrono::{TimeZone, Utc};
-    let stamp = Utc
-        .timestamp_millis_opt(tick_ms)
-        .single()
-        .map_or_else(|| tick_ms.to_string(), |dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    let stamp = Utc.timestamp_millis_opt(tick_ms).single().map_or_else(
+        || tick_ms.to_string(),
+        |dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    );
     format!("{name}@{stamp}")
 }
 
@@ -490,9 +490,13 @@ pub async fn fail(
         ),
         &[
             SqlValue::Text(
-                if exhausted { JobState::Failed } else { JobState::Pending }
-                    .as_str()
-                    .to_string(),
+                if exhausted {
+                    JobState::Failed
+                } else {
+                    JobState::Pending
+                }
+                .as_str()
+                .to_string(),
             ),
             SqlValue::Integer(retry_at.unwrap_or(now_ms)),
             SqlValue::Text(truncate_error(error)),

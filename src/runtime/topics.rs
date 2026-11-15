@@ -154,12 +154,13 @@ where
             // The spec's own arguments are the lookup the route resolves
             // against: a literal answers itself, a param defers to the request.
             let resolved = route.resolve(|name| {
-                spec.args.iter().find(|arg| arg.name() == name).and_then(
-                    |arg| match arg {
+                spec.args
+                    .iter()
+                    .find(|arg| arg.name() == name)
+                    .and_then(|arg| match arg {
                         SourceArgSpec::Literal { value, .. } => Some(value.as_str()),
                         SourceArgSpec::Param { param: from, .. } => param(from.as_str()),
-                    },
-                )
+                    })
             })?;
             Some(ResolvedSourceTopic {
                 binding: spec.binding.clone(),
@@ -236,9 +237,8 @@ mod tests {
     fn a_matched_param_mints_the_canonical_identity() {
         let specs = vec![spec("rows", "messages", "room", "id")];
         let bound = params(&[("id", "42")]);
-        let resolved = resolve_partition_topics(&specs, None, |name| {
-            bound.get(name).map(String::as_str)
-        });
+        let resolved =
+            resolve_partition_topics(&specs, None, |name| bound.get(name).map(String::as_str));
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].topic, "messages:42");
@@ -331,10 +331,10 @@ mod tests {
     fn an_unmatched_param_resolves_to_nothing() {
         let specs = vec![spec("rows", "messages", "room", "id")];
         let bound = params(&[("slug", "42")]);
-        assert!(resolve_partition_topics(&specs, None, |name| bound
-            .get(name)
-            .map(String::as_str))
-        .is_empty());
+        assert!(
+            resolve_partition_topics(&specs, None, |name| bound.get(name).map(String::as_str))
+                .is_empty()
+        );
     }
 
     /// A URL segment is attacker-controlled. It reaches a topic namespace and a
@@ -374,7 +374,10 @@ mod tests {
 
         assert_eq!(from_hash, from_tree);
         assert_eq!(
-            from_hash.iter().map(|r| r.topic.as_str()).collect::<Vec<_>>(),
+            from_hash
+                .iter()
+                .map(|r| r.topic.as_str())
+                .collect::<Vec<_>>(),
             ["messages:room_7", "notes:room_7"]
         );
     }

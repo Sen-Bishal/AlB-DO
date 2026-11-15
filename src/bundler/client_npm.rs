@@ -106,13 +106,13 @@ pub fn client_shake_options() -> ShakeOptions {
 ///
 /// Same hosts, **no refusals**. Two deliberate differences from the client:
 ///
-/// * A package the browser must decline can still be *loaded* on the server —
-///   `react-dom` is imported all over the Radix layer, and refusing it here
-///   would turn 79.6% measured npm coverage into a build error for every action
-///   that merely imports something Radix-shaped. Loading is not rendering.
-/// * The defines are the same, and they have to be: the `QuickJS` prelude already
-///   sets `process.env.NODE_ENV = 'production'`, so folding against any other
-///   value would emit a branch whose dependency was never bundled.
+/// * A package the browser must decline can still be *loaded* on the server — `react-dom` is
+///   imported all over the Radix layer, and refusing it here would turn 79.6% measured npm coverage
+///   into a build error for every action that merely imports something Radix-shaped. Loading is not
+///   rendering.
+/// * The defines are the same, and they have to be: the `QuickJS` prelude already sets
+///   `process.env.NODE_ENV = 'production'`, so folding against any other value would emit a branch
+///   whose dependency was never bundled.
 ///
 /// 🔑 **Why the server externalises `react` at all.** Not as an optimisation —
 /// as the only way it can render. Real React's `forwardRef`/`memo` return
@@ -490,7 +490,9 @@ pub fn scan_client_npm_demand(source: &str) -> BTreeMap<String, BTreeSet<String>
                     .specifiers
                     .iter()
                     .map(|specifier| match specifier {
-                        swc_ecma_ast::ExportSpecifier::Named(entry) => export_name_text(&entry.orig),
+                        swc_ecma_ast::ExportSpecifier::Named(entry) => {
+                            export_name_text(&entry.orig)
+                        }
                         swc_ecma_ast::ExportSpecifier::Default(_) => "default".to_string(),
                         swc_ecma_ast::ExportSpecifier::Namespace(_) => STAR_DEMAND.to_string(),
                     })
@@ -556,7 +558,8 @@ mod tests {
                 );
             }
             for specifier in module.specifiers {
-                let Some(ExternalTarget::Host { provides, .. }) = options.externals().get(*specifier)
+                let Some(ExternalTarget::Host { provides, .. }) =
+                    options.externals().get(*specifier)
                 else {
                     panic!("{specifier} should be a host external");
                 };
@@ -589,8 +592,7 @@ mod tests {
         // `createPortal`), while the entry points that own a render lifecycle
         // stay refused. The property under test is unchanged — a capability the
         // host lacks fails at BUILD, never as a throwing stub in a browser.
-        let Some(ExternalTarget::Refused { reason }) =
-            options.externals().get("react-dom/client")
+        let Some(ExternalTarget::Refused { reason }) = options.externals().get("react-dom/client")
         else {
             panic!("react-dom/client must be refused");
         };
@@ -618,7 +620,9 @@ mod tests {
             "#,
         );
         assert_eq!(
-            demand.get("lucide-react").map(|d| d.iter().cloned().collect::<Vec<_>>()),
+            demand
+                .get("lucide-react")
+                .map(|d| d.iter().cloned().collect::<Vec<_>>()),
             Some(vec!["ArrowLeft".to_string(), "Check".to_string()]),
             "the IMPORTED name is what the package exports, not the local alias"
         );
@@ -635,9 +639,18 @@ mod tests {
             Some(&[STAR_DEMAND.to_string()].into_iter().collect()),
             "a side-effect import must take the module whole"
         );
-        assert!(!demand.contains_key("typed-only"), "type-only imports erase");
-        assert!(!demand.contains_key("react"), "framework runtime imports bind to globals");
-        assert!(!demand.contains_key("./local"), "relative imports are inlined");
+        assert!(
+            !demand.contains_key("typed-only"),
+            "type-only imports erase"
+        );
+        assert!(
+            !demand.contains_key("react"),
+            "framework runtime imports bind to globals"
+        );
+        assert!(
+            !demand.contains_key("./local"),
+            "relative imports are inlined"
+        );
     }
 
     #[test]
@@ -653,12 +666,18 @@ mod tests {
             "@radix-ui/react-slot"
         );
         // An alias artifact is keyed by the bare specifier and falls back.
-        assert_eq!(owning_package("lucide-react", "lucide-react"), "lucide-react");
+        assert_eq!(
+            owning_package("lucide-react", "lucide-react"),
+            "lucide-react"
+        );
     }
 
     #[test]
     fn slugs_are_url_safe() {
-        assert_eq!(slugify_package("@radix-ui/react-slot"), "_radix-ui_react-slot");
+        assert_eq!(
+            slugify_package("@radix-ui/react-slot"),
+            "_radix-ui_react-slot"
+        );
         assert_eq!(slugify_package("date-fns"), "date-fns");
     }
 }

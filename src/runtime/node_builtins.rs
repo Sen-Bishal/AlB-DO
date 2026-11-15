@@ -300,7 +300,10 @@ mod tests {
     fn the_two_kinds_say_different_things_about_the_future() {
         let host = refusal("node:child_process").expect("built-in");
         assert!(host.contains("will not be shimmed"));
-        assert!(host.contains("node:child_process"), "name the specifier as written");
+        assert!(
+            host.contains("node:child_process"),
+            "name the specifier as written"
+        );
 
         let shimmable = refusal("path").expect("built-in");
         assert!(shimmable.contains("no Node built-in shims yet"));

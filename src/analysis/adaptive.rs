@@ -79,8 +79,14 @@ mod tests {
     #[test]
     fn test_should_parallelize() {
         for workers in [8, 16] {
-            assert!(!should_parallelize_on(10, 100, workers), "{workers} workers");
-            assert!(should_parallelize_on(1000, 1000, workers), "{workers} workers");
+            assert!(
+                !should_parallelize_on(10, 100, workers),
+                "{workers} workers"
+            );
+            assert!(
+                should_parallelize_on(1000, 1000, workers),
+                "{workers} workers"
+            );
         }
     }
 
@@ -97,8 +103,8 @@ mod tests {
             let estimated_work_per_item = item_size_bytes * 10;
 
             let sequential_cost = total_items * estimated_work_per_item;
-            let parallel_cost =
-                (total_items / workers) * estimated_work_per_item + (workers * parallelism_overhead);
+            let parallel_cost = (total_items / workers) * estimated_work_per_item
+                + (workers * parallelism_overhead);
 
             parallel_cost < (sequential_cost * 8 / 10)
         }
@@ -129,7 +135,10 @@ mod tests {
             }
         }
         for total_items in [2, 100, 10_000] {
-            assert!(!should_parallelize_on(total_items, 4_096, 1), "one core is serial");
+            assert!(
+                !should_parallelize_on(total_items, 4_096, 1),
+                "one core is serial"
+            );
         }
     }
 }

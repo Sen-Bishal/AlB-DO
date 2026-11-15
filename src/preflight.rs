@@ -90,9 +90,7 @@ pub fn route_default_exports(compiled: &CompiledProject, served: &[String]) -> O
         problems: broken
             .iter()
             .map(|(route, spec, components)| match components.as_slice() {
-                [] => format!(
-                    "{route}  ({spec}) — no `export default` and no exported component"
-                ),
+                [] => format!("{route}  ({spec}) — no `export default` and no exported component"),
                 many => format!(
                     "{route}  ({spec}) — {} exported components ({}); mark one `export default`",
                     many.len(),
@@ -187,7 +185,10 @@ pub fn deferred_module_loads(compiled: &CompiledProject) -> Option<Failure> {
 /// The diagnosis and the reason it is a refusal rather than a feature live on
 /// [`crate::forge::validate_partitioned_whole_reads`].
 #[must_use]
-pub fn partitioned_whole_reads(compiled: &CompiledProject, schema: &ForgeSchema) -> Option<Failure> {
+pub fn partitioned_whole_reads(
+    compiled: &CompiledProject,
+    schema: &ForgeSchema,
+) -> Option<Failure> {
     crate::forge::validate_partitioned_whole_reads(&compiled.literal_topic_reads(), schema)
         .err()
         .map(|problems| Failure {
@@ -236,8 +237,9 @@ pub fn portable_module_paths(manifest: Option<&RenderManifestV2>) -> Option<Fail
         .collect();
 
     (!problems.is_empty()).then(|| Failure {
-        heading: "a component's module path names this build machine, so the artifact is not portable"
-            .to_string(),
+        heading:
+            "a component's module path names this build machine, so the artifact is not portable"
+                .to_string(),
         problems,
     })
 }

@@ -1232,7 +1232,9 @@ mod tests {
             export function getIssue() { return essays[0]; }
         "#;
 
-        let components = parser.parse_source(source, "src/content/essays.ts").unwrap();
+        let components = parser
+            .parse_source(source, "src/content/essays.ts")
+            .unwrap();
         assert_eq!(components.len(), 1, "one synthetic module-only node");
         assert!(components[0].is_module_only);
         assert_eq!(components[0].file_path, "src/content/essays.ts");

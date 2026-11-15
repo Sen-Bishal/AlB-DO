@@ -851,8 +851,14 @@ fn keyed_list_with_key_prop_drives_reconcile_sink() {
     );
     assert_eq!(payload.events.len(), 1, "one onClick append handler");
     let thunk = &payload.lists[0].rows_thunk;
-    assert!(thunk.contains("key:"), "rows thunk must project a key; got: {thunk}");
-    assert!(thunk.contains("html:"), "rows thunk must project row html; got: {thunk}");
+    assert!(
+        thunk.contains("key:"),
+        "rows thunk must project a key; got: {thunk}"
+    );
+    assert!(
+        thunk.contains("html:"),
+        "rows thunk must project row html; got: {thunk}"
+    );
     // SSR HTML carries the wrapper anchor and per-row keys.
     assert!(
         payload.html.contains("display:contents"),
@@ -870,11 +876,15 @@ fn keyed_list_with_key_prop_drives_reconcile_sink() {
     let runtime = Runtime::new().expect("quickjs runtime");
     let context = Context::full(&runtime).expect("quickjs context");
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_AND_VM).expect("DOM + VM shim evaluates");
-        ctx.eval::<(), _>(REACTIVE_DRIVER).expect("reactive driver evaluates");
+        ctx.eval::<(), _>(DOM_AND_VM)
+            .expect("DOM + VM shim evaluates");
+        ctx.eval::<(), _>(REACTIVE_DRIVER)
+            .expect("reactive driver evaluates");
         let bootstrap = format!("globalThis.__PAYLOAD = {payload_json};");
-        ctx.eval::<(), _>(bootstrap.as_str()).expect("payload injects");
-        ctx.eval::<String, _>(KEYED_LIST_SCENARIO).expect("scenario evaluates")
+        ctx.eval::<(), _>(bootstrap.as_str())
+            .expect("payload injects");
+        ctx.eval::<String, _>(KEYED_LIST_SCENARIO)
+            .expect("scenario evaluates")
     });
 
     let value: Value = serde_json::from_str(&summary).expect("scenario summary is JSON");
@@ -896,7 +906,10 @@ fn keyed_list_with_key_prop_drives_reconcile_sink() {
             && after_add.contains(">c</li>"),
         "after append, rows a,b,c present; got: {after_add}"
     );
-    assert_eq!(value["network"], 0, "keyed list reconcile must not round-trip");
+    assert_eq!(
+        value["network"], 0,
+        "keyed list reconcile must not round-trip"
+    );
 }
 
 #[test]
@@ -923,8 +936,8 @@ fn event_reading_handler_falls_back_to_island() {
 
     // A parameterless handler on the same thread must still serve-wire — the
     // decline is specific to reading the event, not a blanket poison.
-    let next = CompiledProject::load_from_dir(hook_fixture("counter"))
-        .expect("counter fixture compiles");
+    let next =
+        CompiledProject::load_from_dir(hook_fixture("counter")).expect("counter fixture compiles");
     let slots2 = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
     assert!(
         next.build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots2)

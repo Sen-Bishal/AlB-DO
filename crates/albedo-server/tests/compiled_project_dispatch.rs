@@ -50,8 +50,7 @@ fn counter_fixture() -> PathBuf {
 async fn compiled_counter_dispatch_increments_slot_through_http_action_route() {
     // ── 1. Compile the counter fixture and share via Arc ─────────────
     let project = Arc::new(
-        CompiledProject::load_from_dir(counter_fixture())
-            .expect("counter fixture compiles"),
+        CompiledProject::load_from_dir(counter_fixture()).expect("counter fixture compiles"),
     );
 
     // ── 2. Discover the proxy_id and slot_id by rendering once ───────
@@ -123,9 +122,9 @@ async fn compiled_counter_dispatch_increments_slot_through_http_action_route() {
     // runtime reading `__ALBEDO_CSRF__` from the shell — pin a session
     // and present its token in the `x-albedo-csrf` header.
     let session_uuid = uuid::Uuid::new_v4().to_string();
-    let csrf_token = server
-        .csrf_registry()
-        .token_for(SessionId::new(uuid::Uuid::parse_str(&session_uuid).unwrap()));
+    let csrf_token = server.csrf_registry().token_for(SessionId::new(
+        uuid::Uuid::parse_str(&session_uuid).unwrap(),
+    ));
     let body_bytes = encode_action_envelope(&ActionEnvelope {
         action_id: proxy_id,
         event_kind: 0,
@@ -190,8 +189,7 @@ async fn compiled_counter_persists_across_two_action_invocations() {
     // the same `x-albedo-session` header scopes both POSTs to the
     // same `(session, slot)` key.
     let project = Arc::new(
-        CompiledProject::load_from_dir(counter_fixture())
-            .expect("counter fixture compiles"),
+        CompiledProject::load_from_dir(counter_fixture()).expect("counter fixture compiles"),
     );
 
     // Render once to discover the proxy_id and slot_id baked into the
@@ -243,9 +241,9 @@ async fn compiled_counter_persists_across_two_action_invocations() {
     let session_uuid = uuid::Uuid::new_v4().to_string();
     // The gate requires a token on every click POST; mint the session's
     // once and present it on each increment (stable per session).
-    let csrf_token = server
-        .csrf_registry()
-        .token_for(SessionId::new(uuid::Uuid::parse_str(&session_uuid).unwrap()));
+    let csrf_token = server.csrf_registry().token_for(SessionId::new(
+        uuid::Uuid::parse_str(&session_uuid).unwrap(),
+    ));
     let router = server.router();
 
     for expected in [1, 2, 3] {
@@ -283,10 +281,12 @@ async fn compiled_counter_persists_across_two_action_invocations() {
                 Instruction::SlotSet { slot_id: s, value } if *s == slot_id => Some(value),
                 _ => None,
             })
-            .unwrap_or_else(|| panic!(
-                "increment #{expected} must emit a SlotSet; got: {:?}",
-                frame.instructions
-            ));
+            .unwrap_or_else(|| {
+                panic!(
+                    "increment #{expected} must emit a SlotSet; got: {:?}",
+                    frame.instructions
+                )
+            });
         let n: Value = serde_json::from_slice(value).unwrap();
         assert_eq!(
             n.as_f64().unwrap() as i64,
@@ -359,9 +359,9 @@ async fn compiled_counter_dispatch_via_quickjs_pool_matches_pure_rust_wire() {
     // Gate parity: the QuickJS path is behind the same CSRF gate, so the
     // click POSTs must present the session token just like the pure-Rust
     // test above.
-    let csrf_token = server
-        .csrf_registry()
-        .token_for(SessionId::new(uuid::Uuid::parse_str(&session_uuid).unwrap()));
+    let csrf_token = server.csrf_registry().token_for(SessionId::new(
+        uuid::Uuid::parse_str(&session_uuid).unwrap(),
+    ));
     let router = server.router();
     for expected in [1, 2] {
         let body = encode_action_envelope(&ActionEnvelope {

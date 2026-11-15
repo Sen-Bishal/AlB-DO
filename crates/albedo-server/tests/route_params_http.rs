@@ -49,7 +49,11 @@ fn run_ok(cmd: &mut Command, what: &str) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(out.status.success(), "{what} failed ({:?})\n{text}", out.status.code());
+    assert!(
+        out.status.success(),
+        "{what} failed ({:?})\n{text}",
+        out.status.code()
+    );
     text
 }
 
@@ -93,7 +97,10 @@ fn write(app: &Path, rel: &str, contents: &str) {
 fn project() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     let home = tempfile::tempdir().expect("temp home");
     let work = tempfile::tempdir().expect("temp workdir");
-    run_ok(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     let app = work.path().join("app");
     write(&app, "post/[id].tsx", POST);
     write(&app, "viaprops/[id].tsx", VIA_PROPS);
@@ -119,8 +126,14 @@ async fn serve(home: &Path, app: &Path) -> (Server, String) {
     let server = Server { child };
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_err() {
-        assert!(Instant::now() < deadline, "albedo serve never answered on {base}");
+    while reqwest::get(format!("{base}/_albedo/runtime.js"))
+        .await
+        .is_err()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "albedo serve never answered on {base}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     (server, base)
@@ -159,7 +172,10 @@ async fn each_url_of_a_dynamic_route_renders_its_own_params() {
     let (home, _work, app) = project();
 
     // The build names the reason in its tier report — `params`, not `user`.
-    let built = run_ok(albedo(home.path(), &app).args(["build", "."]), "albedo build");
+    let built = run_ok(
+        albedo(home.path(), &app).args(["build", "."]),
+        "albedo build",
+    );
     for page in ["Post", "ViaProps", "Files", "Shop", "Link"] {
         let line = built
             .lines()

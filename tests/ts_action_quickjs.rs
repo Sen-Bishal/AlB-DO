@@ -31,13 +31,18 @@ fn fixture(name: &str) -> PathBuf {
 
 fn engine() -> QuickJsEngine {
     let mut engine = QuickJsEngine::new();
-    engine.init(&BootstrapPayload::default()).expect("engine init");
+    engine
+        .init(&BootstrapPayload::default())
+        .expect("engine init");
     engine
 }
 
 /// Render once to discover the handler's `proxy_id` and the slot it writes,
 /// exactly as `bakabox` would from the bind opcodes.
-fn bind_ids(project: &CompiledProject, slots: &SessionSlotView) -> (u32, dom_render_compiler::ir::opcode::SlotId) {
+fn bind_ids(
+    project: &CompiledProject,
+    slots: &SessionSlotView,
+) -> (u32, dom_render_compiler::ir::opcode::SlotId) {
     let opts = RenderOptions { hook_compile: true };
     let out = render_entry_with_bindings(
         project,

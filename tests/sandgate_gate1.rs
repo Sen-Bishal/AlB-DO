@@ -8,10 +8,10 @@
 //!
 //! `ArenaControl::in_request` is a **routing flag**, not a region reset:
 //!
-//! * `in_request == true`  → allocations become QuickJS-managed *system* blocks,
-//!   freed per-block by refcount + the cycle collector.
-//! * `in_request == false` → allocations go to the **persistent bump region**,
-//!   which is never freed while the engine lives (16 MB cap).
+//! * `in_request == true`  → allocations become QuickJS-managed *system* blocks, freed per-block by
+//!   refcount + the cycle collector.
+//! * `in_request == false` → allocations go to the **persistent bump region**, which is never freed
+//!   while the engine lives (16 MB cap).
 //!
 //! `reset_realm` runs *between* renders, so `in_request` is **false** — which
 //! routes an entire fresh context, its intrinsics and the whole prelude into the
@@ -114,9 +114,7 @@ fn g1_2_persistent_growth_per_reset() {
     }
 
     let after = engine.arena_stats();
-    let growth = after
-        .persistent_used
-        .saturating_sub(before.persistent_used);
+    let growth = after.persistent_used.saturating_sub(before.persistent_used);
     let per_reset = growth as f64 / N as f64;
     println!(
         "\n  TOTAL persistent growth over {N} resets: {:.1} KB  →  {:.1} KB per reset",

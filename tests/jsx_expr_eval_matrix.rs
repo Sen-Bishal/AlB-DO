@@ -102,7 +102,8 @@ fn jsx_expr_matrix_renders_every_case_to_expected_html() {
         }
     }
 
-    assert!(failures.is_empty(), 
+    assert!(
+        failures.is_empty(),
         "JSX expr matrix: {}/{} cases failed\n\n{}\n",
         failures.len(),
         cases.len(),

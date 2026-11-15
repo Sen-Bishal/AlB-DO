@@ -206,7 +206,10 @@ fn nested_or_permutations_share_identity_but_preserve_authored_slot_maps() {
     let forward = dedup(all.clone(), &[]);
     all.reverse();
     assert_eq!(forward, dedup(all, &[]));
-    let names: Vec<_> = forward.iter().map(dom_render_compiler::forge::query::index::IndexSpec::name).collect();
+    let names: Vec<_> = forward
+        .iter()
+        .map(dom_render_compiler::forge::query::index::IndexSpec::name)
+        .collect();
     assert_eq!(
         names.len(),
         names
@@ -335,18 +338,24 @@ async fn lowered_null_range_or_group_and_exact_in_semantics_on_libsql() {
         .await,
         vec![2, 3, 5]
     );
-    assert_eq!(ids(
-        &conn,
-        &query("invoices.get(v)"),
-        &[libsql::Value::Integer(999)]
-    )
-    .await, [] as [i64; 0]);
-    assert_eq!(ids(
-        &conn,
-        &query("invoices.where({ status: v }).first()"),
-        &[libsql::Value::Text("absent".into())]
-    )
-    .await, [] as [i64; 0]);
+    assert_eq!(
+        ids(
+            &conn,
+            &query("invoices.get(v)"),
+            &[libsql::Value::Integer(999)]
+        )
+        .await,
+        [] as [i64; 0]
+    );
+    assert_eq!(
+        ids(
+            &conn,
+            &query("invoices.where({ status: v }).first()"),
+            &[libsql::Value::Text("absent".into())]
+        )
+        .await,
+        [] as [i64; 0]
+    );
 
     let count_query = query("invoices.where({ status: v }).count()");
     let mut rows = conn

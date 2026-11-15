@@ -9,8 +9,14 @@ use crate::forge::query::CollectionSchema;
 fn decls() -> BTreeMap<String, CollectionDecl> {
     let mut out = BTreeMap::new();
     for (name, json) in [
-        ("invoices", r#"{ "fields": { "amount": "real", "due": "timestamp", "owner": "text", "status": "text" } }"#),
-        ("messages", r#"{ "fields": { "room": "text", "body": "text" }, "partition_by": "room" }"#),
+        (
+            "invoices",
+            r#"{ "fields": { "amount": "real", "due": "timestamp", "owner": "text", "status": "text" } }"#,
+        ),
+        (
+            "messages",
+            r#"{ "fields": { "room": "text", "body": "text" }, "partition_by": "room" }"#,
+        ),
     ] {
         out.insert(name.to_string(), serde_json::from_str(json).expect("decl"));
     }
@@ -54,14 +60,26 @@ fn the_report_lists_sql_unbounded_and_whole_table_reads_and_indexes() {
     );
     let report = query_report(&c, &decls()).expect("report");
     assert!(report.contains("3 new-style queries"), "{report}");
-    assert!(report.contains("ORDER BY due DESC, id DESC LIMIT 50"), "{report}");
-    assert!(report.contains("CREATE INDEX IF NOT EXISTS idx_invoices_q"), "{report}");
+    assert!(
+        report.contains("ORDER BY due DESC, id DESC LIMIT 50"),
+        "{report}"
+    );
+    assert!(
+        report.contains("CREATE INDEX IF NOT EXISTS idx_invoices_q"),
+        "{report}"
+    );
     assert!(report.contains("(status, due DESC, id DESC)"), "{report}");
     let unbounded = report.split("## Unbounded reads").nth(1).unwrap();
     assert!(unbounded.starts_with(" (no limit/first): 1"), "{report}");
-    assert!(unbounded.contains("src/routes/r.tsx:5:"), "the owner read: {report}");
+    assert!(
+        unbounded.contains("src/routes/r.tsx:5:"),
+        "the owner read: {report}"
+    );
     let whole = report.split("## May examine a whole table").nth(1).unwrap();
-    assert!(whole.contains("src/routes/r.tsx:6:"), "count() over everything: {report}");
+    assert!(
+        whole.contains("src/routes/r.tsx:6:"),
+        "count() over everything: {report}"
+    );
 }
 
 #[test]
@@ -80,7 +98,9 @@ fn more_than_six_derived_indexes_on_a_table_is_a_warning() {
         .iter()
         .flat_map(|col| {
             ["asc", "desc"].iter().map(move |dir| {
-                format!("  await invoices.where({{ id: v }}).orderBy(\"{col}\", \"{dir}\").limit(5);\n")
+                format!(
+                    "  await invoices.where({{ id: v }}).orderBy(\"{col}\", \"{dir}\").limit(5);\n"
+                )
             })
         })
         .collect();

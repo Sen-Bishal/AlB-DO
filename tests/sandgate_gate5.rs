@@ -383,14 +383,20 @@ fn an_app_with_no_npm_is_never_dirty() {
     engine
         .load_module("routes/p.tsx", NO_NPM_ROUTE)
         .expect("route");
-    engine.render_component("routes/p.tsx", "{}").expect("renders");
+    engine
+        .render_component("routes/p.tsx", "{}")
+        .expect("renders");
 
     assert!(
         !engine.holds_third_party_code(),
         "🔴 an app with no npm dependency reported dirty — the pool will confine \
          every request on every project for no benefit"
     );
-    assert_eq!(engine.ledger_len(), 1, "one project module, one ledger entry");
+    assert_eq!(
+        engine.ledger_len(),
+        1,
+        "one project module, one ledger entry"
+    );
 
     let pkg = package("plain", PLAIN);
     register(&mut engine, &pkg).expect("register");
@@ -430,15 +436,20 @@ fn a_failed_rebuild_rolls_back_to_the_realm_that_was_working() {
     // the compiler, which is the cheapest way to make a replay fail for real
     // rather than by mocking one.
     let failed = engine.rebuild_realm(|e| {
-        e.load_module("routes/ok.tsx", "export default function O() { return <i>ok</i>; }")?;
+        e.load_module(
+            "routes/ok.tsx",
+            "export default function O() { return <i>ok</i>; }",
+        )?;
         e.load_module("routes/empty.tsx", "")
     });
     assert!(failed.is_err(), "the rebuild was supposed to fail");
 
     let after = engine
         .render_component(&pkg.route, "{}")
-        .expect("🔴 the engine stopped serving after a failed rebuild — it is now \
-                 initialised and empty, which is a permanent outage for a pooled engine")
+        .expect(
+            "🔴 the engine stopped serving after a failed rebuild — it is now \
+                 initialised and empty, which is a permanent outage for a pooled engine",
+        )
         .html;
     assert_eq!(
         before, after,
@@ -508,9 +519,7 @@ fn a_registered_but_never_imported_package_does_not_trigger_a_confinement() {
     engine
         .load_module(&pkg.route, &pkg.route_src)
         .expect("importing route");
-    engine
-        .render_component(&pkg.route, "{}")
-        .expect("renders");
+    engine.render_component(&pkg.route, "{}").expect("renders");
     assert!(
         engine.third_party_code_ran(),
         "🔴 a package factory executed and the realm did not latch — confinement \

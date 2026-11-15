@@ -34,23 +34,18 @@
 //!
 //! ## Rejection rules
 //!
-//! - `useSharedSlot` inside a conditional / loop body → would change
-//!   the binding count across renders; bakabox cannot align slots
-//!   stably so we refuse at compile time.
+//! - `useSharedSlot` inside a conditional / loop body → would change the binding count across
+//!   renders; bakabox cannot align slots stably so we refuse at compile time.
 //! - Missing argument → no topic to subscribe to.
-//! - An argument that is none of the three forms above → the topic has
-//!   to be derivable *without running the component*, because the
-//!   subscribe path (`RouteAuthority::authorize_route`) resolves the
-//!   same binding from the route path alone. A free expression also
-//!   makes the wire slot id non-deterministic across builds.
-//! - A partition key outside the closed vocabulary (`params.<name>`
-//!   today) → same reason, plus: this value reaches both a topic
-//!   namespace and a SQL parameter. `user.id` is recognised and
-//!   rejected with a message naming item 5, rather than lumped in with
-//!   genuine nonsense.
-//! - Non-identifier destructure pattern → no name to bind the read
-//!   value to. (`const { foo } = useSharedSlot(...)` is unsupported;
-//!   only `const x = useSharedSlot(...)` matches.)
+//! - An argument that is none of the three forms above → the topic has to be derivable *without
+//!   running the component*, because the subscribe path (`RouteAuthority::authorize_route`)
+//!   resolves the same binding from the route path alone. A free expression also makes the wire
+//!   slot id non-deterministic across builds.
+//! - A partition key outside the closed vocabulary (`params.<name>` today) → same reason, plus:
+//!   this value reaches both a topic namespace and a SQL parameter. `user.id` is recognised and
+//!   rejected with a message naming item 5, rather than lumped in with genuine nonsense.
+//! - Non-identifier destructure pattern → no name to bind the read value to. (`const { foo } =
+//!   useSharedSlot(...)` is unsupported; only `const x = useSharedSlot(...)` matches.)
 //!
 //! ## Import binding contract
 //!
@@ -213,13 +208,22 @@ impl SharedSlotBinding {
 /// stops the build instead of slipping into runtime.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SharedSlotExtractError {
-    HookInsideConditional { hook_idx_so_far: usize, location: String },
-    MissingTopicArgument { binding_name: Option<String> },
-    NonStringLiteralTopic { binding_name: Option<String> },
+    HookInsideConditional {
+        hook_idx_so_far: usize,
+        location: String,
+    },
+    MissingTopicArgument {
+        binding_name: Option<String>,
+    },
+    NonStringLiteralTopic {
+        binding_name: Option<String>,
+    },
     UnsupportedDestructurePattern,
     /// `.where(…)` was passed something other than a single-property object
     /// literal naming the partition column.
-    UnsupportedWhereShape { binding_name: Option<String> },
+    UnsupportedWhereShape {
+        binding_name: Option<String>,
+    },
     /// The partition key is an expression the subscribe path cannot reproduce.
     PartitionKeyUnsupported {
         binding_name: Option<String>,
@@ -233,7 +237,9 @@ pub enum SharedSlotExtractError {
     /// 🔑 No longer reachable from the *partition* path: `user.id` lands there
     /// as [`KeySource::Identity`] as of P1, and any other identity field is
     /// [`Self::UnsupportedIdentityField`] — a permanent refusal, not a schedule.
-    IdentityKeyNotYetSupported { binding_name: Option<String> },
+    IdentityKeyNotYetSupported {
+        binding_name: Option<String>,
+    },
     /// The partition key is an identity field that can never be a partition key.
     ///
     /// Separate from [`Self::IdentityKeyNotYetSupported`] because the answer is
@@ -248,7 +254,9 @@ pub enum SharedSlotExtractError {
     },
     /// APERTURE · a source route call whose argument is not a single object
     /// literal of named arguments.
-    UnsupportedSourceShape { binding_name: Option<String> },
+    UnsupportedSourceShape {
+        binding_name: Option<String>,
+    },
     /// APERTURE · a source route argument the resolver cannot reproduce.
     SourceArgUnsupported {
         binding_name: Option<String>,
@@ -441,8 +449,12 @@ fn try_extract_from_var_declarator(
     keys: &SiteKeys,
     out: &mut Vec<SharedSlotBinding>,
 ) -> Result<(), SharedSlotExtractError> {
-    let Some(init) = &decl.init else { return Ok(()) };
-    let Expr::Call(call) = init.as_ref() else { return Ok(()) };
+    let Some(init) = &decl.init else {
+        return Ok(());
+    };
+    let Expr::Call(call) = init.as_ref() else {
+        return Ok(());
+    };
     if !is_use_shared_slot_call(call, imports) {
         return Ok(());
     }
@@ -514,9 +526,12 @@ fn extract_topic_spec(
     sites: &std::collections::HashSet<u32>,
     keys: &SiteKeys,
 ) -> Result<TopicSpec, SharedSlotExtractError> {
-    let first = call.args.first().ok_or_else(|| {
-        SharedSlotExtractError::MissingTopicArgument { binding_name: binding_name.clone() }
-    })?;
+    let first = call
+        .args
+        .first()
+        .ok_or_else(|| SharedSlotExtractError::MissingTopicArgument {
+            binding_name: binding_name.clone(),
+        })?;
     // R5-7 · a FORGE read counts only where the classifier counted it: a
     // collection named by a shadowing parameter is ordinary JS, not a subscription.
     let site = sites.contains(&call.span.lo.0);
@@ -715,18 +730,27 @@ fn extract_partition(
     };
 
     // Callee must be `<ident>.where`, and `<ident>` must be a collection.
-    let Callee::Expr(callee) = &call.callee else { return Err(unsupported()) };
-    let Expr::Member(member) = unwrap_parens(callee) else { return Err(unsupported()) };
-    let MemberProp::Ident(method) = &member.prop else { return Err(unsupported()) };
+    let Callee::Expr(callee) = &call.callee else {
+        return Err(unsupported());
+    };
+    let Expr::Member(member) = unwrap_parens(callee) else {
+        return Err(unsupported());
+    };
+    let MemberProp::Ident(method) = &member.prop else {
+        return Err(unsupported());
+    };
     if method.sym.as_ref() != "where" {
         return Err(unsupported());
     }
-    let Expr::Ident(receiver) = unwrap_parens(&member.obj) else { return Err(unsupported()) };
+    let Expr::Ident(receiver) = unwrap_parens(&member.obj) else {
+        return Err(unsupported());
+    };
     // R5-7 · only a read the classifier counted as legacy is extracted.
     if !site {
         return Err(unsupported());
     }
-    let collection = collection_for_ident(receiver.sym.as_ref(), imports).ok_or_else(unsupported)?;
+    let collection =
+        collection_for_ident(receiver.sym.as_ref(), imports).ok_or_else(unsupported)?;
 
     // Exactly one argument, an object literal with exactly one `key: value`
     // property. More than one partition column is a composite key, which is a
@@ -1014,9 +1038,15 @@ impl TopicArgRewriter {
     }
 
     fn is_where_on_collection(&self, call: &CallExpr) -> bool {
-        let Callee::Expr(callee) = &call.callee else { return false };
-        let Expr::Member(member) = unwrap_parens(callee) else { return false };
-        let MemberProp::Ident(method) = &member.prop else { return false };
+        let Callee::Expr(callee) = &call.callee else {
+            return false;
+        };
+        let Expr::Member(member) = unwrap_parens(callee) else {
+            return false;
+        };
+        let MemberProp::Ident(method) = &member.prop else {
+            return false;
+        };
         if method.sym.as_ref() != "where" {
             return false;
         }
@@ -1030,8 +1060,12 @@ impl TopicArgRewriter {
     /// anything the author declared, including `where`. The receiver's import is
     /// the whole test, mirroring the extractor's dispatch.
     fn is_source_route_call(&self, call: &CallExpr) -> bool {
-        let Callee::Expr(callee) = &call.callee else { return false };
-        let Expr::Member(member) = unwrap_parens(callee) else { return false };
+        let Callee::Expr(callee) = &call.callee else {
+            return false;
+        };
+        let Expr::Member(member) = unwrap_parens(callee) else {
+            return false;
+        };
         if !matches!(&member.prop, MemberProp::Ident(_)) {
             return false;
         }
@@ -1044,26 +1078,39 @@ impl VisitMut for TopicArgRewriter {
     fn visit_mut_var_declarator(&mut self, decl: &mut VarDeclarator) {
         decl.visit_mut_children_with(self);
 
-        let Pat::Ident(binding) = &decl.name else { return };
+        let Pat::Ident(binding) = &decl.name else {
+            return;
+        };
         let binding = binding.id.sym.to_string();
         let Some(init) = &mut decl.init else { return };
-        let Expr::Call(call) = init.as_mut() else { return };
+        let Expr::Call(call) = init.as_mut() else {
+            return;
+        };
         if !self.sites.contains(&call.span.lo.0) && !callee_is_ident(call, &self.hook_local) {
             return;
         }
         if let Some(folded) = self.folded_arg(call, &binding) {
-            call.args[0] = ExprOrSpread { spread: None, expr: Box::new(folded) };
+            call.args[0] = ExprOrSpread {
+                spread: None,
+                expr: Box::new(folded),
+            };
         }
     }
 }
 
 fn callee_is_ident(call: &CallExpr, name: &str) -> bool {
-    let Callee::Expr(callee) = &call.callee else { return false };
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
     matches!(callee.as_ref(), Expr::Ident(ident) if ident.sym.as_ref() == name)
 }
 
 fn string_expr(value: &str) -> Expr {
-    Expr::Lit(Lit::Str(Str { span: DUMMY_SP, value: value.into(), raw: None }))
+    Expr::Lit(Lit::Str(Str {
+        span: DUMMY_SP,
+        value: value.into(),
+        raw: None,
+    }))
 }
 
 /// `__albedo_topic("<binding>")` — the host lookup for a topic only the render
@@ -1075,7 +1122,10 @@ fn topic_lookup_expr(binding: &str) -> Expr {
             TOPIC_LOOKUP_FN.into(),
             DUMMY_SP,
         )))),
-        args: vec![ExprOrSpread { spread: None, expr: Box::new(string_expr(binding)) }],
+        args: vec![ExprOrSpread {
+            spread: None,
+            expr: Box::new(string_expr(binding)),
+        }],
         type_args: None,
         ctxt: Default::default(),
     })
@@ -1100,8 +1150,12 @@ fn unwrap_parens(expr: &Expr) -> &Expr {
 }
 
 fn is_use_shared_slot_call(call: &CallExpr, imports: &HashMap<String, ImportBinding>) -> bool {
-    let Callee::Expr(callee) = &call.callee else { return false };
-    let Expr::Ident(ident) = callee.as_ref() else { return false };
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    let Expr::Ident(ident) = callee.as_ref() else {
+        return false;
+    };
     let name = ident.sym.to_string();
     imports
         .get(&name)
@@ -1424,7 +1478,10 @@ mod tests {
             "#,
         );
         assert!(
-            matches!(err, SharedSlotExtractError::IdentityKeyNotYetSupported { .. }),
+            matches!(
+                err,
+                SharedSlotExtractError::IdentityKeyNotYetSupported { .. }
+            ),
             "got {err:?}"
         );
         assert!(
@@ -1500,18 +1557,21 @@ mod tests {
     mod fold {
         use super::super::{rewrite_shared_slot_topic_args, TOPIC_LOOKUP_FN};
         use swc_common::{sync::Lrc, FileName, SourceMap};
-        use swc_ecma_ast::{
-            Callee, Decl, Expr, Lit, Module, ModuleItem, Pat, Stmt,
-        };
+        use swc_ecma_ast::{Callee, Decl, Expr, Lit, Module, ModuleItem, Pat, Stmt};
         use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax};
         use swc_ecma_visit::{Visit, VisitWith};
 
         fn parse_tsx(source: &str) -> Module {
             let cm: Lrc<SourceMap> = Default::default();
-            let fm =
-                cm.new_source_file(FileName::Custom("test.tsx".into()).into(), source.to_string());
+            let fm = cm.new_source_file(
+                FileName::Custom("test.tsx".into()).into(),
+                source.to_string(),
+            );
             let mut parser = Parser::new(
-                Syntax::Typescript(TsSyntax { tsx: true, ..Default::default() }),
+                Syntax::Typescript(TsSyntax {
+                    tsx: true,
+                    ..Default::default()
+                }),
                 StringInput::from(&*fm),
                 None,
             );
@@ -1543,9 +1603,15 @@ mod tests {
                     let (Pat::Ident(_), Some(init)) = (&decl.name, &decl.init) else {
                         return;
                     };
-                    let Expr::Call(call) = init.as_ref() else { return };
-                    let Callee::Expr(callee) = &call.callee else { return };
-                    let Expr::Ident(name) = callee.as_ref() else { return };
+                    let Expr::Call(call) = init.as_ref() else {
+                        return;
+                    };
+                    let Callee::Expr(callee) = &call.callee else {
+                        return;
+                    };
+                    let Expr::Ident(name) = callee.as_ref() else {
+                        return;
+                    };
                     if name.sym.as_ref() != "useSharedSlot" {
                         return;
                     }
@@ -1761,7 +1827,10 @@ mod tests {
             }
             "#,
         );
-        assert!(matches!(err, SharedSlotExtractError::HookInsideConditional { .. }));
+        assert!(matches!(
+            err,
+            SharedSlotExtractError::HookInsideConditional { .. }
+        ));
     }
 
     #[test]
@@ -1777,7 +1846,10 @@ mod tests {
             }
             "#,
         );
-        assert!(matches!(err, SharedSlotExtractError::HookInsideConditional { .. }));
+        assert!(matches!(
+            err,
+            SharedSlotExtractError::HookInsideConditional { .. }
+        ));
     }
 
     #[test]
@@ -1791,7 +1863,10 @@ mod tests {
             }
             "#,
         );
-        assert!(matches!(err, SharedSlotExtractError::MissingTopicArgument { .. }));
+        assert!(matches!(
+            err,
+            SharedSlotExtractError::MissingTopicArgument { .. }
+        ));
     }
 
     #[test]
@@ -1806,7 +1881,10 @@ mod tests {
             }
             "#,
         );
-        assert!(matches!(err, SharedSlotExtractError::NonStringLiteralTopic { .. }));
+        assert!(matches!(
+            err,
+            SharedSlotExtractError::NonStringLiteralTopic { .. }
+        ));
     }
 
     #[test]
@@ -1837,7 +1915,10 @@ mod tests {
             }
             "#,
         );
-        assert!(matches!(err, SharedSlotExtractError::UnsupportedDestructurePattern));
+        assert!(matches!(
+            err,
+            SharedSlotExtractError::UnsupportedDestructurePattern
+        ));
     }
 
     #[test]
@@ -1878,8 +1959,14 @@ mod tests {
                 route: "repo".to_string(),
                 // Sorted by argument name, not source order.
                 args: vec![
-                    ("name".to_string(), SourceArg::Literal("claude-code".to_string())),
-                    ("owner".to_string(), SourceArg::Literal("anthropics".to_string())),
+                    (
+                        "name".to_string(),
+                        SourceArg::Literal("claude-code".to_string())
+                    ),
+                    (
+                        "owner".to_string(),
+                        SourceArg::Literal("anthropics".to_string())
+                    ),
                 ],
             }
         );
@@ -1906,7 +1993,10 @@ mod tests {
                 source: "github".to_string(),
                 route: "repo".to_string(),
                 args: vec![
-                    ("name".to_string(), SourceArg::Literal("claude-code".to_string())),
+                    (
+                        "name".to_string(),
+                        SourceArg::Literal("claude-code".to_string())
+                    ),
                     ("owner".to_string(), SourceArg::Param("org".to_string())),
                 ],
             }

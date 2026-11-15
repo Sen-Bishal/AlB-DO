@@ -31,16 +31,15 @@
 //! </div>
 //! ```
 //!
-//! - The contents list holds the page's `##` and `###` headings, and is emitted
-//!   when there are at least two. Frontmatter `toc: false` drops it; `toc: true`
-//!   keeps it for a single heading.
-//! - Headings get GitHub's ids (`## Two words` → `two-words`, a repeat gets `-1`,
-//!   `-2`), or the one written as `{#id}`. `##` and below link to themselves.
+//! - The contents list holds the page's `##` and `###` headings, and is emitted when there are at
+//!   least two. Frontmatter `toc: false` drops it; `toc: true` keeps it for a single heading.
+//! - Headings get GitHub's ids (`## Two words` → `two-words`, a repeat gets `-1`, `-2`), or the one
+//!   written as `{#id}`. `##` and below link to themselves.
 //! - Fenced code keeps its language as `data-lang` on the `<pre class="md-code">`.
-//! - GitHub alerts (`> [!NOTE]`) become `<blockquote class="md-callout"
-//!   data-kind="note">` opening with a visible `<p class="md-callout-label">`.
-//! - Tables are wrapped in `<div class="md-table">`, so a wide one can scroll
-//!   inside its own box instead of widening the page.
+//! - GitHub alerts (`> [!NOTE]`) become `<blockquote class="md-callout" data-kind="note">` opening
+//!   with a visible `<p class="md-callout-label">`.
+//! - Tables are wrapped in `<div class="md-table">`, so a wide one can scroll inside its own box
+//!   instead of widening the page.
 //!
 //! Styling is the app's. This module emits structure and class names, nothing else.
 //!
@@ -68,8 +67,8 @@
 //! - raw HTML, block or inline (comments are dropped, not refused);
 //! - a relative link to a `.md` file that does not exist or is not a page;
 //! - a frontmatter key this module does not read;
-//! - a Markdown file at a dynamic segment (`[slug].md`), or named like a
-//!   convention file (`layout.md`, `error.md`, `loading.md`).
+//! - a Markdown file at a dynamic segment (`[slug].md`), or named like a convention file
+//!   (`layout.md`, `error.md`, `loading.md`).
 //!
 //! `_draft.md` is not a page — the rule `discover_routes` applies to `_Private.tsx`.
 
@@ -77,8 +76,8 @@ use crate::manifest::route_path_from_component;
 use crate::routing::ROUTES_DIRNAME;
 use crate::runtime::eval::component::{fnv1a_32, normalize_specifier};
 use pulldown_cmark::{
-    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser,
-    Tag, TagEnd,
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag,
+    TagEnd,
 };
 use std::collections::HashSet;
 use std::fmt;
@@ -123,7 +122,9 @@ impl std::error::Error for MarkdownError {}
 pub fn is_markdown_page(path: &Path) -> bool {
     // Case-sensitive, as `.tsx` is everywhere else: route discovery matches the
     // extension exactly, and a `.MD` it skips must not become a page anyway.
-    let is_markdown = path.extension().is_some_and(|ext| ext == MARKDOWN_EXTENSION);
+    let is_markdown = path
+        .extension()
+        .is_some_and(|ext| ext == MARKDOWN_EXTENSION);
     if !is_markdown {
         return false;
     }
@@ -192,7 +193,10 @@ fn page_route(file: &str) -> Result<String, MarkdownError> {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
-    if CONVENTION_STEMS.iter().any(|conv| stem.eq_ignore_ascii_case(conv)) {
+    if CONVENTION_STEMS
+        .iter()
+        .any(|conv| stem.eq_ignore_ascii_case(conv))
+    {
         return Err(error_at(
             file,
             1,
@@ -353,7 +357,9 @@ fn unquote(value: &str) -> Option<String> {
         return serde_json::from_str::<String>(value).ok();
     }
     if let Some(inner) = value.strip_prefix('\'') {
-        return inner.strip_suffix('\'').map(|inner| inner.replace("''", "'"));
+        return inner
+            .strip_suffix('\'')
+            .map(|inner| inner.replace("''", "'"));
     }
     Some(value.to_string())
 }
@@ -589,7 +595,10 @@ impl<'a> Lowering<'a> {
                 let rank = heading_rank(level);
                 let mut element_attrs = Vec::new();
                 if !classes.is_empty() {
-                    let classes: Vec<String> = classes.iter().map(std::string::ToString::to_string).collect();
+                    let classes: Vec<String> = classes
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect();
                     element_attrs.push(("className", js_string(&classes.join(" "))));
                 }
                 self.heading = Some(Heading {
@@ -626,7 +635,9 @@ impl<'a> Lowering<'a> {
                 });
             }
             Tag::HtmlBlock => self.html_block = Some((String::new(), offset)),
-            Tag::List(Some(first)) if first != 1 => self.open("ol", vec![("start", first.to_string())]),
+            Tag::List(Some(first)) if first != 1 => {
+                self.open("ol", vec![("start", first.to_string())])
+            }
             Tag::List(Some(_)) => self.open("ol", Vec::new()),
             Tag::List(None) => self.open("ul", Vec::new()),
             Tag::Item => self.open("li", Vec::new()),
@@ -673,7 +684,9 @@ impl<'a> Lowering<'a> {
                     None => ("td", None),
                 };
                 let attrs = match align {
-                    Some(Alignment::Left) => vec![("style", r#"{ textAlign: "left" }"#.to_string())],
+                    Some(Alignment::Left) => {
+                        vec![("style", r#"{ textAlign: "left" }"#.to_string())]
+                    }
                     Some(Alignment::Center) => {
                         vec![("style", r#"{ textAlign: "center" }"#.to_string())]
                     }
@@ -824,7 +837,11 @@ impl<'a> Lowering<'a> {
         }
 
         let children = if heading.rank >= 2 && !heading.has_link {
-            element("a", &[("href", js_string(&format!("#{id}")))], &open.children)
+            element(
+                "a",
+                &[("href", js_string(&format!("#{id}")))],
+                &open.children,
+            )
         } else {
             std::mem::take(&mut open.children)
         };
@@ -865,14 +882,21 @@ impl<'a> Lowering<'a> {
         if let Some(language) = &code.language {
             attrs.push(("data-lang", js_string(language)));
         }
-        self.push(element("pre", &attrs, &element("code", &[], &text_child(text))));
+        self.push(element(
+            "pre",
+            &attrs,
+            &element("code", &[], &text_child(text)),
+        ));
     }
 
     fn close_image(&mut self) {
         let Some(image) = self.image.take() else {
             return;
         };
-        let mut attrs = vec![("src", js_string(&image.src)), ("alt", js_string(&image.alt))];
+        let mut attrs = vec![
+            ("src", js_string(&image.src)),
+            ("alt", js_string(&image.alt)),
+        ];
         if !image.title.is_empty() {
             attrs.push(("title", js_string(&image.title)));
         }
@@ -903,7 +927,9 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             let Some((key, value)) = trimmed.split_once(':') else {
-                return fail(format!("frontmatter lines read `key: value`; `{trimmed}` does not."));
+                return fail(format!(
+                    "frontmatter lines read `key: value`; `{trimmed}` does not."
+                ));
             };
             let key = key.trim();
             let Some(value) = unquote(value.trim()) else {
@@ -953,7 +979,11 @@ impl<'a> Lowering<'a> {
             return Ok(dest.to_string());
         }
 
-        let resolved = self.path.parent().unwrap_or_else(|| Path::new("")).join(target);
+        let resolved = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target);
         if !resolved.is_file() {
             return Err(self.error(offset, format!("links to `{dest}`, which does not exist.")));
         }
@@ -1039,7 +1069,11 @@ impl<'a> Lowering<'a> {
         }
         let page = element("div", &[("className", js_string("md-page"))], &page);
 
-        let title = self.frontmatter.title.take().or_else(|| self.first_h1.take());
+        let title = self
+            .frontmatter
+            .title
+            .take()
+            .or_else(|| self.first_h1.take());
         let mut metadata = Vec::new();
         if let Some(title) = title {
             metadata.push(format!("title: {}", js_string(&title)));
@@ -1051,15 +1085,19 @@ impl<'a> Lowering<'a> {
         // Project-relative in the header, never the absolute path: this module is
         // carried into build artifacts, and an absolute path there discloses the
         // author's directory layout to anyone holding the binary.
-        let origin = self
-            .file
-            .split_once("/routes/").map_or_else(|| self.file.to_string(), |(_, tail)| format!("routes/{tail}"));
+        let origin = self.file.split_once("/routes/").map_or_else(
+            || self.file.to_string(),
+            |(_, tail)| format!("routes/{tail}"),
+        );
         let mut module = format!(
             "// Lowered from {origin} by ALB'DO (src/markdown.rs). Edit the Markdown: this \
              module is rebuilt on every build and never written to the project.\n"
         );
         if !metadata.is_empty() {
-            module.push_str(&format!("export const metadata = {{ {} }};\n", metadata.join(", ")));
+            module.push_str(&format!(
+                "export const metadata = {{ {} }};\n",
+                metadata.join(", ")
+            ));
         }
         module.push_str(&format!(
             "export default function {}() {{\n  return {page};\n}}\n",
@@ -1092,7 +1130,10 @@ mod tests {
     #[test]
     fn a_page_is_a_default_export_named_after_its_route() {
         let module = body("docs/getting-started.md", "# Getting started\n\nHello.\n");
-        assert!(module.contains("export default function MdDocsGettingStarted()"), "{module}");
+        assert!(
+            module.contains("export default function MdDocsGettingStarted()"),
+            "{module}"
+        );
         assert!(body("index.md", "Hi").contains("function MdIndex()"));
         assert!(body("docs/index.md", "Hi").contains("function MdDocs()"));
     }
@@ -1108,7 +1149,10 @@ mod tests {
     #[test]
     fn text_is_a_string_literal_so_the_evaluator_escapes_it() {
         let module = body("x.md", "a < b & {c} \"d\"\n");
-        assert!(module.contains(r#"<p>{"a < b & {c} \"d\""}</p>"#), "{module}");
+        assert!(
+            module.contains(r#"<p>{"a < b & {c} \"d\""}</p>"#),
+            "{module}"
+        );
     }
 
     #[test]
@@ -1122,14 +1166,20 @@ mod tests {
             "{with}"
         );
         let without = body("x.md", "# From the heading\n\nText.\n");
-        assert!(without.contains(r#"title: "From the heading""#), "{without}");
+        assert!(
+            without.contains(r#"title: "From the heading""#),
+            "{without}"
+        );
     }
 
     #[test]
     fn an_unknown_frontmatter_key_is_refused_on_its_line() {
         let err = page("x.md", "---\ntitle: A\nauthor: me\n---\nText\n").unwrap_err();
         assert_eq!(err.line, 3, "{err}");
-        assert!(err.message.contains("unknown frontmatter key `author`"), "{err}");
+        assert!(
+            err.message.contains("unknown frontmatter key `author`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1141,7 +1191,10 @@ mod tests {
         let inline = page("x.md", "Press <kbd>K</kbd>\n").unwrap_err();
         assert_eq!(inline.line, 1);
 
-        let module = body("x.md", "<!-- a note\nover two lines -->\n\nText <!-- inline --> here\n");
+        let module = body(
+            "x.md",
+            "<!-- a note\nover two lines -->\n\nText <!-- inline --> here\n",
+        );
         assert!(!module.contains("note"), "{module}");
         assert!(module.contains(r#"{"Text  here"}"#), "{module}");
     }
@@ -1152,9 +1205,14 @@ mod tests {
             "x.md",
             "# Title\n\n## Two words\n\n### Nested `code`\n\n## Two words\n\n## Custom {#mine}\n",
         );
-        assert!(module.contains(r#"<h1 id={"title"}>{"Title"}</h1>"#), "{module}");
         assert!(
-            module.contains(r##"<h2 id={"two-words"}><a href={"#two-words"}>{"Two words"}</a></h2>"##),
+            module.contains(r#"<h1 id={"title"}>{"Title"}</h1>"#),
+            "{module}"
+        );
+        assert!(
+            module.contains(
+                r##"<h2 id={"two-words"}><a href={"#two-words"}>{"Two words"}</a></h2>"##
+            ),
             "{module}"
         );
         assert!(module.contains(r#"id={"two-words-1"}"#), "{module}");
@@ -1208,9 +1266,18 @@ mod tests {
 
     #[test]
     fn images_carry_their_alt_text_and_task_lists_their_state() {
-        let module = body("x.md", "![A *diagram*](/d.png \"Fig\")\n\n- [x] done\n- [ ] not\n");
-        assert!(module.contains(r#"<img src={"/d.png"} alt={"A diagram"} title={"Fig"} />"#), "{module}");
-        assert!(module.contains(r#"<input type={"checkbox"} disabled checked />"#), "{module}");
+        let module = body(
+            "x.md",
+            "![A *diagram*](/d.png \"Fig\")\n\n- [x] done\n- [ ] not\n",
+        );
+        assert!(
+            module.contains(r#"<img src={"/d.png"} alt={"A diagram"} title={"Fig"} />"#),
+            "{module}"
+        );
+        assert!(
+            module.contains(r#"<input type={"checkbox"} disabled checked />"#),
+            "{module}"
+        );
     }
 
     #[test]
@@ -1228,9 +1295,15 @@ mod tests {
             "[r](./routing.md#dynamic) [i](index.md) [ext](https://x.dev/a.md) [hash](#top)\n",
         )
         .unwrap();
-        assert!(module.contains(r#"href={"/docs/routing#dynamic"}"#), "{module}");
+        assert!(
+            module.contains(r#"href={"/docs/routing#dynamic"}"#),
+            "{module}"
+        );
         assert!(module.contains(r#"href={"/docs"}"#), "{module}");
-        assert!(module.contains(r#"href={"https://x.dev/a.md"}"#), "{module}");
+        assert!(
+            module.contains(r#"href={"https://x.dev/a.md"}"#),
+            "{module}"
+        );
         assert!(module.contains(r##"href={"#top"}"##), "{module}");
 
         let dead = compile(&here, "Intro\n\nSee [gone](./gone.md).\n").unwrap_err();
@@ -1243,8 +1316,14 @@ mod tests {
 
     #[test]
     fn a_page_cannot_be_a_convention_file_or_a_dynamic_segment() {
-        assert!(page("docs/layout.md", "x").unwrap_err().message.contains("layout.tsx"));
-        assert!(page("docs/[slug].md", "x").unwrap_err().message.contains("dynamic segment"));
+        assert!(page("docs/layout.md", "x")
+            .unwrap_err()
+            .message
+            .contains("layout.tsx"));
+        assert!(page("docs/[slug].md", "x")
+            .unwrap_err()
+            .message
+            .contains("dynamic segment"));
     }
 
     #[test]
@@ -1260,7 +1339,10 @@ mod tests {
     #[test]
     fn the_module_header_never_carries_an_absolute_path() {
         let module = compile(Path::new("C:/Users/someone/app/src/routes/docs/a.md"), "Hi").unwrap();
-        assert!(module.starts_with("// Lowered from routes/docs/a.md "), "{module}");
+        assert!(
+            module.starts_with("// Lowered from routes/docs/a.md "),
+            "{module}"
+        );
         assert!(!module.contains("someone"), "{module}");
     }
 }

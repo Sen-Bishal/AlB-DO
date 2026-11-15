@@ -130,8 +130,8 @@ async fn open_one() -> LibSqlSubstrate {
 /// refutes "overlapping teardowns".
 ///
 /// **The regression test for T-0040, so it is not ignored.** On libsql 0.6.0
-/// it crashed 13/20 on Windows; on 0.10.0, 0/40. A crash shows as this binary exiting `0xc0000005`, which
-/// fails the run now that CI passes `--no-fail-fast` (the other binaries still
+/// it crashed 13/20 on Windows; on 0.10.0, 0/40. A crash shows as this binary exiting `0xc0000005`,
+/// which fails the run now that CI passes `--no-fail-fast` (the other binaries still
 /// run) and Windows gates. Linux and macOS never faulted on the double close,
 /// so there it only proves the teardown works.
 #[test]

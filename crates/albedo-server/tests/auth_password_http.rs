@@ -169,7 +169,11 @@ async fn load_sign_in_page(client: &reqwest::Client, base: &str) -> ServedForm {
         .send()
         .await
         .expect("sign-in page responds");
-    assert_eq!(response.status(), StatusCode::OK, "sign-in page must render");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "sign-in page must render"
+    );
 
     let cookie = response
         .headers()
@@ -184,7 +188,9 @@ async fn load_sign_in_page(client: &reqwest::Client, base: &str) -> ServedForm {
     let html = response.text().await.expect("html body");
 
     let csrf = hidden_field(&html, "_csrf").unwrap_or_else(|| {
-        panic!("the served sign-in form carried no CSRF token — a stranger cannot submit it:\n{html}")
+        panic!(
+            "the served sign-in form carried no CSRF token — a stranger cannot submit it:\n{html}"
+        )
     });
     assert!(
         !csrf.is_empty(),
@@ -347,7 +353,10 @@ async fn a_stranger_signs_up_signs_in_and_signs_out_over_http() {
         &base,
         "/_albedo/auth/password/register",
         &form,
-        &[("email", "ada@example.com"), ("password", "a-long-passphrase")],
+        &[
+            ("email", "ada@example.com"),
+            ("password", "a-long-passphrase"),
+        ],
     )
     .await;
     assert_eq!(
@@ -395,7 +404,10 @@ async fn a_stranger_signs_up_signs_in_and_signs_out_over_http() {
         &base,
         "/_albedo/auth/password/login",
         &form,
-        &[("email", "ada@example.com"), ("password", "a-long-passphrase")],
+        &[
+            ("email", "ada@example.com"),
+            ("password", "a-long-passphrase"),
+        ],
     )
     .await;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);

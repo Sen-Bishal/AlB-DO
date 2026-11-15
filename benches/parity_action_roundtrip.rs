@@ -43,7 +43,12 @@ fn fixture_root() -> PathBuf {
 
 fn build_session(
     project: &CompiledProject,
-) -> (Arc<BroadcastRegistry>, SessionSlotView, ActionEnvelope, Vec<u8>) {
+) -> (
+    Arc<BroadcastRegistry>,
+    SessionSlotView,
+    ActionEnvelope,
+    Vec<u8>,
+) {
     let broadcast = Arc::new(BroadcastRegistry::new());
     // Pre-register the topic so the action's `broadcast()` call
     // finds a live entry on first dispatch (mirrors Stream C.3's
@@ -67,8 +72,8 @@ fn build_session(
 }
 
 fn bench_action_roundtrip(c: &mut Criterion) {
-    let project = CompiledProject::load_from_dir(fixture_root())
-        .expect("load broadcast_demo fixture");
+    let project =
+        CompiledProject::load_from_dir(fixture_root()).expect("load broadcast_demo fixture");
     let (broadcast, slots, _envelope, encoded_envelope) = build_session(&project);
 
     // The full round-trip mirrors what bakabox / the HTTP handler

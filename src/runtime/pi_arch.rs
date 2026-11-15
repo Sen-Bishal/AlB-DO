@@ -103,7 +103,12 @@ impl PiArchKernel {
             angular_phase_distance(message.phase_result.phase, target.phase) / PI.max(f64::EPSILON);
         let priority_delta = (target.priority - message.phase_result.priority).abs();
 
-        self.weights.load.mul_add(lane_load, self.weights.priority.mul_add(priority_delta, self.weights.phase * phase_distance))
+        self.weights.load.mul_add(
+            lane_load,
+            self.weights
+                .priority
+                .mul_add(priority_delta, self.weights.phase * phase_distance),
+        )
     }
 }
 

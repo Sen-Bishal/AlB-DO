@@ -8,6 +8,7 @@
 //! always-on coverage and these are the ground-truth check against the two
 //! packages Gate 2 names.
 
+use dom_render_compiler::bundler::npm::ShakeOptions;
 use dom_render_compiler::bundler::npm::{bundle_npm_dependency, NpmDependencyBundle};
 use dom_render_compiler::ir::action::ActionEnvelope;
 use dom_render_compiler::ir::opcode::Instruction;
@@ -21,7 +22,6 @@ use dom_render_compiler::runtime::slot_store::SlotStore;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
-use dom_render_compiler::bundler::npm::ShakeOptions;
 
 /// The option set the server actually bundles with (`bundle_project_npm_dependencies`).
 ///
@@ -137,7 +137,8 @@ fn zod_parse_failure_is_loud() {
 fn date_fns_formats_through_root_import() {
     let Some(root) = fixture_root() else { return };
 
-    let bundle = bundle_npm_dependency(&root, "date-fns", &server_options()).expect("bundle date-fns");
+    let bundle =
+        bundle_npm_dependency(&root, "date-fns", &server_options()).expect("bundle date-fns");
     eprintln!(
         "date-fns {} bundled: {} artifacts",
         bundle.package_version,
@@ -268,7 +269,8 @@ fn compiled_project_action_handler_validates_with_zod() {
 fn date_fns_subpath_import_resolves() {
     let Some(root) = fixture_root() else { return };
 
-    let bundle = bundle_npm_dependency(&root, "date-fns/addDays", &server_options()).expect("bundle subpath");
+    let bundle = bundle_npm_dependency(&root, "date-fns/addDays", &server_options())
+        .expect("bundle subpath");
     eprintln!(
         "date-fns/addDays bundled: {} artifacts",
         bundle.artifacts.len()

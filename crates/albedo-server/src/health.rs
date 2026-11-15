@@ -8,13 +8,11 @@
 //!
 //! Two questions, because "no" means different things:
 //!
-//! - **health** — is the process answering? No database, no render, no app
-//!   code. A "no" here means *restart it*, so it must never say no for anything
-//!   a restart would not fix.
-//! - **ready** — should traffic come here? No while shutting down, so a load
-//!   balancer stops sending requests *before* the drain closes connections —
-//!   the half of a rolling deploy that otherwise drops them — and no when the
-//!   database does not answer a read in time.
+//! - **health** — is the process answering? No database, no render, no app code. A "no" here means
+//!   *restart it*, so it must never say no for anything a restart would not fix.
+//! - **ready** — should traffic come here? No while shutting down, so a load balancer stops sending
+//!   requests *before* the drain closes connections — the half of a rolling deploy that otherwise
+//!   drops them — and no when the database does not answer a read in time.
 //!
 //! Mounted on the router itself, ahead of dispatch: no middleware, no route
 //! gate, no rate limit. A probe a sign-in gate could redirect, or that SHUTTER
@@ -120,7 +118,11 @@ mod tests {
         let (_tx, shutdown) = watch::channel(false);
         let substrate: Substrate = Arc::new(OnceLock::new());
         let _ = substrate.set(Arc::new(Broken));
-        let response = ready(Readiness { shutdown, substrate }).await;
+        let response = ready(Readiness {
+            shutdown,
+            substrate,
+        })
+        .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

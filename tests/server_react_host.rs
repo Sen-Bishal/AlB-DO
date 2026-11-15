@@ -63,10 +63,10 @@ fn write_icon_package(root: &Path) {
 ///
 /// Every line here is load-bearing for a reason the eager server renderer used
 /// to break:
-///   * `getElementRef` calls `Object.getOwnPropertyDescriptor(element.props, …)`
-///     — a `TypeError` if an element has no `props` at all;
-///   * `mergeProps` reads the *child's* props to compose `className` and event
-///     handlers, so an element that forgot its props silently loses both;
+///   * `getElementRef` calls `Object.getOwnPropertyDescriptor(element.props, …)` — a `TypeError` if
+///     an element has no `props` at all;
+///   * `mergeProps` reads the *child's* props to compose `className` and event handlers, so an
+///     element that forgot its props silently loses both;
 ///   * `cloneElement` is how the merged result gets back onto the child.
 fn write_slot_package(root: &Path) {
     let pkg = root.join("node_modules").join("slotish");
@@ -225,8 +225,8 @@ fn the_server_bundle_contains_no_react() {
     let dir = tempfile::tempdir().unwrap();
     write_icon_package(dir.path());
 
-    let bundle = bundle_npm_dependency(dir.path(), "icons", &server_shake_options())
-        .expect("bundles");
+    let bundle =
+        bundle_npm_dependency(dir.path(), "icons", &server_shake_options()).expect("bundles");
     let keys: Vec<&str> = bundle.artifacts.iter().map(|a| a.key.as_str()).collect();
     assert!(
         !keys.iter().any(|key| key.starts_with("npm:react@")),
@@ -329,8 +329,14 @@ fn a_slot_merges_its_props_onto_the_child_element() {
         html.contains("class=\"slot mine\""),
         "className must be COMPOSED, slot then child, not overwritten: {html}"
     );
-    assert!(html.contains(">Open<"), "the child's own children survive: {html}");
-    assert!(!html.contains("ref="), "a merged ref is still not an attribute: {html}");
+    assert!(
+        html.contains(">Open<"),
+        "the child's own children survive: {html}"
+    );
+    assert!(
+        !html.contains("ref="),
+        "a merged ref is still not an attribute: {html}"
+    );
 }
 
 /// The other call shape Radix uses — `cloneElement(el, undefined, children)`.
@@ -355,7 +361,10 @@ fn cloning_with_no_config_keeps_every_prop_and_replaces_children() {
         "#,
     );
 
-    assert!(html.contains("class=\"keep\""), "props survive a childless clone: {html}");
+    assert!(
+        html.contains("class=\"keep\""),
+        "props survive a childless clone: {html}"
+    );
     assert!(html.contains("type=\"button\""), "all of them: {html}");
     assert!(html.contains(">after<"), "children are replaced: {html}");
     assert!(!html.contains("before"), "the originals are gone: {html}");
@@ -420,7 +429,10 @@ fn cloning_a_fragment_rooted_element_passes_it_through_unchanged() {
 
     // (`data-albedo-id` stamps mean the tags are matched on their text, not
     // spelled out.)
-    assert!(html.contains(">one</span>"), "the element still renders: {html}");
+    assert!(
+        html.contains(">one</span>"),
+        "the element still renders: {html}"
+    );
     assert!(html.contains(">two</span>"), "both halves: {html}");
     assert!(
         !html.contains("class=\"slot\""),

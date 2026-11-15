@@ -137,7 +137,10 @@ async fn serve(home: &Path, app: &Path) -> (Server, String) {
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_ok() {
+        if reqwest::get(format!("{base}/_albedo/runtime.js"))
+            .await
+            .is_ok()
+        {
             break;
         }
         assert!(
@@ -252,9 +255,13 @@ async fn a_scheduled_job_writes_to_forge_and_the_job_it_enqueued_runs() {
     // The idempotent enqueue: `tick` fires once a second and enqueues under a
     // fixed id every time, so there must be exactly ONE followup row however
     // many times it fired.
-    let followups = rows.iter().filter(|(name, _, _)| name == "followup").count();
+    let followups = rows
+        .iter()
+        .filter(|(name, _, _)| name == "followup")
+        .count();
     assert_eq!(
-        followups, 1,
+        followups,
+        1,
         "an enqueue with a fixed id must land once however often it is called:\n{}",
         describe(&rows)
     );
@@ -463,7 +470,8 @@ async fn an_action_can_queue_work_that_runs_after_the_request_returns() {
         .filter(|(name, state, _)| name == "from_action" && state == "done")
         .count();
     assert_eq!(
-        landed, 1,
+        landed,
+        1,
         "exactly one queued job should have run:\n{}",
         describe(&rows)
     );

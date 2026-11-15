@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use dom_render_compiler::forge::{
-    DataSubstrate, LibSqlSubstrate, ReserveOutcome, ReserveRequest, Reservations, SqlValue,
+    DataSubstrate, LibSqlSubstrate, Reservations, ReserveOutcome, ReserveRequest, SqlValue,
 };
 
 /// Rounds of contention to run. The gate is stated as "×1000" — enough that a
@@ -224,9 +224,8 @@ async fn oversell_invariant_holds_across_a_thousand_contended_rounds() {
 
         let report = contend(&db, &resource, buyers, quantity).await;
 
-        let context = format!(
-            "round {round}: capacity={capacity} buyers={buyers} quantity={quantity}"
-        );
+        let context =
+            format!("round {round}: capacity={capacity} buyers={buyers} quantity={quantity}");
 
         // 1. Every loser was told "sold out" — nobody got an error.
         assert!(
@@ -236,9 +235,7 @@ async fn oversell_invariant_holds_across_a_thousand_contended_rounds() {
         );
 
         // 2. Exactly the number of claims supply can cover, won.
-        let expected_winners = usize::try_from(capacity / quantity)
-            .unwrap()
-            .min(buyers);
+        let expected_winners = usize::try_from(capacity / quantity).unwrap().min(buyers);
         assert_eq!(
             report.winners.len(),
             expected_winners,
@@ -268,8 +265,8 @@ async fn oversell_invariant_holds_across_a_thousand_contended_rounds() {
             .expect("resource is defined");
         assert!(remaining >= 0, "{context}: supply went negative");
 
-        // 6. Conservation — the books balance. What the resource row says is
-        //    gone equals what the reservations say was taken.
+        // 6. Conservation — the books balance. What the resource row says is gone equals what the
+        //    reservations say was taken.
         let claimed = claimed_units(&db, &resource).await;
         assert_eq!(
             claimed,

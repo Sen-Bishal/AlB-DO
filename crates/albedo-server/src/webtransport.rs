@@ -86,9 +86,7 @@ impl WebTransportSessionRegistry {
     }
 
     pub fn count(&self) -> usize {
-        self.sessions
-            .lock()
-            .map_or(0, |sessions| sessions.len())
+        self.sessions.lock().map_or(0, |sessions| sessions.len())
     }
 
     pub fn has(&self, session_id: &Uuid) -> bool {
@@ -177,7 +175,11 @@ impl WebTransportSessionRegistry {
             let handle = sessions
                 .get(&session_id)
                 .ok_or_else(|| format!("WT session '{session_id}' not found"))?;
-            (handle.binding.clone(), handle.gate.clone(), handle.connection.clone())
+            (
+                handle.binding.clone(),
+                handle.gate.clone(),
+                handle.connection.clone(),
+            )
         };
         let presented = identity.token().cloned();
         let (entry, fresh) = {
@@ -192,7 +194,8 @@ impl WebTransportSessionRegistry {
                     (live.entry().clone(), false)
                 }
                 WtBinding::Unbound => {
-                    let handle = live.register(crate::live_authority::LiveKind::WebTransport, identity);
+                    let handle =
+                        live.register(crate::live_authority::LiveKind::WebTransport, identity);
                     let entry = handle.entry().clone();
                     let _ = gate.set(entry.clone());
                     *slot = WtBinding::Bound {
@@ -461,8 +464,18 @@ fn spawn_stream_writers(
     // R1b · control traffic is unbound protocol traffic and is never gated;
     // shell, patches and prefetch carry route data and are.
     spawn_stream_writer(connection.clone(), WT_STREAM_SLOT_CONTROL, control_rx, None);
-    spawn_stream_writer(connection.clone(), WT_STREAM_SLOT_SHELL, shell_rx, Some(gate.clone()));
-    spawn_stream_writer(connection.clone(), WT_STREAM_SLOT_PATCHES, patch_rx, Some(gate.clone()));
+    spawn_stream_writer(
+        connection.clone(),
+        WT_STREAM_SLOT_SHELL,
+        shell_rx,
+        Some(gate.clone()),
+    );
+    spawn_stream_writer(
+        connection.clone(),
+        WT_STREAM_SLOT_PATCHES,
+        patch_rx,
+        Some(gate.clone()),
+    );
     spawn_stream_writer(connection, WT_STREAM_SLOT_PREFETCH, prefetch_rx, Some(gate));
 
     [control_tx, shell_tx, patch_tx, prefetch_tx]

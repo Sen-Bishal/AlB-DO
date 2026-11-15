@@ -193,8 +193,8 @@ impl JobsPlan {
             // Keyed by the row, not by the attempt: a retry of the same row is
             // the same decision, so an upstream that honours idempotency keys
             // will not charge twice for a job that failed after its call landed.
-            let journal = journal
-                .get_or_insert_with(|| Journal::new(format!("job_{}", job.id), "job"));
+            let journal =
+                journal.get_or_insert_with(|| Journal::new(format!("job_{}", job.id), "job"));
             dom_render_compiler::aperture::resolve_pending(client, journal, &pending, None)
                 .await
                 .map_err(|err| err.to_string())?;
@@ -453,7 +453,10 @@ impl JobRunner {
             return Arc::from("null");
         };
         let Ok(id) = PrincipalId::parse(raw) else {
-            return Arc::from(format!(r#"{{"id":{}}}"#, serde_json::Value::String(raw.to_string())));
+            return Arc::from(format!(
+                r#"{{"id":{}}}"#,
+                serde_json::Value::String(raw.to_string())
+            ));
         };
         let loaded = dom_render_compiler::auth::store::load_principal(self.db.as_ref(), &id)
             .await
@@ -548,8 +551,7 @@ impl JobRunner {
 
             self.passes = self.passes.wrapping_add(1);
             if self.passes.is_multiple_of(SWEEP_EVERY) {
-                if let Err(err) =
-                    queue::sweep_done(self.db.as_ref(), now - DONE_RETENTION_MS).await
+                if let Err(err) = queue::sweep_done(self.db.as_ref(), now - DONE_RETENTION_MS).await
                 {
                     tracing::warn!(error = %err, "the finished-job sweep failed");
                 }
@@ -933,12 +935,10 @@ impl JobRunner {
                 // function's only caller in the repository was a test, so every
                 // deployed app accumulated expired session rows forever.
                 let now = crate::auth::now_ms();
-                let purged = dom_render_compiler::auth::store::purge_expired_sessions(
-                    self.db.as_ref(),
-                    now,
-                )
-                .await
-                .map_err(|err| err.to_string())?;
+                let purged =
+                    dom_render_compiler::auth::store::purge_expired_sessions(self.db.as_ref(), now)
+                        .await
+                        .map_err(|err| err.to_string())?;
                 if purged > 0 {
                     tracing::info!(rows = purged, "expired sessions swept");
                 }
@@ -951,10 +951,12 @@ impl JobRunner {
                     .auth()
                     .is_some_and(|auth| !auth.registry().is_empty())
                 {
-                    let tokens =
-                        dom_render_compiler::auth::email_token::purge_expired(self.db.as_ref(), now)
-                            .await
-                            .map_err(|err| err.to_string())?;
+                    let tokens = dom_render_compiler::auth::email_token::purge_expired(
+                        self.db.as_ref(),
+                        now,
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?;
                     if tokens > 0 {
                         tracing::info!(rows = tokens, "expired email tokens swept");
                     }

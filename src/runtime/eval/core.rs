@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::runtime::eval::component::{
-    arg_num, as_rendered_html, classnames_collect, date_value_ms, escape_html, fnv1a_32, fnv1a_hash,
-    import_candidates, is_classnames_source, is_component_module, is_component_tag, is_truthy,
-    is_void_tag, json_int, json_num, lit_to_value, make_date_value, make_html_value,
+    arg_num, as_rendered_html, classnames_collect, date_value_ms, escape_html, fnv1a_32,
+    fnv1a_hash, import_candidates, is_classnames_source, is_component_module, is_component_tag,
+    is_truthy, is_void_tag, json_int, json_num, lit_to_value, make_date_value, make_html_value,
     normalize_jsx_text, normalize_slashes, normalize_specifier, prop_name_to_string,
     push_expression_child, render_attrs, to_number, unwrap_html_markers, value_to_string,
 };
@@ -127,7 +127,11 @@ fn next_use_id() -> String {
         n
     });
     let scope = RENDER_ID_SCOPE.with(|cell| cell.borrow().clone());
-    let scope = if scope.is_empty() { "r".to_string() } else { scope };
+    let scope = if scope.is_empty() {
+        "r".to_string()
+    } else {
+        scope
+    };
     // `n.to_string(36)` on the JS side; base-36 by hand here so the two spell
     // the same digits.
     let mut digits = String::new();
@@ -1271,7 +1275,10 @@ const UNRENDERABLE_KEY: &str = "\u{0}albedo:unrenderable";
 
 fn unrenderable(error: &anyhow::Error) -> Value {
     let mut map = serde_json::Map::new();
-    map.insert(UNRENDERABLE_KEY.to_string(), Value::String(format!("{error:#}")));
+    map.insert(
+        UNRENDERABLE_KEY.to_string(),
+        Value::String(format!("{error:#}")),
+    );
     Value::Object(map)
 }
 
@@ -1280,7 +1287,12 @@ fn pattern_names(pat: &swc_ecma_ast::Pat) -> Vec<String> {
     use swc_ecma_ast::{ObjectPatProp, Pat};
     match pat {
         Pat::Ident(binding) => vec![binding.id.sym.to_string()],
-        Pat::Array(array) => array.elems.iter().flatten().flat_map(pattern_names).collect(),
+        Pat::Array(array) => array
+            .elems
+            .iter()
+            .flatten()
+            .flat_map(pattern_names)
+            .collect(),
         Pat::Object(object) => object
             .props
             .iter()
@@ -1351,7 +1363,11 @@ fn integer_or_zero(value: &Value) -> f64 {
 fn relative_index(value: &Value, len: usize) -> usize {
     let n = integer_or_zero(value);
     let len_f = len as f64;
-    let at = if n < 0.0 { (len_f + n).max(0.0) } else { n.min(len_f) };
+    let at = if n < 0.0 {
+        (len_f + n).max(0.0)
+    } else {
+        n.min(len_f)
+    };
     at as usize
 }
 
@@ -1396,20 +1412,14 @@ fn to_primitive(value: &Value) -> Value {
 const fn is_js_whitespace(c: char) -> bool {
     matches!(
         c,
-        '\t' | '\n'
-            | '\u{B}'
-            | '\u{C}'
-            | '\r'
-            | ' '
-            | '\u{A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
+        '\t' | '\n' | '\u{B}' | '\u{C}' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
     )
 }
 
@@ -1422,19 +1432,34 @@ fn string_to_number(s: &str) -> f64 {
     if s.is_empty() {
         return 0.0;
     }
-    for (prefix, radix) in [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)] {
+    for (prefix, radix) in [
+        ("0x", 16),
+        ("0X", 16),
+        ("0o", 8),
+        ("0O", 8),
+        ("0b", 2),
+        ("0B", 2),
+    ] {
         if let Some(digits) = s.strip_prefix(prefix) {
             if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
                 return f64::NAN;
             }
-            return digits
-                .chars()
-                .fold(0.0, |n, c| f64::mul_add(n, f64::from(radix), f64::from(c.to_digit(radix).unwrap_or(0))));
+            return digits.chars().fold(0.0, |n, c| {
+                f64::mul_add(
+                    n,
+                    f64::from(radix),
+                    f64::from(c.to_digit(radix).unwrap_or(0)),
+                )
+            });
         }
     }
     let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
     if unsigned == "Infinity" {
-        return if s.starts_with('-') { f64::NEG_INFINITY } else { f64::INFINITY };
+        return if s.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
     }
     if !unsigned
         .chars()
@@ -1575,7 +1600,9 @@ fn rfind_units(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
         return None;
     }
     let last = from.min(haystack.len() - needle.len());
-    (0..=last).rev().find(|&i| haystack[i..].starts_with(needle))
+    (0..=last)
+        .rev()
+        .find(|&i| haystack[i..].starts_with(needle))
 }
 
 /// The most UTF-16 code units one `repeat` / `padStart` / `padEnd` may build.
@@ -1615,7 +1642,11 @@ fn parse_int(input: &str, radix: Option<&Value>) -> f64 {
         digits.parse::<f64>().unwrap_or(f64::NAN)
     } else {
         digits.chars().fold(0.0, |n, c| {
-            f64::mul_add(n, f64::from(radix), f64::from(c.to_digit(radix as u32).unwrap_or(0)))
+            f64::mul_add(
+                n,
+                f64::from(radix),
+                f64::from(c.to_digit(radix as u32).unwrap_or(0)),
+            )
         })
     };
     if negative {
@@ -1637,7 +1668,11 @@ fn parse_float(input: &str) -> f64 {
     };
     let mut i = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
     if s[i..].starts_with("Infinity") {
-        return if s.starts_with('-') { f64::NEG_INFINITY } else { f64::INFINITY };
+        return if s.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
     }
     let int_end = digits_from(i);
     let mut has_digits = int_end > i;
@@ -1700,7 +1735,10 @@ fn js_to_fixed(x: f64, digits: usize) -> String {
     // an f64 — ends in a 5 at the first place dropped. Nudged one ulp up, it
     // is no longer a tie, and any correct rounding of it rounds up.
     let exact = format!("{magnitude:.1100}");
-    let fraction = exact.split_once('.').map_or("", |(_, fraction)| fraction).as_bytes();
+    let fraction = exact
+        .split_once('.')
+        .map_or("", |(_, fraction)| fraction)
+        .as_bytes();
     let is_tie = fraction.get(digits) == Some(&b'5')
         && fraction[digits + 1..].iter().all(|&digit| digit == b'0');
     let rounded = if is_tie {
@@ -1763,7 +1801,8 @@ thread_local! {
 pub(crate) fn install_phase_k_css_modules(
     registry: &crate::runtime::compiled::CssModuleRegistry,
 ) -> PhaseKCssModulesGuard {
-    let previous = PHASE_K_CSS_MODULES.with(|cell| cell.replace(Some(std::ptr::from_ref(registry))));
+    let previous =
+        PHASE_K_CSS_MODULES.with(|cell| cell.replace(Some(std::ptr::from_ref(registry))));
     PhaseKCssModulesGuard { previous }
 }
 
@@ -2786,9 +2825,7 @@ impl ComponentProject {
             .get(module_spec)
             .ok_or_else(|| anyhow!("module '{module_spec}' not loaded"))?;
         let function = module.functions.get(function_name).ok_or_else(|| {
-            anyhow!(
-                "function '{function_name}' missing in module '{module_spec}'"
-            )
+            anyhow!("function '{function_name}' missing in module '{module_spec}'")
         })?;
 
         let mut env = HashMap::new();
@@ -2917,7 +2954,12 @@ impl ComponentProject {
     /// in an object literal alike — so a constant that could not be evaluated
     /// (see [`unrenderable`]) raises its reason wherever it is read, and an
     /// imported value resolves in both positions.
-    fn eval_ident(&self, module_spec: &str, name: &str, env: &HashMap<String, Value>) -> Result<Value> {
+    fn eval_ident(
+        &self,
+        module_spec: &str,
+        name: &str,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value> {
         if let Some(value) = env.get(name) {
             return check_renderable(name, value.clone());
         }
@@ -3137,13 +3179,17 @@ impl ComponentProject {
                 // member callee path.
                 Ok(map.get(prop_name).cloned().unwrap_or(Value::Null))
             }
-            Value::Array(items) => if prop_name == "length" { Ok(json_int(items.len() as i64)) } else {
-                // Numeric string indexing: `arr["0"]` matches JS semantics.
-                if let Some(idx) = canonical_index(prop_name) {
-                    return Ok(items.get(idx).cloned().unwrap_or(Value::Null));
+            Value::Array(items) => {
+                if prop_name == "length" {
+                    Ok(json_int(items.len() as i64))
+                } else {
+                    // Numeric string indexing: `arr["0"]` matches JS semantics.
+                    if let Some(idx) = canonical_index(prop_name) {
+                        return Ok(items.get(idx).cloned().unwrap_or(Value::Null));
+                    }
+                    Ok(Value::Null)
                 }
-                Ok(Value::Null)
-            },
+            }
             // UTF-16 code units, as JavaScript counts: `"😀".length` is 2, and
             // `s[i]` is one unit. Counting `char`s disagreed on every string
             // outside the Basic Multilingual Plane.
@@ -3171,7 +3217,8 @@ impl ComponentProject {
         for (i, quasi) in tpl.quasis.iter().enumerate() {
             let text = quasi
                 .cooked
-                .as_ref().map_or_else(|| quasi.raw.to_string(), std::string::ToString::to_string);
+                .as_ref()
+                .map_or_else(|| quasi.raw.to_string(), std::string::ToString::to_string);
             result.push_str(&text);
             if i < tpl.exprs.len() {
                 let val = self.eval_expr(module_spec, &tpl.exprs[i], env)?;
@@ -3309,7 +3356,8 @@ impl ComponentProject {
             BinaryOp::In => {
                 let key = js_string(&self.eval_expr(module_spec, &bin.left, env)?);
                 let target = self.eval_expr(module_spec, &bin.right, env)?;
-                let is_data = date_value_ms(&target).is_none() && as_rendered_html(&target).is_none();
+                let is_data =
+                    date_value_ms(&target).is_none() && as_rendered_html(&target).is_none();
                 match &target {
                     Value::Object(map) if is_data => Ok(Value::Bool(map.contains_key(&key))),
                     Value::Array(items) => Ok(Value::Bool(
@@ -3331,7 +3379,10 @@ impl ComponentProject {
             return Ok(json_num(value));
         }
         let kind = if value.is_nan() { "NaN" } else { "Infinity" };
-        self.unmodelled(module_spec, &format!("arithmetic (`{op}`) that produces {kind}"))
+        self.unmodelled(
+            module_spec,
+            &format!("arithmetic (`{op}`) that produces {kind}"),
+        )
     }
 
     fn eval_cond(
@@ -3426,9 +3477,7 @@ impl ComponentProject {
                 }
                 if module.is_some_and(|m| m.imports.contains_key(name)) {
                     return match self.resolve_imported_value(module_spec, name) {
-                        Some(value) => {
-                            answer_for(&check_renderable(name, value)?)
-                        }
+                        Some(value) => answer_for(&check_renderable(name, value)?),
                         None => self.unmodelled(
                             module_spec,
                             &format!("`typeof {name}` of an import that is not a constant"),
@@ -3554,13 +3603,16 @@ impl ComponentProject {
                     match value {
                         Value::Object(source) => map.extend(source),
                         Value::Array(items) => map.extend(
-                            items.into_iter().enumerate().map(|(i, item)| (i.to_string(), item)),
-                        ),
-                        Value::String(s) => map.extend(
-                            s.encode_utf16()
+                            items
+                                .into_iter()
                                 .enumerate()
-                                .map(|(i, unit)| (i.to_string(), Value::String(from_utf16(&[unit])))),
+                                .map(|(i, item)| (i.to_string(), item)),
                         ),
+                        Value::String(s) => {
+                            map.extend(s.encode_utf16().enumerate().map(|(i, unit)| {
+                                (i.to_string(), Value::String(from_utf16(&[unit])))
+                            }))
+                        }
                         // `null`, `undefined`, booleans and numbers have no own
                         // properties, so spreading one adds nothing — not an error.
                         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -3590,7 +3642,10 @@ impl ComponentProject {
                     map.insert(name, val);
                 }
                 Prop::Method(_) | Prop::Getter(_) | Prop::Setter(_) | Prop::Assign(_) => {
-                    return self.unmodelled(module_spec, "a method, getter or setter in an object literal");
+                    return self.unmodelled(
+                        module_spec,
+                        "a method, getter or setter in an object literal",
+                    );
                 }
             }
         }
@@ -3729,8 +3784,7 @@ impl ComponentProject {
                 let import = module.and_then(|m| m.imports.get(&fn_name));
 
                 // classnames / clsx — flatten args into a class string.
-                let is_classnames = import
-                    .is_some_and(|b| is_classnames_source(&b.source));
+                let is_classnames = import.is_some_and(|b| is_classnames_source(&b.source));
                 if is_classnames {
                     let mut classes = Vec::new();
                     for arg in &call.args {
@@ -3748,8 +3802,7 @@ impl ComponentProject {
                 // slot-store reads/writes; until then this lets `{count}`
                 // render its initial value instead of vanishing.
                 let is_react_use_state = fn_name == "useState"
-                    && import
-                        .is_some_and(|b| b.source == "react" && b.export_name == "useState");
+                    && import.is_some_and(|b| b.source == "react" && b.export_name == "useState");
                 if is_react_use_state {
                     let initial = match call.args.first() {
                         Some(arg) if arg.spread.is_none() => {
@@ -3766,8 +3819,7 @@ impl ComponentProject {
                 // primitive. Both halves are `(scope, n)`; see the prelude for
                 // why that pair is the one the client can also re-derive.
                 let is_react_use_id = fn_name == "useId"
-                    && import
-                        .is_some_and(|b| b.source == "react" && b.export_name == "useId");
+                    && import.is_some_and(|b| b.source == "react" && b.export_name == "useId");
                 if is_react_use_id {
                     return Ok(Value::String(next_use_id()));
                 }
@@ -3786,8 +3838,7 @@ impl ComponentProject {
                 // block-bodied memo resolves neither here nor there, and falls
                 // through to the generic call path as before.
                 let is_react_use_memo = fn_name == "useMemo"
-                    && import
-                        .is_some_and(|b| b.source == "react" && b.export_name == "useMemo");
+                    && import.is_some_and(|b| b.source == "react" && b.export_name == "useMemo");
                 if is_react_use_memo {
                     if let Some(arg) = call.args.first() {
                         if arg.spread.is_none() {
@@ -3814,11 +3865,18 @@ impl ComponentProject {
 
                 // JS-style coercions.
                 if fn_name == "String" || fn_name == "Number" || fn_name == "Boolean" {
-                    let arg = self.eval_args(module_spec, &call.args, env)?.into_iter().next();
+                    let arg = self
+                        .eval_args(module_spec, &call.args, env)?
+                        .into_iter()
+                        .next();
                     return match (fn_name.as_str(), arg) {
-                        ("String", arg) => Ok(Value::String(arg.as_ref().map_or_else(String::new, js_string))),
+                        ("String", arg) => Ok(Value::String(
+                            arg.as_ref().map_or_else(String::new, js_string),
+                        )),
                         ("Number", None) => Ok(json_int(0)),
-                        ("Number", Some(arg)) => self.number_result(module_spec, "Number()", js_number(&arg)),
+                        ("Number", Some(arg)) => {
+                            self.number_result(module_spec, "Number()", js_number(&arg))
+                        }
                         ("Boolean", arg) => Ok(Value::Bool(arg.as_ref().is_some_and(is_truthy))),
                         _ => unreachable!(),
                     };
@@ -3837,7 +3895,13 @@ impl ComponentProject {
                 if !phase_k_enabled() {
                     if let Some((target, local)) = self.resolve_callable(module_spec, &fn_name) {
                         let args = self.eval_args(module_spec, &call.args, env)?;
-                        return self.call_module_function(module_spec, &fn_name, &target, &local, args);
+                        return self.call_module_function(
+                            module_spec,
+                            &fn_name,
+                            &target,
+                            &local,
+                            args,
+                        );
                     }
                 }
 
@@ -3870,7 +3934,10 @@ impl ComponentProject {
         } else {
             binding.export_name.clone()
         };
-        target_module.functions.contains_key(&local).then_some((target, local))
+        target_module
+            .functions
+            .contains_key(&local)
+            .then_some((target, local))
     }
 
     /// Call a module-level function for its value: its parameters bound
@@ -3918,7 +3985,9 @@ impl ComponentProject {
             Err(error) if depth > 0 => Err(error),
             // Flattened, not `.context()`: the build reports `to_string()`,
             // which shows a context and drops its cause.
-            Err(error) => Err(anyhow!("{error:#} (in `{called}()`, called from module '{caller}')")),
+            Err(error) => Err(anyhow!(
+                "{error:#} (in `{called}()`, called from module '{caller}')"
+            )),
         }
     }
 
@@ -3931,14 +4000,23 @@ impl ComponentProject {
         call: &swc_ecma_ast::CallExpr,
         env: &HashMap<String, Value>,
     ) -> Result<Option<Value>> {
-        if !matches!(name, "parseInt" | "parseFloat" | "encodeURIComponent" | "isNaN" | "isFinite") {
+        if !matches!(
+            name,
+            "parseInt" | "parseFloat" | "encodeURIComponent" | "isNaN" | "isFinite"
+        ) {
             return Ok(None);
         }
         let args = self.eval_args(module_spec, &call.args, env)?;
         let first = args.first().cloned().unwrap_or(Value::Null);
         let value = match name {
-            "parseInt" => self.number_result(module_spec, "parseInt()", parse_int(&js_string(&first), args.get(1)))?,
-            "parseFloat" => self.number_result(module_spec, "parseFloat()", parse_float(&js_string(&first)))?,
+            "parseInt" => self.number_result(
+                module_spec,
+                "parseInt()",
+                parse_int(&js_string(&first), args.get(1)),
+            )?,
+            "parseFloat" => {
+                self.number_result(module_spec, "parseFloat()", parse_float(&js_string(&first)))?
+            }
             "encodeURIComponent" => Value::String(encode_uri_component(&js_string(&first))),
             "isNaN" => Value::Bool(js_number(&first).is_nan()),
             "isFinite" => Value::Bool(js_number(&first).is_finite()),
@@ -3960,8 +4038,9 @@ impl ComponentProject {
         args: &[swc_ecma_ast::ExprOrSpread],
         env: &HashMap<String, Value>,
     ) -> Result<Option<Value>> {
-        const NAMESPACES: [&str; 8] =
-            ["Math", "JSON", "Object", "Array", "Number", "Date", "String", "console"];
+        const NAMESPACES: [&str; 8] = [
+            "Math", "JSON", "Object", "Array", "Number", "Date", "String", "console",
+        ];
         if !NAMESPACES.contains(&ns) {
             return Ok(None);
         }
@@ -3998,24 +4077,32 @@ impl ComponentProject {
                 let x = arg_num(&evaluated, 0);
                 math(if x == 0.0 { 0.0 } else { x.signum() })?
             }
-            ("Math", "max") => math(evaluated.iter().map(js_number).fold(f64::NEG_INFINITY, |a, b| {
-                if a.is_nan() || b.is_nan() {
-                    f64::NAN
-                } else {
-                    a.max(b)
-                }
-            }))?,
-            ("Math", "min") => math(evaluated.iter().map(js_number).fold(f64::INFINITY, |a, b| {
-                if a.is_nan() || b.is_nan() {
-                    f64::NAN
-                } else {
-                    a.min(b)
-                }
-            }))?,
+            ("Math", "max") => math(evaluated.iter().map(js_number).fold(
+                f64::NEG_INFINITY,
+                |a, b| {
+                    if a.is_nan() || b.is_nan() {
+                        f64::NAN
+                    } else {
+                        a.max(b)
+                    }
+                },
+            ))?,
+            ("Math", "min") => {
+                math(evaluated.iter().map(js_number).fold(f64::INFINITY, |a, b| {
+                    if a.is_nan() || b.is_nan() {
+                        f64::NAN
+                    } else {
+                        a.min(b)
+                    }
+                }))?
+            }
             ("Math", "pow") => math(arg_num(&evaluated, 0).powf(arg_num(&evaluated, 1)))?,
             ("Math", "random") => {
                 return self
-                    .unmodelled(module_spec, "`Math.random()`, which would differ on every build,")
+                    .unmodelled(
+                        module_spec,
+                        "`Math.random()`, which would differ on every build,",
+                    )
                     .map(Some)
             }
 
@@ -4050,9 +4137,11 @@ impl ComponentProject {
                 }
                 let entries: Vec<(String, Value)> = match target {
                     Value::Object(map) => map.into_iter().collect(),
-                    Value::Array(items) => {
-                        items.into_iter().enumerate().map(|(i, v)| (i.to_string(), v)).collect()
-                    }
+                    Value::Array(items) => items
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| (i.to_string(), v))
+                        .collect(),
                     Value::String(s) => s
                         .encode_utf16()
                         .enumerate()
@@ -4107,7 +4196,11 @@ impl ComponentProject {
                 parse_float(&js_string(&arg(0))),
             )?,
 
-            _ => return self.unmodelled(module_spec, &format!("`{ns}.{method}()`")).map(Some),
+            _ => {
+                return self
+                    .unmodelled(module_spec, &format!("`{ns}.{method}()`"))
+                    .map(Some)
+            }
         };
 
         Ok(Some(result))
@@ -4170,71 +4263,74 @@ impl ComponentProject {
         if let Some(ms) = date_value_ms(receiver) {
             return match self.eval_date_method(method, ms) {
                 Some(value) => Ok(Some(value)),
-                None => self.unmodelled(module_spec, &format!("`.{method}()` on a Date")).map(Some),
+                None => self
+                    .unmodelled(module_spec, &format!("`.{method}()` on a Date"))
+                    .map(Some),
             };
         }
 
         match receiver {
-            Value::String(s) => self.eval_string_method(module_spec, s, method, args, env).map(Some),
+            Value::String(s) => self
+                .eval_string_method(module_spec, s, method, args, env)
+                .map(Some),
             Value::Number(n) => {
                 let f = n.as_f64().unwrap_or(0.0);
                 let evaluated = self.eval_args(module_spec, args, env)?;
-                let result = match method {
-                    "toFixed" => {
-                        let digits = arg_num(&evaluated, 0).clamp(0.0, 100.0) as usize;
-                        Value::String(js_to_fixed(f, digits))
-                    }
-                    "toString" => {
-                        let radix = if evaluated.is_empty() {
-                            10.0
-                        } else {
-                            arg_num(&evaluated, 0)
-                        };
-                        if radix == 10.0 {
-                            Value::String(value_to_string(receiver))
-                        } else if (radix - radix.trunc()).abs() < f64::EPSILON
-                            && (2.0..=36.0).contains(&radix)
-                            && f.is_finite()
-                            && f == f.trunc()
-                        {
-                            let int = f as i64;
-                            let radix = radix as u32;
-                            let mut digits = String::new();
-                            let (sign, mut value) = if int < 0 {
-                                ("-", (-i128::from(int)) as u128)
-                            } else {
-                                ("", int as u128)
-                            };
-                            if value == 0 {
-                                digits.push('0');
-                            }
-                            while value > 0 {
-                                let d = (value % u128::from(radix)) as u32;
-                                let ch = std::char::from_digit(d, radix).unwrap_or('0');
-                                digits.insert(0, ch);
-                                value /= u128::from(radix);
-                            }
-                            Value::String(format!("{sign}{digits}"))
-                        } else {
-                            Value::String(value_to_string(receiver))
+                let result =
+                    match method {
+                        "toFixed" => {
+                            let digits = arg_num(&evaluated, 0).clamp(0.0, 100.0) as usize;
+                            Value::String(js_to_fixed(f, digits))
                         }
-                    }
-                    "valueOf" => receiver.clone(),
-                    "toLocaleString" => {
-                        return self
+                        "toString" => {
+                            let radix = if evaluated.is_empty() {
+                                10.0
+                            } else {
+                                arg_num(&evaluated, 0)
+                            };
+                            if radix == 10.0 {
+                                Value::String(value_to_string(receiver))
+                            } else if (radix - radix.trunc()).abs() < f64::EPSILON
+                                && (2.0..=36.0).contains(&radix)
+                                && f.is_finite()
+                                && f == f.trunc()
+                            {
+                                let int = f as i64;
+                                let radix = radix as u32;
+                                let mut digits = String::new();
+                                let (sign, mut value) = if int < 0 {
+                                    ("-", (-i128::from(int)) as u128)
+                                } else {
+                                    ("", int as u128)
+                                };
+                                if value == 0 {
+                                    digits.push('0');
+                                }
+                                while value > 0 {
+                                    let d = (value % u128::from(radix)) as u32;
+                                    let ch = std::char::from_digit(d, radix).unwrap_or('0');
+                                    digits.insert(0, ch);
+                                    value /= u128::from(radix);
+                                }
+                                Value::String(format!("{sign}{digits}"))
+                            } else {
+                                Value::String(value_to_string(receiver))
+                            }
+                        }
+                        "valueOf" => receiver.clone(),
+                        "toLocaleString" => return self
                             .unmodelled(
                                 module_spec,
                                 "`.toLocaleString()` on a number (its output depends on a locale \
                                  the static renderer does not have)",
                             )
-                            .map(Some)
-                    }
-                    other => {
-                        return self
-                            .unmodelled(module_spec, &format!("`.{other}()` on a number"))
-                            .map(Some)
-                    }
-                };
+                            .map(Some),
+                        other => {
+                            return self
+                                .unmodelled(module_spec, &format!("`.{other}()` on a number"))
+                                .map(Some)
+                        }
+                    };
                 Ok(Some(result))
             }
             Value::Array(items) => self
@@ -4265,7 +4361,9 @@ impl ComponentProject {
                                  toString, trim, trimEnd, trimStart, valueOf";
         match method {
             // The replacement may be a callback, which is called, not evaluated.
-            "replace" | "replaceAll" => return self.eval_string_replace(module_spec, s, method, args, env),
+            "replace" | "replaceAll" => {
+                return self.eval_string_replace(module_spec, s, method, args, env)
+            }
             "localeCompare" => {
                 return self.unmodelled(
                     module_spec,
@@ -4287,9 +4385,15 @@ impl ComponentProject {
         let len = units.len();
         let string = |units: &[u16]| Ok(Value::String(from_utf16(units)));
         // An argument read as a position: missing or `null` is `None`.
-        let given = |i: usize| evaluated.get(i).filter(|value| !matches!(value, Value::Null));
+        let given = |i: usize| {
+            evaluated
+                .get(i)
+                .filter(|value| !matches!(value, Value::Null))
+        };
         let position = |i: usize, default: usize| {
-            given(i).map_or(default, |value| integer_or_zero(value).clamp(0.0, len as f64) as usize)
+            given(i).map_or(default, |value| {
+                integer_or_zero(value).clamp(0.0, len as f64) as usize
+            })
         };
         // An argument read as a string. Missing is `undefined`, whose string is
         // "undefined"; a `null` could be either, and the two spell differently.
@@ -4319,12 +4423,12 @@ impl ComponentProject {
             "toUpperCase" | "toLocaleUpperCase" => Ok(Value::String(s.to_uppercase())),
             "toLowerCase" | "toLocaleLowerCase" => Ok(Value::String(s.to_lowercase())),
             "trim" => Ok(Value::String(s.trim_matches(is_js_whitespace).to_string())),
-            "trimStart" | "trimLeft" => {
-                Ok(Value::String(s.trim_start_matches(is_js_whitespace).to_string()))
-            }
-            "trimEnd" | "trimRight" => {
-                Ok(Value::String(s.trim_end_matches(is_js_whitespace).to_string()))
-            }
+            "trimStart" | "trimLeft" => Ok(Value::String(
+                s.trim_start_matches(is_js_whitespace).to_string(),
+            )),
+            "trimEnd" | "trimRight" => Ok(Value::String(
+                s.trim_end_matches(is_js_whitespace).to_string(),
+            )),
             "toString" | "valueOf" => Ok(Value::String(s.to_string())),
             "at" => {
                 let n = given(0).map_or(0.0, integer_or_zero);
@@ -4344,9 +4448,13 @@ impl ComponentProject {
                 }
             }
             "includes" | "startsWith" | "endsWith" | "indexOf" => {
-                let Some(needle) = text(0)? else { return ambiguous() };
+                let Some(needle) = text(0)? else {
+                    return ambiguous();
+                };
                 match method {
-                    "includes" => Ok(Value::Bool(find_units(&units, &needle, position(1, 0)).is_some())),
+                    "includes" => Ok(Value::Bool(
+                        find_units(&units, &needle, position(1, 0)).is_some(),
+                    )),
                     "startsWith" => Ok(Value::Bool(units[position(1, 0)..].starts_with(&needle))),
                     "endsWith" => {
                         let end = position(1, len);
@@ -4360,13 +4468,17 @@ impl ComponentProject {
                 }
             }
             "lastIndexOf" => {
-                let Some(needle) = text(0)? else { return ambiguous() };
+                let Some(needle) = text(0)? else {
+                    return ambiguous();
+                };
                 // A missing or NaN position searches from the end.
                 let from = match given(1).map(js_number) {
                     Some(n) if !n.is_nan() => n.trunc().clamp(0.0, len as f64) as usize,
                     _ => len,
                 };
-                Ok(json_int(rfind_units(&units, &needle, from).map_or(-1, |i| i as i64)))
+                Ok(json_int(
+                    rfind_units(&units, &needle, from).map_or(-1, |i| i as i64),
+                ))
             }
             "slice" => {
                 let start = given(0).map_or(0, |value| relative_index(value, len));
@@ -4387,7 +4499,13 @@ impl ComponentProject {
                 let limit = given(1).map_or(u32::MAX, to_uint32) as usize;
                 let separator = match evaluated.first() {
                     // No separator: the whole string, once.
-                    None => return Ok(Value::Array(if limit == 0 { Vec::new() } else { vec![Value::String(s.to_string())] })),
+                    None => {
+                        return Ok(Value::Array(if limit == 0 {
+                            Vec::new()
+                        } else {
+                            vec![Value::String(s.to_string())]
+                        }))
+                    }
                     Some(Value::Null) => return ambiguous(),
                     Some(value) => utf16(&js_string(value)),
                 };
@@ -4396,7 +4514,12 @@ impl ComponentProject {
                     return Ok(Value::Array(parts));
                 }
                 if separator.is_empty() {
-                    parts.extend(units.iter().take(limit).map(|&unit| Value::String(from_utf16(&[unit]))));
+                    parts.extend(
+                        units
+                            .iter()
+                            .take(limit)
+                            .map(|&unit| Value::String(from_utf16(&[unit]))),
+                    );
                     return Ok(Value::Array(parts));
                 }
                 let mut from = 0;
@@ -4416,7 +4539,10 @@ impl ComponentProject {
                     return Ok(Value::String(s.to_string()));
                 }
                 if target > MAX_BUILT_STRING_UNITS as f64 {
-                    return self.unmodelled(module_spec, &format!("`.{method}()` to {target} characters"));
+                    return self.unmodelled(
+                        module_spec,
+                        &format!("`.{method}()` to {target} characters"),
+                    );
                 }
                 let filler = match given(1) {
                     None => vec![u16::from(b' ')],
@@ -4425,7 +4551,12 @@ impl ComponentProject {
                 if filler.is_empty() {
                     return Ok(Value::String(s.to_string()));
                 }
-                let pad: Vec<u16> = filler.iter().copied().cycle().take(target as usize - len).collect();
+                let pad: Vec<u16> = filler
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(target as usize - len)
+                    .collect();
                 let joined: Vec<u16> = if method == "padStart" {
                     pad.into_iter().chain(units.iter().copied()).collect()
                 } else {
@@ -4437,7 +4568,8 @@ impl ComponentProject {
                 let count = given(0).map_or(0.0, js_number);
                 let count = if count.is_nan() { 0.0 } else { count.trunc() };
                 if count < 0.0 || count.is_infinite() {
-                    return self.unmodelled(module_spec, &format!("`.repeat({count})`, a RangeError,"));
+                    return self
+                        .unmodelled(module_spec, &format!("`.repeat({count})`, a RangeError,"));
                 }
                 if len as f64 * count > MAX_BUILT_STRING_UNITS as f64 {
                     return self.unmodelled(module_spec, "`.repeat()` past 16M characters");
@@ -4445,7 +4577,9 @@ impl ComponentProject {
                 Ok(Value::String(s.repeat(count as usize)))
             }
             "concat" => Ok(Value::String(
-                std::iter::once(s.to_string()).chain(evaluated.iter().map(js_string)).collect(),
+                std::iter::once(s.to_string())
+                    .chain(evaluated.iter().map(js_string))
+                    .collect(),
             )),
             other => self.unmodelled(
                 module_spec,
@@ -4468,7 +4602,10 @@ impl ComponentProject {
         env: &HashMap<String, Value>,
     ) -> Result<Value> {
         if args.iter().any(|arg| arg.spread.is_some()) {
-            return self.unmodelled(module_spec, &format!("`.{method}()` with a spread argument"));
+            return self.unmodelled(
+                module_spec,
+                &format!("`.{method}()` with a spread argument"),
+            );
         }
         let ambiguous = || {
             self.unmodelled(
@@ -4483,10 +4620,12 @@ impl ComponentProject {
                 value => utf16(&js_string(&value)),
             },
         };
-        let callback = args
-            .get(1)
-            .map(|arg| &*arg.expr)
-            .filter(|expr| matches!(unwrap_updater_parens(expr), swc_ecma_ast::Expr::Arrow(_) | swc_ecma_ast::Expr::Fn(_)));
+        let callback = args.get(1).map(|arg| &*arg.expr).filter(|expr| {
+            matches!(
+                unwrap_updater_parens(expr),
+                swc_ecma_ast::Expr::Arrow(_) | swc_ecma_ast::Expr::Fn(_)
+            )
+        });
         let template = match (callback, args.get(1)) {
             (Some(_), _) => None,
             (None, None) => Some("undefined".to_string()),
@@ -4526,7 +4665,11 @@ impl ComponentProject {
                         module_spec,
                         method,
                         callback,
-                        vec![Value::String(matched), json_int(at as i64), Value::String(s.to_string())],
+                        vec![
+                            Value::String(matched),
+                            json_int(at as i64),
+                            Value::String(s.to_string()),
+                        ],
                         env,
                     )?;
                     out.push_str(&js_string(&value));
@@ -4577,14 +4720,13 @@ impl ComponentProject {
         };
         let first_arg = args.first().map(|arg| &*arg.expr);
         let callback = || {
-            first_arg.ok_or_else(|| anyhow!("`.{method}()` needs a callback (module '{module_spec}')"))
+            first_arg
+                .ok_or_else(|| anyhow!("`.{method}()` needs a callback (module '{module_spec}')"))
         };
         let call = |callback: &swc_ecma_ast::Expr, item: &Value, index: usize| {
             self.call_array_callback(module_spec, method, callback, item, index, items, env)
         };
-        let index_value = |index: Option<usize>| {
-            json_int(index.map_or(-1, |index| index as i64))
-        };
+        let index_value = |index: Option<usize>| json_int(index.map_or(-1, |index| index as i64));
 
         match method {
             "map" => {
@@ -4701,7 +4843,10 @@ impl ComponentProject {
             }
             "flat" => {
                 let depth = arg(0)?.map_or(1.0, |v| to_number(&v));
-                Ok(Value::Array(flatten(items, if depth.is_nan() { 0.0 } else { depth })))
+                Ok(Value::Array(flatten(
+                    items,
+                    if depth.is_nan() { 0.0 } else { depth },
+                )))
             }
             "flatMap" => {
                 let mapper = callback()?;
@@ -4839,7 +4984,12 @@ impl ComponentProject {
                     },
                 ),
                 Expr::Fn(fn_expr) => (
-                    fn_expr.function.params.iter().map(|p| param_from_pat(&p.pat)).collect(),
+                    fn_expr
+                        .function
+                        .params
+                        .iter()
+                        .map(|p| param_from_pat(&p.pat))
+                        .collect(),
                     CallbackBody::Stmts(
                         fn_expr
                             .function
@@ -4860,9 +5010,9 @@ impl ComponentProject {
         bind_params_positional(&params, &args, &mut env);
         match body {
             CallbackBody::Expr(expr) => self.eval_expr(module_spec, expr, &env),
-            CallbackBody::Stmts(stmts) => {
-                Ok(self.eval_body_value(module_spec, stmts, &mut env)?.unwrap_or(Value::Null))
-            }
+            CallbackBody::Stmts(stmts) => Ok(self
+                .eval_body_value(module_spec, stmts, &mut env)?
+                .unwrap_or(Value::Null)),
         }
     }
 
@@ -5287,8 +5437,8 @@ impl ComponentProject {
             Expr::Arrow(arrow) => {
                 let params: Vec<ParamBinding> = arrow.params.iter().map(param_from_pat).collect();
                 let mut env = parent_env.clone();
-                let index_val = serde_json::Number::from_f64(index as f64)
-                    .map_or(Value::Null, Value::Number);
+                let index_val =
+                    serde_json::Number::from_f64(index as f64).map_or(Value::Null, Value::Number);
                 let args = Value::Array(vec![arg.clone(), index_val]);
                 bind_params_positional(&params, &args, &mut env);
                 // 🔴 A block body went through `eval_body_stmts`, which returns
@@ -5313,8 +5463,8 @@ impl ComponentProject {
                     .map(|p| param_from_pat(&p.pat))
                     .collect();
                 let mut env = parent_env.clone();
-                let index_val = serde_json::Number::from_f64(index as f64)
-                    .map_or(Value::Null, Value::Number);
+                let index_val =
+                    serde_json::Number::from_f64(index as f64).map_or(Value::Null, Value::Number);
                 let args = Value::Array(vec![arg.clone(), index_val]);
                 bind_params_positional(&params, &args, &mut env);
                 if let Some(body) = &fn_expr.function.body {
@@ -5342,7 +5492,9 @@ impl ComponentProject {
         stmts: &[swc_ecma_ast::Stmt],
         env: &mut HashMap<String, Value>,
     ) -> Result<String> {
-        Ok(self.eval_body_returned(module_spec, stmts, env)?.unwrap_or_default())
+        Ok(self
+            .eval_body_returned(module_spec, stmts, env)?
+            .unwrap_or_default())
     }
 
     /// The statements' rendered `return`, or `None` when control falls off
@@ -5405,7 +5557,9 @@ impl ComponentProject {
                 }
                 // A nested block (`{ ... }`) is evaluated inline.
                 Stmt::Block(block) => {
-                    if let Some(returned) = self.eval_body_returned(module_spec, &block.stmts, env)? {
+                    if let Some(returned) =
+                        self.eval_body_returned(module_spec, &block.stmts, env)?
+                    {
                         return Ok(Some(returned));
                     }
                 }
@@ -5496,30 +5650,32 @@ impl ComponentProject {
                                 );
                             if let Some(name) = value_name {
                                 if let Some(slot_id) = phase_k_slot_for_value(&name) {
-                                    let value = if let Some(bytes) = phase_k_read_slot_value(slot_id) { serde_json::from_slice::<Value>(&bytes)
-                                    .unwrap_or(Value::Null) } else {
-                                        // First read for this slot — seed it from
-                                        // the initial expression so the state
-                                        // persists across re-renders.
-                                        let initial_expr = phase_k_current_hook_initial(&name);
-                                        let initial_value = initial_expr
-                                            .as_ref()
-                                            .map_or(Value::Null, |expr| {
-                                                self.eval_expr(module_spec, expr, env)
-                                                    .unwrap_or(Value::Null)
-                                            });
-                                        if let Ok(bytes) = serde_json::to_vec(&initial_value) {
-                                            phase_k_write_slot_value(slot_id, bytes);
-                                            // Drain immediately — first-render
-                                            // initialisations are not user-visible
-                                            // mutations, they shouldn't show up
-                                            // in the response opcode frame as a
-                                            // SlotSet. Drop the pending entries
-                                            // by draining and ignoring.
-                                            drain_initial_slot_writes();
-                                        }
-                                        initial_value
-                                    };
+                                    let value =
+                                        if let Some(bytes) = phase_k_read_slot_value(slot_id) {
+                                            serde_json::from_slice::<Value>(&bytes)
+                                                .unwrap_or(Value::Null)
+                                        } else {
+                                            // First read for this slot — seed it from
+                                            // the initial expression so the state
+                                            // persists across re-renders.
+                                            let initial_expr = phase_k_current_hook_initial(&name);
+                                            let initial_value =
+                                                initial_expr.as_ref().map_or(Value::Null, |expr| {
+                                                    self.eval_expr(module_spec, expr, env)
+                                                        .unwrap_or(Value::Null)
+                                                });
+                                            if let Ok(bytes) = serde_json::to_vec(&initial_value) {
+                                                phase_k_write_slot_value(slot_id, bytes);
+                                                // Drain immediately — first-render
+                                                // initialisations are not user-visible
+                                                // mutations, they shouldn't show up
+                                                // in the response opcode frame as a
+                                                // SlotSet. Drop the pending entries
+                                                // by draining and ignoring.
+                                                drain_initial_slot_writes();
+                                            }
+                                            initial_value
+                                        };
                                     env.insert(name.clone(), value);
                                     if let Some(setter) = setter_name {
                                         env.insert(setter, Value::Null);
@@ -5764,7 +5920,10 @@ impl ComponentProject {
             .iter()
             .find(|(name, _)| name == ALBEDO_ID_ATTR)
             .and_then(|(_, value)| value.as_str())
-            .and_then(|s| s.parse::<u32>().ok()) { existing } else {
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            existing
+        } else {
             let id = next_element_stable_id(module_spec);
             attrs.push((ALBEDO_ID_ATTR.to_string(), Value::String(id.to_string())));
             id
@@ -6350,11 +6509,10 @@ impl ComponentProject {
     /// Emits nothing — and so leaves the element with no binding at all — when
     /// the text cannot be rebuilt from parts:
     ///
-    /// * **A child element.** `<p>{name} <b>x</b></p>` cannot be repainted by
-    ///   setting the paragraph's text without deleting the `<b>`, along with any
-    ///   anchor or handler inside it. That is a structural change, so it takes
-    ///   the structural fallback and the whole component hydrates instead —
-    ///   correct, rather than fast and wrong.
+    /// * **A child element.** `<p>{name} <b>x</b></p>` cannot be repainted by setting the
+    ///   paragraph's text without deleting the `<b>`, along with any anchor or handler inside it.
+    ///   That is a structural change, so it takes the structural fallback and the whole component
+    ///   hydrates instead — correct, rather than fast and wrong.
     /// * **No reactive part.** Fully static text needs no binding.
     fn record_text_template(
         &self,
@@ -6550,7 +6708,8 @@ impl ComponentProject {
                                 // reads slots but isn't a bare read. Record it so the
                                 // client recomputes the value from state on change.
                                 if let Some(stable_id) = phase_k_top_element() {
-                                    if let Some((resolved, deps)) = phase_k_collect_slot_deps(expr) {
+                                    if let Some((resolved, deps)) = phase_k_collect_slot_deps(expr)
+                                    {
                                         push_derived_binding(DerivedBindingRaw {
                                             stable_id,
                                             attr: None,

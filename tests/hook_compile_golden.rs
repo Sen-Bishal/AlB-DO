@@ -7,14 +7,13 @@
 //!        - `BindEvent { stable_id, event_id, proxy_id }` per `on*` handler
 //!        - `SetTextRef { stable_id, slot_id }` per `{slot}` read in JSX
 //!
-//!   2. A server-side `ActionHandler` registration per handler, keyed by
-//!      `proxy_id`. Invoking the handler must execute the handler body
-//!      against the session slot store and produce `SlotSet` opcodes
-//!      for every `setX(...)` call inside.
+//!   2. A server-side `ActionHandler` registration per handler, keyed by `proxy_id`. Invoking the
+//!      handler must execute the handler body against the session slot store and produce `SlotSet`
+//!      opcodes for every `setX(...)` call inside.
 //!
 //! The corpus stages risk per the sprint plan:
-//!   - Stage 1: literal `useState(N)` only, no closures over outer scope.
-//!     Counter, `multi_hook`, `string_state`.
+//!   - Stage 1: literal `useState(N)` only, no closures over outer scope. Counter, `multi_hook`,
+//!     `string_state`.
 //!   - Stage 2 (deferred): closures over component props.
 //!   - Stage 3 (deferred): closures over module-level constants.
 //!
@@ -26,8 +25,8 @@ use dom_render_compiler::ir::opcode::{Instruction, SlotId};
 use dom_render_compiler::runtime::eval::{
     render_entry_with_bindings, CompiledProject, RenderOptions, SessionSlotView,
 };
-use dom_render_compiler::runtime::slot_store::SlotStore;
 use dom_render_compiler::runtime::session::SessionId;
+use dom_render_compiler::runtime::slot_store::SlotStore;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,7 +72,10 @@ fn reactive_value_slot(project: &CompiledProject, slots: &SessionSlotView) -> Sl
         .expect("a reactive text binding must name at least one slot")
 }
 
-fn render_initial(project: &CompiledProject, slots: &SessionSlotView) -> (String, Vec<Instruction>) {
+fn render_initial(
+    project: &CompiledProject,
+    slots: &SessionSlotView,
+) -> (String, Vec<Instruction>) {
     let opts = RenderOptions { hook_compile: true };
     let out = render_entry_with_bindings(
         project,
@@ -113,8 +115,14 @@ fn counter_emits_bind_event_and_set_text_ref_on_initial_render() {
         .iter()
         .filter(|op| matches!(op, Instruction::SetTextRef { .. }))
         .count();
-    assert_eq!(bind_event_count, 1, "Counter must emit one BindEvent for onClick; opcodes: {opcodes:?}");
-    assert_eq!(set_text_ref_count, 1, "Counter must emit one SetTextRef for {{n}}; opcodes: {opcodes:?}");
+    assert_eq!(
+        bind_event_count, 1,
+        "Counter must emit one BindEvent for onClick; opcodes: {opcodes:?}"
+    );
+    assert_eq!(
+        set_text_ref_count, 1,
+        "Counter must emit one SetTextRef for {{n}}; opcodes: {opcodes:?}"
+    );
 }
 
 #[test]
@@ -152,7 +160,9 @@ fn counter_action_dispatch_increments_slot_and_emits_slot_set() {
         .expect("compiled handler dispatches without error");
 
     // The handler does `setN(n + 1)`. Slot 0 read 0, write 1.
-    let raw = store.read(session, slot_id).expect("slot must be written by handler");
+    let raw = store
+        .read(session, slot_id)
+        .expect("slot must be written by handler");
     let decoded: Value = serde_json::from_slice(&raw).expect("slot value decodes as JSON");
     let n = decoded
         .as_f64()
@@ -206,7 +216,9 @@ fn counter_second_render_reflects_persisted_slot_value() {
             event_kind: 0,
             payload: Vec::new(),
         };
-        project.invoke_action(&envelope, &slots).expect("dispatch succeeds");
+        project
+            .invoke_action(&envelope, &slots)
+            .expect("dispatch succeeds");
         slots.drain_pending();
     }
 
@@ -231,8 +243,14 @@ fn multi_hook_component_allocates_one_slot_per_useState_in_source_order() {
     let (html, opcodes) = render_initial(&project, &slots);
 
     // Initial HTML carries both initial values.
-    assert!(html.contains(">anon</span>"), "name slot initial 'anon' missing: {html}");
-    assert!(html.contains(">0</span>"), "count slot initial 0 missing: {html}");
+    assert!(
+        html.contains(">anon</span>"),
+        "name slot initial 'anon' missing: {html}"
+    );
+    assert!(
+        html.contains(">0</span>"),
+        "count slot initial 0 missing: {html}"
+    );
 
     // Two SetTextRef opcodes (one per slot-read site).
     let set_text_refs: Vec<SlotId> = opcodes
@@ -260,7 +278,10 @@ fn multi_hook_component_allocates_one_slot_per_useState_in_source_order() {
         .iter()
         .filter(|op| matches!(op, Instruction::BindEvent { .. }))
         .count();
-    assert_eq!(bind_events, 2, "expected two BindEvent opcodes; got: {opcodes:?}");
+    assert_eq!(
+        bind_events, 2,
+        "expected two BindEvent opcodes; got: {opcodes:?}"
+    );
 }
 
 #[test]
@@ -296,20 +317,26 @@ fn multi_hook_writes_to_correct_slot_per_setter() {
     // Invoke the bump handler — must write to count_slot, not name_slot.
     project
         .invoke_action(
-            &ActionEnvelope { action_id: bind_events[0], event_kind: 0, payload: Vec::new() },
+            &ActionEnvelope {
+                action_id: bind_events[0],
+                event_kind: 0,
+                payload: Vec::new(),
+            },
             &slots,
         )
         .expect("bump dispatch ok");
-    let count_raw = store.read(session, count_slot).expect("count must be written");
+    let count_raw = store
+        .read(session, count_slot)
+        .expect("count must be written");
     let count_v: Value = serde_json::from_slice(&count_raw).unwrap();
     assert_eq!(
         count_v.as_f64().map(|f| f as i64),
         Some(1),
         "bump must write 1 to count_slot"
     );
-    let name_after_bump = store.read(session, name_slot).map(|raw| {
-        serde_json::from_slice::<Value>(&raw).ok()
-    });
+    let name_after_bump = store
+        .read(session, name_slot)
+        .map(|raw| serde_json::from_slice::<Value>(&raw).ok());
     if let Some(Some(name_v)) = name_after_bump {
         assert_eq!(
             name_v.as_str(),
@@ -322,11 +349,17 @@ fn multi_hook_writes_to_correct_slot_per_setter() {
     // Invoke the rename handler — must write to name_slot.
     project
         .invoke_action(
-            &ActionEnvelope { action_id: bind_events[1], event_kind: 0, payload: Vec::new() },
+            &ActionEnvelope {
+                action_id: bind_events[1],
+                event_kind: 0,
+                payload: Vec::new(),
+            },
             &slots,
         )
         .expect("rename dispatch ok");
-    let name_raw = store.read(session, name_slot).expect("name must be written");
+    let name_raw = store
+        .read(session, name_slot)
+        .expect("name must be written");
     let name: String = serde_json::from_slice(&name_raw).unwrap();
     assert_eq!(name, "alice", "rename must write 'alice' to name_slot");
 }
@@ -342,7 +375,10 @@ fn string_state_initial_render_emits_set_text_ref_for_string_slot() {
 
     let (html, opcodes) = render_initial(&project, &slots);
 
-    assert!(html.contains(">idle</button>"), "initial label must be 'idle'; got: {html}");
+    assert!(
+        html.contains(">idle</button>"),
+        "initial label must be 'idle'; got: {html}"
+    );
     assert!(
         opcodes
             .iter()
@@ -376,12 +412,18 @@ fn string_state_setter_with_literal_writes_string_to_slot() {
 
     project
         .invoke_action(
-            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &ActionEnvelope {
+                action_id: proxy_id,
+                event_kind: 0,
+                payload: Vec::new(),
+            },
             &slots,
         )
         .expect("dispatch succeeds");
 
-    let raw = store.read(session, slot_id).expect("label slot must be written");
+    let raw = store
+        .read(session, slot_id)
+        .expect("label slot must be written");
     let decoded: String = serde_json::from_slice(&raw).expect("slot value decodes as string");
     assert_eq!(decoded, "ready", "setLabel('ready') must store 'ready'");
 }
@@ -457,7 +499,11 @@ fn stage2_handler_reads_captured_prop_and_writes_correct_increment() {
 
     let response = project
         .invoke_action(
-            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &ActionEnvelope {
+                action_id: proxy_id,
+                event_kind: 0,
+                payload: Vec::new(),
+            },
             &slots,
         )
         .expect("dispatch");
@@ -516,7 +562,11 @@ fn stage2_re_render_with_new_props_updates_captured_snapshot() {
 
     project
         .invoke_action(
-            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &ActionEnvelope {
+                action_id: proxy_id,
+                event_kind: 0,
+                payload: Vec::new(),
+            },
             &slots,
         )
         .expect("dispatch");
@@ -565,7 +615,11 @@ fn stage2_greeter_captures_multiple_props_of_different_shapes() {
 
     project
         .invoke_action(
-            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &ActionEnvelope {
+                action_id: proxy_id,
+                event_kind: 0,
+                payload: Vec::new(),
+            },
             &slots,
         )
         .expect("dispatch");
@@ -636,7 +690,11 @@ fn stage3_handler_resolves_module_constant_in_setter_arg() {
     // Click — `Math.min(0 + 1, MAX=5)` = 1.
     project
         .invoke_action(
-            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &ActionEnvelope {
+                action_id: proxy_id,
+                event_kind: 0,
+                payload: Vec::new(),
+            },
             &slots,
         )
         .expect("dispatch");
@@ -683,7 +741,11 @@ fn stage3_handler_caps_at_module_constant_after_many_clicks() {
     for _ in 0..10 {
         project
             .invoke_action(
-                &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+                &ActionEnvelope {
+                    action_id: proxy_id,
+                    event_kind: 0,
+                    payload: Vec::new(),
+                },
                 &slots,
             )
             .expect("dispatch");
@@ -737,7 +799,11 @@ fn stage3_chained_consts_resolve_in_source_order() {
 
     project
         .invoke_action(
-            &ActionEnvelope { action_id: proxy_id, event_kind: 0, payload: Vec::new() },
+            &ActionEnvelope {
+                action_id: proxy_id,
+                event_kind: 0,
+                payload: Vec::new(),
+            },
             &slots,
         )
         .expect("dispatch");
@@ -760,7 +826,7 @@ fn stage3_chained_consts_resolve_in_source_order() {
 /// `event_id` is unresolvable and the binding silently misfires.
 #[test]
 fn render_prepends_event_intern_table_covering_every_bind_event_id() {
-    use dom_render_compiler::ir::opcode::{InternTableKind, Instruction as I};
+    use dom_render_compiler::ir::opcode::{Instruction as I, InternTableKind};
 
     let project = compile("counter");
     let store = Arc::new(SlotStore::new());
@@ -775,7 +841,10 @@ fn render_prepends_event_intern_table_covering_every_bind_event_id() {
         other => panic!("first opcode must be InitInternTable, got: {other:?}"),
     };
     assert_eq!(table_kind, InternTableKind::Event);
-    assert!(!table_entries.is_empty(), "intern table must carry at least one entry");
+    assert!(
+        !table_entries.is_empty(),
+        "intern table must carry at least one entry"
+    );
 
     // Every BindEvent's event_id must appear in the table.
     let referenced: Vec<u16> = opcodes
@@ -814,23 +883,41 @@ fn proxy_ids_and_slot_ids_are_deterministic_across_compilations() {
     let (_h_a, op_a) = render_initial(&a, &slots_a);
     let (_h_b, op_b) = render_initial(&b, &slots_b);
 
-    let proxy_a: Vec<u32> = op_a.iter().filter_map(|op| match op {
-        Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
-        _ => None,
-    }).collect();
-    let proxy_b: Vec<u32> = op_b.iter().filter_map(|op| match op {
-        Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
-        _ => None,
-    }).collect();
-    assert_eq!(proxy_a, proxy_b, "proxy_ids must be deterministic across compilations");
+    let proxy_a: Vec<u32> = op_a
+        .iter()
+        .filter_map(|op| match op {
+            Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
+            _ => None,
+        })
+        .collect();
+    let proxy_b: Vec<u32> = op_b
+        .iter()
+        .filter_map(|op| match op {
+            Instruction::BindEvent { proxy_id, .. } => Some(proxy_id.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        proxy_a, proxy_b,
+        "proxy_ids must be deterministic across compilations"
+    );
 
-    let slot_a: Vec<SlotId> = op_a.iter().filter_map(|op| match op {
-        Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
-        _ => None,
-    }).collect();
-    let slot_b: Vec<SlotId> = op_b.iter().filter_map(|op| match op {
-        Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
-        _ => None,
-    }).collect();
-    assert_eq!(slot_a, slot_b, "slot_ids must be deterministic across compilations");
+    let slot_a: Vec<SlotId> = op_a
+        .iter()
+        .filter_map(|op| match op {
+            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        })
+        .collect();
+    let slot_b: Vec<SlotId> = op_b
+        .iter()
+        .filter_map(|op| match op {
+            Instruction::SetTextRef { slot_id, .. } => Some(*slot_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        slot_a, slot_b,
+        "slot_ids must be deterministic across compilations"
+    );
 }

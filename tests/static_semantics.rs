@@ -2,17 +2,17 @@
 //! checked against `QuickJS`.
 //!
 //! 🔴 Until 2026-10-07:
-//! - `===`, `==`, `!==` and `!=` compared the *string forms* of their operands,
-//!   so `1 === "1"` was true and `[1, 2] === "12"` was true;
-//! - `<` and friends compared `to_number` of each side, which is `0` for any
-//!   non-numeric string, so `"b" > "a"` was false;
-//! - every other binary operator (`|`, `&`, `<<`, `in`, …) and every unary one
-//!   but `!` and numeric `-` evaluated to `null`;
-//! - six string methods were modelled and the rest — `includes`, `split`,
-//!   `replace`, `slice`, `padStart` — were `null`;
+//! - `===`, `==`, `!==` and `!=` compared the *string forms* of their operands, so `1 === "1"` was
+//!   true and `[1, 2] === "12"` was true;
+//! - `<` and friends compared `to_number` of each side, which is `0` for any non-numeric string, so
+//!   `"b" > "a"` was false;
+//! - every other binary operator (`|`, `&`, `<<`, `in`, …) and every unary one but `!` and numeric
+//!   `-` evaluated to `null`;
+//! - six string methods were modelled and the rest — `includes`, `split`, `replace`, `slice`,
+//!   `padStart` — were `null`;
 //! - a call to a function declared in the module was `null`;
-//! - `if (!x) return null;` did not stop a render: an empty return read as no
-//!   return, and the body ran on past its own guard.
+//! - `if (!x) return null;` did not stop a render: an empty return read as no return, and the body
+//!   ran on past its own guard.
 //!
 //! Every one rendered as nothing, or as the wrong thing, with the build green.
 //! Two properties are pinned here, as in `static_array_methods.rs`:
@@ -46,14 +46,18 @@ fn render_static(project: &CompiledProject, entry: &str) -> anyhow::Result<Strin
         entry,
         &json!({}),
         &slots(),
-        &RenderOptions { hook_compile: false },
+        &RenderOptions {
+            hook_compile: false,
+        },
     )
     .map(|output| output.html)
 }
 
 fn render_quickjs(project: &CompiledProject, entry: &str) -> String {
     let mut engine = QuickJsEngine::new();
-    engine.init(&BootstrapPayload::default()).expect("engine init");
+    engine
+        .init(&BootstrapPayload::default())
+        .expect("engine init");
     project
         .render_entry_quickjs(&mut engine, entry, &json!({}), &slots())
         .expect("quickjs render succeeds")
@@ -196,9 +200,16 @@ fn operators_string_methods_and_calls_render_what_quickjs_renders() {
     for (ours, theirs) in evaluated.iter().zip(&reference) {
         assert_eq!(ours, theirs, "the static renderer diverged from QuickJS");
     }
-    assert_eq!(evaluated.len(), reference.len(), "{evaluated:#?}\n{reference:#?}");
+    assert_eq!(
+        evaluated.len(),
+        reference.len(),
+        "{evaluated:#?}\n{reference:#?}"
+    );
     for expected in EXPECTED {
-        assert!(evaluated.iter().any(|line| line == expected), "missing `{expected}` in {evaluated:#?}");
+        assert!(
+            evaluated.iter().any(|line| line == expected),
+            "missing `{expected}` in {evaluated:#?}"
+        );
     }
 }
 
@@ -208,7 +219,8 @@ fn refusal(body: &str) -> String {
     let project = CompiledProject::load_from_dir(dir.path()).expect("compiles");
     format!(
         "{:#}",
-        render_static(&project, "Probe.tsx").expect_err("the static render must refuse, not render empty")
+        render_static(&project, "Probe.tsx")
+            .expect_err("the static render must refuse, not render empty")
     )
 }
 
@@ -216,27 +228,50 @@ fn refusal(body: &str) -> String {
 #[test]
 fn unmodelled_constructs_are_refused_by_name() {
     let cases: &[(&str, &str)] = &[
-        (r#"<p>{"Hello".normalize()}</p>"#, "`.normalize()` on a string"),
-        (r#"<p>{"Hello".replace(/l/g, "L")}</p>"#, "regular expression `/l/g`"),
+        (
+            r#"<p>{"Hello".normalize()}</p>"#,
+            "`.normalize()` on a string",
+        ),
+        (
+            r#"<p>{"Hello".replace(/l/g, "L")}</p>"#,
+            "regular expression `/l/g`",
+        ),
         (r#"<p>{"b".localeCompare("a")}</p>"#, "`.localeCompare()`"),
-        (r#"<p>{"a".match("a")}</p>"#, "`.match()`, which takes a regular expression"),
+        (
+            r#"<p>{"a".match("a")}</p>"#,
+            "`.match()`, which takes a regular expression",
+        ),
         (r"<p>{String([] instanceof Array)}</p>", "`instanceof`"),
         (r"<p>{Math.random()}</p>", "`Math.random()`"),
         (r"<p>{Math.hypot(3, 4)}</p>", "`Math.hypot()`"),
-        (r"<p>{(1234).toLocaleString()}</p>", "`.toLocaleString()` on a number"),
+        (
+            r"<p>{(1234).toLocaleString()}</p>",
+            "`.toLocaleString()` on a number",
+        ),
         (r"<p>{1 / 0}</p>", "produces Infinity"),
         (r#"<p>{"abc" * 2}</p>"#, "produces NaN"),
         (r"<p>{format(1)}</p>", "calling `format()`"),
         (r"<p>{new Map().size}</p>", "`new Map()`"),
         (r"<p>{[1][0].foo()}</p>", "`.foo()` on a number"),
-        (r"<p>{({ a: 1 }).foo()}</p>", "calling `.foo()` on an object"),
+        (
+            r"<p>{({ a: 1 }).foo()}</p>",
+            "calling `.foo()` on an object",
+        ),
         (r#"<p>{"x".repeat(-1)}</p>"#, "RangeError"),
         (r"<p>{[...5].length}</p>", "not iterable"),
-        (r#"<p>{"a".split(null).length}</p>"#, "null-or-undefined argument"),
+        (
+            r#"<p>{"a".split(null).length}</p>"#,
+            "null-or-undefined argument",
+        ),
     ];
     for (jsx, expected) in cases {
-        let err = refusal(&format!("export default function Probe() {{\n  return {jsx};\n}}\n"));
-        assert!(err.contains(expected), "`{jsx}` should be refused naming {expected:?}, got: {err}");
+        let err = refusal(&format!(
+            "export default function Probe() {{\n  return {jsx};\n}}\n"
+        ));
+        assert!(
+            err.contains(expected),
+            "`{jsx}` should be refused naming {expected:?}, got: {err}"
+        );
     }
 }
 
@@ -251,7 +286,10 @@ export default function Probe() {
   return <p>{typeof none}</p>;
 }",
     );
-    assert!(err.contains("`typeof` of a value that is null or undefined"), "{err}");
+    assert!(
+        err.contains("`typeof` of a value that is null or undefined"),
+        "{err}"
+    );
 }
 
 /// A refusal inside a LOCAL constant used to be swallowed into `null`; it is
@@ -278,7 +316,9 @@ fn a_refusal_inside_a_local_constant_is_raised_where_it_is_read() {
 }"#,
     );
     let project = CompiledProject::load_from_dir(dir.path()).expect("compiles");
-    assert!(render_static(&project, "Probe.tsx").unwrap().contains("fine"));
+    assert!(render_static(&project, "Probe.tsx")
+        .unwrap()
+        .contains("fine"));
 }
 
 /// A helper that fails names both itself and what stopped it.

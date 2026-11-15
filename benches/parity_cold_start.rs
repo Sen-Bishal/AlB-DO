@@ -40,10 +40,9 @@ fn fixture_root() -> PathBuf {
 /// `.tsx` under the fixture's source root, runs Phase K metadata
 /// extraction across every function, builds the CSS-module registry.
 fn measure_compiled_project_load() {
-    let project = dom_render_compiler::runtime::eval::CompiledProject::load_from_dir(
-        fixture_root(),
-    )
-    .expect("load compiled project");
+    let project =
+        dom_render_compiler::runtime::eval::CompiledProject::load_from_dir(fixture_root())
+            .expect("load compiled project");
     black_box(project);
 }
 

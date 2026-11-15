@@ -30,9 +30,12 @@ impl Drop for Server {
 
 fn albedo(home: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_albedo"));
-    cmd.current_dir(cwd).env("USERPROFILE", home).env("HOME", home);
+    cmd.current_dir(cwd)
+        .env("USERPROFILE", home)
+        .env("HOME", home);
     // The variables under test come only from where each test puts them.
-    cmd.env_remove("ALBEDO_SERVER_PORT").env_remove("ALBEDO_SERVER_HOST");
+    cmd.env_remove("ALBEDO_SERVER_PORT")
+        .env_remove("ALBEDO_SERVER_HOST");
     cmd
 }
 
@@ -100,7 +103,10 @@ fn spawn(home: &Path, app: &Path, args: &[&str], port_env: u16, log: &str) -> Se
 async fn serve_binds_the_environment_port_unless_a_flag_names_one() {
     let home = tempfile::tempdir().expect("home");
     let work = tempfile::tempdir().expect("work");
-    run_ok(albedo(home.path(), work.path()).args(["init", "envapp"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "envapp"]),
+        "albedo init",
+    );
     let app = work.path().join("envapp");
     run_ok(albedo(home.path(), &app).arg("build"), "albedo build");
 

@@ -46,7 +46,9 @@ fn a_long_markdown_page_ships_as_escaped_tier_a_markup_inside_its_layout() {
     let report = scanner
         .scan_directory_with_mode(&src, ScanMode::Strict)
         .expect("a valid page scans under strict mode");
-    let compiler = scanner.build_compiler(report.components).with_project_root(dir.path());
+    let compiler = scanner
+        .build_compiler(report.components)
+        .with_project_root(dir.path());
     let (manifest, tiers) = compiler
         .optimize_manifest_v2_with_tier_report()
         .expect("manifest");
@@ -58,10 +60,19 @@ fn a_long_markdown_page_ships_as_escaped_tier_a_markup_inside_its_layout() {
         .expect("the page is a component named after its route");
     assert_eq!(page.tier, Tier::A, "{page:?}");
 
-    let route = manifest.routes.get("/docs/intro").expect("the page is a route");
-    assert!(route.shell.doctype_and_head.contains("<title>Intro</title>"));
+    let route = manifest
+        .routes
+        .get("/docs/intro")
+        .expect("the page is a route");
+    assert!(route
+        .shell
+        .doctype_and_head
+        .contains("<title>Intro</title>"));
     assert!(
-        route.shell.body_open.contains(r#"data-route="/docs/intro""#),
+        route
+            .shell
+            .body_open
+            .contains(r#"data-route="/docs/intro""#),
         "the layout wraps the page and knows its route: {}",
         route.shell.body_open
     );
@@ -73,7 +84,10 @@ fn a_long_markdown_page_ships_as_escaped_tier_a_markup_inside_its_layout() {
         .expect("the page renders at Tier A")
         .html;
     // Escaped exactly once: `&lt;`, never `&amp;lt;` and never a bare `<`.
-    assert!(html.contains("When a &lt; b &amp;&amp; c &gt; d, write "), "{html}");
+    assert!(
+        html.contains("When a &lt; b &amp;&amp; c &gt; d, write "),
+        "{html}"
+    );
     assert!(html.contains("&lt;T,&gt;() =&gt; {}</code>"), "{html}");
     assert!(!html.contains("&amp;lt;"), "double-escaped: {html}");
     assert!(html.contains(r#"<h1 id="intro""#), "{html}");
@@ -83,11 +97,18 @@ fn a_long_markdown_page_ships_as_escaped_tier_a_markup_inside_its_layout() {
 fn a_broken_page_fails_a_strict_scan_with_its_file_and_line() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src");
-    write(&src, "routes/docs/intro.md", "# Intro\n\nSee [the rest](./rest.md).\n");
+    write(
+        &src,
+        "routes/docs/intro.md",
+        "# Intro\n\nSee [the rest](./rest.md).\n",
+    );
 
     let err = ProjectScanner::new()
         .scan_directory_with_mode(&src, ScanMode::Strict)
         .expect_err("a dead link is a build failure")
         .to_string();
-    assert!(err.contains("intro.md:3: links to `./rest.md`, which does not exist"), "{err}");
+    assert!(
+        err.contains("intro.md:3: links to `./rest.md`, which does not exist"),
+        "{err}"
+    );
 }

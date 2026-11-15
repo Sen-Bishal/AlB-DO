@@ -28,10 +28,10 @@
 //! * a dynamic segment (`/room/[id]`) — nothing lists the values it takes;
 //! * `export const auth = "required"` — nothing can check who is asking;
 //! * a form bound to an action — nothing receives the POST;
-//! * a route that opens the live lane — Tier-B/C components, shared-slot
-//!   topics, partitions (the server's own `route_needs_live_lane` decides);
-//! * an app that declares FORGE, AUTH, sources, uploads, webhooks, email,
-//!   `src/middleware.ts` or `src/jobs.ts`.
+//! * a route that opens the live lane — Tier-B/C components, shared-slot topics, partitions (the
+//!   server's own `route_needs_live_lane` decides);
+//! * an app that declares FORGE, AUTH, sources, uploads, webhooks, email, `src/middleware.ts` or
+//!   `src/jobs.ts`.
 //!
 //! Partial exports are refused too. Shipping the routes that happen to work
 //! and dropping the rest is the same lie as before at a smaller scale — a site
@@ -245,8 +245,7 @@ pub fn export_static_site(
         .enable_all()
         .build()
         .map_err(|err| ExportError::Failed(format!("failed to start tokio runtime: {err}")))?;
-    let (rendered, render_refusals) =
-        runtime.block_on(render_through_server(&server, &routes))?;
+    let (rendered, render_refusals) = runtime.block_on(render_through_server(&server, &routes))?;
     drop(server);
     drop(runtime);
     refusals.extend(render_refusals);
@@ -359,14 +358,19 @@ pub fn manifest_refusals(manifest: &RenderManifestV2) -> Vec<Refusal> {
     // `serve` boots with these and reports each one missing from its pages. A
     // file freezes that absence: every visitor gets the page without the
     // component, and no boot report is printed to anyone.
-    refusals.extend(manifest.static_render_failures.iter().map(|failure| Refusal {
-        subject: failure.module_path.clone(),
-        reasons: vec![format!(
-            "`{}` failed its build-time render and is missing from every page that \
+    refusals.extend(
+        manifest
+            .static_render_failures
+            .iter()
+            .map(|failure| Refusal {
+                subject: failure.module_path.clone(),
+                reasons: vec![format!(
+                    "`{}` failed its build-time render and is missing from every page that \
              renders it: {}",
-            failure.component, failure.error
-        )],
-    }));
+                    failure.component, failure.error
+                )],
+            }),
+    );
     refusals
 }
 
@@ -471,8 +475,9 @@ fn read_manifest(dist_dir: &Path) -> Result<RenderManifestV2, ExportError> {
             path.display()
         ))
     })?;
-    serde_json::from_str(&raw)
-        .map_err(|err| ExportError::Failed(format!("'{}' is not a manifest: {err}", path.display())))
+    serde_json::from_str(&raw).map_err(|err| {
+        ExportError::Failed(format!("'{}' is not a manifest: {err}", path.display()))
+    })
 }
 
 /// Everything fetched through the server, held in memory until all of it has
@@ -542,7 +547,9 @@ async fn render_through_server(
                     .unwrap_or("(no content type)")
             ));
         }
-        let html = if let Ok(html) = String::from_utf8(fetched.body) { html } else {
+        let html = if let Ok(html) = String::from_utf8(fetched.body) {
+            html
+        } else {
             reasons.push("the page is not UTF-8".to_string());
             String::new()
         };
@@ -667,12 +674,16 @@ fn write_site(
     // author's `public/` over it (the mount `serve` consults first), then the
     // client scripts over both (dispatched before `public/` is looked at).
     let mut files: BTreeMap<PathBuf, (String, Source)> = BTreeMap::new();
-    for root in [opts.dist_dir.join("public"), opts.project_dir.join("public")] {
+    for root in [
+        opts.dist_dir.join("public"),
+        opts.project_dir.join("public"),
+    ] {
         if !root.is_dir() {
             continue;
         }
         for entry in walkdir::WalkDir::new(&root).follow_links(true) {
-            let entry = entry.map_err(|err| failed(format!("reading '{}': {err}", root.display())))?;
+            let entry =
+                entry.map_err(|err| failed(format!("reading '{}': {err}", root.display())))?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -751,9 +762,8 @@ fn write_site(
                     std::fs::create_dir_all(parent)
                         .map_err(|err| failed(format!("creating '{}': {err}", parent.display())))?;
                 }
-                std::fs::copy(from, &target).map_err(|err| {
-                    failed(format!("copying '{}': {err}", from.display()))
-                })?
+                std::fs::copy(from, &target)
+                    .map_err(|err| failed(format!("copying '{}': {err}", from.display())))?
             }
             Source::Bytes(body) => write(relative, body)?,
         };

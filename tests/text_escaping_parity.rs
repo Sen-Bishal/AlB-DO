@@ -65,7 +65,9 @@ fn render_evaluator(project: &CompiledProject, entry: &str, props: &Value) -> St
         entry,
         props,
         &slots(),
-        &RenderOptions { hook_compile: false },
+        &RenderOptions {
+            hook_compile: false,
+        },
     )
     .expect("evaluator render succeeds")
     .html
@@ -74,7 +76,9 @@ fn render_evaluator(project: &CompiledProject, entry: &str, props: &Value) -> St
 /// The same component's markup through the real JS engine.
 fn render_quickjs(project: &CompiledProject, entry: &str, props: &Value) -> String {
     let mut engine = QuickJsEngine::new();
-    engine.init(&BootstrapPayload::default()).expect("engine init");
+    engine
+        .init(&BootstrapPayload::default())
+        .expect("engine init");
     project
         .render_entry_quickjs(&mut engine, entry, props, &slots())
         .expect("quickjs render succeeds")
@@ -86,11 +90,8 @@ fn render_quickjs(project: &CompiledProject, entry: &str, props: &Value) -> Stri
 /// byte about all of it.
 #[test]
 fn a_hostile_props_string_is_escaped_in_text_position_by_both_renderers() {
-    let project = CompiledProject::load_from_dir(fixture(
-        "render_quickjs",
-        "escaped_props_text",
-    ))
-    .expect("fixture compiles");
+    let project = CompiledProject::load_from_dir(fixture("render_quickjs", "escaped_props_text"))
+        .expect("fixture compiles");
     let props = json!({ "bio": HOSTILE });
 
     let evaluator = render_evaluator(&project, "Component.tsx", &props);

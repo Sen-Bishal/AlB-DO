@@ -96,10 +96,7 @@ impl AddressClass {
     /// multicast and broadcast are never a request's destination.
     #[must_use]
     pub const fn allowed_in_dev(self) -> bool {
-        !matches!(
-            self,
-            Self::LinkLocal | Self::Multicast | Self::Broadcast
-        )
+        !matches!(self, Self::LinkLocal | Self::Multicast | Self::Broadcast)
     }
 
     /// A short human-readable name for the error message.
@@ -512,10 +509,7 @@ mod tests {
         ] {
             let url = Url::parse(refused).expect("parses");
             assert!(
-                matches!(
-                    policy.check_url(&url),
-                    Err(EgressDenial::Address { .. })
-                ),
+                matches!(policy.check_url(&url), Err(EgressDenial::Address { .. })),
                 "serve must refuse {refused}"
             );
         }
@@ -542,8 +536,7 @@ mod tests {
     fn a_declared_literal_and_dev_mode_both_still_pass() {
         // A `base` that names an address is an author declaring that address,
         // which is the same authority a declared hostname carries.
-        let declared =
-            EgressPolicy::with_declared_hosts(EgressMode::Serve, ["127.0.0.1"]);
+        let declared = EgressPolicy::with_declared_hosts(EgressMode::Serve, ["127.0.0.1"]);
         assert!(declared
             .check_url(&Url::parse("http://127.0.0.1:4599/charge").unwrap())
             .is_ok());
@@ -598,12 +591,17 @@ mod tests {
             assert!(
                 matches!(
                     dev.check_url(&Url::parse(refused).expect("parses")),
-                    Err(EgressDenial::Address { class: AddressClass::LinkLocal, .. })
+                    Err(EgressDenial::Address {
+                        class: AddressClass::LinkLocal,
+                        ..
+                    })
                 ),
                 "dev must refuse {refused}"
             );
         }
-        assert!(dev.check_address("metadata.example", v4("169.254.169.254")).is_err());
+        assert!(dev
+            .check_address("metadata.example", v4("169.254.169.254"))
+            .is_err());
     }
 
     /// NAT64 and 6to4 addresses carry an IPv4 address the network connects to
@@ -611,20 +609,35 @@ mod tests {
     #[test]
     fn translation_prefixes_are_judged_by_the_address_they_carry() {
         // 64:ff9b::/96 — 169.254.169.254, 10.0.0.1, 127.0.0.1.
-        assert_eq!(classify(v4("64:ff9b::a9fe:a9fe")), Some(AddressClass::LinkLocal));
+        assert_eq!(
+            classify(v4("64:ff9b::a9fe:a9fe")),
+            Some(AddressClass::LinkLocal)
+        );
         assert_eq!(classify(v4("64:ff9b::a00:1")), Some(AddressClass::Private));
-        assert_eq!(classify(v4("64:ff9b::7f00:1")), Some(AddressClass::Loopback));
+        assert_eq!(
+            classify(v4("64:ff9b::7f00:1")),
+            Some(AddressClass::Loopback)
+        );
         // A public address behind NAT64 is public.
         assert_eq!(classify(v4("64:ff9b::5db8:d822")), None);
         // Local-use NAT64 — refused whole.
-        assert_eq!(classify(v4("64:ff9b:1::a9fe:a9fe")), Some(AddressClass::Private));
+        assert_eq!(
+            classify(v4("64:ff9b:1::a9fe:a9fe")),
+            Some(AddressClass::Private)
+        );
         // 2002::/16 — 6to4 to 169.254.169.254, 192.168.0.1, and a public site.
-        assert_eq!(classify(v4("2002:a9fe:a9fe::1")), Some(AddressClass::LinkLocal));
+        assert_eq!(
+            classify(v4("2002:a9fe:a9fe::1")),
+            Some(AddressClass::LinkLocal)
+        );
         assert_eq!(classify(v4("2002:c0a8:1::")), Some(AddressClass::Private));
         assert_eq!(classify(v4("2002:5db8:d822::1")), None);
 
         let serve = EgressPolicy::new(EgressMode::Serve);
-        for refused in ["http://[64:ff9b::a9fe:a9fe]/", "http://[2002:a9fe:a9fe::1]/"] {
+        for refused in [
+            "http://[64:ff9b::a9fe:a9fe]/",
+            "http://[2002:a9fe:a9fe::1]/",
+        ] {
             assert!(
                 serve.check_url(&Url::parse(refused).unwrap()).is_err(),
                 "serve must refuse {refused}"

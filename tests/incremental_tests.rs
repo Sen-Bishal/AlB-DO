@@ -171,9 +171,7 @@ fn test_cache_stats() {
         let file_path = temp_dir.path().join(format!("comp{i}.tsx"));
         fs::write(
             &file_path,
-            format!(
-                "export default function Component{i}() {{ return null; }}"
-            ),
+            format!("export default function Component{i}() {{ return null; }}"),
         )
         .unwrap();
 

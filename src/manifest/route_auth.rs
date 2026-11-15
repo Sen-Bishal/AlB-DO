@@ -14,17 +14,15 @@
 //!
 //! Two things are refused here, and they fail for different reasons:
 //!
-//! 1. **An unreadable declaration** — `auth` present but not `"public"` /
-//!    `"required"`, or not a string literal at all. A typo (`"requried"`) would
-//!    otherwise be silently public, which is the worst possible outcome for a
-//!    line whose entire purpose is to restrict.
-//! 2. **A gate nothing can satisfy** — `auth = "required"` in a project that
-//!    declares no auth providers. Every request to that route would be refused
-//!    forever, because there is no way to become authenticated. That is a
-//!    misconfiguration the author cannot see from either file alone: the route
-//!    looks right, the `auth` block looks right, and only the pair is wrong.
-//!    R1a adds the same pair-check for roles: `auth = { role: "finance" }` in a
-//!    project whose `auth.roles` does not declare `finance`.
+//! 1. **An unreadable declaration** — `auth` present but not `"public"` / `"required"`, or not a
+//!    string literal at all. A typo (`"requried"`) would otherwise be silently public, which is the
+//!    worst possible outcome for a line whose entire purpose is to restrict.
+//! 2. **A gate nothing can satisfy** — `auth = "required"` in a project that declares no auth
+//!    providers. Every request to that route would be refused forever, because there is no way to
+//!    become authenticated. That is a misconfiguration the author cannot see from either file
+//!    alone: the route looks right, the `auth` block looks right, and only the pair is wrong. R1a
+//!    adds the same pair-check for roles: `auth = { role: "finance" }` in a project whose
+//!    `auth.roles` does not declare `finance`.
 
 use crate::manifest::metadata::auth_from_const_expr;
 use crate::runtime::compiled::CompiledProject;
@@ -101,7 +99,10 @@ mod tests {
         let err = RouteAuth::parse("requried").expect_err("a typo must not be accepted");
         assert!(err.contains("\"public\""), "{err}");
         assert!(err.contains("\"required\""), "{err}");
-        assert!(err.contains("requried"), "the message must quote what was found: {err}");
+        assert!(
+            err.contains("requried"),
+            "the message must quote what was found: {err}"
+        );
     }
 
     #[test]
@@ -162,7 +163,10 @@ mod tests {
         assert_eq!(gate.admits(Some(&roles(&["payroll"]))), Admission::Allowed);
 
         assert_eq!(RouteAuth::Required.admits(None), Admission::Anonymous);
-        assert_eq!(RouteAuth::Required.admits(Some(&roles(&[]))), Admission::Allowed);
+        assert_eq!(
+            RouteAuth::Required.admits(Some(&roles(&[]))),
+            Admission::Allowed
+        );
         assert_eq!(RouteAuth::Public.admits(None), Admission::Allowed);
     }
 

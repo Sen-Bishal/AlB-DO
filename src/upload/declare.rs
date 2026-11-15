@@ -277,7 +277,8 @@ impl UploadRegistry {
     /// what makes its files public.
     #[must_use]
     pub fn read_rule(&self, bucket: &str) -> ReadRule {
-        self.bucket(bucket).map_or(ReadRule::Owner, |found| found.read)
+        self.bucket(bucket)
+            .map_or(ReadRule::Owner, |found| found.read)
     }
 
     /// The largest ceiling any bucket declared.

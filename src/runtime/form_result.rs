@@ -38,12 +38,12 @@ use serde_json::Value;
 /// `data-albedo-error` span.
 ///
 /// Contract on `result`:
-/// - `{ "error": { field: message, … } }` → each declared field named here is
-///   filled with its message; every other declared field is cleared.
-/// - `{ "ok": message }` → the form's success sink is filled — **only if no
-///   declared field failed** in the same result; a result is one or the other.
-/// - any other shape (`{}`, `{ ok: true }`, `null`, a non-object) → every error
-///   sink and the success sink are cleared.
+/// - `{ "error": { field: message, … } }` → each declared field named here is filled with its
+///   message; every other declared field is cleared.
+/// - `{ "ok": message }` → the form's success sink is filled — **only if no declared field failed**
+///   in the same result; a result is one or the other.
+/// - any other shape (`{}`, `{ ok: true }`, `null`, a non-object) → every error sink and the
+///   success sink are cleared.
 ///
 /// So the form's whole feedback state is a function of its *last* result, and
 /// one pass reconciles all of it: a failing re-submit clears a stale "You're on
@@ -85,7 +85,11 @@ pub fn project_form_result(
         })
         .collect();
 
-    let ok = if failed { "" } else { result.get("ok").and_then(Value::as_str).unwrap_or("") };
+    let ok = if failed {
+        ""
+    } else {
+        result.get("ok").and_then(Value::as_str).unwrap_or("")
+    };
     if !declared_fields.is_empty() || !ok.is_empty() {
         ops.push(Instruction::SetText {
             stable_id: StableId(allocate_form_ok_id(action_name)),
@@ -136,9 +140,7 @@ mod tests {
     fn text_for<'a>(ops: &'a [Instruction], action: &str, field: &str) -> Option<&'a [u8]> {
         let want = StableId(allocate_field_error_id(action, field));
         ops.iter().find_map(|op| match op {
-            Instruction::SetText { stable_id, text } if *stable_id == want => {
-                Some(text.as_slice())
-            }
+            Instruction::SetText { stable_id, text } if *stable_id == want => Some(text.as_slice()),
             _ => None,
         })
     }
@@ -188,7 +190,10 @@ mod tests {
     fn an_ok_message_fills_the_success_sink_and_clears_every_error() {
         let result = json!({ "ok": "You're on the list." });
         let ops = project_form_result("join", &result, &fields(&["email"]));
-        assert_eq!(ok_text(&ops, "join"), Some(b"You're on the list.".as_slice()));
+        assert_eq!(
+            ok_text(&ops, "join"),
+            Some(b"You're on the list.".as_slice())
+        );
         assert_eq!(text_for(&ops, "join", "email"), Some(b"".as_slice()));
     }
 
@@ -215,7 +220,11 @@ mod tests {
     #[test]
     fn success_clears_every_declared_field() {
         // `ok: true` is a success with nothing to say: every sink is cleared.
-        let ops = project_form_result("subscribe", &json!({ "ok": true }), &fields(&["email", "name"]));
+        let ops = project_form_result(
+            "subscribe",
+            &json!({ "ok": true }),
+            &fields(&["email", "name"]),
+        );
         assert_eq!(ops.len(), 3);
         assert_eq!(ok_text(&ops, "subscribe"), Some(b"".as_slice()));
         for field in ["email", "name"] {
@@ -240,14 +249,21 @@ mod tests {
         let result = json!({ "error": { "ghost": "nope", "email": "bad" } });
         let ops = project_form_result("subscribe", &result, &fields(&["email"]));
         assert_eq!(ops.len(), 2);
-        assert_eq!(text_for(&ops, "subscribe", "email"), Some(b"bad".as_slice()));
+        assert_eq!(
+            text_for(&ops, "subscribe", "email"),
+            Some(b"bad".as_slice())
+        );
         assert!(text_for(&ops, "subscribe", "ghost").is_none());
     }
 
     #[test]
     fn non_string_message_is_treated_as_no_error() {
         // 42 isn't a message → email has no error → cleared.
-        let ops = project_form_result("subscribe", &json!({ "error": { "email": 42 } }), &fields(&["email"]));
+        let ops = project_form_result(
+            "subscribe",
+            &json!({ "error": { "email": 42 } }),
+            &fields(&["email"]),
+        );
         assert_eq!(text_for(&ops, "subscribe", "email"), Some(b"".as_slice()));
     }
 

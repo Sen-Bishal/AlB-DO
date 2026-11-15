@@ -5,12 +5,12 @@
 //! behind a counting harness that does what Q1b's executor must: coerce first
 //! (`forge::query::coerce`), then bind and run, or short-circuit.
 //!
-//! - accepted inputs: the rows SQL returns are exactly the rows Rust's
-//!   null-safe comparison on the coerced value picks;
-//! - rejected inputs: **zero statements** reach the database — an empty result
-//!   from a route param, an error from code;
-//! - and the danger is real: the same rejected values bound raw *would* match
-//!   through SQLite's type affinity.
+//! - accepted inputs: the rows SQL returns are exactly the rows Rust's null-safe comparison on the
+//!   coerced value picks;
+//! - rejected inputs: **zero statements** reach the database — an empty result from a route param,
+//!   an error from code;
+//! - and the danger is real: the same rejected values bound raw *would* match through SQLite's type
+//!   affinity.
 //!
 //! One database, one test function (the access-violation trap,
 //! `src/forge/libsql.rs`).
@@ -66,7 +66,14 @@ enum Outcome {
 }
 
 impl Harness {
-    async fn run(&mut self, sql: &str, ty: FieldType, column: &str, value: &Value, provenance: Provenance) -> Outcome {
+    async fn run(
+        &mut self,
+        sql: &str,
+        ty: FieldType,
+        column: &str,
+        value: &Value,
+        provenance: Provenance,
+    ) -> Outcome {
         match coerce(value, ty, provenance, column) {
             Err(err) => Outcome::Error(err.to_string()),
             Ok(Coerced::NoMatch) => Outcome::Rows(Vec::new()),
@@ -119,17 +126,29 @@ fn rust_ids(column: &str, bound: &SqlValue) -> Vec<i64> {
 #[tokio::test]
 async fn falsifier_3_rust_coercion_decides_what_reaches_sql() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = libsql::Builder::new_local(dir.path().join("f3.db")).build().await.expect("open");
-    let conn = db.connect().expect("connect");
-    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, n INTEGER, t TEXT)", ())
+    let db = libsql::Builder::new_local(dir.path().join("f3.db"))
+        .build()
         .await
-        .expect("table");
+        .expect("open");
+    let conn = db.connect().expect("connect");
+    conn.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, n INTEGER, t TEXT)",
+        (),
+    )
+    .await
+    .expect("table");
     for (id, n, t) in ROWS {
-        conn.execute("INSERT INTO items(id, n, t) VALUES (?1, ?2, ?3)", libsql::params![*id, *n, *t])
-            .await
-            .expect("row");
+        conn.execute(
+            "INSERT INTO items(id, n, t) VALUES (?1, ?2, ?3)",
+            libsql::params![*id, *n, *t],
+        )
+        .await
+        .expect("row");
     }
-    let mut harness = Harness { conn, statements: 0 };
+    let mut harness = Harness {
+        conn,
+        statements: 0,
+    };
     let (n_sql, n_ty) = lowered("n");
     let (t_sql, t_ty) = lowered("t");
     assert!(n_sql.contains("WHERE n IS ?1"), "{n_sql}");
@@ -151,7 +170,10 @@ async fn falsifier_3_rust_coercion_decides_what_reaches_sql() {
         assert_eq!(harness.statements, before + 1);
         assert_eq!(sql, rust_ids("n", &bound), "{value}: SQL vs Rust");
     }
-    let Outcome::Rows(sql) = harness.run(&t_sql, t_ty, "t", &json!("42"), Provenance::Code).await else {
+    let Outcome::Rows(sql) = harness
+        .run(&t_sql, t_ty, "t", &json!("42"), Provenance::Code)
+        .await
+    else {
         panic!("text accepted");
     };
     assert_eq!(sql, vec![2]);
@@ -167,27 +189,56 @@ async fn falsifier_3_rust_coercion_decides_what_reaches_sql() {
     ];
     let before = harness.statements;
     for value in &rejected_n {
-        match harness.run(&n_sql, n_ty, "n", value, Provenance::RouteParam).await {
-            Outcome::Rows(rows) => assert!(rows.is_empty(), "{value} from a route param matches nothing"),
-            Outcome::Error(e) => panic!("{value} from a route param is a no-match, not an error: {e}"),
+        match harness
+            .run(&n_sql, n_ty, "n", value, Provenance::RouteParam)
+            .await
+        {
+            Outcome::Rows(rows) => assert!(
+                rows.is_empty(),
+                "{value} from a route param matches nothing"
+            ),
+            Outcome::Error(e) => {
+                panic!("{value} from a route param is a no-match, not an error: {e}")
+            }
         }
         assert!(
-            matches!(harness.run(&n_sql, n_ty, "n", value, Provenance::Code).await, Outcome::Error(_)),
+            matches!(
+                harness
+                    .run(&n_sql, n_ty, "n", value, Provenance::Code)
+                    .await,
+                Outcome::Error(_)
+            ),
             "{value} from code is an error"
         );
     }
     assert!(
-        matches!(harness.run(&t_sql, t_ty, "t", &json!(42), Provenance::Code).await, Outcome::Error(_)),
+        matches!(
+            harness
+                .run(&t_sql, t_ty, "t", &json!(42), Provenance::Code)
+                .await,
+            Outcome::Error(_)
+        ),
         "a number for a text column is refused by Rust"
     );
-    assert_eq!(harness.statements, before, "no rejected value reached the database");
+    assert_eq!(
+        harness.statements, before,
+        "no rejected value reached the database"
+    );
 
     // The danger the rejection prevents: bound raw, SQLite's affinity matches.
     let affinity_042 = harness.raw(&n_sql, libsql::Value::Text("042".into())).await;
     let affinity_t = harness.raw(&t_sql, libsql::Value::Integer(42)).await;
     eprintln!("raw `n IS '042'` → {affinity_042:?}; raw `t IS 42` → {affinity_t:?}");
-    assert_eq!(affinity_042, vec![1], "SQLite would have matched \"042\" to 42");
-    assert_eq!(affinity_t, vec![2], "SQLite would have matched 42 to \"42\"");
+    assert_eq!(
+        affinity_042,
+        vec![1],
+        "SQLite would have matched \"042\" to 42"
+    );
+    assert_eq!(
+        affinity_t,
+        vec![2],
+        "SQLite would have matched 42 to \"42\""
+    );
     drop(harness);
     drop(db);
 }

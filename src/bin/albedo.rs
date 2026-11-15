@@ -98,8 +98,7 @@ const SPINNER_FRAMES_ASCII: [&str; 4] = ["|", "/", "-", "\\"];
 // paint bug. A list topic exercises the same substrate and works.
 const SCAFFOLD_LAYOUT: &str = include_str!("../../scaffold/src/routes/layout.tsx");
 const SCAFFOLD_INDEX_ROUTE: &str = include_str!("../../scaffold/src/routes/index.tsx");
-const SCAFFOLD_GUESTBOOK_ROUTE: &str =
-    include_str!("../../scaffold/src/routes/guestbook.tsx");
+const SCAFFOLD_GUESTBOOK_ROUTE: &str = include_str!("../../scaffold/src/routes/guestbook.tsx");
 const SCAFFOLD_ROOM_ROUTE: &str = include_str!("../../scaffold/src/routes/room/[id].tsx");
 // AUTH P2 — the on-ramp's account page. The `auth` block in
 // `scaffold/albedo.config.ts` is what mounts the endpoints these forms post
@@ -109,8 +108,7 @@ const SCAFFOLD_HERO: &str = include_str!("../../scaffold/src/components/Hero.tsx
 const SCAFFOLD_COUNTER: &str = include_str!("../../scaffold/src/components/Counter.tsx");
 // 15.2 · `albedo test` examples — a component, a page, accounts.
 const SCAFFOLD_HERO_TEST: &str = include_str!("../../scaffold/src/components/Hero.test.tsx");
-const SCAFFOLD_GUESTBOOK_TEST: &str =
-    include_str!("../../scaffold/src/routes/guestbook.test.tsx");
+const SCAFFOLD_GUESTBOOK_TEST: &str = include_str!("../../scaffold/src/routes/guestbook.test.tsx");
 const SCAFFOLD_SIGN_IN_TEST: &str = include_str!("../../scaffold/src/routes/sign-in.test.tsx");
 const SCAFFOLD_ENV_DTS: &str = include_str!("../../scaffold/src/albedo-env.d.ts");
 const SCAFFOLD_STYLES: &str = include_str!("../../scaffold/src/styles.css");
@@ -476,7 +474,9 @@ fn run_email_command(raw_args: &[String]) -> Result<(), String> {
     }
     let rest = &raw_args[1..];
     let Some(to) = rest.iter().find(|arg| arg.contains('@')).cloned() else {
-        return Err(format!("which address should receive the test?\n\n{EMAIL_USAGE}"));
+        return Err(format!(
+            "which address should receive the test?\n\n{EMAIL_USAGE}"
+        ));
     };
     let forwarded: Vec<String> = rest.iter().filter(|arg| **arg != to).cloned().collect();
 
@@ -674,11 +674,10 @@ fn check_types(project_dir: &Path) -> TypeCheck {
         return TypeCheck::Skipped("no tsconfig.json in the project".to_string());
     }
 
-    let binary = project_dir.join("node_modules").join(".bin").join(if cfg!(windows) {
-        "tsc.cmd"
-    } else {
-        "tsc"
-    });
+    let binary = project_dir
+        .join("node_modules")
+        .join(".bin")
+        .join(if cfg!(windows) { "tsc.cmd" } else { "tsc" });
     if !binary.exists() {
         return TypeCheck::Skipped(
             "typescript is not installed in this project (`npm i -D typescript`)".to_string(),
@@ -731,11 +730,14 @@ fn print_foreign_layout_notice(contract: &ResolvedDevContract) {
         return;
     }
     print_kv("layout", style_256(layout, ACCENT_SOFT, true));
-    print_warn(style(
+    print_warn(
+        style(
             "root and entry were inferred. ALBEDO discovers routes from `routes/`, so this \
              framework's own routes are NOT in the build — run `albedo doctor` to see which.",
-            "2"
-        ).clone());
+            "2",
+        )
+        .clone(),
+    );
 }
 
 /// Route-shaped files that ALBEDO's own convention did not pick up.
@@ -771,7 +773,10 @@ fn unattributed_route_files(root: &Path) -> Vec<String> {
                 path.extension().and_then(|ext| ext.to_str()),
                 Some("tsx" | "jsx" | "ts" | "js")
             ) && !dom_render_compiler::testing::is_test_module(path);
-            let name = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("");
             // App Router names the route file; Pages Router makes every file one.
             if is_route_shaped && (convention == "pages" || matches!(name, "page" | "route")) {
                 if let Ok(relative) = path.strip_prefix(root) {
@@ -820,7 +825,10 @@ fn print_doctor_report(
     print_section("reach");
     println!(
         "    {}",
-        style("what each route reads, and what decides which rows come back", "2")
+        style(
+            "what each route reads, and what decides which rows come back",
+            "2"
+        )
     );
     println!();
     for row in &matrix.routes {
@@ -830,7 +838,10 @@ fn print_doctor_report(
             style(&format!("[{}]", row.cost.class.as_str()), "2")
         );
         if row.reads.is_empty() {
-            println!("      {}", style("reads nothing — served from the manifest", "2"));
+            println!(
+                "      {}",
+                style("reads nothing — served from the manifest", "2")
+            );
         }
         for read in &row.reads {
             // Pad the PLAIN text and colorize after. ANSI escapes have zero
@@ -927,10 +938,7 @@ fn print_doctor_report(
                 "2"
             )
         );
-        println!(
-            "    {}",
-            style("by anyone who can reach the route.", "2")
-        );
+        println!("    {}", style("by anyone who can reach the route.", "2"));
     }
     println!();
 }
@@ -1035,14 +1043,12 @@ fn enforce_budget_after_build(
 ///
 /// * **Tier-C island bytes** — each Tier-C component lowered through
 ///   [`compile_client_island_module`], which is the *same* lowering
-///   `RendererRuntime::build_hydration_blocks` ships to the browser, so the
-///   count is the payload rather than a proxy for it. A component whose island
-///   fails to compile is skipped and reported as skipped; the total is then a
-///   floor, never a guess.
-/// * **Runtime bytes** — the framework client a rendered page actually loads,
-///   stat'd off disk. This is the cost a page pays no matter how its components
-///   tiered, and omitting it is what let a "zero JS" build still transfer ~96 KB
-///   of JavaScript.
+///   `RendererRuntime::build_hydration_blocks` ships to the browser, so the count is the payload
+///   rather than a proxy for it. A component whose island fails to compile is skipped and reported
+///   as skipped; the total is then a floor, never a guess.
+/// * **Runtime bytes** — the framework client a rendered page actually loads, stat'd off disk. This
+///   is the cost a page pays no matter how its components tiered, and omitting it is what let a
+///   "zero JS" build still transfer ~96 KB of JavaScript.
 ///
 /// The runtime set is read from the output directory rather than from
 /// [`BundleEmitReport`], which carries only the assets the bundler itself wrote
@@ -1104,10 +1110,7 @@ fn measure_client_bytes(
             // which is the same outcome for the reader.
             tier_c_failures.push((
                 component.name.clone(),
-                format!(
-                    "no module source recorded for '{}'",
-                    component.module_path
-                ),
+                format!("no module source recorded for '{}'", component.module_path),
             ));
             continue;
         };
@@ -1133,8 +1136,7 @@ fn measure_client_bytes(
     // live route). Not the whole `_albedo/` directory: `bincode.js`,
     // `phosphor.js` and `hydration.js` are imported on demand, so summing the
     // folder would overstate by ~47 kB in the other direction.
-    const SHELL_RUNTIME_ASSETS: [&str; 3] =
-        ["runtime.js", "link-forms.js", "wt-bootstrap.js"];
+    const SHELL_RUNTIME_ASSETS: [&str; 3] = ["runtime.js", "link-forms.js", "wt-bootstrap.js"];
     let runtime_bytes = SHELL_RUNTIME_ASSETS
         .iter()
         .filter_map(|name| std::fs::metadata(out_dir.join("_albedo").join(name)).ok())
@@ -1203,8 +1205,8 @@ fn merge_budget_reports(primary: &BudgetReport, secondary: Option<&BudgetReport>
 /// `Ok(None)` is the ordinary `albedo` CLI and by far the common case. An
 /// error means a payload is present but damaged, which must be said rather
 /// than degraded into "no project here" — see `bundle_payload::read_index`.
-fn shipped_project() -> Result<Option<(PathBuf, albedo_server::bundle_payload::PayloadIndex)>, String>
-{
+fn shipped_project(
+) -> Result<Option<(PathBuf, albedo_server::bundle_payload::PayloadIndex)>, String> {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         // Not being able to find our own path is not a reason to refuse to run
@@ -1232,8 +1234,7 @@ fn run_shipped_app(
 ) -> Result<(), String> {
     let mut file = std::fs::File::open(&exe)
         .map_err(|err| format!("failed to open this executable to read its payload: {err}"))?;
-    let project =
-        albedo_server::bundle_payload::prepare_unpacked_project(&mut file, &index, &exe)?;
+    let project = albedo_server::bundle_payload::prepare_unpacked_project(&mut file, &index, &exe)?;
 
     // 🔑 **The database belongs beside the executable, not inside the unpacked
     // project.** The unpack directory is keyed by build id, so shipping a new
@@ -1345,8 +1346,7 @@ fn configure_ship_static(contract: &ResolvedDevContract) -> Result<(), String> {
     print_section("static");
     let opts = albedo_server::ProductionServerOptions::from_contract(contract);
     let out_dir = static_export::default_out_dir(&contract.project_dir);
-    let site =
-        static_export::export_static_site(&opts, &out_dir).map_err(|err| err.to_string())?;
+    let site = static_export::export_static_site(&opts, &out_dir).map_err(|err| err.to_string())?;
 
     print_ok(format!(
         "{} page(s) + {} file(s), each rendered by the stack `serve` runs",
@@ -1355,10 +1355,7 @@ fn configure_ship_static(contract: &ResolvedDevContract) -> Result<(), String> {
     ));
     print_kv("output", site.out_dir.display());
     for page in &site.pages {
-        print_kv(
-            "page",
-            format!("{}  →  {}", page.url, page.path.display()),
-        );
+        print_kv("page", format!("{}  →  {}", page.url, page.path.display()));
     }
     print_kv(
         "size",
@@ -1420,10 +1417,10 @@ fn configure_ship_binary(contract: &ResolvedDevContract) -> Result<(), String> {
         ));
     }
 
-    let name = contract
-        .project_dir
-        .file_name()
-        .map_or_else(|| "app".to_string(), |name| name.to_string_lossy().to_string());
+    let name = contract.project_dir.file_name().map_or_else(
+        || "app".to_string(),
+        |name| name.to_string_lossy().to_string(),
+    );
     let extension = if cfg!(windows) { ".exe" } else { "" };
     let output = contract
         .project_dir
@@ -1455,8 +1452,7 @@ fn configure_ship_binary(contract: &ResolvedDevContract) -> Result<(), String> {
     }
 
     let runtime_bytes = std::fs::metadata(&exe).map_or(0, |meta| meta.len());
-    let total = std::fs::metadata(&output)
-        .map_or(0, |meta| meta.len());
+    let total = std::fs::metadata(&output).map_or(0, |meta| meta.len());
 
     print_ok("one file, runtime and app");
     print_kv("output", output.display());
@@ -1474,7 +1470,10 @@ fn configure_ship_binary(contract: &ResolvedDevContract) -> Result<(), String> {
     println!();
     println!(
         "    {}",
-        style("copy it to any box and run it — no Node, no source tree, no node_modules.", "2")
+        style(
+            "copy it to any box and run it — no Node, no source tree, no node_modules.",
+            "2"
+        )
     );
     println!(
         "    {}",
@@ -1638,9 +1637,8 @@ fn resolve_linux_runtime(project_dir: &Path) -> Result<PathBuf, String> {
     let exe = std::env::current_exe()
         .map_err(|err| format!("failed to locate the albedo runtime: {err}"))?;
     if is_linux_elf(&exe) {
-        std::fs::copy(&exe, &supplied).map_err(|err| {
-            format!("failed to stage '{}': {err}", supplied.display())
-        })?;
+        std::fs::copy(&exe, &supplied)
+            .map_err(|err| format!("failed to stage '{}': {err}", supplied.display()))?;
         return Ok(supplied);
     }
 
@@ -1681,9 +1679,7 @@ fn warn_if_staged_runtime_is_a_different_version(runtime: &Path) {
         return;
     };
     let version = env!("CARGO_PKG_VERSION").as_bytes();
-    let matches = bytes
-        .windows(version.len())
-        .any(|window| window == version);
+    let matches = bytes.windows(version.len()).any(|window| window == version);
     if !matches {
         print_warn(format!(
             "'{}' does not look like albedo {} — the image would run a different runtime than \
@@ -1892,7 +1888,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # the executable PID 1 so it receives SIGTERM directly.
 CMD ["sh", "-c", "exec /app/albedo-app --host ${ALBEDO_SERVER_HOST} --port ${ALBEDO_SERVER_PORT}"]
 "#
-
     .to_string()
 }
 
@@ -2334,8 +2329,7 @@ fn parse_serve_args(raw_args: &[String]) -> Result<ServeOptions, String> {
                 let value = raw_args
                     .get(idx)
                     .ok_or_else(|| "missing value after --domain".to_string())?;
-                tls.domains
-                    .extend(albedo_server::tls::split_domains(value));
+                tls.domains.extend(albedo_server::tls::split_domains(value));
             }
             "--acme-contact" => {
                 idx += 1;
@@ -2492,7 +2486,11 @@ fn run_command(raw_args: &[String]) -> Result<(), String> {
 
 fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
     if raw_args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print_dev_help(raw_args.iter().any(|arg| arg == "--prod" || arg == "--production"));
+        print_dev_help(
+            raw_args
+                .iter()
+                .any(|arg| arg == "--prod" || arg == "--production"),
+        );
         return Ok(());
     }
     let mut forwarded = Vec::new();
@@ -2554,9 +2552,10 @@ fn run_dev_mode(raw_args: &[String]) -> Result<(), String> {
         );
         print_kv(
             "config",
-            contract
-                .config_path
-                .as_ref().map_or_else(|| "(defaults)".to_string(), |path| path.display().to_string()),
+            contract.config_path.as_ref().map_or_else(
+                || "(defaults)".to_string(),
+                |path| path.display().to_string(),
+            ),
         );
         print_kv("strict", contract.strict);
     }
@@ -2664,9 +2663,9 @@ fn parse_env_file(text: &str) -> Vec<(String, String)> {
 fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
     use albedo_server::{boot_production_server, ProductionServerOptions};
 
-    // 1. Build the dist the production pipeline serves from. The tier report it
-    //    produces is the dashboard's opening view — the same numbers
-    //    `albedo build` prints, kept instead of discarded.
+    // 1. Build the dist the production pipeline serves from. The tier report it produces is the
+    //    dashboard's opening view — the same numbers `albedo build` prints, kept instead of
+    //    discarded.
     let tier_report = run_prod_build(&contract)?;
 
     // Decide up front whether this session gets a dashboard. Everything below
@@ -2765,7 +2764,10 @@ fn run_live_dev_runtime(contract: ResolvedDevContract) -> Result<(), String> {
 /// a confident dashboard for a server that does not exist. This lane runs
 /// whenever stdout is a TTY, which is every interactive user, so a message that
 /// only survives the piped path is a message nobody reads.
-#[allow(clippy::too_many_arguments, reason = "the dev dashboard's start-up inputs, passed once")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the dev dashboard's start-up inputs, passed once"
+)]
 fn run_dev_dashboard(
     mode: tui::dev::Mode,
     url: String,
@@ -2898,10 +2900,11 @@ fn dev_watch_and_reload(
     // The config sits outside `root`. Watched so an edit to it is at least
     // announced: it is read once at boot, and the running server keeps the one
     // it started with.
-    let config_path = contract
-        .config_path
-        .clone()
-        .filter(|path| watcher.watch(path.as_path(), RecursiveMode::NonRecursive).is_ok());
+    let config_path = contract.config_path.clone().filter(|path| {
+        watcher
+            .watch(path.as_path(), RecursiveMode::NonRecursive)
+            .is_ok()
+    });
     let ignore = contract.watch.ignore_matcher().unwrap_or_default();
 
     // Two sinks, one decision made at startup: with a dashboard every
@@ -3236,13 +3239,22 @@ fn collect_stylesheets(root: &Path) -> Vec<Stylesheet> {
         .map(|entry| {
             let path = entry.path().to_path_buf();
             let reach = path
-                .strip_prefix(&routes_dir).map_or_else(|_| "/".to_string(), directory_url_prefix);
+                .strip_prefix(&routes_dir)
+                .map_or_else(|_| "/".to_string(), directory_url_prefix);
             (reach, path)
         })
         .collect::<Vec<_>>();
     css_files.sort_by(|(reach_a, path_a), (reach_b, path_b)| {
-        let depth = |reach: &str| if reach == "/" { 0 } else { reach.matches('/').count() };
-        depth(reach_a).cmp(&depth(reach_b)).then_with(|| path_a.cmp(path_b))
+        let depth = |reach: &str| {
+            if reach == "/" {
+                0
+            } else {
+                reach.matches('/').count()
+            }
+        };
+        depth(reach_a)
+            .cmp(&depth(reach_b))
+            .then_with(|| path_a.cmp(path_b))
     });
 
     let mut sheets = Vec::new();
@@ -3546,7 +3558,12 @@ fn run_prod_build_with_budget(
         &contract.root,
         &contract.project_dir,
         &contract.forge,
-        Some(&contract.project_dir.join(".albedo").join("query-report.txt")),
+        Some(
+            &contract
+                .project_dir
+                .join(".albedo")
+                .join("query-report.txt"),
+        ),
     )?;
 
     // `quiet` (dev hot reload) does the whole build silently so a save prints a
@@ -3666,9 +3683,7 @@ fn run_prod_build_with_budget(
                         // and failed at container start. The message is boot's,
                         // word for word, so the two lanes cannot drift.
                         Err(err) => {
-                            return Err(format!(
-                                "invalid `forge` block in albedo.config: {err}"
-                            ));
+                            return Err(format!("invalid `forge` block in albedo.config: {err}"));
                         }
                     }
                 };
@@ -3757,7 +3772,11 @@ fn run_prod_build_with_budget(
     // of what the app compiled to (luminance bars per tier). Suppressed for
     // serve / dev (re)builds so a hot reload stays a single line.
     if show_tiers {
-        printer::print_tier_report(&tier_report, &contract.root.display().to_string(), &measured);
+        printer::print_tier_report(
+            &tier_report,
+            &contract.root.display().to_string(),
+            &measured,
+        );
     }
 
     // A4 · inline global CSS into every route shell so prod ships the
@@ -4043,9 +4062,8 @@ fn copy_public_dir(src: &Path, dst: &Path) -> Result<usize, String> {
         } else {
             std::fs::remove_file(entry.path())
         };
-        removed.map_err(|err| {
-            format!("failed to remove stale '{}': {err}", entry.path().display())
-        })?;
+        removed
+            .map_err(|err| format!("failed to remove stale '{}': {err}", entry.path().display()))?;
     }
     Ok(count)
 }
@@ -4343,11 +4361,15 @@ fn sanitize_package_name(value: &str) -> Option<String> {
 }
 
 fn albedo_runtime_shim_template() -> String {
-    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/albedo-runtime.js"))
+    dom_render_compiler::bundler::minify::minify_script(include_str!(
+        "../../assets/albedo-runtime.js"
+    ))
 }
 
 fn albedo_hydration_runtime_template() -> String {
-    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/albedo-hydration.js"))
+    dom_render_compiler::bundler::minify::minify_script(include_str!(
+        "../../assets/albedo-hydration.js"
+    ))
 }
 
 /// Bakabox bincode decoder, deployed to `_albedo/bincode.js` so the
@@ -4362,7 +4384,9 @@ fn albedo_bincode_template() -> String {
 /// `./bincode.js` at runtime, so it must ship alongside both the
 /// runtime and the decoder.
 fn albedo_wt_bootstrap_template() -> String {
-    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/albedo-wt-bootstrap.js"))
+    dom_render_compiler::bundler::minify::minify_script(include_str!(
+        "../../assets/albedo-wt-bootstrap.js"
+    ))
 }
 
 /// PHOSPHOR · the shared per-browser lane, deployed to
@@ -4378,7 +4402,9 @@ fn albedo_phosphor_template() -> String {
 /// asset MUST load after the main runtime — the shell shim emits the
 /// `<script>` tag in document order to guarantee that.
 fn albedo_link_forms_template() -> String {
-    dom_render_compiler::bundler::minify::minify_script(include_str!("../../assets/albedo-link-forms.js"))
+    dom_render_compiler::bundler::minify::minify_script(include_str!(
+        "../../assets/albedo-link-forms.js"
+    ))
 }
 
 fn run_completions_command(raw_args: &[String]) -> Result<(), String> {
@@ -4700,12 +4726,32 @@ fn print_help() {
     print_command("ship", "[dir]", "build and configure a deploy target");
     print_command("files", "[dir]", "serve static files from a folder");
     print_command("budget", "[dir]", "check the tier budget");
-    print_command("doctor", "[dir]", "report what the build knows about itself");
+    print_command(
+        "doctor",
+        "[dir]",
+        "report what the build knows about itself",
+    );
     print_command("test", "[dir]", "run the app's *.test.tsx files");
-    print_command("import", "<collection> <file>", "write rows from another system, with their authors");
-    print_command("db", "backup | backups | restore", "snapshot the data, list snapshots, restore one");
-    print_command("roles", "grant | revoke | list", "give people the roles the app declares");
-    print_command("email test", "<address> [dir]", "send one real email to check the provider");
+    print_command(
+        "import",
+        "<collection> <file>",
+        "write rows from another system, with their authors",
+    );
+    print_command(
+        "db",
+        "backup | backups | restore",
+        "snapshot the data, list snapshots, restore one",
+    );
+    print_command(
+        "roles",
+        "grant | revoke | list",
+        "give people the roles the app declares",
+    );
+    print_command(
+        "email test",
+        "<address> [dir]",
+        "send one real email to check the provider",
+    );
     print_command("completions", "<shell>", "print shell completions");
     print_command("help", "", "show this help");
     print_command("--version", "", "print the version");
@@ -4770,9 +4816,9 @@ fn run_test_command(raw_args: &[String]) -> Result<(), String> {
     while idx < raw_args.len() {
         match raw_args[idx].as_str() {
             "--filter" | "-t" => {
-                let text = raw_args
-                    .get(idx + 1)
-                    .ok_or_else(|| "--filter needs the text a test name must contain".to_string())?;
+                let text = raw_args.get(idx + 1).ok_or_else(|| {
+                    "--filter needs the text a test name must contain".to_string()
+                })?;
                 name_filter = Some(text.clone());
                 idx += 2;
             }
@@ -4781,7 +4827,9 @@ fn run_test_command(raw_args: &[String]) -> Result<(), String> {
                     .get(idx + 1)
                     .and_then(|value| value.parse::<u64>().ok())
                     .filter(|seconds| *seconds > 0)
-                    .ok_or_else(|| "--timeout needs a whole number of seconds, 1 or more".to_string())?;
+                    .ok_or_else(|| {
+                        "--timeout needs a whole number of seconds, 1 or more".to_string()
+                    })?;
                 timeout = Duration::from_secs(seconds);
                 idx += 2;
             }
@@ -4866,12 +4914,19 @@ fn run_test_command(raw_args: &[String]) -> Result<(), String> {
     print_kv(
         "files",
         if broken_files > 0 {
-            format!("{} · {}", reports.len(), style(&format!("{broken_files} did not run"), "1;31"))
+            format!(
+                "{} · {}",
+                reports.len(),
+                style(&format!("{broken_files} did not run"), "1;31")
+            )
         } else {
             reports.len().to_string()
         },
     );
-    print_kv("time", colorize_timing_ms(started.elapsed().as_secs_f64() * 1000.0));
+    print_kv(
+        "time",
+        colorize_timing_ms(started.elapsed().as_secs_f64() * 1000.0),
+    );
     println!();
 
     if failed > 0 || broken_files > 0 {
@@ -4915,7 +4970,10 @@ fn print_test_file(project_dir: &Path, report: &albedo_server::test_runner::File
     println!(
         "  {mark} {}  {}",
         style(&name, "1"),
-        style(&format!("{:.0} ms", report.elapsed.as_secs_f64() * 1000.0), "2")
+        style(
+            &format!("{:.0} ms", report.elapsed.as_secs_f64() * 1000.0),
+            "2"
+        )
     );
     if let Some(error) = &report.error {
         for line in error.lines() {
@@ -4931,7 +4989,10 @@ fn print_test_file(project_dir: &Path, report: &albedo_server::test_runner::File
             TestStatus::Todo => (style("○", "36"), None),
         };
         let timing = if matches!(test.status, TestStatus::Passed | TestStatus::Failed(_)) {
-            style(&format!("{:.0} ms", test.elapsed.as_secs_f64() * 1000.0), "2")
+            style(
+                &format!("{:.0} ms", test.elapsed.as_secs_f64() * 1000.0),
+                "2",
+            )
         } else {
             String::new()
         };
@@ -4974,7 +5035,9 @@ fn run_import_command(raw_args: &[String]) -> Result<(), String> {
             "--author-email" | "--author-id" => {
                 let field = raw_args
                     .get(idx + 1)
-                    .ok_or_else(|| format!("{} needs the name of a field in each row", raw_args[idx]))?
+                    .ok_or_else(|| {
+                        format!("{} needs the name of a field in each row", raw_args[idx])
+                    })?
                     .clone();
                 if raw_args[idx] == "--author-email" {
                     author_email = Some(field);
@@ -5104,7 +5167,9 @@ fn run_import_command(raw_args: &[String]) -> Result<(), String> {
                 } else {
                     users.ids.contains(who.as_str()).then(|| who.clone())
                 };
-                if let Some(id) = found { Some(PrincipalId::parse(&id).map_err(|err| err.to_string())?) } else {
+                if let Some(id) = found {
+                    Some(PrincipalId::parse(&id).map_err(|err| err.to_string())?)
+                } else {
                     if !unresolved.iter().any(|seen| seen.contains(who.as_str())) {
                         unresolved.push(format!("line {line}: no user {who}"));
                     }
@@ -5121,7 +5186,12 @@ fn run_import_command(raw_args: &[String]) -> Result<(), String> {
             });
         }
         if !unresolved.is_empty() {
-            let shown = unresolved.iter().take(10).cloned().collect::<Vec<_>>().join("\n  ");
+            let shown = unresolved
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n  ");
             return Err(format!(
                 "{} author(s) did not resolve, so nothing was imported — users must exist before \
                  the rows they own (sign them up, or import them first):\n  {shown}{}",
@@ -5207,7 +5277,9 @@ fn run_db_command(raw_args: &[String]) -> Result<(), String> {
         "backup" => run_db_backup(rest),
         "backups" | "list" => run_db_list(rest),
         "restore" => run_db_restore(rest),
-        other => Err(format!("unknown `albedo db` command '{other}'\n\n{DB_USAGE}")),
+        other => Err(format!(
+            "unknown `albedo db` command '{other}'\n\n{DB_USAGE}"
+        )),
     }
 }
 
@@ -5241,9 +5313,14 @@ fn db_target(args: &[String]) -> Result<DbTarget, String> {
         &contract.project_dir.join(".albedo").join("dist"),
     );
     let data_dir = albedo_server::forge_db_path::data_dir_for(&db_path);
-    let backups_dir = if let Some(dir) = to { cwd.join(dir) } else {
+    let backups_dir = if let Some(dir) = to {
+        cwd.join(dir)
+    } else {
         let configured = std::env::var("ALBEDO_BACKUP_DIR").ok();
-        let named = configured.as_deref().map(str::trim).filter(|dir| !dir.is_empty());
+        let named = configured
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty());
         albedo_server::backups::resolve_dir(named.unwrap_or(DEFAULT_BACKUP_DIR), &data_dir)
     };
     Ok(DbTarget {
@@ -5306,7 +5383,11 @@ fn run_db_backup(args: &[String]) -> Result<(), String> {
     print_kv("snapshot", snapshot.dir.display());
     print_kv(
         "rows",
-        format!("{} across {} tables", manifest.rows(), manifest.tables.len()),
+        format!(
+            "{} across {} tables",
+            manifest.rows(),
+            manifest.tables.len()
+        ),
     );
     print_kv(
         "uploads",
@@ -5322,7 +5403,10 @@ fn run_db_backup(args: &[String]) -> Result<(), String> {
         ),
     );
     print_kv("database", human_bytes(manifest.database.bytes));
-    for (what, ids) in [("missing from", &uploads.missing), ("damaged in", &uploads.damaged)] {
+    for (what, ids) in [
+        ("missing from", &uploads.missing),
+        ("damaged in", &uploads.damaged),
+    ] {
         if !ids.is_empty() {
             print_warn(format!(
                 "{} upload file(s) are {what} the live store, so they are not in this backup — \
@@ -5426,7 +5510,9 @@ fn run_roles_command(raw_args: &[String]) -> Result<(), String> {
             run_roles_change(command == "grant", who, role, project)
         }
         "list" => run_roles_list(rest),
-        other => Err(format!("unknown `albedo roles` command '{other}'\n\n{ROLES_USAGE}")),
+        other => Err(format!(
+            "unknown `albedo roles` command '{other}'\n\n{ROLES_USAGE}"
+        )),
     }
 }
 
@@ -5500,7 +5586,10 @@ async fn roles_person(
         many => Err(format!(
             "`{who}` is the email of {} accounts — name one by its id: {}",
             many.len(),
-            many.iter().map(PrincipalId::as_str).collect::<Vec<_>>().join(", ")
+            many.iter()
+                .map(PrincipalId::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }
@@ -5531,26 +5620,32 @@ fn run_roles_change(grant: bool, who: &str, role: &str, project: &[String]) -> R
         if grant {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX));
+                .map_or(0, |elapsed| {
+                    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+                });
             match grant_role(&db, &id, role, Some("cli"), now_ms)
                 .await
                 .map_err(|err| err.to_string())?
             {
                 GrantOutcome::Granted => Ok(format!("{who} ({id}) now holds `{role}`")),
-                GrantOutcome::AlreadyHeld => {
-                    Ok(format!("{who} ({id}) already holds `{role}` — nothing changed"))
-                }
+                GrantOutcome::AlreadyHeld => Ok(format!(
+                    "{who} ({id}) already holds `{role}` — nothing changed"
+                )),
                 GrantOutcome::NoSuchPrincipal => Err(format!("there is no account `{id}`")),
             }
         } else {
-            let removed = revoke_role(&db, &id, role).await.map_err(|err| err.to_string())?;
+            let removed = revoke_role(&db, &id, role)
+                .await
+                .map_err(|err| err.to_string())?;
             match (removed, declared) {
                 (true, true) => Ok(format!("{who} ({id}) no longer holds `{role}`")),
                 (true, false) => Ok(format!(
                     "removed {who}'s ({id}) leftover grant of `{role}` — the config no longer \
                      declares it, so it counted for nothing"
                 )),
-                (false, true) => Ok(format!("{who} ({id}) did not hold `{role}` — nothing changed")),
+                (false, true) => Ok(format!(
+                    "{who} ({id}) did not hold `{role}` — nothing changed"
+                )),
                 (false, false) => Err(format!(
                     "{} — and {who} ({id}) holds no leftover grant of it. Check the spelling.",
                     undeclared()
@@ -5713,11 +5808,16 @@ fn run_db_restore(args: &[String]) -> Result<(), String> {
     print_kv("taken", &manifest.taken_at);
     let mut tables: Vec<&String> = manifest.tables.keys().collect();
     if let Some(live) = &live {
-        tables.extend(live.keys().filter(|name| !manifest.tables.contains_key(*name)));
+        tables.extend(
+            live.keys()
+                .filter(|name| !manifest.tables.contains_key(*name)),
+        );
     }
     for table in tables {
         let then = manifest.tables.get(table).copied().unwrap_or(0);
-        let now = live.as_ref().map(|live| live.get(table).copied().unwrap_or(0));
+        let now = live
+            .as_ref()
+            .map(|live| live.get(table).copied().unwrap_or(0));
         // Empty then and now says nothing; every table that changes is shown.
         if then == 0 && now.unwrap_or(0) == 0 {
             continue;
@@ -5819,7 +5919,11 @@ async fn user_principals(
         if let Some(SqlValue::Text(email)) = row.get(1) {
             let key = dom_render_compiler::auth::normalize_email(email)
                 .unwrap_or_else(|| email.trim().to_ascii_lowercase());
-            users.by_email.entry(key).or_default().push(principal.clone());
+            users
+                .by_email
+                .entry(key)
+                .or_default()
+                .push(principal.clone());
         }
     }
     Ok(users)
@@ -5836,7 +5940,10 @@ fn print_import_help() {
             "1"
         )
     );
-    print_option("--author-email <field>", "each row's owner, by the email of an existing user");
+    print_option(
+        "--author-email <field>",
+        "each row's owner, by the email of an existing user",
+    );
     print_option("--author-id <field>", "each row's owner, by principal id");
     print_option("--config <FILE>", "explicit albedo config");
     println!();
@@ -5861,10 +5968,16 @@ fn print_test_help() {
     println!(
         "  {}  {}",
         style("usage", "2"),
-        style("albedo test [dir] [--filter <text>] [--timeout <seconds>]", "1")
+        style(
+            "albedo test [dir] [--filter <text>] [--timeout <seconds>]",
+            "1"
+        )
     );
     print_option("--filter <text>", "run only tests whose name contains this");
-    print_option("--timeout <seconds>", "stop a test that runs longer (default 10)");
+    print_option(
+        "--timeout <seconds>",
+        "stop a test that runs longer (default 10)",
+    );
     print_option("--config <FILE>", "explicit albedo config");
     println!();
     for line in [
@@ -5953,9 +6066,15 @@ fn print_serve_help() {
     print_option("--host <IP>", "bind host (default: 127.0.0.1)");
     print_option("--domain <NAME>", "automatic HTTPS via Let's Encrypt");
     print_option("--acme-contact <EMAIL>", "optional ACME account contact");
-    print_option("--acme-cache <DIR>", "certificate store (default: .albedo-acme)");
+    print_option(
+        "--acme-cache <DIR>",
+        "certificate store (default: .albedo-acme)",
+    );
     print_option("--acme-staging", "rehearse against Let's Encrypt staging");
-    print_option("--tls-cert <FILE>", "HTTPS with a certificate you already have");
+    print_option(
+        "--tls-cert <FILE>",
+        "HTTPS with a certificate you already have",
+    );
     print_option("--tls-key <FILE>", "the PEM key for --tls-cert");
     print_option("--port <PORT>", "bind port (default: 3000)");
     print_option("--dir <DIR>", "static files only — same as `albedo files`");
@@ -5980,7 +6099,10 @@ fn print_dev_flags(server: bool) {
 fn print_dev_help(build: bool) {
     print_banner();
     let (name, what) = if build {
-        ("build", "compiles the app for production and checks the tier budget")
+        (
+            "build",
+            "compiles the app for production and checks the tier budget",
+        )
     } else {
         ("dev", "serves the app and rebuilds it on every save")
     };
@@ -6318,8 +6440,20 @@ REF=${OTHER}
             ("fly.toml", build_fly_toml_template("demo-app")),
         ];
         let markers = [
-            "🔴", "🔑", "🪤", "📏", "🛑", "TODO", "FIXME", "Phase ", "item 1", "corrected 20",
-            "src/bin/", ".rs`", ".rs:", "assets/albedo",
+            "🔴",
+            "🔑",
+            "🪤",
+            "📏",
+            "🛑",
+            "TODO",
+            "FIXME",
+            "Phase ",
+            "item 1",
+            "corrected 20",
+            "src/bin/",
+            ".rs`",
+            ".rs:",
+            "assets/albedo",
         ];
         let ident = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
         for (name, text) in written {
@@ -6332,7 +6466,10 @@ REF=${OTHER}
                 let rust_path = text.match_indices("::").find(|&(at, _)| {
                     ident(text[..at].chars().next_back()) && ident(text[at + 2..].chars().next())
                 });
-                assert!(rust_path.is_none(), "{name} names a Rust path near byte {rust_path:?}");
+                assert!(
+                    rust_path.is_none(),
+                    "{name} names a Rust path near byte {rust_path:?}"
+                );
             }
             let plan_ref = text.split_whitespace().find(|word| {
                 let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
@@ -6413,11 +6550,20 @@ REF=${OTHER}
         assert_eq!(rules("/"), ["global{}"]);
         assert_eq!(rules("/docsx"), ["global{}"]);
         assert_eq!(rules("/docs"), ["global{}", "docs{}"]);
-        assert_eq!(rules("/docs/guide/deploy"), ["global{}", "docs{}", "deep{}"]);
+        assert_eq!(
+            rules("/docs/guide/deploy"),
+            ["global{}", "docs{}", "deep{}"]
+        );
 
         let deep = css_for_route(&sheets, "/docs/guide/deploy");
-        assert!(deep.find("global{}") < deep.find("docs{}"), "global first: {deep}");
-        assert!(deep.find("docs{}") < deep.find("deep{}"), "outer before inner: {deep}");
+        assert!(
+            deep.find("global{}") < deep.find("docs{}"),
+            "global first: {deep}"
+        );
+        assert!(
+            deep.find("docs{}") < deep.find("deep{}"),
+            "outer before inner: {deep}"
+        );
         assert!(deep.contains("/* routes/docs/docs.css */"), "{deep}");
     }
 
@@ -6592,7 +6738,13 @@ REF=${OTHER}
         assert!(ignore.contains("node_modules"));
         assert!(ignore.contains("target/debug"));
         // ALB-04 · the builder stage copies the whole context.
-        for secret in ["**/.env\n", "**/.env.*\n", "**/*.pem\n", "**/*.key\n", ".albedo-acme\n"] {
+        for secret in [
+            "**/.env\n",
+            "**/.env.*\n",
+            "**/*.pem\n",
+            "**/*.key\n",
+            ".albedo-acme\n",
+        ] {
             assert!(ignore.contains(secret), "missing {secret:?}");
         }
     }
@@ -6701,8 +6853,14 @@ REF=${OTHER}
 
         assert!(dst.join("stays.txt").is_file());
         assert!(dst.join("kept").join("b.png").is_file());
-        assert!(!dst.join("gone.txt").exists(), "a deleted file must not keep shipping");
-        assert!(!dst.join("old").exists(), "a deleted directory must not keep shipping");
+        assert!(
+            !dst.join("gone.txt").exists(),
+            "a deleted file must not keep shipping"
+        );
+        assert!(
+            !dst.join("old").exists(),
+            "a deleted directory must not keep shipping"
+        );
         assert_eq!(std::fs::read(dst.join("flip")).unwrap(), b"now a file");
 
         // And with `public/` removed outright, nothing of it is left to serve.
@@ -6720,7 +6878,10 @@ REF=${OTHER}
         std::fs::write(src.join("logo.svg"), b"<svg/>").unwrap();
         assert!(copy_public_dir(&src, &src).is_err());
         assert!(copy_public_dir(&src, &src.join("inner")).is_err());
-        assert!(src.join("logo.svg").is_file(), "the source must be untouched");
+        assert!(
+            src.join("logo.svg").is_file(),
+            "the source must be untouched"
+        );
     }
 
     #[test]
@@ -6753,8 +6914,10 @@ REF=${OTHER}
             .1;
         // Up to the end of that `match`, which is the arm list we care about.
         let block = block
-            .split_once("
-    }")
+            .split_once(
+                "
+    }",
+            )
             .expect("the match has an end")
             .0;
 
@@ -6969,7 +7132,11 @@ REF=${OTHER}
             .expect("ALBEDO_METRICS_ADDR opens the listener [metrics] scrapes")
             .parse()
             .expect("ALBEDO_METRICS_ADDR is ip:port");
-        assert_eq!(i64::from(addr.port()), scrape_port, "the listener and the scrape agree on a port");
+        assert_eq!(
+            i64::from(addr.port()),
+            scrape_port,
+            "the listener and the scrape agree on a port"
+        );
         assert_ne!(
             i64::from(addr.port()),
             table["http_service"]["internal_port"].as_integer().unwrap(),
@@ -7012,7 +7179,9 @@ REF=${OTHER}
             "a Rust toolchain in the image is the symptom of that mistake"
         );
         assert!(
-            directives.contains(&format!("COPY {LINUX_RUNTIME_FILENAME} /usr/local/bin/albedo")),
+            directives.contains(&format!(
+                "COPY {LINUX_RUNTIME_FILENAME} /usr/local/bin/albedo"
+            )),
             "the image needs one Linux executable, staged by `ship --target docker`"
         );
     }

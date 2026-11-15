@@ -33,17 +33,15 @@
 //! Three properties make this affordable *and* safe here, and all three are
 //! load-bearing:
 //!
-//! 1. **The cache never leaves the process.** Gate 3.1 flagged an on-disk cache
-//!    as a new integrity boundary — `Module::load` is `unsafe` because
-//!    malformed bytecode is arbitrary behaviour inside the very realm SANDGATE
-//!    exists to confine, so a tampered file would be code execution. Keeping
-//!    the bytes in memory, produced by `Module::write` microseconds earlier,
-//!    removes that boundary rather than defending it.
-//! 2. **It is keyed by the script's content hash**, so a dev reload that
-//!    changes a module simply misses and recompiles.
-//! 3. **Version lock is automatic.** Bytecode is tied to the exact `QuickJS`
-//!    build; because nothing is persisted, a rebuilt binary cannot meet a stale
-//!    artifact.
+//! 1. **The cache never leaves the process.** Gate 3.1 flagged an on-disk cache as a new integrity
+//!    boundary — `Module::load` is `unsafe` because malformed bytecode is arbitrary behaviour
+//!    inside the very realm SANDGATE exists to confine, so a tampered file would be code execution.
+//!    Keeping the bytes in memory, produced by `Module::write` microseconds earlier, removes that
+//!    boundary rather than defending it.
+//! 2. **It is keyed by the script's content hash**, so a dev reload that changes a module simply
+//!    misses and recompiles.
+//! 3. **Version lock is automatic.** Bytecode is tied to the exact `QuickJS` build; because nothing
+//!    is persisted, a rebuilt binary cannot meet a stale artifact.
 //!
 //! # The strict-mode boundary — the reason first registration is never bytecode
 //!
@@ -55,12 +53,12 @@
 //!
 //! So the split is deliberate:
 //!
-//! * **First registration always takes today's `ctx.eval` path.** Semantics for
-//!   application authors are untouched, whatever they wrote.
-//! * **Only replay uses bytecode**, and only for the module classes that have
-//!   been measured through it.
-//! * A script that refuses to compile is remembered in [`BytecodeCache::refused`]
-//!   and replayed as source forever after — a slower engine, never a broken one.
+//! * **First registration always takes today's `ctx.eval` path.** Semantics for application authors
+//!   are untouched, whatever they wrote.
+//! * **Only replay uses bytecode**, and only for the module classes that have been measured through
+//!   it.
+//! * A script that refuses to compile is remembered in [`BytecodeCache::refused`] and replayed as
+//!   source forever after — a slower engine, never a broken one.
 //!
 //! `ALBEDO_SANDGATE_BYTECODE=0` disables the fast path wholesale, which is the
 //! switch to reach for if a package ever turns out to depend on sloppy-mode
@@ -224,8 +222,7 @@ impl BytecodeCache {
     #[must_use]
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("ALBEDO_SANDGATE_BYTECODE")
-                .map_or(true, |value| value != "0"),
+            enabled: std::env::var("ALBEDO_SANDGATE_BYTECODE").map_or(true, |value| value != "0"),
         }
     }
 
@@ -525,8 +522,12 @@ pub(crate) fn replay_entry(
 
     let mut cached = store().get(entry.script_hash);
     if cached.is_none() {
-        match rquickjs::Module::declare(ctx.clone(), entry.specifier.as_str(), entry.script.as_str())
-            .and_then(|module| module.write(false))
+        match rquickjs::Module::declare(
+            ctx.clone(),
+            entry.specifier.as_str(),
+            entry.script.as_str(),
+        )
+        .and_then(|module| module.write(false))
         {
             Ok(bytes) => {
                 cached = Some(store().insert(entry.script_hash, bytes));
@@ -691,13 +692,12 @@ mod tests {
 /// Capture the intrinsics the trust boundary depends on **before any
 /// third-party code can run**, and put them somewhere a package cannot reach:
 ///
-/// * the property is installed with `writable: false, configurable: false`, so
-///   assignment fails and `defineProperty` throws;
-/// * the object is `Object.freeze`d and has a **null prototype**, so neither
-///   its entries nor `Object.prototype` can be used to shadow them;
-/// * the provenance stack it carries is a closure variable with a
-///   null-prototype backing object, so no `Array.prototype` index setter or
-///   inherited accessor can observe or rewrite it.
+/// * the property is installed with `writable: false, configurable: false`, so assignment fails and
+///   `defineProperty` throws;
+/// * the object is `Object.freeze`d and has a **null prototype**, so neither its entries nor
+///   `Object.prototype` can be used to shadow them;
+/// * the provenance stack it carries is a closure variable with a null-prototype backing object, so
+///   no `Array.prototype` index setter or inherited accessor can observe or rewrite it.
 ///
 /// # What is still reachable, stated precisely
 ///

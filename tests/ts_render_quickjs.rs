@@ -55,7 +55,9 @@ fn render_fixture(name: &str) -> PathBuf {
 
 fn engine() -> QuickJsEngine {
     let mut engine = QuickJsEngine::new();
-    engine.init(&BootstrapPayload::default()).expect("engine init");
+    engine
+        .init(&BootstrapPayload::default())
+        .expect("engine init");
     engine
 }
 
@@ -87,7 +89,8 @@ fn value_slot_id(
 
 #[test]
 fn counter_renders_initial_under_quickjs() {
-    let project = CompiledProject::load_from_dir(hook_fixture("counter")).expect("counter compiles");
+    let project =
+        CompiledProject::load_from_dir(hook_fixture("counter")).expect("counter compiles");
     let store = Arc::new(SlotStore::new());
     let session = SessionId::random();
     let slots = SessionSlotView::new(session, store);
@@ -95,7 +98,12 @@ fn counter_renders_initial_under_quickjs() {
 
     // Fresh slot store: `useState(0)` falls back to its initial.
     let out = project
-        .render_entry_quickjs(&mut engine, "Component.tsx", &Value::Object(Default::default()), &slots)
+        .render_entry_quickjs(
+            &mut engine,
+            "Component.tsx",
+            &Value::Object(Default::default()),
+            &slots,
+        )
         .expect("quickjs render succeeds");
 
     assert_eq!(
@@ -113,7 +121,8 @@ fn counter_renders_initial_under_quickjs() {
 
 #[test]
 fn seeded_slot_value_drives_the_quickjs_render() {
-    let project = CompiledProject::load_from_dir(hook_fixture("counter")).expect("counter compiles");
+    let project =
+        CompiledProject::load_from_dir(hook_fixture("counter")).expect("counter compiles");
     let store = Arc::new(SlotStore::new());
     let session = SessionId::random();
     let slots = SessionSlotView::new(session, store);
@@ -126,7 +135,12 @@ fn seeded_slot_value_drives_the_quickjs_render() {
     let _ = slots.drain_pending();
 
     let out = project
-        .render_entry_quickjs(&mut engine, "Component.tsx", &Value::Object(Default::default()), &slots)
+        .render_entry_quickjs(
+            &mut engine,
+            "Component.tsx",
+            &Value::Object(Default::default()),
+            &slots,
+        )
         .expect("quickjs render succeeds");
 
     assert_eq!(
@@ -148,8 +162,8 @@ fn quickjs_form_render_emits_error_spans_at_the_projection_ids() {
     // from the same function both sides call, so they line up by construction.
     use dom_render_compiler::transforms::form::allocate_field_error_id;
 
-    let project =
-        CompiledProject::load_from_dir(render_fixture("form_errors")).expect("form fixture compiles");
+    let project = CompiledProject::load_from_dir(render_fixture("form_errors"))
+        .expect("form fixture compiles");
     let store = Arc::new(SlotStore::new());
     let session = SessionId::random();
     let slots = SessionSlotView::new(session, store);
@@ -195,8 +209,8 @@ fn both_renderers_close_a_form_on_its_success_sink() {
     // form's last child, from the one `form_ok_span` both call.
     use dom_render_compiler::transforms::form::form_ok_span;
 
-    let project =
-        CompiledProject::load_from_dir(render_fixture("form_errors")).expect("form fixture compiles");
+    let project = CompiledProject::load_from_dir(render_fixture("form_errors"))
+        .expect("form fixture compiles");
     let slots = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
     let props = Value::Object(Default::default());
     let sink_then_close = format!("{}</form>", form_ok_span("sign_guestbook"));
@@ -284,7 +298,8 @@ fn captured_prop_is_snapshotted_for_the_action_path() {
     // `snapshot_captured_props_into_slots`). Without the snapshot the handler's
     // `n + step` reference is unbound and the dispatch errors — so a clean
     // dispatch that yields 4 proves the render persisted the prop.
-    let project = CompiledProject::load_from_dir(hook_fixture("stepper")).expect("stepper compiles");
+    let project =
+        CompiledProject::load_from_dir(hook_fixture("stepper")).expect("stepper compiles");
     let store = Arc::new(SlotStore::new());
     let session = SessionId::random();
     let slots = SessionSlotView::new(session, store.clone());

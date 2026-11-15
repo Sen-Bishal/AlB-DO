@@ -28,10 +28,10 @@
 //! that we would otherwise have had to argue for separately:
 //!
 //! 1. **The alphabet holds by construction**, for providers that do not exist yet.
-//! 2. **R3 resolves to *mirror*, not *reference*** — the question `AUTH.md` § 8 left
-//!    open. A row we own is what makes joins and § 5's instant revocation possible.
-//! 3. **Account linking becomes expressible**: one human, two providers, two
-//!    `accounts` rows, one `PrincipalId`. A derived id could not say that.
+//! 2. **R3 resolves to *mirror*, not *reference*** — the question `AUTH.md` § 8 left open. A row we
+//!    own is what makes joins and § 5's instant revocation possible.
+//! 3. **Account linking becomes expressible**: one human, two providers, two `accounts` rows, one
+//!    `PrincipalId`. A derived id could not say that.
 //!
 //! The cost is one indirection at login — a lookup keyed `(provider, subject)`.
 //! That is the trade, and it is the right way round.
@@ -227,7 +227,8 @@ impl Principal {
     /// Keep only the roles `declared` names. `declared` must be sorted (the
     /// lowered registry's list is).
     pub fn retain_declared_roles(&mut self, declared: &[String]) {
-        self.roles.retain(|role| declared.binary_search(role).is_ok());
+        self.roles
+            .retain(|role| declared.binary_search(role).is_ok());
     }
 
     /// Whether this principal holds `role`.
@@ -375,7 +376,11 @@ mod tests {
     #[test]
     fn only_declared_roles_survive() {
         let mut principal = Principal::new(PrincipalId::parse("u_7f3a").unwrap(), "password");
-        principal.roles = vec!["admin".to_string(), "finance".to_string(), "payroll".to_string()];
+        principal.roles = vec![
+            "admin".to_string(),
+            "finance".to_string(),
+            "payroll".to_string(),
+        ];
         principal.retain_declared_roles(&["admin".to_string(), "payroll".to_string()]);
         assert_eq!(principal.roles, ["admin", "payroll"]);
         assert!(principal.has_role("payroll"));

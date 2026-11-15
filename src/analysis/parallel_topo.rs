@@ -367,12 +367,9 @@ mod critical_path_shape {
         analyses.insert(spine, ComponentAnalysis::new(spine));
 
         for i in 0..diamonds {
-            let left =
-                graph.add_component(Component::new(ComponentId::new(0), format!("l{i}")));
-            let right =
-                graph.add_component(Component::new(ComponentId::new(0), format!("r{i}")));
-            let join =
-                graph.add_component(Component::new(ComponentId::new(0), format!("j{i}")));
+            let left = graph.add_component(Component::new(ComponentId::new(0), format!("l{i}")));
+            let right = graph.add_component(Component::new(ComponentId::new(0), format!("r{i}")));
+            let join = graph.add_component(Component::new(ComponentId::new(0), format!("j{i}")));
             for id in [left, right, join] {
                 analyses.insert(id, ComponentAnalysis::new(id));
             }
@@ -409,8 +406,11 @@ mod critical_path_shape {
             println!(
                 "  {diamonds:>8}   {nodes:>5}   2^{diamonds:<6}  {ms:>8.2} ms{}",
                 match previous {
-                    Some((prev_d, prev_ms)) if prev_ms > 0.0 =>
-                        format!("   ×{:.1} for +{} diamonds", ms / prev_ms, diamonds - prev_d),
+                    Some((prev_d, prev_ms)) if prev_ms > 0.0 => format!(
+                        "   ×{:.1} for +{} diamonds",
+                        ms / prev_ms,
+                        diamonds - prev_d
+                    ),
                     _ => String::new(),
                 }
             );
@@ -462,7 +462,11 @@ mod critical_path_shape {
         }
 
         let (path, total) = find_longest_path(root, &graph, &analyses);
-        assert_eq!(path, vec![root, heavy], "the heavy branch is the critical path");
+        assert_eq!(
+            path,
+            vec![root, heavy],
+            "the heavy branch is the critical path"
+        );
         assert!((total - 101.0).abs() < f64::EPSILON, "total was {total}");
     }
 

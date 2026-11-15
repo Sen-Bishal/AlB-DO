@@ -30,12 +30,12 @@
 //! A job runs **for** a principal, never **as** the framework. There are three
 //! ways it gets one and none of them is a bypass:
 //!
-//! - enqueued from an action → it inherits the caller's principal, so the work
-//!   runs as the user who caused it;
-//! - scheduled, plain → anonymous, exactly like an unauthenticated request, and
-//!   an identity-partitioned read is refused exactly as it is there;
-//! - scheduled with [`FanOut::Users`] → the tick expands into one run per
-//!   principal, each carrying exactly one.
+//! - enqueued from an action → it inherits the caller's principal, so the work runs as the user who
+//!   caused it;
+//! - scheduled, plain → anonymous, exactly like an unauthenticated request, and an
+//!   identity-partitioned read is refused exactly as it is there;
+//! - scheduled with [`FanOut::Users`] → the tick expands into one run per principal, each carrying
+//!   exactly one.
 //!
 //! That third case is the whole point. A per-user nightly digest is the reason
 //! frameworks grow a god-mode principal, and the fan-out delivers it while the
@@ -266,7 +266,10 @@ pub fn module_graph(
 }
 
 /// The argument list of a `job(...)` call, if that is what this expression is.
-fn job_call_args<'a>(expr: &'a Expr, local_job_name: Option<&str>) -> Option<&'a [swc_ecma_ast::ExprOrSpread]> {
+fn job_call_args<'a>(
+    expr: &'a Expr,
+    local_job_name: Option<&str>,
+) -> Option<&'a [swc_ecma_ast::ExprOrSpread]> {
     let Expr::Call(call) = unparen(expr) else {
         return None;
     };
@@ -320,7 +323,9 @@ fn lower(name: &str, args: &[swc_ecma_ast::ExprOrSpread]) -> Result<JobDecl, Vec
             continue;
         };
         let Prop::KeyValue(kv) = &**prop else {
-            problems.push(format!("`{name}`'s options must use `key: value` properties"));
+            problems.push(format!(
+                "`{name}`'s options must use `key: value` properties"
+            ));
             continue;
         };
         let key = match &kv.key {
@@ -544,7 +549,10 @@ mod tests {
         .expect("some");
         let deliver = decl.get("deliver").expect("named");
         assert!(deliver.schedule.is_none());
-        assert_eq!(deliver.max_attempts, 5, "retries are attempts after the first");
+        assert_eq!(
+            deliver.max_attempts, 5,
+            "retries are attempts after the first"
+        );
         assert_eq!(decl.scheduled().count(), 0);
     }
 
@@ -595,7 +603,10 @@ mod tests {
         )
         .expect("declares")
         .expect("some");
-        assert_eq!(decl.get("digest").expect("named").fan_out, Some(FanOut::Users));
+        assert_eq!(
+            decl.get("digest").expect("named").fan_out,
+            Some(FanOut::Users)
+        );
     }
 
     #[test]
@@ -619,7 +630,9 @@ mod tests {
         )
         .expect_err("refused");
         assert!(
-            problems.iter().any(|p| p.contains("nightly") && p.contains("0 3 * *")),
+            problems
+                .iter()
+                .any(|p| p.contains("nightly") && p.contains("0 3 * *")),
             "got {problems:?}"
         );
     }
@@ -669,7 +682,10 @@ mod tests {
                export const nightly = job({ retries: 9999 }, async () => {});"#,
         )
         .expect_err("refused");
-        assert!(problems.iter().any(|p| p.contains("retries")), "got {problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("retries")),
+            "got {problems:?}"
+        );
     }
 
     #[test]

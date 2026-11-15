@@ -76,7 +76,10 @@ fn run_ok(cmd: &mut Command, what: &str) -> Output {
 fn scaffold() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     let home = tempfile::tempdir().expect("temp home");
     let work = tempfile::tempdir().expect("temp workdir");
-    run_ok(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     let app = work.path().join("app");
     (home, work, app)
 }
@@ -172,8 +175,14 @@ async fn serve(home: &Path, app: &Path) -> (Server, String) {
     let server = Server { child };
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_err() {
-        assert!(Instant::now() < deadline, "albedo serve never answered on {base}");
+    while reqwest::get(format!("{base}/_albedo/runtime.js"))
+        .await
+        .is_err()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "albedo serve never answered on {base}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     (server, base)
@@ -210,7 +219,9 @@ async fn static_host(root: PathBuf) -> String {
 }
 
 async fn get(url: &str) -> (StatusCode, Vec<u8>) {
-    let response = reqwest::get(url).await.unwrap_or_else(|err| panic!("GET {url}: {err}"));
+    let response = reqwest::get(url)
+        .await
+        .unwrap_or_else(|err| panic!("GET {url}: {err}"));
     let status = StatusCode::from_u16(response.status().as_u16()).expect("status");
     (status, response.bytes().await.expect("body").to_vec())
 }
@@ -245,7 +256,10 @@ async fn every_exported_page_is_the_page_serve_sends() {
     );
     let printed = text(&out);
     assert!(printed.contains("3 page(s)"), "{printed}");
-    assert!(!printed.contains("static export ready"), "the old claim is gone: {printed}");
+    assert!(
+        !printed.contains("static export ready"),
+        "the old claim is gone: {printed}"
+    );
 
     let exported = app.join(".albedo").join("static");
     for page in ["index.html", "about/index.html", "docs/intro/index.html"] {
@@ -270,8 +284,14 @@ async fn every_exported_page_is_the_page_serve_sends() {
         let served_html = String::from_utf8(served_body).expect("utf-8");
         let hosted_html = String::from_utf8(hosted_body).expect("utf-8");
         // Controls: both are the real page, not two identical error bodies…
-        assert!(served_html.contains(own_text), "serve {route} lacks {own_text:?}");
-        assert!(hosted_html.contains(own_text), "export {route} lacks {own_text:?}");
+        assert!(
+            served_html.contains(own_text),
+            "serve {route} lacks {own_text:?}"
+        );
+        assert!(
+            hosted_html.contains(own_text),
+            "export {route} lacks {own_text:?}"
+        );
 
         // Every page here is static markup, so it ships no client runtime — and
         // with it no session token and no live-lane switch, on either side.
@@ -282,7 +302,10 @@ async fn every_exported_page_is_the_page_serve_sends() {
             ("serve", &served_html, &served_token),
             ("export", &hosted_html, &hosted_token),
         ] {
-            assert_eq!(token, &None, "{side} {route}: a static page carries no session token");
+            assert_eq!(
+                token, &None,
+                "{side} {route}: a static page carries no session token"
+            );
             assert!(
                 !html.contains("/_albedo/runtime.js") && !html.contains("__ALBEDO_LIVE__"),
                 "{side} {route}: a static page ships no client runtime"
@@ -317,7 +340,10 @@ async fn every_exported_page_is_the_page_serve_sends() {
         assert_eq!(served_status, StatusCode::OK, "serve {file}");
         assert_eq!(hosted_status, StatusCode::OK, "static host {file}");
         assert!(!hosted_body.is_empty(), "{file} is empty");
-        assert!(served_body == hosted_body, "{file}: the export differs from serve");
+        assert!(
+            served_body == hosted_body,
+            "{file}: the export differs from serve"
+        );
     }
 }
 
@@ -333,7 +359,10 @@ fn the_scaffold_is_refused_by_name_and_nothing_is_written() {
         "albedo ship --target static",
     );
     let printed = text(&out);
-    assert!(!out.status.success(), "a refused export must exit non-zero:\n{printed}");
+    assert!(
+        !out.status.success(),
+        "a refused export must exit non-zero:\n{printed}"
+    );
     for expected in [
         "static export refused",
         "forge: declares collection(s) `guestbook`, `messages`",
@@ -344,7 +373,10 @@ fn the_scaffold_is_refused_by_name_and_nothing_is_written() {
         "nothing was written",
         "--target binary",
     ] {
-        assert!(printed.contains(expected), "missing {expected:?} in:\n{printed}");
+        assert!(
+            printed.contains(expected),
+            "missing {expected:?} in:\n{printed}"
+        );
     }
     assert!(!printed.contains("static export ready"), "{printed}");
     assert!(
@@ -390,7 +422,10 @@ fn a_form_only_the_rendered_page_shows_refuses_its_route_and_keeps_the_last_expo
         "the second export",
     );
     let printed = text(&out);
-    assert!(!out.status.success(), "a page with a form must refuse:\n{printed}");
+    assert!(
+        !out.status.success(),
+        "a page with a form must refuse:\n{printed}"
+    );
     assert!(
         printed.contains("/about: carries a form bound to an action"),
         "{printed}"

@@ -13,10 +13,10 @@ use super::webtransport::{
     WebTransportFrame, WebTransportMuxer, WT_STREAM_SLOT_PATCHES,
 };
 use crate::analysis::adaptive::should_parallelize;
-use crate::ir::opcode::{Instruction, InstructionRange, OpcodeFrame, StableId, SuspenseId};
-use crate::ir::wire::{self, WireError};
 use crate::graph::ComponentGraph;
 use crate::ir::columns::{IrColumns, LaneColumnPass};
+use crate::ir::opcode::{Instruction, InstructionRange, OpcodeFrame, StableId, SuspenseId};
+use crate::ir::wire::{self, WireError};
 use crate::manifest::schema::Tier;
 use crate::runtime::slot_store::SlotStore;
 use crate::types::{CompilerError, ComponentAnalysis, ComponentId};
@@ -226,9 +226,7 @@ impl FourLaneRuntimePipeline {
     /// failure mode for "pipeline constructed without a runtime handle"
     /// is a well-typed [`RuntimePipelineError::MissingRuntimeHandle`]
     /// instead of a `Handle::current()` panic mid-tick.
-    pub fn require_runtime_handle(
-        &self,
-    ) -> Result<&tokio::runtime::Handle, RuntimePipelineError> {
+    pub fn require_runtime_handle(&self) -> Result<&tokio::runtime::Handle, RuntimePipelineError> {
         self.runtime_handle
             .as_ref()
             .ok_or(RuntimePipelineError::MissingRuntimeHandle)
@@ -502,7 +500,6 @@ impl FourLaneRuntimePipeline {
         }
     }
 
-
     /// Cycle-5 RAF entry point.
     ///
     /// Drives a single reconciliation tick: drain the owned bitmap, partition
@@ -635,7 +632,9 @@ impl FourLaneRuntimePipeline {
             suspense_id,
         }])?;
 
-        if let Ok(mut queue) = self.pending_placeholder_emissions.lock() { queue.push((suspense_id, placeholder_chunk)) } else {
+        if let Ok(mut queue) = self.pending_placeholder_emissions.lock() {
+            queue.push((suspense_id, placeholder_chunk))
+        } else {
             // Lock poisoning would mean an earlier tick panicked while
             // holding it. Drop the placeholder rather than panic again;
             // the island's Future will still resolve and surface a
@@ -722,7 +721,10 @@ impl FourLaneRuntimePipeline {
             });
             instructions.extend(resolution.instructions);
 
-            out.push((resolution.suspense_id, self.build_patches_chunk(instructions)?));
+            out.push((
+                resolution.suspense_id,
+                self.build_patches_chunk(instructions)?,
+            ));
         }
 
         Ok(out)
@@ -788,8 +790,10 @@ impl FourLaneRuntimePipeline {
         // patch with no target and a placeholder nothing fills (CI, 15 Nov
         // 2026). Patches for islands whose placeholders shipped earlier go
         // first, so a re-enqueued element ends up loading, not stale.
-        let fresh: std::collections::HashSet<SuspenseId> =
-            placeholders.iter().map(|(suspense_id, _)| *suspense_id).collect();
+        let fresh: std::collections::HashSet<SuspenseId> = placeholders
+            .iter()
+            .map(|(suspense_id, _)| *suspense_id)
+            .collect();
         let (late, earlier): (Vec<_>, Vec<_>) = resolved
             .into_iter()
             .partition(|(suspense_id, _)| fresh.contains(suspense_id));
@@ -904,10 +908,10 @@ impl FourLaneRuntimePipeline {
         };
 
         let wire_bytes = crate::ir::wire::encode_frame(&frame)?;
-        Ok(Some(self.stream_router.route_global_chunk(
-            WTRenderMode::Patch,
-            wire_bytes,
-        )))
+        Ok(Some(
+            self.stream_router
+                .route_global_chunk(WTRenderMode::Patch, wire_bytes),
+        ))
     }
 }
 
@@ -1351,7 +1355,10 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while pipeline.async_rx.lock().expect("rx").is_empty() {
-            assert!(std::time::Instant::now() < deadline, "resolver never resolved");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resolver never resolved"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
@@ -1360,7 +1367,11 @@ mod tests {
             .iter()
             .map(|chunk| decoded_instructions(chunk)[0].clone())
             .collect();
-        assert_eq!(firsts.len(), 2, "placeholder and patch in one drain: {firsts:?}");
+        assert_eq!(
+            firsts.len(),
+            2,
+            "placeholder and patch in one drain: {firsts:?}"
+        );
         assert!(
             matches!(firsts[0], Instruction::Placeholder { suspense_id: sid, .. } if sid == suspense_id),
             "the placeholder must ship first: {firsts:?}"
@@ -1385,12 +1396,19 @@ mod tests {
             })
             .expect("enqueue old");
         let first = pipeline.drain_opcode_chunks();
-        assert_eq!(first.len(), 1, "only the old placeholder while its resolver waits");
+        assert_eq!(
+            first.len(),
+            1,
+            "only the old placeholder while its resolver waits"
+        );
 
         release.send(()).expect("release the old resolver");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while pipeline.async_rx.lock().expect("rx").is_empty() {
-            assert!(std::time::Instant::now() < deadline, "old resolver never resolved");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "old resolver never resolved"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let (_hold, never) = tokio::sync::oneshot::channel::<()>();
@@ -1440,12 +1458,17 @@ mod tests {
         let instructions = decoded_instructions(&chunks[0]);
         assert_eq!(instructions.len(), 2, "Patch + one resolved Create");
         match &instructions[0] {
-            Instruction::Patch { suspense_id: sid, .. } => assert_eq!(*sid, suspense_id),
+            Instruction::Patch {
+                suspense_id: sid, ..
+            } => assert_eq!(*sid, suspense_id),
             other => panic!("first instruction must be Patch, got {:?}", other),
         }
         assert!(matches!(
             instructions[1],
-            Instruction::Create { stable_id: StableId(11), .. }
+            Instruction::Create {
+                stable_id: StableId(11),
+                ..
+            }
         ));
         assert_eq!(
             pipeline.pending_async_count(),
@@ -1520,9 +1543,15 @@ mod tests {
     #[test]
     fn suspense_ids_are_monotonic_across_enqueues() {
         let (pipeline, _runtime) = build_async_pipeline();
-        let a = pipeline.enqueue_async_island(StableId(1), async { Vec::new() }).unwrap();
-        let b = pipeline.enqueue_async_island(StableId(2), async { Vec::new() }).unwrap();
-        let c = pipeline.enqueue_async_island(StableId(3), async { Vec::new() }).unwrap();
+        let a = pipeline
+            .enqueue_async_island(StableId(1), async { Vec::new() })
+            .unwrap();
+        let b = pipeline
+            .enqueue_async_island(StableId(2), async { Vec::new() })
+            .unwrap();
+        let c = pipeline
+            .enqueue_async_island(StableId(3), async { Vec::new() })
+            .unwrap();
         assert_eq!(a, SuspenseId(0));
         assert_eq!(b, SuspenseId(1));
         assert_eq!(c, SuspenseId(2));

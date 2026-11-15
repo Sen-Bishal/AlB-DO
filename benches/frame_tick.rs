@@ -33,9 +33,7 @@ fn analysis(id: ComponentId, phase: f64) -> ComponentAnalysis {
 fn build_pipeline(n: usize) -> FourLaneRuntimePipeline {
     let graph = ComponentGraph::new();
     let ids: Vec<ComponentId> = (0..n)
-        .map(|i| {
-            graph.add_component(Component::new(ComponentId::new(0), format!("C{i}")))
-        })
+        .map(|i| graph.add_component(Component::new(ComponentId::new(0), format!("C{i}"))))
         .collect();
 
     let mut analyses = HashMap::new();
@@ -45,15 +43,8 @@ fn build_pipeline(n: usize) -> FourLaneRuntimePipeline {
     }
     let tiers: HashMap<_, _> = ids.iter().map(|id| (*id, Tier::B)).collect();
 
-    FourLaneRuntimePipeline::new(
-        &graph,
-        analyses,
-        tiers,
-        &[],
-        SchedulerConfig::default(),
-        64,
-    )
-    .expect("pipeline build")
+    FourLaneRuntimePipeline::new(&graph, analyses, tiers, &[], SchedulerConfig::default(), 64)
+        .expect("pipeline build")
 }
 
 /// Deterministic strided dirty-set so every run marks the same slots and the

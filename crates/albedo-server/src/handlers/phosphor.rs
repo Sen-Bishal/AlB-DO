@@ -14,27 +14,23 @@
 //!
 //! # Contract (inherited from the per-tab lane, then narrowed)
 //!
-//! - **The server decides the topics, not the client.** The subscribe unit is
-//!   a route path, resolved through the same router + manifest the render
-//!   used. All resolution goes through ONE choke point ([`RouteAuthority`]) —
-//!   the seam item 4's parameterized, identity-checked topics land into.
-//! - **Seed precedes live frames, per route.** Guaranteed by the *forwarder
-//!   start-gate*: a circuit's registry sink can buffer frames from the moment
-//!   `auto_subscribe` registers it (under each topic's linearization lock),
-//!   but nothing enters the trunk until the seed has been pushed and the
-//!   forwarder is then started. The trunk is FIFO, so the order is proved by
-//!   construction — the multiplexed restatement of `serve_patch_stream`'s
-//!   yield-order guarantee.
-//! - **Bounded queues; a lane that can't drain dies loudly.** A full trunk
-//!   means the *browser* can't keep up with its one shared stream. Dropping a
-//!   single circuit would leave some routes silently stale on a live
-//!   connection — the lying-page failure the registry's whole-session-drop
-//!   posture exists to prevent — so the forwarder kills the whole lane and the
-//!   client reconnects with resync. Same posture, one level up.
-//! - **Caps exist here** because the lane is the first place they are
-//!   expressible: lanes per process, routes per lane, and a per-lane
-//!   token-bucket on subscribe operations. This closes the uncapped-subscribe
-//!   fd-exhaustion hole § 2d called out. Per-*identity* caps attach to
+//! - **The server decides the topics, not the client.** The subscribe unit is a route path,
+//!   resolved through the same router + manifest the render used. All resolution goes through ONE
+//!   choke point ([`RouteAuthority`]) — the seam item 4's parameterized, identity-checked topics
+//!   land into.
+//! - **Seed precedes live frames, per route.** Guaranteed by the *forwarder start-gate*: a
+//!   circuit's registry sink can buffer frames from the moment `auto_subscribe` registers it (under
+//!   each topic's linearization lock), but nothing enters the trunk until the seed has been pushed
+//!   and the forwarder is then started. The trunk is FIFO, so the order is proved by construction —
+//!   the multiplexed restatement of `serve_patch_stream`'s yield-order guarantee.
+//! - **Bounded queues; a lane that can't drain dies loudly.** A full trunk means the *browser*
+//!   can't keep up with its one shared stream. Dropping a single circuit would leave some routes
+//!   silently stale on a live connection — the lying-page failure the registry's whole-session-drop
+//!   posture exists to prevent — so the forwarder kills the whole lane and the client reconnects
+//!   with resync. Same posture, one level up.
+//! - **Caps exist here** because the lane is the first place they are expressible: lanes per
+//!   process, routes per lane, and a per-lane token-bucket on subscribe operations. This closes the
+//!   uncapped-subscribe fd-exhaustion hole § 2d called out. Per-*identity* caps attach to
 //!   [`Lane::identity`] the day auth lands, with no protocol change.
 //!
 //! # Wire
@@ -221,7 +217,9 @@ impl TokenBucket {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last).as_secs_f64();
         self.last = now;
-        self.tokens = elapsed.mul_add(SUBSCRIBE_REFILL_PER_SEC, self.tokens).min(SUBSCRIBE_BURST);
+        self.tokens = elapsed
+            .mul_add(SUBSCRIBE_REFILL_PER_SEC, self.tokens)
+            .min(SUBSCRIBE_BURST);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -242,7 +240,10 @@ pub struct Lane {
     /// The session cookie's id, when the browser presented one. Unused for
     /// authorization today (every topic is public); it is the accounting key
     /// per-identity caps and item-4 authz attach to.
-    #[allow(dead_code, reason = "the key per-identity caps attach to; not read yet")]
+    #[allow(
+        dead_code,
+        reason = "the key per-identity caps attach to; not read yet"
+    )]
     identity: Option<SessionId>,
     /// AUTH · R2 — **who** this lane belongs to, resolved at trunk open.
     ///
@@ -271,7 +272,8 @@ impl Lane {
 
     /// Drop every route subscription this lane holds.
     fn drop_routes(&self) {
-        let routes = std::mem::take(&mut *self.routes.lock().expect("phosphor route table poisoned"));
+        let routes =
+            std::mem::take(&mut *self.routes.lock().expect("phosphor route table poisoned"));
         for (_, sub) in routes {
             sub.registry.cleanup_session(sub.session);
         }
@@ -472,7 +474,8 @@ fn build_dev_stream(dev: DevTap) -> BoxStream<'static, SseEvent> {
     let overlay: BoxStream<'static, SseEvent> = match dev.errors {
         Some(registry) => BroadcastStream::new(registry.subscribe())
             .filter_map(|item| async move {
-                item.ok().map(|event| crate::handlers::dev::render_overlay_event(&event))
+                item.ok()
+                    .map(|event| crate::handlers::dev::render_overlay_event(&event))
             })
             .boxed(),
         None => stream::pending().boxed(),
@@ -480,7 +483,8 @@ fn build_dev_stream(dev: DevTap) -> BoxStream<'static, SseEvent> {
     let hmr: BoxStream<'static, SseEvent> = match dev.hmr {
         Some(registry) => BroadcastStream::new(registry.subscribe())
             .filter_map(|item| async move {
-                item.ok().map(|event| crate::handlers::dev::render_hmr_event(&event))
+                item.ok()
+                    .map(|event| crate::handlers::dev::render_hmr_event(&event))
             })
             .boxed(),
         None => stream::pending().boxed(),
@@ -498,9 +502,8 @@ struct LaneGuard {
 impl Drop for LaneGuard {
     fn drop(&mut self) {
         if let Some((_, lane)) = self.phosphor.lanes.remove(&self.lane_id) {
-            let routes = std::mem::take(
-                &mut *lane.routes.lock().expect("phosphor route table poisoned"),
-            );
+            let routes =
+                std::mem::take(&mut *lane.routes.lock().expect("phosphor route table poisoned"));
             for (_, sub) in routes {
                 sub.registry.cleanup_session(sub.session);
             }
@@ -525,7 +528,10 @@ fn patch_event(route: &str, nonce: Option<&str>, frame: &[u8], id: u64) -> SseEv
         f: base64::engine::general_purpose::STANDARD.encode(frame),
     })
     .expect("patch envelope serializes");
-    SseEvent::default().event(PATCH_EVENT).id(id.to_string()).data(data)
+    SseEvent::default()
+        .event(PATCH_EVENT)
+        .id(id.to_string())
+        .data(data)
 }
 
 // ─── Subscribe (POST /_albedo/phosphor/routes) ───────────────────────
@@ -576,8 +582,16 @@ pub async fn handle_subscribe(
         // owner to reopen the trunk rather than retry the POST.
         return plain(StatusCode::NOT_FOUND, "unknown lane".to_string());
     };
-    if !lane.budget.lock().expect("phosphor budget poisoned").try_take() {
-        return plain(StatusCode::TOO_MANY_REQUESTS, "subscribe budget exhausted".to_string());
+    if !lane
+        .budget
+        .lock()
+        .expect("phosphor budget poisoned")
+        .try_take()
+    {
+        return plain(
+            StatusCode::TOO_MANY_REQUESTS,
+            "subscribe budget exhausted".to_string(),
+        );
     }
 
     match subscribe_routes(&lane, authority, request).await {
@@ -602,16 +616,14 @@ pub async fn handle_subscribe(
 /// Per added route, in this exact order (the forwarder start-gate):
 ///
 /// 1. authorize → topics (denied routes subscribe nothing);
-/// 2. under the route-table lock: create the circuit (or bump its refcount)
-///    and `auto_subscribe` — the sink is registered and each topic's value
-///    snapshotted under that topic's linearization lock, so frames may begin
-///    queueing in the circuit channel but the seed is exact;
+/// 2. under the route-table lock: create the circuit (or bump its refcount) and `auto_subscribe` —
+///    the sink is registered and each topic's value snapshotted under that topic's linearization
+///    lock, so frames may begin queueing in the circuit channel but the seed is exact;
 /// 3. push the seed frame **directly into the trunk**, nonce-tagged;
-/// 4. when `resync`: project the full row sets from the step-2 snapshot
-///    (rendering, awaited OUTSIDE every lock) and push the `ReconcileList`
-///    frame;
-/// 5. only now start the forwarder. The trunk is FIFO: nothing buffered in
-///    step 2 can precede the seed of steps 3–4.
+/// 4. when `resync`: project the full row sets from the step-2 snapshot (rendering, awaited OUTSIDE
+///    every lock) and push the `ReconcileList` frame;
+/// 5. only now start the forwarder. The trunk is FIFO: nothing buffered in step 2 can precede the
+///    seed of steps 3–4.
 async fn subscribe_routes(
     lane: &Arc<Lane>,
     authority: &dyn RouteAuthority,
@@ -621,8 +633,7 @@ async fn subscribe_routes(
 
     for add in request.add {
         // AUTH R2 · the lane's *principal* decides, not its tab id.
-        let Some(grants) = authority.authorize_route(lane.principal(), &add.p).await
-        else {
+        let Some(grants) = authority.authorize_route(lane.principal(), &add.p).await else {
             outcome.denied.push(add.p);
             continue;
         };
@@ -893,15 +904,30 @@ mod tests {
         };
 
         let laptop = TokenHash::of("laptop");
-        assert_eq!(state.end_lanes_where(|identity| identity.token() == Some(&laptop)), 1);
-        assert!(ended("ada-laptop").await, "the signed-out session's lane ends");
-        assert!(!ended("ada-phone").await, "signing out one device leaves the other");
+        assert_eq!(
+            state.end_lanes_where(|identity| identity.token() == Some(&laptop)),
+            1
+        );
+        assert!(
+            ended("ada-laptop").await,
+            "the signed-out session's lane ends"
+        );
+        assert!(
+            !ended("ada-phone").await,
+            "signing out one device leaves the other"
+        );
 
         let everywhere =
             state.end_lanes_where(|identity| identity.principal().is_some_and(|p| p.id == ada));
         assert_eq!(everywhere, 2);
-        assert!(ended("ada-phone").await, "signing out everywhere reaches every device");
-        assert!(!ended("bob").await && !ended("stranger").await, "nobody else is touched");
+        assert!(
+            ended("ada-phone").await,
+            "signing out everywhere reaches every device"
+        );
+        assert!(
+            !ended("bob").await && !ended("stranger").await,
+            "nobody else is touched"
+        );
     }
 
     fn add(path: &str, nonce: Option<&str>, resync: bool) -> SubscribeRequest {
@@ -1114,8 +1140,11 @@ mod tests {
             .write_topic("guestbook", br#"[{"id":1}]"#.to_vec())
             .expect("write fans out");
 
-        let TrunkEvent::Patch { route, nonce, frame } =
-            trunk.recv().await.expect("seed arrives");
+        let TrunkEvent::Patch {
+            route,
+            nonce,
+            frame,
+        } = trunk.recv().await.expect("seed arrives");
         assert_eq!(&*route, "/guestbook");
         assert_eq!(nonce.as_deref(), Some("abc"), "the seed targets the joiner");
         let (decoded, _) = decode_frame(&frame).unwrap();
@@ -1138,8 +1167,12 @@ mod tests {
         let auth = authority(&[("/a", &["alpha"]), ("/b", &["beta"])]);
         let (lane, mut trunk) = test_lane(16);
 
-        subscribe_routes(&lane, &auth, add("/a", None, false)).await.unwrap();
-        subscribe_routes(&lane, &auth, add("/b", None, false)).await.unwrap();
+        subscribe_routes(&lane, &auth, add("/a", None, false))
+            .await
+            .unwrap();
+        subscribe_routes(&lane, &auth, add("/b", None, false))
+            .await
+            .unwrap();
         // Drain the two seeds.
         let _ = trunk.recv().await.unwrap();
         let _ = trunk.recv().await.unwrap();
@@ -1191,8 +1224,12 @@ mod tests {
         let auth = authority(&[("/g", &["g"])]);
         let (lane, mut trunk) = test_lane(16);
 
-        subscribe_routes(&lane, &auth, add("/g", Some("tab1"), false)).await.unwrap();
-        subscribe_routes(&lane, &auth, add("/g", Some("tab2"), false)).await.unwrap();
+        subscribe_routes(&lane, &auth, add("/g", Some("tab1"), false))
+            .await
+            .unwrap();
+        subscribe_routes(&lane, &auth, add("/g", Some("tab2"), false))
+            .await
+            .unwrap();
         assert_eq!(
             auth.registry.get("g").unwrap().subscriber_count(),
             1,
@@ -1201,7 +1238,11 @@ mod tests {
         let TrunkEvent::Patch { nonce, .. } = trunk.recv().await.unwrap();
         assert_eq!(nonce.as_deref(), Some("tab1"));
         let TrunkEvent::Patch { nonce, .. } = trunk.recv().await.unwrap();
-        assert_eq!(nonce.as_deref(), Some("tab2"), "the second joiner is re-seeded");
+        assert_eq!(
+            nonce.as_deref(),
+            Some("tab2"),
+            "the second joiner is re-seeded"
+        );
 
         subscribe_routes(&lane, &auth, remove("/g")).await.unwrap();
         assert_eq!(
@@ -1257,7 +1298,9 @@ mod tests {
             tokio::spawn(async move { kill.notified().await })
         };
 
-        subscribe_routes(&lane, &auth, add("/g", None, false)).await.unwrap();
+        subscribe_routes(&lane, &auth, add("/g", None, false))
+            .await
+            .unwrap();
         // Seed filled the 1-slot trunk; these writes overflow the circuit
         // into a full trunk — the forwarder must pull the kill cord.
         for i in 0..8 {
@@ -1298,8 +1341,14 @@ mod tests {
         ) -> Option<dom_render_compiler::forge::RenderedRows> {
             (collection == "g").then(|| {
                 [
-                    ("1".to_string(), "<li data-albedo-key=\"1\">ada</li>".to_string()),
-                    ("2".to_string(), "<li data-albedo-key=\"2\">alan</li>".to_string()),
+                    (
+                        "1".to_string(),
+                        "<li data-albedo-key=\"1\">ada</li>".to_string(),
+                    ),
+                    (
+                        "2".to_string(),
+                        "<li data-albedo-key=\"2\">alan</li>".to_string(),
+                    ),
                 ]
                 .into_iter()
                 .collect()
@@ -1316,7 +1365,9 @@ mod tests {
         auth.registry.topic("g", br#"[{"id":1}]"#.to_vec());
         let (lane, mut trunk) = test_lane(16);
 
-        subscribe_routes(&lane, &auth, add("/g", None, true)).await.unwrap();
+        subscribe_routes(&lane, &auth, add("/g", None, true))
+            .await
+            .unwrap();
 
         let TrunkEvent::Patch { nonce, .. } = trunk.recv().await.expect("seed");
         assert_eq!(nonce, None, "takeover seed is broadcast");
@@ -1352,7 +1403,9 @@ mod tests {
         let auth = authority(&[("/g", &["g"])]);
         let lane_id = phosphor.lanes.iter().next().unwrap().key().clone();
         let lane = phosphor.get(&lane_id).unwrap();
-        subscribe_routes(&lane, &auth, add("/g", None, false)).await.unwrap();
+        subscribe_routes(&lane, &auth, add("/g", None, false))
+            .await
+            .unwrap();
         assert_eq!(auth.registry.get("g").unwrap().subscriber_count(), 1);
 
         drop(response);

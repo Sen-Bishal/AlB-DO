@@ -19,22 +19,19 @@
 //!
 //! ## Shape
 //!
-//! - [`value`] — substrate-neutral value/row types the engine speaks, so
-//!   no storage crate's types leak into the compiler or serve loop.
-//! - [`substrate`] — the [`DataSubstrate`] trait: the one seam every
-//!   backend (libSQL for Phase 0, BYO-Postgres later, an edge KV further
-//!   out) implements.
-//! - `mem` (test builds only) — `RecordingSubstrate`, an
-//!   in-memory test double that lets the wiring be exercised before the
-//!   real libSQL backend is attached.
-//! - [`reserve`] — [`Reservations`](reserve::Reservations), atomic claiming
-//!   of a bounded resource (tickets, stock, seats, quotas). The contention
-//!   primitive: supply never goes negative, never oversells, and a retried
-//!   request never claims twice.
-//! - [`drift`] — [`evolve_schema`](drift::evolve_schema), the boot gate that
-//!   reconciles the declaration with the database: it adds new nullable columns
-//!   and refuses to serve any other disagreement. Migrations are `IF NOT EXISTS`
-//!   only, so an edited `forge` block would otherwise apply as silence.
+//! - [`value`] — substrate-neutral value/row types the engine speaks, so no storage crate's types
+//!   leak into the compiler or serve loop.
+//! - [`substrate`] — the [`DataSubstrate`] trait: the one seam every backend (libSQL for Phase 0,
+//!   BYO-Postgres later, an edge KV further out) implements.
+//! - `mem` (test builds only) — `RecordingSubstrate`, an in-memory test double that lets the wiring
+//!   be exercised before the real libSQL backend is attached.
+//! - [`reserve`] — [`Reservations`](reserve::Reservations), atomic claiming of a bounded resource
+//!   (tickets, stock, seats, quotas). The contention primitive: supply never goes negative, never
+//!   oversells, and a retried request never claims twice.
+//! - [`drift`] — [`evolve_schema`](drift::evolve_schema), the boot gate that reconciles the
+//!   declaration with the database: it adds new nullable columns and refuses to serve any other
+//!   disagreement. Migrations are `IF NOT EXISTS` only, so an edited `forge` block would otherwise
+//!   apply as silence.
 //!
 //! ## Roadmap (see `development-plan/backend.md`)
 //!
@@ -60,29 +57,28 @@ pub mod typegen;
 pub mod value;
 pub mod write;
 
-#[cfg(feature = "forge")]
-pub mod libsql;
 /// `albedo db backup` / `restore` — snapshots of the data directory.
 #[cfg(feature = "forge")]
 pub mod backup;
+#[cfg(feature = "forge")]
+pub mod libsql;
 
+pub use bindings::{
+    validate_literal_topic_reads, validate_partition_bindings, validate_partitioned_whole_reads,
+    LiteralTopicRead, PartitionBinding, WritableTopics,
+};
+pub use declare::{CollectionDecl, FieldType};
 pub use delta::{
     appended_rows, classify_positioned_insert, diff_records, project_changes,
     project_inserted_rows, PositionedInsert, RecordChange, RenderedRows, RowProjector,
 };
-pub use reserve::{
-    IdempotencyConflict, ReleaseOutcome, ReserveError, ReserveOutcome, ReserveRequest, Reservations,
-};
-pub use bindings::{
-    validate_literal_topic_reads, validate_partition_bindings,
-    validate_partitioned_whole_reads, LiteralTopicRead,
-    PartitionBinding, WritableTopics,
-};
-pub use declare::{CollectionDecl, FieldType};
 pub use drift::{evolve_schema, Addition, Change, CollectionDrift, SchemaDrift, VerifyError};
-pub use typegen::emit_forge_dts;
+pub use reserve::{
+    IdempotencyConflict, ReleaseOutcome, Reservations, ReserveError, ReserveOutcome, ReserveRequest,
+};
 pub use skeleton::{ForgeCollection, ForgeSchema, ForgeSchemaError, SeedRow};
 pub use substrate::{DataSubstrate, Transaction};
+pub use typegen::emit_forge_dts;
 pub use value::{Result, Row, Rows, SqlValue, SubstrateError};
 pub use write::{
     apply_writes, install_forge_write_collector, FanOut, ForgeWrite, ForgeWriteCollector,

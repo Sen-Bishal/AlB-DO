@@ -2,18 +2,15 @@
 //!
 //! Four gates:
 //!
-//!   1. `styles.foo` in JSX resolves to the scoped class name
-//!      derived from the CSS file's path-hash (`foo_<8hex>`).
-//!   2. The scoping primitive `scope_module_css` is loaded once per
-//!      CSS file and reused across multiple `import styles from ...`
-//!      bindings in the same project — no double-scoping.
-//!   3. Two `.module.css` files that declare the same local class
-//!      name (e.g. both have `.box`) produce DIFFERENT scoped names
-//!      so styles don't bleed across components.
-//!   4. The manifest's `shell.doctype_and_head` carries a `<style
-//!      data-albedo-css-modules>` block with the route's scoped CSS
-//!      so the rendered class names actually paint correctly without
-//!      a separate stylesheet request.
+//!   1. `styles.foo` in JSX resolves to the scoped class name derived from the CSS file's path-hash
+//!      (`foo_<8hex>`).
+//!   2. The scoping primitive `scope_module_css` is loaded once per CSS file and reused across
+//!      multiple `import styles from ...` bindings in the same project — no double-scoping.
+//!   3. Two `.module.css` files that declare the same local class name (e.g. both have `.box`)
+//!      produce DIFFERENT scoped names so styles don't bleed across components.
+//!   4. The manifest's `shell.doctype_and_head` carries a `<style data-albedo-css-modules>` block
+//!      with the route's scoped CSS so the rendered class names actually paint correctly without a
+//!      separate stylesheet request.
 
 use dom_render_compiler::manifest::ManifestOptions;
 use dom_render_compiler::runtime::eval::{CompiledProject, SessionSlotView};
@@ -59,7 +56,9 @@ fn styles_member_access_resolves_to_scoped_class_in_rendered_html() {
     // render. `hook_compile: false` keeps Tier-A behaviour
     // (no opcodes emitted) — CSS modules don't require hook compile.
     let slots = SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()));
-    let opts = RenderOptions { hook_compile: false };
+    let opts = RenderOptions {
+        hook_compile: false,
+    };
     let output = render_entry_with_bindings(
         &project,
         "Component.tsx",
@@ -98,8 +97,7 @@ fn scope_module_css_runs_once_per_file_even_with_multiple_imports() {
 
 #[test]
 fn two_module_css_files_with_same_local_class_produce_different_scoped_names() {
-    let project =
-        CompiledProject::load_from_dir(fixture_root("multi_card")).expect("load project");
+    let project = CompiledProject::load_from_dir(fixture_root("multi_card")).expect("load project");
     let registry = project.css_modules();
     assert_eq!(
         registry.file_count(),
@@ -147,11 +145,7 @@ fn manifest_shell_carries_scoped_css_block_for_route() {
         &ManifestOptions::default(),
     );
 
-    let route = manifest
-        .routes
-        .values()
-        .next()
-        .expect("at least one route");
+    let route = manifest.routes.values().next().expect("at least one route");
     let head = &route.shell.doctype_and_head;
     assert!(
         head.contains("<style data-albedo-css-modules>"),

@@ -14,11 +14,11 @@
 #![cfg(feature = "forge")]
 
 use dom_render_compiler::auth::password::{hash_password, normalize_email, verify_password};
-use dom_render_compiler::auth::store::{
-    create_credential_account, create_session, lookup_credential, resolve_session, upsert_principal,
-    ProviderProfile,
-};
 use dom_render_compiler::auth::schema;
+use dom_render_compiler::auth::store::{
+    create_credential_account, create_session, lookup_credential, resolve_session,
+    upsert_principal, ProviderProfile,
+};
 use dom_render_compiler::forge::skeleton::{bootstrap_schema, ForgeSchema};
 use dom_render_compiler::forge::{DataSubstrate, LibSqlSubstrate};
 
@@ -64,13 +64,18 @@ async fn a_stranger_signs_up_and_then_signs_in() {
         .expect("the account exists");
     assert_eq!(found.principal, created.id);
     assert!(verify_password(&found.secret_hash, "correct horse battery"));
-    assert!(!verify_password(&found.secret_hash, "correct horse batterz"));
+    assert!(!verify_password(
+        &found.secret_hash,
+        "correct horse batterz"
+    ));
 
     // …and the session that follows resolves to the same human.
     let token = create_session(&db, &found.principal, PROVIDER, NOW, 30 * DAY_MS)
         .await
         .expect("session");
-    let resolved = resolve_session(&db, &token, NOW + 1).await.expect("resolve");
+    let resolved = resolve_session(&db, &token, NOW + 1)
+        .await
+        .expect("resolve");
     assert_eq!(resolved.principal().expect("live session").id, created.id);
 }
 
@@ -104,7 +109,10 @@ async fn re_registering_an_address_never_replaces_its_password() {
         .expect("the account exists");
     assert_eq!(found.principal, first.id, "the principal did not change");
     assert!(verify_password(&found.secret_hash, "the original password"));
-    assert!(!verify_password(&found.secret_hash, "the attacker password"));
+    assert!(!verify_password(
+        &found.secret_hash,
+        "the attacker password"
+    ));
 }
 
 /// The email is the account key, so the folding [`normalize_email`] does has to
@@ -115,10 +123,17 @@ async fn case_and_surrounding_space_do_not_create_a_second_account() {
     let secret = hash_password("correct horse battery").expect("hashes");
 
     let canonical = normalize_email("ada@example.com").expect("an address");
-    create_credential_account(&db, PROVIDER, &canonical, &profile(&canonical), &secret, NOW)
-        .await
-        .expect("substrate")
-        .expect("registers");
+    create_credential_account(
+        &db,
+        PROVIDER,
+        &canonical,
+        &profile(&canonical),
+        &secret,
+        NOW,
+    )
+    .await
+    .expect("substrate")
+    .expect("registers");
 
     for spelling in ["  Ada@Example.COM  ", "ADA@EXAMPLE.COM", "ada@example.com"] {
         let folded = normalize_email(spelling).expect("an address");

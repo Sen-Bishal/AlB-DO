@@ -8,7 +8,5 @@
 pub mod error_overlay;
 pub mod hmr;
 
-pub use error_overlay::{
-    DevError, DevErrorRegistry, ErrorKind, OverlayEvent, SharedErrorRegistry,
-};
+pub use error_overlay::{DevError, DevErrorRegistry, ErrorKind, OverlayEvent, SharedErrorRegistry};
 pub use hmr::{HmrEvent, HmrPayload, HmrRegistry, SharedHmrRegistry};

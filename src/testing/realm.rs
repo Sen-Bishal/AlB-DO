@@ -4,13 +4,12 @@
 //! compiler as the realm that renders a page — with three things added:
 //!
 //! * **the test API** (`prelude.js`), bound to `import … from "albedo/test"`;
-//! * **lazy project modules.** A test imports `../components/Card`; the first
-//!   import compiles that file from disk with the server's own module compiler
-//!   and evaluates it here, then its imports, and so on. Only what the test
-//!   reaches is loaded, in the order it reaches it;
-//! * **a synchronous host bridge** — `__albedo_test_host(op, json)` — through
-//!   which `render()`, `visit()` and the rest reach a [`TestHost`]: the build's
-//!   renderers and the app's router, in the server crate.
+//! * **lazy project modules.** A test imports `../components/Card`; the first import compiles that
+//!   file from disk with the server's own module compiler and evaluates it here, then its imports,
+//!   and so on. Only what the test reaches is loaded, in the order it reaches it;
+//! * **a synchronous host bridge** — `__albedo_test_host(op, json)` — through which `render()`,
+//!   `visit()` and the rest reach a [`TestHost`]: the build's renderers and the app's router, in
+//!   the server crate.
 //!
 //! Module keys are paths **relative to the project**, forward-slashed
 //! (`src/components/Card.tsx`). They are what a component reference carries to
@@ -118,7 +117,9 @@ impl TestRealm {
         for (key, script, source_hash) in npm {
             engine
                 .load_precompiled_module(key, script, *source_hash)
-                .map_err(|err| format!("npm bundle '{key}' did not load into the test realm: {err}"))?;
+                .map_err(|err| {
+                    format!("npm bundle '{key}' did not load into the test realm: {err}")
+                })?;
         }
         let root = project_dir.to_path_buf();
         engine
@@ -156,7 +157,8 @@ impl TestRealm {
                     .globals()
                     .get("__albedo_test_list")
                     .map_err(|err| describe(&ctx, &err))?;
-                list.call::<(), String>(()).map_err(|err| describe(&ctx, &err))
+                list.call::<(), String>(())
+                    .map_err(|err| describe(&ctx, &err))
             })
             .map_err(|err| err.to_string())?
             .and_then(|json| {
@@ -281,7 +283,9 @@ fn install_host_bridge(ctx: &Ctx<'_>, project_dir: PathBuf) -> rquickjs::Result<
 
     let host = Function::new(ctx.clone(), |op: String, payload: String| -> String {
         let envelope = match HOST.with(|slot| slot.borrow().clone()) {
-            None => Err("no test is running — albedo/test's functions work inside test()".to_string()),
+            None => {
+                Err("no test is running — albedo/test's functions work inside test()".to_string())
+            }
             Some(host) => match serde_json::from_str::<serde_json::Value>(&payload) {
                 Ok(payload) => host.borrow_mut().call(&op, payload),
                 Err(err) => Err(format!("the test's call to '{op}' was unreadable: {err}")),
@@ -297,28 +301,31 @@ fn install_host_bridge(ctx: &Ctx<'_>, project_dir: PathBuf) -> rquickjs::Result<
     // Modules mid-load, so an import cycle is a named error rather than a
     // stack overflow.
     let loading: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
-    let load = Function::new(ctx.clone(), move |ctx: Ctx<'_>, base: String| -> rquickjs::Result<String> {
-        let Some(key) = find_module(&project_dir, &base) else {
-            return Ok(String::new());
-        };
-        if !loading.borrow_mut().insert(key.clone()) {
-            return Err(Exception::throw_message(
+    let load = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'_>, base: String| -> rquickjs::Result<String> {
+            let Some(key) = find_module(&project_dir, &base) else {
+                return Ok(String::new());
+            };
+            if !loading.borrow_mut().insert(key.clone()) {
+                return Err(Exception::throw_message(
                 &ctx,
                 &format!("{key} imports itself through a cycle; albedo test loads modules in import order and cannot finish a cycle"),
             ));
-        }
-        let outcome = (|| {
-            let path = project_dir.join(&key);
-            let source = crate::markdown::read_module_source(&path).map_err(|err| {
-                Exception::throw_message(&ctx, &format!("could not read {key}: {err}"))
-            })?;
-            let script = compile_module_script_for_quickjs_with_spec(&key, &source, None)
-                .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))?;
-            ctx.eval::<(), _>(script.as_str())
-        })();
-        loading.borrow_mut().remove(&key);
-        outcome.map(|()| key)
-    })?;
+            }
+            let outcome = (|| {
+                let path = project_dir.join(&key);
+                let source = crate::markdown::read_module_source(&path).map_err(|err| {
+                    Exception::throw_message(&ctx, &format!("could not read {key}: {err}"))
+                })?;
+                let script = compile_module_script_for_quickjs_with_spec(&key, &source, None)
+                    .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))?;
+                ctx.eval::<(), _>(script.as_str())
+            })();
+            loading.borrow_mut().remove(&key);
+            outcome.map(|()| key)
+        },
+    )?;
     globals.set("__albedo_test_load", load)?;
     Ok(())
 }
@@ -371,7 +378,10 @@ mod tests {
     #[test]
     fn a_missing_import_is_named_without_the_engines_marker() {
         let project = plain_words(format!("Error: {MODULE_MISSING_MARKER}src/components/Gone"));
-        assert!(project.starts_with("cannot find module 'src/components/Gone'"), "{project}");
+        assert!(
+            project.starts_with("cannot find module 'src/components/Gone'"),
+            "{project}"
+        );
         assert!(!project.contains(MODULE_MISSING_MARKER));
 
         let package = plain_words(format!("{MODULE_MISSING_MARKER}left-pad"));

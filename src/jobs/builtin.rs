@@ -132,7 +132,11 @@ mod tests {
     fn every_builtin_schedule_parses_and_fires() {
         for builtin in Builtin::ALL {
             let Some(schedule) = builtin.schedule() else {
-                assert!(builtin.is_enqueueable(), "{} would never run", builtin.name());
+                assert!(
+                    builtin.is_enqueueable(),
+                    "{} would never run",
+                    builtin.name()
+                );
                 continue;
             };
             assert!(
@@ -148,7 +152,9 @@ mod tests {
     fn the_send_retry_window_spans_half_an_hour_to_an_hour() {
         let waits = Builtin::SendEmail.max_attempts() - 1;
         let total = |jitter| -> i64 {
-            (1..=waits).map(|a| crate::jobs::queue::backoff_ms(a, jitter)).sum()
+            (1..=waits)
+                .map(|a| crate::jobs::queue::backoff_ms(a, jitter))
+                .sum()
         };
         assert_eq!(total(1.0), 4_095_000);
         assert!(total(0.5) >= 30 * 60 * 1000, "{}", total(0.5));

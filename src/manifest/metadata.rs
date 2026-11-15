@@ -289,7 +289,10 @@ pub fn auth_from_const_expr(expr: &Expr) -> Result<RouteAuth, String> {
     match expr {
         Expr::Lit(Lit::Str(s)) => RouteAuth::parse(s.value.as_ref()),
         // R1a · `{ role: "payroll" }` / `{ role: ["hr", "payroll"] }`.
-        Expr::Object(_) | Expr::Paren(_) | Expr::TsConstAssertion(_) | Expr::TsAs(_)
+        Expr::Object(_)
+        | Expr::Paren(_)
+        | Expr::TsConstAssertion(_)
+        | Expr::TsAs(_)
         | Expr::TsSatisfies(_) => match strict_auth_literal(expr) {
             Some(value) => RouteAuth::from_json(&value),
             None => Err(COMPUTED_AUTH.to_string()),
@@ -364,7 +367,8 @@ fn expr_to_json(expr: &Expr) -> Option<Value> {
             let quasi = &tpl.quasis[0];
             let text = quasi
                 .cooked
-                .as_ref().map_or_else(|| quasi.raw.to_string(), std::string::ToString::to_string);
+                .as_ref()
+                .map_or_else(|| quasi.raw.to_string(), std::string::ToString::to_string);
             Some(Value::String(text))
         }
         Expr::Array(arr) => {
@@ -398,7 +402,8 @@ fn expr_to_json(expr: &Expr) -> Option<Value> {
         }
         Expr::Paren(paren) => expr_to_json(&paren.expr),
         // `-1` etc. — a unary minus over a numeric literal.
-        Expr::Unary(unary) if matches!(unary.op, UnaryOp::Minus) => match expr_to_json(&unary.arg)? {
+        Expr::Unary(unary) if matches!(unary.op, UnaryOp::Minus) => match expr_to_json(&unary.arg)?
+        {
             Value::Number(n) => n
                 .as_f64()
                 .and_then(|f| Number::from_f64(-f))
@@ -645,16 +650,28 @@ mod tests {
         let meta = extract(source);
 
         assert_eq!(meta.title.as_deref(), Some("Home — ALBEDO"));
-        assert_eq!(meta.description.as_deref(), Some("The fastest way to ship."));
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("The fastest way to ship.")
+        );
         assert_eq!(tag(&meta, "name", "keywords"), Some("albedo, ssr, rust"));
         assert_eq!(tag(&meta, "name", "robots"), Some("index,follow"));
         assert_eq!(tag(&meta, "property", "og:title"), Some("Home OG"));
         assert_eq!(tag(&meta, "property", "og:url"), Some("https://albedo.dev"));
         assert_eq!(tag(&meta, "property", "og:site_name"), Some("ALBEDO"));
-        assert_eq!(tag(&meta, "property", "og:image"), Some("https://albedo.dev/og.png"));
-        assert_eq!(tag(&meta, "name", "twitter:card"), Some("summary_large_image"));
+        assert_eq!(
+            tag(&meta, "property", "og:image"),
+            Some("https://albedo.dev/og.png")
+        );
+        assert_eq!(
+            tag(&meta, "name", "twitter:card"),
+            Some("summary_large_image")
+        );
         assert_eq!(tag(&meta, "name", "twitter:title"), Some("Home on Twitter"));
-        assert_eq!(tag(&meta, "name", "fediverse:creator"), Some("@albedo@example.com"));
+        assert_eq!(
+            tag(&meta, "name", "fediverse:creator"),
+            Some("@albedo@example.com")
+        );
     }
 
     #[test]
@@ -763,8 +780,14 @@ mod tests {
         meta.push_property("og:title", "OG".to_string());
         let html = render_head_metadata("/post", &meta);
         assert!(html.contains("<title>A &amp; B</title>"), "{html}");
-        assert!(html.contains("<meta name=\"description\" content=\"d\">"), "{html}");
-        assert!(html.contains("<meta property=\"og:title\" content=\"OG\">"), "{html}");
+        assert!(
+            html.contains("<meta name=\"description\" content=\"d\">"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<meta property=\"og:title\" content=\"OG\">"),
+            "{html}"
+        );
 
         // Empty metadata falls back to the `ALBEDO {route}` title — identical to
         // the build-time shell, so a dynamic route whose eval fails degrades

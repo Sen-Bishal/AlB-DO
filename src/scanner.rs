@@ -176,7 +176,6 @@ impl ProjectScanner {
         }
 
         for (parsed, &from_id) in components.iter().zip(&ids) {
-
             // Primary: resolve each import specifier to a file PATH relative to
             // the importer, then look it up in the path-keyed index. Catches
             // data/util imports the name match below cannot.
@@ -264,7 +263,9 @@ fn resolve_import_to_id(
         return None;
     }
 
-    let importer_dir = Path::new(importer_file_path).parent().unwrap_or(Path::new(""));
+    let importer_dir = Path::new(importer_file_path)
+        .parent()
+        .unwrap_or(Path::new(""));
     let base = normalize_specifier(importer_dir.join(source));
 
     import_candidates(&base)
@@ -301,7 +302,11 @@ mod tests {
         let mut parsed = parser
             .parse_source(route_src, "src/routes/index.tsx")
             .unwrap();
-        parsed.extend(parser.parse_source(data_src, "src/content/essays.ts").unwrap());
+        parsed.extend(
+            parser
+                .parse_source(data_src, "src/content/essays.ts")
+                .unwrap(),
+        );
 
         let scanner = ProjectScanner::new();
         let compiler = scanner.build_compiler(parsed);
@@ -424,9 +429,7 @@ mod tests {
     fn same_named_components_keep_their_own_dependency_edges() {
         let parser = ComponentParser::new();
         let counter = |label: &str| {
-            format!(
-                "export default function Counter() {{ return <button>{label}</button>; }}"
-            )
+            format!("export default function Counter() {{ return <button>{label}</button>; }}")
         };
         let page = |path: &str| {
             format!(

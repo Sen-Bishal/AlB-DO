@@ -145,10 +145,7 @@ impl ComponentGraph {
     pub fn calculate_out_degrees(&self) -> HashMap<ComponentId, usize> {
         let mut out_degrees = HashMap::new();
         for id in self.component_ids() {
-            let dep_count = self
-                .dependencies
-                .get(&id)
-                .map_or(0, |deps| deps.len());
+            let dep_count = self.dependencies.get(&id).map_or(0, |deps| deps.len());
             out_degrees.insert(id, dep_count);
         }
 
@@ -159,7 +156,6 @@ impl ComponentGraph {
     pub fn get_component(&self, id: ComponentId) -> Option<Component> {
         self.components.get(&id).map(|r| r.clone())
     }
-
 }
 
 impl Default for ComponentGraph {

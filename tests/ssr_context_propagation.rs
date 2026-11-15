@@ -33,7 +33,9 @@ const MODULE_SPEC: &str = "Component.tsx";
 /// context and would only make every assertion here a substring puzzle.
 fn render(source: &str) -> String {
     let mut engine = QuickJsEngine::new();
-    engine.init(&BootstrapPayload::default()).expect("engine init");
+    engine
+        .init(&BootstrapPayload::default())
+        .expect("engine init");
     engine
         .load_module_with_spec(MODULE_SPEC, source, None)
         .expect("component loads");
@@ -125,7 +127,8 @@ fn the_innermost_provider_wins_and_the_outer_one_is_restored() {
         }
         "#,
     );
-    let expected = "<div><span>outer</span><span>inner</span><span>outer</span><span>light</span></div>";
+    let expected =
+        "<div><span>outer</span><span>inner</span><span>outer</span><span>light</span></div>";
     assert!(
         html.contains(expected),
         "nesting/restore is wrong.\nexpected to contain: {expected}\nHTML: {html}"

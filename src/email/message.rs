@@ -152,7 +152,10 @@ impl Mailbox {
             (None, false) => (None, trimmed),
             _ => return Err(MessageError::Address(raw.to_string())),
         };
-        if name.as_ref().is_some_and(|n| n.len() > MAX_NAME_BYTES || n.contains(['<', '>', '"'])) {
+        if name
+            .as_ref()
+            .is_some_and(|n| n.len() > MAX_NAME_BYTES || n.contains(['<', '>', '"']))
+        {
             return Err(MessageError::Address(raw.to_string()));
         }
         if !is_plausible_address(address) {
@@ -194,9 +197,9 @@ fn is_plausible_address(address: &str) -> bool {
         && !domain.starts_with(['.', '-'])
         && !domain.ends_with(['.', '-'])
         && !domain.contains("..")
-        && !address
-            .chars()
-            .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '(' | ')' | ',' | ';' | '"' | '\\'))
+        && !address.chars().any(|c| {
+            c.is_whitespace() || matches!(c, '<' | '>' | '(' | ')' | ',' | ';' | '"' | '\\')
+        })
 }
 
 /// A message ready to hand to a transport.
@@ -426,9 +429,21 @@ impl Message {
         let message = Self {
             from: authored.from.as_deref().map(Mailbox::parse).transpose()?,
             to: authored.to.parse()?,
-            cc: authored.cc.map(OneOrMany::parse).transpose()?.unwrap_or_default(),
-            bcc: authored.bcc.map(OneOrMany::parse).transpose()?.unwrap_or_default(),
-            reply_to: authored.reply_to.as_deref().map(Mailbox::parse).transpose()?,
+            cc: authored
+                .cc
+                .map(OneOrMany::parse)
+                .transpose()?
+                .unwrap_or_default(),
+            bcc: authored
+                .bcc
+                .map(OneOrMany::parse)
+                .transpose()?
+                .unwrap_or_default(),
+            reply_to: authored
+                .reply_to
+                .as_deref()
+                .map(Mailbox::parse)
+                .transpose()?,
             subject: authored.subject,
             text: authored.text,
             html: authored.html,
@@ -543,7 +558,10 @@ mod tests {
     fn a_bare_address_and_a_named_one_both_parse() {
         assert_eq!(
             Mailbox::parse(" Ada@Example.com "),
-            Ok(Mailbox { name: None, address: "Ada@Example.com".into() })
+            Ok(Mailbox {
+                name: None,
+                address: "Ada@Example.com".into()
+            })
         );
         let named = Mailbox::parse("\"Lovelace, Ada\" <ada@example.com>").expect("parses");
         assert_eq!(named.name.as_deref(), Some("Lovelace, Ada"));
@@ -553,8 +571,19 @@ mod tests {
     #[test]
     fn implausible_addresses_are_refused() {
         for raw in [
-            "", "ada", "@x.dev", "ada@", "ada@x", "a@@x.dev", "ada@.x.dev", "ada@x..dev",
-            "ada lovelace@x.dev", "<ada@x.dev", "ada@x.dev>", "a,b@x.dev", "Ada <>",
+            "",
+            "ada",
+            "@x.dev",
+            "ada@",
+            "ada@x",
+            "a@@x.dev",
+            "ada@.x.dev",
+            "ada@x..dev",
+            "ada lovelace@x.dev",
+            "<ada@x.dev",
+            "ada@x.dev>",
+            "a,b@x.dev",
+            "Ada <>",
             "Evil <a@x.dev> <b@y.dev>",
         ] {
             assert!(Mailbox::parse(raw).is_err(), "`{raw}` must be refused");
@@ -605,7 +634,9 @@ mod tests {
 
     #[test]
     fn the_bounds_hold() {
-        let to: Vec<String> = (0..=MAX_RECIPIENTS).map(|i| format!("u{i}@x.dev")).collect();
+        let to: Vec<String> = (0..=MAX_RECIPIENTS)
+            .map(|i| format!("u{i}@x.dev"))
+            .collect();
         assert_eq!(
             Message::from_authored(&json!({ "to": to, "subject": "s", "text": "t" })).unwrap_err(),
             MessageError::TooManyRecipients(MAX_RECIPIENTS + 1)
@@ -638,8 +669,14 @@ mod tests {
         }))
         .expect("valid");
         assert_eq!(message.attachments.len(), 2);
-        assert_eq!(message.attachments[0].source, AttachmentSource::Inline("aGk=".into()));
-        assert_eq!(message.attachments[1].source, AttachmentSource::Upload(upload.clone()));
+        assert_eq!(
+            message.attachments[0].source,
+            AttachmentSource::Inline("aGk=".into())
+        );
+        assert_eq!(
+            message.attachments[1].source,
+            AttachmentSource::Upload(upload.clone())
+        );
 
         for bad in [
             json!({ "filename": "x", "content": "not base64!!" }),
@@ -669,8 +706,9 @@ mod tests {
             })),
             Err(MessageError::Attachment(_))
         ));
-        let big = base64::engine::general_purpose::STANDARD
-            .encode(vec![0u8; MAX_INLINE_ATTACHMENT_BYTES + 3]);
+        let big =
+            base64::engine::general_purpose::STANDARD
+                .encode(vec![0u8; MAX_INLINE_ATTACHMENT_BYTES + 3]);
         assert!(matches!(
             Message::from_authored(&json!({
                 "to": "a@x.dev", "subject": "s", "text": "t",
@@ -685,8 +723,14 @@ mod tests {
         let message =
             Message::from_authored(&json!({ "to": "a@x.dev", "subject": "s", "text": "t" }))
                 .expect("valid");
-        let queued = QueuedEmail { message, sensitive: true };
+        let queued = QueuedEmail {
+            message,
+            sensitive: true,
+        };
         let row = serde_json::to_string(&queued).expect("serializes");
-        assert_eq!(serde_json::from_str::<QueuedEmail>(&row).expect("parses"), queued);
+        assert_eq!(
+            serde_json::from_str::<QueuedEmail>(&row).expect("parses"),
+            queued
+        );
     }
 }

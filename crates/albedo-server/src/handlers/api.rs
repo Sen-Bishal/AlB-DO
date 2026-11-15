@@ -91,9 +91,8 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_invokes_handler_when_no_auth_policy() {
-        let handler: Arc<dyn ApiHandler> = Arc::new(|ctx: RequestContext| async move {
-            Ok(ApiResponse::ok(ctx.body))
-        });
+        let handler: Arc<dyn ApiHandler> =
+            Arc::new(|ctx: RequestContext| async move { Ok(ApiResponse::ok(ctx.body)) });
         let auth: Arc<dyn AuthProvider> = Arc::new(AllowAllAuthProvider);
 
         let response = dispatch_api_route(

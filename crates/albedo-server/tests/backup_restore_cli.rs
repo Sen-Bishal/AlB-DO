@@ -47,7 +47,12 @@ fn run(cmd: &mut Command, what: &str) -> (bool, String) {
 
 /// Start `serve`, wait until it answers, and return it with its base URL and
 /// the file its stdout goes to.
-async fn serve(home: &Path, app: &Path, env: &[(&str, &str)], log: &str) -> (Server, String, PathBuf) {
+async fn serve(
+    home: &Path,
+    app: &Path,
+    env: &[(&str, &str)],
+    log: &str,
+) -> (Server, String, PathBuf) {
     let port = {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
         probe.local_addr().expect("addr").port()
@@ -63,7 +68,10 @@ async fn serve(home: &Path, app: &Path, env: &[(&str, &str)], log: &str) -> (Ser
     };
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(90);
-    while reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_err() {
+    while reqwest::get(format!("{base}/_albedo/runtime.js"))
+        .await
+        .is_err()
+    {
         assert!(
             Instant::now() < deadline,
             "albedo serve never answered on {base}\n{}",
@@ -112,7 +120,10 @@ fn import(home: &Path, app: &Path, name: &str, rows: &str) {
 async fn a_restore_staged_while_serving_lands_on_the_next_start() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    let (ok, text) = run(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    let (ok, text) = run(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     assert!(ok, "albedo init failed\n{text}");
     let app = work.path().join("app");
     fs::write(app.join("src/routes/list.tsx"), LIST_PAGE).unwrap();
@@ -127,7 +138,10 @@ async fn a_restore_staged_while_serving_lands_on_the_next_start() {
 
     // Nothing to back up yet is a refusal, not an empty backup — but here
     // there is a database, so this is the real one.
-    let (ok, text) = run(albedo(home.path(), &app).args(["db", "backup"]), "albedo db backup");
+    let (ok, text) = run(
+        albedo(home.path(), &app).args(["db", "backup"]),
+        "albedo db backup",
+    );
     assert!(ok, "albedo db backup failed\n{text}");
     assert!(text.contains("backup taken and checked"), "{text}");
     let snapshots: Vec<PathBuf> = fs::read_dir(app.join("backups"))
@@ -144,9 +158,19 @@ async fn a_restore_staged_while_serving_lands_on_the_next_start() {
         "{\"id\": 3, \"author\": \"a\", \"message\": \"written after the backup\"}\n",
     );
 
-    let (ok, text) = run(albedo(home.path(), &app).args(["db", "backups"]), "albedo db backups");
-    let name = snapshots[0].file_name().unwrap().to_string_lossy().into_owned();
-    assert!(ok && text.contains(&name), "the snapshot is not listed\n{text}");
+    let (ok, text) = run(
+        albedo(home.path(), &app).args(["db", "backups"]),
+        "albedo db backups",
+    );
+    let name = snapshots[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        ok && text.contains(&name),
+        "the snapshot is not listed\n{text}"
+    );
 
     {
         let (_server, base, stdout) = serve(
@@ -162,12 +186,11 @@ async fn a_restore_staged_while_serving_lands_on_the_next_start() {
         // The schedule takes one at boot: there were none in its directory.
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let taken = fs::read_dir(app.join("scheduled"))
-                .is_ok_and(|entries| {
-                    entries
-                        .flatten()
-                        .any(|entry| entry.path().join("manifest.json").is_file())
-                });
+            let taken = fs::read_dir(app.join("scheduled")).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.path().join("manifest.json").is_file())
+            });
             if taken {
                 break;
             }
@@ -175,7 +198,10 @@ async fn a_restore_staged_while_serving_lands_on_the_next_start() {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         let banner = fs::read_to_string(&stdout).unwrap_or_default();
-        assert!(banner.contains("every 1d to"), "the schedule is not announced\n{banner}");
+        assert!(
+            banner.contains("every 1d to"),
+            "the schedule is not announced\n{banner}"
+        );
 
         // Staged while serving: checked, compared against what is live, and
         // the running server is untouched by it.
@@ -185,18 +211,33 @@ async fn a_restore_staged_while_serving_lands_on_the_next_start() {
         );
         assert!(ok, "albedo db restore failed\n{text}");
         assert!(text.contains("staged and checked"), "{text}");
-        assert!(text.contains("2 rows (now 3)"), "the comparison with live is missing\n{text}");
+        assert!(
+            text.contains("2 rows (now 3)"),
+            "the comparison with live is missing\n{text}"
+        );
         assert!(page(&base).await.contains("3:written after the backup"));
     }
 
     // The next start applies it, says so, and keeps what it replaced.
     let (_server, base, stdout) = serve(home.path(), &app, &[], "second").await;
     let after = page(&base).await;
-    assert!(after.contains("1:kept one") && after.contains("2:kept two"), "{after}");
-    assert!(!after.contains("written after the backup"), "the restore did not land\n{after}");
+    assert!(
+        after.contains("1:kept one") && after.contains("2:kept two"),
+        "{after}"
+    );
+    assert!(
+        !after.contains("written after the backup"),
+        "the restore did not land\n{after}"
+    );
     let banner = fs::read_to_string(&stdout).unwrap_or_default();
-    assert!(banner.contains("BACKUP · restored the backup taken"), "{banner}");
-    assert!(banner.contains("backups are off"), "an unscheduled server must say so\n{banner}");
+    assert!(
+        banner.contains("BACKUP · restored the backup taken"),
+        "{banner}"
+    );
+    assert!(
+        banner.contains("backups are off"),
+        "an unscheduled server must say so\n{banner}"
+    );
     assert!(!app.join("forge.db.restore-pending").exists());
 
     // The replaced database is kept — and whole. The first server was killed,
@@ -222,7 +263,11 @@ async fn a_restore_staged_while_serving_lands_on_the_next_start() {
     )
     .await
     .expect("the kept database holds the guestbook");
-    assert_eq!(rows.rows.len(), 1, "the row written after the backup is lost");
+    assert_eq!(
+        rows.rows.len(),
+        1,
+        "the row written after the backup is lost"
+    );
 }
 
 /// Found by review 2026-10-30: restore read the live database for its
@@ -233,7 +278,10 @@ async fn a_restore_staged_while_serving_lands_on_the_next_start() {
 async fn a_damaged_live_database_does_not_block_its_own_restore() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    let (ok, text) = run(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    let (ok, text) = run(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     assert!(ok, "albedo init failed\n{text}");
     let app = work.path().join("app");
     fs::write(app.join("src/routes/list.tsx"), LIST_PAGE).unwrap();
@@ -243,7 +291,10 @@ async fn a_damaged_live_database_does_not_block_its_own_restore() {
         "rows.jsonl",
         "{\"id\": 1, \"author\": \"a\", \"message\": \"survives the damage\"}\n",
     );
-    let (ok, text) = run(albedo(home.path(), &app).args(["db", "backup"]), "albedo db backup");
+    let (ok, text) = run(
+        albedo(home.path(), &app).args(["db", "backup"]),
+        "albedo db backup",
+    );
     assert!(ok, "{text}");
 
     for sidecar in ["forge.db-wal", "forge.db-shm"] {
@@ -256,7 +307,10 @@ async fn a_damaged_live_database_does_not_block_its_own_restore() {
         "albedo db restore",
     );
     assert!(ok, "a damaged live database blocked the restore\n{text}");
-    assert!(text.contains("could not be read"), "the missing comparison is not said\n{text}");
+    assert!(
+        text.contains("could not be read"),
+        "the missing comparison is not said\n{text}"
+    );
     assert!(app.join("forge.db.restore-pending").exists());
 
     let (_server, base, _stdout) = serve(home.path(), &app, &[], "restored").await;
@@ -267,14 +321,23 @@ async fn a_damaged_live_database_does_not_block_its_own_restore() {
 async fn a_backup_that_no_longer_fits_the_schema_is_refused_before_staging() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    let (ok, text) = run(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    let (ok, text) = run(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     assert!(ok, "albedo init failed\n{text}");
     let app = work.path().join("app");
 
     // No database yet: nothing to back up, and nothing invented to back up.
-    let (ok, text) = run(albedo(home.path(), &app).args(["db", "backup"]), "albedo db backup");
+    let (ok, text) = run(
+        albedo(home.path(), &app).args(["db", "backup"]),
+        "albedo db backup",
+    );
     assert!(!ok && text.contains("nothing to back up"), "{text}");
-    assert!(!app.join("forge.db").exists(), "a backup created the database it was asked to copy");
+    assert!(
+        !app.join("forge.db").exists(),
+        "a backup created the database it was asked to copy"
+    );
 
     import(
         home.path(),
@@ -282,7 +345,10 @@ async fn a_backup_that_no_longer_fits_the_schema_is_refused_before_staging() {
         "rows.jsonl",
         "{\"id\": 1, \"author\": \"a\", \"message\": \"m\"}\n",
     );
-    let (ok, text) = run(albedo(home.path(), &app).args(["db", "backup"]), "albedo db backup");
+    let (ok, text) = run(
+        albedo(home.path(), &app).args(["db", "backup"]),
+        "albedo db backup",
+    );
     assert!(ok, "{text}");
 
     // The app drops a field the backup's table still has.
@@ -292,15 +358,27 @@ async fn a_backup_that_no_longer_fits_the_schema_is_refused_before_staging() {
         "fields: { author: \"text\", message: \"text\" }",
         "fields: { message: \"text\" }",
     );
-    assert_ne!(declared, narrowed, "the scaffold's guestbook declaration moved");
+    assert_ne!(
+        declared, narrowed,
+        "the scaffold's guestbook declaration moved"
+    );
     fs::write(&config, narrowed).unwrap();
 
     let (ok, text) = run(
         albedo(home.path(), &app).args(["db", "restore", "latest"]),
         "albedo db restore",
     );
-    assert!(!ok, "a restore the server would refuse to boot on was staged\n{text}");
-    assert!(text.contains("does not fit the app as it is declared now"), "{text}");
-    assert!(text.contains("author"), "the drifted field is not named\n{text}");
+    assert!(
+        !ok,
+        "a restore the server would refuse to boot on was staged\n{text}"
+    );
+    assert!(
+        text.contains("does not fit the app as it is declared now"),
+        "{text}"
+    );
+    assert!(
+        text.contains("author"),
+        "the drifted field is not named\n{text}"
+    );
     assert!(!app.join("forge.db.restore-pending").exists());
 }

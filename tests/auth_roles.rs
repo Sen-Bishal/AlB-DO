@@ -59,11 +59,16 @@ async fn resolved_roles(db: &LibSqlSubstrate, token: &SessionToken) -> Vec<Strin
 async fn granted_roles_reach_the_resolved_session_and_the_job_path() {
     let db = booted().await;
     let (ada, token) = person(&db, "ada", "ada@example.com").await;
-    assert_eq!(resolved_roles(&db, &token).await, [] as [std::string::String; 0]);
+    assert_eq!(
+        resolved_roles(&db, &token).await,
+        [] as [std::string::String; 0]
+    );
 
     for role in ["payroll", "admin"] {
         assert_eq!(
-            grant_role(&db, &ada.id, role, Some("cli"), NOW).await.expect("grant"),
+            grant_role(&db, &ada.id, role, Some("cli"), NOW)
+                .await
+                .expect("grant"),
             GrantOutcome::Granted
         );
     }
@@ -82,9 +87,13 @@ async fn granted_roles_reach_the_resolved_session_and_the_job_path() {
 async fn granting_a_held_role_again_is_a_no_op() {
     let db = booted().await;
     let (ada, token) = person(&db, "ada", "ada@example.com").await;
-    grant_role(&db, &ada.id, "admin", Some("cli"), NOW).await.expect("grant");
+    grant_role(&db, &ada.id, "admin", Some("cli"), NOW)
+        .await
+        .expect("grant");
     assert_eq!(
-        grant_role(&db, &ada.id, "admin", Some("cli"), NOW).await.expect("grant"),
+        grant_role(&db, &ada.id, "admin", Some("cli"), NOW)
+            .await
+            .expect("grant"),
         GrantOutcome::AlreadyHeld
     );
     assert_eq!(resolved_roles(&db, &token).await, ["admin"]);
@@ -97,10 +106,15 @@ async fn granting_to_an_unknown_principal_is_refused() {
     let db = booted().await;
     let stranger = PrincipalId::parse("u_doesnotexist").expect("valid id");
     assert_eq!(
-        grant_role(&db, &stranger, "admin", Some("cli"), NOW).await.expect("grant"),
+        grant_role(&db, &stranger, "admin", Some("cli"), NOW)
+            .await
+            .expect("grant"),
         GrantOutcome::NoSuchPrincipal
     );
-    assert_eq!(role_grants(&db, None).await.expect("list"), [] as [dom_render_compiler::auth::store::RoleGrant; 0]);
+    assert_eq!(
+        role_grants(&db, None).await.expect("list"),
+        [] as [dom_render_compiler::auth::store::RoleGrant; 0]
+    );
 }
 
 /// Revocation takes effect on the very next resolution — there is no cache to
@@ -109,8 +123,12 @@ async fn granting_to_an_unknown_principal_is_refused() {
 async fn a_revoked_role_is_gone_at_the_next_resolution() {
     let db = booted().await;
     let (ada, token) = person(&db, "ada", "ada@example.com").await;
-    grant_role(&db, &ada.id, "admin", Some("cli"), NOW).await.expect("grant");
-    grant_role(&db, &ada.id, "payroll", Some("cli"), NOW).await.expect("grant");
+    grant_role(&db, &ada.id, "admin", Some("cli"), NOW)
+        .await
+        .expect("grant");
+    grant_role(&db, &ada.id, "payroll", Some("cli"), NOW)
+        .await
+        .expect("grant");
 
     assert!(revoke_role(&db, &ada.id, "payroll").await.expect("revoke"));
     assert_eq!(resolved_roles(&db, &token).await, ["admin"]);
@@ -127,9 +145,15 @@ async fn role_grants_list_every_grant_or_one_roles() {
     let db = booted().await;
     let (ada, _) = person(&db, "ada", "ada@example.com").await;
     let (bob, _) = person(&db, "bob", "bob@example.com").await;
-    grant_role(&db, &ada.id, "admin", Some("cli"), NOW).await.expect("grant");
-    grant_role(&db, &bob.id, "payroll", Some("cli"), NOW).await.expect("grant");
-    grant_role(&db, &ada.id, "payroll", Some("cli"), NOW).await.expect("grant");
+    grant_role(&db, &ada.id, "admin", Some("cli"), NOW)
+        .await
+        .expect("grant");
+    grant_role(&db, &bob.id, "payroll", Some("cli"), NOW)
+        .await
+        .expect("grant");
+    grant_role(&db, &ada.id, "payroll", Some("cli"), NOW)
+        .await
+        .expect("grant");
 
     let all = role_grants(&db, None).await.expect("list");
     assert_eq!(all.len(), 3);
@@ -138,7 +162,9 @@ async fn role_grants_list_every_grant_or_one_roles() {
     let mut emails: Vec<_> = payroll.iter().filter_map(|g| g.email.clone()).collect();
     emails.sort();
     assert_eq!(emails, ["ada@example.com", "bob@example.com"]);
-    assert!(payroll.iter().all(|g| g.role == "payroll" && g.granted_by.as_deref() == Some("cli")));
+    assert!(payroll
+        .iter()
+        .all(|g| g.role == "payroll" && g.granted_by.as_deref() == Some("cli")));
 }
 
 /// The CLI accepts an email. Email is not unique (two providers may report one
@@ -149,19 +175,26 @@ async fn an_email_can_name_several_principals() {
     let db = booted().await;
     let (ada, _) = person(&db, "ada", "ada@example.com").await;
     assert_eq!(
-        principals_with_email(&db, "ADA@example.com").await.expect("lookup"),
+        principals_with_email(&db, "ADA@example.com")
+            .await
+            .expect("lookup"),
         std::slice::from_ref(&ada.id),
         "email matching ignores case"
     );
     let (other, _) = person(&db, "ada-2", "ada@example.com").await;
-    let mut found = principals_with_email(&db, "ada@example.com").await.expect("lookup");
+    let mut found = principals_with_email(&db, "ada@example.com")
+        .await
+        .expect("lookup");
     found.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     let mut expected = vec![ada.id, other.id];
     expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     assert_eq!(found, expected);
-    assert_eq!(principals_with_email(&db, "nobody@example.com")
-        .await
-        .expect("lookup"), [] as [dom_render_compiler::auth::PrincipalId; 0]);
+    assert_eq!(
+        principals_with_email(&db, "nobody@example.com")
+            .await
+            .expect("lookup"),
+        [] as [dom_render_compiler::auth::PrincipalId; 0]
+    );
 }
 
 /// Erasing a person erases their grants. A role row outliving its principal is
@@ -170,11 +203,16 @@ async fn an_email_can_name_several_principals() {
 async fn deleting_a_principal_deletes_its_roles() {
     let db = booted().await;
     let (ada, _) = person(&db, "ada", "ada@example.com").await;
-    grant_role(&db, &ada.id, "admin", Some("cli"), NOW).await.expect("grant");
+    grant_role(&db, &ada.id, "admin", Some("cli"), NOW)
+        .await
+        .expect("grant");
     delete_principal(&db, &ada.id).await.expect("delete");
     let left = db
         .query(
-            &format!("SELECT COUNT(*) FROM {} WHERE principal = ?1", schema::ROLES),
+            &format!(
+                "SELECT COUNT(*) FROM {} WHERE principal = ?1",
+                schema::ROLES
+            ),
             &[SqlValue::Text(ada.id.as_str().to_string())],
         )
         .await

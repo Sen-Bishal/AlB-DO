@@ -113,7 +113,9 @@ impl Matcher {
         };
         let decoded = percent_decode_path(raw_path);
         let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
-        patterns.iter().any(|pattern| pattern.matches_segments(&segments))
+        patterns
+            .iter()
+            .any(|pattern| pattern.matches_segments(&segments))
     }
 
     /// The pattern sources, for diagnostics. `None` when every request matches.
@@ -136,10 +138,12 @@ impl Pattern {
         if !source.starts_with('/') {
             return refuse("a pattern must start with `/`");
         }
-        if let Some(bad) = source
-            .chars()
-            .find(|c| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '|' | '^' | '$'))
-        {
+        if let Some(bad) = source.chars().find(|c| {
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '|' | '^' | '$'
+            )
+        }) {
             return refuse(&format!(
                 "`{bad}` is regex syntax, which is not supported. Use `:name` for one segment \
                  and `:name*` / `:name+` for the rest of the path"
@@ -152,8 +156,16 @@ impl Pattern {
             let last = index + 1 == parts.len();
             let segment = if let Some(param) = part.strip_prefix(':') {
                 let (name, kind) = match param.chars().last() {
-                    Some('*') => (&param[..param.len() - 1], Segment::Rest { at_least_one: false }),
-                    Some('+') => (&param[..param.len() - 1], Segment::Rest { at_least_one: true }),
+                    Some('*') => (
+                        &param[..param.len() - 1],
+                        Segment::Rest {
+                            at_least_one: false,
+                        },
+                    ),
+                    Some('+') => (
+                        &param[..param.len() - 1],
+                        Segment::Rest { at_least_one: true },
+                    ),
                     Some('?') => (&param[..param.len() - 1], Segment::Optional),
                     _ => (param, Segment::Param),
                 };
@@ -359,7 +371,10 @@ mod tests {
         ] {
             let err = Pattern::parse(pattern).expect_err(pattern);
             assert!(err.contains(needle), "{pattern}: {err}");
-            assert!(err.contains(pattern), "the refusal names the pattern: {err}");
+            assert!(
+                err.contains(pattern),
+                "the refusal names the pattern: {err}"
+            );
         }
     }
 

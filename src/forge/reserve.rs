@@ -33,20 +33,17 @@
 //! Three layers, deliberately redundant — the invariant is the product, so
 //! it does not rest on any single line being right:
 //!
-//! 1. **The conditional decrement.** `UPDATE … SET remaining = remaining - n
-//!    WHERE key = ? AND remaining >= n` is a single atomic statement. Rows
-//!    affected is the verdict: `1` won, `0` lost. No read-then-write race
-//!    exists, because there is no read.
-//! 2. **The transaction.** The decrement and the reservation insert commit as
-//!    one unit through [`DataSubstrate::begin`] (`BEGIN IMMEDIATE` on libSQL —
-//!    the write lock is taken up front, so concurrent claims serialise
-//!    instead of racing a deferred lock upgrade into `SQLITE_BUSY`). A crash
-//!    between the two cannot leave supply consumed with no claim recorded, or
-//!    a claim recorded against supply that was never taken.
-//! 3. **The schema.** `CHECK (remaining >= 0 AND remaining <= capacity)` means
-//!    the *store itself* refuses to represent an oversold or over-released
-//!    resource. If layers 1 and 2 were both wrong, the write still fails loudly
-//!    rather than silently corrupting the count.
+//! 1. **The conditional decrement.** `UPDATE … SET remaining = remaining - n WHERE key = ? AND
+//!    remaining >= n` is a single atomic statement. Rows affected is the verdict: `1` won, `0`
+//!    lost. No read-then-write race exists, because there is no read.
+//! 2. **The transaction.** The decrement and the reservation insert commit as one unit through
+//!    [`DataSubstrate::begin`] (`BEGIN IMMEDIATE` on libSQL — the write lock is taken up front, so
+//!    concurrent claims serialise instead of racing a deferred lock upgrade into `SQLITE_BUSY`). A
+//!    crash between the two cannot leave supply consumed with no claim recorded, or a claim
+//!    recorded against supply that was never taken.
+//! 3. **The schema.** `CHECK (remaining >= 0 AND remaining <= capacity)` means the *store itself*
+//!    refuses to represent an oversold or over-released resource. If layers 1 and 2 were both
+//!    wrong, the write still fails loudly rather than silently corrupting the count.
 //!
 //! ## Idempotency
 //!
@@ -362,17 +359,15 @@ impl<'a> Reservations<'a> {
     /// [`begin`](DataSubstrate::begin) — WAL reads take no lock and run in
     /// parallel:
     ///
-    /// 1. **A replay.** Checked *first*, because a retry must be honoured even
-    ///    when supply is gone: the buyer who took the last unit and never saw
-    ///    the response is owed their reservation, not a "sold out".
-    /// 2. **A claim supply cannot cover.** A fresh read of `remaining` that
-    ///    cannot cover the request is a truthful verdict *for a request
-    ///    arriving at that instant* — which is exactly what linearizability
-    ///    asks. It is never stale in a way that matters: nothing is cached, and
-    ///    a claim that loses this check would equally have lost the race a
-    ///    microsecond later. Under [`release`](Self::release) supply can rise
-    ///    again, so this answers "sold out *now*", not "sold out forever" —
-    ///    the next caller reads the new value.
+    /// 1. **A replay.** Checked *first*, because a retry must be honoured even when supply is gone:
+    ///    the buyer who took the last unit and never saw the response is owed their reservation,
+    ///    not a "sold out".
+    /// 2. **A claim supply cannot cover.** A fresh read of `remaining` that cannot cover the
+    ///    request is a truthful verdict *for a request arriving at that instant* — which is exactly
+    ///    what linearizability asks. It is never stale in a way that matters: nothing is cached,
+    ///    and a claim that loses this check would equally have lost the race a microsecond later.
+    ///    Under [`release`](Self::release) supply can rise again, so this answers "sold out *now*",
+    ///    not "sold out forever" — the next caller reads the new value.
     ///
     /// Neither fast path decides anything. **The authoritative verdict is still
     /// the conditional `UPDATE` inside the transaction**; these only spare the
@@ -467,7 +462,10 @@ impl<'a> Reservations<'a> {
     /// lock. A filter for the fast path; the in-transaction lookup remains the
     /// authority.
     async fn find_prior(&self, key: &str) -> Result<Option<PriorReservation>> {
-        let rows = self.substrate.query(PRIOR_BY_KEY_SQL, &[key.into()]).await?;
+        let rows = self
+            .substrate
+            .query(PRIOR_BY_KEY_SQL, &[key.into()])
+            .await?;
         Ok(parse_prior(&rows))
     }
 
@@ -664,7 +662,11 @@ mod tests {
         let mut exhausted = 0;
         for i in 0..5 {
             let holder = format!("buyer{i}");
-            match r.reserve(&ReserveRequest::new("ticket", &holder)).await.unwrap() {
+            match r
+                .reserve(&ReserveRequest::new("ticket", &holder))
+                .await
+                .unwrap()
+            {
                 ReserveOutcome::Reserved { .. } => reserved += 1,
                 ReserveOutcome::Exhausted { remaining } => {
                     exhausted += 1;
@@ -797,8 +799,10 @@ mod tests {
         let db = with_resource("seat", 1).await;
         let r = Reservations::new(&db);
 
-        let ReserveOutcome::Reserved { reservation_id, .. } =
-            r.reserve(&ReserveRequest::new("seat", "ada")).await.unwrap()
+        let ReserveOutcome::Reserved { reservation_id, .. } = r
+            .reserve(&ReserveRequest::new("seat", "ada"))
+            .await
+            .unwrap()
         else {
             panic!("expected a reservation");
         };
@@ -819,7 +823,9 @@ mod tests {
 
         // The freed unit is genuinely claimable again.
         assert!(matches!(
-            r.reserve(&ReserveRequest::new("seat", "alan")).await.unwrap(),
+            r.reserve(&ReserveRequest::new("seat", "alan"))
+                .await
+                .unwrap(),
             ReserveOutcome::Reserved { .. }
         ));
     }
@@ -829,7 +835,9 @@ mod tests {
         let db = with_resource("ticket", 3).await;
         let r = Reservations::new(&db);
 
-        r.reserve(&ReserveRequest::new("ticket", "ada")).await.unwrap();
+        r.reserve(&ReserveRequest::new("ticket", "ada"))
+            .await
+            .unwrap();
         r.define("ticket", 99).await.unwrap();
 
         assert_eq!(
@@ -895,9 +903,18 @@ mod tests {
             refused.is_empty(),
             "every loser must lose cleanly as Exhausted, not error: {refused:?}"
         );
-        assert_eq!(exhausted, 15, "the other 15 claimants see an honest sold-out");
-        assert_eq!(db.query("SELECT remaining FROM forge_resource", &[]).await.unwrap().rows[0]
-            .get(0)
-            .and_then(SqlValue::as_i64), Some(0));
+        assert_eq!(
+            exhausted, 15,
+            "the other 15 claimants see an honest sold-out"
+        );
+        assert_eq!(
+            db.query("SELECT remaining FROM forge_resource", &[])
+                .await
+                .unwrap()
+                .rows[0]
+                .get(0)
+                .and_then(SqlValue::as_i64),
+            Some(0)
+        );
     }
 }

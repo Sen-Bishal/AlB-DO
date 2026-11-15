@@ -567,11 +567,15 @@ fn test_a3_3_ssr_stamps_island_marker_and_hydrates_end_to_end() {
         result.html
     );
     // Sanity: text content is still there.
-    assert!(result.html.contains("count: 5"), "SSR HTML must contain rendered content");
+    assert!(
+        result.html.contains("count: 5"),
+        "SSR HTML must contain rendered content"
+    );
 
     // --- client side (full e2e under QuickJS) ---------------------------------
-    let island_script = compile_client_island_module("components/counter", A33_COUNTER_TSX, ISLAND_ID)
-        .expect("counter island should compile to a self-registering browser module");
+    let island_script =
+        compile_client_island_module("components/counter", A33_COUNTER_TSX, ISLAND_ID)
+            .expect("counter island should compile to a self-registering browser module");
 
     // Extract the bootstrap script from the head tags.
     let bootstrap_tag = result
@@ -588,13 +592,17 @@ fn test_a3_3_ssr_stamps_island_marker_and_hydrates_end_to_end() {
     let context = Context::full(&runtime).expect("quickjs context should initialise");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM_A33).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME_A33).expect("client runtime should evaluate");
-        ctx.eval::<(), _>(island_script.as_str()).expect("island script should evaluate");
+        ctx.eval::<(), _>(DOM_SHIM_A33)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME_A33)
+            .expect("client runtime should evaluate");
+        ctx.eval::<(), _>(island_script.as_str())
+            .expect("island script should evaluate");
 
         // Wire the payload so the bootstrap can verify the checksum.
         let setup = format!("globalThis.__payloadText = {payload_json};");
-        ctx.eval::<(), _>(setup.as_str()).expect("payload setup should evaluate");
+        ctx.eval::<(), _>(setup.as_str())
+            .expect("payload setup should evaluate");
 
         // Build the DOM tree that matches the SSR output (button with island marker).
         let dom_setup = format!(
@@ -608,11 +616,13 @@ globalThis.__domRoot = body;
 globalThis.__button = button;
 "
         );
-        ctx.eval::<(), _>(dom_setup.as_str()).expect("DOM setup should evaluate");
+        ctx.eval::<(), _>(dom_setup.as_str())
+            .expect("DOM setup should evaluate");
 
         // Run the bootstrap. For OnInteraction islands, it wires a click
         // listener on the island root that fires __ALBEDO_HYDRATE_ISLAND.
-        ctx.eval::<(), _>(bootstrap_script).expect("bootstrap should evaluate");
+        ctx.eval::<(), _>(bootstrap_script)
+            .expect("bootstrap should evaluate");
 
         // First click → bootstrap listener fires → hydrateIslandDescriptor →
         // adopts server button, wires component's onClick.
@@ -624,26 +634,40 @@ globalThis.__button = button;
         ctx.eval::<(), _>("globalThis.__button.__dispatch('click');")
             .expect("second click should dispatch");
 
-        ctx.eval::<String, _>(r"JSON.stringify({
+        ctx.eval::<String, _>(
+            r"JSON.stringify({
   hydrated: globalThis.__button.getAttribute('data-albedo-hydrated'),
   text: globalThis.__button.firstChild.nodeValue,
   sameNode: globalThis.__domRoot.firstChild === globalThis.__button,
   network: globalThis.__net,
-})")
-            .expect("summary should serialize")
+})",
+        )
+        .expect("summary should serialize")
     });
 
     let value: serde_json::Value =
         serde_json::from_str(&summary).expect("summary should be valid JSON");
 
     // The bootstrap marked the root hydrated on first click.
-    assert_eq!(value["hydrated"], "true", "island root must be marked hydrated");
+    assert_eq!(
+        value["hydrated"], "true",
+        "island root must be marked hydrated"
+    );
     // The second click advanced local state — no server round-trip.
-    assert_eq!(value["text"], "count: 6", "client state must advance on click");
+    assert_eq!(
+        value["text"], "count: 6",
+        "client state must advance on click"
+    );
     // The server DOM node was adopted, not recreated.
-    assert_eq!(value["sameNode"], true, "server node must be patched in place");
+    assert_eq!(
+        value["sameNode"], true,
+        "server node must be patched in place"
+    );
     // Zero network calls — the whole interaction was local.
-    assert_eq!(value["network"], 0, "Tier-C interaction must not round-trip");
+    assert_eq!(
+        value["network"], 0,
+        "Tier-C interaction must not round-trip"
+    );
 }
 
 // ── Regression · `<Link>` inside a Tier-C island ─────────────────────────────
@@ -757,7 +781,9 @@ fn tier_c_island_containing_a_link_renders_instead_of_an_empty_placeholder() {
 
     // The whole point: the placeholder is not empty, so the bootstrap has a node.
     assert!(
-        result.html.contains(&format!("data-albedo-island=\"{ISLAND_ID}\"")),
+        result
+            .html
+            .contains(&format!("data-albedo-island=\"{ISLAND_ID}\"")),
         "island marker must be present or hydration can never find the node: got {:?}",
         result.html
     );

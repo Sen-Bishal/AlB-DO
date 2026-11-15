@@ -91,7 +91,8 @@ async fn upstream() -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
                 let (h, a) = (Arc::clone(&h), Arc::clone(&a));
                 async move {
                     h.fetch_add(1, Ordering::SeqCst);
-                    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok())
+                    {
                         a.lock().unwrap().push(value.to_string());
                     }
                     ([("content-type", "application/json")], r#"{"open":true}"#)
@@ -101,7 +102,9 @@ async fn upstream() -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
         // The declared route the source's refresh loop polls. Kept apart from
         // `/flags` so its traffic cannot satisfy an assertion about the middleware.
         .route("/status", axum::routing::get(|| async { "{}" }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("upstream binds");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream binds");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -165,10 +168,16 @@ async fn serve_with_env(home: &Path, app: &Path, env: &[(&str, &str)]) -> (Serve
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_ok() {
+        if reqwest::get(format!("{base}/_albedo/runtime.js"))
+            .await
+            .is_ok()
+        {
             break;
         }
-        assert!(Instant::now() < deadline, "albedo serve never answered on {base}");
+        assert!(
+            Instant::now() < deadline,
+            "albedo serve never answered on {base}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     (server, base)
@@ -209,7 +218,8 @@ async fn sign_up(client: &reqwest::Client, base: &str) -> String {
         .to_string();
     let html = page.text().await.expect("html");
     let csrf = hidden_field(&html, "_csrf").expect("the form carries a CSRF token");
-    let return_path = hidden_field(&html, "_albedo_return").expect("the form carries a return path");
+    let return_path =
+        hidden_field(&html, "_albedo_return").expect("the form carries a return path");
 
     let registered = client
         .post(format!("{base}/_albedo/auth/password/register"))
@@ -223,7 +233,11 @@ async fn sign_up(client: &reqwest::Client, base: &str) -> String {
         .send()
         .await
         .expect("register responds");
-    assert_eq!(registered.status(), StatusCode::SEE_OTHER, "sign-up answers PRG");
+    assert_eq!(
+        registered.status(),
+        StatusCode::SEE_OTHER,
+        "sign-up answers PRG"
+    );
     let session = registered
         .headers()
         .get_all("set-cookie")
@@ -241,7 +255,10 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
     let home = tempfile::tempdir().expect("home");
     let work = tempfile::tempdir().expect("work");
 
-    run_ok(albedo(home.path(), work.path()).args(["init", "mwapp"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "mwapp"]),
+        "albedo init",
+    );
     let app = work.path().join("mwapp");
     fs::create_dir_all(app.join("src/lib")).unwrap();
     fs::create_dir_all(app.join("public")).unwrap();
@@ -249,13 +266,19 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
     fs::write(
         app.join("src/middleware.ts"),
         MIDDLEWARE_TS
-            .replace("__FLAGS_UNDECLARED__", &flags_base.replace("127.0.0.1", "localhost"))
+            .replace(
+                "__FLAGS_UNDECLARED__",
+                &flags_base.replace("127.0.0.1", "localhost"),
+            )
             .replace("__FLAGS__", &flags_base),
     )
     .unwrap();
     let config_path = app.join("albedo.config.ts");
     let config = fs::read_to_string(&config_path).expect("scaffold config");
-    assert!(config.contains("export default {"), "the scaffold config shape changed");
+    assert!(
+        config.contains("export default {"),
+        "the scaffold config shape changed"
+    );
     fs::write(
         &config_path,
         config.replacen(
@@ -271,10 +294,16 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
     fs::write(app.join("src/routes/dash.tsx"), DASH_TSX).unwrap();
     fs::write(app.join("public/hello.txt"), "hello asset").unwrap();
 
-    let build = albedo(home.path(), &app).arg("build").output().expect("albedo build runs");
+    let build = albedo(home.path(), &app)
+        .arg("build")
+        .output()
+        .expect("albedo build runs");
     let build_report = String::from_utf8_lossy(&build.stdout).to_string()
         + &String::from_utf8_lossy(&build.stderr);
-    assert!(build.status.success(), "albedo build failed:\n{build_report}");
+    assert!(
+        build.status.success(),
+        "albedo build failed:\n{build_report}"
+    );
     // The regression that motivated starting from the CLI, checked on the
     // artifact rather than the report: the tier table is decorated for a
     // terminal, and a string search over it passed with the bug reintroduced.
@@ -288,9 +317,14 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
         .iter()
         .filter_map(|c| c["name"].as_str())
         .collect();
-    assert!(components.contains(&"Dash"), "control: routes are components: {components:?}");
     assert!(
-        !components.iter().any(|name| name.eq_ignore_ascii_case("middleware")),
+        components.contains(&"Dash"),
+        "control: routes are components: {components:?}"
+    );
+    assert!(
+        !components
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("middleware")),
         "the middleware was compiled as a component: {components:?}"
     );
 
@@ -307,7 +341,10 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
     assert_eq!(header(&home_page, "x-mw").as_deref(), Some("GET / anon"));
 
     let asset = get("/hello.txt").await.unwrap();
-    assert_eq!(header(&asset, "x-mw").as_deref(), Some("GET /hello.txt anon"));
+    assert_eq!(
+        header(&asset, "x-mw").as_deref(),
+        Some("GET /hello.txt anon")
+    );
     assert_eq!(asset.text().await.unwrap(), "hello asset");
 
     // ── redirect, respond, rewrite ──
@@ -327,7 +364,10 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
         alias.text().await.unwrap().contains("guestbook"),
         "a rewrite serves the target route"
     );
-    assert!(guestbook.contains("guestbook"), "control: the target itself renders");
+    assert!(
+        guestbook.contains("guestbook"),
+        "control: the target itself renders"
+    );
 
     // ── scope: an action is intercepted, the framework's own lanes are not ──
     let action = client
@@ -336,18 +376,31 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
         .send()
         .await
         .unwrap();
-    assert_eq!(header(&action, "x-mw").as_deref(), Some("POST /_albedo/action anon"));
+    assert_eq!(
+        header(&action, "x-mw").as_deref(),
+        Some("POST /_albedo/action anon")
+    );
     let runtime = get("/_albedo/runtime.js").await.unwrap();
     assert_eq!(runtime.status(), StatusCode::OK);
-    assert!(header(&runtime, "x-mw").is_none(), "the client runtime is not app traffic");
+    assert!(
+        header(&runtime, "x-mw").is_none(),
+        "the client runtime is not app traffic"
+    );
 
     // ── fetch(): out through APERTURE, answer read back on the replay ──
     let flagged = get("/?flag=one").await.unwrap();
     assert_eq!(flagged.status(), StatusCode::OK);
     assert_eq!(header(&flagged, "x-flag").as_deref(), Some("true 200"));
-    assert!(flag_hits.load(Ordering::SeqCst) >= 1, "the upstream was really called");
     assert!(
-        flag_auth.lock().unwrap().iter().any(|v| v == "Bearer upstream-secret"),
+        flag_hits.load(Ordering::SeqCst) >= 1,
+        "the upstream was really called"
+    );
+    assert!(
+        flag_auth
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v == "Bearer upstream-secret"),
         "the request's own headers went out with it"
     );
 
@@ -366,7 +419,10 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
     let undeclared = get("/undeclared").await.unwrap();
     assert_eq!(undeclared.status(), StatusCode::BAD_GATEWAY);
     let refusal = undeclared.text().await.unwrap();
-    assert!(refusal.contains("egress refused"), "refused by policy, not by a dead port: {refusal}");
+    assert!(
+        refusal.contains("egress refused"),
+        "refused by policy, not by a dead port: {refusal}"
+    );
     assert_eq!(
         flag_hits.load(Ordering::SeqCst),
         hits_before,
@@ -385,8 +441,12 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
             break;
         }
     }
-    let (before, after) = refused.expect("a middleware fanning out must eventually hit its outbound budget");
-    assert_eq!(before, after, "a refused fetch() is refused before it is sent");
+    let (before, after) =
+        refused.expect("a middleware fanning out must eventually hit its outbound budget");
+    assert_eq!(
+        before, after,
+        "a refused fetch() is refused before it is sent"
+    );
 
     // ── failure is loud, and never a continue ──
     let boom = get("/boom").await.unwrap();
@@ -398,7 +458,11 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
         "a middleware may not set the framework's session cookie"
     );
     assert!(steal.headers().get("set-cookie").is_none());
-    assert_eq!(get("/").await.unwrap().status(), StatusCode::OK, "control: the server still serves");
+    assert_eq!(
+        get("/").await.unwrap().status(),
+        StatusCode::OK,
+        "control: the server still serves"
+    );
 
     // ── 🔑 it cannot grant: a rewrite onto a gated route is gated ──
     let secret = get("/secret-alias").await.unwrap();
@@ -411,7 +475,11 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
         .send()
         .await
         .unwrap();
-    assert_eq!(signed_in.status(), StatusCode::OK, "control: the same rewrite, signed in");
+    assert_eq!(
+        signed_in.status(),
+        StatusCode::OK,
+        "control: the same rewrite, signed in"
+    );
     assert!(signed_in.text().await.unwrap().contains("secret dashboard"));
 
     // ── the body sees the principal, and never the session token ──
@@ -454,7 +522,10 @@ async fn a_scaffolded_app_s_middleware_intercepts_every_app_request_and_grants_n
 async fn a_middleware_that_never_returns_costs_a_timeout_not_an_engine() {
     let home = tempfile::tempdir().expect("home");
     let work = tempfile::tempdir().expect("work");
-    run_ok(albedo(home.path(), work.path()).args(["init", "spinapp"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "spinapp"]),
+        "albedo init",
+    );
     let app = work.path().join("spinapp");
     fs::write(
         app.join("src/middleware.ts"),
@@ -468,18 +539,17 @@ export default function middleware(request) {
     )
     .unwrap();
     run_ok(albedo(home.path(), &app).arg("build"), "albedo build");
-    let (server, base) =
-        serve_with_env(
-            home.path(),
-            &app,
-            &[
-                ("ALBEDO_REQUEST_TIMEOUT_MS", "1500"),
-                // ~50 requests inside two seconds is a burst SHUTTER rightly
-                // refuses from one visitor; each request here is its own.
-                ("ALBEDO_TRUSTED_PROXIES", "127.0.0.1/32"),
-            ],
-        )
-        .await;
+    let (server, base) = serve_with_env(
+        home.path(),
+        &app,
+        &[
+            ("ALBEDO_REQUEST_TIMEOUT_MS", "1500"),
+            // ~50 requests inside two seconds is a burst SHUTTER rightly
+            // refuses from one visitor; each request here is its own.
+            ("ALBEDO_TRUSTED_PROXIES", "127.0.0.1/32"),
+        ],
+    )
+    .await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
@@ -489,7 +559,10 @@ export default function middleware(request) {
         let n = visitor.fetch_add(1, Ordering::Relaxed);
         client
             .get(format!("{base}{path}"))
-            .header("x-forwarded-for", format!("10.9.{}.{}", n / 250, n % 250 + 1))
+            .header(
+                "x-forwarded-for",
+                format!("10.9.{}.{}", n / 250, n % 250 + 1),
+            )
             .send()
     };
 
@@ -502,10 +575,7 @@ export default function middleware(request) {
     // parallelism, and so does this.
     let engines = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     let spinning = Instant::now();
-    let spins = futures_util::future::join_all(
-        (0..engines).map(|_| as_visitor("/spin")),
-    )
-    .await;
+    let spins = futures_util::future::join_all((0..engines).map(|_| as_visitor("/spin"))).await;
     for spin in spins {
         let spin = spin.expect("a spinning request is answered, not abandoned");
         assert_eq!(
@@ -525,13 +595,14 @@ export default function middleware(request) {
     // with nothing stopping them, each of these waits out a full request
     // timeout of its own and fails.
     let started = Instant::now();
-    let after = futures_util::future::join_all(
-        (0..engines).map(|_| as_visitor("/")),
-    )
-    .await;
+    let after = futures_util::future::join_all((0..engines).map(|_| as_visitor("/"))).await;
     for response in after {
         let response = response.expect("answered");
-        assert_eq!(response.status(), StatusCode::OK, "the pool did not recover");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the pool did not recover"
+        );
         assert_eq!(header(&response, "x-mw").as_deref(), Some("ok"));
     }
     assert!(

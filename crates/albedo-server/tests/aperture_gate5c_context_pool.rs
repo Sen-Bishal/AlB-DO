@@ -97,13 +97,13 @@ impl ContextPool {
     /// — which is the entire point: a suspended workflow holds this across its
     /// round trip while the runtime thread serves everyone else.
     async fn checkout(&self) -> Checkout<'_> {
-        self
-            .permits
-            .acquire()
-            .await
-            .expect("pool open")
-            .forget();
-        let index = self.idle.lock().expect("idle").pop().expect("permit implies idle");
+        self.permits.acquire().await.expect("pool open").forget();
+        let index = self
+            .idle
+            .lock()
+            .expect("idle")
+            .pop()
+            .expect("permit implies idle");
         Checkout { pool: self, index }
     }
 }
@@ -125,7 +125,10 @@ impl Checkout<'_> {
         let job: Job = Box::new(move |ctx| {
             let _ = tx.send(f(ctx));
         });
-        self.pool.jobs.send((self.index, job)).expect("worker alive");
+        self.pool
+            .jobs
+            .send((self.index, job))
+            .expect("worker alive");
         rx.await.expect("job ran")
     }
 }
@@ -215,10 +218,8 @@ fn gate_5c_1_a_paused_generator_survives_other_contexts_running() {
     }
 
     // And resume the first one, which has been parked the whole time.
-    let finished: String = contexts[0].with(|ctx| {
-        ctx.eval::<String, _>("__resume('ch_1')")
-            .expect("resume")
-    });
+    let finished: String =
+        contexts[0].with(|ctx| ctx.eval::<String, _>("__resume('ch_1')").expect("resume"));
     assert_eq!(
         finished, "charged:ch_1|true",
         "the paused body resumed from where it stopped, with the value it was given"

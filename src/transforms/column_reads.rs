@@ -404,10 +404,8 @@ impl Walk {
             &[0, 1]
         } else if matches!(method, "reduce" | "reduceRight") {
             &[1]
-        } else if matches!(
-            method,
-            "slice" | "reverse" | "toReversed" | "concat" | "at"
-        ) || OPAQUE_READS.contains(&method)
+        } else if matches!(method, "slice" | "reverse" | "toReversed" | "concat" | "at")
+            || OPAQUE_READS.contains(&method)
         {
             &[]
         } else {
@@ -436,7 +434,12 @@ impl Walk {
                 }),
             ),
             Expr::Fn(function) => (
-                function.function.params.iter().map(|param| &param.pat).collect(),
+                function
+                    .function
+                    .params
+                    .iter()
+                    .map(|param| &param.pat)
+                    .collect(),
                 Box::new(move |walk: &mut Self| {
                     if let Some(body) = &function.function.body {
                         body.visit_with(walk);
@@ -649,8 +652,8 @@ mod tests {
             "import {{ useSharedSlot }} from \"albedo\";\n\
              export default function C(props) {{\n  const rows = useSharedSlot(\"posts\");\n{body}\n}}\n"
         );
-        let parsed = crate::runtime::eval::expr::parse_module(&source, Path::new("C.tsx"))
-            .expect("parses");
+        let parsed =
+            crate::runtime::eval::expr::parse_module(&source, Path::new("C.tsx")).expect("parses");
         column_reads(parsed.functions.get("C").expect("component"), "rows")
     }
 
@@ -715,7 +718,10 @@ mod tests {
             only(&["observed_at", "plan", "seats", "status"])
         );
         // A plain fold reads what its callback reads.
-        assert_eq!(reads("return <p>{rows.reduce((sum, r) => sum + r.amount, 0)}</p>;"), only(&["amount"]));
+        assert_eq!(
+            reads("return <p>{rows.reduce((sum, r) => sum + r.amount, 0)}</p>;"),
+            only(&["amount"])
+        );
         // `&&` never yields a row object; a test reads nothing.
         assert_eq!(
             reads("const first = rows.find((r) => r.pinned); return <div>{first && <b>{first.title}</b>}</div>;"),
@@ -737,7 +743,10 @@ mod tests {
 
     #[test]
     fn a_source_object_reads_its_fields() {
-        assert_eq!(reads("return <p>{rows.stargazers_count} stars</p>;"), only(&["stargazers_count"]));
+        assert_eq!(
+            reads("return <p>{rows.stargazers_count} stars</p>;"),
+            only(&["stargazers_count"])
+        );
     }
 
     /// The direction it fails: anything it cannot follow is unbounded.
@@ -771,18 +780,34 @@ mod tests {
             ("chat:lobby", vec!["text"]),
         ]
         .into_iter()
-        .map(|(key, fields)| (key.to_string(), fields.into_iter().map(str::to_string).collect()))
+        .map(|(key, fields)| {
+            (
+                key.to_string(),
+                fields.into_iter().map(str::to_string).collect(),
+            )
+        })
         .collect();
         let found = |topic: &str| columns_for_topic(&columns, topic).map(<[String]>::to_vec);
         assert_eq!(found("guestbook"), Some(vec!["message".to_string()]));
-        assert_eq!(found("messages:room-a"), Some(vec!["body".to_string()]), "a partition");
+        assert_eq!(
+            found("messages:room-a"),
+            Some(vec!["body".to_string()]),
+            "a partition"
+        );
         assert_eq!(
             found("aperture:github.repo:owner=anthropics,name=claude-code"),
             Some(vec!["stargazers_count".to_string()]),
             "a source with arguments"
         );
-        assert_eq!(found("aperture:github.repo"), Some(vec!["stargazers_count".to_string()]));
-        assert_eq!(found("chat:lobby"), Some(vec!["text".to_string()]), "a static topic with a colon");
+        assert_eq!(
+            found("aperture:github.repo"),
+            Some(vec!["stargazers_count".to_string()])
+        );
+        assert_eq!(
+            found("chat:lobby"),
+            Some(vec!["text".to_string()]),
+            "a static topic with a colon"
+        );
         assert_eq!(found("waitlist"), None, "unbounded");
         assert_eq!(found("aperture:other.route:x=1"), None);
 

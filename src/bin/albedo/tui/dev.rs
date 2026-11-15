@@ -394,14 +394,11 @@ impl Dashboard {
         // `zero JS · static` / `hydrated · {tier_b_hydration_bytes} kB` /
         // `streamed`, which was wrong twice over:
         //
-        // 1. **The vocabulary was inverted.** Tier C — the only tier that ships
-        //    component code — was labelled `streamed`, and Tier B, which ships
-        //    none, was labelled `hydrated`.
-        // 2. **`tier_b_hydration_bytes` is the fabricated number item 4.6
-        //    deleted** — a sum of `WeightEstimator::estimate`
-        //    (`500 + imports*100 + …`), a proxy for source size with no
-        //    relationship to any shipped byte, billed against the tier that
-        //    downloads nothing.
+        // 1. **The vocabulary was inverted.** Tier C — the only tier that ships component code —
+        //    was labelled `streamed`, and Tier B, which ships none, was labelled `hydrated`.
+        // 2. **`tier_b_hydration_bytes` is the fabricated number item 4.6 deleted** — a sum of
+        //    `WeightEstimator::estimate` (`500 + imports*100 + …`), a proxy for source size with no
+        //    relationship to any shipped byte, billed against the tier that downloads nothing.
         //
         // 4.6 fixed `bin/albedo/printer.rs` and never swept this lane, so the
         // dashboard kept printing a number the build output had already
@@ -557,10 +554,7 @@ impl Dashboard {
                         EventKind::Note => ("·", theme::label()),
                     };
                     Line::from(vec![
-                        Span::styled(
-                            format!("{:>4}s", row.at.elapsed().as_secs()),
-                            theme::dim(),
-                        ),
+                        Span::styled(format!("{:>4}s", row.at.elapsed().as_secs()), theme::dim()),
                         Span::raw("  "),
                         Span::styled(glyph, style),
                         Span::raw("  "),
@@ -854,10 +848,7 @@ mod tests {
         let mut dash = dashboard();
         assert!(dash.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
         assert!(dash.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
-        assert!(dash.handle_key(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL
-        )));
+        assert!(dash.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
 
         dash.absorb(DashEvent::Note {
             message: "hello".to_string(),
@@ -873,7 +864,10 @@ mod tests {
     fn the_wordmark_appears_only_when_there_is_room_for_it() {
         let tall = screen(&dashboard(), 104, 38);
         assert!(tall.contains("█████╗"), "block art on a tall terminal");
-        assert!(tall.contains("ALB'DO"), "the literal mark rides beside the art");
+        assert!(
+            tall.contains("ALB'DO"),
+            "the literal mark rides beside the art"
+        );
         assert!(tall.contains(VERSION_LABEL), "{tall}");
 
         let short = screen(&dashboard(), 104, 30);
@@ -894,7 +888,11 @@ mod tests {
         let ten_milli = pulse_height(Duration::from_millis(10));
         assert_eq!(milli - micro, 300, "three decades, three steps");
         assert_eq!(ten_milli - milli, 100, "one decade, one step");
-        assert_eq!(pulse_height(Duration::from_nanos(1)), 0, "anchored at a real floor");
+        assert_eq!(
+            pulse_height(Duration::from_nanos(1)),
+            0,
+            "anchored at a real floor"
+        );
     }
 
     #[test]

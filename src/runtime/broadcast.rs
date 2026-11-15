@@ -11,20 +11,17 @@
 //!
 //! ## Architectural contract
 //!
-//! - **Topics, not sessions.** A topic (`"chat:room-42"`) is global.
-//!   Sessions subscribe to topics, not the other way round.
-//! - **Wire reuse.** Fan-out emits `Instruction::SlotSet` wrapped in an
-//!   `OpcodeFrame`; the client can't tell whether a `SlotSet` came from a
-//!   per-session write or a broadcast — it just applies the value to
-//!   the slot. Since S4 a fan-out MAY carry a second instruction, see
-//!   the delta lane below.
-//! - **Deterministic slot IDs.** A topic string hashes (FNV-1a-32 of
-//!   `"broadcast::{topic}"`) to its `SlotId`. The `"broadcast::"`
-//!   prefix avoids collision with Phase K's per-session slot IDs
+//! - **Topics, not sessions.** A topic (`"chat:room-42"`) is global. Sessions subscribe to topics,
+//!   not the other way round.
+//! - **Wire reuse.** Fan-out emits `Instruction::SlotSet` wrapped in an `OpcodeFrame`; the client
+//!   can't tell whether a `SlotSet` came from a per-session write or a broadcast — it just applies
+//!   the value to the slot. Since S4 a fan-out MAY carry a second instruction, see the delta lane
+//!   below.
+//! - **Deterministic slot IDs.** A topic string hashes (FNV-1a-32 of `"broadcast::{topic}"`) to its
+//!   `SlotId`. The `"broadcast::"` prefix avoids collision with Phase K's per-session slot IDs
 //!   (`"{module}::{fn}#{idx}"`).
-//! - **Server-side state, dumb client.** Subscriptions live on the
-//!   server. The bakabox runtime just receives opcodes on the patches
-//!   lane — same dispatch as any other patch.
+//! - **Server-side state, dumb client.** Subscriptions live on the server. The bakabox runtime just
+//!   receives opcodes on the patches lane — same dispatch as any other patch.
 //!
 //! ## S4 · the delta lane
 //!
@@ -35,13 +32,11 @@
 //! and `listSlots` (the keyed-row sink) — so exactly one of them owns
 //! any given transition:
 //!
-//! - A topic driving a **keyed list** ships its list opcode alone
-//!   (`SlotDelta` / `SlotInsert` / `ReconcileList`). A broadcast list
-//!   anchor (the Tier-B `<ul>` the B2 pass stamped) carries no bind
-//!   site, so a snapshot cannot reach it — and the list sink is the
-//!   only sink the topic has.
-//! - Every **other** topic ships `SlotSet`, the authoritative
-//!   post-write snapshot, which is what value consumers read.
+//! - A topic driving a **keyed list** ships its list opcode alone (`SlotDelta` / `SlotInsert` /
+//!   `ReconcileList`). A broadcast list anchor (the Tier-B `<ul>` the B2 pass stamped) carries no
+//!   bind site, so a snapshot cannot reach it — and the list sink is the only sink the topic has.
+//! - Every **other** topic ships `SlotSet`, the authoritative post-write snapshot, which is what
+//!   value consumers read.
 //!
 //! ## Why the snapshot does not ride along (the S5 rule)
 //!
@@ -90,14 +85,13 @@
 //! holds it across register-sink → read-snapshot. That buys three
 //! invariants worth the (uncontended, non-blocking) cost:
 //!
-//! 1. A delta is always computed against the state the *previous*
-//!    fanned-out delta produced — writers serialize per topic.
-//! 2. Delivery order equals lock order, so `apply(Δ₁..Δₙ) == stored
-//!    value` holds for every subscriber.
-//! 3. A joining session's snapshot is either strictly before or
-//!    strictly after a write, never interleaved with it — so it can
-//!    never apply a delta already folded into its snapshot, nor miss
-//!    one that isn't.
+//! 1. A delta is always computed against the state the *previous* fanned-out delta produced —
+//!    writers serialize per topic.
+//! 2. Delivery order equals lock order, so `apply(Δ₁..Δₙ) == stored value` holds for every
+//!    subscriber.
+//! 3. A joining session's snapshot is either strictly before or strictly after a write, never
+//!    interleaved with it — so it can never apply a delta already folded into its snapshot, nor
+//!    miss one that isn't.
 //!
 //! Fan-out under the lock is `try_send` only — no I/O, no `.await` —
 //! and the lock is per topic, so unrelated topics never contend.
@@ -227,10 +221,7 @@ pub enum TopicIdentity {
     /// Safe to drop when nothing is watching it: FORGE is the truth and the
     /// value is a cache, so the next reader re-materializes it. That is the
     /// whole reason PRISM requires a dynamic topic to be FORGE-backed.
-    Partition {
-        collection: Arc<str>,
-        key: Arc<str>,
-    },
+    Partition { collection: Arc<str>, key: Arc<str> },
     /// APERTURE · a declared external resource, minted on demand for a resolved
     /// argument set.
     ///
@@ -292,10 +283,7 @@ impl TopicIdentity {
     /// so no caller has to re-derive the rule from the variant.
     #[must_use]
     pub const fn is_evictable(&self) -> bool {
-        matches!(
-            self,
-            Self::Partition { .. } | Self::External { .. }
-        )
+        matches!(self, Self::Partition { .. } | Self::External { .. })
     }
 }
 
@@ -709,21 +697,18 @@ impl BroadcastRegistry {
         identity: TopicIdentity,
     ) -> Arc<BroadcastTopic> {
         let slot_id = broadcast_slot_id(&topic);
-        let entry = self
-            .topics
-            .entry(topic.clone())
-            .or_insert_with(|| {
-                Arc::new(BroadcastTopic {
-                    name: topic,
-                    slot_id,
-                    value: Mutex::new(initial),
-                    subscribers: DashMap::new(),
-                    projections: DashMap::new(),
-                    version: AtomicU64::new(0),
-                    identity,
-                    touched: AtomicU64::new(self.tick.fetch_add(1, Ordering::Relaxed)),
-                })
-            });
+        let entry = self.topics.entry(topic.clone()).or_insert_with(|| {
+            Arc::new(BroadcastTopic {
+                name: topic,
+                slot_id,
+                value: Mutex::new(initial),
+                subscribers: DashMap::new(),
+                projections: DashMap::new(),
+                version: AtomicU64::new(0),
+                identity,
+                touched: AtomicU64::new(self.tick.fetch_add(1, Ordering::Relaxed)),
+            })
+        });
         entry.clone()
     }
 
@@ -779,11 +764,7 @@ impl BroadcastRegistry {
             return Ok(existing.clone());
         }
         let _reservation = self.guard_slot_id(&name)?;
-        Ok(self.insert_topic(
-            name,
-            initial,
-            TopicIdentity::Partition { collection, key },
-        ))
+        Ok(self.insert_topic(name, initial, TopicIdentity::Partition { collection, key }))
     }
 
     /// APERTURE · mint (or resolve, or **replace the value of**) one declared
@@ -850,11 +831,7 @@ impl BroadcastRegistry {
         }
         let _reservation = self.guard_slot_id(&name)?;
         Ok(ExternalWarm {
-            topic: self.insert_topic(
-                name,
-                value,
-                TopicIdentity::External { source, route, url },
-            ),
+            topic: self.insert_topic(name, value, TopicIdentity::External { source, route, url }),
             // A first warm mints the topic with the value already in it, so
             // there is no fan-out and — by construction — nobody subscribed yet
             // to receive one. Reporting `true` here would make the loop's
@@ -1426,7 +1403,8 @@ impl BroadcastRegistry {
         topics: &[String],
     ) -> Vec<Instruction> {
         let grants: Vec<TopicGrant> = topics.iter().map(TopicGrant::whole).collect();
-        self.subscribe_granted(session, sender, &grants).instructions
+        self.subscribe_granted(session, sender, &grants)
+            .instructions
     }
 
     /// Column projection · [`Self::auto_subscribe`] where each topic carries
@@ -1486,7 +1464,6 @@ impl BroadcastRegistry {
     pub fn topic_count(&self) -> usize {
         self.topics.len()
     }
-
 }
 
 /// Lower a [`ListUpdate`] to the single opcode that carries it, or `None` when
@@ -1645,7 +1622,9 @@ mod tests {
             .map(|rx| rx.try_recv().expect("a frame"))
             .collect();
         assert!(
-            frames.windows(2).all(|pair| pair[0].as_ptr() == pair[1].as_ptr()),
+            frames
+                .windows(2)
+                .all(|pair| pair[0].as_ptr() == pair[1].as_ptr()),
             "each subscriber got its own copy of the frame"
         );
     }
@@ -1663,7 +1642,11 @@ mod tests {
     /// SlotSet (which is what the broadcast path emits).
     fn extract_slot_set(bytes: &[u8]) -> (SlotId, Vec<u8>) {
         let (frame, _) = decode_frame(bytes).expect("decode frame");
-        assert_eq!(frame.instructions.len(), 1, "broadcast frame must carry one SlotSet");
+        assert_eq!(
+            frame.instructions.len(),
+            1,
+            "broadcast frame must carry one SlotSet"
+        );
         match frame.instructions.into_iter().next().unwrap() {
             Instruction::SlotSet { slot_id, value } => (slot_id, value),
             other => panic!("expected SlotSet, got {other:?}"),
@@ -1740,7 +1723,9 @@ mod tests {
             .try_topic(COLLIDING_B, b"[]".to_vec())
             .expect_err("refused");
         match err {
-            BroadcastError::SlotIdCollision { topic, existing, .. } => {
+            BroadcastError::SlotIdCollision {
+                topic, existing, ..
+            } => {
                 assert_eq!(topic, COLLIDING_B);
                 assert_eq!(existing, COLLIDING_A);
             }
@@ -1752,13 +1737,18 @@ mod tests {
             "the refused topic must not be registered — a half-registered topic \
              accepts writes nobody receives"
         );
-        assert!(registry.get(COLLIDING_A).is_some(), "the holder is untouched");
+        assert!(
+            registry.get(COLLIDING_A).is_some(),
+            "the holder is untouched"
+        );
     }
 
     #[test]
     fn try_topic_is_idempotent_for_the_same_name() {
         let registry = BroadcastRegistry::new();
-        let first = registry.try_topic("guestbook", b"[]".to_vec()).expect("first");
+        let first = registry
+            .try_topic("guestbook", b"[]".to_vec())
+            .expect("first");
         let second = registry
             .try_topic("guestbook", b"ignored".to_vec())
             .expect("second");
@@ -1775,12 +1765,16 @@ mod tests {
         let topic = registry.topic("counter", b"0".to_vec());
         assert_eq!(topic.version(), 0, "registered but never written");
 
-        registry.write_topic("counter", b"1".to_vec()).expect("write");
+        registry
+            .write_topic("counter", b"1".to_vec())
+            .expect("write");
         let (value, version) = topic.value_and_version();
         assert_eq!(value, b"1".to_vec());
         assert_eq!(version, 1);
 
-        registry.write_topic("counter", b"2".to_vec()).expect("write");
+        registry
+            .write_topic("counter", b"2".to_vec())
+            .expect("write");
         assert_eq!(topic.version(), 2);
         assert!(
             topic.version() > version,
@@ -1811,7 +1805,12 @@ mod tests {
     fn a_partition_carries_its_collection_and_key() {
         let registry = BroadcastRegistry::new();
         let topic = registry
-            .try_topic_partition("messages:42", "messages".into(), "42".into(), b"[]".to_vec())
+            .try_topic_partition(
+                "messages:42",
+                "messages".into(),
+                "42".into(),
+                b"[]".to_vec(),
+            )
             .expect("minted");
         assert_eq!(
             topic.identity(),
@@ -1830,7 +1829,12 @@ mod tests {
     fn an_idle_partition_is_dropped_and_releases_its_wire_slot() {
         let registry = BroadcastRegistry::new();
         registry
-            .try_topic_partition("messages:42", "messages".into(), "42".into(), b"[]".to_vec())
+            .try_topic_partition(
+                "messages:42",
+                "messages".into(),
+                "42".into(),
+                b"[]".to_vec(),
+            )
             .expect("minted");
 
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
@@ -1939,7 +1943,10 @@ mod tests {
         let err = registry
             .try_topic_partition(COLLIDING_B, "rooms".into(), "x".into(), b"[]".to_vec())
             .expect_err("refused");
-        assert!(matches!(err, BroadcastError::SlotIdCollision { .. }), "{err:?}");
+        assert!(
+            matches!(err, BroadcastError::SlotIdCollision { .. }),
+            "{err:?}"
+        );
         assert_eq!(registry.dynamic_topic_count(), 0);
     }
 
@@ -1949,7 +1956,12 @@ mod tests {
     fn re_resolving_a_name_preserves_the_identity_it_was_created_with() {
         let registry = BroadcastRegistry::new();
         registry
-            .try_topic_partition("messages:42", "messages".into(), "42".into(), b"[1]".to_vec())
+            .try_topic_partition(
+                "messages:42",
+                "messages".into(),
+                "42".into(),
+                b"[1]".to_vec(),
+            )
             .expect("minted");
 
         let again = registry.topic("messages:42", b"ignored".to_vec());
@@ -2030,7 +2042,9 @@ mod tests {
             partition(&registry, key, 100);
         }
         // Touch `a` so it is no longer the oldest; `b` becomes the LRU.
-        registry.write_topic("messages:a", b"[\"fresh\"]".to_vec()).unwrap();
+        registry
+            .write_topic("messages:a", b"[\"fresh\"]".to_vec())
+            .unwrap();
 
         let footprint = registry.evictable_bytes();
         assert!(footprint > 0);
@@ -2089,7 +2103,10 @@ mod tests {
             keepalive.push(rx);
         }
         assert_eq!(registry.enforce_byte_budget(0), 0);
-        assert!(registry.evictable_bytes() > 0, "still over budget, and that is fine");
+        assert!(
+            registry.evictable_bytes() > 0,
+            "still over budget, and that is fine"
+        );
     }
 
     /// Eviction returns the wire slot, so the name can be re-minted later — the
@@ -2143,9 +2160,7 @@ mod tests {
         let registry = BroadcastRegistry::new();
         registry.topic("seed", b"initial".to_vec());
         let (tx, _rx) = mpsc::channel::<bytes::Bytes>(4);
-        let value = registry
-            .subscribe(SessionId::random(), "seed", tx)
-            .unwrap();
+        let value = registry.subscribe(SessionId::random(), "seed", tx).unwrap();
         assert_eq!(value, b"initial".to_vec());
     }
 
@@ -2185,9 +2200,7 @@ mod tests {
     #[tokio::test]
     async fn write_to_unknown_topic_yields_typed_error() {
         let registry = BroadcastRegistry::new();
-        let err = registry
-            .write_topic("nope", b"x".to_vec())
-            .unwrap_err();
+        let err = registry.write_topic("nope", b"x".to_vec()).unwrap_err();
         assert!(matches!(err, BroadcastError::UnknownTopic(_)));
     }
 
@@ -2225,7 +2238,9 @@ mod tests {
         registry.subscribe(fast, "hot", tx_fast).unwrap();
 
         // Fill the slow channel so the next try_send returns Full.
-        tx_slow.try_send(bytes::Bytes::from_static(b"prefill")).unwrap();
+        tx_slow
+            .try_send(bytes::Bytes::from_static(b"prefill"))
+            .unwrap();
 
         let report = registry.write_topic("hot", b"new".to_vec()).unwrap();
         assert_eq!(report.delivered, 1, "fast consumer must receive");
@@ -2257,7 +2272,9 @@ mod tests {
         assert_eq!(registry.get("quiet").unwrap().subscriber_count(), 1);
 
         // Fill the sink, then write to just ONE of the two topics.
-        registry.write_topic("busy", b"fills-the-channel".to_vec()).unwrap();
+        registry
+            .write_topic("busy", b"fills-the-channel".to_vec())
+            .unwrap();
         let report = registry.write_topic("busy", b"refused".to_vec()).unwrap();
         assert_eq!(report.dropped_full, vec![session]);
 
@@ -2266,7 +2283,10 @@ mod tests {
             0,
             "the untouched topic must release the same broken sink"
         );
-        assert!(!registry.by_session.contains_key(&session), "reverse index pruned");
+        assert!(
+            !registry.by_session.contains_key(&session),
+            "reverse index pruned"
+        );
 
         // Draining what was buffered must then see the channel CLOSED, which is
         // what ends the SSE stream and triggers the client's reconnect.
@@ -2647,7 +2667,11 @@ mod tests {
         };
 
         /// Rows before, rows after, and the slot changes expected between them.
-        type ListCase<'a> = (Vec<(&'a str, &'a str)>, Vec<(&'a str, &'a str)>, Vec<SlotChange>);
+        type ListCase<'a> = (
+            Vec<(&'a str, &'a str)>,
+            Vec<(&'a str, &'a str)>,
+            Vec<SlotChange>,
+        );
         let cases: Vec<ListCase<'_>> = vec![
             // Append — the guestbook case.
             (
@@ -2880,7 +2904,10 @@ mod tests {
             project_value(WAITLIST, &cols(&["id", "name"])),
             br#"[{"id":1,"name":"Ada"},{"id":2,"name":"Bob"}]"#.to_vec()
         );
-        assert_eq!(project_value(WAITLIST, &cols(&["id"])), br#"[{"id":1},{"id":2}]"#.to_vec());
+        assert_eq!(
+            project_value(WAITLIST, &cols(&["id"])),
+            br#"[{"id":1},{"id":2}]"#.to_vec()
+        );
         assert_eq!(
             project_value(br#"{"stars":42,"token":"x"}"#, &cols(&["stars"])),
             br#"{"stars":42}"#.to_vec()
@@ -2911,11 +2938,17 @@ mod tests {
             }
             other => panic!("expected one SlotSet, got {other:?}"),
         }
-        assert_eq!(seed.values, vec![("waitlist".to_string(), WAITLIST.to_vec())], "kept whole server-side");
+        assert_eq!(
+            seed.values,
+            vec![("waitlist".to_string(), WAITLIST.to_vec())],
+            "kept whole server-side"
+        );
 
         let (tx, _rx) = mpsc::channel::<bytes::Bytes>(8);
         let whole = registry.auto_subscribe(SessionId::random(), tx, &["waitlist".to_string()]);
-        assert!(matches!(whole.as_slice(), [Instruction::SlotSet { value, .. }] if value == WAITLIST));
+        assert!(
+            matches!(whole.as_slice(), [Instruction::SlotSet { value, .. }] if value == WAITLIST)
+        );
     }
 
     /// Every later snapshot, per subscriber, encoded once per column set.
@@ -2940,9 +2973,19 @@ mod tests {
         assert_eq!(delivery.delivered, 3);
 
         let counted = drain_into_vec(&mut count_rx).remove(0);
-        assert_eq!(extract_slot_set(&counted).1, br#"[{"id":1},{"id":2}]"#.to_vec());
-        assert_eq!(drain_into_vec(&mut count2_rx).remove(0), counted, "one encode per column set");
-        assert_eq!(extract_slot_set(&drain_into_vec(&mut admin_rx)[0]).1, WAITLIST.to_vec());
+        assert_eq!(
+            extract_slot_set(&counted).1,
+            br#"[{"id":1},{"id":2}]"#.to_vec()
+        );
+        assert_eq!(
+            drain_into_vec(&mut count2_rx).remove(0),
+            counted,
+            "one encode per column set"
+        );
+        assert_eq!(
+            extract_slot_set(&drain_into_vec(&mut admin_rx)[0]).1,
+            WAITLIST.to_vec()
+        );
     }
 
     /// A list opcode's rows are rendered markup, not columns: untouched.
@@ -2966,7 +3009,9 @@ mod tests {
             })
             .unwrap();
         match instructions_of(&drain_into_vec(&mut rx)[0]).as_slice() {
-            [Instruction::SlotDelta { changes, .. }] => assert_eq!(changes[0].payload, b"<li>Ada</li>"),
+            [Instruction::SlotDelta { changes, .. }] => {
+                assert_eq!(changes[0].payload, b"<li>Ada</li>")
+            }
             other => panic!("expected the delta untouched, got {other:?}"),
         }
     }
@@ -2989,6 +3034,9 @@ mod tests {
         );
         registry.subscribe(session, "waitlist", tx).unwrap();
         registry.write_topic("waitlist", WAITLIST.to_vec()).unwrap();
-        assert_eq!(extract_slot_set(&drain_into_vec(&mut rx)[0]).1, WAITLIST.to_vec());
+        assert_eq!(
+            extract_slot_set(&drain_into_vec(&mut rx)[0]).1,
+            WAITLIST.to_vec()
+        );
     }
 }

@@ -77,9 +77,9 @@ impl RuntimeError {
     pub fn thrown_message(&self) -> String {
         match self {
             Self::RenderComponentError { message, .. } => message.clone(),
-            Self::RenderError(message)
-            | Self::PropsError(message)
-            | Self::InitError(message) => message.clone(),
+            Self::RenderError(message) | Self::PropsError(message) | Self::InitError(message) => {
+                message.clone()
+            }
             Self::LoadError { message, .. } => message.clone(),
         }
     }

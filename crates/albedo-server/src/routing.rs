@@ -86,10 +86,14 @@ pub struct MatchedRoute {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteMatch {
     Matched(MatchedRoute),
-    MethodNotAllowed { allowed: Vec<HttpMethod> },
+    MethodNotAllowed {
+        allowed: Vec<HttpMethod>,
+    },
     /// The path names a route, but the param `name` percent-decodes to bytes
     /// that are not UTF-8, so there is no string to hand the page.
-    UndecodableParam { name: String },
+    UndecodableParam {
+        name: String,
+    },
     NotFound,
 }
 
@@ -231,15 +235,13 @@ pub fn parse_query_string(query: Option<&str>) -> BTreeMap<String, Vec<String>> 
 /// decoded. Only then is each segment of the capture decoded on its own and the
 /// pieces rejoined with `/`. That order is the whole rule for `%2F`:
 ///
-/// - In a `[id]` capture it decodes to `/`. `/post/a%2Fb` is still the one
-///   segment that matched `post/[id]` — it never reaches a deeper route — and
-///   `id === "a/b"` is what `encodeURIComponent("a/b")` put in the link, so the
-///   value round-trips.
-/// - In a `[...rest]` capture it decodes to `/` too, so `/files/a%2Fb` and
-///   `/files/a/b` both give `"a/b"`. The rest arrives as one string, and a string
-///   has no way to say which `/` was a segment boundary. Refusing `%2F` here
-///   would keep the two apart only by answering 400 to a link built with
-///   `encodeURIComponent`, for a value whose text is the same either way.
+/// - In a `[id]` capture it decodes to `/`. `/post/a%2Fb` is still the one segment that matched
+///   `post/[id]` — it never reaches a deeper route — and `id === "a/b"` is what
+///   `encodeURIComponent("a/b")` put in the link, so the value round-trips.
+/// - In a `[...rest]` capture it decodes to `/` too, so `/files/a%2Fb` and `/files/a/b` both give
+///   `"a/b"`. The rest arrives as one string, and a string has no way to say which `/` was a
+///   segment boundary. Refusing `%2F` here would keep the two apart only by answering 400 to a link
+///   built with `encodeURIComponent`, for a value whose text is the same either way.
 ///
 /// Invalid UTF-8 (`%FF`, a truncated `%C3`) is refused rather than kept raw or
 /// replaced with U+FFFD. Kept raw, `/post/%FF` and `/post/%25FF` would hand a

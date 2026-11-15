@@ -172,9 +172,12 @@ fn client_runtime_hydrates_and_updates_counter_with_zero_network() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
-        ctx.eval::<String, _>(SCENARIO).expect("scenario should evaluate")
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
+        ctx.eval::<String, _>(SCENARIO)
+            .expect("scenario should evaluate")
     });
 
     let value: serde_json::Value =
@@ -182,7 +185,10 @@ fn client_runtime_hydrates_and_updates_counter_with_zero_network() {
 
     // Hydration adopts the server node and leaves the painted text untouched.
     assert_eq!(value["afterHydrateText"], "count: 0");
-    assert_eq!(value["adoptedOnHydrate"], true, "server <button> must be adopted, not recreated");
+    assert_eq!(
+        value["adoptedOnHydrate"], true,
+        "server <button> must be adopted, not recreated"
+    );
 
     // useEffect ran client-side exactly once on mount.
     assert_eq!(value["effectsAfterHydrate"], 1);
@@ -190,14 +196,20 @@ fn client_runtime_hydrates_and_updates_counter_with_zero_network() {
     // The local click drove state → re-render → in-place text patch, with the
     // same DOM node preserved (a diff, not a teardown).
     assert_eq!(value["afterClickText"], "count: 1");
-    assert_eq!(value["sameNodeAfterClick"], true, "update must patch in place, not replace the node");
+    assert_eq!(
+        value["sameNodeAfterClick"], true,
+        "update must patch in place, not replace the node"
+    );
 
     // useEffect re-ran because its dependency [n] changed.
     assert_eq!(value["effectsAfterClick"], 2);
     assert_eq!(value["effectLog"], serde_json::json!([0, 1]));
 
     // The whole interaction was local — nothing touched the network.
-    assert_eq!(value["network"], 0, "Tier-C interaction must not round-trip to the server");
+    assert_eq!(
+        value["network"], 0,
+        "Tier-C interaction must not round-trip to the server"
+    );
 }
 
 // The production entry the ≤2KB bootstrap actually calls: a registered
@@ -243,9 +255,12 @@ fn hydrate_island_descriptor_drives_the_bootstrap_facing_entry() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
-        ctx.eval::<String, _>(ISLAND_SCENARIO).expect("island scenario should evaluate")
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
+        ctx.eval::<String, _>(ISLAND_SCENARIO)
+            .expect("island scenario should evaluate")
     });
 
     let value: serde_json::Value =
@@ -255,7 +270,10 @@ fn hydrate_island_descriptor_drives_the_bootstrap_facing_entry() {
     // state on the adopted node — no network, idempotent on a second call.
     assert_eq!(value["hydratedAttr"], "true");
     assert_eq!(value["afterClickText"], "hits: 1");
-    assert_eq!(value["sameNode"], true, "island root must be patched in place");
+    assert_eq!(
+        value["sameNode"], true,
+        "island root must be patched in place"
+    );
     assert_eq!(value["network"], 0);
 }
 
@@ -303,21 +321,30 @@ fn transpiled_tsx_island_ships_and_hydrates_with_seeded_props() {
     // The browser module must be self-contained: no server-only module helpers,
     // no leftover ESM syntax — just a self-registering IIFE.
     assert!(island_script.contains("registerComponent(\"42\""));
-    assert!(!island_script.contains("__albedo_import"), "no server import helpers in client JS");
-    assert!(!island_script.contains("import "), "no ESM import syntax in client JS");
+    assert!(
+        !island_script.contains("__albedo_import"),
+        "no server import helpers in client JS"
+    );
+    assert!(
+        !island_script.contains("import "),
+        "no ESM import syntax in client JS"
+    );
 
     let runtime = Runtime::new().expect("quickjs runtime should initialize");
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
-        ctx.eval::<(), _>(island_script.as_str()).expect("transpiled island should evaluate");
-        ctx.eval::<String, _>(TSX_ISLAND_SCENARIO).expect("scenario should evaluate")
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
+        ctx.eval::<(), _>(island_script.as_str())
+            .expect("transpiled island should evaluate");
+        ctx.eval::<String, _>(TSX_ISLAND_SCENARIO)
+            .expect("scenario should evaluate")
     });
 
-    let value: serde_json::Value =
-        serde_json::from_str(&summary).expect("summary should be JSON");
+    let value: serde_json::Value = serde_json::from_str(&summary).expect("summary should be JSON");
 
     // Server-seeded props (start: 5) drove the hydrated state; the local click
     // advanced it, in place, with no network.
@@ -417,9 +444,12 @@ fn client_runtime_runs_useref_usememo_usecallback() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
-        ctx.eval::<String, _>(HOOK_FAMILY_SCENARIO).expect("scenario should evaluate")
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
+        ctx.eval::<String, _>(HOOK_FAMILY_SCENARIO)
+            .expect("scenario should evaluate")
     });
 
     let value: serde_json::Value =
@@ -434,15 +464,30 @@ fn client_runtime_runs_useref_usememo_usecallback() {
     // Unrelated update: ref cell persisted (renders climbs to 2), memo did NOT
     // recompute (still 1), callback identity held.
     assert_eq!(value["afterLabel"]["text"], "n:0 x2:0 L:y");
-    assert_eq!(value["afterLabel"]["memoCalls"], 1, "useMemo must not recompute when its deps are unchanged");
-    assert_eq!(value["afterLabel"]["renders"], 2, "useRef cell must survive re-render");
-    assert_eq!(value["afterLabel"]["cbStable"], true, "useCallback must keep identity when deps are equal");
+    assert_eq!(
+        value["afterLabel"]["memoCalls"], 1,
+        "useMemo must not recompute when its deps are unchanged"
+    );
+    assert_eq!(
+        value["afterLabel"]["renders"], 2,
+        "useRef cell must survive re-render"
+    );
+    assert_eq!(
+        value["afterLabel"]["cbStable"], true,
+        "useCallback must keep identity when deps are equal"
+    );
 
     // Relevant update: memo recomputed (2), callback identity broke, value patched.
     assert_eq!(value["afterN"]["text"], "n:5 x2:10 L:y");
-    assert_eq!(value["afterN"]["memoCalls"], 2, "useMemo must recompute when deps change");
+    assert_eq!(
+        value["afterN"]["memoCalls"], 2,
+        "useMemo must recompute when deps change"
+    );
     assert_eq!(value["afterN"]["renders"], 3);
-    assert_eq!(value["afterN"]["cbChanged"], true, "useCallback must return a fresh function when deps change");
+    assert_eq!(
+        value["afterN"]["cbChanged"], true,
+        "useCallback must return a fresh function when deps change"
+    );
 
     // The whole sequence was local — no round-trip.
     assert_eq!(value["network"], 0);
@@ -450,12 +495,12 @@ fn client_runtime_runs_useref_usememo_usecallback() {
 
 // B (Gate 2) — `useContext` resolves the nearest Provider's value on the client,
 // the last hook in the React family. Three invariants the slice must hold:
-//   1. a consumer reads the Provider `value`, NOT the createContext default
-//      (default "light" vs provider "dark");
-//   2. a consumer re-rendering on its OWN state still resolves context (proves
-//      the per-fiber context snapshot, not a transient render-time stack);
-//   3. changing the Provider value (held in an ancestor's state) propagates to
-//      every consumer below it.
+//   1. a consumer reads the Provider `value`, NOT the createContext default (default "light" vs
+//      provider "dark");
+//   2. a consumer re-rendering on its OWN state still resolves context (proves the per-fiber
+//      context snapshot, not a transient render-time stack);
+//   3. changing the Provider value (held in an ancestor's state) propagates to every consumer below
+//      it.
 const CONTEXT_SCENARIO: &str = r"
 var ThemeContext = createContext('light');
 
@@ -519,9 +564,12 @@ fn client_runtime_resolves_usecontext_through_provider() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
-        ctx.eval::<String, _>(CONTEXT_SCENARIO).expect("scenario should evaluate")
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
+        ctx.eval::<String, _>(CONTEXT_SCENARIO)
+            .expect("scenario should evaluate")
     });
 
     let value: serde_json::Value =
@@ -550,11 +598,10 @@ fn client_runtime_resolves_usecontext_through_provider() {
 // must agree:
 //   * classic single child     — `h(Component, props, child)`
 //   * classic multiple children — `h(Component, props, child, child)`
-//   * the automatic JSX runtime's shape — `children` pre-folded into the
-//     config object by the compiler, then pulled back out and handed to `h`
-//     positionally by `react_host.rs`'s `__albedo_jsx` (simulated here rather
-//     than pulled in, since that prelude is plain JS text generated by the
-//     Rust side, not something this test links against).
+//   * the automatic JSX runtime's shape — `children` pre-folded into the config object by the
+//     compiler, then pulled back out and handed to `h` positionally by `react_host.rs`'s
+//     `__albedo_jsx` (simulated here rather than pulled in, since that prelude is plain JS text
+//     generated by the Rust side, not something this test links against).
 const CHILDREN_SCENARIO: &str = r"
 function Label(props) {
   return h('span', null, props.children);
@@ -597,16 +644,22 @@ fn h_folds_positional_children_into_props_for_component_vnodes() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
-        ctx.eval::<String, _>(CHILDREN_SCENARIO).expect("scenario should evaluate")
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
+        ctx.eval::<String, _>(CHILDREN_SCENARIO)
+            .expect("scenario should evaluate")
     });
 
     let value: serde_json::Value =
         serde_json::from_str(&summary).expect("scenario summary should be JSON");
 
     assert_eq!(value["singleTag"], "SPAN");
-    assert_eq!(value["singleText"], "solo", "a single positional child must reach props.children");
+    assert_eq!(
+        value["singleText"], "solo",
+        "a single positional child must reach props.children"
+    );
     assert_eq!(
         value["multiTexts"],
         serde_json::json!(["a", "b"]),
@@ -687,8 +740,10 @@ fn multi_child_fragment_island_hydrates_and_updates() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
         ctx.eval::<String, _>(MULTI_CHILD_FRAGMENT_ISLAND_SCENARIO)
             .expect("scenario should evaluate")
     });
@@ -696,14 +751,20 @@ fn multi_child_fragment_island_hydrates_and_updates() {
     let value: serde_json::Value =
         serde_json::from_str(&summary).expect("scenario summary should be JSON");
 
-    assert_eq!(value["childCount"], 4, "all four Fragment siblings must be present");
+    assert_eq!(
+        value["childCount"], 4,
+        "all four Fragment siblings must be present"
+    );
     assert_eq!(
         value["adoptedBeforeClick"],
         serde_json::json!([true, true, true, true]),
         "every sibling must be ADOPTED from the server markup, not recreated"
     );
     assert_eq!(value["tallyBeforeClick"], "tally: 0");
-    assert_eq!(value["tallyAfterClick"], "tally: 1", "state update must patch the fourth sibling");
+    assert_eq!(
+        value["tallyAfterClick"], "tally: 1",
+        "state update must patch the fourth sibling"
+    );
     assert_eq!(
         value["sameNodesAfterClick"], true,
         "the update must patch in place, not tear down and remount the group"
@@ -762,8 +823,10 @@ fn fragment_child_count_grows_and_shrinks_across_reconcile() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
         ctx.eval::<String, _>(FRAGMENT_GROW_SHRINK_SCENARIO)
             .expect("scenario should evaluate")
     });
@@ -778,7 +841,10 @@ fn fragment_child_count_grows_and_shrinks_across_reconcile() {
         serde_json::json!(["item0", "item1", "item2", "item3"]),
         "new items must append in order after the existing ones"
     );
-    assert_eq!(value["countAfterShrink"], 3, "button + 2 items after shrinking back");
+    assert_eq!(
+        value["countAfterShrink"], 3,
+        "button + 2 items after shrinking back"
+    );
 }
 
 // Regression: a Fragment nested INSIDE a host element's children — one JSX
@@ -829,9 +895,12 @@ fn fragment_nested_inside_host_element_children_hydrates_all_siblings() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
-        ctx.eval::<String, _>(NESTED_FRAGMENT_SCENARIO).expect("scenario should evaluate")
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
+        ctx.eval::<String, _>(NESTED_FRAGMENT_SCENARIO)
+            .expect("scenario should evaluate")
     });
 
     let value: serde_json::Value =
@@ -839,20 +908,33 @@ fn fragment_nested_inside_host_element_children_hydrates_all_siblings() {
 
     assert_eq!(value["tags"], serde_json::json!(["SPAN", "I", "I", "SPAN"]));
     assert_eq!(value["sameLead"], true);
-    assert_eq!(value["sameIa"], true, "the fragment's first child must be adopted, not recreated");
-    assert_eq!(value["sameIb"], true, "the fragment's second child must be adopted, not recreated");
-    assert_eq!(value["sameTrail"], true, "the sibling after the fragment must line up correctly");
+    assert_eq!(
+        value["sameIa"], true,
+        "the fragment's first child must be adopted, not recreated"
+    );
+    assert_eq!(
+        value["sameIb"], true,
+        "the fragment's second child must be adopted, not recreated"
+    );
+    assert_eq!(
+        value["sameTrail"], true,
+        "the sibling after the fragment must line up correctly"
+    );
 }
 
 #[test]
 fn client_island_rejects_unbundled_imports_loudly() {
     // A non-framework import has no client binding yet — it must fail loudly
     // rather than emit a browser module that references undefined helpers.
-    let source = "import { z } from \"zod\";\nexport default function F() { return <i>{z.name}</i>; }";
+    let source =
+        "import { z } from \"zod\";\nexport default function F() { return <i>{z.name}</i>; }";
     let err = compile_client_island_module("components/f", source, 7)
         .expect_err("unbundled npm import should be rejected");
     let message = format!("{err}");
-    assert!(message.contains("zod"), "error should name the offending import: {message}");
+    assert!(
+        message.contains("zod"),
+        "error should name the offending import: {message}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -957,8 +1039,10 @@ fn client_use_id_matches_the_server_golden() {
     let runtime = Runtime::new().expect("quickjs runtime should initialize");
     let context = Context::full(&runtime).expect("quickjs context should initialize");
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
         ctx.eval::<String, _>(USE_ID_SCENARIO)
             .expect("useId scenario should evaluate")
     });
@@ -1059,8 +1143,10 @@ fn create_portal_mounts_into_its_container_and_cleans_up() {
     let runtime = Runtime::new().expect("quickjs runtime should initialize");
     let context = Context::full(&runtime).expect("quickjs context should initialize");
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
         ctx.eval::<String, _>(PORTAL_SCENARIO)
             .expect("portal scenario should evaluate")
     });
@@ -1180,8 +1266,10 @@ fn a_component_that_renders_null_mounts_hydrates_and_toggles() {
     let runtime = Runtime::new().expect("quickjs runtime should initialize");
     let context = Context::full(&runtime).expect("quickjs context should initialize");
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
         ctx.eval::<String, _>(NULL_RENDER_SCENARIO)
             .expect("null-render scenario should evaluate")
     });
@@ -1318,9 +1406,13 @@ fn slot_clones_merged_props_onto_the_child_and_composes_its_handlers() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
-        if let Ok(v) = ctx.eval::<String, _>(SLOT_CLONE_SCENARIO) { v } else {
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
+        if let Ok(v) = ctx.eval::<String, _>(SLOT_CLONE_SCENARIO) {
+            v
+        } else {
             let e = ctx.catch();
             panic!("scenario threw: {e:?}");
         }
@@ -1344,7 +1436,10 @@ fn slot_clones_merged_props_onto_the_child_and_composes_its_handlers() {
     );
 
     // The clone.
-    assert_eq!(value["adopted"], true, "hydration must adopt the server's button");
+    assert_eq!(
+        value["adopted"], true,
+        "hydration must adopt the server's button"
+    );
     assert_eq!(value["tag"], "BUTTON", "the clone renders the child's tag");
     assert_eq!(
         value["className"], "slot mine",
@@ -1361,7 +1456,11 @@ fn slot_clones_merged_props_onto_the_child_and_composes_its_handlers() {
         "a boolean `aria-*` prop lands as the literal word"
     );
     assert_eq!(value["type"], "button", "the child keeps its own props");
-    assert_eq!(value["refAttr"], serde_json::Value::Null, "a ref is never an attribute");
+    assert_eq!(
+        value["refAttr"],
+        serde_json::Value::Null,
+        "a ref is never an attribute"
+    );
     assert_eq!(value["text"], "Open", "and its children");
 
     // Handler composition is the reason `asChild` is worth having at all.
@@ -1446,8 +1545,10 @@ fn hydration_keeps_the_servers_spelling_of_boolean_attributes() {
     let context = Context::full(&runtime).expect("quickjs context should initialize");
 
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
         ctx.eval::<String, _>(BOOLEAN_ATTR_SCENARIO)
             .expect("boolean attribute scenario should evaluate")
     });
@@ -1455,7 +1556,10 @@ fn hydration_keeps_the_servers_spelling_of_boolean_attributes() {
     let value: serde_json::Value =
         serde_json::from_str(&summary).expect("scenario summary should be JSON");
 
-    assert_eq!(value["adopted"], true, "the server <button> must be adopted");
+    assert_eq!(
+        value["adopted"], true,
+        "the server <button> must be adopted"
+    );
 
     // Nothing was rewritten and nothing was dropped: the client's spelling for
     // these props IS the server's.
@@ -1961,8 +2065,10 @@ fn the_client_rebuilds_the_servers_radix_markup() {
     let mut skipped = true;
     let mut mismatches: Vec<String> = Vec::new();
     for (label, package, source) in cases {
-        let (Some(server), Some(client)) = (server_render(package, source), client_render(package, source))
-        else {
+        let (Some(server), Some(client)) = (
+            server_render(package, source),
+            client_render(package, source),
+        ) else {
             continue;
         };
         skipped = false;
@@ -1991,14 +2097,12 @@ fn the_client_rebuilds_the_servers_radix_markup() {
 /// Exactly two attributes disagree, both driven by effects rather than by the
 /// first render:
 ///
-/// * `tabIndex` on the tablist — `RovingFocusGroup` computes it from focus
-///   state in an effect, so the server writes `-1` and the client settles on
-///   `0`.
-/// * `hidden` on the active tabpanel — the server emits it and the client does
-///   not, which means the two disagree about `Presence`'s INITIAL `present`.
-///   React initialises that state to `present ? 'mounted' : 'unmounted'`, so
-///   the server marking a *selected* panel hidden looks like OUR bug, not a
-///   settling difference. **Unresolved.**
+/// * `tabIndex` on the tablist — `RovingFocusGroup` computes it from focus state in an effect, so
+///   the server writes `-1` and the client settles on `0`.
+/// * `hidden` on the active tabpanel — the server emits it and the client does not, which means the
+///   two disagree about `Presence`'s INITIAL `present`. React initialises that state to `present ?
+///   'mounted' : 'unmounted'`, so the server marking a *selected* panel hidden looks like OUR bug,
+///   not a settling difference. **Unresolved.**
 ///
 /// Asserted as an exact set so any further drift fails: this pins the size of
 /// the gap rather than waving it through.
@@ -2031,10 +2135,20 @@ client: {client:#?}"
         if s == c {
             continue;
         }
-        let server_attrs: std::collections::BTreeSet<&str> =
-            s.trim_end_matches(']').split('[').nth(1).unwrap_or("").split(',').collect();
-        let client_attrs: std::collections::BTreeSet<&str> =
-            c.trim_end_matches(']').split('[').nth(1).unwrap_or("").split(',').collect();
+        let server_attrs: std::collections::BTreeSet<&str> = s
+            .trim_end_matches(']')
+            .split('[')
+            .nth(1)
+            .unwrap_or("")
+            .split(',')
+            .collect();
+        let client_attrs: std::collections::BTreeSet<&str> = c
+            .trim_end_matches(']')
+            .split('[')
+            .nth(1)
+            .unwrap_or("")
+            .split(',')
+            .collect();
         for attr in server_attrs.symmetric_difference(&client_attrs) {
             differing.push((*attr).to_string());
         }
@@ -2085,9 +2199,12 @@ fn an_island_never_writes_a_script_url_into_an_href() {
     let runtime = Runtime::new().expect("quickjs runtime should initialize");
     let context = Context::full(&runtime).expect("quickjs context should initialize");
     let summary: String = context.with(|ctx| {
-        ctx.eval::<(), _>(DOM_SHIM).expect("DOM shim should evaluate");
-        ctx.eval::<(), _>(CLIENT_RUNTIME).expect("client runtime should evaluate");
-        ctx.eval::<String, _>(SCRIPT_URL_SCENARIO).expect("scenario should evaluate")
+        ctx.eval::<(), _>(DOM_SHIM)
+            .expect("DOM shim should evaluate");
+        ctx.eval::<(), _>(CLIENT_RUNTIME)
+            .expect("client runtime should evaluate");
+        ctx.eval::<String, _>(SCRIPT_URL_SCENARIO)
+            .expect("scenario should evaluate")
     });
     let value: serde_json::Value = serde_json::from_str(&summary).expect("summary is JSON");
 
@@ -2097,5 +2214,8 @@ fn an_island_never_writes_a_script_url_into_an_href() {
         dom_render_compiler::runtime::jsx_attributes::BLOCKED_URL,
         "the client must refuse what the server renderers refuse"
     );
-    assert_eq!(value["title"], " JaVa\tScRiPt:alert(1)", "a text attribute is text");
+    assert_eq!(
+        value["title"], " JaVa\tScRiPt:alert(1)",
+        "a text attribute is text"
+    );
 }

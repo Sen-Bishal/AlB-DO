@@ -66,12 +66,20 @@ fn rows(terms: Vec<Term>, order: Vec<(&str, Direction)>, bound: RowBound) -> Que
 fn two_sites_writing_keys_in_different_orders_share_one_id_with_their_own_slot_maps() {
     let schema = invoices();
     // Site A: where({ status: a0, owner: a1 }); site B: where({ owner: b0, status: b1 }).
-    let a = rows(vec![eq("status", 0), eq("owner", 1)], vec![], RowBound::Limit { n: 50 })
-        .finish(&schema)
-        .unwrap();
-    let b = rows(vec![eq("owner", 0), eq("status", 1)], vec![], RowBound::Limit { n: 50 })
-        .finish(&schema)
-        .unwrap();
+    let a = rows(
+        vec![eq("status", 0), eq("owner", 1)],
+        vec![],
+        RowBound::Limit { n: 50 },
+    )
+    .finish(&schema)
+    .unwrap();
+    let b = rows(
+        vec![eq("owner", 0), eq("status", 1)],
+        vec![],
+        RowBound::Limit { n: 50 },
+    )
+    .finish(&schema)
+    .unwrap();
     assert_eq!(a.id, b.id);
     assert_eq!(a.json, b.json);
     assert!(a.id.starts_with("q_") && a.id.len() == 18, "{}", a.id);
@@ -79,17 +87,25 @@ fn two_sites_writing_keys_in_different_orders_share_one_id_with_their_own_slot_m
     assert_eq!(a.slot_map, vec![1, 0], "site A: status→1, owner→0");
     assert_eq!(b.slot_map, vec![0, 1], "site B: owner→0, status→1");
     // Byte-identical across runs.
-    let again = rows(vec![eq("status", 0), eq("owner", 1)], vec![], RowBound::Limit { n: 50 })
-        .finish(&schema)
-        .unwrap();
+    let again = rows(
+        vec![eq("status", 0), eq("owner", 1)],
+        vec![],
+        RowBound::Limit { n: 50 },
+    )
+    .finish(&schema)
+    .unwrap();
     assert_eq!(a.json, again.json);
 }
 
 #[test]
 fn different_shapes_get_different_ids() {
     let schema = invoices();
-    let a = rows(vec![eq("status", 0)], vec![], RowBound::Limit { n: 50 }).finish(&schema).unwrap();
-    let b = rows(vec![eq("status", 0)], vec![], RowBound::Limit { n: 51 }).finish(&schema).unwrap();
+    let a = rows(vec![eq("status", 0)], vec![], RowBound::Limit { n: 50 })
+        .finish(&schema)
+        .unwrap();
+    let b = rows(vec![eq("status", 0)], vec![], RowBound::Limit { n: 51 })
+        .finish(&schema)
+        .unwrap();
     assert_ne!(a.id, b.id);
 }
 
@@ -98,7 +114,9 @@ fn different_shapes_get_different_ids() {
 #[test]
 fn the_key_is_appended_as_tie_break_in_the_last_terms_direction() {
     let schema = invoices();
-    let c = rows(vec![], vec![("due", Direction::Desc)], RowBound::None).finish(&schema).unwrap();
+    let c = rows(vec![], vec![("due", Direction::Desc)], RowBound::None)
+        .finish(&schema)
+        .unwrap();
     let sql = &lower(&c.descriptor, &schema).statements[0].sql;
     assert!(sql.ends_with("ORDER BY due DESC, inv_id DESC"), "{sql}");
 }
@@ -106,7 +124,9 @@ fn the_key_is_appended_as_tie_break_in_the_last_terms_direction() {
 #[test]
 fn an_explicit_key_sort_keeps_authored_order_and_nothing_is_appended() {
     let schema = invoices();
-    let c = rows(vec![], vec![("inv_id", Direction::Asc)], RowBound::First).finish(&schema).unwrap();
+    let c = rows(vec![], vec![("inv_id", Direction::Asc)], RowBound::First)
+        .finish(&schema)
+        .unwrap();
     let sql = &lower(&c.descriptor, &schema).statements[0].sql;
     assert!(sql.ends_with("ORDER BY inv_id LIMIT 1"), "{sql}");
 }
@@ -121,14 +141,21 @@ fn a_sort_after_an_explicit_key_sort_is_refused() {
     .finish(&invoices())
     .unwrap_err();
     assert!(matches!(err, QueryError::SortAfterKey { .. }), "{err}");
-    assert!(err.to_string().contains("can never change the order"), "{err}");
+    assert!(
+        err.to_string().contains("can never change the order"),
+        "{err}"
+    );
 }
 
 #[test]
 fn sorting_one_column_twice_is_refused() {
-    let err = rows(vec![], vec![("due", Direction::Asc), ("due", Direction::Desc)], RowBound::None)
-        .finish(&invoices())
-        .unwrap_err();
+    let err = rows(
+        vec![],
+        vec![("due", Direction::Asc), ("due", Direction::Desc)],
+        RowBound::None,
+    )
+    .finish(&invoices())
+    .unwrap_err();
     assert!(matches!(err, QueryError::DuplicateSort { .. }), "{err}");
 }
 
@@ -139,7 +166,9 @@ fn no_authored_order_uses_the_collections_declared_order_then_the_key() {
         column: "due".into(),
         dir: Direction::Asc,
     }];
-    let c = rows(vec![], vec![], RowBound::None).finish(&schema).unwrap();
+    let c = rows(vec![], vec![], RowBound::None)
+        .finish(&schema)
+        .unwrap();
     let sql = &lower(&c.descriptor, &schema).statements[0].sql;
     assert!(sql.ends_with("ORDER BY due, inv_id"), "{sql}");
 }
@@ -149,7 +178,11 @@ fn no_authored_order_uses_the_collections_declared_order_then_the_key() {
 #[test]
 fn lowering_honours_table_and_key_overrides_and_binds_every_value() {
     let schema = invoices();
-    let mut d = rows(vec![eq("status", 0)], vec![("due", Direction::Desc)], RowBound::Limit { n: 50 });
+    let mut d = rows(
+        vec![eq("status", 0)],
+        vec![("due", Direction::Desc)],
+        RowBound::Limit { n: 50 },
+    );
     d.terms.push(Term {
         column: "due".into(),
         op: TermOp::Range {
@@ -184,8 +217,16 @@ fn optional_slots_produce_one_statement_per_presence_mask() {
     let c = d.finish(&schema).unwrap();
     let low = lower(&c.descriptor, &schema);
     assert_eq!(low.statements.len(), 2);
-    assert!(!low.statements[0].sql.contains("owner IS"), "{}", low.statements[0].sql);
-    assert!(low.statements[1].sql.contains("owner IS"), "{}", low.statements[1].sql);
+    assert!(
+        !low.statements[0].sql.contains("owner IS"),
+        "{}",
+        low.statements[0].sql
+    );
+    assert!(
+        low.statements[1].sql.contains("owner IS"),
+        "{}",
+        low.statements[1].sql
+    );
     assert_eq!(low.statements[0].binds.len(), 1);
     assert_eq!(low.statements[1].binds.len(), 2);
 }
@@ -212,13 +253,22 @@ fn or_groups_get_explicit_parentheses_at_both_levels() {
     let schema = invoices();
     let mut d = rows(vec![], vec![], RowBound::None);
     d.or_groups = vec![
-        vec![vec![eq("status", 0), eq("owner", 1)], vec![eq("paid", 2), eq("amount", 3)]],
+        vec![
+            vec![eq("status", 0), eq("owner", 1)],
+            vec![eq("paid", 2), eq("amount", 3)],
+        ],
         vec![vec![eq("due", 4)], vec![eq("inv_id", 5)]],
     ];
     let c = d.finish(&schema).unwrap();
     let sql = &lower(&c.descriptor, &schema).statements[0].sql;
     assert!(sql.contains(") OR ("), "{sql}");
-    let where_part = sql.split(" WHERE ").nth(1).unwrap().split(" ORDER BY ").next().unwrap();
+    let where_part = sql
+        .split(" WHERE ")
+        .nth(1)
+        .unwrap()
+        .split(" ORDER BY ")
+        .next()
+        .unwrap();
     assert!(where_part.starts_with("(("), "{where_part}");
     assert_eq!(where_part.matches(") AND (").count(), 1, "{where_part}");
 }
@@ -227,7 +277,10 @@ fn or_groups_get_explicit_parentheses_at_both_levels() {
 fn or_arity_is_two_to_four() {
     let mut d = rows(vec![], vec![], RowBound::None);
     d.or_groups = vec![vec![vec![eq("status", 0)]]];
-    assert!(matches!(d.finish(&invoices()).unwrap_err(), QueryError::OrArity { count: 1 }));
+    assert!(matches!(
+        d.finish(&invoices()).unwrap_err(),
+        QueryError::OrArity { count: 1 }
+    ));
 }
 
 #[test]
@@ -312,10 +365,22 @@ fn aggregate_and_alias_rules() {
         d.finish(&schema)
     };
     assert!(matches!(
-        group("x", Aggregate::Sum { column: "owner".into() }).unwrap_err(),
+        group(
+            "x",
+            Aggregate::Sum {
+                column: "owner".into()
+            }
+        )
+        .unwrap_err(),
         QueryError::AggregateType { .. }
     ));
-    assert!(group("x", Aggregate::Min { column: "owner".into() }).is_ok());
+    assert!(group(
+        "x",
+        Aggregate::Min {
+            column: "owner".into()
+        }
+    )
+    .is_ok());
     assert!(matches!(
         group("status", Aggregate::Count).unwrap_err(),
         QueryError::AliasClash { .. }
@@ -330,14 +395,20 @@ fn aggregate_and_alias_rules() {
 fn limit_range_and_unknown_columns() {
     let schema = invoices();
     assert!(matches!(
-        rows(vec![], vec![], RowBound::Limit { n: 0 }).finish(&schema).unwrap_err(),
+        rows(vec![], vec![], RowBound::Limit { n: 0 })
+            .finish(&schema)
+            .unwrap_err(),
         QueryError::LimitOutOfRange { .. }
     ));
     assert!(matches!(
-        rows(vec![], vec![], RowBound::Limit { n: 1001 }).finish(&schema).unwrap_err(),
+        rows(vec![], vec![], RowBound::Limit { n: 1001 })
+            .finish(&schema)
+            .unwrap_err(),
         QueryError::LimitOutOfRange { .. }
     ));
-    let err = rows(vec![eq("nope", 0)], vec![], RowBound::None).finish(&schema).unwrap_err();
+    let err = rows(vec![eq("nope", 0)], vec![], RowBound::None)
+        .finish(&schema)
+        .unwrap_err();
     assert!(err.to_string().contains("has no column `nope`"), "{err}");
 }
 
@@ -354,7 +425,11 @@ fn col(c: &str, d: Direction) -> IndexColumn {
 fn esr_index_puts_the_range_column_after_the_sort_columns() {
     // Falsifier 8's fixture: equality status, range amount, order due.
     let schema = invoices();
-    let mut d = rows(vec![eq("status", 0)], vec![("due", Direction::Asc)], RowBound::Limit { n: 50 });
+    let mut d = rows(
+        vec![eq("status", 0)],
+        vec![("due", Direction::Asc)],
+        RowBound::Limit { n: 50 },
+    );
     d.terms.push(Term {
         column: "amount".into(),
         op: TermOp::Range {
@@ -396,7 +471,11 @@ fn legacy_index_names_drop_directions_and_the_new_scheme_does_not() {
             .clone();
         ddl.split_whitespace().nth(5).unwrap().to_string()
     };
-    assert_eq!(name("b"), name("b desc"), "legacy naming is direction-blind");
+    assert_eq!(
+        name("b"),
+        name("b desc"),
+        "legacy naming is direction-blind"
+    );
 
     // New scheme: distinct.
     let a = IndexSpec {
@@ -434,9 +513,18 @@ fn dedup_keeps_two_of_a_ab_ab_desc_and_none_already_served_by_a_legacy_index() {
 fn int_coercion_accepts_exact_integers_and_rejects_everything_else() {
     let code = Provenance::Code;
     let route = Provenance::RouteParam;
-    for accepted in [json!(42), json!("42"), json!("9007199254740993"), json!("0"), json!("-7")] {
+    for accepted in [
+        json!(42),
+        json!("42"),
+        json!("9007199254740993"),
+        json!("0"),
+        json!("-7"),
+    ] {
         assert!(
-            matches!(coerce(&accepted, FieldType::Int, code, "n"), Ok(Coerced::Bind(SqlValue::Integer(_)))),
+            matches!(
+                coerce(&accepted, FieldType::Int, code, "n"),
+                Ok(Coerced::Bind(SqlValue::Integer(_)))
+            ),
             "{accepted} should be accepted"
         );
     }
@@ -444,15 +532,30 @@ fn int_coercion_accepts_exact_integers_and_rejects_everything_else() {
         coerce(&json!("9007199254740993"), FieldType::Int, code, "n").unwrap(),
         Coerced::Bind(SqlValue::Integer(9_007_199_254_740_993))
     );
-    for rejected in [json!("042"), json!(" 42"), json!("4a"), json!("42.0"), json!("1e3"), json!("-0"), json!(9_007_199_254_740_993_i64), json!(4.5)] {
+    for rejected in [
+        json!("042"),
+        json!(" 42"),
+        json!("4a"),
+        json!("42.0"),
+        json!("1e3"),
+        json!("-0"),
+        json!(9_007_199_254_740_993_i64),
+        json!(4.5),
+    ] {
         assert_eq!(
             coerce(&rejected, FieldType::Int, route, "n").unwrap(),
             Coerced::NoMatch,
             "{rejected} from a route param can't match"
         );
-        assert!(coerce(&rejected, FieldType::Int, code, "n").is_err(), "{rejected} from code is an error");
+        assert!(
+            coerce(&rejected, FieldType::Int, code, "n").is_err(),
+            "{rejected} from code is an error"
+        );
     }
-    assert_eq!(coerce(&json!(null), FieldType::Int, code, "n").unwrap(), Coerced::Bind(SqlValue::Null));
+    assert_eq!(
+        coerce(&json!(null), FieldType::Int, code, "n").unwrap(),
+        Coerced::Bind(SqlValue::Null)
+    );
 }
 
 #[test]
@@ -468,24 +571,38 @@ fn text_compared_with_a_number_is_refused_by_rust() {
 #[test]
 fn real_and_bool_coercion() {
     let code = Provenance::Code;
-    assert!(matches!(coerce(&json!("1.5e3"), FieldType::Real, code, "x"), Ok(Coerced::Bind(SqlValue::Real(_)))));
+    assert!(matches!(
+        coerce(&json!("1.5e3"), FieldType::Real, code, "x"),
+        Ok(Coerced::Bind(SqlValue::Real(_)))
+    ));
     assert!(coerce(&json!("1.5e"), FieldType::Real, code, "x").is_err());
     assert!(coerce(&json!(".5"), FieldType::Real, code, "x").is_err());
     assert_eq!(
         coerce(&json!("true"), FieldType::Bool, Provenance::RouteParam, "b").unwrap(),
         Coerced::Bind(SqlValue::Integer(1))
     );
-    assert!(coerce(&json!("true"), FieldType::Bool, code, "b").is_err(), "the string only counts from a route param");
+    assert!(
+        coerce(&json!("true"), FieldType::Bool, code, "b").is_err(),
+        "the string only counts from a route param"
+    );
 }
 
 #[test]
 fn in_arrays_coerce_each_element_and_keep_i64s_exact() {
     let route = Provenance::RouteParam;
-    let json_text = coerce_in(&[json!("9007199254740993"), json!("abc"), json!(3)], FieldType::Int, route, "n")
-        .unwrap()
-        .unwrap();
+    let json_text = coerce_in(
+        &[json!("9007199254740993"), json!("abc"), json!(3)],
+        FieldType::Int,
+        route,
+        "n",
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(json_text, "[9007199254740993,3]");
-    assert_eq!(coerce_in(&[json!("abc")], FieldType::Int, route, "n").unwrap(), None);
+    assert_eq!(
+        coerce_in(&[json!("abc")], FieldType::Int, route, "n").unwrap(),
+        None
+    );
     assert!(coerce_in(&[json!("abc")], FieldType::Int, Provenance::Code, "n").is_err());
     assert!(coerce_in(&[json!(null)], FieldType::Int, route, "n").is_err());
     let big: Vec<_> = (0..1001).map(|i| json!(i)).collect();

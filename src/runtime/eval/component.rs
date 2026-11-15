@@ -119,15 +119,13 @@ pub fn import_candidates(base: &str) -> Vec<String> {
 pub fn normalize_jsx_text(value: &str) -> Option<String> {
     // React JSX whitespace rules (paraphrased):
     //   * Interior runs of whitespace collapse to a single space.
-    //   * A leading/trailing whitespace run is REMOVED when it
-    //     contains a newline (source indentation adjacent to a tag)
-    //     but PRESERVED as a single space when it does not — so
-    //     `Built at the <span>speed</span>` keeps the space before
-    //     `<span>` even when the text node opens with a newline+indent,
-    //     while `\n  x \n` (indented on its own line) collapses to `x`.
-    //   * A pure-whitespace node collapses to nothing if it spans a
-    //     newline, but to a single significant space otherwise (the
-    //     space in `{a} {b}` on one line).
+    //   * A leading/trailing whitespace run is REMOVED when it contains a newline (source
+    //     indentation adjacent to a tag) but PRESERVED as a single space when it does not — so
+    //     `Built at the <span>speed</span>` keeps the space before `<span>` even when the text node
+    //     opens with a newline+indent, while `\n  x \n` (indented on its own line) collapses to
+    //     `x`.
+    //   * A pure-whitespace node collapses to nothing if it spans a newline, but to a single
+    //     significant space otherwise (the space in `{a} {b}` on one line).
     let inner = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if inner.is_empty() {
         if value.is_empty() || value.contains('\n') {
@@ -159,9 +157,7 @@ pub fn normalize_jsx_text(value: &str) -> Option<String> {
 }
 
 pub fn is_component_tag(tag: &str) -> bool {
-    tag.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_uppercase())
+    tag.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
 /// The key that tags an evaluator value as ALREADY-RENDERED MARKUP.
@@ -279,9 +275,9 @@ pub fn escape_attr(value: &str) -> String {
 
 /// JSX props that are framework-level and must never reach the HTML.
 ///
-/// * `key` — React's reconciliation identity. It addresses an element within a
-///   sibling list; it is not data about the element, and `key` is not a valid
-///   HTML attribute. React strips it rather than emitting it, and so must we.
+/// * `key` — React's reconciliation identity. It addresses an element within a sibling list; it is
+///   not data about the element, and `key` is not a valid HTML attribute. React strips it rather
+///   than emitting it, and so must we.
 /// * `ref` — an escape hatch to the host node. Also not an HTML attribute.
 /// * `children` — the element's content, rendered between the tags.
 ///
@@ -602,8 +598,9 @@ pub fn lit_to_value(lit: &swc_ecma_ast::Lit) -> Value {
     match lit {
         swc_ecma_ast::Lit::Str(str_lit) => Value::String(str_lit.value.to_string()),
         swc_ecma_ast::Lit::Bool(bool_lit) => Value::Bool(bool_lit.value),
-        swc_ecma_ast::Lit::Num(num) => serde_json::Number::from_f64(num.value)
-            .map_or(Value::Null, Value::Number),
+        swc_ecma_ast::Lit::Num(num) => {
+            serde_json::Number::from_f64(num.value).map_or(Value::Null, Value::Number)
+        }
         swc_ecma_ast::Lit::Null(_) => Value::Null,
         _ => Value::Null,
     }
@@ -664,8 +661,7 @@ pub fn make_date_value(ms: f64) -> Value {
     let mut map = serde_json::Map::new();
     map.insert(
         "__albedo_date__".to_string(),
-        serde_json::Number::from_f64(ms)
-            .map_or(Value::Null, Value::Number),
+        serde_json::Number::from_f64(ms).map_or(Value::Null, Value::Number),
     );
     Value::Object(map)
 }
@@ -701,8 +697,7 @@ pub fn json_num(value: f64) -> Value {
     if value.is_finite() && value == value.trunc() && value.abs() < 1e16 {
         return Value::Number(serde_json::Number::from(value as i64));
     }
-    serde_json::Number::from_f64(value)
-        .map_or(Value::Null, Value::Number)
+    serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
 }
 
 pub fn json_int(value: i64) -> Value {
@@ -722,9 +717,7 @@ fn format_date_iso(ms: f64) -> String {
         millis -= 1000;
     }
     let (y, mo, d, h, mi, s) = epoch_seconds_to_ymd_hms(secs);
-    format!(
-        "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z"
-    )
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
 }
 
 const fn epoch_seconds_to_ymd_hms(mut secs: i64) -> (i64, u32, u32, u32, u32, u32) {
@@ -738,7 +731,11 @@ const fn epoch_seconds_to_ymd_hms(mut secs: i64) -> (i64, u32, u32, u32, u32, u3
     // Civil-from-days (Howard Hinnant), works for the full proleptic Gregorian
     // range including pre-1970 negative inputs.
     days += 719_468;
-    let era = if days >= 0 { days / 146_097 } else { (days - 146_096) / 146_097 };
+    let era = if days >= 0 {
+        days / 146_097
+    } else {
+        (days - 146_096) / 146_097
+    };
     let doe = (days - era * 146_097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
@@ -944,7 +941,10 @@ mod tests {
         for value in [Value::Null, Value::Bool(false), Value::Bool(true)] {
             assert_eq!(style_value_to_css("color", &value), None);
         }
-        assert_eq!(style_value_to_css("padding", &Value::String(String::new())), None);
+        assert_eq!(
+            style_value_to_css("padding", &Value::String(String::new())),
+            None
+        );
     }
 
     /// The whole rule end to end, on the excalidraw shape that found the bug.
@@ -976,7 +976,10 @@ mod tests {
         // A `serde_json::Map` is a `BTreeMap`, so this path is alphabetical —
         // the documented residual. What matters is that it is CSS, not JSON.
         assert_eq!(html, "style=\"color:red;height:1px\"");
-        assert!(!html.contains('{'), "a style object must never ship as JSON: {html}");
+        assert!(
+            !html.contains('{'),
+            "a style object must never ship as JSON: {html}"
+        );
     }
 
     #[test]

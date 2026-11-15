@@ -117,7 +117,10 @@ fn email_app(home: &Path, work: &Path, name: &str) -> PathBuf {
         &config[..end],
         &config[end..]
     );
-    assert!(config.contains("verify: \"required\""), "the provider edit applied");
+    assert!(
+        config.contains("verify: \"required\""),
+        "the provider edit applied"
+    );
     fs::write(&config_path, config).expect("write config");
     app
 }
@@ -139,7 +142,10 @@ async fn serve(home: &Path, app: &Path) -> (Server, String) {
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        if reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_ok() {
+        if reqwest::get(format!("{base}/_albedo/runtime.js"))
+            .await
+            .is_ok()
+        {
             break;
         }
         assert!(
@@ -202,7 +208,11 @@ async fn post(
     fields: &[(&str, &str)],
 ) -> reqwest::Response {
     let mut body = vec![("_csrf".to_string(), tab.csrf.clone())];
-    body.extend(fields.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())));
+    body.extend(
+        fields
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+    );
     let cookie = match extra_cookie {
         Some(extra) => format!("{}; {extra}", tab.cookie),
         None => tab.cookie.clone(),
@@ -269,13 +279,16 @@ fn read_outbox(app: &Path) -> Vec<Mail> {
 /// The base64 `text/plain` part, decoded — or the html part when there is none.
 fn decoded_text(raw: &str) -> String {
     for kind in ["text/plain", "text/html"] {
-        let marker = format!("Content-Type: {kind}; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n");
+        let marker = format!(
+            "Content-Type: {kind}; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+        );
         if let Some(start) = raw.find(&marker) {
             let body: String = raw[start + marker.len()..]
                 .lines()
                 .take_while(|l| !l.is_empty() && !l.starts_with("--"))
                 .collect();
-            return String::from_utf8(STANDARD.decode(body).unwrap_or_default()).unwrap_or_default();
+            return String::from_utf8(STANDARD.decode(body).unwrap_or_default())
+                .unwrap_or_default();
         }
     }
     String::new()
@@ -332,18 +345,44 @@ async fn reset_verify_and_magic_link_work_end_to_end() {
     assert!(!tab.csrf.is_empty(), "the sign-in page arms its forms");
 
     // ── verify: sign-up opens NO session, and mails a link ────────────────
-    let reg = post(&client, &base, "/_albedo/auth/password/register", &tab, None, &[
-        ("email", "ada@example.com"), ("password", "a-long-passphrase"), ("next", "/guestbook"),
-    ]).await;
+    let reg = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/register",
+        &tab,
+        None,
+        &[
+            ("email", "ada@example.com"),
+            ("password", "a-long-passphrase"),
+            ("next", "/guestbook"),
+        ],
+    )
+    .await;
     assert_eq!(reg.status(), StatusCode::SEE_OTHER);
-    assert!(session_cookie(&reg).is_none(), "an unconfirmed sign-up must not be signed in");
+    assert!(
+        session_cookie(&reg).is_none(),
+        "an unconfirmed sign-up must not be signed in"
+    );
     let first = wait_for_mail(&app, "ada@example.com", "Confirm your email", 0).await;
 
     // ── the same address again answers IDENTICALLY, and the owner is told ──
-    let again = post(&client, &base, "/_albedo/auth/password/register", &tab, None, &[
-        ("email", "ada@example.com"), ("password", "someone-elses-guess"),
-    ]).await;
-    assert_eq!(again.status(), reg.status(), "a taken address must not be distinguishable");
+    let again = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/register",
+        &tab,
+        None,
+        &[
+            ("email", "ada@example.com"),
+            ("password", "someone-elses-guess"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        again.status(),
+        reg.status(),
+        "a taken address must not be distinguishable"
+    );
     assert_eq!(
         again.headers().get("location"),
         reg.headers().get("location"),
@@ -351,13 +390,26 @@ async fn reset_verify_and_magic_link_work_end_to_end() {
     );
     assert!(session_cookie(&again).is_none());
     let notice = wait_for_mail(&app, "ada@example.com", "Sign-up attempt", 0).await;
-    assert!(!notice.text.contains("token="), "the notice grants nothing: {}", notice.text);
+    assert!(
+        !notice.text.contains("token="),
+        "the notice grants nothing: {}",
+        notice.text
+    );
 
     // ── the right password is refused until the address is proven ─────────
-    let login = post(&client, &base, "/_albedo/auth/password/login", &tab, None, &[
-        ("email", "ada@example.com"), ("password", "a-long-passphrase"),
-        ("_albedo_return", "/guestbook"),
-    ]).await;
+    let login = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/login",
+        &tab,
+        None,
+        &[
+            ("email", "ada@example.com"),
+            ("password", "a-long-passphrase"),
+            ("_albedo_return", "/guestbook"),
+        ],
+    )
+    .await;
     assert_eq!(login.status(), StatusCode::FORBIDDEN);
     assert!(session_cookie(&login).is_none());
     assert!(login.text().await.unwrap().contains("Confirm your email"));
@@ -373,7 +425,11 @@ async fn reset_verify_and_magic_link_work_end_to_end() {
         .filter(|m| m.to.contains("ada@example.com") && m.subject.contains("Confirm your email"))
         .map(token_in)
         .collect();
-    assert_eq!(confirms.len(), 2, "exactly two confirmation links: {confirms:?}");
+    assert_eq!(
+        confirms.len(),
+        2,
+        "exactly two confirmation links: {confirms:?}"
+    );
     let fresh = confirms
         .into_iter()
         .find(|token| *token != stale)
@@ -381,56 +437,139 @@ async fn reset_verify_and_magic_link_work_end_to_end() {
 
     // The mailbox budget: a burst of three, all spent on ada. A fourth link
     // is not sent — and the response does not say so.
-    let throttled = post(&client, &base, "/_albedo/auth/password/forgot", &tab, None, &[
-        ("email", "ada@example.com"),
-    ]).await;
+    let throttled = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/forgot",
+        &tab,
+        None,
+        &[("email", "ada@example.com")],
+    )
+    .await;
     assert_eq!(throttled.status(), StatusCode::SEE_OTHER);
 
     // ── the landing page: GET renders, never spends ────────────────────────
-    let (_, status, _) = open_tab(&client, &format!("{base}/_albedo/auth/email/verify?token={stale}")).await;
+    let (_, status, _) = open_tab(
+        &client,
+        &format!("{base}/_albedo/auth/email/verify?token={stale}"),
+    )
+    .await;
     assert_eq!(status, StatusCode::GONE, "a superseded link is dead");
     let verify_url = format!("{base}/_albedo/auth/email/verify?token={fresh}");
     for _ in 0..2 {
         // Twice: a mail scanner's prefetch must leave the link working.
         let (_, status, html) = open_tab(&client, &verify_url).await;
         assert_eq!(status, StatusCode::OK, "{html}");
-        assert!(html.contains(&format!("value=\"{fresh}\"")), "the form carries the token");
+        assert!(
+            html.contains(&format!("value=\"{fresh}\"")),
+            "the form carries the token"
+        );
     }
     let (page, _, _) = open_tab(&client, &verify_url).await;
-    let verified = post(&client, &base, "/_albedo/auth/email/verify", &page, None, &[("token", &fresh)]).await;
+    let verified = post(
+        &client,
+        &base,
+        "/_albedo/auth/email/verify",
+        &page,
+        None,
+        &[("token", &fresh)],
+    )
+    .await;
     assert_eq!(verified.status(), StatusCode::SEE_OTHER);
     assert_eq!(
-        verified.headers().get("location").and_then(|v| v.to_str().ok()),
+        verified
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok()),
         Some("/guestbook"),
         "the re-sent link lands where the login that asked for it would have"
     );
-    assert!(session_cookie(&verified).is_some(), "confirming signs you in");
-    let replay = post(&client, &base, "/_albedo/auth/email/verify", &page, None, &[("token", &fresh)]).await;
+    assert!(
+        session_cookie(&verified).is_some(),
+        "confirming signs you in"
+    );
+    let replay = post(
+        &client,
+        &base,
+        "/_albedo/auth/email/verify",
+        &page,
+        None,
+        &[("token", &fresh)],
+    )
+    .await;
     assert_eq!(replay.status(), StatusCode::GONE, "a link works once");
 
-    let login = post(&client, &base, "/_albedo/auth/password/login", &tab, None, &[
-        ("email", "ada@example.com"), ("password", "a-long-passphrase"),
-    ]).await;
+    let login = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/login",
+        &tab,
+        None,
+        &[
+            ("email", "ada@example.com"),
+            ("password", "a-long-passphrase"),
+        ],
+    )
+    .await;
     assert_eq!(login.status(), StatusCode::SEE_OTHER);
-    assert!(session_cookie(&login).is_some(), "a confirmed account signs in");
+    assert!(
+        session_cookie(&login).is_some(),
+        "a confirmed account signs in"
+    );
 
     // ── reset, on a fresh mailbox ──────────────────────────────────────────
-    let reg = post(&client, &base, "/_albedo/auth/password/register", &tab, None, &[
-        ("email", "bob@example.com"), ("password", "bobs-first-password"),
-    ]).await;
+    let reg = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/register",
+        &tab,
+        None,
+        &[
+            ("email", "bob@example.com"),
+            ("password", "bobs-first-password"),
+        ],
+    )
+    .await;
     assert_eq!(reg.status(), StatusCode::SEE_OTHER);
     let confirm = token_in(&wait_for_mail(&app, "bob@example.com", "Confirm your email", 0).await);
     let bob_session = session_cookie(
-        &post(&client, &base, "/_albedo/auth/email/verify", &tab, None, &[("token", &confirm)]).await,
+        &post(
+            &client,
+            &base,
+            "/_albedo/auth/email/verify",
+            &tab,
+            None,
+            &[("token", &confirm)],
+        )
+        .await,
     )
     .expect("bob is signed in");
 
-    let forgot = post(&client, &base, "/_albedo/auth/password/forgot", &tab, None, &[("email", "bob@example.com")]).await;
+    let forgot = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/forgot",
+        &tab,
+        None,
+        &[("email", "bob@example.com")],
+    )
+    .await;
     assert_eq!(forgot.status(), StatusCode::SEE_OTHER);
     // An address with no account answers the same, and nothing is mailed.
-    let nobody = post(&client, &base, "/_albedo/auth/password/forgot", &tab, None, &[("email", "nobody@example.com")]).await;
+    let nobody = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/forgot",
+        &tab,
+        None,
+        &[("email", "nobody@example.com")],
+    )
+    .await;
     assert_eq!(nobody.status(), forgot.status());
-    assert_eq!(nobody.headers().get("location"), forgot.headers().get("location"));
+    assert_eq!(
+        nobody.headers().get("location"),
+        forgot.headers().get("location")
+    );
 
     let reset_token = token_in(&wait_for_mail(&app, "bob@example.com", "Reset your", 0).await);
     let reset_url = format!("{base}/_albedo/auth/password/reset?token={reset_token}");
@@ -439,33 +578,81 @@ async fn reset_verify_and_magic_link_work_end_to_end() {
     assert!(html.contains("type=\"password\""), "{html}");
 
     // Too short: refused, and the link survives.
-    let short = post(&client, &base, "/_albedo/auth/password/reset", &page, None, &[
-        ("token", &reset_token), ("password", "short"),
-    ]).await;
+    let short = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/reset",
+        &page,
+        None,
+        &[("token", &reset_token), ("password", "short")],
+    )
+    .await;
     assert_eq!(short.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(open_tab(&client, &reset_url).await.1, StatusCode::OK, "a policy refusal must not spend the link");
+    assert_eq!(
+        open_tab(&client, &reset_url).await.1,
+        StatusCode::OK,
+        "a policy refusal must not spend the link"
+    );
 
-    let done = post(&client, &base, "/_albedo/auth/password/reset", &page, Some(&bob_session), &[
-        ("token", &reset_token), ("password", "bobs-new-password"),
-    ]).await;
+    let done = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/reset",
+        &page,
+        Some(&bob_session),
+        &[("token", &reset_token), ("password", "bobs-new-password")],
+    )
+    .await;
     assert_eq!(done.status(), StatusCode::SEE_OTHER);
     let after_reset = session_cookie(&done).expect("a reset signs you in");
     assert_ne!(after_reset, bob_session, "on a NEW session");
-    assert_eq!(open_tab(&client, &reset_url).await.1, StatusCode::GONE, "and the link is spent");
+    assert_eq!(
+        open_tab(&client, &reset_url).await.1,
+        StatusCode::GONE,
+        "and the link is spent"
+    );
 
-    let old = post(&client, &base, "/_albedo/auth/password/login", &tab, None, &[
-        ("email", "bob@example.com"), ("password", "bobs-first-password"),
-    ]).await;
-    assert_eq!(old.status(), StatusCode::UNAUTHORIZED, "the old password is gone");
-    let new = post(&client, &base, "/_albedo/auth/password/login", &tab, None, &[
-        ("email", "bob@example.com"), ("password", "bobs-new-password"),
-    ]).await;
+    let old = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/login",
+        &tab,
+        None,
+        &[
+            ("email", "bob@example.com"),
+            ("password", "bobs-first-password"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        old.status(),
+        StatusCode::UNAUTHORIZED,
+        "the old password is gone"
+    );
+    let new = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/login",
+        &tab,
+        None,
+        &[
+            ("email", "bob@example.com"),
+            ("password", "bobs-new-password"),
+        ],
+    )
+    .await;
     assert_eq!(new.status(), StatusCode::SEE_OTHER);
 
     // ── magic link: sign-in AND sign-up, one call ──────────────────────────
-    let start = post(&client, &base, "/_albedo/auth/magiclink/start", &tab, None, &[
-        ("email", "carol@example.com"), ("next", "/guestbook"),
-    ]).await;
+    let start = post(
+        &client,
+        &base,
+        "/_albedo/auth/magiclink/start",
+        &tab,
+        None,
+        &[("email", "carol@example.com"), ("next", "/guestbook")],
+    )
+    .await;
     assert_eq!(start.status(), StatusCode::SEE_OTHER);
     // The subject is the app's override; the body is still the built-in.
     let magic = wait_for_mail(&app, "carol@example.com", "Sign in to Mail Test now", 0).await;
@@ -478,47 +665,142 @@ async fn reset_verify_and_magic_link_work_end_to_end() {
     let magic_url = format!("{base}/_albedo/auth/magiclink/signin?token={magic_token}");
     let (page, status, _) = open_tab(&client, &magic_url).await;
     assert_eq!(status, StatusCode::OK);
-    let signed_in = post(&client, &base, "/_albedo/auth/magiclink/signin", &page, None, &[("token", &magic_token)]).await;
+    let signed_in = post(
+        &client,
+        &base,
+        "/_albedo/auth/magiclink/signin",
+        &page,
+        None,
+        &[("token", &magic_token)],
+    )
+    .await;
     assert_eq!(signed_in.status(), StatusCode::SEE_OTHER);
-    assert_eq!(signed_in.headers().get("location").and_then(|v| v.to_str().ok()), Some("/guestbook"));
+    assert_eq!(
+        signed_in
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok()),
+        Some("/guestbook")
+    );
     assert!(session_cookie(&signed_in).is_some());
 
     // ── a magic-link user sets a FIRST password through "forgot password" ──
-    let forgot = post(&client, &base, "/_albedo/auth/password/forgot", &tab, None, &[("email", "carol@example.com")]).await;
+    let forgot = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/forgot",
+        &tab,
+        None,
+        &[("email", "carol@example.com")],
+    )
+    .await;
     assert_eq!(forgot.status(), StatusCode::SEE_OTHER);
     let first_pw = token_in(&wait_for_mail(&app, "carol@example.com", "Reset your", 0).await);
-    let (page, _, _) = open_tab(&client, &format!("{base}/_albedo/auth/password/reset?token={first_pw}")).await;
-    let set = post(&client, &base, "/_albedo/auth/password/reset", &page, None, &[
-        ("token", &first_pw), ("password", "carols-password"),
-    ]).await;
+    let (page, _, _) = open_tab(
+        &client,
+        &format!("{base}/_albedo/auth/password/reset?token={first_pw}"),
+    )
+    .await;
+    let set = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/reset",
+        &page,
+        None,
+        &[("token", &first_pw), ("password", "carols-password")],
+    )
+    .await;
     assert_eq!(set.status(), StatusCode::SEE_OTHER);
-    let login = post(&client, &base, "/_albedo/auth/password/login", &tab, None, &[
-        ("email", "carol@example.com"), ("password", "carols-password"),
-    ]).await;
-    assert_eq!(login.status(), StatusCode::SEE_OTHER, "one person, two ways in");
+    let login = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/login",
+        &tab,
+        None,
+        &[
+            ("email", "carol@example.com"),
+            ("password", "carols-password"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        login.status(),
+        StatusCode::SEE_OTHER,
+        "one person, two ways in"
+    );
     // …and a password SIGN-UP for her proven address is "taken", quietly.
-    let squat = post(&client, &base, "/_albedo/auth/password/register", &tab, None, &[
-        ("email", "carol@example.com"), ("password", "a-strangers-guess"),
-    ]).await;
+    let squat = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/register",
+        &tab,
+        None,
+        &[
+            ("email", "carol@example.com"),
+            ("password", "a-strangers-guess"),
+        ],
+    )
+    .await;
     assert_eq!(squat.status(), StatusCode::SEE_OTHER);
     wait_for_mail(&app, "carol@example.com", "Sign-up attempt", 0).await;
 
     // ── the pre-account-takeover defence, observed ─────────────────────────
     // A stranger registers erin's address with a password they know and never
     // confirms it. Erin signs in by link; the stranger's password must die.
-    let planted = post(&client, &base, "/_albedo/auth/password/register", &tab, None, &[
-        ("email", "erin@example.com"), ("password", "the-strangers-password"),
-    ]).await;
+    let planted = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/register",
+        &tab,
+        None,
+        &[
+            ("email", "erin@example.com"),
+            ("password", "the-strangers-password"),
+        ],
+    )
+    .await;
     assert_eq!(planted.status(), StatusCode::SEE_OTHER);
     wait_for_mail(&app, "erin@example.com", "Confirm your email", 0).await;
-    post(&client, &base, "/_albedo/auth/magiclink/start", &tab, None, &[("email", "erin@example.com")]).await;
+    post(
+        &client,
+        &base,
+        "/_albedo/auth/magiclink/start",
+        &tab,
+        None,
+        &[("email", "erin@example.com")],
+    )
+    .await;
     let erin = token_in(&wait_for_mail(&app, "erin@example.com", "Sign in to", 0).await);
-    let (page, _, _) = open_tab(&client, &format!("{base}/_albedo/auth/magiclink/signin?token={erin}")).await;
-    let claimed = post(&client, &base, "/_albedo/auth/magiclink/signin", &page, None, &[("token", &erin)]).await;
-    assert!(session_cookie(&claimed).is_some(), "the mailbox owner is signed in");
-    let stranger = post(&client, &base, "/_albedo/auth/password/login", &tab, None, &[
-        ("email", "erin@example.com"), ("password", "the-strangers-password"),
-    ]).await;
+    let (page, _, _) = open_tab(
+        &client,
+        &format!("{base}/_albedo/auth/magiclink/signin?token={erin}"),
+    )
+    .await;
+    let claimed = post(
+        &client,
+        &base,
+        "/_albedo/auth/magiclink/signin",
+        &page,
+        None,
+        &[("token", &erin)],
+    )
+    .await;
+    assert!(
+        session_cookie(&claimed).is_some(),
+        "the mailbox owner is signed in"
+    );
+    let stranger = post(
+        &client,
+        &base,
+        "/_albedo/auth/password/login",
+        &tab,
+        None,
+        &[
+            ("email", "erin@example.com"),
+            ("password", "the-strangers-password"),
+        ],
+    )
+    .await;
     assert_eq!(
         stranger.status(),
         StatusCode::UNAUTHORIZED,
@@ -531,7 +813,10 @@ async fn reset_verify_and_magic_link_work_end_to_end() {
         "an address with no account must receive nothing"
     );
     assert_eq!(
-        read_outbox(&app).iter().filter(|m| m.to.contains("ada@")).count(),
+        read_outbox(&app)
+            .iter()
+            .filter(|m| m.to.contains("ada@"))
+            .count(),
         3,
         "ada's fourth link was over her mailbox's budget"
     );
@@ -570,7 +855,15 @@ async fn send_email_from_an_action_and_a_job_lands_once_and_is_scrubbed() {
         };
         // Twice, with the same idempotency id: ONE action email.
         for _ in 0..2 {
-            let posted = post(&client, &base, &action, &tab, None, &[("to", "dora@example.com")]).await;
+            let posted = post(
+                &client,
+                &base,
+                &action,
+                &tab,
+                None,
+                &[("to", "dora@example.com")],
+            )
+            .await;
             assert!(
                 posted.status().is_success() || posted.status().is_redirection(),
                 "the action accepts the submit: {}",
@@ -578,9 +871,14 @@ async fn send_email_from_an_action_and_a_job_lands_once_and_is_scrubbed() {
             );
         }
         let from_action = wait_for_mail(&app, "dora@example.com", "Hello from an action", 0).await;
-        assert!(from_action.text.contains("sent by dora@example.com"), "{from_action:?}");
         assert!(
-            from_action.raw.contains("Content-Disposition: attachment; filename=\"note.txt\"\r\n")
+            from_action.text.contains("sent by dora@example.com"),
+            "{from_action:?}"
+        );
+        assert!(
+            from_action
+                .raw
+                .contains("Content-Disposition: attachment; filename=\"note.txt\"\r\n")
                 && from_action.raw.contains("aGVsbG8="),
             "the inline attachment travels with the message:\n{}",
             from_action.raw
@@ -591,13 +889,24 @@ async fn send_email_from_an_action_and_a_job_lands_once_and_is_scrubbed() {
         wait_for_mail(&app, "dora@example.com", "Hello from a job", 1).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(
-            read_outbox(&app).iter().filter(|m| m.subject.contains("from an action")).count(),
+            read_outbox(&app)
+                .iter()
+                .filter(|m| m.subject.contains("from an action"))
+                .count(),
             1,
             "a repeated `sendEmail` with the same id is one email"
         );
 
         // A header-injection attempt throws in the action and queues nothing.
-        let _ = post(&client, &base, &action, &tab, None, &[("to", "eve@example.com\r\nBcc: all@example.com")]).await;
+        let _ = post(
+            &client,
+            &base,
+            &action,
+            &tab,
+            None,
+            &[("to", "eve@example.com\r\nBcc: all@example.com")],
+        )
+        .await;
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(
             !read_outbox(&app).iter().any(|m| m.to.contains("eve@")),
@@ -608,7 +917,9 @@ async fn send_email_from_an_action_and_a_job_lands_once_and_is_scrubbed() {
 
     // Every sent row's body is gone from the queue.
     use dom_render_compiler::forge::{DataSubstrate, LibSqlSubstrate, SqlValue};
-    let db = LibSqlSubstrate::open_local(&app.join("forge.db")).await.expect("db opens");
+    let db = LibSqlSubstrate::open_local(&app.join("forge.db"))
+        .await
+        .expect("db opens");
     let rows = db
         .query(
             "SELECT state, args FROM albedo_jobs WHERE name = 'albedo:send_email'",
@@ -618,7 +929,12 @@ async fn send_email_from_an_action_and_a_job_lands_once_and_is_scrubbed() {
         .expect("reads");
     assert_eq!(rows.rows.len(), 3, "one action email + two job emails");
     for row in &rows.rows {
-        let text = |i: usize| row.get(i).and_then(SqlValue::as_str).unwrap_or_default().to_string();
+        let text = |i: usize| {
+            row.get(i)
+                .and_then(SqlValue::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
         assert_eq!(text(0), "done");
         assert_eq!(text(1), "{}", "a delivered message's body must be scrubbed");
     }
@@ -631,7 +947,10 @@ async fn send_email_from_an_action_and_a_job_lands_once_and_is_scrubbed() {
 fn magic_link_beside_an_unconfirmed_password_provider_fails_the_build() {
     let home = tempfile::tempdir().expect("home");
     let work = tempfile::tempdir().expect("work");
-    run_ok(albedo(home.path(), work.path()).args(["init", "squat"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "squat"]),
+        "albedo init",
+    );
     let app = work.path().join("squat");
     let config_path = app.join("albedo.config.ts");
     let config = fs::read_to_string(&config_path).unwrap().replacen(
@@ -647,14 +966,20 @@ fn magic_link_beside_an_unconfirmed_password_provider_fails_the_build() {
     );
     fs::write(&config_path, config).unwrap();
 
-    let build = albedo(home.path(), &app).arg("build").output().expect("runs");
+    let build = albedo(home.path(), &app)
+        .arg("build")
+        .output()
+        .expect("runs");
     let output = format!(
         "{}{}",
         String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
     assert!(!build.status.success(), "must fail:\n{output}");
-    assert!(output.contains("verify: \\\"required\\\"") || output.contains("verify: \"required\""), "names the fix:\n{output}");
+    assert!(
+        output.contains("verify: \\\"required\\\"") || output.contains("verify: \"required\""),
+        "names the fix:\n{output}"
+    );
 }
 
 /// `reset: "email"` with nowhere to send it fails the BUILD, naming the fix.
@@ -662,15 +987,23 @@ fn magic_link_beside_an_unconfirmed_password_provider_fails_the_build() {
 fn an_auth_flow_that_mails_without_an_email_block_fails_the_build() {
     let home = tempfile::tempdir().expect("home");
     let work = tempfile::tempdir().expect("work");
-    run_ok(albedo(home.path(), work.path()).args(["init", "nomail"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "nomail"]),
+        "albedo init",
+    );
     let app = work.path().join("nomail");
     let config_path = app.join("albedo.config.ts");
-    let config = fs::read_to_string(&config_path)
-        .unwrap()
-        .replacen("      password: {},", "      password: { reset: \"email\" },", 1);
+    let config = fs::read_to_string(&config_path).unwrap().replacen(
+        "      password: {},",
+        "      password: { reset: \"email\" },",
+        1,
+    );
     fs::write(&config_path, config).unwrap();
 
-    let build = albedo(home.path(), &app).arg("build").output().expect("runs");
+    let build = albedo(home.path(), &app)
+        .arg("build")
+        .output()
+        .expect("runs");
     let output = format!(
         "{}{}",
         String::from_utf8_lossy(&build.stdout),

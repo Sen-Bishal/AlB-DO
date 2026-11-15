@@ -196,9 +196,7 @@ impl StreamingAppState {
     /// registry, used by the streaming handler's WT path and by
     /// tests that want to seed topic values before the session
     /// connects.
-    pub const fn broadcast(
-        &self,
-    ) -> Option<&Arc<dom_render_compiler::runtime::BroadcastRegistry>> {
+    pub const fn broadcast(&self) -> Option<&Arc<dom_render_compiler::runtime::BroadcastRegistry>> {
         self.broadcast.as_ref()
     }
 
@@ -501,10 +499,7 @@ async fn serve_manifest_route(
     let (page_session, is_fresh_session) =
         match crate::render::csrf::read_session_cookie(req.headers()) {
             Some(existing) => (existing, false),
-            None => (
-                dom_render_compiler::runtime::SessionId::random(),
-                true,
-            ),
+            None => (dom_render_compiler::runtime::SessionId::random(), true),
         };
 
     if negotiated_transport == NegotiatedTransport::WebTransport {
@@ -564,9 +559,18 @@ async fn serve_manifest_route(
     let feedback = crate::forms::FormFeedback::read(req.headers());
     let expire_feedback = feedback.is_some();
 
-    let render_errors = req.extensions().get::<crate::access_log::RenderErrors>().cloned();
+    let render_errors = req
+        .extensions()
+        .get::<crate::access_log::RenderErrors>()
+        .cloned();
     let stream = build_stream(
-        route, ctx, app, response_transport, page_session, feedback, render_errors.clone(),
+        route,
+        ctx,
+        app,
+        response_transport,
+        page_session,
+        feedback,
+        render_errors.clone(),
     );
 
     let mut response = Response::builder()
@@ -587,7 +591,10 @@ async fn serve_manifest_route(
         );
     }
     if expire_feedback {
-        response = response.header(header::SET_COOKIE, crate::forms::FormFeedback::clear_cookie());
+        response = response.header(
+            header::SET_COOKIE,
+            crate::forms::FormFeedback::clear_cookie(),
+        );
     }
 
     if let Some(alt_svc) = transport_config.alt_svc {
@@ -1077,7 +1084,10 @@ fn build_stream(
     }
 }
 
-#[allow(clippy::too_many_arguments, reason = "private; one route's shell inputs")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "private; one route's shell inputs"
+)]
 fn build_shell_chunk(
     route: &RouteManifest,
     negotiated_transport: NegotiatedTransport,
@@ -1092,7 +1102,13 @@ fn build_shell_chunk(
     painted: &HashMap<String, InjectionChunk>,
 ) -> String {
     fill_server_placeholders(
-        assemble_shell(route, negotiated_transport, webtransport_path, csrf_token, painted),
+        assemble_shell(
+            route,
+            negotiated_transport,
+            webtransport_path,
+            csrf_token,
+            painted,
+        ),
         hydration
             .map(|h| h.placeholders.as_slice())
             .unwrap_or_default(),
@@ -1191,8 +1207,7 @@ fn fill_server_placeholders(
     // function exists at all: a form that got one fill and not the other
     // submits successfully and then lands the reader on `/`, which reads as the
     // app losing their place rather than as a missing substitution.
-    let with_return =
-        crate::render::csrf::substitute_return_path_in_html(&with_csrf, request_path);
+    let with_return = crate::render::csrf::substitute_return_path_in_html(&with_csrf, request_path);
     // …and the intent token, fused for the same reason: a form that reached the
     // browser with an empty one still submits, and still works — it simply
     // cannot be resumed after a crash, which is the failure that looks like
@@ -1322,9 +1337,10 @@ async fn bind_webtransport_session(
     session_id: Uuid,
     identity: Option<&crate::auth::Identity>,
 ) -> Result<(), String> {
-    let (Some(wiring), Some(sessions)) =
-        (app.live_authority.as_ref(), app.webtransport_sessions.as_ref())
-    else {
+    let (Some(wiring), Some(sessions)) = (
+        app.live_authority.as_ref(),
+        app.webtransport_sessions.as_ref(),
+    ) else {
         return Ok(());
     };
     let anonymous = crate::auth::Identity::Anonymous;
@@ -1368,9 +1384,9 @@ async fn stream_route_over_webtransport(
     // any cookie round-trip on the WT path.
     let page_session = dom_render_compiler::runtime::SessionId::new(session_id);
 
-    // 1. Shell HTML on the text slot. A3 client hydration rides the SSE/HTTP
-    //    path (`build_stream`); the WT path stays on its opcode-frame model, so
-    //    no per-route hydration block is threaded here.
+    // 1. Shell HTML on the text slot. A3 client hydration rides the SSE/HTTP path (`build_stream`);
+    //    the WT path stays on its opcode-frame model, so no per-route hydration block is threaded
+    //    here.
     let mut shell = build_shell_chunk(
         &route,
         NegotiatedTransport::WebTransport,
@@ -1412,8 +1428,7 @@ async fn stream_route_over_webtransport(
     // manifest by Stream B) references it.
     if !route.shared_slot_topics.is_empty() {
         if let Some(broadcast) = app.broadcast() {
-            if let Some(patches_sender) =
-                sessions.stream_sender(session_id, WT_STREAM_SLOT_PATCHES)
+            if let Some(patches_sender) = sessions.stream_sender(session_id, WT_STREAM_SLOT_PATCHES)
             {
                 // Column projection · the same per-route columns the other two
                 // lanes cut by, from the same rule.
@@ -1443,8 +1458,8 @@ async fn stream_route_over_webtransport(
                         component_id: None,
                         instructions: initial,
                     };
-                    let encoded = dom_render_compiler::ir::wire::encode_frame(&frame)
-                        .map_err(|err| {
+                    let encoded =
+                        dom_render_compiler::ir::wire::encode_frame(&frame).map_err(|err| {
                             format!("auto_subscribe initial-state encode failed: {err}")
                         })?;
                     sessions
@@ -1456,23 +1471,21 @@ async fn stream_route_over_webtransport(
         }
     }
 
-    // 2. Bootstrap intern table on the binary patches slot. The
-    //    classifier is a stub for Phase E (Phase F+ will plug in a real
-    //    one driven by the renderer's intern context); shipping an
+    // 2. Bootstrap intern table on the binary patches slot. The classifier is a stub for Phase E
+    //    (Phase F+ will plug in a real one driven by the renderer's intern context); shipping an
     //    empty bootstrap is a valid no-op the bakabox VM tolerates.
-    if let Some(chunk) = drain_pipeline_bootstrap(app.as_ref(), |_, _| None)
-        .map_err(|err| err.to_string())?
+    if let Some(chunk) =
+        drain_pipeline_bootstrap(app.as_ref(), |_, _| None).map_err(|err| err.to_string())?
     {
         ship_chunk(sessions, session_id, chunk)
             .await
             .map_err(|err| err.to_string())?;
     }
 
-    // 3. Enqueue every Tier-B node as a Phase-D async island. The
-    //    Future that resolves each island runs render_tier_b_opcodes
-    //    inside the node's manifest-declared timeout; on error or
-    //    timeout the island resolves to an empty instruction vector so
-    //    the placeholder stays empty rather than crashing the tick.
+    // 3. Enqueue every Tier-B node as a Phase-D async island. The Future that resolves each island
+    //    runs render_tier_b_opcodes inside the node's manifest-declared timeout; on error or
+    //    timeout the island resolves to an empty instruction vector so the placeholder stays empty
+    //    rather than crashing the tick.
     for node in &route.tier_b {
         let node_owned = node.clone();
         let ctx_owned = ctx.clone();
@@ -1484,12 +1497,7 @@ async fn stream_route_over_webtransport(
         let resolver = async move {
             let rendered = tokio::time::timeout(
                 Duration::from_millis(timeout_ms),
-                render_tier_b_opcodes(
-                    &node_owned,
-                    &ctx_owned,
-                    registry.as_ref(),
-                    fetcher.as_ref(),
-                ),
+                render_tier_b_opcodes(&node_owned, &ctx_owned, registry.as_ref(), fetcher.as_ref()),
             )
             .await;
             match rendered {
@@ -1520,13 +1528,13 @@ async fn stream_route_over_webtransport(
             .map_err(|err| err.to_string())?;
     }
 
-    // 4. Drive ticks + drain chunks until every island has resolved or
-    //    the hard deadline elapses. Each drain ships Placeholder frames
-    //    (on the first iteration) and Patch frames (as resolvers land).
+    // 4. Drive ticks + drain chunks until every island has resolved or the hard deadline elapses.
+    //    Each drain ships Placeholder frames (on the first iteration) and Patch frames (as
+    //    resolvers land).
     drain_async_islands_into_session(app.as_ref(), sessions, session_id).await?;
 
-    // 5. Prefetch hints on slot 3 (JSON). Hydration triggers stay on
-    //    the SSE path until Phase F ports them to opcodes.
+    // 5. Prefetch hints on slot 3 (JSON). Hydration triggers stay on the SSE path until Phase F
+    //    ports them to opcodes.
     let prefetch_modules: Vec<String> = route
         .tier_c
         .iter()
@@ -1588,8 +1596,7 @@ async fn drain_async_islands_into_session(
     sessions: &WebTransportSessionRegistry,
     session_id: Uuid,
 ) -> Result<(), String> {
-    let deadline = std::time::Instant::now()
-        + Duration::from_millis(WT_ASYNC_DRAIN_TIMEOUT_MS);
+    let deadline = std::time::Instant::now() + Duration::from_millis(WT_ASYNC_DRAIN_TIMEOUT_MS);
 
     loop {
         let chunks = drive_pipeline_tick(app);
@@ -1613,8 +1620,7 @@ async fn drain_async_islands_into_session(
         if std::time::Instant::now() >= deadline {
             warn!(
                 pending,
-                "async-island drain deadline reached; leaving {} islands unresolved",
-                pending
+                "async-island drain deadline reached; leaving {} islands unresolved", pending
             );
             return Ok(());
         }
@@ -1649,7 +1655,9 @@ fn request_context_from_request(
         params,
         headers,
         cookies,
-        user: principal.as_ref().map(dom_render_compiler::auth::Principal::user_value),
+        user: principal
+            .as_ref()
+            .map(dom_render_compiler::auth::Principal::user_value),
         principal: principal.map(|who| who.id),
     }
 }
@@ -2046,7 +2054,10 @@ mod tests {
 
         let shell = "<div id=\"__b_feature\" data-albedo-tier=\"b\"></div>".to_string();
         let painted_html = paint_tier_b_placeholders(shell, &painted);
-        assert!(painted_html.contains("data-albedo-error=\"error\""), "{painted_html}");
+        assert!(
+            painted_html.contains("data-albedo-error=\"error\""),
+            "{painted_html}"
+        );
 
         let after_seed = seed_tier_b_placeholders(painted_html, std::slice::from_ref(&node));
         assert!(
@@ -2308,7 +2319,10 @@ mod tests {
             script.contains("globalThis.__ALBEDO_CSRF__=\"cafebabecafebabecafebabecafebabe\""),
             "token must be published to the runtime's global: {script}"
         );
-        assert!(!script.contains("=\"\""), "an empty token is the silent 403 this guards");
+        assert!(
+            !script.contains("=\"\""),
+            "an empty token is the silent 403 this guards"
+        );
     }
 
     #[test]
@@ -2332,7 +2346,10 @@ mod tests {
             !out.contains("data-albedo-tier=\"c\""),
             "the empty placeholder must be gone: {out}"
         );
-        assert!(out.contains("<h1>Essay</h1>"), "page content preserved: {out}");
+        assert!(
+            out.contains("<h1>Essay</h1>"),
+            "page content preserved: {out}"
+        );
     }
 
     /// Phase L · the fill pass is shared by the shell and the Tier-B
@@ -2344,7 +2361,9 @@ mod tests {
     fn fill_server_placeholders_stamps_the_csrf_token_into_tier_b_html() {
         use dom_render_compiler::transforms::form::CSRF_PLACEHOLDER_INPUT;
 
-        let html = format!("<main><form data-albedo-action=\"sign\">{CSRF_PLACEHOLDER_INPUT}</form></main>");
+        let html = format!(
+            "<main><form data-albedo-action=\"sign\">{CSRF_PLACEHOLDER_INPUT}</form></main>"
+        );
         let out = fill_server_placeholders(html, &[], "cafebabe", "/guestbook", &[]);
 
         assert!(
@@ -2365,8 +2384,14 @@ mod tests {
         use dom_render_compiler::transforms::form::{allocate_form_ok_id, form_ok_span};
 
         let html = "<main><div id=\"i1\" data-albedo-tier=\"c\"></div></main>".to_string();
-        let fills = vec![("i1".to_string(), format!("<form>{}</form>", form_ok_span("join")))];
-        let feedback = [(allocate_form_ok_id("join"), "You're on the list.".to_string())];
+        let fills = vec![(
+            "i1".to_string(),
+            format!("<form>{}</form>", form_ok_span("join")),
+        )];
+        let feedback = [(
+            allocate_form_ok_id("join"),
+            "You're on the list.".to_string(),
+        )];
         let out = fill_server_placeholders(html, &fills, "cafebabe", "/", &feedback);
 
         assert!(
@@ -2466,7 +2491,9 @@ mod tests {
             binding: "rows".to_string(),
             collection: "messages".to_string(),
             column: "room".to_string(),
-            key: dom_render_compiler::manifest::schema::PartitionKeySource::RouteParam("id".to_string()),
+            key: dom_render_compiler::manifest::schema::PartitionKeySource::RouteParam(
+                "id".to_string(),
+            ),
         }];
         assert!(route_needs_live_lane(&route));
     }
@@ -2617,10 +2644,12 @@ mod tests {
                 break;
             };
             let (frame, _) = decode_frame(&bytes).expect("patch bytes must decode");
-            if frame.instructions.iter().any(|instr| matches!(
-                instr,
-                dom_render_compiler::ir::opcode::Instruction::Placeholder { .. }
-            )) {
+            if frame.instructions.iter().any(|instr| {
+                matches!(
+                    instr,
+                    dom_render_compiler::ir::opcode::Instruction::Placeholder { .. }
+                )
+            }) {
                 saw_placeholder = true;
                 break;
             }
@@ -3032,5 +3061,4 @@ mod tests {
             "a bridge that resumes after close installed a topic subscription"
         );
     }
-
 }

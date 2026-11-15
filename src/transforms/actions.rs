@@ -41,9 +41,8 @@
 //!
 //! - Missing handler argument → no body to invoke.
 //! - Non-function handler argument → cannot be invoked as a closure.
-//! - Duplicate action name within one module → `FNV-1a-32(name)` would
-//!   collide on the wire and dispatch would silently route to whichever
-//!   handler `wrap()` happened to insert last.
+//! - Duplicate action name within one module → `FNV-1a-32(name)` would collide on the wire and
+//!   dispatch would silently route to whichever handler `wrap()` happened to insert last.
 
 use crate::runtime::eval::expr::{param_from_pat, ParsedModule};
 use crate::runtime::eval::{ImportBinding, ParamBinding};
@@ -206,7 +205,11 @@ pub enum ActionExtractError {
     /// same `NAME` within one module. FNV-1a-32 would collide on the
     /// wire so the dispatcher would silently route to whichever the
     /// extractor saw last.
-    DuplicateActionName { name: String, first_idx: usize, second_idx: usize },
+    DuplicateActionName {
+        name: String,
+        first_idx: usize,
+        second_idx: usize,
+    },
 }
 
 impl std::fmt::Display for ActionExtractError {
@@ -223,10 +226,9 @@ impl std::fmt::Display for ActionExtractError {
                  function expression; bare identifiers and other values are \
                  not supported",
             ),
-            Self::MissingFunctionBody { name } => write!(
-                f,
-                "action declaration '{name}' has no function body",
-            ),
+            Self::MissingFunctionBody { name } => {
+                write!(f, "action declaration '{name}' has no function body",)
+            }
             Self::DuplicateActionName {
                 name,
                 first_idx,
@@ -299,9 +301,12 @@ fn try_extract_action_body(
         return Ok(None);
     }
 
-    let handler_arg = call.args.first().ok_or_else(|| {
-        ActionExtractError::MissingHandlerArgument { name: name.to_string() }
-    })?;
+    let handler_arg =
+        call.args
+            .first()
+            .ok_or_else(|| ActionExtractError::MissingHandlerArgument {
+                name: name.to_string(),
+            })?;
     if handler_arg.spread.is_some() {
         // Spread args (`action(...handler)`) cannot resolve to a
         // single arrow body at compile time.
@@ -352,8 +357,12 @@ fn function_to_body(
 }
 
 fn is_action_call(call: &CallExpr, imports: &HashMap<String, ImportBinding>) -> bool {
-    let Callee::Expr(callee_expr) = &call.callee else { return false };
-    let Expr::Ident(ident) = callee_expr.as_ref() else { return false };
+    let Callee::Expr(callee_expr) = &call.callee else {
+        return false;
+    };
+    let Expr::Ident(ident) = callee_expr.as_ref() else {
+        return false;
+    };
     let local = ident.sym.to_string();
     if local != "action" {
         return false;
@@ -397,14 +406,20 @@ mod tests {
 
     #[test]
     fn a_body_without_broadcast_seeds_nothing() {
-        assert_eq!(reads("append(\"guestbook\", { author: \"x\" });"), BroadcastReads::None);
+        assert_eq!(
+            reads("append(\"guestbook\", { author: \"x\" });"),
+            BroadcastReads::None
+        );
     }
 
     /// The old gate was a substring test on the body source, so this body paid
     /// for every topic in the process.
     #[test]
     fn the_word_broadcast_in_a_comment_is_not_a_broadcast() {
-        assert_eq!(reads("// we could broadcast here later\nlet x = 1;"), BroadcastReads::None);
+        assert_eq!(
+            reads("// we could broadcast here later\nlet x = 1;"),
+            BroadcastReads::None
+        );
     }
 
     #[test]
@@ -526,9 +541,7 @@ mod tests {
                             .imported
                             .as_ref()
                             .and_then(|n| match n {
-                                swc_ecma_ast::ModuleExportName::Ident(i) => {
-                                    Some(i.sym.to_string())
-                                }
+                                swc_ecma_ast::ModuleExportName::Ident(i) => Some(i.sym.to_string()),
                                 _ => None,
                             })
                             .unwrap_or_else(|| local.clone());
@@ -555,7 +568,9 @@ mod tests {
             };
             if let Some(var_decl) = var_decl {
                 for VarDeclarator { name, init, .. } in &var_decl.decls {
-                    let swc_ecma_ast::Pat::Ident(binding) = name else { continue };
+                    let swc_ecma_ast::Pat::Ident(binding) = name else {
+                        continue;
+                    };
                     let Some(init) = init else { continue };
                     if matches!(
                         init.as_ref(),
@@ -679,7 +694,10 @@ mod tests {
             export const broken = action();
             "#,
         );
-        assert!(matches!(err, ActionExtractError::MissingHandlerArgument { .. }));
+        assert!(matches!(
+            err,
+            ActionExtractError::MissingHandlerArgument { .. }
+        ));
     }
 
     #[test]
@@ -706,7 +724,10 @@ mod tests {
             export const same = action(() => 2);
             "#,
         );
-        assert!(matches!(err, ActionExtractError::DuplicateActionName { .. }));
+        assert!(matches!(
+            err,
+            ActionExtractError::DuplicateActionName { .. }
+        ));
     }
 
     #[test]

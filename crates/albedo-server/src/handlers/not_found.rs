@@ -123,7 +123,10 @@ mod tests {
         let response = builtin_page("/<script>alert('x')</script>");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = futures_body(response);
-        assert!(body.contains("/&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"), "{body}");
+        assert!(
+            body.contains("/&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"),
+            "{body}"
+        );
         assert!(!body.contains("<script>"), "{body}");
     }
 

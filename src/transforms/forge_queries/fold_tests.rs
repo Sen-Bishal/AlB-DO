@@ -50,7 +50,11 @@ fn a_fold_lowers_to_one_descriptor_with_one_optional_slot_per_if() {
         .terms
         .iter()
         .any(|t| t.column == "status" && t.optional_slot.is_none()));
-    assert_eq!(q.lowered.statements.len(), 4, "2 optional slots → 4 presence masks");
+    assert_eq!(
+        q.lowered.statements.len(),
+        4,
+        "2 optional slots → 4 presence masks"
+    );
 }
 
 #[test]
@@ -152,7 +156,9 @@ fn more_than_three_optional_slots_is_refused_by_the_cap() {
     );
     assert!(c.queries.is_empty());
     assert!(
-        c.diagnostics.iter().any(|d| d.message.contains("at most 3")),
+        c.diagnostics
+            .iter()
+            .any(|d| d.message.contains("at most 3")),
         "{:?}",
         messages(&c)
     );
@@ -176,7 +182,9 @@ fn a_shorthand_predicate_names_its_column() {
 
 #[test]
 fn a_limit_may_be_a_const_bound_to_an_integer_literal() {
-    let c = fold("  const PAGE = 20;\n  return await invoices.where({ status: \"open\" }).limit(PAGE);");
+    let c = fold(
+        "  const PAGE = 20;\n  return await invoices.where({ status: \"open\" }).limit(PAGE);",
+    );
     assert!(c.diagnostics.is_empty(), "{:?}", messages(&c));
     assert_eq!(
         c.queries[0].canonical.descriptor.bound,
@@ -235,13 +243,21 @@ fn a_const_predicate_lowers_like_its_literal() {
 fn a_const_predicate_used_any_other_way_is_refused_naming_that_use() {
     let read = "  return await invoices.where(open).count();";
     let cases: &[(&str, &str, u32)] = &[
-        ("const open = { status: \"open\" };\nconst alias = open;", "outside a query", 4),
+        (
+            "const open = { status: \"open\" };\nconst alias = open;",
+            "outside a query",
+            4,
+        ),
         (
             "const open = { status: \"open\" };\nObject.assign(open, { status: \"x\" });",
             "passed to a function",
             4,
         ),
-        ("const open = { status: \"open\" };\nopen.status = \"x\";", "outside a query", 4),
+        (
+            "const open = { status: \"open\" };\nopen.status = \"x\";",
+            "outside a query",
+            4,
+        ),
         ("let open = { status: \"open\" };", "by name", 5),
         ("const open = { ...base };", "spread", 3),
         ("const open = { owner: optional(1) };", "optional()", 3),
@@ -251,10 +267,11 @@ fn a_const_predicate_used_any_other_way_is_refused_naming_that_use() {
         assert!(c.queries.is_empty(), "{prelude}\nlowered {:?}", c.queries);
         let messages = messages(&c);
         assert!(
-            messages.iter().any(|m| m.contains(expected)
-                && m.starts_with(&format!("src/routes/probe.tsx:{line}:"))),
+            messages
+                .iter()
+                .any(|m| m.contains(expected)
+                    && m.starts_with(&format!("src/routes/probe.tsx:{line}:"))),
             "{prelude}\nexpected `{expected}` at line {line}, got {messages:?}"
         );
     }
 }
-

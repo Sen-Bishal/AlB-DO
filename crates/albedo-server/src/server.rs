@@ -184,7 +184,12 @@ impl RoleControl {
             .auth()
             .cloned()
             .ok_or_else(|| "this app declares no `auth` block".to_string())?;
-        if !auth.registry().roles.iter().any(|declared| declared == role) {
+        if !auth
+            .registry()
+            .roles
+            .iter()
+            .any(|declared| declared == role)
+        {
             return Err(format!(
                 "`{role}` is not a role this app declares (declared: {})",
                 if auth.registry().roles.is_empty() {
@@ -311,7 +316,10 @@ impl LiveRuntime {
         kind: crate::live_authority::LiveKind,
         headers: &axum::http::HeaderMap,
     ) -> crate::live_authority::LiveHandle {
-        let presented = self.auth.get().and_then(|auth| auth.presented_hash(headers));
+        let presented = self
+            .auth
+            .get()
+            .and_then(|auth| auth.presented_hash(headers));
         self.live_authority.register_presented(kind, presented)
     }
 
@@ -363,10 +371,7 @@ impl LiveRuntime {
 
     /// Install the outbound client for action-body `fetch()`. Idempotent, on the
     /// same terms as the reader.
-    fn install_aperture_client(
-        &self,
-        client: Arc<dom_render_compiler::aperture::ApertureClient>,
-    ) {
+    fn install_aperture_client(&self, client: Arc<dom_render_compiler::aperture::ApertureClient>) {
         let _ = self.aperture_client.set(client);
     }
 
@@ -435,14 +440,14 @@ impl LiveRuntime {
     /// The read-through half of "the substrate is the truth, the value is a
     /// cache". Three outcomes, all of them fine for the page:
     ///
-    /// - **hit** — the entry exists; stamp it so the byte budget sees a read as
-    ///   use, and do no I/O. A hit is authoritative rather than merely likely:
-    ///   within a process the write path keeps every warm partition exact by
-    ///   splicing or evicting it, so there is no staleness window to re-check.
+    /// - **hit** — the entry exists; stamp it so the byte budget sees a read as use, and do no I/O.
+    ///   A hit is authoritative rather than merely likely: within a process the write path keeps
+    ///   every warm partition exact by splicing or evicting it, so there is no staleness window to
+    ///   re-check.
     /// - **miss** — one indexed range scan over the partition, then mint.
-    /// - **refused** — a slot-id collision, a collection that is not declared, a
-    ///   substrate error. Logged with the topic named; the topic stays
-    ///   unregistered and the route degrades to no live data.
+    /// - **refused** — a slot-id collision, a collection that is not declared, a substrate error.
+    ///   Logged with the topic named; the topic stays unregistered and the route degrades to no
+    ///   live data.
     async fn warm_partition(&self, partition: &ResolvedPartition) -> bool {
         if self.broadcast.touch(&partition.topic) {
             return true;
@@ -806,7 +811,8 @@ impl CompiledProjectActionAdapter {
                 fields.remove("_csrf");
                 fields.remove("_albedo_return");
             }
-            let canonical = payload.map_or_else(|| envelope.payload.clone(), |v| v.to_string().into_bytes());
+            let canonical =
+                payload.map_or_else(|| envelope.payload.clone(), |v| v.to_string().into_bytes());
             let mut digest = Sha256::new();
             digest.update(self.action_id.to_le_bytes());
             digest.update([envelope.event_kind]);
@@ -1421,9 +1427,8 @@ impl AlbedoServerBuilder {
         // already been answered with a timeout, so JS still running is running
         // for nobody — and holding an engine while it does.
         self.action_engine_pool = Some(Arc::new(
-            crate::engine_pool::QuickJsEnginePool::with_size(size).with_job_budget(
-                Duration::from_millis(self.config.server.request_timeout_ms),
-            ),
+            crate::engine_pool::QuickJsEnginePool::with_size(size)
+                .with_job_budget(Duration::from_millis(self.config.server.request_timeout_ms)),
         ));
         self
     }
@@ -1524,7 +1529,10 @@ impl AlbedoServerBuilder {
     /// Install the declared webhooks. Lowered in `boot.rs`, where a missing
     /// secret or a job `src/jobs.ts` does not declare can fail the boot by name.
     #[must_use]
-    pub(crate) fn with_webhooks(self, registry: dom_render_compiler::webhook::WebhookRegistry) -> Self {
+    pub(crate) fn with_webhooks(
+        self,
+        registry: dom_render_compiler::webhook::WebhookRegistry,
+    ) -> Self {
         self.live.install_webhooks(Arc::new(registry));
         self
     }
@@ -1576,10 +1584,7 @@ impl AlbedoServerBuilder {
     /// swapping build output without disturbing live state. The corollary is
     /// that editing the config's `forge` block needs a restart, not a reload.
     #[must_use]
-    pub fn with_forge_schema(
-        mut self,
-        schema: dom_render_compiler::forge::ForgeSchema,
-    ) -> Self {
+    pub fn with_forge_schema(mut self, schema: dom_render_compiler::forge::ForgeSchema) -> Self {
         self.live.forge_schema = Arc::new(schema);
         self
     }
@@ -1675,11 +1680,7 @@ impl AlbedoServerBuilder {
         // per adapter. `<no-build-id>` is deliberately not the empty string: two
         // builds that both defaulted to `""` would compare equal and R8's check
         // would pass without ever having been configured.
-        let build_id: Arc<str> = Arc::from(
-            self.build_id
-                .as_deref()
-                .unwrap_or("<no-build-id>"),
-        );
+        let build_id: Arc<str> = Arc::from(self.build_id.as_deref().unwrap_or("<no-build-id>"));
 
         for proxy_id in project.handler_proxy_ids() {
             let adapter = CompiledProjectActionAdapter {
@@ -1856,14 +1857,14 @@ impl AlbedoServerBuilder {
                 dom_render_compiler::aperture::EgressMode::Serve
             };
             let policy = Arc::new(dom_render_compiler::aperture::EgressPolicy::new(mode));
-            let transport =
-                dom_render_compiler::aperture::ReqwestTransport::new(Arc::clone(&policy)).map_err(
-                    |err| {
-                        RuntimeError::ServerStartup(format!(
-                            "could not build the APERTURE outbound client: {err}"
-                        ))
-                    },
-                )?;
+            let transport = dom_render_compiler::aperture::ReqwestTransport::new(Arc::clone(
+                &policy,
+            ))
+            .map_err(|err| {
+                RuntimeError::ServerStartup(format!(
+                    "could not build the APERTURE outbound client: {err}"
+                ))
+            })?;
             self.live.install_aperture_client(Arc::new(
                 dom_render_compiler::aperture::ApertureClient::new(
                     Arc::new(transport),
@@ -2288,9 +2289,9 @@ impl AlbedoServerBuilder {
                     && route.auth.is_none()
                     && route.middleware.is_empty()
                     && !has_layout_handlers
-                    && streaming_runtime
-                        .as_ref()
-                        .is_some_and(|runtime| runtime.manifest.routes.contains_key(route.path.as_str()));
+                    && streaming_runtime.as_ref().is_some_and(|runtime| {
+                        runtime.manifest.routes.contains_key(route.path.as_str())
+                    });
 
             // Phase-F: a route's `handler` may resolve to either a
             // page `RouteHandler` or an API `ApiHandler`. Build fails
@@ -2398,8 +2399,9 @@ impl AlbedoServerBuilder {
                             decl.entry
                         )));
                     };
-                    let modules = dom_render_compiler::middleware::module_graph(project, &decl.entry)
-                        .map_err(RuntimeError::ServerStartup)?;
+                    let modules =
+                        dom_render_compiler::middleware::module_graph(project, &decl.entry)
+                            .map_err(RuntimeError::ServerStartup)?;
                     Some(Arc::new(crate::middleware::MiddlewarePlan::new(
                         decl.entry,
                         decl.matcher,
@@ -2454,7 +2456,10 @@ impl AlbedoServerBuilder {
         // the first place both declarations are in hand.
         if let Some(webhooks) = self.live.webhooks() {
             for hook in webhooks.iter() {
-                if !jobs_plan.as_ref().is_some_and(|plan| plan.declares(&hook.job)) {
+                if !jobs_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.declares(&hook.job))
+                {
                     return Err(RuntimeError::ServerStartup(format!(
                         "webhook `{}` queues job `{}`, which src/jobs.ts does not declare",
                         hook.name, hook.job
@@ -2504,11 +2509,14 @@ impl AlbedoServerBuilder {
         // comes from, so a host cannot be declared in one and missed in the other.
         if let Some(reader) = self.live.source_reader() {
             for (host, quota) in reader.registry().upstream_limits() {
-                shutter.shutter().set_upstream_quota(host, quota).map_err(|err| {
-                    RuntimeError::ServerStartup(format!(
-                        "the `limit` declared for `{host}` cannot be enforced: {err}"
-                    ))
-                })?;
+                shutter
+                    .shutter()
+                    .set_upstream_quota(host, quota)
+                    .map_err(|err| {
+                        RuntimeError::ServerStartup(format!(
+                            "the `limit` declared for `{host}` cannot be enforced: {err}"
+                        ))
+                    })?;
             }
         }
         // …and charged at the wire, by every client that can send. The reader's
@@ -2521,7 +2529,9 @@ impl AlbedoServerBuilder {
             client.install_upstream_budget(shutter.shutter().clone());
         }
         if let Some(reader) = self.live.source_reader() {
-            reader.client().install_upstream_budget(shutter.shutter().clone());
+            reader
+                .client()
+                .install_upstream_budget(shutter.shutter().clone());
         }
 
         let state = RuntimeState {
@@ -2705,7 +2715,10 @@ impl AlbedoServer {
             limiter: Arc::clone(&self.state.shutter),
         });
         Router::new()
-            .route(crate::health::HEALTH_PATH, axum::routing::get(crate::health::health))
+            .route(
+                crate::health::HEALTH_PATH,
+                axum::routing::get(crate::health::health),
+            )
             .route(
                 crate::health::READY_PATH,
                 axum::routing::get(move || crate::health::ready(readiness.clone())),
@@ -2944,7 +2957,6 @@ impl AlbedoServer {
             // derived from the artifacts this server is already reading, and
             // overridable by config or `ALBEDO_FORGE_DB` for a mounted volume.
 
-
             // A restore `albedo db restore` staged, swapped in before anything
             // has the database open — the one moment that is true. See
             // `forge::backup` for why it is staged rather than applied live.
@@ -2962,14 +2974,12 @@ impl AlbedoServer {
                 ));
             }
 
-            let opened = Arc::new(LibSqlSubstrate::open_local(&db_path)
-                .await
-                .map_err(|err| {
-                    RuntimeError::ServerStartup(format!(
-                        "FORGE: failed to open {}: {err}",
-                        db_path.display()
-                    ))
-                })?);
+            let opened = Arc::new(LibSqlSubstrate::open_local(&db_path).await.map_err(|err| {
+                RuntimeError::ServerStartup(format!(
+                    "FORGE: failed to open {}: {err}",
+                    db_path.display()
+                ))
+            })?);
             let substrate: Arc<dyn forge::DataSubstrate> = opened.clone();
 
             // Gate 1 — hand-authored schema, then materialise every
@@ -3043,10 +3053,9 @@ impl AlbedoServer {
                     // whatever the previous process left behind.
                     loop {
                         ticker.tick().await;
-                        let cutoff = dom_render_compiler::aperture::now_ms()
-                            .saturating_sub(
-                                i64::try_from(DEFAULT_RETENTION.as_millis()).unwrap_or(i64::MAX),
-                            );
+                        let cutoff = dom_render_compiler::aperture::now_ms().saturating_sub(
+                            i64::try_from(DEFAULT_RETENTION.as_millis()).unwrap_or(i64::MAX),
+                        );
                         match JournalLedger::new(swept.as_ref()).sweep(cutoff).await {
                             Ok(0) => {}
                             Ok(rows) => tracing::debug!(
@@ -3223,12 +3232,14 @@ impl AlbedoServer {
                 provider = plan.config.provider.as_str(),
                 "EMAIL enabled"
             );
-            self.state.live.install_email(Arc::new(crate::email::EmailRuntime::new(
-                plan.config,
-                plan.mailer,
-                link_origin,
-                plan.data_dir,
-            )));
+            self.state
+                .live
+                .install_email(Arc::new(crate::email::EmailRuntime::new(
+                    plan.config,
+                    plan.mailer,
+                    link_origin,
+                    plan.data_dir,
+                )));
         }
 
         let mut acme_driver = None;
@@ -3244,13 +3255,9 @@ impl AlbedoServer {
                 cache,
                 staging,
             } => {
-                let (config, driver) = crate::tls::acme_config(
-                    domains,
-                    contact.as_deref(),
-                    cache,
-                    *staging,
-                )
-                .map_err(RuntimeError::ServerStartup)?;
+                let (config, driver) =
+                    crate::tls::acme_config(domains, contact.as_deref(), cache, *staging)
+                        .map_err(RuntimeError::ServerStartup)?;
                 info!(
                     target: "albedo.tls.acme",
                     domains = %domains.join(", "),
@@ -3630,7 +3637,10 @@ fn render_metrics(state: &RuntimeState) -> String {
     });
     // The reader's client and the workflow client are usually one instance, but
     // not by construction (see `build`) — count each distinct client once.
-    let reader_client = state.live.source_reader().map(|reader| reader.client().clone());
+    let reader_client = state
+        .live
+        .source_reader()
+        .map(|reader| reader.client().clone());
     let workflow_client = state.live.aperture_client().cloned();
     let mut clients: Vec<Arc<dom_render_compiler::aperture::ApertureClient>> = Vec::new();
     for client in [reader_client, workflow_client].into_iter().flatten() {
@@ -3638,8 +3648,10 @@ fn render_metrics(state: &RuntimeState) -> String {
             clients.push(client);
         }
     }
-    let aperture = clients.iter().map(|client| client.metrics()).reduce(|a, b| {
-        dom_render_compiler::aperture::MetricsSnapshot {
+    let aperture = clients
+        .iter()
+        .map(|client| client.metrics())
+        .reduce(|a, b| dom_render_compiler::aperture::MetricsSnapshot {
             upstream_requests: a.upstream_requests + b.upstream_requests,
             conditional_requests: a.conditional_requests + b.conditional_requests,
             not_modified: a.not_modified + b.not_modified,
@@ -3648,8 +3660,7 @@ fn render_metrics(state: &RuntimeState) -> String {
             coalesced: a.coalesced + b.coalesced,
             stale_on_error: a.stale_on_error + b.stale_on_error,
             throttled: a.throttled + b.throttled,
-        }
-    });
+        });
     let runtime = crate::metrics::RuntimeGauges {
         engine_pool,
         phosphor_lanes: state.phosphor.lane_count(),
@@ -3725,10 +3736,9 @@ async fn end_event_streams_on_shutdown(
 }
 
 fn compression_layer() -> CompressionLayer<And<DefaultPredicate, NotForContentType>> {
-    CompressionLayer::new()
-        .compress_when(DefaultPredicate::new().and(NotForContentType::const_new(
-            "text/event-stream",
-        )))
+    CompressionLayer::new().compress_when(
+        DefaultPredicate::new().and(NotForContentType::const_new("text/event-stream")),
+    )
 }
 
 /// How long a connection may stay silent at each stage.
@@ -3768,13 +3778,12 @@ fn is_connection_error(err: &std::io::Error) -> bool {
 ///
 /// Things it must not lose, each silent if dropped:
 ///
-/// * **`ConnectInfo`** — SHUTTER keys its rate-limit buckets on the peer, and
-///   without it every request in the process shares `UNATTRIBUTED`. Inserted
-///   per connection by hand.
-/// * **graceful shutdown, bounded** — in-flight requests finish instead of being
-///   cut (for a streaming response, a complete page rather than a truncated
-///   one), and `drain_timeout` (`shutdown_timeout_ms`) is how long they get: a
-///   connection that will not finish must not hold the process open.
+/// * **`ConnectInfo`** — SHUTTER keys its rate-limit buckets on the peer, and without it every
+///   request in the process shares `UNATTRIBUTED`. Inserted per connection by hand.
+/// * **graceful shutdown, bounded** — in-flight requests finish instead of being cut (for a
+///   streaming response, a complete page rather than a truncated one), and `drain_timeout`
+///   (`shutdown_timeout_ms`) is how long they get: a connection that will not finish must not hold
+///   the process open.
 ///
 /// A connection that says nothing is closed: one that never finishes the TLS
 /// handshake after `timeouts.handshake`, and one that never finishes a
@@ -3837,24 +3846,30 @@ pub(crate) async fn serve_connections(
                     serve_one(TokioIo::new(stream), false, router, peer, timeouts, watcher).await;
                 }
                 Some(acceptor) => {
-                    let tls_stream = match tokio::time::timeout(
-                        timeouts.handshake,
-                        acceptor.accept(stream),
-                    )
-                    .await
-                    {
-                        Ok(Ok(stream)) => stream,
-                        Ok(Err(err)) => {
-                            debug!(peer = %peer, error = %err, "TLS handshake failed");
-                            return;
-                        }
-                        Err(_) => {
-                            debug!(peer = %peer, "TLS handshake timed out");
-                            return;
-                        }
-                    };
+                    let tls_stream =
+                        match tokio::time::timeout(timeouts.handshake, acceptor.accept(stream))
+                            .await
+                        {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(err)) => {
+                                debug!(peer = %peer, error = %err, "TLS handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                debug!(peer = %peer, "TLS handshake timed out");
+                                return;
+                            }
+                        };
                     let h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
-                    serve_one(TokioIo::new(tls_stream), h2, router, peer, timeouts, watcher).await;
+                    serve_one(
+                        TokioIo::new(tls_stream),
+                        h2,
+                        router,
+                        peer,
+                        timeouts,
+                        watcher,
+                    )
+                    .await;
                 }
             }
         });
@@ -3903,7 +3918,11 @@ async fn serve_one<I>(
     // timer is what makes hyper's header timeout run at all: with none set,
     // hyper skips its 30 s default without a word.
     let builder = ConnBuilder::new(TokioExecutor::new());
-    let mut builder = if h2 { builder.http2_only() } else { builder.http1_only() };
+    let mut builder = if h2 {
+        builder.http2_only()
+    } else {
+        builder.http1_only()
+    };
     builder
         .http1()
         .timer(TokioTimer::new())
@@ -4026,7 +4045,10 @@ fn public_origin_for(state: &RuntimeState, headers: &HeaderMap) -> String {
 /// and must not — an indexed session query per image on the page is a real cost
 /// for an answer that branch never reads. An asset therefore rations by address,
 /// which is the correct subject for an unauthenticated byte stream anyway.
-#[allow(clippy::result_large_err, reason = "Err is the HTTP response itself, returned early")]
+#[allow(
+    clippy::result_large_err,
+    reason = "Err is the HTTP response itself, returned early"
+)]
 fn ration(
     state: &RuntimeState,
     peer: Option<IpAddr>,
@@ -4057,8 +4079,14 @@ async fn dispatch_inner(
 ) -> Response {
     let mut rationed: Option<Verdict> = None;
     let mut middleware_headers: Option<dom_render_compiler::middleware::outcome::Headers> = None;
-    let mut response =
-        dispatch_routed(&state, peer, request, &mut rationed, &mut middleware_headers).await;
+    let mut response = dispatch_routed(
+        &state,
+        peer,
+        request,
+        &mut rationed,
+        &mut middleware_headers,
+    )
+    .await;
     // MIDDLEWARE · 15.6 — a `next()` or `rewrite()` decision's headers, on
     // whatever the route answered. Stamped here for the reason the budget headers
     // below are: every branch of `dispatch_routed` returns its own response, and
@@ -4096,7 +4124,10 @@ async fn not_found_page(
     use crate::handlers::not_found::{builtin_page, carries_over, NOT_FOUND_ROUTE};
 
     let declared = matches!(
-        state.world().router.match_route(HttpMethod::Get, NOT_FOUND_ROUTE),
+        state
+            .world()
+            .router
+            .match_route(HttpMethod::Get, NOT_FOUND_ROUTE),
         RouteMatch::Matched(_)
     );
     // `path != NOT_FOUND_ROUTE` is the recursion guard: the internal request is
@@ -4104,7 +4135,11 @@ async fn not_found_page(
     // route vanished in between — and then it gets the built-in page.
     if declared && path != NOT_FOUND_ROUTE {
         let mut internal = Request::builder()
-            .method(if method == HttpMethod::Head { "HEAD" } else { "GET" })
+            .method(if method == HttpMethod::Head {
+                "HEAD"
+            } else {
+                "GET"
+            })
             .uri(NOT_FOUND_ROUTE);
         for (name, value) in headers {
             if carries_over(name) {
@@ -4267,14 +4302,16 @@ async fn dispatch_routed(
                     .await
                     .admitted();
                 match streaming_runtime.broadcast() {
-                    Some(broadcast) if admitted => crate::handlers::patches::serve_patch_stream_live(
-                        broadcast.clone(),
-                        &grants,
-                        projector,
-                        Some(live),
-                    )
-                    .await
-                    .into_response(),
+                    Some(broadcast) if admitted => {
+                        crate::handlers::patches::serve_patch_stream_live(
+                            broadcast.clone(),
+                            &grants,
+                            projector,
+                            Some(live),
+                        )
+                        .await
+                        .into_response()
+                    }
                     Some(_) => empty_patch_stream().await,
                     // No registry wired: nothing can ever publish, so an empty
                     // stream is the truthful answer, not an error.
@@ -4326,8 +4363,7 @@ async fn dispatch_routed(
         // `?dev=1` merges the overlay/HMR event streams onto the trunk so a
         // dev browser holds exactly one connection. Inert in production: the
         // registries are `None`, so the flag has nothing to stream.
-        let wants_dev = crate::routing::parse_query_string(query.as_deref())
-            .contains_key("dev");
+        let wants_dev = crate::routing::parse_query_string(query.as_deref()).contains_key("dev");
         let dev = if wants_dev {
             crate::handlers::phosphor::DevTap {
                 errors: state.dev_error_registry.clone(),
@@ -4562,7 +4598,10 @@ async fn dispatch_routed(
                     session_cookie.as_deref(),
                     world.request_timeout,
                     crate::middleware::Outbound {
-                        client: state.live.aperture_client().map(std::convert::AsRef::as_ref),
+                        client: state
+                            .live
+                            .aperture_client()
+                            .map(std::convert::AsRef::as_ref),
                         admit: &admit,
                     },
                 )
@@ -4740,8 +4779,8 @@ async fn dispatch_routed(
         let headers = request.headers().clone();
         // The tab session the link form's CSRF token is bound to — as for the
         // password endpoints, a fresh id when absent, which cannot validate.
-        let session = crate::render::csrf::read_session_cookie(&headers)
-            .unwrap_or_else(SessionId::random);
+        let session =
+            crate::render::csrf::read_session_cookie(&headers).unwrap_or_else(SessionId::random);
         let provider_name = provider_name.to_string();
         let body = if leg == OAuthRoute::Link {
             match to_bytes(request.into_body(), crate::forms::MAX_FORM_BODY_BYTES).await {
@@ -4941,10 +4980,12 @@ async fn dispatch_routed(
                 Err(refusal) => return refusal,
             };
 
-            let outbound_caller =
-                state
-                    .shutter
-                    .key(&principal, peer, request.headers(), OperationClass::Outbound);
+            let outbound_caller = state.shutter.key(
+                &principal,
+                peer,
+                request.headers(),
+                OperationClass::Outbound,
+            );
             let ((response, fan_out), outbound_refusal) = crate::shutter::outbound_scope(
                 Arc::clone(&state.shutter),
                 outbound_caller,
@@ -5016,10 +5057,12 @@ async fn dispatch_routed(
             Err(refusal) => return refusal,
         };
 
-        let outbound_caller =
-            state
-                .shutter
-                .key(&principal, peer, request.headers(), OperationClass::Outbound);
+        let outbound_caller = state.shutter.key(
+            &principal,
+            peer,
+            request.headers(),
+            OperationClass::Outbound,
+        );
         let ((response, fan_out), outbound_refusal) = crate::shutter::outbound_scope(
             Arc::clone(&state.shutter),
             outbound_caller,
@@ -5182,8 +5225,16 @@ async fn dispatch_routed(
                     && crate::handlers::not_found::wants_html(request.headers()) =>
                 {
                     let headers = request.headers().clone();
-                    not_found_page(state, peer, method, &headers, &path, rationed, middleware_headers)
-                        .await
+                    not_found_page(
+                        state,
+                        peer,
+                        method,
+                        &headers,
+                        &path,
+                        rationed,
+                        middleware_headers,
+                    )
+                    .await
                 }
                 // `NotFound`, and `Matched` which the arm above took.
                 _ => RuntimeError::RouteNotFound {
@@ -5254,11 +5305,14 @@ async fn dispatch_routed(
                 .manifest
                 .routes
                 .get(route_pattern.as_str())
-                .map_or(dom_render_compiler::manifest::schema::Admission::Allowed, |route| {
-                    route
-                        .auth
-                        .admits(identity.principal().map(|who| who.roles.as_slice()))
-                });
+                .map_or(
+                    dom_render_compiler::manifest::schema::Admission::Allowed,
+                    |route| {
+                        route
+                            .auth
+                            .admits(identity.principal().map(|who| who.roles.as_slice()))
+                    },
+                );
             if admission == dom_render_compiler::manifest::schema::Admission::Forbidden {
                 debug!(
                     target: "albedo.auth",
@@ -5289,7 +5343,10 @@ async fn dispatch_routed(
                 let navigating =
                     crate::handlers::auth_gate::is_document_navigation(request.headers());
                 // Where they were going, so the sign-in returns them there.
-                let requested = request.uri().path_and_query().map(|pq| pq.as_str().to_string());
+                let requested = request
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string());
                 return crate::handlers::auth_gate::refuse_anonymous_returning(
                     &route_pattern,
                     login_path,
@@ -5580,10 +5637,8 @@ async fn run_form_action_route(
                 Some(_) => return crate::uploads::refusal(&crate::uploads::UploadError::Forged),
                 None => crate::uploads::Genuine::Pending(&check),
             };
-            let stream = futures_util::TryStreamExt::map_err(
-                body.into_data_stream(),
-                std::io::Error::other,
-            );
+            let stream =
+                futures_util::TryStreamExt::map_err(body.into_data_stream(), std::io::Error::other);
             let form = match crate::uploads::decode_multipart(
                 stream,
                 &boundary,
@@ -5604,12 +5659,7 @@ async fn run_form_action_route(
             // findable. Recorded before the action runs so an action body that
             // reads the uploads table sees its own upload.
             if let Some(substrate) = substrate.as_ref() {
-                crate::uploads::record_all(
-                    substrate.as_ref(),
-                    &form,
-                    crate::auth::now_ms(),
-                )
-                .await;
+                crate::uploads::record_all(substrate.as_ref(), &form, crate::auth::now_ms()).await;
             }
 
             parts.headers.insert(
@@ -5832,13 +5882,8 @@ async fn lane_page_after_middleware(
         .live
         .auth()
         .map(|auth| auth.registry().session_cookie.clone());
-    let request_json = crate::middleware::request_json(
-        "GET",
-        page_path,
-        None,
-        headers,
-        session_cookie.as_deref(),
-    );
+    let request_json =
+        crate::middleware::request_json("GET", page_path, None, headers, session_cookie.as_deref());
     let outbound_key = state
         .shutter
         .key(identity, peer, headers, OperationClass::Outbound);
@@ -5853,7 +5898,10 @@ async fn lane_page_after_middleware(
             session_cookie.as_deref(),
             world.request_timeout,
             crate::middleware::Outbound {
-                client: state.live.aperture_client().map(std::convert::AsRef::as_ref),
+                client: state
+                    .live
+                    .aperture_client()
+                    .map(std::convert::AsRef::as_ref),
                 admit: &admit,
             },
         )
@@ -5927,9 +5975,7 @@ fn resolve_route_topics_detailed(
     //
     // R1a · the same `admits` the render and the action doors call, so a role
     // gate means one thing on every door.
-    let admission = route
-        .auth
-        .admits(principal.map(|who| who.roles.as_slice()));
+    let admission = route.auth.admits(principal.map(|who| who.roles.as_slice()));
     if admission != dom_render_compiler::manifest::schema::Admission::Allowed {
         debug!(
             target: "albedo.auth",
@@ -5945,10 +5991,9 @@ fn resolve_route_topics_detailed(
     // params. A spec whose param the route did not match, or whose key is
     // outside the alphabet, contributes no topic — the page is live for
     // everything else it reads and static for this one.
-    let partitions =
-        resolve_partition_topics(&route.shared_slot_partitions, principal, |name| {
-            matched.params.get(name).map(String::as_str)
-        });
+    let partitions = resolve_partition_topics(&route.shared_slot_partitions, principal, |name| {
+        matched.params.get(name).map(String::as_str)
+    });
 
     // APERTURE · the other derivation, resolved from the same matched params by
     // the same rule. A source binding is reachable only through a route that
@@ -6337,9 +6382,13 @@ mod tests {
         ));
 
         // TCP open, handshake never started.
-        let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        let mut silent = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
         assert!(
-            until_closed(&mut silent, Duration::from_secs(5)).await.is_some(),
+            until_closed(&mut silent, Duration::from_secs(5))
+                .await
+                .is_some(),
             "a connection that never started the handshake was held open"
         );
 
@@ -6364,7 +6413,8 @@ mod tests {
                 message: &[u8],
                 cert: &rustls::pki_types::CertificateDer<'_>,
                 dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
                 rustls::crypto::verify_tls12_signature(
                     message,
                     cert,
@@ -6377,7 +6427,8 @@ mod tests {
                 message: &[u8],
                 cert: &rustls::pki_types::CertificateDer<'_>,
                 dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
                 rustls::crypto::verify_tls13_signature(
                     message,
                     cert,
@@ -6400,19 +6451,28 @@ mod tests {
         let localhost = rustls::pki_types::ServerName::try_from("localhost").expect("name");
 
         // Handshake done, no request ever sent.
-        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
         let mut idle = connector
             .connect(localhost.clone(), tcp)
             .await
             .expect("the handshake completes");
         assert!(
-            until_closed(&mut idle, Duration::from_secs(5)).await.is_some(),
+            until_closed(&mut idle, Duration::from_secs(5))
+                .await
+                .is_some(),
             "a connection that sent no request was held open"
         );
 
         // Control: a prompt request is still answered.
-        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connects");
-        let mut prompt = connector.connect(localhost, tcp).await.expect("the handshake completes");
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
+        let mut prompt = connector
+            .connect(localhost, tcp)
+            .await
+            .expect("the handshake completes");
         prompt
             .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
             .await
@@ -6490,31 +6550,47 @@ mod tests {
         ));
 
         // Connected, nothing sent.
-        let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        let mut silent = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
         assert!(
-            until_closed(&mut silent, Duration::from_secs(5)).await.is_some(),
+            until_closed(&mut silent, Duration::from_secs(5))
+                .await
+                .is_some(),
             "a connection that sent nothing was held open"
         );
 
         // Half a request line, then nothing — slowloris.
-        let mut slow = tokio::net::TcpStream::connect(addr).await.expect("connects");
-        slow.write_all(b"GET / HTTP/1.1\r\nhost: loc").await.expect("writes");
+        let mut slow = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
+        slow.write_all(b"GET / HTTP/1.1\r\nhost: loc")
+            .await
+            .expect("writes");
         assert!(
-            until_closed(&mut slow, Duration::from_secs(5)).await.is_some(),
+            until_closed(&mut slow, Duration::from_secs(5))
+                .await
+                .is_some(),
             "a connection that stopped mid-headers was held open"
         );
 
         // A prefix that could still be the HTTP/2 preface: the old sniff waited
         // here for more bytes, with no timeout at all.
-        let mut maybe_h2 = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        let mut maybe_h2 = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
         maybe_h2.write_all(b"PRI").await.expect("writes");
         assert!(
-            until_closed(&mut maybe_h2, Duration::from_secs(5)).await.is_some(),
+            until_closed(&mut maybe_h2, Duration::from_secs(5))
+                .await
+                .is_some(),
             "a connection that sent part of the HTTP/2 preface was held open"
         );
 
         // Control: a prompt request is answered, and with the peer attached.
-        let mut prompt = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        let mut prompt = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
         prompt
             .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
             .await
@@ -6550,9 +6626,9 @@ mod tests {
                 "/hang",
                 axum::routing::get(|| async {
                     // A body that never ends, like a live-update stream.
-                    Body::from_stream(futures_util::stream::pending::<
-                        Result<Bytes, std::io::Error>,
-                    >())
+                    Body::from_stream(
+                        futures_util::stream::pending::<Result<Bytes, std::io::Error>>(),
+                    )
                 }),
             );
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -6570,7 +6646,9 @@ mod tests {
 
         // Longer than the drain bound, with no signal: still serving.
         tokio::time::sleep(drain * 2).await;
-        let mut prompt = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        let mut prompt = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
         prompt
             .write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
             .await
@@ -6584,7 +6662,9 @@ mod tests {
         );
 
         // A response in flight that will never finish.
-        let mut hanging = tokio::net::TcpStream::connect(addr).await.expect("connects");
+        let mut hanging = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
         hanging
             .write_all(b"GET /hang HTTP/1.1\r\nhost: localhost\r\n\r\n")
             .await
@@ -6795,7 +6875,9 @@ mod tests {
 
         let refusal = refusal.expect("a thousand requests were all admitted — nothing is rationed");
         assert!(
-            refusal.headers().contains_key(axum::http::header::RETRY_AFTER),
+            refusal
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER),
             "a refusal without Retry-After tells a client to guess"
         );
         let body = to_bytes(refusal.into_body(), MAX_REQUEST_BODY_BYTES)
@@ -6852,7 +6934,10 @@ mod tests {
         let server = rationed_server();
 
         let handled = server.router().oneshot(get("/ping", None)).await.unwrap();
-        let policy = handled.headers()["ratelimit-policy"].to_str().unwrap().to_string();
+        let policy = handled.headers()["ratelimit-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(
             policy.contains("class=read"),
             "a route running a userland handler should answer to the read limit: {policy}"
@@ -6866,7 +6951,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-        let policy = missing.headers()["ratelimit-policy"].to_str().unwrap().to_string();
+        let policy = missing.headers()["ratelimit-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(
             policy.contains("class=static-read"),
             "an unmatched path should answer to the static limit: {policy}"
@@ -8424,8 +8512,16 @@ mod workflow_identity_tests {
     #[test]
     fn the_same_intent_token_names_the_same_workflow() {
         let user = principal("u_alice");
-        let first = workflow_identity(7, Some(&user), &envelope(serde_json::json!({INTENT_FIELD: "t1"})));
-        let again = workflow_identity(7, Some(&user), &envelope(serde_json::json!({INTENT_FIELD: "t1"})));
+        let first = workflow_identity(
+            7,
+            Some(&user),
+            &envelope(serde_json::json!({INTENT_FIELD: "t1"})),
+        );
+        let again = workflow_identity(
+            7,
+            Some(&user),
+            &envelope(serde_json::json!({INTENT_FIELD: "t1"})),
+        );
         assert_eq!(first.id, again.id);
         assert!(first.resumable);
     }
@@ -8436,8 +8532,16 @@ mod workflow_identity_tests {
     #[test]
     fn two_intent_tokens_name_two_workflows() {
         let user = principal("u_alice");
-        let first = workflow_identity(7, Some(&user), &envelope(serde_json::json!({INTENT_FIELD: "t1"})));
-        let second = workflow_identity(7, Some(&user), &envelope(serde_json::json!({INTENT_FIELD: "t2"})));
+        let first = workflow_identity(
+            7,
+            Some(&user),
+            &envelope(serde_json::json!({INTENT_FIELD: "t1"})),
+        );
+        let second = workflow_identity(
+            7,
+            Some(&user),
+            &envelope(serde_json::json!({INTENT_FIELD: "t2"})),
+        );
         assert_ne!(first.id, second.id);
     }
 
@@ -8481,7 +8585,10 @@ mod workflow_identity_tests {
     fn a_request_with_no_token_gets_a_fresh_unresumable_id() {
         let first = workflow_identity(7, None, &envelope(serde_json::json!({"author": "ada"})));
         let second = workflow_identity(7, None, &envelope(serde_json::json!({"author": "ada"})));
-        assert_ne!(first.id, second.id, "two clicks must not dedupe by accident");
+        assert_ne!(
+            first.id, second.id,
+            "two clicks must not dedupe by accident"
+        );
         assert!(!first.resumable);
     }
 

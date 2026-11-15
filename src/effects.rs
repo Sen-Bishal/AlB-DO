@@ -31,7 +31,6 @@ impl EffectProfile {
             side_effects: self.side_effects || other.side_effects,
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,25 +82,24 @@ pub struct TieringInputs {
 /// - `client_interactive` — at least one handler is provably client-satisfiable (its closure
 ///   reaches no server boundary). This is the lever that promotes to Tier-C (client island, zero
 ///   round-trip). A handler that must round-trip (e.g. `onClick` → `fetch`) leaves this false,
-///   keeping the component Tier-B.
-///   ⚠️ **Measured 2026-08-05: this bit is true for 534 of 536 interactive components in the
-///   real-world corpus** (`TIER_DISTRIBUTION.md`). Its negative case is a 12-name list that real
-///   code almost never hits, so on its own it is closer to a constant than a lever. That is why
-///   `state_escapes` exists and why it is consulted first.
+///   keeping the component Tier-B. ⚠️ **Measured 2026-08-05: this bit is true for 534 of 536
+///   interactive components in the real-world corpus** (`TIER_DISTRIBUTION.md`). Its negative case
+///   is a 12-name list that real code almost never hits, so on its own it is closer to a constant
+///   than a lever. That is why `state_escapes` exists and why it is consulted first.
 /// - `state_escapes` — item 4.9 T1 · **who owns the state.** True when the state is *proven* to
 ///   leave this client (a `useSharedSlot` topic, a FORGE write, a server `action`, a network
-///   boundary), which makes it the server's and keeps the component Tier-B with no island.
-///   **False means "not proven to escape", never "proven local"** — the unknown case must round
-///   toward Tier C, because a wrong Tier C still works (an island is the general fallback) while a
-///   wrong Tier B ships a binding for state the wire cannot drive.
-/// - `reads_principal` — AUTH § 3 · **the render needs the request.** True when the component
-///   names `user`, read off the AST by `parser::scan_reads_principal`. It is not a tier *preference*
-///   but a tier *impossibility*: Tier-A markup is baked once at build time, so there is no request
-///   for a principal to come from, and a component baked that way renders its anonymous branch
-///   forever. Like `state_escapes` this is a proof rather than a guess — the distinction
-///   `TODO.md` P-c asks this signature to stop losing.
-/// - `imports_npm` — **the renderer that bakes Tier A cannot execute this component.** True when the
-///   component's file imports a specifier `runtime::eval` cannot resolve, read off the AST by
+///   boundary), which makes it the server's and keeps the component Tier-B with no island. **False
+///   means "not proven to escape", never "proven local"** — the unknown case must round toward Tier
+///   C, because a wrong Tier C still works (an island is the general fallback) while a wrong Tier B
+///   ships a binding for state the wire cannot drive.
+/// - `reads_principal` — AUTH § 3 · **the render needs the request.** True when the component names
+///   `user`, read off the AST by `parser::scan_reads_principal`. It is not a tier *preference* but
+///   a tier *impossibility*: Tier-A markup is baked once at build time, so there is no request for
+///   a principal to come from, and a component baked that way renders its anonymous branch forever.
+///   Like `state_escapes` this is a proof rather than a guess — the distinction `TODO.md` P-c asks
+///   this signature to stop losing.
+/// - `imports_npm` — **the renderer that bakes Tier A cannot execute this component.** True when
+///   the component's file imports a specifier `runtime::eval` cannot resolve, read off the AST by
 ///   `parser::imports_unresolvable_specifier`. The second tier *impossibility*, and the harsher of
 ///   the two: `reads_principal` baked at Tier A renders the wrong branch, whereas this raises —
 ///   `render_component_ref` returns `Err`, the error propagates to the top of the static render,
@@ -336,8 +334,7 @@ mod tests {
 
     #[test]
     fn test_pure_small_component_is_tier_a() {
-        let decision =
-            decide_tier_and_hydration(
+        let decision = decide_tier_and_hydration(
             EffectProfile::pure(),
             false,
             false,
@@ -357,8 +354,7 @@ mod tests {
     fn test_handler_without_hooks_is_not_tier_a() {
         // A pure component that nonetheless declares an `on*` handler must
         // hydrate to run the handler — it can never collapse to static Tier-A.
-        let decision =
-            decide_tier_and_hydration(
+        let decision = decide_tier_and_hydration(
             EffectProfile::pure(),
             true,
             false,
@@ -495,7 +491,11 @@ mod tests {
             "#,
             "Row.tsx",
         );
-        assert_eq!(shadowed.tier, Tier::A, "a local `user` is not the principal");
+        assert_eq!(
+            shadowed.tier,
+            Tier::A,
+            "a local `user` is not the principal"
+        );
 
         // A member-property name: `row.user` is someone else's column.
         let member = tier_of(
@@ -506,7 +506,11 @@ mod tests {
             "#,
             "Member.tsx",
         );
-        assert_eq!(member.tier, Tier::A, "`row.user` is a field, not the principal");
+        assert_eq!(
+            member.tier,
+            Tier::A,
+            "`row.user` is a field, not the principal"
+        );
 
         // A JSX attribute name: `<Profile user={author} />` names a prop on
         // someone else's component.

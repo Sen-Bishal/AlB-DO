@@ -2,13 +2,13 @@
 //!
 //! Verifies that a typed `form_action_handler::<T>(name, handler)`:
 //!
-//!   1. Receives the JSON-encoded payload bytes decoded into `T` and
-//!      runs the user closure on success.
-//!   2. Emits `SetText` opcodes targeting the per-field
-//!      `data-albedo-error` ids when `FromFormPayload::from_form_payload`
-//!      returns `FormDecodeError::Validation`. No user closure runs.
-//!   3. Returns a `RuntimeError` for genuinely malformed payloads so
-//!      the dispatcher can render a 400.
+//!   1. Receives the JSON-encoded payload bytes decoded into `T` and runs the user closure on
+//!      success.
+//!   2. Emits `SetText` opcodes targeting the per-field `data-albedo-error` ids when
+//!      `FromFormPayload::from_form_payload` returns `FormDecodeError::Validation`. No user closure
+//!      runs.
+//!   3. Returns a `RuntimeError` for genuinely malformed payloads so the dispatcher can render a
+//!      400.
 //!
 //! The dispatcher is exercised directly (no HTTP layer) so the test
 //! stays fast and deterministic.
@@ -159,7 +159,10 @@ async fn typed_handler_emits_settext_on_validation_errors() {
     for op in &out {
         match op {
             Instruction::SetText { stable_id, text } => {
-                assert!(!text.is_empty(), "validation error message must not be empty");
+                assert!(
+                    !text.is_empty(),
+                    "validation error message must not be empty"
+                );
                 if *stable_id == expected_user {
                     saw_user = true;
                 } else if *stable_id == expected_pass {
@@ -207,7 +210,6 @@ async fn action_id_round_trips_with_compiler_side_allocator() {
     // hash-family change can't drift one side without breaking this.
     let name = "submit_login";
     let server_side = form_action_id(name);
-    let compiler_side =
-        dom_render_compiler::transforms::form::allocate_form_action_id(name);
+    let compiler_side = dom_render_compiler::transforms::form::allocate_form_action_id(name);
     assert_eq!(server_side, compiler_side);
 }

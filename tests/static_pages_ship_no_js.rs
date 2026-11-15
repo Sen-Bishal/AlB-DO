@@ -29,15 +29,19 @@ fn build(files: &[(&str, &str)]) -> RenderManifestV2 {
     let report = scanner
         .scan_directory_with_mode(&src, ScanMode::Strict)
         .expect("scans");
-    let compiler = scanner.build_compiler(report.components).with_project_root(dir.path());
+    let compiler = scanner
+        .build_compiler(report.components)
+        .with_project_root(dir.path());
     compiler.optimize_manifest_v2().expect("manifest")
 }
 
 fn route<'m>(manifest: &'m RenderManifestV2, path: &str) -> &'m RouteManifest {
-    manifest
-        .routes
-        .get(path)
-        .unwrap_or_else(|| panic!("no route {path}: {:?}", manifest.routes.keys().collect::<Vec<_>>()))
+    manifest.routes.get(path).unwrap_or_else(|| {
+        panic!(
+            "no route {path}: {:?}",
+            manifest.routes.keys().collect::<Vec<_>>()
+        )
+    })
 }
 
 /// Every script a route's shell can carry, as the server writes it out.
@@ -62,7 +66,11 @@ fn a_route_of_static_markup_ships_no_script() {
         ),
     ]);
     let about = route(&manifest, "/about");
-    assert!(!ships_script(about), "a static page shipped a script: {:?}", about.shell);
+    assert!(
+        !ships_script(about),
+        "a static page shipped a script: {:?}",
+        about.shell
+    );
 }
 
 #[test]

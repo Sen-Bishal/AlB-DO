@@ -84,7 +84,10 @@ async fn role_delete_failure_rolls_back_account_and_session_erasure() {
         .expect("old session")
         .principal()
         .is_none());
-    assert_eq!(role_grants(&db, None).await.expect("grants"), [] as [dom_render_compiler::auth::store::RoleGrant; 0]);
+    assert_eq!(
+        role_grants(&db, None).await.expect("grants"),
+        [] as [dom_render_compiler::auth::store::RoleGrant; 0]
+    );
 }
 
 #[tokio::test]
@@ -187,12 +190,18 @@ async fn provider_role_claims_never_become_first_party_grants() {
     let token = create_session(&db, &created.id, "password", NOW, 60_000)
         .await
         .expect("session");
-    assert_eq!(resolved(&db, &token).await.roles, [] as [std::string::String; 0]);
-    assert_eq!(load_principal(&db, &created.id)
-        .await
-        .expect("load")
-        .expect("exists")
-        .roles, [] as [std::string::String; 0]);
+    assert_eq!(
+        resolved(&db, &token).await.roles,
+        [] as [std::string::String; 0]
+    );
+    assert_eq!(
+        load_principal(&db, &created.id)
+            .await
+            .expect("load")
+            .expect("exists")
+            .roles,
+        [] as [std::string::String; 0]
+    );
     grant_role(&db, &created.id, "hr", Some("cli"), NOW)
         .await
         .expect("real grant");

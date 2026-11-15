@@ -55,8 +55,9 @@ impl PublicAssets {
     pub fn read_response(&self, path: &Path) -> Response<Body> {
         match std::fs::read(path) {
             Ok(bytes) => {
-                let mut response =
-                    Response::builder().status(StatusCode::OK).body(Body::from(bytes));
+                let mut response = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(bytes));
                 if let Ok(ref mut resp) = response {
                     resp.headers_mut().insert(
                         header::CONTENT_TYPE,
@@ -196,14 +197,8 @@ mod tests {
 
     #[test]
     fn content_type_table_covers_expected_extensions() {
-        assert_eq!(
-            content_type_for_path(Path::new("x.svg")),
-            "image/svg+xml"
-        );
-        assert_eq!(
-            content_type_for_path(Path::new("x.woff2")),
-            "font/woff2"
-        );
+        assert_eq!(content_type_for_path(Path::new("x.svg")), "image/svg+xml");
+        assert_eq!(content_type_for_path(Path::new("x.woff2")), "font/woff2");
         assert_eq!(
             content_type_for_path(Path::new("x.unknown")),
             "application/octet-stream"

@@ -10,8 +10,10 @@
 //! ALBEDO does not have to guess, because it already knows what the endpoint
 //! *does*:
 //!
-//! - the compiler knows the [`EffectProfile`](crate::effects::EffectProfile) of every component and action, whether it writes to FORGE, and whether it calls a declared APERTURE source;
-//! - the live registry knows, **before the write happens**, how many lanes are subscribed to the topic it will fan out to.
+//! - the compiler knows the [`EffectProfile`](crate::effects::EffectProfile) of every component and
+//!   action, whether it writes to FORGE, and whether it calls a declared APERTURE source;
+//! - the live registry knows, **before the write happens**, how many lanes are subscribed to the
+//!   topic it will fan out to.
 //!
 //! 🔑 **A FORGE write is not an O(1) operation, and this is the only rate
 //! limiter that can know that.** Writing to a topic with five hundred open lanes
@@ -198,7 +200,11 @@ impl Cost {
                 "{} fan-out to {} subscribed lane{} costs {}",
                 self.class.as_str(),
                 self.observed_subscribers,
-                if self.observed_subscribers == 1 { "" } else { "s" },
+                if self.observed_subscribers == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 self.weight
             );
         }
@@ -217,7 +223,11 @@ impl Cost {
                 self.base,
                 self.fanout,
                 self.observed_subscribers,
-                if self.observed_subscribers == 1 { "" } else { "s" }
+                if self.observed_subscribers == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             )
         }
     }
@@ -268,7 +278,11 @@ pub const fn classify_route(route: &crate::manifest::schema::RouteManifest) -> O
 }
 
 #[must_use]
-pub const fn classify(effects: EffectProfile, writes_forge: bool, calls_aperture: bool) -> OperationClass {
+pub const fn classify(
+    effects: EffectProfile,
+    writes_forge: bool,
+    calls_aperture: bool,
+) -> OperationClass {
     // Ordered most-restrictive-first: an action that both writes and calls out
     // answers to the outbound limit, because the third party's quota is the
     // scarcer resource and the one whose exhaustion we cannot undo.
@@ -337,10 +351,7 @@ mod tests {
             side_effects: true,
             ..EffectProfile::pure()
         };
-        assert_eq!(
-            classify(side_effecting, false, false),
-            OperationClass::Read
-        );
+        assert_eq!(classify(side_effecting, false, false), OperationClass::Read);
     }
 
     /// **The claim nobody else can make.** The same write costs more when more
@@ -380,7 +391,10 @@ mod tests {
     #[test]
     fn a_surcharge_explains_itself_without_claiming_a_base() {
         let explanation = Cost::surcharge(OperationClass::Write, 512).explain();
-        assert!(explanation.contains("512 subscribed lanes"), "{explanation}");
+        assert!(
+            explanation.contains("512 subscribed lanes"),
+            "{explanation}"
+        );
         assert!(!explanation.contains("0 base"), "{explanation}");
     }
 
@@ -440,6 +454,8 @@ mod tests {
 
         let singular = Cost::fan_out(OperationClass::Write, 2).explain();
         assert!(singular.contains("2 subscribed lanes"), "{singular}");
-        assert!(Cost::flat(OperationClass::Read).explain().contains("2 base"));
+        assert!(Cost::flat(OperationClass::Read)
+            .explain()
+            .contains("2 base"));
     }
 }

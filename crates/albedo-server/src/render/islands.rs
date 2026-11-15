@@ -18,15 +18,14 @@
 //!
 //! # Where an island's props come from on a request
 //!
-//! - **From its parent's render**, when the parent is rendered per request
-//!   (Tier B). The island's client-reference stub now hands its `props` to
-//!   `__albedo_island_placeholder`, which writes them onto the placeholder as
-//!   `data-albedo-props`. This pass reads them off, renders the island, and
-//!   replaces the whole placeholder — so the attribute never reaches a browser.
+//! - **From its parent's render**, when the parent is rendered per request (Tier B). The island's
+//!   client-reference stub now hands its `props` to `__albedo_island_placeholder`, which writes
+//!   them onto the placeholder as `data-albedo-props`. This pass reads them off, renders the
+//!   island, and replaces the whole placeholder — so the attribute never reaches a browser.
 //! - **From the request itself**, for the props the island reads on its own
-//!   (`TierCNode::dynamic_prop_keys`: `params` on a `[slug]` page that is
-//!   itself an island, `user` on one that names the principal) — resolved by
-//!   the same [`RequestContext::resolve`] a Tier-B node's are.
+//!   (`TierCNode::dynamic_prop_keys`: `params` on a `[slug]` page that is itself an island, `user`
+//!   on one that names the principal) — resolved by the same [`RequestContext::resolve`] a Tier-B
+//!   node's are.
 //!
 //! An island with neither keeps its boot render, which is still exact for it.
 //!
@@ -206,8 +205,8 @@ async fn render_island(
             if !is_serve_wireable(&payload) {
                 return Err("these props make it ineligible for binding mode".to_string());
             }
-            let install = reactive_install_script(&payload)
-                .ok_or("its binding payload did not serialise")?;
+            let install =
+                reactive_install_script(&payload).ok_or("its binding payload did not serialise")?;
             Ok((payload.html, Some(install)))
         }
         IslandRender::Hydrate {
@@ -364,10 +363,15 @@ mod tests {
         assert!(out.contains(r#"island:Picker {"id":"7"}"#), "{out}");
         // Carried on the island root for the client, escaped.
         assert!(
-            out.contains(r#"data-albedo-island="2" data-albedo-props="{&quot;id&quot;:&quot;7&quot;}""#),
+            out.contains(
+                r#"data-albedo-island="2" data-albedo-props="{&quot;id&quot;:&quot;7&quot;}""#
+            ),
             "{out}"
         );
-        assert!(!out.contains("data-albedo-tier=\"c\""), "the placeholder is replaced: {out}");
+        assert!(
+            !out.contains("data-albedo-tier=\"c\""),
+            "the placeholder is replaced: {out}"
+        );
     }
 
     #[tokio::test]
@@ -414,7 +418,9 @@ mod tests {
             ..RouteHydration::default()
         };
         let overrides: HashMap<String, String> =
-            [("__c_b_2".to_string(), "<request b>".to_string())].into_iter().collect();
+            [("__c_b_2".to_string(), "<request b>".to_string())]
+                .into_iter()
+                .collect();
         assert_eq!(
             block.closing_scripts_for(&overrides),
             "<driver><boot a><request b>"

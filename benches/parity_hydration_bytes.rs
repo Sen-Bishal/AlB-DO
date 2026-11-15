@@ -29,9 +29,7 @@
 //!   cargo bench --bench `parity_hydration_bytes`
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use dom_render_compiler::ir::opcode::{
-    Instruction, OpcodeFrame, ProxyId, SlotId, StableId, TagId,
-};
+use dom_render_compiler::ir::opcode::{Instruction, OpcodeFrame, ProxyId, SlotId, StableId, TagId};
 use dom_render_compiler::ir::wire::encode_frame;
 
 /// Synthesise the opcode frame Phase K emits for a useState counter

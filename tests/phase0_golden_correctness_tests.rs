@@ -161,7 +161,10 @@ fn normalize_module_paths(value: &mut Value) {
 fn normalize_build_id(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         if object.contains_key("build_id") {
-            object.insert("build_id".to_string(), Value::String("<normalized>".to_string()));
+            object.insert(
+                "build_id".to_string(),
+                Value::String("<normalized>".to_string()),
+            );
         }
     }
 }

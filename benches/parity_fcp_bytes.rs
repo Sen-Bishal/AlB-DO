@@ -35,16 +35,16 @@ fn build_ten_route_manifest() -> dom_render_compiler::manifest::schema::RenderMa
     // renderer falls back to placeholder HTML for missing sources,
     // which is fine for an FCP byte-budget measurement.
     let routes: &[(&str, &str)] = &[
-        ("Home",     "src/routes/index.tsx"),
-        ("About",    "src/routes/about.tsx"),
-        ("Pricing",  "src/routes/pricing.tsx"),
-        ("Blog",     "src/routes/blog.tsx"),
+        ("Home", "src/routes/index.tsx"),
+        ("About", "src/routes/about.tsx"),
+        ("Pricing", "src/routes/pricing.tsx"),
+        ("Blog", "src/routes/blog.tsx"),
         ("BlogPost", "src/routes/blog/post.tsx"),
-        ("Docs",     "src/routes/docs.tsx"),
-        ("Contact",  "src/routes/contact.tsx"),
-        ("Login",    "src/routes/login.tsx"),
-        ("Signup",   "src/routes/signup.tsx"),
-        ("Dashboard","src/routes/dashboard.tsx"),
+        ("Docs", "src/routes/docs.tsx"),
+        ("Contact", "src/routes/contact.tsx"),
+        ("Login", "src/routes/login.tsx"),
+        ("Signup", "src/routes/signup.tsx"),
+        ("Dashboard", "src/routes/dashboard.tsx"),
     ];
     for (id, (name, path)) in routes.iter().enumerate() {
         let mut comp = Component::new(ComponentId::new(id as u64), name.to_string());
@@ -62,18 +62,14 @@ fn build_ten_route_manifest() -> dom_render_compiler::manifest::schema::RenderMa
 ///
 /// `body_open` after Stream B carries the inlined Tier-A HTML
 /// (placeholders for Tier-B), so this is the actual FCP payload.
-fn fcp_bytes_for_route(
-    route: &dom_render_compiler::manifest::schema::RouteManifest,
-) -> usize {
+fn fcp_bytes_for_route(route: &dom_render_compiler::manifest::schema::RouteManifest) -> usize {
     route.shell.doctype_and_head.len()
         + route.shell.body_open.len()
         + route.shell.body_close.len()
         + route.shell.shim_script.len()
 }
 
-fn print_fcp_summary(
-    manifest: &dom_render_compiler::manifest::schema::RenderManifestV2,
-) {
+fn print_fcp_summary(manifest: &dom_render_compiler::manifest::schema::RenderManifestV2) {
     let mut sizes: Vec<(String, usize)> = manifest
         .routes
         .iter()
@@ -81,7 +77,11 @@ fn print_fcp_summary(
         .collect();
     sizes.sort_by_key(|(path, _)| path.clone());
     let total: usize = sizes.iter().map(|(_, s)| *s).sum();
-    let mean = if sizes.is_empty() { 0 } else { total / sizes.len() };
+    let mean = if sizes.is_empty() {
+        0
+    } else {
+        total / sizes.len()
+    };
     let max = sizes.iter().map(|(_, s)| *s).max().unwrap_or(0);
     let min = sizes.iter().map(|(_, s)| *s).min().unwrap_or(0);
 

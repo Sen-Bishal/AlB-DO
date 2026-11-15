@@ -201,7 +201,10 @@ fn decode_headers(value: Option<&Value>) -> Result<Headers, String> {
                 .iter()
                 .map(|item| {
                     item.as_str().map(str::to_string).ok_or_else(|| {
-                        format!("every `set-cookie` value must be a string, got {}", describe(item))
+                        format!(
+                            "every `set-cookie` value must be a string, got {}",
+                            describe(item)
+                        )
                     })
                 })
                 .collect::<Result<_, _>>()?,
@@ -244,7 +247,8 @@ fn validate_location(location: &str) -> Result<(), String> {
     // `//evil.example` is an absolute URL to a browser. Written as a path it is
     // almost always a bug (a doubled slash from string concatenation) that
     // becomes an open redirect; an author who means another host writes a scheme.
-    let path = location.starts_with('/') && !location.starts_with("//") && !location.starts_with("/\\");
+    let path =
+        location.starts_with('/') && !location.starts_with("//") && !location.starts_with("/\\");
     if absolute || path {
         Ok(())
     } else {
@@ -262,7 +266,10 @@ fn validate_rewrite(target: &str) -> Result<(String, Option<String>), String> {
         Some((path, query)) => (path, Some(query.to_string())),
         None => (target, None),
     };
-    if target.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0 || b == b'#') {
+    if target
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0 || b == b'#')
+    {
         return Err(format!(
             "rewrite target \"{target}\" contains a character a request path cannot"
         ));
@@ -278,7 +285,9 @@ fn validate_rewrite(target: &str) -> Result<(String, Option<String>), String> {
         .split('/')
         .any(|segment| segment == "." || segment == ".." || segment.contains('\\'))
     {
-        return Err(format!("rewrite target \"{target}\" contains a `.`, `..` or `\\` segment"));
+        return Err(format!(
+            "rewrite target \"{target}\" contains a `.`, `..` or `\\` segment"
+        ));
     }
     // 🔒 The framework's own lanes — sign-in endpoints, actions, the live
     // streams — each run their own checks in an order that assumes they were
@@ -299,7 +308,10 @@ fn string_field(
 ) -> Result<String, String> {
     match object.get(field) {
         Some(Value::String(value)) if !value.is_empty() => Ok(value.clone()),
-        Some(other) => Err(format!("{call} needs a non-empty string, got {}", describe(other))),
+        Some(other) => Err(format!(
+            "{call} needs a non-empty string, got {}",
+            describe(other)
+        )),
         None => Err(format!("{call} needs a non-empty string")),
     }
 }
@@ -308,7 +320,12 @@ fn status_of(value: &Value, what: &str) -> Result<u16, String> {
     value
         .as_u64()
         .and_then(|n| u16::try_from(n).ok())
-        .ok_or_else(|| format!("{what} must be an integer status code, got {}", describe(value)))
+        .ok_or_else(|| {
+            format!(
+                "{what} must be an integer status code, got {}",
+                describe(value)
+            )
+        })
 }
 
 fn describe(value: &Value) -> String {
@@ -365,8 +382,11 @@ mod tests {
 
     #[test]
     fn a_header_that_would_split_the_response_is_refused() {
-        let err = decode(&branded("next", json!({ "headers": { "x-a": "1\r\nx-b: 2" } })))
-            .expect_err("refused");
+        let err = decode(&branded(
+            "next",
+            json!({ "headers": { "x-a": "1\r\nx-b: 2" } }),
+        ))
+        .expect_err("refused");
         assert!(err.contains("line break"), "{err}");
     }
 
@@ -382,8 +402,11 @@ mod tests {
 
     #[test]
     fn transport_headers_are_refused_by_name() {
-        let err = decode(&branded("next", json!({ "headers": { "Content-Length": "4" } })))
-            .expect_err("refused");
+        let err = decode(&branded(
+            "next",
+            json!({ "headers": { "Content-Length": "4" } }),
+        ))
+        .expect_err("refused");
         assert!(err.contains("Content-Length"), "{err}");
     }
 
@@ -392,19 +415,29 @@ mod tests {
         let outcome = decode(&branded("redirect", json!({ "location": "/sign-in" }))).unwrap();
         assert!(matches!(outcome, Outcome::Redirect { status: 307, .. }));
 
-        let err = decode(&branded("redirect", json!({ "location": "/x", "status": 200 })))
-            .expect_err("refused");
+        let err = decode(&branded(
+            "redirect",
+            json!({ "location": "/x", "status": 200 }),
+        ))
+        .expect_err("refused");
         assert!(err.contains("not a redirect"), "{err}");
     }
 
     #[test]
     fn a_protocol_relative_redirect_is_refused() {
-        for location in ["//evil.example", "/\\evil.example", "evil.example", "javascript:alert(1)"] {
-            decode(&branded("redirect", json!({ "location": location })))
-                .expect_err(location);
+        for location in [
+            "//evil.example",
+            "/\\evil.example",
+            "evil.example",
+            "javascript:alert(1)",
+        ] {
+            decode(&branded("redirect", json!({ "location": location }))).expect_err(location);
         }
-        decode(&branded("redirect", json!({ "location": "https://example.com/x" })))
-            .expect("an absolute URL with a scheme is the author's explicit choice");
+        decode(&branded(
+            "redirect",
+            json!({ "location": "https://example.com/x" }),
+        ))
+        .expect("an absolute URL with a scheme is the author's explicit choice");
     }
 
     #[test]
@@ -440,8 +473,11 @@ mod tests {
 
         decode(&branded("respond", json!({ "status": 101 }))).expect_err("1xx");
         decode(&branded("respond", json!({}))).expect_err("no status");
-        let err = decode(&branded("respond", json!({ "status": 200, "body": { "a": 1 } })))
-            .expect_err("object body");
+        let err = decode(&branded(
+            "respond",
+            json!({ "status": 200, "body": { "a": 1 } }),
+        ))
+        .expect_err("object body");
         assert!(err.contains("JSON.stringify"), "{err}");
     }
 }

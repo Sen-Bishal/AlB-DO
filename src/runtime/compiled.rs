@@ -10,11 +10,11 @@
 //! pre-extracted metadata**, not source-to-source codegen. Same wire
 //! opcodes; reuses the Phase-J evaluator end-to-end.
 
-use crate::bundler::npm_prebuilt::PrebuiltNpmBundles;
 use crate::bundler::npm::{
     bundle_npm_dependency, scan_bare_imports, scan_deferred_loads, DeferredLoad,
     NpmDependencyBundle,
 };
+use crate::bundler::npm_prebuilt::PrebuiltNpmBundles;
 use crate::ir::action::ActionEnvelope;
 use crate::ir::opcode::{Instruction, InternTableKind, SlotId};
 use crate::runtime::bridge::{HandlerEffect, HandlerInvocation, HandlerRun, PendingRequest};
@@ -26,6 +26,7 @@ use crate::runtime::eval::{ComponentProject, PatchReport};
 use crate::runtime::quickjs_engine::QuickJsEngine;
 use crate::runtime::slot_store::SessionSlotView;
 use crate::transforms::actions::ActionDeclaration;
+use crate::transforms::actions::{broadcast_reads_in_body, BroadcastReads};
 use crate::transforms::css_modules::{is_css_module_path, scope_module_css, ScopedCssModule};
 use crate::transforms::events::{
     collect_free_idents_in_handler_body, HandlerBody, HandlerEventParam, HandlerExtract,
@@ -33,7 +34,6 @@ use crate::transforms::events::{
 use crate::transforms::form::{allocate_form_action_id, extract_forms_in_function, FormExtract};
 use crate::transforms::hooks::{extract_use_state_hooks, HookBinding, HookExtractError};
 use crate::transforms::link::{extract_links_in_function, LinkExtract};
-use crate::transforms::actions::{broadcast_reads_in_body, BroadcastReads};
 use crate::transforms::shared_slots::{
     extract_shared_slot_hooks, SharedSlotBinding, SharedSlotExtractError,
 };
@@ -237,7 +237,9 @@ pub struct CompiledComponent {
 impl CompiledComponent {
     /// The broadcast topics this component names literally, in source order.
     pub fn static_topics(&self) -> impl Iterator<Item = &str> + '_ {
-        self.shared_slots.iter().filter_map(SharedSlotBinding::static_topic)
+        self.shared_slots
+            .iter()
+            .filter_map(SharedSlotBinding::static_topic)
     }
 
     /// PRISM · the partitioned bindings, lowered for the manifest.
@@ -256,7 +258,12 @@ impl CompiledComponent {
         self.shared_slots
             .iter()
             .filter_map(|binding| {
-                let TopicSpec::Partition { collection, column, key } = &binding.spec else {
+                let TopicSpec::Partition {
+                    collection,
+                    column,
+                    key,
+                } = &binding.spec
+                else {
                     return None;
                 };
                 let key = match key {
@@ -283,7 +290,12 @@ impl CompiledComponent {
         self.shared_slots
             .iter()
             .filter_map(|binding| {
-                let TopicSpec::Source { source, route, args } = &binding.spec else {
+                let TopicSpec::Source {
+                    source,
+                    route,
+                    args,
+                } = &binding.spec
+                else {
                     return None;
                 };
                 Some(SourceTopicSpec {
@@ -383,7 +395,10 @@ impl CssModuleRegistry {
     ) -> Option<&str> {
         let file_key = self.bindings.get(module_spec)?.get(binding)?;
         let scoped = self.files.get(file_key)?;
-        scoped.class_map.get(class_name).map(std::string::String::as_str)
+        scoped
+            .class_map
+            .get(class_name)
+            .map(std::string::String::as_str)
     }
 
     /// Phase P · E.3 — every CSS-module file's scoped CSS body
@@ -453,7 +468,6 @@ impl CssModuleRegistry {
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
-
 }
 
 /// Phase-K facade over [`ComponentProject`]. Owns the per-component
@@ -585,12 +599,12 @@ impl CompiledProject {
                     &module.shared_slot_sites,
                     &module.shared_slot_keys,
                 )
-                    .map_err(|err: SharedSlotExtractError| {
-                        anyhow!(
-                            "shared-slot extraction failed in \
+                .map_err(|err: SharedSlotExtractError| {
+                    anyhow!(
+                        "shared-slot extraction failed in \
                                  {module_spec}::{function_name}: {err}"
-                        )
-                    })?;
+                    )
+                })?;
 
                 let mut value_slots: HashMap<String, SlotId> = HashMap::new();
                 let mut setter_slots: HashMap<String, SlotId> = HashMap::new();
@@ -747,7 +761,8 @@ impl CompiledProject {
         // scans the retained sources (catches namespace and side-effect
         // imports the eval-side `ParsedModule.imports` map doesn't record);
         // specifiers that name an existing project module are skipped.
-        let (npm_bundles, unresolved_npm_imports) = resolve_project_npm(&project, prebuilt.as_ref());
+        let (npm_bundles, unresolved_npm_imports) =
+            resolve_project_npm(&project, prebuilt.as_ref());
         let deferred_module_loads = scan_deferred_module_loads(&project);
 
         // P6 · index each `<form action="action:NAME">`'s declared field set by
@@ -1305,7 +1320,10 @@ impl CompiledProject {
         for component in self.components.values() {
             for hook in &component.hooks {
                 if let Some(slot_id) = component.value_slots.get(&hook.value_name) {
-                    out.insert(slot_id.0, self.slot_initial_js(*slot_id, &hook.initial, slots)?);
+                    out.insert(
+                        slot_id.0,
+                        self.slot_initial_js(*slot_id, &hook.initial, slots)?,
+                    );
                 }
             }
         }
@@ -1449,7 +1467,11 @@ impl CompiledProject {
             // Partitioned bindings are absent by construction: a partition
             // cannot be pre-registered at boot because its key does not exist
             // until a request names it. PRISM § 5 registers those on resolve.
-            for topic in component.shared_slots.iter().filter_map(|b| b.static_topic()) {
+            for topic in component
+                .shared_slots
+                .iter()
+                .filter_map(|b| b.static_topic())
+            {
                 topics.insert(topic.to_string());
             }
         }
@@ -1526,10 +1548,11 @@ impl CompiledProject {
         function_name: &str,
     ) -> Option<&CompiledComponent> {
         let module_spec = self.project.resolve_entry(entry)?;
-        self.component_meta(&module_spec, function_name).or_else(|| {
-            let default_export = self.module(&module_spec)?.default_export.as_deref()?;
-            self.component_meta(&module_spec, default_export)
-        })
+        self.component_meta(&module_spec, function_name)
+            .or_else(|| {
+                let default_export = self.module(&module_spec)?.default_export.as_deref()?;
+                self.component_meta(&module_spec, default_export)
+            })
     }
 
     /// PRISM · the partitioned shared-slot bindings one render `entry`'s
@@ -1618,7 +1641,12 @@ impl CompiledProject {
         let mut out: Vec<crate::forge::PartitionBinding> = Vec::new();
         for component in self.components.values() {
             for binding in &component.shared_slots {
-                let TopicSpec::Partition { collection, column, key } = &binding.spec else {
+                let TopicSpec::Partition {
+                    collection,
+                    column,
+                    key,
+                } = &binding.spec
+                else {
                     continue;
                 };
                 out.push(crate::forge::PartitionBinding {
@@ -1676,10 +1704,7 @@ impl CompiledProject {
             .flat_map(|component| {
                 component.forms.iter().map(move |form| {
                     (
-                        format!(
-                            "{}::{}",
-                            component.module_spec, component.function_name
-                        ),
+                        format!("{}::{}", component.module_spec, component.function_name),
                         form.action_name.clone(),
                     )
                 })
@@ -1719,12 +1744,11 @@ impl CompiledProject {
     /// export" — is wrong twice over, and the first attempt at this check made
     /// both mistakes:
     ///
-    /// * `resolve_entry_component(route_path)` returns `None` for **every**
-    ///   route (it takes a module spec, not a URL path), so a check built on it
-    ///   fails the scaffold the CLI itself generates.
-    /// * a helper module under `routes/` — `routes/_util.ts` with named exports
-    ///   only — maps to a route path but is never served, and flagging it would
-    ///   refuse correct code.
+    /// * `resolve_entry_component(route_path)` returns `None` for **every** route (it takes a
+    ///   module spec, not a URL path), so a check built on it fails the scaffold the CLI itself
+    ///   generates.
+    /// * a helper module under `routes/` — `routes/_util.ts` with named exports only — maps to a
+    ///   route path but is never served, and flagging it would refuse correct code.
     ///
     /// Intersecting with the served set removes both: a path the manifest
     /// serves, whose source module has no default export, is broken with no
@@ -1775,7 +1799,10 @@ impl CompiledProject {
     }
 
     #[must_use]
-    pub fn routes_without_default_export(&self, served: &[String]) -> Vec<(String, String, Vec<String>)> {
+    pub fn routes_without_default_export(
+        &self,
+        served: &[String],
+    ) -> Vec<(String, String, Vec<String>)> {
         let mut broken: Vec<(String, String, Vec<String>)> = self
             .project
             .modules()
@@ -1783,7 +1810,8 @@ impl CompiledProject {
             .filter(|(_, module)| module.default_export.is_none())
             .filter_map(|(spec, module)| {
                 let route = crate::manifest::route_path_from_component(spec)?;
-                served.contains(&route)
+                served
+                    .contains(&route)
                     .then(|| (route, spec.clone(), module.component_exports.clone()))
             })
             .collect();
@@ -1869,7 +1897,10 @@ impl CompiledProject {
     /// registered N actions" without iterating.
     #[must_use]
     pub fn action_declaration_count(&self) -> usize {
-        self.action_declarations.values().map(std::vec::Vec::len).sum()
+        self.action_declarations
+            .values()
+            .map(std::vec::Vec::len)
+            .sum()
     }
 
     /// Dispatch an [`ActionEnvelope`] against the registered handler.
@@ -1882,7 +1913,11 @@ impl CompiledProject {
         envelope: &ActionEnvelope,
         slots: &SessionSlotView,
     ) -> Result<Vec<Instruction>> {
-        self.invoke_action_as(envelope, slots, crate::runtime::RequestBindings::anonymous())
+        self.invoke_action_as(
+            envelope,
+            slots,
+            crate::runtime::RequestBindings::anonymous(),
+        )
     }
 
     /// [`Self::invoke_action`] for a known request — its `user` and `origin`,
@@ -3248,7 +3283,8 @@ fn request_props_read(function: &ComponentFunction) -> Vec<&'static str> {
             impl Visit for Reads<'_> {
                 // `props.params`, `props["user"]`.
                 fn visit_member_expr(&mut self, member: &swc_ecma_ast::MemberExpr) {
-                    if matches!(&*member.obj, Expr::Ident(ident) if ident.sym.as_ref() == self.props) {
+                    if matches!(&*member.obj, Expr::Ident(ident) if ident.sym.as_ref() == self.props)
+                    {
                         match &member.prop {
                             MemberProp::Ident(name) => self.note(name.sym.as_ref()),
                             MemberProp::Computed(computed) => {

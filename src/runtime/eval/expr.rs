@@ -71,8 +71,7 @@ pub struct ParsedModule {
 pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
     let module = parse_source(source, file_path)?;
     // 9.1a · computed here because the walk below consumes `module.body`.
-    let component_exports =
-        crate::runtime::implied_default::exported_component_names(&module.body);
+    let component_exports = crate::runtime::implied_default::exported_component_names(&module.body);
     let crate::transforms::forge_queries::LegacySiteIndex {
         sites: shared_slot_sites,
         keys: shared_slot_keys,
@@ -139,13 +138,14 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
                 },
                 ModuleDecl::ExportDefaultDecl(default_decl) => {
                     if let DefaultDecl::Fn(fn_expr) = default_decl.decl {
-                        let name = fn_expr
-                            .ident
-                            .as_ref().map_or_else(|| {
+                        let name = fn_expr.ident.as_ref().map_or_else(
+                            || {
                                 let generated = format!("__default_{synthetic_index}");
                                 synthetic_index += 1;
                                 generated
-                            }, |ident| ident.sym.to_string());
+                            },
+                            |ident| ident.sym.to_string(),
+                        );
                         parsed
                             .functions
                             .insert(name.clone(), function_from_function(&fn_expr.function)?);
@@ -157,13 +157,14 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
                         parsed.default_export = Some(ident.sym.to_string());
                     }
                     Expr::Fn(fn_expr) => {
-                        let name = fn_expr
-                            .ident
-                            .as_ref().map_or_else(|| {
+                        let name = fn_expr.ident.as_ref().map_or_else(
+                            || {
                                 let generated = format!("__default_{synthetic_index}");
                                 synthetic_index += 1;
                                 generated
-                            }, |ident| ident.sym.to_string());
+                            },
+                            |ident| ident.sym.to_string(),
+                        );
                         parsed
                             .functions
                             .insert(name.clone(), function_from_function(&fn_expr.function)?);
@@ -206,10 +207,9 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
     // "function missing in module" at render time — trading a good error for
     // a bad one further from the cause.
     if parsed.default_export.is_none() {
-        parsed.default_export = crate::runtime::implied_default::implied_default(
-            &parsed.component_exports,
-        )
-        .filter(|name| parsed.functions.contains_key(name));
+        parsed.default_export =
+            crate::runtime::implied_default::implied_default(&parsed.component_exports)
+                .filter(|name| parsed.functions.contains_key(name));
     }
 
     // Phase P · Stream C.1 — run the action extractor over the
@@ -218,13 +218,13 @@ pub fn parse_module(source: &str, file_path: &Path) -> Result<ParsedModule> {
     // declaration (duplicate name, non-function handler, etc.) fails
     // the build with a clean message instead of silently dropping the
     // declaration.
-    parsed.action_declarations =
-        crate::transforms::actions::extract_action_declarations(&parsed).map_err(|err| {
-            anyhow!(
-                "action extraction failed in '{}': {err}",
-                file_path.display()
-            )
-        })?;
+    parsed.action_declarations = crate::transforms::actions::extract_action_declarations(&parsed)
+        .map_err(|err| {
+        anyhow!(
+            "action extraction failed in '{}': {err}",
+            file_path.display()
+        )
+    })?;
 
     Ok(parsed)
 }

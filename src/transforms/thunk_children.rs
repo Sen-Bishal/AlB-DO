@@ -10,16 +10,14 @@
 //!
 //! That single ordering fact produced two independent, measured defects:
 //!
-//! * **`useId` diverged between the renderers.** Server `[outer=0, Wrapper=2,
-//!   Inner=1]`, client `[outer=0, Wrapper=1, Inner=2]` — transposed, so the
-//!   client silently rewrote every id the server had baked into the markup.
-//!   Pinned by `use_id_agrees_when_children_are_passed_in`.
-//! * **SSR context propagation was impossible.** A Provider cannot thread its
-//!   value to consumers that were already finished HTML before it ran. Real
-//!   Radix did not degrade to the context default — it *threw*
-//!   (`` `DialogTrigger` must be used within `Dialog` ``), the island SSR
-//!   failed, no `data-albedo-island` marker was emitted, and the component was
-//!   absent from the page entirely.
+//! * **`useId` diverged between the renderers.** Server `[outer=0, Wrapper=2, Inner=1]`, client
+//!   `[outer=0, Wrapper=1, Inner=2]` — transposed, so the client silently rewrote every id the
+//!   server had baked into the markup. Pinned by `use_id_agrees_when_children_are_passed_in`.
+//! * **SSR context propagation was impossible.** A Provider cannot thread its value to consumers
+//!   that were already finished HTML before it ran. Real Radix did not degrade to the context
+//!   default — it *threw* (`` `DialogTrigger` must be used within `Dialog` ``), the island SSR
+//!   failed, no `data-albedo-island` marker was emitted, and the component was absent from the page
+//!   entirely.
 //!
 //! ## The transform
 //!
@@ -91,7 +89,10 @@ impl VisitMut for ChildThunker {
         }
         // A host tag's type is a string literal after lowering. Everything else
         // — an identifier, a member expression, `h.Fragment` — is a component.
-        if matches!(call.args.first().map(|arg| &*arg.expr), Some(Expr::Lit(Lit::Str(_)))) {
+        if matches!(
+            call.args.first().map(|arg| &*arg.expr),
+            Some(Expr::Lit(Lit::Str(_)))
+        ) {
             return;
         }
 

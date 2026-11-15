@@ -3,11 +3,11 @@
 //! `return { redirect: url }` from an action becomes a `Navigate`. Before any
 //! transport sends one, the action adapter asks [`RedirectPolicy::check`]:
 //!
-//! - **A same-origin path** (`/account/welcome`) always passes, under the same
-//!   rules as a form's return path ([`crate::forms::ReturnPath`]) — rooted, not
-//!   protocol-relative, no backslashes or control characters.
-//! - **Anything else** passes only when its origin is listed in the config's
-//!   `redirects`. A checkout page, an identity provider: declared, by origin.
+//! - **A same-origin path** (`/account/welcome`) always passes, under the same rules as a form's
+//!   return path ([`crate::forms::ReturnPath`]) — rooted, not protocol-relative, no backslashes or
+//!   control characters.
+//! - **Anything else** passes only when its origin is listed in the config's `redirects`. A
+//!   checkout page, an identity provider: declared, by origin.
 //!
 //! The refusal is an error, not a quiet fallback to `/`. An action that computes
 //! a redirect from input — a `next` field, an upstream response — and meets this
@@ -42,9 +42,11 @@ impl RedirectPolicy {
     /// Why not — naming the origin to list, when that is the fix.
     pub fn check(&self, url: &str) -> Result<(), String> {
         if url.starts_with('/') {
-            return crate::forms::ReturnPath::parse(url).map(|_| ()).ok_or_else(|| {
-                "a same-origin redirect must be a plain path like \"/account\"".to_string()
-            });
+            return crate::forms::ReturnPath::parse(url)
+                .map(|_| ())
+                .ok_or_else(|| {
+                    "a same-origin redirect must be a plain path like \"/account\"".to_string()
+                });
         }
         let parsed = url::Url::parse(url)
             .map_err(|_| "a redirect is a path (\"/account\") or an https URL".to_string())?;
@@ -77,12 +79,17 @@ mod tests {
 
     #[test]
     fn another_origin_passes_only_when_listed_and_only_over_https() {
-        assert!(policy().check("https://checkout.stripe.com/c/pay/cs_1#x").is_ok());
+        assert!(policy()
+            .check("https://checkout.stripe.com/c/pay/cs_1#x")
+            .is_ok());
         assert!(policy().check("https://evil.example/pay").is_err());
         assert!(policy().check("http://checkout.stripe.com/pay").is_err());
         assert!(policy().check("javascript:alert(1)").is_err());
         let refusal = policy().check("https://evil.example/").unwrap_err();
-        assert!(refusal.contains("redirects: [\"https://evil.example\"]"), "{refusal}");
+        assert!(
+            refusal.contains("redirects: [\"https://evil.example\"]"),
+            "{refusal}"
+        );
     }
 
     #[test]

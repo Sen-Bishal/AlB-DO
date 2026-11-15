@@ -210,11 +210,18 @@ pub fn dedup(mut wanted: Vec<IndexSpec>, existing: &[IndexSpec]) -> Vec<IndexSpe
     });
     let mut kept: Vec<IndexSpec> = Vec::new();
     for spec in wanted {
-        let subsumed = existing.iter().chain(kept.iter()).any(|other| spec.is_prefix_of(other));
+        let subsumed = existing
+            .iter()
+            .chain(kept.iter())
+            .any(|other| spec.is_prefix_of(other));
         if !subsumed {
             kept.push(spec);
         }
     }
-    kept.sort_by(|a, b| a.table.cmp(&b.table).then_with(|| a.column_spec().cmp(&b.column_spec())));
+    kept.sort_by(|a, b| {
+        a.table
+            .cmp(&b.table)
+            .then_with(|| a.column_spec().cmp(&b.column_spec()))
+    });
     kept
 }

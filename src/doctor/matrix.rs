@@ -149,7 +149,9 @@ impl RouteReach {
     /// Whether anything on this route is keyed by the session's principal.
     #[must_use]
     pub fn is_principal_keyed(&self) -> bool {
-        self.reads.iter().any(|read| read.key == ReachKey::Principal)
+        self.reads
+            .iter()
+            .any(|read| read.key == ReachKey::Principal)
     }
 
     /// Reads that any caller reaches simply by naming a parameter.

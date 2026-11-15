@@ -96,7 +96,9 @@ fn many_connections_each_close_once() {
         for n in 0..DATABASES {
             let db = database(&root, "plain", n).await;
             let conn = db.connect().expect("connect");
-            conn.execute("CREATE TABLE t (v BLOB)", ()).await.expect("table");
+            conn.execute("CREATE TABLE t (v BLOB)", ())
+                .await
+                .expect("table");
             conn.execute("INSERT INTO t VALUES (zeroblob(131072))", ())
                 .await
                 .expect("insert");
@@ -109,66 +111,84 @@ fn many_connections_each_close_once() {
 /// A clone of the connection outlives the original.
 #[test]
 fn a_cloned_connection_can_outlive_the_original() {
-    check_in_children("a_cloned_connection_can_outlive_the_original", |root| async move {
-        let mut live = Vec::new();
-        for n in 0..DATABASES {
-            let db = database(&root, "clone", n).await;
-            let conn = db.connect().expect("connect");
-            conn.execute("CREATE TABLE t (v BLOB)", ()).await.expect("table");
-            let escaped = conn.clone();
-            drop(conn);
-            escaped
-                .execute("INSERT INTO t VALUES (zeroblob(131072))", ())
-                .await
-                .expect("insert through the clone");
-            live.push((escaped, db));
-        }
-        drop(live);
-    });
+    check_in_children(
+        "a_cloned_connection_can_outlive_the_original",
+        |root| async move {
+            let mut live = Vec::new();
+            for n in 0..DATABASES {
+                let db = database(&root, "clone", n).await;
+                let conn = db.connect().expect("connect");
+                conn.execute("CREATE TABLE t (v BLOB)", ())
+                    .await
+                    .expect("table");
+                let escaped = conn.clone();
+                drop(conn);
+                escaped
+                    .execute("INSERT INTO t VALUES (zeroblob(131072))", ())
+                    .await
+                    .expect("insert through the clone");
+                live.push((escaped, db));
+            }
+            drop(live);
+        },
+    );
 }
 
 /// A transaction (which holds its own clone) outlives its connection.
 #[test]
 fn a_transaction_can_outlive_its_connection() {
-    check_in_children("a_transaction_can_outlive_its_connection", |root| async move {
-        let mut live = Vec::new();
-        for n in 0..DATABASES {
-            let db = database(&root, "transaction", n).await;
-            let conn = db.connect().expect("connect");
-            conn.execute("CREATE TABLE t (v BLOB)", ()).await.expect("table");
-            let transaction = conn.transaction().await.expect("begin");
-            drop(conn);
-            transaction
-                .execute("INSERT INTO t VALUES (zeroblob(131072))", ())
-                .await
-                .expect("insert in the transaction");
-            live.push((transaction, db));
-        }
-        for (transaction, _db) in live {
-            transaction.commit().await.expect("commit");
-        }
-    });
+    check_in_children(
+        "a_transaction_can_outlive_its_connection",
+        |root| async move {
+            let mut live = Vec::new();
+            for n in 0..DATABASES {
+                let db = database(&root, "transaction", n).await;
+                let conn = db.connect().expect("connect");
+                conn.execute("CREATE TABLE t (v BLOB)", ())
+                    .await
+                    .expect("table");
+                let transaction = conn.transaction().await.expect("begin");
+                drop(conn);
+                transaction
+                    .execute("INSERT INTO t VALUES (zeroblob(131072))", ())
+                    .await
+                    .expect("insert in the transaction");
+                live.push((transaction, db));
+            }
+            for (transaction, _db) in live {
+                transaction.commit().await.expect("commit");
+            }
+        },
+    );
 }
 
 /// A prepared statement (which holds its own clone) outlives its connection.
 #[test]
 fn a_statement_can_outlive_its_connection() {
-    check_in_children("a_statement_can_outlive_its_connection", |root| async move {
-        let mut live = Vec::new();
-        for n in 0..DATABASES {
-            let db = database(&root, "statement", n).await;
-            let conn = db.connect().expect("connect");
-            conn.execute("CREATE TABLE t (v BLOB)", ()).await.expect("table");
-            let statement = conn
-                .prepare("INSERT INTO t VALUES (zeroblob(131072))")
-                .await
-                .expect("prepare");
-            drop(conn);
-            statement.execute(()).await.expect("execute after the connection dropped");
-            live.push((statement, db));
-        }
-        drop(live);
-    });
+    check_in_children(
+        "a_statement_can_outlive_its_connection",
+        |root| async move {
+            let mut live = Vec::new();
+            for n in 0..DATABASES {
+                let db = database(&root, "statement", n).await;
+                let conn = db.connect().expect("connect");
+                conn.execute("CREATE TABLE t (v BLOB)", ())
+                    .await
+                    .expect("table");
+                let statement = conn
+                    .prepare("INSERT INTO t VALUES (zeroblob(131072))")
+                    .await
+                    .expect("prepare");
+                drop(conn);
+                statement
+                    .execute(())
+                    .await
+                    .expect("execute after the connection dropped");
+                live.push((statement, db));
+            }
+            drop(live);
+        },
+    );
 }
 
 /// Rows, and then a single row, retain the native statement after all explicit

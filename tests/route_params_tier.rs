@@ -31,7 +31,9 @@ fn page(rel: &str, source: &str) -> (Tier, String, String) {
     let report = scanner
         .scan_directory_with_mode(&src, ScanMode::Strict)
         .expect("scans");
-    let compiler = scanner.build_compiler(report.components).with_project_root(dir.path());
+    let compiler = scanner
+        .build_compiler(report.components)
+        .with_project_root(dir.path());
     let (manifest, tiers) = compiler
         .optimize_manifest_v2_with_tier_report()
         .expect("manifest");
@@ -41,7 +43,11 @@ fn page(rel: &str, source: &str) -> (Tier, String, String) {
         .iter()
         .find(|c| c.name == "Post")
         .expect("the page is a component");
-    let route = manifest.routes.values().next().expect("the page is a route");
+    let route = manifest
+        .routes
+        .values()
+        .next()
+        .expect("the page is a route");
     let served = if let Some(node) = route.tier_b.iter().find(|n| n.component_id == "Post") {
         format!("b:{}", node.dynamic_prop_keys.join(","))
     } else if route.tier_a_root.iter().any(|n| n.component_id == "Post") {
@@ -61,15 +67,26 @@ fn a_dynamic_page_that_takes_params_is_rendered_per_request() {
         "export default function Post({ params }) {\n  return <h1>{params.slug}</h1>;\n}\n",
     );
     assert_eq!(tier, Tier::B, "{reason}");
-    assert_eq!(reason, "reads route `params` - rendered per request, no component JS");
-    assert_eq!(served, "b:params", "the server must resolve `params` for it per request");
+    assert_eq!(
+        reason,
+        "reads route `params` - rendered per request, no component JS"
+    );
+    assert_eq!(
+        served, "b:params",
+        "the server must resolve `params` for it per request"
+    );
 }
 
 /// `props.params`, a rest element, a computed key: shapes the signature scan
 /// cannot see into round toward "reads it" — slower and correct.
 #[test]
 fn an_opaque_signature_rounds_toward_reading_params() {
-    for signature in ["props", "{ ...rest }", "{ [key]: value }", "{ params } = {}"] {
+    for signature in [
+        "props",
+        "{ ...rest }",
+        "{ [key]: value }",
+        "{ params } = {}",
+    ] {
         let (tier, reason, _) = page(
             SLUG,
             &format!("export default function Post({signature}) {{\n  return <h1>x</h1>;\n}}\n"),
@@ -84,7 +101,9 @@ fn a_dynamic_page_that_cannot_reach_params_stays_tier_a() {
     for signature in ["", "{ title }"] {
         let (tier, reason, served) = page(
             SLUG,
-            &format!("export default function Post({signature}) {{\n  return <h1>static</h1>;\n}}\n"),
+            &format!(
+                "export default function Post({signature}) {{\n  return <h1>static</h1>;\n}}\n"
+            ),
         );
         assert_eq!(tier, Tier::A, "`({signature})`: {reason}");
         assert_eq!(served, "a");

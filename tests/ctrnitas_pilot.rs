@@ -13,7 +13,9 @@ const HDR: &str = "import { useSharedSlot } from \"albedo\";\n";
 /// (name, body-of-component, ground truth for topic "cart")
 fn corpus() -> Vec<(&'static str, String, RowProjection)> {
     use RowProjection::{PerRecord, PositionStable, WholeView};
-    let c = |s: &str| format!("{HDR}export default function C() {{\n  const cart = useSharedSlot(\"cart\");\n  return (<div>{s}</div>);\n}}\n");
+    let c = |s: &str| {
+        format!("{HDR}export default function C() {{\n  const cart = useSharedSlot(\"cart\");\n  return (<div>{s}</div>);\n}}\n")
+    };
     vec![
         ("01 plain product row",
          c(r"<ul>{cart.map((p) => <li key={p.id}>{p.name} — {p.price}</li>)}</ul>"),
@@ -81,7 +83,10 @@ fn ctrnitas_pilot_provable_vs_actual() {
     let mut agree = 0usize;
     let mut conservative = 0usize;
     let mut unsound = 0usize;
-    println!("\n{:<46} {:<15} {:<15} verdict", "case", "classifier", "truth");
+    println!(
+        "\n{:<46} {:<15} {:<15} verdict",
+        "case", "classifier", "truth"
+    );
     println!("{}", "-".repeat(96));
     for (name, src, truth) in corpus() {
         let got = classify_shared_slot_lists_source("C.tsx", &src)

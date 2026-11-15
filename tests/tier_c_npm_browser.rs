@@ -10,8 +10,7 @@
 //! actually produces*, and for a browser bundle that is the emitted script text.
 
 use dom_render_compiler::bundler::client_npm::{
-    build_browser_npm_runtime_script, build_client_npm_graph, ClientIsland,
-    CLIENT_NPM_CHUNK_PREFIX,
+    build_browser_npm_runtime_script, build_client_npm_graph, ClientIsland, CLIENT_NPM_CHUNK_PREFIX,
 };
 use dom_render_compiler::runtime::quickjs_engine::compile_client_island_module_with_npm;
 use std::collections::HashMap;
@@ -96,7 +95,11 @@ fn a_packages_react_import_never_reaches_the_browser() {
         graph.chunks().len(),
         1,
         "one package in, one chunk out: {:?}",
-        graph.chunks().iter().map(|c| &c.package).collect::<Vec<_>>()
+        graph
+            .chunks()
+            .iter()
+            .map(|c| &c.package)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -357,7 +360,9 @@ fn a_shimmable_builtin_and_a_host_capability_read_differently() {
     );
     assert_eq!(pure.failures().len(), 1, "{:?}", pure.failures());
     assert!(
-        pure.failures()[0].reason.contains("no Node built-in shims yet"),
+        pure.failures()[0]
+            .reason
+            .contains("no Node built-in shims yet"),
         "{}",
         pure.failures()[0].reason
     );

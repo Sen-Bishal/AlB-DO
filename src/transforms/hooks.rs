@@ -18,11 +18,10 @@
 //! existing Phase-J interpreter.
 //!
 //! Misuse is rejected at extraction time (a `HookExtractError`):
-//!   * `useState` inside a conditional branch → would change hook
-//!     count across renders (React's Rules of Hooks).
-//!   * Non-array, non-binding destructure pattern (e.g. `const x =
-//!     useState(0)`) — supported as a single-binding form returning
-//!     the tuple, but loses setter access; surfaced as a warning.
+//!   * `useState` inside a conditional branch → would change hook count across renders (React's
+//!     Rules of Hooks).
+//!   * Non-array, non-binding destructure pattern (e.g. `const x = useState(0)`) — supported as a
+//!     single-binding form returning the tuple, but loses setter access; surfaced as a warning.
 //!
 //! The extractor is intentionally a pure function over the AST; it
 //! does NOT allocate `SlotId`s. That happens in `compiled.rs` so the
@@ -61,7 +60,10 @@ pub struct HookBinding {
 pub enum HookExtractError {
     /// `useState` appeared inside an `if`/`for`/`while` body — would
     /// change hook count between renders.
-    HookInsideConditional { hook_idx_so_far: usize, location: String },
+    HookInsideConditional {
+        hook_idx_so_far: usize,
+        location: String,
+    },
 }
 
 impl std::fmt::Display for HookExtractError {
@@ -118,9 +120,7 @@ fn visit_stmt_top_level(
             }
             Ok(())
         }
-        Stmt::For(ForStmt { body, .. }) => {
-            check_no_hook_calls_in_stmt(body, imports, out.len())
-        }
+        Stmt::For(ForStmt { body, .. }) => check_no_hook_calls_in_stmt(body, imports, out.len()),
         Stmt::While(node) => check_no_hook_calls_in_stmt(&node.body, imports, out.len()),
         Stmt::DoWhile(node) => check_no_hook_calls_in_stmt(&node.body, imports, out.len()),
         Stmt::Try(node) => {
@@ -145,15 +145,20 @@ fn try_extract_from_var_declarator(
     out: &mut Vec<HookBinding>,
 ) {
     let Some(init) = &decl.init else { return };
-    let Expr::Call(call) = init.as_ref() else { return };
+    let Expr::Call(call) = init.as_ref() else {
+        return;
+    };
     if !is_use_state_call(call, imports) {
         return;
     }
-    let initial = call
-        .args
-        .first().map_or_else(|| Expr::Lit(swc_ecma_ast::Lit::Null(swc_ecma_ast::Null {
-            span: Default::default(),
-        })), |spread| (*spread.expr).clone());
+    let initial = call.args.first().map_or_else(
+        || {
+            Expr::Lit(swc_ecma_ast::Lit::Null(swc_ecma_ast::Null {
+                span: Default::default(),
+            }))
+        },
+        |spread| (*spread.expr).clone(),
+    );
     let (value_name, setter_name) = destructure_names(&decl.name);
     let Some(value_name) = value_name else { return };
 
@@ -196,8 +201,12 @@ fn pat_to_ident_name(pat: &Pat) -> Option<String> {
 }
 
 fn is_use_state_call(call: &CallExpr, imports: &HashMap<String, ImportBinding>) -> bool {
-    let Callee::Expr(callee) = &call.callee else { return false };
-    let Expr::Ident(ident) = callee.as_ref() else { return false };
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    let Expr::Ident(ident) = callee.as_ref() else {
+        return false;
+    };
     let name = ident.sym.to_string();
     if name != "useState" {
         return false;
@@ -237,10 +246,15 @@ fn stmt_contains_hook_call(stmt: &Stmt, imports: &HashMap<String, ImportBinding>
                 .is_some_and(|e| expr_contains_hook_call(e, imports))
         }),
         Stmt::Expr(ExprStmt { expr, .. }) => expr_contains_hook_call(expr, imports),
-        Stmt::Block(block) => block.stmts.iter().any(|s| stmt_contains_hook_call(s, imports)),
+        Stmt::Block(block) => block
+            .stmts
+            .iter()
+            .any(|s| stmt_contains_hook_call(s, imports)),
         Stmt::If(IfStmt { cons, alt, .. }) => {
             stmt_contains_hook_call(cons, imports)
-                || alt.as_ref().is_some_and(|a| stmt_contains_hook_call(a, imports))
+                || alt
+                    .as_ref()
+                    .is_some_and(|a| stmt_contains_hook_call(a, imports))
         }
         Stmt::For(ForStmt { body, .. }) => stmt_contains_hook_call(body, imports),
         Stmt::While(node) => stmt_contains_hook_call(&node.body, imports),
@@ -259,9 +273,13 @@ fn expr_contains_hook_call(expr: &Expr, imports: &HashMap<String, ImportBinding>
             if is_use_state_call(call, imports) {
                 return true;
             }
-            call.args.iter().any(|a| expr_contains_hook_call(&a.expr, imports))
+            call.args
+                .iter()
+                .any(|a| expr_contains_hook_call(&a.expr, imports))
         }
-        Expr::Bin(b) => expr_contains_hook_call(&b.left, imports) || expr_contains_hook_call(&b.right, imports),
+        Expr::Bin(b) => {
+            expr_contains_hook_call(&b.left, imports) || expr_contains_hook_call(&b.right, imports)
+        }
         Expr::Cond(c) => {
             expr_contains_hook_call(&c.test, imports)
                 || expr_contains_hook_call(&c.cons, imports)
@@ -269,9 +287,10 @@ fn expr_contains_hook_call(expr: &Expr, imports: &HashMap<String, ImportBinding>
         }
         Expr::Paren(p) => expr_contains_hook_call(&p.expr, imports),
         Expr::Arrow(arrow) => match &*arrow.body {
-            BlockStmtOrExpr::BlockStmt(block) => {
-                block.stmts.iter().any(|s| stmt_contains_hook_call(s, imports))
-            }
+            BlockStmtOrExpr::BlockStmt(block) => block
+                .stmts
+                .iter()
+                .any(|s| stmt_contains_hook_call(s, imports)),
             BlockStmtOrExpr::Expr(e) => expr_contains_hook_call(e, imports),
         },
         _ => false,

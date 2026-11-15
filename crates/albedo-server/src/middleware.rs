@@ -105,21 +105,19 @@ impl MiddlewarePlan {
         timeout: Duration,
         outbound: Outbound<'_>,
     ) -> Result<Outcome, RunError> {
-        let value = match tokio::time::timeout(
-            timeout,
-            self.drive(&request_json, &user_json, outbound),
-        )
-        .await
-        {
-            Err(_) => {
-                return Err(RunError::Failed(format!(
-                    "middleware {} did not finish within {} ms",
-                    self.entry,
-                    timeout.as_millis()
-                )))
-            }
-            Ok(result) => result?,
-        };
+        let value =
+            match tokio::time::timeout(timeout, self.drive(&request_json, &user_json, outbound))
+                .await
+            {
+                Err(_) => {
+                    return Err(RunError::Failed(format!(
+                        "middleware {} did not finish within {} ms",
+                        self.entry,
+                        timeout.as_millis()
+                    )))
+                }
+                Ok(result) => result?,
+            };
 
         let outcome = dom_render_compiler::middleware::outcome::decode(&value)
             .map_err(|message| RunError::Failed(format!("middleware {}: {message}", self.entry)))?;
@@ -148,7 +146,8 @@ impl MiddlewarePlan {
         use dom_render_compiler::aperture::{resolve_pending, Journal, DEFAULT_PASS_CAP};
         use dom_render_compiler::runtime::quickjs_engine::MiddlewareRun;
 
-        let fail = |message: String| RunError::Failed(format!("middleware {}: {message}", self.entry));
+        let fail =
+            |message: String| RunError::Failed(format!("middleware {}: {message}", self.entry));
         // Shared, not re-copied per pass: a middleware that calls out runs its
         // body once per round trip, and the request it sees does not change.
         let request_json: Arc<str> = Arc::from(request_json);
@@ -282,9 +281,8 @@ pub fn request_json(
     headers: &HeaderMap,
     session_cookie: Option<&str>,
 ) -> String {
-    let is_framework_cookie = |name: &str| {
-        name.starts_with(FRAMEWORK_COOKIE_PREFIX) || Some(name) == session_cookie
-    };
+    let is_framework_cookie =
+        |name: &str| name.starts_with(FRAMEWORK_COOKIE_PREFIX) || Some(name) == session_cookie;
 
     // Built straight into the JSON value the engine parses — no intermediate
     // map to copy from. Repeated headers are joined the way HTTP folds them.
@@ -357,7 +355,11 @@ pub fn terminal_response(outcome: &Outcome) -> Option<Response<Body>> {
                 Ok(value) => {
                     response.headers_mut().insert(header::LOCATION, value);
                 }
-                Err(_) => return Some(failure_response("middleware redirect location is not a valid header value")),
+                Err(_) => {
+                    return Some(failure_response(
+                        "middleware redirect location is not a valid header value",
+                    ))
+                }
             }
             response
         }
@@ -426,7 +428,14 @@ mod tests {
 
     #[test]
     fn framework_lanes_are_out_of_scope_and_app_requests_are_in() {
-        for path in ["/", "/logo.png", "/admin/x", "/_albedo/action", "/_albedo/action/sign", "/_albedo/uploads/abc"] {
+        for path in [
+            "/",
+            "/logo.png",
+            "/admin/x",
+            "/_albedo/action",
+            "/_albedo/action/sign",
+            "/_albedo/uploads/abc",
+        ] {
             assert!(in_scope(path), "{path}");
         }
         for path in [
@@ -451,9 +460,14 @@ mod tests {
             ),
         );
         headers.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
-        let json: Value =
-            serde_json::from_str(&request_json("GET", "/a", Some("q=1"), &headers, Some("my_sess")))
-                .unwrap();
+        let json: Value = serde_json::from_str(&request_json(
+            "GET",
+            "/a",
+            Some("q=1"),
+            &headers,
+            Some("my_sess"),
+        ))
+        .unwrap();
         assert_eq!(json["cookies"], json!({ "theme": "dark" }));
         assert!(json["headers"].get("cookie").is_none(), "{json}");
         assert_eq!(json["headers"]["x-forwarded-for"], "1.2.3.4");

@@ -38,9 +38,9 @@ pub fn is_test_module(path: &Path) -> bool {
     };
     let lower = name.to_ascii_lowercase();
     TEST_INFIXES.iter().any(|infix| {
-        lower.rfind(infix).is_some_and(|at| {
-            matches!(&lower[at + infix.len()..], "ts" | "tsx" | "js" | "jsx")
-        })
+        lower
+            .rfind(infix)
+            .is_some_and(|at| matches!(&lower[at + infix.len()..], "ts" | "tsx" | "js" | "jsx"))
     })
 }
 
@@ -68,7 +68,10 @@ mod tests {
             "card.test.d.ts",
             "testing/card.tsx",
         ] {
-            assert!(!is_test_module(Path::new(name)), "{name} should not be a test");
+            assert!(
+                !is_test_module(Path::new(name)),
+                "{name} should not be a test"
+            );
         }
     }
 }

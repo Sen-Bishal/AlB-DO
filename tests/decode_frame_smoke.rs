@@ -6,18 +6,32 @@ use dom_render_compiler::ir::wire::decode_frame;
 
 fn decode_b64(s: &str) -> Vec<u8> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let core: String = s.chars().filter(|c| *c != '=' && !c.is_whitespace()).collect();
-    let chars: Vec<u8> = core.bytes().map(|b| ALPHABET.iter().position(|&x| x == b).unwrap_or(0) as u8).collect();
+    let core: String = s
+        .chars()
+        .filter(|c| *c != '=' && !c.is_whitespace())
+        .collect();
+    let chars: Vec<u8> = core
+        .bytes()
+        .map(|b| ALPHABET.iter().position(|&x| x == b).unwrap_or(0) as u8)
+        .collect();
     let mut out = Vec::new();
     for chunk in chars.chunks(4) {
         let mut n: u32 = 0;
-        for &c in chunk { n = (n << 6) | u32::from(c); }
+        for &c in chunk {
+            n = (n << 6) | u32::from(c);
+        }
         let pad_in_chunk = if chunk.len() < 4 { 4 - chunk.len() } else { 0 };
         n <<= 6 * pad_in_chunk;
         let bytes_in = 3 - pad_in_chunk;
-        if bytes_in >= 1 { out.push((n >> 16) as u8); }
-        if bytes_in >= 2 { out.push((n >> 8) as u8); }
-        if bytes_in >= 3 { out.push(n as u8); }
+        if bytes_in >= 1 {
+            out.push((n >> 16) as u8);
+        }
+        if bytes_in >= 2 {
+            out.push((n >> 8) as u8);
+        }
+        if bytes_in >= 3 {
+            out.push(n as u8);
+        }
     }
     out
 }
@@ -25,7 +39,10 @@ fn decode_b64(s: &str) -> Vec<u8> {
 #[test]
 fn decode_dev_smoke_frame() {
     let frames = [
-        ("home", "AAAEDfx2IUINBG51bGwAAgEBBWNsaWNrB/yUK8JjAfysKSIlC/xNMMJm/EZQpY0="),
+        (
+            "home",
+            "AAAEDfx2IUINBG51bGwAAgEBBWNsaWNrB/yUK8JjAfysKSIlC/xNMMJm/EZQpY0=",
+        ),
         ("chat", "AAACDfx2IUINBG51bGwL/AQDqR38diFCDQ=="),
     ];
     for (label, b64) in frames {

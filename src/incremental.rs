@@ -104,21 +104,29 @@ impl IncrementalCache {
                 for (id, deps) in cache.dependency_graph {
                     self.dependency_graph.insert(id, deps);
                 }
-                *self.loaded.write().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                *self
+                    .loaded
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
                 Ok(())
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: Failed to deserialize cache, starting fresh: {e}"
-                );
-                *self.loaded.write().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                eprintln!("Warning: Failed to deserialize cache, starting fresh: {e}");
+                *self
+                    .loaded
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
                 Ok(())
             }
         }
     }
 
     fn ensure_loaded(&self) {
-        if !*self.loaded.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        if !*self
+            .loaded
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             let _ = self.load();
         }
     }
@@ -126,7 +134,11 @@ impl IncrementalCache {
     fn get_or_load_component(&self, id: ComponentId) -> Option<CachedAnalysis> {
         self.ensure_loaded();
 
-        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        if let Some(ref data) = *self
+            .lazy_data
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             if let Some(cached) = data.component_cache.get(&id) {
                 return Some(cached.clone());
             }
@@ -142,7 +154,11 @@ impl IncrementalCache {
     fn get_or_load_file_hash(&self, path: &PathBuf) -> Option<FileHash> {
         self.ensure_loaded();
 
-        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        if let Some(ref data) = *self
+            .lazy_data
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             if let Some(&hash) = data.file_hashes.get(path) {
                 return Some(hash);
             }
@@ -158,7 +174,11 @@ impl IncrementalCache {
     fn get_or_load_file_components(&self, path: &PathBuf) -> Option<HashSet<ComponentId>> {
         self.ensure_loaded();
 
-        if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        if let Some(ref data) = *self
+            .lazy_data
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             if let Some(ids) = data.file_to_components.get(path) {
                 return Some(ids.clone());
             }
@@ -257,7 +277,11 @@ impl IncrementalCache {
             for entry in &self.file_hashes {
                 files.push(entry.key().clone());
             }
-            if let Some(ref data) = *self.lazy_data.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            if let Some(ref data) = *self
+                .lazy_data
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
                 for path in data.file_hashes.keys() {
                     if !self.file_hashes.contains_key(path) {
                         files.push(path.clone());

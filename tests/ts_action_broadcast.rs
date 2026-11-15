@@ -6,17 +6,15 @@
 //! asserts:
 //!
 //!   1. The broadcast registry's topic value updates.
-//!   2. The updater receives the topic's current JSON value (so the
-//!      read-modify-write semantics line up with `setState(fn)`).
-//!   3. A subscribed session receives a `SlotSet` opcode whose
-//!      `slot_id == broadcast_slot_id(topic)` over the WT patches
-//!      lane — i.e. the same wire shape Phase O.2 fan-out emits.
-//!   4. `broadcast()` without an installed `PHASE_K_BROADCAST` (the
-//!      v1 scope guard) surfaces a clean Rust error rather than
-//!      silently no-op-ing.
-//!   5. Updater body sees full JSON value (here: a `Vec<String>`),
-//!      not a string-coerced summary — proves the eval path doesn't
-//!      drop into `value_to_string`.
+//!   2. The updater receives the topic's current JSON value (so the read-modify-write semantics
+//!      line up with `setState(fn)`).
+//!   3. A subscribed session receives a `SlotSet` opcode whose `slot_id ==
+//!      broadcast_slot_id(topic)` over the WT patches lane — i.e. the same wire shape Phase O.2
+//!      fan-out emits.
+//!   4. `broadcast()` without an installed `PHASE_K_BROADCAST` (the v1 scope guard) surfaces a
+//!      clean Rust error rather than silently no-op-ing.
+//!   5. Updater body sees full JSON value (here: a `Vec<String>`), not a string-coerced summary —
+//!      proves the eval path doesn't drop into `value_to_string`.
 
 use dom_render_compiler::ir::action::ActionEnvelope;
 use dom_render_compiler::ir::opcode::{Instruction, SlotId};
@@ -46,11 +44,7 @@ fn compile() -> CompiledProject {
 fn fresh_session() -> (SessionSlotView, SessionId, Arc<SlotStore>) {
     let store = Arc::new(SlotStore::new());
     let session = SessionId::random();
-    (
-        SessionSlotView::new(session, store.clone()),
-        session,
-        store,
-    )
+    (SessionSlotView::new(session, store.clone()), session, store)
 }
 
 fn envelope_for(action_name: &str) -> ActionEnvelope {
@@ -285,8 +279,7 @@ async fn second_invoke_of_increment_continues_from_first_write() {
             .invoke_action_with_broadcast(&envelope, &slots, broadcast.as_ref())
             .expect("increment dispatches");
         let topic = broadcast.get("counter").unwrap();
-        let value: serde_json::Value =
-            serde_json::from_slice(&topic.current_value()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&topic.current_value()).unwrap();
         assert_eq!(
             value.as_f64(),
             Some(f64::from(expected)),
@@ -311,7 +304,9 @@ async fn quickjs_broadcast_updater_reads_current_value() {
     broadcast.topic("counter", serde_json::to_vec(&41).unwrap());
 
     let mut engine = QuickJsEngine::new();
-    engine.init(&BootstrapPayload::default()).expect("engine init");
+    engine
+        .init(&BootstrapPayload::default())
+        .expect("engine init");
 
     let (slots, _session, _store) = fresh_session();
     let envelope = envelope_for("increment_counter");

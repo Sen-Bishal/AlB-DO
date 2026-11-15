@@ -7,12 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const BUNDLE_PLAN_VERSION: &str = "1.0";
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BundlePlanOptions {
     pub vendor: VendorPlanOptions,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BundleModulePlan {

@@ -55,8 +55,14 @@ async fn concurrent_subscribers_all_receive_a_single_write() {
         .write_topic(TOPIC, b"broadcast".to_vec())
         .expect("write");
     assert_eq!(report.delivered, SUBSCRIBERS);
-    assert_eq!(report.dropped_full, [] as [dom_render_compiler::runtime::SessionId; 0]);
-    assert_eq!(report.dropped_closed, [] as [dom_render_compiler::runtime::SessionId; 0]);
+    assert_eq!(
+        report.dropped_full,
+        [] as [dom_render_compiler::runtime::SessionId; 0]
+    );
+    assert_eq!(
+        report.dropped_closed,
+        [] as [dom_render_compiler::runtime::SessionId; 0]
+    );
 
     for mut rx in receivers {
         let payload = rx.recv().await.expect("each subscriber receives");
@@ -127,23 +133,35 @@ async fn slow_consumer_dropped_does_not_block_thousand_fast_writes() {
     let (fast_tx, mut fast_rx) = mpsc::channel::<bytes::Bytes>(2048);
     let slow_session = SessionId::random();
     let fast_session = SessionId::random();
-    registry.subscribe(slow_session, TOPIC, slow_tx.clone()).unwrap();
+    registry
+        .subscribe(slow_session, TOPIC, slow_tx.clone())
+        .unwrap();
     registry.subscribe(fast_session, TOPIC, fast_tx).unwrap();
-    slow_tx.try_send(bytes::Bytes::from_static(b"prefill")).unwrap(); // saturate slow channel
+    slow_tx
+        .try_send(bytes::Bytes::from_static(b"prefill"))
+        .unwrap(); // saturate slow channel
 
     let mut total_drop_full = 0usize;
     for i in 0..1000_u32 {
-        let report = registry.write_topic(TOPIC, i.to_be_bytes().to_vec()).unwrap();
+        let report = registry
+            .write_topic(TOPIC, i.to_be_bytes().to_vec())
+            .unwrap();
         total_drop_full += report.dropped_full.len();
     }
 
-    assert_eq!(total_drop_full, 1, "slow session should be pruned on its first dropped write");
+    assert_eq!(
+        total_drop_full, 1,
+        "slow session should be pruned on its first dropped write"
+    );
 
     let mut fast_received = 0;
     while fast_rx.try_recv().is_ok() {
         fast_received += 1;
     }
-    assert_eq!(fast_received, 1000, "fast consumer must observe every write");
+    assert_eq!(
+        fast_received, 1000,
+        "fast consumer must observe every write"
+    );
 
     assert_eq!(registry.get(TOPIC).unwrap().subscriber_count(), 1);
 }
@@ -168,7 +186,10 @@ async fn large_payload_broadcasts_round_trip_correctly() {
     match frame.instructions.into_iter().next().unwrap() {
         Instruction::SlotSet { slot_id, value } => {
             assert_eq!(slot_id, broadcast_slot_id(TOPIC));
-            assert_eq!(value, big_value, "large payload must round-trip without truncation");
+            assert_eq!(
+                value, big_value,
+                "large payload must round-trip without truncation"
+            );
         }
         other => panic!("expected SlotSet, got {other:?}"),
     }
@@ -193,7 +214,9 @@ async fn write_storm_to_one_thousand_subscribers_delivers_every_event() {
     }
 
     for i in 0..WRITES as u32 {
-        let report = registry.write_topic(TOPIC, i.to_be_bytes().to_vec()).unwrap();
+        let report = registry
+            .write_topic(TOPIC, i.to_be_bytes().to_vec())
+            .unwrap();
         assert_eq!(report.delivered, SESSIONS, "write #{i} dropped sessions");
     }
 

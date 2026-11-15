@@ -572,11 +572,7 @@ pub fn classify_positioned_insert(
 
     // (3) every previous row survived, so the survivors in `next` order must be
     // the previous order exactly.
-    if !prev_rows
-        .iter()
-        .map(|(key, _)| key.as_str())
-        .eq(survivors)
-    {
+    if !prev_rows.iter().map(|(key, _)| key.as_str()).eq(survivors) {
         return None;
     }
 

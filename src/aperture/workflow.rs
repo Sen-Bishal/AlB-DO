@@ -27,9 +27,9 @@
 //! ask for its appends to stand on their own.
 
 use crate::aperture::cache::CacheScope;
-use crate::aperture::ledger::JournalLedger;
 use crate::aperture::client::{ApertureClient, ApertureError, ApertureRequest};
 use crate::aperture::journal::{Journal, JournalError, StepKind, StepOutcome, DEFAULT_PASS_CAP};
+use crate::aperture::ledger::JournalLedger;
 use crate::aperture::SourceCredentials;
 use crate::ir::opcode::Instruction;
 use crate::runtime::bridge::PendingRequest;
@@ -234,7 +234,10 @@ fn wire_request(pending: &PendingRequest, journal: &Journal) -> ApertureRequest 
     // noise, and some upstreams reject headers they do not expect. A body that
     // supplied its own key keeps it — § 6's escape hatch is not a cage, and a
     // caller who wrote a key was reasoning about an upstream we cannot see.
-    let idempotent = matches!(pending.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
+    let idempotent = matches!(
+        pending.method.as_str(),
+        "GET" | "HEAD" | "OPTIONS" | "TRACE"
+    );
     let authored = headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case(IDEMPOTENCY_KEY_HEADER));
@@ -440,18 +443,14 @@ pub async fn resolve_pending(
         }
     }
 
-    let outcomes = futures_util::future::join_all(
-        requests
-            .iter()
-            .map(|request| async move {
-                match request {
-                    Ok(request) => resolve_one(client, request).await,
-                    // Refused before it could leave, so the body sees a throw at
-                    // the call that caused it — the egress refusal's shape.
-                    Err(reason) => StepOutcome::Failed(reason.clone()),
-                }
-            }),
-    )
+    let outcomes = futures_util::future::join_all(requests.iter().map(|request| async move {
+        match request {
+            Ok(request) => resolve_one(client, request).await,
+            // Refused before it could leave, so the body sees a throw at
+            // the call that caused it — the egress refusal's shape.
+            Err(reason) => StepOutcome::Failed(reason.clone()),
+        }
+    }))
     .await;
 
     for (staged, outcome) in pending.iter().zip(outcomes) {
@@ -514,7 +513,16 @@ where
     F: FnMut(Journal) -> Fut,
     Fut: Future<Output = Result<(ActionPass, T), WorkflowError>>,
 {
-    drive_workflow_admitting(client, journal, limits, build_id, durability, |_| Ok(()), pass).await
+    drive_workflow_admitting(
+        client,
+        journal,
+        limits,
+        build_id,
+        durability,
+        |_| Ok(()),
+        pass,
+    )
+    .await
 }
 
 /// [`drive_workflow`], asking `admit` about every staged call **before** it is
@@ -684,23 +692,28 @@ mod tests {
 
         let sent = transport.requests();
         let auth_of = |url: &str| {
-            sent.iter()
-                .find(|wire| wire.url == url)
-                .and_then(|wire| {
-                    wire.headers
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-                        .map(|(_, value)| value.clone())
-                })
+            sent.iter().find(|wire| wire.url == url).and_then(|wire| {
+                wire.headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.clone())
+            })
         };
         assert_eq!(
             auth_of("https://api.pay.test/v1/checkout/sessions").as_deref(),
             Some("Bearer sk_live_secret")
         );
         assert_eq!(auth_of("https://elsewhere.test/v1/checkout/sessions"), None);
-        assert_eq!(auth_of("http://api.pay.test/v1/customers"), None, "never in the clear");
+        assert_eq!(
+            auth_of("http://api.pay.test/v1/customers"),
+            None,
+            "never in the clear"
+        );
         assert!(
-            !journal.to_script_value().to_string().contains("sk_live_secret"),
+            !journal
+                .to_script_value()
+                .to_string()
+                .contains("sk_live_secret"),
             "the journal holds what the body staged and what came back, never the key"
         );
     }
@@ -722,8 +735,14 @@ mod tests {
         let record = journal.to_script_value()[0].clone();
         assert_eq!(record["ok"], Value::Bool(false));
         let reason = record.to_string();
-        assert!(reason.contains("authorization") && reason.contains("`pay`"), "{reason}");
-        assert!(!reason.contains("sk_live_secret"), "the refusal never quotes the key");
+        assert!(
+            reason.contains("authorization") && reason.contains("`pay`"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("sk_live_secret"),
+            "the refusal never quotes the key"
+        );
     }
 
     #[tokio::test]
@@ -732,9 +751,14 @@ mod tests {
         let client = client(transport);
         let mut journal = Journal::new("w", "b");
 
-        resolve_pending(&client, &mut journal, &[staged(0, "GET", "https://api.test/s")], None)
-            .await
-            .expect("resolves");
+        resolve_pending(
+            &client,
+            &mut journal,
+            &[staged(0, "GET", "https://api.test/s")],
+            None,
+        )
+        .await
+        .expect("resolves");
 
         let script = journal.to_script_value();
         let record = &script[0];
@@ -826,13 +850,21 @@ mod tests {
         let client = client(transport);
         let mut journal = Journal::new("w", "b");
 
-        resolve_pending(&client, &mut journal, &[staged(0, "GET", "https://api.test/s")], None)
-            .await
-            .expect("resolves");
+        resolve_pending(
+            &client,
+            &mut journal,
+            &[staged(0, "GET", "https://api.test/s")],
+            None,
+        )
+        .await
+        .expect("resolves");
 
         let script = journal.to_script_value();
         assert_eq!(script[0]["ok"], Value::Bool(true), "the step completed");
-        assert_eq!(script[0]["v"]["status"], 503, "and the body sees the status");
+        assert_eq!(
+            script[0]["v"]["status"], 503,
+            "and the body sees the status"
+        );
     }
 
     /// A refused host must not look like a network problem, and must not look
@@ -848,9 +880,14 @@ mod tests {
         );
         let mut journal = Journal::new("w", "b");
 
-        resolve_pending(&client, &mut journal, &[staged(0, "GET", "ftp://api.test/s")], None)
-            .await
-            .expect("the step resolves — as a failure");
+        resolve_pending(
+            &client,
+            &mut journal,
+            &[staged(0, "GET", "ftp://api.test/s")],
+            None,
+        )
+        .await
+        .expect("the step resolves — as a failure");
 
         let script = journal.to_script_value();
         assert_eq!(script[0]["ok"], Value::Bool(false));
@@ -1175,7 +1212,10 @@ mod durability_tests {
         // must survive a restart is exactly what the body reads on a live pass,
         // and anything less would make a resumed run diverge from a fresh one.
         let StepOutcome::Completed(answer) = &resumed.steps()[0].outcome else {
-            panic!("the step must come back completed: {:?}", resumed.steps()[0]);
+            panic!(
+                "the step must come back completed: {:?}",
+                resumed.steps()[0]
+            );
         };
         assert_eq!(answer["status"], 200);
         assert_eq!(answer["url"], "https://api.test/charges");

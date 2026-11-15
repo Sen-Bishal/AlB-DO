@@ -69,10 +69,10 @@ pub trait FromFormPayload: Sized + Send {
 // collide with userland custom impls that wrap a `DeserializeOwned`
 // value to add validation. Users wire one of two paths:
 //
-//   1. Their type derives `serde::Deserialize` AND they wrap it in
-//      [`JsonFormPayload`], which performs the JSON decode.
-//   2. Their type implements `FromFormPayload` directly with custom
-//      validation that emits `FormDecodeError::Validation`.
+//   1. Their type derives `serde::Deserialize` AND they wrap it in [`JsonFormPayload`], which
+//      performs the JSON decode.
+//   2. Their type implements `FromFormPayload` directly with custom validation that emits
+//      `FormDecodeError::Validation`.
 
 /// The adapter the dispatcher actually sees. Wraps a typed user
 /// closure as a Phase-G `ActionHandler`. Construct via
@@ -164,7 +164,8 @@ where
     Fut: Future<Output = Result<Vec<Instruction>, RuntimeError>> + Send + 'static,
 {
     Arc::new(TypedFormActionHandler::<T, F, Fut>::new(
-        action_name, handler,
+        action_name,
+        handler,
     ))
 }
 

@@ -189,7 +189,10 @@ pub async fn take(
         .map_err(io(format!("could not create {}", backups_dir.display())))?;
     let now = chrono::Utc::now();
     let (name, partial) = claim_partial(backups_dir, now)?;
-    let previous = list(backups_dir).into_iter().next().map(|snapshot| snapshot.dir);
+    let previous = list(backups_dir)
+        .into_iter()
+        .next()
+        .map(|snapshot| snapshot.dir);
 
     let filled = fill(substrate, data_dir, &partial, previous, now).await;
     let manifest = match filled {
@@ -215,7 +218,11 @@ fn claim_partial(
 ) -> Result<(String, PathBuf), BackupError> {
     let base = now.format(NAME_FORMAT).to_string();
     for n in 1..100 {
-        let name = if n == 1 { base.clone() } else { format!("{base}-{n}") };
+        let name = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
         if backups_dir.join(&name).exists() {
             continue;
         }
@@ -359,7 +366,10 @@ fn copy_verified(source: &Path, dest: &Path, id: &str) -> Result<Copied, BackupE
 }
 
 /// Read `input` to the end, hashing it and writing it on to `output` if given.
-fn pump(input: &mut impl Read, mut output: Option<&mut std::fs::File>) -> std::io::Result<(String, u64)> {
+fn pump(
+    input: &mut impl Read,
+    mut output: Option<&mut std::fs::File>,
+) -> std::io::Result<(String, u64)> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; CHUNK];
     let mut total = 0u64;
@@ -600,7 +610,9 @@ pub async fn stage_restore(
     };
     if let Err(err) = LibSqlSubstrate::seal(&staging).await {
         clear_staging();
-        return Err(BackupError::Database(format!("could not seal the staged copy: {err}")));
+        return Err(BackupError::Database(format!(
+            "could not seal the staged copy: {err}"
+        )));
     }
 
     // 3 · every file those records name, decided before any is written, so a
@@ -686,7 +698,9 @@ async fn prepare(staging: &Path, schema: &ForgeSchema) -> Result<Vec<String>, Ba
     let database = |err: crate::forge::value::SubstrateError| {
         BackupError::Database(format!("the staged copy: {err}"))
     };
-    let substrate = LibSqlSubstrate::open_local(staging).await.map_err(database)?;
+    let substrate = LibSqlSubstrate::open_local(staging)
+        .await
+        .map_err(database)?;
     let check = substrate
         .query("PRAGMA quick_check", &[])
         .await
@@ -777,7 +791,11 @@ fn check(path: &Path, id: &str) -> Result<Checked, BackupError> {
         Ok(mut file) => {
             let (hash, _) =
                 pump(&mut file, None).map_err(io(format!("could not read {}", path.display())))?;
-            Ok(if hash == id { Checked::Good } else { Checked::Damaged })
+            Ok(if hash == id {
+                Checked::Good
+            } else {
+                Checked::Damaged
+            })
         }
     }
 }
@@ -800,7 +818,12 @@ fn plan_uploads(
     for id in ids {
         // A record holding something that is not an id names no file anywhere.
         let (Ok(live), Ok(backed_up)) = (path_for(data_dir, id), path_for(snapshot, id)) else {
-            plan.push((id.clone(), Step::Unavailable { recorded: recorded(id) }));
+            plan.push((
+                id.clone(),
+                Step::Unavailable {
+                    recorded: recorded(id),
+                },
+            ));
             continue;
         };
         let live = check(&live, id)?;
@@ -812,7 +835,9 @@ fn plan_uploads(
             Checked::Good => Step::Copy {
                 repair: matches!(live, Checked::Damaged),
             },
-            Checked::Absent | Checked::Damaged => Step::Unavailable { recorded: recorded(id) },
+            Checked::Absent | Checked::Damaged => Step::Unavailable {
+                recorded: recorded(id),
+            },
         };
         plan.push((id.clone(), step));
     }
@@ -860,8 +885,14 @@ pub fn apply_staged_restore(db_path: &Path) -> Result<Option<RestoreApplied>, Ba
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok());
     let stamp = note.as_ref().map(|note| note.staged.clone()).or_else(|| {
-        let modified = std::fs::metadata(&pending).and_then(|meta| meta.modified()).ok()?;
-        Some(chrono::DateTime::<chrono::Utc>::from(modified).format(NAME_FORMAT).to_string())
+        let modified = std::fs::metadata(&pending)
+            .and_then(|meta| meta.modified())
+            .ok()?;
+        Some(
+            chrono::DateTime::<chrono::Utc>::from(modified)
+                .format(NAME_FORMAT)
+                .to_string(),
+        )
     });
     let stamp = stamp.unwrap_or_else(|| "staged".to_string());
     let aside = (1..)
@@ -918,9 +949,13 @@ mod tests {
     use super::*;
 
     async fn live(dir: &Path) -> LibSqlSubstrate {
-        let substrate = LibSqlSubstrate::open_local(dir.join("forge.db")).await.unwrap();
+        let substrate = LibSqlSubstrate::open_local(dir.join("forge.db"))
+            .await
+            .unwrap();
         substrate
-            .migrate("CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL)")
+            .migrate(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL)",
+            )
             .await
             .unwrap();
         substrate
@@ -938,12 +973,20 @@ mod tests {
     async fn a_snapshot_holds_commits_still_in_the_wal() {
         let temp = tempfile::tempdir().unwrap();
         let substrate = live(temp.path()).await;
-        assert!(temp.path().join("forge.db-wal").exists(), "the commit is in the WAL");
+        assert!(
+            temp.path().join("forge.db-wal").exists(),
+            "the commit is in the WAL"
+        );
 
-        let snapshot = take(&substrate, temp.path(), &temp.path().join("backups")).await.unwrap();
+        let snapshot = take(&substrate, temp.path(), &temp.path().join("backups"))
+            .await
+            .unwrap();
 
         assert_eq!(snapshot.manifest.tables.get("notes"), Some(&1));
-        assert!(!sibling(&snapshot.dir.join(SNAPSHOT_DB), "-wal").exists(), "sealed: one file");
+        assert!(
+            !sibling(&snapshot.dir.join(SNAPSHOT_DB), "-wal").exists(),
+            "sealed: one file"
+        );
         let (sha, _) = hash_file(&snapshot.dir.join(SNAPSHOT_DB)).unwrap();
         assert_eq!(sha, snapshot.manifest.database.sha256);
     }
@@ -961,21 +1004,32 @@ mod tests {
             .unwrap();
 
         let schema = ForgeSchema::empty();
-        stage_restore(&snapshot.dir, &db, temp.path(), &schema, false).await.unwrap();
+        stage_restore(&snapshot.dir, &db, temp.path(), &schema, false)
+            .await
+            .unwrap();
         drop(substrate);
 
-        let applied = apply_staged_restore(&db).unwrap().expect("a restore was pending");
+        let applied = apply_staged_restore(&db)
+            .unwrap()
+            .expect("a restore was pending");
         let previous = applied.previous.expect("the old database was kept");
         assert!(previous.exists());
         assert!(!pending_path(&db).exists());
 
         let restored = LibSqlSubstrate::open_local(&db).await.unwrap();
-        let rows = restored.query("SELECT count(*) FROM notes", &[]).await.unwrap();
+        let rows = restored
+            .query("SELECT count(*) FROM notes", &[])
+            .await
+            .unwrap();
         assert_eq!(rows.rows[0].get(0), Some(&SqlValue::Integer(1)));
         drop(restored);
         let kept = LibSqlSubstrate::open_local(&previous).await.unwrap();
         let rows = kept.query("SELECT count(*) FROM notes", &[]).await.unwrap();
-        assert_eq!(rows.rows[0].get(0), Some(&SqlValue::Integer(2)), "nothing lost");
+        assert_eq!(
+            rows.rows[0].get(0),
+            Some(&SqlValue::Integer(2)),
+            "nothing lost"
+        );
     }
 
     #[tokio::test]
@@ -983,7 +1037,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("forge.db");
         let substrate = live(temp.path()).await;
-        let snapshot = take(&substrate, temp.path(), &temp.path().join("backups")).await.unwrap();
+        let snapshot = take(&substrate, temp.path(), &temp.path().join("backups"))
+            .await
+            .unwrap();
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(snapshot.dir.join(SNAPSHOT_DB))
@@ -991,9 +1047,15 @@ mod tests {
         file.write_all(b"x").unwrap();
         drop(file);
 
-        let err = stage_restore(&snapshot.dir, &db, temp.path(), &ForgeSchema::empty(), false)
-            .await
-            .unwrap_err();
+        let err = stage_restore(
+            &snapshot.dir,
+            &db,
+            temp.path(),
+            &ForgeSchema::empty(),
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, BackupError::Refused(_)), "{err}");
         assert!(!pending_path(&db).exists());
     }
@@ -1034,10 +1096,16 @@ mod tests {
         assert_eq!((uploads.files, uploads.linked), (1, 0));
         assert_eq!(uploads.missing, vec![gone.clone()]);
         assert_eq!(uploads.damaged, vec![rotted.clone()]);
-        assert_eq!(std::fs::read(path_for(&first.dir, &good).unwrap()).unwrap(), b"a photo");
+        assert_eq!(
+            std::fs::read(path_for(&first.dir, &good).unwrap()).unwrap(),
+            b"a photo"
+        );
 
         let second = take(&substrate, data, &backups).await.unwrap();
-        assert_eq!(second.manifest.uploads.linked, 1, "an unchanged file is linked, not copied");
+        assert_eq!(
+            second.manifest.uploads.linked, 1,
+            "an unchanged file is linked, not copied"
+        );
 
         let fresh = tempfile::tempdir().unwrap();
         let staged = stage_restore(
@@ -1100,7 +1168,10 @@ mod tests {
 
         let second = take(&substrate, temp.path(), &backups).await.unwrap();
 
-        assert!(holds(path_for(&second.dir, &id).unwrap(), &id), "rot carried forward");
+        assert!(
+            holds(path_for(&second.dir, &id).unwrap(), &id),
+            "rot carried forward"
+        );
         let uploads = &second.manifest.uploads;
         assert_eq!((uploads.files, uploads.linked), (1, 0));
         assert_eq!(uploads.earlier_damaged, vec![id]);
@@ -1112,7 +1183,9 @@ mod tests {
     async fn a_restore_repairs_a_damaged_live_file() {
         let temp = tempfile::tempdir().unwrap();
         let (substrate, id) = with_upload(temp.path()).await;
-        let snapshot = take(&substrate, temp.path(), &temp.path().join("backups")).await.unwrap();
+        let snapshot = take(&substrate, temp.path(), &temp.path().join("backups"))
+            .await
+            .unwrap();
         drop(substrate);
         std::fs::write(path_for(temp.path(), &id).unwrap(), b"damaged live bytes").unwrap();
 
@@ -1137,22 +1210,42 @@ mod tests {
     async fn a_backup_that_lost_a_file_is_refused_unless_the_loss_is_accepted() {
         let temp = tempfile::tempdir().unwrap();
         let (substrate, id) = with_upload(temp.path()).await;
-        let snapshot = take(&substrate, temp.path(), &temp.path().join("backups")).await.unwrap();
+        let snapshot = take(&substrate, temp.path(), &temp.path().join("backups"))
+            .await
+            .unwrap();
         drop(substrate);
         std::fs::remove_file(path_for(&snapshot.dir, &id).unwrap()).unwrap();
         let fresh = tempfile::tempdir().unwrap();
         let db = fresh.path().join("forge.db");
 
-        let refused = stage_restore(&snapshot.dir, &db, fresh.path(), &ForgeSchema::empty(), false)
-            .await
-            .unwrap_err();
-        assert!(matches!(&refused, BackupError::Refused(why) if why.contains(&id)), "{refused}");
+        let refused = stage_restore(
+            &snapshot.dir,
+            &db,
+            fresh.path(),
+            &ForgeSchema::empty(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&refused, BackupError::Refused(why) if why.contains(&id)),
+            "{refused}"
+        );
         assert!(!pending_path(&db).exists());
-        assert!(!fresh.path().join(UPLOAD_DIR_FOR_TESTS).exists(), "a refusal wrote files");
+        assert!(
+            !fresh.path().join(UPLOAD_DIR_FOR_TESTS).exists(),
+            "a refusal wrote files"
+        );
 
-        let accepted = stage_restore(&snapshot.dir, &db, fresh.path(), &ForgeSchema::empty(), true)
-            .await
-            .unwrap();
+        let accepted = stage_restore(
+            &snapshot.dir,
+            &db,
+            fresh.path(),
+            &ForgeSchema::empty(),
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(accepted.uploads_unavailable, vec![id]);
         assert!(pending_path(&db).exists());
     }
@@ -1189,9 +1282,21 @@ mod tests {
 
             apply_staged_restore(&db).unwrap();
 
-            assert_eq!(std::fs::read(&db).unwrap(), b"restored database", "state {state}");
-            assert_eq!(std::fs::read(&aside).unwrap(), b"old database", "state {state}");
-            assert_eq!(std::fs::read(sibling(&aside, "-wal")).unwrap(), b"old WAL", "state {state}");
+            assert_eq!(
+                std::fs::read(&db).unwrap(),
+                b"restored database",
+                "state {state}"
+            );
+            assert_eq!(
+                std::fs::read(&aside).unwrap(),
+                b"old database",
+                "state {state}"
+            );
+            assert_eq!(
+                std::fs::read(sibling(&aside, "-wal")).unwrap(),
+                b"old WAL",
+                "state {state}"
+            );
             assert!(!wal.exists(), "state {state}");
         }
     }
@@ -1207,7 +1312,10 @@ mod tests {
                 albedo: "test".into(),
                 taken_at: String::new(),
                 taken_at_ms: ms,
-                database: DatabaseFacts { sha256: String::new(), bytes: 0 },
+                database: DatabaseFacts {
+                    sha256: String::new(),
+                    bytes: 0,
+                },
                 tables: BTreeMap::new(),
                 uploads: UploadFacts::default(),
             };

@@ -28,10 +28,10 @@
 //!
 //! ## The three rules this module owns
 //!
-//! 1. **A submitted body is decoded, never trusted.** `application/x-www-form-urlencoded`
-//!    only, size-capped before parsing, and percent-decoding failures are lossy rather than
-//!    fatal — a browser will not send a malformed body, so a malformed body is not a browser and
-//!    should not get a distinct error to probe.
+//! 1. **A submitted body is decoded, never trusted.** `application/x-www-form-urlencoded` only,
+//!    size-capped before parsing, and percent-decoding failures are lossy rather than fatal — a
+//!    browser will not send a malformed body, so a malformed body is not a browser and should not
+//!    get a distinct error to probe.
 //! 2. **A redirect target is a rooted, same-origin path or it is `/`.** See [`ReturnPath`]; the
 //!    whole open-redirect family lives in the two characters this refuses.
 //! 3. **The response shape is negotiated, not guessed.** A `fetch()` caller asks for the opcode
@@ -322,7 +322,8 @@ impl ReturnPath {
     /// so the result is held to every rule the original was.
     #[must_use]
     pub fn at_anchor(&self, anchor: &str) -> Self {
-        Self::parse(&format!("{}#{anchor}", self.without_fragment())).unwrap_or_else(|| self.clone())
+        Self::parse(&format!("{}#{anchor}", self.without_fragment()))
+            .unwrap_or_else(|| self.clone())
     }
 }
 
@@ -455,8 +456,12 @@ impl FormFeedback {
         let mut budget = FEEDBACK_MAX_BYTES.saturating_sub(encoded_len("p", &path));
         let mut entries = Vec::new();
         for op in frame.iter().rev() {
-            let Instruction::SetText { stable_id, text } = op else { continue };
-            let Ok(text) = std::str::from_utf8(text) else { continue };
+            let Instruction::SetText { stable_id, text } = op else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(text) else {
+                continue;
+            };
             let cost = encoded_len(&stable_id.0.to_string(), text);
             if text.is_empty() || cost > budget {
                 continue;
@@ -592,7 +597,10 @@ mod tests {
     fn the_first_value_wins_so_a_duplicate_cannot_shadow_a_stamped_field() {
         let body = FormBody::parse(b"_csrf=real&_csrf=forged&x=1");
         assert_eq!(body.get("_csrf"), Some("real"));
-        assert_eq!(body.all("_csrf").collect::<Vec<_>>(), vec!["real", "forged"]);
+        assert_eq!(
+            body.all("_csrf").collect::<Vec<_>>(),
+            vec!["real", "forged"]
+        );
     }
 
     #[test]
@@ -666,7 +674,9 @@ mod tests {
     fn a_submit_naming_no_return_path_goes_to_the_root() {
         assert_eq!(FormBody::parse(b"x=1").return_path(), ReturnPath::root());
         assert_eq!(
-            FormBody::parse(b"_albedo_return=%2Fmine").return_path().as_str(),
+            FormBody::parse(b"_albedo_return=%2Fmine")
+                .return_path()
+                .as_str(),
             "/mine"
         );
     }
@@ -702,10 +712,7 @@ mod tests {
     #[test]
     fn an_explicit_octet_stream_accept_gets_a_frame() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::ACCEPT,
-            "application/octet-stream".parse().unwrap(),
-        );
+        headers.insert(header::ACCEPT, "application/octet-stream".parse().unwrap());
         assert_eq!(negotiate(&headers), Wants::Frame);
         headers.insert(
             header::ACCEPT,
@@ -737,21 +744,30 @@ mod tests {
     use dom_render_compiler::ir::opcode::{Instruction, StableId};
 
     fn set_text(id: u32, text: &str) -> Instruction {
-        Instruction::SetText { stable_id: StableId(id), text: text.as_bytes().to_vec() }
+        Instruction::SetText {
+            stable_id: StableId(id),
+            text: text.as_bytes().to_vec(),
+        }
     }
 
     /// Replay a `Set-Cookie` value the way a browser would send it back.
     fn sent_back(set_cookie: &str) -> HeaderMap {
         let pair = set_cookie.split(';').next().unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, format!("theme=dark; {pair}").parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("theme=dark; {pair}").parse().unwrap(),
+        );
         headers
     }
 
     #[test]
     fn feedback_survives_the_round_trip_through_a_real_cookie() {
         let path = ReturnPath::parse("/room/42?tab=chat").unwrap();
-        let frame = [set_text(7, ""), set_text(9, "You're on the list; see you & soon.")];
+        let frame = [
+            set_text(7, ""),
+            set_text(9, "You're on the list; see you & soon."),
+        ];
         let feedback = FormFeedback::from_frame(&path, &frame).expect("one sink has text");
 
         let cookie = feedback.set_cookie();
@@ -760,7 +776,10 @@ mod tests {
         }
         let read = FormFeedback::read(&sent_back(&cookie)).expect("cookie is present");
         // The clear (empty text) was never carried; the message survives `;` and `&`.
-        assert_eq!(read.entries_for("/room/42?tab=chat"), &[(9, "You're on the list; see you & soon.".to_string())]);
+        assert_eq!(
+            read.entries_for("/room/42?tab=chat"),
+            &[(9, "You're on the list; see you & soon.".to_string())]
+        );
         // Keyed by the page it was issued for, and nowhere else.
         assert!(read.entries_for("/").is_empty());
     }
@@ -779,14 +798,20 @@ mod tests {
         let huge = "x".repeat(FEEDBACK_MAX_BYTES);
         let frame = [set_text(1, &huge), set_text(2, "Enter a real address.")];
         let feedback = FormFeedback::from_frame(&ReturnPath::root(), &frame).unwrap();
-        assert_eq!(feedback.entries_for("/"), &[(2, "Enter a real address.".to_string())]);
+        assert_eq!(
+            feedback.entries_for("/"),
+            &[(2, "Enter a real address.".to_string())]
+        );
         assert!(feedback.set_cookie().len() < FEEDBACK_MAX_BYTES + 128);
     }
 
     #[test]
     fn a_mangled_cookie_still_reads_as_present_so_it_is_expired() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, format!("{FEEDBACK_COOKIE}=%%%;junk").parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("{FEEDBACK_COOKIE}=%%%;junk").parse().unwrap(),
+        );
         let read = FormFeedback::read(&headers).expect("present, so the render expires it");
         assert!(read.entries_for("/").is_empty());
         assert!(FormFeedback::clear_cookie().contains("Max-Age=0"));
@@ -795,7 +820,10 @@ mod tests {
     #[test]
     fn the_anchor_replaces_any_fragment_and_keeps_the_query() {
         let path = ReturnPath::parse("/room/42?tab=chat#old").unwrap();
-        assert_eq!(path.at_anchor("albedo-feedback-join").as_str(), "/room/42?tab=chat#albedo-feedback-join");
+        assert_eq!(
+            path.at_anchor("albedo-feedback-join").as_str(),
+            "/room/42?tab=chat#albedo-feedback-join"
+        );
         assert_eq!(path.without_fragment(), "/room/42?tab=chat");
     }
 }

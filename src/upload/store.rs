@@ -13,16 +13,16 @@
 //!
 //! The id **is** the SHA-256 of the contents, so:
 //!
-//! - **dedup is free** — the same file uploaded twice is one file on disk, and the second write is a
-//!   rename onto a path that already exists;
+//! - **dedup is free** — the same file uploaded twice is one file on disk, and the second write is
+//!   a rename onto a path that already exists;
 //! - **the id is a perfect `ETag`**, because it cannot survive a change to the bytes, so a browser
 //!   that already has a file revalidates for a `304`. (Not `immutable`: that let shared caches
 //!   answer for the app, past any middleware gating the read.)
-//! - **the id is not a capability.** It is derived from content anyone holding the file already has,
-//!   so it must not be treated as an unguessable token. Every read is checked against the bucket's
-//!   declared [`ReadRule`](crate::upload::ReadRule) — the uploader only, unless the bucket says
-//!   `"signed-in"` or `"public"` — exactly as a FORGE row is checked against its author. This is
-//!   written down because the opposite assumption — "the URL is unguessable, therefore it is
+//! - **the id is not a capability.** It is derived from content anyone holding the file already
+//!   has, so it must not be treated as an unguessable token. Every read is checked against the
+//!   bucket's declared [`ReadRule`](crate::upload::ReadRule) — the uploader only, unless the bucket
+//!   says `"signed-in"` or `"public"` — exactly as a FORGE row is checked against its author. This
+//!   is written down because the opposite assumption — "the URL is unguessable, therefore it is
 //!   private" — is the standard way upload stores leak, and this store made it until 2026-10-30.
 //!
 //! The bytes are shared; the records are not. Two people who upload the same
@@ -77,7 +77,9 @@ pub enum UploadStoreError {
 impl fmt::Display for UploadStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Substrate(reason) => write!(f, "the upload record could not be written: {reason}"),
+            Self::Substrate(reason) => {
+                write!(f, "the upload record could not be written: {reason}")
+            }
             Self::Io(reason) => write!(f, "the upload could not be stored: {reason}"),
             Self::MalformedId => write!(f, "that is not an upload id"),
         }
@@ -116,7 +118,10 @@ pub struct StoredUpload {
 /// be incomplete.
 #[must_use]
 pub fn is_upload_id(id: &str) -> bool {
-    id.len() == ID_LEN && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    id.len() == ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// Where an id's bytes live, under `project_dir`.
@@ -223,11 +228,7 @@ pub fn augment(
 ///
 /// # Errors
 /// [`UploadStoreError::Substrate`] if the write fails.
-pub async fn record(
-    db: &dyn DataSubstrate,
-    upload: &StoredUpload,
-    now_ms: i64,
-) -> Result<()> {
+pub async fn record(db: &dyn DataSubstrate, upload: &StoredUpload, now_ms: i64) -> Result<()> {
     // `INSERT OR IGNORE` rather than a read-then-write: the same bytes uploaded
     // twice is the *expected* case for a content-addressed store, not a race to
     // resolve, and the unique index already states the rule.
@@ -395,7 +396,10 @@ mod tests {
         );
         // The old pair index is dropped, or it would keep refusing the second
         // uploader's row on every database created before the change.
-        assert!(ddl.contains("DROP INDEX IF EXISTS albedo_uploads_identity"), "{ddl}");
+        assert!(
+            ddl.contains("DROP INDEX IF EXISTS albedo_uploads_identity"),
+            "{ddl}"
+        );
     }
 
     fn stored(bucket: &str, principal: Option<&str>, name: &str) -> StoredUpload {
@@ -429,7 +433,8 @@ mod tests {
             stored("docs", Some("u_ada"), "ada.json"),
             stored("docs", Some("u_bob"), "bob.json"),
         ];
-        let name = |reader| readable_by(&shared, &registry, reader).map(|r| r.original_name.as_str());
+        let name =
+            |reader| readable_by(&shared, &registry, reader).map(|r| r.original_name.as_str());
         assert_eq!(name(Some("u_ada")), Some("ada.json"));
         assert_eq!(name(Some("u_bob")), Some("bob.json"));
         assert_eq!(name(Some("u_eve")), None);

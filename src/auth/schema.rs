@@ -85,8 +85,15 @@ pub const AUTHORITY: &str = "albedo_authority";
 pub const AUTHORITY_CLOCK: &str = "albedo_authority_clock";
 
 /// Every reserved collection name, for error messages that list them.
-pub const RESERVED_COLLECTIONS: &[&str] =
-    &[USERS, ACCOUNTS, SESSIONS, CREDENTIALS, ROLES, AUTHORITY, AUTHORITY_CLOCK];
+pub const RESERVED_COLLECTIONS: &[&str] = &[
+    USERS,
+    ACCOUNTS,
+    SESSIONS,
+    CREDENTIALS,
+    ROLES,
+    AUTHORITY,
+    AUTHORITY_CLOCK,
+];
 
 /// Whether a collection name belongs to AUTH.
 ///
@@ -164,9 +171,7 @@ pub fn users() -> ForgeCollection {
             // every principal-keyed topic is named after. Two rows claiming one
             // principal is not a slow query, it is two different humans behind
             // one id.
-            format!(
-                "CREATE UNIQUE INDEX IF NOT EXISTS {USERS}_principal ON {USERS} (principal)"
-            ),
+            format!("CREATE UNIQUE INDEX IF NOT EXISTS {USERS}_principal ON {USERS} (principal)"),
             // Email is *not* unique. Two providers can report the same address
             // for what may or may not be the same human, and deciding that
             // question is account linking — a policy, not a constraint. A
@@ -187,9 +192,7 @@ pub fn accounts() -> ForgeCollection {
     let mut collection = ForgeCollection::new(
         ACCOUNTS,
         ACCOUNTS,
-        format!(
-            "SELECT id, created_at, principal, provider, subject FROM {ACCOUNTS} ORDER BY id"
-        ),
+        format!("SELECT id, created_at, principal, provider, subject FROM {ACCOUNTS} ORDER BY id"),
         "id",
         Box::new([
             format!(
@@ -213,9 +216,7 @@ pub fn accounts() -> ForgeCollection {
             ),
             // Account linking reads the other direction: every provider one
             // human has connected.
-            format!(
-                "CREATE INDEX IF NOT EXISTS {ACCOUNTS}_principal ON {ACCOUNTS} (principal)"
-            ),
+            format!("CREATE INDEX IF NOT EXISTS {ACCOUNTS}_principal ON {ACCOUNTS} (principal)"),
         ]),
         Box::new([]),
     );
@@ -522,7 +523,9 @@ mod tests {
             ddl.contains("CREATE UNIQUE INDEX") && ddl.contains("(principal, role)"),
             "missing the uniqueness that makes a grant idempotent: {ddl}"
         );
-        assert!(collections().iter().any(|collection| collection.topic == ROLES));
+        assert!(collections()
+            .iter()
+            .any(|collection| collection.topic == ROLES));
     }
 
     /// Every migration must be re-runnable, because they run on every boot.
@@ -548,8 +551,14 @@ mod tests {
         let clock = authority_clock().migrations.join(" ");
         assert!(clock.contains("CHECK (id = 1)"), "{clock}");
         let authority = authority().migrations.join(" ");
-        assert!(authority.contains("principal TEXT PRIMARY KEY"), "{authority}");
-        assert!(authority.contains("ON albedo_authority (seq)"), "{authority}");
+        assert!(
+            authority.contains("principal TEXT PRIMARY KEY"),
+            "{authority}"
+        );
+        assert!(
+            authority.contains("ON albedo_authority (seq)"),
+            "{authority}"
+        );
     }
 
     #[test]

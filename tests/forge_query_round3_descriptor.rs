@@ -39,7 +39,10 @@ fn a_query_exceeding_parameter_slot_capacity_is_refused_without_panicking() {
         classify_source("src/parameter_capacity.ts", &source, false, &schemas)
     });
     let result = result.expect("a large query must produce a diagnostic, not panic");
-    assert!(result.queries.is_empty(), "an overflowing slot map is unusable");
+    assert!(
+        result.queries.is_empty(),
+        "an overflowing slot map is unusable"
+    );
     assert!(
         result.diagnostics.iter().any(|diagnostic| {
             let message = diagnostic.message.to_ascii_lowercase();

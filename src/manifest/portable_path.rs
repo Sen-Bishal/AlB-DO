@@ -52,7 +52,10 @@ pub fn portable_module_path(file_path: &str, root: Option<&Path>) -> Option<Stri
     };
 
     let cleaned = normalize_lexically(relative.as_path());
-    if cleaned.components().any(|c| matches!(c, PathComponent::ParentDir)) {
+    if cleaned
+        .components()
+        .any(|c| matches!(c, PathComponent::ParentDir))
+    {
         // A `..` that survives normalisation means the file genuinely sits
         // outside the project. There is no relative spelling that a serving
         // box could resolve, so this is a refusal, not a best effort.
@@ -176,7 +179,10 @@ mod tests {
     fn an_absolute_host_path_becomes_project_relative() {
         let root = PathBuf::from("B:/beta-two/test-app");
         assert_eq!(
-            portable_module_path("B:\\beta-two\\test-app/src/components\\App.jsx", Some(&root)),
+            portable_module_path(
+                "B:\\beta-two\\test-app/src/components\\App.jsx",
+                Some(&root)
+            ),
             Some("src/components/App.jsx".to_string())
         );
     }

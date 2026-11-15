@@ -82,18 +82,25 @@ fn both_server_renderers_replace_a_script_url_from_props() {
         "Component.tsx",
         &props,
         &slots(),
-        &RenderOptions { hook_compile: false },
+        &RenderOptions {
+            hook_compile: false,
+        },
     )
     .expect("evaluator renders")
     .html;
     let mut engine = QuickJsEngine::new();
-    engine.init(&BootstrapPayload::default()).expect("engine init");
+    engine
+        .init(&BootstrapPayload::default())
+        .expect("engine init");
     let quickjs = project
         .render_entry_quickjs(&mut engine, "Component.tsx", &props, &slots())
         .expect("quickjs renders")
         .html;
 
-    assert_eq!(evaluator, quickjs, "the two renderers must agree byte for byte");
+    assert_eq!(
+        evaluator, quickjs,
+        "the two renderers must agree byte for byte"
+    );
 
     let blocked = blocked_in_markup();
     for html in [&evaluator, &quickjs] {
@@ -114,7 +121,10 @@ fn both_server_renderers_replace_a_script_url_from_props() {
             " JaVa\tScRiPt:alert(1)",
             "a text attribute is text"
         );
-        assert!(!html.contains("alert(2)"), "no payload survives in a URL: {html}");
+        assert!(
+            !html.contains("alert(2)"),
+            "no payload survives in a URL: {html}"
+        );
     }
 }
 
@@ -125,7 +135,11 @@ fn a_list_row_rebuilt_from_state_replaces_a_script_url() {
     let project = CompiledProject::load_from_dir(fixture("hook_compile", "list_keyed_url"))
         .expect("fixture compiles");
     let payload = project
-        .build_reactive_payload("Component.tsx", &Value::Object(Default::default()), &slots())
+        .build_reactive_payload(
+            "Component.tsx",
+            &Value::Object(Default::default()),
+            &slots(),
+        )
         .expect("reactive payload builds");
     assert_eq!(payload.lists.len(), 1, "one keyed list");
     let list = &payload.lists[0];
@@ -149,7 +163,10 @@ fn a_list_row_rebuilt_from_state_replaces_a_script_url() {
     let safe = rows[0]["html"].as_str().unwrap();
     let hostile = rows[1]["html"].as_str().unwrap();
     assert!(safe.contains("href=\"https://example.com/\""), "{safe}");
-    assert!(!hostile.contains("alert(1)"), "the payload must not survive: {hostile}");
+    assert!(
+        !hostile.contains("alert(1)"),
+        "the payload must not survive: {hostile}"
+    );
     assert!(
         hostile.contains("ALBEDO blocked a javascript: URL"),
         "replaced by the shared BLOCKED_URL: {hostile}"

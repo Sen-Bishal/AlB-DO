@@ -11,8 +11,10 @@ fn decls() -> BTreeMap<String, CollectionDecl> {
     let mut out = BTreeMap::new();
     out.insert(
         "invoices".to_string(),
-        serde_json::from_str(r#"{ "fields": { "owner": "text", "status": "text", "due": "timestamp" } }"#)
-            .expect("decl"),
+        serde_json::from_str(
+            r#"{ "fields": { "owner": "text", "status": "text", "due": "timestamp" } }"#,
+        )
+        .expect("decl"),
     );
     out
 }
@@ -50,7 +52,10 @@ fn an_imported_const_predicate_lowers_like_its_literal() {
         "routes/page.tsx",
         "import { invoices } from \"albedo/forge\";\nexport default async function P(x) {\n  return await invoices.where({ status: \"open\", due: { lt: x } }).count();\n}\n",
     )]);
-    assert_eq!(imported.queries[0].canonical.id, inline.queries[0].canonical.id);
+    assert_eq!(
+        imported.queries[0].canonical.id,
+        inline.queries[0].canonical.id
+    );
 }
 
 #[test]
@@ -69,7 +74,10 @@ fn export_as_and_index_modules_resolve() {
 #[test]
 fn a_rule_broken_inside_an_imported_predicate_is_named_at_the_import_with_its_home_line() {
     let c = project(&[
-        ("lib/preds.ts", "const base = {};\nexport const open = { ...base };\n"),
+        (
+            "lib/preds.ts",
+            "const base = {};\nexport const open = { ...base };\n",
+        ),
         ("routes/page.tsx", PAGE),
     ]);
     assert!(c.queries.is_empty());
@@ -88,21 +96,33 @@ fn an_imported_predicate_used_any_other_way_anywhere_is_refused_and_its_queries_
     type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str);
     let cases: &[Case<'_>] = &[
         (
-            &[("lib/preds.ts", "export const open = { status: \"open\" };\nopen.status = \"closed\";\n")],
+            &[(
+                "lib/preds.ts",
+                "export const open = { status: \"open\" };\nopen.status = \"closed\";\n",
+            )],
             "src/lib/preds.ts:2:1",
             "written to outside a query",
         ),
         (
             &[
-                ("lib/preds.ts", "export const open = { status: \"open\" };\n"),
-                ("lib/tamper.ts", "import { open } from \"./preds\";\nObject.assign(open, { status: \"x\" });\n"),
+                (
+                    "lib/preds.ts",
+                    "export const open = { status: \"open\" };\n",
+                ),
+                (
+                    "lib/tamper.ts",
+                    "import { open } from \"./preds\";\nObject.assign(open, { status: \"x\" });\n",
+                ),
             ],
             "src/lib/tamper.ts:2:15",
             "passed to a function",
         ),
         (
             &[
-                ("lib/preds.ts", "export const open = { status: \"open\" };\n"),
+                (
+                    "lib/preds.ts",
+                    "export const open = { status: \"open\" };\n",
+                ),
                 ("lib/again.ts", "export { open } from \"./preds\";\n"),
             ],
             "src/lib/again.ts:1:10",
@@ -110,7 +130,10 @@ fn an_imported_predicate_used_any_other_way_anywhere_is_refused_and_its_queries_
         ),
         (
             &[
-                ("lib/preds.ts", "export const open = { status: \"open\" };\n"),
+                (
+                    "lib/preds.ts",
+                    "export const open = { status: \"open\" };\n",
+                ),
                 ("lib/star.ts", "export * from \"./preds\";\n"),
             ],
             "src/lib/star.ts:1:1",
@@ -118,8 +141,14 @@ fn an_imported_predicate_used_any_other_way_anywhere_is_refused_and_its_queries_
         ),
         (
             &[
-                ("lib/preds.ts", "export const open = { status: \"open\" };\n"),
-                ("lib/alias.ts", "import { open } from \"./preds\";\nexport const copy = open;\n"),
+                (
+                    "lib/preds.ts",
+                    "export const open = { status: \"open\" };\n",
+                ),
+                (
+                    "lib/alias.ts",
+                    "import { open } from \"./preds\";\nexport const copy = open;\n",
+                ),
             ],
             "src/lib/alias.ts:2:21",
             "used outside a query",
@@ -129,10 +158,15 @@ fn an_imported_predicate_used_any_other_way_anywhere_is_refused_and_its_queries_
         let mut files: Vec<(&str, &str)> = extra.to_vec();
         files.push(("routes/page.tsx", PAGE));
         let c = project(&files);
-        assert!(c.queries.is_empty(), "{site}: the query reading it stands: {:?}", c.queries);
+        assert!(
+            c.queries.is_empty(),
+            "{site}: the query reading it stands: {:?}",
+            c.queries
+        );
         let m = messages(&c);
         assert!(
-            m.iter().any(|m| m.starts_with(site) && m.contains(expected)),
+            m.iter()
+                .any(|m| m.starts_with(site) && m.contains(expected)),
             "expected `{expected}` at {site}, got {m:?}"
         );
     }

@@ -408,7 +408,10 @@ mod tests {
         let set = set_cookie_value("__Host-albedo_session", &SessionToken::mint(), 60);
         let clear = clear_cookie_value("__Host-albedo_session");
         for attribute in ["Path=/", "HttpOnly", "Secure", "SameSite=Lax"] {
-            assert!(set.contains(attribute) && clear.contains(attribute), "{attribute}");
+            assert!(
+                set.contains(attribute) && clear.contains(attribute),
+                "{attribute}"
+            );
         }
         assert!(clear.contains("Max-Age=0"));
     }
@@ -416,10 +419,7 @@ mod tests {
     #[test]
     fn a_cookie_is_found_among_its_neighbours() {
         let header = "theme=dark; __Host-albedo_session=tok123; __Host-albedo-session=abc";
-        assert_eq!(
-            read_cookie(header, "__Host-albedo_session"),
-            Some("tok123")
-        );
+        assert_eq!(read_cookie(header, "__Host-albedo_session"), Some("tok123"));
         assert_eq!(read_cookie(header, "theme"), Some("dark"));
         assert_eq!(read_cookie(header, "absent"), None);
     }
@@ -463,7 +463,10 @@ mod tests {
 
     #[test]
     fn a_header_of_only_valueless_entries_finds_nothing() {
-        assert_eq!(read_cookie("consent; dnt; whatever", "__Host-albedo_session"), None);
+        assert_eq!(
+            read_cookie("consent; dnt; whatever", "__Host-albedo_session"),
+            None
+        );
     }
 
     /// The tokenizer is now shared by all three readers, so its behaviour is

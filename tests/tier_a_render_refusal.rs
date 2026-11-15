@@ -30,12 +30,11 @@
 //!
 //! Two independent halves, because fixing either says nothing about the other:
 //!
-//! 1. **The refusal** — a Tier-A render that raises emits no source text and
-//!    records a `StaticRenderFailure` that reaches the manifest (and from there
-//!    the `BootReport`).
-//! 2. **The tiering** — a component importing npm never reaches that path at
-//!    all, because it is no longer eligible for Tier A. It is served from Tier
-//!    B, which renders through `QuickJS`, which has the npm graph.
+//! 1. **The refusal** — a Tier-A render that raises emits no source text and records a
+//!    `StaticRenderFailure` that reaches the manifest (and from there the `BootReport`).
+//! 2. **The tiering** — a component importing npm never reaches that path at all, because it is no
+//!    longer eligible for Tier A. It is served from Tier B, which renders through `QuickJS`, which
+//!    has the npm graph.
 
 use dom_render_compiler::effects::{decide_tier_and_hydration, TieringInputs, TieringReason};
 use dom_render_compiler::manifest::schema::{HydrationMode, RenderManifestV2, Tier};
@@ -100,7 +99,12 @@ fn a_failed_static_render_leaks_no_source_text() {
     let manifest = build_manifest("tier_a_refusal");
     let html = all_tier_a_html(&manifest);
 
-    for leaked in [");}", "export default", "function SpreadRoute", "const rest"] {
+    for leaked in [
+        ");}",
+        "export default",
+        "function SpreadRoute",
+        "const rest",
+    ] {
         assert!(
             !html.contains(leaked),
             "the served HTML carries source text {leaked:?} — this is the scrape \
@@ -352,6 +356,10 @@ fn the_react_exemption_does_not_leak_to_react_prefixed_packages() {
 fn the_fixtures_exist() {
     for name in ["tier_a_refusal", "tier_a_npm"] {
         let root: &Path = &fixture_root(name);
-        assert!(root.join("routes").is_dir(), "{} has no routes/", root.display());
+        assert!(
+            root.join("routes").is_dir(),
+            "{} has no routes/",
+            root.display()
+        );
     }
 }

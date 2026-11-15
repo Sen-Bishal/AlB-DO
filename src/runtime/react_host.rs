@@ -461,15 +461,13 @@ pub const HOST_MODULES: &[HostModule] = &[REACT_HOST, JSX_RUNTIME_HOST, REACT_DO
 /// also unreachable in practice once `NODE_ENV` folds, because the only thing
 /// that imports it is `prop-types`' development arm. **A refusal must name a
 /// capability the host genuinely lacks, not a package that looks React-shaped.**
-pub const REFUSED_MODULES: &[RefusedModule] = &[
-    RefusedModule {
-        specifiers: &["react-dom/client", "react-dom/server"],
-        reason: "Albedo's client runtime is not react-dom — `createRoot`, \
+pub const REFUSED_MODULES: &[RefusedModule] = &[RefusedModule {
+    specifiers: &["react-dom/client", "react-dom/server"],
+    reason: "Albedo's client runtime is not react-dom — `createRoot`, \
                  `hydrateRoot` and `renderToString` own a render lifecycle \
                  Albedo already owns. Bare `react-dom` IS available for \
                  `createPortal`; these entry points are not.",
-    },
-];
+}];
 
 /// The factory registrations for every host module, as JavaScript.
 ///
@@ -493,9 +491,7 @@ pub fn build_host_module_records_script() -> String {
             key = module.record_key
         ));
         for (name, expression) in module.exports {
-            out.push_str(&format!(
-                "    __albedo_exports['{name}'] = {expression};\n"
-            ));
+            out.push_str(&format!("    __albedo_exports['{name}'] = {expression};\n"));
         }
         if module.default_is_namespace {
             out.push_str("    __albedo_exports['default'] = __albedo_exports;\n");

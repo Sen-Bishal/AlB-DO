@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 fn albedo(home: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_albedo"));
-    cmd.current_dir(cwd).env("USERPROFILE", home).env("HOME", home);
+    cmd.current_dir(cwd)
+        .env("USERPROFILE", home)
+        .env("HOME", home);
     cmd
 }
 
@@ -75,7 +77,10 @@ async fn boot(app: &Path) -> Running {
 async fn a_live_viewer_does_not_hold_a_graceful_shutdown_open() {
     let home = tempfile::tempdir().expect("home");
     let work = tempfile::tempdir().expect("work");
-    run_ok(albedo(home.path(), work.path()).args(["init", "shutdownapp"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "shutdownapp"]),
+        "albedo init",
+    );
     let app = work.path().join("shutdownapp");
     std::fs::write(
         app.join("src/middleware.ts"),
@@ -99,7 +104,11 @@ export default function middleware(request) {
         .await
         .expect("the trunk opens");
     assert_eq!(trunk.status(), 200);
-    let hello = trunk.chunk().await.expect("readable").expect("a first event");
+    let hello = trunk
+        .chunk()
+        .await
+        .expect("readable")
+        .expect("a first event");
     assert!(
         String::from_utf8_lossy(&hello).contains("hello"),
         "CONTROL — the trunk is live before the shutdown: {hello:?}"
@@ -125,7 +134,10 @@ export default function middleware(request) {
     })
     .await
     .expect("the stream ends");
-    assert!(rest.is_ok(), "the trunk was cut rather than ended: {rest:?}");
+    assert!(
+        rest.is_ok(),
+        "the trunk was cut rather than ended: {rest:?}"
+    );
 
     // ── 2 · a request that genuinely runs long, with the drain lowered ──
     std::env::set_var("ALBEDO_SHUTDOWN_TIMEOUT_MS", "600");

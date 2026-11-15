@@ -7,11 +7,10 @@
 //! `pages.findIndex(...)` shipped an empty pager with the build green.
 //!
 //! Two properties are pinned here:
-//! 1. Each supported method gives the markup `QuickJS` gives — the engine that
-//!    runs real JavaScript is the reference, not this file's idea of it.
-//! 2. An unsupported method, a function passed by name, and a read of a
-//!    constant that failed to evaluate are ERRORS that name the call, never
-//!    an empty render.
+//! 1. Each supported method gives the markup `QuickJS` gives — the engine that runs real JavaScript
+//!    is the reference, not this file's idea of it.
+//! 2. An unsupported method, a function passed by name, and a read of a constant that failed to
+//!    evaluate are ERRORS that name the call, never an empty render.
 
 use dom_render_compiler::runtime::engine::{BootstrapPayload, RuntimeEngine};
 use dom_render_compiler::runtime::eval::{
@@ -40,14 +39,18 @@ fn render_static(project: &CompiledProject, entry: &str) -> anyhow::Result<Strin
         entry,
         &json!({}),
         &slots(),
-        &RenderOptions { hook_compile: false },
+        &RenderOptions {
+            hook_compile: false,
+        },
     )
     .map(|output| output.html)
 }
 
 fn render_quickjs(project: &CompiledProject, entry: &str) -> String {
     let mut engine = QuickJsEngine::new();
-    engine.init(&BootstrapPayload::default()).expect("engine init");
+    engine
+        .init(&BootstrapPayload::default())
+        .expect("engine init");
     project
         .render_entry_quickjs(&mut engine, entry, &json!({}), &slots())
         .expect("quickjs render succeeds")
@@ -87,20 +90,35 @@ fn supported_array_methods_render_what_quickjs_renders() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "data.ts", DATA);
     write(dir.path(), "Probe.tsx", &format!("{DATA}{PROBE}"));
-    write(dir.path(), "Imported.tsx", &format!("import {{ pages, sections }} from \"./data\";
-{PROBE}"));
+    write(
+        dir.path(),
+        "Imported.tsx",
+        &format!(
+            "import {{ pages, sections }} from \"./data\";
+{PROBE}"
+        ),
+    );
 
     let project = CompiledProject::load_from_dir(dir.path()).expect("compiles");
     let evaluated = text(&render_static(&project, "Probe.tsx").expect("static render succeeds"));
     let reference = text(&render_quickjs(&project, "Probe.tsx"));
     let imported = text(&render_static(&project, "Imported.tsx").expect("static render succeeds"));
 
-    assert_eq!(evaluated, reference, "the static renderer diverged from QuickJS");
-    assert_eq!(imported, evaluated, "an imported constant rendered differently from a local one");
+    assert_eq!(
+        evaluated, reference,
+        "the static renderer diverged from QuickJS"
+    );
+    assert_eq!(
+        imported, evaluated,
+        "an imported constant rendered differently from a local one"
+    );
     // And the reference is what it looks like — so an engine regression cannot
     // make both sides agree on nothing.
     for expected in EXPECTED {
-        assert!(evaluated.contains(expected), "missing `{expected}` in: {evaluated}");
+        assert!(
+            evaluated.contains(expected),
+            "missing `{expected}` in: {evaluated}"
+        );
     }
 }
 
@@ -137,18 +155,18 @@ export default function Probe() {
 "#;
 
 const EXPECTED: [&str; 13] = [
-        "at:1 current:B",
-        "miss:-1",
-        "find:C",
-        "findLast:B",
-        "findLastIndex:-1",
-        "filter:A+C",
-        "some:true every:false",
-        "includes:true indexOf:2 lastIndexOf:2",
-        "at:C slice:BC slice2:2,3",
-        "concat:1,2,3,4 flat:3 flatMap:1,2,3",
-        "reduce:6 reduceRight:cba",
-        "sorted:BCA reversed:CBA",
+    "at:1 current:B",
+    "miss:-1",
+    "find:C",
+    "findLast:B",
+    "findLastIndex:-1",
+    "filter:A+C",
+    "some:true every:false",
+    "includes:true indexOf:2 lastIndexOf:2",
+    "at:C slice:BC slice2:2,3",
+    "concat:1,2,3,4 flat:3 flatMap:1,2,3",
+    "reduce:6 reduceRight:cba",
+    "sorted:BCA reversed:CBA",
     "third:C",
 ];
 
@@ -159,7 +177,8 @@ fn refusal(component: &str) -> String {
     let project = CompiledProject::load_from_dir(dir.path()).expect("compiles");
     format!(
         "{:#}",
-        render_static(&project, "Probe.tsx").expect_err("the static render must refuse, not render empty")
+        render_static(&project, "Probe.tsx")
+            .expect_err("the static render must refuse, not render empty")
     )
 }
 
@@ -170,7 +189,10 @@ fn an_unsupported_array_method_is_refused_by_name() {
   return <p>{[3, 1].entries()}</p>;
 }",
     );
-    assert!(err.contains("`.entries()` on an array is not supported"), "{err}");
+    assert!(
+        err.contains("`.entries()` on an array is not supported"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -202,7 +224,10 @@ export default function Probe() {
   return <p>{pages.filter(big).length}</p>;
 }"#,
     );
-    assert!(filter.contains("`.filter()` needs an inline arrow"), "{filter}");
+    assert!(
+        filter.contains("`.filter()` needs an inline arrow"),
+        "{filter}"
+    );
 }
 
 /// The constant fails; READING it raises that failure, by name, in the module
@@ -216,11 +241,18 @@ export default function Probe() {
 }",
     );
     assert!(local.contains("`pages` could not be evaluated"), "{local}");
-    assert!(local.contains("`.entries()` on an array is not supported"), "{local}");
+    assert!(
+        local.contains("`.entries()` on an array is not supported"),
+        "{local}"
+    );
 
     let imported = {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "data.ts", "export const broken = [1].entries();\n");
+        write(
+            dir.path(),
+            "data.ts",
+            "export const broken = [1].entries();\n",
+        );
         write(
             dir.path(),
             "Probe.tsx",
@@ -230,9 +262,15 @@ export default function Probe() {
 }"#,
         );
         let project = CompiledProject::load_from_dir(dir.path()).expect("compiles");
-        format!("{:#}", render_static(&project, "Probe.tsx").expect_err("refused"))
+        format!(
+            "{:#}",
+            render_static(&project, "Probe.tsx").expect_err("refused")
+        )
     };
-    assert!(imported.contains("`broken` could not be evaluated"), "{imported}");
+    assert!(
+        imported.contains("`broken` could not be evaluated"),
+        "{imported}"
+    );
 }
 
 /// A constant that fails but is never read costs nothing — `export const join =
@@ -249,5 +287,7 @@ export default function Probe() {
 }",
     );
     let project = CompiledProject::load_from_dir(dir.path()).expect("compiles");
-    assert!(render_static(&project, "Probe.tsx").unwrap().contains("fine"));
+    assert!(render_static(&project, "Probe.tsx")
+        .unwrap()
+        .contains("fine"));
 }

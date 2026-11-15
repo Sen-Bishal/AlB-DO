@@ -7,8 +7,8 @@
 //! binary, edits the file four times, and asks over HTTP after each edit:
 //!
 //! 1. a changed body is served;
-//! 2. a **broken** file fails the reload loudly and the last good middleware
-//!    keeps serving — a dev server that went dark on a typo would be worse;
+//! 2. a **broken** file fails the reload loudly and the last good middleware keeps serving — a dev
+//!    server that went dark on a typo would be worse;
 //! 3. a fixed file with a matcher takes effect, matcher included;
 //! 4. a deleted file stops running.
 
@@ -75,16 +75,28 @@ where
 }
 
 #[tokio::test]
-async fn editing_the_middleware_under_albedo_dev_reloads_it_and_a_broken_edit_keeps_the_last_good_one() {
+async fn editing_the_middleware_under_albedo_dev_reloads_it_and_a_broken_edit_keeps_the_last_good_one(
+) {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    let init = albedo(home.path(), work.path()).args(["init", "app"]).output().unwrap();
-    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    let init = albedo(home.path(), work.path())
+        .args(["init", "app"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
     let app = work.path().join("app");
     let file = app.join("src/middleware.ts");
     fs::write(&file, middleware("one", None)).unwrap();
 
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let log = app.join("dev.log");
     let child = albedo(home.path(), &app)
         .args(["dev", ".", "--port", &port.to_string()])
@@ -109,10 +121,17 @@ async fn editing_the_middleware_under_albedo_dev_reloads_it_and_a_broken_edit_ke
     .await;
 
     // ── 2 · a broken edit fails loudly and the last good one keeps serving ──
-    let reloads_before = fs::read_to_string(&log).unwrap().matches("reload failed").count();
+    let reloads_before = fs::read_to_string(&log)
+        .unwrap()
+        .matches("reload failed")
+        .count();
     fs::write(&file, middleware("broken", Some("/admin/(.*)"))).unwrap();
     eventually("the reload to fail", &log, || async {
-        fs::read_to_string(&log).unwrap_or_default().matches("reload failed").count() > reloads_before
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("reload failed")
+            .count()
+            > reloads_before
     })
     .await;
     let report = fs::read_to_string(&log).unwrap();
@@ -128,11 +147,17 @@ async fn editing_the_middleware_under_albedo_dev_reloads_it_and_a_broken_edit_ke
 
     // ── 3 · fixed, with a matcher — the matcher reloads too ──
     fs::write(&file, middleware("three", Some("/guestbook"))).unwrap();
-    eventually("the scoped middleware to serve /guestbook", &log, || async {
-        version(&base, "/guestbook").await.as_deref() == Some("three")
-    })
+    eventually(
+        "the scoped middleware to serve /guestbook",
+        &log,
+        || async { version(&base, "/guestbook").await.as_deref() == Some("three") },
+    )
     .await;
-    assert_eq!(version(&base, "/").await, None, "and not paths outside its matcher");
+    assert_eq!(
+        version(&base, "/").await,
+        None,
+        "and not paths outside its matcher"
+    );
 
     // ── 4 · deleted ──
     fs::remove_file(&file).unwrap();

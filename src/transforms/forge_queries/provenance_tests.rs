@@ -77,10 +77,10 @@ fn provenance_follows_the_binding_not_the_spelling() {
     assert_eq!(
         by_line,
         vec![
-            (4, Provenance::Code),       // inner's own `params` parameter shadows the prop
-            (6, Provenance::Code),       // a local `const params`
-            (7, Provenance::RouteParam), // the component's destructured `params`
-            (8, Provenance::Principal),  // its `user`
+            (4, Provenance::Code),        // inner's own `params` parameter shadows the prop
+            (6, Provenance::Code),        // a local `const params`
+            (7, Provenance::RouteParam),  // the component's destructured `params`
+            (8, Provenance::Principal),   // its `user`
             (12, Provenance::RouteParam), // `props.params.id`
             (15, Provenance::RouteParam), // `{ params: p }` → `p.id`
         ],

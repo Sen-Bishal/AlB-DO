@@ -287,22 +287,37 @@ pub fn discover_routes(routes_dir: &Path) -> Result<RouteDiscovery, RouteDiscove
     }
 
     // Stable, dedup, deterministic order: shortest prefix first.
-    let prefix_sort = |a_len: usize, a: &str, b_len: usize, b: &str| {
-        a_len.cmp(&b_len).then_with(|| a.cmp(b))
-    };
-    layouts.sort_by(|a, b| prefix_sort(a.url_prefix.len(), &a.url_prefix, b.url_prefix.len(), &b.url_prefix));
+    let prefix_sort =
+        |a_len: usize, a: &str, b_len: usize, b: &str| a_len.cmp(&b_len).then_with(|| a.cmp(b));
+    layouts.sort_by(|a, b| {
+        prefix_sort(
+            a.url_prefix.len(),
+            &a.url_prefix,
+            b.url_prefix.len(),
+            &b.url_prefix,
+        )
+    });
     error_boundaries.sort_by(|a, b| {
-        prefix_sort(a.url_prefix.len(), &a.url_prefix, b.url_prefix.len(), &b.url_prefix)
+        prefix_sort(
+            a.url_prefix.len(),
+            &a.url_prefix,
+            b.url_prefix.len(),
+            &b.url_prefix,
+        )
     });
     loading_fallbacks.sort_by(|a, b| {
-        prefix_sort(a.url_prefix.len(), &a.url_prefix, b.url_prefix.len(), &b.url_prefix)
+        prefix_sort(
+            a.url_prefix.len(),
+            &a.url_prefix,
+            b.url_prefix.len(),
+            &b.url_prefix,
+        )
     });
     raw_routes.sort_by(|a, b| a.url_path.cmp(&b.url_path));
 
     for route in &mut raw_routes {
         route.layout_chain = layouts_for_route(&route.url_path, &layouts);
-        route.error_boundary =
-            nearest_boundary_for_route(&route.url_path, &error_boundaries);
+        route.error_boundary = nearest_boundary_for_route(&route.url_path, &error_boundaries);
         route.loading = nearest_loading_for_route(&route.url_path, &loading_fallbacks);
     }
 
@@ -321,7 +336,8 @@ pub fn discover_routes(routes_dir: &Path) -> Result<RouteDiscovery, RouteDiscove
 /// unsupported extensions).
 pub fn file_path_to_url(rel_path: &Path) -> Option<String> {
     let stem = file_stem(rel_path)?;
-    if stem.starts_with('_') || is_convention_stem(stem) || crate::testing::is_test_module(rel_path) {
+    if stem.starts_with('_') || is_convention_stem(stem) || crate::testing::is_test_module(rel_path)
+    {
         return None;
     }
     if !has_route_extension(rel_path) {
@@ -664,7 +680,11 @@ mod tests {
         let routes = temp.path().join("routes");
         fs::create_dir_all(&routes).unwrap();
         write(&routes, "layout.tsx", "export default function Root() {}");
-        write(&routes, "docs/layout.tsx", "export default function Docs() {}");
+        write(
+            &routes,
+            "docs/layout.tsx",
+            "export default function Docs() {}",
+        );
         write(&routes, "docs/index.md", "# Docs");
         write(&routes, "docs/routing.md", "# Routing");
         write(&routes, "docs/_draft.md", "# Not yet");
@@ -673,7 +693,11 @@ mod tests {
         write(&routes, "docs/guide/layout.md", "# Not a layout");
 
         let discovery = discover_routes(&routes).unwrap();
-        let urls: Vec<&str> = discovery.routes.iter().map(|r| r.url_path.as_str()).collect();
+        let urls: Vec<&str> = discovery
+            .routes
+            .iter()
+            .map(|r| r.url_path.as_str())
+            .collect();
         assert_eq!(urls, vec!["/docs", "/docs/routing"]);
         assert!(discovery
             .layouts
@@ -681,7 +705,10 @@ mod tests {
             .all(|layout| layout.source_rel_path.extension().unwrap() == "tsx"));
         assert_eq!(
             discovery.routes[1].layout_chain,
-            vec![PathBuf::from("layout.tsx"), PathBuf::from("docs/layout.tsx")]
+            vec![
+                PathBuf::from("layout.tsx"),
+                PathBuf::from("docs/layout.tsx")
+            ]
         );
     }
 
@@ -778,7 +805,11 @@ mod tests {
         write(&routes, "about.tsx", "");
         write(&routes, "dashboard/index.tsx", "");
         write(&routes, "dashboard/settings.tsx", "");
-        write(&routes, "error.tsx", "export default function RootError() {}");
+        write(
+            &routes,
+            "error.tsx",
+            "export default function RootError() {}",
+        );
         write(
             &routes,
             "dashboard/error.tsx",

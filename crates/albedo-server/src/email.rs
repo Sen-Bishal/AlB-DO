@@ -86,9 +86,13 @@ impl Mailer for HttpMailer {
         attachments: &[ResolvedAttachment],
         idempotency_key: &str,
     ) -> SendOutcome {
-        let Some(request) =
-            build_request(&self.config, &self.key, message, attachments, idempotency_key)
-        else {
+        let Some(request) = build_request(
+            &self.config,
+            &self.key,
+            message,
+            attachments,
+            idempotency_key,
+        ) else {
             return SendOutcome::Reject(format!(
                 "provider `{}` cannot describe a request",
                 self.config.provider.as_str()
@@ -162,7 +166,13 @@ impl Mailer for OutboxMailer {
         // provider honouring the key would have delivered.
         let stem: String = idempotency_key
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .take(96)
             .collect();
         let rendered = eml::render(
@@ -351,7 +361,9 @@ impl EmailRuntime {
             Ok(files) => files,
             Err(outcome) => return outcome,
         };
-        self.mailer.send(&queued.message, &files, idempotency_key).await
+        self.mailer
+            .send(&queued.message, &files, idempotency_key)
+            .await
     }
 }
 
@@ -435,7 +447,9 @@ async fn resolve_attachments(
                     .unwrap_or_else(|| "application/octet-stream".to_string()),
                 bytes: base64::engine::general_purpose::STANDARD
                     .decode(content.as_bytes())
-                    .map_err(|_| SendOutcome::Reject("an inline attachment is not base64".into()))?,
+                    .map_err(|_| {
+                        SendOutcome::Reject("an inline attachment is not base64".into())
+                    })?,
             },
             AttachmentSource::Upload(id) => {
                 let stored = owned_upload(db, principal, id)
@@ -460,7 +474,10 @@ async fn resolve_attachments(
                     } else {
                         attachment.filename.clone()
                     },
-                    content_type: attachment.content_type.clone().unwrap_or(stored.content_type),
+                    content_type: attachment
+                        .content_type
+                        .clone()
+                        .unwrap_or(stored.content_type),
                     bytes,
                 }
             }
@@ -491,7 +508,9 @@ pub async fn send_test(
     to: &str,
     outbox: PathBuf,
 ) -> Result<SendOutcome, String> {
-    use dom_render_compiler::aperture::{EgressMode, EgressPolicy, ReqwestTransport, ResponseCache};
+    use dom_render_compiler::aperture::{
+        EgressMode, EgressPolicy, ReqwestTransport, ResponseCache,
+    };
 
     let to = Mailbox::parse(to).map_err(|err| err.to_string())?;
     let policy = Arc::new(EgressPolicy::with_declared_hosts(
@@ -543,7 +562,12 @@ pub fn mailer_for(
     let key = config
         .resolve_key()
         .map_err(|err| err.to_string())?
-        .ok_or_else(|| format!("`email.provider` \"{}\" needs an apiKey", config.provider.as_str()))?;
+        .ok_or_else(|| {
+            format!(
+                "`email.provider` \"{}\" needs an apiKey",
+                config.provider.as_str()
+            )
+        })?;
     Ok(Arc::new(HttpMailer::new(config.clone(), key, client)))
 }
 
@@ -564,8 +588,12 @@ pub fn resolve_link_origin(
     dev_mode: bool,
 ) -> Result<Option<String>, String> {
     if let Some(raw) = public_origin.map(str::trim).filter(|raw| !raw.is_empty()) {
-        let url = url::Url::parse(raw)
-            .map_err(|err| format!("{} = `{raw}` is not a URL: {err}", crate::tls::PUBLIC_ORIGIN_ENV))?;
+        let url = url::Url::parse(raw).map_err(|err| {
+            format!(
+                "{} = `{raw}` is not a URL: {err}",
+                crate::tls::PUBLIC_ORIGIN_ENV
+            )
+        })?;
         let bare = matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
             && url.path() == "/"
@@ -601,7 +629,10 @@ mod tests {
 
     const ALICE: &str = "u_alice";
 
-    async fn db_with_upload(owner: Option<&str>, project: &std::path::Path) -> (LibSqlSubstrate, String) {
+    async fn db_with_upload(
+        owner: Option<&str>,
+        project: &std::path::Path,
+    ) -> (LibSqlSubstrate, String) {
         let db = LibSqlSubstrate::open_ephemeral().await.expect("opens");
         for statement in uploads::collection().migrations.iter() {
             db.migrate(statement).await.expect("upload table");
@@ -644,7 +675,9 @@ mod tests {
 
         assert!(check_attachments(&db, Some(ALICE), &message).await.is_ok());
         for stranger in [Some("u_bob"), None] {
-            let err = check_attachments(&db, stranger, &message).await.unwrap_err();
+            let err = check_attachments(&db, stranger, &message)
+                .await
+                .unwrap_err();
             assert!(err.contains("different user"), "{err}");
         }
 
@@ -652,7 +685,10 @@ mod tests {
         let resolved = resolve_attachments(&db, dir.path(), Some(ALICE), &message)
             .await
             .expect("alice's own file");
-        assert_eq!(resolved[0].filename, "invoice.pdf", "falls back to the uploaded name");
+        assert_eq!(
+            resolved[0].filename, "invoice.pdf",
+            "falls back to the uploaded name"
+        );
         assert_eq!(resolved[0].content_type, "application/pdf");
         assert_eq!(resolved[0].bytes, b"%PDF");
         assert!(matches!(
@@ -689,7 +725,10 @@ mod tests {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         assert_eq!(runtime.drain(Duration::from_secs(5)).await, 0);
-        assert!(done.load(std::sync::atomic::Ordering::SeqCst), "drain returned before the work finished");
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "drain returned before the work finished"
+        );
 
         runtime.spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
         assert_eq!(
@@ -764,23 +803,44 @@ mod tests {
 
     #[test]
     fn links_come_from_configuration_in_a_fixed_order() {
-        let resolve = |origin, acme, host, dev| resolve_link_origin(origin, acme, host, 3000, false, dev);
+        let resolve =
+            |origin, acme, host, dev| resolve_link_origin(origin, acme, host, 3000, false, dev);
         assert_eq!(
-            resolve(Some("https://app.acme.dev/"), Some("x.dev"), "0.0.0.0", false),
+            resolve(
+                Some("https://app.acme.dev/"),
+                Some("x.dev"),
+                "0.0.0.0",
+                false
+            ),
             Ok(Some("https://app.acme.dev".into()))
         );
         assert_eq!(
             resolve(None, Some("app.acme.dev"), "0.0.0.0", false),
             Ok(Some("https://app.acme.dev".into()))
         );
-        assert_eq!(resolve(None, None, "127.0.0.1", false), Ok(Some("http://localhost:3000".into())));
-        assert_eq!(resolve(None, None, "0.0.0.0", true), Ok(Some("http://localhost:3000".into())));
-        assert_eq!(resolve(None, None, "0.0.0.0", false), Ok(None), "production with nothing declared");
+        assert_eq!(
+            resolve(None, None, "127.0.0.1", false),
+            Ok(Some("http://localhost:3000".into()))
+        );
+        assert_eq!(
+            resolve(None, None, "0.0.0.0", true),
+            Ok(Some("http://localhost:3000".into()))
+        );
+        assert_eq!(
+            resolve(None, None, "0.0.0.0", false),
+            Ok(None),
+            "production with nothing declared"
+        );
     }
 
     #[test]
     fn a_public_origin_with_a_path_is_refused() {
-        for bad in ["https://app.dev/base", "https://app.dev/?x=1", "ftp://app.dev", "https://u:p@app.dev"] {
+        for bad in [
+            "https://app.dev/base",
+            "https://app.dev/?x=1",
+            "ftp://app.dev",
+            "https://u:p@app.dev",
+        ] {
             assert!(
                 resolve_link_origin(Some(bad), None, "0.0.0.0", 3000, false, false).is_err(),
                 "{bad}"
@@ -798,7 +858,9 @@ mod tests {
         );
         assert_eq!(runtime.app_name(), "Acme");
         assert_eq!(
-            runtime.link("/_albedo/auth/password/reset?token=t").as_deref(),
+            runtime
+                .link("/_albedo/auth/password/reset?token=t")
+                .as_deref(),
             Some("https://app.acme.dev/_albedo/auth/password/reset?token=t")
         );
     }

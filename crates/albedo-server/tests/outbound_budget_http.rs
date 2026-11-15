@@ -14,11 +14,10 @@
 //!
 //! One host, `limit: "4/m"`, reached through two doors by two different callers:
 //!
-//! 1. An **anonymous** visitor submits a form action whose body calls the host.
-//!    The first four submits go out; the fifth is `429` and never arrives.
-//! 2. A **signed-in** user — a different SHUTTER caller, who has made no calls of
-//!    their own — hits a page whose **middleware** calls the same host, and is
-//!    refused at once.
+//! 1. An **anonymous** visitor submits a form action whose body calls the host. The first four
+//!    submits go out; the fifth is `429` and never arrives.
+//! 2. A **signed-in** user — a different SHUTTER caller, who has made no calls of their own — hits
+//!    a page whose **middleware** calls the same host, and is refused at once.
 //!
 //! (2) is the point of a per-host budget: no per-caller bucket would refuse a
 //! caller with a clean record. Its control is (1) itself — the same host admitted
@@ -70,11 +69,17 @@ async fn upstream() -> (String, Hits) {
     let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
         let counted = Arc::clone(&counted);
         async move {
-            *counted.lock().unwrap().entry(uri.path().to_string()).or_default() += 1;
+            *counted
+                .lock()
+                .unwrap()
+                .entry(uri.path().to_string())
+                .or_default() += 1;
             ([("content-type", "application/json")], "{}")
         }
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -120,7 +125,10 @@ async fn one_host_budget_is_shared_across_callers_and_across_actions_and_middlew
     let (base, upstream_hits) = upstream().await;
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    run_ok(albedo(home.path(), work.path()).args(["init", "budget"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "budget"]),
+        "albedo init",
+    );
     let app = work.path().join("budget");
 
     let config_path = app.join("albedo.config.ts");
@@ -171,7 +179,11 @@ export default async function middleware() {{
     .unwrap();
     run_ok(albedo(home.path(), &app).arg("build"), "albedo build");
 
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let child = albedo(home.path(), &app)
         .args(["serve", ".", "--port", &port.to_string()])
         .stdout(Stdio::null())
@@ -181,11 +193,17 @@ export default async function middleware() {{
     let _server = Server { child };
     let origin = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while reqwest::get(format!("{origin}/_albedo/runtime.js")).await.is_err() {
+    while reqwest::get(format!("{origin}/_albedo/runtime.js"))
+        .await
+        .is_err()
+    {
         assert!(Instant::now() < deadline, "serve never answered");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let client = reqwest::Client::builder().redirect(Policy::none()).build().unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .unwrap();
 
     // ── 1 · an anonymous visitor's form action spends the host's budget ──
     let mut statuses = Vec::new();
@@ -195,7 +213,11 @@ export default async function middleware() {{
         let response = client
             .post(format!("{origin}/_albedo/action/ping"))
             .header("cookie", &tab)
-            .form(&[("_csrf", csrf.as_str()), ("_albedo_return", back.as_str()), ("note", "x")])
+            .form(&[
+                ("_csrf", csrf.as_str()),
+                ("_albedo_return", back.as_str()),
+                ("note", "x"),
+            ])
             .send()
             .await
             .unwrap();
@@ -206,7 +228,10 @@ export default async function middleware() {{
                 before,
                 "attempt {attempt}: a refused call never reached the upstream"
             );
-            assert!(response.headers().contains_key("retry-after"), "a 429 says when to retry");
+            assert!(
+                response.headers().contains_key("retry-after"),
+                "a 429 says when to retry"
+            );
         }
         statuses.push(status);
     }
@@ -217,7 +242,10 @@ export default async function middleware() {{
         "exactly the declared limit went out; statuses {statuses:?}\nserver stderr:\n{stderr}"
     );
     assert_eq!(
-        statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count(),
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+            .count(),
         2,
         "the fifth and sixth submits were refused: {statuses:?}"
     );
@@ -299,8 +327,15 @@ async fn albedo_instances_splits_the_declared_host_budget_and_refuses_what_it_ca
     let app = scaffold_pinging_app(home.path(), work.path(), &base, "4/m");
 
     // ── refusals first: a boot that must not start ──
-    for (value, needle) in [("8", "cannot be split across 8"), ("two", "not a positive whole number")] {
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    for (value, needle) in [
+        ("8", "cannot be split across 8"),
+        ("two", "not a positive whole number"),
+    ] {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let mut child = albedo(home.path(), &app)
             .args(["serve", ".", "--port", &port.to_string()])
             .env("ALBEDO_INSTANCES", value)
@@ -323,11 +358,18 @@ async fn albedo_instances_splits_the_declared_host_budget_and_refuses_what_it_ca
         let said = String::from_utf8_lossy(&output.stdout).to_string()
             + &String::from_utf8_lossy(&output.stderr);
         assert!(!status.success(), "ALBEDO_INSTANCES={value} must not boot");
-        assert!(said.contains(needle), "ALBEDO_INSTANCES={value}: the refusal says why:\n{said}");
+        assert!(
+            said.contains(needle),
+            "ALBEDO_INSTANCES={value}: the refusal says why:\n{said}"
+        );
     }
 
     // ── one of two instances admits half ──
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let child = albedo(home.path(), &app)
         .args(["serve", ".", "--port", &port.to_string()])
         .env("ALBEDO_INSTANCES", "2")
@@ -338,11 +380,17 @@ async fn albedo_instances_splits_the_declared_host_budget_and_refuses_what_it_ca
     let _server = Server { child };
     let origin = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while reqwest::get(format!("{origin}/_albedo/runtime.js")).await.is_err() {
+    while reqwest::get(format!("{origin}/_albedo/runtime.js"))
+        .await
+        .is_err()
+    {
         assert!(Instant::now() < deadline, "serve never answered");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let client = reqwest::Client::builder().redirect(Policy::none()).build().unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .unwrap();
 
     let mut statuses = Vec::new();
     for _ in 0..4 {
@@ -350,15 +398,26 @@ async fn albedo_instances_splits_the_declared_host_budget_and_refuses_what_it_ca
         let response = client
             .post(format!("{origin}/_albedo/action/ping"))
             .header("cookie", &tab)
-            .form(&[("_csrf", csrf.as_str()), ("_albedo_return", back.as_str()), ("note", "x")])
+            .form(&[
+                ("_csrf", csrf.as_str()),
+                ("_albedo_return", back.as_str()),
+                ("note", "x"),
+            ])
             .send()
             .await
             .unwrap();
         statuses.push(response.status());
     }
-    assert_eq!(hits(&upstream_hits, "/from-action"), 2, "half of 4/m: {statuses:?}");
     assert_eq!(
-        statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count(),
+        hits(&upstream_hits, "/from-action"),
+        2,
+        "half of 4/m: {statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+            .count(),
         2,
         "{statuses:?}"
     );

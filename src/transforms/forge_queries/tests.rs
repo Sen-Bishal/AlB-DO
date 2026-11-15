@@ -6,7 +6,11 @@ use super::{classify_source, Classification};
 use crate::forge::declare::{FieldSpec, FieldType};
 use crate::forge::query::{CollectionSchema, Shape};
 
-fn schema(name: &str, fields: &[(&str, FieldType)], partition_by: Option<&str>) -> CollectionSchema {
+fn schema(
+    name: &str,
+    fields: &[(&str, FieldType)],
+    partition_by: Option<&str>,
+) -> CollectionSchema {
     CollectionSchema {
         name: name.into(),
         table: name.into(),
@@ -24,7 +28,11 @@ pub(super) fn schemas() -> BTreeMap<String, CollectionSchema> {
     let mut out = BTreeMap::new();
     out.insert(
         "guestbook".into(),
-        schema("guestbook", &[("author", FieldType::Text), ("message", FieldType::Text)], None),
+        schema(
+            "guestbook",
+            &[("author", FieldType::Text), ("message", FieldType::Text)],
+            None,
+        ),
     );
     out.insert(
         "invoices".into(),
@@ -41,11 +49,18 @@ pub(super) fn schemas() -> BTreeMap<String, CollectionSchema> {
     );
     out.insert(
         "messages".into(),
-        schema("messages", &[("room", FieldType::Text), ("body", FieldType::Text)], Some("room")),
+        schema(
+            "messages",
+            &[("room", FieldType::Text), ("body", FieldType::Text)],
+            Some("room"),
+        ),
     );
     // Collections named like helpers (Falsifier 7).
     for name in ["count", "sum", "optional"] {
-        out.insert(name.into(), schema(name, &[("label", FieldType::Text)], None));
+        out.insert(
+            name.into(),
+            schema(name, &[("label", FieldType::Text)], None),
+        );
     }
     out
 }
@@ -83,12 +98,22 @@ fn the_why_2_probe_lowers_to_a_count_and_is_named_by_its_line() {
 #[test]
 fn a_bare_collection_value_is_its_own_diagnostic() {
     let d = one_diagnostic("import { guestbook } from \"albedo/forge\";\n\nconst x = guestbook;\n");
-    assert!(d.starts_with("src/routes/probe.tsx:3:11 — `guestbook` is a collection"), "{d}");
+    assert!(
+        d.starts_with("src/routes/probe.tsx:3:11 — `guestbook` is a collection"),
+        "{d}"
+    );
 }
 
 #[test]
 fn member_reads_and_calls_on_a_collection_are_diagnostics() {
-    for body in ["guestbook.length", "fn(guestbook)", "guestbook()", "guestbook[\"where\"]({})", "typeof guestbook", "({ guestbook })"] {
+    for body in [
+        "guestbook.length",
+        "fn(guestbook)",
+        "guestbook()",
+        "guestbook[\"where\"]({})",
+        "typeof guestbook",
+        "({ guestbook })",
+    ] {
         let d = one_diagnostic(&format!("import {{ guestbook }} from \"albedo/forge\";\nconst fn = (x) => x;\nconst y = {body};\n"));
         assert!(d.contains("`guestbook` is a collection"), "{body}: {d}");
     }
@@ -186,7 +211,10 @@ fn the_count_helper_lowers_beside_a_collection_named_count() {
     assert!(c.diagnostics.is_empty(), "{:?}", c.diagnostics);
     assert_eq!(c.queries.len(), 1);
     assert_eq!(c.queries[0].collection, "count");
-    assert!(matches!(c.queries[0].canonical.descriptor.shape, Shape::Group { .. }));
+    assert!(matches!(
+        c.queries[0].canonical.descriptor.shape,
+        Shape::Group { .. }
+    ));
 }
 
 #[test]
@@ -228,22 +256,46 @@ fn rejected_shapes_each_name_their_rule() {
         ("invoices.where({ owner: { contains: \"a\" } })", "Q2"),
         ("invoices.where({ owner: 1, owner: 2 })", "appears twice"),
         ("invoices.where({ __proto__: 1 })", "`__proto__`"),
-        ("invoices.where({ get owner() { return 1; } })", "no getters"),
+        (
+            "invoices.where({ get owner() { return 1; } })",
+            "no getters",
+        ),
         ("invoices.where({ ...p })", "spread"),
         ("invoices.where({ [k]: 1 })", "computed"),
-        ("invoices.where(or({ owner: optional(x) }, { status: 1 }))", "optional() inside or"),
-        ("invoices.where({ due: { lt: null } })", "can't bound a range"),
-        ("invoices.where({ due: { lt: 1, lte: 2 } })", "two upper bounds"),
-        ("invoices.where({ due: { not: 1 } })", "`not` takes only `null`"),
+        (
+            "invoices.where(or({ owner: optional(x) }, { status: 1 }))",
+            "optional() inside or",
+        ),
+        (
+            "invoices.where({ due: { lt: null } })",
+            "can't bound a range",
+        ),
+        (
+            "invoices.where({ due: { lt: 1, lte: 2 } })",
+            "two upper bounds",
+        ),
+        (
+            "invoices.where({ due: { not: 1 } })",
+            "`not` takes only `null`",
+        ),
         ("invoices.filter({ a: 1 })", "isn't a query method"),
-        ("invoices.orderBy(\"due\").where({ owner: 1 })", "out of order"),
-        ("invoices.where({ owner: 1 }).limit(10).count()", "out of order"),
+        (
+            "invoices.orderBy(\"due\").where({ owner: 1 })",
+            "out of order",
+        ),
+        (
+            "invoices.where({ owner: 1 }).limit(10).count()",
+            "out of order",
+        ),
         ("invoices.get(1).count()", "stands alone"),
         ("invoices.where({ owner: 1 }).limit(n)", "integer literal"),
         ("invoices.where({ owner: 1 }).limit(0)", "integer 1..=1000"),
         ("invoices.where({ owner: 1 }).limit(5000)", "out of range"),
         ("invoices.where({ nope: 1 })", "has no column `nope`"),
-        ("invoices.orderBy(\"due\", \"sideways\")", "\"asc\" or \"desc\""),
+        (
+            "invoices.orderBy(\"due\", \"sideways\")",
+            "\"asc\" or \"desc\"",
+        ),
         ("invoices.where(pred)", "by name"),
     ];
     for (chain, expected) in cases {
@@ -252,9 +304,15 @@ fn rejected_shapes_each_name_their_rule() {
         );
         let c = classify(&source);
         assert!(c.queries.is_empty(), "{chain}: lowered {:?}", c.queries);
-        let messages: Vec<String> = c.diagnostics.iter().map(|d| format!("{} — {}", d.at, d.message)).collect();
+        let messages: Vec<String> = c
+            .diagnostics
+            .iter()
+            .map(|d| format!("{} — {}", d.at, d.message))
+            .collect();
         assert!(
-            messages.iter().any(|m| m.contains(expected) && m.starts_with("src/routes/probe.tsx:3:")),
+            messages
+                .iter()
+                .any(|m| m.contains(expected) && m.starts_with("src/routes/probe.tsx:3:")),
             "{chain}: expected `{expected}` at line 3, got {messages:?}"
         );
     }
@@ -263,7 +321,10 @@ fn rejected_shapes_each_name_their_rule() {
 #[test]
 fn a_helper_outside_a_chain_is_a_diagnostic() {
     let d = one_diagnostic("import { count } from \"albedo/query\";\nconst c = count();\n");
-    assert!(d.contains("only means something inside a query chain"), "{d}");
+    assert!(
+        d.contains("only means something inside a query chain"),
+        "{d}"
+    );
 }
 
 #[test]
@@ -273,12 +334,16 @@ fn misuse_inside_a_chain_argument_is_still_caught() {
     );
     assert_eq!(c.queries.len(), 1);
     assert_eq!(c.diagnostics.len(), 1, "{:?}", c.diagnostics);
-    assert!(c.diagnostics[0].message.contains("`guestbook` is a collection"));
+    assert!(c.diagnostics[0]
+        .message
+        .contains("`guestbook` is a collection"));
 }
 
 #[test]
 fn an_undeclared_collection_is_named() {
-    let d = one_diagnostic("import { ghosts } from \"albedo/forge\";\nconst r = ghosts.where({ a: 1 }).count();\n");
+    let d = one_diagnostic(
+        "import { ghosts } from \"albedo/forge\";\nconst r = ghosts.where({ a: 1 }).count();\n",
+    );
     assert!(d.contains("`ghosts` isn't a declared collection"), "{d}");
 }
 

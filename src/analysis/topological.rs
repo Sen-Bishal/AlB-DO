@@ -144,9 +144,7 @@ fn find_longest_path_from(
 
     visited.insert(node);
 
-    let node_time = analyses
-        .get(&node)
-        .map_or(0.0, |a| a.estimated_time_ms);
+    let node_time = analyses.get(&node).map_or(0.0, |a| a.estimated_time_ms);
 
     let dependents = graph.get_dependents(&node);
 

@@ -70,16 +70,40 @@ mod tests {
     /// Every script the server hands a browser. Kept in step with
     /// `albedo-server`'s `handlers::albedo_assets` and `handlers::dev`.
     const SHIPPED: &[(&str, &str)] = &[
-        ("albedo-runtime.js", include_str!("../../assets/albedo-runtime.js")),
+        (
+            "albedo-runtime.js",
+            include_str!("../../assets/albedo-runtime.js"),
+        ),
         ("bincode.js", include_str!("../../assets/bincode.js")),
-        ("albedo-link-forms.js", include_str!("../../assets/albedo-link-forms.js")),
-        ("albedo-hydration.js", include_str!("../../assets/albedo-hydration.js")),
-        ("albedo-wt-bootstrap.js", include_str!("../../assets/albedo-wt-bootstrap.js")),
+        (
+            "albedo-link-forms.js",
+            include_str!("../../assets/albedo-link-forms.js"),
+        ),
+        (
+            "albedo-hydration.js",
+            include_str!("../../assets/albedo-hydration.js"),
+        ),
+        (
+            "albedo-wt-bootstrap.js",
+            include_str!("../../assets/albedo-wt-bootstrap.js"),
+        ),
         ("phosphor.js", include_str!("../../assets/phosphor.js")),
-        ("albedo-client.js", include_str!("../../assets/albedo-client.js")),
-        ("albedo-error-overlay.js", include_str!("../../assets/albedo-error-overlay.js")),
-        ("albedo-hmr-apply.js", include_str!("../../assets/albedo-hmr-apply.js")),
-        ("albedo-dev-stream.js", include_str!("../../assets/albedo-dev-stream.js")),
+        (
+            "albedo-client.js",
+            include_str!("../../assets/albedo-client.js"),
+        ),
+        (
+            "albedo-error-overlay.js",
+            include_str!("../../assets/albedo-error-overlay.js"),
+        ),
+        (
+            "albedo-hmr-apply.js",
+            include_str!("../../assets/albedo-hmr-apply.js"),
+        ),
+        (
+            "albedo-dev-stream.js",
+            include_str!("../../assets/albedo-dev-stream.js"),
+        ),
     ];
 
     /// The fallback must never fire for anything we ship: if it did, that
@@ -109,9 +133,18 @@ mod tests {
     fn minification_changes_layout_not_meaning() {
         let source = "// explain\nconst answer = 40 + 2; /* why */\nfunction greet(name) {\n  return `hi ${name} — ok`;\n}\nexport { answer, greet };\n";
         let minified = minify_script(source);
-        assert!(!minified.contains("explain") && !minified.contains("why"), "{minified}");
-        assert!(minified.contains("answer") && minified.contains("greet"), "{minified}");
-        assert!(minified.contains("`hi ${name} — ok`"), "strings are kept: {minified}");
+        assert!(
+            !minified.contains("explain") && !minified.contains("why"),
+            "{minified}"
+        );
+        assert!(
+            minified.contains("answer") && minified.contains("greet"),
+            "{minified}"
+        );
+        assert!(
+            minified.contains("`hi ${name} — ok`"),
+            "strings are kept: {minified}"
+        );
         assert!(minified.len() < source.len());
     }
 
@@ -136,4 +169,3 @@ mod tests {
         assert_eq!(minify_script(broken), broken);
     }
 }
-

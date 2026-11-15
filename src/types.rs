@@ -45,12 +45,11 @@ pub struct Component {
     /// `parser::scan_reads_principal`, not declared.
     ///
     /// Two consequences, and they are the whole point of the fact:
-    /// - the manifest records `user` among the component's dynamic prop keys, so
-    ///   the serve path resolves it per request;
-    /// - the component **can never be Tier A**, because Tier-A markup is baked
-    ///   once at build time and there is no request in scope to read a principal
-    ///   from. Before this existed such a component was baked with `user`
-    ///   undefined and its signed-in branch could never render.
+    /// - the manifest records `user` among the component's dynamic prop keys, so the serve path
+    ///   resolves it per request;
+    /// - the component **can never be Tier A**, because Tier-A markup is baked once at build time
+    ///   and there is no request in scope to read a principal from. Before this existed such a
+    ///   component was baked with `user` undefined and its signed-in branch could never render.
     ///
     /// Defaults to `false` so existing manifests deserialize unchanged.
     #[serde(default)]

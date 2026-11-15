@@ -42,9 +42,15 @@ fn profile(email: &str, name: &str) -> ProviderProfile {
 }
 
 async fn login(db: &LibSqlSubstrate, provider: &str, subject: &str) -> (Principal, SessionToken) {
-    let principal = upsert_principal(db, provider, subject, &profile("ada@example.com", "Ada"), NOW)
-        .await
-        .expect("upsert");
+    let principal = upsert_principal(
+        db,
+        provider,
+        subject,
+        &profile("ada@example.com", "Ada"),
+        NOW,
+    )
+    .await
+    .expect("upsert");
     let token = create_session(db, &principal.id, provider, NOW, 30 * DAY_MS)
         .await
         .expect("create session");
@@ -57,7 +63,9 @@ async fn a_session_cookie_resolves_to_its_principal() {
     let db = booted().await;
     let (principal, token) = login(&db, "passkey", "ada-authenticator").await;
 
-    let resolved = resolve_session(&db, &token, NOW + 1).await.expect("resolve");
+    let resolved = resolve_session(&db, &token, NOW + 1)
+        .await
+        .expect("resolve");
     let seen = resolved.principal().expect("a live session resolves");
 
     assert_eq!(seen.id, principal.id);
@@ -218,9 +226,15 @@ async fn concurrent_first_logins_converge_on_one_principal() {
 async fn a_returning_login_reuses_the_principal_and_refreshes_the_profile() {
     let db = booted().await;
 
-    let first = upsert_principal(&db, "github", "gh-1", &profile("ada@example.com", "Ada"), NOW)
-        .await
-        .expect("first login");
+    let first = upsert_principal(
+        &db,
+        "github",
+        "gh-1",
+        &profile("ada@example.com", "Ada"),
+        NOW,
+    )
+    .await
+    .expect("first login");
     let renamed = upsert_principal(
         &db,
         "github",
@@ -250,12 +264,24 @@ async fn a_returning_login_reuses_the_principal_and_refreshes_the_profile() {
 async fn the_same_subject_at_two_providers_is_two_principals_until_linked() {
     let db = booted().await;
 
-    let google = upsert_principal(&db, "google", "shared-subject", &ProviderProfile::default(), NOW)
-        .await
-        .expect("google");
-    let github = upsert_principal(&db, "github", "shared-subject", &ProviderProfile::default(), NOW)
-        .await
-        .expect("github");
+    let google = upsert_principal(
+        &db,
+        "google",
+        "shared-subject",
+        &ProviderProfile::default(),
+        NOW,
+    )
+    .await
+    .expect("google");
+    let github = upsert_principal(
+        &db,
+        "github",
+        "shared-subject",
+        &ProviderProfile::default(),
+        NOW,
+    )
+    .await
+    .expect("github");
 
     assert_ne!(
         google.id, github.id,
@@ -280,7 +306,10 @@ async fn revoking_everywhere_kills_every_device_at_once() {
                 .expect("session"),
         );
     }
-    assert_eq!(sessions_for(&db, &principal.id, NOW).await.unwrap().len(), 3);
+    assert_eq!(
+        sessions_for(&db, &principal.id, NOW).await.unwrap().len(),
+        3
+    );
 
     let killed = revoke_all_sessions(&db, &principal.id)
         .await
@@ -354,7 +383,9 @@ async fn deleting_a_principal_takes_their_sessions_with_it() {
 
     delete_principal(&db, &principal.id).await.expect("delete");
 
-    let resolved = resolve_session(&db, &token, NOW + 1).await.expect("resolve");
+    let resolved = resolve_session(&db, &token, NOW + 1)
+        .await
+        .expect("resolve");
     assert!(
         resolved.principal().is_none(),
         "a deleted account's session still resolves"
@@ -382,7 +413,10 @@ async fn deleting_a_principal_takes_their_sessions_with_it() {
     }
     let tombstone = db
         .query(
-            &format!("SELECT epoch FROM {} WHERE principal = ?1", schema::AUTHORITY),
+            &format!(
+                "SELECT epoch FROM {} WHERE principal = ?1",
+                schema::AUTHORITY
+            ),
             &[SqlValue::Text(principal.id.as_str().to_string())],
         )
         .await
@@ -408,7 +442,9 @@ async fn an_orphaned_session_resolves_to_nobody() {
     .await
     .expect("delete user row only");
 
-    let resolved = resolve_session(&db, &token, NOW + 1).await.expect("resolve");
+    let resolved = resolve_session(&db, &token, NOW + 1)
+        .await
+        .expect("resolve");
     assert!(matches!(
         resolved,
         Resolved::Anonymous(SessionRejection::PrincipalGone)

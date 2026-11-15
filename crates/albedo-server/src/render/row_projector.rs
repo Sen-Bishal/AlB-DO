@@ -75,7 +75,10 @@ impl PooledRowProjector {
     /// Count readers across the whole project, not only the Tier-B plan. See
     /// [`Self::sole_reader`].
     #[must_use]
-    pub fn with_project_readers(mut self, readers: std::collections::HashMap<String, usize>) -> Self {
+    pub fn with_project_readers(
+        mut self,
+        readers: std::collections::HashMap<String, usize>,
+    ) -> Self {
         self.project_readers = Some(readers);
         self
     }
@@ -105,7 +108,11 @@ impl PooledRowProjector {
         }
         let mut found = None;
         for entry in &self.plan {
-            let reads = entry.1.shared_topics.iter().any(|topic| topic == collection)
+            let reads = entry
+                .1
+                .shared_topics
+                .iter()
+                .any(|topic| topic == collection)
                 || entry
                     .1
                     .shared_partitions
@@ -195,12 +202,7 @@ impl PooledRowProjector {
                 .shared_partitions
                 .iter()
                 .filter(|spec| spec.collection == collection)
-                .map(|spec| {
-                    (
-                        spec.binding.clone(),
-                        Value::String(collection.to_string()),
-                    )
-                })
+                .map(|spec| (spec.binding.clone(), Value::String(collection.to_string())))
                 .collect::<serde_json::Map<String, Value>>();
             if !topics.is_empty() {
                 host.insert("topics".to_string(), Value::Object(topics));

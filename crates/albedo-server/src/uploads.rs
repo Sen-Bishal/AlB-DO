@@ -128,10 +128,9 @@ impl fmt::Display for UploadError {
                 "no upload bucket called `{bucket}` is declared — a file input's `name` is the \
                  bucket it writes to"
             ),
-            Self::TypeRefused { bucket, offered } => write!(
-                f,
-                "`{bucket}` does not accept `{offered}`"
-            ),
+            Self::TypeRefused { bucket, offered } => {
+                write!(f, "`{bucket}` does not accept `{offered}`")
+            }
             Self::SignInRequired { bucket } => write!(
                 f,
                 "sign in to upload to `{bucket}` — only the person who uploads a file there may \
@@ -238,12 +237,13 @@ where
     let mut body_seen = 0u64;
     let mut genuine = matches!(context.genuine, Genuine::Yes);
 
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| UploadError::Malformed {
-            reason: err.to_string(),
-        })?
+    while let Some(mut field) =
+        multipart
+            .next_field()
+            .await
+            .map_err(|err| UploadError::Malformed {
+                reason: err.to_string(),
+            })?
     {
         let Some(name) = field.name().map(str::to_string) else {
             // A part with no name cannot be addressed by anything downstream.
@@ -272,11 +272,13 @@ where
 
             // The bucket is decided **before** the first chunk is read, so the
             // limit that governs this part is in hand when the reading starts.
-            let bucket = context.registry.bucket(&name).ok_or_else(|| {
-                UploadError::UnknownBucket {
-                    bucket: name.clone(),
-                }
-            })?;
+            let bucket =
+                context
+                    .registry
+                    .bucket(&name)
+                    .ok_or_else(|| UploadError::UnknownBucket {
+                        bucket: name.clone(),
+                    })?;
 
             // An owner-only bucket keeps a file for whoever uploaded it, and an
             // anonymous visitor is nobody: the file would be stored, and then
@@ -508,19 +510,19 @@ pub fn serve_id(path: &str) -> Option<&str> {
 /// ## Why the headers are what they are
 ///
 /// - **`Content-Type` from the row, never sniffed.** The type recorded is the one the bucket's
-///   `accept` list approved; trusting the bytes instead would let a file that passed as
-///   `image/png` be served as whatever a sniffer decided it looked like.
+///   `accept` list approved; trusting the bytes instead would let a file that passed as `image/png`
+///   be served as whatever a sniffer decided it looked like.
 /// - **`X-Content-Type-Options: nosniff`.** The other half of that. A part's declared type is a
 ///   *claim*, so a file that lied still gets served as the type we accepted — a PNG that does not
 ///   render, rather than script a browser will run.
 /// - **`Content-Disposition: attachment` for anything we did not positively decide is safe to
 ///   render inline.** The bytes are attacker-supplied and same-origin, which is the shape that
 ///   turns an upload store into stored XSS.
-/// - **`private, no-cache`, with the hash as the `ETag`.** The bytes never change, but who may
-///   read them can. A shared cache or CDN holding a copy would answer for the app, and neither
-///   the read rule below nor `src/middleware.ts` would see the request. So every read reaches
-///   the server, and a browser that already has the file gets a `304` instead of the bytes. An
-///   app whose uploads are public can set its own `cache-control` from middleware.
+/// - **`private, no-cache`, with the hash as the `ETag`.** The bytes never change, but who may read
+///   them can. A shared cache or CDN holding a copy would answer for the app, and neither the read
+///   rule below nor `src/middleware.ts` would see the request. So every read reaches the server,
+///   and a browser that already has the file gets a `304` instead of the bytes. An app whose
+///   uploads are public can set its own `cache-control` from middleware.
 ///
 /// ## Who may read it
 ///
@@ -626,9 +628,8 @@ pub async fn serve(
         }
     }
 
-    let mut response = axum::response::Response::new(axum::body::Body::from_stream(
-        file_chunks(file, length),
-    ));
+    let mut response =
+        axum::response::Response::new(axum::body::Body::from_stream(file_chunks(file, length)));
     *response.status_mut() = status;
     let response_headers = response.headers_mut();
     let mut set = |name: h::HeaderName, value: String| {
@@ -642,7 +643,10 @@ pub async fn serve(
     set(h::CACHE_CONTROL, UPLOAD_CACHE_CONTROL.to_string());
     set(h::ETAG, etag);
     set(h::CONTENT_DISPOSITION, disposition);
-    set(h::HeaderName::from_static("x-content-type-options"), "nosniff".to_string());
+    set(
+        h::HeaderName::from_static("x-content-type-options"),
+        "nosniff".to_string(),
+    );
     if let Some(content_range) = content_range {
         set(h::CONTENT_RANGE, content_range);
     }
@@ -864,13 +868,28 @@ mod tests {
         assert_eq!(parse_range("bytes=0-3", 10), part(0, 3));
         assert_eq!(parse_range("bytes=4-", 10), part(4, 9));
         assert_eq!(parse_range("bytes=-3", 10), part(7, 9));
-        assert_eq!(parse_range("bytes=-30", 10), part(0, 9), "a suffix past the start is the whole file");
-        assert_eq!(parse_range("bytes=8-200", 10), part(8, 9), "the end is clamped");
+        assert_eq!(
+            parse_range("bytes=-30", 10),
+            part(0, 9),
+            "a suffix past the start is the whole file"
+        );
+        assert_eq!(
+            parse_range("bytes=8-200", 10),
+            part(8, 9),
+            "the end is clamped"
+        );
         assert_eq!(parse_range("bytes=10-", 10), ByteRange::Unsatisfiable);
         assert_eq!(parse_range("bytes=12-20", 10), ByteRange::Unsatisfiable);
         assert_eq!(parse_range("bytes=-0", 10), ByteRange::Unsatisfiable);
         assert_eq!(parse_range("bytes=0-", 0), ByteRange::Unsatisfiable);
-        for ignored in ["bytes=0-1,4-5", "items=0-3", "bytes=5-2", "bytes=x-y", "bytes=-", "0-3"] {
+        for ignored in [
+            "bytes=0-1,4-5",
+            "items=0-3",
+            "bytes=5-2",
+            "bytes=x-y",
+            "bytes=-",
+            "0-3",
+        ] {
             assert_eq!(parse_range(ignored, 10), ByteRange::Whole, "{ignored}");
         }
     }
@@ -907,8 +926,9 @@ mod tests {
         out
     }
 
-    fn stream(bytes: Vec<u8>) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
-    {
+    fn stream(
+        bytes: Vec<u8>,
+    ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
         // Deliberately chunked small, so the streaming path is actually
         // exercised rather than handed one buffer that hides every boundary
         // bug in the read loop.
@@ -947,7 +967,13 @@ mod tests {
         let registry = registry(serde_json::json!({ "avatars": {} }));
         let boundary = "albedotestboundary";
         let check = |token: &str| token == "good";
-        let attempt = |dir: std::path::PathBuf, parts: Vec<(&'static str, Option<&'static str>, &'static str, &'static [u8])>| {
+        let attempt = |dir: std::path::PathBuf,
+                       parts: Vec<(
+            &'static str,
+            Option<&'static str>,
+            &'static str,
+            &'static [u8],
+        )>| {
             let registry = &registry;
             async move {
                 decode_multipart(
@@ -963,7 +989,12 @@ mod tests {
                 .await
             }
         };
-        let file = ("avatars", Some("a.bin"), "application/octet-stream", &b"forged bytes"[..]);
+        let file = (
+            "avatars",
+            Some("a.bin"),
+            "application/octet-stream",
+            &b"forged bytes"[..],
+        );
         let stored = |dir: &Path| {
             store::path_for(dir, &format!("{:x}", Sha256::digest(b"forged bytes")))
                 .unwrap()
@@ -971,15 +1002,27 @@ mod tests {
         };
 
         let temp = tempfile::tempdir().unwrap();
-        let before = attempt(temp.path().to_path_buf(), vec![file, ("_csrf", None, "", b"good")]).await;
+        let before = attempt(
+            temp.path().to_path_buf(),
+            vec![file, ("_csrf", None, "", b"good")],
+        )
+        .await;
         assert_eq!(before.unwrap_err(), UploadError::Forged);
         assert!(!stored(temp.path()), "a file before the token reached disk");
 
-        let wrong = attempt(temp.path().to_path_buf(), vec![("_csrf", None, "", b"bad"), file]).await;
+        let wrong = attempt(
+            temp.path().to_path_buf(),
+            vec![("_csrf", None, "", b"bad"), file],
+        )
+        .await;
         assert_eq!(wrong.unwrap_err(), UploadError::Forged);
         assert!(!stored(temp.path()));
 
-        let first = attempt(temp.path().to_path_buf(), vec![("_csrf", None, "", b"good"), file]).await;
+        let first = attempt(
+            temp.path().to_path_buf(),
+            vec![("_csrf", None, "", b"good"), file],
+        )
+        .await;
         assert!(first.is_ok(), "{first:?}");
         assert!(stored(temp.path()));
     }
@@ -1026,11 +1069,19 @@ mod tests {
     async fn the_same_bytes_twice_are_one_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let registry = registry(serde_json::json!({ "avatars": {} }));
-        let parts: &[(&str, Option<&str>, &str, &[u8])] =
-            &[("avatars", Some("a.bin"), "application/octet-stream", b"same")];
+        let parts: &[(&str, Option<&str>, &str, &[u8])] = &[(
+            "avatars",
+            Some("a.bin"),
+            "application/octet-stream",
+            b"same",
+        )];
 
-        let first = decode(&registry, temp.path(), parts).await.expect("decodes");
-        let second = decode(&registry, temp.path(), parts).await.expect("decodes");
+        let first = decode(&registry, temp.path(), parts)
+            .await
+            .expect("decodes");
+        let second = decode(&registry, temp.path(), parts)
+            .await
+            .expect("decodes");
         assert_eq!(first.get("avatars"), second.get("avatars"));
 
         let mut count = 0;
@@ -1041,7 +1092,9 @@ mod tests {
             if entry.file_name() == TMP_DIR {
                 continue;
             }
-            let mut files = tokio::fs::read_dir(entry.path()).await.expect("fan-out dir");
+            let mut files = tokio::fs::read_dir(entry.path())
+                .await
+                .expect("fan-out dir");
             while let Ok(Some(_)) = files.next_entry().await {
                 count += 1;
             }
@@ -1093,7 +1146,12 @@ mod tests {
         let error = decode(
             &registry,
             temp.path(),
-            &[("tiny", Some("big.bin"), "application/octet-stream", &[b'x'; 4096])],
+            &[(
+                "tiny",
+                Some("big.bin"),
+                "application/octet-stream",
+                &[b'x'; 4096],
+            )],
         )
         .await
         .expect_err("refused");

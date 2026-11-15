@@ -18,7 +18,6 @@ pub enum RenderPriority {
     Critical = 3,
 }
 
-
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum HotSetError {
     #[error("hot set capacity exceeded: max={max}")]

@@ -9,11 +9,11 @@
 //! suite, landing in Phase C). If the Rust side emits different bytes than
 //! the fixture, either:
 //!
-//! - The wire format changed without a [`LOCKED_WIRE_VERSION`] bump (a
-//!   silent break), in which case fix the cause and re-run; OR
-//! - The wire format change is intentional, in which case set
-//!   `UPDATE_BAKABOX_FIXTURE=1` when running this test, commit the new
-//!   fixture, bump `LOCKED_WIRE_VERSION`, and coordinate a bakabox release.
+//! - The wire format changed without a [`LOCKED_WIRE_VERSION`] bump (a silent break), in which case
+//!   fix the cause and re-run; OR
+//! - The wire format change is intentional, in which case set `UPDATE_BAKABOX_FIXTURE=1` when
+//!   running this test, commit the new fixture, bump `LOCKED_WIRE_VERSION`, and coordinate a
+//!   bakabox release.
 //!
 //! Treat the failure as a wire break, not a flaky test.
 
@@ -53,7 +53,8 @@ fn encode_and_lock_fixture() -> Vec<u8> {
             fs::create_dir_all(parent).expect("must create fixture directory");
         }
         fs::write(&path, &bytes).expect("must write fixture file");
-        assert!(update_mode(), 
+        assert!(
+            update_mode(),
             "bakabox conformance fixture was missing at {}; it has been \
              generated. Re-run the test to verify, then commit the file.",
             path.display()
@@ -69,8 +70,7 @@ fn encode_and_lock_fixture() -> Vec<u8> {
     });
 
     assert_eq!(
-        bytes,
-        expected,
+        bytes, expected,
         "BAKABOX WIRE BREAK: canonical frame bytes diverged from the \
          checked-in fixture. Either restore the wire format to the locked \
          version, or — if this change is intentional — bump \
@@ -89,8 +89,7 @@ fn canonical_frame_bytes_match_fixture() {
 #[test]
 fn fixture_round_trips_through_decoder() {
     let bytes = encode_and_lock_fixture();
-    let (decoded, consumed) =
-        decode_frame(&bytes).expect("fixture bytes must decode cleanly");
+    let (decoded, consumed) = decode_frame(&bytes).expect("fixture bytes must decode cleanly");
     assert_eq!(
         consumed,
         bytes.len(),

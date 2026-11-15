@@ -395,7 +395,7 @@ mod tests {
             transport,
             NO_EXTRA_HOSTS,
         )
-            .expect("lowers")
+        .expect("lowers")
     }
 
     /// The union, not the intersection and not an override.
@@ -670,15 +670,14 @@ mod tests {
         });
 
         let transport = Arc::new(CountingTransport::always(json(r#"{"n":1}"#, "\"v1\"")));
-        let reader =
-            SourceReader::with_transport(
-                &block,
-                EgressMode::Dev,
-                |_| None,
-                transport.clone(),
-                NO_EXTRA_HOSTS,
-            )
-                .expect("lowers");
+        let reader = SourceReader::with_transport(
+            &block,
+            EgressMode::Dev,
+            |_| None,
+            transport.clone(),
+            NO_EXTRA_HOSTS,
+        )
+        .expect("lowers");
 
         let resolved = reader
             .resolve("github", "repo", bound(&[("owner", "a"), ("name", "b")]))

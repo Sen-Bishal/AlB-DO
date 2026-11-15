@@ -155,7 +155,6 @@ impl TlsSettings {
             acme_staging: std::env::var(ACME_STAGING_ENV).is_ok_and(|raw| is_truthy(&raw)),
         }
     }
-
 }
 
 /// Split a comma-separated domain list, dropping blanks.
@@ -399,7 +398,12 @@ pub fn server_config_from_files(
 
     let chain = rustls_pemfile::certs(&mut cert_pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("TLS certificate '{}' is not valid PEM: {err}", cert.display()))?;
+        .map_err(|err| {
+            format!(
+                "TLS certificate '{}' is not valid PEM: {err}",
+                cert.display()
+            )
+        })?;
     if chain.is_empty() {
         return Err(format!(
             "TLS certificate '{}' contains no CERTIFICATE block. A chain has to hold at least the \
@@ -409,7 +413,12 @@ pub fn server_config_from_files(
     }
 
     let private_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|err| format!("TLS private key '{}' is not valid PEM: {err}", key.display()))?
+        .map_err(|err| {
+            format!(
+                "TLS private key '{}' is not valid PEM: {err}",
+                key.display()
+            )
+        })?
         .ok_or_else(|| {
             format!(
                 "TLS private key '{}' contains no PRIVATE KEY block (PKCS#8, PKCS#1 and SEC1 are \
@@ -627,10 +636,7 @@ pub fn origin_stores_secure_cookies(origin: &str) -> Option<bool> {
 
     let rest = origin.strip_prefix("http://")?;
     // Authority is everything before the first `/`, `?` or `#`.
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.is_empty() {
         return None;
     }
@@ -722,7 +728,12 @@ mod tests {
     /// module exists to prevent, arriving by a different door.
     #[test]
     fn an_unreadable_origin_is_refused_rather_than_ignored() {
-        for bad in ["app.example.com", "ftp://app.example.com", "https://", "http://"] {
+        for bad in [
+            "app.example.com",
+            "ftp://app.example.com",
+            "https://",
+            "http://",
+        ] {
             assert!(
                 insecure_auth_refusal(&TlsMode::Disabled, true, false, "0.0.0.0", Some(bad))
                     .is_some(),
@@ -743,21 +754,35 @@ mod tests {
             "blank should fall through, and a loopback bind is exempt"
         );
         assert!(
-            insecure_auth_refusal(&TlsMode::Disabled, true, false, "0.0.0.0", Some(""))
-                .is_some(),
+            insecure_auth_refusal(&TlsMode::Disabled, true, false, "0.0.0.0", Some("")).is_some(),
             "blank should fall through, and 0.0.0.0 without TLS is refused"
         );
     }
 
     #[test]
     fn origin_parsing_handles_ports_paths_and_ipv6() {
-        assert_eq!(origin_stores_secure_cookies("https://a.example.com"), Some(true));
-        assert_eq!(origin_stores_secure_cookies("http://localhost:3000/app"), Some(true));
-        assert_eq!(origin_stores_secure_cookies("http://[::1]:8080"), Some(true));
+        assert_eq!(
+            origin_stores_secure_cookies("https://a.example.com"),
+            Some(true)
+        );
+        assert_eq!(
+            origin_stores_secure_cookies("http://localhost:3000/app"),
+            Some(true)
+        );
+        assert_eq!(
+            origin_stores_secure_cookies("http://[::1]:8080"),
+            Some(true)
+        );
         assert_eq!(origin_stores_secure_cookies("http://127.0.0.1"), Some(true));
-        assert_eq!(origin_stores_secure_cookies("http://example.com:3000"), Some(false));
+        assert_eq!(
+            origin_stores_secure_cookies("http://example.com:3000"),
+            Some(false)
+        );
         // 🪤 A hostname that merely *contains* "localhost" is not localhost.
-        assert_eq!(origin_stores_secure_cookies("http://localhost.evil.com"), Some(false));
+        assert_eq!(
+            origin_stores_secure_cookies("http://localhost.evil.com"),
+            Some(false)
+        );
         assert_eq!(origin_stores_secure_cookies("nonsense"), None);
     }
 
@@ -791,7 +816,10 @@ mod tests {
             ..TlsSettings::default()
         };
         let err = resolve(&settings, Path::new("/srv/app")).unwrap_err();
-        assert!(err.contains("--tls-key"), "the remedy must name the flag: {err}");
+        assert!(
+            err.contains("--tls-key"),
+            "the remedy must name the flag: {err}"
+        );
     }
 
     #[test]
@@ -802,7 +830,10 @@ mod tests {
             ..TlsSettings::default()
         };
         let err = resolve(&settings, Path::new("/srv/app")).unwrap_err();
-        assert!(err.contains("--tls-cert"), "the remedy must name the flag: {err}");
+        assert!(
+            err.contains("--tls-cert"),
+            "the remedy must name the flag: {err}"
+        );
     }
 
     /// Same rule as `forge.db`: a relative path belongs to the project, not to
@@ -926,7 +957,10 @@ mod tests {
             cert: PathBuf::from("c"),
             key: PathBuf::from("k"),
         };
-        assert_eq!(insecure_auth_refusal(&mode, true, false, "0.0.0.0", None), None);
+        assert_eq!(
+            insecure_auth_refusal(&mode, true, false, "0.0.0.0", None),
+            None
+        );
     }
 
     /// 🔑 The most common production shape there is: TLS terminated in a proxy,
@@ -1188,9 +1222,17 @@ mod tests {
     fn a_domain_alone_selects_automatic_certificates() {
         let mode = resolve(&acme(&["app.example.com"]), Path::new("/srv/app")).expect("resolves");
         match mode {
-            TlsMode::Acme { domains, cache, contact, staging } => {
+            TlsMode::Acme {
+                domains,
+                cache,
+                contact,
+                staging,
+            } => {
                 assert_eq!(domains, vec!["app.example.com".to_string()]);
-                assert_eq!(cache, PathBuf::from("/srv/app").join(DEFAULT_ACME_CACHE_DIR));
+                assert_eq!(
+                    cache,
+                    PathBuf::from("/srv/app").join(DEFAULT_ACME_CACHE_DIR)
+                );
                 assert_eq!(contact, None, "Let's Encrypt made contact optional in 2025");
                 assert!(!staging);
             }
@@ -1233,8 +1275,11 @@ mod tests {
     /// Several names on one certificate is ordinary — apex plus www.
     #[test]
     fn several_domains_share_one_certificate() {
-        let mode = resolve(&acme(&["example.com", "www.example.com"]), Path::new("/srv/app"))
-            .expect("resolves");
+        let mode = resolve(
+            &acme(&["example.com", "www.example.com"]),
+            Path::new("/srv/app"),
+        )
+        .expect("resolves");
         let TlsMode::Acme { domains, .. } = mode else {
             panic!("expected ACME")
         };
@@ -1301,6 +1346,9 @@ mod tests {
             staging: false,
         };
         assert!(mode.is_enabled());
-        assert_eq!(insecure_auth_refusal(&mode, true, false, "0.0.0.0", None), None);
+        assert_eq!(
+            insecure_auth_refusal(&mode, true, false, "0.0.0.0", None),
+            None
+        );
     }
 }

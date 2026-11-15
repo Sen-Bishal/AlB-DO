@@ -403,7 +403,7 @@ mod tests {
                 transport,
                 NO_EXTRA_HOSTS,
             )
-                .expect("lowers"),
+            .expect("lowers"),
         )
     }
 
@@ -601,8 +601,15 @@ mod tests {
             refresher.tick().await;
         }
 
-        assert_eq!(transport.calls(), 3, "the warm plus two polls, then the budget held");
-        assert!(reader.client().metrics().throttled >= 1, "later polls were refused, not skipped");
+        assert_eq!(
+            transport.calls(),
+            3,
+            "the warm plus two polls, then the budget held"
+        );
+        assert!(
+            reader.client().metrics().throttled >= 1,
+            "later polls were refused, not skipped"
+        );
         assert_eq!(
             registry.get(&wanted.topic).unwrap().current_value(),
             br#"{"n":3}"#.to_vec(),

@@ -160,9 +160,8 @@ mod tests {
     #[test]
     fn known_assets_resolve_to_non_empty_bodies() {
         for &path in EMBEDDED_ASSET_PATHS {
-            let body = resolve_albedo_asset(path).unwrap_or_else(|| {
-                panic!("expected asset to resolve: {path}")
-            });
+            let body = resolve_albedo_asset(path)
+                .unwrap_or_else(|| panic!("expected asset to resolve: {path}"));
             assert!(
                 !body.trim().is_empty(),
                 "asset body must be non-empty: {path}"
@@ -175,11 +174,25 @@ mod tests {
     #[test]
     fn served_assets_are_minified_and_keep_their_contract() {
         let served = resolve_albedo_asset("/_albedo/runtime.js").expect("resolves");
-        assert!(served.len() * 2 < RUNTIME_JS.len(), "{} vs {}", served.len(), RUNTIME_JS.len());
-        assert!(!served.contains("\n//") && !served.contains("/*"), "comments were shipped");
-        assert!(served.contains("__ALBEDO_INJECT_QUEUE"), "the inject-queue contract survives");
+        assert!(
+            served.len() * 2 < RUNTIME_JS.len(),
+            "{} vs {}",
+            served.len(),
+            RUNTIME_JS.len()
+        );
+        assert!(
+            !served.contains("\n//") && !served.contains("/*"),
+            "comments were shipped"
+        );
+        assert!(
+            served.contains("__ALBEDO_INJECT_QUEUE"),
+            "the inject-queue contract survives"
+        );
         let client = resolve_albedo_asset("/_albedo/client.js").expect("resolves");
-        assert!(client.contains("__ALBEDO_HYDRATE_ISLAND"), "the hydration entry point survives");
+        assert!(
+            client.contains("__ALBEDO_HYDRATE_ISLAND"),
+            "the hydration entry point survives"
+        );
     }
 
     #[test]

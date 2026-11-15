@@ -24,16 +24,14 @@
 //!
 //! - **The database is not corrupt** (`PRAGMA integrity_check`).
 //! - **Supply never went negative.**
-//! - **Conservation** — units claimed, summed from the reservations themselves,
-//!   equals the supply consumed. This is the one that would catch a torn write:
-//!   supply taken with no claim recorded, or a claim recorded against supply
-//!   never taken. A kill between those two statements is *precisely* the failure
-//!   the transaction exists to prevent.
-//! - **Durability** — claims committed before the kill are all still there
-//!   afterwards. Work never goes backwards across a crash.
-//! - **The kill actually interrupted work** — if the child never claimed
-//!   anything, the cycle proved nothing and the harness says so rather than
-//!   passing quietly.
+//! - **Conservation** — units claimed, summed from the reservations themselves, equals the supply
+//!   consumed. This is the one that would catch a torn write: supply taken with no claim recorded,
+//!   or a claim recorded against supply never taken. A kill between those two statements is
+//!   *precisely* the failure the transaction exists to prevent.
+//! - **Durability** — claims committed before the kill are all still there afterwards. Work never
+//!   goes backwards across a crash.
+//! - **The kill actually interrupted work** — if the child never claimed anything, the cycle proved
+//!   nothing and the harness says so rather than passing quietly.
 //!
 //! ## Scope: atomic, not resumable
 //!
@@ -51,7 +49,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dom_render_compiler::forge::{
-    DataSubstrate, LibSqlSubstrate, ReserveOutcome, ReserveRequest, Reservations, SqlValue,
+    DataSubstrate, LibSqlSubstrate, Reservations, ReserveOutcome, ReserveRequest, SqlValue,
 };
 
 /// Set on the child to tell it which database to hammer. Its presence is also
@@ -203,7 +201,10 @@ async fn committed_claims_survive_a_kill_mid_write() {
         let db = LibSqlSubstrate::open_local(&db_path).await.unwrap();
 
         let health = integrity(&db).await;
-        assert_eq!(health, "ok", "cycle {cycle}: database corrupted by the kill");
+        assert_eq!(
+            health, "ok",
+            "cycle {cycle}: database corrupted by the kill"
+        );
 
         let remaining = remaining_supply(&db).await;
         let claimed = claimed_units(&db).await;

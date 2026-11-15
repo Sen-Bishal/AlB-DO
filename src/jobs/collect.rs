@@ -142,13 +142,21 @@ mod tests {
             let inner = install_enqueue_collector();
             assert!(record(intent("inner")));
             assert_eq!(
-                inner.take().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+                inner
+                    .take()
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["inner"]
             );
         }
         assert!(record(intent("outer-after")));
         assert_eq!(
-            outer.take().iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            outer
+                .take()
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["outer-before", "outer-after"],
             "the outer collector must still hold exactly its own"
         );

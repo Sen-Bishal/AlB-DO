@@ -13,7 +13,12 @@ use super::matcher::Matcher;
 use crate::runtime::compiled::CompiledProject;
 
 /// The file names a middleware may have, relative to the project root (`src/`).
-pub const ENTRY_NAMES: &[&str] = &["middleware.ts", "middleware.tsx", "middleware.js", "middleware.jsx"];
+pub const ENTRY_NAMES: &[&str] = &[
+    "middleware.ts",
+    "middleware.tsx",
+    "middleware.js",
+    "middleware.jsx",
+];
 
 /// A project's middleware, as the build found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +190,9 @@ fn matcher_sources(expr: &Expr) -> Result<Vec<String>, String> {
                 _ => Err(not_literal()),
             })
             .collect(),
-        other => string_literal(other).map(|s| vec![s]).ok_or_else(not_literal),
+        other => string_literal(other)
+            .map(|s| vec![s])
+            .ok_or_else(not_literal),
     }
 }
 
@@ -197,7 +204,8 @@ fn string_literal(expr: &Expr) -> Option<String> {
             Some(
                 quasi
                     .cooked
-                    .as_ref().map_or_else(|| quasi.raw.to_string(), std::string::ToString::to_string),
+                    .as_ref()
+                    .map_or_else(|| quasi.raw.to_string(), std::string::ToString::to_string),
             )
         }
         _ => None,
@@ -329,17 +337,28 @@ mod tests {
     #[test]
     fn an_unreadable_or_misspelled_config_is_refused_not_defaulted() {
         for (config, needle) in [
-            ("const paths = ['/a']; export const config = { matcher: paths };", "string literal"),
-            ("export const config = { matchers: ['/a'] };", "`config.matchers`"),
+            (
+                "const paths = ['/a']; export const config = { matcher: paths };",
+                "string literal",
+            ),
+            (
+                "export const config = { matchers: ['/a'] };",
+                "`config.matchers`",
+            ),
             ("export const config = { matcher: ['/a/(.*)'] };", "regex"),
-            ("export const config = { matcher: [{ source: '/a' }] };", "objects"),
+            (
+                "export const config = { matcher: [{ source: '/a' }] };",
+                "objects",
+            ),
             ("export const config = { matcher: [] };", "could never run"),
         ] {
             let source = format!("{config}\nexport default function middleware() {{}}");
             let (_dir, compiled) = project(&[("middleware.ts", source.as_str())]);
             let problems = declaration(&compiled).expect_err(config);
             assert!(
-                problems.iter().any(|p| p.contains(needle) && p.contains("middleware.ts")),
+                problems
+                    .iter()
+                    .any(|p| p.contains(needle) && p.contains("middleware.ts")),
                 "{config}: {problems:?}"
             );
         }
@@ -393,6 +412,9 @@ mod tests {
             "import { x } from './nope';\nexport default function m() { return x; }",
         )]);
         let problems = declaration(&compiled).expect_err("missing import");
-        assert!(problems.iter().any(|p| p.contains("./nope")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("./nope")),
+            "{problems:?}"
+        );
     }
 }

@@ -62,8 +62,7 @@ pub struct PayloadIndex {
     pub entries: Vec<PayloadEntry>,
 }
 
-impl PayloadIndex {
-}
+impl PayloadIndex {}
 
 /// Reject a path that would escape the directory it is extracted into.
 ///
@@ -107,7 +106,9 @@ pub fn validate_entry_path(path: &str) -> Result<(), String> {
                 ))
             }
             Component::Prefix(_) | Component::RootDir => {
-                return Err(format!("payload entry '{path}' is rooted or has a drive prefix"))
+                return Err(format!(
+                    "payload entry '{path}' is rooted or has a drive prefix"
+                ))
             }
         }
     }
@@ -558,7 +559,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut on_disk = Vec::new();
         for (path, bytes) in files {
-            let source = dir.path().join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let source = dir
+                .path()
+                .join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
             if let Some(parent) = source.parent() {
                 std::fs::create_dir_all(parent).expect("parent");
             }
@@ -604,7 +607,10 @@ mod tests {
             ("src/App.tsx", b"export default () => <p>hi</p>"),
             (".albedo/dist/render-manifest.v2.json", b"{\"version\":2}"),
             // A binary asset, to prove nothing assumes UTF-8.
-            ("public/logo.png", &[0x89, b'P', b'N', b'G', 0x00, 0xFF, 0x1A]),
+            (
+                "public/logo.png",
+                &[0x89, b'P', b'N', b'G', 0x00, 0xFF, 0x1A],
+            ),
         ];
         let (shipped, _dir) = ship(files);
 
@@ -643,7 +649,10 @@ mod tests {
             .iter()
             .find(|entry| entry.path == "after.txt")
             .expect("present");
-        assert_eq!(read_entry(&mut cursor, after).expect("read"), b"this must still be found");
+        assert_eq!(
+            read_entry(&mut cursor, after).expect("read"),
+            b"this must still be found"
+        );
     }
 
     /// 🔴 Zip-slip. An entry that climbs out of the extraction root must be
@@ -772,9 +781,13 @@ mod tests {
     /// stale `.albedo/dist` inside the new payload.
     #[test]
     fn a_previously_unpacked_project_does_not_travel() {
-        assert!(!should_ship(".albedo-app-6cae2768a239ce6d/.albedo/dist/render-manifest.v2.json"));
+        assert!(!should_ship(
+            ".albedo-app-6cae2768a239ce6d/.albedo/dist/render-manifest.v2.json"
+        ));
         assert!(!should_ship(".albedo-app-6cae2768a239ce6d/src/App.tsx"));
-        assert!(!should_ship(".albedo-app-6cae2768a239ce6d/.albedo-unpacked"));
+        assert!(!should_ship(
+            ".albedo-app-6cae2768a239ce6d/.albedo-unpacked"
+        ));
     }
 
     /// 🔴 ALB-04 · the audit's payload index held `.env`, `public/.env` and
@@ -815,18 +828,30 @@ mod tests {
     #[test]
     fn secrets_in_public_are_found_by_path() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for path in ["public/.env", "public/nested/server.key", "public/logo.png", ".env"] {
-            let full = dir.path().join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        for path in [
+            "public/.env",
+            "public/nested/server.key",
+            "public/logo.png",
+            ".env",
+        ] {
+            let full = dir
+                .path()
+                .join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
             std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
             std::fs::write(&full, b"x").expect("write");
         }
         assert_eq!(
             secret_files_in_public(dir.path()).expect("walk"),
-            vec!["public/.env".to_string(), "public/nested/server.key".to_string()],
+            vec![
+                "public/.env".to_string(),
+                "public/nested/server.key".to_string()
+            ],
             "the root .env is where it belongs; only public/ is refused"
         );
         let empty = tempfile::tempdir().expect("tempdir");
-        assert!(secret_files_in_public(empty.path()).expect("walk").is_empty());
+        assert!(secret_files_in_public(empty.path())
+            .expect("walk")
+            .is_empty());
     }
 
     /// Collection walks the tree, applies the rule, and returns a stable order
@@ -841,7 +866,9 @@ mod tests {
             "node_modules/react/index.js",
             "forge.db",
         ] {
-            let full = dir.path().join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let full = dir
+                .path()
+                .join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
             std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
             std::fs::write(&full, b"x").expect("write");
         }
@@ -877,7 +904,9 @@ mod tests {
         extract_to(&mut cursor, &index, target.path()).expect("extract");
 
         for (path, expected) in files {
-            let landed = target.path().join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let landed = target
+                .path()
+                .join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
             assert_eq!(
                 std::fs::read(&landed).unwrap_or_else(|_| panic!("{path} was extracted")),
                 *expected,
@@ -902,7 +931,12 @@ mod tests {
         let err = extract_to(&mut cursor, &index, target.path()).unwrap_err();
         assert!(err.contains(".."), "{err}");
         assert!(
-            !target.path().parent().expect("parent").join("escaped.txt").exists(),
+            !target
+                .path()
+                .parent()
+                .expect("parent")
+                .join("escaped.txt")
+                .exists(),
             "nothing may be written outside the extraction root"
         );
     }

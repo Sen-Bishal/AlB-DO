@@ -5,9 +5,7 @@
 //! CLI's job — formatters here are pure-string so they round-trip
 //! through tests.
 
-use crate::budget::report::{
-    BudgetReport, BudgetViolation, RouteSummary, ViolationKind,
-};
+use crate::budget::report::{BudgetReport, BudgetViolation, RouteSummary, ViolationKind};
 
 /// Render the report as the multi-line failure message printed by
 /// `albedo budget` and the build/ship gate.
@@ -44,9 +42,7 @@ fn append_violation(out: &mut String, violation: &BudgetViolation) {
         route = route_label,
     ));
     out.push_str(&format!("    limit   {limit_disp}\n"));
-    out.push_str(&format!(
-        "    actual  {actual_disp}  ({delta_disp} over)\n"
-    ));
+    out.push_str(&format!("    actual  {actual_disp}  ({delta_disp} over)\n"));
     if !violation.top_contributors.is_empty() {
         out.push_str("    top contributors:\n");
         for contrib in &violation.top_contributors {
@@ -63,7 +59,8 @@ fn append_violation(out: &mut String, violation: &BudgetViolation) {
     if violation.kind == ViolationKind::TierBBundleKbPerComponent {
         let component = violation
             .top_contributors
-            .first().map_or_else(|| "<component>".to_string(), |c| c.name.clone());
+            .first()
+            .map_or_else(|| "<component>".to_string(), |c| c.name.clone());
         let suggested_kb = (violation.actual as f64 / 1024.0).ceil() as u32;
         out.push_str(&format!(
             "    hint    Move heavy imports in {component} to Tier-C, or raise \

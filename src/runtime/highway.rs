@@ -204,7 +204,10 @@ impl HighwayPlan {
         }
 
         let mut end = anchor.saturating_add(1);
-        while deps.get(end).is_some_and(|entry| entry.dependent.as_u64() == key) {
+        while deps
+            .get(end)
+            .is_some_and(|entry| entry.dependent.as_u64() == key)
+        {
             end = end.saturating_add(1);
         }
 

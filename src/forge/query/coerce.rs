@@ -135,7 +135,9 @@ fn int(value: &Value) -> Option<i64> {
     match value {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                return (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&i).then_some(i);
+                return (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER)
+                    .contains(&i)
+                    .then_some(i);
             }
             let f = n.as_f64()?;
             if f.fract() != 0.0 || f.abs() > MAX_SAFE_INTEGER as f64 {
@@ -163,7 +165,10 @@ fn int(value: &Value) -> Option<i64> {
 fn real(value: &Value) -> Option<f64> {
     match value {
         Value::Number(n) => n.as_f64().filter(|f| f.is_finite()),
-        Value::String(s) => real_literal(s).then(|| s.parse::<f64>().ok()).flatten().filter(|f| f.is_finite()),
+        Value::String(s) => real_literal(s)
+            .then(|| s.parse::<f64>().ok())
+            .flatten()
+            .filter(|f| f.is_finite()),
         _ => None,
     }
 }

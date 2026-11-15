@@ -12,15 +12,14 @@
 //! Two things they say *about production* no longer do.
 //!
 //! 1. **"The realm spans every request and every principal."** No longer true.
-//!    `QuickJsEnginePool::with_engine` now confines the realm after any checkout
-//!    on an engine that has npm registered — `QuickJsEngine::confine` discards
-//!    the context and replays the registration ledger
-//!    (`runtime::confinement`). Pinned by
-//!    `engine_pool::tests::a_pooled_engine_does_not_carry_realm_state_between_checkouts`
-//!    and `tests/sandgate_gate5.rs`.
+//!    `QuickJsEnginePool::with_engine` now confines the realm after any checkout on an engine that
+//!    has npm registered — `QuickJsEngine::confine` discards the context and replays the
+//!    registration ledger (`runtime::confinement`). Pinned by
+//!    `engine_pool::tests::a_pooled_engine_does_not_carry_realm_state_between_checkouts` and
+//!    `tests/sandgate_gate5.rs`.
 //!
-//! 2. **"The effect stream is unauthenticated."** No longer true either, and by
-//!    a different mechanism — see the note on claim 2 below. `tests/sandgate_gate4.rs`.
+//! 2. **"The effect stream is unauthenticated."** No longer true either, and by a different
+//!    mechanism — see the note on claim 2 below. `tests/sandgate_gate4.rs`.
 //!
 //! What confinement does **not** change, and what these tests remain the record
 //! of: the realm is not frozen, `globalThis` is reachable, and a package's code
@@ -40,19 +39,17 @@
 //!
 //! `FLOOR.md` makes two claims this contradicts:
 //!
-//! 1. *"A floor function runs with exactly the requesting principal's authority
-//!    ⇒ it cannot reach data the caller could not ⇒ adding one cannot widen the
-//!    attack surface at all."* — 🔴 False for anything sharing the realm. The
-//!    realm outlives the request, so package code runs with **every** principal's
-//!    authority in turn.
-//! 2. *"Enforcement is at the effect, not the syntax — `__albedo_effects` is the
-//!    only exit this runtime has, so no amount of dynamic code escapes it."* —
-//!    🔑 The exit is real, but it is **unauthenticated**. The array is handed to
-//!    Rust by `JSON.stringify` (a mutable intrinsic) and `bridge::lower_effect`
-//!    dispatches on `kind` alone. An effect carries **no provenance**, so a
-//!    forged one is indistinguishable from one the `append` shim pushed.
-//!    Enforcement-at-the-effect is sound only if the effect stream's *integrity*
-//!    is, and it was not.
+//! 1. *"A floor function runs with exactly the requesting principal's authority ⇒ it cannot reach
+//!    data the caller could not ⇒ adding one cannot widen the attack surface at all."* — 🔴 False
+//!    for anything sharing the realm. The realm outlives the request, so package code runs with
+//!    **every** principal's authority in turn.
+//! 2. *"Enforcement is at the effect, not the syntax — `__albedo_effects` is the only exit this
+//!    runtime has, so no amount of dynamic code escapes it."* — 🔑 The exit is real, but it is
+//!    **unauthenticated**. The array is handed to Rust by `JSON.stringify` (a mutable intrinsic)
+//!    and `bridge::lower_effect` dispatches on `kind` alone. An effect carries **no provenance**,
+//!    so a forged one is indistinguishable from one the `append` shim pushed.
+//!    Enforcement-at-the-effect is sound only if the effect stream's *integrity* is, and it was
+//!    not.
 //!
 //!    ✅ **CLOSED 2026-08-30 (SANDGATE-B).** The effect list no longer passes
 //!    through the realm's `JSON` or through an array at all: each effect is a
@@ -309,12 +306,7 @@ fn the_realms_intrinsics_and_host_globals_are_all_writable() {
         module.exports = { tag: JSON.stringify(results) };
         ",
     );
-    for surface in [
-        "arrayPrototype",
-        "jsonStringify",
-        "hostH",
-        "moduleTable",
-    ] {
+    for surface in ["arrayPrototype", "jsonStringify", "hostH", "moduleTable"] {
         assert!(
             html.contains(&format!(r#""{surface}":true"#)),
             "🔴 {surface} is writable by package code. If this now fails, the realm was \

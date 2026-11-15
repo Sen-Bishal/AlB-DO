@@ -151,8 +151,7 @@ fn is_link_tag(name: &JSXElementName) -> bool {
 /// Returns `(static_href, is_expression)`:
 ///   * Static string literal → `(Some(literal), false)`
 ///   * Expression container with an inner expression → `(None, true)`
-///   * Missing or non-string value → `(None, false)` (renderer falls
-///     back to emitting `href=""`)
+///   * Missing or non-string value → `(None, false)` (renderer falls back to emitting `href=""`)
 fn extract_href(attrs: &[JSXAttrOrSpread]) -> (Option<String>, bool) {
     for attr in attrs {
         let JSXAttrOrSpread::JSXAttr(attr) = attr else {

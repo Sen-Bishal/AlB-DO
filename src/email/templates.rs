@@ -326,7 +326,9 @@ mod tests {
             AuthEmail::AlreadyRegistered,
         ] {
             let message = render(kind, to(), "Acme", link, 30, None);
-            message.validate().expect("a template must pass the queue's own checks");
+            message
+                .validate()
+                .expect("a template must pass the queue's own checks");
             assert!(message.text.as_deref().unwrap().contains(link), "{kind:?}");
             assert!(message.html.as_deref().unwrap().contains(link), "{kind:?}");
             assert!(message.subject.contains("Acme"), "{kind:?}");
@@ -335,7 +337,14 @@ mod tests {
 
     #[test]
     fn a_hostile_app_name_cannot_become_markup() {
-        let message = render(AuthEmail::MagicLink, to(), "<script>x</script>", "https://a.dev/?t=1&u=2", 15, None);
+        let message = render(
+            AuthEmail::MagicLink,
+            to(),
+            "<script>x</script>",
+            "https://a.dev/?t=1&u=2",
+            15,
+            None,
+        );
         let html = message.html.unwrap();
         assert!(!html.contains("<script>"), "{html}");
         assert!(html.contains("https://a.dev/?t=1&amp;u=2"), "{html}");
@@ -356,8 +365,17 @@ mod tests {
             30,
             Some(&custom),
         );
-        assert_eq!(message.subject, "A&B <Co>: new password", "subjects are plain text");
-        assert!(message.text.unwrap().contains("https://a.dev/r?token=t&x=1"), "text kept the built-in");
+        assert_eq!(
+            message.subject, "A&B <Co>: new password",
+            "subjects are plain text"
+        );
+        assert!(
+            message
+                .text
+                .unwrap()
+                .contains("https://a.dev/r?token=t&x=1"),
+            "text kept the built-in"
+        );
         assert_eq!(
             message.html.unwrap(),
             "<h1>A&amp;B &lt;Co&gt;</h1><a href=\"https://a.dev/r?token=t&amp;x=1\">go</a> (30 minutes)"
@@ -371,24 +389,45 @@ mod tests {
             text: Some("{{app}} {{link}}".into()),
             ..TemplateOverride::default()
         };
-        let message = render(AuthEmail::MagicLink, to(), "{{link}}", "https://a.dev/x", 15, Some(&custom));
+        let message = render(
+            AuthEmail::MagicLink,
+            to(),
+            "{{link}}",
+            "https://a.dev/x",
+            15,
+            Some(&custom),
+        );
         assert_eq!(message.text.unwrap(), "{{link}} https://a.dev/x");
     }
 
     #[test]
     fn an_override_that_could_not_work_is_refused_at_build() {
-        let with = |over: TemplateOverride| TemplatesDecl {
-            password_reset: Some(over),
-            ..TemplatesDecl::default()
-        }
-        .validate();
-        let text = |t: &str| TemplateOverride { text: Some(t.into()), ..TemplateOverride::default() };
+        let with = |over: TemplateOverride| {
+            TemplatesDecl {
+                password_reset: Some(over),
+                ..TemplatesDecl::default()
+            }
+            .validate()
+        };
+        let text = |t: &str| TemplateOverride {
+            text: Some(t.into()),
+            ..TemplateOverride::default()
+        };
         assert!(with(text("Click {{link}} within {{expires}}")).is_ok());
-        assert!(with(text("Click here")).unwrap_err().contains("no `{{link}}`"));
+        assert!(with(text("Click here"))
+            .unwrap_err()
+            .contains("no `{{link}}`"));
         assert!(with(text("Click {{url}}")).unwrap_err().contains("{{url}}"));
-        assert!(with(text("Click {{link")).unwrap_err().contains("never closed"));
-        let subject = |s: &str| TemplateOverride { subject: Some(s.into()), ..TemplateOverride::default() };
-        assert!(with(subject("Reset: {{link}}")).unwrap_err().contains("credential"));
+        assert!(with(text("Click {{link"))
+            .unwrap_err()
+            .contains("never closed"));
+        let subject = |s: &str| TemplateOverride {
+            subject: Some(s.into()),
+            ..TemplateOverride::default()
+        };
+        assert!(with(subject("Reset: {{link}}"))
+            .unwrap_err()
+            .contains("credential"));
         assert!(with(subject("a\nBcc: x@y.dev")).is_err());
         assert!(with(subject("Reset your {{app}} password")).is_ok());
     }

@@ -145,7 +145,10 @@ pub async fn import_rows(
                 build_append_returning(&slot.table, &slot.key_column, record)?;
             let returned = tx.query(&sql, &params).await?;
             if let Some(author) = &row.author {
-                let key = returned.rows.first().and_then(|first| first.get(0).cloned());
+                let key = returned
+                    .rows
+                    .first()
+                    .and_then(|first| first.get(0).cloned());
                 record_author(tx.as_ref(), slot, key, author).await?;
             }
             Ok::<_, SubstrateError>(())
@@ -176,8 +179,8 @@ fn prepare(slot: &ForgeCollection, row: &ImportRow) -> Result<Map<String, Value>
                 Value::Null => continue,
                 other => {
                     return Err(format!(
-                        "`{column}` is the row's key and must be a positive whole number, not {other}"
-                    ))
+                    "`{column}` is the row's key and must be a positive whole number, not {other}"
+                ))
                 }
             }
             out.insert(column.clone(), value.clone());
@@ -225,7 +228,11 @@ fn lower(column: &str, value: &Value, spec: Option<&FieldSpec>) -> Result<Value,
         return match value {
             Value::Array(_) | Value::Object(_) => Err(format!(
                 "`{column}` holds {}; a column holds one value",
-                if value.is_array() { "a list" } else { "an object" }
+                if value.is_array() {
+                    "a list"
+                } else {
+                    "an object"
+                }
             )),
             other => Ok(other.clone()),
         };
@@ -245,10 +252,7 @@ fn lower(column: &str, value: &Value, spec: Option<&FieldSpec>) -> Result<Value,
     };
     match spec.ty {
         FieldType::Text => value.is_string().then(|| value.clone()).ok_or_else(wrong),
-        FieldType::Int => value
-            .as_i64()
-            .map(Value::from)
-            .ok_or_else(wrong),
+        FieldType::Int => value.as_i64().map(Value::from).ok_or_else(wrong),
         FieldType::Real => value.as_f64().map(Value::from).ok_or_else(wrong),
         FieldType::Bool => value.as_bool().map(Value::from).ok_or_else(wrong),
         FieldType::Timestamp => match value {
@@ -319,7 +323,9 @@ mod tests {
     async fn an_imported_row_is_changed_by_its_author_and_nobody_else() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let schema = schema();
-        crate::forge::skeleton::bootstrap_schema(&db, &schema).await.unwrap();
+        crate::forge::skeleton::bootstrap_schema(&db, &schema)
+            .await
+            .unwrap();
         let ada = PrincipalId::mint();
         let bob = PrincipalId::mint();
 
@@ -334,7 +340,13 @@ mod tests {
         )
         .await
         .expect("imports");
-        assert_eq!(summary, ImportSummary { rows: 2, authored: 1 });
+        assert_eq!(
+            summary,
+            ImportSummary {
+                rows: 2,
+                authored: 1
+            }
+        );
 
         // The source's ids survive, and the timestamp is stored as milliseconds.
         let stored = db
@@ -342,7 +354,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.rows.len(), 2);
-        assert_eq!(stored.rows[0].get(0), Some(&crate::forge::value::SqlValue::Integer(41)));
+        assert_eq!(
+            stored.rows[0].get(0),
+            Some(&crate::forge::value::SqlValue::Integer(41))
+        );
         assert_eq!(
             stored.rows[0].get(1),
             Some(&crate::forge::value::SqlValue::Integer(1_793_491_200_000))
@@ -357,9 +372,18 @@ mod tests {
             let broadcast = &broadcast;
             async move { apply_writes(db, broadcast, &schema, &writes, None, Some(&who)).await }
         };
-        assert!(as_(&bob, 41).await.is_err(), "another user changed ada's imported row");
-        assert!(as_(&ada, 41).await.is_ok(), "ada could not change her own imported row");
-        assert!(as_(&ada, 42).await.is_err(), "an authorless row was changed");
+        assert!(
+            as_(&bob, 41).await.is_err(),
+            "another user changed ada's imported row"
+        );
+        assert!(
+            as_(&ada, 41).await.is_ok(),
+            "ada could not change her own imported row"
+        );
+        assert!(
+            as_(&ada, 42).await.is_err(),
+            "an authorless row was changed"
+        );
     }
 
     /// One bad line and the file writes nothing, with the line named.
@@ -367,23 +391,51 @@ mod tests {
     async fn a_bad_line_writes_nothing_and_says_where() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let schema = schema();
-        crate::forge::skeleton::bootstrap_schema(&db, &schema).await.unwrap();
+        crate::forge::skeleton::bootstrap_schema(&db, &schema)
+            .await
+            .unwrap();
         let ok = || serde_json::json!({ "title": "a", "amount": 1, "paid": false, "due": 0 });
 
         for (bad, says) in [
-            (serde_json::json!({ "title": "a", "amount": 1, "paid": false, "due": 0, "colour": "red" }), "`colour` is not a field"),
-            (serde_json::json!({ "title": "a", "amount": "lots", "paid": false, "due": 0 }), "declared `real`"),
-            (serde_json::json!({ "amount": 1, "paid": false, "due": 0 }), "`title` is required"),
-            (serde_json::json!({ "title": "a", "amount": 1, "paid": false, "due": "next tuesday" }), "RFC 3339"),
-            (serde_json::json!({ "id": "x7", "title": "a", "amount": 1, "paid": false, "due": 0 }), "positive whole number"),
+            (
+                serde_json::json!({ "title": "a", "amount": 1, "paid": false, "due": 0, "colour": "red" }),
+                "`colour` is not a field",
+            ),
+            (
+                serde_json::json!({ "title": "a", "amount": "lots", "paid": false, "due": 0 }),
+                "declared `real`",
+            ),
+            (
+                serde_json::json!({ "amount": 1, "paid": false, "due": 0 }),
+                "`title` is required",
+            ),
+            (
+                serde_json::json!({ "title": "a", "amount": 1, "paid": false, "due": "next tuesday" }),
+                "RFC 3339",
+            ),
+            (
+                serde_json::json!({ "id": "x7", "title": "a", "amount": 1, "paid": false, "due": 0 }),
+                "positive whole number",
+            ),
         ] {
-            let error = import_rows(&db, &schema, "invoices", &[row(1, ok(), None), row(2, bad, None)])
-                .await
-                .expect_err("refused");
+            let error = import_rows(
+                &db,
+                &schema,
+                "invoices",
+                &[row(1, ok(), None), row(2, bad, None)],
+            )
+            .await
+            .expect_err("refused");
             let message = error.to_string();
-            assert!(message.starts_with("line 2:") && message.contains(says), "{message}");
+            assert!(
+                message.starts_with("line 2:") && message.contains(says),
+                "{message}"
+            );
         }
-        let count = db.query("SELECT COUNT(*) FROM invoices", &[]).await.unwrap();
+        let count = db
+            .query("SELECT COUNT(*) FROM invoices", &[])
+            .await
+            .unwrap();
         assert_eq!(
             count.rows[0].get(0),
             Some(&crate::forge::value::SqlValue::Integer(0)),
@@ -392,21 +444,42 @@ mod tests {
 
         // A key that collides fails at the database — and still writes nothing.
         let colliding = [
-            row(1, serde_json::json!({ "id": 7, "title": "a", "amount": 1, "paid": false, "due": 0 }), None),
-            row(2, serde_json::json!({ "id": 7, "title": "b", "amount": 1, "paid": false, "due": 0 }), None),
+            row(
+                1,
+                serde_json::json!({ "id": 7, "title": "a", "amount": 1, "paid": false, "due": 0 }),
+                None,
+            ),
+            row(
+                2,
+                serde_json::json!({ "id": 7, "title": "b", "amount": 1, "paid": false, "due": 0 }),
+                None,
+            ),
         ];
-        let error = import_rows(&db, &schema, "invoices", &colliding).await.expect_err("refused");
+        let error = import_rows(&db, &schema, "invoices", &colliding)
+            .await
+            .expect_err("refused");
         assert!(error.to_string().starts_with("line 2:"), "{error}");
-        let count = db.query("SELECT COUNT(*) FROM invoices", &[]).await.unwrap();
-        assert_eq!(count.rows[0].get(0), Some(&crate::forge::value::SqlValue::Integer(0)));
+        let count = db
+            .query("SELECT COUNT(*) FROM invoices", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            count.rows[0].get(0),
+            Some(&crate::forge::value::SqlValue::Integer(0))
+        );
     }
 
     #[tokio::test]
     async fn framework_tables_and_undeclared_collections_are_refused() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let schema = schema();
-        let reserved = import_rows(&db, &schema, "albedo_users", &[]).await.unwrap_err();
-        assert!(reserved.to_string().contains("framework table"), "{reserved}");
+        let reserved = import_rows(&db, &schema, "albedo_users", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            reserved.to_string().contains("framework table"),
+            "{reserved}"
+        );
         let unknown = import_rows(&db, &schema, "invoice", &[]).await.unwrap_err();
         assert!(unknown.to_string().contains("`invoices`"), "{unknown}");
     }

@@ -48,10 +48,10 @@
 //! * **`<children />`.** Lowercase, so it *looks* like a host tag, but it is the layout-wrap
 //!   intrinsic: both renderers lower it to a sentinel comment and neither allocates an id for it.
 //!   Stamping it advanced this side's counter and not the evaluator's, so in any layout with markup
-//!   **after** the sentinel — a footer, a closing `</nav>`'s siblings — every subsequent element was
-//!   numbered one step ahead on the `QuickJS` side. The two renders stayed byte-identical up to the
-//!   sentinel and disagreed on every id after it, which is the worst version of this bug: it looks
-//!   fine in a diff of the opening markup.
+//!   **after** the sentinel — a footer, a closing `</nav>`'s siblings — every subsequent element
+//!   was numbered one step ahead on the `QuickJS` side. The two renders stayed byte-identical up to
+//!   the sentinel and disagreed on every id after it, which is the worst version of this bug: it
+//!   looks fine in a diff of the opening markup.
 
 use swc_common::DUMMY_SP;
 use swc_ecma_ast::{

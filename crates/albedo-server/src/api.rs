@@ -51,8 +51,7 @@ impl ApiResponse {
         let encoded = serde_json::to_vec(value).map_err(|err| {
             RuntimeError::RequestHandling(format!("failed to encode JSON response: {err}"))
         })?;
-        Ok(Self::ok(Bytes::from(encoded))
-            .with_header("content-type", "application/json"))
+        Ok(Self::ok(Bytes::from(encoded)).with_header("content-type", "application/json"))
     }
 
     /// Empty response with the supplied status — handy for 204, 404, etc.
@@ -74,7 +73,6 @@ impl ApiResponse {
             .insert(name.into().to_lowercase(), value.into());
         self
     }
-
 }
 
 impl IntoResponse for ApiResponse {
@@ -141,8 +139,7 @@ mod tests {
 
     #[test]
     fn with_header_lowercases_the_name() {
-        let response = ApiResponse::status(StatusCode::NO_CONTENT)
-            .with_header("X-Trace-Id", "abc");
+        let response = ApiResponse::status(StatusCode::NO_CONTENT).with_header("X-Trace-Id", "abc");
         assert_eq!(
             response.headers.get("x-trace-id").map(String::as_str),
             Some("abc"),

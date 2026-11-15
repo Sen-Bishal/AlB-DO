@@ -51,9 +51,7 @@ fn slots() -> SessionSlotView {
     SessionSlotView::new(SessionId::random(), Arc::new(SlotStore::new()))
 }
 
-fn payload(
-    name: &str,
-) -> dom_render_compiler::runtime::eval::ReactivePayload {
+fn payload(name: &str) -> dom_render_compiler::runtime::eval::ReactivePayload {
     let project = project(name);
     project
         .build_reactive_payload(
@@ -144,9 +142,7 @@ fn the_server_renders_the_static_and_dynamic_parts_together() {
         "Component.tsx",
         &Value::Object(Default::default()),
         &slots(),
-        &RenderOptions {
-            hook_compile: true,
-        },
+        &RenderOptions { hook_compile: true },
     )
     .expect("renders")
     .html;

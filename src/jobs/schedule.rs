@@ -132,12 +132,11 @@ impl Schedule {
         }
 
         let normalised = normalise_cron(trimmed)?;
-        let schedule = cron::Schedule::from_str(&normalised).map_err(|err| {
-            ScheduleError::Unparseable {
+        let schedule =
+            cron::Schedule::from_str(&normalised).map_err(|err| ScheduleError::Unparseable {
                 value: trimmed.to_string(),
                 reason: err.to_string(),
-            }
-        })?;
+            })?;
 
         // A schedule with no upcoming instant is a typo that would otherwise
         // present as "the job silently never ran".
@@ -198,7 +197,10 @@ impl Schedule {
         match self {
             Self::Cron(schedule) => {
                 let after = Utc.timestamp_millis_opt(after_ms).single()?;
-                schedule.after(&after).next().map(|dt| dt.timestamp_millis())
+                schedule
+                    .after(&after)
+                    .next()
+                    .map(|dt| dt.timestamp_millis())
             }
             Self::Every(period) => {
                 // Epoch-anchored, so every process computes the same set.
@@ -312,7 +314,14 @@ mod tests {
 
     #[test]
     fn aliases_resolve() {
-        for alias in ["@minutely", "@hourly", "@daily", "@weekly", "@monthly", "@yearly"] {
+        for alias in [
+            "@minutely",
+            "@hourly",
+            "@daily",
+            "@weekly",
+            "@monthly",
+            "@yearly",
+        ] {
             let schedule = Schedule::parse(alias).unwrap_or_else(|e| panic!("{alias}: {e}"));
             assert!(schedule.next_after(NOON).is_some(), "{alias} must fire");
         }
@@ -330,12 +339,22 @@ mod tests {
         let ScheduleError::Unparseable { reason, .. } = &err else {
             panic!("expected an unparseable, got {err:?}");
         };
-        assert!(reason.contains('4'), "the message must name the count: {reason}");
+        assert!(
+            reason.contains('4'),
+            "the message must name the count: {reason}"
+        );
     }
 
     #[test]
     fn nonsense_is_refused_rather_than_defaulted() {
-        for bad in ["", "soon", "@fortnightly", "every", "every 5 bananas", "* * *"] {
+        for bad in [
+            "",
+            "soon",
+            "@fortnightly",
+            "every",
+            "every 5 bananas",
+            "* * *",
+        ] {
             assert!(
                 Schedule::parse(bad).is_err(),
                 "`{bad}` must not silently become a schedule"

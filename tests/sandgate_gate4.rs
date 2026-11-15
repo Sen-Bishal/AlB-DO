@@ -103,7 +103,6 @@ fn run_package(engine: &mut QuickJsEngine, pkg: &Package) -> String {
         .html
 }
 
-
 /// Read a JS expression out of the realm the way gate 2 does — by rendering it
 /// through a throwaway route — rather than by adding an `eval` door to
 /// `QuickJsEngine` that only tests would ever walk through.

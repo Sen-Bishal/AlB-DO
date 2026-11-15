@@ -41,7 +41,12 @@ pub fn inject_island_marker(html: &str, component_id: u64) -> String {
     }
     let mut i = 1;
     // skip tag name
-    while i < bytes.len() && bytes[i] != b'>' && bytes[i] != b' ' && bytes[i] != b'\n' && bytes[i] != b'/' {
+    while i < bytes.len()
+        && bytes[i] != b'>'
+        && bytes[i] != b' '
+        && bytes[i] != b'\n'
+        && bytes[i] != b'/'
+    {
         i += 1;
     }
     // walk attributes, respecting quoted values
@@ -216,7 +221,8 @@ impl<E: RuntimeEngine> ServerRenderer<E> {
         script: &str,
         source_hash: u64,
     ) -> RuntimeResult<()> {
-        self.engine.load_precompiled_module(key, script, source_hash)
+        self.engine
+            .load_precompiled_module(key, script, source_hash)
     }
 
     pub const fn module_registry(&self) -> &ModuleRegistry {

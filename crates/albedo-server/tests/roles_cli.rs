@@ -56,7 +56,11 @@ async fn person(db: &LibSqlSubstrate, subject: &str, email: &str) -> PrincipalId
 
 async fn roles_of(db_path: &Path, id: &PrincipalId) -> Vec<String> {
     let db = LibSqlSubstrate::open_local(db_path).await.expect("reopen");
-    load_principal(&db, id).await.expect("load").expect("exists").roles
+    load_principal(&db, id)
+        .await
+        .expect("load")
+        .expect("exists")
+        .roles
 }
 
 #[tokio::test]
@@ -81,16 +85,21 @@ async fn an_operator_grants_lists_and_revokes_roles() {
         "login: \"/sign-in\",\n    roles: [\"payroll\", \"hr\"],",
         1,
     );
-    assert_ne!(declared, config, "the scaffold's auth block has a login line to anchor on");
+    assert_ne!(
+        declared, config,
+        "the scaffold's auth block has a login line to anchor on"
+    );
     fs::write(&config_path, declared).expect("write config");
 
     let db_path = work.path().join("data").join("forge.db");
     fs::create_dir_all(db_path.parent().expect("dir")).expect("data dir");
     let (ada, bob_1, bob_2) = {
         let db = LibSqlSubstrate::open_local(&db_path).await.expect("db");
-        let auth_schema = schema::augment(&ForgeSchema::build(Vec::new()).expect("empty"))
-            .expect("auth tables");
-        bootstrap_schema(&db, &auth_schema).await.expect("bootstrap");
+        let auth_schema =
+            schema::augment(&ForgeSchema::build(Vec::new()).expect("empty")).expect("auth tables");
+        bootstrap_schema(&db, &auth_schema)
+            .await
+            .expect("bootstrap");
         (
             person(&db, "ada", "ada@example.com").await,
             person(&db, "bob-1", "bob@example.com").await,
@@ -109,45 +118,62 @@ async fn an_operator_grants_lists_and_revokes_roles() {
     assert_eq!(roles_of(&db_path, &ada).await, ["payroll"]);
 
     // ── a second grant changes nothing, and says so ──
-    let (ok, text) = run(albedo(home.path(), &app, &db_path).args([
-        "roles",
-        "grant",
-        ada.as_str(),
-        "payroll",
-    ]));
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "grant", ada.as_str(), "payroll"]));
     assert!(ok, "a repeated grant is not an error\n{text}");
     assert!(text.contains("already"), "{text}");
 
     // ── refusals ──
     for (args, needle) in [
-        (vec!["roles", "grant", "ada@example.com", "finance"], "finance"),
-        (vec!["roles", "grant", "nobody@example.com", "payroll"], "nobody@example.com"),
-        (vec!["roles", "grant", "bob@example.com", "payroll"], bob_1.as_str()),
+        (
+            vec!["roles", "grant", "ada@example.com", "finance"],
+            "finance",
+        ),
+        (
+            vec!["roles", "grant", "nobody@example.com", "payroll"],
+            "nobody@example.com",
+        ),
+        (
+            vec!["roles", "grant", "bob@example.com", "payroll"],
+            bob_1.as_str(),
+        ),
         (vec!["roles", "grant", "ada@example.com"], "needs"),
     ] {
         let (ok, text) = run(albedo(home.path(), &app, &db_path).args(&args));
         assert!(!ok, "{args:?} must fail\n{text}");
-        assert!(text.contains(needle), "{args:?} must name `{needle}`\n{text}");
+        assert!(
+            text.contains(needle),
+            "{args:?} must name `{needle}`\n{text}"
+        );
     }
-    assert_eq!(roles_of(&db_path, &bob_1).await, [] as [std::string::String; 0]);
-    assert_eq!(roles_of(&db_path, &bob_2).await, [] as [std::string::String; 0]);
+    assert_eq!(
+        roles_of(&db_path, &bob_1).await,
+        [] as [std::string::String; 0]
+    );
+    assert_eq!(
+        roles_of(&db_path, &bob_2).await,
+        [] as [std::string::String; 0]
+    );
 
     // ── the ambiguous email, resolved by id ──
-    let (ok, text) = run(albedo(home.path(), &app, &db_path).args([
-        "roles",
-        "grant",
-        bob_2.as_str(),
-        "hr",
-    ]));
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "grant", bob_2.as_str(), "hr"]));
     assert!(ok, "grant by id\n{text}");
 
     // ── list, all and one role ──
     let (ok, text) = run(albedo(home.path(), &app, &db_path).args(["roles", "list"]));
     assert!(ok, "list\n{text}");
-    assert!(text.contains("ada@example.com") && text.contains(bob_2.as_str()), "{text}");
-    let (ok, text) = run(albedo(home.path(), &app, &db_path).args(["roles", "list", "--role", "hr"]));
+    assert!(
+        text.contains("ada@example.com") && text.contains(bob_2.as_str()),
+        "{text}"
+    );
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "list", "--role", "hr"]));
     assert!(ok, "list --role\n{text}");
-    assert!(text.contains(bob_2.as_str()) && !text.contains("ada@example.com"), "{text}");
+    assert!(
+        text.contains(bob_2.as_str()) && !text.contains("ada@example.com"),
+        "{text}"
+    );
 
     // ── revoke ──
     let (ok, text) = run(albedo(home.path(), &app, &db_path).args([
@@ -157,7 +183,10 @@ async fn an_operator_grants_lists_and_revokes_roles() {
         "payroll",
     ]));
     assert!(ok, "revoke\n{text}");
-    assert_eq!(roles_of(&db_path, &ada).await, [] as [std::string::String; 0]);
+    assert_eq!(
+        roles_of(&db_path, &ada).await,
+        [] as [std::string::String; 0]
+    );
     assert_eq!(roles_of(&db_path, &bob_2).await, ["hr"]);
 }
 
@@ -257,7 +286,10 @@ async fn concurrent_cli_grants_are_unique_and_persist_after_restart() {
         "payroll",
     ]));
     assert!(ok, "{text}");
-    assert_eq!(roles_of(&db_path, &id).await, [] as [std::string::String; 0]);
+    assert_eq!(
+        roles_of(&db_path, &id).await,
+        [] as [std::string::String; 0]
+    );
     drop(work);
 }
 
@@ -291,38 +323,48 @@ async fn shipped_binary_forwards_role_changes_and_list() {
     assert!(ok && text.contains(id.as_str()), "shipped list\n{text}");
     let (ok, text) = run(shipped().args(["roles", "revoke", id.as_str(), "hr"]));
     assert!(ok, "shipped revoke\n{text}");
-    assert_eq!(roles_of(&db_path, &id).await, [] as [std::string::String; 0]);
+    assert_eq!(
+        roles_of(&db_path, &id).await,
+        [] as [std::string::String; 0]
+    );
 }
-
 
 #[tokio::test]
 async fn malformed_requests_and_missing_database_do_not_write_grants() {
     let (home, _work, app, db_path, id) = role_rig().await;
     for args in [
         vec!["roles", "list", "--role"],
-        vec!["roles", "grant", id.as_str(), "payroll'); DROP TABLE albedo_users;--"],
+        vec![
+            "roles",
+            "grant",
+            id.as_str(),
+            "payroll'); DROP TABLE albedo_users;--",
+        ],
         vec!["roles", "grant", "' OR 1=1 --", "payroll"],
         vec!["roles", "not-a-command"],
     ] {
         let (ok, text) = run(albedo(home.path(), &app, &db_path).args(&args));
         assert!(!ok, "malformed request {args:?} succeeded\n{text}");
     }
-    assert_eq!(roles_of(&db_path, &id).await, [] as [std::string::String; 0]);
+    assert_eq!(
+        roles_of(&db_path, &id).await,
+        [] as [std::string::String; 0]
+    );
     let missing = db_path.with_file_name("missing.db");
-    let (ok, text) = run(albedo(home.path(), &app, &missing).args([
-        "roles", "grant", id.as_str(), "payroll",
-    ]));
-    assert!(!ok && !missing.exists(), "missing DB should be refused without creating it\n{text}");
+    let (ok, text) =
+        run(albedo(home.path(), &app, &missing).args(["roles", "grant", id.as_str(), "payroll"]));
+    assert!(
+        !ok && !missing.exists(),
+        "missing DB should be refused without creating it\n{text}"
+    );
 }
-
 
 /// The brief's undeclared-role refusal applies to the listing filter too.
 #[tokio::test]
 async fn list_refuses_an_undeclared_role() {
     let (home, _work, app, db_path, _) = role_rig().await;
-    let (ok, text) = run(albedo(home.path(), &app, &db_path).args([
-        "roles", "list", "--role", "finance",
-    ]));
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "list", "--role", "finance"]));
     assert!(!ok, "an undeclared role filter must be refused\n{text}");
     assert!(text.contains("finance"), "{text}");
 }
@@ -344,22 +386,28 @@ async fn leftover_grants_of_an_undeclared_role_can_be_cleaned_up() {
     }
     assert_eq!(roles_of(&db_path, &id).await, ["finance", "payroll"]);
 
-    let (ok, text) = run(albedo(home.path(), &app, &db_path).args([
-        "roles", "revoke", id.as_str(), "payrol",
-    ]));
-    assert!(!ok, "a misspelt revoke must fail, not report a no-op\n{text}");
-    assert!(text.contains("payrol") && text.contains("spelling"), "{text}");
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "revoke", id.as_str(), "payrol"]));
+    assert!(
+        !ok,
+        "a misspelt revoke must fail, not report a no-op\n{text}"
+    );
+    assert!(
+        text.contains("payrol") && text.contains("spelling"),
+        "{text}"
+    );
     assert_eq!(roles_of(&db_path, &id).await, ["finance", "payroll"]);
 
-    let (ok, text) = run(albedo(home.path(), &app, &db_path).args([
-        "roles", "list", "--role", "finance",
-    ]));
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "list", "--role", "finance"]));
     assert!(ok, "leftovers of an undeclared role are listable\n{text}");
-    assert!(text.contains(id.as_str()) && text.contains("not declared"), "{text}");
+    assert!(
+        text.contains(id.as_str()) && text.contains("not declared"),
+        "{text}"
+    );
 
-    let (ok, text) = run(albedo(home.path(), &app, &db_path).args([
-        "roles", "revoke", id.as_str(), "finance",
-    ]));
+    let (ok, text) =
+        run(albedo(home.path(), &app, &db_path).args(["roles", "revoke", id.as_str(), "finance"]));
     assert!(ok, "a leftover grant is revocable\n{text}");
     assert!(text.contains("leftover"), "{text}");
     assert_eq!(roles_of(&db_path, &id).await, ["payroll"]);
@@ -417,12 +465,18 @@ async fn leftover_cleanup_is_scoped_to_the_holder_and_never_allows_grant() {
         let (ok, text) = run(albedo(home.path(), &app, &db_path).args(&args));
         assert!(!ok && text.contains("retired"), "{args:?}\n{text}");
         assert_eq!(roles_of(&db_path, &id).await, ["retired"]);
-        assert_eq!(roles_of(&db_path, &other).await, [] as [std::string::String; 0]);
+        assert_eq!(
+            roles_of(&db_path, &other).await,
+            [] as [std::string::String; 0]
+        );
     }
     let (ok, text) =
         run(albedo(home.path(), &app, &db_path).args(["roles", "revoke", id.as_str(), "retired"]));
     assert!(ok && text.contains("leftover"), "{text}");
-    assert_eq!(roles_of(&db_path, &id).await, [] as [std::string::String; 0]);
+    assert_eq!(
+        roles_of(&db_path, &id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 #[tokio::test]
@@ -529,12 +583,14 @@ async fn a_locked_database_fails_loudly_then_concurrent_cli_changes_get_unique_s
         "failure must identify contention: {text}"
     );
     assert_eq!(authority_clock(&db).await.unwrap(), 0);
-    assert_eq!(authority_changes_after(&db, 0).await.unwrap(), [] as [dom_render_compiler::auth::store::AuthorityChange; 0]);
-    assert_eq!(load_principal(&db, &ada)
-        .await
-        .unwrap()
-        .unwrap()
-        .roles, [] as [std::string::String; 0]);
+    assert_eq!(
+        authority_changes_after(&db, 0).await.unwrap(),
+        [] as [dom_render_compiler::auth::store::AuthorityChange; 0]
+    );
+    assert_eq!(
+        load_principal(&db, &ada).await.unwrap().unwrap().roles,
+        [] as [std::string::String; 0]
+    );
     transaction.rollback().await.unwrap();
 
     let ids = [ada, bob, cat];

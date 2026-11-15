@@ -1,8 +1,8 @@
 pub mod classify;
 pub mod client_npm;
 pub mod defines;
-pub mod minify;
 pub mod emit;
+pub mod minify;
 pub mod npm;
 pub mod npm_prebuilt;
 pub mod plan;

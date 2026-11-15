@@ -3,16 +3,14 @@
 //! Loads a TSX fixture that declares two `export const NAME = action(...)`
 //! handlers and asserts the C.1 wiring:
 //!
-//!   1. `ParsedModule.action_declarations` is populated in source
-//!      order with both declarations.
-//!   2. `CompiledProject::wrap` registers a `ResolvedHandler` per
-//!      action keyed by `FNV-1a-32(name)` (the same hash family
-//!      Phase L's `allocate_form_action_id` produces, so the wire
-//!      `action_id` is identical whether the action came from a
-//!      `<form action="action:NAME">` or a TS `action()` declaration).
-//!   3. The synthetic `CompiledComponent` carrying the action body
-//!      is reachable via `component_meta` so `invoke_action`'s
-//!      lookup resolves once C.2 lands the `broadcast()` builtin.
+//!   1. `ParsedModule.action_declarations` is populated in source order with both declarations.
+//!   2. `CompiledProject::wrap` registers a `ResolvedHandler` per action keyed by `FNV-1a-32(name)`
+//!      (the same hash family Phase L's `allocate_form_action_id` produces, so the wire `action_id`
+//!      is identical whether the action came from a `<form action="action:NAME">` or a TS
+//!      `action()` declaration).
+//!   3. The synthetic `CompiledComponent` carrying the action body is reachable via
+//!      `component_meta` so `invoke_action`'s lookup resolves once C.2 lands the `broadcast()`
+//!      builtin.
 //!   4. Async vs. sync handler shape survives the round-trip.
 //!
 //! Action body **invocation** is not exercised here — that needs
@@ -84,7 +82,10 @@ fn synthetic_component_for_each_action_is_reachable_via_component_meta() {
         assert!(component.value_slots.is_empty());
         assert!(component.setter_slots.is_empty());
         assert!(component.handlers.is_empty());
-        assert_eq!(component.shared_slots, [] as [dom_render_compiler::transforms::SharedSlotBinding; 0]);
+        assert_eq!(
+            component.shared_slots,
+            [] as [dom_render_compiler::transforms::SharedSlotBinding; 0]
+        );
     }
 }
 

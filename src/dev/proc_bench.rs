@@ -5,10 +5,9 @@
 //! the first *uncontended* hit, not a fresh process. Two numbers it
 //! structurally can't produce live here:
 //!
-//!   1. **Cold-process-start TTFB** — spawn the server, wait until it's
-//!      listening, then time the very first HTTP request. Repeated over
-//!      N boots so boot time and first-render latency get a real
-//!      distribution, not a single anecdote. (This module.)
+//!   1. **Cold-process-start TTFB** — spawn the server, wait until it's listening, then time the
+//!      very first HTTP request. Repeated over N boots so boot time and first-render latency get a
+//!      real distribution, not a single anecdote. (This module.)
 //!   2. **Build-time clean-vs-incremental** — see [`build_bench`].
 //!
 //! Both wrap a subprocess, so the orchestration is written against
@@ -350,7 +349,10 @@ mod tests {
                     }
                 }
             });
-            Ok((Box::new(StubProcess { shutdown }), format!("http://127.0.0.1:{port}")))
+            Ok((
+                Box::new(StubProcess { shutdown }),
+                format!("http://127.0.0.1:{port}"),
+            ))
         }
     }
 

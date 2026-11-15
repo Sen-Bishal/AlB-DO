@@ -102,7 +102,9 @@ async fn gate_3_unchanged_refreshes_change_nothing() {
     let sent = transport.requests();
     assert!(!sent[0].is_conditional(), "nothing to validate with yet");
     assert!(
-        sent[1..].iter().all(dom_render_compiler::aperture::WireRequest::is_conditional),
+        sent[1..]
+            .iter()
+            .all(dom_render_compiler::aperture::WireRequest::is_conditional),
         "GATE 3: every refresh must carry If-None-Match"
     );
     assert_eq!(metrics.conditional_requests, REFRESHES as u64);

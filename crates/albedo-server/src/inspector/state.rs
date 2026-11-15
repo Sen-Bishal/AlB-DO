@@ -58,7 +58,8 @@ impl InspectorState {
 
     pub fn graph_snapshot(&self) -> GraphSnapshot {
         self.graph
-            .read().map_or_else(|_| GraphSnapshot::empty(), |guard| guard.clone())
+            .read()
+            .map_or_else(|_| GraphSnapshot::empty(), |guard| guard.clone())
     }
 
     pub fn set_graph(&self, snapshot: GraphSnapshot) {
@@ -83,4 +84,3 @@ impl InspectorState {
             .map_or([0.0; 4], |guard| *guard)
     }
 }
-

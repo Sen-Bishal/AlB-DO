@@ -154,7 +154,10 @@ mod tests {
         let json = written.to_json().expect("serializes");
         let read: PrebuiltNpmBundles = serde_json::from_str(&json).expect("deserializes");
 
-        assert_eq!(read.specifiers(), vec!["clsx".to_string(), "zod".to_string()]);
+        assert_eq!(
+            read.specifiers(),
+            vec!["clsx".to_string(), "zod".to_string()]
+        );
         let zod = read
             .bundles
             .iter()

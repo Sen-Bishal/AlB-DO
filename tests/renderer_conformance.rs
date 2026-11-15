@@ -6,14 +6,12 @@
 //!
 //! ## Reading a failure
 //!
-//! * `DIVERGE` — both renderers produced markup and it differs. The output
-//!   locates the first differing byte and windows both sides around it. This is
-//!   a real bug in one of the two renderers; which one is a judgement call, and
-//!   the evaluator is *usually* the one to trust, because it is the model the
-//!   opcodes are emitted from.
-//! * `EVALUATOR-FAULT` — the evaluator errored without naming a construct it
-//!   does not model. That is a defect, not a coverage boundary; see
-//!   `classify_evaluator_error`.
+//! * `DIVERGE` — both renderers produced markup and it differs. The output locates the first
+//!   differing byte and windows both sides around it. This is a real bug in one of the two
+//!   renderers; which one is a judgement call, and the evaluator is *usually* the one to trust,
+//!   because it is the model the opcodes are emitted from.
+//! * `EVALUATOR-FAULT` — the evaluator errored without naming a construct it does not model. That
+//!   is a defect, not a coverage boundary; see `classify_evaluator_error`.
 //!
 //! ## Adding to the corpus
 //!
@@ -29,7 +27,7 @@
 //! learns the divergence is gone. This one cannot.
 
 use dom_render_compiler::conformance::{
-    CaseId, ConformanceReport, Contract, Verdict, compare_entry,
+    compare_entry, CaseId, ConformanceReport, Contract, Verdict,
 };
 use dom_render_compiler::runtime::eval::CompiledProject;
 use serde_json::{json, Value};
@@ -358,7 +356,11 @@ fn the_two_renderers_agree_across_the_corpus() {
                 Verdict::QuickJsFaulted { reason } | Verdict::NotComparable { reason } => reason,
                 _ => unreachable!(),
             };
-            eprintln!("  [{}] {}\n      {reason}", outcome.verdict.label(), outcome.id);
+            eprintln!(
+                "  [{}] {}\n      {reason}",
+                outcome.verdict.label(),
+                outcome.id
+            );
         }
         eprintln!();
     }
@@ -528,7 +530,8 @@ fn external_corpora_report_the_coverage_frontier() {
         }
         let name = dir
             .parent()
-            .and_then(|p| p.file_name()).map_or_else(|| raw_dir.to_string(), |n| n.to_string_lossy().to_string());
+            .and_then(|p| p.file_name())
+            .map_or_else(|| raw_dir.to_string(), |n| n.to_string_lossy().to_string());
         match whole_project_corpus(&name, &dir) {
             Some(corpus) => corpora.push(corpus),
             None => eprintln!("  skipped (did not compile): {}", dir.display()),
@@ -626,12 +629,7 @@ fn each_declared_refusal_still_classifies_as_a_decline() {
         std::fs::write(dir.join("Component.tsx"), source).expect("write fixture");
 
         let project = CompiledProject::load_from_dir(&dir).expect("fixture compiles");
-        let verdict = compare_entry(
-            &project,
-            "Component.tsx",
-            &json!({}),
-            Contract::Structural,
-        );
+        let verdict = compare_entry(&project, "Component.tsx", &json!({}), Contract::Structural);
 
         match verdict {
             Verdict::EvaluatorDeclined { construct } => assert_eq!(

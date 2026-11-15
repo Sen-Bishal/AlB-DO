@@ -30,7 +30,7 @@
 //! `auth::declare` validated it at boot. It is the one value here that becomes
 //! a header, and a redirect target that is merely *probably* same-origin is an
 //! open redirect; if it does not parse, the refusal falls back to `401`.
-//!//! ## Why a body at all
+//! //! ## Why a body at all
 //!
 //! A bare 401 renders as a blank page in a browser, which reads as *broken*
 //! rather than as *refused*. The body is deliberately plain: it names the rule
@@ -96,7 +96,8 @@ const NEXT_TTL_SECONDS: u32 = 600;
 
 /// The `Set-Cookie` that remembers `destination`.
 fn remember_destination(destination: &ReturnPath) -> String {
-    let encoded: String = url::form_urlencoded::byte_serialize(destination.as_str().as_bytes()).collect();
+    let encoded: String =
+        url::form_urlencoded::byte_serialize(destination.as_str().as_bytes()).collect();
     format!("{NEXT_COOKIE}={encoded}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={NEXT_TTL_SECONDS}")
 }
 
@@ -211,7 +212,10 @@ mod tests {
             .find(|v| v.starts_with(NEXT_COOKIE))
             .expect("the destination is remembered")
             .to_string();
-        assert!(cookie.contains("HttpOnly") && cookie.contains("Secure"), "{cookie}");
+        assert!(
+            cookie.contains("HttpOnly") && cookie.contains("Secure"),
+            "{cookie}"
+        );
 
         let value = cookie.split(';').next().unwrap();
         let mut headers = HeaderMap::new();
@@ -223,7 +227,10 @@ mod tests {
 
         // A planted cookie naming another origin reads as nothing.
         let mut planted = HeaderMap::new();
-        planted.insert(header::COOKIE, format!("{NEXT_COOKIE}=%2F%2Fevil.example").parse().unwrap());
+        planted.insert(
+            header::COOKIE,
+            format!("{NEXT_COOKIE}=%2F%2Fevil.example").parse().unwrap(),
+        );
         assert!(remembered_destination(&planted).is_none());
 
         // A programmatic client gets the 401 and no cookie.

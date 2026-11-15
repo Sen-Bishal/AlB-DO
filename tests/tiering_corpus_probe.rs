@@ -49,9 +49,7 @@
 //! probe calls the decision function rather than reading a manifest — and it is
 //! itself a finding worth keeping.
 
-use dom_render_compiler::effects::{
-    decide_tier_and_hydration, TieringInputs, TieringReason,
-};
+use dom_render_compiler::effects::{decide_tier_and_hydration, TieringInputs, TieringReason};
 use dom_render_compiler::manifest::schema::Tier;
 use dom_render_compiler::manifest::ManifestOptions;
 use dom_render_compiler::scanner::{ProjectScanner, ScanMode};
@@ -159,9 +157,19 @@ struct Row {
 fn is_non_shipping(path: &str) -> bool {
     let p = path.replace('\\', "/").to_lowercase();
     const MARKERS: &[&str] = &[
-        ".test.", ".spec.", ".stories.", ".cy.", ".bench.",
-        "/__tests__/", "/__mocks__/", "/__snapshots__/",
-        "/e2e/", "/tests/", "/test/", "/cypress/", "/playwright/",
+        ".test.",
+        ".spec.",
+        ".stories.",
+        ".cy.",
+        ".bench.",
+        "/__tests__/",
+        "/__mocks__/",
+        "/__snapshots__/",
+        "/e2e/",
+        "/tests/",
+        "/test/",
+        "/cypress/",
+        "/playwright/",
     ];
     MARKERS.iter().any(|marker| p.contains(marker))
 }
@@ -313,12 +321,7 @@ fn write_corpus_section(out: &mut String, result: &CorpusResult) {
     let counts = result.tier_counts();
     let matrix = result.matrix();
 
-    let _ = writeln!(
-        out,
-        "\n### {} · `{}`\n",
-        result.name,
-        result.kind.label()
-    );
+    let _ = writeln!(out, "\n### {} · `{}`\n", result.name, result.kind.label());
     let _ = writeln!(
         out,
         "{total} renderable components · {} module-only · {} test/story \
@@ -410,7 +413,9 @@ fn measure_tier_distribution_across_corpora() {
         .unwrap_or_else(|err| panic!("read corpus manifest '{manifest_path}': {err}"));
     let manifest: serde_json::Value =
         serde_json::from_str(&raw).unwrap_or_else(|err| panic!("parse corpus manifest: {err}"));
-    let entries = manifest.as_array().expect("corpus manifest is a JSON array");
+    let entries = manifest
+        .as_array()
+        .expect("corpus manifest is a JSON array");
 
     let mut results: Vec<CorpusResult> = Vec::new();
 
@@ -424,7 +429,11 @@ fn measure_tier_distribution_across_corpora() {
             continue;
         }
 
-        eprintln!("── {name} ({}) — scanning {} ──", kind.label(), dir.display());
+        eprintln!(
+            "── {name} ({}) — scanning {} ──",
+            kind.label(),
+            dir.display()
+        );
         results.push(measure(name, kind, &dir));
     }
 
@@ -457,7 +466,12 @@ fn measure_tier_distribution_across_corpora() {
             }
         }
 
-        let _ = writeln!(out, "\n---\n\n## {} corpora — {} components\n", kind.label(), total);
+        let _ = writeln!(
+            out,
+            "\n---\n\n## {} corpora — {} components\n",
+            kind.label(),
+            total
+        );
 
         if kind == Kind::Control {
             let _ = writeln!(
@@ -470,7 +484,13 @@ fn measure_tier_distribution_across_corpora() {
         let _ = writeln!(out, "| tier | n | share |\n|---|---:|---:|");
         for tier in TIERS {
             let n = counts[tier_index(tier)];
-            let _ = writeln!(out, "| **{}** | {} | **{}** |", tier_label(tier), n, pct(n, total));
+            let _ = writeln!(
+                out,
+                "| **{}** | {} | **{}** |",
+                tier_label(tier),
+                n,
+                pct(n, total)
+            );
         }
 
         let mut ranked: Vec<(usize, TieringReason)> = REASONS
@@ -482,7 +502,13 @@ fn measure_tier_distribution_across_corpora() {
 
         let _ = writeln!(out, "\n| reason (ranked) | n | share |\n|---|---:|---:|");
         for (n, reason) in ranked {
-            let _ = writeln!(out, "| `{}` | {} | {} |", reason_label(reason), n, pct(n, total));
+            let _ = writeln!(
+                out,
+                "| `{}` | {} | {} |",
+                reason_label(reason),
+                n,
+                pct(n, total)
+            );
         }
 
         for result in group {

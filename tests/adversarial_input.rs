@@ -7,10 +7,10 @@
 //! or merely corrupt client can hand it arbitrary bytes. The contract for all
 //! of them is the same — **any** input is either a successfully decoded value
 //! or a typed `Err`. It must never:
-//!   * panic (a panic on the request path is a crashed worker, or — behind the
-//!     `catch_unwind` backstop — a 500 the operator can't explain);
-//!   * allocate unboundedly from an attacker-chosen length prefix (a decode
-//!     bomb: a few bytes on the wire requesting gigabytes of heap → OOM).
+//!   * panic (a panic on the request path is a crashed worker, or — behind the `catch_unwind`
+//!     backstop — a 500 the operator can't explain);
+//!   * allocate unboundedly from an attacker-chosen length prefix (a decode bomb: a few bytes on
+//!     the wire requesting gigabytes of heap → OOM).
 //!
 //! ## What this covers (the untrusted boundary, in `dom-render-compiler`)
 //!
@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dom_render_compiler::ir::action::{decode_action_envelope, ActionEnvelope, ActionEventKind};
 use dom_render_compiler::ir::opcode::{
-    InternEntry, InternTable, InternTableKind, Instruction, OpcodeFrame, StableId, TagId,
+    Instruction, InternEntry, InternTable, InternTableKind, OpcodeFrame, StableId, TagId,
 };
 use dom_render_compiler::ir::wire::{
     decode_frame, decode_intern_table, encode_frame, encode_intern_table,
@@ -143,7 +143,8 @@ fn assert_no_panic<T>(
     let outcome = std::panic::catch_unwind(|| decoder(input));
     std::panic::set_hook(prev);
 
-    assert!(outcome.is_ok(), 
+    assert!(
+        outcome.is_ok(),
         "{label} PANICKED on adversarial input ({} bytes): {:02x?}",
         input.len(),
         input
@@ -162,18 +163,19 @@ fn hammer<T>(
 ) {
     // 1. Curated adversarial corpus — the inputs that historically break codecs.
     let mut corpus: Vec<Vec<u8>> = vec![
-        vec![],                       // empty
-        vec![0x00],                   // single zero
-        vec![0xFF],                   // single high byte
-        vec![0xFF; 16],               // all-ones, short
-        vec![0xFF; 256],              // all-ones, longer
-        vec![0x00; 256],              // all-zeros
-        vec![0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], // bincode u64 varint marker + max
-        vec![0xFE, 0xFF, 0xFF, 0xFF, 0xFF],                         // bincode u32 varint marker + max
+        vec![],          // empty
+        vec![0x00],      // single zero
+        vec![0xFF],      // single high byte
+        vec![0xFF; 16],  // all-ones, short
+        vec![0xFF; 256], // all-ones, longer
+        vec![0x00; 256], // all-zeros
+        vec![0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], /* bincode u64 varint marker
+                          * + max */
+        vec![0xFE, 0xFF, 0xFF, 0xFF, 0xFF], // bincode u32 varint marker + max
     ];
 
-    // 2. Truncations of every valid seed — the classic "valid prefix, missing
-    //    tail" that trips length-then-body decoders.
+    // 2. Truncations of every valid seed — the classic "valid prefix, missing tail" that trips
+    //    length-then-body decoders.
     for seed in valid_seeds {
         for cut in 0..seed.len() {
             corpus.push(seed[..cut].to_vec());
@@ -213,7 +215,11 @@ fn hammer<T>(
 fn valid_action_envelopes() -> Vec<Vec<u8>> {
     use dom_render_compiler::ir::action::encode_action_envelope;
     [
-        ActionEnvelope { action_id: 0, event_kind: ActionEventKind::Click as u8, payload: vec![] },
+        ActionEnvelope {
+            action_id: 0,
+            event_kind: ActionEventKind::Click as u8,
+            payload: vec![],
+        },
         ActionEnvelope {
             action_id: u32::MAX,
             event_kind: ActionEventKind::Input as u8,
@@ -232,31 +238,56 @@ fn valid_action_envelopes() -> Vec<Vec<u8>> {
 
 fn valid_frames() -> Vec<Vec<u8>> {
     let frames = [
-        OpcodeFrame { frame_id: 0, component_id: None, instructions: vec![] },
+        OpcodeFrame {
+            frame_id: 0,
+            component_id: None,
+            instructions: vec![],
+        },
         OpcodeFrame {
             frame_id: 7,
             component_id: Some(3),
             instructions: vec![
-                Instruction::Create { tag_id: TagId(0), stable_id: StableId(1) },
-                Instruction::Append { parent_id: StableId(0), child_id: StableId(1) },
+                Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(1),
+                },
+                Instruction::Append {
+                    parent_id: StableId(0),
+                    child_id: StableId(1),
+                },
             ],
         },
     ];
-    frames.iter().map(|f| encode_frame(f).expect("seed encodes")).collect()
+    frames
+        .iter()
+        .map(|f| encode_frame(f).expect("seed encodes"))
+        .collect()
 }
 
 fn valid_intern_tables() -> Vec<Vec<u8>> {
     let tables = [
-        InternTable { kind: InternTableKind::Tag, entries: vec![] },
+        InternTable {
+            kind: InternTableKind::Tag,
+            entries: vec![],
+        },
         InternTable {
             kind: InternTableKind::Attr,
             entries: vec![
-                InternEntry { id: 0, value: "class".into() },
-                InternEntry { id: 1, value: "id".into() },
+                InternEntry {
+                    id: 0,
+                    value: "class".into(),
+                },
+                InternEntry {
+                    id: 1,
+                    value: "id".into(),
+                },
             ],
         },
     ];
-    tables.iter().map(|t| encode_intern_table(t).expect("seed encodes")).collect()
+    tables
+        .iter()
+        .map(|t| encode_intern_table(t).expect("seed encodes"))
+        .collect()
 }
 
 // ── No-panic tests ───────────────────────────────────────────────────────
@@ -273,7 +304,12 @@ fn action_envelope_decoder_never_panics() {
 
 #[test]
 fn frame_decoder_never_panics() {
-    hammer("decode_frame", decode_frame, &valid_frames(), 0xF2A3_E5C1_0B47_9D6E);
+    hammer(
+        "decode_frame",
+        decode_frame,
+        &valid_frames(),
+        0xF2A3_E5C1_0B47_9D6E,
+    );
 }
 
 #[test]
@@ -323,10 +359,18 @@ fn bincode_varint_helper_matches_codec() {
     // [1, 0], so the bytes between the prefix and the payload are exactly
     // varint(payload.len()).
     for len in [0usize, 2, 250, 251, 300, 70_000] {
-        let env = ActionEnvelope { action_id: 1, event_kind: 0, payload: vec![0u8; len] };
+        let env = ActionEnvelope {
+            action_id: 1,
+            event_kind: 0,
+            payload: vec![0u8; len],
+        };
         let bytes = encode_action_envelope(&env).expect("encode");
         let on_wire = &bytes[2..bytes.len() - len];
-        assert_eq!(on_wire, bincode_varint(len as u64).as_slice(), "varint mismatch at len={len}");
+        assert_eq!(
+            on_wire,
+            bincode_varint(len as u64).as_slice(),
+            "varint mismatch at len={len}"
+        );
     }
 }
 

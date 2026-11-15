@@ -172,7 +172,11 @@ pub fn print_tier_report(report: &TierReport, root: &str, measured: &MeasuredByt
                     "— {:.1} kB across {} chunk{}",
                     total_npm as f64 / 1024.0,
                     measured.npm_chunks.len(),
-                    if measured.npm_chunks.len() == 1 { "" } else { "s" }
+                    if measured.npm_chunks.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
                 ),
                 "2"
             )

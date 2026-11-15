@@ -60,7 +60,12 @@ enum Value {
     Json(&'static str),
 }
 
-fn bind(params: &[ParamSpec], binds: &[u16], values: &[(&str, Value)], lo_hi: (Value, Value)) -> Vec<libsql::Value> {
+fn bind(
+    params: &[ParamSpec],
+    binds: &[u16],
+    values: &[(&str, Value)],
+    lo_hi: (Value, Value),
+) -> Vec<libsql::Value> {
     binds
         .iter()
         .map(|slot| {
@@ -70,7 +75,8 @@ fn bind(params: &[ParamSpec], binds: &[u16], values: &[(&str, Value)], lo_hi: (V
                 ParamRole::RangeHi => lo_hi.1,
                 _ => values
                     .iter()
-                    .find(|(c, _)| *c == spec.column).map_or_else(|| panic!("no value for {}", spec.column), |(_, v)| *v),
+                    .find(|(c, _)| *c == spec.column)
+                    .map_or_else(|| panic!("no value for {}", spec.column), |(_, v)| *v),
             };
             match value {
                 Value::Text(t) | Value::Json(t) => libsql::Value::Text(t.to_string()),
@@ -94,7 +100,12 @@ async fn plan(conn: &libsql::Connection, sql: &str, params: Vec<libsql::Value>) 
 }
 
 /// Median wall time over `runs`, and the row count.
-async fn time(conn: &libsql::Connection, sql: &str, params: Vec<libsql::Value>, runs: usize) -> (Duration, usize) {
+async fn time(
+    conn: &libsql::Connection,
+    sql: &str,
+    params: Vec<libsql::Value>,
+    runs: usize,
+) -> (Duration, usize) {
     let mut times = Vec::new();
     let mut count = 0;
     for _ in 0..runs {
@@ -122,7 +133,10 @@ async fn ids(conn: &libsql::Connection, sql: &str, params: Vec<libsql::Value>) -
 const TABLE: &str = "CREATE TABLE invoices (id INTEGER PRIMARY KEY AUTOINCREMENT, amount REAL NOT NULL, due INTEGER NOT NULL, owner TEXT NOT NULL, status TEXT NOT NULL)";
 
 async fn open(dir: &std::path::Path, name: &str) -> (libsql::Database, libsql::Connection) {
-    let db = libsql::Builder::new_local(dir.join(name)).build().await.expect("open");
+    let db = libsql::Builder::new_local(dir.join(name))
+        .build()
+        .await
+        .expect("open");
     let conn = db.connect().expect("connect");
     conn.execute(TABLE, ()).await.expect("table");
     (db, conn)
@@ -162,7 +176,10 @@ const SHAPES: &[Shape] = &[
     Shape {
         name: "or",
         chain: "invoices.where(or({ status: v }, { owner: v })).orderBy(\"due\").limit(50)",
-        values: &[("status", Value::Text("void")), ("owner", Value::Text("o7"))],
+        values: &[
+            ("status", Value::Text("void")),
+            ("owner", Value::Text("o7")),
+        ],
     },
     Shape {
         name: "in + order",
@@ -207,10 +224,18 @@ async fn plans_per_shape_at_5k_and_500k_rows_on_libsql() {
         for (shape, q) in &queries {
             let statement = &q.lowered.statements[0];
             let ranges: &[(&str, (Value, Value))] = match shape.name {
-                "range on the first sort column + limit" => &[("", (Value::Int(500_000), Value::Int(0)))],
+                "range on the first sort column + limit" => {
+                    &[("", (Value::Int(500_000), Value::Int(0)))]
+                }
                 "range on a non-sort column + order + limit" => &[
-                    ("selective amount > 9990", (Value::Real(9990.0), Value::Real(0.0))),
-                    ("non-selective amount > 10", (Value::Real(10.0), Value::Real(0.0))),
+                    (
+                        "selective amount > 9990",
+                        (Value::Real(9990.0), Value::Real(0.0)),
+                    ),
+                    (
+                        "non-selective amount > 10",
+                        (Value::Real(10.0), Value::Real(0.0)),
+                    ),
                 ],
                 _ => &[("", (Value::Real(5000.0), Value::Real(0.0)))],
             };
@@ -228,13 +253,23 @@ async fn plans_per_shape_at_5k_and_500k_rows_on_libsql() {
                 let temp_sort = detail.contains("USE TEMP B-TREE FOR ORDER BY");
                 match shape.name {
                     "equality + order + limit" => {
-                        assert!(search && detail.contains("(status=?)") && !temp_sort, "{rows}: {detail}");
-                        assert!(detail.contains("idx_invoices_q"), "the derived index: {detail}");
+                        assert!(
+                            search && detail.contains("(status=?)") && !temp_sort,
+                            "{rows}: {detail}"
+                        );
+                        assert!(
+                            detail.contains("idx_invoices_q"),
+                            "the derived index: {detail}"
+                        );
                     }
                     "range on the first sort column + limit" => {
-                        assert!(search && detail.contains("due>?") && !temp_sort, "{rows}: {detail}");
+                        assert!(
+                            search && detail.contains("due>?") && !temp_sort,
+                            "{rows}: {detail}"
+                        );
                     }
-                    "equality + range, ordered by the range column" | "count with equality + range" => {
+                    "equality + range, ordered by the range column"
+                    | "count with equality + range" => {
                         assert!(
                             search && detail.contains("status=? AND amount>?") && !temp_sort,
                             "{rows}: {detail}"
@@ -254,7 +289,11 @@ async fn plans_per_shape_at_5k_and_500k_rows_on_libsql() {
                         // R3-3: an `in` prefix gives SEARCH (owner=?) and a temp
                         // b-tree bounded by the matches — expected and labelled.
                         assert!(search && detail.contains("owner=?"), "{rows}: {detail}");
-                        writeln!(report, "   (temp b-tree for ORDER BY expected here: {temp_sort})").unwrap();
+                        writeln!(
+                            report,
+                            "   (temp b-tree for ORDER BY expected here: {temp_sort})"
+                        )
+                        .unwrap();
                     }
                     _ => {} // or: recorded, not asserted
                 }
@@ -272,21 +311,32 @@ async fn plans_per_shape_at_5k_and_500k_rows_on_libsql() {
                 .unwrap();
             let statement = &q.lowered.statements[0];
             for (label, lo) in [("selective", 9990.0), ("non-selective", 10.0)] {
-                let params = bind(&q.lowered.params, &statement.binds, shape.values, (Value::Real(lo), Value::Real(0.0)));
+                let params = bind(
+                    &q.lowered.params,
+                    &statement.binds,
+                    shape.values,
+                    (Value::Real(lo), Value::Real(0.0)),
+                );
                 let detail = plan(&conn, &statement.sql, params.clone()).await;
                 let (median, count) = time(&conn, &statement.sql, params, runs).await;
                 writeln!(report, "after ANALYZE, all indexes, {label}: {detail}\n   {count} rows, median {median:?}").unwrap();
             }
         }
-        conn.execute("DROP TABLE IF EXISTS sqlite_stat1", ()).await.ok();
-        conn.execute("DROP TABLE IF EXISTS sqlite_stat4", ()).await.ok();
+        conn.execute("DROP TABLE IF EXISTS sqlite_stat1", ())
+            .await
+            .ok();
+        conn.execute("DROP TABLE IF EXISTS sqlite_stat4", ())
+            .await
+            .ok();
 
         // Falsifier 8, part 1, in isolation: the ESR fixture (equality status,
         // range amount, order due) with only ITS derived index serves the order
         // without a sort; with the range column put before the sort column it
         // needs one — so the "no temp b-tree" assertion can fail.
         for index in &indexes {
-            conn.execute(&format!("DROP INDEX {}", index.name()), ()).await.expect("drop");
+            conn.execute(&format!("DROP INDEX {}", index.name()), ())
+                .await
+                .expect("drop");
         }
         let (shape, q) = queries
             .iter()
@@ -298,21 +348,46 @@ async fn plans_per_shape_at_5k_and_500k_rows_on_libsql() {
         conn.execute(&own[0].ddl(), ()).await.expect("esr index");
         let statement = &q.lowered.statements[0];
         for (label, lo) in [("selective", 9990.0), ("non-selective", 10.0)] {
-            let params = bind(&q.lowered.params, &statement.binds, shape.values, (Value::Real(lo), Value::Real(0.0)));
+            let params = bind(
+                &q.lowered.params,
+                &statement.binds,
+                shape.values,
+                (Value::Real(lo), Value::Real(0.0)),
+            );
             let detail = plan(&conn, &statement.sql, params.clone()).await;
             let (median, count) = time(&conn, &statement.sql, params, runs).await;
-            writeln!(report, "ESR index alone, {label}: {detail}
-   {count} rows, median {median:?}").unwrap();
-            assert!(!detail.contains("USE TEMP B-TREE FOR ORDER BY"), "{rows} {label}: {detail}");
+            writeln!(
+                report,
+                "ESR index alone, {label}: {detail}
+   {count} rows, median {median:?}"
+            )
+            .unwrap();
+            assert!(
+                !detail.contains("USE TEMP B-TREE FOR ORDER BY"),
+                "{rows} {label}: {detail}"
+            );
         }
-        conn.execute(&format!("DROP INDEX {}", own[0].name()), ()).await.expect("drop");
-        conn.execute("CREATE INDEX mutant_range_first ON invoices(status, amount, due, id)", ())
+        conn.execute(&format!("DROP INDEX {}", own[0].name()), ())
             .await
-            .expect("mutant index");
-        let params = bind(&q.lowered.params, &statement.binds, shape.values, (Value::Real(9990.0), Value::Real(0.0)));
+            .expect("drop");
+        conn.execute(
+            "CREATE INDEX mutant_range_first ON invoices(status, amount, due, id)",
+            (),
+        )
+        .await
+        .expect("mutant index");
+        let params = bind(
+            &q.lowered.params,
+            &statement.binds,
+            shape.values,
+            (Value::Real(9990.0), Value::Real(0.0)),
+        );
         let detail = plan(&conn, &statement.sql, params).await;
         writeln!(report, "mutant (range column before sort): {detail}").unwrap();
-        assert!(detail.contains("USE TEMP B-TREE FOR ORDER BY"), "the mutant must need a sort: {detail}");
+        assert!(
+            detail.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "the mutant must need a sort: {detail}"
+        );
         drop(conn);
         drop(db);
     }
@@ -335,10 +410,24 @@ async fn plans_per_shape_at_5k_and_500k_rows_on_libsql() {
     }
     let statement = &q.lowered.statements[0];
     let values = &[("status", Value::Text("open"))];
-    let params = bind(&q.lowered.params, &statement.binds, values, (Value::Real(0.0), Value::Real(0.0)));
+    let params = bind(
+        &q.lowered.params,
+        &statement.binds,
+        values,
+        (Value::Real(0.0), Value::Real(0.0)),
+    );
     let real = ids(&conn, &statement.sql, params.clone()).await;
-    assert_eq!(real, vec![1, 2, 3], "ties come back in key order: {}", statement.sql);
-    assert!(statement.sql.contains("ORDER BY due, id"), "{}", statement.sql);
+    assert_eq!(
+        real,
+        vec![1, 2, 3],
+        "ties come back in key order: {}",
+        statement.sql
+    );
+    assert!(
+        statement.sql.contains("ORDER BY due, id"),
+        "{}",
+        statement.sql
+    );
 
     let (db2, conn2) = open(dir.path(), "ties-mutant.db").await;
     drop(conn);
@@ -353,13 +442,23 @@ async fn plans_per_shape_at_5k_and_500k_rows_on_libsql() {
             .expect("tie row");
     }
     conn2
-        .execute("CREATE INDEX mutant_no_key ON invoices(status, due, amount)", ())
+        .execute(
+            "CREATE INDEX mutant_no_key ON invoices(status, due, amount)",
+            (),
+        )
         .await
         .expect("mutant index");
     let mutant_sql = statement.sql.replace("ORDER BY due, id", "ORDER BY due");
     let mutant = ids(&conn2, &mutant_sql, params).await;
-    writeln!(report, "\nties: real {real:?}; tie-break removed {mutant:?}").unwrap();
-    assert_ne!(mutant, real, "the mutant must reorder the ties, or this test proves nothing");
+    writeln!(
+        report,
+        "\nties: real {real:?}; tie-break removed {mutant:?}"
+    )
+    .unwrap();
+    assert_ne!(
+        mutant, real,
+        "the mutant must reorder the ties, or this test proves nothing"
+    );
     drop(conn2);
     drop(db2);
 

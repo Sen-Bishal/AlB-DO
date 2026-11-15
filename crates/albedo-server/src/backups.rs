@@ -121,7 +121,9 @@ impl BackupStatus {
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// Run the plan for as long as the runtime lives.
@@ -204,19 +206,30 @@ mod tests {
     fn the_due_time_comes_from_the_newest_snapshot_not_from_boot() {
         let day = Duration::from_secs(86_400);
         let hour_ms = 3_600_000;
-        assert_eq!(due_in(None, 0, day), Duration::ZERO, "none yet: take one now");
+        assert_eq!(
+            due_in(None, 0, day),
+            Duration::ZERO,
+            "none yet: take one now"
+        );
         assert_eq!(
             due_in(Some(0), 23 * hour_ms, day),
             Duration::from_millis(hour_ms as u64)
         );
-        assert_eq!(due_in(Some(0), 30 * hour_ms, day), Duration::ZERO, "overdue: now");
+        assert_eq!(
+            due_in(Some(0), 30 * hour_ms, day),
+            Duration::ZERO,
+            "overdue: now"
+        );
     }
 
     #[test]
     fn a_relative_directory_sits_beside_the_data() {
         let data = Path::new("/data");
         assert_eq!(resolve_dir("backups", data), PathBuf::from("/data/backups"));
-        assert_eq!(resolve_dir("/mnt/offsite", data), PathBuf::from("/mnt/offsite"));
+        assert_eq!(
+            resolve_dir("/mnt/offsite", data),
+            PathBuf::from("/mnt/offsite")
+        );
         let plan = Plan::from_settings(
             &BackupSettings {
                 dir: Some("backups".into()),

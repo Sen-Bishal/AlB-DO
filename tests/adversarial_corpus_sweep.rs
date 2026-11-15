@@ -70,7 +70,10 @@ const FIXTURE_GROUPS: &[&str] = &["hook_compile", "jsx_matrix", "render_quickjs"
 /// Two channels have to come up empty for a case to land here: no data string literal
 /// in its source, and no prop it reads. Anything with either is exercised.
 const NOT_EXERCISED: &[(&str, &str)] = &[
-    ("jsx_matrix/arithmetic", "interpolates `a - b` over two number consts"),
+    (
+        "jsx_matrix/arithmetic",
+        "interpolates `a - b` over two number consts",
+    ),
     (
         "jsx_matrix/function_call_result",
         "interpolates `Math.floor(3.7)`",
@@ -181,13 +184,13 @@ fn repo_root() -> PathBuf {
 /// Deliberately not every `Str` in the tree. Four kinds are skipped, and the reasons
 /// differ enough to be worth stating separately:
 ///
-/// * **Module specifiers** (`from "./config"`, `require("x")`, `import("x")`) — rewriting
-///   one does not make a hostile value, it makes an unresolvable import.
+/// * **Module specifiers** (`from "./config"`, `require("x")`, `import("x")`) — rewriting one does
+///   not make a hostile value, it makes an unresolvable import.
 /// * **Directive prologues** (`"use client"`) — semantic, not data.
-/// * **JSX attribute literals** (`href="x"`) — JSX attribute strings are HTML-like: they
-///   carry no backslash escapes, so a `"` inside one terminates it and the file stops
-///   parsing. The escaping question they would answer is already answered by the
-///   expression form (`href={v}`), which this sweep *does* mutate, so nothing is lost.
+/// * **JSX attribute literals** (`href="x"`) — JSX attribute strings are HTML-like: they carry no
+///   backslash escapes, so a `"` inside one terminates it and the file stops parsing. The escaping
+///   question they would answer is already answered by the expression form (`href={v}`), which this
+///   sweep *does* mutate, so nothing is lost.
 struct DataLiterals {
     spans: Vec<(usize, usize)>,
     base: u32,
@@ -253,7 +256,7 @@ impl Visit for DataLiterals {
 /// (`function C({ a, b })`) and a named one dereferenced as `props.a`.
 fn prop_names(module: &Module) -> Vec<String> {
     use swc_ecma_ast::{
-        ArrowExpr, DefaultDecl, Decl, ExportDefaultDecl, ExportDefaultExpr, ObjectPatProp, Param,
+        ArrowExpr, Decl, DefaultDecl, ExportDefaultDecl, ExportDefaultExpr, ObjectPatProp, Param,
         Pat,
     };
 
@@ -684,11 +687,7 @@ fn every_case_carries_a_hostile_value_or_says_why_not() {
     let stale: Vec<&str> = NOT_EXERCISED
         .iter()
         .map(|(name, _)| *name)
-        .filter(|name| {
-            outcomes
-                .iter()
-                .any(|o| o.name == *name && o.exercised())
-        })
+        .filter(|name| outcomes.iter().any(|o| o.name == *name && o.exercised()))
         .collect();
     assert!(
         stale.is_empty(),

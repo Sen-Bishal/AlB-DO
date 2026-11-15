@@ -15,7 +15,10 @@ impl Drop for Server {
 }
 
 fn albedo(home: &Path, cwd: &Path) -> Command {
-    let binary = std::env::var_os("ALBEDO_TEST_BINARY").map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_albedo")), PathBuf::from);
+    let binary = std::env::var_os("ALBEDO_TEST_BINARY").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_albedo")),
+        PathBuf::from,
+    );
     let mut command = Command::new(binary);
     command
         .current_dir(cwd)

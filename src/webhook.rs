@@ -14,20 +14,18 @@
 //!
 //! ## What happens to a delivery
 //!
-//! 1. The body is read (at most [`MAX_BODY_BYTES`]) and its **signature is checked
-//!    against the raw bytes** — before anything parses them. A payment provider's
-//!    signature is the only thing that makes a `POST` from the internet mean
-//!    anything; parsing first would hand unauthenticated input to a JSON parser
-//!    for no reason.
-//! 2. The body is parsed as a JSON object and its **event id** read — from the
-//!    body or a header, per [`SignatureScheme`].
-//! 3. The declared job is queued with the event as its `args` and
-//!    `webhook:{name}:{event id}` as its **queue id**. The jobs queue inserts on
-//!    that id with `OR IGNORE`, so a provider's retry of an event already
-//!    received is a no-op — exactly-once is the queue's property, inherited, not
-//!    rebuilt here.
-//! 4. `200` once the row is durable. A provider that sees anything else retries,
-//!    so an enqueue that failed is a `500` on purpose.
+//! 1. The body is read (at most [`MAX_BODY_BYTES`]) and its **signature is checked against the raw
+//!    bytes** — before anything parses them. A payment provider's signature is the only thing that
+//!    makes a `POST` from the internet mean anything; parsing first would hand unauthenticated
+//!    input to a JSON parser for no reason.
+//! 2. The body is parsed as a JSON object and its **event id** read — from the body or a header,
+//!    per [`SignatureScheme`].
+//! 3. The declared job is queued with the event as its `args` and `webhook:{name}:{event id}` as
+//!    its **queue id**. The jobs queue inserts on that id with `OR IGNORE`, so a provider's retry
+//!    of an event already received is a no-op — exactly-once is the queue's property, inherited,
+//!    not rebuilt here.
+//! 4. `200` once the row is durable. A provider that sees anything else retries, so an enqueue that
+//!    failed is a `500` on purpose.
 //!
 //! The job runs with retries, backoff and dead-lettering like any other, and
 //! **for no principal** (`user` is `null`): a webhook is a third party speaking,
@@ -258,10 +256,15 @@ pub fn validate_declarations(decls: &BTreeMap<String, WebhookDecl>) -> Result<()
             return fail(format!("`{path}` is already the path of webhook `{other}`"));
         }
         if !is_identifier(&decl.job) {
-            return fail(format!("`job` must name an export of src/jobs.ts; `{}` cannot", decl.job));
+            return fail(format!(
+                "`job` must name an export of src/jobs.ts; `{}` cannot",
+                decl.job
+            ));
         }
         if decl.secret.env.trim().is_empty() {
-            return fail("`secret` must name an environment variable: { env: \"NAME\" }".to_string());
+            return fail(
+                "`secret` must name an environment variable: { env: \"NAME\" }".to_string(),
+            );
         }
         let fixes_its_own_header = !matches!(decl.signature, SignatureScheme::HmacSha256);
         match (&decl.header, fixes_its_own_header) {
@@ -271,7 +274,9 @@ pub fn validate_declarations(decls: &BTreeMap<String, WebhookDecl>) -> Result<()
                 )
             }
             (None, false) => {
-                return fail("`hmac-sha256` needs `header`: the header carrying the digest".to_string())
+                return fail(
+                    "`hmac-sha256` needs `header`: the header carrying the digest".to_string(),
+                )
             }
             (Some(header), false) if !is_header_name(header) => {
                 return fail(format!("`{header}` is not a header name"))
@@ -279,9 +284,15 @@ pub fn validate_declarations(decls: &BTreeMap<String, WebhookDecl>) -> Result<()
             _ => {}
         }
         if decl.tolerance.is_some()
-            && !matches!(decl.signature, SignatureScheme::Stripe | SignatureScheme::Paddle)
+            && !matches!(
+                decl.signature,
+                SignatureScheme::Stripe | SignatureScheme::Paddle
+            )
         {
-            return fail("`tolerance` is only for schemes that sign a timestamp (stripe, paddle)".to_string());
+            return fail(
+                "`tolerance` is only for schemes that sign a timestamp (stripe, paddle)"
+                    .to_string(),
+            );
         }
         if matches!(decl.signature, SignatureScheme::HmacSha256) && decl.id.is_none() {
             return fail(
@@ -323,7 +334,10 @@ fn parse_id_source(raw: &str) -> Result<IdSource, String> {
         };
     }
     let path: Vec<String> = raw.split('.').map(str::to_string).collect();
-    if path.iter().any(|segment| segment.is_empty() || !is_header_name(segment)) {
+    if path
+        .iter()
+        .any(|segment| segment.is_empty() || !is_header_name(segment))
+    {
         return Err(format!(
             "`id: \"{raw}\"` must be a dot path into the body, like \"id\" or \"data.id\""
         ));
@@ -509,7 +523,10 @@ impl Webhook {
     }
 
     fn check_fresh(&self, timestamp: &str, now_s: i64) -> Result<(), Rejection> {
-        let signed: i64 = timestamp.trim().parse().map_err(|_| Rejection::MissingSignature)?;
+        let signed: i64 = timestamp
+            .trim()
+            .parse()
+            .map_err(|_| Rejection::MissingSignature)?;
         let skew = now_s.saturating_sub(signed).unsigned_abs();
         if skew > self.tolerance {
             return Err(Rejection::Stale);
@@ -597,7 +614,9 @@ mod tests {
         WebhookDecl {
             path: "/hooks/pay".into(),
             signature: scheme,
-            secret: EnvSecret { env: "PAY_SECRET".into() },
+            secret: EnvSecret {
+                env: "PAY_SECRET".into(),
+            },
             job: "pay_event".into(),
             id: None,
             header: None,
@@ -612,12 +631,17 @@ mod tests {
         let mut d = decl(SignatureScheme::Stripe);
         d.principal = Some("data.object.client_reference_id".into());
         let hook = one(d);
-        let event = serde_json::json!({ "data": { "object": { "client_reference_id": "u_7f3a" } } });
+        let event =
+            serde_json::json!({ "data": { "object": { "client_reference_id": "u_7f3a" } } });
         assert_eq!(hook.principal_of(&event).unwrap().as_str(), "u_7f3a");
-        let hostile = serde_json::json!({ "data": { "object": { "client_reference_id": "u:admin" } } });
+        let hostile =
+            serde_json::json!({ "data": { "object": { "client_reference_id": "u:admin" } } });
         assert_eq!(hook.principal_of(&hostile), None);
         assert_eq!(hook.principal_of(&serde_json::json!({ "id": "evt" })), None);
-        assert_eq!(one(decl(SignatureScheme::Stripe)).principal_of(&event), None);
+        assert_eq!(
+            one(decl(SignatureScheme::Stripe)).principal_of(&event),
+            None
+        );
     }
 
     fn one(decl: WebhookDecl) -> Webhook {
@@ -661,11 +685,20 @@ mod tests {
         let good = hmac_hex(&[t.as_bytes(), b".", body]);
         let h = [("stripe-signature", format!("t={t},v1={good}"))];
         let tampered = br#"{"id":"evt_1","amount":999}"#;
-        assert_eq!(hook.verify(headers(&h), tampered, NOW), Err(Rejection::BadSignature));
+        assert_eq!(
+            hook.verify(headers(&h), tampered, NOW),
+            Err(Rejection::BadSignature)
+        );
 
         let forged = [("stripe-signature", format!("t={t},v1={}", "00".repeat(32)))];
-        assert_eq!(hook.verify(headers(&forged), body, NOW), Err(Rejection::BadSignature));
-        assert_eq!(hook.verify(headers(&[]), body, NOW), Err(Rejection::MissingSignature));
+        assert_eq!(
+            hook.verify(headers(&forged), body, NOW),
+            Err(Rejection::BadSignature)
+        );
+        assert_eq!(
+            hook.verify(headers(&[]), body, NOW),
+            Err(Rejection::MissingSignature)
+        );
     }
 
     /// A captured delivery replayed later is refused by its signed timestamp —
@@ -689,7 +722,10 @@ mod tests {
         let body = br#"{"id":"evt_2"}"#;
         let t = NOW.to_string();
         let good = hmac_hex(&[t.as_bytes(), b".", body]);
-        let h = [("stripe-signature", format!("t={t},v1={},v1={good}", "ab".repeat(32)))];
+        let h = [(
+            "stripe-signature",
+            format!("t={t},v1={},v1={good}", "ab".repeat(32)),
+        )];
         assert_eq!(hook.verify(headers(&h), body, NOW), Ok(()));
     }
 
@@ -709,7 +745,10 @@ mod tests {
 
         let github = one(decl(SignatureScheme::Github));
         let h = [
-            ("X-Hub-Signature-256", format!("sha256={}", hmac_hex(&[body]))),
+            (
+                "X-Hub-Signature-256",
+                format!("sha256={}", hmac_hex(&[body])),
+            ),
             ("X-GitHub-Delivery", "d-1".to_string()),
         ];
         assert_eq!(github.verify(headers(&h), body, NOW), Ok(()));
@@ -735,9 +774,15 @@ mod tests {
     fn a_verified_body_without_an_event_id_is_refused() {
         let hook = one(decl(SignatureScheme::Stripe));
         let event = serde_json::json!({ "type": "x" });
-        assert_eq!(hook.event_id(headers(&[]), &event), Err(Rejection::NoEventId));
+        assert_eq!(
+            hook.event_id(headers(&[]), &event),
+            Err(Rejection::NoEventId)
+        );
         let empty = serde_json::json!({ "id": "  " });
-        assert_eq!(hook.event_id(headers(&[]), &empty), Err(Rejection::NoEventId));
+        assert_eq!(
+            hook.event_id(headers(&[]), &empty),
+            Err(Rejection::NoEventId)
+        );
     }
 
     #[test]

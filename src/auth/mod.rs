@@ -8,8 +8,8 @@
 //! Two corollaries, and they are the whole design:
 //!
 //! - **Identity is one more key source, beside `params`.** `user.id` mints a topic identity exactly
-//!   as `params.id` already does, so `todos.where({ owner: user.id })` is per-user live data with no
-//!   authorization code anywhere in the app. A session that is not `u_7f3a` cannot *name*
+//!   as `params.id` already does, so `todos.where({ owner: user.id })` is per-user live data with
+//!   no authorization code anywhere in the app. A session that is not `u_7f3a` cannot *name*
 //!   `todos:owner=u_7f3a`, which is the same guarantee PRISM already gives two chat rooms —
 //!   inherited, not rebuilt.
 //! - **A provider is one more declaration, beside `sources`.** Ours and a third party's produce the
@@ -59,12 +59,12 @@ pub use declare::{
     Preset, ProviderDecl, ProviderKind, ResolvedProvider, SecretDecl, SessionDecl,
     DEFAULT_SESSION_COOKIE, DEFAULT_SESSION_TTL, PRESETS,
 };
+pub use oauth::{
+    FlowStart, OAuthEndpoints, OAuthError, OutboundRequest, TokenResponse, FLOW_TTL_SECONDS,
+};
 pub use password::{
     absorb_timing, hash_password, normalize_email, verify_password, PasswordError,
     MAX_PASSWORD_BYTES, MIN_PASSWORD_BYTES,
-};
-pub use oauth::{
-    FlowStart, OAuthEndpoints, OAuthError, OutboundRequest, TokenResponse, FLOW_TTL_SECONDS,
 };
 pub use principal::{Principal, PrincipalId, PrincipalIdError, PRINCIPAL_ID_PREFIX};
 pub use session::{

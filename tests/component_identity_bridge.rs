@@ -47,7 +47,10 @@ fn same_named_components_resolve_to_their_own_module() {
         project.shared_slot_topics_for_entry(live),
         vec!["guestbook".to_string()]
     );
-    assert_eq!(project.shared_slot_topics_for_entry(still), [] as [std::string::String; 0]);
+    assert_eq!(
+        project.shared_slot_topics_for_entry(still),
+        [] as [std::string::String; 0]
+    );
 
     let nested = project
         .module_spec_for(&abs("routes/b/a.tsx"), "Page")
@@ -111,7 +114,10 @@ fn windows_extended_paths_spaces_and_crlf_preserve_module_metadata() {
     let still = project
         .module_spec_for(r"C:\app space\routes\space dir\still.tsx", "Page")
         .unwrap();
-    assert_eq!(project.shared_slot_topics_for_entry(still), [] as [std::string::String; 0]);
+    assert_eq!(
+        project.shared_slot_topics_for_entry(still),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
@@ -188,5 +194,8 @@ fn case_sensitive_module_paths_do_not_alias() {
         project.shared_slot_topics_for_entry(lower),
         vec!["guestbook".to_string()]
     );
-    assert_eq!(project.shared_slot_topics_for_entry(upper), [] as [std::string::String; 0]);
+    assert_eq!(
+        project.shared_slot_topics_for_entry(upper),
+        [] as [std::string::String; 0]
+    );
 }

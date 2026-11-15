@@ -35,14 +35,13 @@ use super::opcode::{
 /// Version history:
 /// - **v1** — Phase A locked the original 14 variants (0..=13).
 /// - **v2** — Phase I added `Instruction::Navigate` at index 14.
-/// - **v3** — Engine-expansion S2 added `Instruction::SlotDelta` at index 15
-///   (the z-set delta primitive).
-/// - **v4** — Insert-position work added `Instruction::ReconcileList` at index
-///   16 (the full-desired-set list primitive: reorder, mid-insert, and the
-///   resync that retracts ghost rows).
-/// - **v5** — Incremental-projection piece (c) added `Instruction::SlotInsert`
-///   at index 17 (positioned insert: `O(|Δ|)` for a non-tail insert, where v4
-///   had to re-assert the whole view).
+/// - **v3** — Engine-expansion S2 added `Instruction::SlotDelta` at index 15 (the z-set delta
+///   primitive).
+/// - **v4** — Insert-position work added `Instruction::ReconcileList` at index 16 (the
+///   full-desired-set list primitive: reorder, mid-insert, and the resync that retracts ghost
+///   rows).
+/// - **v5** — Incremental-projection piece (c) added `Instruction::SlotInsert` at index 17
+///   (positioned insert: `O(|Δ|)` for a non-tail insert, where v4 had to re-assert the whole view).
 pub const LOCKED_WIRE_VERSION: u32 = 5;
 
 /// Returns the deterministic conformance frame for [`LOCKED_WIRE_VERSION`].
@@ -74,15 +73,24 @@ pub fn canonical_v1_frame() -> OpcodeFrame {
                 table: InternTable {
                     kind: InternTableKind::Tag,
                     entries: vec![
-                        InternEntry { id: 0, value: "div".to_string() },
-                        InternEntry { id: 1, value: "span".to_string() },
+                        InternEntry {
+                            id: 0,
+                            value: "div".to_string(),
+                        },
+                        InternEntry {
+                            id: 1,
+                            value: "span".to_string(),
+                        },
                     ],
                 },
             },
             Instruction::PatchInternTable {
                 kind: InternTableKind::Attr,
                 ops: vec![
-                    InternPatchOp::Set { id: 0, value: "class".to_string() },
+                    InternPatchOp::Set {
+                        id: 0,
+                        value: "class".to_string(),
+                    },
                     InternPatchOp::Remove { id: 9 },
                 ],
             },
@@ -121,8 +129,7 @@ pub fn canonical_v1_frame() -> OpcodeFrame {
             },
             Instruction::Patch {
                 suspense_id: SuspenseId(10),
-                range: InstructionRange::try_new(0, 64)
-                    .expect("0..64 is a valid InstructionRange"),
+                range: InstructionRange::try_new(0, 64).expect("0..64 is a valid InstructionRange"),
             },
             Instruction::SetTextRef {
                 stable_id: StableId(1),
@@ -209,8 +216,7 @@ mod tests {
     fn canonical_v1_frame_round_trips() {
         let frame = canonical_v1_frame();
         let bytes = encode_frame(&frame).expect("canonical frame must encode");
-        let (decoded, consumed) =
-            decode_frame(&bytes).expect("canonical frame must decode");
+        let (decoded, consumed) = decode_frame(&bytes).expect("canonical frame must decode");
         assert_eq!(consumed, bytes.len(), "decoder must consume every byte");
         assert_eq!(frame, decoded);
     }

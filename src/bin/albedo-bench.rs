@@ -1,12 +1,12 @@
 use dom_render_compiler::benchmark::{
     run_workloads, write_report_json, BaselineEnvelopeFile, BenchmarkWorkloads, GateStatus,
 };
-use dom_render_compiler::dev::serve_bench::{
-    run as run_serve_bench, RequestSpec, ServeBenchConfig, ServeBenchReport,
-};
 use dom_render_compiler::dev::proc_bench::{
     build_bench::{run_build_bench, BuildBenchConfig, CommandBuildWorkload},
     run_cold_starts, ColdStartConfig, ProcessSpawner,
+};
+use dom_render_compiler::dev::serve_bench::{
+    run as run_serve_bench, RequestSpec, ServeBenchConfig, ServeBenchReport,
 };
 use dom_render_compiler::ir::action::{encode_action_envelope, ActionEnvelope, ActionEventKind};
 use dom_render_compiler::transforms::form::allocate_form_action_id;
@@ -82,9 +82,9 @@ fn parse_event_kind(value: &str) -> Result<u8, String> {
         "input" => Ok(ActionEventKind::Input as u8),
         "submit" => Ok(ActionEventKind::Submit as u8),
         "other" => Ok(ActionEventKind::Other as u8),
-        other => other
-            .parse::<u8>()
-            .map_err(|_| format!("invalid --event-kind '{value}' (click|input|submit|other|0-255)")),
+        other => other.parse::<u8>().map_err(|_| {
+            format!("invalid --event-kind '{value}' (click|input|submit|other|0-255)")
+        }),
     }
 }
 
@@ -182,7 +182,11 @@ fn run_serve(options: ServeOptions) -> Result<(), String> {
     let mut requests = paths
         .iter()
         .map(|p| {
-            let name = if p == "/" { "root" } else { p.trim_start_matches('/') };
+            let name = if p == "/" {
+                "root"
+            } else {
+                p.trim_start_matches('/')
+            };
             RequestSpec::get(name.to_string(), p.clone())
         })
         .collect::<Vec<_>>();
@@ -219,7 +223,11 @@ fn run_serve(options: ServeOptions) -> Result<(), String> {
         config.warmup,
         config.samples,
         config.concurrency,
-        if config.keep_alive { "keep-alive" } else { "close" }
+        if config.keep_alive {
+            "keep-alive"
+        } else {
+            "close"
+        }
     );
 
     let report = run_serve_bench(&config).map_err(|err| format!("serve bench failed: {err}"))?;
@@ -336,15 +344,18 @@ fn parse_cold_start_args(args: &[String]) -> Result<Option<ColdStartCli>, String
             }
             "--ready-timeout-ms" => {
                 idx += 1;
-                ready_timeout = Duration::from_millis(parse_num(args.get(idx), "--ready-timeout-ms")?);
+                ready_timeout =
+                    Duration::from_millis(parse_num(args.get(idx), "--ready-timeout-ms")?);
             }
             "--poll-interval-ms" => {
                 idx += 1;
-                poll_interval = Duration::from_millis(parse_num(args.get(idx), "--poll-interval-ms")?);
+                poll_interval =
+                    Duration::from_millis(parse_num(args.get(idx), "--poll-interval-ms")?);
             }
             "--timeout-ms" => {
                 idx += 1;
-                request_timeout = Duration::from_millis(parse_num::<u64>(args.get(idx), "--timeout-ms")?.max(1));
+                request_timeout =
+                    Duration::from_millis(parse_num::<u64>(args.get(idx), "--timeout-ms")?.max(1));
             }
             "--settle-ms" => {
                 idx += 1;
@@ -412,14 +423,21 @@ fn run_cold_start(cli: ColdStartCli) -> Result<(), String> {
 
     // A non-2xx first hit means the cold number reflects an error page,
     // not a real render — refuse to cite it.
-    if let Some(bad) = report.samples.iter().find(|s| !(200..400).contains(&s.status)) {
+    if let Some(bad) = report
+        .samples
+        .iter()
+        .find(|s| !(200..400).contains(&s.status))
+    {
         return Err(format!(
             "cold hit returned status {} — boot is erroring, numbers not citable",
             bad.status
         ));
     }
 
-    println!("ALBEDO Cold-Process-Start Report ({} boots)", report.iterations);
+    println!(
+        "ALBEDO Cold-Process-Start Report ({} boots)",
+        report.iterations
+    );
     println!(
         "  boot → ready:    p50={:.2}ms p90={:.2}ms p99={:.2}ms (min {:.2} / max {:.2})",
         report.boot_ready.p50_ms,
@@ -542,8 +560,8 @@ fn run_build_bench_cli(cli: BuildBenchCli) -> Result<(), String> {
         cli.incremental_samples,
     );
 
-    let report = run_build_bench(&workload, &config)
-        .map_err(|err| format!("build-bench failed: {err}"))?;
+    let report =
+        run_build_bench(&workload, &config).map_err(|err| format!("build-bench failed: {err}"))?;
 
     println!("ALBEDO Build-Time Report");
     println!(
@@ -703,8 +721,9 @@ fn parse_serve_args(args: &[String]) -> Result<Option<ServeOptions>, String> {
                 let path = args
                     .get(idx)
                     .ok_or_else(|| "missing value for --action-payload-file".to_string())?;
-                let bytes = std::fs::read(path)
-                    .map_err(|err| format!("failed to read --action-payload-file '{path}': {err}"))?;
+                let bytes = std::fs::read(path).map_err(|err| {
+                    format!("failed to read --action-payload-file '{path}': {err}")
+                })?;
                 action_payload = Some(bytes);
             }
             "--action-path" => {
@@ -766,11 +785,7 @@ fn print_serve_summary(report: &ServeBenchReport) {
     println!();
     for ep in &report.endpoints {
         println!("Endpoint: {} ({} {})", ep.name, method_str(ep), ep.path);
-        println!(
-            "  status: {} ({:.0}% 2xx)",
-            ep.status,
-            ep.ok_ratio * 100.0
-        );
+        println!("  status: {} ({:.0}% 2xx)", ep.status, ep.ok_ratio * 100.0);
         println!(
             "  cold:       ttfb={:.2}ms total={:.2}ms ({} B)",
             ep.cold.ttfb_ms, ep.cold.total_ms, ep.cold.bytes
@@ -925,7 +940,9 @@ fn print_usage() {
     println!("  --warmup <N>           Discarded warmup requests per endpoint (default: 50)");
     println!("  --samples <N>          Measured requests per endpoint (default: 500)");
     println!("  --concurrency <N>      Concurrent connections (default: 16)");
-    println!("  --keep-alive           Reuse one connection per worker (strips per-req TCP connect)");
+    println!(
+        "  --keep-alive           Reuse one connection per worker (strips per-req TCP connect)"
+    );
     println!("  --timeout-ms <N>       Per-request timeout in ms (default: 10000)");
     println!("  --output <FILE>        Write the serve-bench report JSON");
     println!("  --markdown             Print a README-ready Markdown table");
@@ -997,7 +1014,10 @@ mod tests {
             id: None,
             ..by_name
         };
-        assert!(neither.resolve_id().is_err(), "no name and no id is an error");
+        assert!(
+            neither.resolve_id().is_err(),
+            "no name and no id is an error"
+        );
     }
 
     #[test]
@@ -1051,7 +1071,9 @@ mod tests {
             "--iterations".to_string(),
             "5".to_string(),
         ];
-        let cli = parse_cold_start_args(&args).unwrap().expect("cold-start mode");
+        let cli = parse_cold_start_args(&args)
+            .unwrap()
+            .expect("cold-start mode");
         assert_eq!(cli.url, "http://127.0.0.1:3000");
         assert_eq!(cli.program, "../target/release/albedo");
         assert_eq!(cli.exec_args, vec!["serve", "--port", "3000"]);
@@ -1085,7 +1107,9 @@ mod tests {
             "--incremental-samples".to_string(),
             "4".to_string(),
         ];
-        let cli = parse_build_bench_args(&args).unwrap().expect("build-bench mode");
+        let cli = parse_build_bench_args(&args)
+            .unwrap()
+            .expect("build-bench mode");
         assert_eq!(cli.exec_args, vec!["build", "my-app"]);
         assert_eq!(cli.artifacts.len(), 2);
         assert_eq!(cli.clean_samples, 2);

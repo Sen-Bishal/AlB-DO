@@ -206,7 +206,11 @@ fn hidden_field(html: &str, name: &str) -> Option<String> {
 
 async fn load_public_page(client: &reqwest::Client, base: &str) -> ServedForm {
     let response = client.get(format!("{base}/")).send().await.expect("home");
-    assert_eq!(response.status(), StatusCode::OK, "the public route renders");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the public route renders"
+    );
     let cookie = response
         .headers()
         .get_all("set-cookie")
@@ -302,9 +306,11 @@ async fn a_role_gated_route_admits_only_holders_on_every_door() {
     // People first, then the server — see the module docs.
     let (holder, outsider, hr_holder, both_holder) = {
         let db = LibSqlSubstrate::open_local(&db_path).await.expect("db");
-        let auth_schema = schema::augment(&ForgeSchema::build(Vec::new()).expect("empty"))
-            .expect("auth tables");
-        bootstrap_schema(&db, &auth_schema).await.expect("bootstrap");
+        let auth_schema =
+            schema::augment(&ForgeSchema::build(Vec::new()).expect("empty")).expect("auth tables");
+        bootstrap_schema(&db, &auth_schema)
+            .await
+            .expect("bootstrap");
         let holder = signed_in(&db, "pat", &["payroll"]).await;
         let outsider = signed_in(&db, "sam", &[]).await;
         let hr_holder = signed_in(&db, "harriet", &["hr"]).await;
@@ -360,9 +366,27 @@ async fn a_role_gated_route_admits_only_holders_on_every_door() {
     let form = load_public_page(&client, &base).await;
 
     for (who, session, page, lane_ok, action_refusal) in [
-        ("a stranger", None, StatusCode::UNAUTHORIZED, vec!["/"], Some(StatusCode::UNAUTHORIZED)),
-        ("someone without the role", Some(&outsider), StatusCode::FORBIDDEN, vec!["/"], Some(StatusCode::FORBIDDEN)),
-        ("the role holder", Some(&holder), StatusCode::OK, vec!["/", "/payroll"], None),
+        (
+            "a stranger",
+            None,
+            StatusCode::UNAUTHORIZED,
+            vec!["/"],
+            Some(StatusCode::UNAUTHORIZED),
+        ),
+        (
+            "someone without the role",
+            Some(&outsider),
+            StatusCode::FORBIDDEN,
+            vec!["/"],
+            Some(StatusCode::FORBIDDEN),
+        ),
+        (
+            "the role holder",
+            Some(&holder),
+            StatusCode::OK,
+            vec!["/", "/payroll"],
+            None,
+        ),
     ] {
         let cookies = session.map(|session| format!("{}; {session}", form.cookie));
 
@@ -385,7 +409,10 @@ async fn a_role_gated_route_admits_only_holders_on_every_door() {
         // the render gate that precedes the WebTransport bridge.
         let mut request = client
             .get(format!("{base}/payroll"))
-            .header("x-albedo-wt-session", "00000000-0000-0000-0000-000000000001")
+            .header(
+                "x-albedo-wt-session",
+                "00000000-0000-0000-0000-000000000001",
+            )
             .header("x-albedo-wt-prefer", "webtransport")
             .header("x-forwarded-proto", "h3");
         if let Some(cookies) = &cookies {
@@ -396,7 +423,11 @@ async fn a_role_gated_route_admits_only_holders_on_every_door() {
         if page == StatusCode::FORBIDDEN {
             assert_eq!(response.headers()["vary"], "Cookie");
             assert_eq!(response.headers()["cache-control"], "no-store");
-            assert!(!response.text().await.expect("refusal body").contains("payroll"));
+            assert!(!response
+                .text()
+                .await
+                .expect("refusal body")
+                .contains("payroll"));
         }
 
         // ── the live lane, with the public route as the control ──
@@ -412,7 +443,10 @@ async fn a_role_gated_route_admits_only_holders_on_every_door() {
         // ── the route's action ──
         let mut request = client
             .post(format!("{base}/_albedo/action/{GATED_ACTION}"))
-            .header("cookie", cookies.clone().unwrap_or_else(|| form.cookie.clone()))
+            .header(
+                "cookie",
+                cookies.clone().unwrap_or_else(|| form.cookie.clone()),
+            )
             .form(&[
                 ("_csrf", form.csrf.as_str()),
                 ("_albedo_return", form.return_path.as_str()),
@@ -434,15 +468,46 @@ async fn a_role_gated_route_admits_only_holders_on_every_door() {
     // A list on one route is OR. The same action on separate routes is AND,
     // even when a third, public route declares that action too.
     for (who, session, hr_page, either_page, shared_refusal, either_refusal) in [
-        ("stranger", None, StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED,
-            Some(StatusCode::UNAUTHORIZED), Some(StatusCode::UNAUTHORIZED)),
-        ("no roles", Some(&outsider), StatusCode::FORBIDDEN, StatusCode::FORBIDDEN,
-            Some(StatusCode::FORBIDDEN), Some(StatusCode::FORBIDDEN)),
-        ("payroll only", Some(&holder), StatusCode::FORBIDDEN, StatusCode::OK,
-            Some(StatusCode::FORBIDDEN), None),
-        ("hr only", Some(&hr_holder), StatusCode::OK, StatusCode::OK,
-            Some(StatusCode::FORBIDDEN), None),
-        ("both roles", Some(&both_holder), StatusCode::OK, StatusCode::OK, None, None),
+        (
+            "stranger",
+            None,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::UNAUTHORIZED,
+            Some(StatusCode::UNAUTHORIZED),
+            Some(StatusCode::UNAUTHORIZED),
+        ),
+        (
+            "no roles",
+            Some(&outsider),
+            StatusCode::FORBIDDEN,
+            StatusCode::FORBIDDEN,
+            Some(StatusCode::FORBIDDEN),
+            Some(StatusCode::FORBIDDEN),
+        ),
+        (
+            "payroll only",
+            Some(&holder),
+            StatusCode::FORBIDDEN,
+            StatusCode::OK,
+            Some(StatusCode::FORBIDDEN),
+            None,
+        ),
+        (
+            "hr only",
+            Some(&hr_holder),
+            StatusCode::OK,
+            StatusCode::OK,
+            Some(StatusCode::FORBIDDEN),
+            None,
+        ),
+        (
+            "both roles",
+            Some(&both_holder),
+            StatusCode::OK,
+            StatusCode::OK,
+            None,
+            None,
+        ),
     ] {
         let cookies = session.map(|session| format!("{}; {session}", form.cookie));
         for (path, expected) in [("/hr", hr_page), ("/either", either_page)] {
@@ -450,28 +515,55 @@ async fn a_role_gated_route_admits_only_holders_on_every_door() {
             if let Some(cookies) = &cookies {
                 request = request.header("cookie", cookies);
             }
-            assert_eq!(request.send().await.expect("page").status(), expected,
-                "{who}: {path} render");
+            assert_eq!(
+                request.send().await.expect("page").status(),
+                expected,
+                "{who}: {path} render"
+            );
         }
-        let (ok, denied) = subscribe(&client, &base, cookies.as_deref(), &["/", "/hr", "/either"]).await;
-        for (path, allowed) in [("/", true), ("/hr", hr_page == StatusCode::OK),
-            ("/either", either_page == StatusCode::OK)] {
-            assert_eq!(ok.iter().any(|candidate| candidate == path), allowed,
-                "{who}: {path} live grant");
-            assert_eq!(denied.iter().any(|candidate| candidate == path), !allowed,
-                "{who}: {path} live denial");
+        let (ok, denied) =
+            subscribe(&client, &base, cookies.as_deref(), &["/", "/hr", "/either"]).await;
+        for (path, allowed) in [
+            ("/", true),
+            ("/hr", hr_page == StatusCode::OK),
+            ("/either", either_page == StatusCode::OK),
+        ] {
+            assert_eq!(
+                ok.iter().any(|candidate| candidate == path),
+                allowed,
+                "{who}: {path} live grant"
+            );
+            assert_eq!(
+                denied.iter().any(|candidate| candidate == path),
+                !allowed,
+                "{who}: {path} live denial"
+            );
         }
-        for (action, refusal) in [(SHARED_ACTION, shared_refusal), (ANY_ROLE_ACTION, either_refusal)] {
-            let status = client.post(format!("{base}/_albedo/action/{action}"))
-                .header("cookie", cookies.clone().unwrap_or_else(|| form.cookie.clone()))
+        for (action, refusal) in [
+            (SHARED_ACTION, shared_refusal),
+            (ANY_ROLE_ACTION, either_refusal),
+        ] {
+            let status = client
+                .post(format!("{base}/_albedo/action/{action}"))
+                .header(
+                    "cookie",
+                    cookies.clone().unwrap_or_else(|| form.cookie.clone()),
+                )
                 .header("accept", "application/json")
-                .form(&[("_csrf", form.csrf.as_str()),
-                    ("_albedo_return", form.return_path.as_str())])
-                .send().await.expect("action").status();
+                .form(&[
+                    ("_csrf", form.csrf.as_str()),
+                    ("_albedo_return", form.return_path.as_str()),
+                ])
+                .send()
+                .await
+                .expect("action")
+                .status();
             match refusal {
                 Some(expected) => assert_eq!(status, expected, "{who}: {action}"),
-                None => assert!(status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
-                    "{who}: {action} must pass its gate, got {status}"),
+                None => assert!(
+                    status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                    "{who}: {action} must pass its gate, got {status}"
+                ),
             }
         }
     }

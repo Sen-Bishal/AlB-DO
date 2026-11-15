@@ -528,10 +528,13 @@ impl SourceCredentials {
         self.0
             .iter()
             .filter(|credential| credential.covers(url))
-            .fold(None, |best: Option<&SourceCredential>, candidate| match best {
-                Some(best) if best.path.len() >= candidate.path.len() => Some(best),
-                _ => Some(candidate),
-            })
+            .fold(
+                None,
+                |best: Option<&SourceCredential>, candidate| match best {
+                    Some(best) if best.path.len() >= candidate.path.len() => Some(best),
+                    _ => Some(candidate),
+                },
+            )
     }
 
     /// Whether no source declared a credential.
@@ -583,8 +586,12 @@ impl SourceRegistry {
                     }
                 }
             }
-            let (scope, auth_header) =
-                lower_auth(source_name, decl.auth.as_ref(), &env, !decl.routes.is_empty())?;
+            let (scope, auth_header) = lower_auth(
+                source_name,
+                decl.auth.as_ref(),
+                &env,
+                !decl.routes.is_empty(),
+            )?;
 
             let mut headers: Vec<(String, String)> = decl
                 .headers
@@ -982,7 +989,11 @@ mod tests {
         let mut c = source("https://api.test/v3", &[("r", "/r")]);
         c.limit = Some("10/s".to_string());
         assert!(registry(&[("a", a.clone()), ("c", c)]).is_ok());
-        assert!(registry(&[("a", a), ("d", source("https://api.test/v4", &[("r", "/r")]))]).is_ok());
+        assert!(registry(&[
+            ("a", a),
+            ("d", source("https://api.test/v4", &[("r", "/r")]))
+        ])
+        .is_ok());
     }
 
     fn registry(decls: &[(&str, SourceDecl)]) -> Result<SourceRegistry, SourceSchemaError> {
@@ -1387,13 +1398,25 @@ mod tests {
         assert!(covered("https://api.x.test/v1"));
         assert!(covered("https://api.x.test/v1/charges?limit=3"));
         assert!(covered("https://API.X.TEST:443/v1/charges"));
-        assert!(!covered("http://api.x.test/v1/charges"), "never in the clear");
-        assert!(!covered("https://api.x.test:8443/v1/charges"), "another server");
+        assert!(
+            !covered("http://api.x.test/v1/charges"),
+            "never in the clear"
+        );
+        assert!(
+            !covered("https://api.x.test:8443/v1/charges"),
+            "another server"
+        );
         assert!(!covered("https://api.x.test.evil.test/v1/charges"));
         assert!(!covered("https://x.test/v1/charges"));
-        assert!(!covered("https://api.x.test/v10/charges"), "a prefix, not a segment");
+        assert!(
+            !covered("https://api.x.test/v10/charges"),
+            "a prefix, not a segment"
+        );
         assert!(!covered("https://api.x.test/"));
-        assert!(!covered("https://api.x.test/v1/../admin"), "`..` resolved first");
+        assert!(
+            !covered("https://api.x.test/v1/../admin"),
+            "`..` resolved first"
+        );
     }
 
     #[test]

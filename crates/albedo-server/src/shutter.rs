@@ -6,8 +6,10 @@
 //!
 //! ## The subject, in priority order
 //!
-//! 1. **The principal**, when AUTH resolved one. Rationing the actor is strictly better than rationing their network position.
-//! 2. **The client address**, otherwise — with the trust question below answered before it is believed.
+//! 1. **The principal**, when AUTH resolved one. Rationing the actor is strictly better than
+//!    rationing their network position.
+//! 2. **The client address**, otherwise — with the trust question below answered before it is
+//!    believed.
 //!
 //! ## `X-Forwarded-For` is a vulnerability until it is configured
 //!
@@ -240,11 +242,7 @@ impl TrustedProxies {
 /// `principal` is AUTH's answer; `client` is the address resolved through
 /// [`TrustedProxies`].
 #[must_use]
-pub fn subject(
-    identity: &crate::auth::Identity,
-    client: IpAddr,
-    class: OperationClass,
-) -> Key {
+pub fn subject(identity: &crate::auth::Identity, client: IpAddr, class: OperationClass) -> Key {
     match identity.principal() {
         Some(principal) => Key::Principal {
             id: principal.id.as_str().to_string(),
@@ -501,7 +499,11 @@ struct OutboundScope {
 /// Run `future` with outbound calls charged to `caller`, and report the
 /// refusal that stopped it, if one did — so the dispatcher can answer `429`
 /// rather than the error the refused workflow produced.
-pub async fn outbound_scope<F, T>(limiter: Arc<Limiter>, caller: Key, future: F) -> (T, Option<Verdict>)
+pub async fn outbound_scope<F, T>(
+    limiter: Arc<Limiter>,
+    caller: Key,
+    future: F,
+) -> (T, Option<Verdict>)
 where
     F: std::future::Future<Output = T>,
 {
@@ -528,19 +530,21 @@ where
 /// `tests/outbound_budget_http.rs` fails if the action path stops reaching one.
 pub fn admit_outbound(url: &str) -> Result<(), String> {
     OUTBOUND
-        .try_with(|scope| match scope.limiter.outbound_call(&scope.caller, url) {
-            Some(verdict) if !verdict.is_admitted() => {
-                let reason = format!(
-                    "outbound budget exhausted; retry after {}s",
-                    verdict.retry_after_secs().unwrap_or(1)
-                );
-                if let Ok(mut slot) = scope.refused.lock() {
-                    slot.get_or_insert(verdict);
+        .try_with(
+            |scope| match scope.limiter.outbound_call(&scope.caller, url) {
+                Some(verdict) if !verdict.is_admitted() => {
+                    let reason = format!(
+                        "outbound budget exhausted; retry after {}s",
+                        verdict.retry_after_secs().unwrap_or(1)
+                    );
+                    if let Ok(mut slot) = scope.refused.lock() {
+                        slot.get_or_insert(verdict);
+                    }
+                    Err(reason)
                 }
-                Err(reason)
-            }
-            _ => Ok(()),
-        })
+                _ => Ok(()),
+            },
+        )
         .unwrap_or(Ok(()))
 }
 
@@ -731,10 +735,7 @@ mod tests {
     fn a_trusted_proxy_with_no_header_falls_back_to_the_peer() {
         let balancer = ip(10, 0, 0, 1);
         let proxies = TrustedProxies::new(vec![balancer]);
-        assert_eq!(
-            proxies.client_addr(balancer, &HeaderMap::new()),
-            balancer
-        );
+        assert_eq!(proxies.client_addr(balancer, &HeaderMap::new()), balancer);
     }
 
     /// A principal outranks an address: the same person behind a different
@@ -911,9 +912,12 @@ mod tests {
 
     fn refused_verdict() -> Verdict {
         let clock = Arc::new(ManualClock::new());
-        let shutter =
-            Shutter::with(Limits::default(), clock as Arc<dyn dom_render_compiler::shutter::Clock>, 64)
-                .unwrap();
+        let shutter = Shutter::with(
+            Limits::default(),
+            clock as Arc<dyn dom_render_compiler::shutter::Clock>,
+            64,
+        )
+        .unwrap();
         let key = Key::Address {
             addr: ip(198, 51, 100, 7),
             class: OperationClass::Credential,

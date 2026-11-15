@@ -142,7 +142,9 @@ async fn concurrent_processes_racing_one_tick_produce_one_row() {
 #[tokio::test]
 async fn a_due_row_is_claimed_and_a_future_one_is_not() {
     let db = substrate().await;
-    queue::enqueue(&db, &work("due", "a", NOW, 3)).await.unwrap();
+    queue::enqueue(&db, &work("due", "a", NOW, 3))
+        .await
+        .unwrap();
     queue::enqueue(&db, &work("later", "b", NOW + 60_000, 3))
         .await
         .unwrap();
@@ -237,7 +239,9 @@ async fn concurrent_claims_never_hand_one_row_to_two_runners() {
 #[tokio::test]
 async fn an_expired_lease_returns_the_work_and_counts_the_attempt() {
     let db = substrate().await;
-    queue::enqueue(&db, &work("job", "a", NOW, 5)).await.unwrap();
+    queue::enqueue(&db, &work("job", "a", NOW, 5))
+        .await
+        .unwrap();
 
     let first = queue::claim_due(&db, NOW, DEFAULT_LEASE_MS)
         .await
@@ -271,7 +275,9 @@ async fn an_expired_lease_returns_the_work_and_counts_the_attempt() {
 #[tokio::test]
 async fn a_row_that_always_kills_its_holder_eventually_dead_letters() {
     let db = substrate().await;
-    queue::enqueue(&db, &work("poison", "a", NOW, 3)).await.unwrap();
+    queue::enqueue(&db, &work("poison", "a", NOW, 3))
+        .await
+        .unwrap();
 
     let mut now = NOW;
     let mut claims = 0;
@@ -279,7 +285,10 @@ async fn a_row_that_always_kills_its_holder_eventually_dead_letters() {
     // never failing cleanly. The only thing that advances is the clock.
     while let Some(job) = queue::claim_due(&db, now, DEFAULT_LEASE_MS).await.unwrap() {
         claims += 1;
-        assert!(claims <= 10, "it must stop being reclaimed, not loop forever");
+        assert!(
+            claims <= 10,
+            "it must stop being reclaimed, not loop forever"
+        );
         if job.attempts >= job.max_attempts {
             queue::fail(&db, &job, now, "the holder died", 1.0)
                 .await
@@ -299,7 +308,9 @@ async fn a_row_that_always_kills_its_holder_eventually_dead_letters() {
 #[tokio::test]
 async fn a_failure_with_attempts_left_is_retried_later() {
     let db = substrate().await;
-    queue::enqueue(&db, &work("job", "a", NOW, 3)).await.unwrap();
+    queue::enqueue(&db, &work("job", "a", NOW, 3))
+        .await
+        .unwrap();
 
     let job = queue::claim_due(&db, NOW, DEFAULT_LEASE_MS)
         .await
@@ -331,7 +342,9 @@ async fn a_failure_with_attempts_left_is_retried_later() {
 #[tokio::test]
 async fn a_failure_with_no_attempts_left_dead_letters_and_keeps_the_reason() {
     let db = substrate().await;
-    queue::enqueue(&db, &work("job", "a", NOW, 1)).await.unwrap();
+    queue::enqueue(&db, &work("job", "a", NOW, 1))
+        .await
+        .unwrap();
 
     let job = queue::claim_due(&db, NOW, DEFAULT_LEASE_MS)
         .await
@@ -354,13 +367,18 @@ async fn a_failure_with_no_attempts_left_dead_letters_and_keeps_the_reason() {
         .get(0)
         .and_then(dom_render_compiler::forge::SqlValue::as_str)
         .expect("the reason is kept");
-    assert_eq!(stored, "it threw", "a dead letter nobody can read is a job that vanished");
+    assert_eq!(
+        stored, "it threw",
+        "a dead letter nobody can read is a job that vanished"
+    );
 }
 
 #[tokio::test]
 async fn completing_clears_the_lease_and_the_row_is_never_handed_out_again() {
     let db = substrate().await;
-    queue::enqueue(&db, &work("job", "a", NOW, 3)).await.unwrap();
+    queue::enqueue(&db, &work("job", "a", NOW, 3))
+        .await
+        .unwrap();
     let job = queue::claim_due(&db, NOW, DEFAULT_LEASE_MS)
         .await
         .unwrap()
@@ -408,11 +426,19 @@ async fn the_next_due_instant_is_the_earliest_future_row() {
 async fn the_sweep_removes_finished_work_but_never_a_dead_letter() {
     let db = substrate().await;
     queue::enqueue(&db, &work("ok", "a", NOW, 1)).await.unwrap();
-    queue::enqueue(&db, &work("bad", "a", NOW, 1)).await.unwrap();
+    queue::enqueue(&db, &work("bad", "a", NOW, 1))
+        .await
+        .unwrap();
 
-    let ok = queue::claim_due(&db, NOW, DEFAULT_LEASE_MS).await.unwrap().unwrap();
+    let ok = queue::claim_due(&db, NOW, DEFAULT_LEASE_MS)
+        .await
+        .unwrap()
+        .unwrap();
     queue::complete(&db, &ok.id, NOW).await.unwrap();
-    let bad = queue::claim_due(&db, NOW, DEFAULT_LEASE_MS).await.unwrap().unwrap();
+    let bad = queue::claim_due(&db, NOW, DEFAULT_LEASE_MS)
+        .await
+        .unwrap()
+        .unwrap();
     queue::fail(&db, &bad, NOW, "threw", 1.0).await.unwrap();
 
     let removed = queue::sweep_done(&db, NOW + 1).await.unwrap();
@@ -444,7 +470,10 @@ async fn a_fan_out_row_advances_by_cursor_and_then_finishes() {
         .await
         .unwrap()
         .expect("claimed");
-    assert!(first.is_fanout, "the runner must be told to expand, not to run");
+    assert!(
+        first.is_fanout,
+        "the runner must be told to expand, not to run"
+    );
     assert_eq!(first.cursor, None, "the first pass starts at the beginning");
 
     queue::advance_fanout(&db, &first.id, Some("user-500"), NOW)
@@ -457,7 +486,9 @@ async fn a_fan_out_row_advances_by_cursor_and_then_finishes() {
         .expect("the row comes back for its next batch");
     assert_eq!(second.cursor.as_deref(), Some("user-500"));
 
-    queue::advance_fanout(&db, &second.id, None, NOW).await.unwrap();
+    queue::advance_fanout(&db, &second.id, None, NOW)
+        .await
+        .unwrap();
     assert_eq!(state_of(&db, &fire).await, JobState::Done.as_str());
     assert!(
         queue::claim_due(&db, NOW, DEFAULT_LEASE_MS)
@@ -511,7 +542,9 @@ async fn the_claim_update_refuses_a_row_whose_state_has_already_moved() {
     use dom_render_compiler::forge::SqlValue;
 
     let db = substrate().await;
-    queue::enqueue(&db, &work("job", "a", NOW, 5)).await.unwrap();
+    queue::enqueue(&db, &work("job", "a", NOW, 5))
+        .await
+        .unwrap();
     queue::claim_due(&db, NOW, DEFAULT_LEASE_MS)
         .await
         .unwrap()
@@ -547,9 +580,13 @@ async fn the_claim_update_refuses_a_row_whose_state_has_already_moved() {
 #[tokio::test]
 async fn the_ddl_is_idempotent() {
     let db = substrate().await;
-    queue::enqueue(&db, &work("job", "a", NOW, 1)).await.unwrap();
+    queue::enqueue(&db, &work("job", "a", NOW, 1))
+        .await
+        .unwrap();
     for statement in queue::ddl() {
-        db.migrate(&statement).await.expect("re-applying is a no-op");
+        db.migrate(&statement)
+            .await
+            .expect("re-applying is a no-op");
     }
     assert_eq!(count(&db).await, 1, "and it does not clear the table");
 }

@@ -69,8 +69,14 @@ async fn serve(home: &Path, app: &Path) -> (Server, String) {
     let server = Server { child };
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_err() {
-        assert!(Instant::now() < deadline, "albedo serve never answered on {base}");
+    while reqwest::get(format!("{base}/_albedo/runtime.js"))
+        .await
+        .is_err()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "albedo serve never answered on {base}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     (server, base)
@@ -102,14 +108,22 @@ struct Visitor {
 
 /// A fresh anonymous visitor — the tab cookie the first page mints.
 async fn stranger(client: &reqwest::Client, base: &str) -> Visitor {
-    let page = client.get(format!("{base}/files")).send().await.expect("GET /files");
+    let page = client
+        .get(format!("{base}/files"))
+        .send()
+        .await
+        .expect("GET /files");
     let tab = cookie_named(&page, "__Host-albedo-session").expect("the render mints a tab cookie");
     Visitor { cookie: tab }
 }
 
 /// Register an account through the scaffold's own form.
 async fn sign_up(client: &reqwest::Client, base: &str, email: &str) -> Visitor {
-    let form = client.get(format!("{base}/sign-in")).send().await.expect("GET /sign-in");
+    let form = client
+        .get(format!("{base}/sign-in"))
+        .send()
+        .await
+        .expect("GET /sign-in");
     let tab = cookie_named(&form, "__Host-albedo-session").expect("the render mints a tab cookie");
     let html = form.text().await.expect("body");
     let csrf = hidden_field(&html, "_csrf").expect("the form carries a CSRF token");
@@ -153,7 +167,9 @@ async fn upload(
         .await
         .expect("body");
     let marker = format!(r#"data-albedo-action="{action}""#);
-    let at = page.find(&marker).unwrap_or_else(|| panic!("no form for {action}\n{page}"));
+    let at = page
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no form for {action}\n{page}"));
     let form = &page[at..at + page[at..].find("</form>").expect("the form closes")];
 
     let boundary = "----albedo-upload-test-boundary";
@@ -181,7 +197,10 @@ async fn upload(
     let response = client
         .post(format!("{base}/_albedo/action/{action}"))
         .header("cookie", &who.cookie)
-        .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
         .header("sec-fetch-mode", "navigate")
         .body(body)
         .send()
@@ -287,8 +306,20 @@ async fn an_upload_is_read_back_only_by_whom_its_bucket_allows() {
     // ── owner-only bucket (the default) ──
     let secret = br#"{"payslip": 4200}"#;
     let id = id_of(secret);
-    let (status, body) = upload(&client, &base, &ada, "keep_private", "private_docs", "ada.json", secret).await;
-    assert!(status == 303 || status == 200, "ada's upload: {status} {body}");
+    let (status, body) = upload(
+        &client,
+        &base,
+        &ada,
+        "keep_private",
+        "private_docs",
+        "ada.json",
+        secret,
+    )
+    .await;
+    assert!(
+        status == 303 || status == 200,
+        "ada's upload: {status} {body}"
+    );
 
     let (status, bytes, disposition, _) = read(&client, &base, Some(&ada), &id, None).await;
     assert_eq!(status, 200, "the uploader reads her own file");
@@ -299,7 +330,11 @@ async fn an_upload_is_read_back_only_by_whom_its_bucket_allows() {
     let never = id_of(b"never uploaded by anyone");
     let missing = read(&client, &base, Some(&bob), &never, None).await;
     assert_eq!(missing.0, 404);
-    for (who, label) in [(Some(&bob), "another user"), (Some(&anon), "a stranger"), (None, "no cookies")] {
+    for (who, label) in [
+        (Some(&bob), "another user"),
+        (Some(&anon), "a stranger"),
+        (None, "no cookies"),
+    ] {
         let refused = read(&client, &base, who, &id, None).await;
         assert_eq!(
             (refused.0, &refused.1, &refused.3),
@@ -309,28 +344,79 @@ async fn an_upload_is_read_back_only_by_whom_its_bucket_allows() {
     }
     // Revalidation is not a way round it.
     let etag = format!("\"{id}\"");
-    assert_eq!(read(&client, &base, Some(&bob), &id, Some(&etag)).await.0, 404);
-    assert_eq!(read(&client, &base, Some(&ada), &id, Some(&etag)).await.0, 304);
+    assert_eq!(
+        read(&client, &base, Some(&bob), &id, Some(&etag)).await.0,
+        404
+    );
+    assert_eq!(
+        read(&client, &base, Some(&ada), &id, Some(&etag)).await.0,
+        304
+    );
 
     // The same bytes from a second person: their own record, their own name.
-    let (status, body) = upload(&client, &base, &bob, "keep_private", "private_docs", "bob.json", secret).await;
-    assert!(status == 303 || status == 200, "bob's upload: {status} {body}");
+    let (status, body) = upload(
+        &client,
+        &base,
+        &bob,
+        "keep_private",
+        "private_docs",
+        "bob.json",
+        secret,
+    )
+    .await;
+    assert!(
+        status == 303 || status == 200,
+        "bob's upload: {status} {body}"
+    );
     let (status, _, disposition, _) = read(&client, &base, Some(&bob), &id, None).await;
     assert_eq!(status, 200, "bob reads the file he uploaded");
-    assert!(disposition.contains("bob.json"), "bob gets his own record: {disposition}");
+    assert!(
+        disposition.contains("bob.json"),
+        "bob gets his own record: {disposition}"
+    );
     let (_, _, disposition, _) = read(&client, &base, Some(&ada), &id, None).await;
-    assert!(disposition.contains("ada.json"), "ada still gets hers: {disposition}");
+    assert!(
+        disposition.contains("ada.json"),
+        "ada still gets hers: {disposition}"
+    );
 
     // Nobody can own an anonymous upload, so an owner-only bucket refuses one.
-    let (status, body) = upload(&client, &base, &anon, "keep_private", "private_docs", "x.json", b"{}").await;
-    assert_eq!(status, 401, "an anonymous upload into an owner-only bucket: {body}");
+    let (status, body) = upload(
+        &client,
+        &base,
+        &anon,
+        "keep_private",
+        "private_docs",
+        "x.json",
+        b"{}",
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "an anonymous upload into an owner-only bucket: {body}"
+    );
     assert!(body.contains("sign in to upload"), "{body}");
 
     // ── public bucket ──
     let picture = br#"{"cat": true}"#;
-    let (status, body) = upload(&client, &base, &anon, "keep_public", "public_pics", "cat.json", picture).await;
-    assert!(status == 303 || status == 200, "anonymous public upload: {status} {body}");
+    let (status, body) = upload(
+        &client,
+        &base,
+        &anon,
+        "keep_public",
+        "public_pics",
+        "cat.json",
+        picture,
+    )
+    .await;
+    assert!(
+        status == 303 || status == 200,
+        "anonymous public upload: {status} {body}"
+    );
     let public_id = id_of(picture);
     assert_eq!(read(&client, &base, None, &public_id, None).await.0, 200);
-    assert_eq!(read(&client, &base, Some(&bob), &public_id, None).await.0, 200);
+    assert_eq!(
+        read(&client, &base, Some(&bob), &public_id, None).await.0,
+        200
+    );
 }

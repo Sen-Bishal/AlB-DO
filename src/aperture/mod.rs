@@ -7,19 +7,19 @@
 //!
 //! ## Phase status
 //!
-//! - **A0 · the client** ✅ — outbound HTTP, the shared response cache, request
-//!   coalescing, conditional requests, and the egress policy.
-//! - **A1 · the read path** ✅ — declared `sources`, `useSharedSlot(ops.status())`,
-//!   the refresh loop, and `.d.ts` codegen ([`typegen`]).
-//! - **A2 · the protocol and the server seam** ✅ — the journal, suspend/replay,
-//!   `await` lowering, and [`drive_workflow`] called from the action path. An
-//!   authored `await fetch(…)` inside a handler body runs to completion; see
-//!   `tests/aperture_workflow.rs` and the `hook_compile/fetching_handler`
-//!   fixture, which is deliberately verbatim copy-paste-shaped code.
-//! - **A2 · R1.3 hoisting** ❌ — there is no batching. Three independent GETs
-//!   cost 4 passes and 3 round trips.
-//! - **A3 · durable journal** ❌ — the journal is not persisted to FORGE, so
-//!   there is no crash recovery and no retry policy.
+//! - **A0 · the client** ✅ — outbound HTTP, the shared response cache, request coalescing,
+//!   conditional requests, and the egress policy.
+//! - **A1 · the read path** ✅ — declared `sources`, `useSharedSlot(ops.status())`, the refresh
+//!   loop, and `.d.ts` codegen ([`typegen`]).
+//! - **A2 · the protocol and the server seam** ✅ — the journal, suspend/replay, `await` lowering,
+//!   and [`drive_workflow`] called from the action path. An authored `await fetch(…)` inside a
+//!   handler body runs to completion; see `tests/aperture_workflow.rs` and the
+//!   `hook_compile/fetching_handler` fixture, which is deliberately verbatim copy-paste-shaped
+//!   code.
+//! - **A2 · R1.3 hoisting** ❌ — there is no batching. Three independent GETs cost 4 passes and 3
+//!   round trips.
+//! - **A3 · durable journal** ❌ — the journal is not persisted to FORGE, so there is no crash
+//!   recovery and no retry policy.
 //!
 //! ⚠️ **This header claimed "A0 only, no JS surface" long after A1 and A2 had
 //! landed**, and that stale sentence was copied into the public README as a
@@ -75,35 +75,34 @@ pub mod workflow;
 
 pub use bindings::{validate_source_bindings, SourceBinding, SourceBindingProblem};
 pub use declare::{
-    source_topic_name, AuthDecl, AuthScope, PathSegment, ResolvedSource, RouteDecl, SourceDecl,
-    SourceCredential, SourceCredentials, SourceRegistry, SourceRoute, SourceSchemaError,
-    DEFAULT_REFRESH,
+    source_topic_name, AuthDecl, AuthScope, PathSegment, ResolvedSource, RouteDecl,
+    SourceCredential, SourceCredentials, SourceDecl, SourceRegistry, SourceRoute,
+    SourceSchemaError, DEFAULT_REFRESH,
 };
-pub use ledger::{JournalLedger, DEFAULT_RETENTION, DEFAULT_SWEEP_INTERVAL};
 pub use journal::{
     Journal, JournalError, Step, StepKind, StepOutcome, DEFAULT_PASS_CAP, DEFAULT_STEP_CAP,
 };
+pub use ledger::{JournalLedger, DEFAULT_RETENTION, DEFAULT_SWEEP_INTERVAL};
 pub use reader::{SourceRead, SourceReadError, SourceReader, NO_EXTRA_HOSTS};
 pub use refresh::{
     refresh_topic, RefreshLoop, RefreshOutcome, RefreshReport, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TICK,
 };
 pub use typegen::emit_sources_dts;
-pub use workflow::{now_ms, Durability};
 pub use workflow::{
     drive_workflow, drive_workflow_admitting, resolve_pending, WorkflowError, WorkflowLimits,
-    DEFAULT_WORKFLOW_DEADLINE,
-    IDEMPOTENCY_KEY_HEADER,
+    DEFAULT_WORKFLOW_DEADLINE, IDEMPOTENCY_KEY_HEADER,
 };
+pub use workflow::{now_ms, Durability};
 
 pub use cache::{
     CacheHit, CacheScope, CachedResponse, Freshness, ResourceKey, ResponseCache, Validators,
     DEFAULT_RESPONSE_BUDGET,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use client::CountingTransport;
 pub use client::{
     ApertureClient, ApertureError, ApertureRequest, Disposition, FetchOutcome, Metrics,
     MetricsSnapshot, Transport, WireRequest, WireResponse, DEFAULT_REQUEST_TIMEOUT,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use client::CountingTransport;
 pub use egress::{AddressClass, EgressDenial, EgressMode, EgressPolicy};
 pub use transport::{ApertureResolver, ReqwestTransport};

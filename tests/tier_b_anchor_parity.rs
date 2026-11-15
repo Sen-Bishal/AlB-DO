@@ -68,7 +68,8 @@ fn rust_render(name: &str) -> (String, Vec<Instruction>) {
 }
 
 fn quickjs_render(name: &str) -> String {
-    let source = std::fs::read_to_string(fixture_dir(name).join(MODULE_SPEC)).expect("fixture read");
+    let source =
+        std::fs::read_to_string(fixture_dir(name).join(MODULE_SPEC)).expect("fixture read");
     let mut engine = QuickJsEngine::new();
     engine
         .init(&BootstrapPayload::default())

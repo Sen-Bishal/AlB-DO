@@ -48,6 +48,7 @@
 //! writes* — the 9.0 definition — rather than `package.json` names, and it is
 //! produced by the same function the build uses rather than a lookalike.
 
+use dom_render_compiler::bundler::npm::ShakeOptions;
 use dom_render_compiler::bundler::npm::{
     bundle_npm_dependency, is_bare_npm_specifier, scan_bare_imports, NpmBundleError,
     NpmDependencyBundle,
@@ -55,7 +56,6 @@ use dom_render_compiler::bundler::npm::{
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use dom_render_compiler::bundler::npm::ShakeOptions;
 
 /// The option set the server actually bundles with (`bundle_project_npm_dependencies`).
 ///
@@ -621,7 +621,6 @@ fn render_report(probes: &[Probe]) -> String {
     out
 }
 
-
 /// Regenerate the projects manifest by scanning a corpus root.
 ///
 /// Each immediate subdirectory that contains a `node_modules` is one project.
@@ -666,10 +665,7 @@ fn generate_npm_coverage_manifest() {
 
     let json = serde_json::to_string_pretty(&projects).expect("manifest serializes");
     std::fs::write(&out_path, json).unwrap_or_else(|err| panic!("write '{out_path}': {err}"));
-    eprintln!(
-        "wrote {} projects to {out_path}",
-        projects.len()
-    );
+    eprintln!("wrote {} projects to {out_path}", projects.len());
 }
 
 /// Every directory at or under `dir` that owns a `node_modules`, not descending
@@ -701,7 +697,14 @@ fn collect_projects(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
 /// project's own code* imports.
 fn scan_sources(dir: &Path, sites: &mut BTreeMap<String, u32>) {
     const SKIP: [&str; 8] = [
-        "node_modules", ".git", "dist", "build", ".next", "out", "coverage", ".turbo",
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        ".next",
+        "out",
+        "coverage",
+        ".turbo",
     ];
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

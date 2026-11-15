@@ -105,15 +105,19 @@ pub struct DevConfig {
 /// # Errors
 /// What is wrong with the entry.
 pub fn parse_redirect_origin(raw: &str) -> Result<String, String> {
-    let url = url::Url::parse(raw.trim())
-        .map_err(|_| format!("`{raw}` is not a URL; write an origin like \"https://checkout.example.com\""))?;
+    let url = url::Url::parse(raw.trim()).map_err(|_| {
+        format!("`{raw}` is not a URL; write an origin like \"https://checkout.example.com\"")
+    })?;
     if url.scheme() != "https" {
         return Err(format!("`{raw}` must be https"));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(format!("`{raw}` must not carry credentials"));
     }
-    if (url.path() != "/" && !url.path().is_empty()) || url.query().is_some() || url.fragment().is_some() {
+    if (url.path() != "/" && !url.path().is_empty())
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err(format!(
             "`{raw}` must be an origin only — no path, query or fragment; the whole origin is \
              allowed either way"
@@ -229,7 +233,8 @@ impl DevConfig {
         }
 
         for origin in &self.redirects {
-            parse_redirect_origin(origin).map_err(|err| format!("invalid `redirects` entry: {err}"))?;
+            parse_redirect_origin(origin)
+                .map_err(|err| format!("invalid `redirects` entry: {err}"))?;
         }
         // Structure only: whether the secret is set is the machine's business,
         // and whether the job exists is checked at boot, against src/jobs.ts.
@@ -314,8 +319,9 @@ impl DevWatchConfig {
         self.ignore
             .iter()
             .map(|pattern| {
-                glob::Pattern::new(pattern)
-                    .map_err(|err| format!("watch.ignore pattern \"{pattern}\" is not a valid glob: {err}"))
+                glob::Pattern::new(pattern).map_err(|err| {
+                    format!("watch.ignore pattern \"{pattern}\" is not a valid glob: {err}")
+                })
             })
             .collect::<Result<Vec<_>, _>>()
             .map(|patterns| WatchIgnore { patterns })
@@ -406,7 +412,6 @@ pub enum HmrTransport {
     WebSocket,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HotSetRegistration {
@@ -425,7 +430,6 @@ pub enum HotSetPriority {
     High,
     Critical,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -465,8 +469,7 @@ impl StaticSliceConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DevCliOptions {
     pub root_override: Option<PathBuf>,
     /// The **project** directory — where `albedo.config.*` is looked for and
@@ -492,7 +495,6 @@ pub struct DevCliOptions {
     pub verbose: bool,
     pub print_contract: bool,
 }
-
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ResolvedDevContract {
@@ -747,12 +749,12 @@ pub fn resolve_dev_contract(
     // Detected only when the author declared no root — a declared one is
     // authoritative and must not be second-guessed by a heuristic. Computed
     // before the entry because the two are one fact: see `SourceLayout`.
-    let detected = if declared_root.is_none() && cli.entry_override.is_none() && config.entry.is_none()
-    {
-        detect_source_layout(&project_dir)
-    } else {
-        None
-    };
+    let detected =
+        if declared_root.is_none() && cli.entry_override.is_none() && config.entry.is_none() {
+            detect_source_layout(&project_dir)
+        } else {
+            None
+        };
 
     let root_input = match (&declared_root, &detected) {
         (Some(root), _) => root.clone(),
@@ -818,7 +820,8 @@ pub fn resolve_dev_contract(
                 project_dir.display(),
                 loaded
                     .config_path
-                    .as_ref().map_or_else(|| DEV_CONFIG_JSON.to_string(), |p| p.display().to_string())
+                    .as_ref()
+                    .map_or_else(|| DEV_CONFIG_JSON.to_string(), |p| p.display().to_string())
             )
         })?
     };
@@ -1115,10 +1118,7 @@ fn resolve_entry_path(project_dir: &Path, root: &Path, entry: &str) -> Option<(S
     let canonical_root = root.canonicalize().ok()?;
     let canonical_entry = from_project.canonicalize().ok()?;
     let relative = canonical_entry.strip_prefix(&canonical_root).ok()?;
-    Some((
-        relative.to_string_lossy().replace('\\', "/"),
-        from_project,
-    ))
+    Some((relative.to_string_lossy().replace('\\', "/"), from_project))
 }
 
 /// Find an entry inside a root the author *did* declare.
@@ -1210,7 +1210,8 @@ fn load_dev_config(cwd: &Path, explicit_path: Option<&Path>) -> Result<LoadedDev
             cwd.join(path)
         };
         let project_dir = full_path
-            .parent().map_or_else(|| cwd.to_path_buf(), Path::to_path_buf);
+            .parent()
+            .map_or_else(|| cwd.to_path_buf(), Path::to_path_buf);
         let config = parse_dev_config_file(&full_path)?;
         return Ok(LoadedDevConfig {
             config,
@@ -1564,9 +1565,17 @@ mod tests {
     #[test]
     fn the_bind_address_is_flag_then_environment_then_config() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| (*v).to_string())
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_string())
+            }
         };
-        let from_config = || super::DevServerConfig { host: "10.0.0.1".to_string(), port: 4000 };
+        let from_config = || super::DevServerConfig {
+            host: "10.0.0.1".to_string(),
+            port: 4000,
+        };
 
         // Nothing set: the config file stands.
         let mut server = from_config();
@@ -1577,7 +1586,10 @@ mod tests {
         let mut server = from_config();
         super::layer_server_bind(
             &mut server,
-            env(&[("ALBEDO_SERVER_HOST", "0.0.0.0"), ("ALBEDO_SERVER_PORT", "5477")]),
+            env(&[
+                ("ALBEDO_SERVER_HOST", "0.0.0.0"),
+                ("ALBEDO_SERVER_PORT", "5477"),
+            ]),
             None,
             None,
         )
@@ -1588,7 +1600,10 @@ mod tests {
         let mut server = from_config();
         super::layer_server_bind(
             &mut server,
-            env(&[("ALBEDO_SERVER_HOST", "0.0.0.0"), ("ALBEDO_SERVER_PORT", "5477")]),
+            env(&[
+                ("ALBEDO_SERVER_HOST", "0.0.0.0"),
+                ("ALBEDO_SERVER_PORT", "5477"),
+            ]),
             None,
             Some(3001),
         )
@@ -1596,13 +1611,23 @@ mod tests {
         assert_eq!((server.host.as_str(), server.port), ("0.0.0.0", 3001));
 
         let mut server = from_config();
-        let err = super::layer_server_bind(&mut server, env(&[("ALBEDO_SERVER_PORT", "eighty")]), None, None)
-            .unwrap_err();
+        let err = super::layer_server_bind(
+            &mut server,
+            env(&[("ALBEDO_SERVER_PORT", "eighty")]),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("ALBEDO_SERVER_PORT"), "{err}");
         // …and a malformed variable is not an error when a flag makes it moot.
         let mut server = from_config();
-        super::layer_server_bind(&mut server, env(&[("ALBEDO_SERVER_PORT", "eighty")]), None, Some(3001))
-            .unwrap();
+        super::layer_server_bind(
+            &mut server,
+            env(&[("ALBEDO_SERVER_PORT", "eighty")]),
+            None,
+            Some(3001),
+        )
+        .unwrap();
         assert_eq!(server.port, 3001);
     }
 
@@ -1772,7 +1797,8 @@ export default defineConfig({
         };
         let ignore = watch.ignore_matcher().expect("valid globs");
         let project = Path::new("/work/app");
-        let at = |relative: &str| project.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let at =
+            |relative: &str| project.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
 
         assert!(ignore.ignores(project, &at(".git/index")));
         assert!(ignore.ignores(project, &at("src/node_modules/pkg/index.js")));
@@ -1780,9 +1806,15 @@ export default defineConfig({
             ignore.ignores(project, &at("src/node_modules")),
             "creating the ignored directory itself must not rebuild"
         );
-        assert!(!ignore.ignores(project, &at("src")), "an ancestor of ignored paths is not ignored");
+        assert!(
+            !ignore.ignores(project, &at("src")),
+            "an ancestor of ignored paths is not ignored"
+        );
         assert!(ignore.ignores(project, &at("src/draft.tmp")));
-        assert!(!ignore.ignores(project, &at("src/routes/draft.tmp")), "`*` stays in one directory");
+        assert!(
+            !ignore.ignores(project, &at("src/routes/draft.tmp")),
+            "`*` stays in one directory"
+        );
         assert!(!ignore.ignores(project, &at("src/routes/index.tsx")));
         assert!(
             !ignore.ignores(project, Path::new("/elsewhere/.git/index")),
@@ -1793,7 +1825,9 @@ export default defineConfig({
             debounce_ms: 75,
             ignore: vec!["src/[".to_string()],
         };
-        let err = broken.validate().expect_err("an unclosed class is not a glob");
+        let err = broken
+            .validate()
+            .expect_err("an unclosed class is not a glob");
         assert!(err.contains("src/["), "{err}");
     }
 
@@ -1804,7 +1838,11 @@ export default defineConfig({
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("src");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("App.tsx"), "export default function App(){return null;}").unwrap();
+        std::fs::write(
+            root.join("App.tsx"),
+            "export default function App(){return null;}",
+        )
+        .unwrap();
         let write = |body: &str| {
             std::fs::write(temp.path().join(DEV_CONFIG_TS), format!(
                 "export default {{ contract_version: 1, root: \"src\", entry: \"App.tsx\", {body} }};"
@@ -1887,16 +1925,31 @@ export default defineConfig({
     fn every_known_layout_resolves_its_own_shape() {
         let cases: &[(&str, &str, &str, &str)] = &[
             // (label, file to place, expected layout name, expected entry)
-            ("albedo", "src/routes/index.tsx", "ALBEDO", "routes/index.tsx"),
+            (
+                "albedo",
+                "src/routes/index.tsx",
+                "ALBEDO",
+                "routes/index.tsx",
+            ),
             ("albedo-legacy", "src/App.tsx", "ALBEDO", "App.tsx"),
-            ("albedo-flat", "routes/index.tsx", "ALBEDO (flat)", "routes/index.tsx"),
+            (
+                "albedo-flat",
+                "routes/index.tsx",
+                "ALBEDO (flat)",
+                "routes/index.tsx",
+            ),
             (
                 "next-app-src",
                 "src/app/page.tsx",
                 "Next.js App Router (src/)",
                 "app/page.tsx",
             ),
-            ("next-app", "app/page.tsx", "Next.js App Router", "app/page.tsx"),
+            (
+                "next-app",
+                "app/page.tsx",
+                "Next.js App Router",
+                "app/page.tsx",
+            ),
             (
                 "next-pages-src",
                 "src/pages/index.tsx",

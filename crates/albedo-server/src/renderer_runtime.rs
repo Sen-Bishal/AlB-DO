@@ -1,5 +1,8 @@
 use crate::config::RendererConfig;
 use crate::error::RuntimeError;
+use dom_render_compiler::bundler::client_npm::{
+    build_client_npm_graph, ClientIsland, ClientNpmGraph, CLIENT_NPM_RUNTIME_URL,
+};
 use dom_render_compiler::bundler::emit::{
     BUNDLE_PRECOMPILED_MODULES_FILENAME, BUNDLE_ROUTE_PREFETCH_MANIFEST_FILENAME,
     BUNDLE_STATIC_SLICES_FILENAME,
@@ -18,9 +21,6 @@ use dom_render_compiler::manifest::schema::{
     ComponentManifestEntry, HydrationMode, PrecompiledRuntimeModulesArtifact, RenderManifestV2,
 };
 use dom_render_compiler::runtime::engine::BootstrapPayload;
-use dom_render_compiler::bundler::client_npm::{
-    build_client_npm_graph, ClientIsland, ClientNpmGraph, CLIENT_NPM_RUNTIME_URL,
-};
 use dom_render_compiler::runtime::quickjs_engine::{
     compile_client_island_module_with_npm, ClientNpmBindings, QuickJsEngine,
 };
@@ -351,18 +351,17 @@ impl RendererRuntime {
         //
         // Three independent reasons it could not have worked:
         //
-        // 1. **The key is a category error.** `routes` is keyed by URL path
-        //    (`/`, `/room/[id]`); the module registry is keyed by module
-        //    specifier (an absolute path to `routes/index.tsx`). No route path
-        //    is ever a registry key, so `resolve_topological_order` rejects the
-        //    first one and `?` aborts the loop — zero routes were primed, ever.
-        // 2. **Nothing reads that cache.** The concurrent request path never
-        //    touches QuickJS; it serves the baked manifest through
-        //    `StreamingAppState` with the hydration map built once at boot.
-        //    `RendererRuntime::render_route_stream` had zero callers.
-        // 3. **The cache does not survive.** `AlbedoServerBuilder::build` holds
-        //    this `RendererRuntime` in a local, takes what it needs into `Arc`s,
-        //    and drops it on return. Anything warmed here dies with it.
+        // 1. **The key is a category error.** `routes` is keyed by URL path (`/`, `/room/[id]`);
+        //    the module registry is keyed by module specifier (an absolute path to
+        //    `routes/index.tsx`). No route path is ever a registry key, so
+        //    `resolve_topological_order` rejects the first one and `?` aborts the loop — zero
+        //    routes were primed, ever.
+        // 2. **Nothing reads that cache.** The concurrent request path never touches QuickJS; it
+        //    serves the baked manifest through `StreamingAppState` with the hydration map built
+        //    once at boot. `RendererRuntime::render_route_stream` had zero callers.
+        // 3. **The cache does not survive.** `AlbedoServerBuilder::build` holds this
+        //    `RendererRuntime` in a local, takes what it needs into `Arc`s, and drops it on return.
+        //    Anything warmed here dies with it.
         //
         // So the loop was residue from an architecture where a request rendered
         // its route through the engine by route entry. Removing it changes no
@@ -436,13 +435,13 @@ impl RendererRuntime {
     /// Returns how many artifacts were refused; each is logged with its key.
     /// Must be called before [`Self::build_hydration_blocks`], which renders
     /// every island.
-    pub fn install_npm_bundles(
-        &mut self,
-        artifacts: &[(String, String, u64)],
-    ) -> usize {
+    pub fn install_npm_bundles(&mut self, artifacts: &[(String, String, u64)]) -> usize {
         let mut failed = 0usize;
         for (key, script, source_hash) in artifacts {
-            if let Err(err) = self.renderer.register_npm_artifact(key, script, *source_hash) {
+            if let Err(err) = self
+                .renderer
+                .register_npm_artifact(key, script, *source_hash)
+            {
                 failed += 1;
                 tracing::warn!(
                     target: "albedo.renderer",
@@ -779,11 +778,12 @@ impl RendererRuntime {
                 // won't match the project-relative module specs). T-0044: by
                 // module path as well as name, so two same-named islands in
                 // different modules each find their own entry.
-                let Some(entry) = index
-                    .get(&node.component_id, node.component_key)
-                    .and_then(|component| {
-                        compiled.module_spec_for(&component.module_path, &component.name)
-                    })
+                let Some(entry) =
+                    index
+                        .get(&node.component_id, node.component_key)
+                        .and_then(|component| {
+                            compiled.module_spec_for(&component.module_path, &component.name)
+                        })
                 else {
                     continue;
                 };
@@ -857,7 +857,6 @@ impl RendererRuntime {
     /// source is missing is skipped (it falls back to the registry's loud
     /// "no plan" error at request time rather than rendering wrong HTML).
     #[must_use]
-    ///
     /// `compiled` supplies each component's `useSharedSlot` topics, which the
     /// render manifest does not carry. Passing `None` yields plans with no
     /// shared topics — every component still renders, but any that reads a
@@ -913,7 +912,15 @@ impl RendererRuntime {
             {
                 let (name, key) =
                     dom_render_compiler::manifest::schema::split_qualified_component_name(stored);
-                self.add_component_to_plan(&mut plan, &index, &island_modules, compiled, stored, name, key);
+                self.add_component_to_plan(
+                    &mut plan,
+                    &index,
+                    &island_modules,
+                    compiled,
+                    stored,
+                    name,
+                    key,
+                );
             }
 
             // Every island, under its own key, so a request whose props differ
@@ -933,10 +940,12 @@ impl RendererRuntime {
                     &index,
                     &no_client_references,
                     compiled,
-                    &island_plan_key(&dom_render_compiler::manifest::schema::qualified_component_name(
-                        &node.component_id,
-                        node.component_key,
-                    )),
+                    &island_plan_key(
+                        &dom_render_compiler::manifest::schema::qualified_component_name(
+                            &node.component_id,
+                            node.component_key,
+                        ),
+                    ),
                     &node.component_id,
                     node.component_key,
                 );
@@ -969,7 +978,10 @@ impl RendererRuntime {
     /// missing is logged and skipped (it then surfaces as the registry's loud
     /// "no plan" error at request time rather than rendering wrong HTML).
     /// Idempotent per `key`.
-    #[allow(clippy::too_many_arguments, reason = "private; plan accumulators by reference")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "private; plan accumulators by reference"
+    )]
     fn add_component_to_plan(
         &self,
         plan: &mut crate::render::tier_b::TierBRenderPlan,
@@ -1008,7 +1020,8 @@ impl RendererRuntime {
         // the same reason: boot knows the spec, and only the request knows the
         // params that turn it into a topic.
         let (shared_topics, shared_partitions, shared_sources) = match compiled {
-            Some(project) => match project.module_spec_for(&component.module_path, &component.name) {
+            Some(project) => match project.module_spec_for(&component.module_path, &component.name)
+            {
                 Some(spec) => (
                     project.shared_slot_topics_for_entry(spec),
                     project.shared_slot_partitions_for_entry(spec),
@@ -1077,17 +1090,17 @@ impl RendererRuntime {
         // can take the single-row fast path for `PerRecord` collections. Every
         // module in the entry's load set is classified and merged conservatively:
         // a topic mapped in more than one place collapses to its safest class.
-        let mut shared_topic_classes: HashMap<String, dom_render_compiler::transforms::shared_slot_lists::RowProjection> =
-            HashMap::new();
+        let mut shared_topic_classes: HashMap<
+            String,
+            dom_render_compiler::transforms::shared_slot_lists::RowProjection,
+        > = HashMap::new();
         // PRISM · a component that reads only partitions has an empty
         // `shared_topics`, so gating on that alone skipped classification
         // entirely — the collection fell back to `WholeView` and every write
         // re-rendered the whole room. The same shape of mistake as
         // `route_needs_live_lane`: asking about the static list when the
         // question is "does this component read anything live".
-        if !shared_topics.is_empty()
-            || !shared_partitions.is_empty()
-            || !shared_sources.is_empty()
+        if !shared_topics.is_empty() || !shared_partitions.is_empty() || !shared_sources.is_empty()
         {
             for (specifier, code) in &modules {
                 for (topic, class) in
@@ -1116,7 +1129,9 @@ impl RendererRuntime {
                     .iter()
                     .find(|candidate| &candidate.module_path == specifier)
                 {
-                    if let Some(spec) = project.module_spec_for(&component.module_path, &component.name) {
+                    if let Some(spec) =
+                        project.module_spec_for(&component.module_path, &component.name)
+                    {
                         stamp_specs.insert(specifier.clone(), spec.to_string());
                     }
                 }
@@ -1153,7 +1168,11 @@ impl RendererRuntime {
     ///
     /// `props` is `Value::Null` for an island nobody passed anything, which
     /// lowers to `{}` — the historical behaviour, and still the right one.
-    fn render_island_html(&mut self, module_path: &str, props: &serde_json::Value) -> Option<String> {
+    fn render_island_html(
+        &mut self,
+        module_path: &str,
+        props: &serde_json::Value,
+    ) -> Option<String> {
         let props_json = match props {
             serde_json::Value::Null => "{}".to_string(),
             other => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
@@ -1241,12 +1260,13 @@ fn load_module_sources(
         let resolved = resolve_portable_module_path(&component.module_path, &project_root);
         // A Markdown page registers as the JSX module it lowers to, exactly as the
         // build saw it — the engine cannot execute Markdown.
-        let source = dom_render_compiler::markdown::read_module_source(&resolved).map_err(|err| {
-            RuntimeError::RendererArtifactIo {
-                path: resolved.display().to_string(),
-                message: err.to_string(),
-            }
-        })?;
+        let source =
+            dom_render_compiler::markdown::read_module_source(&resolved).map_err(|err| {
+                RuntimeError::RendererArtifactIo {
+                    path: resolved.display().to_string(),
+                    message: err.to_string(),
+                }
+            })?;
         module_sources.insert(component.module_path.clone(), source);
     }
 
@@ -1460,24 +1480,43 @@ export default function Page() {
         let mut hydration = HashMap::new();
         hydration.insert(
             "/page".to_string(),
-            block(&[("__c_island_1", "<a>hydrated</a>")], "<script>client</script>"),
+            block(
+                &[("__c_island_1", "<a>hydrated</a>")],
+                "<script>client</script>",
+            ),
         );
 
         let mut reactive = HashMap::new();
         reactive.insert(
             "/page".to_string(),
-            block(&[("__c_island_2", "<b>wired</b>")], "<script>driver</script>"),
+            block(
+                &[("__c_island_2", "<b>wired</b>")],
+                "<script>driver</script>",
+            ),
         );
 
         let merged = merge_island_blocks(hydration, reactive);
         let route = &merged["/page"];
 
-        let ids: Vec<&str> = route.placeholders.iter().map(|(id, _)| id.as_str()).collect();
-        assert!(ids.contains(&"__c_island_1"), "A3 island survives the merge");
-        assert!(ids.contains(&"__c_island_2"), "serve-wired island survives the merge");
+        let ids: Vec<&str> = route
+            .placeholders
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"__c_island_1"),
+            "A3 island survives the merge"
+        );
+        assert!(
+            ids.contains(&"__c_island_2"),
+            "serve-wired island survives the merge"
+        );
         assert_eq!(route.placeholders.len(), 2, "no placeholder dropped");
         assert!(route.closing_scripts.contains("client"), "A3 scripts kept");
-        assert!(route.closing_scripts.contains("driver"), "reactive scripts kept");
+        assert!(
+            route.closing_scripts.contains("driver"),
+            "reactive scripts kept"
+        );
     }
 
     /// Routes present in only one map pass through untouched, in either direction.

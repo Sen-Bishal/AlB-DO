@@ -76,16 +76,16 @@ pub mod manifest;
 pub mod markdown;
 pub mod middleware;
 pub mod parser;
-pub mod routing;
 pub mod preflight;
+pub mod routing;
 pub mod runtime;
 pub mod scanner;
 pub mod shutter;
+/// `albedo test`: which files are tests, and the realm a test file runs in.
+pub mod testing;
 pub mod transforms;
 pub mod types;
 pub mod upload;
-/// `albedo test`: which files are tests, and the realm a test file runs in.
-pub mod testing;
 /// Inbound webhooks: a provider's signed POST, verified and queued as a job.
 pub mod webhook;
 
@@ -515,14 +515,13 @@ impl RenderCompiler {
                         if changes.new_files.contains(&file_path) {
                             if let Some(analysis) = new_analyses.get(&comp_id) {
                                 analyses.insert(comp_id, analysis.clone());
-                                if let Err(e) = cache.cache_analysis(
-                                    component,
-                                    analysis.clone(),
-                                    file_path,
-                                ) {
+                                if let Err(e) =
+                                    cache.cache_analysis(component, analysis.clone(), file_path)
+                                {
                                     tracing::warn!(
                                         "Warning: Failed to cache new component {:?}: {}",
-                                        comp_id, e
+                                        comp_id,
+                                        e
                                     );
                                 }
                             }
@@ -598,7 +597,9 @@ impl RenderCompiler {
 
     /// Returns a snapshot of cache performance metrics, or `None` if caching is disabled.
     pub fn cache_stats(&self) -> Option<incremental::CacheStats> {
-        self.cache.as_ref().map(incremental::IncrementalCache::get_stats)
+        self.cache
+            .as_ref()
+            .map(incremental::IncrementalCache::get_stats)
     }
 
     fn build_tier_report(&self, options: &manifest::ManifestOptions) -> TierReport {
@@ -679,8 +680,8 @@ impl RenderCompiler {
 ///
 /// The vocabulary, fixed once, matching `bin/albedo/printer.rs`:
 /// - **A** — static markup, zero JS.
-/// - **B** — server-rendered markup, **zero component JS**; updates arrive as
-///   opcodes over the wire.
+/// - **B** — server-rendered markup, **zero component JS**; updates arrive as opcodes over the
+///   wire.
 /// - **C** — ships a compiled client island.
 ///
 /// ⚠️ **These messages describe the signal the classifier actually used, not the

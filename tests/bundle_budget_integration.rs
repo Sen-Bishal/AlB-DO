@@ -5,11 +5,9 @@
 //! the bundle-budget evaluator. Covers:
 //!
 //!   1. A small Tier-B component passes the 1 KB default ceiling.
-//!   2. A Tier-B component pumped past the ceiling triggers a
-//!      `TierBBundleKbPerComponent` violation with the actionable
-//!      diff text the sprint plan's demo asks for.
-//!   3. Bumping the per-component ceiling via the config relaxes
-//!      the gate.
+//!   2. A Tier-B component pumped past the ceiling triggers a `TierBBundleKbPerComponent` violation
+//!      with the actionable diff text the sprint plan's demo asks for.
+//!   3. Bumping the per-component ceiling via the config relaxes the gate.
 
 use dom_render_compiler::budget::{
     compute_bundle_byte_report, evaluate_bundle_budget, format_report_pretty, BudgetDefaults,
@@ -131,7 +129,10 @@ fn oversized_tier_b_wrapper_trips_bundle_ceiling_with_actionable_diff() {
         pretty.contains("tier-b component bundle exceeded"),
         "expected the bundle ceiling label, got:\n{pretty}"
     );
-    assert!(pretty.contains("BloatedIsland"), "expected component name in diff");
+    assert!(
+        pretty.contains("BloatedIsland"),
+        "expected component name in diff"
+    );
     assert!(
         pretty.contains("Move heavy imports in BloatedIsland to Tier-C"),
         "expected the actionable hint, got:\n{pretty}"

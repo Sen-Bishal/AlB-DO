@@ -2,15 +2,14 @@
 //!
 //! Two trait types live here, deliberately separated:
 //!
-//! * [`RenderObserver`] sees one event per component render in the **compile-time**
-//!   evaluator (`ComponentProject::render_local`). It carries the cascade chain
-//!   collected from a thread-local stack — when component `A` calls into `B`
-//!   during its render, `B` is recorded as a cascade child of `A` before its
-//!   own frame opens. Request-time renders that cross an `.await` report
+//! * [`RenderObserver`] sees one event per component render in the **compile-time** evaluator
+//!   (`ComponentProject::render_local`). It carries the cascade chain collected from a thread-local
+//!   stack — when component `A` calls into `B` during its render, `B` is recorded as a cascade
+//!   child of `A` before its own frame opens. Request-time renders that cross an `.await` report
 //!   through [`publish_render`] instead, without a cascade.
-//! * [`LaneObserver`] sees one event per **runtime** [`super::frame::frame_tick`]
-//!   call. It exposes the per-lane patch counts and bytes the muxer just
-//!   shipped, which the dev inspector renders as a lane-utilization heatmap.
+//! * [`LaneObserver`] sees one event per **runtime** [`super::frame::frame_tick`] call. It exposes
+//!   the per-lane patch counts and bytes the muxer just shipped, which the dev inspector renders as
+//!   a lane-utilization heatmap.
 //!
 //! Both observers are installed via process-wide [`OnceLock`]s. The publish path
 //! is `OnceLock::get()` + an `Option::is_some` check when no observer is
@@ -108,9 +107,7 @@ pub fn install_render_observer(
 
 /// Installs a process-wide lane observer. Same one-shot semantics as
 /// [`install_render_observer`].
-pub fn install_lane_observer(
-    observer: Arc<dyn LaneObserver>,
-) -> Result<(), Arc<dyn LaneObserver>> {
+pub fn install_lane_observer(observer: Arc<dyn LaneObserver>) -> Result<(), Arc<dyn LaneObserver>> {
     LANE_OBSERVER.set(observer)
 }
 
@@ -267,11 +264,7 @@ mod tests {
         // share the recorder in sequence on whatever thread the harness gives
         // them, the thread id because the rest of the suite shares it in
         // parallel.
-        let baseline = active
-            .events
-            .lock()
-            .map(|events| events.len())
-            .unwrap_or(0);
+        let baseline = active.events.lock().map(|events| events.len()).unwrap_or(0);
         let this_thread = std::thread::current().id();
         let result = f(active);
         let new_events = active
@@ -337,7 +330,10 @@ mod tests {
         // Children publish first (drop order is reverse), then the parent.
         let names: Vec<&str> = events.iter().map(|e| e.component_name.as_str()).collect();
         assert_eq!(names, vec!["ChildA", "ChildB", "Parent"]);
-        let parent = events.iter().find(|e| e.component_name == "Parent").unwrap();
+        let parent = events
+            .iter()
+            .find(|e| e.component_name == "Parent")
+            .unwrap();
         assert_eq!(parent.cascade_children, vec!["ChildA", "ChildB"]);
     }
 

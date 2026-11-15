@@ -243,8 +243,8 @@ pub fn substitute_return_path_in_html(html: &str, path: &str) -> String {
 /// come for free, with the author writing nothing:
 ///
 /// * `F5` → *resend?* replays this same field, so the workflow **resumes**;
-/// * a second deliberate submit comes from a fresh render with a fresh token,
-///   so it correctly starts its own.
+/// * a second deliberate submit comes from a fresh render with a fresh token, so it correctly
+///   starts its own.
 ///
 /// The value is never trusted as an identity — it is hashed together with the
 /// action and the **principal** before it names anything
@@ -302,18 +302,16 @@ pub fn read_session_cookie(headers: &HeaderMap) -> Option<SessionId> {
 
 /// Build a `Set-Cookie` header value that pins the tab session to
 /// the supplied [`SessionId`]. Attributes:
-///   * `Path=/` — every route on the origin sees the cookie, and the
-///     `__Host-` prefix requires exactly this value.
-///   * `HttpOnly` — JavaScript can't read it, so token leakage via
-///     XSS doesn't directly compromise the CSRF surface.
-///   * `Secure` — required by the `__Host-` prefix, and correct
-///     regardless. A cookie that also rides plain HTTP is one a
-///     network attacker can both read and overwrite.
-///   * `SameSite=Lax` — sent on top-level same-site navigations but
-///     not on cross-site POSTs, which is exactly the threat CSRF
-///     tokens guard against.
-///   * No `Domain` — also required by `__Host-`, and the half of the
-///     prefix that actually closes sibling-subdomain cookie tossing.
+///   * `Path=/` — every route on the origin sees the cookie, and the `__Host-` prefix requires
+///     exactly this value.
+///   * `HttpOnly` — JavaScript can't read it, so token leakage via XSS doesn't directly compromise
+///     the CSRF surface.
+///   * `Secure` — required by the `__Host-` prefix, and correct regardless. A cookie that also
+///     rides plain HTTP is one a network attacker can both read and overwrite.
+///   * `SameSite=Lax` — sent on top-level same-site navigations but not on cross-site POSTs, which
+///     is exactly the threat CSRF tokens guard against.
+///   * No `Domain` — also required by `__Host-`, and the half of the prefix that actually closes
+///     sibling-subdomain cookie tossing.
 ///
 /// The cookie is session-scoped (no `Max-Age` / `Expires`) so it
 /// rolls when the browser closes — matches the lifetime semantics
@@ -449,7 +447,8 @@ mod tests {
 
     #[test]
     fn substitute_csrf_token_fills_empty_value_placeholder() {
-        let rendered = r#"<form><input type="hidden" name="_csrf" value="" data-albedo-csrf /></form>"#;
+        let rendered =
+            r#"<form><input type="hidden" name="_csrf" value="" data-albedo-csrf /></form>"#;
         let out = substitute_csrf_token_in_html(rendered, "abc123");
         assert!(out.contains("value=\"abc123\" data-albedo-csrf"));
         assert!(!out.contains("value=\"\" data-albedo-csrf"));
@@ -481,15 +480,35 @@ mod tests {
         let submitting = SessionId::random();
         let _ = registry.token_for(idle);
         let token = registry.token_for(submitting);
-        registry.tokens.get(&idle).unwrap().seen_ms.store(0, Ordering::Relaxed);
-        registry.tokens.get(&submitting).unwrap().seen_ms.store(0, Ordering::Relaxed);
+        registry
+            .tokens
+            .get(&idle)
+            .unwrap()
+            .seen_ms
+            .store(0, Ordering::Relaxed);
+        registry
+            .tokens
+            .get(&submitting)
+            .unwrap()
+            .seen_ms
+            .store(0, Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(5));
         registry.validate(submitting, &token).expect("valid");
 
         assert_eq!(registry.evict_seen_before(1), 1);
-        assert!(matches!(registry.validate(idle, "anything"), Err(CsrfError::Missing)));
-        assert!(registry.validate(submitting, &token).is_ok(), "the used token survives");
-        assert_eq!(registry.token_for(submitting), token, "and is still the same token");
+        assert!(matches!(
+            registry.validate(idle, "anything"),
+            Err(CsrfError::Missing)
+        ));
+        assert!(
+            registry.validate(submitting, &token).is_ok(),
+            "the used token survives"
+        );
+        assert_eq!(
+            registry.token_for(submitting),
+            token,
+            "and is still the same token"
+        );
     }
 
     #[test]

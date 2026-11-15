@@ -3,10 +3,10 @@
 //! The compiler crate exposes two trait surfaces in
 //! `dom_render_compiler::runtime::render_observer`:
 //!
-//! * `RenderObserver::on_render(RenderInfo)` — fires once per finished compile-time
-//!   component render, with cascade children recorded from a thread-local stack.
-//! * `LaneObserver::on_frame(LaneFrameReport)` — fires once per runtime
-//!   `frame_tick`, with per-lane patch counts and bytes.
+//! * `RenderObserver::on_render(RenderInfo)` — fires once per finished compile-time component
+//!   render, with cascade children recorded from a thread-local stack.
+//! * `LaneObserver::on_frame(LaneFrameReport)` — fires once per runtime `frame_tick`, with per-lane
+//!   patch counts and bytes.
 //!
 //! [`InspectorPublisher`] implements both. It owns a handle on
 //! [`InspectorState`] and, from the build manifest, each component's graph
@@ -215,10 +215,8 @@ mod tests {
     #[test]
     fn events_carry_the_graph_node_id_from_the_manifest() {
         let inspector = Arc::new(InspectorState::new());
-        let publisher = InspectorPublisher::new(inspector.clone()).with_manifest(&manifest(&[
-            (11, "List", Tier::B),
-            (12, "Item", Tier::C),
-        ]));
+        let publisher = InspectorPublisher::new(inspector.clone())
+            .with_manifest(&manifest(&[(11, "List", Tier::B), (12, "Item", Tier::C)]));
         let mut events = inspector.subscribe();
 
         publisher.on_render(RenderInfo {
@@ -229,7 +227,10 @@ mod tests {
         });
         let event = events.try_recv().expect("the render was published");
         assert_eq!((event.component_id, event.tier), (11, EventTier::B));
-        assert_eq!(event.cascade_children[0], 12, "a cascade names the child's node");
+        assert_eq!(
+            event.cascade_children[0], 12,
+            "a cascade names the child's node"
+        );
         assert_eq!(
             event.cascade_children[1],
             component_id("Unlisted", ""),
@@ -250,7 +251,10 @@ mod tests {
         ]));
         assert_eq!(publisher.identify("Card", "x"), (3, EventTier::A));
         let (id, tier) = publisher.identify("Button", "src/a.tsx");
-        assert!(id != 1 && id != 2, "an ambiguous name must not claim a node");
+        assert!(
+            id != 1 && id != 2,
+            "an ambiguous name must not claim a node"
+        );
         assert_eq!(tier, EventTier::B);
     }
 

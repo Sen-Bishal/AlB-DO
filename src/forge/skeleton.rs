@@ -4,13 +4,12 @@
 //! It is now an owned, boot-built [`ForgeSchema`] — the seam every source of
 //! collections funnels through:
 //!
-//! - **today** — [`ForgeSchema::guestbook_default`], the built-in default that
-//!   reproduces the walking-skeleton guestbook byte-for-byte, so nothing that
-//!   depended on it changed;
-//! - **next (Phase 2)** — an app-declared schema (a `forge` block in the app's
-//!   config, or a schema file) parsed into [`ForgeCollection`]s;
-//! - **endgame (Pillar 1)** — escape analysis emitting the same
-//!   [`ForgeCollection`]s from the component's own `useSharedSlot` reads.
+//! - **today** — [`ForgeSchema::guestbook_default`], the built-in default that reproduces the
+//!   walking-skeleton guestbook byte-for-byte, so nothing that depended on it changed;
+//! - **next (Phase 2)** — an app-declared schema (a `forge` block in the app's config, or a schema
+//!   file) parsed into [`ForgeCollection`]s;
+//! - **endgame (Pillar 1)** — escape analysis emitting the same [`ForgeCollection`]s from the
+//!   component's own `useSharedSlot` reads.
 //!
 //! All three produce a `Vec<ForgeCollection>` and hand it to
 //! [`ForgeSchema::build`]; the *runtime* never learns which source it came from.
@@ -280,7 +279,10 @@ pub fn parse_order_by(query: &str) -> Box<[SortKey]> {
         if parts.next().is_some() {
             return Box::new([]);
         }
-        keys.push(SortKey { column: column.to_string(), dir });
+        keys.push(SortKey {
+            column: column.to_string(),
+            dir,
+        });
     }
     keys.into_boxed_slice()
 }
@@ -504,13 +506,11 @@ impl ForgeSchema {
             "guestbook",
             "SELECT id, author, message FROM guestbook ORDER BY id",
             "id",
-            Box::new([
-                "CREATE TABLE IF NOT EXISTS guestbook (\
+            Box::new(["CREATE TABLE IF NOT EXISTS guestbook (\
                      id INTEGER PRIMARY KEY AUTOINCREMENT, \
                      author TEXT NOT NULL, \
                      message TEXT NOT NULL)"
-                    .to_string(),
-            ]),
+                .to_string()]),
             Box::new([
                 SeedRow {
                     sql: "INSERT INTO guestbook (author, message) VALUES (?1, ?2)".to_string(),
@@ -778,7 +778,10 @@ mod schema_tests {
     }
 
     fn key(column: &str, dir: SortDir) -> SortKey {
-        SortKey { column: column.to_string(), dir }
+        SortKey {
+            column: column.to_string(),
+            dir,
+        }
     }
 
     #[test]
@@ -849,7 +852,9 @@ mod schema_tests {
         assert_eq!(gb.topic, "guestbook");
         // The lookup key IS the wire id, so resolving by it lands the same row.
         assert_eq!(
-            schema.resolve(broadcast_slot_id("guestbook")).map(|c| &c.topic),
+            schema
+                .resolve(broadcast_slot_id("guestbook"))
+                .map(|c| &c.topic),
             Some(&"guestbook".to_string())
         );
         assert!(schema.slot_for_topic("unknown").is_none());
@@ -857,12 +862,17 @@ mod schema_tests {
 
     #[test]
     fn the_id_spine_is_sorted_and_parallel_to_the_payload() {
-        let schema =
-            ForgeSchema::build(vec![coll("zeta", "zeta", "id"), coll("alpha", "alpha", "id")])
-                .unwrap();
+        let schema = ForgeSchema::build(vec![
+            coll("zeta", "zeta", "id"),
+            coll("alpha", "alpha", "id"),
+        ])
+        .unwrap();
         assert!(schema.ids.windows(2).all(|w| w[0] < w[1]), "spine sorted");
         for (i, id) in schema.ids.iter().enumerate() {
-            assert_eq!(*id, schema.collections[i].slot_id.0, "spine parallel to payload");
+            assert_eq!(
+                *id, schema.collections[i].slot_id.0,
+                "spine parallel to payload"
+            );
         }
     }
 
@@ -876,7 +886,10 @@ mod schema_tests {
         a.slot_id = SlotId(42);
         b.slot_id = SlotId(42);
         let err = ForgeSchema::build(vec![a, b]).unwrap_err();
-        assert!(matches!(err, ForgeSchemaError::SlotCollision { slot: 42, .. }));
+        assert!(matches!(
+            err,
+            ForgeSchemaError::SlotCollision { slot: 42, .. }
+        ));
     }
 
     #[test]
@@ -887,7 +900,10 @@ mod schema_tests {
         ));
         assert!(matches!(
             ForgeSchema::build(vec![coll("t", "t", "1; DELETE")]).unwrap_err(),
-            ForgeSchemaError::InvalidIdentifier { field: "key_column", .. }
+            ForgeSchemaError::InvalidIdentifier {
+                field: "key_column",
+                ..
+            }
         ));
     }
 
@@ -897,7 +913,10 @@ mod schema_tests {
         assert_eq!(schema.len(), 1);
         let gb = schema.slot_for_topic("guestbook").unwrap();
         assert_eq!(gb.key_column, "id");
-        assert_eq!(gb.query, "SELECT id, author, message FROM guestbook ORDER BY id");
+        assert_eq!(
+            gb.query,
+            "SELECT id, author, message FROM guestbook ORDER BY id"
+        );
         assert_eq!(gb.seed.len(), 2, "ada + alan");
     }
 }
@@ -995,9 +1014,12 @@ mod tests {
             ("flag", FieldSpec::nullable(FieldType::Bool)),
         ]);
         bootstrap_schema(&db, &schema).await.unwrap();
-        db.execute("INSERT INTO records (nickname, flag) VALUES (NULL, NULL)", &[])
-            .await
-            .unwrap();
+        db.execute(
+            "INSERT INTO records (nickname, flag) VALUES (NULL, NULL)",
+            &[],
+        )
+        .await
+        .unwrap();
 
         let collection = schema.slot_for_topic("records").expect("collection");
         let bytes = materialize_slot(&db, collection, None).await.unwrap();
@@ -1023,7 +1045,10 @@ mod tests {
         ]);
         let ddl = &schema.slot_for_topic("records").unwrap().migrations[0];
         assert!(ddl.contains("required TEXT NOT NULL"), "{ddl}");
-        assert!(ddl.contains("optional TEXT,") || ddl.contains("optional TEXT)"), "{ddl}");
+        assert!(
+            ddl.contains("optional TEXT,") || ddl.contains("optional TEXT)"),
+            "{ddl}"
+        );
         assert!(!ddl.contains("optional TEXT NOT NULL"), "{ddl}");
     }
 
@@ -1057,12 +1082,17 @@ mod tests {
             .expect("hydration registers the guestbook topic");
         let value: serde_json::Value =
             serde_json::from_slice(&topic.current_value()).expect("topic value is JSON");
-        let rows = value.as_array().expect("materialised value is a JSON array");
+        let rows = value
+            .as_array()
+            .expect("materialised value is a JSON array");
 
         assert_eq!(rows.len(), 2, "both seed rows materialised");
         assert_eq!(rows[0]["author"], "ada");
         assert_eq!(rows[0]["message"], "first light");
-        assert!(rows[0]["id"].is_number(), "id column carried through as a number");
+        assert!(
+            rows[0]["id"].is_number(),
+            "id column carried through as a number"
+        );
     }
 
     /// Build a partitioned collection the way the config path would.
@@ -1144,10 +1174,12 @@ mod tests {
                 // column; the leading ones are ids. Scan for the first text
                 // column rather than hard-coding an index, which differs across
                 // SQLite versions.
-                (0..8).filter_map(|idx| match row.get(idx) {
-                    Some(SqlValue::Text(text)) => Some(text.clone()),
-                    _ => None,
-                }).next()
+                (0..8)
+                    .filter_map(|idx| match row.get(idx) {
+                        Some(SqlValue::Text(text)) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .next()
             })
             .collect::<Vec<_>>()
             .join(" | ");

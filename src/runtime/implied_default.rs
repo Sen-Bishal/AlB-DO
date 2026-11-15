@@ -24,12 +24,11 @@
 //! Two independent lowerings decide what a module's default is, and **both
 //! run on the serve path**:
 //!
-//! * [`crate::runtime::eval::expr::parse_module`] → `ParsedModule::default_export`,
-//!   which the Tier-A evaluator renders through and which
-//!   `CompiledProject::routes_without_default_export` — the `preflight` refusal —
-//!   reads.
-//! * `quickjs_engine::lower_module_to_statements` → `__albedo_exports.default`,
-//!   which is what the **live `albedo serve` path** actually invokes.
+//! * [`crate::runtime::eval::expr::parse_module`] → `ParsedModule::default_export`, which the
+//!   Tier-A evaluator renders through and which `CompiledProject::routes_without_default_export` —
+//!   the `preflight` refusal — reads.
+//! * `quickjs_engine::lower_module_to_statements` → `__albedo_exports.default`, which is what the
+//!   **live `albedo serve` path** actually invokes.
 //!
 //! 🪤 **If those two disagree, the failure is silent in the worst direction:**
 //! preflight sees a default and passes the build, then `QuickJS` finds no

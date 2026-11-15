@@ -711,8 +711,11 @@ impl std::fmt::Display for AuthSchemaError {
                     .collect();
                 let kinds: Vec<&str> = ProviderKind::all()
                     .iter()
-                    .filter(|kind| served(**kind) && **kind != ProviderKind::Password
-                        && **kind != ProviderKind::MagicLink)
+                    .filter(|kind| {
+                        served(**kind)
+                            && **kind != ProviderKind::Password
+                            && **kind != ProviderKind::MagicLink
+                    })
                     .map(|kind| kind.as_str())
                     .collect();
                 write!(
@@ -907,7 +910,9 @@ impl AuthRegistry {
     /// Whether `role` is one this app declared.
     #[must_use]
     pub fn declares_role(&self, role: &str) -> bool {
-        self.roles.binary_search_by(|declared| declared.as_str().cmp(role)).is_ok()
+        self.roles
+            .binary_search_by(|declared| declared.as_str().cmp(role))
+            .is_ok()
     }
 
     /// Whether this app has any way to authenticate anyone.
@@ -919,9 +924,7 @@ impl AuthRegistry {
     /// Look a provider up by declared name.
     #[must_use]
     pub fn provider(&self, name: &str) -> Option<&ResolvedProvider> {
-        self.providers
-            .iter()
-            .find(|provider| provider.name == name)
+        self.providers.iter().find(|provider| provider.name == name)
     }
 
     /// Every host this block will talk to — the **egress allowlist** contribution.
@@ -1022,7 +1025,8 @@ impl AuthDeclaration {
     /// [`AuthSchemaError::UnprovenPasswordBesideMagicLink`].
     pub fn check_email_proof(&self) -> Result<(), AuthSchemaError> {
         let kind_of = |name: &str, decl: &ProviderDecl| {
-            decl.kind.or_else(|| preset_for(name).map(|preset| preset.kind))
+            decl.kind
+                .or_else(|| preset_for(name).map(|preset| preset.kind))
         };
         let Some(magic) = self
             .providers
@@ -1051,9 +1055,8 @@ impl AuthDeclaration {
     /// message is stable across builds.
     pub fn lower(&self) -> Result<AuthRegistry, AuthSchemaError> {
         let session_ttl = match &self.session.ttl {
-            Some(raw) => parse_duration(raw).ok_or_else(|| AuthSchemaError::InvalidTtl {
-                value: raw.clone(),
-            })?,
+            Some(raw) => parse_duration(raw)
+                .ok_or_else(|| AuthSchemaError::InvalidTtl { value: raw.clone() })?,
             None => DEFAULT_SESSION_TTL,
         };
 
@@ -1153,8 +1156,7 @@ impl ProviderDecl {
         // field on the resolved provider carried it, so `reset: "email"` meant
         // nothing and a typo in it meant nothing too. Both options now lower,
         // and both refuse a value or a kind they cannot honour.
-        let reset_by_email =
-            password_option(name, kind, "reset", self.reset.as_deref(), "email")?;
+        let reset_by_email = password_option(name, kind, "reset", self.reset.as_deref(), "email")?;
         let verify_email =
             password_option(name, kind, "verify", self.verify.as_deref(), "required")?;
 
@@ -1329,7 +1331,11 @@ impl ProviderDecl {
             (ProviderKind::OAuth, Some("discord")) => {
                 vec!["identify".to_string(), "email".to_string()]
             }
-            (ProviderKind::Oidc, _) => vec!["openid".to_string(), "email".to_string(), "profile".to_string()],
+            (ProviderKind::Oidc, _) => vec![
+                "openid".to_string(),
+                "email".to_string(),
+                "profile".to_string(),
+            ],
             _ => Vec::new(),
         }
     }
@@ -1340,14 +1346,12 @@ impl ProviderDecl {
     /// Three layers, each narrower and each allowed to overwrite the one before
     /// it, because each is a stronger statement about this specific provider:
     ///
-    /// 1. **OIDC standard.** Right for every compliant issuer, and the only
-    ///    sensible answer for a provider we have never heard of.
-    /// 2. **The preset.** What *this* provider actually returns. Only a plain
-    ///    OAuth 2.0 preset carries one — an OIDC preset's document is the OIDC
-    ///    document by definition, so [`Preset::claims`] is empty there and this
-    ///    layer is a no-op.
-    /// 3. **The author.** They are looking at the provider's response and we
-    ///    are not, so they win.
+    /// 1. **OIDC standard.** Right for every compliant issuer, and the only sensible answer for a
+    ///    provider we have never heard of.
+    /// 2. **The preset.** What *this* provider actually returns. Only a plain OAuth 2.0 preset
+    ///    carries one — an OIDC preset's document is the OIDC document by definition, so
+    ///    [`Preset::claims`] is empty there and this layer is a no-op.
+    /// 3. **The author.** They are looking at the provider's response and we are not, so they win.
     ///
     /// A preset claim of `""` **removes** the field rather than mapping it to
     /// the empty claim name: it is how a preset says *this provider has no
@@ -1548,9 +1552,18 @@ mod tests {
         .lower()
         .expect("lowers");
 
-        assert_eq!(registry.provider("passkey").unwrap().kind, ProviderKind::Passkey);
-        assert_eq!(registry.provider("github").unwrap().kind, ProviderKind::OAuth);
-        assert_eq!(registry.provider("google").unwrap().kind, ProviderKind::Oidc);
+        assert_eq!(
+            registry.provider("passkey").unwrap().kind,
+            ProviderKind::Passkey
+        );
+        assert_eq!(
+            registry.provider("github").unwrap().kind,
+            ProviderKind::OAuth
+        );
+        assert_eq!(
+            registry.provider("google").unwrap().kind,
+            ProviderKind::Oidc
+        );
     }
 
     /// **The § 8.1 rule.** Inference over an unknown name has a silently wrong
@@ -1568,7 +1581,10 @@ mod tests {
             }
         );
         let rendered = error.to_string();
-        assert!(rendered.contains("oidc") && rendered.contains("oauth"), "must list the generic kinds");
+        assert!(
+            rendered.contains("oidc") && rendered.contains("oauth"),
+            "must list the generic kinds"
+        );
         assert!(
             !rendered.contains("custom") && !rendered.contains("passkey"),
             "must not suggest a kind the build refuses: {rendered}"
@@ -1653,7 +1669,10 @@ mod tests {
         .expect_err("issuer is required");
         assert!(matches!(
             error,
-            AuthSchemaError::MissingField { field: "issuer", .. }
+            AuthSchemaError::MissingField {
+                field: "issuer",
+                ..
+            }
         ));
     }
 
@@ -1666,7 +1685,10 @@ mod tests {
         .expect_err("module is required");
         assert!(matches!(
             error,
-            AuthSchemaError::MissingField { field: "module", .. }
+            AuthSchemaError::MissingField {
+                field: "module",
+                ..
+            }
         ));
     }
 
@@ -1679,7 +1701,10 @@ mod tests {
         .expect_err("http is refused");
         assert!(matches!(
             error,
-            AuthSchemaError::InvalidUrl { field: "issuer", .. }
+            AuthSchemaError::InvalidUrl {
+                field: "issuer",
+                ..
+            }
         ));
     }
 
@@ -1882,7 +1907,8 @@ mod tests {
                 .expect("parses")
                 .lower("password")
         };
-        let on = lower(serde_json::json!({ "reset": "email", "verify": "required" })).expect("lowers");
+        let on =
+            lower(serde_json::json!({ "reset": "email", "verify": "required" })).expect("lowers");
         assert!(on.reset_by_email && on.verify_email && on.sends_email());
 
         let off = lower(serde_json::json!({})).expect("lowers");
@@ -1893,18 +1919,30 @@ mod tests {
             serde_json::json!({ "verify": "optional" }),
         ] {
             assert!(
-                matches!(lower(bad.clone()), Err(AuthSchemaError::InvalidOption { .. })),
+                matches!(
+                    lower(bad.clone()),
+                    Err(AuthSchemaError::InvalidOption { .. })
+                ),
                 "{bad}"
             );
         }
 
-        let on_passkey = serde_json::from_value::<ProviderDecl>(serde_json::json!({ "reset": "email" }))
-            .expect("parses")
-            .lower("passkey");
-        assert!(matches!(on_passkey, Err(AuthSchemaError::InvalidOption { field: "reset", .. })));
+        let on_passkey =
+            serde_json::from_value::<ProviderDecl>(serde_json::json!({ "reset": "email" }))
+                .expect("parses")
+                .lower("passkey");
+        assert!(matches!(
+            on_passkey,
+            Err(AuthSchemaError::InvalidOption { field: "reset", .. })
+        ));
 
-        let magic = ProviderDecl::default().lower("magiclink").expect("a preset");
-        assert!(magic.sends_email(), "a magic link provider is nothing but email");
+        let magic = ProviderDecl::default()
+            .lower("magiclink")
+            .expect("a preset");
+        assert!(
+            magic.sends_email(),
+            "a magic link provider is nothing but email"
+        );
     }
 
     /// A provider kind with no server-side flow must fail the build — by kind
@@ -1922,7 +1960,10 @@ mod tests {
             }))
             .expect("parses");
             let err = decl.check_supported().unwrap_err();
-            assert!(matches!(err, AuthSchemaError::Unsupported { .. }), "{providers}: {err}");
+            assert!(
+                matches!(err, AuthSchemaError::Unsupported { .. }),
+                "{providers}: {err}"
+            );
             assert!(err.to_string().contains("Supported kinds"), "{err}");
         }
         for supported in [
@@ -1948,7 +1989,9 @@ mod tests {
             }))
             .expect("parses")
         };
-        let err = block(serde_json::json!({ "reset": "email" })).lower().unwrap_err();
+        let err = block(serde_json::json!({ "reset": "email" }))
+            .lower()
+            .unwrap_err();
         assert_eq!(
             err,
             AuthSchemaError::UnprovenPasswordBesideMagicLink {
@@ -1957,7 +2000,9 @@ mod tests {
             }
         );
         assert!(err.to_string().contains("verify: \"required\""), "{err}");
-        assert!(block(serde_json::json!({ "verify": "required" })).lower().is_ok());
+        assert!(block(serde_json::json!({ "verify": "required" }))
+            .lower()
+            .is_ok());
 
         // Either alone is fine; the refusal is about the pair.
         for alone in [
@@ -1968,7 +2013,10 @@ mod tests {
             let decl = serde_json::from_value::<AuthDeclaration>(alone.clone()).expect("parses");
             let result = decl.check_email_proof();
             if alone["providers"].get("pw").is_some() {
-                assert!(result.is_err(), "kinds are inferred from `kind`, not only preset names");
+                assert!(
+                    result.is_err(),
+                    "kinds are inferred from `kind`, not only preset names"
+                );
             } else {
                 assert!(result.is_ok(), "{alone}");
             }
@@ -2077,10 +2125,7 @@ mod tests {
                 "login": hostile
             }));
             assert!(
-                matches!(
-                    block.lower(),
-                    Err(AuthSchemaError::InvalidLoginPath { .. })
-                ),
+                matches!(block.lower(), Err(AuthSchemaError::InvalidLoginPath { .. })),
                 "{hostile:?} must not lower into a Location header"
             );
         }
@@ -2112,7 +2157,15 @@ mod tests {
     /// otherwise reach the database.
     #[test]
     fn a_role_name_outside_the_alphabet_is_refused() {
-        for bad in ["", "Admin", "1st", "pay roll", "a,b", "röle", &"r".repeat(33)] {
+        for bad in [
+            "",
+            "Admin",
+            "1st",
+            "pay roll",
+            "a,b",
+            "röle",
+            &"r".repeat(33),
+        ] {
             let block = decl(serde_json::json!({
                 "providers": { "password": {} },
                 "roles": [bad]

@@ -275,7 +275,8 @@ fn does_bytecode_collapse_module_reregistration() {
         let t = Instant::now();
         ctx.with(|ctx| {
             for (_, script) in &scripts {
-                ctx.eval::<(), _>(script.as_str()).expect("script registers");
+                ctx.eval::<(), _>(script.as_str())
+                    .expect("script registers");
             }
         });
         eval_all.push(t.elapsed());
@@ -290,7 +291,8 @@ fn does_bytecode_collapse_module_reregistration() {
         let t = Instant::now();
         ctx.with(|ctx| {
             for (_, script) in &compilable {
-                ctx.eval::<(), _>(script.as_str()).expect("script registers");
+                ctx.eval::<(), _>(script.as_str())
+                    .expect("script registers");
             }
         });
         eval_subset.push(t.elapsed());
@@ -309,8 +311,8 @@ fn does_bytecode_collapse_module_reregistration() {
                 // process's `Runtime` a few microseconds ago, so it is
                 // well-formed QuickJS bytecode of matching endianness and
                 // version. Nothing untrusted reaches this call.
-                let module = unsafe { Module::load(ctx.clone(), bytes.as_slice()) }
-                    .expect("bytecode loads");
+                let module =
+                    unsafe { Module::load(ctx.clone(), bytes.as_slice()) }.expect("bytecode loads");
                 let _ = module.eval().expect("bytecode evaluates");
             }
         });

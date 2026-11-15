@@ -37,10 +37,10 @@
 //! Both come from the providers' own documentation rather than the spec, and
 //! both are silent failures:
 //!
-//! - **GitHub's token endpoint answers `application/x-www-form-urlencoded` unless you send
-//!   `Accept: application/json`.** A JSON-only parser gets a `SyntaxError` on a *successful*
-//!   exchange. [`parse_token_response`] therefore accepts both encodings rather than trusting the
-//!   header to be honoured.
+//! - **GitHub's token endpoint answers `application/x-www-form-urlencoded` unless you send `Accept:
+//!   application/json`.** A JSON-only parser gets a `SyntaxError` on a *successful* exchange.
+//!   [`parse_token_response`] therefore accepts both encodings rather than trusting the header to
+//!   be honoured.
 //! - **GitHub's API refuses a request with no `User-Agent`** — `403`, on a token that is perfectly
 //!   valid. [`profile_request`] always sets one.
 //!
@@ -423,13 +423,14 @@ pub fn parse_token_response(body: &[u8]) -> Result<TokenResponse> {
         });
     }
 
-    let access_token = fields
-        .get("access_token")
-        .cloned()
-        .ok_or_else(|| OAuthError::Malformed {
-            what: "token response",
-            reason: "no `access_token`".to_string(),
-        })?;
+    let access_token =
+        fields
+            .get("access_token")
+            .cloned()
+            .ok_or_else(|| OAuthError::Malformed {
+                what: "token response",
+                reason: "no `access_token`".to_string(),
+            })?;
 
     Ok(TokenResponse {
         access_token,
@@ -483,10 +484,11 @@ pub fn profile_from_document(
     claim_map: &BTreeMap<String, String>,
     body: &[u8],
 ) -> Result<(String, ProviderProfile)> {
-    let document: JsonValue = serde_json::from_slice(body).map_err(|err| OAuthError::Malformed {
-        what: "profile",
-        reason: err.to_string(),
-    })?;
+    let document: JsonValue =
+        serde_json::from_slice(body).map_err(|err| OAuthError::Malformed {
+            what: "profile",
+            reason: err.to_string(),
+        })?;
     let JsonValue::Object(claims) = document else {
         return Err(OAuthError::Malformed {
             what: "profile",
@@ -805,10 +807,13 @@ mod tests {
         let endpoints = endpoints(&registry, "github");
         let mut seen = std::collections::HashSet::new();
         for _ in 0..256 {
-            let start = begin(provider, &endpoints, "https://app.example/cb", |_| None)
-                .expect("begins");
+            let start =
+                begin(provider, &endpoints, "https://app.example/cb", |_| None).expect("begins");
             assert!(seen.insert(start.state.clone()), "the CSPRNG repeated");
-            assert!(seen.insert(start.verifier), "verifier collided with a state");
+            assert!(
+                seen.insert(start.verifier),
+                "verifier collided with a state"
+            );
         }
     }
 
@@ -858,7 +863,10 @@ mod tests {
         assert_eq!(fields.get("grant_type").unwrap(), "authorization_code");
         assert_eq!(fields.get("code").unwrap(), "the-code");
         assert_eq!(fields.get("code_verifier").unwrap(), "the-verifier");
-        assert_eq!(fields.get("redirect_uri").unwrap(), "https://app.example/cb");
+        assert_eq!(
+            fields.get("redirect_uri").unwrap(),
+            "https://app.example/cb"
+        );
         assert_eq!(fields.get("client_secret").unwrap(), "shh");
     }
 

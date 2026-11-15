@@ -3,16 +3,15 @@
 //! A test file runs in a [`TestRealm`] (the compiler crate). Everything it asks
 //! of the app lands here:
 //!
-//! * **`visit()` / `page.submit()`** go through the router `albedo serve`
-//!   binds, in process, with the cookies and client address of the visitor
-//!   making them. The server is the real one — [`AlbedoServer::run_until`]
-//!   boots it, so FORGE, AUTH, the job runner and the middleware are all live —
-//!   and the request carries `Sec-Fetch-Mode: navigate`, so a refusal comes back
-//!   the way a browser gets it.
-//! * **`render(<Card />)`** renders through the renderer the app uses for that
-//!   component's tier: the build's Tier-A renderer ([`TierARenderer`], the very
-//!   function that bakes pages) or the server's `QuickJS` renderer for Tier B
-//!   and C. A component test therefore asserts against markup a visitor gets.
+//! * **`visit()` / `page.submit()`** go through the router `albedo serve` binds, in process, with
+//!   the cookies and client address of the visitor making them. The server is the real one —
+//!   [`AlbedoServer::run_until`] boots it, so FORGE, AUTH, the job runner and the middleware are
+//!   all live — and the request carries `Sec-Fetch-Mode: navigate`, so a refusal comes back the way
+//!   a browser gets it.
+//! * **`render(<Card />)`** renders through the renderer the app uses for that component's tier:
+//!   the build's Tier-A renderer ([`TierARenderer`], the very function that bakes pages) or the
+//!   server's `QuickJS` renderer for Tier B and C. A component test therefore asserts against
+//!   markup a visitor gets.
 //! * **`signUp()` / `signIn()`** post to the app's own password endpoints.
 //!
 //! ## Isolation
@@ -333,7 +332,10 @@ impl Host {
     fn role(&mut self, payload: &Value) -> Result<Value, String> {
         let jar = str_field(payload, "jar")?.to_string();
         let role = str_field(payload, "role")?.to_string();
-        let grant = payload.get("grant").and_then(Value::as_bool).unwrap_or(true);
+        let grant = payload
+            .get("grant")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let call = if grant { "grantRole" } else { "revokeRole" };
         let auth_cookie = self.auth_cookie.clone();
         let Some(token) = self.jar(&jar)?.cookies.get(&auth_cookie).cloned() else {
@@ -350,7 +352,12 @@ impl Host {
         self.runtime
             .block_on(async move { roles.change(&headers, &role, grant).await })
             .map(|_| Value::Null)
-            .map_err(|err| format!("{call}(user, \"{}\"): {err}", str_field(payload, "role").unwrap_or("")))
+            .map_err(|err| {
+                format!(
+                    "{call}(user, \"{}\"): {err}",
+                    str_field(payload, "role").unwrap_or("")
+                )
+            })
     }
 
     fn jar(&mut self, id: &str) -> Result<&mut Jar, String> {
@@ -365,7 +372,12 @@ impl Host {
         // Every visitor gets its own address, so SHUTTER rations them apart the
         // way it rations two people — a test that signs up six users is not one
         // client hammering the sign-up form.
-        let ip = Ipv4Addr::new(10, ((n >> 16) & 0xff) as u8, ((n >> 8) & 0xff) as u8, (n & 0xff) as u8);
+        let ip = Ipv4Addr::new(
+            10,
+            ((n >> 16) & 0xff) as u8,
+            ((n >> 8) & 0xff) as u8,
+            (n & 0xff) as u8,
+        );
         let id = format!("visitor-{n}");
         self.jars.insert(
             id.clone(),
@@ -416,10 +428,7 @@ impl Host {
         }
         let body = match form {
             Some(fields) => {
-                builder = builder.header(
-                    header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
-                );
+                builder = builder.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
                 let mut encoded = url::form_urlencoded::Serializer::new(String::new());
                 for (name, value) in fields {
                     let text = match value {
@@ -476,7 +485,10 @@ impl Host {
             return Err(format!("{path} is not a path on this app"));
         }
         let mut form = payload.get("form").and_then(Value::as_object).cloned();
-        let follow = payload.get("follow").and_then(Value::as_bool).unwrap_or(true);
+        let follow = payload
+            .get("follow")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         let mut redirects = Vec::new();
 
         loop {
@@ -530,8 +542,15 @@ impl Host {
         };
         let session = self.jar(&jar)?.tab_session();
         let mut form = Map::new();
-        form.insert("_csrf".to_string(), Value::String(self.csrf.token_for(session)));
-        let email = payload.get("email").and_then(Value::as_str).unwrap_or_default().to_string();
+        form.insert(
+            "_csrf".to_string(),
+            Value::String(self.csrf.token_for(session)),
+        );
+        let email = payload
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         if kind != "logout" {
             form.insert("email".to_string(), Value::String(email.clone()));
             form.insert(
@@ -539,14 +558,19 @@ impl Host {
                 Value::String(str_field(payload, "password")?.to_string()),
             );
         }
-        let who = if email.is_empty() { String::new() } else { format!("\"{email}\"") };
+        let who = if email.is_empty() {
+            String::new()
+        } else {
+            format!("\"{email}\"")
+        };
         let answer = self.send(&jar, &Method::POST, endpoint, Some(&form), false)?;
 
         if !(answer.status.is_redirection() || answer.status.is_success()) {
             return Err(format!(
                 "{call}({who}) was refused — {}: {}",
                 answer.status,
-                first_paragraph(&answer.body).unwrap_or_else(|| "the server gave no reason".to_string())
+                first_paragraph(&answer.body)
+                    .unwrap_or_else(|| "the server gave no reason".to_string())
             ));
         }
         let auth_cookie = self.auth_cookie.clone();
@@ -610,7 +634,11 @@ fn header_map(headers: &HeaderMap) -> Value {
             .iter()
             .filter_map(|value| value.to_str().ok())
             .collect::<Vec<_>>()
-            .join(if name == header::SET_COOKIE { "\n" } else { ", " });
+            .join(if name == header::SET_COOKIE {
+                "\n"
+            } else {
+                ", "
+            });
         out.insert(name.as_str().to_string(), Value::String(joined));
     }
     Value::Object(out)
@@ -653,7 +681,13 @@ pub fn run_tests(
         .npm_bundles()
         .iter()
         .flat_map(|bundle| bundle.artifacts.iter())
-        .map(|artifact| (artifact.key.clone(), artifact.script.clone(), artifact.source_hash))
+        .map(|artifact| {
+            (
+                artifact.key.clone(),
+                artifact.script.clone(),
+                artifact.source_hash,
+            )
+        })
         .collect();
     // Both the render engine and each file's test realm need these records:
     // importing a component loads its CSS before render() reaches the host.
@@ -704,8 +738,8 @@ fn run_file(
     let mut realm = TestRealm::new(&opts.server.project_dir, npm)?;
     let cases = realm.load_file(file)?;
 
-    let scratch = tempfile::tempdir()
-        .map_err(|err| format!("could not make a scratch directory: {err}"))?;
+    let scratch =
+        tempfile::tempdir().map_err(|err| format!("could not make a scratch directory: {err}"))?;
     let mut server_opts = opts.server.clone();
     server_opts.forge_db = Some(scratch.path().join("forge.db"));
     // Bound on a port nobody chose, though no test reaches it over TCP: the
@@ -743,7 +777,10 @@ fn run_file(
                     Err(err) => format!("the app's server panicked while booting: {err}"),
                 }
             } else {
-                format!("the app was not ready after {} s", SERVER_DEADLINE.as_secs())
+                format!(
+                    "the app was not ready after {} s",
+                    SERVER_DEADLINE.as_secs()
+                )
             };
             return Err(reason);
         }
@@ -781,9 +818,7 @@ fn run_file(
         drop(host);
 
         let _ = stop_tx.send(());
-        let _ = runtime.block_on(async {
-            tokio::time::timeout(SERVER_DEADLINE, serving).await
-        });
+        let _ = runtime.block_on(async { tokio::time::timeout(SERVER_DEADLINE, serving).await });
         Ok(())
     })();
     drop(realm);
@@ -800,10 +835,19 @@ mod tests {
 
     #[test]
     fn redirects_are_followed_only_while_they_stay_on_the_app() {
-        assert_eq!(same_app_path("/sign-in?next=%2F").as_deref(), Some("/sign-in?next=%2F"));
-        assert_eq!(same_app_path("http://localhost:3000/a?b=1").as_deref(), Some("/a?b=1"));
+        assert_eq!(
+            same_app_path("/sign-in?next=%2F").as_deref(),
+            Some("/sign-in?next=%2F")
+        );
+        assert_eq!(
+            same_app_path("http://localhost:3000/a?b=1").as_deref(),
+            Some("/a?b=1")
+        );
         assert_eq!(same_app_path("//evil.example/x"), None);
-        assert_eq!(same_app_path("https://github.com/login/oauth/authorize"), None);
+        assert_eq!(
+            same_app_path("https://github.com/login/oauth/authorize"),
+            None
+        );
     }
 
     #[test]
@@ -813,13 +857,22 @@ mod tests {
             peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
         };
         let mut headers = HeaderMap::new();
-        headers.append(header::SET_COOKIE, HeaderValue::from_static("a=1; Path=/; HttpOnly"));
-        headers.append(header::SET_COOKIE, HeaderValue::from_static("b=2; Max-Age=3600"));
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("a=1; Path=/; HttpOnly"),
+        );
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("b=2; Max-Age=3600"),
+        );
         jar.absorb(&headers);
         assert_eq!(jar.cookie_header().unwrap(), "a=1; b=2");
 
         let mut expiring = HeaderMap::new();
-        expiring.append(header::SET_COOKIE, HeaderValue::from_static("a=; Max-Age=0"));
+        expiring.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("a=; Max-Age=0"),
+        );
         jar.absorb(&expiring);
         assert_eq!(jar.cookie_header().unwrap(), "b=2");
     }
@@ -847,7 +900,10 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect();
-        assert_eq!(found, vec!["src/components/Card.test.tsx", "tests/flow.spec.ts"]);
+        assert_eq!(
+            found,
+            vec!["src/components/Card.test.tsx", "tests/flow.spec.ts"]
+        );
     }
 
     #[cfg(feature = "forge")]

@@ -5,12 +5,12 @@
 //! boot, from props the build captured with no request in scope, so the page
 //! around an island was right per URL and the island was not:
 //!
-//! - a `[id]` page that is itself an island (`useState` + a handler) rendered
-//!   `counter ` on `/counter/7` and `/counter/zz` alike;
-//! - `<Picker id={params.id} />` under a correct per-request page rendered
-//!   `picker ` under both ids;
-//! - `<WhoIsland name={user.id} />` under a page reading `user` rendered
-//!   `who anon` to a signed-in reader whose page said their id.
+//! - a `[id]` page that is itself an island (`useState` + a handler) rendered `counter ` on
+//!   `/counter/7` and `/counter/zz` alike;
+//! - `<Picker id={params.id} />` under a correct per-request page rendered `picker ` under both
+//!   ids;
+//! - `<WhoIsland name={user.id} />` under a page reading `user` rendered `who anon` to a signed-in
+//!   reader whose page said their id.
 //!
 //! The build was green and every response 200. `route_params_http.rs` pins the
 //! same consequence for pages; this pins it for islands, on both of the paths an
@@ -140,7 +140,10 @@ fn write(app: &Path, rel: &str, contents: &str) {
 fn scaffold() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
     let home = tempfile::tempdir().expect("temp home");
     let work = tempfile::tempdir().expect("temp workdir");
-    run_ok(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     let app = work.path().join("app");
     (home, work, app)
 }
@@ -161,8 +164,14 @@ async fn serve(home: &Path, app: &Path) -> (Server, String) {
     let server = Server { child };
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_err() {
-        assert!(Instant::now() < deadline, "albedo serve never answered on {base}");
+    while reqwest::get(format!("{base}/_albedo/runtime.js"))
+        .await
+        .is_err()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "albedo serve never answered on {base}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     (server, base)
@@ -263,7 +272,10 @@ async fn every_island_renders_its_own_requests_params_and_user() {
     // The fixture is what it claims to be: every one of these is an island.
     // Were tiering to stop making them islands this test would pass while
     // testing nothing, so it says so instead.
-    let built = run_ok(albedo(home.path(), &app).args(["build", "."]), "albedo build");
+    let built = run_ok(
+        albedo(home.path(), &app).args(["build", "."]),
+        "albedo build",
+    );
     for island in ["CounterPage", "EffectPage", "Picker", "Ticker", "WhoIsland"] {
         let line = built
             .lines()
@@ -294,8 +306,14 @@ async fn every_island_renders_its_own_requests_params_and_user() {
         // Anywhere in the body — a binding-mode island is re-painted from the
         // HTML its `boot(…)` script carries, so a boot-time value surviving
         // there would undo a correct first paint on the first click.
-        assert!(!one.contains(second_text), "GET {first} carries {second_text:?}");
-        assert!(!two.contains(first_text), "GET {second} carries {first_text:?}");
+        assert!(
+            !one.contains(second_text),
+            "GET {first} carries {second_text:?}"
+        );
+        assert!(
+            !two.contains(first_text),
+            "GET {second} carries {first_text:?}"
+        );
         assert_no_carried_placeholder(&one, first);
         assert_no_carried_placeholder(&two, second);
     }
@@ -303,8 +321,15 @@ async fn every_island_renders_its_own_requests_params_and_user() {
     // A binding-mode island is wired by exactly one script — the one rendered
     // for this request, not that one beside the boot render's.
     let counter = page(&client, &base, "/counter/7", None).await;
-    assert_eq!(counter.matches("__albedoReactive.boot(").count(), 1, "{counter}");
-    assert!(counter.contains(r"counter 7<\/p>"), "the install carries this request's markup");
+    assert_eq!(
+        counter.matches("__albedoReactive.boot(").count(),
+        1,
+        "{counter}"
+    );
+    assert!(
+        counter.contains(r"counter 7<\/p>"),
+        "the install carries this request's markup"
+    );
 
     // An A3 island hydrates from the props on its root, which are this
     // request's; the payload's are the boot render's, shared by every visitor.
@@ -315,7 +340,8 @@ async fn every_island_renders_its_own_requests_params_and_user() {
     );
     let effect = page(&client, &base, "/fx/7", None).await;
     assert!(
-        effect.contains(r#"data-albedo-props="{&quot;params&quot;:{&quot;id&quot;:&quot;7&quot;}}""#),
+        effect
+            .contains(r#"data-albedo-props="{&quot;params&quot;:{&quot;id&quot;:&quot;7&quot;}}""#),
         "a page that is an island carries this request's params\n{effect}"
     );
 
@@ -326,16 +352,27 @@ async fn every_island_renders_its_own_requests_params_and_user() {
     let bob = sign_up(&client, &base, "bob@example.test").await;
     let as_ada = page(&client, &base, "/who", Some(&ada)).await;
     let as_bob = page(&client, &base, "/who", Some(&bob)).await;
-    let ada_id = text_of(&as_ada, "/who", "wp").trim_start_matches("page ").to_string();
-    let bob_id = text_of(&as_bob, "/who", "wp").trim_start_matches("page ").to_string();
-    assert!(ada_id.starts_with("u_") && bob_id.starts_with("u_"), "{ada_id} / {bob_id}");
+    let ada_id = text_of(&as_ada, "/who", "wp")
+        .trim_start_matches("page ")
+        .to_string();
+    let bob_id = text_of(&as_bob, "/who", "wp")
+        .trim_start_matches("page ")
+        .to_string();
+    assert!(
+        ada_id.starts_with("u_") && bob_id.starts_with("u_"),
+        "{ada_id} / {bob_id}"
+    );
     assert_ne!(ada_id, bob_id, "two accounts, two principals");
     assert_eq!(text_of(&as_ada, "/who", "w"), format!("who {ada_id}"));
     assert_eq!(text_of(&as_bob, "/who", "w"), format!("who {bob_id}"));
     assert!(!as_ada.contains(&bob_id), "Ada's page carries Bob's id");
     assert!(!as_bob.contains(&ada_id), "Bob's page carries Ada's id");
     assert!(!anonymous.contains(&ada_id) && !anonymous.contains(&bob_id));
-    for (html, who) in [(&anonymous, "anonymous"), (&as_ada, "ada"), (&as_bob, "bob")] {
+    for (html, who) in [
+        (&anonymous, "anonymous"),
+        (&as_ada, "ada"),
+        (&as_bob, "bob"),
+    ] {
         assert_no_carried_placeholder(html, &format!("/who as {who}"));
     }
 }
@@ -366,9 +403,18 @@ async fn a_layout_that_reads_params_or_user_is_refused_by_name() {
         "export default function Account() { return <main>account</main>; }\n",
     );
 
-    let (ok, out) = run(albedo(home.path(), &app).args(["build", "."]), "albedo build");
-    assert!(!ok, "a layout reading the request must fail the build\n{out}");
-    assert!(out.contains("a layout cannot read `params` or `user`"), "{out}");
+    let (ok, out) = run(
+        albedo(home.path(), &app).args(["build", "."]),
+        "albedo build",
+    );
+    assert!(
+        !ok,
+        "a layout reading the request must fail the build\n{out}"
+    );
+    assert!(
+        out.contains("a layout cannot read `params` or `user`"),
+        "{out}"
+    );
     assert!(
         out.contains("shop/[cat]/layout.tsx (ShopLayout) reads route `params`"),
         "the refusal names the layout and the prop\n{out}"
@@ -393,7 +439,10 @@ async fn a_layout_that_reads_params_or_user_is_refused_by_name() {
         "export default function AccountLayout({ children }) {\n  \
          return <section>{children}</section>;\n}\n",
     );
-    let built = run_ok(albedo(home.path(), &app).args(["build", "."]), "albedo build");
+    let built = run_ok(
+        albedo(home.path(), &app).args(["build", "."]),
+        "albedo build",
+    );
     let line = built
         .lines()
         .map(str::trim)

@@ -1,10 +1,10 @@
 use crate::error::RuntimeError;
 use crate::routing::{parse_query_string, HttpMethod};
 use axum::body::Body;
-use dom_render_compiler::auth::PrincipalId;
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
+use dom_render_compiler::auth::PrincipalId;
 use futures_util::stream;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -78,7 +78,10 @@ impl RequestContext {
     /// Attach the request's resolved identity: its id, for ownership, and the
     /// `user` an action body reads — from one value, in one call.
     #[must_use]
-    pub fn with_identity(mut self, principal: Option<&dom_render_compiler::auth::Principal>) -> Self {
+    pub fn with_identity(
+        mut self,
+        principal: Option<&dom_render_compiler::auth::Principal>,
+    ) -> Self {
         self.principal = principal.map(|who| who.id.clone());
         self.user = principal.map(dom_render_compiler::auth::Principal::user_value);
         self.roles = principal.map(|who| who.roles.clone()).unwrap_or_default();
@@ -102,7 +105,6 @@ impl RequestContext {
             .get(key)
             .and_then(|values| values.first().map(String::as_str))
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -119,16 +121,11 @@ pub enum ResponseBody {
 }
 
 impl ResponseBody {
-
     fn into_axum_body(self) -> Body {
         match self {
             Self::Full(bytes) => Body::from(bytes),
             Self::Stream(chunks) => {
-                let stream = stream::iter(
-                    chunks
-                        .into_iter()
-                        .map(Ok::<Bytes, Infallible>),
-                );
+                let stream = stream::iter(chunks.into_iter().map(Ok::<Bytes, Infallible>));
                 Body::from_stream(stream)
             }
         }

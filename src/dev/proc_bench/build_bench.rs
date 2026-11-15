@@ -194,7 +194,9 @@ impl BuildWorkload for CommandBuildWorkload {
         } else {
             Err(format!(
                 "build command exited with {}",
-                status.code().map_or_else(|| "signal".into(), |c| c.to_string())
+                status
+                    .code()
+                    .map_or_else(|| "signal".into(), |c| c.to_string())
             ))
         }
     }
@@ -256,8 +258,16 @@ mod tests {
         };
         let report = run_build_bench(&workload, &config).expect("bench runs");
 
-        assert_eq!(cleans.load(Ordering::SeqCst), 2, "one clean per clean sample");
-        assert_eq!(builds.load(Ordering::SeqCst), 5, "2 clean + 3 incremental builds");
+        assert_eq!(
+            cleans.load(Ordering::SeqCst),
+            2,
+            "one clean per clean sample"
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            5,
+            "2 clean + 3 incremental builds"
+        );
         assert_eq!(report.clean.count, 2);
         assert_eq!(report.incremental.count, 3);
         assert!(

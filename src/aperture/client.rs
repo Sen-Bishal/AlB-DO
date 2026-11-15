@@ -826,7 +826,8 @@ mod tests {
         shutter
             .set_upstream_quota(
                 host,
-                crate::shutter::Quota::with_burst(burst, Duration::from_secs(3_600), burst).unwrap(),
+                crate::shutter::Quota::with_burst(burst, Duration::from_secs(3_600), burst)
+                    .unwrap(),
             )
             .unwrap();
         let client = client(transport);
@@ -851,12 +852,18 @@ mod tests {
         assert!(client.send_effect(&effect).await.is_ok());
         assert!(client.send_effect(&effect).await.is_ok());
         let err = client.send_effect(&effect).await.unwrap_err();
-        assert!(matches!(err, ApertureError::Throttled { ref host, .. } if host == "x.test"), "{err}");
+        assert!(
+            matches!(err, ApertureError::Throttled { ref host, .. } if host == "x.test"),
+            "{err}"
+        );
         assert_eq!(transport.calls(), 2, "the refused request never left");
         assert_eq!(client.metrics().throttled, 1);
 
         // Control: another host is not affected.
-        let other = ApertureRequest { url: "https://y.test/".to_string(), ..effect };
+        let other = ApertureRequest {
+            url: "https://y.test/".to_string(),
+            ..effect
+        };
         assert!(client.send_effect(&other).await.is_ok());
     }
 
@@ -874,22 +881,35 @@ mod tests {
         for _ in 0..5 {
             assert!(client.fetch(&fresh).await.is_ok());
         }
-        assert_eq!(transport.calls(), 1, "one wire call and four fresh hits spend one unit");
+        assert_eq!(
+            transport.calls(),
+            1,
+            "one wire call and four fresh hits spend one unit"
+        );
 
         // A read that is always stale spends the second unit…
         let polled = ApertureRequest::get("https://x.test/b", Duration::ZERO);
-        assert_eq!(client.fetch(&polled).await.unwrap().disposition, Disposition::Fetched);
+        assert_eq!(
+            client.fetch(&polled).await.unwrap().disposition,
+            Disposition::Fetched
+        );
         assert_eq!(transport.calls(), 2);
 
         // …and its next poll is refused at the wire and served from what it had.
-        let again = client.fetch(&polled).await.expect("degrades to the last good value");
+        let again = client
+            .fetch(&polled)
+            .await
+            .expect("degrades to the last good value");
         assert_eq!(again.disposition, Disposition::StaleOnError);
         assert_eq!(transport.calls(), 2, "nothing was sent");
         assert_eq!(client.metrics().throttled, 1);
 
         // An uncached read over budget has nothing to fall back on.
         let cold = ApertureRequest::get("https://x.test/c", Duration::ZERO);
-        assert!(matches!(client.fetch(&cold).await.unwrap_err(), ApertureError::Throttled { .. }));
+        assert!(matches!(
+            client.fetch(&cold).await.unwrap_err(),
+            ApertureError::Throttled { .. }
+        ));
     }
 
     #[tokio::test]

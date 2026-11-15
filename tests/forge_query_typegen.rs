@@ -24,8 +24,14 @@ const SCAFFOLD_ENV: &str = include_str!("../scaffold/src/albedo-env.d.ts");
 fn decls() -> BTreeMap<String, CollectionDecl> {
     let mut out = BTreeMap::new();
     for (name, json) in [
-        ("guestbook", r#"{ "fields": { "author": "text", "message": "text" } }"#),
-        ("messages", r#"{ "fields": { "room": "text", "body": "text" }, "partition_by": "room" }"#),
+        (
+            "guestbook",
+            r#"{ "fields": { "author": "text", "message": "text" } }"#,
+        ),
+        (
+            "messages",
+            r#"{ "fields": { "room": "text", "body": "text" }, "partition_by": "room" }"#,
+        ),
         (
             "invoices",
             r#"{ "fields": { "amount": "real", "due": "timestamp", "owner": "text", "status": "text" } }"#,
@@ -139,7 +145,10 @@ fn tsc_version() -> String {
         return "tsc not available (ALBEDO_TSC unset)".into();
     };
     let out = Command::new("node").arg(&tsc).arg("--version").output();
-    out.map_or_else(|e| format!("tsc failed to start: {e}"), |o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    out.map_or_else(
+        |e| format!("tsc failed to start: {e}"),
+        |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+    )
 }
 
 #[test]

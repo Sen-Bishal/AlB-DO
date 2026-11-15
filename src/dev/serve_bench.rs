@@ -19,17 +19,14 @@
 //! already booted; spawning the server is the driver's job.
 //!
 //! Methodology notes (kept honest, mirrored into the README table):
-//!   * One TCP connection per request (`Connection: close`). This
-//!     folds connect cost into every sample — consistent across any
-//!     framework you point a comparable tool at, and the conservative
-//!     choice (keep-alive would only make ALBEDO look faster).
-//!   * TTFB = time from just-before-write to the first response byte.
-//!     Total = time to EOF (last byte). We read to close, so both
-//!     `Content-Length` and `Transfer-Encoding: chunked` responses
+//!   * One TCP connection per request (`Connection: close`). This folds connect cost into every
+//!     sample — consistent across any framework you point a comparable tool at, and the
+//!     conservative choice (keep-alive would only make ALBEDO look faster).
+//!   * TTFB = time from just-before-write to the first response byte. Total = time to EOF (last
+//!     byte). We read to close, so both `Content-Length` and `Transfer-Encoding: chunked` responses
 //!     (the streaming shell uses chunked) are handled identically.
-//!   * Cold = the first request after the caller booted the server,
-//!     measured once, sequentially, before warmup. Warm = the measured
-//!     batch after `warmup` discarded requests.
+//!   * Cold = the first request after the caller booted the server, measured once, sequentially,
+//!     before warmup. Warm = the measured batch after `warmup` discarded requests.
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -139,10 +136,7 @@ pub enum ServeBenchError {
     #[error("could not resolve '{0}'")]
     UnresolvedHost(String),
     #[error("server at {url} is unreachable: {source}")]
-    Unreachable {
-        url: String,
-        source: std::io::Error,
-    },
+    Unreachable { url: String, source: std::io::Error },
     #[error("no request specs configured")]
     NoRequests,
 }
@@ -244,10 +238,7 @@ impl ServeBenchReport {
     /// perf section. One row per endpoint, warm percentiles + cold.
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "### Serve-time latency — `{}`\n\n",
-            self.base_url
-        ));
+        out.push_str(&format!("### Serve-time latency — `{}`\n\n", self.base_url));
         let conn_mode = if self.keep_alive {
             "keep-alive (conn reused)"
         } else {
@@ -260,9 +251,7 @@ impl ServeBenchReport {
         out.push_str(
             "| Endpoint | Status | TTFB p50 | TTFB p99 | Total p50 | Total p99 | Cold TTFB |\n",
         );
-        out.push_str(
-            "|---|---|--:|--:|--:|--:|--:|\n",
-        );
+        out.push_str("|---|---|--:|--:|--:|--:|--:|\n");
         for ep in &self.endpoints {
             out.push_str(&format!(
                 "| {} `{} {}` | {} ({:.0}% ok) | {:.2} ms | {:.2} ms | {:.2} ms | {:.2} ms | {:.2} ms |\n",
@@ -413,7 +402,11 @@ impl KeepAliveConn {
         let mut read_buf = [0u8; 16 * 1024];
         // TTFB counts from write to the first response byte. If leftover
         // carried bytes from a pipelined read, first byte already arrived.
-        let mut ttfb: Option<Duration> = if buf.is_empty() { None } else { Some(Duration::ZERO) };
+        let mut ttfb: Option<Duration> = if buf.is_empty() {
+            None
+        } else {
+            Some(Duration::ZERO)
+        };
 
         // Phase 1: accumulate until headers are complete.
         let (header_end, status, content_length, chunked) = loop {
@@ -492,10 +485,9 @@ fn parse_head(head: &[u8]) -> (u16, Option<usize>, bool) {
         let value = value.trim();
         match name.as_str() {
             "content-length" => content_length = value.parse::<usize>().ok(),
-            "transfer-encoding"
-                if value.to_ascii_lowercase().contains("chunked") => {
-                    chunked = true;
-                }
+            "transfer-encoding" if value.to_ascii_lowercase().contains("chunked") => {
+                chunked = true;
+            }
             _ => {}
         }
     }
@@ -636,7 +628,9 @@ pub fn probe_tcp_ready(
     let started = Instant::now();
     // Per-attempt connect timeout is bounded so a hung SYN doesn't blow
     // the whole readiness budget on one attempt.
-    let attempt_timeout = poll_interval.min(Duration::from_millis(250)).max(Duration::from_millis(20));
+    let attempt_timeout = poll_interval
+        .min(Duration::from_millis(250))
+        .max(Duration::from_millis(20));
     loop {
         match TcpStream::connect_timeout(&addr, attempt_timeout) {
             Ok(_) => return Ok(started.elapsed()),
@@ -892,10 +886,8 @@ mod tests {
                             Ok(n) => n,
                         };
                         acc.extend_from_slice(&chunk[..n]);
-                        while let Some(end) = acc
-                            .windows(4)
-                            .position(|w| w == b"\r\n\r\n")
-                            .map(|p| p + 4)
+                        while let Some(end) =
+                            acc.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
                         {
                             acc.drain(..end);
                             let resp = format!(
@@ -957,10 +949,8 @@ mod tests {
                     let mut chunk = [0u8; 1024];
                     // Read until we have headers + the declared body.
                     let (head_end, content_length) = loop {
-                        if let Some(he) = acc
-                            .windows(4)
-                            .position(|w| w == b"\r\n\r\n")
-                            .map(|p| p + 4)
+                        if let Some(he) =
+                            acc.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
                         {
                             let (_s, cl, _ch) = parse_head(&acc[..he]);
                             break (he, cl.unwrap_or(0));
@@ -1026,7 +1016,10 @@ mod tests {
         // envelope — a 100% ok ratio proves the wire delivery.
         assert_eq!(ep.method, Method::Post);
         assert_eq!(ep.cold.status, 200, "stub decoded the cold envelope");
-        assert_eq!(ep.ok_ratio, 1.0, "every warm POST delivered a valid envelope");
+        assert_eq!(
+            ep.ok_ratio, 1.0,
+            "every warm POST delivered a valid envelope"
+        );
     }
 
     #[test]
@@ -1037,7 +1030,11 @@ mod tests {
         let header_end = buf.len();
         buf.extend_from_slice(body);
         let end = chunked_body_end(&buf, header_end).expect("complete chunked body");
-        assert_eq!(end, buf.len(), "end is just past the 0\\r\\n\\r\\n terminator");
+        assert_eq!(
+            end,
+            buf.len(),
+            "end is just past the 0\\r\\n\\r\\n terminator"
+        );
 
         // Truncated (terminator missing) → needs more bytes.
         let partial = &buf[..buf.len() - 3];
@@ -1064,7 +1061,8 @@ mod tests {
         // A 200 status line followed by a non-UTF-8 body (an action's
         // bincode OpcodeFrame). Decoding the whole buffer as a string
         // would fail; we must still read the 200 from the status line.
-        let mut bytes = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+        let mut bytes =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
         bytes.extend_from_slice(&[0xff, 0x00, 0xfe, 0x80, 0x01]); // invalid UTF-8
         assert_eq!(parse_status_line(&bytes), Some(200));
 

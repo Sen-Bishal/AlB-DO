@@ -126,7 +126,6 @@ pub struct InternTable {
 /// drops the entry by id. Bootstrap remains
 /// [`Instruction::InitInternTable`] (single-shot, ships the full table) so
 /// the warm path stays a single byte of discriminant.
-//
 // PHASE 2 (B-emitter): the compiler's intern-table-diff pass
 // emits these ops on the control stream when the JSX corpus grows new
 // tags/attrs/events between hot reloads. `Remove` is for evicting an id
@@ -177,7 +176,6 @@ pub struct ReconcileRow {
 /// Wire-format note: variant order is the bincode discriminant. Adding new
 /// variants is allowed; **reordering existing ones is a wire break**. Any
 /// reorder requires a coordinated client/server upgrade.
-//
 // PHASE 2 (B-emitter): `src/runtime/emitter.rs` is the only
 // producer. Walk `IrColumns` lane slices via the existing `LaneColumnPass`
 // (`src/ir/columns.rs`), emit one `OpcodeFrame` per lane, hand the encoded
@@ -374,7 +372,6 @@ pub enum Instruction {
 /// [`crate::runtime::webtransport::WebTransportMuxer::reassemble_binary_stream`]
 /// BEFORE invoking [`crate::ir::wire::decode_frame`]. Per-message decoding
 /// is unsupported; do not assume frame == STREAM message.
-//
 // PHASE 2 (B-emitter): `frame_id` MUST be allocated via the
 // per-stream sequence in `WebTransportMuxer::allocate_sequence` so a frame
 // split across STREAM messages stays attributable to the same logical
@@ -399,11 +396,9 @@ mod tests {
             stable_id: StableId(42),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -415,11 +410,9 @@ mod tests {
             value: b"my-class".to_vec(),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -430,11 +423,9 @@ mod tests {
             text: "Hello, world! 🌍".as_bytes().to_vec(),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -445,11 +436,9 @@ mod tests {
             child_id: StableId(2),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -459,11 +448,9 @@ mod tests {
             stable_id: StableId(99),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -475,11 +462,9 @@ mod tests {
             proxy_id: ProxyId(1001),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -490,11 +475,9 @@ mod tests {
             slot_id: SlotId(200),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -505,11 +488,9 @@ mod tests {
             suspense_id: SuspenseId(500),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -520,11 +501,9 @@ mod tests {
             range: InstructionRange::try_new(64, 256).expect("valid range"),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -534,18 +513,25 @@ mod tests {
             table: InternTable {
                 kind: InternTableKind::Tag,
                 entries: vec![
-                    InternEntry { id: 0, value: "div".to_string() },
-                    InternEntry { id: 1, value: "span".to_string() },
-                    InternEntry { id: 2, value: "section".to_string() },
+                    InternEntry {
+                        id: 0,
+                        value: "div".to_string(),
+                    },
+                    InternEntry {
+                        id: 1,
+                        value: "span".to_string(),
+                    },
+                    InternEntry {
+                        id: 2,
+                        value: "section".to_string(),
+                    },
                 ],
             },
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -554,17 +540,21 @@ mod tests {
         let instruction = Instruction::PatchInternTable {
             kind: InternTableKind::Event,
             ops: vec![
-                InternPatchOp::Set { id: 1, value: "change".to_string() },
+                InternPatchOp::Set {
+                    id: 1,
+                    value: "change".to_string(),
+                },
                 InternPatchOp::Remove { id: 0 },
-                InternPatchOp::Set { id: 2, value: "submit".to_string() },
+                InternPatchOp::Set {
+                    id: 2,
+                    value: "submit".to_string(),
+                },
             ],
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -575,11 +565,9 @@ mod tests {
             slot_id: SlotId(42),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -591,11 +579,9 @@ mod tests {
             slot_id: SlotId(99),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -606,11 +592,9 @@ mod tests {
             value: b"new-text".to_vec(),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -645,11 +629,9 @@ mod tests {
             ],
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -666,11 +648,9 @@ mod tests {
             }],
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -694,11 +674,9 @@ mod tests {
             ],
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         let (decoded, _): (Instruction, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(instruction, decoded);
     }
 
@@ -723,12 +701,9 @@ mod tests {
                 },
             ],
         };
-        let bytes =
-            bincode::encode_to_vec(&frame, bincode::config::standard())
-                .expect("encode");
+        let bytes = bincode::encode_to_vec(&frame, bincode::config::standard()).expect("encode");
         let (decoded, _): (OpcodeFrame, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(frame, decoded);
     }
 
@@ -737,7 +712,10 @@ mod tests {
         let err = InstructionRange::try_new(100, 50).unwrap_err();
         assert_eq!(
             err,
-            RangeError::StartAfterEnd { start: 100, end: 50 }
+            RangeError::StartAfterEnd {
+                start: 100,
+                end: 50
+            }
         );
     }
 
@@ -766,9 +744,10 @@ mod tests {
                 Instruction::InitInternTable {
                     table: InternTable {
                         kind: InternTableKind::Tag,
-                        entries: vec![
-                            InternEntry { id: 0, value: "div".to_string() },
-                        ],
+                        entries: vec![InternEntry {
+                            id: 0,
+                            value: "div".to_string(),
+                        }],
                     },
                 },
                 Instruction::Create {
@@ -810,12 +789,9 @@ mod tests {
                 },
             ],
         };
-        let bytes =
-            bincode::encode_to_vec(&frame, bincode::config::standard())
-                .expect("encode");
+        let bytes = bincode::encode_to_vec(&frame, bincode::config::standard()).expect("encode");
         let (decoded, _): (OpcodeFrame, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(frame, decoded);
     }
 
@@ -824,19 +800,14 @@ mod tests {
         let frame = OpcodeFrame {
             frame_id: 0,
             component_id: None,
-            instructions: vec![
-                Instruction::Create {
-                    tag_id: TagId(5),
-                    stable_id: StableId(100),
-                },
-            ],
+            instructions: vec![Instruction::Create {
+                tag_id: TagId(5),
+                stable_id: StableId(100),
+            }],
         };
-        let bytes =
-            bincode::encode_to_vec(&frame, bincode::config::standard())
-                .expect("encode");
+        let bytes = bincode::encode_to_vec(&frame, bincode::config::standard()).expect("encode");
         let (decoded, _): (OpcodeFrame, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(frame, decoded);
     }
 
@@ -845,17 +816,23 @@ mod tests {
         let table = InternTable {
             kind: InternTableKind::Attr,
             entries: vec![
-                InternEntry { id: 0, value: "class".to_string() },
-                InternEntry { id: 1, value: "id".to_string() },
-                InternEntry { id: 2, value: "href".to_string() },
+                InternEntry {
+                    id: 0,
+                    value: "class".to_string(),
+                },
+                InternEntry {
+                    id: 1,
+                    value: "id".to_string(),
+                },
+                InternEntry {
+                    id: 2,
+                    value: "href".to_string(),
+                },
             ],
         };
-        let bytes =
-            bincode::encode_to_vec(&table, bincode::config::standard())
-                .expect("encode");
+        let bytes = bincode::encode_to_vec(&table, bincode::config::standard()).expect("encode");
         let (decoded, _): (InternTable, _) =
-            bincode::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(table, decoded);
     }
 
@@ -866,8 +843,7 @@ mod tests {
             stable_id: StableId(1),
         };
         let bytes =
-            bincode::encode_to_vec(&instruction, bincode::config::standard())
-                .expect("encode");
+            bincode::encode_to_vec(&instruction, bincode::config::standard()).expect("encode");
         assert!(
             bytes.len() <= 8,
             "Create instruction should encode to ≤ 8 bytes, got {}",

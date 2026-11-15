@@ -146,7 +146,11 @@ async fn form_submit_with_matching_csrf_token_dispatches_and_returns_navigate() 
         .await
         .expect("router responds");
 
-    assert_eq!(response.status(), StatusCode::OK, "valid CSRF must dispatch");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "valid CSRF must dispatch"
+    );
     let body = to_bytes(response.into_body(), MAX_BODY).await.unwrap();
     let (frame, _) = decode_frame(&body).expect("response decodes as OpcodeFrame");
 
@@ -369,10 +373,7 @@ async fn cookie_session_round_trips_into_action_handler() {
         .expect("router responds");
     assert_eq!(response.status(), StatusCode::OK);
 
-    let recorded = observed
-        .lock()
-        .unwrap()
-        .expect("handler must have run");
+    let recorded = observed.lock().unwrap().expect("handler must have run");
     assert_eq!(
         recorded, session,
         "handler observed session must match the cookie's session id"
@@ -387,8 +388,6 @@ async fn cookie_session_round_trips_into_action_handler() {
 #[test]
 fn action_id_parity_across_compiler_and_server() {
     let server_side = form_action_id(ACTION_NAME);
-    let compiler_side =
-        dom_render_compiler::transforms::form::allocate_form_action_id(ACTION_NAME);
+    let compiler_side = dom_render_compiler::transforms::form::allocate_form_action_id(ACTION_NAME);
     assert_eq!(server_side, compiler_side);
 }
-

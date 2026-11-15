@@ -210,7 +210,12 @@ pub struct EnginePoolGauges {
 pub fn render(http: &HttpMetrics, runtime: &RuntimeGauges) -> String {
     let mut out = String::with_capacity(4096);
 
-    family(&mut out, "albedo_build_info", "gauge", "Always 1; the labels carry the build.");
+    family(
+        &mut out,
+        "albedo_build_info",
+        "gauge",
+        "Always 1; the labels carry the build.",
+    );
     let _ = writeln!(
         out,
         "albedo_build_info{{version=\"{}\"}} 1",
@@ -221,7 +226,12 @@ pub fn render(http: &HttpMetrics, runtime: &RuntimeGauges) -> String {
         .started_at
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
-    gauge(&mut out, "process_start_time_seconds", "Start time of the process since the Unix epoch.", start);
+    gauge(
+        &mut out,
+        "process_start_time_seconds",
+        "Start time of the process since the Unix epoch.",
+        start,
+    );
     process_gauges(&mut out);
 
     family(
@@ -269,7 +279,10 @@ pub fn render(http: &HttpMetrics, runtime: &RuntimeGauges) -> String {
     );
     // `_count` must equal the `+Inf` bucket; both are read from one pass so a
     // request landing mid-scrape cannot make them disagree.
-    let _ = writeln!(out, "albedo_http_request_duration_seconds_count {cumulative}");
+    let _ = writeln!(
+        out,
+        "albedo_http_request_duration_seconds_count {cumulative}"
+    );
 
     gauge(
         &mut out,
@@ -285,17 +298,62 @@ pub fn render(http: &HttpMetrics, runtime: &RuntimeGauges) -> String {
     );
 
     if let Some(pool) = runtime.engine_pool {
-        gauge(&mut out, "albedo_engine_pool_size", "QuickJS engines the pool was built with.", pool.size as f64);
-        gauge(&mut out, "albedo_engine_pool_live", "Engines still serving; below size means slots were retired.", pool.live as f64);
-        gauge(&mut out, "albedo_engine_pool_busy", "Engines checked out right now.", pool.busy as f64);
-        counter(&mut out, "albedo_engine_interruptions_total", "Checkouts stopped for running past the job budget.", pool.interruptions);
-        counter(&mut out, "albedo_engine_replacements_total", "Engines replaced after a job panicked on them.", pool.replacements);
-        counter(&mut out, "albedo_engine_confinements_total", "JavaScript realms rebuilt after a checkout, so no request sees another's state.", pool.confinements);
-        counter(&mut out, "albedo_engine_confinement_failures_total", "Realm rebuilds that failed.", pool.confinement_failures);
+        gauge(
+            &mut out,
+            "albedo_engine_pool_size",
+            "QuickJS engines the pool was built with.",
+            pool.size as f64,
+        );
+        gauge(
+            &mut out,
+            "albedo_engine_pool_live",
+            "Engines still serving; below size means slots were retired.",
+            pool.live as f64,
+        );
+        gauge(
+            &mut out,
+            "albedo_engine_pool_busy",
+            "Engines checked out right now.",
+            pool.busy as f64,
+        );
+        counter(
+            &mut out,
+            "albedo_engine_interruptions_total",
+            "Checkouts stopped for running past the job budget.",
+            pool.interruptions,
+        );
+        counter(
+            &mut out,
+            "albedo_engine_replacements_total",
+            "Engines replaced after a job panicked on them.",
+            pool.replacements,
+        );
+        counter(
+            &mut out,
+            "albedo_engine_confinements_total",
+            "JavaScript realms rebuilt after a checkout, so no request sees another's state.",
+            pool.confinements,
+        );
+        counter(
+            &mut out,
+            "albedo_engine_confinement_failures_total",
+            "Realm rebuilds that failed.",
+            pool.confinement_failures,
+        );
     }
 
-    gauge(&mut out, "albedo_phosphor_lanes_open", "Open PHOSPHOR lanes.", runtime.phosphor_lanes as f64);
-    gauge(&mut out, "albedo_broadcast_topics", "Registered broadcast topics.", runtime.broadcast_topics as f64);
+    gauge(
+        &mut out,
+        "albedo_phosphor_lanes_open",
+        "Open PHOSPHOR lanes.",
+        runtime.phosphor_lanes as f64,
+    );
+    gauge(
+        &mut out,
+        "albedo_broadcast_topics",
+        "Registered broadcast topics.",
+        runtime.broadcast_topics as f64,
+    );
     #[cfg(feature = "forge")]
     counter(
         &mut out,
@@ -314,19 +372,64 @@ pub fn render(http: &HttpMetrics, runtime: &RuntimeGauges) -> String {
     // `scheduled` is always present, so "nothing is backing this up" is a
     // value a rule can see rather than a missing series.
     let (scheduled, last_success, failures) = runtime.backups;
-    gauge(&mut out, "albedo_backups_scheduled", "1 when ALBEDO_BACKUP_DIR schedules backups.", f64::from(u8::from(scheduled)));
+    gauge(
+        &mut out,
+        "albedo_backups_scheduled",
+        "1 when ALBEDO_BACKUP_DIR schedules backups.",
+        f64::from(u8::from(scheduled)),
+    );
     if scheduled {
-        gauge(&mut out, "albedo_backup_last_success_timestamp_seconds", "When the newest backup was taken; 0 if none has been.", last_success);
-        counter(&mut out, "albedo_backup_failures_total", "Scheduled backups that failed.", failures);
+        gauge(
+            &mut out,
+            "albedo_backup_last_success_timestamp_seconds",
+            "When the newest backup was taken; 0 if none has been.",
+            last_success,
+        );
+        counter(
+            &mut out,
+            "albedo_backup_failures_total",
+            "Scheduled backups that failed.",
+            failures,
+        );
     }
 
     if let Some(aperture) = runtime.aperture {
-        counter(&mut out, "albedo_aperture_upstream_requests_total", "Outbound requests put on the wire.", aperture.upstream_requests);
-        counter(&mut out, "albedo_aperture_not_modified_total", "Outbound requests answered 304.", aperture.not_modified);
-        counter(&mut out, "albedo_aperture_fresh_hits_total", "Reads served from cache without contacting upstream.", aperture.fresh_hits);
-        counter(&mut out, "albedo_aperture_coalesced_total", "Callers that joined an in-flight outbound request.", aperture.coalesced);
-        counter(&mut out, "albedo_aperture_stale_on_error_total", "Stale bodies served because upstream failed.", aperture.stale_on_error);
-        counter(&mut out, "albedo_aperture_throttled_total", "Outbound requests refused because the host budget was spent.", aperture.throttled);
+        counter(
+            &mut out,
+            "albedo_aperture_upstream_requests_total",
+            "Outbound requests put on the wire.",
+            aperture.upstream_requests,
+        );
+        counter(
+            &mut out,
+            "albedo_aperture_not_modified_total",
+            "Outbound requests answered 304.",
+            aperture.not_modified,
+        );
+        counter(
+            &mut out,
+            "albedo_aperture_fresh_hits_total",
+            "Reads served from cache without contacting upstream.",
+            aperture.fresh_hits,
+        );
+        counter(
+            &mut out,
+            "albedo_aperture_coalesced_total",
+            "Callers that joined an in-flight outbound request.",
+            aperture.coalesced,
+        );
+        counter(
+            &mut out,
+            "albedo_aperture_stale_on_error_total",
+            "Stale bodies served because upstream failed.",
+            aperture.stale_on_error,
+        );
+        counter(
+            &mut out,
+            "albedo_aperture_throttled_total",
+            "Outbound requests refused because the host budget was spent.",
+            aperture.throttled,
+        );
     }
 
     out
@@ -360,10 +463,20 @@ fn process_gauges(out: &mut String) {
         // 4 KiB pages: every architecture this is shipped for (x86_64, aarch64
         // with the default kernel) uses them, and reading the real value needs
         // `libc::sysconf`, which is not worth a dependency for a gauge.
-        gauge(out, "process_resident_memory_bytes", "Resident memory size in bytes.", (pages * 4096) as f64);
+        gauge(
+            out,
+            "process_resident_memory_bytes",
+            "Resident memory size in bytes.",
+            (pages * 4096) as f64,
+        );
     }
     if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
-        gauge(out, "process_open_fds", "Number of open file descriptors.", entries.count() as f64);
+        gauge(
+            out,
+            "process_open_fds",
+            "Number of open file descriptors.",
+            entries.count() as f64,
+        );
     }
 }
 
@@ -444,16 +557,59 @@ mod tests {
         let http = HttpMetrics::new();
         http.record(&Method::GET, StatusCode::OK, Duration::from_millis(3));
         http.record(&Method::GET, StatusCode::OK, Duration::from_millis(30));
-        http.record(&Method::POST, StatusCode::NOT_FOUND, Duration::from_secs(20));
+        http.record(
+            &Method::POST,
+            StatusCode::NOT_FOUND,
+            Duration::from_secs(20),
+        );
         let text = render(&http, &RuntimeGauges::default());
 
-        assert_eq!(line(&text, "albedo_http_request_duration_seconds_bucket{le=\"0.005\"}"), "albedo_http_request_duration_seconds_bucket{le=\"0.005\"} 1");
-        assert_eq!(line(&text, "albedo_http_request_duration_seconds_bucket{le=\"0.05\"}"), "albedo_http_request_duration_seconds_bucket{le=\"0.05\"} 2");
-        assert_eq!(line(&text, "albedo_http_request_duration_seconds_bucket{le=\"10\"}"), "albedo_http_request_duration_seconds_bucket{le=\"10\"} 2");
-        assert_eq!(line(&text, "albedo_http_request_duration_seconds_bucket{le=\"+Inf\"}"), "albedo_http_request_duration_seconds_bucket{le=\"+Inf\"} 3");
-        assert_eq!(line(&text, "albedo_http_request_duration_seconds_count"), "albedo_http_request_duration_seconds_count 3");
-        assert_eq!(line(&text, "albedo_http_requests_total{method=\"GET\",code=\"200\"}"), "albedo_http_requests_total{method=\"GET\",code=\"200\"} 2");
-        assert_eq!(line(&text, "albedo_http_requests_total{method=\"POST\",code=\"404\"}"), "albedo_http_requests_total{method=\"POST\",code=\"404\"} 1");
+        assert_eq!(
+            line(
+                &text,
+                "albedo_http_request_duration_seconds_bucket{le=\"0.005\"}"
+            ),
+            "albedo_http_request_duration_seconds_bucket{le=\"0.005\"} 1"
+        );
+        assert_eq!(
+            line(
+                &text,
+                "albedo_http_request_duration_seconds_bucket{le=\"0.05\"}"
+            ),
+            "albedo_http_request_duration_seconds_bucket{le=\"0.05\"} 2"
+        );
+        assert_eq!(
+            line(
+                &text,
+                "albedo_http_request_duration_seconds_bucket{le=\"10\"}"
+            ),
+            "albedo_http_request_duration_seconds_bucket{le=\"10\"} 2"
+        );
+        assert_eq!(
+            line(
+                &text,
+                "albedo_http_request_duration_seconds_bucket{le=\"+Inf\"}"
+            ),
+            "albedo_http_request_duration_seconds_bucket{le=\"+Inf\"} 3"
+        );
+        assert_eq!(
+            line(&text, "albedo_http_request_duration_seconds_count"),
+            "albedo_http_request_duration_seconds_count 3"
+        );
+        assert_eq!(
+            line(
+                &text,
+                "albedo_http_requests_total{method=\"GET\",code=\"200\"}"
+            ),
+            "albedo_http_requests_total{method=\"GET\",code=\"200\"} 2"
+        );
+        assert_eq!(
+            line(
+                &text,
+                "albedo_http_requests_total{method=\"POST\",code=\"404\"}"
+            ),
+            "albedo_http_requests_total{method=\"POST\",code=\"404\"} 1"
+        );
     }
 
     #[test]
@@ -465,7 +621,9 @@ mod tests {
         }
         let text = render(&http, &RuntimeGauges::default());
         assert_eq!(
-            text.lines().filter(|l| l.starts_with("albedo_http_requests_total{")).count(),
+            text.lines()
+                .filter(|l| l.starts_with("albedo_http_requests_total{"))
+                .count(),
             1,
             "attacker-chosen methods must not mint label values:\n{text}"
         );
@@ -476,7 +634,11 @@ mod tests {
         let http = HttpMetrics::new();
         http.record(&Method::GET, StatusCode::OK, Duration::from_millis(1));
         let runtime = RuntimeGauges {
-            engine_pool: Some(EnginePoolGauges { size: 4, live: 4, ..Default::default() }),
+            engine_pool: Some(EnginePoolGauges {
+                size: 4,
+                live: 4,
+                ..Default::default()
+            }),
             aperture: Some(dom_render_compiler::aperture::MetricsSnapshot {
                 upstream_requests: 0,
                 conditional_requests: 0,
@@ -505,9 +667,16 @@ mod tests {
             let sample = l.split(['{', ' ']).next().expect("sample name");
             let family = ["_bucket", "_sum", "_count"]
                 .iter()
-                .find_map(|suffix| sample.strip_suffix(suffix).filter(|base| typed.contains(*base)))
+                .find_map(|suffix| {
+                    sample
+                        .strip_suffix(suffix)
+                        .filter(|base| typed.contains(*base))
+                })
                 .unwrap_or(sample);
-            assert!(typed.contains(family), "`{sample}` has no # TYPE line before it");
+            assert!(
+                typed.contains(family),
+                "`{sample}` has no # TYPE line before it"
+            );
         }
     }
 }

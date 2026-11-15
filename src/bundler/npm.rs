@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swc_common::{sync::Lrc, FileName, SourceMap};
 use swc_ecma_ast::{
-    CallExpr, Callee, Decl, Expr, ExportSpecifier, ImportSpecifier, Lit, Module, ModuleDecl,
+    CallExpr, Callee, Decl, ExportSpecifier, Expr, ImportSpecifier, Lit, Module, ModuleDecl,
     ModuleExportName, ModuleItem, Pat, Program,
 };
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
@@ -150,7 +150,9 @@ pub enum NpmBundleError {
     /// 🔑 **Refused at build, never stubbed to throw at run time.** A stub that
     /// throws moves a fact the compiler already knows into the user's browser,
     /// where it arrives as a blank island instead of a build error.
-    #[error("'{specifier}' (imported from '{importer}') is not available to client code: {reason}")]
+    #[error(
+        "'{specifier}' (imported from '{importer}') is not available to client code: {reason}"
+    )]
     ExternalRefused {
         /// The refused specifier as written.
         specifier: String,
@@ -550,14 +552,12 @@ fn classify_format(path: &Path, source: &str) -> NpmModuleFormat {
 /// too expensive to run over every file in a 1,771-file graph like
 /// `lucide-react`:
 ///
-/// 1. A word-boundary scan for `import` / `export`. 🪤 **A plain substring test
-///    is useless here** — `exports.foo`, the single most common token in CJS,
-///    contains `export`. The boundary check is what keeps the parse off the
-///    overwhelming majority of CJS files.
-/// 2. A real parse for the files that survive it. Only a top-level
-///    `ModuleDecl` (or `import.meta`) is proof; a *dynamic* `import()` call is
-///    legal in CJS and must not promote the file, which is precisely the
-///    distinction a text scan cannot make and a parse makes for free.
+/// 1. A word-boundary scan for `import` / `export`. 🪤 **A plain substring test is useless here** —
+///    `exports.foo`, the single most common token in CJS, contains `export`. The boundary check is
+///    what keeps the parse off the overwhelming majority of CJS files.
+/// 2. A real parse for the files that survive it. Only a top-level `ModuleDecl` (or `import.meta`)
+///    is proof; a *dynamic* `import()` call is legal in CJS and must not promote the file, which is
+///    precisely the distinction a text scan cannot make and a parse makes for free.
 ///
 /// An unparseable file is left as CJS: if it will not parse as a module it
 /// cannot be one, and the CJS path passes source through verbatim, so a file
@@ -606,8 +606,7 @@ fn source_is_esm(source: &str) -> bool {
 fn has_module_keyword(source: &str) -> bool {
     const KEYWORDS: [&str; 2] = ["import", "export"];
     let bytes = source.as_bytes();
-    let is_ident_byte =
-        |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
 
     for keyword in KEYWORDS {
         let mut from = 0usize;
@@ -729,8 +728,10 @@ fn resolve_from_file(
 
 /// Canonical record key for a file inside a package.
 fn record_key(package: &ResolvedPackage, file: &Path) -> String {
-    let relative = file
-        .strip_prefix(&package.dir).map_or_else(|_| file.to_string_lossy().replace('\\', "/"), |rel| rel.to_string_lossy().replace('\\', "/"));
+    let relative = file.strip_prefix(&package.dir).map_or_else(
+        |_| file.to_string_lossy().replace('\\', "/"),
+        |rel| rel.to_string_lossy().replace('\\', "/"),
+    );
     format!("npm:{}@{}/{}", package.name, package.version, relative)
 }
 
@@ -1238,11 +1239,11 @@ fn check_entry_external(specifier: &str, options: &ShakeOptions) -> Result<(), N
 ///
 /// # What `options` adds
 ///
-/// * **Externals** — a specifier the host already provides is never walked, so
-///   a package's `import 'react'` costs zero bytes instead of 98 kB.
-/// * **Defines** — `process.env.NODE_ENV` folds to `"production"` before the
-///   specifier scan, so a `NODE_ENV` fork contributes *one* arm to the graph
-///   rather than both. See [`crate::bundler::defines`].
+/// * **Externals** — a specifier the host already provides is never walked, so a package's `import
+///   'react'` costs zero bytes instead of 98 kB.
+/// * **Defines** — `process.env.NODE_ENV` folds to `"production"` before the specifier scan, so a
+///   `NODE_ENV` fork contributes *one* arm to the graph rather than both. See
+///   [`crate::bundler::defines`].
 ///
 /// # When shaking is declined
 ///
@@ -1499,7 +1500,10 @@ impl<'a> DemandWalk<'a> {
             });
         }
 
-        if !self.resolving.insert((path.to_path_buf(), name.to_string())) {
+        if !self
+            .resolving
+            .insert((path.to_path_buf(), name.to_string()))
+        {
             // Already being resolved higher in this chain — a cycle. Bind to
             // this file; the runtime linker's memoisation handles the rest.
             self.mark_live(package, path);
@@ -1606,11 +1610,7 @@ impl<'a> DemandWalk<'a> {
     /// analysis rather than an import list. The same is true of CJS
     /// `require('react').x`. Both pass, and a missing member surfaces as an
     /// ordinary `undefined is not a function` at run time.
-    fn check_host_import(
-        &self,
-        path: &Path,
-        entry: &FileImport,
-    ) -> Result<(), NpmBundleError> {
+    fn check_host_import(&self, path: &Path, entry: &FileImport) -> Result<(), NpmBundleError> {
         let Some(ExternalTarget::Host { provides, .. }) =
             self.options.externals.get(&entry.specifier)
         else {
@@ -2066,7 +2066,9 @@ mod tests {
     fn import_meta_promotes_a_file_with_no_module_declarations() {
         // An expression, not a `ModuleDecl`, so the declaration check misses it
         // — this is the `import.meta only valid in module code` failure class.
-        assert!(source_is_esm("const url = import.meta.url; module.exports = url;"));
+        assert!(source_is_esm(
+            "const url = import.meta.url; module.exports = url;"
+        ));
     }
 
     // ── The deferred-load scan · Tier C Phase 3's residual ────────────────
@@ -2116,10 +2118,10 @@ mod tests {
     /// author never wrote.
     #[test]
     fn a_computed_specifier_is_not_collected() {
-        assert!(scan_deferred_loads(
-            "const name = 'fs'; export const load = () => require(name);"
-        )
-        .is_empty());
+        assert!(
+            scan_deferred_loads("const name = 'fs'; export const load = () => require(name);")
+                .is_empty()
+        );
         assert!(
             scan_deferred_loads("export const load = (p) => import(`./pages/${p}.js`);").is_empty()
         );
@@ -2196,8 +2198,8 @@ mod tests {
     #[test]
     fn every_export_form_the_corpus_produced_is_detected() {
         for source in [
-            "export * from './a';",              // Unexpected token '*'
-            "export { a as b } from './a';",     // Unexpected token '{'
+            "export * from './a';",          // Unexpected token '*'
+            "export { a as b } from './a';", // Unexpected token '{'
             "export default function () {}",
             "const e = 1; export { e };",
             "import a from './a'; a();",
@@ -2358,7 +2360,8 @@ mod tests {
         )
         .unwrap();
 
-        let bundle = bundle_npm_dependency(dir.path(), "tinylib", &ShakeOptions::default()).unwrap();
+        let bundle =
+            bundle_npm_dependency(dir.path(), "tinylib", &ShakeOptions::default()).unwrap();
         assert_eq!(bundle.package_name, "tinylib");
         assert_eq!(bundle.package_version, "1.2.3");
         assert_eq!(bundle.entry_key, "npm:tinylib@1.2.3/lib/index.js");
@@ -2411,7 +2414,9 @@ mod tests {
         )
         .unwrap();
 
-        let bundle = bundle_npm_dependency(dir.path(), "scroll-bar/constants", &ShakeOptions::default()).unwrap();
+        let bundle =
+            bundle_npm_dependency(dir.path(), "scroll-bar/constants", &ShakeOptions::default())
+                .unwrap();
         assert_eq!(
             bundle.entry_key, "npm:scroll-bar@2.3.8/dist/es2015/constants.js",
             "the directory's own manifest must redirect the probe, and `module` \
@@ -2437,9 +2442,14 @@ mod tests {
         )
         .unwrap();
         std::fs::write(pkg.join("sub").join("real.js"), "module.exports = 'real';").unwrap();
-        std::fs::write(pkg.join("sub").join("index.js"), "module.exports = 'index';").unwrap();
+        std::fs::write(
+            pkg.join("sub").join("index.js"),
+            "module.exports = 'index';",
+        )
+        .unwrap();
 
-        let bundle = bundle_npm_dependency(dir.path(), "both/sub", &ShakeOptions::default()).unwrap();
+        let bundle =
+            bundle_npm_dependency(dir.path(), "both/sub", &ShakeOptions::default()).unwrap();
         assert_eq!(bundle.entry_key, "npm:both@1.0.0/sub/real.js");
     }
 
@@ -2460,9 +2470,14 @@ mod tests {
             r#"{ "main": "./does-not-exist.js" }"#,
         )
         .unwrap();
-        std::fs::write(pkg.join("sub").join("index.js"), "module.exports = 'index';").unwrap();
+        std::fs::write(
+            pkg.join("sub").join("index.js"),
+            "module.exports = 'index';",
+        )
+        .unwrap();
 
-        let bundle = bundle_npm_dependency(dir.path(), "broken/sub", &ShakeOptions::default()).unwrap();
+        let bundle =
+            bundle_npm_dependency(dir.path(), "broken/sub", &ShakeOptions::default()).unwrap();
         assert_eq!(bundle.entry_key, "npm:broken@1.0.0/sub/index.js");
     }
 
@@ -2539,8 +2554,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         barrel_package(dir.path());
 
-        let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"]), &ShakeOptions::default()).unwrap();
+        let shaken = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "barrel",
+            &demand(&["Beta"]),
+            &ShakeOptions::default(),
+        )
+        .unwrap();
 
         assert!(!shaken.taken_whole);
         let beta = shaken.bindings.get("Beta").expect("Beta resolved");
@@ -2553,7 +2573,9 @@ mod tests {
             "no barrel should be emitted: {keys:?}"
         );
         assert!(
-            !keys.iter().any(|k| k.ends_with("alpha.js") || k.ends_with("gamma.js")),
+            !keys
+                .iter()
+                .any(|k| k.ends_with("alpha.js") || k.ends_with("gamma.js")),
             "unreached siblings must not ship: {keys:?}"
         );
         // The leaf and the helper its import demands, and nothing else.
@@ -2567,8 +2589,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         barrel_package(dir.path());
 
-        let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha"]), &ShakeOptions::default()).unwrap();
+        let shaken = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "barrel",
+            &demand(&["Alpha"]),
+            &ShakeOptions::default(),
+        )
+        .unwrap();
         assert!(shaken
             .artifacts
             .iter()
@@ -2581,11 +2608,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         barrel_package(dir.path());
 
-        let one =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha"]), &ShakeOptions::default()).unwrap();
-        let two =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Alpha", "Beta"]), &ShakeOptions::default())
-                .unwrap();
+        let one = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "barrel",
+            &demand(&["Alpha"]),
+            &ShakeOptions::default(),
+        )
+        .unwrap();
+        let two = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "barrel",
+            &demand(&["Alpha", "Beta"]),
+            &ShakeOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(one.artifacts.len(), 2);
         assert_eq!(two.artifacts.len(), 3, "one extra leaf, one shared helper");
@@ -2606,8 +2642,13 @@ mod tests {
         )
         .unwrap();
 
-        let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"]), &ShakeOptions::default()).unwrap();
+        let shaken = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "barrel",
+            &demand(&["Beta"]),
+            &ShakeOptions::default(),
+        )
+        .unwrap();
         assert!(shaken.taken_whole);
         assert!(shaken.artifacts.len() > 3, "the whole package ships");
         // The binding still resolves — through the entry record, as before.
@@ -2628,8 +2669,13 @@ mod tests {
         )
         .unwrap();
 
-        let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Beta"]), &ShakeOptions::default()).unwrap();
+        let shaken = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "barrel",
+            &demand(&["Beta"]),
+            &ShakeOptions::default(),
+        )
+        .unwrap();
         assert!(shaken.taken_whole);
     }
 
@@ -2640,10 +2686,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         barrel_package(dir.path());
 
-        let err = bundle_npm_dependency_for_demand(dir.path(), "barrel", &demand(&["Delta"]), &ShakeOptions::default())
-            .unwrap_err();
+        let err = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "barrel",
+            &demand(&["Delta"]),
+            &ShakeOptions::default(),
+        )
+        .unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("Delta"), "must name the binding: {message}");
+        assert!(
+            message.contains("Delta"),
+            "must name the binding: {message}"
+        );
     }
 
     /// A re-export cycle terminates instead of recursing until the stack dies.
@@ -2662,7 +2716,12 @@ mod tests {
 
         // Either a clean "not exported" error or a bound record — never a hang
         // or a stack overflow.
-        let _ = bundle_npm_dependency_for_demand(dir.path(), "loopy", &demand(&["Whatever"]), &ShakeOptions::default());
+        let _ = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "loopy",
+            &demand(&["Whatever"]),
+            &ShakeOptions::default(),
+        );
     }
 
     /// CommonJS has no static export graph, so a CJS entry is opaque to this
@@ -2679,8 +2738,13 @@ mod tests {
         .unwrap();
         std::fs::write(pkg.join("index.js"), "module.exports = { hello: 1 };").unwrap();
 
-        let shaken =
-            bundle_npm_dependency_for_demand(dir.path(), "cjspkg", &demand(&["hello"]), &ShakeOptions::default()).unwrap();
+        let shaken = bundle_npm_dependency_for_demand(
+            dir.path(),
+            "cjspkg",
+            &demand(&["hello"]),
+            &ShakeOptions::default(),
+        )
+        .unwrap();
         let hello = shaken.bindings.get("hello").expect("bound");
         assert!(hello.record_key.ends_with("index.js"));
         assert_eq!(hello.export_name, "hello");
@@ -2689,7 +2753,8 @@ mod tests {
     #[test]
     fn missing_package_fails_loudly() {
         let dir = tempfile::tempdir().unwrap();
-        let err = bundle_npm_dependency(dir.path(), "ghost-package", &ShakeOptions::default()).unwrap_err();
+        let err = bundle_npm_dependency(dir.path(), "ghost-package", &ShakeOptions::default())
+            .unwrap_err();
         assert!(matches!(err, NpmBundleError::PackageNotFound { .. }));
         assert!(err.to_string().contains("ghost-package"));
     }
@@ -2720,7 +2785,10 @@ mod tests {
         let shimmable = bundle_npm_dependency(dir.path(), "path", &ShakeOptions::default())
             .unwrap_err()
             .to_string();
-        assert!(shimmable.contains("no Node built-in shims yet"), "{shimmable}");
+        assert!(
+            shimmable.contains("no Node built-in shims yet"),
+            "{shimmable}"
+        );
     }
 
     /// 🪤 **The falsifier for the whole refusal table.** `events`, `buffer`,
@@ -2739,7 +2807,11 @@ mod tests {
             r#"{"name":"events","version":"3.3.0","main":"./index.js"}"#,
         )
         .unwrap();
-        std::fs::write(pkg.join("index.js"), "module.exports = { EventEmitter: 1 };").unwrap();
+        std::fs::write(
+            pkg.join("index.js"),
+            "module.exports = { EventEmitter: 1 };",
+        )
+        .unwrap();
 
         let bundle = bundle_npm_dependency(dir.path(), "events", &ShakeOptions::default())
             .expect("an installed package wins over the built-in name");
@@ -2747,8 +2819,8 @@ mod tests {
 
         // ...but the unambiguous form is still the built-in, because no npm
         // package can be named with a colon.
-        let err = bundle_npm_dependency(dir.path(), "node:events", &ShakeOptions::default())
-            .unwrap_err();
+        let err =
+            bundle_npm_dependency(dir.path(), "node:events", &ShakeOptions::default()).unwrap_err();
         assert!(matches!(err, NpmBundleError::NodeBuiltin { .. }), "{err}");
     }
 
@@ -2784,11 +2856,18 @@ mod tests {
             r#"{"name":"react-dom","version":"18.2.0","main":"./index.js"}"#,
         )
         .unwrap();
-        std::fs::write(bare.join("index.js"), "module.exports = { createPortal: 1 };").unwrap();
+        std::fs::write(
+            bare.join("index.js"),
+            "module.exports = { createPortal: 1 };",
+        )
+        .unwrap();
 
         let options = crate::bundler::client_npm::client_shake_options();
         let err = bundle_npm_dependency(dir.path(), "react-dom/client", &options).unwrap_err();
-        assert!(matches!(err, NpmBundleError::ExternalRefused { .. }), "{err}");
+        assert!(
+            matches!(err, NpmBundleError::ExternalRefused { .. }),
+            "{err}"
+        );
         let err = bundle_npm_dependency_for_demand(
             dir.path(),
             "react-dom/client",
@@ -2796,12 +2875,19 @@ mod tests {
             &options,
         )
         .unwrap_err();
-        assert!(matches!(err, NpmBundleError::ExternalRefused { .. }), "{err}");
+        assert!(
+            matches!(err, NpmBundleError::ExternalRefused { .. }),
+            "{err}"
+        );
 
         // The server takes the same package whole, on purpose: loading is not
         // rendering, and 79.6% npm coverage is the loading number.
-        bundle_npm_dependency(dir.path(), "react-dom", &crate::bundler::client_npm::server_shake_options())
-            .expect("the server must still load a react-dom-shaped package");
+        bundle_npm_dependency(
+            dir.path(),
+            "react-dom",
+            &crate::bundler::client_npm::server_shake_options(),
+        )
+        .expect("the server must still load a react-dom-shaped package");
     }
 
     #[test]
@@ -2817,7 +2903,8 @@ mod tests {
         .unwrap();
         std::fs::write(pkg.join("index.js"), "export const x = 1;").unwrap();
 
-        let err = bundle_npm_dependency(dir.path(), "sealed/secret", &ShakeOptions::default()).unwrap_err();
+        let err = bundle_npm_dependency(dir.path(), "sealed/secret", &ShakeOptions::default())
+            .unwrap_err();
         assert!(matches!(err, NpmBundleError::SubpathNotExported { .. }));
     }
 }

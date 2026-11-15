@@ -59,8 +59,12 @@ fn a_new_app_passes_its_own_tests_and_a_run_leaves_nothing_behind() {
     }
 
     // Test files are tests, not app: no route, no component.
-    let manifest = std::fs::read_to_string(app.join(".albedo/dist/render-manifest.v2.json")).unwrap();
-    assert!(!manifest.contains("guestbook.test"), "a test file was compiled into the app");
+    let manifest =
+        std::fs::read_to_string(app.join(".albedo/dist/render-manifest.v2.json")).unwrap();
+    assert!(
+        !manifest.contains("guestbook.test"),
+        "a test file was compiled into the app"
+    );
 }
 
 /// A failing test fails the run, and the output says which and why.
@@ -123,7 +127,11 @@ fn a_test_can_grant_and_revoke_a_role() {
     }
     let config_path = app.join("albedo.config.ts");
     let config = std::fs::read_to_string(&config_path).unwrap();
-    let declared = config.replacen("login: \"/sign-in\",", "login: \"/sign-in\",\n    roles: [\"payroll\"],", 1);
+    let declared = config.replacen(
+        "login: \"/sign-in\",",
+        "login: \"/sign-in\",\n    roles: [\"payroll\"],",
+        1,
+    );
     assert_ne!(declared, config, "the scaffold config changed shape");
     std::fs::write(config_path, declared).unwrap();
     write(

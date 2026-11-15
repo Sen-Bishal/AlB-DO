@@ -94,7 +94,11 @@ pub struct WTComponentStream {
 }
 
 impl WTComponentStream {
-    pub const fn new(component_id: ComponentId, stream_slot: u8, render_mode: WTRenderMode) -> Self {
+    pub const fn new(
+        component_id: ComponentId,
+        stream_slot: u8,
+        render_mode: WTRenderMode,
+    ) -> Self {
         Self {
             component_id,
             stream_slot,
@@ -304,9 +308,8 @@ pub struct WebTransportMuxer {
 
 impl std::fmt::Debug for WebTransportMuxer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let snapshot: [u64; WEBTRANSPORT_STREAM_COUNT] = std::array::from_fn(|idx| {
-            self.next_sequence[idx].load(Ordering::Acquire)
-        });
+        let snapshot: [u64; WEBTRANSPORT_STREAM_COUNT] =
+            std::array::from_fn(|idx| self.next_sequence[idx].load(Ordering::Acquire));
         formatter
             .debug_struct("WebTransportMuxer")
             .field("next_sequence", &snapshot)
@@ -368,7 +371,11 @@ impl WebTransportMuxer {
         let mut frames = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             let stream_id = self.stream_for_route_chunk(chunk.kind);
-            frames.push(self.make_frame(stream_id, None, FramePayload::Text(chunk.content.clone())));
+            frames.push(self.make_frame(
+                stream_id,
+                None,
+                FramePayload::Text(chunk.content.clone()),
+            ));
         }
         frames
     }
@@ -718,9 +725,8 @@ mod tests {
             },
         ];
 
-        let err =
-            WebTransportMuxer::reassemble_binary_stream(WT_STREAM_SLOT_PATCHES, &frames)
-                .unwrap_err();
+        let err = WebTransportMuxer::reassemble_binary_stream(WT_STREAM_SLOT_PATCHES, &frames)
+            .unwrap_err();
         assert!(
             matches!(
                 err,

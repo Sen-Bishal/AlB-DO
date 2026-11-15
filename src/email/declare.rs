@@ -177,14 +177,19 @@ impl EmailDecl {
     /// # Errors
     /// [`EmailDeclError`] naming the field at fault.
     pub fn lower(&self) -> Result<EmailConfig, EmailDeclError> {
-        let from = Mailbox::parse(&self.from)
-            .map_err(|reason| EmailDeclError::Address { field: "from", reason })?;
+        let from = Mailbox::parse(&self.from).map_err(|reason| EmailDeclError::Address {
+            field: "from",
+            reason,
+        })?;
         let reply_to = self
             .reply_to
             .as_deref()
             .map(Mailbox::parse)
             .transpose()
-            .map_err(|reason| EmailDeclError::Address { field: "replyTo", reason })?;
+            .map_err(|reason| EmailDeclError::Address {
+                field: "replyTo",
+                reason,
+            })?;
 
         if self.provider != ProviderKind::Log && self.api_key.is_none() {
             return Err(EmailDeclError::MissingKey(self.provider));
@@ -211,7 +216,9 @@ impl EmailDecl {
             (None, Some(default)) => Some(Url::parse(default).expect("default endpoints parse")),
         };
 
-        self.templates.validate().map_err(EmailDeclError::Template)?;
+        self.templates
+            .validate()
+            .map_err(EmailDeclError::Template)?;
 
         Ok(EmailConfig {
             provider: self.provider,
@@ -319,7 +326,10 @@ mod tests {
         let base = serde_json::json!({
             "from": "a@b.dev", "provider": "mailgun", "apiKey": { "value": "k" }
         });
-        assert_eq!(decl(base.clone()).lower().unwrap_err(), EmailDeclError::MailgunDomain);
+        assert_eq!(
+            decl(base.clone()).lower().unwrap_err(),
+            EmailDeclError::MailgunDomain
+        );
 
         let mut eu = base;
         eu["domain"] = "mg.b.dev".into();
@@ -339,9 +349,18 @@ mod tests {
             }))
             .lower()
         };
-        assert!(matches!(with("http://relay.example.com"), Err(EmailDeclError::Endpoint(_))));
-        assert!(matches!(with("ftp://x.dev"), Err(EmailDeclError::Endpoint(_))));
-        assert!(matches!(with("https://x.dev/?a=1"), Err(EmailDeclError::Endpoint(_))));
+        assert!(matches!(
+            with("http://relay.example.com"),
+            Err(EmailDeclError::Endpoint(_))
+        ));
+        assert!(matches!(
+            with("ftp://x.dev"),
+            Err(EmailDeclError::Endpoint(_))
+        ));
+        assert!(matches!(
+            with("https://x.dev/?a=1"),
+            Err(EmailDeclError::Endpoint(_))
+        ));
         assert!(with("http://127.0.0.1:8025").is_ok());
         assert!(with("https://relay.example.com").is_ok());
     }
@@ -353,7 +372,10 @@ mod tests {
         }))
         .lower()
         .unwrap_err();
-        assert!(matches!(err, EmailDeclError::Address { field: "from", .. }), "{err}");
+        assert!(
+            matches!(err, EmailDeclError::Address { field: "from", .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -371,7 +393,10 @@ mod tests {
             "from": "a@b.dev", "provider": "log",
             "templates": { "passwordRest": { "text": "{{link}}" } }
         }));
-        assert!(typo.is_err(), "a misspelled template name must not be ignored");
+        assert!(
+            typo.is_err(),
+            "a misspelled template name must not be ignored"
+        );
     }
 
     /// `deny_unknown_fields` — `apikey` (lowercase k) must not silently mean

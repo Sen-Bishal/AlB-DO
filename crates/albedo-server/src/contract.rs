@@ -151,7 +151,10 @@ mod tests {
     async fn the_default_provider_fails_closed() {
         let provider = UnconfiguredAuthProvider;
         assert_eq!(
-            provider.authorize(&ctx(), &AuthPolicy::Optional).await.unwrap(),
+            provider
+                .authorize(&ctx(), &AuthPolicy::Optional)
+                .await
+                .unwrap(),
             AuthDecision::Allow
         );
         for policy in [AuthPolicy::Required, AuthPolicy::Role("admin".into())] {

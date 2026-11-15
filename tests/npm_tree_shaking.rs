@@ -50,9 +50,15 @@ fn one_lucide_icon_does_not_drag_in_the_whole_set() {
         return;
     };
 
-    let whole = bundle_npm_dependency(&dir, "lucide-react", &ShakeOptions::default()).expect("bundles whole");
-    let shaken = bundle_npm_dependency_for_demand(&dir, "lucide-react", &demand(&["Check"]), &ShakeOptions::default())
-        .expect("bundles shaken");
+    let whole = bundle_npm_dependency(&dir, "lucide-react", &ShakeOptions::default())
+        .expect("bundles whole");
+    let shaken = bundle_npm_dependency_for_demand(
+        &dir,
+        "lucide-react",
+        &demand(&["Check"]),
+        &ShakeOptions::default(),
+    )
+    .expect("bundles shaken");
 
     eprintln!(
         "lucide-react: whole = {} artifacts, shaken for `Check` = {}",
@@ -83,7 +89,10 @@ fn one_lucide_icon_does_not_drag_in_the_whole_set() {
         eprintln!("    · {:>8} B  {}", artifact.script.len(), artifact.key);
     }
 
-    assert!(!shaken.taken_whole, "lucide-react declares sideEffects:false");
+    assert!(
+        !shaken.taken_whole,
+        "lucide-react declares sideEffects:false"
+    );
     assert!(
         shaken.artifacts.len() * 20 < whole.artifacts.len(),
         "shaking must be an order-of-magnitude saving, not a rounding error: \
@@ -118,11 +127,20 @@ fn two_icons_share_one_graph() {
         return;
     };
 
-    let one = bundle_npm_dependency_for_demand(&dir, "lucide-react", &demand(&["Check"]), &ShakeOptions::default())
-        .expect("bundles");
-    let two =
-        bundle_npm_dependency_for_demand(&dir, "lucide-react", &demand(&["Check", "ArrowLeft"]), &ShakeOptions::default())
-            .expect("bundles");
+    let one = bundle_npm_dependency_for_demand(
+        &dir,
+        "lucide-react",
+        &demand(&["Check"]),
+        &ShakeOptions::default(),
+    )
+    .expect("bundles");
+    let two = bundle_npm_dependency_for_demand(
+        &dir,
+        "lucide-react",
+        &demand(&["Check", "ArrowLeft"]),
+        &ShakeOptions::default(),
+    )
+    .expect("bundles");
 
     eprintln!(
         "lucide-react: 1 icon = {} artifacts, 2 icons = {}",
@@ -148,9 +166,15 @@ fn one_date_fns_function_does_not_drag_in_the_library() {
         return;
     };
 
-    let whole = bundle_npm_dependency(&dir, "date-fns", &ShakeOptions::default()).expect("bundles whole");
-    let shaken = bundle_npm_dependency_for_demand(&dir, "date-fns", &demand(&["format"]), &ShakeOptions::default())
-        .expect("bundles shaken");
+    let whole =
+        bundle_npm_dependency(&dir, "date-fns", &ShakeOptions::default()).expect("bundles whole");
+    let shaken = bundle_npm_dependency_for_demand(
+        &dir,
+        "date-fns",
+        &demand(&["format"]),
+        &ShakeOptions::default(),
+    )
+    .expect("bundles shaken");
 
     eprintln!(
         "date-fns: whole = {} artifacts, shaken for `format` = {}",
@@ -175,8 +199,13 @@ fn a_package_without_a_side_effect_declaration_is_taken_whole() {
     };
 
     // `clsx` ships no `sideEffects` field.
-    let shaken =
-        bundle_npm_dependency_for_demand(&dir, "clsx", &demand(&["default"]), &ShakeOptions::default()).expect("bundles");
+    let shaken = bundle_npm_dependency_for_demand(
+        &dir,
+        "clsx",
+        &demand(&["default"]),
+        &ShakeOptions::default(),
+    )
+    .expect("bundles");
     assert!(
         shaken.taken_whole,
         "without the declaration the package must not be shaken"
@@ -207,7 +236,6 @@ fn an_unexported_name_is_a_build_error() {
         "the error must name the binding: {message}"
     );
 }
-
 
 // ── Tier C · Phase 2 ────────────────────────────────────────────────────
 //
@@ -304,7 +332,9 @@ fn the_node_env_fold_drops_the_development_arm() {
     let keys: Vec<&str> = client.artifacts.iter().map(|a| a.key.as_str()).collect();
     if keys.iter().any(|key| key.starts_with("npm:prop-types@")) {
         assert!(
-            !keys.iter().any(|key| key.contains("factoryWithTypeCheckers")),
+            !keys
+                .iter()
+                .any(|key| key.contains("factoryWithTypeCheckers")),
             "the checking factory is the development arm: {keys:?}"
         );
     }
@@ -340,22 +370,35 @@ fn the_client_graph_emits_one_chunk_per_package() {
             failure.module_path, failure.specifier, failure.reason
         );
     }
-    let total: usize = graph.chunks().iter().map(dom_render_compiler::bundler::client_npm::ClientNpmChunk::bytes).sum();
-    eprintln!("client npm: {} B across {} chunks", total, graph.chunks().len());
+    let total: usize = graph
+        .chunks()
+        .iter()
+        .map(dom_render_compiler::bundler::client_npm::ClientNpmChunk::bytes)
+        .sum();
+    eprintln!(
+        "client npm: {} B across {} chunks",
+        total,
+        graph.chunks().len()
+    );
     for chunk in graph.chunks() {
-        eprintln!("    · {:>8} B  {}  {}", chunk.bytes(), chunk.package, chunk.url);
+        eprintln!(
+            "    · {:>8} B  {}  {}",
+            chunk.bytes(),
+            chunk.package,
+            chunk.url
+        );
     }
 
-    assert!(graph.failures().is_empty(), "nothing should fail to resolve");
+    assert!(
+        graph.failures().is_empty(),
+        "nothing should fail to resolve"
+    );
     assert!(
         !graph.chunks().is_empty(),
         "two packages were imported; chunks must be emitted"
     );
     assert!(
-        graph
-            .chunks()
-            .iter()
-            .all(|chunk| chunk.package != "react"),
+        graph.chunks().iter().all(|chunk| chunk.package != "react"),
         "react is a host module and must never be a chunk"
     );
 

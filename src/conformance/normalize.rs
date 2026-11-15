@@ -8,15 +8,13 @@
 //!
 //! Two rules keep this honest:
 //!
-//! 1. **No normalization may delete information.** Reordering attributes keeps
-//!    every attribute; unwrapping an anchor keeps every child. A normalization
-//!    that could drop a wrong value would turn the harness into a machine for
-//!    agreeing with itself.
-//! 2. **Each one is recorded per case.** [`super::Verdict::Equivalent`] carries
-//!    the list of normalizations a case actually needed, so the report can
-//!    distinguish "identical bytes" from "identical after we forgave two
-//!    things" — and a case that slips from the first to the second is visible
-//!    the day it happens.
+//! 1. **No normalization may delete information.** Reordering attributes keeps every attribute;
+//!    unwrapping an anchor keeps every child. A normalization that could drop a wrong value would
+//!    turn the harness into a machine for agreeing with itself.
+//! 2. **Each one is recorded per case.** [`super::Verdict::Equivalent`] carries the list of
+//!    normalizations a case actually needed, so the report can distinguish "identical bytes" from
+//!    "identical after we forgave two things" — and a case that slips from the first to the second
+//!    is visible the day it happens.
 
 use std::fmt;
 

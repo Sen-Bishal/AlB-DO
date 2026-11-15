@@ -126,12 +126,12 @@ pub fn validate_partition_bindings(
 /// A collection read one way in one component and the other way in another has
 /// no single safe answer at write time, and both ways of guessing lose:
 ///
-/// - *Identity wins whenever any binding is identity* would kill the legitimate
-///   admin view at `/user/[id]/todos` — at write time, in production, which is
-///   the failure a build exists to catch.
-/// - *Identity only when every binding is identity* is worse: one admin view
-///   added anywhere silently unlocks writes for the whole collection, so the
-///   security property degrades on an unrelated edit with no error.
+/// - *Identity wins whenever any binding is identity* would kill the legitimate admin view at
+///   `/user/[id]/todos` — at write time, in production, which is the failure a build exists to
+///   catch.
+/// - *Identity only when every binding is identity* is worse: one admin view added anywhere
+///   silently unlocks writes for the whole collection, so the security property degrades on an
+///   unrelated edit with no error.
 ///
 /// 🔑 **The deciding argument is the calendar, not the design.** This refusal
 /// costs nothing while no app uses mixed mode, and gets permanently more
@@ -142,7 +142,9 @@ fn mixed_mode_problems(bindings: &[PartitionBinding]) -> Vec<String> {
     let mut by_collection: BTreeMap<&str, (Vec<&PartitionBinding>, Vec<&PartitionBinding>)> =
         BTreeMap::new();
     for binding in bindings {
-        let slot = by_collection.entry(binding.collection.as_str()).or_default();
+        let slot = by_collection
+            .entry(binding.collection.as_str())
+            .or_default();
         match binding.key {
             KeySource::Identity => slot.0.push(binding),
             KeySource::Param(_) => slot.1.push(binding),
@@ -433,7 +435,10 @@ mod tests {
         assert_eq!(problems.len(), 1);
         let message = &problems[0];
         for expected in ["routes/guestbook.tsx", "Guestbook", "entries", "guestbok"] {
-            assert!(message.contains(expected), "message misses {expected}: {message}");
+            assert!(
+                message.contains(expected),
+                "message misses {expected}: {message}"
+            );
         }
         assert!(
             message.contains("guestbook"),
@@ -487,7 +492,12 @@ mod tests {
     }
 
     fn binding(collection: &str, column: &str) -> PartitionBinding {
-        binding_at(collection, column, KeySource::Param("id".to_string()), "Room")
+        binding_at(
+            collection,
+            column,
+            KeySource::Param("id".to_string()),
+            "Room",
+        )
     }
 
     fn identity_binding(collection: &str, column: &str) -> PartitionBinding {
@@ -532,8 +542,8 @@ mod tests {
     #[test]
     fn an_unknown_collection_lists_what_is_declared() {
         let schema = schema(&[("messages", &[("room", FieldType::Text)], Some("room"))]);
-        let errs =
-            validate_partition_bindings(&[binding("mesages", "room")], &schema).expect_err("refused");
+        let errs = validate_partition_bindings(&[binding("mesages", "room")], &schema)
+            .expect_err("refused");
         assert!(errs[0].contains("not a declared collection"), "{}", errs[0]);
         assert!(errs[0].contains("declared: messages"), "{}", errs[0]);
     }
@@ -605,7 +615,11 @@ mod tests {
         )
         .expect_err("mixed mode is refused");
         assert_eq!(errs.len(), 1, "{errs:?}");
-        assert!(errs[0].contains("Inbox"), "identity site missing: {}", errs[0]);
+        assert!(
+            errs[0].contains("Inbox"),
+            "identity site missing: {}",
+            errs[0]
+        );
         assert!(
             errs[0].contains("AdminTodos"),
             "param site missing: {}",
@@ -672,8 +686,9 @@ mod tests {
             &[("post_id", FieldType::Int), ("body", FieldType::Text)],
             Some("post_id"),
         )]);
-        let problems = validate_partitioned_whole_reads(&[read("comments", "allComments")], &schema)
-            .expect_err("a partitioned collection has no whole-collection value");
+        let problems =
+            validate_partitioned_whole_reads(&[read("comments", "allComments")], &schema)
+                .expect_err("a partitioned collection has no whole-collection value");
         assert_eq!(problems.len(), 1);
         let problem = &problems[0];
         // The message has to carry all four facts, or it cannot be acted on.

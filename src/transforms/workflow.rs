@@ -16,18 +16,16 @@
 //!
 //! Two folds make that source run on an engine with no event loop:
 //!
-//! 1. [`strip_await`] — `await` is a **compiler lowering, not a runtime
-//!    feature**. A handler body is spliced into an ordinary function, so an
-//!    `await` in it is a `SyntaxError` before it is anything else. The engine's
-//!    `fetch` returns its value directly (it is answered from the journal), so
-//!    removing the marker is exact rather than approximate. No `AsyncRuntime`,
-//!    no job queue, no event loop; the marker never survives into emitted JS.
+//! 1. [`strip_await`] — `await` is a **compiler lowering, not a runtime feature**. A handler body
+//!    is spliced into an ordinary function, so an `await` in it is a `SyntaxError` before it is
+//!    anything else. The engine's `fetch` returns its value directly (it is answered from the
+//!    journal), so removing the marker is exact rather than approximate. No `AsyncRuntime`, no job
+//!    queue, no event loop; the marker never survives into emitted JS.
 //!
-//! 2. [`guard_userland_catches`] — § 11 R3. The suspend sentinel travels as a
-//!    throw, and a userland `try { … } catch { … }` around a call would eat it
-//!    and run the body on garbage. React Suspense has this exact bug class. So
-//!    every userland `catch` gets `if (__albedo_is_suspend(<param>)) throw
-//!    <param>;` prepended, recursing into nested functions.
+//! 2. [`guard_userland_catches`] — § 11 R3. The suspend sentinel travels as a throw, and a userland
+//!    `try { … } catch { … }` around a call would eat it and run the body on garbage. React
+//!    Suspense has this exact bug class. So every userland `catch` gets `if
+//!    (__albedo_is_suspend(<param>)) throw <param>;` prepended, recursing into nested functions.
 //!
 //! **Neither fold is exhaustive on its own, and that is by design.** The AST
 //! cannot see inside an npm bundle, so a `fetch` in a callback handed to a
@@ -36,9 +34,9 @@
 //! sentinel degrades to *suspend anyway*, never to *commit the effects of a body
 //! that never got its data*.
 
+use swc_common::DUMMY_SP;
 use swc_ecma_ast::{CatchClause, Expr, Ident, Pat, Stmt};
 use swc_ecma_visit::{VisitMut, VisitMutWith};
-use swc_common::DUMMY_SP;
 
 /// Name of the runtime predicate the catch guard calls. Defined once in
 /// `bridge.rs`'s handler prelude; named here so the two cannot drift.
@@ -112,10 +110,7 @@ impl VisitMut for CatchGuard {
             }
         };
 
-        clause
-            .body
-            .stmts
-            .insert(0, suspend_rethrow(&param_name));
+        clause.body.stmts.insert(0, suspend_rethrow(&param_name));
     }
 }
 
@@ -265,16 +260,16 @@ mod tests {
 
     fn parse(src: &str) -> Vec<Stmt> {
         let cm: Lrc<SourceMap> = Default::default();
-        let file = cm.new_source_file(Lrc::new(FileName::Custom("body.js".into())), src.to_string());
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("body.js".into())),
+            src.to_string(),
+        );
         let mut parser = Parser::new(
             Syntax::Es(EsSyntax::default()),
             StringInput::from(&*file),
             None,
         );
-        parser
-            .parse_script()
-            .expect("body parses")
-            .body
+        parser.parse_script().expect("body parses").body
     }
 
     fn emit(stmts: &[Stmt]) -> String {
@@ -313,7 +308,10 @@ mod tests {
              const paid = await res.json(); append('orders', { id: paid.id });",
         );
         assert!(!out.contains("await"), "no await survives; got {out}");
-        assert!(out.contains("fetch('https://api.test/charges'"), "got {out}");
+        assert!(
+            out.contains("fetch('https://api.test/charges'"),
+            "got {out}"
+        );
         assert!(out.contains("res.json()"), "got {out}");
     }
 
@@ -332,7 +330,10 @@ mod tests {
         assert!(out.contains(guard), "got {out}");
         let guard_at = out.find(guard).unwrap();
         let userland_at = out.find("console.log(e)").unwrap();
-        assert!(guard_at < userland_at, "the guard must come first; got {out}");
+        assert!(
+            guard_at < userland_at,
+            "the guard must come first; got {out}"
+        );
     }
 
     /// `catch {}` and `catch ({ message })` cannot name the error, so the guard
@@ -345,14 +346,16 @@ mod tests {
         assert!(bare.contains("__albedo_caught"), "got {bare}");
 
         let destructured = lowered("try { fetch('/a'); } catch ({ message }) { log(message); }");
-        assert!(destructured.contains("__albedo_caught"), "got {destructured}");
+        assert!(
+            destructured.contains("__albedo_caught"),
+            "got {destructured}"
+        );
     }
 
     #[test]
     fn nested_catches_are_all_guarded() {
-        let out = lowered(
-            "try { try { fetch('/a'); } catch (inner) { x(); } } catch (outer) { y(); }",
-        );
+        let out =
+            lowered("try { try { fetch('/a'); } catch (inner) { x(); } } catch (outer) { y(); }");
         assert!(out.contains("__albedo_is_suspend(inner)"), "got {out}");
         assert!(out.contains("__albedo_is_suspend(outer)"), "got {out}");
     }

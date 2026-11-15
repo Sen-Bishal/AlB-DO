@@ -66,10 +66,10 @@ fn collection_aliases_parens_and_crlf_keep_real_and_shadowed_sites_distinct() {
             .len(),
         1
     );
-    assert_eq!(project
-        .component_meta("B.tsx", "B")
-        .unwrap()
-        .shared_slots, [] as [dom_render_compiler::transforms::SharedSlotBinding; 0]);
+    assert_eq!(
+        project.component_meta("B.tsx", "B").unwrap().shared_slots,
+        [] as [dom_render_compiler::transforms::SharedSlotBinding; 0]
+    );
 }
 
 #[test]

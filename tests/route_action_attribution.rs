@@ -128,7 +128,10 @@ fn the_gate_and_the_actions_it_governs_arrive_together() {
     let dash = manifest.routes.get("/dash").expect("/dash present");
 
     assert_eq!(dash.auth, RouteAuth::Required);
-    assert_ne!(dash.action_ids, [] as [dom_render_compiler::manifest::schema::RouteActionEntry; 0]);
+    assert_ne!(
+        dash.action_ids,
+        [] as [dom_render_compiler::manifest::schema::RouteActionEntry; 0]
+    );
 
     let home = manifest.routes.get("/").expect("/ present");
     assert_eq!(home.auth, RouteAuth::Public);
@@ -147,5 +150,8 @@ fn a_role_requirement_reaches_the_manifest_with_its_actions() {
         RouteAuth::Roles(vec!["hr".to_string(), "payroll".to_string()])
     );
     assert!(!payroll.auth.allows_anonymous());
-    assert_eq!(action_names(&manifest, "/payroll"), vec!["payroll_close".to_string()]);
+    assert_eq!(
+        action_names(&manifest, "/payroll"),
+        vec!["payroll_close".to_string()]
+    );
 }

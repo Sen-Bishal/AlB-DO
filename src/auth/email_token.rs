@@ -6,23 +6,20 @@
 //!
 //! ## Properties, and the mechanism that provides each
 //!
-//! - **Only the hash is stored.** The table holds `SHA-256(token)`, as
-//!   `albedo_sessions` does — a database read, backup or `SELECT *` yields
-//!   nothing that opens a reset form. The raw value exists in the email and, until
-//!   the send completes, in that job's queue row, which the runner scrubs
-//!   (`email::QueuedEmail::sensitive`).
-//! - **Single use** is one transaction: the `SELECT` and the `DELETE` of the same
-//!   primary key commit together, so two concurrent redemptions cannot both see
-//!   the row. The second finds nothing, which is the same answer as a wrong token.
-//! - **Newest wins.** Issuing a token deletes every outstanding token for the
-//!   same `(purpose, provider, email)` first. Three "forgot password" clicks
-//!   leave one working link, not three, so the one in the inbox that the person
-//!   opens last is the only one that can matter.
-//! - **A reset ends every session.** [`reset_password`] rewrites the hash, deletes
-//!   the principal's sessions and every other reset token in one transaction.
-//!   Somebody resetting a password is very often somebody who thinks another
-//!   person has it; leaving that person signed in would make the reset
-//!   decorative.
+//! - **Only the hash is stored.** The table holds `SHA-256(token)`, as `albedo_sessions` does — a
+//!   database read, backup or `SELECT *` yields nothing that opens a reset form. The raw value
+//!   exists in the email and, until the send completes, in that job's queue row, which the runner
+//!   scrubs (`email::QueuedEmail::sensitive`).
+//! - **Single use** is one transaction: the `SELECT` and the `DELETE` of the same primary key
+//!   commit together, so two concurrent redemptions cannot both see the row. The second finds
+//!   nothing, which is the same answer as a wrong token.
+//! - **Newest wins.** Issuing a token deletes every outstanding token for the same `(purpose,
+//!   provider, email)` first. Three "forgot password" clicks leave one working link, not three, so
+//!   the one in the inbox that the person opens last is the only one that can matter.
+//! - **A reset ends every session.** [`reset_password`] rewrites the hash, deletes the principal's
+//!   sessions and every other reset token in one transaction. Somebody resetting a password is very
+//!   often somebody who thinks another person has it; leaving that person signed in would make the
+//!   reset decorative.
 //!
 //! ## Why these are plain tables and not FORGE collections
 //!
@@ -162,9 +159,7 @@ pub async fn issue(
     let token = SessionToken::mint();
     let tx = db.begin().await?;
     tx.execute(
-        &format!(
-            "DELETE FROM {EMAIL_TOKENS} WHERE purpose = ?1 AND provider = ?2 AND email = ?3"
-        ),
+        &format!("DELETE FROM {EMAIL_TOKENS} WHERE purpose = ?1 AND provider = ?2 AND email = ?3"),
         &[
             SqlValue::Text(purpose.as_str().to_string()),
             SqlValue::Text(provider.to_string()),
@@ -285,9 +280,9 @@ pub async fn consume(
 /// Two shapes, one call:
 ///
 /// - **A reset.** The principal has a password credential under `provider`; its hash is replaced.
-/// - **A first password.** The principal has none — it signed up by magic link — and proved
-///   `email` by clicking this link. The `(provider, email)` account and the credential are
-///   created, so the same person can now sign in either way and lands on one principal.
+/// - **A first password.** The principal has none — it signed up by magic link — and proved `email`
+///   by clicking this link. The `(provider, email)` account and the credential are created, so the
+///   same person can now sign in either way and lands on one principal.
 ///
 /// Returns `false` when neither applies: the principal no longer exists, or
 /// `(provider, email)` already belongs to somebody else.
@@ -302,9 +297,11 @@ pub async fn reset_password(
     secret_hash: &str,
     now_ms: i64,
 ) -> Result<bool> {
-    Ok(reset_password_ending(db, principal, provider, email, secret_hash, now_ms)
-        .await?
-        .is_some())
+    Ok(
+        reset_password_ending(db, principal, provider, email, secret_hash, now_ms)
+            .await?
+            .is_some(),
+    )
 }
 
 /// [`reset_password`], returning (R1b) exactly the session hashes it deleted —
@@ -368,7 +365,9 @@ pub async fn reset_password_ending(
             // gain a password here.
             let owner = tx
                 .query(
-                    &format!("SELECT principal FROM {ACCOUNTS} WHERE provider = ?1 AND subject = ?2"),
+                    &format!(
+                        "SELECT principal FROM {ACCOUNTS} WHERE provider = ?1 AND subject = ?2"
+                    ),
                     &[
                         SqlValue::Text(provider.to_string()),
                         SqlValue::Text(email.to_string()),
@@ -426,7 +425,10 @@ pub async fn reset_password_ending(
 ///
 /// # Errors
 /// [`StoreError`] on substrate failure.
-pub async fn verified_principal(db: &dyn DataSubstrate, email: &str) -> Result<Option<PrincipalId>> {
+pub async fn verified_principal(
+    db: &dyn DataSubstrate,
+    email: &str,
+) -> Result<Option<PrincipalId>> {
     let rows = db
         .query(
             &format!(
@@ -471,8 +473,8 @@ pub struct MagicLinked {
 ///    waits; the victim later signs in by magic link and, if the two were merely linked, the
 ///    attacker's password still opens the victim's account. Whoever clicked this link owns the
 ///    mailbox; whoever set that password never proved they did. The owner loses nothing they can
-///    prove was theirs, and can set a password through "forgot password". Every other unproven
-///    way in goes too — credentials, account rows, sessions, links.
+///    prove was theirs, and can set a password through "forgot password". Every other unproven way
+///    in goes too — credentials, account rows, sessions, links.
 ///
 ///    **Why the claimant inherits nothing the squatter made**: this branch is reachable only
 ///    where the password provider declares `verify: "required"` —
@@ -495,7 +497,11 @@ pub async fn resolve_magic_link(
     use crate::auth::store::{lookup_account, upsert_principal, ProviderProfile};
 
     if let Some(principal) = lookup_account(db, magic_provider, email).await? {
-        return Ok(MagicLinked { principal, took_over: false, ended: Vec::new() });
+        return Ok(MagicLinked {
+            principal,
+            took_over: false,
+            ended: Vec::new(),
+        });
     }
 
     let (target, took_over) = match verified_principal(db, email).await? {
@@ -626,7 +632,11 @@ pub async fn mark_verified(
 ///
 /// # Errors
 /// [`StoreError`] on substrate failure.
-pub async fn is_verified(db: &dyn DataSubstrate, principal: &PrincipalId, email: &str) -> Result<bool> {
+pub async fn is_verified(
+    db: &dyn DataSubstrate,
+    principal: &PrincipalId,
+    email: &str,
+) -> Result<bool> {
     let rows = db
         .query(
             &format!("SELECT 1 FROM {EMAIL_VERIFIED} WHERE principal = ?1 AND email = ?2"),
@@ -746,7 +756,10 @@ mod tests {
             db,
             "password",
             email,
-            &ProviderProfile { email: Some(email.into()), ..ProviderProfile::default() },
+            &ProviderProfile {
+                email: Some(email.into()),
+                ..ProviderProfile::default()
+            },
             &hash_password("old password 1").expect("hashes"),
             NOW,
         )
@@ -760,11 +773,21 @@ mod tests {
     async fn a_token_redeems_exactly_once() {
         let db = db().await;
         let who = account(&db, "ada@x.dev").await;
-        let token = issue(&db, Purpose::PasswordReset, "password", Some(&who), "ada@x.dev", Some("/home"), NOW)
-            .await
-            .expect("issues");
+        let token = issue(
+            &db,
+            Purpose::PasswordReset,
+            "password",
+            Some(&who),
+            "ada@x.dev",
+            Some("/home"),
+            NOW,
+        )
+        .await
+        .expect("issues");
 
-        let first = consume(&db, Purpose::PasswordReset, &token, NOW + 1).await.expect("reads");
+        let first = consume(&db, Purpose::PasswordReset, &token, NOW + 1)
+            .await
+            .expect("reads");
         assert_eq!(
             first,
             Some(Redeemed {
@@ -774,16 +797,29 @@ mod tests {
                 next: Some("/home".into()),
             })
         );
-        assert_eq!(consume(&db, Purpose::PasswordReset, &token, NOW + 2).await.expect("reads"), None);
+        assert_eq!(
+            consume(&db, Purpose::PasswordReset, &token, NOW + 2)
+                .await
+                .expect("reads"),
+            None
+        );
     }
 
     /// Only the hash is stored: nothing in the table opens a reset form.
     #[tokio::test]
     async fn the_raw_token_is_never_written() {
         let db = db().await;
-        let token = issue(&db, Purpose::MagicLink, "magiclink", None, "a@x.dev", None, NOW)
-            .await
-            .expect("issues");
+        let token = issue(
+            &db,
+            Purpose::MagicLink,
+            "magiclink",
+            None,
+            "a@x.dev",
+            None,
+            NOW,
+        )
+        .await
+        .expect("issues");
         let rows = db
             .query(&format!("SELECT * FROM {EMAIL_TOKENS}"), &[])
             .await
@@ -796,15 +832,39 @@ mod tests {
     #[tokio::test]
     async fn expiry_and_purpose_both_refuse() {
         let db = db().await;
-        let token = issue(&db, Purpose::MagicLink, "magiclink", None, "a@x.dev", None, NOW)
+        let token = issue(
+            &db,
+            Purpose::MagicLink,
+            "magiclink",
+            None,
+            "a@x.dev",
+            None,
+            NOW,
+        )
+        .await
+        .expect("issues");
+        assert!(!peek(&db, Purpose::PasswordReset, &token, NOW)
             .await
-            .expect("issues");
-        assert!(!peek(&db, Purpose::PasswordReset, &token, NOW).await.expect("reads"));
-        assert_eq!(consume(&db, Purpose::VerifyEmail, &token, NOW).await.expect("reads"), None);
+            .expect("reads"));
+        assert_eq!(
+            consume(&db, Purpose::VerifyEmail, &token, NOW)
+                .await
+                .expect("reads"),
+            None
+        );
         let after = NOW + Purpose::MagicLink.ttl_ms();
-        assert!(!peek(&db, Purpose::MagicLink, &token, after).await.expect("reads"));
-        assert_eq!(consume(&db, Purpose::MagicLink, &token, after).await.expect("reads"), None);
-        assert!(peek(&db, Purpose::MagicLink, &token, NOW).await.expect("still there"));
+        assert!(!peek(&db, Purpose::MagicLink, &token, after)
+            .await
+            .expect("reads"));
+        assert_eq!(
+            consume(&db, Purpose::MagicLink, &token, after)
+                .await
+                .expect("reads"),
+            None
+        );
+        assert!(peek(&db, Purpose::MagicLink, &token, NOW)
+            .await
+            .expect("still there"));
         assert_eq!(purge_expired(&db, after).await.expect("purges"), 1);
     }
 
@@ -812,14 +872,38 @@ mod tests {
     async fn a_newer_link_voids_the_older_one() {
         let db = db().await;
         let who = account(&db, "ada@x.dev").await;
-        let old = issue(&db, Purpose::PasswordReset, "password", Some(&who), "ada@x.dev", None, NOW)
+        let old = issue(
+            &db,
+            Purpose::PasswordReset,
+            "password",
+            Some(&who),
+            "ada@x.dev",
+            None,
+            NOW,
+        )
+        .await
+        .expect("issues");
+        let new = issue(
+            &db,
+            Purpose::PasswordReset,
+            "password",
+            Some(&who),
+            "ada@x.dev",
+            None,
+            NOW + 5,
+        )
+        .await
+        .expect("issues");
+        assert_eq!(
+            consume(&db, Purpose::PasswordReset, &old, NOW + 6)
+                .await
+                .expect("reads"),
+            None
+        );
+        assert!(consume(&db, Purpose::PasswordReset, &new, NOW + 6)
             .await
-            .expect("issues");
-        let new = issue(&db, Purpose::PasswordReset, "password", Some(&who), "ada@x.dev", None, NOW + 5)
-            .await
-            .expect("issues");
-        assert_eq!(consume(&db, Purpose::PasswordReset, &old, NOW + 6).await.expect("reads"), None);
-        assert!(consume(&db, Purpose::PasswordReset, &new, NOW + 6).await.expect("reads").is_some());
+            .expect("reads")
+            .is_some());
     }
 
     /// The reset contract: new hash, no sessions, no other reset links.
@@ -827,30 +911,61 @@ mod tests {
     async fn a_reset_ends_every_session_and_voids_other_links() {
         let db = db().await;
         let who = account(&db, "ada@x.dev").await;
-        store::create_session(&db, &who, "password", NOW, 60_000).await.expect("session");
-        store::create_session(&db, &who, "password", NOW, 60_000).await.expect("session");
-        let other = issue(&db, Purpose::PasswordReset, "password", Some(&who), "ada@x.dev", None, NOW)
+        store::create_session(&db, &who, "password", NOW, 60_000)
             .await
-            .expect("issues");
+            .expect("session");
+        store::create_session(&db, &who, "password", NOW, 60_000)
+            .await
+            .expect("session");
+        let other = issue(
+            &db,
+            Purpose::PasswordReset,
+            "password",
+            Some(&who),
+            "ada@x.dev",
+            None,
+            NOW,
+        )
+        .await
+        .expect("issues");
 
         let new_hash = hash_password("brand new password").expect("hashes");
-        assert!(reset_password(&db, &who, "password", "ada@x.dev", &new_hash, NOW).await.expect("writes"));
+        assert!(
+            reset_password(&db, &who, "password", "ada@x.dev", &new_hash, NOW)
+                .await
+                .expect("writes")
+        );
 
-        assert!(store::sessions_for(&db, &who, NOW).await.expect("reads").is_empty());
-        assert!(!peek(&db, Purpose::PasswordReset, &other, NOW).await.expect("reads"));
+        assert!(store::sessions_for(&db, &who, NOW)
+            .await
+            .expect("reads")
+            .is_empty());
+        assert!(!peek(&db, Purpose::PasswordReset, &other, NOW)
+            .await
+            .expect("reads"));
         let credential = store::lookup_credential(&db, "password", "ada@x.dev")
             .await
             .expect("reads")
             .expect("exists");
-        assert!(crate::auth::password::verify_password(&credential.secret_hash, "brand new password"));
-        assert!(!crate::auth::password::verify_password(&credential.secret_hash, "old password 1"));
+        assert!(crate::auth::password::verify_password(
+            &credential.secret_hash,
+            "brand new password"
+        ));
+        assert!(!crate::auth::password::verify_password(
+            &credential.secret_hash,
+            "old password 1"
+        ));
     }
 
     #[tokio::test]
     async fn a_reset_for_a_principal_with_no_password_changes_nothing() {
         let db = db().await;
         let stranger = PrincipalId::mint();
-        assert!(!reset_password(&db, &stranger, "password", "nobody@x.dev", "x", NOW).await.expect("reads"));
+        assert!(
+            !reset_password(&db, &stranger, "password", "nobody@x.dev", "x", NOW)
+                .await
+                .expect("reads")
+        );
     }
 
     /// Case 4 then case 1: a new address makes a principal, and the next link
@@ -873,8 +988,12 @@ mod tests {
     async fn a_magic_link_joins_the_principal_that_proved_the_address() {
         let db = db().await;
         let who = account(&db, "ada@x.dev").await;
-        mark_verified(&db, &who, "ada@x.dev", NOW).await.expect("writes");
-        store::create_session(&db, &who, "password", NOW, 60_000).await.expect("session");
+        mark_verified(&db, &who, "ada@x.dev", NOW)
+            .await
+            .expect("writes");
+        store::create_session(&db, &who, "password", NOW, 60_000)
+            .await
+            .expect("session");
 
         let linked = resolve_magic_link(&db, "magiclink", Some("password"), "ada@x.dev", NOW)
             .await
@@ -882,10 +1001,19 @@ mod tests {
         assert_eq!(linked.principal, who);
         assert!(!linked.took_over);
         assert!(
-            store::lookup_credential(&db, "password", "ada@x.dev").await.expect("reads").is_some(),
+            store::lookup_credential(&db, "password", "ada@x.dev")
+                .await
+                .expect("reads")
+                .is_some(),
             "a proven password is kept"
         );
-        assert_eq!(store::sessions_for(&db, &who, NOW).await.expect("reads").len(), 1);
+        assert_eq!(
+            store::sessions_for(&db, &who, NOW)
+                .await
+                .expect("reads")
+                .len(),
+            1
+        );
     }
 
     /// Case 3 — the pre-account-takeover defence. Someone registered the
@@ -897,17 +1025,34 @@ mod tests {
         for _ in 0..MAIL_BURST {
             assert!(admit_mail(&db, "ada@x.dev", NOW).await.expect("charges"));
         }
-        assert!(!admit_mail(&db, "ada@x.dev", NOW).await.expect("charges"), "burst spent");
-        assert!(admit_mail(&db, "bob@x.dev", NOW).await.expect("charges"), "another inbox is untouched");
+        assert!(
+            !admit_mail(&db, "ada@x.dev", NOW).await.expect("charges"),
+            "burst spent"
+        );
+        assert!(
+            admit_mail(&db, "bob@x.dev", NOW).await.expect("charges"),
+            "another inbox is untouched"
+        );
         // Refusals must not push the refill further away: hammering the form
         // cannot keep the owner locked out.
         for _ in 0..50 {
-            assert!(!admit_mail(&db, "ada@x.dev", NOW + 1).await.expect("charges"));
+            assert!(!admit_mail(&db, "ada@x.dev", NOW + 1)
+                .await
+                .expect("charges"));
         }
-        assert!(admit_mail(&db, "ada@x.dev", NOW + MAIL_INTERVAL_MS).await.expect("charges"));
-        assert!(!admit_mail(&db, "ada@x.dev", NOW + MAIL_INTERVAL_MS).await.expect("charges"));
+        assert!(admit_mail(&db, "ada@x.dev", NOW + MAIL_INTERVAL_MS)
+            .await
+            .expect("charges"));
+        assert!(!admit_mail(&db, "ada@x.dev", NOW + MAIL_INTERVAL_MS)
+            .await
+            .expect("charges"));
         // Fully refilled rows are swept.
-        assert!(purge_expired(&db, NOW + 10 * MAIL_BURST * MAIL_INTERVAL_MS).await.expect("purges") >= 2);
+        assert!(
+            purge_expired(&db, NOW + 10 * MAIL_BURST * MAIL_INTERVAL_MS)
+                .await
+                .expect("purges")
+                >= 2
+        );
     }
 
     /// 🔑 The point of moving it out of memory: two processes on one
@@ -922,7 +1067,9 @@ mod tests {
         for statement in ddl() {
             a.migrate(&statement).await.expect("ddl");
         }
-        let b = LibSqlSubstrate::open_local(&path).await.expect("opens again");
+        let b = LibSqlSubstrate::open_local(&path)
+            .await
+            .expect("opens again");
 
         let charges = (0..12).map(|i| {
             let handle = if i % 2 == 0 { &a } else { &b };
@@ -965,9 +1112,17 @@ mod tests {
         )
         .await
         .expect("planted passkey");
-        issue(&db, Purpose::PasswordReset, "password", Some(&squatter), "ada@x.dev", None, NOW)
-            .await
-            .expect("an outstanding link");
+        issue(
+            &db,
+            Purpose::PasswordReset,
+            "password",
+            Some(&squatter),
+            "ada@x.dev",
+            None,
+            NOW,
+        )
+        .await
+        .expect("an outstanding link");
 
         let linked = resolve_magic_link(&db, "magiclink", Some("password"), "ada@x.dev", NOW)
             .await
@@ -978,17 +1133,28 @@ mod tests {
             let db = &db;
             let who = who.clone();
             async move {
-                db.query(&format!("SELECT COUNT(*) FROM {table} WHERE principal = ?1"), &[who])
-                    .await
-                    .expect("reads")
-                    .rows[0]
+                db.query(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE principal = ?1"),
+                    &[who],
+                )
+                .await
+                .expect("reads")
+                .rows[0]
                     .get(0)
                     .cloned()
                     .expect("a count")
             }
         };
-        assert_eq!(count(CREDENTIALS).await, SqlValue::Integer(0), "no credential survives");
-        assert_eq!(count(EMAIL_TOKENS).await, SqlValue::Integer(0), "no outstanding link survives");
+        assert_eq!(
+            count(CREDENTIALS).await,
+            SqlValue::Integer(0),
+            "no credential survives"
+        );
+        assert_eq!(
+            count(EMAIL_TOKENS).await,
+            SqlValue::Integer(0),
+            "no outstanding link survives"
+        );
         let accounts = db
             .query(
                 &format!("SELECT provider FROM {ACCOUNTS} WHERE principal = ?1"),
@@ -996,22 +1162,36 @@ mod tests {
             )
             .await
             .expect("reads");
-        let providers: Vec<_> = accounts.rows.iter().filter_map(|r| r.get(0).cloned()).collect();
-        assert_eq!(providers, vec![SqlValue::Text("magiclink".into())], "only the proven identity");
+        let providers: Vec<_> = accounts
+            .rows
+            .iter()
+            .filter_map(|r| r.get(0).cloned())
+            .collect();
+        assert_eq!(
+            providers,
+            vec![SqlValue::Text("magiclink".into())],
+            "only the proven identity"
+        );
 
         // …and the owner can still set a first password afterwards.
-        mark_verified(&db, &linked.principal, "ada@x.dev", NOW).await.expect("writes");
-        let hash = hash_password("owners own password").expect("hashes");
-        assert!(reset_password(&db, &linked.principal, "password", "ada@x.dev", &hash, NOW)
+        mark_verified(&db, &linked.principal, "ada@x.dev", NOW)
             .await
-            .expect("writes"));
+            .expect("writes");
+        let hash = hash_password("owners own password").expect("hashes");
+        assert!(
+            reset_password(&db, &linked.principal, "password", "ada@x.dev", &hash, NOW)
+                .await
+                .expect("writes")
+        );
     }
 
     #[tokio::test]
     async fn a_magic_link_takes_over_an_unproven_password_account() {
         let db = db().await;
         let squatter = account(&db, "ada@x.dev").await;
-        store::create_session(&db, &squatter, "password", NOW, 60_000).await.expect("session");
+        store::create_session(&db, &squatter, "password", NOW, 60_000)
+            .await
+            .expect("session");
 
         let linked = resolve_magic_link(&db, "magiclink", Some("password"), "ada@x.dev", NOW)
             .await
@@ -1019,10 +1199,16 @@ mod tests {
         assert_eq!(linked.principal, squatter);
         assert!(linked.took_over);
         assert!(
-            store::lookup_credential(&db, "password", "ada@x.dev").await.expect("reads").is_none(),
+            store::lookup_credential(&db, "password", "ada@x.dev")
+                .await
+                .expect("reads")
+                .is_none(),
             "the unproven password must not survive"
         );
-        assert!(store::sessions_for(&db, &squatter, NOW).await.expect("reads").is_empty());
+        assert!(store::sessions_for(&db, &squatter, NOW)
+            .await
+            .expect("reads")
+            .is_empty());
     }
 
     /// A magic-link user can set a first password through a reset link, and it
@@ -1033,13 +1219,20 @@ mod tests {
         let linked = resolve_magic_link(&db, "magiclink", Some("password"), "bo@x.dev", NOW)
             .await
             .expect("resolves");
-        mark_verified(&db, &linked.principal, "bo@x.dev", NOW).await.expect("writes");
-        assert_eq!(verified_principal(&db, "bo@x.dev").await.expect("reads"), Some(linked.principal.clone()));
+        mark_verified(&db, &linked.principal, "bo@x.dev", NOW)
+            .await
+            .expect("writes");
+        assert_eq!(
+            verified_principal(&db, "bo@x.dev").await.expect("reads"),
+            Some(linked.principal.clone())
+        );
 
         let hash = hash_password("a first password").expect("hashes");
-        assert!(reset_password(&db, &linked.principal, "password", "bo@x.dev", &hash, NOW)
-            .await
-            .expect("writes"));
+        assert!(
+            reset_password(&db, &linked.principal, "password", "bo@x.dev", &hash, NOW)
+                .await
+                .expect("writes")
+        );
         let credential = store::lookup_credential(&db, "password", "bo@x.dev")
             .await
             .expect("reads")
@@ -1057,9 +1250,11 @@ mod tests {
             .expect("resolves")
             .principal;
         assert_ne!(owner, other);
-        assert!(!reset_password(&db, &other, "password", "ada@x.dev", "h", NOW)
-            .await
-            .expect("reads"));
+        assert!(
+            !reset_password(&db, &other, "password", "ada@x.dev", "h", NOW)
+                .await
+                .expect("reads")
+        );
         let credential = store::lookup_credential(&db, "password", "ada@x.dev")
             .await
             .expect("reads")
@@ -1072,9 +1267,16 @@ mod tests {
         let db = db().await;
         let who = account(&db, "ada@x.dev").await;
         assert!(!is_verified(&db, &who, "ada@x.dev").await.expect("reads"));
-        mark_verified(&db, &who, "ada@x.dev", NOW).await.expect("writes");
-        mark_verified(&db, &who, "ada@x.dev", NOW + 1).await.expect("idempotent");
+        mark_verified(&db, &who, "ada@x.dev", NOW)
+            .await
+            .expect("writes");
+        mark_verified(&db, &who, "ada@x.dev", NOW + 1)
+            .await
+            .expect("idempotent");
         assert!(is_verified(&db, &who, "ada@x.dev").await.expect("reads"));
-        assert!(!is_verified(&db, &who, "ada@y.dev").await.expect("reads"), "a new address is unproven");
+        assert!(
+            !is_verified(&db, &who, "ada@y.dev").await.expect("reads"),
+            "a new address is unproven"
+        );
     }
 }

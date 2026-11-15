@@ -391,7 +391,9 @@ mod tests {
     /// guard mean what this module needs them to mean, which is the entire
     /// question.
     async fn substrate() -> LibSqlSubstrate {
-        LibSqlSubstrate::open_ephemeral().await.expect("ephemeral db")
+        LibSqlSubstrate::open_ephemeral()
+            .await
+            .expect("ephemeral db")
     }
 
     async fn ledger_on(substrate: &LibSqlSubstrate) -> JournalLedger<'_> {
@@ -507,7 +509,10 @@ mod tests {
             .await
             .expect("begin again");
 
-        assert_eq!(ledger.load("w1").await.expect("load").expect("some").len(), 1);
+        assert_eq!(
+            ledger.load("w1").await.expect("load").expect("some").len(),
+            1
+        );
         // The original age is what the sweep must judge it by.
         assert_eq!(
             ledger.sweep(1_001).await.expect("sweep"),
@@ -561,11 +566,23 @@ mod tests {
         }
 
         assert_eq!(
-            ledger.load("w1").await.expect("load").expect("some").steps()[0].outcome,
+            ledger
+                .load("w1")
+                .await
+                .expect("load")
+                .expect("some")
+                .steps()[0]
+                .outcome,
             StepOutcome::Completed(json!("w1"))
         );
         assert_eq!(
-            ledger.load("w2").await.expect("load").expect("some").steps()[0].outcome,
+            ledger
+                .load("w2")
+                .await
+                .expect("load")
+                .expect("some")
+                .steps()[0]
+                .outcome,
             StepOutcome::Completed(json!("w2"))
         );
     }
@@ -669,7 +686,10 @@ mod result_tests {
         ledger.migrate().await.expect("migrate");
 
         assert!(ledger.completed("w", "b").await.expect("read").is_none());
-        ledger.complete("w", "b", b"instructions", 1).await.expect("complete");
+        ledger
+            .complete("w", "b", b"instructions", 1)
+            .await
+            .expect("complete");
         assert_eq!(
             ledger.completed("w", "b").await.expect("read").as_deref(),
             Some(&b"instructions"[..])
@@ -684,10 +704,17 @@ mod result_tests {
         let substrate = ledger().await;
         let ledger = JournalLedger::new(&substrate);
         ledger.migrate().await.expect("migrate");
-        ledger.complete("w", "old-build", b"x", 1).await.expect("complete");
+        ledger
+            .complete("w", "old-build", b"x", 1)
+            .await
+            .expect("complete");
 
         assert!(
-            ledger.completed("w", "new-build").await.expect("read").is_none(),
+            ledger
+                .completed("w", "new-build")
+                .await
+                .expect("read")
+                .is_none(),
             "the workflow must run again under the code that is actually deployed"
         );
     }
@@ -700,8 +727,14 @@ mod result_tests {
         let ledger = JournalLedger::new(&substrate);
         ledger.migrate().await.expect("migrate");
 
-        ledger.complete("w", "b", b"first", 1).await.expect("complete");
-        ledger.complete("w", "b", b"second", 2).await.expect("complete again");
+        ledger
+            .complete("w", "b", b"first", 1)
+            .await
+            .expect("complete");
+        ledger
+            .complete("w", "b", b"second", 2)
+            .await
+            .expect("complete again");
         assert_eq!(
             ledger.completed("w", "b").await.expect("read").as_deref(),
             Some(&b"first"[..])
@@ -721,7 +754,10 @@ mod result_tests {
             .begin_step("w", "b", 0, StepKind::Fetch, "d", 1_000)
             .await
             .expect("begin");
-        ledger.complete("w", "b", b"x", 1_000).await.expect("complete");
+        ledger
+            .complete("w", "b", b"x", 1_000)
+            .await
+            .expect("complete");
 
         assert_eq!(
             ledger.sweep(2_000).await.expect("sweep"),

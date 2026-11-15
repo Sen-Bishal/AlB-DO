@@ -12,12 +12,10 @@
 //! Two properties make a contended write behave correctly here, and both are
 //! load-bearing for the oversell invariant:
 //!
-//! - **A connection per transaction.** SQLite allows one open transaction per
-//!   connection, so a shared connection would fail concurrent claimants at
-//!   `begin` rather than at the supply check.
-//! - **`BEGIN IMMEDIATE` + a busy timeout + WAL.** Writers serialise and *wait*
-//!   for the lock instead of erroring, then read the truth; readers never block
-//!   the writer.
+//! - **A connection per transaction.** SQLite allows one open transaction per connection, so a
+//!   shared connection would fail concurrent claimants at `begin` rather than at the supply check.
+//! - **`BEGIN IMMEDIATE` + a busy timeout + WAL.** Writers serialise and *wait* for the lock
+//!   instead of erroring, then read the truth; readers never block the writer.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,14 +119,13 @@ impl Drop for Connections {
 /// SQLite allows **one writer at a time, per database** — that is not a tuning
 /// knob, it is the storage engine. The only question is *where* writers queue.
 ///
-/// - **In SQLite** (many connections racing for the write lock): a blocked
-///   writer *sleeps* on the busy handler in growing increments (1, 2, 5, 10,
-///   25, 50 ms…). Measured on the claim path, that cost **~15 ms per queued
-///   buyer** — buyer #100 in a drop waits over a second, for a lock they may
-///   not even need.
-/// - **In this process** (one writer connection behind a fair async mutex):
-///   writers queue in memory in microseconds, in FIFO order, and SQLite never
-///   sees contention at all because there is only ever one writer.
+/// - **In SQLite** (many connections racing for the write lock): a blocked writer *sleeps* on the
+///   busy handler in growing increments (1, 2, 5, 10, 25, 50 ms…). Measured on the claim path, that
+///   cost **~15 ms per queued buyer** — buyer #100 in a drop waits over a second, for a lock they
+///   may not even need.
+/// - **In this process** (one writer connection behind a fair async mutex): writers queue in memory
+///   in microseconds, in FIFO order, and SQLite never sees contention at all because there is only
+///   ever one writer.
 ///
 /// The second is strictly better, so: **`writer` is the single connection every
 /// write and every transaction goes through**, serialised by an async mutex;
@@ -407,7 +404,12 @@ async fn inspect_attached_snapshot(conn: &Connection) -> Result<SnapshotFacts> {
         // The name came out of the file's own catalogue, so it is quoted
         // rather than trusted to be a plain identifier.
         let quoted = name.replace('"', "\"\"");
-        let counted = run_query(conn, &format!("SELECT count(*) FROM snap.\"{quoted}\""), &[]).await?;
+        let counted = run_query(
+            conn,
+            &format!("SELECT count(*) FROM snap.\"{quoted}\""),
+            &[],
+        )
+        .await?;
         let count = match counted.rows.first().and_then(|row| row.get(0)) {
             Some(SqlValue::Integer(n)) => u64::try_from(*n).unwrap_or(0),
             _ => 0,
@@ -543,15 +545,14 @@ impl DataSubstrate for LibSqlSubstrate {
     /// The mutex is acquired **before** the transaction and released only when
     /// the transaction resolves, which is what makes the whole design work:
     ///
-    /// - Only one transaction can exist on `writer` at a time, so the
-    ///   `cannot start a transaction within a transaction` failure that a
-    ///   shared connection produces is impossible by construction.
-    /// - SQLite never sees two writers, so its busy handler never fires and
-    ///   nobody sleeps. Claimants queue here, in memory, in FIFO order —
-    ///   microseconds instead of milliseconds, and *fair*, which a backoff loop
-    ///   is not.
-    /// - `IMMEDIATE` still takes the write lock up front rather than lazily, so
-    ///   the transaction cannot fail a deferred lock upgrade halfway through.
+    /// - Only one transaction can exist on `writer` at a time, so the `cannot start a transaction
+    ///   within a transaction` failure that a shared connection produces is impossible by
+    ///   construction.
+    /// - SQLite never sees two writers, so its busy handler never fires and nobody sleeps.
+    ///   Claimants queue here, in memory, in FIFO order — microseconds instead of milliseconds, and
+    ///   *fair*, which a backoff loop is not.
+    /// - `IMMEDIATE` still takes the write lock up front rather than lazily, so the transaction
+    ///   cannot fail a deferred lock upgrade halfway through.
     ///
     /// This is the seam the oversell invariant is built on: a losing buyer must
     /// lose *cleanly*, and a waiting buyer must not pay 15 ms to do it.
@@ -566,7 +567,10 @@ impl DataSubstrate for LibSqlSubstrate {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .map_err(|e| SubstrateError::Backend(e.to_string()))?;
-        Ok(Box::new(LibSqlTransaction { tx, _writer: writer }))
+        Ok(Box::new(LibSqlTransaction {
+            tx,
+            _writer: writer,
+        }))
     }
 }
 

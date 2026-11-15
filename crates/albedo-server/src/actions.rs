@@ -150,14 +150,13 @@ mod tests {
 
     #[tokio::test]
     async fn closure_impl_receives_envelope_and_returns_instructions() {
-        let handler =
-            |_ctx: RequestContext, env: ActionEnvelope, _slots: SessionSlots| async move {
-                assert_eq!(env.action_id, 99);
-                Ok(vec![Instruction::Create {
-                    tag_id: TagId(0),
-                    stable_id: StableId(env.action_id),
-                }])
-            };
+        let handler = |_ctx: RequestContext, env: ActionEnvelope, _slots: SessionSlots| async move {
+            assert_eq!(env.action_id, 99);
+            Ok(vec![Instruction::Create {
+                tag_id: TagId(0),
+                stable_id: StableId(env.action_id),
+            }])
+        };
         let envelope = ActionEnvelope {
             action_id: 99,
             event_kind: 0,
@@ -166,28 +165,37 @@ mod tests {
         let out = handler.handle(&ctx(), &envelope, slots()).await.unwrap();
         assert!(matches!(
             out[0],
-            Instruction::Create { stable_id: StableId(99), .. }
+            Instruction::Create {
+                stable_id: StableId(99),
+                ..
+            }
         ));
     }
 
     #[tokio::test]
     async fn closure_can_mutate_slots_and_dispatcher_drains_them() {
         let view = slots();
-        let handler =
-            |_ctx: RequestContext, _env: ActionEnvelope, slots: SessionSlots| async move {
-                slots.write(SlotId(1), b"updated".to_vec());
-                Ok(Vec::new())
-            };
+        let handler = |_ctx: RequestContext, _env: ActionEnvelope, slots: SessionSlots| async move {
+            slots.write(SlotId(1), b"updated".to_vec());
+            Ok(Vec::new())
+        };
         let envelope = ActionEnvelope {
             action_id: 1,
             event_kind: 0,
             payload: Vec::new(),
         };
-        let out = handler.handle(&ctx(), &envelope, view.clone()).await.unwrap();
+        let out = handler
+            .handle(&ctx(), &envelope, view.clone())
+            .await
+            .unwrap();
         assert!(out.is_empty(), "handler returned no explicit opcodes");
 
         let drained = view.drain_pending();
-        assert_eq!(drained.len(), 1, "the slot.write must surface as one SlotSet");
+        assert_eq!(
+            drained.len(),
+            1,
+            "the slot.write must surface as one SlotSet"
+        );
         assert!(matches!(
             &drained[0],
             Instruction::SlotSet { slot_id: SlotId(1), value } if value == b"updated"

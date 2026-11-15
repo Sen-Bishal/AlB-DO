@@ -30,7 +30,11 @@ pub fn render(
         512 + message.text.as_ref().map_or(0, String::len) * 4 / 3
             + message.html.as_ref().map_or(0, String::len) * 4 / 3,
     );
-    header(&mut out, "From", &mailbox(message.from.as_ref().unwrap_or(from)));
+    header(
+        &mut out,
+        "From",
+        &mailbox(message.from.as_ref().unwrap_or(from)),
+    );
     header(&mut out, "To", &list(&message.to));
     if !message.cc.is_empty() {
         header(&mut out, "Cc", &list(&message.cc));
@@ -45,7 +49,11 @@ pub fn render(
     }
     header(&mut out, "Subject", &encode_word(&message.subject));
     header(&mut out, "Date", date);
-    header(&mut out, "Message-ID", &format!("<{message_id}@albedo.local>"));
+    header(
+        &mut out,
+        "Message-ID",
+        &format!("<{message_id}@albedo.local>"),
+    );
     header(&mut out, "MIME-Version", "1.0");
 
     // Boundaries cannot collide with content: every part is base64, whose
@@ -124,9 +132,10 @@ fn filename_param(name: &str) -> String {
 #[must_use]
 pub fn rfc2822(ms: i64) -> String {
     use chrono::{TimeZone, Utc};
-    Utc.timestamp_millis_opt(ms)
-        .single()
-        .map_or_else(|| "Thu, 01 Jan 1970 00:00:00 +0000".to_string(), |dt| dt.to_rfc2822())
+    Utc.timestamp_millis_opt(ms).single().map_or_else(
+        || "Thu, 01 Jan 1970 00:00:00 +0000".to_string(),
+        |dt| dt.to_rfc2822(),
+    )
 }
 
 fn header(out: &mut String, name: &str, value: &str) {
@@ -189,12 +198,25 @@ mod tests {
             "html": "<a href=\"https://a.dev/r?t=1\">Reset</a>"
         }))
         .expect("valid");
-        let eml = render(&message, &[], &from(), None, "m1", "Tue, 1 Sep 2026 00:00:00 +0000");
-        assert!(eml.contains("From: \"Acme\" <no-reply@acme.dev>\r\n"), "{eml}");
+        let eml = render(
+            &message,
+            &[],
+            &from(),
+            None,
+            "m1",
+            "Tue, 1 Sep 2026 00:00:00 +0000",
+        );
+        assert!(
+            eml.contains("From: \"Acme\" <no-reply@acme.dev>\r\n"),
+            "{eml}"
+        );
         assert!(eml.contains("Content-Type: multipart/alternative; boundary=\"albedo-alt-m1\""));
         assert!(eml.contains("--albedo-alt-m1--\r\n"));
         let encoded = STANDARD.encode("Go to https://a.dev/r?t=1");
-        assert!(eml.contains(&encoded), "the text part is base64 of the body");
+        assert!(
+            eml.contains(&encoded),
+            "the text part is base64 of the body"
+        );
         assert!(eml.lines().all(|l| l.len() <= 998), "RFC 5322 line limit");
         assert!(eml.is_ascii(), "7-bit clean");
     }
@@ -234,8 +256,14 @@ mod tests {
         }))
         .expect("valid");
         let eml = render(&message, &[], &from(), None, "m2", "d");
-        assert!(eml.contains(&format!("Subject: =?utf-8?B?{}?=", STANDARD.encode("Bienvenue, Zoë"))));
-        assert!(eml.contains(&format!("To: =?utf-8?B?{}?= <zoe@x.dev>", STANDARD.encode("Zoë"))));
+        assert!(eml.contains(&format!(
+            "Subject: =?utf-8?B?{}?=",
+            STANDARD.encode("Bienvenue, Zoë")
+        )));
+        assert!(eml.contains(&format!(
+            "To: =?utf-8?B?{}?= <zoe@x.dev>",
+            STANDARD.encode("Zoë")
+        )));
         assert!(eml.is_ascii());
     }
 }

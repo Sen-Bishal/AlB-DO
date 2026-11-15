@@ -131,7 +131,11 @@ fn an_escape_reached_through_a_local_definition_still_escapes() {
         }
         "#,
     );
-    assert_eq!(decision.tier, Tier::B, "escape is transitive through locals");
+    assert_eq!(
+        decision.tier,
+        Tier::B,
+        "escape is transitive through locals"
+    );
     assert_eq!(decision.reason, TieringReason::ServerOwnedState);
 }
 

@@ -4,16 +4,13 @@
 //! end-to-end without QUIC certs or a real JSX renderer. The whole
 //! flow is:
 //!
-//! 1. A client opens `GET /sse` — server mints a session id, hands
-//!    back the SSE event stream, and subscribes the session to topic
-//!    `"chat:lobby"` via [`BroadcastRegistry::auto_subscribe`].
-//! 2. A client `POST /post` with `{"from": "...", "text": "..."}`
-//!    appends to the message list and calls `write_topic` — every
-//!    subscribed SSE stream gets the new state as a base64-encoded
+//! 1. A client opens `GET /sse` — server mints a session id, hands back the SSE event stream, and
+//!    subscribes the session to topic `"chat:lobby"` via [`BroadcastRegistry::auto_subscribe`].
+//! 2. A client `POST /post` with `{"from": "...", "text": "..."}` appends to the message list and
+//!    calls `write_topic` — every subscribed SSE stream gets the new state as a base64-encoded
 //!    `SlotSet` opcode frame.
-//! 3. Open two terminals (`curl -N http://127.0.0.1:3000/sse`),
-//!    `POST /post` from a third, and watch both SSE streams receive
-//!    the same patch. Two-tab chat over a binary wire, the dumb
+//! 3. Open two terminals (`curl -N http://127.0.0.1:3000/sse`), `POST /post` from a third, and
+//!    watch both SSE streams receive the same patch. Two-tab chat over a binary wire, the dumb
 //!    client just needs to decode and apply.
 //!
 //! Run:
@@ -163,7 +160,10 @@ async fn post_handler(
             }
         }
     };
-    messages.push(Message { from: req.from, text: req.text });
+    messages.push(Message {
+        from: req.from,
+        text: req.text,
+    });
 
     let bytes = match serde_json::to_vec(&messages) {
         Ok(b) => b,
@@ -207,12 +207,12 @@ fn error_response(status: StatusCode, message: &str) -> Response<Body> {
 /// in a `base64` crate dependency. Plain RFC 4648 alphabet, no
 /// padding shortcut (we always pad).
 fn b64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
-        let n = (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8) | u32::from(bytes[i + 2]);
+        let n =
+            (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8) | u32::from(bytes[i + 2]);
         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);

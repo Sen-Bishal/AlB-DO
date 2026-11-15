@@ -43,10 +43,9 @@ fn serve_html() -> Response<Body> {
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -98,10 +97,9 @@ fn json_response<T: serde::Serialize>(value: &T) -> Response<Body> {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store"),
-        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         response
     } else {
         let mut response = Response::new(Body::from("{\"error\":\"serialize_failed\"}"));

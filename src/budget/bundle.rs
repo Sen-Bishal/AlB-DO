@@ -11,18 +11,14 @@
 //! ## Attribution rules
 //!
 //! - Wrapper module bytes → the owning `component_id`'s tier.
-//! - Wrapper source-map bytes (`*.mjs.map`) → the same component as
-//!   their paired wrapper. Source maps inflate dev artefacts without
-//!   reflecting hot-path size; the formatter calls them out
-//!   separately so an oversized map doesn't masquerade as oversized
-//!   JS.
-//! - Vendor chunks → tracked as a separate "vendor" line, not
-//!   per-component, since they're shared across the components that
-//!   import them. Per-component ceilings would otherwise double-count
-//!   a vendor shared by ten components.
-//! - Everything else (manifests, plan JSON, static slices) →
-//!   classified as `BundleArtifactClass::Infrastructure` and
-//!   excluded from per-component ceilings.
+//! - Wrapper source-map bytes (`*.mjs.map`) → the same component as their paired wrapper. Source
+//!   maps inflate dev artefacts without reflecting hot-path size; the formatter calls them out
+//!   separately so an oversized map doesn't masquerade as oversized JS.
+//! - Vendor chunks → tracked as a separate "vendor" line, not per-component, since they're shared
+//!   across the components that import them. Per-component ceilings would otherwise double-count a
+//!   vendor shared by ten components.
+//! - Everything else (manifests, plan JSON, static slices) → classified as
+//!   `BundleArtifactClass::Infrastructure` and excluded from per-component ceilings.
 
 use crate::bundler::emit::{build_bundle_runtime_map, BundleEmitReport, BundleRuntimeMap};
 use crate::bundler::plan::BundlePlan;
@@ -129,7 +125,11 @@ pub fn compute_bundle_byte_report(
             BundleArtifactClass::Wrapper => {
                 let id = wrapper_index.get(artifact.relative_path.as_str()).copied();
                 let meta = id.and_then(|id| component_index.get(&id));
-                (id, meta.map(|(name, _)| name.clone()), meta.map(|(_, tier)| *tier))
+                (
+                    id,
+                    meta.map(|(name, _)| name.clone()),
+                    meta.map(|(_, tier)| *tier),
+                )
             }
             BundleArtifactClass::SourceMap => {
                 // Map files inherit their wrapper's attribution by
@@ -138,7 +138,11 @@ pub fn compute_bundle_byte_report(
                 let wrapper_path = artifact.relative_path.trim_end_matches(".map");
                 let id = wrapper_index.get(wrapper_path).copied();
                 let meta = id.and_then(|id| component_index.get(&id));
-                (id, meta.map(|(name, _)| name.clone()), meta.map(|(_, tier)| *tier))
+                (
+                    id,
+                    meta.map(|(name, _)| name.clone()),
+                    meta.map(|(_, tier)| *tier),
+                )
             }
             BundleArtifactClass::Vendor | BundleArtifactClass::Infrastructure => (None, None, None),
         };
@@ -146,25 +150,29 @@ pub fn compute_bundle_byte_report(
         match class {
             BundleArtifactClass::Wrapper => {
                 if let (Some(id), Some(name), Some(tier)) = (component_id, &component_name, tier) {
-                    let entry = summaries.entry(id).or_insert_with(|| ComponentBundleSummary {
-                        component_id: id,
-                        component_name: name.clone(),
-                        tier,
-                        wrapper_bytes: 0,
-                        source_map_bytes: 0,
-                    });
+                    let entry = summaries
+                        .entry(id)
+                        .or_insert_with(|| ComponentBundleSummary {
+                            component_id: id,
+                            component_name: name.clone(),
+                            tier,
+                            wrapper_bytes: 0,
+                            source_map_bytes: 0,
+                        });
                     entry.wrapper_bytes = entry.wrapper_bytes.saturating_add(bytes);
                 }
             }
             BundleArtifactClass::SourceMap => {
                 if let (Some(id), Some(name), Some(tier)) = (component_id, &component_name, tier) {
-                    let entry = summaries.entry(id).or_insert_with(|| ComponentBundleSummary {
-                        component_id: id,
-                        component_name: name.clone(),
-                        tier,
-                        wrapper_bytes: 0,
-                        source_map_bytes: 0,
-                    });
+                    let entry = summaries
+                        .entry(id)
+                        .or_insert_with(|| ComponentBundleSummary {
+                            component_id: id,
+                            component_name: name.clone(),
+                            tier,
+                            wrapper_bytes: 0,
+                            source_map_bytes: 0,
+                        });
                     entry.source_map_bytes = entry.source_map_bytes.saturating_add(bytes);
                 }
             }
@@ -353,10 +361,7 @@ mod tests {
 
     #[test]
     fn multiple_wrappers_summed_independently_per_component() {
-        let manifest = manifest_for(vec![
-            entry(10, "A", Tier::B, 0),
-            entry(11, "B", Tier::B, 0),
-        ]);
+        let manifest = manifest_for(vec![entry(10, "A", Tier::B, 0), entry(11, "B", Tier::B, 0)]);
         let plan = plan(vec![
             bundle_module(10, "A", BundleClass::Critical),
             bundle_module(11, "B", BundleClass::Critical),

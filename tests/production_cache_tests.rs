@@ -369,7 +369,10 @@ fn test_production_realistic_workflow() {
             "a warm workflow run should be served from the cache, got {:.1}%",
             stats.cache_hit_rate * 100.0
         );
-        assert_eq!(stats.total_cached, 8, "every production component stays cached");
+        assert_eq!(
+            stats.total_cached, 8,
+            "every production component stays cached"
+        );
 
         println!("\n  [OK] PASSED - Realistic workflow optimized");
     }

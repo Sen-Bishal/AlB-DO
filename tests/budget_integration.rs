@@ -35,7 +35,10 @@ fn default_budget_passes_against_components_fixture() {
         "default ceilings should accept the small fixture set; got violations: {:?}",
         report.violations
     );
-    assert_ne!(report.route_summaries, [] as [dom_render_compiler::budget::report::RouteSummary; 0]);
+    assert_ne!(
+        report.route_summaries,
+        [] as [dom_render_compiler::budget::report::RouteSummary; 0]
+    );
 }
 
 #[test]
@@ -56,12 +59,19 @@ fn aggressive_tier_b_ceiling_trips_the_gate() {
         routes: BTreeMap::new(),
     };
     let report = evaluate_budget(&manifest, &aggressive);
-    if report.route_summaries.iter().all(|s| s.tier_b_total_bytes == 0) {
+    if report
+        .route_summaries
+        .iter()
+        .all(|s| s.tier_b_total_bytes == 0)
+    {
         // Manifest happens to have no Tier-B; budget shape can't
         // surface a violation. Pass vacuously rather than mis-fail.
         return;
     }
-    assert!(!report.is_ok(), "expected at least one violation under impossible ceilings");
+    assert!(
+        !report.is_ok(),
+        "expected at least one violation under impossible ceilings"
+    );
 }
 
 #[test]

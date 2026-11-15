@@ -255,11 +255,13 @@ pub async fn upsert_principal(
         // winner's — the alternative is two principals for one person, with
         // the loser owning rows nobody can reach.
         tx.rollback().await?;
-        let winner = lookup_account(db, provider, subject).await?.ok_or_else(|| {
-            StoreError::Corrupt(format!(
-                "insert into {ACCOUNTS} for ({provider}, <subject>) failed but no row exists"
-            ))
-        })?;
+        let winner = lookup_account(db, provider, subject)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Corrupt(format!(
+                    "insert into {ACCOUNTS} for ({provider}, <subject>) failed but no row exists"
+                ))
+            })?;
         Ok(build_principal(winner, provider, profile))
     }
 }
@@ -403,7 +405,11 @@ pub async fn delete_sessions_returning(
         .await?;
     let mut hashes = Vec::with_capacity(rows.rows.len());
     for row in &rows.rows {
-        hashes.push(TokenHash::from_stored(text_at(row, 0, "sessions.token_hash")?));
+        hashes.push(TokenHash::from_stored(text_at(
+            row,
+            0,
+            "sessions.token_hash",
+        )?));
     }
     tx.execute(&format!("DELETE FROM {SESSIONS} WHERE {filter}"), params)
         .await?;
@@ -821,7 +827,9 @@ pub async fn grant_role(
     granted_by: Option<&str>,
     now_ms: i64,
 ) -> Result<GrantOutcome> {
-    Ok(grant_role_changed(db, principal, role, granted_by, now_ms).await?.0)
+    Ok(grant_role_changed(db, principal, role, granted_by, now_ms)
+        .await?
+        .0)
 }
 
 /// [`grant_role`], also returning the principal's new authority epoch when the
@@ -954,7 +962,11 @@ pub async fn revoke_role_in_transaction(
     if removed == 0 {
         return Ok(None);
     }
-    Ok(Some(bump_authority_in_transaction(tx, principal, now_ms).await?.0))
+    Ok(Some(
+        bump_authority_in_transaction(tx, principal, now_ms)
+            .await?
+            .0,
+    ))
 }
 
 /// R1b · allocate the next clock `seq` and bump `principal`'s epoch, in the
@@ -977,10 +989,15 @@ pub async fn bump_authority_in_transaction(
         )
         .await?;
     if bumped != 1 {
-        return Err(StoreError::Corrupt(format!("{AUTHORITY_CLOCK} has no clock row")));
+        return Err(StoreError::Corrupt(format!(
+            "{AUTHORITY_CLOCK} has no clock row"
+        )));
     }
     let seq_rows = tx
-        .query(&format!("SELECT seq FROM {AUTHORITY_CLOCK} WHERE id = 1"), &[])
+        .query(
+            &format!("SELECT seq FROM {AUTHORITY_CLOCK} WHERE id = 1"),
+            &[],
+        )
         .await?;
     let seq = seq_rows
         .rows
@@ -995,7 +1012,11 @@ pub async fn bump_authority_in_transaction(
              ON CONFLICT(principal) DO UPDATE SET epoch = epoch + 1, seq = excluded.seq, \
              changed_at = excluded.changed_at"
         ),
-        &[who.clone(), SqlValue::Integer(seq), SqlValue::Integer(now_ms)],
+        &[
+            who.clone(),
+            SqlValue::Integer(seq),
+            SqlValue::Integer(now_ms),
+        ],
     )
     .await?;
     let epoch_rows = tx
@@ -1059,7 +1080,10 @@ pub async fn authority_changes_after(
 /// [`StoreError`] on substrate failure or a missing clock row.
 pub async fn authority_clock(db: &dyn DataSubstrate) -> Result<i64> {
     let rows = db
-        .query(&format!("SELECT seq FROM {AUTHORITY_CLOCK} WHERE id = 1"), &[])
+        .query(
+            &format!("SELECT seq FROM {AUTHORITY_CLOCK} WHERE id = 1"),
+            &[],
+        )
         .await?;
     rows.rows
         .first()

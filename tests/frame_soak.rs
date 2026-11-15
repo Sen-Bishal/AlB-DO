@@ -50,9 +50,7 @@ fn analysis(id: ComponentId, phase: f64) -> ComponentAnalysis {
 fn build_pipeline() -> (FourLaneRuntimePipeline, usize) {
     let graph = ComponentGraph::new();
     let ids: Vec<ComponentId> = (0..COMPONENT_COUNT)
-        .map(|i| {
-            graph.add_component(Component::new(ComponentId::new(0), format!("C{i}")))
-        })
+        .map(|i| graph.add_component(Component::new(ComponentId::new(0), format!("C{i}"))))
         .collect();
 
     let mut analyses = HashMap::new();
@@ -62,15 +60,9 @@ fn build_pipeline() -> (FourLaneRuntimePipeline, usize) {
     }
     let tiers: HashMap<_, _> = ids.iter().map(|id| (*id, Tier::B)).collect();
 
-    let pipeline = FourLaneRuntimePipeline::new(
-        &graph,
-        analyses,
-        tiers,
-        &[],
-        SchedulerConfig::default(),
-        64,
-    )
-    .expect("pipeline construction");
+    let pipeline =
+        FourLaneRuntimePipeline::new(&graph, analyses, tiers, &[], SchedulerConfig::default(), 64)
+            .expect("pipeline construction");
 
     let len = pipeline.columns().len();
     (pipeline, len)
@@ -108,7 +100,10 @@ fn pipeline_tick_frame_soak_1m_frames_no_growth() {
     );
     let metrics = pipeline.frame_metrics();
     assert_eq!(metrics.total_ticks(), (FRAME_COUNT + 1) as u64);
-    assert!(metrics.p99_ns() > 0, "percentile should observe at least one sample");
+    assert!(
+        metrics.p99_ns() > 0,
+        "percentile should observe at least one sample"
+    );
     assert!(metrics.p99_ns() >= metrics.p50_ns());
 }
 

@@ -5,16 +5,14 @@
 //! to a helper imported from `albedo/query`, in a compiled runtime module is
 //! exactly one of:
 //!
-//! - **legacy** — `useSharedSlot(collection)` or
-//!   `useSharedSlot(collection.where({ col: v }))` with nothing chained
-//!   (Design 9). Left to the legacy extractor, byte for byte.
-//! - **a new-style query** — a chain (`where* → orderBy* → limit | first |
-//!   count | groupBy`, or `get(key)` alone) that lowers to a schema-checked
-//!   [`QueryDescriptor`] and SQL per presence mask. Q1a lowers it and then
-//!   **refuses** it by name: running it arrives with Q1b.
-//! - **a diagnostic** naming `file:line:column` in the original source and the
-//!   rule it broke (`const x = guestbook`, `guestbook.length`, a helper outside
-//!   a chain, a namespace import, a re-export, …).
+//! - **legacy** — `useSharedSlot(collection)` or `useSharedSlot(collection.where({ col: v }))` with
+//!   nothing chained (Design 9). Left to the legacy extractor, byte for byte.
+//! - **a new-style query** — a chain (`where* → orderBy* → limit | first | count | groupBy`, or
+//!   `get(key)` alone) that lowers to a schema-checked [`QueryDescriptor`] and SQL per presence
+//!   mask. Q1a lowers it and then **refuses** it by name: running it arrives with Q1b.
+//! - **a diagnostic** naming `file:line:column` in the original source and the rule it broke
+//!   (`const x = guestbook`, `guestbook.length`, a helper outside a chain, a namespace import, a
+//!   re-export, …).
 //!
 //! Identity is the binding, not the spelling: the module runs through SWC's
 //! resolver first, so a parameter or local that shadows a collection import is
@@ -38,12 +36,11 @@ use std::rc::Rc;
 use swc_common::{sync::Lrc, Globals, Mark, SourceMap, Span, Spanned, GLOBALS};
 use swc_ecma_ast::{
     ArrowExpr, AssignExpr, AssignOp, AssignTarget, CallExpr, Callee, Constructor, Decl,
-    DoWhileStmt, ExportNamedSpecifier, Expr, ExprOrSpread, ForInStmt, ForOfStmt, ForStmt,
-    Function, GetterProp, Id, Ident, ImportSpecifier, JSXElementName, JSXObject,
-    JSXOpeningElement, Lit, MemberProp, Module, ModuleDecl, NamedExport,
-    ModuleExportName, ModuleItem, NewExpr, ObjectLit, Pat, Prop, PropName, PropOrSpread,
-    ReturnStmt, SetterProp, SimpleAssignTarget, Stmt, TsInterfaceDecl, TsType, TsTypeAliasDecl,
-    UpdateExpr, VarDecl, VarDeclKind, WhileStmt,
+    DoWhileStmt, ExportNamedSpecifier, Expr, ExprOrSpread, ForInStmt, ForOfStmt, ForStmt, Function,
+    GetterProp, Id, Ident, ImportSpecifier, JSXElementName, JSXObject, JSXOpeningElement, Lit,
+    MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, NamedExport, NewExpr, ObjectLit,
+    Pat, Prop, PropName, PropOrSpread, ReturnStmt, SetterProp, SimpleAssignTarget, Stmt,
+    TsInterfaceDecl, TsType, TsTypeAliasDecl, UpdateExpr, VarDecl, VarDeclKind, WhileStmt,
 };
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_visit::{Visit, VisitMutWith, VisitWith};
@@ -287,8 +284,16 @@ fn resolve_relative(importer: &Path, specifier: &str) -> Option<PathBuf> {
     }
     const EXTENSIONS: [&str; 4] = ["ts", "tsx", "js", "jsx"];
     std::iter::once(base.clone())
-        .chain(EXTENSIONS.iter().map(|ext| PathBuf::from(format!("{}.{ext}", base.display()))))
-        .chain(EXTENSIONS.iter().map(|ext| base.join(format!("index.{ext}"))))
+        .chain(
+            EXTENSIONS
+                .iter()
+                .map(|ext| PathBuf::from(format!("{}.{ext}", base.display()))),
+        )
+        .chain(
+            EXTENSIONS
+                .iter()
+                .map(|ext| base.join(format!("index.{ext}"))),
+        )
         .find(|candidate| {
             candidate.is_file() && crate::runtime::eval::component::is_component_module(candidate)
         })
@@ -1059,7 +1064,11 @@ pub fn query_report(
             continue;
         };
         let d = &query.canonical.descriptor;
-        let _ = writeln!(out, "## {} — {} on `{}`", query.at, query.canonical.id, query.collection);
+        let _ = writeln!(
+            out,
+            "## {} — {} on `{}`",
+            query.at, query.canonical.id, query.collection
+        );
         let _ = writeln!(out, "descriptor: {}", query.canonical.json);
         for statement in &query.lowered.statements {
             let _ = writeln!(out, "mask {:03b}: {}", statement.mask, statement.sql);
@@ -1084,7 +1093,10 @@ pub fn query_report(
         if !get && !constrained && (d.bound == RowBound::None || wanted.is_empty()) {
             whole_table.push(query.at.to_string());
         }
-        wanted_by_table.entry(schema.table.clone()).or_default().extend(wanted);
+        wanted_by_table
+            .entry(schema.table.clone())
+            .or_default()
+            .extend(wanted);
         let _ = writeln!(out);
     }
 
@@ -1107,7 +1119,11 @@ pub fn query_report(
             );
         }
     }
-    let _ = writeln!(out, "\n## Unbounded reads (no limit/first): {}", unbounded.len());
+    let _ = writeln!(
+        out,
+        "\n## Unbounded reads (no limit/first): {}",
+        unbounded.len()
+    );
     for at in &unbounded {
         let _ = writeln!(out, "  {at}");
     }
@@ -1172,7 +1188,8 @@ pub fn classify_source(
 ///
 /// - an inline chain → `__albedo_q_run(__albedo_q_new("<id>", [slots], [values]), [], [])`
 /// - `let q = <chain>` → `let q = __albedo_q_new("<id>", [slots], [values])`
-/// - `if (…) q = q.where({ c: v })` → `if (…) q = __albedo_q_set(q, <optional slot>, [slots], [values])`
+/// - `if (…) q = q.where({ c: v })` → `if (…) q = __albedo_q_set(q, <optional slot>, [slots],
+///   [values])`
 /// - the one use → `__albedo_q_run(q, [slots], [values])`
 ///
 /// `values` are the authored expressions in source order, each written once
@@ -1258,7 +1275,12 @@ fn relative_imports(module: &Module) -> Vec<(Id, String, String, Span)> {
                 Some(ModuleExportName::Str(s)) => s.value.to_string(),
                 None => named.local.sym.to_string(),
             };
-            out.push((named.local.to_id(), source.to_string(), exported, named.local.span));
+            out.push((
+                named.local.to_id(),
+                source.to_string(),
+                exported,
+                named.local.span,
+            ));
         }
     }
     out
@@ -1286,7 +1308,10 @@ fn run_pass(
         let unresolved_mark = Mark::new();
         let top_level_mark = Mark::new();
         parsed.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, true));
-        let file_start = source_map.files().first().map_or(0, |file| file.start_pos.0);
+        let file_start = source_map
+            .files()
+            .first()
+            .map_or(0, |file| file.start_pos.0);
 
         let mut census = Census::default();
         parsed.visit_with(&mut census);
@@ -1431,7 +1456,11 @@ impl Census {
 
 impl Visit for Census {
     fn visit_ident(&mut self, ident: &Ident) {
-        let role = self.marks.get(&key(ident.span)).copied().unwrap_or(Role::Read);
+        let role = self
+            .marks
+            .get(&key(ident.span))
+            .copied()
+            .unwrap_or(Role::Read);
         self.refs.entry(ident.to_id()).or_default().push(Ref {
             span: ident.span,
             fn_depth: self.fn_depth,
@@ -1915,10 +1944,12 @@ impl<'s> Node<'s> {
         match self {
             Node::Stmt(Stmt::Decl(Decl::Var(var)))
             | Node::Item(ModuleItem::Stmt(Stmt::Decl(Decl::Var(var)))) => Some(var),
-            Node::Item(ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export))) => match &export.decl {
-                Decl::Var(var) => Some(var),
-                _ => None,
-            },
+            Node::Item(ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export))) => {
+                match &export.decl {
+                    Decl::Var(var) => Some(var),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -2120,7 +2151,10 @@ impl Pass<'_> {
                         let has_values = export.specifiers.iter().any(|spec| {
                             !matches!(spec, swc_ecma_ast::ExportSpecifier::Named(named) if named.is_type_only)
                         });
-                        if !export.type_only && has_values && matches!(source, FORGE_MODULE | QUERY_MODULE) {
+                        if !export.type_only
+                            && has_values
+                            && matches!(source, FORGE_MODULE | QUERY_MODULE)
+                        {
                             self.diagnose(
                                 export.span,
                                 format!(
@@ -2228,7 +2262,11 @@ impl Pass<'_> {
             .iter()
             .find(|r| r.span == handle.span)
             .map_or((0, 0), |r| (r.fn_depth, r.loop_depth));
-        let refs: Vec<Ref> = all.iter().filter(|r| r.span != handle.span).copied().collect();
+        let refs: Vec<Ref> = all
+            .iter()
+            .filter(|r| r.span != handle.span)
+            .copied()
+            .collect();
 
         let mut accounted: HashSet<SpanKey> = HashSet::new();
         let mut folds: Vec<(Span, Vec<Step<'_>>)> = Vec::new();
@@ -2389,7 +2427,11 @@ impl Pass<'_> {
                 root.span,
                 format!(
                     "`{collection}` isn't a declared collection (declared: {})",
-                    if declared.is_empty() { "none" } else { &declared }
+                    if declared.is_empty() {
+                        "none"
+                    } else {
+                        &declared
+                    }
                 ),
             );
             return;
@@ -2479,7 +2521,14 @@ impl Pass<'_> {
             .iter()
             .zip(&infos)
             .map(|(segment, (params, optional))| {
-                self.emit(segment, params.clone(), *optional, &sources, &canonical, handle)
+                self.emit(
+                    segment,
+                    params.clone(),
+                    *optional,
+                    &sources,
+                    &canonical,
+                    handle,
+                )
             })
             .collect();
         let lowered = lower(&canonical.descriptor, &schema);
@@ -2553,7 +2602,10 @@ impl Pass<'_> {
                 format!("__albedo_q_run(__albedo_q_new({id}, [{slots}], ["),
                 "]), [], [])".to_string(),
             ),
-            SegKind::Base => (format!("__albedo_q_new({id}, [{slots}], ["), "])".to_string()),
+            SegKind::Base => (
+                format!("__albedo_q_new({id}, [{slots}], ["),
+                "])".to_string(),
+            ),
             SegKind::Fold => {
                 let slot = optional.map_or(0, |o| canonical.optional_map[o as usize]);
                 (
@@ -2561,7 +2613,10 @@ impl Pass<'_> {
                     "])".to_string(),
                 )
             }
-            SegKind::Final => (format!("__albedo_q_run({handle}, [{slots}], ["), "])".to_string()),
+            SegKind::Final => (
+                format!("__albedo_q_run({handle}, [{slots}], ["),
+                "])".to_string(),
+            ),
         };
         let mut pieces = vec![Piece::Text(open)];
         pieces.extend(values);
@@ -2637,13 +2692,21 @@ impl Pass<'_> {
             && (matches!(arg, Expr::Ident(ident) if self.collection_of(ident).is_some())
                 || self.chain(arg).is_some())
         {
-            self.diagnose(first.expr.span(), "useSharedSlot takes one source, not a spread collection");
+            self.diagnose(
+                first.expr.span(),
+                "useSharedSlot takes one source, not a spread collection",
+            );
             for arg in &call.args {
                 arg.expr.visit_with(self);
             }
             return true;
         }
-        let rest: Vec<Value<'_>> = call.args.iter().skip(1).map(|a| Value::Expr(&a.expr)).collect();
+        let rest: Vec<Value<'_>> = call
+            .args
+            .iter()
+            .skip(1)
+            .map(|a| Value::Expr(&a.expr))
+            .collect();
         if let Expr::Ident(ident) = arg {
             if self.collection_of(ident).is_some() {
                 self.out.legacy += 1;
@@ -2764,7 +2827,10 @@ impl Visit for Pass<'_> {
     fn visit_jsx_opening_element(&mut self, node: &JSXOpeningElement) {
         let root = match &node.name {
             JSXElementName::Ident(ident)
-                if !ident.sym.starts_with(|c: char| c.is_ascii_lowercase()) => Some(ident),
+                if !ident.sym.starts_with(|c: char| c.is_ascii_lowercase()) =>
+            {
+                Some(ident)
+            }
             JSXElementName::JSXMemberExpr(member) => {
                 let mut object = &member.obj;
                 loop {
@@ -2941,10 +3007,12 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
         }
         self.next_param += 1;
         self.provenance.push(self.pass.provenance(value));
-        if let Some((base, keys)) = &self.path { self.sources.push(Source::Path {
-            base: *base,
-            keys: keys.clone(),
-        }); } else {
+        if let Some((base, keys)) = &self.path {
+            self.sources.push(Source::Path {
+                base: *base,
+                keys: keys.clone(),
+            });
+        } else {
             self.values.push(Value::Expr(value));
             self.sources.push(Source::Span(value.span()));
         }
@@ -2960,10 +3028,12 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
         self.next_param += 1;
         self.provenance
             .push(self.pass.provenance(&Expr::Ident(ident.clone())));
-        if let Some((base, keys)) = &self.path { self.sources.push(Source::Path {
-            base: *base,
-            keys: keys.clone(),
-        }); } else {
+        if let Some((base, keys)) = &self.path {
+            self.sources.push(Source::Path {
+                base: *base,
+                keys: keys.clone(),
+            });
+        } else {
             self.values.push(Value::Ident(ident));
             self.sources.push(Source::Span(ident.span));
         }
@@ -2985,7 +3055,10 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
     fn steps(&mut self, collection: &str, steps: &[Step<'e>]) -> Result<(), Refuse> {
         for step in steps {
             if let Some(arg) = step.args.iter().find(|arg| arg.spread.is_some()) {
-                return Err(refuse(arg.expr.span(), "query methods take explicit arguments, not a spread"));
+                return Err(refuse(
+                    arg.expr.span(),
+                    "query methods take explicit arguments, not a spread",
+                ));
             }
             if self.got_key {
                 return Err(refuse(
@@ -3063,14 +3136,20 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
             ));
         };
         if arg.spread.is_some() {
-            return Err(refuse(step.span, "`.where(...)` takes a predicate, not a spread"));
+            return Err(refuse(
+                step.span,
+                "`.where(...)` takes a predicate, not a spread",
+            ));
         }
         let expr: &'e Expr = &arg.expr;
         if let Some(call) = self.pass.helper_call(expr, "or") {
             let mut branches = Vec::new();
             for branch in &call.args {
                 if branch.spread.is_some() {
-                    return Err(refuse(branch.expr.span(), "or(…) takes objects, not a spread"));
+                    return Err(refuse(
+                        branch.expr.span(),
+                        "or(…) takes objects, not a spread",
+                    ));
                 }
                 branches.push(self.predicate_arg(&branch.expr, false)?);
             }
@@ -3084,7 +3163,11 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
 
     /// A `.where()` or `or()` argument: an object literal, or an identifier bound
     /// by `const` to one (a named predicate, R3-1).
-    fn predicate_arg(&mut self, expr: &'e Expr, optional_allowed: bool) -> Result<Vec<Term>, Refuse> {
+    fn predicate_arg(
+        &mut self,
+        expr: &'e Expr,
+        optional_allowed: bool,
+    ) -> Result<Vec<Term>, Refuse> {
         match unwrap(expr) {
             Expr::Object(obj) => self.predicate(obj, optional_allowed),
             Expr::Ident(ident) => {
@@ -3136,12 +3219,19 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
         }
     }
 
-    fn predicate(&mut self, obj: &'e ObjectLit, optional_allowed: bool) -> Result<Vec<Term>, Refuse> {
+    fn predicate(
+        &mut self,
+        obj: &'e ObjectLit,
+        optional_allowed: bool,
+    ) -> Result<Vec<Term>, Refuse> {
         let mut terms = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for prop in &obj.props {
             let PropOrSpread::Prop(prop) = prop else {
-                return Err(refuse(obj.span, "a predicate can't contain a spread: name each column"));
+                return Err(refuse(
+                    obj.span,
+                    "a predicate can't contain a spread: name each column",
+                ));
             };
             let (column, key_span) = match &**prop {
                 Prop::KeyValue(kv) => {
@@ -3154,12 +3244,10 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
                     (column, kv.key.span())
                 }
                 Prop::Shorthand(ident) => (ident.sym.to_string(), ident.span),
-                _ => {
-                    return Err(refuse(
-                        prop.span(),
-                        "a predicate holds `column: value` pairs only — no getters, setters or methods",
-                    ))
-                }
+                _ => return Err(refuse(
+                    prop.span(),
+                    "a predicate holds `column: value` pairs only — no getters, setters or methods",
+                )),
             };
             if column == "__proto__" {
                 return Err(refuse(key_span, "`__proto__` isn't a column"));
@@ -3192,7 +3280,12 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
         Ok(terms)
     }
 
-    fn term(&mut self, column: String, value: &'e Expr, optional_allowed: bool) -> Result<Term, Refuse> {
+    fn term(
+        &mut self,
+        column: String,
+        value: &'e Expr,
+        optional_allowed: bool,
+    ) -> Result<Term, Refuse> {
         if let Some(call) = self.pass.helper_call(value, "optional") {
             if let Some((base, _)) = &self.path {
                 return Err(refuse(
@@ -3222,7 +3315,10 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
                 return Err(refuse(call.span, "optional(x) takes exactly one value"));
             };
             if arg.spread.is_some() {
-                return Err(refuse(arg.expr.span(), "optional(x) takes one value, not a spread"));
+                return Err(refuse(
+                    arg.expr.span(),
+                    "optional(x) takes one value, not a spread",
+                ));
             }
             let param = self.param(&arg.expr);
             let slot = self.next_optional;
@@ -3251,20 +3347,32 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
         let mut entries: Vec<(String, &'e Expr, Span)> = Vec::new();
         for prop in &ops.props {
             let PropOrSpread::Prop(prop) = prop else {
-                return Err(refuse(ops.span, "an operator object can't contain a spread"));
+                return Err(refuse(
+                    ops.span,
+                    "an operator object can't contain a spread",
+                ));
             };
             let Prop::KeyValue(kv) = &**prop else {
-                return Err(refuse(prop.span(), "an operator object holds `op: value` pairs only"));
+                return Err(refuse(
+                    prop.span(),
+                    "an operator object holds `op: value` pairs only",
+                ));
             };
             let Some(key) = prop_key(&kv.key) else {
-                return Err(refuse(kv.key.span(), "an operator is a name, not a computed key"));
+                return Err(refuse(
+                    kv.key.span(),
+                    "an operator is a name, not a computed key",
+                ));
             };
             if entries.iter().any(|(k, _, _)| *k == key) {
                 return Err(refuse(kv.key.span(), format!("`{key}` appears twice")));
             }
             entries.push((key, &kv.value, kv.key.span()));
         }
-        if let Some((key, _, span)) = entries.iter().find(|(k, _, _)| SEARCH_KEYS.contains(&k.as_str())) {
+        if let Some((key, _, span)) = entries
+            .iter()
+            .find(|(k, _, _)| SEARCH_KEYS.contains(&k.as_str()))
+        {
             return Err(refuse(
                 *span,
                 format!("`{column}: {{ {key}: … }}` is a text search: search arrives with Q2"),
@@ -3287,7 +3395,10 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
         }
         if let Some((_, value, span)) = entries.iter().find(|(k, _, _)| k == "not") {
             if entries.len() != 1 || !matches!(unwrap(value), Expr::Lit(Lit::Null(_))) {
-                return Err(refuse(*span, "`not` takes only `null`, alone: `{ not: null }`"));
+                return Err(refuse(
+                    *span,
+                    "`not` takes only `null`, alone: `{ not: null }`",
+                ));
             }
             return Ok(TermOp::NotNull);
         }
@@ -3309,7 +3420,10 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
             if if lower { lo.is_some() } else { hi.is_some() } {
                 return Err(refuse(
                     span,
-                    format!("`{column}` has two {} bounds", if lower { "lower" } else { "upper" }),
+                    format!(
+                        "`{column}` has two {} bounds",
+                        if lower { "lower" } else { "upper" }
+                    ),
                 ));
             }
             let param = self.keyed(&key, |build| build.param(value));
@@ -3330,22 +3444,26 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
         let (column, dir) = match step.args {
             [column] => (column, None),
             [column, dir] => (column, Some(dir)),
-            _ => {
-                return Err(refuse(
-                    step.span,
-                    "`.orderBy(column, \"asc\" | \"desc\")` takes a column and an optional direction",
-                ))
-            }
+            _ => return Err(refuse(
+                step.span,
+                "`.orderBy(column, \"asc\" | \"desc\")` takes a column and an optional direction",
+            )),
         };
         let Some(column) = string_literal(&column.expr) else {
-            return Err(refuse(column.expr.span(), "`.orderBy` names its column as a string literal"));
+            return Err(refuse(
+                column.expr.span(),
+                "`.orderBy` names its column as a string literal",
+            ));
         };
         let dir = match dir.map(|d| string_literal(&d.expr)) {
             None => Direction::Asc,
             Some(Some(d)) if d == "asc" => Direction::Asc,
             Some(Some(d)) if d == "desc" => Direction::Desc,
             Some(_) => {
-                return Err(refuse(step.span, "`.orderBy`'s direction is \"asc\" or \"desc\""));
+                return Err(refuse(
+                    step.span,
+                    "`.orderBy`'s direction is \"asc\" or \"desc\"",
+                ));
             }
         };
         self.descriptor.order.push(OrderTerm { column, dir });
@@ -3369,7 +3487,10 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
             ));
         };
         if value.fract() != 0.0 || value < 1.0 {
-            return Err(refuse(arg.expr.span(), "`.limit(n)` takes an integer 1..=1000"));
+            return Err(refuse(
+                arg.expr.span(),
+                "`.limit(n)` takes an integer 1..=1000",
+            ));
         }
         self.descriptor.bound = RowBound::Limit {
             n: value.min(f64::from(u32::MAX)) as u32,
@@ -3385,10 +3506,16 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
             ));
         };
         let Some(column) = string_literal(&column.expr) else {
-            return Err(refuse(column.expr.span(), "`.groupBy` names its column as a string literal"));
+            return Err(refuse(
+                column.expr.span(),
+                "`.groupBy` names its column as a string literal",
+            ));
         };
         let Expr::Object(obj) = unwrap(&aggs.expr) else {
-            return Err(refuse(aggs.expr.span(), "`.groupBy`'s aggregates are an object literal"));
+            return Err(refuse(
+                aggs.expr.span(),
+                "`.groupBy`'s aggregates are an object literal",
+            ));
         };
         let mut out = BTreeMap::new();
         for prop in &obj.props {
@@ -3403,7 +3530,10 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
             };
             let aggregate = self.aggregate(&kv.value)?;
             if out.insert(alias.clone(), aggregate).is_some() {
-                return Err(refuse(kv.key.span(), format!("the alias `{alias}` is used twice")));
+                return Err(refuse(
+                    kv.key.span(),
+                    format!("the alias `{alias}` is used twice"),
+                ));
             }
         }
         self.descriptor.shape = Shape::Group { column, aggs: out };
@@ -3412,22 +3542,38 @@ impl<'a: 'e, 'e> Build<'_, 'a, 'e> {
 
     fn aggregate(&mut self, value: &Expr) -> Result<Aggregate, Refuse> {
         let Expr::Call(call) = unwrap(value) else {
-            return Err(refuse(value.span(), "an aggregate is count(), sum(\"col\"), avg, min or max"));
+            return Err(refuse(
+                value.span(),
+                "an aggregate is count(), sum(\"col\"), avg, min or max",
+            ));
         };
         if let Some(arg) = call.args.iter().find(|arg| arg.spread.is_some()) {
-            return Err(refuse(arg.expr.span(), "aggregate helpers take explicit arguments, not a spread"));
+            return Err(refuse(
+                arg.expr.span(),
+                "aggregate helpers take explicit arguments, not a spread",
+            ));
         }
         let Callee::Expr(callee) = &call.callee else {
-            return Err(refuse(call.span, "an aggregate is a helper from \"albedo/query\""));
+            return Err(refuse(
+                call.span,
+                "an aggregate is a helper from \"albedo/query\"",
+            ));
         };
         let Some(helper) = self.pass.helper_of(callee) else {
-            return Err(refuse(call.span, "an aggregate is a helper from \"albedo/query\""));
+            return Err(refuse(
+                call.span,
+                "an aggregate is a helper from \"albedo/query\"",
+            ));
         };
         let column = || -> Result<String, Refuse> {
             match call.args.as_slice() {
-                [arg] => string_literal(&arg.expr)
-                    .ok_or_else(|| refuse(call.span, format!("{helper}(\"column\") names a column"))),
-                _ => Err(refuse(call.span, format!("{helper}(\"column\") takes one column"))),
+                [arg] => string_literal(&arg.expr).ok_or_else(|| {
+                    refuse(call.span, format!("{helper}(\"column\") names a column"))
+                }),
+                _ => Err(refuse(
+                    call.span,
+                    format!("{helper}(\"column\") takes one column"),
+                )),
             }
         };
         Ok(match helper {
@@ -3452,7 +3598,10 @@ fn no_args(step: &Step<'_>) -> Result<(), Refuse> {
     if step.args.is_empty() {
         Ok(())
     } else {
-        Err(refuse(step.span, format!("`.{}()` takes no arguments", step.name)))
+        Err(refuse(
+            step.span,
+            format!("`.{}()` takes no arguments", step.name),
+        ))
     }
 }
 

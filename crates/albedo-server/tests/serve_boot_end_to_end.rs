@@ -3,15 +3,12 @@
 //! Five gate tests for `boot_production_server`:
 //!
 //! 1. Options derivation absorbs the contract's host/port overrides.
-//! 2. Boot fails loud with a "did you run `albedo build`?" hint when
-//!    `.albedo/dist/` is missing.
-//! 3. Every manifest route becomes a synthetic GET `RouteSpec` so the
-//!    manifest-streaming arm activates.
-//! 4. Bakabox runtime assets at `<dist>/_albedo/runtime.js` resolve at
-//!    `/_albedo/runtime.js`.
-//! 5. A Phase K useState component lands in the action registry, so the
-//!    action endpoint is mounted (POST → not 404 because the route
-//!    exists; HEAD → 405 because the route is POST-only).
+//! 2. Boot fails loud with a "did you run `albedo build`?" hint when `.albedo/dist/` is missing.
+//! 3. Every manifest route becomes a synthetic GET `RouteSpec` so the manifest-streaming arm
+//!    activates.
+//! 4. Bakabox runtime assets at `<dist>/_albedo/runtime.js` resolve at `/_albedo/runtime.js`.
+//! 5. A Phase K useState component lands in the action registry, so the action endpoint is mounted
+//!    (POST → not 404 because the route exists; HEAD → 405 because the route is POST-only).
 
 use albedo_server::{boot_production_server, ProductionServerOptions};
 use axum::body::{to_bytes, Body};
@@ -76,11 +73,7 @@ impl Fixture {
         // absolute form is neither needed nor producible — `albedo build`
         // refuses to emit one, and so does boot.
         let manifest_json = build_minimal_manifest_json(Path::new("src/Hello.tsx"));
-        fs::write(
-            dist_dir.join("render-manifest.v2.json"),
-            manifest_json,
-        )
-        .expect("write manifest");
+        fs::write(dist_dir.join("render-manifest.v2.json"), manifest_json).expect("write manifest");
 
         // Bakabox runtime stub. Real bytes don't matter; we just
         // want the public-asset mount to find a file at this path.
@@ -112,10 +105,10 @@ impl Fixture {
             // declare its own collections.
             forge: Default::default(),
             sources: Default::default(),
-        uploads: Default::default(),
-        email: None,
-        redirects: Vec::new(),
-        webhooks: Default::default(),
+            uploads: Default::default(),
+            email: None,
+            redirects: Vec::new(),
+            webhooks: Default::default(),
             // No `auth` block either — every request resolves as anonymous,
             // and none of AUTH's tables are emitted.
             auth: Default::default(),
@@ -327,8 +320,7 @@ async fn boot_production_server_emits_no_warnings() {
             struct Render(String);
             impl Visit for Render {
                 fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                    self.0
-                        .push_str(&format!(" {}={:?}", field.name(), value));
+                    self.0.push_str(&format!(" {}={:?}", field.name(), value));
                 }
             }
             let mut render = Render(format!("{level} {}", event.metadata().target()));

@@ -219,9 +219,9 @@ impl VisitMut for DefineFolder<'_> {
         expr.visit_mut_children_with(self);
 
         if matches!(expr, Expr::Member(_)) {
-            if let Some(value) = dotted_path(expr).and_then(|path| {
-                self.defines.lookup(path.as_str()).map(str::to_string)
-            }) {
+            if let Some(value) = dotted_path(expr)
+                .and_then(|path| self.defines.lookup(path.as_str()).map(str::to_string))
+            {
                 *expr = Expr::Lit(Lit::Str(Str {
                     span: DUMMY_SP,
                     value: value.into(),
@@ -497,7 +497,10 @@ mod tests {
             "if (process.env.NODE_ENV === 'production') {\n  module.exports = require('./prod');\n} else {\n  module.exports = require('./dev');\n}",
         )
         .expect("the fork folds");
-        assert!(folded.contains("./prod"), "kept the production arm: {folded}");
+        assert!(
+            folded.contains("./prod"),
+            "kept the production arm: {folded}"
+        );
         assert!(
             !folded.contains("./dev"),
             "the development arm must not survive: {folded}"
@@ -517,11 +520,16 @@ mod tests {
 
     #[test]
     fn a_ternary_folds_too() {
-        let folded =
-            browser_fold("var mode = process.env.NODE_ENV === 'production' ? 'p' : 'd';")
-                .expect("the ternary folds");
-        assert!(folded.contains("'p'") || folded.contains("\"p\""), "{folded}");
-        assert!(!folded.contains("'d'") && !folded.contains("\"d\""), "{folded}");
+        let folded = browser_fold("var mode = process.env.NODE_ENV === 'production' ? 'p' : 'd';")
+            .expect("the ternary folds");
+        assert!(
+            folded.contains("'p'") || folded.contains("\"p\""),
+            "{folded}"
+        );
+        assert!(
+            !folded.contains("'d'") && !folded.contains("\"d\""),
+            "{folded}"
+        );
     }
 
     #[test]
@@ -563,7 +571,10 @@ mod tests {
         assert!(folded.contains("./factoryWithThrowingShims"), "{folded}");
         assert!(!folded.contains("react-is"), "{folded}");
         assert!(!folded.contains("factoryWithTypeCheckers"), "{folded}");
-        assert!(folded.contains("var ReactIs"), "the bindings stay: {folded}");
+        assert!(
+            folded.contains("var ReactIs"),
+            "the bindings stay: {folded}"
+        );
     }
 
     /// A function declaration is the one thing that still pins its branch:
@@ -576,7 +587,10 @@ mod tests {
         )
         .expect("the test still folds to a literal");
         assert!(folded.contains("./noisy"), "{folded}");
-        assert!(folded.contains("false"), "the test is still constant: {folded}");
+        assert!(
+            folded.contains("false"),
+            "the test is still constant: {folded}"
+        );
     }
 
     /// Destructured `var`s hoist every name they bind.

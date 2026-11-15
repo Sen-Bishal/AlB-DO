@@ -229,7 +229,11 @@ fn tier_b_weight_breakdown(
 
 fn top_n_contributors(contribs: &[ComponentContribution], n: usize) -> Vec<ComponentContribution> {
     let mut sorted: Vec<ComponentContribution> = contribs.to_vec();
-    sorted.sort_by(|a, b| b.weight_bytes.cmp(&a.weight_bytes).then_with(|| a.name.cmp(&b.name)));
+    sorted.sort_by(|a, b| {
+        b.weight_bytes
+            .cmp(&a.weight_bytes)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     sorted.truncate(n);
     sorted
 }
@@ -418,7 +422,10 @@ mod tests {
         }
     }
 
-    fn manifest(routes: Vec<RouteManifest>, components: Vec<ComponentManifestEntry>) -> RenderManifestV2 {
+    fn manifest(
+        routes: Vec<RouteManifest>,
+        components: Vec<ComponentManifestEntry>,
+    ) -> RenderManifestV2 {
         let mut m = RenderManifestV2::legacy_defaults();
         for r in routes {
             m.routes.insert(r.route.clone(), r);
@@ -431,8 +438,16 @@ mod tests {
     #[test]
     fn under_ceiling_yields_no_violations() {
         let m = manifest(
-            vec![route("/", vec![tier_a_node("Hero")], vec![tier_b_node("Counter")], vec![])],
-            vec![entry("Hero", Tier::A, 0), entry("Counter", Tier::B, 2 * 1024)],
+            vec![route(
+                "/",
+                vec![tier_a_node("Hero")],
+                vec![tier_b_node("Counter")],
+                vec![],
+            )],
+            vec![
+                entry("Hero", Tier::A, 0),
+                entry("Counter", Tier::B, 2 * 1024),
+            ],
         );
         let report = evaluate_budget(&m, &TierBudget::default());
         assert!(report.is_ok());
@@ -475,7 +490,12 @@ mod tests {
     #[test]
     fn tier_b_per_component_over_ceiling_violates() {
         let m = manifest(
-            vec![route("/", Vec::new(), vec![tier_b_node("Bloated")], Vec::new())],
+            vec![route(
+                "/",
+                Vec::new(),
+                vec![tier_b_node("Bloated")],
+                Vec::new(),
+            )],
             vec![entry("Bloated", Tier::B, 6 * 1024)],
         );
         let report = evaluate_budget(&m, &TierBudget::default());
@@ -492,9 +512,7 @@ mod tests {
 
     #[test]
     fn tier_a_component_count_over_ceiling_violates() {
-        let many: Vec<RenderedNode> = (0..52)
-            .map(|i| tier_a_node(&format!("Card{i}")))
-            .collect();
+        let many: Vec<RenderedNode> = (0..52).map(|i| tier_a_node(&format!("Card{i}"))).collect();
         let m = manifest(vec![route("/", many, Vec::new(), Vec::new())], Vec::new());
         let report = evaluate_budget(&m, &TierBudget::default());
         let v = report
@@ -511,7 +529,12 @@ mod tests {
         let mut node = tier_b_node("Card");
         node.tier_a_children = vec![tier_a_node("Inner1"), tier_a_node("Inner2")];
         let m = manifest(
-            vec![route("/", vec![tier_a_node("Header")], vec![node], Vec::new())],
+            vec![route(
+                "/",
+                vec![tier_a_node("Header")],
+                vec![node],
+                Vec::new(),
+            )],
             vec![entry("Card", Tier::B, 0)],
         );
         let report = evaluate_budget(&m, &TierBudget::default());
@@ -556,7 +579,11 @@ mod tests {
             },
         );
         let report = evaluate_budget(&m, &budget);
-        assert!(report.is_ok(), "expected pass under overridden ceiling, got {:?}", report.violations);
+        assert!(
+            report.is_ok(),
+            "expected pass under overridden ceiling, got {:?}",
+            report.violations
+        );
     }
 
     #[test]

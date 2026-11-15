@@ -73,7 +73,11 @@ async fn stored_bytes_are_reachable_and_the_guards_hold() {
     let dist_dir = project_dir.join(".albedo").join("dist");
     fs::create_dir_all(&source_root).expect("src dir");
     fs::create_dir_all(dist_dir.join("_albedo")).expect("dist dir");
-    fs::write(source_root.join("Home.tsx"), "export default function Home(){}").expect("write");
+    fs::write(
+        source_root.join("Home.tsx"),
+        "export default function Home(){}",
+    )
+    .expect("write");
     fs::write(dist_dir.join("render-manifest.v2.json"), manifest_json()).expect("manifest");
     fs::write(dist_dir.join("_albedo").join("runtime.js"), b"// stub\n").expect("runtime");
 
@@ -139,11 +143,10 @@ async fn stored_bytes_are_reachable_and_the_guards_hold() {
     // already there because boot ran its DDL — which is itself the check that
     // the `uploads` block reached the schema, since an app that declared no
     // bucket contributes no table and this insert would fail.
-    let substrate = dom_render_compiler::forge::LibSqlSubstrate::open_local(
-        project_dir.join("forge.db"),
-    )
-    .await
-    .expect("the database boot opened");
+    let substrate =
+        dom_render_compiler::forge::LibSqlSubstrate::open_local(project_dir.join("forge.db"))
+            .await
+            .expect("the database boot opened");
     store::record(
         &substrate,
         &StoredUpload {
@@ -238,13 +241,18 @@ async fn stored_bytes_are_reachable_and_the_guards_hold() {
     let head = ranged("bytes=0-3").await.expect("responds");
     assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(
-        head.headers().get("content-range").and_then(|v| v.to_str().ok()),
+        head.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
         Some(format!("bytes 0-3/{total}").as_str())
     );
     assert_eq!(head.bytes().await.expect("body").as_ref(), &bytes[..4]);
     let tail = ranged("bytes=-5").await.expect("responds");
     assert_eq!(tail.status(), StatusCode::PARTIAL_CONTENT);
-    assert_eq!(tail.bytes().await.expect("body").as_ref(), &bytes[total - 5..]);
+    assert_eq!(
+        tail.bytes().await.expect("body").as_ref(),
+        &bytes[total - 5..]
+    );
     let past = client
         .get(format!("{base}/_albedo/uploads/{id}"))
         .header("range", format!("bytes={total}-"))
@@ -253,7 +261,9 @@ async fn stored_bytes_are_reachable_and_the_guards_hold() {
         .expect("responds");
     assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     assert_eq!(
-        past.headers().get("content-range").and_then(|v| v.to_str().ok()),
+        past.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
         Some(format!("bytes */{total}").as_str())
     );
     // A partial copy of some other entity gets the whole file, not a splice.

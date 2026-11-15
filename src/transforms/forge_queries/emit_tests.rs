@@ -61,7 +61,8 @@ fn run(source: &str, tail: &str) -> String {
     })
 }
 
-const IMPORTS: &str = "import { invoices } from \"albedo/forge\";\nimport { optional } from \"albedo/query\";\n";
+const IMPORTS: &str =
+    "import { invoices } from \"albedo/forge\";\nimport { optional } from \"albedo/query\";\n";
 
 #[test]
 fn falsifier_4a_values_are_read_when_the_handle_is_made_not_when_it_runs() {
@@ -144,7 +145,10 @@ fn two_concurrent_invocations_keep_their_own_handles() {
 
 #[test]
 fn r4_4_two_bounds_evaluate_in_source_order_and_bind_to_their_sides() {
-    for written in ["{ lt: read(\"g\", 20), gt: read(\"f\", 10) }", "{ gt: read(\"f\", 10), lt: read(\"g\", 20) }"] {
+    for written in [
+        "{ lt: read(\"g\", 20), gt: read(\"f\", 10) }",
+        "{ gt: read(\"f\", 10), lt: read(\"g\", 20) }",
+    ] {
         let source = format!(
             "{IMPORTS}function page() {{\n  return invoices.where({{ due: {written} }}).count();\n}}\n"
         );
@@ -154,7 +158,11 @@ fn r4_4_two_bounds_evaluate_in_source_order_and_bind_to_their_sides() {
         );
         // Canonical params: the lower bound (`gt`) is p0, the upper (`lt`) p1,
         // whatever order they were written in; reads follow the source.
-        let reads = if written.starts_with("{ lt") { r#"["read g","read f"]"# } else { r#"["read f","read g"]"# };
+        let reads = if written.starts_with("{ lt") {
+            r#"["read g","read f"]"#
+        } else {
+            r#"["read f","read g"]"#
+        };
         assert_eq!(out, format!(r#"[{reads},{{"0":10,"1":20}}]"#), "{written}");
     }
 }
@@ -203,7 +211,11 @@ fn a_query_nested_in_another_querys_argument_is_rewritten_too() {
     let rewritten = rewrite(&format!(
         "{IMPORTS}async function page(id) {{\n  return await invoices.where({{ owner: (await invoices.get(id)).owner }}).count();\n}}\n"
     ));
-    assert_eq!(rewritten.matches("__albedo_q_new(").count(), 2, "{rewritten}");
+    assert_eq!(
+        rewritten.matches("__albedo_q_new(").count(),
+        2,
+        "{rewritten}"
+    );
     assert!(!rewritten.contains("invoices.get("), "{rewritten}");
     assert!(!rewritten.contains("invoices.where("), "{rewritten}");
 }

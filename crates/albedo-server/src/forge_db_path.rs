@@ -5,11 +5,11 @@
 //! someone runs `albedo serve` from inside their project — and wrong every
 //! other time it matters:
 //!
-//! * `albedo serve <dir>` from anywhere else opens (or *creates*) a second,
-//!   empty database beside the shell, and the app comes up with no data;
-//! * a container started with a different `WORKDIR` writes into the image's
-//!   own filesystem, so **every restart loses every row** unless the volume
-//!   happens to be mounted at exactly the right place;
+//! * `albedo serve <dir>` from anywhere else opens (or *creates*) a second, empty database beside
+//!   the shell, and the app comes up with no data;
+//! * a container started with a different `WORKDIR` writes into the image's own filesystem, so
+//!   **every restart loses every row** unless the volume happens to be mounted at exactly the right
+//!   place;
 //! * two apps served from one shell share one file.
 //!
 //! 🔑 The failure is *silent in the worst direction*: `open_local` **creates**
@@ -30,12 +30,12 @@ pub const FORGE_DB_ENV: &str = "ALBEDO_FORGE_DB";
 ///
 /// Precedence, highest first:
 ///
-/// 1. `configured` — an explicit `forge.db_path` in the config file. The
-///    operator said it; nothing should second-guess it.
-/// 2. `ALBEDO_FORGE_DB` — the container seam. An env var is what a Dockerfile,
-///    a systemd unit or a `PaaS` can set without rewriting the app's config.
-/// 3. `<project>/forge.db`, where the project is derived from `artifacts_dir`.
-///    This is the case that used to be CWD-relative.
+/// 1. `configured` — an explicit `forge.db_path` in the config file. The operator said it; nothing
+///    should second-guess it.
+/// 2. `ALBEDO_FORGE_DB` — the container seam. An env var is what a Dockerfile, a systemd unit or a
+///    `PaaS` can set without rewriting the app's config.
+/// 3. `<project>/forge.db`, where the project is derived from `artifacts_dir`. This is the case
+///    that used to be CWD-relative.
 ///
 /// A relative path from (1) or (2) is resolved against the project root too,
 /// not the CWD — the same reason: the shell's location is not a property of
@@ -142,7 +142,11 @@ mod tests {
     #[test]
     fn an_explicit_config_path_outranks_the_environment() {
         assert_eq!(
-            resolve_forge_db_path(Some("/data/from-config.db"), Some("/data/from-env.db"), &artifacts()),
+            resolve_forge_db_path(
+                Some("/data/from-config.db"),
+                Some("/data/from-env.db"),
+                &artifacts()
+            ),
             PathBuf::from("/data/from-config.db")
         );
     }
@@ -161,7 +165,11 @@ mod tests {
     #[test]
     fn the_data_directory_is_wherever_the_database_is() {
         assert_eq!(
-            data_dir_for(&resolve_forge_db_path(None, Some("/data/forge.db"), &artifacts())),
+            data_dir_for(&resolve_forge_db_path(
+                None,
+                Some("/data/forge.db"),
+                &artifacts()
+            )),
             PathBuf::from("/data")
         );
         assert_eq!(

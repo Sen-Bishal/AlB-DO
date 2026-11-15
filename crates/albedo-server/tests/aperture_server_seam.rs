@@ -13,11 +13,11 @@
 //!
 //! ## The two things being asserted
 //!
-//! 1. **The round trip closes.** The upstream's body reaches a slot, through the
-//!    same wire opcode a `setState` would have used.
-//! 2. **The engine is released across it** (invariant 2.6). Gate 5 measured this
-//!    against a synthetic loop; here it is measured against the shipped one,
-//!    which is the only version that can regress.
+//! 1. **The round trip closes.** The upstream's body reaches a slot, through the same wire opcode a
+//!    `setState` would have used.
+//! 2. **The engine is released across it** (invariant 2.6). Gate 5 measured this against a
+//!    synthetic loop; here it is measured against the shipped one, which is the only version that
+//!    can regress.
 
 use albedo_server::{AlbedoServerBuilder, AppConfig};
 use async_trait::async_trait;
@@ -179,9 +179,9 @@ async fn dispatch(
     proxy_id: u32,
 ) -> (StatusCode, Vec<Instruction>) {
     let session_uuid = uuid::Uuid::new_v4().to_string();
-    let csrf = server
-        .csrf_registry()
-        .token_for(SessionId::new(uuid::Uuid::parse_str(&session_uuid).unwrap()));
+    let csrf = server.csrf_registry().token_for(SessionId::new(
+        uuid::Uuid::parse_str(&session_uuid).unwrap(),
+    ));
     let body = encode_action_envelope(&ActionEnvelope {
         action_id: proxy_id,
         event_kind: 0,
@@ -205,13 +205,17 @@ async fn dispatch(
 
     let status = response.status();
     if status != StatusCode::OK {
-        let bytes = to_bytes(response.into_body(), MAX_BODY).await.expect("body");
+        let bytes = to_bytes(response.into_body(), MAX_BODY)
+            .await
+            .expect("body");
         panic!(
             "action dispatch returned {status}: {}",
             String::from_utf8_lossy(&bytes)
         );
     }
-    let bytes = to_bytes(response.into_body(), MAX_BODY).await.expect("body");
+    let bytes = to_bytes(response.into_body(), MAX_BODY)
+        .await
+        .expect("body");
     let (frame, _) = decode_frame(&bytes).expect("response decodes as an OpcodeFrame");
     (status, frame.instructions)
 }
@@ -310,9 +314,9 @@ async fn four_concurrent_actions_share_one_engine_and_still_overlap_their_round_
     let mut tasks = Vec::with_capacity(ACTIONS);
     for _ in 0..ACTIONS {
         let server = Arc::clone(&server);
-        tasks.push(tokio::spawn(async move {
-            dispatch(&server, proxy_id).await.0
-        }));
+        tasks.push(tokio::spawn(
+            async move { dispatch(&server, proxy_id).await.0 },
+        ));
     }
     for task in tasks {
         assert_eq!(task.await.expect("task joins"), StatusCode::OK);
@@ -363,9 +367,9 @@ async fn a_failed_step_takes_the_dispatch_down_rather_than_writing_nothing() {
         .expect("server builds");
 
     let session_uuid = uuid::Uuid::new_v4().to_string();
-    let csrf = server
-        .csrf_registry()
-        .token_for(SessionId::new(uuid::Uuid::parse_str(&session_uuid).unwrap()));
+    let csrf = server.csrf_registry().token_for(SessionId::new(
+        uuid::Uuid::parse_str(&session_uuid).unwrap(),
+    ));
     let body = encode_action_envelope(&ActionEnvelope {
         action_id: proxy_id,
         event_kind: 0,
@@ -392,7 +396,9 @@ async fn a_failed_step_takes_the_dispatch_down_rather_than_writing_nothing() {
         StatusCode::OK,
         "a body whose only call failed must not report success"
     );
-    let bytes = to_bytes(response.into_body(), MAX_BODY).await.expect("body");
+    let bytes = to_bytes(response.into_body(), MAX_BODY)
+        .await
+        .expect("body");
     let message = String::from_utf8_lossy(&bytes);
     assert!(
         message.contains("connection refused"),

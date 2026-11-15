@@ -103,19 +103,18 @@ pub fn emit_forge_dts(declarations: &BTreeMap<String, CollectionDecl>) -> String
 
 /// The shapes every collection shares (T-0033 · Q1a, Design 10).
 ///
-/// - `Collection<Row>` reads whole (`useSharedSlot(c)`, via the `__row`
-///   phantom the scaffold's `SharedSlotSource` matches) or through the query
-///   chain: `where` → `orderBy` → `limit | first | count | groupBy`, or `get`.
-/// - `Query<Row>` is a `PromiseLike<Row[]>` with **no `__row`**, so TypeScript's
-///   weak-type check refuses it as a `useSharedSlot` source: live new-style
-///   queries arrive with Q3.
-/// - `PartitionedCollection<Row, Col>` adds the legacy overload first, typed so
-///   only the exact `{ Col: v }` key matches (`K & Record<Exclude<keyof K, Col>,
-///   never>`); anything wider falls through to the query chain. Before Q1a the
-///   comment here claimed `Record<never, …>` made `.where` uncallable on an
-///   unpartitioned collection; `Record<never, T>` is `{}`, so it never did.
-/// - Number columns accept a string too, and booleans `"true"`/`"false"`: route
-///   params are text, and coercion (Design 7) decides what reaches SQL.
+/// - `Collection<Row>` reads whole (`useSharedSlot(c)`, via the `__row` phantom the scaffold's
+///   `SharedSlotSource` matches) or through the query chain: `where` → `orderBy` → `limit | first |
+///   count | groupBy`, or `get`.
+/// - `Query<Row>` is a `PromiseLike<Row[]>` with **no `__row`**, so TypeScript's weak-type check
+///   refuses it as a `useSharedSlot` source: live new-style queries arrive with Q3.
+/// - `PartitionedCollection<Row, Col>` adds the legacy overload first, typed so only the exact `{
+///   Col: v }` key matches (`K & Record<Exclude<keyof K, Col>, never>`); anything wider falls
+///   through to the query chain. Before Q1a the comment here claimed `Record<never, …>` made
+///   `.where` uncallable on an unpartitioned collection; `Record<never, T>` is `{}`, so it never
+///   did.
+/// - Number columns accept a string too, and booleans `"true"`/`"false"`: route params are text,
+///   and coercion (Design 7) decides what reaches SQL.
 const SHARED_SHAPES: &str = r#"declare module "albedo/forge" {
   /** One partition of a collection, selected by its partition column. */
   export interface Partition<Row> {
@@ -278,7 +277,10 @@ mod tests {
     fn a_row_interface_carries_the_implicit_key_and_every_declared_field() {
         let dts = emit(&[(
             "guestbook",
-            decl(&[("author", FieldType::Text), ("message", FieldType::Text)], None),
+            decl(
+                &[("author", FieldType::Text), ("message", FieldType::Text)],
+                None,
+            ),
         )]);
         assert!(dts.contains("export interface GuestbookRow {"), "{dts}");
         assert!(dts.contains("id: number;"), "the key is implicit: {dts}");
@@ -297,7 +299,10 @@ mod tests {
             dts.contains("export const guestbook: Collection<GuestbookRow>;"),
             "{dts}"
         );
-        assert!(dts.contains("export interface Query<Row> extends PromiseLike<Row[]>"), "{dts}");
+        assert!(
+            dts.contains("export interface Query<Row> extends PromiseLike<Row[]>"),
+            "{dts}"
+        );
         assert!(dts.contains("declare module \"albedo/query\""), "{dts}");
     }
 
@@ -324,7 +329,10 @@ mod tests {
         let dts = emit(&[(
             "todos",
             decl(
-                &[("done", FieldType::Bool), ("created_at", FieldType::Timestamp)],
+                &[
+                    ("done", FieldType::Bool),
+                    ("created_at", FieldType::Timestamp),
+                ],
                 None,
             ),
         )]);
@@ -361,7 +369,10 @@ mod tests {
     fn int_and_real_are_both_numbers() {
         let dts = emit(&[(
             "leaderboard",
-            decl(&[("score", FieldType::Int), ("ratio", FieldType::Real)], None),
+            decl(
+                &[("score", FieldType::Int), ("ratio", FieldType::Real)],
+                None,
+            ),
         )]);
         assert!(dts.contains("score: number;"), "{dts}");
         assert!(dts.contains("ratio: number;"), "{dts}");

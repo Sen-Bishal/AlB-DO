@@ -11,9 +11,9 @@ pub mod eval;
 pub mod form_result;
 pub mod frame;
 pub mod highway;
+pub mod hot_set;
 pub mod implied_default;
 pub mod jsx_attributes;
-pub mod hot_set;
 pub mod node_builtins;
 pub mod pi_arch;
 pub mod pipeline;
@@ -29,9 +29,7 @@ pub mod static_slice;
 pub mod topics;
 pub mod webtransport;
 
-pub use bridge::{
-    HandlerEffect, HandlerInvocation, HandlerOutcome, HandlerRun, PendingRequest,
-};
+pub use bridge::{HandlerEffect, HandlerInvocation, HandlerOutcome, HandlerRun, PendingRequest};
 pub use broadcast::{
     broadcast_slot_id, check_topic_slot_ids, is_valid_partition_key, partition_topic_name,
     project_value, BroadcastDelivery, BroadcastError, BroadcastRegistry, BroadcastSender,
@@ -46,8 +44,8 @@ pub use compiled::{
 pub use eval::{render_from_components_dir, ComponentProject, PatchReport};
 pub use request_bindings::RequestBindings;
 pub use session::SessionId;
+pub use slot_store::{SessionSlotView, SlotStore};
 pub use topics::{
     resolve_partition_topics, resolve_source_topics, split_partition_topic, ResolvedPartition,
     ResolvedSourceTopic,
 };
-pub use slot_store::{SessionSlotView, SlotStore};

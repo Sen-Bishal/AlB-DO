@@ -58,9 +58,7 @@ pub fn label() -> Style {
 }
 
 pub fn dim() -> Style {
-    Style::default()
-        .fg(MUTED)
-        .add_modifier(Modifier::DIM)
+    Style::default().fg(MUTED).add_modifier(Modifier::DIM)
 }
 
 pub fn border() -> Style {

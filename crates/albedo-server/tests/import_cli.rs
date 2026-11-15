@@ -59,8 +59,14 @@ async fn serve(home: &Path, app: &Path) -> (Server, String) {
     let server = Server { child };
     let base = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while reqwest::get(format!("{base}/_albedo/runtime.js")).await.is_err() {
-        assert!(Instant::now() < deadline, "albedo serve never answered on {base}");
+    while reqwest::get(format!("{base}/_albedo/runtime.js"))
+        .await
+        .is_err()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "albedo serve never answered on {base}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     (server, base)
@@ -85,14 +91,22 @@ fn hidden_field(html: &str, name: &str) -> Option<String> {
 }
 
 async fn sign_up(client: &reqwest::Client, base: &str, email: &str) {
-    let form = client.get(format!("{base}/sign-in")).send().await.expect("GET /sign-in");
+    let form = client
+        .get(format!("{base}/sign-in"))
+        .send()
+        .await
+        .expect("GET /sign-in");
     let tab = cookie_named(&form, "__Host-albedo-session").expect("a tab cookie");
     let html = form.text().await.expect("body");
     let csrf = hidden_field(&html, "_csrf").expect("a CSRF token");
     let registered = client
         .post(format!("{base}/_albedo/auth/password/register"))
         .header("cookie", &tab)
-        .form(&[("_csrf", csrf.as_str()), ("email", email), ("password", PASSWORD)])
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("email", email),
+            ("password", PASSWORD),
+        ])
         .send()
         .await
         .expect("register responds");
@@ -104,14 +118,22 @@ async fn sign_up(client: &reqwest::Client, base: &str, email: &str) {
 }
 
 async fn sign_in(client: &reqwest::Client, base: &str, email: &str) -> String {
-    let form = client.get(format!("{base}/sign-in")).send().await.expect("GET /sign-in");
+    let form = client
+        .get(format!("{base}/sign-in"))
+        .send()
+        .await
+        .expect("GET /sign-in");
     let tab = cookie_named(&form, "__Host-albedo-session").expect("a tab cookie");
     let html = form.text().await.expect("body");
     let csrf = hidden_field(&html, "_csrf").expect("a CSRF token");
     let signed_in = client
         .post(format!("{base}/_albedo/auth/password/login"))
         .header("cookie", &tab)
-        .form(&[("_csrf", csrf.as_str()), ("email", email), ("password", PASSWORD)])
+        .form(&[
+            ("_csrf", csrf.as_str()),
+            ("email", email),
+            ("password", PASSWORD),
+        ])
         .send()
         .await
         .expect("login responds");
@@ -132,7 +154,11 @@ async fn rename(client: &reqwest::Client, base: &str, cookie: &str, id: u32, mes
         .await
         .expect("body");
     let csrf = hidden_field(&page, "_csrf").expect("the form carries a CSRF token");
-    let mut form = vec![("_csrf", csrf), ("id", id.to_string()), ("message", message.to_string())];
+    let mut form = vec![
+        ("_csrf", csrf),
+        ("id", id.to_string()),
+        ("message", message.to_string()),
+    ];
     for name in ["_albedo_return", "_albedo_intent"] {
         if let Some(value) = hidden_field(&page, name) {
             form.push((name, value));
@@ -223,10 +249,19 @@ async fn imported_rows_belong_to_the_users_they_name() {
     )
     .unwrap();
     let (ok, text) = run(
-        albedo(home.path(), &app).args(["import", "guestbook", "unknown.jsonl", "--author-email", "owner"]),
+        albedo(home.path(), &app).args([
+            "import",
+            "guestbook",
+            "unknown.jsonl",
+            "--author-email",
+            "owner",
+        ]),
         "albedo import (unknown author)",
     );
-    assert!(!ok, "an import naming a user who does not exist succeeded\n{text}");
+    assert!(
+        !ok,
+        "an import naming a user who does not exist succeeded\n{text}"
+    );
     assert!(text.contains("no user eve@example.test"), "{text}");
 
     // The real import: two of Ada's rows, one of Bob's, one nobody's.
@@ -240,7 +275,13 @@ async fn imported_rows_belong_to_the_users_they_name() {
     )
     .unwrap();
     let (ok, text) = run(
-        albedo(home.path(), &app).args(["import", "guestbook", "rows.jsonl", "--author-email", "owner"]),
+        albedo(home.path(), &app).args([
+            "import",
+            "guestbook",
+            "rows.jsonl",
+            "--author-email",
+            "owner",
+        ]),
         "albedo import",
     );
     assert!(ok, "albedo import failed\n{text}");
@@ -250,9 +291,15 @@ async fn imported_rows_belong_to_the_users_they_name() {
     let (_server, base) = serve(home.path(), &app).await;
     let page = messages(&client, &base).await;
     for line in ["11:ada one", "12:ada two", "21:bob one", "31:nobody's"] {
-        assert!(page.contains(line), "the imported row {line:?} is not on the page\n{page}");
+        assert!(
+            page.contains(line),
+            "the imported row {line:?} is not on the page\n{page}"
+        );
     }
-    assert!(!page.contains("should not land"), "the refused import wrote rows\n{page}");
+    assert!(
+        !page.contains("should not land"),
+        "the refused import wrote rows\n{page}"
+    );
 
     let ada = sign_in(&client, &base, "ada@example.test").await;
     let bob = sign_in(&client, &base, "bob@example.test").await;
@@ -262,7 +309,16 @@ async fn imported_rows_belong_to_the_users_they_name() {
     rename(&client, &base, &ada, 31, "ada renamed nobody's").await;
 
     let page = messages(&client, &base).await;
-    assert!(page.contains("11:ada renamed her own"), "ada could not change her imported row\n{page}");
-    assert!(page.contains("12:ada two"), "bob changed ada's imported row\n{page}");
-    assert!(page.contains("31:nobody's"), "an authorless imported row was changed\n{page}");
+    assert!(
+        page.contains("11:ada renamed her own"),
+        "ada could not change her imported row\n{page}"
+    );
+    assert!(
+        page.contains("12:ada two"),
+        "bob changed ada's imported row\n{page}"
+    );
+    assert!(
+        page.contains("31:nobody's"),
+        "an authorless imported row was changed\n{page}"
+    );
 }

@@ -212,9 +212,7 @@ impl ModuleRegistry {
         if visiting.contains(current) {
             return Err(crate::runtime::engine::RuntimeError::load(
                 LoadErrorKind::DependencyCycle,
-                format!(
-                    "dependency cycle detected while visiting module '{current}'"
-                ),
+                format!("dependency cycle detected while visiting module '{current}'"),
             ));
         }
 

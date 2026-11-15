@@ -17,8 +17,8 @@
 //! Its own test binary, holding one database at a time: the libSQL teardown
 //! crash needs several alive at once.
 
-use dom_render_compiler::forge::{skeleton, ForgeSchema, LibSqlSubstrate};
 use dom_render_compiler::forge::value::SqlValue;
+use dom_render_compiler::forge::{skeleton, ForgeSchema, LibSqlSubstrate};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -68,8 +68,12 @@ fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
 async fn write_local_row(app: &Path, message: &str) {
     let declarations = dom_render_compiler::dev::contract::load_forge_declarations(app).unwrap();
     let schema = ForgeSchema::from_declarations(&declarations).unwrap();
-    let substrate = LibSqlSubstrate::open_local(app.join("forge.db")).await.unwrap();
-    skeleton::bootstrap_schema(&substrate, &schema).await.unwrap();
+    let substrate = LibSqlSubstrate::open_local(app.join("forge.db"))
+        .await
+        .unwrap();
+    skeleton::bootstrap_schema(&substrate, &schema)
+        .await
+        .unwrap();
     use dom_render_compiler::forge::DataSubstrate;
     substrate
         .execute(
@@ -87,7 +91,10 @@ async fn write_local_row(app: &Path, message: &str) {
 async fn a_build_bakes_declared_seeds_and_never_the_local_database() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    run_ok(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     let app = work.path().join("app");
 
     // A declared seed row: source code, so a fresh deployment shows it and the
@@ -95,7 +102,10 @@ async fn a_build_bakes_declared_seeds_and_never_the_local_database() {
     let config_path = app.join("albedo.config.ts");
     let config = std::fs::read_to_string(&config_path).unwrap();
     let declared = "    guestbook: {\n      fields: { author: \"text\", message: \"text\" },\n";
-    assert!(config.contains(declared), "the scaffold's guestbook block moved");
+    assert!(
+        config.contains(declared),
+        "the scaffold's guestbook block moved"
+    );
     std::fs::write(
         &config_path,
         config.replace(
@@ -119,10 +129,9 @@ async fn a_build_bakes_declared_seeds_and_never_the_local_database() {
 
     // Not fixed by switching the pre-render off: the page still has its
     // content as HTML before any request, rendered from the declared seed.
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(dist.join("render-manifest.v2.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dist.join("render-manifest.v2.json")).unwrap())
+            .unwrap();
     let initial = manifest["routes"]["/guestbook"]["tier_b"]
         .as_array()
         .unwrap()
@@ -130,7 +139,10 @@ async fn a_build_bakes_declared_seeds_and_never_the_local_database() {
         .filter_map(|node| node["initial_html"].as_str())
         .collect::<Vec<_>>()
         .join("");
-    assert!(initial.contains("class=\"ledger\""), "no pre-rendered guestbook:\n{initial}");
+    assert!(
+        initial.contains("class=\"ledger\""),
+        "no pre-rendered guestbook:\n{initial}"
+    );
     assert!(
         initial.contains("DECLARED-SEED-ROW"),
         "the declared seed row was not pre-rendered:\n{initial}"
@@ -143,7 +155,10 @@ async fn a_build_bakes_declared_seeds_and_never_the_local_database() {
 fn a_build_does_not_create_the_projects_database() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
-    run_ok(albedo(home.path(), work.path()).args(["init", "app"]), "albedo init");
+    run_ok(
+        albedo(home.path(), work.path()).args(["init", "app"]),
+        "albedo init",
+    );
     let app = work.path().join("app");
 
     run_ok(albedo(home.path(), &app).arg("build"), "albedo build");

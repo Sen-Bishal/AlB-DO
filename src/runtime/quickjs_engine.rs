@@ -1,15 +1,15 @@
 use super::arena::{ArenaAllocator, ArenaControl, ArenaStats};
-use super::confinement::{BytecodeCache, ModuleLedger, Origin, PreludeFragment, ReplayOutcome};
 use super::bridge::{
     build_handler_script, decode_handler_run, HandlerInvocation, HandlerOutcome, HandlerRun,
 };
+use super::confinement::{BytecodeCache, ModuleLedger, Origin, PreludeFragment, ReplayOutcome};
 use super::engine::{
     stable_source_hash, BootstrapPayload, LoadErrorKind, RenderOutput, RuntimeEngine, RuntimeError,
     RuntimeResult,
 };
+use crate::runtime::eval::component::fnv1a_32;
 use rquickjs::{promise::MaybePromise, Context, Ctx, Function, Runtime};
 use serde::Deserialize;
-use crate::runtime::eval::component::fnv1a_32;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -129,7 +129,12 @@ impl<'js> rquickjs::object::AsProperty<'js, ()> for HostDataProperty<'js> {
             | qjs::JS_PROP_HAS_CONFIGURABLE
             | qjs::JS_PROP_C_W_E;
         let undefined = rquickjs::Value::new_undefined(ctx.clone());
-        Ok((flags as rquickjs::object::PropertyFlags, self.0, undefined.clone(), undefined))
+        Ok((
+            flags as rquickjs::object::PropertyFlags,
+            self.0,
+            undefined.clone(),
+            undefined,
+        ))
     }
 }
 
@@ -152,7 +157,9 @@ fn restore_fetch<'js>(
 ) -> bool {
     match previous {
         Some(value) => globals.prop("fetch", HostDataProperty(value)).is_ok(),
-        None => globals.remove("fetch").is_ok() && matches!(globals.contains_key("fetch"), Ok(false)),
+        None => {
+            globals.remove("fetch").is_ok() && matches!(globals.contains_key("fetch"), Ok(false))
+        }
     }
 }
 
@@ -827,9 +834,9 @@ impl QuickJsEngine {
 
         let eval_result = self.context.as_ref().unwrap().with(|ctx| {
             let globals = ctx.globals();
-            let begin_fn: Function = globals.get("__ALBEDO_MIDDLEWARE_BEGIN").map_err(|err| {
-                RuntimeError::render(format!("job pass prologue missing: {err}"))
-            })?;
+            let begin_fn: Function = globals
+                .get("__ALBEDO_MIDDLEWARE_BEGIN")
+                .map_err(|err| RuntimeError::render(format!("job pass prologue missing: {err}")))?;
             let eval_fn: Function = globals
                 .get("__ALBEDO_EVAL_JOB")
                 .map_err(|err| RuntimeError::render(format!("job eval function missing: {err}")))?;
@@ -934,7 +941,10 @@ impl QuickJsEngine {
         match settled {
             Err(rquickjs::Error::WouldBlock) if !pending.is_empty() => Ok(JobRun::Suspended {
                 journal_len: u32::try_from(journal_len).unwrap_or(u32::MAX),
-                pending: pending.into_iter().map(RawMiddlewarePending::lower).collect(),
+                pending: pending
+                    .into_iter()
+                    .map(RawMiddlewarePending::lower)
+                    .collect(),
             }),
             // Effects are deliberately dropped here — see `JobRun::Suspended`.
             Err(rquickjs::Error::WouldBlock) => Err(RuntimeError::render(format!(
@@ -975,7 +985,9 @@ impl QuickJsEngine {
                 } else {
                     Err(RuntimeError::render(format!(
                         "job '{name}' threw: {}",
-                        envelope.error.unwrap_or_else(|| "unknown error".to_string())
+                        envelope
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string())
                     )))
                 }
             }
@@ -1009,7 +1021,9 @@ impl QuickJsEngine {
             let previous_fetch: Option<rquickjs::Value> = match globals.contains_key("fetch") {
                 Ok(false) => None,
                 Ok(true) => Some(globals.get("fetch").map_err(|err| {
-                    RuntimeError::render(format!("middleware '{entry}' could not read `fetch`: {err}"))
+                    RuntimeError::render(format!(
+                        "middleware '{entry}' could not read `fetch`: {err}"
+                    ))
                 })?),
                 Err(err) => {
                     return Err(RuntimeError::render(format!(
@@ -1067,7 +1081,9 @@ impl QuickJsEngine {
             )));
         }
         let staged: MiddlewareStaged = serde_json::from_str(&staged_json?).map_err(|err| {
-            RuntimeError::render(format!("middleware '{entry}' staged an unreadable fetch(): {err}"))
+            RuntimeError::render(format!(
+                "middleware '{entry}' staged an unreadable fetch(): {err}"
+            ))
         })?;
         if let Some(hook) = staged.refused {
             return Err(middleware_refusal(entry, &hook));
@@ -1077,10 +1093,15 @@ impl QuickJsEngine {
             .map_or(0, |steps| steps.len());
 
         match settled {
-            Err(rquickjs::Error::WouldBlock) if !pending.is_empty() => Ok(MiddlewareRun::Suspended {
-                journal_len: u32::try_from(journal_len).unwrap_or(u32::MAX),
-                pending: pending.into_iter().map(RawMiddlewarePending::lower).collect(),
-            }),
+            Err(rquickjs::Error::WouldBlock) if !pending.is_empty() => {
+                Ok(MiddlewareRun::Suspended {
+                    journal_len: u32::try_from(journal_len).unwrap_or(u32::MAX),
+                    pending: pending
+                        .into_iter()
+                        .map(RawMiddlewarePending::lower)
+                        .collect(),
+                })
+            }
             Err(rquickjs::Error::WouldBlock) => Err(RuntimeError::render(format!(
                 "middleware '{entry}' did not settle — it awaited something that can never \
                  resolve during a request (a timer, or a promise nothing resolves)"
@@ -1111,7 +1132,9 @@ impl QuickJsEngine {
                 } else {
                     Err(RuntimeError::render(format!(
                         "middleware '{entry}' threw: {}",
-                        envelope.error.unwrap_or_else(|| "unknown error".to_string())
+                        envelope
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string())
                     )))
                 }
             }
@@ -1350,17 +1373,19 @@ impl QuickJsEngine {
         let bytecode = &mut self.bytecode;
         context.with(|ctx| -> RuntimeResult<()> {
             for entry in ledger.entries() {
-                let from_bytecode = crate::runtime::confinement::replay_entry(&ctx, entry, bytecode)
-                    .map_err(|err| {
-                        RuntimeError::load(
-                            LoadErrorKind::EngineFailure,
-                            format!(
-                                "rebuilding the sandbox failed to re-register '{}': {}",
-                                entry.specifier,
-                                describe_js_error(&ctx, &err)
-                            ),
-                        )
-                    })?;
+                let from_bytecode = crate::runtime::confinement::replay_entry(
+                    &ctx, entry, bytecode,
+                )
+                .map_err(|err| {
+                    RuntimeError::load(
+                        LoadErrorKind::EngineFailure,
+                        format!(
+                            "rebuilding the sandbox failed to re-register '{}': {}",
+                            entry.specifier,
+                            describe_js_error(&ctx, &err)
+                        ),
+                    )
+                })?;
                 outcome.replayed += 1;
                 if from_bytecode {
                     outcome.bytecode_hits += 1;
@@ -1433,7 +1458,6 @@ impl QuickJsEngine {
     pub fn confinement_resident_bytes(&self) -> (usize, usize) {
         (self.ledger.resident_bytes(), self.bytecode.resident_bytes())
     }
-
 }
 
 impl Default for QuickJsEngine {
@@ -1524,19 +1548,16 @@ impl RuntimeEngine for QuickJsEngine {
 ///
 /// # Order is load-bearing, in three places
 ///
-/// 1. **The sealed intrinsics are first.** They capture what the trust boundary
-///    serialises through, and a capture taken after any other fragment captures
-///    whatever that fragment left behind.
-/// 2. **The form contract precedes the helpers that read it.** `h()` only
-///    dereferences it at render time, so this is not strictly required — but an
-///    engine that could observe a half-installed contract renders forms with no
-///    CSRF input and says nothing, so the order is pinned rather than left to
-///    chance.
-/// 3. **The React host records run after the npm linker**, because they write
-///    into `__ALBEDO_NPM_FACTORIES`. A package's `import 'react'` resolves to
-///    `albedo:host/react` on both the server and the browser, which is what
-///    stops a React component library rendering as the literal text
-///    `<[object Object]>` server-side while working perfectly in the browser.
+/// 1. **The sealed intrinsics are first.** They capture what the trust boundary serialises through,
+///    and a capture taken after any other fragment captures whatever that fragment left behind.
+/// 2. **The form contract precedes the helpers that read it.** `h()` only dereferences it at render
+///    time, so this is not strictly required — but an engine that could observe a half-installed
+///    contract renders forms with no CSRF input and says nothing, so the order is pinned rather
+///    than left to chance.
+/// 3. **The React host records run after the npm linker**, because they write into
+///    `__ALBEDO_NPM_FACTORIES`. A package's `import 'react'` resolves to `albedo:host/react` on
+///    both the server and the browser, which is what stops a React component library rendering as
+///    the literal text `<[object Object]>` server-side while working perfectly in the browser.
 ///
 /// The bootstrap-supplied fragments (the DOM shim, the runtime helpers) vary
 /// per project, so the returned list is cached per bootstrap identity rather
@@ -1548,10 +1569,7 @@ fn build_prelude_fragments(bootstrap: &BootstrapPayload) -> Vec<PreludeFragment>
             crate::runtime::confinement::build_sealed_intrinsics_script(),
         ),
         PreludeFragment::new("the form contract", build_form_contract_script()),
-        PreludeFragment::new(
-            "the markup contract",
-            build_markup_contract_script(),
-        ),
+        PreludeFragment::new("the markup contract", build_markup_contract_script()),
         PreludeFragment::new(
             "the JSX attribute table",
             crate::runtime::jsx_attributes::build_jsx_attribute_table_script(),
@@ -3862,13 +3880,12 @@ pub(crate) fn compile_module_script_for_quickjs_with_spec(
         ));
     }
 
-    let transpiled =
-        transpile_module_source_for_quickjs(
-            specifier,
-            normalized,
-            stamp_module_spec,
-            TranspileTarget::Server,
-        )?;
+    let transpiled = transpile_module_source_for_quickjs(
+        specifier,
+        normalized,
+        stamp_module_spec,
+        TranspileTarget::Server,
+    )?;
 
     if !transpiled.contains("export") && !transpiled.contains("import") {
         return compile_legacy_expression_module(specifier, transpiled.as_str());
@@ -4197,10 +4214,13 @@ fn resolve_relative_module(
         format!("{base}/index.ts"),
         format!("{base}/index.tsx"),
     ];
-    modules.keys().find(|key| {
-        let normalized_key = key.replace('\\', "/");
-        candidates.contains(&normalized_key)
-    }).cloned()
+    modules
+        .keys()
+        .find(|key| {
+            let normalized_key = key.replace('\\', "/");
+            candidates.contains(&normalized_key)
+        })
+        .cloned()
 }
 
 /// Where one name imported from an npm package lives in the client chunk.
@@ -4309,13 +4329,12 @@ fn rewrite_import_for_client_with_modules(
             let target_source = modules
                 .get(&target_key)
                 .expect("resolve_relative_module returned a key from this map");
-            let transpiled =
-                transpile_module_source_for_quickjs(
-                    &target_key,
-                    target_source,
-                    None,
-                    TranspileTarget::ClientIsland,
-                )?;
+            let transpiled = transpile_module_source_for_quickjs(
+                &target_key,
+                target_source,
+                None,
+                TranspileTarget::ClientIsland,
+            )?;
             let nested = |decl: swc_ecma_ast::ImportDecl, spec: &str| {
                 rewrite_import_for_client_with_modules(decl, spec, modules, npm, depth + 1)
             };
@@ -4355,10 +4374,7 @@ fn rewrite_import_for_client_with_modules(
                 if name.is_empty() {
                     continue;
                 }
-                returns.push((
-                    name,
-                    local.trim_end_matches(';').trim().to_string(),
-                ));
+                returns.push((name, local.trim_end_matches(';').trim().to_string()));
             }
             if returns.is_empty() {
                 return Err(RuntimeError::load(
@@ -4395,10 +4411,7 @@ fn rewrite_import_for_client_with_modules(
                             Some(ModuleExportName::Str(s)) => s.value.to_string(),
                             None => named.local.sym.to_string(),
                         };
-                        out.push(format!(
-                            "const {} = {slot}.{exported};",
-                            named.local.sym
-                        ));
+                        out.push(format!("const {} = {slot}.{exported};", named.local.sym));
                     }
                     ImportSpecifier::Default(default_spec) => {
                         out.push(format!(
@@ -5548,7 +5561,9 @@ fn is_relative_specifier(source: &str) -> bool {
 fn resolve_project_specifier_base(importer: &str, source: &str) -> String {
     use std::path::{Component, Path};
 
-    let parent = Path::new(importer).parent().unwrap_or_else(|| Path::new(""));
+    let parent = Path::new(importer)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
     let joined = parent.join(source);
 
     let mut parts: Vec<String> = Vec::new();
@@ -5919,7 +5934,9 @@ mod tests {
         // The same engine still answers.
         engine.collect_garbage();
         let after = engine
-            .with_ctx(|ctx| ctx.eval::<i32, _>("[1, 2, 3].map((n) => n * 2).reduce((a, b) => a + b)"))
+            .with_ctx(|ctx| {
+                ctx.eval::<i32, _>("[1, 2, 3].map((n) => n * 2).reduce((a, b) => a + b)")
+            })
             .expect("the engine runs")
             .expect("a small script runs after the refusal");
         assert_eq!(after, 12);
@@ -5949,7 +5966,8 @@ mod tests {
             .expect("the thread survived");
         let message = outcome.expect_err("unbounded recursion returned a value");
         assert!(
-            message.contains("stack overflow") || message.contains("Maximum call stack size exceeded"),
+            message.contains("stack overflow")
+                || message.contains("Maximum call stack size exceeded"),
             "{message}"
         );
     }
@@ -6501,7 +6519,10 @@ mod tests {
             origin: Some("https://app.test".to_string()),
         };
         assert_eq!(run(&mut engine, &signed_in), r#""u_1 @ https://app.test""#);
-        assert_eq!(run(&mut engine, RequestBindings::anonymous()), r#""null @ null""#);
+        assert_eq!(
+            run(&mut engine, RequestBindings::anonymous()),
+            r#""null @ null""#
+        );
     }
 
     // A throw inside the handler must surface loudly, not vanish.
@@ -6553,13 +6574,15 @@ mod tests {
     #[test]
     fn the_engine_drives_generators_and_resumes_them_with_a_value() {
         use super::QuickJsEngine;
+        use crate::ir::opcode::SlotId;
         use crate::runtime::bridge::{HandlerEffect, HandlerInvocation};
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
-        use crate::ir::opcode::SlotId;
         use serde_json::Map;
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let env = Map::new();
         let bc: Vec<(String, Vec<u8>)> = Vec::new();
@@ -6670,7 +6693,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let setters = vec![("setName".to_string(), SlotId(3))];
         let mut issued: Vec<String> = Vec::new();
@@ -6711,7 +6736,9 @@ mod tests {
         use serde_json::Map;
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let env = Map::new();
         let bc: Vec<(String, Vec<u8>)> = Vec::new();
@@ -6732,8 +6759,14 @@ mod tests {
             .eval_handler_run("routes/poisoned", &invocation)
             .expect_err("a poisoned realm must not stage a request");
         let message = err.to_string();
-        assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
-        assert!(message.contains("patched a JavaScript built-in"), "Got: {message}");
+        assert!(
+            message.contains("Object.prototype.toJSON"),
+            "Got: {message}"
+        );
+        assert!(
+            message.contains("patched a JavaScript built-in"),
+            "Got: {message}"
+        );
     }
 
     /// 🔴 **This test falsifies `APERTURE.md` § 5.4's second property.**
@@ -6759,7 +6792,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let mut issued = 0usize;
         let (_outcome, journal, passes) = drive(
@@ -6790,7 +6825,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let (_outcome, journal, passes) = drive(
             &mut engine,
@@ -6806,7 +6843,10 @@ mod tests {
             },
         );
 
-        assert_eq!(passes, 3, "two dependent links, two round trips, three passes");
+        assert_eq!(
+            passes, 3,
+            "two dependent links, two round trips, three passes"
+        );
         assert_eq!(journal.len(), 2);
     }
 
@@ -6845,7 +6885,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let mut issued: Vec<String> = Vec::new();
         let (outcome, journal, passes) = drive(
@@ -6915,7 +6957,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let setters = vec![("setName".to_string(), SlotId(1))];
         let (outcome, journal, passes) = drive(
@@ -6948,7 +6992,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let setters = vec![("setName".to_string(), SlotId(1))];
         let (outcome, _journal, passes) = drive(
@@ -6985,7 +7031,9 @@ mod tests {
         use serde_json::Map;
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         // A journal recorded against a DIFFERENT url than the body asks for.
         let mut journal = Journal::new("w", "b");
@@ -7034,7 +7082,9 @@ mod tests {
         use serde_json::Map;
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let env = Map::new();
         let bc: Vec<(String, Vec<u8>)> = Vec::new();
@@ -7068,7 +7118,10 @@ mod tests {
         );
         assert_eq!(
             authed[0].headers,
-            vec![("Authorization".to_string(), "Bearer sk_live_secret".to_string())],
+            vec![(
+                "Authorization".to_string(),
+                "Bearer sk_live_secret".to_string()
+            )],
             "but they do travel with the request"
         );
     }
@@ -7406,7 +7459,10 @@ mod tests {
                 r#"{"shared":{"chat:room":"hello"}}"#,
             )
             .expect("seeded render");
-        assert_eq!(out.html, "<span data-albedo-slot=\"chat:room\">hello</span>");
+        assert_eq!(
+            out.html,
+            "<span data-albedo-slot=\"chat:room\">hello</span>"
+        );
 
         // No seed → null binding renders empty (matches the pure-Rust fallback).
         // The stamp still rides, so a later broadcast has somewhere to land.
@@ -7433,7 +7489,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
         engine
             .load_module(
                 "routes/ops.tsx",
@@ -7492,7 +7550,9 @@ mod tests {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
 
         let mut engine = QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
         engine
             .load_module(
                 "routes/ops.tsx",
@@ -7852,7 +7912,10 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
 
         let anon = job_completed(&mut engine, "echo", r#"{"value":7}"#, "null");
         assert_eq!(anon["got"], 7);
-        assert_eq!(anon["who"], "anonymous", "a plain scheduled run is anonymous");
+        assert_eq!(
+            anon["who"], "anonymous",
+            "a plain scheduled run is anonymous"
+        );
 
         // The fan-out's shape: the same body, one principal, supplied by the
         // host. There is no way for the body to widen this.
@@ -7926,7 +7989,9 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
     fn job_refuses_a_handler_that_is_not_a_function_when_the_module_loads() {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
         let mut engine = super::QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         let message = engine
             .load_module(
@@ -7963,7 +8028,10 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
             .eval_job("jobs.ts", "caller", "{}", "null", "[]")
             .expect("suspends rather than failing")
         {
-            super::JobRun::Suspended { pending, journal_len } => {
+            super::JobRun::Suspended {
+                pending,
+                journal_len,
+            } => {
                 assert_eq!(journal_len, 0, "the first pass is seeded with nothing");
                 assert_eq!(pending.len(), 1, "one call staged");
                 assert_eq!(pending[0].url, "https://example.test/ping");
@@ -8020,7 +8088,11 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
         else {
             panic!("expected a completed pass");
         };
-        assert_eq!(effects.len(), 4, "every call must reach the host: {effects:?}");
+        assert_eq!(
+            effects.len(),
+            4,
+            "every call must reach the host: {effects:?}"
+        );
 
         match &effects[0] {
             HandlerEffect::ForgeAppend { collection, record } => {
@@ -8092,7 +8164,9 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
     fn a_write_builtin_called_outside_a_job_run_throws() {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
         let mut engine = super::QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
 
         // Module top-level code runs at load — which is exactly the position a
         // package's factory body is in, and exactly when no pass is open.
@@ -8134,10 +8208,7 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
         let err = engine
             .eval_job("jobs.ts", "sneaky", "{}", "null", "[]")
             .expect_err("re-entry must be refused");
-        assert!(
-            err.to_string().contains("already open"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("already open"), "got: {err}");
     }
 
     // ── 15.6 · middleware under QuickJS ─────────────────────────────
@@ -8145,7 +8216,9 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
     fn middleware_engine(modules: &[(&str, &str)]) -> super::QuickJsEngine {
         use crate::runtime::engine::{BootstrapPayload, RuntimeEngine};
         let mut engine = super::QuickJsEngine::new();
-        engine.init(&BootstrapPayload::default()).expect("engine init");
+        engine
+            .init(&BootstrapPayload::default())
+            .expect("engine init");
         for (spec, src) in modules {
             engine.load_module(spec, src).expect("loads");
         }
@@ -8234,7 +8307,10 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
             ),
         ]);
         let v = completed(&mut engine, r#"{"path":"/banned"}"#, "null");
-        assert_eq!(v["status"], 403, "the relative import resolved and the promise settled");
+        assert_eq!(
+            v["status"], 403,
+            "the relative import resolved and the promise settled"
+        );
 
         let err = engine
             .eval_middleware("middleware.ts", r#"{"path":"/boom"}"#, "null", "[]")
@@ -8280,7 +8356,9 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
                 if reload {
                     engine.load_module("middleware.ts", SRC).unwrap();
                 }
-                engine.eval_middleware("middleware.ts", &request, "null", "[]").unwrap();
+                engine
+                    .eval_middleware("middleware.ts", &request, "null", "[]")
+                    .unwrap();
             }
             let per = start.elapsed().as_nanos() / u128::from(N);
             eprintln!("{label:<44} {per:>7} ns");
@@ -8302,10 +8380,18 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
             export default function Big() { return null; }
         "#;
         let mut heavy = middleware_engine(&[("big.ts", HEAP), ("middleware.ts", SRC)]);
-        measure("eval, scoped, 150k retained objects on engine", &mut heavy, false);
+        measure(
+            "eval, scoped, 150k retained objects on engine",
+            &mut heavy,
+            false,
+        );
         let mut heavy_persistent = middleware_engine(&[("big.ts", HEAP), ("middleware.ts", SRC)]);
         heavy_persistent.begin_warmup();
-        measure("eval, persistent, 150k retained objects", &mut heavy_persistent, false);
+        measure(
+            "eval, persistent, 150k retained objects",
+            &mut heavy_persistent,
+            false,
+        );
     }
 
     /// 📏 The same eval, one engine per thread, `threads` at once — the shape a
@@ -8343,7 +8429,9 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
                         barrier.wait();
                         let start = Instant::now();
                         for _ in 0..N {
-                            engine.eval_middleware("middleware.ts", &request, "null", "[]").unwrap();
+                            engine
+                                .eval_middleware("middleware.ts", &request, "null", "[]")
+                                .unwrap();
                         }
                         start.elapsed().as_nanos() / u128::from(N)
                     })
@@ -8461,7 +8549,11 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
                 engine.render_component("list.tsx", &props).unwrap();
                 engine.collect_garbage();
             });
-            eprintln!("  {:<34} {:>8.1}x", "render saving", forced as f64 / now as f64);
+            eprintln!(
+                "  {:<34} {:>8.1}x",
+                "render saving",
+                forced as f64 / now as f64
+            );
 
             let now = time("action, boundary as shipped", || {
                 engine.eval_handler("bench_action", &invocation).unwrap();
@@ -8470,7 +8562,11 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
                 engine.eval_handler("bench_action", &invocation).unwrap();
                 engine.collect_garbage();
             });
-            eprintln!("  {:<34} {:>8.1}x", "action saving", forced as f64 / now as f64);
+            eprintln!(
+                "  {:<34} {:>8.1}x",
+                "action saving",
+                forced as f64 / now as f64
+            );
         }
     }
 
@@ -8484,10 +8580,18 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
         run: super::MiddlewareRun,
         respond: impl Fn(&crate::runtime::bridge::PendingRequest) -> crate::aperture::StepOutcome,
     ) -> (String, Vec<crate::runtime::bridge::PendingRequest>) {
-        let super::MiddlewareRun::Suspended { pending, journal_len } = run else {
+        let super::MiddlewareRun::Suspended {
+            pending,
+            journal_len,
+        } = run
+        else {
             panic!("expected a suspended pass, got {run:?}");
         };
-        assert_eq!(journal_len as usize, journal.len(), "the pass saw the whole journal");
+        assert_eq!(
+            journal_len as usize,
+            journal.len(),
+            "the pass saw the whole journal"
+        );
         for request in &pending {
             journal
                 .append(
@@ -8529,7 +8633,9 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
         let first = engine
             .eval_middleware("middleware.ts", r#"{"path":"/a"}"#, "null", "[]")
             .expect("first pass");
-        let (seeded, pending) = answer(&mut journal, first, |r| ok_body(&r.url, r#"{"open":false}"#));
+        let (seeded, pending) = answer(&mut journal, first, |r| {
+            ok_body(&r.url, r#"{"open":false}"#)
+        });
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].url, "https://flags.test/v1?path=/a");
         assert_eq!(pending[0].method, "GET");
@@ -8574,9 +8680,14 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
             "#,
         )]);
         let mut journal = crate::aperture::Journal::new("mw", "b");
-        let first = engine.eval_middleware("middleware.ts", "{}", "null", "[]").unwrap();
+        let first = engine
+            .eval_middleware("middleware.ts", "{}", "null", "[]")
+            .unwrap();
         let (seeded, _) = answer(&mut journal, first, |r| ok_body(&r.url, "live"));
-        match engine.eval_middleware("middleware.ts", "{}", "null", &seeded).unwrap() {
+        match engine
+            .eval_middleware("middleware.ts", "{}", "null", &seeded)
+            .unwrap()
+        {
             super::MiddlewareRun::Completed(v) => assert_eq!(v["headers"]["x-got"], "live"),
             other => panic!("{other:?}"),
         }
@@ -8594,13 +8705,20 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
             "#,
         )]);
         let mut journal = crate::aperture::Journal::new("mw", "b");
-        let first = engine.eval_middleware("middleware.ts", "{}", "null", "[]").unwrap();
-        let (seeded, pending) = answer(&mut journal, first, |r| ok_body(&r.url, if r.step == 0 { "A" } else { "B" }));
+        let first = engine
+            .eval_middleware("middleware.ts", "{}", "null", "[]")
+            .unwrap();
+        let (seeded, pending) = answer(&mut journal, first, |r| {
+            ok_body(&r.url, if r.step == 0 { "A" } else { "B" })
+        });
         assert_eq!(pending.len(), 2, "both calls staged together: {pending:?}");
         assert_eq!(pending[1].method, "POST");
         assert_eq!(pending[1].body.as_deref(), Some(r#"{"n":1}"#));
 
-        match engine.eval_middleware("middleware.ts", "{}", "null", &seeded).unwrap() {
+        match engine
+            .eval_middleware("middleware.ts", "{}", "null", &seeded)
+            .unwrap()
+        {
             super::MiddlewareRun::Completed(v) => assert_eq!(v["headers"]["x-both"], "AB"),
             other => panic!("{other:?}"),
         }
@@ -8619,12 +8737,19 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
             "#,
         )]);
         let mut journal = crate::aperture::Journal::new("mw", "b");
-        let first = engine.eval_middleware("middleware.ts", "{}", "null", "[]").unwrap();
+        let first = engine
+            .eval_middleware("middleware.ts", "{}", "null", "[]")
+            .unwrap();
         let (seeded, _) = answer(&mut journal, first, |_| {
             crate::aperture::StepOutcome::Failed("connection refused".to_string())
         });
-        match engine.eval_middleware("middleware.ts", "{}", "null", &seeded).unwrap() {
-            super::MiddlewareRun::Completed(v) => assert_eq!(v["headers"]["x-err"], "connection refused"),
+        match engine
+            .eval_middleware("middleware.ts", "{}", "null", &seeded)
+            .unwrap()
+        {
+            super::MiddlewareRun::Completed(v) => {
+                assert_eq!(v["headers"]["x-err"], "connection refused")
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -8656,7 +8781,9 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
             "#,
         )]);
         let mut journal = crate::aperture::Journal::new("mw", "b");
-        let first = engine.eval_middleware("middleware.ts", r#"{"path":"x"}"#, "null", "[]").unwrap();
+        let first = engine
+            .eval_middleware("middleware.ts", r#"{"path":"x"}"#, "null", "[]")
+            .unwrap();
         let (seeded, _) = answer(&mut journal, first, |r| ok_body(&r.url, ""));
         let err = engine
             .eval_middleware("middleware.ts", r#"{"path":"y"}"#, "null", &seeded)
@@ -8689,7 +8816,9 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
                 .clone()
         };
         let before = title(&mut engine);
-        let _ = engine.eval_middleware("middleware.ts", "{}", "null", "[]").unwrap();
+        let _ = engine
+            .eval_middleware("middleware.ts", "{}", "null", "[]")
+            .unwrap();
         assert_eq!(title(&mut engine), before, "the realm's fetch was restored");
     }
 
@@ -8709,11 +8838,15 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
 
         // CONTROL — no deadline: 150 ms of work completes.
         assert!(
-            engine.eval_middleware("middleware.ts", r#"{"path":"/long"}"#, "null", "[]").is_ok(),
+            engine
+                .eval_middleware("middleware.ts", r#"{"path":"/long"}"#, "null", "[]")
+                .is_ok(),
             "without a deadline a long script must be allowed to finish"
         );
 
-        engine.set_deadline(Some(std::time::Instant::now() + std::time::Duration::from_millis(40)));
+        engine.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(40),
+        ));
         let started = std::time::Instant::now();
         let err = engine
             .eval_middleware("middleware.ts", r#"{"path":"/spin"}"#, "null", "[]")
@@ -8723,11 +8856,16 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
             "the interrupt took {:?}",
             started.elapsed()
         );
-        assert!(!err.to_string().contains("swallowed"), "a userland catch absorbed the interrupt: {err}");
+        assert!(
+            !err.to_string().contains("swallowed"),
+            "a userland catch absorbed the interrupt: {err}"
+        );
 
         engine.set_deadline(None);
         assert!(
-            engine.eval_middleware("middleware.ts", r#"{"path":"/"}"#, "null", "[]").is_ok(),
+            engine
+                .eval_middleware("middleware.ts", r#"{"path":"/"}"#, "null", "[]")
+                .is_ok(),
             "the interrupted engine must serve the next call"
         );
     }
@@ -8905,12 +9043,18 @@ return globalThis.__albedo_island_placeholder(\"__c_progress_7\", props); });",
                 .clone()
         };
         let before = title(&mut engine);
-        engine.set_deadline(Some(std::time::Instant::now() + std::time::Duration::from_millis(40)));
+        engine.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(40),
+        ));
         let _ = engine
             .eval_middleware("middleware.ts", "{}", "null", "[]")
             .expect_err("the loop is interrupted");
         engine.set_deadline(None);
-        assert_eq!(title(&mut engine), before, "an interrupted pass left its fetch installed");
+        assert_eq!(
+            title(&mut engine),
+            before,
+            "an interrupted pass left its fetch installed"
+        );
     }
 
     // ── Phase L · form-action rewrite under QuickJS ──────────────────

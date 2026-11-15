@@ -174,7 +174,11 @@ pub fn build_request(
             // Repeated fields, not a joined string: Mailgun parses a joined
             // value itself, and a display name with a comma in it splits.
             let mut fields: Vec<(&str, String)> = vec![("from", from.formatted())];
-            for (field, list) in [("to", &message.to), ("cc", &message.cc), ("bcc", &message.bcc)] {
+            for (field, list) in [
+                ("to", &message.to),
+                ("cc", &message.cc),
+                ("bcc", &message.bcc),
+            ] {
                 fields.extend(list.iter().map(|mailbox| (field, mailbox.formatted())));
             }
             if let Some(reply_to) = reply_to {
@@ -431,8 +435,14 @@ mod tests {
 
     #[test]
     fn resend_carries_the_row_id_as_its_idempotency_key() {
-        let request = build_request(&config("resend", json!({})), "sk_test", &message(), &[], "row-7")
-            .expect("a request");
+        let request = build_request(
+            &config("resend", json!({})),
+            "sk_test",
+            &message(),
+            &[],
+            "row-7",
+        )
+        .expect("a request");
         assert_eq!(request.url, "https://api.resend.com/emails");
         assert_eq!(header(&request, "authorization"), Some("Bearer sk_test"));
         assert_eq!(header(&request, "idempotency-key"), Some("row-7"));
@@ -466,15 +476,24 @@ mod tests {
         let body = json_body(&request);
         assert_eq!(body["content"][0]["type"], "text/plain");
         assert_eq!(body["content"][1]["type"], "text/html");
-        assert_eq!(body["personalizations"][0]["to"][0], json!({ "email": "ada@x.dev", "name": "Ada" }));
-        assert_eq!(body["from"], json!({ "email": "no-reply@acme.dev", "name": "Acme" }));
+        assert_eq!(
+            body["personalizations"][0]["to"][0],
+            json!({ "email": "ada@x.dev", "name": "Ada" })
+        );
+        assert_eq!(
+            body["from"],
+            json!({ "email": "no-reply@acme.dev", "name": "Acme" })
+        );
     }
 
     #[test]
     fn mailgun_is_form_encoded_with_basic_auth_and_repeated_recipients() {
         let config = config("mailgun", json!({ "domain": "mg.acme.dev" }));
         let request = build_request(&config, "key-1", &message(), &[], "r").expect("a request");
-        assert_eq!(request.url, "https://api.mailgun.net/v3/mg.acme.dev/messages");
+        assert_eq!(
+            request.url,
+            "https://api.mailgun.net/v3/mg.acme.dev/messages"
+        );
         assert_eq!(
             header(&request, "authorization"),
             Some(format!("Basic {}", STANDARD.encode("api:key-1")).as_str())
@@ -483,7 +502,11 @@ mod tests {
             url::form_urlencoded::parse(request.body.as_deref().expect("body"))
                 .into_owned()
                 .collect();
-        let to: Vec<&str> = form.iter().filter(|(k, _)| k == "to").map(|(_, v)| v.as_str()).collect();
+        let to: Vec<&str> = form
+            .iter()
+            .filter(|(k, _)| k == "to")
+            .map(|(_, v)| v.as_str())
+            .collect();
         assert_eq!(to, ["\"Ada\" <ada@x.dev>", "bob@x.dev"]);
         assert!(form.contains(&("h:Reply-To".into(), "support@acme.dev".into())));
     }
@@ -492,7 +515,8 @@ mod tests {
     fn a_per_message_sender_overrides_the_block() {
         let mut m = message();
         m.from = Some(Mailbox::parse("billing@acme.dev").expect("parses"));
-        let request = build_request(&config("resend", json!({})), "k", &m, &[], "r").expect("a request");
+        let request =
+            build_request(&config("resend", json!({})), "k", &m, &[], "r").expect("a request");
         assert_eq!(json_body(&request)["from"], "billing@acme.dev");
     }
 
@@ -509,13 +533,22 @@ mod tests {
     fn attachments_travel_in_each_json_dialect() {
         let encoded = STANDARD.encode(b"%PDF-1.4 hi");
         let cases = [
-            ("resend", "attachments", ["filename", "content", "content_type"]),
-            ("postmark", "Attachments", ["Name", "Content", "ContentType"]),
+            (
+                "resend",
+                "attachments",
+                ["filename", "content", "content_type"],
+            ),
+            (
+                "postmark",
+                "Attachments",
+                ["Name", "Content", "ContentType"],
+            ),
             ("sendgrid", "attachments", ["filename", "content", "type"]),
         ];
         for (provider, list, [name, content, kind]) in cases {
-            let request = build_request(&config(provider, json!({})), "k", &message(), &files(), "r")
-                .expect("a request");
+            let request =
+                build_request(&config(provider, json!({})), "k", &message(), &files(), "r")
+                    .expect("a request");
             let body = json_body(&request);
             let first = &body[list][0];
             assert_eq!(first[name], "report.pdf", "{provider}");
@@ -535,7 +568,11 @@ mod tests {
         let boundary = kind
             .strip_prefix("multipart/form-data; boundary=")
             .expect("multipart");
-        assert_ne!(kind, header(&b, "content-type").unwrap(), "same row, different boundary");
+        assert_ne!(
+            kind,
+            header(&b, "content-type").unwrap(),
+            "same row, different boundary"
+        );
         assert!(!boundary.contains("row"), "never derived from the row id");
 
         let body = String::from_utf8_lossy(a.body.as_deref().expect("body")).into_owned();
@@ -549,10 +586,11 @@ mod tests {
 
     #[test]
     fn log_describes_no_request() {
-        let config = serde_json::from_value::<EmailDecl>(json!({ "from": "a@b.dev", "provider": "log" }))
-            .expect("parses")
-            .lower()
-            .expect("lowers");
+        let config =
+            serde_json::from_value::<EmailDecl>(json!({ "from": "a@b.dev", "provider": "log" }))
+                .expect("parses")
+                .lower()
+                .expect("lowers");
         assert!(build_request(&config, "", &message(), &[], "r").is_none());
     }
 
@@ -571,13 +609,19 @@ mod tests {
 
         for status in [408, 425, 429, 500, 502, 503] {
             assert!(
-                matches!(classify(ProviderKind::Resend, status, &[], b"{}"), SendOutcome::Retry(_)),
+                matches!(
+                    classify(ProviderKind::Resend, status, &[], b"{}"),
+                    SendOutcome::Retry(_)
+                ),
                 "{status} is transient"
             );
         }
         for status in [400, 401, 403, 404, 422] {
             assert!(
-                matches!(classify(ProviderKind::Resend, status, &[], b"{}"), SendOutcome::Reject(_)),
+                matches!(
+                    classify(ProviderKind::Resend, status, &[], b"{}"),
+                    SendOutcome::Reject(_)
+                ),
                 "{status} is permanent"
             );
         }
@@ -649,6 +693,9 @@ mod tests {
             &[],
             br#"{"ErrorCode":406,"Message":"Inactive recipient"}"#,
         );
-        assert!(matches!(outcome, SendOutcome::Reject(ref r) if r.contains("Inactive")), "{outcome:?}");
+        assert!(
+            matches!(outcome, SendOutcome::Reject(ref r) if r.contains("Inactive")),
+            "{outcome:?}"
+        );
     }
 }

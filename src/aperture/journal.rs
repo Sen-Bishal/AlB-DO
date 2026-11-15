@@ -361,8 +361,12 @@ mod tests {
     #[test]
     fn steps_read_back_by_index_in_the_order_they_were_appended() {
         let mut journal = Journal::new("w_abc", "build-1");
-        journal.append(0, StepKind::Fetch, "d0", completed("a")).unwrap();
-        journal.append(1, StepKind::Fetch, "d1", completed("b")).unwrap();
+        journal
+            .append(0, StepKind::Fetch, "d0", completed("a"))
+            .unwrap();
+        journal
+            .append(1, StepKind::Fetch, "d1", completed("b"))
+            .unwrap();
 
         assert_eq!(journal.len(), 2);
         assert_eq!(journal.get(0).unwrap().request_digest, "d0");
@@ -376,15 +380,23 @@ mod tests {
     #[test]
     fn an_out_of_order_append_is_refused() {
         let mut journal = Journal::new("w", "b");
-        journal.append(0, StepKind::Fetch, "d0", completed("a")).unwrap();
+        journal
+            .append(0, StepKind::Fetch, "d0", completed("a"))
+            .unwrap();
 
         assert_eq!(
             journal.append(2, StepKind::Fetch, "d2", completed("c")),
-            Err(JournalError::OutOfOrder { expected: 1, got: 2 })
+            Err(JournalError::OutOfOrder {
+                expected: 1,
+                got: 2
+            })
         );
         assert_eq!(
             journal.append(0, StepKind::Fetch, "d0", completed("a")),
-            Err(JournalError::OutOfOrder { expected: 1, got: 0 }),
+            Err(JournalError::OutOfOrder {
+                expected: 1,
+                got: 0
+            }),
             "a repeat is the same failure as a gap — the log is append-only"
         );
     }
@@ -392,8 +404,12 @@ mod tests {
     #[test]
     fn the_step_cap_bounds_a_looping_body() {
         let mut journal = Journal::new("w", "b").with_step_cap(2);
-        journal.append(0, StepKind::Fetch, "d", completed("a")).unwrap();
-        journal.append(1, StepKind::Fetch, "d", completed("a")).unwrap();
+        journal
+            .append(0, StepKind::Fetch, "d", completed("a"))
+            .unwrap();
+        journal
+            .append(1, StepKind::Fetch, "d", completed("a"))
+            .unwrap();
         assert_eq!(
             journal.append(2, StepKind::Fetch, "d", completed("a")),
             Err(JournalError::StepCap { cap: 2 })
@@ -417,9 +433,15 @@ mod tests {
     #[test]
     fn an_unknown_step_encodes_as_a_miss_but_keeps_its_slot() {
         let mut journal = Journal::new("w", "b");
-        journal.append(0, StepKind::Fetch, "d0", completed("a")).unwrap();
-        journal.append(1, StepKind::Fetch, "d1", StepOutcome::Unknown).unwrap();
-        journal.append(2, StepKind::Fetch, "d2", completed("c")).unwrap();
+        journal
+            .append(0, StepKind::Fetch, "d0", completed("a"))
+            .unwrap();
+        journal
+            .append(1, StepKind::Fetch, "d1", StepOutcome::Unknown)
+            .unwrap();
+        journal
+            .append(2, StepKind::Fetch, "d2", completed("c"))
+            .unwrap();
 
         let seeded = journal.to_script_value();
         let array = seeded.as_array().expect("array");
@@ -469,7 +491,10 @@ mod settle_tests {
             .settle(0, "d0", StepOutcome::Completed(json!("answer")))
             .expect("settles");
         assert_eq!(journal.len(), 1, "settling must not grow the log");
-        assert_eq!(journal.steps()[0].outcome, StepOutcome::Completed(json!("answer")));
+        assert_eq!(
+            journal.steps()[0].outcome,
+            StepOutcome::Completed(json!("answer"))
+        );
     }
 
     /// A settled step is an answer the body has already been given. Rewriting it
@@ -515,7 +540,10 @@ mod settle_tests {
         assert!(!journal.holds(1));
         assert_eq!(
             journal.settle(1, "d1", StepOutcome::Completed(json!("x"))),
-            Err(JournalError::OutOfOrder { expected: 1, got: 1 })
+            Err(JournalError::OutOfOrder {
+                expected: 1,
+                got: 1
+            })
         );
     }
 }

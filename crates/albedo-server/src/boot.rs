@@ -22,9 +22,9 @@ use crate::error::RuntimeError;
 use crate::renderer_runtime::RendererRuntime;
 use crate::routing::HttpMethod;
 use crate::server::{AlbedoServer, AlbedoServerBuilder, LiveRuntime};
-use std::collections::BTreeMap;
 use dom_render_compiler::dev_contract::ResolvedDevContract;
 use dom_render_compiler::runtime::CompiledProject;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -331,16 +331,14 @@ fn boot_inner(
     // serving does not need `node_modules` — see `bundler::npm_prebuilt`. It
     // falls back to bundling when the file is absent or does not match this
     // source tree, which is what dev and a from-source boot rely on.
-    let compiled = CompiledProject::load_from_dir_with_prebuilt_npm(
-        &opts.source_root,
-        &opts.dist_dir,
-    )
-    .map_err(|err| {
-        RuntimeError::ServerStartup(format!(
-            "failed to load source tree at '{}': {err}",
-            opts.source_root.display()
-        ))
-    })?;
+    let compiled =
+        CompiledProject::load_from_dir_with_prebuilt_npm(&opts.source_root, &opts.dist_dir)
+            .map_err(|err| {
+                RuntimeError::ServerStartup(format!(
+                    "failed to load source tree at '{}': {err}",
+                    opts.source_root.display()
+                ))
+            })?;
 
     let configured_db = opts
         .forge_db
@@ -395,8 +393,8 @@ fn boot_inner(
     // every action adapter. The QuickJS path is at full correctness parity with
     // the pure-Rust interpreter (counter + broadcast tests) and additionally
     // runs loops/`try`/array methods that the pure-Rust path rejects.
-    let action_engine_pool_size = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get);
+    let action_engine_pool_size =
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
 
     // The app's declared collections, lowered and validated here so a malformed
     // `forge` block fails the boot with the offending collection named, rather
@@ -557,7 +555,9 @@ fn boot_inner(
         .as_ref()
         .map(|decl| {
             decl.lower().map_err(|err| {
-                RuntimeError::ServerStartup(format!("invalid `email` block in albedo.config: {err}"))
+                RuntimeError::ServerStartup(format!(
+                    "invalid `email` block in albedo.config: {err}"
+                ))
             })
         })
         .transpose()?;
@@ -574,7 +574,10 @@ fn boot_inner(
     // the reason they are there: a relay on a private address is refused by
     // `check_address` unless it is declared, and the `email` block declares it.
     let mut auth_egress_hosts = auth_registry.egress_hosts();
-    if let Some(host) = email_config.as_ref().and_then(dom_render_compiler::email::EmailConfig::egress_host) {
+    if let Some(host) = email_config
+        .as_ref()
+        .and_then(dom_render_compiler::email::EmailConfig::egress_host)
+    {
         auth_egress_hosts.insert(host);
     }
     let source_reader = if opts.sources.is_empty() && auth_egress_hosts.is_empty() {

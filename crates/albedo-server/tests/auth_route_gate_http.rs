@@ -7,17 +7,15 @@
 //! Two other entry points reach the same route's data and neither consulted the
 //! declaration:
 //!
-//! - `POST /_albedo/phosphor/routes` — the live lane. `authorize_route` resolved
-//!   the route's topics and granted them, on the recorded reasoning that a
-//!   subscribe *"grants exactly the read the page GET already granted"*. That
-//!   was true while the only way a page GET could refuse was resolving no topic.
-//!   A declared gate refuses a page whose topics resolve perfectly well — which
-//!   is § 8.1.3's motivating case, a dashboard over global data — so an
-//!   anonymous lane received the rows of a page whose GET had just answered 401.
-//! - `POST /_albedo/action/{name}` and `POST /_albedo/action` — the action the
-//!   gated route declares. F1 refuses an anonymous write to an
-//!   *identity-partitioned* collection; an action appending to a global one has
-//!   no owner to compare against and ran for anybody.
+//! - `POST /_albedo/phosphor/routes` — the live lane. `authorize_route` resolved the route's topics
+//!   and granted them, on the recorded reasoning that a subscribe *"grants exactly the read the
+//!   page GET already granted"*. That was true while the only way a page GET could refuse was
+//!   resolving no topic. A declared gate refuses a page whose topics resolve perfectly well — which
+//!   is § 8.1.3's motivating case, a dashboard over global data — so an anonymous lane received the
+//!   rows of a page whose GET had just answered 401.
+//! - `POST /_albedo/action/{name}` and `POST /_albedo/action` — the action the gated route
+//!   declares. F1 refuses an anonymous write to an *identity-partitioned* collection; an action
+//!   appending to a global one has no owner to compare against and ran for anybody.
 //!
 //! ## Why this binds a listener instead of driving the router
 //!
@@ -174,7 +172,11 @@ async fn load_public_page(client: &reqwest::Client, base: &str) -> ServedForm {
         .send()
         .await
         .expect("home page responds");
-    assert_eq!(response.status(), StatusCode::OK, "the public route renders");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the public route renders"
+    );
 
     let cookie = response
         .headers()
@@ -436,17 +438,14 @@ async fn a_gated_route_refuses_the_live_lane_and_its_action_to_a_stranger() {
         .send()
         .await
         .expect("responds");
-    assert_eq!(signed_in_page.status(), StatusCode::OK, "control: the render");
+    assert_eq!(
+        signed_in_page.status(),
+        StatusCode::OK,
+        "control: the render"
+    );
 
     let (lane, _signed_in_trunk) = open_lane(&client, &base, Some(&both_cookies)).await;
-    let outcome = subscribe(
-        &client,
-        &base,
-        &lane,
-        &["/", "/dash"],
-        Some(&both_cookies),
-    )
-    .await;
+    let outcome = subscribe(&client, &base, &lane, &["/", "/dash"], Some(&both_cookies)).await;
     assert!(
         granted(&outcome, "denied").is_empty(),
         "control: a signed-in lane is denied nothing — got {outcome}"
@@ -513,10 +512,21 @@ async fn a_gated_route_refuses_the_live_lane_and_its_action_to_a_stranger() {
         .send()
         .await
         .expect("responds");
-    assert_eq!(before.status(), StatusCode::OK, "control: the second device is signed in");
+    assert_eq!(
+        before.status(),
+        StatusCode::OK,
+        "control: the second device is signed in"
+    );
     // …and is live on the gated route, with a lane opened under that session.
     let (other_lane, mut other_trunk) = open_lane(&client, &base, Some(&other_cookies)).await;
-    let live = subscribe(&client, &base, &other_lane, &["/dash"], Some(&other_cookies)).await;
+    let live = subscribe(
+        &client,
+        &base,
+        &other_lane,
+        &["/dash"],
+        Some(&other_cookies),
+    )
+    .await;
     assert_eq!(
         granted(&live, "ok"),
         vec!["/dash".to_string()],
@@ -555,7 +565,10 @@ async fn a_gated_route_refuses_the_live_lane_and_its_action_to_a_stranger() {
         "the other device's open live lane kept streaming after it was signed out"
     );
 
-    for (device, cookies) in [("the device that asked", &both_cookies), ("the other device", &other_cookies)] {
+    for (device, cookies) in [
+        ("the device that asked", &both_cookies),
+        ("the other device", &other_cookies),
+    ] {
         let after = client
             .get(format!("{base}/dash"))
             .header("cookie", cookies)

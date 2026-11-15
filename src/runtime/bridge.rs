@@ -131,9 +131,7 @@ impl HandlerEffect {
     #[must_use]
     pub const fn slot_id(&self) -> Option<SlotId> {
         match self {
-            Self::SlotSet { slot_id, .. } | Self::Broadcast { slot_id, .. } => {
-                Some(*slot_id)
-            }
+            Self::SlotSet { slot_id, .. } | Self::Broadcast { slot_id, .. } => Some(*slot_id),
             Self::ForgeAppend { .. }
             | Self::ForgeUpdate { .. }
             | Self::ForgeDelete { .. }
@@ -407,13 +405,13 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
     // re-applied *before* the handler it attacks (gate 2, row 3).
     //
     // Three properties make the list unforgeable, and all three are needed:
-    //  1. every effect is a NULL-PROTOTYPE record, so encoding one cannot pick
-    //     up an inherited `toJSON`;
-    //  2. each is encoded at push time through the PRISTINE `stringify`
-    //     captured before any package ran;
-    //  3. the list is assembled by STRING CONCATENATION over those encoded
-    //     entries, so no array — and therefore no `Array.prototype` hook and no
-    //     second `stringify` call on an object — is on the path at all.
+    //  1. every effect is a NULL-PROTOTYPE record, so encoding one cannot pick up an inherited
+    //     `toJSON`;
+    //  2. each is encoded at push time through the PRISTINE `stringify` captured before any package
+    //     ran;
+    //  3. the list is assembled by STRING CONCATENATION over those encoded entries, so no array —
+    //     and therefore no `Array.prototype` hook and no second `stringify` call on an object — is
+    //     on the path at all.
     script.push_str("const __albedo_effect_json=__albedo_S.record();\n");
     script.push_str("let __albedo_effect_n=0;\n");
     // `origin` is the sealed provenance stack's current frame: the npm linker
@@ -457,8 +455,8 @@ pub(crate) fn build_handler_script(inv: &HandlerInvocation) -> RuntimeResult<Str
         // graceful-degradation property at a fraction of the cost. A successful
         // parse also proves the bytes are UTF-8, which is why `from_utf8` below
         // cannot realistically fail.
-        let valid = !bytes.is_empty()
-            && serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok();
+        let valid =
+            !bytes.is_empty() && serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok();
         match valid.then(|| std::str::from_utf8(bytes).ok()).flatten() {
             Some(json) => script.push_str(json),
             None => script.push_str("null"),
@@ -725,9 +723,7 @@ throw __ALBEDO_SUSPEND;\
         // `stringify` skips `toJSON` for primitives.
         "var __albedo_result_json=__albedo_S.stringify(__albedo_result===undefined?null:__albedo_result);\n",
     );
-    script.push_str(
-        "if(typeof __albedo_result_json!=='string'){__albedo_result_json='null';}\n",
-    );
+    script.push_str("if(typeof __albedo_result_json!=='string'){__albedo_result_json='null';}\n");
     script.push_str(&format!(
         "var __albedo_integrity={probe};\n",
         probe = crate::runtime::confinement::integrity_probe_expression()
@@ -751,10 +747,7 @@ throw __ALBEDO_SUSPEND;\
 /// The suspension arm is checked **before** the error arm on purpose. Both are
 /// `ok:false` on the wire (the script has one return shape), and reading them in
 /// the other order would turn every outbound call into a handler crash.
-pub(crate) fn decode_handler_run(
-    entry: &str,
-    envelope_json: &str,
-) -> RuntimeResult<HandlerRun> {
+pub(crate) fn decode_handler_run(entry: &str, envelope_json: &str) -> RuntimeResult<HandlerRun> {
     let envelope: HandlerEnvelope = serde_json::from_str(envelope_json).map_err(|err| {
         RuntimeError::render(format!(
             "failed to decode handler effect envelope for '{entry}': {err}"
@@ -1235,7 +1228,10 @@ mod tests {
             message.contains("npm:evil@1.0.0/index.js"),
             "the refusal must name the module it caught. Got: {message}"
         );
-        assert!(message.contains("a package reached an effect builtin"), "Got: {message}");
+        assert!(
+            message.contains("a package reached an effect builtin"),
+            "Got: {message}"
+        );
     }
 
     /// The ordinary case must not trip it: a handler body runs with the
@@ -1260,8 +1256,14 @@ mod tests {
         .to_string();
         let err = decode_completed("routes/x", &envelope).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
-        assert!(message.contains("patched a JavaScript built-in"), "Got: {message}");
+        assert!(
+            message.contains("Object.prototype.toJSON"),
+            "Got: {message}"
+        );
+        assert!(
+            message.contains("patched a JavaScript built-in"),
+            "Got: {message}"
+        );
     }
 
     /// 🔴 SANDGATE-B on the **suspend** path — the arm that carries a staged
@@ -1281,8 +1283,14 @@ mod tests {
         .to_string();
         let err = decode_handler_run("routes/x", &envelope).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("Object.prototype.toJSON"), "Got: {message}");
-        assert!(message.contains("patched a JavaScript built-in"), "Got: {message}");
+        assert!(
+            message.contains("Object.prototype.toJSON"),
+            "Got: {message}"
+        );
+        assert!(
+            message.contains("patched a JavaScript built-in"),
+            "Got: {message}"
+        );
     }
 
     /// CONTROL — a clean suspend still stages its request. A suspend arm that

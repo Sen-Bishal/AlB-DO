@@ -6,15 +6,14 @@
 //! value, renders the component, and asserts the wire-shape contract:
 //!
 //!   1. The rendered HTML inlines the topic's current value.
-//!   2. The opcode stream carries one `SetTextRef` whose slot id
-//!      equals `broadcast_slot_id("chat:lobby")` — i.e. the same id
-//!      future `write_topic` calls fan out as `SlotSet` opcodes.
-//!   3. The session is auto-subscribed; a follow-up `write_topic`
-//!      delivers a `SlotSet` to the session's mpsc receiver.
-//!   4. The initial-state opcodes prepended by
-//!      `render_entry_with_broadcast` carry the topic's current value
-//!      so the bakabox dispatch order (`SlotSet` first, then
-//!      `SetTextRef`) leaves the DOM coherent.
+//!   2. The opcode stream carries one `SetTextRef` whose slot id equals
+//!      `broadcast_slot_id("chat:lobby")` — i.e. the same id future `write_topic` calls fan out as
+//!      `SlotSet` opcodes.
+//!   3. The session is auto-subscribed; a follow-up `write_topic` delivers a `SlotSet` to the
+//!      session's mpsc receiver.
+//!   4. The initial-state opcodes prepended by `render_entry_with_broadcast` carry the topic's
+//!      current value so the bakabox dispatch order (`SlotSet` first, then `SetTextRef`) leaves the
+//!      DOM coherent.
 //!
 //! Bakabox is a dumb client — it can't tell a per-session `SlotSet`
 //! from a broadcast one. This test verifies that fact at the wire
@@ -56,7 +55,11 @@ fn fresh_session() -> (SessionSlotView, SessionId, Arc<SlotStore>) {
 
 fn extract_slot_set_value(payload: &[u8]) -> (SlotId, Vec<u8>) {
     let (frame, _) = decode_frame(payload).expect("decode frame");
-    assert_eq!(frame.instructions.len(), 1, "broadcast frame must carry one SlotSet");
+    assert_eq!(
+        frame.instructions.len(),
+        1,
+        "broadcast frame must carry one SlotSet"
+    );
     match frame.instructions.into_iter().next().expect("non-empty") {
         Instruction::SlotSet { slot_id, value } => (slot_id, value),
         other => panic!("expected SlotSet, got {other:?}"),
@@ -251,5 +254,9 @@ async fn rendering_without_broadcast_falls_back_to_null_binding() {
 
     // The HTML renders without a topic value — it should at least
     // produce the wrapping element without panicking.
-    assert!(out.html.contains("<ul"), "render should not break; got: {}", out.html);
+    assert!(
+        out.html.contains("<ul"),
+        "render should not break; got: {}",
+        out.html
+    );
 }

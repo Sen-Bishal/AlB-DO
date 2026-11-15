@@ -21,9 +21,9 @@
 //! * the pure-Rust renderer calls [`jsx_attribute_name`] directly;
 //! * the `QuickJS` prelude is **generated** from [`JSX_ATTRIBUTE_RENAMES`] by
 //!   [`build_jsx_attribute_table_script`];
-//! * `albedo-client.js` is hand-written JavaScript that cannot be generated, so
-//!   a test asserts its table is set-equal to this one. That test is the only
-//!   thing standing between the three, and it is deliberately loud.
+//! * `albedo-client.js` is hand-written JavaScript that cannot be generated, so a test asserts its
+//!   table is set-equal to this one. That test is the only thing standing between the three, and it
+//!   is deliberately loud.
 //!
 //! ## The SVG half, and why it needs no context
 //!
@@ -397,7 +397,10 @@ mod tests {
     #[test]
     fn camel_case_svg_attributes_are_identities() {
         assert_eq!(jsx_attribute_name("viewBox"), "viewBox");
-        assert_eq!(jsx_attribute_name("preserveAspectRatio"), "preserveAspectRatio");
+        assert_eq!(
+            jsx_attribute_name("preserveAspectRatio"),
+            "preserveAspectRatio"
+        );
         assert_eq!(jsx_attribute_name("gradientUnits"), "gradientUnits");
     }
 
@@ -688,9 +691,17 @@ mod tests {
         for url in SCRIPT_URLS {
             assert!(is_script_url(url), "{url:?} runs as script");
             for attribute in ["href", "HREF", "src", "action", "formaction", "xlink:href"] {
-                assert_eq!(safe_attribute_value(attribute, url), BLOCKED_URL, "{attribute}={url:?}");
+                assert_eq!(
+                    safe_attribute_value(attribute, url),
+                    BLOCKED_URL,
+                    "{attribute}={url:?}"
+                );
             }
-            assert_eq!(safe_attribute_value("title", url), *url, "title is text, not a URL");
+            assert_eq!(
+                safe_attribute_value("title", url),
+                *url,
+                "title is text, not a URL"
+            );
         }
         for url in SAFE_URLS {
             assert!(!is_script_url(url), "{url:?} must pass unchanged");
@@ -707,12 +718,18 @@ mod tests {
         let assets = [
             (
                 "albedo-client.js",
-                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/albedo-client.js")),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/albedo-client.js"
+                )),
                 "var URL_ATTRIBUTES = {",
             ),
             (
                 "albedo-runtime.js",
-                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/albedo-runtime.js")),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/assets/albedo-runtime.js"
+                )),
                 "const URL_ATTRIBUTES = {",
             ),
         ];
@@ -732,7 +749,10 @@ mod tests {
                 .collect();
             assert_eq!(found, expected, "{name}'s URL_ATTRIBUTES has drifted");
             assert!(
-                source.contains(&format!("BLOCKED_URL = {};", serde_json::to_string(BLOCKED_URL).unwrap())),
+                source.contains(&format!(
+                    "BLOCKED_URL = {};",
+                    serde_json::to_string(BLOCKED_URL).unwrap()
+                )),
                 "{name}'s BLOCKED_URL has drifted from the server's"
             );
         }
@@ -742,9 +762,15 @@ mod tests {
     fn the_generated_script_carries_the_url_rule() {
         let script = build_jsx_attribute_table_script();
         for attribute in URL_ATTRIBUTES {
-            assert!(script.contains(&format!("'{attribute}': true")), "{attribute}");
+            assert!(
+                script.contains(&format!("'{attribute}': true")),
+                "{attribute}"
+            );
         }
         assert!(script.contains("__albedo_attr_value"));
-        assert!(!script.contains("</"), "inlined raw into a <script>, it must not close one");
+        assert!(
+            !script.contains("</"),
+            "inlined raw into a <script>, it must not close one"
+        );
     }
 }

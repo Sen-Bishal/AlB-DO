@@ -69,10 +69,15 @@ async fn a_resolved_session_lists_every_connected_provider() {
     let (principal, token) = sign_in(&db, "github", "gh-1").await;
     assert_eq!(resolved(&db, &token).await.providers, ["github"]);
 
-    link_account(&db, &principal.id, "google", "g-1", NOW).await.expect("link");
+    link_account(&db, &principal.id, "google", "g-1", NOW)
+        .await
+        .expect("link");
     let seen = resolved(&db, &token).await;
     assert_eq!(seen.providers, ["github", "google"]);
-    assert_eq!(seen.user_value()["providers"], serde_json::json!(["github", "google"]));
+    assert_eq!(
+        seen.user_value()["providers"],
+        serde_json::json!(["github", "google"])
+    );
     assert_eq!(seen.user_value()["email"], "ada@example.com");
     assert_eq!(seen.user_value()["provider"], "github");
 }
@@ -85,7 +90,9 @@ async fn a_linked_identity_signs_in_as_the_principal_it_was_linked_to() {
     let (principal, _) = sign_in(&db, "github", "gh-1").await;
 
     assert_eq!(
-        link_account(&db, &principal.id, "google", "g-1", NOW).await.unwrap(),
+        link_account(&db, &principal.id, "google", "g-1", NOW)
+            .await
+            .unwrap(),
         LinkOutcome::Linked
     );
     let (via_google, _) = sign_in(&db, "google", "g-1").await;
@@ -93,7 +100,9 @@ async fn a_linked_identity_signs_in_as_the_principal_it_was_linked_to() {
 
     // …and a second click is not an error.
     assert_eq!(
-        link_account(&db, &principal.id, "google", "g-1", NOW).await.unwrap(),
+        link_account(&db, &principal.id, "google", "g-1", NOW)
+            .await
+            .unwrap(),
         LinkOutcome::AlreadyLinked
     );
 }
@@ -107,11 +116,16 @@ async fn an_identity_owned_by_another_principal_is_never_taken() {
     let (attacker, _) = sign_in(&db, "github", "gh-attacker").await;
 
     assert_eq!(
-        link_account(&db, &attacker.id, "google", "g-victim", NOW).await.unwrap(),
+        link_account(&db, &attacker.id, "google", "g-victim", NOW)
+            .await
+            .unwrap(),
         LinkOutcome::TakenByAnother
     );
     let (still, _) = sign_in(&db, "google", "g-victim").await;
-    assert_eq!(still.id, victim.id, "the identity must still sign in as its owner");
+    assert_eq!(
+        still.id, victim.id,
+        "the identity must still sign in as its owner"
+    );
 }
 
 /// Same email at two providers is NOT a link. Only an explicit link is.
@@ -128,7 +142,9 @@ async fn a_second_identity_at_the_same_provider_is_refused() {
     let db = booted().await;
     let (principal, _) = sign_in(&db, "github", "gh-1").await;
     assert_eq!(
-        link_account(&db, &principal.id, "github", "gh-2", NOW).await.unwrap(),
+        link_account(&db, &principal.id, "github", "gh-2", NOW)
+            .await
+            .unwrap(),
         LinkOutcome::ProviderAlreadyConnected
     );
 }
@@ -140,11 +156,15 @@ async fn the_last_sign_in_method_cannot_be_disconnected() {
     let db = booted().await;
     let (principal, token) = sign_in(&db, "github", "gh-1").await;
     assert_eq!(
-        unlink_account(&db, &principal.id, "github", &token.hash()).await.unwrap(),
+        unlink_account(&db, &principal.id, "github", &token.hash())
+            .await
+            .unwrap(),
         UnlinkOutcome::LastMethod
     );
     assert_eq!(
-        unlink_account(&db, &principal.id, "google", &token.hash()).await.unwrap(),
+        unlink_account(&db, &principal.id, "google", &token.hash())
+            .await
+            .unwrap(),
         UnlinkOutcome::NotConnected
     );
 }
@@ -156,7 +176,9 @@ async fn the_last_sign_in_method_cannot_be_disconnected() {
 async fn disconnecting_ends_its_other_sessions_and_keeps_the_one_asking() {
     let db = booted().await;
     let (principal, github_session) = sign_in(&db, "github", "gh-1").await;
-    link_account(&db, &principal.id, "google", "g-1", NOW).await.unwrap();
+    link_account(&db, &principal.id, "google", "g-1", NOW)
+        .await
+        .unwrap();
     let google_elsewhere = create_session(&db, &principal.id, "google", NOW, DAY_MS)
         .await
         .unwrap();
@@ -200,10 +222,16 @@ async fn disconnecting_ends_its_other_sessions_and_keeps_the_one_asking() {
         )
         .await
         .unwrap();
-    assert!(credentials.rows.is_empty(), "the credential goes with the provider");
+    assert!(
+        credentials.rows.is_empty(),
+        "the credential goes with the provider"
+    );
 
     let (fresh, _) = sign_in(&db, "google", "g-1").await;
-    assert_ne!(fresh.id, principal.id, "a disconnected identity is a stranger again");
+    assert_ne!(
+        fresh.id, principal.id,
+        "a disconnected identity is a stranger again"
+    );
 }
 
 /// A path with no session — a job, a webhook — still gets the whole profile.
@@ -211,7 +239,10 @@ async fn disconnecting_ends_its_other_sessions_and_keeps_the_one_asking() {
 async fn a_principal_loads_by_id_with_no_session() {
     let db = booted().await;
     let (principal, _) = sign_in(&db, "github", "gh-1").await;
-    let loaded = load_principal(&db, &principal.id).await.unwrap().expect("exists");
+    let loaded = load_principal(&db, &principal.id)
+        .await
+        .unwrap()
+        .expect("exists");
     assert_eq!(loaded.email.as_deref(), Some("ada@example.com"));
     assert_eq!(loaded.providers, ["github"]);
     assert_eq!(loaded.user_value()["provider"], serde_json::Value::Null);

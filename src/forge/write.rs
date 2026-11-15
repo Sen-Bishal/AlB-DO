@@ -46,17 +46,17 @@
 //!
 //! [`CompiledProject::invoke_action_with_broadcast`]: crate::runtime::CompiledProject::invoke_action_with_broadcast
 
+use crate::auth::PrincipalId;
 use crate::forge::delta::{
     appended_rows, classify_positioned_insert, diff_records, is_tail_append, project_changes,
     project_inserted_rows, RenderedRows, RowProjector,
 };
-use crate::transforms::shared_slot_lists::RowProjection;
 use crate::forge::skeleton::{materialize_slot, EditRule, ForgeCollection, ForgeSchema, SortDir};
-use crate::auth::PrincipalId;
 use crate::forge::substrate::{DataSubstrate, Transaction};
 use crate::forge::value::{Result, SqlValue, SubstrateError};
 use crate::ir::opcode::{ReconcileRow, RowKey, SlotChange};
 use crate::runtime::broadcast::{BroadcastRegistry, ListUpdate, TopicTransition};
+use crate::transforms::shared_slot_lists::RowProjection;
 use serde_json::{Map, Value};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -730,7 +730,10 @@ fn authorize_append<'a>(
         // owner at all, and the server is the only thing that can name it.
         None => {
             let mut owned = record.clone();
-            owned.insert(column.clone(), Value::String(principal.as_str().to_string()));
+            owned.insert(
+                column.clone(),
+                Value::String(principal.as_str().to_string()),
+            );
             Ok(Cow::Owned(owned))
         }
         Some(Value::String(owner)) if owner == principal.as_str() => Ok(Cow::Borrowed(record)),
@@ -826,14 +829,13 @@ fn note_touched<'a>(
     partition: Option<String>,
 ) -> Result<()> {
     let channel = match (&slot.partition_by, &partition) {
-        (Some(_), Some(key)) => {
-            crate::runtime::broadcast::partition_topic_name(&slot.topic, key).ok_or_else(|| {
-                SubstrateError::Backend(format!(
-                    "FORGE write: partition key {key:?} for '{}' cannot name a channel",
-                    slot.topic
-                ))
-            })?
-        }
+        (Some(_), Some(key)) => crate::runtime::broadcast::partition_topic_name(&slot.topic, key)
+            .ok_or_else(|| {
+            SubstrateError::Backend(format!(
+                "FORGE write: partition key {key:?} for '{}' cannot name a channel",
+                slot.topic
+            ))
+        })?,
         // A partitioned write whose row vanished: nothing to notify.
         (Some(_), None) => return Ok(()),
         _ => slot.topic.clone(),
@@ -864,10 +866,7 @@ fn record_outcome(touched: &mut [Touched<'_>], channel: &str, appended: Option<V
 /// Build the statement for one write against its resolved slot. Dispatches on
 /// the variant; the slot supplies the `&'static` collection name and key column,
 /// so no userland string reaches the SQL as an identifier.
-fn build_statement(
-    slot: &ForgeCollection,
-    write: &ForgeWrite,
-) -> Result<(String, Vec<SqlValue>)> {
+fn build_statement(slot: &ForgeCollection, write: &ForgeWrite) -> Result<(String, Vec<SqlValue>)> {
     match write {
         // `slot.table`, not `slot.topic`. They coincide unless the declaration
         // overrides `table:`, which `CollectionDecl` explicitly allows — and
@@ -1369,7 +1368,9 @@ async fn render_changed_rows(
         let mut rows = RenderedRows::new();
         for (key, record) in &appended {
             let singleton = serde_json::to_vec(&Value::Array(vec![record.clone()])).ok()?;
-            let rendered = projector.project_rows(&slot.topic, partition, &singleton).await?;
+            let rendered = projector
+                .project_rows(&slot.topic, partition, &singleton)
+                .await?;
             rows.insert(key.clone(), rendered.get(key)?.clone());
         }
         return Some(rows);
@@ -1390,7 +1391,9 @@ async fn render_changed_rows(
         // template the singleton render is byte-identical to the whole-view
         // render's slice of this row (the classifier's guarantee).
         let singleton = serde_json::to_vec(&Value::Array(vec![change.record.clone()])).ok()?;
-        let rendered = projector.project_rows(&slot.topic, partition, &singleton).await?;
+        let rendered = projector
+            .project_rows(&slot.topic, partition, &singleton)
+            .await?;
         let html = rendered.get(&change.key)?.clone();
         rows.insert(change.key.clone(), html);
     }
@@ -2185,7 +2188,10 @@ mod substrate_tests {
         let queried = materialize_slot(&db, schema.slot_for_topic("guestbook").unwrap(), None)
             .await
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&value), String::from_utf8_lossy(&queried));
+        assert_eq!(
+            String::from_utf8_lossy(&value),
+            String::from_utf8_lossy(&queried)
+        );
 
         let rows: Vec<Value> = serde_json::from_slice(&value).unwrap();
         let authors: Vec<&str> = rows.iter().filter_map(|r| r["author"].as_str()).collect();
@@ -2223,7 +2229,10 @@ mod substrate_tests {
         let queried = materialize_slot(&db, schema.slot_for_topic("guestbook").unwrap(), None)
             .await
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&value), String::from_utf8_lossy(&queried));
+        assert_eq!(
+            String::from_utf8_lossy(&value),
+            String::from_utf8_lossy(&queried)
+        );
         assert!(String::from_utf8_lossy(&value).contains("edited"));
     }
 
@@ -2832,9 +2841,16 @@ mod substrate_tests {
         bootstrap_schema(&db, &schema).await.unwrap();
         let broadcast = BroadcastRegistry::new();
 
-        let err = apply_writes(&db, &broadcast, &schema, &[msg("a:b", "sneaky")], None, None)
-            .await
-            .expect_err("refused");
+        let err = apply_writes(
+            &db,
+            &broadcast,
+            &schema,
+            &[msg("a:b", "sneaky")],
+            None,
+            None,
+        )
+        .await
+        .expect_err("refused");
         assert!(format!("{err}").contains("alphabet"), "{err}");
     }
 
@@ -2905,9 +2921,11 @@ mod substrate_tests {
             // `INSERT`/`UPDATE … RETURNING` runs through `query` because it
             // returns rows, but it IS the mutation, not a re-read. Counting it
             // would make the assertion meaningless.
-            if !sql.trim_start().get(..6).is_some_and(|head| {
-                head.eq_ignore_ascii_case("select")
-            }) {
+            if !sql
+                .trim_start()
+                .get(..6)
+                .is_some_and(|head| head.eq_ignore_ascii_case("select"))
+            {
                 return self.inner.query(sql, params).await;
             }
             self.queries.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2952,7 +2970,12 @@ mod substrate_tests {
         let collection = schema.slot_for_topic("messages").unwrap();
         let bytes = materialize_slot(&db, collection, Some("a")).await.unwrap();
         broadcast
-            .try_topic_partition("messages:a".to_string(), "messages".into(), "a".into(), bytes)
+            .try_topic_partition(
+                "messages:a".to_string(),
+                "messages".into(),
+                "a".into(),
+                bytes,
+            )
             .unwrap();
 
         queries.store(0, AtomicOrdering::Relaxed);
@@ -2960,10 +2983,7 @@ mod substrate_tests {
             &db,
             &broadcast,
             &schema,
-            &[append(
-                "messages",
-                json!({ "room": "a", "body": "hello" }),
-            )],
+            &[append("messages", json!({ "room": "a", "body": "hello" }))],
             None,
             None,
         )
@@ -2997,10 +3017,7 @@ mod substrate_tests {
             &db,
             &broadcast,
             &schema,
-            &[append(
-                "messages",
-                json!({ "room": "a", "body": "hello" }),
-            )],
+            &[append("messages", json!({ "room": "a", "body": "hello" }))],
             None,
             None,
         )
@@ -3039,9 +3056,13 @@ mod substrate_tests {
     #[tokio::test]
     async fn an_append_persists_and_rematerialises_the_topic() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         assert_eq!(topic_rows(&broadcast, "guestbook").len(), 2, "seeded rows");
 
         apply_writes(
@@ -3081,9 +3102,13 @@ mod substrate_tests {
     #[tokio::test]
     async fn a_hostile_value_is_stored_as_data_and_the_table_survives() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         let hostile = "'); DROP TABLE guestbook;--";
         apply_writes(
@@ -3110,9 +3135,13 @@ mod substrate_tests {
     #[tokio::test]
     async fn a_failed_write_rolls_back_the_whole_action() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         let mut bad = serde_json::Map::new();
         bad.insert(
@@ -3151,9 +3180,13 @@ mod substrate_tests {
     #[tokio::test]
     async fn an_unknown_collection_is_refused() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         let err = apply_writes(
             &db,
@@ -3219,9 +3252,13 @@ mod substrate_tests {
         }
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
@@ -3321,16 +3358,22 @@ mod substrate_tests {
         }
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
             .subscribe(SessionId::random(), "guestbook", tx)
             .unwrap();
 
-        let projector = CountingGuestbook { render_sizes: std::sync::Mutex::new(Vec::new()) };
+        let projector = CountingGuestbook {
+            render_sizes: std::sync::Mutex::new(Vec::new()),
+        };
         apply_writes(
             &db,
             &broadcast,
@@ -3422,9 +3465,13 @@ mod substrate_tests {
         use crate::runtime::session::SessionId;
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
@@ -3490,9 +3537,13 @@ mod substrate_tests {
         use crate::runtime::session::SessionId;
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
@@ -3532,9 +3583,13 @@ mod substrate_tests {
     #[tokio::test]
     async fn a_bad_write_in_a_batch_rolls_back_the_good_ones() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         // A good delete, then an update with a null key (refused before execute).
         let err = apply_writes(
@@ -3566,9 +3621,13 @@ mod substrate_tests {
         use crate::runtime::session::SessionId;
 
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         broadcast
@@ -3603,13 +3662,17 @@ mod substrate_tests {
 
         {
             let db = LibSqlSubstrate::open_local(&path).await.unwrap();
-            bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+            bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+                .await
+                .unwrap();
             let broadcast = BroadcastRegistry::new();
-            hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+            hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+                .await
+                .unwrap();
             apply_writes(
                 &db,
                 &broadcast,
-            &ForgeSchema::guestbook_default(),
+                &ForgeSchema::guestbook_default(),
                 &[append(
                     "guestbook",
                     json!({ "author": "ada", "message": "again" }),
@@ -3624,9 +3687,13 @@ mod substrate_tests {
         // Fresh process-shaped boot: reopen, re-bootstrap (must not re-seed),
         // rehydrate — the appended row has to come back.
         let db = LibSqlSubstrate::open_local(&path).await.unwrap();
-        bootstrap_schema(&db, &ForgeSchema::guestbook_default()).await.unwrap();
+        bootstrap_schema(&db, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
         let broadcast = BroadcastRegistry::new();
-        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default()).await.unwrap();
+        hydrate_topics(&db, &broadcast, &ForgeSchema::guestbook_default())
+            .await
+            .unwrap();
 
         let rows = topic_rows(&broadcast, "guestbook");
         assert_eq!(rows.len(), 3, "the appended row survived the restart");
@@ -4045,7 +4112,15 @@ mod owner_rules_tests {
         write: ForgeWrite,
         principal: Option<&PrincipalId>,
     ) -> Result<FanOut> {
-        apply_writes(db, &BroadcastRegistry::new(), schema, &[write], None, principal).await
+        apply_writes(
+            db,
+            &BroadcastRegistry::new(),
+            schema,
+            &[write],
+            None,
+            principal,
+        )
+        .await
     }
 
     async fn authors_recorded(db: &LibSqlSubstrate) -> i64 {
@@ -4066,9 +4141,14 @@ mod owner_rules_tests {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let schema = room_schema();
         bootstrap_schema(&db, &schema).await.unwrap();
-        run(&db, &schema, append_todo(Some("lobby"), "alice was here"), Some(&alice()))
-            .await
-            .expect("alice appends");
+        run(
+            &db,
+            &schema,
+            append_todo(Some("lobby"), "alice was here"),
+            Some(&alice()),
+        )
+        .await
+        .expect("alice appends");
 
         for (who, principal) in [("bob", Some(bob())), ("anonymous", None)] {
             for write in [set_text(1, "defaced"), delete(1)] {
@@ -4076,7 +4156,10 @@ mod owner_rules_tests {
                     .await
                     .expect_err("someone else's row must be refused");
                 assert!(format!("{err}").contains("refused"), "{who}: {err}");
-                assert!(!format!("{err}").contains("u_alice"), "{who} must not learn the author: {err}");
+                assert!(
+                    !format!("{err}").contains("u_alice"),
+                    "{who} must not learn the author: {err}"
+                );
             }
         }
         assert_eq!(
@@ -4091,9 +4174,14 @@ mod owner_rules_tests {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let schema = room_schema();
         bootstrap_schema(&db, &schema).await.unwrap();
-        run(&db, &schema, append_todo(Some("lobby"), "draft"), Some(&alice()))
-            .await
-            .unwrap();
+        run(
+            &db,
+            &schema,
+            append_todo(Some("lobby"), "draft"),
+            Some(&alice()),
+        )
+        .await
+        .unwrap();
         assert_eq!(authors_recorded(&db).await, 1);
 
         // A form submits the key as text; it must find the same row.
@@ -4113,7 +4201,11 @@ mod owner_rules_tests {
             .await
             .expect("the author removes");
         assert!(stored(&db).await.is_empty());
-        assert_eq!(authors_recorded(&db).await, 0, "the record goes with the row");
+        assert_eq!(
+            authors_recorded(&db).await,
+            0,
+            "the record goes with the row"
+        );
 
         // A missing row is "nothing there", not "you may not".
         run(&db, &schema, delete(99), Some(&alice()))
@@ -4145,9 +4237,14 @@ mod owner_rules_tests {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let schema = room_schema().open_to_anyone();
         bootstrap_schema(&db, &schema).await.unwrap();
-        run(&db, &schema, append_todo(Some("lobby"), "shared"), Some(&alice()))
-            .await
-            .unwrap();
+        run(
+            &db,
+            &schema,
+            append_todo(Some("lobby"), "shared"),
+            Some(&alice()),
+        )
+        .await
+        .unwrap();
         run(&db, &schema, delete(1), None)
             .await
             .expect("declared open, so a stranger may remove");
@@ -4172,6 +4269,10 @@ mod owner_rules_tests {
         assert!(parse("everyone").is_err());
         let omitted: CollectionDecl =
             serde_json::from_value(serde_json::json!({ "fields": { "text": "text" } })).unwrap();
-        assert_eq!(omitted.edit, EditRule::Author, "the default is the safe one");
+        assert_eq!(
+            omitted.edit,
+            EditRule::Author,
+            "the default is the safe one"
+        );
     }
 }

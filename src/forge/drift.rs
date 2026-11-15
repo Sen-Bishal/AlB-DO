@@ -12,13 +12,12 @@
 //! [`evolve_schema`] closes that hole in two moves. It compares the schema about
 //! to be served against the tables that exist, and then:
 //!
-//! - **a new nullable column is added**, with `ALTER TABLE … ADD COLUMN`, so the
-//!   headline edit — *append a field, reload* — simply works;
-//! - **everything else refuses to boot with a message naming the field**. Drops,
-//!   renames, type changes and nullability flips stay refusals permanently,
-//!   because there is no answer a compiler can pick on the author's behalf. A
-//!   loud refusal was already a complete fix for the failure mode — silence is
-//!   the defect, not the absence of `ALTER`.
+//! - **a new nullable column is added**, with `ALTER TABLE … ADD COLUMN`, so the headline edit —
+//!   *append a field, reload* — simply works;
+//! - **everything else refuses to boot with a message naming the field**. Drops, renames, type
+//!   changes and nullability flips stay refusals permanently, because there is no answer a compiler
+//!   can pick on the author's behalf. A loud refusal was already a complete fix for the failure
+//!   mode — silence is the defect, not the absence of `ALTER`.
 //!
 //! A *required* new column is in the second group and always will be: SQLite
 //! cannot add a `NOT NULL` column without a default, and inventing values for
@@ -157,18 +156,30 @@ impl fmt::Display for Change {
                 "field '{field}' ({sql_type}) is in the table, but is no longer declared"
             ),
             Self::TypeChanged { field, from, to } => {
-                write!(f, "field '{field}' is {from} in the table, declared as {to}")
+                write!(
+                    f,
+                    "field '{field}' is {from} in the table, declared as {to}"
+                )
             }
             Self::NullabilityChanged {
                 field,
                 now_required: true,
-            } => write!(f, "field '{field}' is nullable in the table, declared required"),
+            } => write!(
+                f,
+                "field '{field}' is nullable in the table, declared required"
+            ),
             Self::NullabilityChanged {
                 field,
                 now_required: false,
-            } => write!(f, "field '{field}' is required in the table, declared nullable"),
+            } => write!(
+                f,
+                "field '{field}' is required in the table, declared nullable"
+            ),
             Self::KeyChanged { from, to } => {
-                write!(f, "the row key is '{from}' in the table, declared as '{to}'")
+                write!(
+                    f,
+                    "the row key is '{from}' in the table, declared as '{to}'"
+                )
             }
         }
     }
@@ -654,7 +665,9 @@ mod parse_tests {
     /// partitioned collection ships one in the same migration list.
     #[test]
     fn an_index_migration_is_not_a_table() {
-        assert!(parse_create_table("CREATE INDEX IF NOT EXISTS idx_m_room ON m(room, id)").is_none());
+        assert!(
+            parse_create_table("CREATE INDEX IF NOT EXISTS idx_m_room ON m(room, id)").is_none()
+        );
     }
 
     /// `reserve.rs` owns DDL outside this grammar. It never reaches the check,
@@ -817,7 +830,9 @@ mod tests {
             ("body", FieldSpec::new(FieldType::Text)),
             ("nickname", FieldSpec::nullable(FieldType::Text)),
         ]);
-        let applied = evolve_schema(&db, &after).await.expect("additive, so applied");
+        let applied = evolve_schema(&db, &after)
+            .await
+            .expect("additive, so applied");
 
         assert_eq!(
             applied,
@@ -834,7 +849,10 @@ mod tests {
             .await
             .expect("the read the app is about to run must now succeed");
         assert_eq!(rows.rows.len(), 1);
-        assert_eq!(rows.rows[0].get(0).and_then(SqlValue::as_str), Some("hello"));
+        assert_eq!(
+            rows.rows[0].get(0).and_then(SqlValue::as_str),
+            Some("hello")
+        );
         assert_eq!(
             rows.rows[0].get(1),
             Some(&SqlValue::Null),
@@ -907,15 +925,24 @@ mod tests {
         // a wipe.
         let message = drift.to_string();
         assert!(message.contains("created_at"), "names the field: {message}");
-        assert!(message.contains("messages"), "names the collection: {message}");
+        assert!(
+            message.contains("messages"),
+            "names the collection: {message}"
+        );
         assert!(message.contains("text?"), "names the fix: {message}");
-        assert!(message.contains("intact"), "says the data survived: {message}");
+        assert!(
+            message.contains("intact"),
+            "says the data survived: {message}"
+        );
     }
 
     #[tokio::test]
     async fn a_removed_field_is_refused_and_named() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
-        let before = schema_of(&[("body", FieldType::Text), ("nickname", FieldType::Text)], None);
+        let before = schema_of(
+            &[("body", FieldType::Text), ("nickname", FieldType::Text)],
+            None,
+        );
         bootstrap_schema(&db, &before).await.unwrap();
 
         let after = schema_of(&[("body", FieldType::Text)], None);
@@ -1096,7 +1123,9 @@ mod tests {
     async fn adding_a_partition_is_not_drift() {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let fields = [("room", FieldType::Text), ("body", FieldType::Text)];
-        bootstrap_schema(&db, &schema_of(&fields, None)).await.unwrap();
+        bootstrap_schema(&db, &schema_of(&fields, None))
+            .await
+            .unwrap();
 
         let partitioned = schema_of(&fields, Some("room"));
         evolve_schema(&db, &partitioned)
@@ -1132,7 +1161,11 @@ mod tests {
         let db = LibSqlSubstrate::open_ephemeral().await.unwrap();
         let before = spec_schema_of(&[
             ("notes", &[("body", FieldSpec::new(FieldType::Text))], None),
-            ("counters", &[("hits", FieldSpec::new(FieldType::Int))], None),
+            (
+                "counters",
+                &[("hits", FieldSpec::new(FieldType::Int))],
+                None,
+            ),
         ]);
         bootstrap_schema(&db, &before).await.unwrap();
 
@@ -1147,7 +1180,11 @@ mod tests {
                 ],
                 None,
             ),
-            ("counters", &[("hits", FieldSpec::new(FieldType::Text))], None),
+            (
+                "counters",
+                &[("hits", FieldSpec::new(FieldType::Text))],
+                None,
+            ),
         ]);
         let drift = drift_of(evolve_schema(&db, &after).await.expect_err("must refuse"));
 
@@ -1261,7 +1298,10 @@ mod tests {
 
         let message = drift.to_string();
         for expected in ["body", "old", "new"] {
-            assert!(message.contains(expected), "reports '{expected}': {message}");
+            assert!(
+                message.contains(expected),
+                "reports '{expected}': {message}"
+            );
         }
         assert_eq!(drift.collections[0].changes.len(), 3);
     }

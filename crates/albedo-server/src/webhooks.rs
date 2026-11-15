@@ -37,7 +37,12 @@ pub async fn receive(
     // make us buffer this much and no more.
     let body = match to_bytes(body, MAX_BODY_BYTES).await {
         Ok(body) => body,
-        Err(_) => return answer(StatusCode::PAYLOAD_TOO_LARGE, "body exceeds the webhook limit"),
+        Err(_) => {
+            return answer(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body exceeds the webhook limit",
+            )
+        }
     };
     let header_value = |name: &str| {
         headers
@@ -94,17 +99,19 @@ pub async fn receive(
     // theirs and can be nobody else's. There is still no identity that writes
     // everyone's rows.
     let principal = match hook.principal_of(&intent.args) {
-        Some(id) => match dom_render_compiler::auth::store::load_principal(substrate.as_ref(), &id).await {
-            Ok(Some(_)) => Some(id.as_str().to_string()),
-            Ok(None) => {
-                warn!(target: "albedo.webhook", webhook = %hook.name, "event names an unknown principal; the job runs for nobody");
-                None
+        Some(id) => {
+            match dom_render_compiler::auth::store::load_principal(substrate.as_ref(), &id).await {
+                Ok(Some(_)) => Some(id.as_str().to_string()),
+                Ok(None) => {
+                    warn!(target: "albedo.webhook", webhook = %hook.name, "event names an unknown principal; the job runs for nobody");
+                    None
+                }
+                Err(err) => {
+                    warn!(target: "albedo.webhook", webhook = %hook.name, %err, "principal lookup failed");
+                    return answer(StatusCode::SERVICE_UNAVAILABLE, "not ready to receive");
+                }
             }
-            Err(err) => {
-                warn!(target: "albedo.webhook", webhook = %hook.name, %err, "principal lookup failed");
-                return answer(StatusCode::SERVICE_UNAVAILABLE, "not ready to receive");
-            }
-        },
+        }
         None => None,
     };
     match crate::jobs::write_enqueue(substrate.as_ref(), &jobs, &intent, principal, now_ms).await {
@@ -115,7 +122,10 @@ pub async fn receive(
         }
         Err(err) => {
             warn!(target: "albedo.webhook", webhook = %hook.name, %err, "queueing a delivery failed");
-            answer(StatusCode::INTERNAL_SERVER_ERROR, "could not queue the event")
+            answer(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not queue the event",
+            )
         }
     }
 }

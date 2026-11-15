@@ -109,11 +109,15 @@ fn a_confined_request_costs_what_gate_3_1_projected() {
     // Warm past the arena's persistent window before timing anything.
     for _ in 0..16 {
         plain.confine().expect("confine");
-        plain.render_component("routes/p.tsx", props).expect("render");
+        plain
+            .render_component("routes/p.tsx", props)
+            .expect("render");
     }
 
     let (render_mean, render_median) = time(REPS, || {
-        let out = plain.render_component("routes/p.tsx", props).expect("render");
+        let out = plain
+            .render_component("routes/p.tsx", props)
+            .expect("render");
         assert_ne!(out.html, "");
     });
     let (confine_mean, confine_median) = time(REPS, || plain.confine().expect("confine"));
@@ -293,11 +297,15 @@ fn a_confined_request_costs_what_gate_3_1_projected() {
     relaxed.set_gc_threshold(64 * 1024 * 1024);
     for _ in 0..16 {
         relaxed.confine().expect("confine");
-        relaxed.render_component("routes/p.tsx", props).expect("render");
+        relaxed
+            .render_component("routes/p.tsx", props)
+            .expect("render");
     }
     let (relaxed_confine, _) = time(REPS, || relaxed.confine().expect("confine"));
     let (relaxed_render, _) = time(REPS, || {
-        relaxed.render_component("routes/p.tsx", props).expect("render");
+        relaxed
+            .render_component("routes/p.tsx", props)
+            .expect("render");
     });
 
     println!(

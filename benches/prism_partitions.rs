@@ -5,19 +5,16 @@
 //! would be unfalsifiable — "1.2 ms" is fast or slow depending on a machine
 //! nobody reading the result is sitting at. A ratio is a claim:
 //!
-//! 1. **A write costs the same in a 100,000-row room as in a 10-row room.**
-//!    This is the v2 claim that is not parity with anything — v1 could only
-//!    promise flat in room *count*. If the ratio drifts from ~1×, the
-//!    zero-query path has silently fallen back to re-querying the partition.
-//! 2. **The composite index is what makes a partitioned read affordable.**
-//!    Measured with and without it over the same 100k rows / 1,000 rooms, so
-//!    the emitted `CREATE INDEX` line has a number attached to it rather than
-//!    an assertion that it is a good idea. (`skeleton.rs` already asserts the
-//!    *plan* via `EXPLAIN QUERY PLAN`; this says what the plan is worth.)
-//! 3. **The byte budget actually bounds memory.** Touch 10,000 distinct rooms
-//!    and the resident footprint must settle at the budget, not at 10,000
-//!    rooms' worth of rows. This is the one cap PRISM v2 kept, replacing v1's
-//!    reaper + leases + TTL + three counters.
+//! 1. **A write costs the same in a 100,000-row room as in a 10-row room.** This is the v2 claim
+//!    that is not parity with anything — v1 could only promise flat in room *count*. If the ratio
+//!    drifts from ~1×, the zero-query path has silently fallen back to re-querying the partition.
+//! 2. **The composite index is what makes a partitioned read affordable.** Measured with and
+//!    without it over the same 100k rows / 1,000 rooms, so the emitted `CREATE INDEX` line has a
+//!    number attached to it rather than an assertion that it is a good idea. (`skeleton.rs` already
+//!    asserts the *plan* via `EXPLAIN QUERY PLAN`; this says what the plan is worth.)
+//! 3. **The byte budget actually bounds memory.** Touch 10,000 distinct rooms and the resident
+//!    footprint must settle at the budget, not at 10,000 rooms' worth of rows. This is the one cap
+//!    PRISM v2 kept, replacing v1's reaper + leases + TTL + three counters.
 //!
 //! Run with:
 //!   cargo bench --bench `prism_partitions`
@@ -124,9 +121,16 @@ async fn median_append_us(
         // write path's shape, not authorization. (The second argument arrived when
         // `apply_writes` grew its `principal` parameter; this call site was not
         // updated then, which is why the target stopped compiling.)
-        apply_writes(db, broadcast, schema, std::slice::from_ref(&write), None, None)
-            .await
-            .expect("write");
+        apply_writes(
+            db,
+            broadcast,
+            schema,
+            std::slice::from_ref(&write),
+            None,
+            None,
+        )
+        .await
+        .expect("write");
         samples.push(t.elapsed());
     }
     samples.sort();
@@ -170,12 +174,10 @@ async fn bench_write_flat_in_partition_size() {
     // honest reading is:
     //
     //   - The *query* is gone. Asserted separately and exactly, by counting:
-    //     `an_append_to_a_warm_partition_runs_zero_queries`. Nothing here
-    //     re-reads the partition.
-    //   - The *copy* is not. A topic value is an owned `Vec<u8>` behind the
-    //     linearization lock, so producing the next version of a 100k-row room
-    //     moves its bytes — twice, once to splice and once to store. That is
-    //     O(bytes), and at this size it dominates the durable commit.
+    //     `an_append_to_a_warm_partition_runs_zero_queries`. Nothing here re-reads the partition.
+    //   - The *copy* is not. A topic value is an owned `Vec<u8>` behind the linearization lock, so
+    //     producing the next version of a 100k-row room moves its bytes — twice, once to splice and
+    //     once to store. That is O(bytes), and at this size it dominates the durable commit.
     //
     // So the shape is O(bytes moved), not O(rows re-rendered) and not O(1).
     // Sublinear by ~1000× against the row count, which is the part that
@@ -183,7 +185,9 @@ async fn bench_write_flat_in_partition_size() {
     // doc currently overclaims.
     println!("  reading:");
     println!("    · zero queries — proven by count, not by this timing");
-    println!("    · residual is O(bytes moved), not O(rows): {ratio:.1}× for {rows_ratio:.0}× the data");
+    println!(
+        "    · residual is O(bytes moved), not O(rows): {ratio:.1}× for {rows_ratio:.0}× the data"
+    );
     println!(
         "    · {:.0}× sublinear against the row count",
         rows_ratio / ratio
@@ -297,7 +301,12 @@ async fn bench_steady_state_memory() {
     for room in 0..ROOMS {
         let name = format!("messages:room{room}");
         broadcast
-            .try_topic_partition(name, "messages".into(), format!("room{room}").into(), payload.clone())
+            .try_topic_partition(
+                name,
+                "messages".into(),
+                format!("room{room}").into(),
+                payload.clone(),
+            )
             .expect("mint");
         // Swept on the same cadence the write path sweeps: after the bytes grow.
         broadcast.enforce_byte_budget(BUDGET);
@@ -315,11 +324,11 @@ async fn bench_steady_state_memory() {
         "  live partitions        {} of {ROOMS}",
         broadcast.dynamic_topic_count()
     );
+    println!("  unbounded would be     {:.1} MB", unbounded as f64 / 1e6);
     println!(
-        "  unbounded would be     {:.1} MB",
-        unbounded as f64 / 1e6
+        "  sweep cost             {:.1} ms total",
+        elapsed.as_secs_f64() * 1e3
     );
-    println!("  sweep cost             {:.1} ms total", elapsed.as_secs_f64() * 1e3);
     println!();
     println!(
         "  {}",

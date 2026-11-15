@@ -5,23 +5,20 @@
 //! request at all. Asked "what happened to request X", an operator had nothing
 //! to search.
 //!
-//! - **One line per response**, from the outermost layer, so a 429, a
-//!   probe and a dispatch panic's 500 are logged like a 200. Tier-B bodies
-//!   finish their line at body end/drop so render errors are included; `ms`
-//!   still measures time to the response head.
-//! - **`x-request-id` on every response**, logged or not: the caller's own when
-//!   it is a plausible id (a proxy's id threads straight through), otherwise
-//!   minted. It is the one thing a user's bug report and a log line share, and
-//!   the request carries it inward too, so a handler's own error log names it.
-//! - **The path without its query.** Queries carry sign-in tokens
-//!   (`/_albedo/auth/magic?token=…`), reset links and search terms; a log file
-//!   is the wrong place for every one of them.
-//! - **Who, without a second lookup.** The principal the dispatcher already
-//!   resolved is noted on the way past ([`note_identity`]); an access log that
-//!   doubled the session queries is a cost nobody would leave switched on.
-//! - **The client behind a proxy** is the address SHUTTER rations — the same
-//!   trust rule, so a forged `X-Forwarded-For` cannot write someone else's
-//!   address into the log.
+//! - **One line per response**, from the outermost layer, so a 429, a probe and a dispatch panic's
+//!   500 are logged like a 200. Tier-B bodies finish their line at body end/drop so render errors
+//!   are included; `ms` still measures time to the response head.
+//! - **`x-request-id` on every response**, logged or not: the caller's own when it is a plausible
+//!   id (a proxy's id threads straight through), otherwise minted. It is the one thing a user's bug
+//!   report and a log line share, and the request carries it inward too, so a handler's own error
+//!   log names it.
+//! - **The path without its query.** Queries carry sign-in tokens (`/_albedo/auth/magic?token=…`),
+//!   reset links and search terms; a log file is the wrong place for every one of them.
+//! - **Who, without a second lookup.** The principal the dispatcher already resolved is noted on
+//!   the way past ([`note_identity`]); an access log that doubled the session queries is a cost
+//!   nobody would leave switched on.
+//! - **The client behind a proxy** is the address SHUTTER rations — the same trust rule, so a
+//!   forged `X-Forwarded-For` cannot write someone else's address into the log.
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -71,7 +68,10 @@ pub(crate) struct RenderErrors(Arc<Mutex<Vec<String>>>);
 
 impl RenderErrors {
     pub(crate) fn note(&self, message: &str) {
-        let mut errors = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut errors = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !errors.iter().any(|error| error == message) {
             errors.push(message.to_string());
         }
@@ -88,7 +88,10 @@ struct PendingLine {
 impl Drop for PendingLine {
     fn drop(&mut self) {
         if let Some(errors) = &self.errors {
-            let errors = errors.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let errors = errors
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !errors.is_empty() {
                 self.text.truncate(self.text.len().saturating_sub(2));
                 let _ = writeln!(
@@ -138,7 +141,9 @@ pub async fn layer(
         .map_or_else(mint, str::to_string);
     let header = HeaderValue::from_str(&id).ok();
     if let Some(value) = &header {
-        request.headers_mut().insert(REQUEST_ID_HEADER, value.clone());
+        request
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER, value.clone());
     }
 
     let line = log.enabled.then(|| {
@@ -148,7 +153,11 @@ pub async fn layer(
             .map(|connect| connect.0.ip());
         let client: Option<IpAddr> =
             peer.map(|peer| log.limiter.client_addr(peer, request.headers()));
-        (request.method().clone(), request.uri().path().to_string(), client)
+        (
+            request.method().clone(),
+            request.uri().path().to_string(),
+            client,
+        )
     });
     if log.enabled {
         request.extensions_mut().insert(RenderErrors::default());
@@ -160,7 +169,10 @@ pub async fn layer(
     }
 
     if let Some((method, path, client)) = line {
-        let who = response.extensions().get::<Principal>().map(|who| who.0.as_str());
+        let who = response
+            .extensions()
+            .get::<Principal>()
+            .map(|who| who.0.as_str());
         let text = render(
             &id,
             method.as_str(),

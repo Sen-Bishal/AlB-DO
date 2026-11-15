@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 fn albedo(home: &Path, cwd: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_albedo"));
-    cmd.current_dir(cwd).env("USERPROFILE", home).env("HOME", home);
+    cmd.current_dir(cwd)
+        .env("USERPROFILE", home)
+        .env("HOME", home);
     cmd.env_remove("ALBEDO_METRICS_ADDR");
     cmd
 }
@@ -98,8 +100,14 @@ async fn traffic_moves_the_scrape_and_the_scrape_stays_off_the_app_port() {
     .await
     .expect("a boot that cannot bind returns instead of serving");
     let err = result.expect_err("🔴 the server booted with its metrics port taken");
-    assert!(err.to_string().contains("metrics"), "the error names the listener: {err}");
-    assert!(ready_rx.try_recv().is_err(), "`on_ready` fired for a failed boot");
+    assert!(
+        err.to_string().contains("metrics"),
+        "the error names the listener: {err}"
+    );
+    assert!(
+        ready_rx.try_recv().is_err(),
+        "`on_ready` fired for a failed boot"
+    );
     drop(squatter);
 
     // ── the real boot ──
@@ -123,18 +131,26 @@ async fn traffic_moves_the_scrape_and_the_scrape_stays_off_the_app_port() {
     let pool_size = sample(&before, "albedo_engine_pool_size").expect("serve runs a QuickJS pool");
     assert!(pool_size >= 1.0, "{before}");
     assert_eq!(sample(&before, "albedo_engine_pool_live"), Some(pool_size));
-    let ok_before = sample(&before, "albedo_http_requests_total{method=\"GET\",code=\"200\"}").unwrap_or(0.0);
+    let ok_before = sample(
+        &before,
+        "albedo_http_requests_total{method=\"GET\",code=\"200\"}",
+    )
+    .unwrap_or(0.0);
 
     for _ in 0..3 {
         let page = reqwest::get(format!("{base}/")).await.expect("page");
         assert_eq!(page.status(), 200);
         page.text().await.expect("page body");
     }
-    let missing = reqwest::get(format!("{base}/definitely-not-a-route")).await.expect("404");
+    let missing = reqwest::get(format!("{base}/definitely-not-a-route"))
+        .await
+        .expect("404");
     assert_eq!(missing.status(), 404);
 
     // 🔑 The scrape is not an app route: the app port must not hand it out.
-    let leaked = reqwest::get(format!("{base}/metrics")).await.expect("app /metrics");
+    let leaked = reqwest::get(format!("{base}/metrics"))
+        .await
+        .expect("app /metrics");
     let leaked = leaked.text().await.unwrap_or_default();
     assert!(
         !leaked.contains("albedo_http_requests_total"),
@@ -143,29 +159,51 @@ async fn traffic_moves_the_scrape_and_the_scrape_stays_off_the_app_port() {
     let stray = reqwest::get(format!("http://127.0.0.1:{metrics_port}/"))
         .await
         .expect("metrics listener root");
-    assert_eq!(stray.status(), 404, "the metrics listener serves /metrics and nothing else");
+    assert_eq!(
+        stray.status(),
+        404,
+        "the metrics listener serves /metrics and nothing else"
+    );
 
     let after = scrape(metrics_port).await;
-    let ok_after = sample(&after, "albedo_http_requests_total{method=\"GET\",code=\"200\"}")
-        .expect("GET 200 counted");
+    let ok_after = sample(
+        &after,
+        "albedo_http_requests_total{method=\"GET\",code=\"200\"}",
+    )
+    .expect("GET 200 counted");
     assert!(
         ok_after - ok_before >= 3.0,
         "🔴 three page loads moved GET/200 by {} :\n{after}",
         ok_after - ok_before
     );
     assert!(
-        sample(&after, "albedo_http_requests_total{method=\"GET\",code=\"404\"}").unwrap_or(0.0) >= 1.0,
+        sample(
+            &after,
+            "albedo_http_requests_total{method=\"GET\",code=\"404\"}"
+        )
+        .unwrap_or(0.0)
+            >= 1.0,
         "the 404 is counted under its own code:\n{after}"
     );
     let count = sample(&after, "albedo_http_request_duration_seconds_count").expect("histogram");
-    let inf = sample(&after, "albedo_http_request_duration_seconds_bucket{le=\"+Inf\"}").expect("+Inf");
+    let inf = sample(
+        &after,
+        "albedo_http_request_duration_seconds_bucket{le=\"+Inf\"}",
+    )
+    .expect("+Inf");
     assert_eq!(count, inf, "_count must equal the +Inf bucket");
     assert!(count >= 5.0, "{after}");
     assert_eq!(sample(&after, "albedo_http_requests_in_flight"), Some(0.0));
 
     // ── an open event stream is a gauge, and leaves it when it closes ──
-    assert_eq!(sample(&after, "albedo_http_event_streams_open"), Some(0.0), "CONTROL");
-    let mut trunk = reqwest::get(format!("{base}/_albedo/phosphor")).await.expect("trunk");
+    assert_eq!(
+        sample(&after, "albedo_http_event_streams_open"),
+        Some(0.0),
+        "CONTROL"
+    );
+    let mut trunk = reqwest::get(format!("{base}/_albedo/phosphor"))
+        .await
+        .expect("trunk");
     assert_eq!(trunk.status(), 200);
     trunk.chunk().await.expect("readable").expect("hello frame");
     let open = scrape(metrics_port).await;
@@ -304,7 +342,10 @@ async fn serve_opens_the_scrape_listener_only_when_the_environment_asks() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(up, "CONTROL — the app itself must be up before its absence of metrics means anything");
+    assert!(
+        up,
+        "CONTROL — the app itself must be up before its absence of metrics means anything"
+    );
     assert!(
         client
             .get(format!("http://127.0.0.1:{metrics_port}/metrics"))

@@ -78,7 +78,10 @@ fn the_first_command_on_a_fresh_machine_can_be_something_other_than_init() {
         .output()
         .expect("the albedo binary runs");
 
-    assert!(out.status.success(), "`albedo help` must work on a fresh machine");
+    assert!(
+        out.status.success(),
+        "`albedo help` must work on a fresh machine"
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(

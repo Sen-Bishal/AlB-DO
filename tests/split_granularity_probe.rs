@@ -23,11 +23,9 @@
 //! For every Tier-C component, over the real corpus:
 //!
 //! * `total` — JSX elements in the component's own body.
-//! * `shipped` — every element in a subtree rooted at a **reactive** node: one carrying
-//!   an `on*` handler, or one whose own attributes/immediate expression children name a
-//!   `useState` binding.
-//! * `static_remainder` — `total - shipped`: what a perfect split would leave on the
-//!   server.
+//! * `shipped` — every element in a subtree rooted at a **reactive** node: one carrying an `on*`
+//!   handler, or one whose own attributes/immediate expression children name a `useState` binding.
+//! * `static_remainder` — `total - shipped`: what a perfect split would leave on the server.
 //!
 //! **Ancestors deliberately do not ship.** The metric assumes the best case for the
 //! proposal — that a reactive subtree can be anchored in place (the `display:contents`
@@ -36,15 +34,14 @@
 //!
 //! ## Limits, stated so the number is not over-read
 //!
-//! * A `useState` binding is found only as `const [x, setX] = useState(...)`. Custom
-//!   hooks returning state (`useQuery`, `useForm`) are **not** traced — those components
-//!   will under-report `shipped`, biasing the result *toward* the proposal.
+//! * A `useState` binding is found only as `const [x, setX] = useState(...)`. Custom hooks
+//!   returning state (`useQuery`, `useForm`) are **not** traced — those components will
+//!   under-report `shipped`, biasing the result *toward* the proposal.
 //! * Props are not traced. A prop that is reactive at the call site reads as static here.
-//! * Element count is the unit, not bytes. A big static table and a small one weigh the
-//!   same.
-//! * `useEffect`-driven components ship for a reason this metric cannot see at all: the
-//!   effect must run. Their static remainder is reported, but the effect body has to
-//!   ship regardless of how much markup is static.
+//! * Element count is the unit, not bytes. A big static table and a small one weigh the same.
+//! * `useEffect`-driven components ship for a reason this metric cannot see at all: the effect must
+//!   run. Their static remainder is reported, but the effect body has to ship regardless of how
+//!   much markup is static.
 //!
 //! ## 🔴 RESULT 2026-08-21 — the ranking selects for the probe's own blind spot
 //!
@@ -91,8 +88,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use swc_common::{FileName, SourceMap};
 use swc_ecma_ast::{
-    Decl, ExportDefaultDecl, Expr, JSXAttrOrSpread, JSXElement, JSXElementChild,
-    JSXExpr, Module, ModuleDecl, ModuleItem, Pat, Stmt,
+    Decl, ExportDefaultDecl, Expr, JSXAttrOrSpread, JSXElement, JSXElementChild, JSXExpr, Module,
+    ModuleDecl, ModuleItem, Pat, Stmt,
 };
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use swc_ecma_visit::{Visit, VisitWith};
@@ -344,7 +341,8 @@ fn function_named(module: &Module, name: &str) -> Option<FunctionJsx> {
                         }
                         match declarator.init.as_deref() {
                             Some(Expr::Arrow(arrow)) => {
-                                if let swc_ecma_ast::BlockStmtOrExpr::BlockStmt(block) = &*arrow.body
+                                if let swc_ecma_ast::BlockStmtOrExpr::BlockStmt(block) =
+                                    &*arrow.body
                                 {
                                     return Some(block.clone());
                                 }
@@ -509,7 +507,11 @@ fn how_much_of_a_tier_c_component_is_static() {
     let total_shipped: usize = rows.iter().map(|r| r.shipped).sum();
     let total_static = total_elements - total_shipped;
 
-    writeln!(out, "\n# Tier-C split granularity — {analysed} components analysed").unwrap();
+    writeln!(
+        out,
+        "\n# Tier-C split granularity — {analysed} components analysed"
+    )
+    .unwrap();
     writeln!(
         out,
         "\ncorpus-wide: {total_elements} JSX elements in Tier-C components, \
@@ -569,7 +571,11 @@ fn how_much_of_a_tier_c_component_is_static() {
         };
         buckets[idx] += 1;
     }
-    writeln!(out, "\n## Distribution — what fraction of each component is static\n").unwrap();
+    writeln!(
+        out,
+        "\n## Distribution — what fraction of each component is static\n"
+    )
+    .unwrap();
     writeln!(out, "| static share | components | share |").unwrap();
     writeln!(out, "|---|---:|---:|").unwrap();
     for (i, label) in ["0–20%", "20–40%", "40–60%", "60–80%", "80–100%"]
@@ -587,7 +593,11 @@ fn how_much_of_a_tier_c_component_is_static() {
 
     // By reason: a useEffect component ships its effect no matter how static its markup.
     writeln!(out, "\n## By reason\n").unwrap();
-    writeln!(out, "| reason | components | elements | static | static share |").unwrap();
+    writeln!(
+        out,
+        "| reason | components | elements | static | static share |"
+    )
+    .unwrap();
     writeln!(out, "|---|---:|---:|---:|---:|").unwrap();
     let mut reasons: Vec<TieringReason> = rows.iter().map(|r| r.reason).collect();
     reasons.sort_by_key(|r| format!("{r:?}"));

@@ -20,10 +20,10 @@
 //! that hold in **any** realm, fresh or poisoned, because they never cross a
 //! request boundary at all:
 //!
-//! * `the_global_parameter_is_a_redundant_alias` — `globalThis` is an intrinsic.
-//!   A brand-new context has one too.
-//! * `the_realms_intrinsics_and_host_globals_are_all_writable` — a *fresh* realm
-//!   is exactly as writable as a used one. Recycling is not freezing.
+//! * `the_global_parameter_is_a_redundant_alias` — `globalThis` is an intrinsic. A brand-new
+//!   context has one too.
+//! * `the_realms_intrinsics_and_host_globals_are_all_writable` — a *fresh* realm is exactly as
+//!   writable as a used one. Recycling is not freezing.
 //!
 //! Confinement is a **temporal** boundary: it bounds how long a poisoning
 //! lasts, not whether one is possible. The two tests it can move are the two

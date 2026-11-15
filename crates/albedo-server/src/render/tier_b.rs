@@ -40,9 +40,7 @@ impl RenderError {
         match self {
             Self::RegistryFailure { thrown_message, .. } => thrown_message.clone(),
             Self::DataFetchFailure { message, .. } => message.clone(),
-            Self::MissingDynamicProp { .. } | Self::StaticPropsNotObject { .. } => {
-                self.to_string()
-            }
+            Self::MissingDynamicProp { .. } | Self::StaticPropsNotObject { .. } => self.to_string(),
         }
     }
 }
@@ -380,12 +378,18 @@ pub struct InjectionChunk {
 
 #[derive(Clone)]
 enum ChunkKind {
-    Success { html: String },
-    Fallback { html: String },
+    Success {
+        html: String,
+    },
+    Fallback {
+        html: String,
+    },
     /// A route `error.tsx` boundary rendered to real HTML — the placeholder
     /// is replaced by the fallback UI and marked `'error'` so the client can
     /// style it, instead of being left a blank `data-albedo-error` stub.
-    ErrorBoundary { html: String },
+    ErrorBoundary {
+        html: String,
+    },
     Error,
 }
 
@@ -459,7 +463,9 @@ impl InjectionChunk {
             | ChunkKind::Fallback { html }
             | ChunkKind::ErrorBoundary { html } => html,
             ChunkKind::Error => {
-                format!("<div id=\"{id}\" data-albedo-tier=\"b\" data-albedo-error=\"error\"></div>")
+                format!(
+                    "<div id=\"{id}\" data-albedo-tier=\"b\" data-albedo-error=\"error\"></div>"
+                )
             }
         }
     }
@@ -609,7 +615,8 @@ pub struct PooledTierBRenderRegistry {
     /// must render whatever is current *at that request*.
     broadcast: Arc<dom_render_compiler::runtime::BroadcastRegistry>,
     /// P6 · per-action `data-albedo-error` span markup, keyed by action name.
-    /// Computed once at boot by [`dom_render_compiler::runtime::eval::CompiledProject::form_feedback_span_seed`]
+    /// Computed once at boot by
+    /// [`dom_render_compiler::runtime::eval::CompiledProject::form_feedback_span_seed`]
     /// — the SAME generator the non-pooled render path uses — so a Tier-B
     /// form emits the exact error sinks the submit projection targets and
     /// bakabox stops dropping the frame. Empty when the project has no forms.
@@ -811,20 +818,16 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
         // A component with no boot-built plan can't be rendered on the request
         // path — surface it loudly instead of silently injecting nothing (the
         // exact silent-empty failure this registry exists to kill).
-        let plan =
-            self.plan
-                .get(render_fn)
-                .cloned()
-                .ok_or_else(|| {
-                    let reason =
-                        "no Tier-B render plan registered at boot (component not in manifest routes?)"
-                            .to_string();
-                    RenderError::RegistryFailure {
-                        render_fn: render_fn.to_string(),
-                        thrown_message: reason.clone(),
-                        diagnostic: reason,
-                    }
-                })?;
+        let plan = self.plan.get(render_fn).cloned().ok_or_else(|| {
+            let reason =
+                "no Tier-B render plan registered at boot (component not in manifest routes?)"
+                    .to_string();
+            RenderError::RegistryFailure {
+                render_fn: render_fn.to_string(),
+                thrown_message: reason.clone(),
+                diagnostic: reason,
+            }
+        })?;
 
         let props_json = serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string());
         let render_fn_owned = render_fn.to_string();
@@ -910,11 +913,7 @@ impl TierBRenderRegistry for PooledTierBRenderRegistry {
         })
     }
 
-    async fn call_metadata(
-        &self,
-        key: &str,
-        props: &Value,
-    ) -> Result<Option<Value>, RenderError> {
+    async fn call_metadata(&self, key: &str, props: &Value) -> Result<Option<Value>, RenderError> {
         // Same boot-plan + pooled-engine path as `call`, but the engine
         // evaluates `generateMetadata` to a DATA object rather than rendering
         // HTML. A route without a registered plan can't be dynamic — treat it as
@@ -1105,7 +1104,11 @@ mod tests {
             let broadcast = BroadcastRegistry::new();
             broadcast.topic("guestbook", br#"[{"author":"ada"}]"#.to_vec());
 
-            let host = host_seed_for(&plan_reading(&["guestbook"]), &broadcast, &serde_json::Map::new());
+            let host = host_seed_for(
+                &plan_reading(&["guestbook"]),
+                &broadcast,
+                &serde_json::Map::new(),
+            );
             let parsed: Value = serde_json::from_str(&host).expect("host seed is JSON");
 
             assert_eq!(parsed["shared"]["guestbook"], json!([{"author": "ada"}]));
@@ -1193,7 +1196,9 @@ mod tests {
                     binding: "rows".to_string(),
                     collection: "messages".to_string(),
                     column: "room".to_string(),
-                    key: dom_render_compiler::manifest::schema::PartitionKeySource::RouteParam("id".to_string()),
+                    key: dom_render_compiler::manifest::schema::PartitionKeySource::RouteParam(
+                        "id".to_string(),
+                    ),
                 }],
                 shared_topic_classes: HashMap::new(),
                 stamp_specs: HashMap::new(),
@@ -1218,10 +1223,8 @@ mod tests {
         fn a_hostile_param_yields_no_topic_and_no_failure() {
             let plan = plan_reading_partition();
             for hostile in ["a:b", "../secrets", ""] {
-                let resolved = resolve_partitions_for_props(
-                    &plan,
-                    &json!({ "params": { "id": hostile } }),
-                );
+                let resolved =
+                    resolve_partitions_for_props(&plan, &json!({ "params": { "id": hostile } }));
                 assert!(resolved.is_empty(), "{hostile:?} must mint nothing");
             }
         }
@@ -1385,11 +1388,17 @@ mod tests {
         // `__albedo_inject(id, null, 'error')` → a blank placeholder. With a
         // route `error.tsx`, it must ship the rendered boundary HTML so the
         // client replaces the placeholder with fallback UI.
-        let script = InjectionChunk::error_boundary(&node(), "<p>boom</p>".to_string())
-            .into_script_tag();
+        let script =
+            InjectionChunk::error_boundary(&node(), "<p>boom</p>".to_string()).into_script_tag();
         assert!(script.contains("__albedo_inject"));
-        assert!(script.contains("<p>boom</p>"), "must carry the boundary HTML");
-        assert!(script.contains("'error'"), "must keep the error status marker");
+        assert!(
+            script.contains("<p>boom</p>"),
+            "must carry the boundary HTML"
+        );
+        assert!(
+            script.contains("'error'"),
+            "must keep the error status marker"
+        );
         assert!(
             !script.contains("null"),
             "the regression: error boundary must not inject null"

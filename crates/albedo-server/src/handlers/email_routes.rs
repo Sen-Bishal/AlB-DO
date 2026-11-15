@@ -46,7 +46,9 @@ use tracing::{debug, warn};
 use crate::auth::{now_ms, AuthRuntime};
 use crate::email::EmailRuntime;
 use crate::forms::{see_other, FormBody, ReturnPath};
-use crate::handlers::auth_routes::{open_session, refusal, AuthRequest, EMAIL_FIELD, PASSWORD_FIELD};
+use crate::handlers::auth_routes::{
+    open_session, refusal, AuthRequest, EMAIL_FIELD, PASSWORD_FIELD,
+};
 use crate::render::csrf::CsrfRegistry;
 
 /// Field a mailed token is submitted under.
@@ -114,7 +116,11 @@ pub async fn run_email_page(page: EmailPage, request: PageRequest<'_>) -> Respon
     };
     let offered = provider(request.auth, kind).is_some_and(|p| offers(p, purpose));
     if !offered || request.email.is_none() {
-        return refusal(StatusCode::NOT_FOUND, "This app does not offer that.", &ReturnPath::root());
+        return refusal(
+            StatusCode::NOT_FOUND,
+            "This app does not offer that.",
+            &ReturnPath::root(),
+        );
     }
 
     let token = url::form_urlencoded::parse(request.query.as_bytes())
@@ -123,7 +129,8 @@ pub async fn run_email_page(page: EmailPage, request: PageRequest<'_>) -> Respon
     let live = match &token {
         None => false,
         Some(token) => {
-            match email_token::peek(request.auth.substrate().as_ref(), purpose, token, now_ms()).await
+            match email_token::peek(request.auth.substrate().as_ref(), purpose, token, now_ms())
+                .await
             {
                 Ok(live) => live,
                 Err(err) => {
@@ -134,21 +141,34 @@ pub async fn run_email_page(page: EmailPage, request: PageRequest<'_>) -> Respon
         }
     };
     let (Some(token), true) = (token, live) else {
-        return landing(StatusCode::GONE, "Link expired", &format!("<p>{}</p>", html(LINK_DEAD)), None);
+        return landing(
+            StatusCode::GONE,
+            "Link expired",
+            &format!("<p>{}</p>", html(LINK_DEAD)),
+            None,
+        );
     };
 
     // The form's CSRF token is bound to the tab session. A browser arriving from
     // an email client often has none yet, so one is minted and set here.
-    let (session, minted) = if let Some(session) = request.session { (session, None) } else {
+    let (session, minted) = if let Some(session) = request.session {
+        (session, None)
+    } else {
         let session = SessionId::random();
-        (session, Some(crate::render::csrf::build_session_set_cookie(session)))
+        (
+            session,
+            Some(crate::render::csrf::build_session_set_cookie(session)),
+        )
     };
     let csrf = crate::render::csrf::csrf_hidden_input_html(&request.csrf.token_for(session));
     let hidden = format!(
         "{csrf}<input type=\"hidden\" name=\"{TOKEN_FIELD}\" value=\"{}\">",
         html(token.expose_for_cookie())
     );
-    let app = request.email.map(EmailRuntime::app_name).unwrap_or_default();
+    let app = request
+        .email
+        .map(EmailRuntime::app_name)
+        .unwrap_or_default();
 
     let (title, body) = match page {
         EmailPage::ResetForm => (
@@ -182,12 +202,26 @@ pub async fn run_email_page(page: EmailPage, request: PageRequest<'_>) -> Respon
 }
 
 /// `POST /_albedo/auth/password/forgot`.
-pub(crate) async fn forgot(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) -> Response<Body> {
-    let Some((provider, email_rt, jobs)) = mail_ready(request, ProviderKind::Password, Purpose::PasswordReset) else {
-        return refusal(StatusCode::NOT_FOUND, "This app does not offer password reset.", back);
+pub(crate) async fn forgot(
+    request: &AuthRequest<'_>,
+    form: &FormBody,
+    back: &ReturnPath,
+) -> Response<Body> {
+    let Some((provider, email_rt, jobs)) =
+        mail_ready(request, ProviderKind::Password, Purpose::PasswordReset)
+    else {
+        return refusal(
+            StatusCode::NOT_FOUND,
+            "This app does not offer password reset.",
+            back,
+        );
     };
     let Some(email) = form.get(EMAIL_FIELD).and_then(normalize_email) else {
-        return refusal(StatusCode::BAD_REQUEST, &PasswordError::InvalidEmail.to_string(), back);
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            &PasswordError::InvalidEmail.to_string(),
+            back,
+        );
     };
     let db = Arc::clone(request.auth.substrate());
     let runtime = Arc::clone(&email_rt);
@@ -257,7 +291,11 @@ pub(crate) async fn set_password(request: &AuthRequest<'_>, back: &ReturnPath) -
     let Some(principal) = request.identity.principal() else {
         return refusal(StatusCode::UNAUTHORIZED, "Sign in first.", back);
     };
-    if principal.providers.iter().any(|connected| connected == &provider) {
+    if principal
+        .providers
+        .iter()
+        .any(|connected| connected == &provider)
+    {
         return refusal(
             StatusCode::CONFLICT,
             "This account already has a password. Use “forgot password” to change it.",
@@ -300,9 +338,14 @@ pub(crate) async fn set_password(request: &AuthRequest<'_>, back: &ReturnPath) -
 /// `POST /_albedo/auth/password/reset`.
 pub(crate) async fn reset(request: &AuthRequest<'_>, form: &FormBody) -> Response<Body> {
     let root = ReturnPath::root();
-    let Some(provider) = provider(request.auth, ProviderKind::Password).filter(|p| p.reset_by_email)
+    let Some(provider) =
+        provider(request.auth, ProviderKind::Password).filter(|p| p.reset_by_email)
     else {
-        return refusal(StatusCode::NOT_FOUND, "This app does not offer password reset.", &root);
+        return refusal(
+            StatusCode::NOT_FOUND,
+            "This app does not offer password reset.",
+            &root,
+        );
     };
     let Some(token) = form.get(TOKEN_FIELD).and_then(SessionToken::from_presented) else {
         return refusal(StatusCode::GONE, LINK_DEAD, &root);
@@ -325,16 +368,29 @@ pub(crate) async fn reset(request: &AuthRequest<'_>, form: &FormBody) -> Respons
         }
         Err(err) => {
             warn!(target: "albedo.auth", %err, "password hashing failed");
-            return refusal(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Try again.", &root);
+            return refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong. Try again.",
+                &root,
+            );
         }
     };
 
     let db = request.auth.substrate().as_ref();
-    let Some((principal, redeemed)) = redeem(db, Purpose::PasswordReset, &token, &provider.name).await else {
+    let Some((principal, redeemed)) =
+        redeem(db, Purpose::PasswordReset, &token, &provider.name).await
+    else {
         return refusal(StatusCode::GONE, LINK_DEAD, &root);
     };
-    match email_token::reset_password_ending(db, &principal, &provider.name, &redeemed.email, &secret, now_ms())
-        .await
+    match email_token::reset_password_ending(
+        db,
+        &principal,
+        &provider.name,
+        &redeemed.email,
+        &secret,
+        now_ms(),
+    )
+    .await
     {
         // A reset ended every session of the account; R1b · exactly those
         // sessions' live connections close, after the commit.
@@ -342,7 +398,11 @@ pub(crate) async fn reset(request: &AuthRequest<'_>, form: &FormBody) -> Respons
         Ok(None) => return refusal(StatusCode::GONE, LINK_DEAD, &root),
         Err(err) => {
             warn!(target: "albedo.auth", %err, "password reset failed");
-            return refusal(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Try again.", &root);
+            return refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong. Try again.",
+                &root,
+            );
         }
     }
     // Clicking the link proved the mailbox.
@@ -352,12 +412,26 @@ pub(crate) async fn reset(request: &AuthRequest<'_>, form: &FormBody) -> Respons
 }
 
 /// `POST /_albedo/auth/magiclink/start`.
-pub(crate) async fn magic_start(request: &AuthRequest<'_>, form: &FormBody, back: &ReturnPath) -> Response<Body> {
-    let Some((provider, email_rt, jobs)) = mail_ready(request, ProviderKind::MagicLink, Purpose::MagicLink) else {
-        return refusal(StatusCode::NOT_FOUND, "This app does not offer email sign-in.", back);
+pub(crate) async fn magic_start(
+    request: &AuthRequest<'_>,
+    form: &FormBody,
+    back: &ReturnPath,
+) -> Response<Body> {
+    let Some((provider, email_rt, jobs)) =
+        mail_ready(request, ProviderKind::MagicLink, Purpose::MagicLink)
+    else {
+        return refusal(
+            StatusCode::NOT_FOUND,
+            "This app does not offer email sign-in.",
+            back,
+        );
     };
     let Some(email) = form.get(EMAIL_FIELD).and_then(normalize_email) else {
-        return refusal(StatusCode::BAD_REQUEST, &PasswordError::InvalidEmail.to_string(), back);
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            &PasswordError::InvalidEmail.to_string(),
+            back,
+        );
     };
     let next = form.get(NEXT_FIELD).and_then(ReturnPath::parse);
     let db = Arc::clone(request.auth.substrate());
@@ -389,7 +463,11 @@ pub(crate) async fn magic_start(request: &AuthRequest<'_>, form: &FormBody, back
 pub(crate) async fn magic_signin(request: &AuthRequest<'_>, form: &FormBody) -> Response<Body> {
     let root = ReturnPath::root();
     let Some(provider) = provider(request.auth, ProviderKind::MagicLink) else {
-        return refusal(StatusCode::NOT_FOUND, "This app does not offer email sign-in.", &root);
+        return refusal(
+            StatusCode::NOT_FOUND,
+            "This app does not offer email sign-in.",
+            &root,
+        );
     };
     let Some(token) = form.get(TOKEN_FIELD).and_then(SessionToken::from_presented) else {
         return refusal(StatusCode::GONE, LINK_DEAD, &root);
@@ -418,7 +496,11 @@ pub(crate) async fn magic_signin(request: &AuthRequest<'_>, form: &FormBody) -> 
         Ok(linked) => linked,
         Err(err) => {
             warn!(target: "albedo.auth", %err, "magic link account resolution failed");
-            return refusal(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Try again.", &root);
+            return refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong. Try again.",
+                &root,
+            );
         }
     };
     // R1b · whatever `took_over` ended up saying, the deletes it reports were
@@ -442,13 +524,19 @@ pub(crate) async fn verify(request: &AuthRequest<'_>, form: &FormBody) -> Respon
     let root = ReturnPath::root();
     let Some(provider) = provider(request.auth, ProviderKind::Password).filter(|p| p.verify_email)
     else {
-        return refusal(StatusCode::NOT_FOUND, "This app does not confirm email addresses.", &root);
+        return refusal(
+            StatusCode::NOT_FOUND,
+            "This app does not confirm email addresses.",
+            &root,
+        );
     };
     let Some(token) = form.get(TOKEN_FIELD).and_then(SessionToken::from_presented) else {
         return refusal(StatusCode::GONE, LINK_DEAD, &root);
     };
     let db = request.auth.substrate().as_ref();
-    let Some((principal, redeemed)) = redeem(db, Purpose::VerifyEmail, &token, &provider.name).await else {
+    let Some((principal, redeemed)) =
+        redeem(db, Purpose::VerifyEmail, &token, &provider.name).await
+    else {
         return refusal(StatusCode::GONE, LINK_DEAD, &root);
     };
     note_verified(db, &principal, &redeemed.email).await;
@@ -513,7 +601,9 @@ pub(crate) fn register_quietly(
                 .await
                 {
                     Ok(created) => created.map(|principal| principal.id),
-                    Err(err) => return warn!(target: "albedo.auth", %err, "account creation failed"),
+                    Err(err) => {
+                        return warn!(target: "albedo.auth", %err, "account creation failed")
+                    }
                 }
             }
             Err(err) => return warn!(target: "albedo.auth", %err, "account lookup failed"),
@@ -645,12 +735,26 @@ async fn mail_link(
     link: Link<'_>,
 ) {
     let now = now_ms();
-    let token = match email_token::issue(db, link.purpose, link.provider, link.principal, link.email, link.next, now).await {
+    let token = match email_token::issue(
+        db,
+        link.purpose,
+        link.provider,
+        link.principal,
+        link.email,
+        link.next,
+        now,
+    )
+    .await
+    {
         Ok(token) => token,
         Err(err) => return warn!(target: "albedo.auth", %err, "could not issue an email token"),
     };
     // base64url, so it needs no escaping in a query string.
-    let Some(url) = email_rt.link(&format!("{}?{TOKEN_FIELD}={}", link.path, token.expose_for_cookie())) else {
+    let Some(url) = email_rt.link(&format!(
+        "{}?{TOKEN_FIELD}={}",
+        link.path,
+        token.expose_for_cookie()
+    )) else {
         return warn!(target: "albedo.auth", "no link origin; boot should have refused this app");
     };
     let message = templates::render(
@@ -739,13 +843,22 @@ fn mail_ready(
     purpose: Purpose,
 ) -> Option<(String, Arc<EmailRuntime>, crate::jobs::JobHandle)> {
     let provider = provider(request.auth, kind).filter(|p| offers(p, purpose))?;
-    Some((provider.name.clone(), request.email.clone()?, request.jobs.clone()?))
+    Some((
+        provider.name.clone(),
+        request.email.clone()?,
+        request.jobs.clone()?,
+    ))
 }
 
 /// A self-contained page. No external resources, so nothing on it can leak the
 /// token in the URL through a `Referer`; and `no-referrer` besides, for the
 /// links a browser extension might add.
-fn landing(status: StatusCode, title: &str, body: &str, set_cookie: Option<String>) -> Response<Body> {
+fn landing(
+    status: StatusCode,
+    title: &str,
+    body: &str,
+    set_cookie: Option<String>,
+) -> Response<Body> {
     let page = format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -793,7 +906,10 @@ mod tests {
     #[test]
     fn the_landing_paths_are_matched_literally() {
         assert_eq!(match_email_page(RESET_PATH), Some(EmailPage::ResetForm));
-        assert_eq!(match_email_page(MAGIC_SIGNIN_PATH), Some(EmailPage::MagicSignIn));
+        assert_eq!(
+            match_email_page(MAGIC_SIGNIN_PATH),
+            Some(EmailPage::MagicSignIn)
+        );
         assert_eq!(match_email_page(VERIFY_PATH), Some(EmailPage::Verify));
         for path in [
             "/_albedo/auth/password/reset/",

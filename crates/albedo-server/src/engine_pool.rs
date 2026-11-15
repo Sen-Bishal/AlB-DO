@@ -47,10 +47,10 @@ use dom_render_compiler::ir::opcode::SlotId;
 use dom_render_compiler::runtime::quickjs_engine::QuickJsEngine;
 use dom_render_compiler::runtime::HandlerInvocation;
 use serde_json::Map;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::panic::AssertUnwindSafe;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Semaphore};
@@ -165,7 +165,10 @@ impl Drop for CheckedOut<'_> {
         if let Some(worker) = self.worker.take() {
             // A poisoned lock means another checkout panicked while holding it
             // for an O(1) push/pop; keep the engine rather than lose it too.
-            let mut idle = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut idle = self
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             idle.push(worker);
         }
     }
@@ -733,7 +736,9 @@ impl Drop for QuickJsEnginePool {
 fn lock_provision(provision: &Mutex<Provision>) -> std::sync::MutexGuard<'_, Provision> {
     // Held only to swap or clone registration vectors; a poisoned lock still holds a
     // complete value, and a replacement engine needs it more than it needs purity.
-    provision.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    provision
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A new engine given everything the pool has given its others: warmed, with
@@ -743,7 +748,10 @@ fn provisioned_engine(provision: &Mutex<Provision>) -> QuickJsEngine {
     let (npm, css, warm) = {
         let provision = lock_provision(provision);
         #[cfg(test)]
-        assert!(!provision.fail_replacement, "test: replacement provisioning fails");
+        assert!(
+            !provision.fail_replacement,
+            "test: replacement provisioning fails"
+        );
         (
             provision.npm.clone(),
             provision.css.clone(),
@@ -840,7 +848,9 @@ fn engine_worker_loop(
                 true
             }
         };
-        if let Ok(fresh) = std::panic::catch_unwind(AssertUnwindSafe(|| provisioned_engine(provision))) {
+        if let Ok(fresh) =
+            std::panic::catch_unwind(AssertUnwindSafe(|| provisioned_engine(provision)))
+        {
             let previous = std::mem::replace(&mut engine, fresh);
             if panicked {
                 // A panic may have unwound through inconsistent runtime
@@ -1263,7 +1273,10 @@ globalThis.__ALBEDO_NPM_ALIASES['poison'] = 'npm:poison@1.0.0/index.js';
             confinements >= 2,
             "the pool reported {confinements} confinements for 3 checkouts on a dirty              engine — the dirty bit is not latching"
         );
-        assert_eq!(failures, 0, "a confinement failed; the engine is under-populated");
+        assert_eq!(
+            failures, 0,
+            "a confinement failed; the engine is under-populated"
+        );
     }
 
     const ATTACKER_ROUTE: &str = r#"import { tag } from "poison";
@@ -1303,7 +1316,10 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
         assert_eq!(pool.install_npm_bundles(&[]), 0);
         // The pool is still serviceable afterwards — the early return must not
         // leave the idle set drained.
-        assert!(pool.with_engine(|engine| engine.is_initialized()).await.unwrap());
+        assert!(pool
+            .with_engine(|engine| engine.is_initialized())
+            .await
+            .unwrap());
     }
 
     /// Warm-on-construction reaches the arena layer: after construction, a
@@ -1565,7 +1581,10 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
                 if exited >= n {
                     return;
                 }
-                assert!(std::time::Instant::now() < deadline, "{exited} of {n} workers exited");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{exited} of {n} workers exited"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }
@@ -1577,7 +1596,9 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
     async fn a_slot_whose_replacement_also_panics_is_retired() {
         let pool = QuickJsEnginePool::with_size(2);
         pool.fail_replacements_for_test();
-        let lost = pool.with_engine(|_| -> () { panic!("a bug in a pool consumer") }).await;
+        let lost = pool
+            .with_engine(|_| -> () { panic!("a bug in a pool consumer") })
+            .await;
         assert!(matches!(lost, Err(EnginePoolError::WorkerLost)), "{lost:?}");
         pool.exited_workers(1).await;
 
@@ -1597,7 +1618,9 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
     async fn a_pool_with_no_engine_left_fails_instead_of_hanging() {
         let pool = QuickJsEnginePool::with_size(1);
         pool.fail_replacements_for_test();
-        let _ = pool.with_engine(|_| -> () { panic!("a bug in a pool consumer") }).await;
+        let _ = pool
+            .with_engine(|_| -> () { panic!("a bug in a pool consumer") })
+            .await;
         pool.exited_workers(1).await;
 
         for _ in 0..2 {
@@ -1607,7 +1630,10 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
             )
             .await
             .expect("🔴 a pool with no engines hung its caller");
-            assert!(matches!(outcome, Err(EnginePoolError::Exhausted)), "{outcome:?}");
+            assert!(
+                matches!(outcome, Err(EnginePoolError::Exhausted)),
+                "{outcome:?}"
+            );
         }
     }
 
@@ -1626,7 +1652,10 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
             pool.with_engine(|_| std::thread::sleep(std::time::Duration::from_millis(200))),
         )
         .await;
-        assert!(cancelled.is_err(), "CONTROL — the checkout must actually be cancelled");
+        assert!(
+            cancelled.is_err(),
+            "CONTROL — the checkout must actually be cancelled"
+        );
 
         // The one engine is still finishing the abandoned job; a checkout now
         // must wait for it and then succeed, twice, on the same engine.
@@ -1634,7 +1663,9 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
             let pool = Arc::clone(&pool);
             let outcome = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                tokio::spawn(async move { pool.with_engine(|engine| engine.is_initialized()).await }),
+                tokio::spawn(
+                    async move { pool.with_engine(|engine| engine.is_initialized()).await },
+                ),
             )
             .await
             .expect("the pool must not hang after a cancelled checkout")
@@ -1650,8 +1681,8 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
     /// is rebuilt, and the same engine serves the next checkout clean.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_runaway_checkout_is_stopped_and_its_realm_rebuilt() {
-        let pool = QuickJsEnginePool::with_size(1)
-            .with_job_budget(std::time::Duration::from_millis(50));
+        let pool =
+            QuickJsEnginePool::with_size(1).with_job_budget(std::time::Duration::from_millis(50));
         let spin = r#"
             export function generateMetadata() {
                 globalThis.__torn = "left by the runaway";
@@ -1700,8 +1731,8 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
     /// realm is not rebuilt for nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_checkout_within_its_budget_is_left_alone() {
-        let pool = QuickJsEnginePool::with_size(1)
-            .with_job_budget(std::time::Duration::from_millis(500));
+        let pool =
+            QuickJsEnginePool::with_size(1).with_job_budget(std::time::Duration::from_millis(500));
         let ok = pool
             .with_engine(|engine| {
                 engine
@@ -1737,7 +1768,11 @@ export default function A() { return <b data-tag={tag}>{String(globalThis.__pois
             })
             .await
             .unwrap();
-        assert_eq!(kept, serde_json::json!("kept"), "an uninterrupted realm was rebuilt");
+        assert_eq!(
+            kept,
+            serde_json::json!("kept"),
+            "an uninterrupted realm was rebuilt"
+        );
         assert_eq!(pool.interruptions(), 0);
     }
 

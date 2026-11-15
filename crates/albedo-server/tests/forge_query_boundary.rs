@@ -73,7 +73,10 @@ fn a_scaffold_without_new_style_queries_still_builds() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     let app = scaffold(home.path(), work.path());
-    let out = albedo(home.path(), &app).args(["build", "."]).output().unwrap();
+    let out = albedo(home.path(), &app)
+        .args(["build", "."])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", text(&out));
     assert!(
         !app.join(".albedo/query-report.txt").exists(),
@@ -88,9 +91,15 @@ fn build_refuses_a_new_style_query_naming_its_line() {
     let app = scaffold(home.path(), work.path());
     fs::write(app.join("src/routes/probe.tsx"), PROBE).unwrap();
 
-    let out = albedo(home.path(), &app).args(["build", "."]).output().unwrap();
+    let out = albedo(home.path(), &app)
+        .args(["build", "."])
+        .output()
+        .unwrap();
     let all = text(&out);
-    assert!(!out.status.success(), "the probe must fail the build:\n{all}");
+    assert!(
+        !out.status.success(),
+        "the probe must fail the build:\n{all}"
+    );
     assert!(
         all.contains("src/routes/probe.tsx:4:19"),
         "names the call site in source coordinates:\n{all}"
@@ -99,7 +108,10 @@ fn build_refuses_a_new_style_query_naming_its_line() {
     assert!(all.contains("Q1b"), "says what runs it:\n{all}");
     let report = fs::read_to_string(app.join(".albedo/query-report.txt"))
         .expect("the build wrote the query report");
-    assert!(all.contains("query-report.txt"), "the refusal points at it:\n{all}");
+    assert!(
+        all.contains("query-report.txt"),
+        "the refusal points at it:\n{all}"
+    );
     assert!(report.contains("src/routes/probe.tsx:4:19"), "{report}");
     assert!(
         report.contains("SELECT COUNT(*) AS a0 FROM guestbook WHERE author IS ?1"),
@@ -108,7 +120,10 @@ fn build_refuses_a_new_style_query_naming_its_line() {
 
     // Remove the probe: the next build succeeds and the stale report is gone.
     fs::remove_file(app.join("src/routes/probe.tsx")).unwrap();
-    let out = albedo(home.path(), &app).args(["build", "."]).output().unwrap();
+    let out = albedo(home.path(), &app)
+        .args(["build", "."])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", text(&out));
     assert!(!app.join(".albedo/query-report.txt").exists());
 }
@@ -120,7 +135,10 @@ fn the_query_refusal_is_the_first_error_ahead_of_render_failures() {
     let app = scaffold(home.path(), work.path());
     fs::write(app.join("src/routes/probe.tsx"), PROBE_THAT_ALSO_THROWS).unwrap();
 
-    let out = albedo(home.path(), &app).args(["build", "."]).output().unwrap();
+    let out = albedo(home.path(), &app)
+        .args(["build", "."])
+        .output()
+        .unwrap();
     let all = text(&out);
     assert!(!out.status.success(), "{all}");
     assert!(all.contains("src/routes/probe.tsx:4:19"), "{all}");
@@ -212,7 +230,10 @@ fn a_query_is_refused_in_every_kind_of_runtime_module() {
         fs::write(file, body).unwrap();
     }
 
-    let out = albedo(home.path(), &app).args(["build", "."]).output().unwrap();
+    let out = albedo(home.path(), &app)
+        .args(["build", "."])
+        .output()
+        .unwrap();
     let all = text(&out);
     assert!(!out.status.success(), "{all}");
     for site in [
@@ -238,7 +259,10 @@ fn a_bare_collection_value_fails_with_its_own_diagnostic() {
     let app = scaffold(home.path(), work.path());
     fs::write(app.join("src/routes/alias.tsx"), ALIAS).unwrap();
 
-    let out = albedo(home.path(), &app).args(["build", "."]).output().unwrap();
+    let out = albedo(home.path(), &app)
+        .args(["build", "."])
+        .output()
+        .unwrap();
     let all = text(&out);
     assert!(!out.status.success(), "{all}");
     assert!(all.contains("src/routes/alias.tsx:3:11"), "{all}");
