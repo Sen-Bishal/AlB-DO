@@ -26,7 +26,10 @@ use std::path::Path;
 
 const CHILD: &str = "ALBEDO_CONNECTION_OWNERSHIP_CHILD";
 const ROOT: &str = "ALBEDO_CONNECTION_OWNERSHIP_ROOT";
-const ATTEMPTS: usize = 20;
+// 10, not 20, and a 120 s child timeout, not 30: on CI's windows-latest the
+// binary took 267 s and one child timed out at 30 s writing its databases
+// (15 Nov 2026, run on 49880d0). Codex's isolated 0.6.0 run crashed at attempt 8.
+const ATTEMPTS: usize = 10;
 const DATABASES: usize = 30;
 
 /// Run `exercise` in a fresh child process `ATTEMPTS` times; every child must
@@ -58,7 +61,7 @@ where
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn child");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut timed_out = false;
         while child.try_wait().expect("poll child").is_none() {
             if std::time::Instant::now() >= deadline {
