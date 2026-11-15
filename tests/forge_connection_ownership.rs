@@ -16,6 +16,10 @@
 //! child per attempt and asserts on the child's exit status. Codex wrote the
 //! first three as falsifiers against a wrapper that preceded the upgrade
 //! (15 Nov 2026); they are kept here in the form that tests the dependency.
+//!
+//! Codex's later cases (rows outliving everything, rolled-back transactions)
+//! pass on 0.10. Its concurrent-final-owners case is a different upstream
+//! defect, a missed close, and is ignored here pending T-0049.
 
 use std::future::Future;
 use std::path::Path;
@@ -165,4 +169,180 @@ fn a_statement_can_outlive_its_connection() {
         }
         drop(live);
     });
+}
+
+/// Rows, and then a single row, retain the native statement after all explicit
+/// connection and database owners have gone away.
+#[test]
+fn rows_can_outlive_the_statement_connection_and_database() {
+    check_in_children(
+        "rows_can_outlive_the_statement_connection_and_database",
+        |root| async move {
+            let mut live = Vec::new();
+            for n in 0..DATABASES {
+                let db = database(&root, "rows", n).await;
+                let conn = db.connect().expect("connect");
+                conn.execute("CREATE TABLE t (v BLOB)", ())
+                    .await
+                    .expect("table");
+                conn.execute("INSERT INTO t VALUES (zeroblob(131072))", ())
+                    .await
+                    .expect("insert");
+                let mut statement = conn.prepare("SELECT v FROM t").await.expect("prepare");
+                let mut rows = statement.query(()).await.expect("query");
+                drop(statement);
+                drop(conn);
+                drop(db);
+                let row = rows
+                    .next()
+                    .await
+                    .expect("next after owners dropped")
+                    .expect("row");
+                drop(rows);
+                assert_eq!(
+                    row.get::<Vec<u8>>(0).expect("read after rows dropped"),
+                    vec![0; 131072]
+                );
+                live.push(row);
+            }
+            drop(live);
+            for n in 0..DATABASES {
+                std::fs::remove_file(root.join(format!("rows-{n}.db")))
+                    .expect("rows released the file before process exit");
+            }
+        },
+    );
+}
+
+/// Separately prepared statements own distinct native connection clones.
+/// Release those clones concurrently, then check for leaked handles while the
+/// child is still alive; process exit would otherwise hide a missed close.
+///
+/// **Ignored: it fails on libsql 0.10 and on 0.6 alike (T-0049).** Codex wrote
+/// it verifying T-0040 (15 Nov 2026). `local::Connection::disconnect` asks
+/// `Arc::get_mut` "am I the last owner?" before its own reference drops, so two
+/// final clones dropping at once on different threads can both answer no and
+/// neither closes: a leaked handle (Windows error 32 on delete), not a crash.
+/// Failed at child attempts 11 and 5 of 20. Kept out of the gating suite so CI
+/// stays trustworthy; run it with `--ignored`. Un-ignore when the upstream fix
+/// (atomic last-owner detection, e.g. `Arc::into_inner`) lands.
+#[test]
+#[ignore = "T-0049: libsql's last-owner check races between threads (leak, not a crash); run with --ignored"]
+fn prepared_statements_can_drop_concurrently_after_database_drop() {
+    check_in_children(
+        "prepared_statements_can_drop_concurrently_after_database_drop",
+        |root| async move {
+            const THREADS: usize = 8;
+            let mut owners = (0..THREADS).map(|_| Vec::new()).collect::<Vec<_>>();
+            for n in 0..DATABASES {
+                let db = database(&root, "concurrent", n).await;
+                let conn = db.connect().expect("connect");
+                conn.execute("CREATE TABLE t (v BLOB)", ())
+                    .await
+                    .expect("table");
+                conn.execute("INSERT INTO t VALUES (zeroblob(131072))", ())
+                    .await
+                    .expect("insert");
+                for thread_owners in &mut owners {
+                    thread_owners.push(conn.prepare("SELECT v FROM t").await.expect("prepare"));
+                }
+                drop(conn);
+                drop(db);
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let handles = owners
+                .into_iter()
+                .map(|connections| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        drop(connections);
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().expect("teardown thread");
+            }
+            for n in 0..DATABASES {
+                let path = root.join(format!("concurrent-{n}.db"));
+                // Allow transient Windows file inspection to finish, while
+                // keeping this check inside the child so exit cannot close
+                // a handle that the connection's own teardown leaked.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                loop {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => break,
+                        Err(error) if std::time::Instant::now() >= deadline => {
+                            panic!("concurrent final owners left {path:?} locked for one second: {error}");
+                        }
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    }
+                }
+            }
+        },
+    );
+}
+
+/// Dropping the last live transaction must roll back before its connection is
+/// closed; a reopened database must remain intact and contain no pending row.
+#[test]
+fn dropping_transactions_after_their_owners_rolls_back_and_reopens() {
+    check_in_children(
+        "dropping_transactions_after_their_owners_rolls_back_and_reopens",
+        |root| async move {
+            let mut live = Vec::new();
+            for n in 0..DATABASES {
+                let db = database(&root, "rollback", n).await;
+                let conn = db.connect().expect("connect");
+                conn.execute("CREATE TABLE t (v BLOB)", ())
+                    .await
+                    .expect("table");
+                let transaction = conn.transaction().await.expect("begin");
+                transaction
+                    .execute("INSERT INTO t VALUES (zeroblob(131072))", ())
+                    .await
+                    .expect("uncommitted insert");
+                drop(conn);
+                drop(db);
+                live.push(transaction);
+            }
+            drop(live);
+            for n in 0..DATABASES {
+                let db = database(&root, "rollback", n).await;
+                let conn = db.connect().expect("reconnect");
+                let mut rows = conn
+                    .query("SELECT COUNT(*) FROM t", ())
+                    .await
+                    .expect("count");
+                assert_eq!(
+                    rows.next()
+                        .await
+                        .expect("next")
+                        .expect("count row")
+                        .get::<i64>(0)
+                        .expect("count value"),
+                    0
+                );
+                drop(rows);
+                let mut rows = conn
+                    .query("PRAGMA integrity_check", ())
+                    .await
+                    .expect("integrity check");
+                assert_eq!(
+                    rows.next()
+                        .await
+                        .expect("next")
+                        .expect("integrity row")
+                        .get::<String>(0)
+                        .expect("integrity result"),
+                    "ok"
+                );
+                drop(rows);
+                drop(conn);
+                drop(db);
+                std::fs::remove_file(root.join(format!("rollback-{n}.db")))
+                    .expect("rolled-back transaction released the file before process exit");
+            }
+        },
+    );
 }
