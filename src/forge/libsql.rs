@@ -369,8 +369,12 @@ impl Drop for LibSqlSubstrate {
 /// handle once. The statement is never stepped, so it holds no lock and blocks
 /// no journal-mode change, `DETACH` or checkpoint.
 ///
+/// **Every libSQL connection in this repository goes through this**, tests
+/// included: wrap a raw `Database::connect()` with [`Self::new`]. A raw
+/// connection still closes twice when it drops.
+///
 /// Remove this when libsql is upgraded past the double close.
-pub(crate) struct ClosedOnceConnection {
+pub struct ClosedOnceConnection {
     /// Dropped first: its two closes see `last_owner`'s clone and do nothing.
     conn: Connection,
     /// Dropped second: holds the last clone and closes the handle once.
@@ -379,12 +383,21 @@ pub(crate) struct ClosedOnceConnection {
 }
 
 impl ClosedOnceConnection {
-    async fn new(conn: Connection) -> Result<Self> {
-        let last_owner = conn
-            .prepare("SELECT 1")
-            .await
-            .map_err(|e| SubstrateError::Backend(e.to_string()))?;
-        Ok(Self { conn, last_owner })
+    /// Take ownership of `conn` so it is closed exactly once.
+    ///
+    /// # Errors
+    /// [`SubstrateError::Backend`] if the keeper statement cannot be
+    /// prepared. `conn` is then **leaked, not dropped**: without a keeper
+    /// its drop is the double close this type exists to prevent, and one
+    /// leaked handle on a failing database is the lesser harm.
+    pub async fn new(conn: Connection) -> Result<Self> {
+        match conn.prepare("SELECT 1").await {
+            Ok(last_owner) => Ok(Self { conn, last_owner }),
+            Err(e) => {
+                std::mem::forget(conn);
+                Err(SubstrateError::Backend(e.to_string()))
+            }
+        }
     }
 }
 

@@ -287,7 +287,7 @@ async fn lowered_null_range_or_group_and_exact_in_semantics_on_libsql() {
         .build()
         .await
         .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = dom_render_compiler::forge::libsql::ClosedOnceConnection::new(db.connect().unwrap()).await.unwrap();
     conn.execute("CREATE TABLE invoice_rows(invoice_key INTEGER PRIMARY KEY, amount REAL, due INTEGER, n INTEGER, owner TEXT, paid INTEGER, status TEXT)", ()).await.unwrap();
     conn.execute("INSERT INTO invoice_rows VALUES (3,NULL,10,9007199254740993,'x',0,'b'),(1,NULL,10,42,'x',1,'a'),(2,8,10,9223372036854775807,'y',1,'b'),(4,NULL,30,NULL,NULL,NULL,NULL),(5,4,20,-9223372036854775808,'x',0,'a'),(6,NULL,30,7,'y',1,'c')", ()).await.unwrap();
 
@@ -392,7 +392,7 @@ async fn lowered_null_range_or_group_and_exact_in_semantics_on_libsql() {
     for index in wanted(&sorted.canonical.descriptor, &schema()) {
         conn.execute(&index.ddl(), ()).await.unwrap();
     }
-    let fresh = db.connect().unwrap();
+    let fresh = dom_render_compiler::forge::libsql::ClosedOnceConnection::new(db.connect().unwrap()).await.unwrap();
     let mut plan = fresh
         .query(
             &format!("EXPLAIN QUERY PLAN {}", sorted.lowered.statements[0].sql),

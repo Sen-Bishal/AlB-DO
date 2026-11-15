@@ -118,7 +118,7 @@ pub struct FourLaneRuntimePipeline {
     pending_placeholders: DashMap<SuspenseId, AsyncIslandRecord>,
     async_tx: mpsc::UnboundedSender<AsyncResolution>,
     async_rx: Mutex<mpsc::UnboundedReceiver<AsyncResolution>>,
-    pending_placeholder_emissions: Mutex<Vec<LaneRenderedChunk>>,
+    pending_placeholder_emissions: Mutex<Vec<(SuspenseId, LaneRenderedChunk)>>,
 
     // Phase H — server-side reactive slot store. Shared via `Arc` with
     // the server's action dispatcher so handlers can read/write slots
@@ -636,7 +636,7 @@ impl FourLaneRuntimePipeline {
         }])?;
 
         match self.pending_placeholder_emissions.lock() {
-            Ok(mut queue) => queue.push(placeholder_chunk),
+            Ok(mut queue) => queue.push((suspense_id, placeholder_chunk)),
             Err(_) => {
                 // Lock poisoning would mean an earlier tick panicked while
                 // holding it. Drop the placeholder rather than panic again;
@@ -694,7 +694,9 @@ impl FourLaneRuntimePipeline {
     /// Returns chunks ready to enqueue on the patches stream. Caller is
     /// `drain_opcode_chunks`; outside callers should not normally need
     /// this directly.
-    fn drain_async_patch_chunks(&self) -> Result<Vec<LaneRenderedChunk>, RuntimePipelineError> {
+    fn drain_async_patch_chunks(
+        &self,
+    ) -> Result<Vec<(SuspenseId, LaneRenderedChunk)>, RuntimePipelineError> {
         let mut out = Vec::new();
 
         let mut rx = match self.async_rx.lock() {
@@ -724,7 +726,7 @@ impl FourLaneRuntimePipeline {
             });
             instructions.extend(resolution.instructions);
 
-            out.push(self.build_patches_chunk(instructions)?);
+            out.push((resolution.suspense_id, self.build_patches_chunk(instructions)?));
         }
 
         Ok(out)
@@ -771,13 +773,31 @@ impl FourLaneRuntimePipeline {
     pub fn drain_opcode_chunks(&self) -> Vec<LaneRenderedChunk> {
         let mut chunks = Vec::new();
 
-        // Phase D: resolved async islands first. Cancelled or unknown
-        // resolutions are dropped silently; errors collapsing to an
-        // empty Vec keep the tick loop alive even if the patches stream
-        // hits a transient routing problem.
-        if let Ok(async_chunks) = self.drain_async_patch_chunks() {
-            chunks.extend(async_chunks);
-        }
+        // Phase D, and the order is the point. Resolutions are received
+        // BEFORE this tick's placeholders are taken: `enqueue_async_island`
+        // queues the placeholder before it spawns the resolver, so every
+        // resolution in hand has its placeholder either shipped by an
+        // earlier drain or in the batch taken below — never missing.
+        //
+        // Cancelled or unknown resolutions are dropped silently; an error
+        // collapses to nothing so the tick loop stays alive.
+        let resolved = self.drain_async_patch_chunks().unwrap_or_default();
+        let placeholders = self
+            .pending_placeholder_emissions
+            .lock()
+            .map(|mut queued| std::mem::take(&mut *queued))
+            .unwrap_or_default();
+        // A resolver can finish before the drain after its enqueue; its
+        // patch must then follow its own placeholder, or the client gets a
+        // patch with no target and a placeholder nothing fills (CI, 15 Nov
+        // 2026). Patches for islands whose placeholders shipped earlier go
+        // first, so a re-enqueued element ends up loading, not stale.
+        let fresh: std::collections::HashSet<SuspenseId> =
+            placeholders.iter().map(|(suspense_id, _)| *suspense_id).collect();
+        let (late, earlier): (Vec<_>, Vec<_>) = resolved
+            .into_iter()
+            .partition(|(suspense_id, _)| fresh.contains(suspense_id));
+        chunks.extend(earlier.into_iter().map(|(_, chunk)| chunk));
 
         // Per-tick patch frames from the synchronous emitter.
         for result in self.frame_arena.opcode_results() {
@@ -795,13 +815,9 @@ impl FourLaneRuntimePipeline {
             chunks.push(chunk);
         }
 
-        // Phase D: Placeholders queued by `enqueue_async_island` this
-        // tick. Drained last so the client sees them after any
-        // resolutions from prior ticks have already replaced earlier
-        // placeholders.
-        if let Ok(mut queued) = self.pending_placeholder_emissions.lock() {
-            chunks.append(&mut queued);
-        }
+        // This tick's placeholders, then the patches that resolve them.
+        chunks.extend(placeholders.into_iter().map(|(_, chunk)| chunk));
+        chunks.extend(late.into_iter().map(|(_, chunk)| chunk));
 
         chunks
     }
@@ -1292,8 +1308,14 @@ mod tests {
     fn enqueue_async_island_emits_placeholder_chunk() {
         let (pipeline, _runtime) = build_async_pipeline();
 
+        // Held unresolved: a resolver that finishes before the drain puts
+        // its Patch in the same drain (see the ordering tests below).
+        let (_hold, never) = tokio::sync::oneshot::channel::<()>();
         let suspense_id = pipeline
-            .enqueue_async_island(StableId(7), async { Vec::new() })
+            .enqueue_async_island(StableId(7), async move {
+                let _ = never.await;
+                Vec::new()
+            })
             .expect("enqueue must succeed when runtime handle is bound");
         assert_eq!(suspense_id, SuspenseId(0));
         assert_eq!(pipeline.pending_async_count(), 1);
@@ -1309,6 +1331,93 @@ mod tests {
                 stable_id: StableId(7),
                 suspense_id: SuspenseId(0),
             }]
+        );
+    }
+
+    /// The resolver can finish before the next drain: `async { .. }` with
+    /// nothing to wait on resolves on the worker at once. That drain then
+    /// holds both the island's `Placeholder` and its `Patch`, and the client
+    /// must see the placeholder first, or the patch has no target and the
+    /// placeholder that follows it is never filled. CI caught the old
+    /// order (Patch, then Placeholder) on a loaded Windows runner, 15 Nov
+    /// 2026; this waits for the resolution so the race always happens.
+    #[test]
+    fn a_resolution_in_the_placeholders_own_drain_ships_after_it() {
+        let (pipeline, _runtime) = build_async_pipeline();
+        let suspense_id = pipeline
+            .enqueue_async_island(StableId(9), async {
+                vec![Instruction::Create {
+                    tag_id: TagId(0),
+                    stable_id: StableId(9),
+                }]
+            })
+            .expect("enqueue must succeed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pipeline.async_rx.lock().expect("rx").is_empty() {
+            assert!(std::time::Instant::now() < deadline, "resolver never resolved");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let chunks = pipeline.drain_opcode_chunks();
+        let firsts: Vec<Instruction> = chunks
+            .iter()
+            .map(|chunk| decoded_instructions(chunk)[0].clone())
+            .collect();
+        assert_eq!(firsts.len(), 2, "placeholder and patch in one drain: {firsts:?}");
+        assert!(
+            matches!(firsts[0], Instruction::Placeholder { suspense_id: sid, .. } if sid == suspense_id),
+            "the placeholder must ship first: {firsts:?}"
+        );
+        assert!(
+            matches!(firsts[1], Instruction::Patch { suspense_id: sid, .. } if sid == suspense_id),
+            "its patch must ship after it: {firsts:?}"
+        );
+    }
+
+    /// An island resolved in an earlier tick, re-enqueued at the same
+    /// element in this one: the old island's patch must still ship before
+    /// the new placeholder, so the element ends up loading, not stale.
+    #[test]
+    fn an_earlier_islands_patch_ships_before_a_new_placeholder() {
+        let (pipeline, _runtime) = build_async_pipeline();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let old = pipeline
+            .enqueue_async_island(StableId(4), async move {
+                let _ = gate.await;
+                Vec::new()
+            })
+            .expect("enqueue old");
+        let first = pipeline.drain_opcode_chunks();
+        assert_eq!(first.len(), 1, "only the old placeholder while its resolver waits");
+
+        release.send(()).expect("release the old resolver");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pipeline.async_rx.lock().expect("rx").is_empty() {
+            assert!(std::time::Instant::now() < deadline, "old resolver never resolved");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (_hold, never) = tokio::sync::oneshot::channel::<()>();
+        let new = pipeline
+            .enqueue_async_island(StableId(4), async move {
+                let _ = never.await;
+                Vec::new()
+            })
+            .expect("enqueue new");
+
+        let firsts: Vec<Instruction> = pipeline
+            .drain_opcode_chunks()
+            .iter()
+            .map(|chunk| decoded_instructions(chunk)[0].clone())
+            .collect();
+        assert_eq!(firsts.len(), 2, "{firsts:?}");
+        assert!(
+            matches!(firsts[0], Instruction::Patch { suspense_id: sid, .. } if sid == old),
+            "the earlier island's patch first: {firsts:?}"
+        );
+        assert!(
+            matches!(firsts[1], Instruction::Placeholder { suspense_id: sid, .. } if sid == new),
+            "then the new placeholder: {firsts:?}"
         );
     }
 

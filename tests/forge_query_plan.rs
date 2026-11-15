@@ -123,9 +123,12 @@ async fn ids(conn: &libsql::Connection, sql: &str, params: Vec<libsql::Value>) -
 
 const TABLE: &str = "CREATE TABLE invoices (id INTEGER PRIMARY KEY AUTOINCREMENT, amount REAL NOT NULL, due INTEGER NOT NULL, owner TEXT NOT NULL, status TEXT NOT NULL)";
 
-async fn open(dir: &std::path::Path, name: &str) -> (libsql::Database, libsql::Connection) {
+async fn open(
+    dir: &std::path::Path,
+    name: &str,
+) -> (libsql::Database, dom_render_compiler::forge::libsql::ClosedOnceConnection) {
     let db = libsql::Builder::new_local(dir.join(name)).build().await.expect("open");
-    let conn = db.connect().expect("connect");
+    let conn = dom_render_compiler::forge::libsql::ClosedOnceConnection::new(db.connect().expect("connect")).await.expect("connect");
     conn.execute(TABLE, ()).await.expect("table");
     (db, conn)
 }
