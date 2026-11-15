@@ -10,19 +10,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # P-buyer-blockers BB1a: 12 Nov 2026 measured 282 files / 2,121 hunks.
-  # fmt stays advisory until the one-off reformat commit; clippy until its lint debt
-  # (3,946 diagnostics on 12 Nov, T-0039) is cleared. Neither gates the tests.
+  # fmt gates since the one-off reformat (04431d2, 15 Nov 2026). It is pinned to
+  # the nightly that reformat used: rustfmt.toml needs nightly options
+  # (wrap_comments, normalize_comments), and their output can change between
+  # nightlies, so an unpinned check could fail on untouched code. Bump the pin
+  # and reformat in the same commit.
+  # clippy stays advisory until its lint debt is cleared (T-0039).
   fmt:
-    name: fmt (advisory until the reformat commit)
+    name: fmt
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-19
           components: rustfmt
 
       - uses: Swatinem/rust-cache@v2

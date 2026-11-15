@@ -1,0 +1,6 @@
+# Formatting-only commits. `git blame` skips them with
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# (GitHub's blame view reads this file automatically.)
+
+# Format the tree with rustfmt (nightly-2026-10-19)
+04431d29de65af94fb101822ec43ddedd8366360
